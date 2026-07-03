@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from ingestion.llm_client import MalformedResponseError, parse_with_retry
@@ -39,6 +40,30 @@ logger = logging.getLogger(__name__)
 _IDENT_RE = re.compile(r"#\d{2,6}\b|\b[0-9a-f]{7,40}\b")
 _ANNOUNCE_VERBS = ("committed", "merged", "pushed")
 _XDEDUP_WINDOW_HOURS = 72
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _resolve_event_date(date_str: str | None, turn_date: str) -> str:
+    """Validate the gate's resolved event date against the turn date; fall back to the
+    turn date on any failure. ``turn_date`` and the return value are YYYY-MM-DD.
+
+    Mirrors event_extract_v2.resolve() (the write-side fix validated on LongMemEval):
+    the event date must be a parseable ISO date, not in the future (a 1-day skew is
+    tolerated), and within 2 years back of the turn. A wrong resolution outside that
+    window collapses to the turn date rather than poisoning the timeline order."""
+    if not date_str or not _ISO_DATE_RE.match(date_str.strip()):
+        return turn_date
+    ds = date_str.strip()
+    try:
+        d = datetime.strptime(ds, "%Y-%m-%d")
+        t = datetime.strptime(turn_date, "%Y-%m-%d")
+    except ValueError:
+        return turn_date
+    # events lie in the past, within 2 years of the turn
+    if d > t + timedelta(days=1) or d < t - timedelta(days=730):
+        return turn_date
+    return ds
 
 
 def extract_idents(fact: str) -> list[str]:
@@ -58,12 +83,12 @@ Write the `event` under two hard rules:
 3. Start with a LOWERCASE verb (it's a log line, not a sentence).
 4. NO third-party personal names (clients, transcript subjects, other people's data) — describe generically ("8 client transcripts", not the names). Project/tool/service names are fine.
 
+DATE. This turn's date is given below. Most events happen the day they're discussed — leave `date` OUT for those. Only when the user reports something that ALREADY happened on a DIFFERENT day set `date` to the resolved calendar date (YYYY-MM-DD): resolve an absolute mention ("on May 3rd" -> that date, this turn's year unless stated) or a relative one ("last Tuesday", "two weeks ago", "this past weekend") against this turn's date. When the date you set differs from this turn's date, KEEP the user's original timing phrase in the event text verbatim so a wrong resolution stays auditable (e.g. "deployed the search reindex (reported as 'last Tuesday')"). Omit `date` when the event happened this turn or the timing can't be inferred.
+
 salience: 2 = milestone / shipped to prod / major decision; 1 = a normal action or decision; 0 = minor or routine.
 event_type: "decision" (a choice/direction was reached), "action" (something was executed: code, command, deploy, fix), "finding" (a result/diagnosis/measurement was learned), or "milestone" (a phase completed / shipped).
 
-Output ONLY JSON: {"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone"}  OR  {"event": null}
-
-THE TURN:
+Output ONLY JSON: {"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone", "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}  OR  {"event": null}
 """
 
 
@@ -78,10 +103,14 @@ def _parse_gate(text: str) -> dict[str, Any] | None:
         return None
     sal = d.get("salience", 1)
     et = d.get("event_type")
+    raw_date = d.get("date")
+    # Shape only here (a non-empty string); range/parse validation is _resolve_event_date's job.
+    date = raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None
     return {
         "event": str(ev).strip(),
         "salience": sal if isinstance(sal, int) and 0 <= sal <= 2 else 1,
         "event_type": et if et in ("decision", "action", "finding", "milestone") else None,
+        "date": date,
     }
 
 
@@ -116,9 +145,19 @@ class TimelineGate:
         if not episode_id or len(content) < _MIN_CONTENT:
             return
 
+        # The turn's own date (episodes.created_at, MAX over the window) — the anchor
+        # the gate resolves relative timing against, and the default t_valid. Fetched
+        # BEFORE the gate call so the prompt can carry it; never ingest wall-clock.
+        turn_ts = self._db.get_episodes_valid_at([int(episode_id)])
+        if not turn_ts:
+            return
+        turn_date = turn_ts[:10]  # YYYY-MM-DD
+
         gate = parse_with_retry(
             self._llm_client,
-            base_prompt=GATE_PROMPT + content[:6000],
+            base_prompt=(
+                f"{GATE_PROMPT}\nThis turn happened on {turn_date}.\n\nTHE TURN:\n{content[:6000]}"
+            ),
             parser=_parse_gate,
             model=self._model,
             max_tokens=256,
@@ -126,10 +165,11 @@ class TimelineGate:
         if gate is None:
             return
 
-        # Dated to the turn itself (episodes.created_at) — never ingest wall-clock.
-        t_valid = self._db.get_episodes_valid_at([int(episode_id)])
-        if not t_valid:
-            return
+        # When the gate resolved the event to a DIFFERENT past day (something the user
+        # reports as already-happened), stamp t_valid to that day at noon UTC; otherwise
+        # keep the precise turn timestamp. _resolve_event_date validates + clamps first.
+        resolved_date = _resolve_event_date(gate.get("date"), turn_date)
+        t_valid = turn_ts if resolved_date == turn_date else f"{resolved_date}T12:00:00+00:00"
 
         # Write-time cross-source dedup: a bare commit/merge ANNOUNCEMENT whose PR-ref/SHA
         # is already on the timeline (git is canonical for those) adds nothing — skip it.
