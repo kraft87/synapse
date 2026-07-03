@@ -2,17 +2,21 @@
 
 Self-hosted long-term memory for AI coding agents. Synapse captures Claude Code (and Cursor)
 session transcripts, structures them into retrievable episodes plus a knowledge graph, and
-serves it all back over MCP during active sessions, with hybrid search that returns in well
-under a second.
+serves it all back over MCP during active sessions, fusing episodes and knowledge-graph facts
+into one ranked result.
 
 **The problem it solves:** Claude Code sessions have no memory across restarts. Every new
 session starts cold. Synapse indexes everything that happened in past sessions and makes it
 retrievable, so a fresh session can recall what was decided, built, and tried weeks ago.
 
-It runs entirely on your own hardware. The extraction LLM takes a Claude subscription token, an
-`ANTHROPIC_API_KEY`, or any OpenAI-compatible endpoint (`SYNAPSE_LLM_PROVIDER=openai`); embeddings
-and rerank are Voyage AI by default, or any OpenAI-compatible endpoint, or the bundled
-`local-inference` profile for a fully local stack with zero external accounts.
+Your memory data and the whole serving stack live on your own hardware — no third-party service
+holds your history. The default pipeline does call paid APIs, though: Voyage for embeddings and
+rerank (on every ingest *and* every recall), and Anthropic for extraction (a Claude subscription
+token, an `ANTHROPIC_API_KEY`, or any OpenAI-compatible endpoint via `SYNAPSE_LLM_PROVIDER=openai`).
+Extraction cost scales with how much you ingest, so backfilling months of history is the one large
+spend. For a no-API setup, the bundled `local-inference` profile plus a local LLM runs the whole
+thing with zero external accounts — retrieval quality was tuned on the Voyage stack, so expect a
+drop.
 
 ## Demo
 
