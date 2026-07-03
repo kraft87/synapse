@@ -61,17 +61,13 @@ _RERANKER_UNSET = object()
 _KG_CANDIDATE_LIMIT = 30
 _RRF_K = 60
 # Timeline leg (schema 033). recall() fuses a compact chronological event list into the
-# payload when the query has TEMPORAL INTENT — the LME lesson: temporal questions only
-# recover if the answer path actually reads the timeline. Conservative regex (precision
-# over recall; a false fire costs ~0.5KB of context). Kill switch SYNAPSE_RECALL_TIMELINE=0.
+# payload on EVERY query. It originally fired behind a temporal-intent regex, but the
+# regex missed 41% of dated questions on LongMemEval (ordering phrasings like "which
+# came first, X or Y" carry no temporal keyword), and the leg is one cheap parallel DB
+# read serving <=8 events (~0.5KB; empty result = no payload change) — a gate buys
+# nothing. Kill switch SYNAPSE_RECALL_TIMELINE=0.
 _TIMELINE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_TIMELINE", "1") != "0"
 _TIMELINE_LIMIT = 8
-_TEMPORAL_RE = re.compile(
-    r"\b(when (did|was|were)|how long|how many (days|weeks|months)|last (week|month|night)"
-    r"|yesterday|days? (ago|since|between|before|after)|weeks? ago|months? ago"
-    r"|timeline|chronolog|what did (i|we) (do|ship|build)|recently (did|shipped|built))\b",
-    re.IGNORECASE,
-)
 _RECENCY_HALF_LIFE_DAYS = 30  # content this old scores ~50% of today's content
 # Recency re-injection AFTER the cross-encoder rerank. The reranker is
 # recency-blind and an old *definitive* statement ("X is canonical") out-scores
@@ -752,6 +748,13 @@ class Recall:
         if len(passages) > _RECALL_PASSAGE_CAND:
             passages = passages[:_RECALL_PASSAGE_CAND]
             owner = owner[:_RECALL_PASSAGE_CAND]
+        # EXPERIMENT (env-gated): structural compaction v2.
+        # SYNAPSE_PASSAGE_QUOTA=k caps served chunks per parent episode (slot allocation —
+        # one loud session can't eat every slot). SYNAPSE_PASSAGE_WINDOW=w merges each
+        # winning chunk with up to w adjacent chunks of the same episode (restores the
+        # connective context that makes fragments summable). Both 0/off by default.
+        _quota = int(os.environ.get("SYNAPSE_PASSAGE_QUOTA", "0") or "0")
+        _window = int(os.environ.get("SYNAPSE_PASSAGE_WINDOW", "0") or "0")
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
         else:
@@ -759,18 +762,41 @@ class Recall:
             if reranker is None:  # rerank disabled — no selection signal, serve full episodes
                 return []
             try:
-                scored = reranker.rerank_scored(query, passages, top_k=n)
+                scored = reranker.rerank_scored(query, passages, top_k=None if _quota else n)
             except Exception as e:
                 logger.warning("Passage rerank failed, serving full episodes: %s", e)
                 return []
-            chosen = [i for i, _ in scored[:n]]
+            if _quota:
+                per: dict[int, int] = {}
+                chosen = []
+                for i, _s in scored:
+                    k = id(owner[i])
+                    if per.get(k, 0) >= _quota:
+                        continue
+                    per[k] = per.get(k, 0) + 1
+                    chosen.append(i)
+                    if len(chosen) >= n:
+                        break
+            else:
+                chosen = [i for i, _ in scored[:n]]
         out: list[dict[str, Any]] = []
+        used: set[int] = set()
         for i in chosen:
+            if i in used:
+                continue
             ep = owner[i]
+            lo = hi = i
+            for _ in range(_window):
+                if lo - 1 >= 0 and owner[lo - 1] is ep:
+                    lo -= 1
+                if hi + 1 < len(passages) and owner[hi + 1] is ep:
+                    hi += 1
+            span = [j for j in range(lo, hi + 1) if j not in used]
+            used.update(span)
             item: dict[str, Any] = {}
             if (rid := ep.get("id")) is not None:
                 item["id"] = rid  # parent episode — pass to fetch_episode() to expand the full turn
-            item["content"] = passages[i]
+            item["content"] = "\n".join(passages[j] for j in span)
             if (project := ep.get("project")) is not None:
                 item["project"] = project
             if (ts := ep.get("created_at")) is not None:
@@ -1158,11 +1184,7 @@ class Recall:
             )
             return list(res.get("items") or [])[:_TIMELINE_LIMIT]
 
-        f_timeline = (
-            ex.submit(_timed, _timeline_leg)
-            if _TIMELINE_IN_RECALL and _TEMPORAL_RE.search(query)
-            else None
-        )
+        f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
 
         # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
         # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
