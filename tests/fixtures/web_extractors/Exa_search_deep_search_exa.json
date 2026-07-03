@@ -1,0 +1,74 @@
+{
+  "tool": "mcp__claude_ai_Exa_search__deep_search_exa",
+  "happy_count": 6,
+  "error_count": 0,
+  "happy_samples": [
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__deep_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres memory topic 1",
+        "numResults": 5
+      },
+      "result_text": "# Search summary\n\n### 1. Scaling Postgres for analytics\n**URL:** https://blog.example.com/postgres-analytics\n\nA guide to partitioning and indexing large tables.\n\n### 2. HNSW tuning for pgvector\n**URL:** https://docs.example.com/pgvector-hnsw\n\nHow to set ef_search and m for fast recall.\n\n### 3. Reciprocal rank fusion explained\n**URL:** https://blog.example.com/rrf\n\nCombining BM25 and vector search results.\n",
+      "result_chars": 409,
+      "fingerprint": "0000gen00"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__deep_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres memory topic 2",
+        "numResults": 5
+      },
+      "result_text": "# Search summary\n\n### 1. HNSW tuning for pgvector\n**URL:** https://docs.example.com/pgvector-hnsw\n\nHow to set ef_search and m for fast recall.\n\n### 2. Reciprocal rank fusion explained\n**URL:** https://blog.example.com/rrf\n\nCombining BM25 and vector search results.\n\n### 3. Building an MCP server\n**URL:** https://docs.example.com/mcp-server\n\nA walkthrough of the Model Context Protocol server API.\n",
+      "result_chars": 398,
+      "fingerprint": "0000gen01"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__deep_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres memory topic 3",
+        "numResults": 5
+      },
+      "result_text": "# Search summary\n\n### 1. Reciprocal rank fusion explained\n**URL:** https://blog.example.com/rrf\n\nCombining BM25 and vector search results.\n\n### 2. Building an MCP server\n**URL:** https://docs.example.com/mcp-server\n\nA walkthrough of the Model Context Protocol server API.\n\n### 3. Contextual retrieval basics\n**URL:** https://blog.example.com/contextual-retrieval\n\nPrepending context to chunks before embedding.\n",
+      "result_chars": 411,
+      "fingerprint": "0000gen02"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__deep_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres memory topic 4",
+        "numResults": 5
+      },
+      "result_text": "# Search summary\n\n### 1. Building an MCP server\n**URL:** https://docs.example.com/mcp-server\n\nA walkthrough of the Model Context Protocol server API.\n\n### 2. Contextual retrieval basics\n**URL:** https://blog.example.com/contextual-retrieval\n\nPrepending context to chunks before embedding.\n\n### 3. Bitemporal graphs in Postgres\n**URL:** https://docs.example.com/bitemporal\n\nModeling valid-time and transaction-time edges.\n",
+      "result_chars": 421,
+      "fingerprint": "0000gen03"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__deep_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres memory topic 5",
+        "numResults": 5
+      },
+      "result_text": "# Search summary\n\n### 1. Contextual retrieval basics\n**URL:** https://blog.example.com/contextual-retrieval\n\nPrepending context to chunks before embedding.\n\n### 2. Bitemporal graphs in Postgres\n**URL:** https://docs.example.com/bitemporal\n\nModeling valid-time and transaction-time edges.\n\n### 3. Cross-encoder reranking\n**URL:** https://blog.example.com/rerank\n\nWhy a reranker beats deeper fusion for hard queries.\n",
+      "result_chars": 415,
+      "fingerprint": "0000gen04"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__deep_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres memory topic 6",
+        "numResults": 5
+      },
+      "result_text": "# Search summary\n\n### 1. Bitemporal graphs in Postgres\n**URL:** https://docs.example.com/bitemporal\n\nModeling valid-time and transaction-time edges.\n\n### 2. Cross-encoder reranking\n**URL:** https://blog.example.com/rerank\n\nWhy a reranker beats deeper fusion for hard queries.\n\n### 3. Chunking strategies for RAG\n**URL:** https://docs.example.com/chunking\n\nSliding-window chunks as a fact substrate.\n",
+      "result_chars": 399,
+      "fingerprint": "0000gen05"
+    }
+  ],
+  "error_samples": []
+}

@@ -1,0 +1,74 @@
+{
+  "tool": "mcp__claude_ai_firecrawl__firecrawl_search",
+  "happy_count": 6,
+  "error_count": 0,
+  "happy_samples": [
+    {
+      "tool_name": "mcp__claude_ai_firecrawl__firecrawl_search",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "python postgres search topic 1",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"web\": [\n    {\n      \"url\": \"https://blog.example.com/postgres-analytics\",\n      \"title\": \"Scaling Postgres for analytics\",\n      \"description\": \"A guide to partitioning and indexing large tables.\",\n      \"position\": 1\n    },\n    {\n      \"url\": \"https://docs.example.com/pgvector-hnsw\",\n      \"title\": \"HNSW tuning for pgvector\",\n      \"description\": \"How to set ef_search and m for fast recall.\",\n      \"position\": 2\n    },\n    {\n      \"url\": \"https://blog.example.com/rrf\",\n      \"title\": \"Reciprocal rank fusion explained\",\n      \"description\": \"Combining BM25 and vector search results.\",\n      \"position\": 3\n    },\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"description\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"position\": 4\n    }\n  ]\n}",
+      "result_chars": 834,
+      "fingerprint": "0000gen00"
+    },
+    {
+      "tool_name": "mcp__claude_ai_firecrawl__firecrawl_search",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "python postgres search topic 2",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"web\": [\n    {\n      \"url\": \"https://docs.example.com/pgvector-hnsw\",\n      \"title\": \"HNSW tuning for pgvector\",\n      \"description\": \"How to set ef_search and m for fast recall.\",\n      \"position\": 1\n    },\n    {\n      \"url\": \"https://blog.example.com/rrf\",\n      \"title\": \"Reciprocal rank fusion explained\",\n      \"description\": \"Combining BM25 and vector search results.\",\n      \"position\": 2\n    },\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"description\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"position\": 3\n    },\n    {\n      \"url\": \"https://blog.example.com/contextual-retrieval\",\n      \"title\": \"Contextual retrieval basics\",\n      \"description\": \"Prepending context to chunks before embedding.\",\n      \"position\": 4\n    }\n  ]\n}",
+      "result_chars": 829,
+      "fingerprint": "0000gen01"
+    },
+    {
+      "tool_name": "mcp__claude_ai_firecrawl__firecrawl_search",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "python postgres search topic 3",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"web\": [\n    {\n      \"url\": \"https://blog.example.com/rrf\",\n      \"title\": \"Reciprocal rank fusion explained\",\n      \"description\": \"Combining BM25 and vector search results.\",\n      \"position\": 1\n    },\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"description\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"position\": 2\n    },\n    {\n      \"url\": \"https://blog.example.com/contextual-retrieval\",\n      \"title\": \"Contextual retrieval basics\",\n      \"description\": \"Prepending context to chunks before embedding.\",\n      \"position\": 3\n    },\n    {\n      \"url\": \"https://docs.example.com/bitemporal\",\n      \"title\": \"Bitemporal graphs in Postgres\",\n      \"description\": \"Modeling valid-time and transaction-time edges.\",\n      \"position\": 4\n    }\n  ]\n}",
+      "result_chars": 835,
+      "fingerprint": "0000gen02"
+    },
+    {
+      "tool_name": "mcp__claude_ai_firecrawl__firecrawl_search",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "python postgres search topic 4",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"web\": [\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"description\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"position\": 1\n    },\n    {\n      \"url\": \"https://blog.example.com/contextual-retrieval\",\n      \"title\": \"Contextual retrieval basics\",\n      \"description\": \"Prepending context to chunks before embedding.\",\n      \"position\": 2\n    },\n    {\n      \"url\": \"https://docs.example.com/bitemporal\",\n      \"title\": \"Bitemporal graphs in Postgres\",\n      \"description\": \"Modeling valid-time and transaction-time edges.\",\n      \"position\": 3\n    },\n    {\n      \"url\": \"https://blog.example.com/rerank\",\n      \"title\": \"Cross-encoder reranking\",\n      \"description\": \"Why a reranker beats deeper fusion for hard queries.\",\n      \"position\": 4\n    }\n  ]\n}",
+      "result_chars": 840,
+      "fingerprint": "0000gen03"
+    },
+    {
+      "tool_name": "mcp__claude_ai_firecrawl__firecrawl_search",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "python postgres search topic 5",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"web\": [\n    {\n      \"url\": \"https://blog.example.com/contextual-retrieval\",\n      \"title\": \"Contextual retrieval basics\",\n      \"description\": \"Prepending context to chunks before embedding.\",\n      \"position\": 1\n    },\n    {\n      \"url\": \"https://docs.example.com/bitemporal\",\n      \"title\": \"Bitemporal graphs in Postgres\",\n      \"description\": \"Modeling valid-time and transaction-time edges.\",\n      \"position\": 2\n    },\n    {\n      \"url\": \"https://blog.example.com/rerank\",\n      \"title\": \"Cross-encoder reranking\",\n      \"description\": \"Why a reranker beats deeper fusion for hard queries.\",\n      \"position\": 3\n    },\n    {\n      \"url\": \"https://docs.example.com/chunking\",\n      \"title\": \"Chunking strategies for RAG\",\n      \"description\": \"Sliding-window chunks as a fact substrate.\",\n      \"position\": 4\n    }\n  ]\n}",
+      "result_chars": 830,
+      "fingerprint": "0000gen04"
+    },
+    {
+      "tool_name": "mcp__claude_ai_firecrawl__firecrawl_search",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "python postgres search topic 6",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"web\": [\n    {\n      \"url\": \"https://docs.example.com/bitemporal\",\n      \"title\": \"Bitemporal graphs in Postgres\",\n      \"description\": \"Modeling valid-time and transaction-time edges.\",\n      \"position\": 1\n    },\n    {\n      \"url\": \"https://blog.example.com/rerank\",\n      \"title\": \"Cross-encoder reranking\",\n      \"description\": \"Why a reranker beats deeper fusion for hard queries.\",\n      \"position\": 2\n    },\n    {\n      \"url\": \"https://docs.example.com/chunking\",\n      \"title\": \"Chunking strategies for RAG\",\n      \"description\": \"Sliding-window chunks as a fact substrate.\",\n      \"position\": 3\n    },\n    {\n      \"url\": \"https://blog.example.com/postgres-analytics\",\n      \"title\": \"Scaling Postgres for analytics\",\n      \"description\": \"A guide to partitioning and indexing large tables.\",\n      \"position\": 4\n    }\n  ]\n}",
+      "result_chars": 835,
+      "fingerprint": "0000gen05"
+    }
+  ],
+  "error_samples": []
+}

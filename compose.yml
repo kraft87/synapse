@@ -1,0 +1,204 @@
+# Single Synapse stack: data layer (postgres) and app layer
+# (poller, mcp-server, dream) in one compose.
+#
+# Fresh install: `cp .env.example .env`, fill it in, then
+# `docker compose up -d --build` — the app services carry a `build: .` key so
+# the image builds locally from the repo, and postgres applies the schema on
+# first boot via ./init (see init/01_apply_schema.sh).
+#
+# CI only pulls/ups the app services (see .github/workflows/ci.yml) — the
+# DB service is managed by hand so an app code push can never recreate
+# postgres out from under the data.
+#
+# App ↔ DB connectivity uses the compose service name (SYNAPSE_DB_URL points
+# at postgres:5432); the published host port exists only for host-side psql
+# and scripts. depends_on only orders local startup.
+#
+# Running a second instance on one host: export COMPOSE_PROJECT_NAME=<name>
+# (the container_names below track it) and set MCP_PORT / POSTGRES_HOST_PORT
+# to free ports.
+
+services:
+
+  # --- Data layer (manual lifecycle; CI never touches these) ------------
+
+  postgres:
+    # Pinned by digest: the data layer must never be auto-updated. A
+    # synapse-scoped Watchtower (see the app services' watchtower labels) is
+    # told to ignore Postgres, and this digest pin is the belt-and-suspenders —
+    # no `docker compose pull`, Watchtower, or stray tag move can replace it.
+    # Bump deliberately when you actually want a new ParadeDB.
+    image: paradedb/paradedb:latest-pg17@sha256:0defbfb50d530e6e875ab584528f1e235662225127c09e7a8d5651e59dabe341
+    container_name: ${COMPOSE_PROJECT_NAME:-synapse}-postgres-1
+    restart: unless-stopped
+    # Never auto-update the data layer: explicitly disabled for any Watchtower
+    # (this label is honored even by an unscoped instance), on top of the digest
+    # pin above. The app services opt IN via watchtower.scope=synapse.
+    labels:
+      - com.centurylinklabs.watchtower.enable=false
+    environment:
+      POSTGRES_USER: synapse
+      POSTGRES_PASSWORD: ${SYNAPSE_DB_PASSWORD}
+      POSTGRES_DB: synapse
+      # Embedding geometry for FIRST-BOOT schema provisioning only (read by
+      # init/01_apply_schema.sh -> scripts/apply_schema.sh): a non-default
+      # width substitutes the vector/halfvec dims into the DDL and records
+      # dims+model in synapse_meta. No effect on a populated data volume.
+      SYNAPSE_EMBED_DIMS: ${SYNAPSE_EMBED_DIMS:-2048}
+      SYNAPSE_EMBED_MODEL: ${SYNAPSE_EMBED_MODEL:-voyage-4-large}
+    ports:
+      # Host-side port only (apps connect via service DNS postgres:5432).
+      - "${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - synapse_data:/var/lib/postgresql/data
+      # First-boot schema init: docker-entrypoint-initdb.d runs init/*.sh only
+      # when the data volume is empty, so existing deployments (populated
+      # volume) never re-run it. The init hook delegates to
+      # scripts/apply_schema.sh against the mounted ./schema dir.
+      - ./init:/docker-entrypoint-initdb.d:ro
+      - ./schema:/schema:ro
+      - ./scripts/apply_schema.sh:/apply_schema.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synapse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      # Grace before health failures count — a cold ParadeDB recreate (index
+      # warmup) can take >50s; without this a manual `compose up` of the data
+      # stack can mark it unhealthy and abort dependents. CI deploys never
+      # touch this service (--no-deps), so this only guards the hand path.
+      start_period: 40s
+
+  # --- App layer --------------------------------------------------------
+  # Each service declares both `image:` and `build:` — a fresh clone builds
+  # locally (`docker compose up -d --build`); CI/prod pulls the published
+  # image (`docker compose pull ... && up -d --no-deps ...`, never --build).
+
+  poller:
+    image: ghcr.io/kraft87/synapse:latest
+    build: .
+    # container_name removed so this service can be scaled via
+    # `docker compose up -d --scale poller=N`. Replicas claim disjoint
+    # slices of extraction_queue via SELECT ... FOR UPDATE SKIP LOCKED.
+    restart: unless-stopped
+    command: python -m ingestion
+    env_file: .env
+    environment:
+      # Emit spans to a dedicated telemetry project so Synapse's own traces
+      # stay separate from any project it reads from.
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - LOGFIRE_SERVICE_NAME=synapse-poller
+    # Auto-update scope: a synapse-scoped Watchtower (--scope synapse) updates
+    # only the app services carrying this label. Postgres is deliberately
+    # unlabeled + digest-pinned, so the data layer is never auto-updated.
+    labels:
+      - com.centurylinklabs.watchtower.scope=synapse
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from ingestion.config import get_settings; get_settings()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  poller-drain:
+    # Scaled-out extraction-queue worker. SYNAPSE_DRAIN_ONLY=1 skips
+    # summarize / embed (the master `poller` service owns those) and runs
+    # ONLY drain_extraction_queue against the shared queue via FOR UPDATE
+    # SKIP LOCKED claims. Scale via `docker compose up -d --scale poller-drain=N`.
+    image: ghcr.io/kraft87/synapse:latest
+    build: .
+    restart: unless-stopped
+    command: python -m ingestion
+    env_file: .env
+    environment:
+      - SYNAPSE_DRAIN_ONLY=1
+      # Emit spans to a dedicated telemetry project so Synapse's own traces
+      # stay separate from any project it reads from.
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - LOGFIRE_SERVICE_NAME=synapse-poller-drain
+    labels:
+      - com.centurylinklabs.watchtower.scope=synapse
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "from ingestion.config import get_settings; get_settings()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+
+  mcp-server:
+    image: ghcr.io/kraft87/synapse:latest
+    build: .
+    container_name: ${COMPOSE_PROJECT_NAME:-synapse}-mcp
+    restart: unless-stopped
+    command: python -m mcp_server.server
+    labels:
+      - com.centurylinklabs.watchtower.scope=synapse
+    env_file: .env
+    environment:
+      - LOGFIRE_SERVICE_NAME=synapse-mcp
+      # Same dedicated-telemetry-project override as the poller services so all
+      # Synapse traces collect in one place. The MCP server emits a span
+      # per tool call (recall, recall_episodes, query_graph, remember).
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Both sides track MCP_PORT: the server process reads it (via env_file)
+      # for its internal listener, so the published port must match it.
+      - "${MCP_PORT:-8765}:${MCP_PORT:-8765}"
+    healthcheck:
+      # HTTP probe against the unauthenticated /health route. Importing the
+      # server module in a fresh interpreter per probe (the old check) paid
+      # full startup cost each time and regularly tripped its own timeout.
+      test: ["CMD-SHELL", "curl -sf http://localhost:${MCP_PORT:-8765}/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  dream:
+    image: ghcr.io/kraft87/synapse:latest
+    build: .
+    container_name: ${COMPOSE_PROJECT_NAME:-synapse}-dream
+    restart: unless-stopped
+    command: python -m dream --schedule
+    labels:
+      - com.centurylinklabs.watchtower.scope=synapse
+    env_file: .env
+    environment:
+      # Emit spans to a dedicated telemetry project so Synapse's own traces
+      # stay separate from any project it reads from.
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
+      - CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1
+      - LOGFIRE_SERVICE_NAME=synapse-dream
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # --- Optional local inference (zero external accounts) -----------------
+  # OFF by default — `docker compose up -d` never starts it. Enable with:
+  #   docker compose --profile local-inference up -d
+  # One CPU container (michaelf34/infinity) serving BOTH an OpenAI-compatible
+  # POST /embeddings and a Cohere/TEI-compatible POST /rerank on port 7997.
+  # Models download from Hugging Face on first start (cached in the volume).
+  # Wire it up via the SYNAPSE_EMBED_* / SYNAPSE_RERANK_* block in .env.example
+  # — SYNAPSE_EMBED_DIMS=768 (bge-base) must be set BEFORE the database's first
+  # boot, because the schema's vector width is fixed at provision time.
+  local-inference:
+    profiles: ["local-inference"]
+    image: michaelf34/infinity:0.0.77-cpu
+    container_name: ${COMPOSE_PROJECT_NAME:-synapse}-local-inference
+    restart: unless-stopped
+    command: v2 --model-id BAAI/bge-base-en-v1.5 --model-id BAAI/bge-reranker-base --port 7997
+    ports:
+      - "7997:7997"
+    volumes:
+      - infinity_cache:/app/.cache
+
+volumes:
+  synapse_data:
+  infinity_cache:

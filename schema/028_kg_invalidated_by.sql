@@ -1,0 +1,13 @@
+-- 028: record WHICH edge superseded a retired one.
+--
+-- invalidate_edge() only stamps t_invalid; it never recorded the new edge that
+-- contradicted the old one, so a retired edge's successor could only be guessed
+-- (by src/tgt pair — too noisy: a pair hosts many distinct facts). This column
+-- stores the superseding edge's uuid, set ONLY on the contradiction-detector path
+-- (kg_client: detector.detect_contradictions -> invalidate_edge(by_uuid=new)).
+-- NULL = unknown or self-invalidation (a fact that arrived already-bookended, e.g.
+-- "worked at X from 2020 to 2022" — no superseder). This is the precise foundation
+-- for a future episode-validity overlay: served episode -> retired edge citing it
+-- (episodes @> [id]) with invalidated_by set -> the current "now" fact = that edge.
+-- Go-forward only; historical retirements have no recoverable link.
+ALTER TABLE kg_relationships ADD COLUMN IF NOT EXISTS invalidated_by TEXT;

@@ -1,0 +1,411 @@
+"""Tests for the OpenAI-compatible extraction-LLM backend.
+
+Covers:
+
+* ``create_llm_client`` provider selection from ``SYNAPSE_LLM_PROVIDER``
+  (claude-code default, openai, unknown → ValueError).
+* ``OpenAIChatClient.messages.create`` happy path through
+  ``parse_with_retry`` — request shape (path, auth header, payload),
+  fence stripping, and the anthropic-shaped ``.content[0].text`` result.
+* HTTP error surfacing: status + body snippet in the message, the API
+  key NEVER echoed.
+* 402 → ``UsageLimitError`` and 429 → raised after retries — neither is
+  ever swallowed as empty text (the OpenRouter-credits incident).
+* Single-model mode: ``SYNAPSE_LLM_MODEL`` / the configured model
+  overrides per-call Claude model names.
+
+No network: every test uses ``httpx.MockTransport``.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+from unittest.mock import patch
+
+import httpx
+import pytest
+
+from ingestion.llm_client import (
+    DEFAULT_OPENAI_BASE_URL,
+    DEFAULT_OPENAI_MODEL,
+    ClaudeCLIClient,
+    LLMHTTPError,
+    OpenAIChatClient,
+    TransientLLMHTTPError,
+    UsageLimitError,
+    create_llm_client,
+    parse_with_retry,
+)
+
+_API_KEY = "sk-or-test-SECRET-key"
+
+
+def _completion_body(text: str, finish_reason: str = "stop") -> dict[str, Any]:
+    return {
+        "id": "gen-123",
+        "choices": [
+            {"message": {"role": "assistant", "content": text}, "finish_reason": finish_reason}
+        ],
+    }
+
+
+def _client_with(
+    handler,
+    *,
+    model: str = DEFAULT_OPENAI_MODEL,
+    api_key: str = _API_KEY,
+) -> OpenAIChatClient:
+    return OpenAIChatClient(
+        base_url=DEFAULT_OPENAI_BASE_URL,
+        api_key=api_key,
+        model=model,
+        transport=httpx.MockTransport(handler),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep():
+    """Short-circuit tenacity's backoff sleep so retry tests don't stall."""
+    with patch("tenacity.nap.time.sleep"):
+        yield
+
+
+# ---------------------------------------------------------------------------
+# Provider selection
+# ---------------------------------------------------------------------------
+
+
+class TestProviderSelection:
+    def test_default_is_claude_code(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_LLM_PROVIDER", raising=False)
+        assert isinstance(create_llm_client(), ClaudeCLIClient)
+
+    def test_explicit_claude_code(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "claude-code")
+        assert isinstance(create_llm_client(), ClaudeCLIClient)
+
+    def test_blank_provider_is_claude_code(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "")
+        assert isinstance(create_llm_client(), ClaudeCLIClient)
+
+    def test_openai_provider(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
+        monkeypatch.delenv("SYNAPSE_LLM_BASE_URL", raising=False)
+        monkeypatch.delenv("SYNAPSE_LLM_API_KEY", raising=False)
+        monkeypatch.delenv("SYNAPSE_LLM_MODEL", raising=False)
+        client = create_llm_client()
+        assert isinstance(client, OpenAIChatClient)
+        assert client.model == DEFAULT_OPENAI_MODEL
+        assert str(client.http.base_url).rstrip("/") == DEFAULT_OPENAI_BASE_URL
+
+    def test_openai_env_overrides(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("SYNAPSE_LLM_BASE_URL", "http://localhost:11434/v1")
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "qwen2.5:14b")
+        client = create_llm_client()
+        assert isinstance(client, OpenAIChatClient)
+        assert client.model == "qwen2.5:14b"
+        assert "localhost:11434" in str(client.http.base_url)
+
+    def test_unknown_provider_raises(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "bedrock")
+        with pytest.raises(ValueError, match="SYNAPSE_LLM_PROVIDER"):
+            create_llm_client()
+
+    def test_provider_is_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "OpenAI")
+        assert isinstance(create_llm_client(), OpenAIChatClient)
+
+
+# ---------------------------------------------------------------------------
+# Happy path — request shape and parse_with_retry integration
+# ---------------------------------------------------------------------------
+
+
+class TestSuccessfulCompletion:
+    def test_create_returns_anthropic_shape(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_completion_body("hello"))
+
+        client = _client_with(handler)
+        resp = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=64,
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert resp.content[0].text == "hello"
+
+    def test_request_payload_and_headers(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            seen["auth"] = request.headers.get("Authorization")
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=777,
+            messages=[{"role": "user", "content": "extract facts"}],
+            system="you are an extractor",
+        )
+        assert seen["path"].endswith("/chat/completions")
+        assert seen["auth"] == f"Bearer {_API_KEY}"
+        assert seen["payload"]["max_tokens"] == 777
+        assert seen["payload"]["stream"] is False
+        assert seen["payload"]["messages"][0] == {
+            "role": "system",
+            "content": "you are an extractor",
+        }
+        assert seen["payload"]["messages"][1]["content"] == "extract facts"
+
+    def test_no_auth_header_when_key_blank(self):
+        """Keyless endpoints (local Ollama) must not get an empty bearer."""
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["auth"] = request.headers.get("Authorization")
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler, api_key="")
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert seen["auth"] is None
+
+    def test_parse_with_retry_happy_path(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_completion_body('```json\n{"facts": [1, 2]}\n```'))
+
+        client = _client_with(handler)
+        result = parse_with_retry(
+            client,
+            base_prompt="extract",
+            parser=json.loads,
+            model="claude-haiku-4-5",
+            max_tokens=128,
+            response_format={"type": "json", "schema": {"type": "object"}},
+        )
+        assert result == {"facts": [1, 2]}
+
+    def test_parse_with_retry_refires_on_malformed(self):
+        """First response unparseable → feedback retry → second parses."""
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content)
+            calls.append(body["messages"][-1]["content"])
+            text = "not json at all" if len(calls) == 1 else '{"ok": true}'
+            return httpx.Response(200, json=_completion_body(text))
+
+        client = _client_with(handler)
+        result = parse_with_retry(
+            client,
+            base_prompt="extract",
+            parser=json.loads,
+            model="claude-haiku-4-5",
+        )
+        assert result == {"ok": True}
+        assert len(calls) == 2
+        assert "failed to parse" in calls[1]
+
+    def test_response_format_schema_travels_in_prompt(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("{}"))
+
+        client = _client_with(handler)
+        client.messages.create(
+            messages=[{"role": "user", "content": "extract"}],
+            response_format={"type": "json", "schema": {"required": ["facts"]}},
+        )
+        user_msg = seen["payload"]["messages"][-1]["content"]
+        assert "ONLY valid JSON" in user_msg
+        assert '"required": ["facts"]' in user_msg
+
+
+# ---------------------------------------------------------------------------
+# Single-model mode — configured model overrides per-call Claude names
+# ---------------------------------------------------------------------------
+
+
+class TestModelOverride:
+    def test_configured_model_wins_over_per_call_name(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["model"] = json.loads(request.content)["model"]
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler, model="meta-llama/llama-3.3-70b-instruct")
+        client.messages.create(
+            model="claude-haiku-4-5",  # Claude-specific id — must NOT hit the wire
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert seen["model"] == "meta-llama/llama-3.3-70b-instruct"
+
+    def test_default_model_is_openrouter_haiku_id(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["model"] = json.loads(request.content)["model"]
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(
+            model="claude-opus-4-8",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert seen["model"] == "anthropic/claude-haiku-4.5"
+
+
+# ---------------------------------------------------------------------------
+# HTTP errors — status + snippet surfaced, key never echoed, no empties
+# ---------------------------------------------------------------------------
+
+
+class TestHTTPErrors:
+    def test_400_raises_with_status_and_snippet(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(400, json={"error": {"message": "bad schema xyz"}})
+
+        client = _client_with(handler)
+        with pytest.raises(LLMHTTPError) as exc_info:
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert "400" in str(exc_info.value)
+        assert "bad schema xyz" in str(exc_info.value)
+        assert exc_info.value.status_code == 400
+
+    def test_error_message_never_contains_api_key(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(401, json={"error": {"message": "invalid key"}})
+
+        client = _client_with(handler)
+        with pytest.raises(LLMHTTPError) as exc_info:
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert _API_KEY not in str(exc_info.value)
+        assert _API_KEY not in repr(exc_info.value)
+
+    def test_400_is_not_retried(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(400, json={"error": {"message": "nope"}})
+
+        client = _client_with(handler)
+        with pytest.raises(LLMHTTPError):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert len(calls) == 1
+
+    def test_402_raises_usage_limit_not_empty(self):
+        """OpenRouter out-of-credits must STOP the cycle, never return ''."""
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(
+                402, json={"error": {"code": 402, "message": "Insufficient credits"}}
+            )
+
+        client = _client_with(handler)
+        with pytest.raises(UsageLimitError, match="402"):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert len(calls) == 1  # non-transient: no retry burn
+
+    def test_429_retried_then_raised_not_swallowed(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(429, json={"error": {"message": "rate limited"}})
+
+        client = _client_with(handler)
+        with pytest.raises(TransientLLMHTTPError, match="429"):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert len(calls) == 3  # tenacity: 3 attempts, then reraise
+
+    def test_429_recovers_on_retry(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 3:
+                return httpx.Response(429, json={"error": {"message": "slow down"}})
+            return httpx.Response(200, json=_completion_body("recovered"))
+
+        client = _client_with(handler)
+        resp = client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.content[0].text == "recovered"
+        assert len(calls) == 3
+
+    def test_500_is_transient(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 2:
+                return httpx.Response(502, text="bad gateway")
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        resp = client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.content[0].text == "ok"
+        assert len(calls) == 2
+
+    def test_connect_error_is_transient(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 2:
+                raise httpx.ConnectError("connection refused")
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        resp = client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.content[0].text == "ok"
+        assert len(calls) == 2
+
+    def test_200_wrapped_402_error_body_raises_usage_limit(self):
+        """OpenRouter quirk: HTTP 200 carrying {"error": {"code": 402}}."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json={"error": {"code": 402, "message": "Insufficient credits"}}
+            )
+
+        client = _client_with(handler)
+        with pytest.raises(UsageLimitError, match="Insufficient credits"):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+
+    def test_empty_completion_raises_not_returns(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_completion_body("", finish_reason="length"))
+
+        client = _client_with(handler)
+        with pytest.raises(LLMHTTPError, match="empty completion"):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+
+    def test_non_json_2xx_body_raises(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, text="<html>login page</html>")
+
+        client = _client_with(handler)
+        with pytest.raises(LLMHTTPError, match="non-JSON"):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+
+    def test_usage_limit_text_in_completion_raises(self):
+        """Content-based detector parity with the Claude SDK path."""
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200, json=_completion_body("Your credit balance is too low to run this.")
+            )
+
+        client = _client_with(handler)
+        with pytest.raises(UsageLimitError):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])

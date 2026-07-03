@@ -1,0 +1,4 @@
+# The POSIX launcher must stay LF — a CRLF in the shebang line breaks it on Linux/macOS.
+plugin/bin/synapse-login text eol=lf
+# Windows batch launchers stay CRLF.
+*.cmd text eol=crlf

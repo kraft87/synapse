@@ -1,0 +1,41 @@
+{
+  "tool": "mcp__claude_ai_Exa_search__web_search_advanced_exa",
+  "happy_count": 3,
+  "error_count": 0,
+  "happy_samples": [
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_advanced_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "vector search postgres topic 1",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"requestId\": \"req000000\",\n  \"results\": [\n    {\n      \"url\": \"https://blog.example.com/postgres-analytics\",\n      \"title\": \"Scaling Postgres for analytics\",\n      \"text\": \"A guide to partitioning and indexing large tables.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://docs.example.com/pgvector-hnsw\",\n      \"title\": \"HNSW tuning for pgvector\",\n      \"text\": \"How to set ef_search and m for fast recall.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://blog.example.com/rrf\",\n      \"title\": \"Reciprocal rank fusion explained\",\n      \"text\": \"Combining BM25 and vector search results.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"text\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    }\n  ]\n}",
+      "result_chars": 1094,
+      "fingerprint": "0000gen00"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_advanced_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "vector search postgres topic 2",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"requestId\": \"req000001\",\n  \"results\": [\n    {\n      \"url\": \"https://docs.example.com/pgvector-hnsw\",\n      \"title\": \"HNSW tuning for pgvector\",\n      \"text\": \"How to set ef_search and m for fast recall.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://blog.example.com/rrf\",\n      \"title\": \"Reciprocal rank fusion explained\",\n      \"text\": \"Combining BM25 and vector search results.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"text\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://blog.example.com/contextual-retrieval\",\n      \"title\": \"Contextual retrieval basics\",\n      \"text\": \"Prepending context to chunks before embedding.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    }\n  ]\n}",
+      "result_chars": 1089,
+      "fingerprint": "0000gen01"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_advanced_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "vector search postgres topic 3",
+        "numResults": 5
+      },
+      "result_text": "{\n  \"requestId\": \"req000002\",\n  \"results\": [\n    {\n      \"url\": \"https://blog.example.com/rrf\",\n      \"title\": \"Reciprocal rank fusion explained\",\n      \"text\": \"Combining BM25 and vector search results.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://docs.example.com/mcp-server\",\n      \"title\": \"Building an MCP server\",\n      \"text\": \"A walkthrough of the Model Context Protocol server API.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://blog.example.com/contextual-retrieval\",\n      \"title\": \"Contextual retrieval basics\",\n      \"text\": \"Prepending context to chunks before embedding.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    },\n    {\n      \"url\": \"https://docs.example.com/bitemporal\",\n      \"title\": \"Bitemporal graphs in Postgres\",\n      \"text\": \"Modeling valid-time and transaction-time edges.\",\n      \"publishedDate\": \"2026-02-03T03:07:19.000Z\",\n      \"author\": \"Example Author\"\n    }\n  ]\n}",
+      "result_chars": 1095,
+      "fingerprint": "0000gen02"
+    }
+  ],
+  "error_samples": []
+}

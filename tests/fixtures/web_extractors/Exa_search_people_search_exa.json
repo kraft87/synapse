@@ -1,0 +1,74 @@
+{
+  "tool": "mcp__claude_ai_Exa_search__people_search_exa",
+  "happy_count": 6,
+  "error_count": 0,
+  "happy_samples": [
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__people_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "security engineering manager placeholder",
+        "numResults": 5
+      },
+      "result_text": "Title: Jane Doe | Security Engineering Manager\nURL: https://example.com/in/jane-doe\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Jane Doe\nHighlights:\n# Jane Doe\n\nSecurity Engineering Manager at Example Corp\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Security Engineering Manager at Example Corp (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n\n\n---\n\nTitle: John Smith | Security Leader\nURL: https://example.com/in/john-smith\nPublished: N/A\nAuthor: John Smith\nHighlights:\n# John Smith\n\nSecurity Leader at Example Corp\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Security Leader at Example Corp (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n",
+      "result_chars": 807,
+      "fingerprint": "00000000people00"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__people_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "director security operations engineering placeholder",
+        "numResults": 5
+      },
+      "result_text": "Title: Alex Rivera | Director, Security Engineering\nURL: https://example.com/in/alex-rivera\nPublished: 2026-02-01T03:35:15.000Z\nAuthor: Alex Rivera\nHighlights:\n# Alex Rivera\n\nDirector, Security Engineering at Placeholder Inc\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Director, Security Engineering at Placeholder Inc (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n\n\n---\n\nTitle: Sam Patel | Lead Security Engineer\nURL: https://example.com/in/sam-patel\nPublished: 2026-01-21T01:36:23.000Z\nAuthor: Sam Patel\nHighlights:\n# Sam Patel\n\nLead Security Engineer at Placeholder Inc\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Lead Security Engineer at Placeholder Inc (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n",
+      "result_chars": 875,
+      "fingerprint": "00000000people01"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__people_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "category:people security operations engineering lead placeholder",
+        "numResults": 5
+      },
+      "result_text": "Title: Chris Lee | Security Operations Engineer\nURL: https://example.com/in/chris-lee\nPublished: 2026-02-05T11:04:30.000Z\nAuthor: Chris Lee\nHighlights:\n# Chris Lee\n\nSecurity Operations Engineer at Sample Security Co\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Security Operations Engineer at Sample Security Co (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n\n\n---\n\nTitle: Pat Morgan | SOC Analyst\nURL: https://example.com/in/pat-morgan\nPublished: N/A\nAuthor: Pat Morgan\nHighlights:\n# Pat Morgan\n\nSOC Analyst at Sample Security Co\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### SOC Analyst at Sample Security Co (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n",
+      "result_chars": 823,
+      "fingerprint": "00000000people02"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__people_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "principal security architect placeholder",
+        "numResults": 5
+      },
+      "result_text": "Title: Dana Kim | Principal Security Architect\nURL: https://example.com/in/dana-kim\nPublished: 2026-01-21T16:12:29.000Z\nAuthor: Dana Kim\nHighlights:\n# Dana Kim\n\nPrincipal Security Architect at Example Corp\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Principal Security Architect at Example Corp (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n\n\n---\n\nTitle: Robin Diaz | Security Analyst\nURL: https://example.com/in/robin-diaz\nPublished: 2026-02-07T04:13:21.000Z\nAuthor: Robin Diaz\nHighlights:\n# Robin Diaz\n\nSecurity Analyst at Example Corp\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Security Analyst at Example Corp (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n",
+      "result_chars": 837,
+      "fingerprint": "00000000people03"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__people_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "cloud security engineer placeholder",
+        "numResults": 5
+      },
+      "result_text": "Title: Taylor Fox | Cloud Security Engineer\nURL: https://example.com/in/taylor-fox\nPublished: 2026-02-09T03:24:08.000Z\nAuthor: Taylor Fox\nHighlights:\n# Taylor Fox\n\nCloud Security Engineer at Placeholder Inc\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Cloud Security Engineer at Placeholder Inc (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n\n\n---\n\nTitle: Jordan Reese | Security Architect\nURL: https://example.com/in/jordan-reese\nPublished: N/A\nAuthor: Jordan Reese\nHighlights:\n# Jordan Reese\n\nSecurity Architect at Placeholder Inc\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Security Architect at Placeholder Inc (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n",
+      "result_chars": 829,
+      "fingerprint": "00000000people04"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__people_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "senior security engineer placeholder",
+        "numResults": 5
+      },
+      "result_text": "Title: Casey Vaughn | Senior Security Engineer\nURL: https://example.com/in/casey-vaughn\nPublished: 2026-02-03T13:37:15.000Z\nAuthor: Casey Vaughn\nHighlights:\n# Casey Vaughn\n\nSenior Security Engineer at Sample Security Co\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Senior Security Engineer at Sample Security Co (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n\n\n---\n\nTitle: Morgan Ellis | Security Program Manager\nURL: https://example.com/in/morgan-ellis\nPublished: N/A\nAuthor: Morgan Ellis\nHighlights:\n# Morgan Ellis\n\nSecurity Program Manager at Sample Security Co\n\n## About A placeholder professional summary. Total Experience: 10 years.\n\n## Experience\n### Security Program Manager at Sample Security Co (Current)\nJan 2023 - Present. Company: 1001-5000 employees. Software Development.\n",
+      "result_chars": 870,
+      "fingerprint": "00000000people05"
+    }
+  ],
+  "error_samples": []
+}

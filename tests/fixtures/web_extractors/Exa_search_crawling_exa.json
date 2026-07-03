@@ -1,0 +1,58 @@
+{
+  "tool": "mcp__claude_ai_Exa_search__crawling_exa",
+  "happy_count": 1,
+  "error_count": 3,
+  "happy_samples": [
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__crawling_exa",
+      "timestamp": "2026-04-24T14:09:10.129Z",
+      "input": {
+        "urls": "[\"https://example.com/blog/scaling-postgres\"]",
+        "maxCharacters": "15000"
+      },
+      "result_text": "# Scaling Postgres for Analytics Workloads\nURL: https://example.com/blog/scaling-postgres\nAuthor: Jane Doe\n\n# Scaling Postgres for Analytics Workloads\n\nA practical guide to keeping analytical queries fast as the dataset grows.\n\n## Partitioning\n\nRange-partition large fact tables by date so the planner can prune irrelevant partitions.\n\n## Indexing\n\nUse partial and covering indexes for the hottest query paths; avoid indexing low-selectivity columns.\n\n## Connection pooling\n\nPut a pooler in front of the database to cap backend connections under load.",
+      "result_chars": 551,
+      "fingerprint": "00000000crawl01"
+    }
+  ],
+  "error_samples": [
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__crawling_exa",
+      "timestamp": "2026-05-01T00:34:42.625Z",
+      "input": {
+        "urls": [
+          "https://example.com/a",
+          "https://example.com/b"
+        ],
+        "maxCharacters": 5000
+      },
+      "result_text": "<persisted-output>\nOutput too large (63.5KB). Full output saved to: /tmp/tool-results/toolu_placeholder_a.json\n\nPreview (first 2KB):\n[\n  {\n    \"type\": \"text\",\n    \"text\": \"# example-project (@example-project)\\nURL: https://example.com/repo\\nPublished: 2012-04-14\\n\\nGeneric placeholder preview for an oversized crawl result.\"\n  }\n]\n...\n</persisted-output>",
+      "result_chars": 355,
+      "fingerprint": "00000000crawl02"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__crawling_exa",
+      "timestamp": "2026-05-01T00:34:48.384Z",
+      "input": {
+        "urls": [
+          "https://example.com/c",
+          "https://example.com/d"
+        ],
+        "maxCharacters": 4500
+      },
+      "result_text": "<persisted-output>\nOutput too large (281.1KB). Full output saved to: /tmp/tool-results/toolu_placeholder_b.json\n\nPreview (first 2KB):\n[\n  {\n    \"type\": \"text\",\n    \"text\": \"# GitHub - example-org/example-repo\\nURL: https://example.com/example-org/example-repo\\nPublished: 2026-02-14\\nAuthor: example-org\\n\\nA placeholder README describing a sample open-source library.\"\n  }\n]\n...\n</persisted-output>",
+      "result_chars": 399,
+      "fingerprint": "00000000crawl03"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__crawling_exa",
+      "timestamp": "2026-04-24T14:09:03.183Z",
+      "input": {
+        "url": "https://example.com/blog/scaling-postgres"
+      },
+      "result_text": "MCP error -32602: Input validation error: Invalid arguments for tool crawling_exa: [\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"array\",\n    \"received\": \"undefined\",\n    \"path\": [\n      \"urls\"\n    ],\n    \"message\": \"Required\"\n  }\n]",
+      "result_chars": 236,
+      "fingerprint": "00000000crawl04"
+    }
+  ]
+}

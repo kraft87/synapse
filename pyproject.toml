@@ -1,0 +1,93 @@
+[project]
+name = "synapse"
+version = "1.0.0"
+description = "Self-hosted long-term memory for AI coding agents — episodic store, knowledge graph, and MCP server"
+license = { text = "MIT" }
+authors = [{ name = "Kyle Doucette" }]
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "pgvector>=0.3",
+    "httpx>=0.28",
+    "pydantic>=2.10",
+    "pydantic-settings>=2.14.2",
+    "logfire[httpx,query-client]>=3.0",
+    "anthropic>=0.40",
+    "orjson>=3.10",
+    "tokenizers>=0.21",
+    "voyageai>=0.3",
+    "claude-agent-sdk>=0.1.72",
+    "tenacity>=8.0",
+    "datasketch>=1.6",
+    "fastmcp>=3.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+    "pytest-xdist>=3.6",
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "types-psycopg2>=2.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ingestion", "mcp_server", "dream"]
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.25",
+    "pytest-xdist>=3.6",
+    "ruff>=0.9",
+    "mypy>=1.14",
+    "pytest-timeout>=2.3",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["synapse"]
+
+[tool.ruff.lint.per-file-ignores]
+# Bundled host-side operational scripts (the Claude Code plugin) favor terse one-liners.
+"plugin/scripts/*" = ["E702"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+exclude = ["tests/", "mcp_server/", "dream/__main__.py", "plugin/"]
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

@@ -1,0 +1,16 @@
+{
+  "name": "synapse",
+  "owner": {
+    "name": "kraft87"
+  },
+  "metadata": {
+    "description": "Synapse persistent-memory plugin for Claude Code (ingest, auto-recall, dream→skills)."
+  },
+  "plugins": [
+    {
+      "name": "synapse",
+      "source": "./plugin",
+      "description": "Synapse persistent memory for Claude Code: transcript ingest, auto-recall, and an autonomously-maintained, two-way-synced skills library."
+    }
+  ]
+}

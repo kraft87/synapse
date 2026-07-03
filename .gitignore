@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+.venv/
+venv/
+*.log
+
+# KG eval per-run scorecards (keep baseline.json, ignore timestamped runs)
+scripts/kg_eval_runs/*.json
+!scripts/kg_eval_runs/baseline.json
+
+# Orphan-sweep backups contain raw graph node dumps (incl. personal-scope
+# entities) — keep them local on the host, never in the repo.
+scripts/kg_eval_runs/orphan_sweep_backups/
+scripts/kg_eval_personal.py
+scripts/kg_golden_personal.py

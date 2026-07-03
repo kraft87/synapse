@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# synapse-login — run the Synapse device-flow login directly, no LLM in the loop.
+#
+# Claude Code puts a plugin's bin/ on PATH, so this is just `synapse-login` in any terminal.
+# It locates the login script relative to itself and reads config from settings.json, so it
+# needs NO environment variables and NO $CLAUDE_PLUGIN_ROOT. Run it in a real terminal for
+# live streaming (it prints a github.com/login/device code, then polls until you approve).
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$DIR/../scripts/synapse_login.py"
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "synapse-login: need python3 or python on PATH" >&2
+  exit 1
+fi
+exec "$PY" "$SCRIPT" "$@"

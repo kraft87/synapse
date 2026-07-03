@@ -1,0 +1,38 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.15
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.14.1
+    hooks:
+      - id: mypy
+        additional_dependencies:
+          - psycopg[binary]>=3.2
+          - pgvector>=0.3
+          - pydantic>=2.10
+          - pydantic-settings>=2.7
+          - voyageai>=0.3
+        args: [--ignore-missing-imports]
+        # mcp_server/server.py + skill_sync_routes.py: FastMCP @custom_route decorators
+        #   are inherently untyped; these are route-handler modules, not the typed core.
+        # dream/: pre-existing untyped pipeline scripts, type later if needed.
+        # scripts/: utility/bench scripts, not shipped with the package.
+        # oauth-proxy/: standalone FastAPI shim, untyped route decorators
+        #   (same rationale as mcp_server/server.py); not part of the core
+        #   typed surface and not checked by the CI mypy job either.
+        exclude: ^(tests/|mcp_server/(server|skills_provider|skill_sync_routes|config_sync_routes)\.py$|dream/|scripts/|oauth-proxy/)
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: no-commit-to-branch
+        args: [--branch, main]

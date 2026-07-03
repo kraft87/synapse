@@ -1,0 +1,41 @@
+{
+  "name": "synapse",
+  "version": "0.8.0",
+  "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), two-way-syncs your skills library, mirrors opted-in config files for the dream lane, and wires up the recall/remember MCP tools. Point it at a local or central Synapse.",
+  "author": {
+    "name": "Kyle Doucette"
+  },
+  "userConfig": {
+    "SYNAPSE_URL": {
+      "type": "string",
+      "title": "Synapse URL",
+      "description": "Base URL of your Synapse server (no path), e.g. https://synapse.example.net or http://localhost:8765",
+      "required": true
+    },
+    "SYNAPSE_INGEST_TOKEN": {
+      "type": "string",
+      "title": "Machine token",
+      "description": "Bearer token if your Synapse is auth-gated. Leave blank for an open/local server, or run `! synapse-login` in the Claude prompt to fetch it.",
+      "sensitive": true
+    },
+    "SYNAPSE_CONFIG_SYNC": {
+      "type": "string",
+      "title": "Mirror config files",
+      "description": "Opt-in: mirror your config into Synapse for the dream lane. OFF by default \u2014 your CLAUDE.md + rules/*.md stay on this machine unless you set this to 1, which auto-grabs them from ~/.claude and the current project's .claude."
+    },
+    "SYNAPSE_CONFIG_PATHS": {
+      "type": "string",
+      "title": "Extra config globs",
+      "description": "Optional EXTRA globs (relative to ~/.claude) to mirror beyond the auto-discovered CLAUDE.md + rules/*.md, e.g. \"output-styles/*.md\"."
+    }
+  },
+  "mcpServers": {
+    "synapse": {
+      "type": "http",
+      "url": "${user_config.SYNAPSE_URL}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${user_config.SYNAPSE_INGEST_TOKEN}"
+      }
+    }
+  }
+}

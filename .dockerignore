@@ -1,0 +1,45 @@
+# Version control + CI
+.git
+.gitignore
+.github
+
+# Tests + dev-only assets
+tests
+docs
+*.md
+README*
+LICENSE*
+
+# Local dev / IDE
+.venv
+.idea
+.vscode
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Build / package artifacts
+build
+dist
+*.egg-info
+
+# Docker / compose drafts (not needed inside the image itself)
+compose.yml
+compose.yml.bak*
+*.bak
+
+# One-shot operator scripts not used by the runtime services
+scripts
+
+# Environment + secrets — never bake into image
+.env
+.env.*
+*.pem
+*.key
+
+# OS junk
+.DS_Store
+Thumbs.db

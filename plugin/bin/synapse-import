@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# synapse-import — bulk-import existing Claude Code transcripts into Synapse, no LLM in the loop.
+#
+# Claude Code puts a plugin's bin/ on PATH, so this is just `synapse-import` in any terminal
+# (or `! synapse-import` inside a session). It locates the import script relative to itself
+# and reads config from settings.json, so it needs NO environment variables and NO
+# $CLAUDE_PLUGIN_ROOT. It prints a summary and asks for confirmation before sending anything;
+# the server dedups by span_id, so Ctrl-C and re-running are always safe.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$DIR/../scripts/import_history.py"
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "synapse-import: need python3 or python on PATH" >&2
+  exit 1
+fi
+exec "$PY" "$SCRIPT" "$@"

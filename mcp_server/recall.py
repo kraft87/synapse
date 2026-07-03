@@ -1,0 +1,1502 @@
+"""recall() — the core retrieval function for Synapse.
+
+Document types served by recall():
+  1. Episodes  — individual user-turn exchanges, via a deep wide-pool rerank (WIN1)
+  2. KG facts  — entity/relationship triples (extracted from chunks)
+
+Search strategy:
+  - BM25 (ParadeDB) + ANN cosine over episodes
+  - KG vector seed + graph traversal for facts / entities
+  - ONE cross-encoder rerank over the episode pool
+
+KG legs serve from Postgres (kg_entities / kg_relationships, task #67).
+The cutover was judged quality-EQUAL to FalkorDB on the relational golden set
+(delta -0.017, CI spans zero; scripts/ab_kg_pg_quality.py) and fixed FalkorDB's
+silently-dead BM25 leg (AND/phrase semantics returned 0 results on real
+multi-word queries). FalkorDB itself was decommissioned in #67 PR 3, so the
+``SYNAPSE_KG_READ`` rollback seam is gone; a KG-leg failure degrades to an
+empty facts bucket rather than failing the whole recall.
+
+The communities bucket was retired with the cutover: never measured as
+contributing (absent from every layer ablation), stale since the Stage-4
+community refresh was shelved, and it was the last FalkorDB read in recall.
+
+recall_episodes() exposes the raw episode drill-down. The summary layer and the
+chunk bucket were both retired (task #63): the KG owns facts and the direct
+episode leg owns broad/needle, so neither earned its serving slot.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
+
+import psycopg
+from psycopg.rows import dict_row, tuple_row
+
+from ingestion import embedding as _embedding
+from mcp_server.kg_pg import _vec_literal, search_kg_postgres
+
+logger = logging.getLogger(__name__)
+
+_KG_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
+
+# Embedding width for every vector/halfvec SQL cast below. Resolved once from
+# SYNAPSE_EMBED_DIMS (default 2048 — Voyage prod, SQL byte-identical); must match
+# the width the schema was provisioned with or the halfvec HNSW index expressions
+# don't apply. See ingestion/embedding.py (dims are validated against synapse_meta).
+_EMBED_DIMS = _embedding.embed_dims()
+
+# Sentinel for the lazily-built reranker: ``None`` is a VALID resolved value
+# (SYNAPSE_RERANK_PROVIDER=none — fusion-only serving), so "unset" needs its own marker.
+_RERANKER_UNSET = object()
+
+_KG_CANDIDATE_LIMIT = 30
+_RRF_K = 60
+# Timeline leg (schema 033). recall() fuses a compact chronological event list into the
+# payload when the query has TEMPORAL INTENT — the LME lesson: temporal questions only
+# recover if the answer path actually reads the timeline. Conservative regex (precision
+# over recall; a false fire costs ~0.5KB of context). Kill switch SYNAPSE_RECALL_TIMELINE=0.
+_TIMELINE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_TIMELINE", "1") != "0"
+_TIMELINE_LIMIT = 8
+_TEMPORAL_RE = re.compile(
+    r"\b(when (did|was|were)|how long|how many (days|weeks|months)|last (week|month|night)"
+    r"|yesterday|days? (ago|since|between|before|after)|weeks? ago|months? ago"
+    r"|timeline|chronolog|what did (i|we) (do|ship|build)|recently (did|shipped|built))\b",
+    re.IGNORECASE,
+)
+_RECENCY_HALF_LIFE_DAYS = 30  # content this old scores ~50% of today's content
+# Recency re-injection AFTER the cross-encoder rerank. The reranker is
+# recency-blind and an old *definitive* statement ("X is canonical") out-scores
+# a newer *transition* statement ("switched off X to Y"), so stale synth docs
+# eat the limited slots. A shorter half-life here (the corpus churns within a
+# single month) lets a fresh doc reclaim a slot from a marginally-more-relevant
+# stale one. Tunable knob; validate on the staleness probe before changing.
+_RERANK_RECENCY_HALF_LIFE_DAYS = 14
+
+_RERANK_POOL = 6  # candidates per type fed to the reranker
+_RERANK_DOC_CAP = 4000  # per-doc char cap (~1k tokens) sent to the reranker (bounds tokens).
+# Keeps each doc FAR under Voyage rerank-2.5's ~32k-token PER-(query+doc) context limit, so
+# no single doc is ever silently truncated. That 32k limit is per query+doc PAIR, NOT a
+# total-request budget: verified 2026-06-18 that a 55.6k-token pool reranks in full (a gold
+# planted at index 99 returns to rank 1), so _EPISODE_RERANK_POOL total size is unbounded by
+# Voyage — pool size is a quality/latency knob, not a truncation risk. Don't re-litigate.
+# Long-episode rerank windowing. The cross-encoder only sees each doc's first _RERANK_DOC_CAP
+# chars, so an answer in the truncated tail of a long episode is invisible to ranking — measured
+# on a back-half golden as retr@5 0.139 vs a 0.917 pool ceiling (scripts/passage_bench_v*.py,
+# 2026-06-26). Fix: also feed the reranker the BM25-relevant window of long episodes and score the
+# episode by max(head, window). BM25 selection is pure-Python (no embeddings, ~ms) so the read path
+# pays only ~14 extra short rerank docs. max() is conservative — it can only RAISE an episode's
+# score, never lower the head's — so short episodes are unaffected: validated as a STRICT win
+# (tail retr@5 0.139→0.889; natural 0.929→0.929 retr@5, 0.952→0.976 retr@10). Disable with
+# SYNAPSE_RERANK_WINDOW=0.
+_RERANK_WINDOW = os.getenv("SYNAPSE_RERANK_WINDOW", "1") != "0"
+_RERANK_WINDOW_SIZE = 1024  # window granularity for locating the relevant region of a long episode
+
+
+def _bm25_tokenize(s: str) -> list[str]:
+    return re.findall(r"[a-z0-9_./#+-]+", s.lower())
+
+
+def _bm25_best_window(content: str, q_tokens: list[str], cap: int) -> str:
+    """Return the cap-sized slice of ``content`` centered on the window with the highest BM25 score
+    vs the query tokens. Pure-Python (no embeddings) — cheap enough for the read path. Lets the
+    reranker see the query-relevant region of a long episode instead of just its first ``cap`` chars."""
+    win = _RERANK_WINDOW_SIZE
+    starts = list(range(0, len(content), win))
+    win_tokens = [_bm25_tokenize(content[s : s + win]) for s in starts]
+    n = len(win_tokens)
+    if n <= 1:
+        return content[:cap]
+    avgdl = sum(len(d) for d in win_tokens) / n
+    df: dict[str, int] = {}
+    for d in win_tokens:
+        for t in set(d):
+            df[t] = df.get(t, 0) + 1
+    k1, b = 1.5, 0.75
+    qset = set(q_tokens)
+    best_i, best_s = 0, -1.0
+    for i, d in enumerate(win_tokens):
+        if not d:
+            continue
+        tf: dict[str, int] = {}
+        for t in d:
+            tf[t] = tf.get(t, 0) + 1
+        dl = len(d)
+        s = 0.0
+        for t in qset:
+            f = tf.get(t)
+            if not f:
+                continue
+            idf = math.log(1 + (n - df[t] + 0.5) / (df[t] + 0.5))
+            s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * dl / avgdl))
+        if s > best_s:
+            best_s, best_i = s, i
+    lo = max(0, starts[best_i] + win // 2 - cap // 2)
+    return content[lo : lo + cap]
+
+
+_FACT_LIMIT = 12  # KG facts returned by recall()
+# Raised 5→12 (2026-06-03). The KG is the STRONGEST layer on relational/multi-hop
+# questions — its real job — where it beats summaries+chunks (kg_only 0.715 vs 0.489,
+# marginal +0.307; scripts/kg_relational_baseline.py on a 40-Q relational golden set).
+# Serving more of the graph's EXISTING facts (no new nodes/edges, zero graph bloat)
+# lifts relational answer quality 0.746→0.826 and DOUBLES exact-fact keyword recall
+# 0.119→0.214, while nudging broad +0.015 — safe on all query types (kg_factcount_safety.py).
+# A wide-pool fact reranker added only +0.01-0.03 more for a per-recall API call — not
+# worth it; just serving more is the win. Costs ~+200 fact-tokens/recall (facts are short).
+_EPISODE_LIMIT = 5  # episodes returned by recall_episodes()
+# WIN1 (2026-06-03, episode_pool_rerank): exact-fact misses were pure truncation —
+# golds rank 16-88 in a leg but prod fetched only _EPISODE_LIMIT*3=15, so they never
+# entered the served pool. Deep-fetch + WIDE-pool cross-encoder recovers them:
+# answerability 90.5%→95.2%, exact-gold hit +7pts, served tokens -20%. Plain deeper
+# RRF does nothing (can't lift a rank-40 gold) — the reranker is the active ingredient.
+_EPISODE_FETCH = 100  # per-leg fetch depth for recall_episodes (was 15)
+_EPISODE_RERANK_POOL = 100  # fused candidates fed to the cross-encoder, served down to limit
+# (pool 50 → 0.929 answerability at half the rerank payload; 100 → 0.952. Dial down if
+#  drill-down latency bites; exact-gold hit is identical 0.881 either way.)
+_RECALL_EPISODE_LIMIT = 5  # direct episode turns served by recall()
+# 2026-06-04 (episode_count_sweep): with summaries retired, episodes are the primary
+# served layer — re-swept n now that they own the budget. Broad synthesis PEAKS at 5
+# (0.658) and declines on both sides (n=3 0.566, n=6 0.599) — more turns dilute the
+# synthesis; needle hits its early plateau at 4-5 (0.714); relational is n-indifferent
+# (facts own it). 3→5 buys broad +0.092 / needle +0.047 for +444 ctx tokens; past 5 is
+# strictly worse on broad. Was 3 (chosen when summaries competed for the slots).
+# 2026-06-03 (recall_episode_blend): recall()'s chunk-derived bucket was redundant
+# (marginal ~0 on needle/broad/relational per layer_contribution.py). Swapping it for the
+# SAME direct wide-pool episode leg recall_episodes() uses lifts broad +0.127 and needle
+# +0.262 while HOLDING relational (-0.015, noise), at +247 tokens (episodes paid for by
+# dropping chunks). Adding episodes ON TOP of chunks hurt relational and cost ~2.7x the
+# tokens; the swap is the win. Summaries (not starved: 2.58/3 served) now rank solo.
+# recall() co-reranks summaries + the episode pool in ONE cross-encoder call and partitions
+# by type (the reranker scores docs independently, so per-type order is identical to ranking
+# each alone, in one round-trip). recall() keeps the full pool: profile_recall shows the
+# rerank is cheap (~0.6s for 106 docs) and pool size barely moves it; the episode cost is the
+# scan-bound BM25+vector fetch (~2.5s). Latency lever is parallelizing the legs, not the pool.
+# Stage 2 (passage compaction). recall()'s episode bucket serves the most query-relevant PASSAGES
+# (markdown chunks) of the top reranked episodes instead of whole episode turns: ~1/4 the tokens at
+# near-baseline answer survival (kw-survival ~0.94 tail / ~0.95 natural at ~1050 served tokens vs
+# ~5000 for full episodes; scripts/passage_bench_v*, 2026-06-26). recall_episodes() (drill-down) stays
+# on FULL episodes. Passages are picked by a SECOND cross-encoder rerank over the markdown chunks of
+# the top _RECALL_PASSAGE_SRC_K episodes. The bench's hybrid->rerank cascade collapses to a DIRECT
+# rerank here because the chunk count is bounded (~10-40 from 10 episodes) and a direct rerank IS that
+# cascade's quality ceiling — and rerank-only (no live passage embedding) keeps the second pass ~0.2s,
+# not the ~2.2s a cosine leg would add.
+_RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "3") or "3")  # passages served
+_RECALL_PASSAGE_SRC_K = 10  # top reranked episodes to mine passages from
+_RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds the extra call)
+
+_ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
+_HISTORY_LIMIT = 2  # bi-temporal history pairs returned by recall()
+_WEB_LIMIT = 3  # web_chunks (deduped by parent page) returned by recall()
+
+# Adaptive episode serving (variable-k) for recall_episodes() — OFF by default.
+# When SYNAPSE_EPISODE_CUTOFF_TAU > 0, recall_episodes() serves the reranked turns
+# scoring >= tau*top_score instead of a fixed top-`limit`, clamped to [MIN_K, MAX_K]:
+# fewer turns when the top result dominates (focused/needle queries), more when many
+# turns are comparably relevant (broad/multi-session). Validated on LongMemEval-S
+# (tau=0.50 -> 81.8% vs fixed k=12 80.0%). PROD DEFAULT STAYS OFF: that win is bench-
+# specific (LME's synthetic personas have no KG facts, so episodes carry everything),
+# whereas on real data the KG owns multi-hop and the episode_count_sweep above measured
+# broad synthesis PEAKING at 5 — so bench-tuned params do NOT transfer. Enabling needs a
+# prod-data answerability sweep; conservative MAX_K=8 reflects that plateau. Applies to
+# the drill-down path only; recall()'s overview bucket stays fixed at _RECALL_EPISODE_LIMIT
+# (serving past 5 is "strictly worse on broad" per the sweep).
+_EPISODE_CUTOFF_TAU = float(os.getenv("SYNAPSE_EPISODE_CUTOFF_TAU", "0") or "0")
+_EPISODE_CUTOFF_MIN_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MIN_K", "3") or "3")
+_EPISODE_CUTOFF_MAX_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MAX_K", "8") or "8")
+
+# Absolute relevance gate on KG FACTS (default 0 = OFF). When SYNAPSE_RECALL_FACT_FLOOR > 0,
+# cross-encoder-score the served facts against the query and DROP those below the floor — the
+# genuine off-topic facts the vector/BM25/graph legs surface (e.g. a "Mattermost decommission"
+# fact, scored 0.39, for a "FalkorDB decommission" query; a wholly-unrelated 0.28 fact). Probe
+# (2026-06-18) on real prod facts: off-topic ~0.28-0.39, relevant >=0.44, so ~0.40 separates —
+# but CALIBRATED ON ONLY 3 QUERIES with a thin gap, so default OFF until validated on more.
+# This is where the "recall returns irrelevant stuff" lever actually lives: episodes score
+# flat-high (0.68-0.94 at full length) so an episode floor is a no-op, but facts are short and
+# fully scored, so off-topic ones genuinely score low. Costs ONE extra rerank of ~12 short facts
+# per recall(), ONLY when enabled. Keeps >=1 fact so a query can't lose its facts bucket.
+_RECALL_FACT_FLOOR = float(os.getenv("SYNAPSE_RECALL_FACT_FLOOR", "0") or "0")
+
+# Supersession surface (2026-06-27): a query that matches a now-INVALID fact should still
+# return the CURRENT answer. When a superseded edge near the query carries a precise successor link
+# (invalidated_by, schema 028), surface that successor's fact in the facts bucket (deduped) instead
+# of silently dropping the stale match. Distance-gated so only ON-TOPIC superseded facts pull their
+# correction in; go-forward coverage only (no link => skip); never serves the stale fact itself.
+_SUP_CANDIDATES = 10  # nearest invalid-with-link edges to consider per recall
+_SUP_LIMIT = 3  # max successor facts added per recall (additive, beyond _FACT_LIMIT)
+_SUP_MAX_DIST = float(os.getenv("SYNAPSE_SUPERSEDE_MAX_DIST", "0.45") or "0.45")  # cosine-dist gate
+
+
+def _to_web_recall_item(row: dict[str, Any]) -> dict[str, Any]:
+    """Web chunk → slim recall shape.
+
+    Returns the LLM-written Contextual Retrieval `context_prefix` as the
+    user-facing description when available — ~80 tokens of "where this
+    chunk fits in the parent doc" rather than ~375 tokens of raw chunk
+    content. The caller has the URL if they want the full page; this
+    keeps recall token-light.
+
+    Falls back to a 200-char excerpt of raw content for chunks that
+    haven't been contextualized yet.
+    """
+    out: dict[str, Any] = {}
+    context = (row.get("context_prefix") or "").strip()
+    if context:
+        out["context"] = context
+    else:
+        excerpt = (row.get("content") or "")[:200].strip()
+        if excerpt:
+            out["excerpt"] = excerpt
+    if url := row.get("url"):
+        out["url"] = url
+    if title := row.get("title"):
+        out["title"] = title
+    if (ts := row.get("created_at")) is not None:
+        out["date"] = str(ts)[:10]
+    return out
+
+
+def _to_recall_item(row: dict[str, Any]) -> dict[str, Any]:
+    """Slim a SQL row into the minimum shape an LLM caller can act on.
+
+    Keeps the episode id (for fetch_episode drill-down) + content + project (only when
+    non-null) + date (truncated from full timestamp). Drops everything used only for ranking
+    or debug: session_id, doc_type, retrieval_count, vec_distance, bm25_score, etc.
+    """
+    out: dict[str, Any] = {}
+    if (rid := row.get("id")) is not None:
+        out["id"] = rid  # "e:N" — pass to fetch_episode() to expand the full turn
+    out["content"] = row.get("content", "")
+    if (project := row.get("project")) is not None:
+        out["project"] = project
+    if (ts := row.get("created_at")) is not None:
+        out["date"] = str(ts)[:10]
+    return out
+
+
+_FETCH_MAX = 20  # max episodes fetch_episodes() will expand in one call (bounds the by-id read)
+
+
+def _parse_episode_ids(ids: list[Any]) -> list[int]:
+    """Parse recall()'s episode ids ("e:227168" strings or bare ints) into int episode ids,
+    deduped, order-preserving, capped at _FETCH_MAX. Skips anything unparseable."""
+    out: list[int] = []
+    seen: set[int] = set()
+    for x in ids:
+        n: int | None = None
+        if isinstance(x, bool):
+            continue
+        if isinstance(x, int):
+            n = x
+        elif isinstance(x, str):
+            s = x.split(":", 1)[1] if x.startswith("e:") else x
+            if s.isdigit():
+                n = int(s)
+        if n is not None and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out[:_FETCH_MAX]
+
+
+def _apply_supersessions(
+    items: list[dict[str, Any]], sup: dict[int, list[str]], served_facts: set[str]
+) -> None:
+    """Attach ``superseded_by`` (current facts that superseded a claim the item made) to each served
+    episode/passage, keyed by its parsed "e:N" id. Skips now-facts already in the served facts bucket
+    (no duplicate tokens) — this is a top-up for the case the correction didn't rank into facts.
+    Mutates ``items`` in place."""
+    for it in items:
+        rid = it.get("id")
+        if not isinstance(rid, str) or not rid.startswith("e:"):
+            continue
+        s = rid.split(":", 1)[1]
+        if not s.isdigit():
+            continue
+        nows = [f for f in sup.get(int(s), []) if f and f not in served_facts]
+        if nows:
+            it["superseded_by"] = nows
+
+
+def _rrf_score(rank: int, k: int = _RRF_K) -> float:
+    return 1.0 / (k + rank + 1)
+
+
+def _recency_multiplier(created_at: Any, half_life_days: float = _RECENCY_HALF_LIFE_DAYS) -> float:
+    """Exponential decay: 1.0 today → 0.5 at half_life → approaches 0."""
+    if created_at is None:
+        return 1.0
+    from datetime import UTC, datetime
+
+    try:
+        if isinstance(created_at, str):
+            ts = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        else:
+            ts = created_at
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=UTC)
+        age_days = (datetime.now(UTC) - ts).total_seconds() / 86400
+        return math.exp(-age_days * math.log(2) / half_life_days)
+    except Exception:
+        return 1.0
+
+
+def _feedback_multiplier(retrieval_count: Any) -> float:
+    """Boost frequently retrieved items: log(1 + count), capped at 2x."""
+    try:
+        count = int(retrieval_count or 0)
+        return min(2.0, 1.0 + math.log1p(count) * 0.3)
+    except Exception:
+        return 1.0
+
+
+# Reciprocal Rank Fusion constant (Graphiti uses 1). Score for an item at
+# 0-based rank r in a list is 1/(r + _RRF_KG_K + 1).
+_RRF_KG_K = 1
+
+
+def _rrf_fuse(ranked_lists: list[list[str]]) -> dict[str, float]:
+    """Fuse several ranked uuid lists into one {uuid: score} via RRF.
+
+    Each list contributes 1/(rank + _RRF_KG_K + 1) to an item's score; scores
+    sum across lists so items found by multiple methods rise. This replaces
+    the old "fact-embedding fills slots, traversal on scraps" selection — every
+    method competes in one pool, which both improves relevance (benchmarked
+    S1, +12% vs the fallback model) and removes the slot-boundary instability.
+    """
+    scores: dict[str, float] = {}
+    for lst in ranked_lists:
+        for rank, uuid_ in enumerate(lst):
+            scores[uuid_] = scores.get(uuid_, 0.0) + 1.0 / (rank + _RRF_KG_K + 1)
+    return scores
+
+
+def _merge_rrf(
+    *ranked_lists: list[dict[str, Any]],
+    id_key: str = "id",
+    apply_recency: bool = True,
+) -> list[dict[str, Any]]:
+    """Merge ranked lists with RRF + recency decay + feedback boost."""
+    scores: dict[Any, float] = {}
+    items: dict[Any, dict[str, Any]] = {}
+
+    for ranked in ranked_lists:
+        for rank, item in enumerate(ranked):
+            item_id = item[id_key]
+            base = _rrf_score(rank)
+            if apply_recency:
+                base *= _recency_multiplier(item.get("created_at"))
+            base *= _feedback_multiplier(item.get("retrieval_count"))
+            scores[item_id] = scores.get(item_id, 0.0) + base
+            if item_id not in items:
+                items[item_id] = item
+
+    return sorted(items.values(), key=lambda x: scores[x[id_key]], reverse=True)
+
+
+def _timed(fn: Any, *args: Any) -> tuple[Any, float]:
+    """Run ``fn(*args)`` and return ``(result, elapsed_ms)`` — per-leg latency
+    telemetry. Submitted through the leg executor so each leg reports its own
+    wall time (vs. submit-to-result, which would include queue wait)."""
+    t = time.perf_counter()
+    r = fn(*args)
+    return r, (time.perf_counter() - t) * 1000.0
+
+
+def _served_chars(out: dict[str, Any]) -> int:
+    """Total characters of the SERVED payload — the context cost recall() imposes
+    on the caller's window. ``est_tokens`` ~= chars/4. Counts every answer-bearing
+    bucket (facts/episodes/entities/web/history), not the ranking-only fields."""
+    n = len(out.get("query") or "")
+    for f in out.get("facts", []):
+        n += len(f.get("fact") or "")
+    for e in out.get("episodes", []):
+        n += len(e.get("content") or "") + len(str(e.get("date") or ""))
+    for e in out.get("entities", []):
+        n += len(e.get("name") or "") + len(e.get("summary") or "")
+    for w in out.get("web", []):
+        n += len(w.get("context") or "") + len(w.get("excerpt") or "") + len(w.get("title") or "")
+    for t in out.get("timeline", []):
+        n += len(t.get("fact") or "") + len(str(t.get("date") or ""))
+    for h in out.get("history", []):
+        n += len(str(h.get("previously") or "")) + len(str(h.get("now") or ""))
+    return n
+
+
+def _cutoff_k(scores: list[float], tau: float, min_k: int, max_k: int) -> int:
+    """Adaptive serving size from a RELATIVE rerank-score cutoff.
+
+    Keeps the leading docs whose score >= tau*top_score, then clamps the count
+    to [min_k, max_k] (and to len(scores)). `scores` must be in rerank order
+    (descending). The top doc always qualifies, so the result is >= 1."""
+    if not scores:
+        return 0
+    top = scores[0]
+    if top <= 0:  # rerank degraded to RRF order (all 0.0) — caller handles fallback
+        return min(len(scores), max_k)
+    keep = sum(1 for s in scores if s >= tau * top)
+    return min(max(keep, min_k), max_k, len(scores))
+
+
+class Recall:
+    """Stateful retrieval engine. One instance per MCP server process."""
+
+    def __init__(
+        self,
+        db_url: str,
+        voyage_api_key: str,
+    ) -> None:
+        self._db_url = db_url
+        self._voyage_key = voyage_api_key
+        self._embedder: Any = None
+        self._reranker: Any = _RERANKER_UNSET
+        # Postgres connections are THREAD-LOCAL: recall() fans its independent search
+        # legs out across the leg executor, and a single psycopg connection can't be
+        # used by two threads at once. Each worker lazily opens its own connection.
+        self._pg_local = threading.local()
+        # Background executor for fire-and-forget feedback writes (retrieval
+        # count bumps). One worker is enough for single-user scale; queueing
+        # on a hot recall burst is cheaper than blocking the response.
+        self._async_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="recall-feedback"
+        )
+        # Leg executor: runs recall()'s independent search legs (summaries, episodes,
+        # web, KG) concurrently. Persistent so each worker's thread-local PG connection
+        # is reused across calls. Legs never submit here, so concurrent recalls queue
+        # rather than deadlock.
+        self._leg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="recall-leg")
+        self._timeline_engine: Any = None  # lazy TimelineRecall (timeline leg)
+
+    def _ensure_pg(self) -> Any:
+        # Thread-local: each thread (the caller + every leg-executor worker) owns its
+        # own connection, so parallel search legs never share one psycopg handle.
+        conn = getattr(self._pg_local, "conn", None)
+        if conn is not None and not conn.closed:
+            # Probe for half-open TCP connections (closed=False but server dropped us)
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except Exception:
+                conn = None
+        conn = psycopg.connect(self._db_url, row_factory=dict_row, autocommit=True)
+        # HNSW search breadth for the halfvec vector indexes. Default 40 under-recalls a
+        # 100-deep fetch; 200 gives recall@100 0.981 / recall@10 1.000 vs exact (validated).
+        # Harmless on tables/queries that don't use an HNSW index.
+        conn.execute("SET hnsw.ef_search = 200")
+        self._pg_local.conn = conn
+        return conn
+
+    def _ensure_timeline(self) -> Any:
+        if self._timeline_engine is None:
+            from mcp_server.timeline import TimelineRecall
+
+            self._timeline_engine = TimelineRecall(
+                db_url=self._db_url, voyage_api_key=self._voyage_key
+            )
+        return self._timeline_engine
+
+    def _ensure_embedder(self) -> Any:
+        if self._embedder is None:
+            self._embedder = _embedding.create_embedder(
+                voyage_api_key=self._voyage_key, db_url=self._db_url
+            )
+        return self._embedder
+
+    def _ensure_reranker(self) -> Any:
+        """Lazily-built rerank backend. ``None`` = rerank disabled
+        (SYNAPSE_RERANK_PROVIDER=none) — callers serve the fusion (RRF) order."""
+        if self._reranker is _RERANKER_UNSET:
+            self._reranker = _embedding.create_reranker(voyage_api_key=self._voyage_key)
+        return self._reranker
+
+    # ------------------------------------------------------------------
+    # BM25 search (ParadeDB) — episodes + chunks
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ts_col(table: str) -> str:
+        """Timestamp column name varies by table."""
+        return "generated_at" if table == "synth_documents" else "created_at"
+
+    @staticmethod
+    def _extra_cols(table: str) -> str:
+        # Slim SELECT: only fields read by the ranking pipeline. Drill-down
+        # columns (source_ids, sequence ranges, synth_type) are dropped — caller
+        # never sees them, so don't waste DB→Python wire bytes.
+        # retrieval_count IS kept for episodes because _feedback_multiplier reads it.
+        if table == "episodes":
+            return ", retrieval_count"
+        if table == "chunks":
+            return ", episode_ids"  # chunk = retrieval signal; serve its episodes
+        return ""
+
+    def _bm25_table(
+        self, table: str, query: str, project: str | None, limit: int, doc_type: str
+    ) -> list[dict[str, Any]]:
+        pg = self._ensure_pg()
+        ts = self._ts_col(table)
+        extra = self._extra_cols(table)
+        try:
+            if project:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project,
+                           {ts} AS created_at{extra},
+                           paradedb.score(id) AS bm25_score
+                    FROM {table}
+                    WHERE id @@@ paradedb.match('content', %s) AND project = %s
+                    ORDER BY bm25_score DESC LIMIT %s
+                    """,
+                    (query, project, limit),
+                ).fetchall()
+            else:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project,
+                           {ts} AS created_at{extra},
+                           paradedb.score(id) AS bm25_score
+                    FROM {table}
+                    WHERE id @@@ paradedb.match('content', %s)
+                    ORDER BY bm25_score DESC LIMIT %s
+                    """,
+                    (query, limit),
+                ).fetchall()
+            return [
+                {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
+            ]
+        except Exception as e:
+            logger.warning("BM25 %s search failed: %s", table, e)
+            return []
+
+    def _search_bm25_episodes(
+        self, query: str, project: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        return self._bm25_table("episodes", query, project, limit, "episode")
+
+    # ------------------------------------------------------------------
+    # Vector search — episodes
+    # ------------------------------------------------------------------
+
+    def _vector_table(
+        self, table: str, emb_literal: str, project: str | None, limit: int, doc_type: str
+    ) -> list[dict[str, Any]]:
+        pg = self._ensure_pg()
+        ts = self._ts_col(table)
+        extra = self._extra_cols(table)
+        # Distance is computed over halfvec(N), NOT vector(N). The default embeddings are
+        # 2048-dim (voyage-4-large), which exceeds pgvector's 2000-dim limit for HNSW on
+        # the full `vector` type — so the HNSW indexes are built on `embedding::halfvec(N)`
+        # (half-precision, index limit 4000 dims), with N = _EMBED_DIMS as provisioned.
+        # The ORDER BY expression must match that index expression verbatim to be served
+        # from it; the alias form is NOT index-eligible.
+        # Half precision is loss-free for what's served: recall@10 vs exact scan = 1.000,
+        # recall@100 = 0.981 (and the reranker re-scores the pool). 878ms -> 23ms on episodes.
+        try:
+            if project:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project,
+                           {ts} AS created_at{extra},
+                           (embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})) AS vec_distance
+                    FROM {table}
+                    WHERE is_embedded = TRUE AND project = %s
+                    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s
+                    """,
+                    (emb_literal, project, emb_literal, limit),
+                ).fetchall()
+            else:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project,
+                           {ts} AS created_at{extra},
+                           (embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})) AS vec_distance
+                    FROM {table}
+                    WHERE is_embedded = TRUE
+                    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s
+                    """,
+                    (emb_literal, emb_literal, limit),
+                ).fetchall()
+            return [
+                {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
+            ]
+        except Exception as e:
+            logger.warning("Vector %s search failed: %s", table, e)
+            return []
+
+    def _search_vector_episodes(
+        self, query_emb: list[float], project: str | None, limit: int
+    ) -> list[dict[str, Any]]:
+        emb_literal = "[" + ",".join(str(x) for x in query_emb) + "]"
+        return self._vector_table("episodes", emb_literal, project, limit, "episode")
+
+    # ------------------------------------------------------------------
+    # Reranking + episode leg
+    # ------------------------------------------------------------------
+
+    def _rerank_docs(self, query: str, pool: list[dict[str, Any]]) -> tuple[list[str], list[int]]:
+        """Build the docs fed to the reranker + their pool owner index.
+
+        Every item contributes its head (first _RERANK_DOC_CAP chars). With _RERANK_WINDOW on,
+        items longer than the cap ALSO contribute their BM25-relevant window, so the caller can
+        score the episode by max(head, window) and recover answers in the truncated tail (see the
+        _RERANK_WINDOW note). ``owner[k]`` is the pool index doc ``k`` belongs to."""
+        docs: list[str] = []
+        owner: list[int] = []
+        q_tokens = _bm25_tokenize(query) if _RERANK_WINDOW else []
+        for i, c in enumerate(pool):
+            content = c.get("content") or ""
+            docs.append(content[:_RERANK_DOC_CAP])
+            owner.append(i)
+            if _RERANK_WINDOW and len(content) > _RERANK_DOC_CAP:
+                docs.append(_bm25_best_window(content, q_tokens, _RERANK_DOC_CAP))
+                owner.append(i)
+        return docs, owner
+
+    def _rerank_pool(self, query: str, pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reorder a pooled candidate list by a Voyage cross-encoder. Degrades
+        gracefully to the incoming RRF order if the reranker errors (rate limit,
+        outage) — recall must never hard-fail on the rerank leg."""
+        if len(pool) <= 1:
+            return pool
+        scored = self._rerank_pool_scored(query, pool)
+        return [pool[i] for i, _ in scored] if scored else pool
+
+    def _rerank_pool_scored(
+        self, query: str, pool: list[dict[str, Any]]
+    ) -> list[tuple[int, float]]:
+        """Like _rerank_pool but returns (pool_index, relevance_score) pairs in
+        rerank order, so callers can apply a relative score cutoff. Each episode is scored by the
+        MAX over its rerank docs (head + optional BM25 window — see _rerank_docs). Degrades to the
+        incoming RRF order with score 0.0 if the reranker errors — recall must never hard-fail on
+        the rerank leg. A 0.0 top score signals the caller to fall back to fixed-k serving."""
+        if not pool:
+            return []
+        if len(pool) == 1:
+            return [(0, 1.0)]
+        reranker = self._ensure_reranker()
+        if reranker is None:
+            # Rerank disabled (SYNAPSE_RERANK_PROVIDER=none): serve the incoming
+            # fusion (RRF) order. Score 0.0 = the same "fixed-k" signal as the
+            # degraded path below. Logged once at startup by create_reranker().
+            return [(i, 0.0) for i in range(len(pool))]
+        docs, owner = self._rerank_docs(query, pool)
+        try:
+            scored = reranker.rerank_scored(query, docs)
+        except Exception as e:
+            logger.warning("Scored rerank failed, using RRF order: %s", e)
+            return [(i, 0.0) for i in range(len(pool))]
+        best: dict[int, float] = {}
+        for di, s in scored:
+            if 0 <= di < len(owner):
+                oi = owner[di]
+                if oi not in best or s > best[oi]:
+                    best[oi] = s
+        return sorted(best.items(), key=lambda x: x[1], reverse=True)
+
+    def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop served facts the cross-encoder scores below _RECALL_FACT_FLOOR (off-topic).
+
+        Facts are short, so they're scored at full length — unlike episodes (flat-high at
+        full length), off-topic facts genuinely score low here, so an absolute floor works.
+        Degrades to keeping all facts on rerank failure; keeps >=1 so the bucket is never
+        blanked. Caller gates on _RECALL_FACT_FLOOR > 0 so this runs only when enabled."""
+        reranker = self._ensure_reranker()
+        if reranker is None:  # rerank disabled — no floor, keep all facts
+            return facts
+        texts = [(f.get("fact") or "")[:_RERANK_DOC_CAP] for f in facts]
+        try:
+            scored = reranker.rerank_scored(query, texts)
+        except Exception as e:
+            logger.warning("Fact-floor rerank failed, keeping all facts: %s", e)
+            return facts
+        kept = [facts[i] for i, s in scored if s >= _RECALL_FACT_FLOOR]
+        return kept or [facts[i] for i, _ in scored[:1]]
+
+    def _compact_to_passages(
+        self, query: str, episodes: list[dict[str, Any]], n: int
+    ) -> list[dict[str, Any]]:
+        """Compact the top reranked episodes into the n most query-relevant PASSAGES (Stage 2).
+
+        Splits each episode into markdown chunks (ingestion.web_chunker.chunk_markdown), reranks the
+        pooled chunks with the SAME cross-encoder, and serves the top-n with their parent episode's
+        project/date. ~1/4 the tokens of full-episode serving at near-baseline answer survival
+        (scripts/passage_bench_v*, 2026-06-26). A direct rerank over the chunks is the bench's
+        hybrid->rerank cascade's ceiling at this bounded chunk count, and rerank-only avoids a live
+        passage embed. Returns [] on chunk/rerank failure so the caller falls back to full episodes;
+        gated by _RECALL_PASSAGES so this runs only when enabled."""
+        from ingestion.web_chunker import chunk_markdown
+
+        passages: list[str] = []
+        owner: list[dict[str, Any]] = []
+        for e in episodes:
+            content = e.get("content") or ""
+            if not content.strip():
+                continue
+            try:
+                chunks = [c.content for c in chunk_markdown(content) if c.content.strip()]
+            except Exception:
+                chunks = [content]
+            for ch in chunks:
+                passages.append(ch)
+                owner.append(e)
+        if not passages:
+            return []
+        # Cap the rerank input so a pathologically long episode can't blow up the call.
+        if len(passages) > _RECALL_PASSAGE_CAND:
+            passages = passages[:_RECALL_PASSAGE_CAND]
+            owner = owner[:_RECALL_PASSAGE_CAND]
+        if len(passages) <= n:
+            chosen = list(range(len(passages)))  # already in episode-rerank order
+        else:
+            reranker = self._ensure_reranker()
+            if reranker is None:  # rerank disabled — no selection signal, serve full episodes
+                return []
+            try:
+                scored = reranker.rerank_scored(query, passages, top_k=n)
+            except Exception as e:
+                logger.warning("Passage rerank failed, serving full episodes: %s", e)
+                return []
+            chosen = [i for i, _ in scored[:n]]
+        out: list[dict[str, Any]] = []
+        for i in chosen:
+            ep = owner[i]
+            item: dict[str, Any] = {}
+            if (rid := ep.get("id")) is not None:
+                item["id"] = rid  # parent episode — pass to fetch_episode() to expand the full turn
+            item["content"] = passages[i]
+            if (project := ep.get("project")) is not None:
+                item["project"] = project
+            if (ts := ep.get("created_at")) is not None:
+                item["date"] = str(ts)[:10]
+            out.append(item)
+        return out
+
+    def _select_episodes(
+        self, query: str, pool: list[dict[str, Any]], limit: int
+    ) -> list[dict[str, Any]]:
+        """Rerank `pool` and pick which episodes to serve.
+
+        Default (SYNAPSE_EPISODE_CUTOFF_TAU <= 0): fixed top-`limit` in rerank
+        order — byte-identical to the prior `_rerank_pool(...)[:limit]` path.
+        With tau > 0: adaptive relative score-cutoff (keep score >= tau*top,
+        clamped [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K]). Always degrades
+        to RRF order on rerank failure; never hard-fails."""
+        if not pool:
+            return []
+        if _EPISODE_CUTOFF_TAU <= 0:
+            return self._rerank_pool(query, pool)[:limit]
+        scored = self._rerank_pool_scored(query, pool)
+        if not scored or scored[0][1] <= 0.0:  # reranker degraded -> fixed-k, RRF order
+            return pool[:limit]
+        k = _cutoff_k(
+            [s for _, s in scored],
+            _EPISODE_CUTOFF_TAU,
+            _EPISODE_CUTOFF_MIN_K,
+            _EPISODE_CUTOFF_MAX_K,
+        )
+        return [pool[i] for i, _ in scored[:k]]
+
+    def _episode_pool(
+        self,
+        query: str,
+        query_emb: list[float] | None,
+        project: str | None,
+        fetch: int = _EPISODE_FETCH,
+        pool_size: int = _EPISODE_RERANK_POOL,
+    ) -> list[dict[str, Any]]:
+        """Fused BM25+vector episode candidate pool, PRE-rerank (WIN1 deep-fetch).
+
+        Shared primitive: recall_episodes() reranks it and serves top-k (deep
+        drill-down); recall() merges it with the summary candidates and co-reranks
+        in a single cross-encoder pass, then partitions by doc_type. The deep fetch
+        is what lets the reranker recover a rank-16..88 gold; plain RRF can't.
+        BM25-only when the query embedding is unavailable."""
+        bm25_eps = self._search_bm25_episodes(query, project, fetch)
+        vec_eps: list[dict[str, Any]] = []
+        if query_emb is not None:
+            vec_eps = self._search_vector_episodes(query_emb, project, fetch)
+        return _merge_rrf(bm25_eps, vec_eps, id_key="id")[:pool_size]
+
+    # ------------------------------------------------------------------
+    # web_chunks search — BM25 + vector over scraped web pages
+    # ------------------------------------------------------------------
+    #
+    # web_chunks is a sidecar of web_artifacts (1:N). Each scrape produces
+    # ~1500-char chunks with 20% overlap. Both search paths JOIN web_artifacts
+    # to surface url + title in the result row. Dedup by web_artifact_id at
+    # the merge layer so a single page never takes more than one slot.
+
+    def _search_bm25_web(self, query: str, limit: int) -> list[dict[str, Any]]:
+        pg = self._ensure_pg()
+        try:
+            rows = pg.execute(
+                """
+                SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
+                       c.content_ts AS created_at,
+                       a.url, a.title, a.tool_name,
+                       paradedb.score(c.id) AS bm25_score
+                FROM web_chunks c
+                JOIN web_artifacts a ON a.id = c.web_artifact_id
+                WHERE c.id @@@ paradedb.match('content', %s)
+                ORDER BY bm25_score DESC LIMIT %s
+                """,
+                (query, limit),
+            ).fetchall()
+            return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
+        except Exception as e:
+            logger.warning("BM25 web search failed: %s", e)
+            return []
+
+    def _search_vector_web(self, query_emb: list[float], limit: int) -> list[dict[str, Any]]:
+        pg = self._ensure_pg()
+        emb_literal = "[" + ",".join(str(x) for x in query_emb) + "]"
+        try:
+            rows = pg.execute(
+                """
+                SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
+                       c.content_ts AS created_at,
+                       a.url, a.title, a.tool_name,
+                       (c.embedding <=> %s::vector) AS vec_distance
+                FROM web_chunks c
+                JOIN web_artifacts a ON a.id = c.web_artifact_id
+                WHERE c.is_embedded = TRUE
+                ORDER BY vec_distance ASC LIMIT %s
+                """,
+                (emb_literal, limit),
+            ).fetchall()
+            return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
+        except Exception as e:
+            logger.warning("Vector web search failed: %s", e)
+            return []
+
+    @staticmethod
+    def _dedupe_by_artifact(chunks: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        """Keep only the highest-ranked chunk per parent web_artifact_id.
+
+        Input is assumed already RRF-ordered. First occurrence of an
+        artifact_id wins; subsequent chunks from the same page drop.
+        """
+        seen: set[int] = set()
+        out: list[dict[str, Any]] = []
+        for c in chunks:
+            aid = c.get("web_artifact_id")
+            if aid in seen:
+                continue
+            if aid is not None:
+                seen.add(aid)
+            out.append(c)
+            if len(out) >= limit:
+                break
+        return out
+
+    # ------------------------------------------------------------------
+    # KG traversal (Postgres)
+    # ------------------------------------------------------------------
+
+    def _search_kg(
+        self,
+        query: str,
+        query_emb: list[float],
+        group_id: str,
+        session_focus: list[str],
+        fact_limit: int,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """KG facts leg over kg_entities / kg_relationships (task #67).
+
+        Runs inside one transaction so the planner GUCs are SET LOCAL — scoped
+        to this query, not the thread-local connection that other legs may
+        reuse later (enable_seqscan=off session-wide would be a foot-gun for
+        any future unindexed query). hnsw.ef_search is already set
+        session-wide by _ensure_pg. A failure degrades to an empty facts
+        bucket rather than failing the whole recall.
+        """
+        try:
+            conn = self._ensure_pg()
+            with conn.transaction():
+                # kg_pg indexes rows positionally; recall's thread-local conns
+                # default to dict_row, so override at the cursor.
+                cur = conn.cursor(row_factory=tuple_row)
+                cur.execute("SET LOCAL enable_seqscan = off")
+                cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                return search_kg_postgres(
+                    cur, query, query_emb, _KG_OWNER, group_id, session_focus, fact_limit
+                )
+        except Exception as e:
+            logger.warning("KG search failed: %s", e)
+            return [], []
+
+    def _fetch_history_pairs_pg(
+        self,
+        group_id: str,
+        active_edge_uuids: list[str],
+        cap: int,
+    ) -> list[dict[str, Any]]:
+        """Postgres port of _fetch_history_pairs over kg_relationships.
+
+        DISTINCT ON picks the most recently invalidated predecessor per active
+        edge in SQL (the FalkorDB path does this dedup in Python).
+        """
+        if not active_edge_uuids or cap <= 0:
+            return []
+        try:
+            conn = self._ensure_pg()
+            rows = conn.execute(
+                """
+                SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
+                       o.fact AS old_fact
+                FROM kg_relationships a
+                JOIN kg_relationships o
+                  ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
+                 AND o.owner_id = a.owner_id AND o.group_id = a.group_id
+                WHERE a.owner_id = %s AND a.group_id = %s
+                  AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
+                  AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
+                  AND o.fact IS NOT NULL AND a.fact IS NOT NULL
+                ORDER BY a.uuid, o.t_invalid DESC
+                """,
+                (_KG_OWNER, group_id, active_edge_uuids),
+            ).fetchall()
+        except Exception as e:
+            logger.debug("PG history query failed: %s", e)
+            return []
+        by_uid = {r["uid"]: r for r in rows}
+        out: list[dict[str, Any]] = []
+        for uid in active_edge_uuids:
+            r = by_uid.get(uid)
+            if r is None:
+                continue
+            out.append({"previously": r["old_fact"], "now": r["now_fact"]})
+            if len(out) >= cap:
+                break
+        return out
+
+    # ------------------------------------------------------------------
+    # Feedback weights
+    # ------------------------------------------------------------------
+
+    def _increment_retrieval_counts(self, episode_ids: list[int]) -> None:
+        if not episode_ids:
+            return
+        pg = self._ensure_pg()
+        try:
+            placeholders = ",".join(["%s"] * len(episode_ids))
+            pg.execute(
+                f"UPDATE episodes SET retrieval_count = retrieval_count + 1 WHERE id IN ({placeholders})",
+                episode_ids,
+            )
+        except Exception as e:
+            logger.warning("Failed to increment retrieval counts: %s", e)
+
+    def _increment_fact_retrieval_counts(self, edge_uuids: list[str], group_id: str) -> None:
+        """Bump retrieval_count on each surfaced RELATES_TO edge — fire-and-forget.
+
+        Submitted to a background thread so recall() returns immediately. The
+        bump itself is single-Cypher-batch via UNWIND (one round-trip instead
+        of N). Best-effort: a failure here must not affect the response that's
+        already on its way back to the caller.
+
+        Uses COALESCE because pre-existing edges (Graphiti era) have no
+        retrieval_count property — only edges Synapse created from round 2
+        onward initialize it explicitly.
+        """
+        if not edge_uuids:
+            return
+        # Submit to background pool; do NOT wait for the future. The recall
+        # response is already returning by the time this runs.
+        self._async_executor.submit(self._do_increment, list(edge_uuids), group_id)
+
+    def _do_increment(self, edge_uuids: list[str], group_id: str) -> None:
+        """Worker that runs in the background thread. Uses its own connection
+        to avoid contention with a follow-up recall already mid-flight."""
+        try:
+            with psycopg.connect(self._db_url, autocommit=True) as conn:
+                conn.execute(
+                    "UPDATE kg_relationships "
+                    "SET retrieval_count = COALESCE(retrieval_count, 0) + 1 "
+                    "WHERE owner_id = %s AND group_id = %s AND uuid = ANY(%s)",
+                    (_KG_OWNER, group_id, edge_uuids),
+                )
+        except Exception as e:
+            logger.debug("Background fact-bump (PG) failed: %s", e)
+
+    # Telemetry: every recall()/recall_episodes() call records one row to
+    # recall_metrics (schema/021) — timing per leg, served-payload tokens, pool
+    # sizes, rerank model + top score, origin. NOT logfire: this is local,
+    # SQL-queryable, and reuses the existing background-write pattern. A recall_
+    # episodes row leaves the recall-only columns NULL.
+    _METRIC_COLS = (
+        "kind",
+        "source",
+        "query",
+        "group_id",
+        "write_feedback",
+        "ms_total",
+        "ms_embed",
+        "ms_bm25",
+        "ms_vector",
+        "ms_kg",
+        "ms_web",
+        "ms_rerank",
+        "n_facts",
+        "n_episodes",
+        "n_entities",
+        "n_web",
+        "n_history",
+        "chars",
+        "est_tokens",
+        "pool_bm25",
+        "pool_vector",
+        "pool_fused",
+        "kg_candidates",
+        "rerank_model",
+        "rerank_top_score",
+        "emb_ok",
+    )
+
+    def _record_metrics(self, m: dict[str, Any]) -> None:
+        """Fire-and-forget: submit the metrics row to the background pool so the
+        recall response returns immediately (same discipline as the fact bump)."""
+        self._async_executor.submit(self._do_record, m)
+
+    def _do_record(self, m: dict[str, Any]) -> None:
+        """Background worker: insert one recall_metrics row. Best-effort — a
+        failure (table missing pre-migration, DB hiccup) must never surface to
+        the caller, whose response already returned."""
+        try:
+            cols = self._METRIC_COLS
+            placeholders = ",".join(["%s"] * len(cols))
+            with psycopg.connect(self._db_url, autocommit=True) as conn:
+                conn.execute(
+                    f"INSERT INTO recall_metrics ({','.join(cols)}) VALUES ({placeholders})",
+                    [m.get(c) for c in cols],
+                )
+        except Exception as e:
+            logger.debug("recall_metrics write failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Main entry points
+    # ------------------------------------------------------------------
+
+    def recall(
+        self,
+        query: str,
+        project: str | None = None,
+        session_focus: list[str] | None = None,
+        group_id: str = "technical",
+        write_feedback: bool = True,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Overview retrieval: reranked episodes + KG facts (+ entities, web).
+
+        Best for session start and 'what's the state of X?' queries. Serves a wide-pool
+        reranked episode leg (the broad/needle workhorse) plus knowledge-graph facts for
+        entity-level precision. The summary layer was retired (task #63).
+
+        write_feedback=False suppresses the retrieval_count bump on surfaced facts — used
+        by the auto-recall memory hook so automatic (non-agentic) recalls don't pollute the
+        frequency-feedback signal that ranks future results. History fetch is unaffected.
+
+        ``source`` tags the call origin (e.g. "mcp-tool", "http", "recall-hook:session")
+        on the recall_metrics row so per-origin metrics are filterable in SQL.
+
+        The episode bucket serves compact passages (markdown chunks) of the top reranked episodes
+        instead of whole turns (Stage 2 — see _RECALL_PASSAGE_N). For raw full-episode drill-down,
+        use recall_episodes(). Facts carry their t_valid "as-of" date for currency weighting.
+        """
+        t_start = time.perf_counter()
+        web_n = _WEB_LIMIT * 4  # depth for dedup-by-artifact to have headroom
+        ex = self._leg_executor
+
+        # BM25 is pure text search — it does NOT need the query embedding. Start it
+        # FIRST so its ~165ms fetch overlaps the ~170ms Voyage query-embedding call
+        # below, instead of running after it (the embed gates the vector/KG/web legs,
+        # but not BM25). Each leg owns a thread-local PG connection, so concurrent
+        # psycopg use is safe. Legs run through _timed for per-leg latency telemetry.
+        f_bm25 = ex.submit(_timed, self._search_bm25_episodes, query, project, _EPISODE_FETCH)
+
+        t_emb = time.perf_counter()
+        try:
+            query_emb = self._ensure_embedder().embed([query], task="query")[0]
+        except Exception as e:
+            logger.error("Embedding query failed: %s", e)
+            query_emb = None
+        ms_embed = (time.perf_counter() - t_emb) * 1000.0
+
+        # The remaining legs all need the embedding; fan them out concurrently (they
+        # no-op when it's unavailable). Summaries were retired (task #63): the KG owns
+        # facts and the wide episode leg owns broad/needle, so no synth_documents leg.
+        def _web_leg() -> list[dict[str, Any]]:
+            return self._search_vector_web(query_emb, web_n) if query_emb is not None else []
+
+        def _kg_leg() -> tuple[list[Any], list[Any]]:
+            if query_emb is None:
+                return [], []
+            return self._search_kg(
+                query, query_emb, group_id, session_focus or [], fact_limit=_FACT_LIMIT
+            )
+
+        f_vec = (
+            ex.submit(_timed, self._search_vector_episodes, query_emb, project, _EPISODE_FETCH)
+            if query_emb is not None
+            else None
+        )
+        f_web = ex.submit(_timed, _web_leg)
+        f_kg = ex.submit(_timed, _kg_leg)
+
+        # Timeline leg: only on temporal intent. Reuses this call's query embedding
+        # (no second Voyage call); the engine owns its own thread-local PG conns.
+        def _timeline_leg() -> list[dict[str, Any]]:
+            res = self._ensure_timeline().recall_timeline(
+                query=query, project=project, query_emb=query_emb
+            )
+            return list(res.get("items") or [])[:_TIMELINE_LIMIT]
+
+        f_timeline = (
+            ex.submit(_timed, _timeline_leg)
+            if _TIMELINE_IN_RECALL and _TEMPORAL_RE.search(query)
+            else None
+        )
+
+        # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
+        # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
+        bm25_eps, ms_bm25 = f_bm25.result()
+        vec_eps, ms_vec = f_vec.result() if f_vec is not None else ([], 0.0)
+        ep_pool = _merge_rrf(bm25_eps, vec_eps, id_key="id")[:_EPISODE_RERANK_POOL]
+        vec_web, ms_web = f_web.result()
+        (kg_results, seed_entities), ms_kg = f_kg.result()
+
+        facts_internal = kg_results[:_FACT_LIMIT]  # carry _uuid for bump + history
+        # Feedback loop: bump retrieval_count on every surfaced edge so frequent hits
+        # float higher next time. Already fire-and-forget — never blocks the response.
+        surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
+        if surfaced_edge_uuids and write_feedback:
+            self._increment_fact_retrieval_counts(surfaced_edge_uuids, group_id)
+
+        # Second wave, also concurrent: the cross-encoder rerank (Voyage HTTP) and the
+        # bi-temporal history fetch hit different backends. Use the SCORED rerank — same
+        # ordering as _rerank_pool, but it also yields the top relevance score (a recall-
+        # confidence signal, and the basis for an eventual inject-only-if-relevant gate).
+        f_rerank = ex.submit(_timed, self._rerank_pool_scored, query, ep_pool)
+        f_history = ex.submit(
+            self._fetch_history_pairs_pg, group_id, surfaced_edge_uuids, _HISTORY_LIMIT
+        )
+        scored, ms_rerank = f_rerank.result()
+        history = f_history.result()
+        ranked = [ep_pool[i] for i, _ in scored]
+        rerank_top = scored[0][1] if scored else 0.0
+
+        # Episodes: pure rerank order (matches recall_episodes / the measured swap).
+        ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
+        episodes_served = ranked_eps[:_RECALL_EPISODE_LIMIT]
+        # Stage 2: serve compact passages of the top reranked episodes instead of whole turns.
+        # Falls back to full episodes if compaction yields nothing. Drill-down stays full.
+        ep_items: list[dict[str, Any]] | None = None
+        if ranked_eps:
+            ep_items = (
+                self._compact_to_passages(
+                    query, ranked_eps[:_RECALL_PASSAGE_SRC_K], _RECALL_PASSAGE_N
+                )
+                or None
+            )
+        if ep_items is None and episodes_served:
+            ep_items = [_to_recall_item(r) for r in episodes_served]
+        # Web bucket: vector-only, dedupe by parent page. BM25 over this corpus produces
+        # cross-domain token collisions; the bi-encoder captures topic over surface tokens.
+        web_chunks = self._dedupe_by_artifact(vec_web, _WEB_LIMIT)
+
+        # Strip internal _uuid before exposing facts to caller (slim contract).
+        # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
+        # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
+        # default (adds one rerank of the served facts), so this is a no-op until enabled.
+        served_facts = facts_internal
+        if _RECALL_FACT_FLOOR > 0 and len(served_facts) > 1:
+            served_facts = self._floor_facts(query, served_facts)
+        # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
+        # (deduped) so a query about something that changed still gets today's answer, not nothing.
+        sup_extras = self._surface_supersessions(
+            query_emb, group_id, {f.get("_uuid") for f in served_facts if f.get("_uuid")}
+        )
+        if sup_extras:
+            served_facts = list(served_facts) + sup_extras
+        # Slim facts to {fact, date} — date = t_valid (when the fact became true), so the reader
+        # can weight currency. Served facts are already live (invalidated edges filtered upstream).
+        facts: list[dict[str, Any]] = []
+        for f in served_facts:
+            item: dict[str, Any] = {"fact": f["fact"]}
+            if (d := f.get("_date")) is not None:
+                item["date"] = str(d)[:10]
+            facts.append(item)
+
+        # Episode-validity overlay: if a served episode/passage asserted a claim the KG has since
+        # superseded, attach the CURRENT fact (via the invalidated_by link). Augments, never replaces
+        # — the turn is immutable history and usually carries more than the stale claim. Deduped
+        # against the facts bucket above. Cheap (partial GIN, fail-open); usually a no-op.
+        if ep_items:
+            sup = self._episode_supersessions(
+                _parse_episode_ids([it.get("id") for it in ep_items if it.get("id")]),
+                group_id,
+            )
+            if sup:
+                _apply_supersessions(ep_items, sup, {f["fact"] for f in facts})
+
+        # Entity bucket: top-N seed entities with non-trivial summaries.
+        # Skip when summary is missing or just echoes the entity name.
+        entities_bucket: list[dict[str, Any]] = []
+        for s in seed_entities[:_ENTITY_LIMIT]:
+            summary = (s.get("summary") or "").strip()
+            name = (s.get("name") or "").strip()
+            if not summary or summary.lower() == name.lower():
+                continue
+            entities_bucket.append({"name": name, "summary": summary})
+
+        out: dict[str, Any] = {
+            "query": query,
+            "facts": facts,  # slim {fact: ...}
+        }
+        if ep_items:
+            out["episodes"] = ep_items
+        if entities_bucket:
+            out["entities"] = entities_bucket  # {name, summary}
+        if web_chunks:
+            out["web"] = [_to_web_recall_item(r) for r in web_chunks]
+        if history:
+            out["history"] = history  # {previously, now}
+        timeline_items: list[dict[str, Any]] = []
+        ms_timeline = 0.0
+        if f_timeline is not None:
+            try:
+                timeline_items, ms_timeline = f_timeline.result()
+            except Exception as e:
+                logger.warning("timeline leg failed: %s", e)
+        if timeline_items:
+            # Slim chronological bucket: date + fact (+type/salience). The dates make
+            # interval questions answerable AND auditable (anchor events, never a bare N).
+            out["timeline"] = [
+                {
+                    "date": str(t.get("t_valid"))[:10],
+                    "fact": t.get("fact"),
+                    "type": t.get("event_type"),
+                    "salience": t.get("salience"),
+                }
+                for t in timeline_items
+                if t.get("kind", "event") == "event"
+            ]
+
+        # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
+        # pattern as the retrieval_count bump, so zero read-path latency.
+        chars = _served_chars(out)
+        self._record_metrics(
+            {
+                "kind": "recall",
+                "source": source or "mcp",
+                "query": query[:200],
+                "group_id": group_id,
+                "write_feedback": write_feedback,
+                "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
+                "ms_embed": round(ms_embed, 1),
+                "ms_bm25": round(ms_bm25, 1),
+                "ms_vector": round(ms_vec, 1),
+                "ms_kg": round(ms_kg, 1),
+                "ms_web": round(ms_web, 1),
+                "ms_rerank": round(ms_rerank, 1),
+                "n_facts": len(facts),
+                "n_episodes": len(out.get("episodes", [])),
+                "n_entities": len(entities_bucket),
+                "n_web": len(web_chunks),
+                "n_history": len(history),
+                "n_timeline": len(out.get("timeline", [])),
+                "ms_timeline": round(ms_timeline, 1),
+                "chars": chars,
+                "est_tokens": chars // 4,
+                "pool_bm25": len(bm25_eps),
+                "pool_vector": len(vec_eps),
+                "pool_fused": len(ep_pool),
+                "kg_candidates": len(kg_results),
+                "rerank_model": _embedding._RERANK_MODEL,
+                "rerank_top_score": round(float(rerank_top), 4),
+                "emb_ok": query_emb is not None,
+            }
+        )
+        return out
+
+    def recall_episodes(
+        self,
+        query: str,
+        project: str | None = None,
+        limit: int = _EPISODE_LIMIT,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Raw episode drill-down: individual conversation turns.
+
+        Best for 'show me exactly what was said about X' queries.
+        Returns full episode content ranked by relevance + recency.
+        """
+        t_start = time.perf_counter()
+        try:
+            query_emb = self._ensure_embedder().embed([query], task="query")[0]
+        except Exception as e:
+            logger.error("Embedding query failed: %s", e)
+            query_emb = None
+
+        # Deep-fetch both legs (golds rank up to ~88 in a single leg), fuse, then
+        # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
+        # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
+        # _select_episodes / _EPISODE_CUTOFF_TAU).
+        episodes = self._select_episodes(
+            query, self._episode_pool(query, query_emb, project), limit
+        )
+
+        # Increment feedback counts BEFORE slimming (we lose the parseable id afterwards)
+        ep_ids = [
+            int(r["id"].split(":")[1])
+            for r in episodes
+            if isinstance(r.get("id"), str) and r["id"].startswith("e:")
+        ]
+        if ep_ids:
+            self._increment_retrieval_counts(ep_ids)
+
+        out = {
+            "query": query,
+            "episodes": [_to_recall_item(r) for r in episodes],
+        }
+        chars = _served_chars(out)
+        self._record_metrics(
+            {
+                "kind": "episodes",
+                "source": source or "mcp",
+                "query": query[:200],
+                "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
+                "n_episodes": len(episodes),
+                "chars": chars,
+                "est_tokens": chars // 4,
+                "emb_ok": query_emb is not None,
+            }
+        )
+        return out
+
+    def fetch_episodes(self, ids: list[Any], source: str | None = None) -> dict[str, Any]:
+        """Drill-down by id: return the FULL untruncated text of specific episodes.
+
+        recall() serves compact passages (Stage 2), each tagged with its parent episode ``id``
+        ("e:N"). When a passage looks relevant but you need the whole turn, pass its id(s) here.
+        Accepts the "e:N" ids (or bare ints) from recall()/recall_episodes(); returns the matching
+        episodes in the SAME shape as the other legs ({id, content, project, date}), ordered to
+        match the requested ids. Unknown/unparseable ids are skipped; capped at _FETCH_MAX."""
+        t_start = time.perf_counter()
+        parsed = _parse_episode_ids(ids)
+        if not parsed:
+            return {"episodes": []}
+        try:
+            conn = self._ensure_pg()
+            rows = conn.execute(
+                "SELECT id, content, project, created_at FROM episodes WHERE id = ANY(%s)",
+                (parsed,),
+            ).fetchall()
+        except Exception as e:
+            logger.warning("fetch_episodes failed: %s", e)
+            return {"episodes": []}
+        by_id = {r["id"]: r for r in rows}
+        episodes = [_to_recall_item({**by_id[n], "id": f"e:{n}"}) for n in parsed if n in by_id]
+        if parsed:
+            self._increment_retrieval_counts([n for n in parsed if n in by_id])
+        out = {"episodes": episodes}
+        self._record_metrics(
+            {
+                "kind": "fetch",
+                "source": source or "mcp",
+                "query": ",".join(str(n) for n in parsed)[:200],
+                "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
+                "n_episodes": len(episodes),
+                "chars": _served_chars(out),
+            }
+        )
+        return out
+
+    def _episode_supersessions(
+        self, episode_ids: list[int], group_id: str, cap: int = 6
+    ) -> dict[int, list[str]]:
+        """Map served episode ids -> the CURRENT facts that superseded a claim each made.
+
+        A retired edge P citing the episode (episodes @> [id]) links to its superseding live edge N
+        via P.invalidated_by (schema 028 + backfill); N.fact is the "now" value. Hits the partial GIN
+        (schema 029, WHERE invalidated_by IS NOT NULL) so the per-recall lookup is cheap. Fail-open —
+        a lookup error just yields no annotations, never breaks recall."""
+        if not episode_ids:
+            return {}
+        ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
+        params: list[Any] = [json.dumps([i]) for i in episode_ids] + [_KG_OWNER, group_id, cap]
+        try:
+            conn = self._ensure_pg()
+            rows = conn.execute(
+                "SELECT p.episodes, n.fact FROM kg_relationships p "
+                "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
+                f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
+                "  AND p.owner_id = %s AND p.group_id = %s LIMIT %s",
+                params,
+            ).fetchall()
+        except Exception as e:
+            logger.warning("episode supersession lookup failed: %s", e)
+            return {}
+        idset = set(episode_ids)
+        out: dict[int, list[str]] = {}
+        for r in rows:
+            fact = r.get("fact")
+            if not fact:
+                continue
+            for eid in r.get("episodes") or []:
+                if eid in idset:
+                    out.setdefault(int(eid), []).append(fact)
+        return out
+
+    def _surface_supersessions(
+        self,
+        query_emb: list[float] | None,
+        group_id: str,
+        served_uuids: set[str],
+        cap: int = _SUP_LIMIT,
+    ) -> list[dict[str, Any]]:
+        """A query that matches a now-INVALID fact should still return the CURRENT answer.
+
+        Finds superseded edges near the query that carry a precise successor link (invalidated_by,
+        schema 028), resolves the live successor, and returns those not already served — deduped by
+        uuid and distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
+        correction in. Go-forward coverage only (no link => skipped); never returns the stale fact
+        itself. Shape matches the KG fact leg ({fact, _uuid, _date}) so it flows through fact serving.
+        Fail-open — a lookup error just yields no extras."""
+        if query_emb is None:
+            return []
+        vec = _vec_literal(query_emb)
+        try:
+            conn = self._ensure_pg()
+            rows = conn.execute(
+                "SELECT n.uuid, n.fact, n.t_valid, "
+                f"  (p.fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})) AS d "
+                "FROM kg_relationships p "
+                "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
+                "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
+                "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
+                f"ORDER BY p.fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s",
+                (vec, _KG_OWNER, group_id, vec, _SUP_CANDIDATES),
+            ).fetchall()
+        except Exception as e:
+            logger.warning("supersession surface failed: %s", e)
+            return []
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = r.get("d")
+            if d is None or d > _SUP_MAX_DIST:
+                continue
+            u, fact = r.get("uuid"), r.get("fact")
+            if u and fact and u not in served_uuids:
+                out.append({"fact": fact, "_uuid": u, "_date": r.get("t_valid")})
+                served_uuids.add(u)
+                if len(out) >= cap:
+                    break
+        return out

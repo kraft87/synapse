@@ -1,0 +1,74 @@
+{
+  "tool": "mcp__claude_ai_Exa_search__web_search_exa",
+  "happy_count": 6,
+  "error_count": 0,
+  "happy_samples": [
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres rag topic 1",
+        "numResults": 5
+      },
+      "result_text": "Title: Scaling Postgres for analytics\nURL: https://blog.example.com/postgres-analytics\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nA guide to partitioning and indexing large tables.\n\nTitle: HNSW tuning for pgvector\nURL: https://docs.example.com/pgvector-hnsw\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nHow to set ef_search and m for fast recall.\n\nTitle: Reciprocal rank fusion explained\nURL: https://blog.example.com/rrf\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nCombining BM25 and vector search results.",
+      "result_chars": 588,
+      "fingerprint": "0000gen00"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres rag topic 2",
+        "numResults": 5
+      },
+      "result_text": "Title: HNSW tuning for pgvector\nURL: https://docs.example.com/pgvector-hnsw\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nHow to set ef_search and m for fast recall.\n\nTitle: Reciprocal rank fusion explained\nURL: https://blog.example.com/rrf\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nCombining BM25 and vector search results.\n\nTitle: Building an MCP server\nURL: https://docs.example.com/mcp-server\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nA walkthrough of the Model Context Protocol server API.",
+      "result_chars": 577,
+      "fingerprint": "0000gen01"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres rag topic 3",
+        "numResults": 5
+      },
+      "result_text": "Title: Reciprocal rank fusion explained\nURL: https://blog.example.com/rrf\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nCombining BM25 and vector search results.\n\nTitle: Building an MCP server\nURL: https://docs.example.com/mcp-server\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nA walkthrough of the Model Context Protocol server API.\n\nTitle: Contextual retrieval basics\nURL: https://blog.example.com/contextual-retrieval\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nPrepending context to chunks before embedding.",
+      "result_chars": 590,
+      "fingerprint": "0000gen02"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres rag topic 4",
+        "numResults": 5
+      },
+      "result_text": "Title: Building an MCP server\nURL: https://docs.example.com/mcp-server\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nA walkthrough of the Model Context Protocol server API.\n\nTitle: Contextual retrieval basics\nURL: https://blog.example.com/contextual-retrieval\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nPrepending context to chunks before embedding.\n\nTitle: Bitemporal graphs in Postgres\nURL: https://docs.example.com/bitemporal\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nModeling valid-time and transaction-time edges.",
+      "result_chars": 600,
+      "fingerprint": "0000gen03"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres rag topic 5",
+        "numResults": 5
+      },
+      "result_text": "Title: Contextual retrieval basics\nURL: https://blog.example.com/contextual-retrieval\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nPrepending context to chunks before embedding.\n\nTitle: Bitemporal graphs in Postgres\nURL: https://docs.example.com/bitemporal\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nModeling valid-time and transaction-time edges.\n\nTitle: Cross-encoder reranking\nURL: https://blog.example.com/rerank\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nWhy a reranker beats deeper fusion for hard queries.",
+      "result_chars": 594,
+      "fingerprint": "0000gen04"
+    },
+    {
+      "tool_name": "mcp__claude_ai_Exa_search__web_search_exa",
+      "timestamp": "2026-04-04T01:47:36.627Z",
+      "input": {
+        "query": "postgres rag topic 6",
+        "numResults": 5
+      },
+      "result_text": "Title: Bitemporal graphs in Postgres\nURL: https://docs.example.com/bitemporal\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nModeling valid-time and transaction-time edges.\n\nTitle: Cross-encoder reranking\nURL: https://blog.example.com/rerank\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nWhy a reranker beats deeper fusion for hard queries.\n\nTitle: Chunking strategies for RAG\nURL: https://docs.example.com/chunking\nPublished: 2026-02-03T03:07:19.000Z\nAuthor: Example Author\nHighlights:\nSliding-window chunks as a fact substrate.",
+      "result_chars": 578,
+      "fingerprint": "0000gen05"
+    }
+  ],
+  "error_samples": []
+}
