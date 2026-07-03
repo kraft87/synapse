@@ -28,6 +28,7 @@ _DB_FILES = {
     "test_config_proposer_db.py",
     "test_config_review_routes.py",
     "test_timeline_routes.py",
+    "test_preferences_routes.py",
 }
 
 
