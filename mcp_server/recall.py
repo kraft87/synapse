@@ -72,6 +72,24 @@ _TEMPORAL_RE = re.compile(
     r"|timeline|chronolog|what did (i|we) (do|ship|build)|recently (did|shipped|built))\b",
     re.IGNORECASE,
 )
+# Escalation gate (LME flip autopsies, 2026-07-03). Aggregation (count/sum/percent),
+# ordering ("which came first, X or Y"), and duration-arithmetic questions fail under
+# passage compaction: the number- or date-bearing turn is rarely the most query-similar
+# chunk (so it loses its rerank slot), and components shattered into one-sentence
+# fragments can't be summed or ordered by the reader. Full-episode serving wins those
+# same questions (15/15 multi-session, 11/12 temporal flips), so these query shapes skip
+# Stage 2 compaction and serve full episodes. A false fire costs tokens (~4x passages),
+# never correctness. Kill switch SYNAPSE_RECALL_ESCALATE=0; depth SYNAPSE_RECALL_ESCALATE_K.
+_ESCALATE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_ESCALATE", "1") != "0"
+_ESCALATE_K = int(os.getenv("SYNAPSE_RECALL_ESCALATE_K", "12") or "12")
+_ESCALATE_RE = re.compile(
+    r"\b(how (many|much|often)|in total|total (cost|amount|number|of)|altogether|combined"
+    r"|what percent(age)?|(which|who|what)\b[^?]{0,80}\b(first|last|earlier|earliest|later"
+    r"|latest|longer|longest|more|most)|in what order|order of events|before or after"
+    r"|how long|days? (passed|elapsed|between)|(days?|weeks?|months?) ago"
+    r"|past (weekend|week|month|year)|the (two|three|four)\b|\bboth\b)",
+    re.IGNORECASE,
+)
 _RECENCY_HALF_LIFE_DAYS = 30  # content this old scores ~50% of today's content
 # Recency re-injection AFTER the cross-encoder rerank. The reranker is
 # recency-blind and an old *definitive* statement ("X is canonical") out-scores
@@ -1197,8 +1215,13 @@ class Recall:
         episodes_served = ranked_eps[:_RECALL_EPISODE_LIMIT]
         # Stage 2: serve compact passages of the top reranked episodes instead of whole turns.
         # Falls back to full episodes if compaction yields nothing. Drill-down stays full.
+        # ESCALATION: aggregation/ordering/duration query shapes skip compaction and serve
+        # full episodes at _ESCALATE_K depth — the format that wins them (see _ESCALATE_RE).
         ep_items: list[dict[str, Any]] | None = None
-        if ranked_eps:
+        escalated = _ESCALATE_IN_RECALL and bool(_ESCALATE_RE.search(query))
+        if ranked_eps and escalated:
+            ep_items = [_to_recall_item(r) for r in ranked_eps[:_ESCALATE_K]] or None
+        elif ranked_eps:
             ep_items = (
                 self._compact_to_passages(
                     query, ranked_eps[:_RECALL_PASSAGE_SRC_K], _RECALL_PASSAGE_N
