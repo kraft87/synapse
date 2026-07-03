@@ -412,6 +412,12 @@ Rules:
   "the inbox was checked and found empty", "discord-send.sh was used to post the
   briefing", "the calendar was clear", "X was run". GOOD: "the briefing pipeline posts
   to Discord #briefings via discord-send.sh", "Voyage embeddings are 2048-dim".
+- PRESERVE EXACT QUANTITIES. A fact carrying a number, price, percentage, count, or
+  duration MUST keep the figure VERBATIM in the fact text ("Women hold 20% of
+  leadership positions at User's company", "User spent $120 on a helmet"). Never
+  paraphrase a figure and never convert it — "20%" must NOT become "20 people" or
+  "20 women". If one statement carries several distinct quantities, emit one fact
+  per figure rather than folding them together.
 
 ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
 - Every entity you list in `entities` MUST appear as the `source` or `target` of at
