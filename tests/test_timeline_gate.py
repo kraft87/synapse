@@ -9,6 +9,18 @@ from ingestion.llm_client import MalformedResponseError
 from ingestion.timeline_gate import TimelineGate, _parse_gate
 
 
+def test_gate_prompt_ports_framing_and_date_anchoring():
+    """v2 disciplines from the Mastra study: the framing preamble (only-record +
+    authoritative user, question != happening) and in-text date anchoring."""
+    from ingestion.timeline_gate import GATE_PROMPT
+
+    # Framing preamble.
+    assert "ONLY record" in GATE_PROMPT
+    assert "authoritative" in GATE_PROMPT
+    # In-text date anchoring for a further (non-event-timing) date.
+    assert "(meaning 2026-01-31)" in GATE_PROMPT
+
+
 def test_parse_gate_null_is_skip():
     assert _parse_gate('{"event": null}') is None
 

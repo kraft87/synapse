@@ -383,6 +383,14 @@ class DeterministicExtractor:
 # ---------------------------------------------------------------------------
 
 _EXTRACTION_PROMPT = """\
+These facts are the ONLY memory the system keeps from this conversation — anything you \
+do not capture here is forgotten, so extract completely. The user is the authoritative \
+source about their own work, life, and preferences: treat a user assertion as a fact even \
+when phrased casually ("I'll just go with Postgres" -> a decision), but a user QUESTION is \
+NOT an assertion — never mint a fact from something the user only asked about.
+
+Session date: {session_date}. Resolve every dated mention in the facts against it.
+
 Given the session summary and pre-identified entities below, extract any additional \
 entities and the relationships between all entities.
 
@@ -418,6 +426,21 @@ Rules:
   paraphrase a figure and never convert it — "20%" must NOT become "20 people" or
   "20 women". If one statement carries several distinct quantities, emit one fact
   per figure rather than folding them together.
+- NAME WHAT CHANGED. When a fact records a switch, upgrade, migration, or a replaced
+  choice/config/state, name what it REPLACED in the fact text — "switched the embedder to
+  voyage-4-large, replacing voyage-3", not "uses voyage-4-large". Same for moves and
+  cancellations ("moved the prod compose to /opt/docker/synapse, no longer at
+  /home/kyle/synapse"). Naming the superseded value is what lets a later reader tell
+  current state from stale.
+- ANCHOR EVERY DATE. When a fact's text carries a dated reference, append its resolved
+  absolute date in parentheses right after the original wording. Resolve an ABSOLUTE
+  mention against the session date's year unless the text states one ("my flight is
+  January 31" -> "... January 31 (meaning 2026-01-31)"); resolve a RELATIVE mention against
+  the session date ("two days from now", "last Tuesday" -> that calendar date, e.g.
+  "(meaning 2026-01-17)"). Keep the user's original wording and add "(meaning YYYY-MM-DD)"
+  after it. If the session date is unknown or the reference is too vague to pin
+  ("recently", "a while ago"), leave it unanchored. When one statement carries SEVERAL
+  dated events, SPLIT it into one fact per event so each fact carries exactly one date.
 
 ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
 - Every entity you list in `entities` MUST appear as the `source` or `target` of at
@@ -491,8 +514,17 @@ class LLMExtractor:
         self._client = llm_client
         self._model = model
 
-    def extract(self, summary: str, context_entities: list[ExtractedEntity]) -> ExtractionResult:
+    def extract(
+        self,
+        summary: str,
+        context_entities: list[ExtractedEntity],
+        session_date: str | None = None,
+    ) -> ExtractionResult:
         """Run the extractor LLM, then validate + cross-ref the response.
+
+        ``session_date`` (YYYY-MM-DD, the segment's conversation date) is the
+        anchor the prompt resolves in-text date mentions against; None renders
+        "unknown" and the prompt leaves relative dates unanchored.
 
         Phase 5 consolidation: the tenacity ``@retry`` wrapper that used to
         live inline here is gone. Two retry concerns now compose at separate
@@ -515,6 +547,7 @@ class LLMExtractor:
         base_prompt = _EXTRACTION_PROMPT.format(
             context_entities=context_str,
             summary=summary,
+            session_date=session_date or "unknown",
         )
         return self._run(base_prompt)
 
@@ -987,7 +1020,12 @@ class ExtractionPipeline:
             span.set_attribute("entities", len(entities))
             return entities
 
-    def _stage3_llm(self, summary: str, det_entities: list[ExtractedEntity]) -> ExtractionResult:
+    def _stage3_llm(
+        self,
+        summary: str,
+        det_entities: list[ExtractedEntity],
+        session_date: str | None = None,
+    ) -> ExtractionResult:
         import logfire
 
         with logfire.span(
@@ -995,7 +1033,9 @@ class ExtractionPipeline:
             chars=len(summary),
             det=len(det_entities),
         ) as span:
-            result = self._llm.extract(summary=summary, context_entities=det_entities)
+            result = self._llm.extract(
+                summary=summary, context_entities=det_entities, session_date=session_date
+            )
             span.set_attribute("entities", len(result.entities))
             span.set_attribute("facts", len(result.facts))
             return result
@@ -1435,6 +1475,36 @@ class ExtractionPipeline:
         default_group = _default_group_for_project(project)
         web_provenance: dict[str, Any] | None = None
 
+        # Segment date (conversation time, NOT ingest wall-clock) = the source
+        # episodes' latest created_at. Resolved up-front, BEFORE Stage 3, so the
+        # extraction prompt can anchor in-text date mentions against it; reused below
+        # as the edge backlink and the default fact valid-time. Drill-back: the turn's
+        # own id for episodes, else the segment's source episodes.
+        episode_ids: list[int] = []
+        if item.get("episode_id"):
+            episode_ids = [item["episode_id"]]
+        elif content_type == "summary" and session_id:
+            # Summaries -> the synth_document's source_ids so edges trace back to the
+            # episodes they were derived from.
+            try:
+                episode_ids = self._db.get_synth_document_source_ids(session_id, content)
+            except Exception:
+                episode_ids = []
+        elif content_type == "chunk" and session_id:
+            # Chunks -> the window the chunk was built from (task #63).
+            try:
+                episode_ids = self._db.get_chunk_episode_ids(session_id, content)
+            except Exception:
+                episode_ids = []
+        # Episodes emit no facts and skip Stage 3, so their segment date is never
+        # consumed — skip the lookup for them to keep the per-turn hot path lean.
+        segment_valid_at = (
+            self._db.get_episodes_valid_at(episode_ids)
+            if (episode_ids and content_type != "episode")
+            else None
+        )
+        session_date = segment_valid_at[:10] if segment_valid_at else None
+
         # Stage 2: deterministic extraction
         if content_type == "episode":
             episodes = [{"content": content, "metadata": json.loads(item.get("metadata") or "{}")}]
@@ -1449,7 +1519,7 @@ class ExtractionPipeline:
             # then full LLM extraction runs on the window. Edge backlink to the
             # source episodes is resolved below via get_chunk_episode_ids.
             det_entities = self._stage2_deterministic([{"content": content, "metadata": {}}])
-            llm_result = self._stage3_llm(content, det_entities)
+            llm_result = self._stage3_llm(content, det_entities, session_date)
         elif content_type == "web_chunk":
             # Web chunk = ~400-token slice of a scraped page or research brief
             # (task #68). Third-party content: extraction uses the web prompt
@@ -1472,7 +1542,7 @@ class ExtractionPipeline:
             if session_id:
                 episodes_raw = self._db.get_session_episodes(session_id)
             det_entities = self._stage2_deterministic(episodes_raw)
-            llm_result = self._stage3_llm(content, det_entities)
+            llm_result = self._stage3_llm(content, det_entities, session_date)
 
         all_entities = det_entities + [
             e for e in llm_result.entities if e.name not in {x.name for x in det_entities}
@@ -1592,24 +1662,6 @@ class ExtractionPipeline:
                 "y" if orphan_count == 1 else "ies",
             )
 
-        episode_ids: list[int] = []
-        if item.get("episode_id"):
-            episode_ids = [item["episode_id"]]
-        elif content_type == "summary" and session_id:
-            # For summaries, drill back to the synth_document's source_ids so edges
-            # can be traced to the episodes they were derived from.
-            try:
-                episode_ids = self._db.get_synth_document_source_ids(session_id, content)
-            except Exception:
-                episode_ids = []
-        elif content_type == "chunk" and session_id:
-            # For chunks, the source episodes are the window the chunk was built
-            # from — drill back via the chunk's stored episode_ids (task #63).
-            try:
-                episode_ids = self._db.get_chunk_episode_ids(session_id, content)
-            except Exception:
-                episode_ids = []
-
         if not llm_result.facts:
             return
 
@@ -1644,7 +1696,8 @@ class ExtractionPipeline:
             # this a fact carrying no in-text date got t_valid=now() — coincidentally
             # right for live ingestion (now ≈ conversation time) but wrong for any
             # backfilled/retro transcript. Mirrors how web provenance dates its facts.
-            default_valid_at = self._db.get_episodes_valid_at(episode_ids) if episode_ids else None
+            # Computed once up-front (segment_valid_at) and reused here.
+            default_valid_at = segment_valid_at
 
         # Stage 6 + 7 run separately per group — same code path, different graph.
         # default_valid_at doubles as the relative-date reference_time (the segment

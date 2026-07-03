@@ -378,6 +378,42 @@ class TestLLMExtractorRetry:
         assert client.messages.create.call_count == 3
 
 
+class TestExtractionPromptDisciplines:
+    """The v2 prompt ports three Mastra observational-memory disciplines:
+    authoritative-assertion framing, per-mention date anchoring, and
+    supersession naming. Assert each survives in the rendered prompt and that
+    the session date threads through the format call.
+    """
+
+    @staticmethod
+    def _rendered_prompt(session_date: str | None = None) -> str:
+        msg = MagicMock()
+        msg.content = [MagicMock(text='{"entities": [], "facts": []}')]
+        client = MagicMock()
+        client.messages.create.return_value = msg
+        LLMExtractor(llm_client=client, model="claude-haiku-4-5").extract(
+            summary="anything", context_entities=[], session_date=session_date
+        )
+        return client.messages.create.call_args.kwargs["messages"][0]["content"]
+
+    def test_session_date_threaded_into_prompt(self):
+        assert "2026-01-15" in self._rendered_prompt(session_date="2026-01-15")
+
+    def test_unknown_session_date_renders_placeholder(self):
+        assert "Session date: unknown" in self._rendered_prompt(session_date=None)
+
+    def test_framing_and_disciplines_present(self):
+        prompt = self._rendered_prompt(session_date="2026-01-15")
+        # Framing: capture-or-forget + user-is-authoritative.
+        assert "ONLY memory" in prompt
+        assert "authoritative" in prompt
+        # Per-mention date anchoring.
+        assert "ANCHOR EVERY DATE" in prompt
+        assert "(meaning" in prompt
+        # Supersession naming.
+        assert "NAME WHAT CHANGED" in prompt
+
+
 # ---------------------------------------------------------------------------
 # EntityResolver
 # ---------------------------------------------------------------------------

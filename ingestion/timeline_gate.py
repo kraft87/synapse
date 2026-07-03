@@ -74,6 +74,8 @@ _MIN_CONTENT = 80  # turns shorter than this can't contain a happening worth kee
 
 GATE_PROMPT = """You are building a personal work TIMELINE from ONE turn of a coding/assistant session (the user directs; an AI agent executes). Decide if SOMETHING HAPPENED this turn worth a permanent dated timeline entry, and if so write it as ONE naked past-tense event.
 
+This event is the ONLY record the timeline keeps of this turn — a happening you don't capture is forgotten. The user directs and is authoritative about what they decided or want, so a user assertion counts even when phrased casually; but a QUESTION, request, or instruction with no outcome yet is NOT a happening — return null for it.
+
 EMIT for a concrete happening: a decision reached, an action carried out (usually visible in the [tool:...] activity lines — code written, a command run, a commit, a deploy, a bug fixed), a result/finding, or a milestone / state change.
 DO NOT emit (return null) for: questions, requests or instructions with no outcome yet, opinions, brainstorming or design talk with NO decision reached, greetings, status checks, acknowledgements. Most turns are discussion — return null for them.
 
@@ -84,6 +86,7 @@ Write the `event` under two hard rules:
 4. NO third-party personal names (clients, transcript subjects, other people's data) — describe generically ("8 client transcripts", not the names). Project/tool/service names are fine.
 
 DATE. This turn's date is given below. Most events happen the day they're discussed — leave `date` OUT for those. Only when the user reports something that ALREADY happened on a DIFFERENT day set `date` to the resolved calendar date (YYYY-MM-DD): resolve an absolute mention ("on May 3rd" -> that date, this turn's year unless stated) or a relative one ("last Tuesday", "two weeks ago", "this past weekend") against this turn's date. When the date you set differs from this turn's date, KEEP the user's original timing phrase in the event text verbatim so a wrong resolution stays auditable (e.g. "deployed the search reindex (reported as 'last Tuesday')"). Omit `date` when the event happened this turn or the timing can't be inferred.
+If the event text itself names a FURTHER date that is NOT the event's own timing (a deadline, a scheduled-for day), anchor it inline with its resolved absolute date in parens: "scheduled the cutover for January 31 (meaning 2026-01-31)" (this turn's year unless stated).
 
 salience: 2 = milestone / shipped to prod / major decision; 1 = a normal action or decision; 0 = minor or routine.
 event_type: "decision" (a choice/direction was reached), "action" (something was executed: code, command, deploy, fix), "finding" (a result/diagnosis/measurement was learned), or "milestone" (a phase completed / shipped).
