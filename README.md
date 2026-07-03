@@ -14,6 +14,13 @@ It runs entirely on your own hardware. The extraction LLM takes a Claude subscri
 and rerank are Voyage AI by default, or any OpenAI-compatible endpoint, or the bundled
 `local-inference` profile for a fully local stack with zero external accounts.
 
+## Demo
+
+A cold session recalling a decision made earlier. Claude calls `recall` on its own and answers
+from a past session, fusing knowledge-graph facts with the original episode:
+
+![Claude Code answering from Synapse memory](docs/media/recall-demo.gif)
+
 ## How it works
 
 ```
@@ -85,6 +92,10 @@ The architecture, design decisions, and the measurements behind them are documen
 
 ## Quick start
 
+The whole install, end to end — clone, configure, `compose up`, wire up the plugin:
+
+![Installing Synapse end to end](docs/media/setup-demo.gif)
+
 Single box, everything local:
 
 ```bash
@@ -118,7 +129,17 @@ throughput, per-tool-call spans) to [Pydantic Logfire](https://logfire.pydantic.
 blank and telemetry is fully off — nothing is emitted.
 
 Then install the [plugin](./plugin/README.md) on each Claude Code machine so sessions feed and
-query the server automatically.
+query the server automatically. The repo ships its own marketplace manifest, so there is nothing
+to publish:
+
+```
+/plugin marketplace add kraft87/synapse
+/plugin install synapse@synapse
+```
+
+Install prompts for your `SYNAPSE_URL` (`http://localhost:8765` for the local quickstart) and an
+optional token, then run `/reload-plugins`. Backfill months of past sessions in one shot with
+`! synapse-import` (see [Import your existing sessions](#import-your-existing-sessions) below).
 
 ### Verify your install
 
