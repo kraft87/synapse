@@ -16,8 +16,10 @@ and rerank are Voyage AI by default, or any OpenAI-compatible endpoint, or the b
 
 ## Demo
 
-A cold session recalling a decision made earlier. Claude calls `recall` on its own and answers
-from a past session, fusing knowledge-graph facts with the original episode:
+The recall flow, using the repository's bundled example transcript
+([`docs/example-transcript.json`](docs/example-transcript.json), so it reproduces exactly): a
+fresh session asks a question and Synapse answers from an earlier session, fusing knowledge-graph
+facts with the original episode.
 
 ![Claude Code answering from Synapse memory](docs/media/recall-demo.gif)
 
