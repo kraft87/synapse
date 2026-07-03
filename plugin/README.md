@@ -1,185 +1,210 @@
 # Synapse — Claude Code plugin
 
-Connects Claude Code to a [Synapse](../) memory instance. Single-user; works against a
-**local** Synapse (Docker on your machine) or a **central** one (hosted, shared by all your
-machines — laptop, work box, server).
+Connects Claude Code to a [Synapse](../) memory instance — either local (Docker on your
+machine) or central (one hosted server shared by all your machines).
 
-The plugin is a **thin client**: stdlib-only scripts that talk to the server over HTTP
-(one base URL + an optional bearer token — never a database connection). All the heavy
-lifting (memory extraction, recall, the dream→skills lane) runs server-side in the Synapse
-stack.
+The plugin is a thin client: stdlib-only scripts that talk to the server over HTTP with a
+base URL and an optional bearer token — never a database connection. Extraction, recall,
+and the dream→skills lane all run server-side.
 
 ## What it does
 
-Five hooks (see `hooks/hooks.json`), plus the MCP wiring:
+Five hooks (`hooks/hooks.json`) plus MCP wiring:
 
-1. **Transcript ingest** (`Stop` hook) — after every turn, pushes a bounded tail of the
-   session transcript to your Synapse `/ingest`. This is the point of the plugin — it's how
-   your sessions become memory. Works over the network, so a work laptop can feed a central
-   Synapse. The hook only captures sessions from install onward; run the bundled
-   `synapse-import` once to backfill everything that came before (see
-   [Import your existing history](#4-import-your-existing-history-optional-recommended)).
-2. **Skill sync** (`SessionStart` hook) — two-way sync of your skills between the server and
-   `~/.claude/skills` (plus the current project's `.claude/skills`). Newest edit wins per
-   skill, with an append-only server-side history; deletes never auto-propagate. The
-   server-side dream→skills lane can improve a skill and have it flow back to every machine.
-3. **Config mirroring** (`SessionStart` hook, **opt-in — off by default**) — mirrors your
-   `CLAUDE.md` + `rules/*.md` to the server so the dream lane can propose config edits
-   (reviewed with `/synapse:config-review`).
-4. **Timeline git feeder** (`SessionStart` hook, **opt-in — off until configured**) — pushes
-   commit subjects from repos you list in `SYNAPSE_TIMELINE_REPOS` to the server's timeline.
-5. **Timeline milestones** (`SessionStart` hook) — fetches the last 7 days' high-salience
-   timeline events from the server and prints a bounded block (max 5 lines) into the
-   session's context.
+1. **Transcript ingest** (`Stop`) — after every turn, pushes a bounded tail of the session
+   transcript to `/ingest`. This is how sessions become memory, and it works over the
+   network, so a work laptop can feed a central Synapse. It only captures sessions from
+   install onward — run `synapse-import` once to backfill
+   ([step 4](#4-import-your-existing-history-recommended)).
+2. **Skill sync** (`SessionStart`) — two-way sync between the server and `~/.claude/skills`
+   (plus the project's `.claude/skills`). Newest edit wins per skill, with an append-only
+   server-side history; deletes never auto-propagate.
+3. **Config mirroring** (`SessionStart`, off by default) — mirrors your `CLAUDE.md` +
+   `rules/*.md` to the server so the dream lane can propose config edits.
+4. **Timeline git feeder** (`SessionStart`, off until configured) — pushes commit subjects
+   from repos listed in `SYNAPSE_TIMELINE_REPOS` to the server's timeline.
+5. **Timeline milestones** (`SessionStart`) — prints the last 7 days' high-salience timeline
+   events (max 5 lines) into the session's context.
 
-Plus **MCP tools** — the plugin registers the Synapse MCP server, so `recall` / `remember` /
-`query_graph` are wired up automatically (no hand-written `.mcp.json`).
+MCP tools (`recall`, `remember`, `query_graph`, …) are registered automatically — no
+hand-written `.mcp.json`.
 
-The **dream→skills lane** (mines your transcripts → proposes new skills, retunes triggers,
-nominates merges) runs **server-side** in the Synapse `dream` container — you don't run a cron.
-You just review what it proposes with `/synapse:skill-review`.
+The dream→skills lane (mines your transcripts → proposes new skills, retunes triggers,
+nominates merges) runs server-side in the `dream` container — you don't run a cron. You
+just review what it proposes with `/synapse:skill-review`.
 
-> Recall-injection (a `UserPromptSubmit` hook that pushed memory into every prompt) was removed:
-> it injected top-k unconditionally with no relevance gate, which added noise and anchored the
-> model on stale priors. Use the `recall`/`remember` MCP tools for pull-on-demand recall instead.
+> Recall-injection (a `UserPromptSubmit` hook that pushed memory into every prompt) was
+> removed: unconditional top-k injection added noise and anchored the model on stale
+> priors. Use the `recall` MCP tool to pull on demand instead.
 
-## What gets sent to your server (and how to turn each off)
+## What gets sent to your server
 
-Everything below goes only to the Synapse URL **you** configure. All hooks are fail-soft: an
-unreachable server is a silent no-op and never breaks or spams your session.
+Everything below goes only to the Synapse URL **you** configure. All hooks are fail-soft:
+an unreachable server is a silent no-op.
 
-- **Transcript ingest** — **on** (the plugin's core function). Sends the raw JSONL tail of
-  each session transcript — your prompts, Claude's replies, tool calls — to `/ingest`. There
-  is no separate toggle; if you don't want transcripts leaving the machine, don't install the
-  plugin (or disable it with `/plugin`).
-- **Skill sync** — **on by default**. Sends skill bodies + bundled files from your skills
-  dirs to `/skills/*`, and pulls server-side versions back. Turn off with
-  `SYNAPSE_SKILLS_SYNC=0`.
-- **Config mirroring** — **off by default** (opt-in). When enabled, sends your global
-  `~/.claude/CLAUDE.md` + `rules/*.md` and the current project's equivalents to
-  `/config/publish`. These files often carry personal instructions, which is why it ships
-  off. Enable with `SYNAPSE_CONFIG_SYNC=1`; add extra globs with `SYNAPSE_CONFIG_PATHS`.
-- **Timeline git feeder** — **off by default** (opt-in). When you set
-  `SYNAPSE_TIMELINE_REPOS` (comma/space-separated checkout paths), sends commit subjects,
-  dates, and a coarse salience score from those repos to `/timeline/events`. Unset = nothing
-  runs.
-- **Timeline milestones** — **on by default**, but it *sends* nothing: it reads
-  `/timeline/recent` and prints up to 5 lines into your context. Turn off with
-  `SYNAPSE_TIMELINE_MILESTONES=0`.
+- **Transcript ingest** — **on** (the core function). Sends the raw JSONL tail of each
+  session transcript — your prompts, Claude's replies, tool calls. No separate toggle: if
+  transcripts shouldn't leave the machine, don't install the plugin.
+- **Skill sync** — **on**. Sends skill bodies + bundled files, pulls server versions back.
+  Off: `SYNAPSE_SKILLS_SYNC=0`.
+- **Config mirroring** — **off** (opt-in). When enabled, sends your `~/.claude/CLAUDE.md` +
+  `rules/*.md` and the project's equivalents — these often carry personal instructions,
+  which is why it ships off. On: `SYNAPSE_CONFIG_SYNC=1`.
+- **Timeline git feeder** — **off** (opt-in). When `SYNAPSE_TIMELINE_REPOS` is set, sends
+  commit subjects, dates, and a coarse salience score from those repos. Unset = nothing runs.
+- **Timeline milestones** — **on**, but it *sends* nothing: it reads `/timeline/recent` and
+  prints up to 5 lines into your context. Off: `SYNAPSE_TIMELINE_MILESTONES=0`.
 
-Each toggle can be set as an environment variable or a plugin option in `settings.json`
-(`pluginConfigs."synapse@<marketplace>".options`).
+## Configuration
+
+Settings resolve in order: env var → `CLAUDE_PLUGIN_OPTION_*` → your `/plugin install`
+answers (stored in `settings.json`) → built-in default. A fresh install just answers the
+install prompt; env vars are optional overrides (e.g. CI).
+
+Prompted at install:
+
+- **`SYNAPSE_URL`** (required) — base URL of your server, no path (`http://localhost:8765`
+  or `https://synapse.example.net`). The plugin derives `/ingest`, `/recall`, `/skills`,
+  `/timeline`, and `/mcp`.
+- **`SYNAPSE_INGEST_TOKEN`** — bearer token for an auth-gated server; blank for a
+  local/open one. One token covers ingest, recall, skill sync, and MCP. Fetch it with
+  `! synapse-login`.
+- **`SYNAPSE_CONFIG_SYNC`** — `1` to mirror config for the dream lane. Off by default.
+- **`SYNAPSE_CONFIG_PATHS`** — optional extra globs (relative to `~/.claude`) to mirror.
+
+Env / `settings.json` only:
+
+- **`SYNAPSE_SKILLS_SYNC`** — `0` disables two-way skill sync.
+- **`SYNAPSE_TIMELINE_REPOS`** — comma/space-separated repo paths for the timeline feeder.
+- **`SYNAPSE_TIMELINE_MILESTONES`** — `0` disables the milestone block.
+- **`SYNAPSE_INGEST_URL`** — legacy full-endpoint override, still honored.
 
 ## Setup
+
+Prerequisites: a running Synapse server (below), Claude Code, and Python 3 on PATH —
+everything is stdlib, no `pip install`.
 
 ### 1. Stand up Synapse (the server)
 
 ```bash
 cd <repo> && docker compose up -d
 ```
-This provisions Postgres, runs migrations, and starts the poller, MCP server, and the
-`dream` container (which runs the dream→skills lane on its daily schedule). Central deployments
-expose the one server URL behind auth and point every machine's plugin at it.
+
+This provisions Postgres, applies the schema, and starts the poller, MCP server, and the
+`dream` container. For a central deployment, expose the one server URL behind auth and
+point every machine's plugin at it.
 
 ### 2. Install the plugin (the client) on each Claude Code machine
 
-This repo *is* a marketplace (it ships `.claude-plugin/marketplace.json`), so there's nothing
-to publish or get approved:
+The repo is its own marketplace (it ships `.claude-plugin/marketplace.json`), so there's
+nothing to publish:
 
 ```
 /plugin marketplace add kraft87/synapse
 /plugin install synapse@synapse
 ```
 
-On install, Claude Code prompts for the `userConfig` and stores secrets in the OS keychain — no
-hand-editing `settings.json` or `.mcp.json`:
-
-- `SYNAPSE_URL` — the **base** URL of your Synapse server, e.g. `https://synapse.example.net`
-  or `http://localhost:8765` (no path). The plugin derives `/ingest`, `/recall`, `/skills`, and `/mcp`.
-- `SYNAPSE_INGEST_TOKEN` — bearer for an auth-gated server. This one token covers ingest,
-  recall, skill sync, and the MCP tools — the client never needs a database DSN.
-
-Then `/reload-plugins` (or restart) to activate the hooks + MCP server in the current session.
-
-**No environment variables required.** `scripts/config.py` resolves settings in this order:
-explicit env var → `CLAUDE_PLUGIN_OPTION_*` (injected for hooks/MCP) → the install-prompt value
-in `settings.json` (`pluginConfigs."synapse@<marketplace>".options`) → built-in default. A new
-user just answers the `/plugin install` prompt; every hook and command reads straight from it.
-Env vars stay available as optional overrides (e.g. CI). The legacy `SYNAPSE_INGEST_URL` is
-still honored.
+Claude Code prompts for the configuration above and stores secrets in the OS keychain — no
+hand-editing `settings.json` or `.mcp.json`. Then `/reload-plugins` (or restart) to activate
+the hooks + MCP server.
 
 ### 3. Auth (only for auth-gated servers)
 
-The default local quickstart (`docker compose up` + `http://localhost:8765`) needs **no auth
-at all** — leave the token blank and skip this section.
+The local quickstart (`docker compose up` + `http://localhost:8765`) needs no auth — leave
+the token blank and skip this section.
 
-For an auth-gated (central/hosted) server, either paste a machine token into the install
-prompt, or run the bundled login once:
-
-```
-! synapse-login        # in the Claude prompt — runs directly in-session, no LLM, streams live
-```
-
-By default this is the **device flow** (RFC 8628): it prints a short code, you approve at
-`github.com/login/device` on **any device** (phone, another laptop), and it polls until done —
-no same-host browser, no loopback, so it works on servers and headless boxes. It needs a server
-new enough to expose `/device/code` with the GitHub OAuth App's "Enable Device Flow" turned on.
-Older servers (or if you prefer): `synapse-login --browser` runs the legacy loopback
-authorization-code flow that opens a browser on the same machine. Either way the token is
-stashed for the hooks and MCP server.
-
-The `synapse-login` command (+ `synapse-login.cmd` for Windows) ships in the plugin's `bin/`,
-which Claude Code adds to PATH **inside its own session** — so `! synapse-login` runs the
-script directly. That `bin/` is *not* on a separate OS terminal's PATH; to run it from one,
-call the script by full path: `python "<plugin>/scripts/synapse_login.py"` (the path prints in
-the plugin cache, e.g. `~/.claude/plugins/cache/synapse/synapse/<version>/scripts/`).
-
-Truly headless with no second device? Set `SYNAPSE_INGEST_TOKEN` directly (env / plugin
-config) instead of running login.
-
-### 4. Import your existing history (optional, recommended)
-
-The `Stop` hook only sees sessions from install onward, but your machine likely already
-holds months of transcripts under `~/.claude/projects`. Import them once and recall works
-on day one:
+For a central/hosted server, paste a machine token into the install prompt, or run the
+bundled login once:
 
 ```
-! synapse-import        # in the Claude prompt — or run it from any terminal
+! synapse-login        # in the Claude prompt — runs in-session, no LLM, streams live
 ```
 
-What it does:
+Default is the GitHub **device flow** (RFC 8628): it prints a short code, you approve at
+`github.com/login/device` from any device (phone, another laptop), and it polls until done —
+no same-host browser, so it works on servers and headless boxes. It needs a server exposing
+`/device/code` with "Enable Device Flow" on the GitHub OAuth App; on older servers, use
+`synapse-login --browser` (legacy loopback flow). Either way the token is stored for the
+hooks and MCP server.
 
-- Discovers every session transcript under `~/.claude/projects` (`--projects-dir` to
-  override), oldest-first.
-- Prints a summary — file count, total size, estimated turns — and **asks for confirmation
-  before sending anything**: importing runs KG extraction on the server's configured LLM
-  for every new turn, which consumes subscription usage or API credits (`--yes` skips the
-  prompt for scripted runs).
-- Ships each file full-length (not the hook's bounded tail) in turn-aligned batches
-  (`--batch-size`, default 500 records per POST), with a per-file progress line.
-- Is safe to interrupt and re-run: the server dedups turns by `span_id`, so a re-run skips
-  everything already stored and resumes where it left off. Failures are per-file — one bad
-  file never stops the rest, and the exit code is non-zero only if *every* file failed.
+Truly headless with no second device? Set `SYNAPSE_INGEST_TOKEN` directly instead.
 
-It resolves the endpoint and token exactly like the ingest hook (env var → plugin
-userConfig → `settings.json` install answers → localhost default), and ships as
-`synapse-import` / `synapse-import.cmd` in the plugin's `bin/`, which is on PATH inside
-Claude Code sessions — from an outside terminal, call the script by full path:
-`python "<plugin>/scripts/import_history.py"`.
+> `synapse-login` and `synapse-import` ship in the plugin's `bin/`, which Claude Code puts
+> on PATH **inside sessions only** — hence the `!` prefix. From an outside terminal, run the
+> script by full path, e.g.
+> `python ~/.claude/plugins/cache/synapse/synapse/<version>/scripts/synapse_login.py`.
+
+### 4. Import your existing history (recommended)
+
+The `Stop` hook only sees sessions from install onward, but months of transcripts likely
+already sit under `~/.claude/projects`. Import them once and recall works on day one:
+
+```
+! synapse-import        # in the Claude prompt — or by full path from any terminal
+```
+
+It discovers every transcript (oldest-first; `--projects-dir` to override), prints a summary
+— file count, total size, estimated turns — and **asks for confirmation before sending
+anything**: importing runs KG extraction on the server's LLM for every new turn, which
+consumes subscription usage or API credits (`--yes` skips the prompt for scripted runs).
+Files ship full-length in turn-aligned batches (`--batch-size`, default 500 records per
+POST). Safe to Ctrl-C and re-run: the server dedups turns by `span_id`, so a re-run resumes
+where it left off, and one bad file never stops the rest.
 
 Cursor history is importable too, but only as a server-side dev path for now
 (`python -m ingestion.cursor_sqlite_backfill` on the Synapse host).
 
-## Using it
+### 5. Verify it's working
 
-- **Review skill proposals:** `/synapse:skill-review` (or `python3 scripts/skill_review.py list`).
-- **Accept / reject / promote:** `… accept <id>` → edit/place the draft into your skills
-  dir → `… promote <id>`. Nothing touches your live skills without a grounded accept.
-- **Review config proposals** (if you opted into config mirroring): `/synapse:config-review`.
+Run a few turns and end one — the `Stop` hook ships the transcript. Then ask Claude to call
+`list_projects`; your project should show a rising episode count. Knowledge-graph facts land
+a few minutes later, on the poll cycle. Seeing nothing? Hooks fail silently by design —
+check that `curl -fsS $SYNAPSE_URL/health` returns ok and that `SYNAPSE_URL` and any token
+are set (`/plugin` shows the stored values).
+
+## Commands and MCP tools
+
+Slash commands:
+
+- **`/synapse:skill-review`** — triage dream→skills proposals (new skills, trigger retunes,
+  merges): accept / reject / promote. Nothing touches your live skills without an explicit
+  accept.
+- **`/synapse:config-review`** — triage dream→config proposals. Only relevant with config
+  mirroring on.
+
+Bundled commands (`!` prefix in a session; full path from an outside terminal):
+
+- **`! synapse-login`** — fetch a machine token via GitHub device flow (or `--browser`).
+- **`! synapse-import`** — backfill your existing history (step 4).
+
+MCP tools (registered automatically; Claude calls them during a session):
+
+- **`recall`** — primary retrieval: reranked episodes + KG facts + web + history.
+- **`recall_episodes`** — raw episode drill-down.
+- **`recall_timeline`** — dated events for "when / in what order" questions.
+- **`remember`** — write a manual memory and extract it into the graph.
+- **`fetch_episode`** — expand full turns by id (from a prior recall).
+- **`list_projects`** — per-project episode counts and last activity.
+- **`query_graph`** — experimental natural-language graph query.
+
+## Troubleshooting
+
+- **Recall returns nothing / hooks seem dead.** Hooks are fail-soft — an unreachable server
+  is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health`, then that `SYNAPSE_URL` and any
+  token are set (`/plugin`).
+- **`401 Unauthorized`.** Token missing or stale. Re-run `! synapse-login`, or paste a fresh
+  token into the `/plugin` config.
+- **`synapse-login` / `synapse-import` not found.** The plugin's `bin/` is only on PATH
+  inside Claude Code sessions (hence the `!` prefix). From a plain terminal, run the script
+  by full path.
+- **`python3: not found`.** The hooks and scripts are stdlib Python 3 — put it on PATH.
+- **Episodes appear but the graph stays empty.** KG facts are extracted from ≥4-turn windows
+  on a poll cycle (default 5 min); a short session or a fresh import needs a few minutes.
+- **Device-flow login fails on an older server.** It needs `/device/code` + "Enable Device
+  Flow" on the GitHub OAuth App; fall back to `! synapse-login --browser`.
 
 ## How it talks to Synapse
 
-HTTP only, machine-token gated: `/ingest`, `/skills/*`, `/config/publish`, `/timeline/*`, and
-`/mcp`, all under the one `SYNAPSE_URL`. The client holds no Postgres credentials — the
-database stays behind the server, and skill/config proposals are only ever applied through
-your explicit review commands.
+HTTP only: `/ingest`, `/skills/*`, `/config/publish`, `/timeline/*`, and `/mcp`, all under
+the one `SYNAPSE_URL`, gated by one machine token. The client holds no Postgres credentials,
+and skill/config proposals are only ever applied through your explicit review commands.
