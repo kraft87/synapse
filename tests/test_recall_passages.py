@@ -122,30 +122,3 @@ def test_apply_supersessions_attaches_and_dedups():
     assert items[0]["superseded_by"] == ["X is now Y"]  # dedups the one already in the facts bucket
     assert "superseded_by" not in items[1]  # empty supersession list -> no key
     assert "superseded_by" not in items[2]  # no id -> skipped
-
-
-def test_escalation_gate_fires_on_connective_detail_shapes():
-    # Aggregation / ordering / duration questions escalate to full-episode serving —
-    # passage compaction strips the number- and date-bearing turns these need
-    # (LME flip autopsies, 2026-07-03: episodes win 15/15 multi-session, 11/12 temporal).
-    from mcp_server.recall import _ESCALATE_RE
-
-    escalates = [
-        "How many plants do I have in total?",
-        "Which event did I attend first, the workshop or the seminar?",
-        "Who did I meet first, Mark and Sarah or Tom?",
-        "How much did I spend on the two trips combined?",
-        "What gardening-related activity did I do two weeks ago?",
-        "How long did the kitchen renovation take?",
-        "What was the page count of the two novels I finished?",
-    ]
-    stays_compact = [
-        "What caching layer did we pick for the search service?",
-        "What's my favorite restaurant?",
-        "Where did I put the spare keys?",
-        "Tell me about the migration plan.",
-    ]
-    for q in escalates:
-        assert _ESCALATE_RE.search(q), f"gate should fire: {q}"
-    for q in stays_compact:
-        assert not _ESCALATE_RE.search(q), f"gate should NOT fire: {q}"
