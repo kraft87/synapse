@@ -68,6 +68,12 @@ _RRF_K = 60
 # nothing. Kill switch SYNAPSE_RECALL_TIMELINE=0.
 _TIMELINE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_TIMELINE", "1") != "0"
 _TIMELINE_LIMIT = 8
+# Preferences leg (schema 035): the standing USER-preference bucket. Like the timeline
+# leg, one cheap parallel DB read on every query — top-5 live prefs by cosine to the
+# query embedding — reusing this call's query_emb (no extra Voyage round-trip). Kept out
+# of the KG so preferences don't rebuild the User-supernode. Kill switch SYNAPSE_RECALL_PREFS=0.
+_PREFS_IN_RECALL = os.environ.get("SYNAPSE_RECALL_PREFS", "1") != "0"
+_PREFS_LIMIT = 5
 _RECENCY_HALF_LIFE_DAYS = 30  # content this old scores ~50% of today's content
 # Recency re-injection AFTER the cross-encoder rerank. The reranker is
 # recency-blind and an old *definitive* statement ("X is canonical") out-scores
@@ -421,6 +427,8 @@ def _served_chars(out: dict[str, Any]) -> int:
         n += len(w.get("context") or "") + len(w.get("excerpt") or "") + len(w.get("title") or "")
     for t in out.get("timeline", []):
         n += len(t.get("fact") or "") + len(str(t.get("date") or ""))
+    for p in out.get("preferences", []):
+        n += len(p.get("pref") or "") + len(str(p.get("polarity") or ""))
     for h in out.get("history", []):
         n += len(str(h.get("previously") or "")) + len(str(h.get("now") or ""))
     return n
@@ -497,6 +505,34 @@ class Recall:
                 db_url=self._db_url, voyage_api_key=self._voyage_key
             )
         return self._timeline_engine
+
+    def _search_preferences(
+        self, query_emb: list[float] | None, group_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """The preferences leg (schema 035): top-N LIVE user preferences for this
+        owner/group, nearest to the query embedding by cosine. Reuses the query_emb
+        recall already computed — no extra Voyage call. Thread-local PG (leg executor).
+        Degrades to [] if the table isn't present or the embedding is unavailable."""
+        if query_emb is None:
+            return []
+        conn = self._ensure_pg()
+        vlit = _vec_literal(query_emb)
+        try:
+            rows: list[dict[str, Any]] = conn.execute(
+                # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                "SELECT pref, polarity, left(first_seen::text, 10) AS since, assert_count "
+                "FROM preferences "
+                "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+                "AND embedding IS NOT NULL "
+                f"ORDER BY embedding <=> %s::vector({_EMBED_DIMS}) ASC LIMIT %s",
+                (_KG_OWNER, group_id, vlit, limit),
+            ).fetchall()
+        except psycopg.errors.UndefinedTable:
+            return []  # migration 035 not applied on this deployment yet — degrade
+        except Exception as e:
+            logger.warning("preferences leg failed: %s", e)
+            return []
+        return rows
 
     def _ensure_embedder(self) -> Any:
         if self._embedder is None:
@@ -1186,6 +1222,15 @@ class Recall:
 
         f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
 
+        # Preferences leg: top-5 live user preferences by cosine to this query. One cheap
+        # parallel read reusing query_emb; empty result = no payload change (kill switch
+        # SYNAPSE_RECALL_PREFS=0). Group-scoped like the KG; owner is the single-user const.
+        f_prefs = (
+            ex.submit(_timed, self._search_preferences, query_emb, group_id, _PREFS_LIMIT)
+            if _PREFS_IN_RECALL
+            else None
+        )
+
         # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
         # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
         bm25_eps, ms_bm25 = f_bm25.result()
@@ -1311,6 +1356,26 @@ class Recall:
                 if t.get("kind", "event") == "event"
             ]
 
+        prefs_items: list[dict[str, Any]] = []
+        ms_prefs = 0.0
+        if f_prefs is not None:
+            try:
+                prefs_items, ms_prefs = f_prefs.result()
+            except Exception as e:
+                logger.warning("preferences leg failed: %s", e)
+        if prefs_items:
+            # Slim preference bucket: the pref text + polarity, plus since/asserted so the
+            # reader can weight a long-standing, oft-repeated preference over a one-off.
+            out["preferences"] = [
+                {
+                    "pref": p.get("pref"),
+                    "polarity": p.get("polarity"),
+                    "since": p.get("since"),
+                    "asserted": p.get("assert_count"),
+                }
+                for p in prefs_items
+            ]
+
         # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
         # pattern as the retrieval_count bump, so zero read-path latency.
         chars = _served_chars(out)
@@ -1335,6 +1400,8 @@ class Recall:
                 "n_history": len(history),
                 "n_timeline": len(out.get("timeline", [])),
                 "ms_timeline": round(ms_timeline, 1),
+                "n_prefs": len(out.get("preferences", [])),
+                "ms_prefs": round(ms_prefs, 1),
                 "chars": chars,
                 "est_tokens": chars // 4,
                 "pool_bm25": len(bm25_eps),

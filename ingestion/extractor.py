@@ -1007,6 +1007,15 @@ class ExtractionPipeline:
         self._timeline_gate = TimelineGate(
             db=db, llm_client=llm_client, embedder=embedder, model=llm_model
         )
+        # Preferences chat gate (schema 035): per-turn "did the user assert a durable
+        # preference?" check on episode-type items -> reconciled rows in `preferences`.
+        # Same fail-soft, env-gated (SYNAPSE_PREFS_GATE=0) shape as the timeline gate;
+        # kept out of the KG so preferences don't rebuild the User-supernode.
+        from ingestion.preferences_gate import PreferencesGate
+
+        self._preferences_gate = PreferencesGate(
+            db=db, llm_client=llm_client, embedder=embedder, model=llm_model
+        )
 
     # ------------------------------------------------------------------
     # Stage methods
@@ -1513,6 +1522,9 @@ class ExtractionPipeline:
             # Timeline chat gate rides the per-turn item (chunks span turns and
             # would blur the event's date). Fail-soft; never blocks KG work.
             self._timeline_gate.process(item)
+            # Preferences gate rides the same per-turn item (a preference is stated in
+            # one turn, not spread across a window). Fail-soft; never blocks KG work.
+            self._preferences_gate.process(item)
         elif content_type == "chunk":
             # Chunk = a 3-5 turn window (task #63). Deterministic entities come
             # from the chunk's OWN text — not a full-session fetch per chunk —

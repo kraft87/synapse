@@ -30,6 +30,7 @@ import os
 import re
 import socket
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -175,6 +176,23 @@ def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST", headers=headers
     )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
+    """GET JSON from a Synapse endpoint under BASE_URL and return the parsed reply.
+
+    `path` is endpoint-relative ("/preferences/top") or absolute. `params` are urlencoded
+    onto the query string. Sends the bearer when one is configured. Raises on transport /
+    HTTP error — callers decide whether to fail-open (hooks) or surface it."""
+    url = path if path.startswith("http") else BASE_URL + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": _UA}
+    if INGEST_TOKEN:
+        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
+    req = urllib.request.Request(url, method="GET", headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 

@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), two-way-syncs your skills library, mirrors opted-in config files for the dream lane, and wires up the recall/remember MCP tools. Point it at a local or central Synapse.",
   "author": {
     "name": "Kyle Doucette"

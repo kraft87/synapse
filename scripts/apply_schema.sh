@@ -76,6 +76,7 @@ FILES=(
   032_config_scan_cursor.sql
   033_timeline.sql
   034_embedding_meta.sql
+  035_preferences.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

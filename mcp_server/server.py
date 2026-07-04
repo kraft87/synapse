@@ -185,6 +185,12 @@ from mcp_server.timeline_routes import register as _register_timeline_routes  # 
 
 _register_timeline_routes(mcp, DB_URL, _machine_authorized, VOYAGE_API_KEY)
 
+# Preferences read route — the plugin's SessionStart block GETs the top standing user
+# preferences here (schema 035). Same machine-token seam; server owns the DB. No-op w/o DB.
+from mcp_server.preferences_routes import register as _register_preferences_routes  # noqa: E402
+
+_register_preferences_routes(mcp, DB_URL, _machine_authorized)
+
 # Device-login lane — RFC 8628 device flow so `synapse login` works browser-free on servers /
 # headless boxes. Proxies GitHub's device flow and gates the machine token by the same GitHub
 # allowlist as the web leg. No-op unless GITHUB_CLIENT_ID + SYNAPSE_MACHINE_TOKEN are set.
