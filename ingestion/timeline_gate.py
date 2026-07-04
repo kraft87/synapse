@@ -72,49 +72,70 @@ def extract_idents(fact: str) -> list[str]:
 
 _MIN_CONTENT = 80  # turns shorter than this can't contain a happening worth keeping
 
-GATE_PROMPT = """You are building a personal work TIMELINE from ONE turn of a coding/assistant session (the user directs; an AI agent executes). Decide if SOMETHING HAPPENED this turn worth a permanent dated timeline entry, and if so write it as ONE naked past-tense event.
+GATE_PROMPT = """You are building a personal TIMELINE from ONE turn of a chat/assistant session (the user directs; an AI agent may execute work). Decide if anything HAPPENED this turn worth a permanent dated timeline entry, and if so write each happening as a naked past-tense event (up to 3).
 
-This event is the ONLY record the timeline keeps of this turn — a happening you don't capture is forgotten. The user directs and is authoritative about what they decided or want, so a user assertion counts even when phrased casually; but a QUESTION, request, or instruction with no outcome yet is NOT a happening — return null for it.
+These events are the ONLY record the timeline keeps of this turn — a happening you don't capture is forgotten. The user directs and is authoritative about what they decided or want, so a user assertion counts even when phrased casually; but a QUESTION, request, or instruction with no outcome yet is NOT a happening.
 
-EMIT for a concrete happening: a decision reached, an action carried out (usually visible in the [tool:...] activity lines — code written, a command run, a commit, a deploy, a bug fixed), a result/finding, or a milestone / state change.
-DO NOT emit (return null) for: questions, requests or instructions with no outcome yet, opinions, brainstorming or design talk with NO decision reached, greetings, status checks, acknowledgements. Most turns are discussion — return null for them.
+EMIT one event per concrete happening:
+- WORK: a decision reached, an action carried out (usually visible in the [tool:...] activity lines — code written, a command run, a commit, a deploy, a bug fixed), a result/finding, or a milestone / state change.
+- LIFE: something from the user's OWN life the user reports as already having happened — did, attended, visited, bought, sold, received, started, finished, achieved, experienced. Including things that happened on an earlier day than this turn.
+DO NOT emit for: questions, requests or instructions with no outcome yet, opinions, brainstorming or design talk with NO decision reached, future plans or intentions, greetings, status checks, acknowledgements, or anything the assistant (not the user) relates. Most turns are discussion — return an empty list for them.
 
-Write the `event` under two hard rules:
-1. NAKED + VERB-HONEST. No leading name. Start with the past-tense verb, and let the VERB carry who-did-what: "decided / chose / approved / rejected" for a DECISION or direction; "committed / shipped / deployed / fixed / built / wrote / ran / added" for an ACTION the agent carried out. (e.g. "decided episodic and semantic memory live in separate stores"; "fixed the ingest dating bug so fact valid-time inherits the segment timestamp".)
+Write each `event` under these hard rules:
+1. NAKED + VERB-HONEST. No leading name. Start with the past-tense verb, and let the VERB carry who-did-what: "decided / chose / approved / rejected" for a DECISION or direction; "committed / shipped / deployed / fixed / built / wrote / ran / added" for an ACTION carried out. (e.g. "decided episodic and semantic memory live in separate stores"; "finished a 5K run in 27 minutes 12 seconds".)
 2. SELF-CONTAINED. It must make sense a month from now with NO other context. Name the concrete thing. NEVER "the bug above", "that approach" — spell it out.
 3. Start with a LOWERCASE verb (it's a log line, not a sentence).
 4. NO third-party personal names (clients, transcript subjects, other people's data) — describe generically ("8 client transcripts", not the names). Project/tool/service names are fine.
+5. EXACT NUMBERS VERBATIM. Keep quantities, prices, times, distances, and scores exactly as stated ("27 minutes 12 seconds", "$1,450", "20%") — never round, convert, or paraphrase them.
 
 DATE. This turn's date is given below. Most events happen the day they're discussed — leave `date` OUT for those. Only when the user reports something that ALREADY happened on a DIFFERENT day set `date` to the resolved calendar date (YYYY-MM-DD): resolve an absolute mention ("on May 3rd" -> that date, this turn's year unless stated) or a relative one ("last Tuesday", "two weeks ago", "this past weekend") against this turn's date. When the date you set differs from this turn's date, KEEP the user's original timing phrase in the event text verbatim so a wrong resolution stays auditable (e.g. "deployed the search reindex (reported as 'last Tuesday')"). Omit `date` when the event happened this turn or the timing can't be inferred.
 If the event text itself names a FURTHER date that is NOT the event's own timing (a deadline, a scheduled-for day), anchor it inline with its resolved absolute date in parens: "scheduled the cutover for January 31 (meaning 2026-01-31)" (this turn's year unless stated).
 
-salience: 2 = milestone / shipped to prod / major decision; 1 = a normal action or decision; 0 = minor or routine.
-event_type: "decision" (a choice/direction was reached), "action" (something was executed: code, command, deploy, fix), "finding" (a result/diagnosis/measurement was learned), or "milestone" (a phase completed / shipped).
+salience: 2 = milestone / shipped to prod / major decision or life event; 1 = a normal action, decision, or happening; 0 = minor or routine.
+event_type: "decision" (a choice/direction was reached), "action" (something was executed or done), "finding" (a result/diagnosis/measurement was learned), or "milestone" (a phase completed / shipped / achieved).
 
-Output ONLY JSON: {"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone", "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}  OR  {"event": null}
+Output ONLY JSON: {"events": [{"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone", "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}]} — at most 3 events, ordered by importance. Most turns: {"events": []}
 """
 
 
-def _parse_gate(text: str) -> dict[str, Any] | None:
-    """Parser for parse_with_retry: {"event": null} -> None, else validated dict."""
+_MAX_EVENTS_PER_TURN = 3
+
+
+def _parse_gate(text: str) -> list[dict[str, Any]]:
+    """Parser for parse_with_retry: {"events": []} -> [], else validated dicts (capped).
+
+    Also accepts the legacy single-event shape ({"event": ...}) so a model that
+    regresses to the old contract degrades to one event instead of a retry loop."""
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise MalformedResponseError("no JSON object in response", text[:200])
     d = json.loads(text[start : end + 1])
-    ev = d.get("event")
-    if not ev:
-        return None
-    sal = d.get("salience", 1)
-    et = d.get("event_type")
-    raw_date = d.get("date")
-    # Shape only here (a non-empty string); range/parse validation is _resolve_event_date's job.
-    date = raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None
-    return {
-        "event": str(ev).strip(),
-        "salience": sal if isinstance(sal, int) and 0 <= sal <= 2 else 1,
-        "event_type": et if et in ("decision", "action", "finding", "milestone") else None,
-        "date": date,
-    }
+    raw = d.get("events")
+    if raw is None:
+        raw = [d] if d.get("event") else []
+    if not isinstance(raw, list):
+        raise MalformedResponseError("'events' is not a list", text[:200])
+    out: list[dict[str, Any]] = []
+    for item in raw[:_MAX_EVENTS_PER_TURN]:
+        if not isinstance(item, dict):
+            continue
+        ev = item.get("event")
+        if not ev:
+            continue
+        sal = item.get("salience", 1)
+        et = item.get("event_type")
+        raw_date = item.get("date")
+        # Shape only here (a non-empty string); range/parse validation is _resolve_event_date's job.
+        date = raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None
+        out.append(
+            {
+                "event": str(ev).strip(),
+                "salience": sal if isinstance(sal, int) and 0 <= sal <= 2 else 1,
+                "event_type": et if et in ("decision", "action", "finding", "milestone") else None,
+                "date": date,
+            }
+        )
+    return out
 
 
 class TimelineGate:
@@ -156,55 +177,61 @@ class TimelineGate:
             return
         turn_date = turn_ts[:10]  # YYYY-MM-DD
 
-        gate = parse_with_retry(
+        events = parse_with_retry(
             self._llm_client,
             base_prompt=(
                 f"{GATE_PROMPT}\nThis turn happened on {turn_date}.\n\nTHE TURN:\n{content[:6000]}"
             ),
             parser=_parse_gate,
             model=self._model,
-            max_tokens=256,
+            max_tokens=512,
         )
-        if gate is None:
+        if not events:
             return
 
-        # When the gate resolved the event to a DIFFERENT past day (something the user
-        # reports as already-happened), stamp t_valid to that day at noon UTC; otherwise
-        # keep the precise turn timestamp. _resolve_event_date validates + clamps first.
-        resolved_date = _resolve_event_date(gate.get("date"), turn_date)
-        t_valid = turn_ts if resolved_date == turn_date else f"{resolved_date}T12:00:00+00:00"
-
-        # Write-time cross-source dedup: a bare commit/merge ANNOUNCEMENT whose PR-ref/SHA
-        # is already on the timeline (git is canonical for those) adds nothing — skip it.
-        # Deploys/fixes/decisions about the same ref are distinct happenings and still write.
-        # Ordering caveat: chat often ingests BEFORE the git feeder pushes, so this catches
-        # only chat-after-git; the read-time identifier-collapse in serving covers the rest.
-        verb = gate["event"].split(None, 1)[0].lower().rstrip(":,")
-        idents = extract_idents(gate["event"])
-        if idents and verb in _ANNOUNCE_VERBS:
-            if self._db.timeline_ident_exists(
-                idents, item.get("project"), t_valid, _XDEDUP_WINDOW_HOURS
-            ):
-                logger.info("timeline gate skip (ident dup %s) ep:%s", idents, episode_id)
-                return
-
         project = item.get("project")
-        vec = self._embedder.embed(
-            [f"Project: {project or '-'} | {gate['event']}"], task="document"
-        )[0]
-        self._db.insert_timeline_event(
-            t_valid=t_valid,
-            fact=gate["event"],
-            source="chat",
-            source_ref=f"ep:{episode_id}",
-            project=project,
-            salience=gate["salience"],
-            embedding=vec,
-            # model_name is set by every factory-built embedder; the getattr
-            # fallback covers test stubs that only implement embed().
-            embed_model=getattr(self._embedder, "model_name", None) or "voyage-4-large",
-            event_type=gate.get("event_type"),
+        # One embed round-trip for the whole turn's events.
+        vecs = self._embedder.embed(
+            [f"Project: {project or '-'} | {e['event']}" for e in events], task="document"
         )
-        logger.info(
-            "timeline event (s%d) from ep:%s: %s", gate["salience"], episode_id, gate["event"][:80]
-        )
+        for k, (gate, vec) in enumerate(zip(events, vecs, strict=True), start=1):
+            # When the gate resolved the event to a DIFFERENT past day (something the user
+            # reports as already-happened), stamp t_valid to that day at noon UTC; otherwise
+            # keep the precise turn timestamp. _resolve_event_date validates + clamps first.
+            resolved_date = _resolve_event_date(gate.get("date"), turn_date)
+            t_valid = turn_ts if resolved_date == turn_date else f"{resolved_date}T12:00:00+00:00"
+
+            # Write-time cross-source dedup: a bare commit/merge ANNOUNCEMENT whose PR-ref/SHA
+            # is already on the timeline (git is canonical for those) adds nothing — skip it.
+            # Deploys/fixes/decisions about the same ref are distinct happenings and still write.
+            # Ordering caveat: chat often ingests BEFORE the git feeder pushes, so this catches
+            # only chat-after-git; the read-time identifier-collapse in serving covers the rest.
+            verb = gate["event"].split(None, 1)[0].lower().rstrip(":,")
+            idents = extract_idents(gate["event"])
+            if idents and verb in _ANNOUNCE_VERBS:
+                if self._db.timeline_ident_exists(idents, project, t_valid, _XDEDUP_WINDOW_HOURS):
+                    logger.info("timeline gate skip (ident dup %s) ep:%s", idents, episode_id)
+                    continue
+
+            self._db.insert_timeline_event(
+                t_valid=t_valid,
+                fact=gate["event"],
+                source="chat",
+                # "ep:<id>" for the first event keeps the historic key shape (idempotent
+                # re-processing); "#k" suffixes let 2nd/3rd events coexist under the
+                # UNIQUE(source, source_ref) constraint. Nothing parses source_ref at serve.
+                source_ref=f"ep:{episode_id}" if k == 1 else f"ep:{episode_id}#{k}",
+                project=project,
+                salience=gate["salience"],
+                embedding=vec,
+                # model_name is set by every factory-built embedder; the getattr
+                # fallback covers test stubs that only implement embed().
+                embed_model=getattr(self._embedder, "model_name", None) or "voyage-4-large",
+                event_type=gate.get("event_type"),
+            )
+            logger.info(
+                "timeline event (s%d) from ep:%s: %s",
+                gate["salience"],
+                episode_id,
+                gate["event"][:80],
+            )

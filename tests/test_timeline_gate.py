@@ -22,43 +22,54 @@ def test_gate_prompt_ports_framing_and_date_anchoring():
 
 
 def test_parse_gate_null_is_skip():
-    assert _parse_gate('{"event": null}') is None
+    assert _parse_gate('{"events": []}') == []
+    assert _parse_gate('{"event": null}') == []  # legacy single-event shape
 
 
 def test_parse_gate_event_and_salience():
     d = _parse_gate(
-        'noise {"event": "fixed the dating bug", "salience": 2, "event_type": "action"} trailing'
+        'noise {"events": [{"event": "fixed the dating bug", "salience": 2, '
+        '"event_type": "action"}]} trailing'
     )
-    assert d == {
-        "event": "fixed the dating bug",
-        "salience": 2,
-        "event_type": "action",
-        "date": None,
-    }
+    assert d == [
+        {
+            "event": "fixed the dating bug",
+            "salience": 2,
+            "event_type": "action",
+            "date": None,
+        }
+    ]
 
 
 def test_parse_gate_accepts_date():
     d = _parse_gate(
-        '{"event": "attended the conference", "salience": 1, "event_type": "action", '
-        '"date": " 2026-06-20 "}'
+        '{"events": [{"event": "attended the conference", "salience": 1, '
+        '"event_type": "action", "date": " 2026-06-20 "}]}'
     )
-    assert d["date"] == "2026-06-20"
+    assert d[0]["date"] == "2026-06-20"
 
 
 def test_parse_gate_ignores_nonstring_or_empty_date():
-    assert _parse_gate('{"event": "did a thing", "date": 20260620}')["date"] is None
-    assert _parse_gate('{"event": "did a thing", "date": ""}')["date"] is None
-    assert _parse_gate('{"event": "did a thing"}')["date"] is None
+    assert _parse_gate('{"event": "did a thing", "date": 20260620}')[0]["date"] is None
+    assert _parse_gate('{"event": "did a thing", "date": ""}')[0]["date"] is None
+    assert _parse_gate('{"event": "did a thing"}')[0]["date"] is None
 
 
 def test_parse_gate_bad_event_type_nulls():
     d = _parse_gate('{"event": "did a thing", "salience": 1, "event_type": "vibe"}')
-    assert d["event_type"] is None
+    assert d[0]["event_type"] is None
 
 
 def test_parse_gate_bad_salience_clamps_to_med():
     d = _parse_gate('{"event": "ran the benchmark", "salience": 9}')
-    assert d["salience"] == 1
+    assert d[0]["salience"] == 1
+
+
+def test_parse_gate_caps_at_three_events():
+    import json as _json
+
+    raw = _json.dumps({"events": [{"event": f"did thing {i}", "salience": 1} for i in range(5)]})
+    assert len(_parse_gate(raw)) == 3
 
 
 def test_parse_gate_malformed_raises():
@@ -139,7 +150,9 @@ def _gated(monkeypatch, event, exists):
     db = _Rec(exists)
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
-        tg, "parse_with_retry", lambda *a, **k: {"event": event, "salience": 1, "event_type": None}
+        tg,
+        "parse_with_retry",
+        lambda *a, **k: [{"event": event, "salience": 1, "event_type": None, "date": None}],
     )
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
     return db.inserted
@@ -202,9 +215,34 @@ def _gated_full(monkeypatch, gate_ret, exists=False):
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
     db = _Rec(exists)  # get_episodes_valid_at -> "2026-07-02T10:00:00+00:00"
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
-    monkeypatch.setattr(tg, "parse_with_retry", lambda *a, **k: gate_ret)
+    monkeypatch.setattr(
+        tg,
+        "parse_with_retry",
+        lambda *a, **k: gate_ret if isinstance(gate_ret, list) else [gate_ret],
+    )
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
     return db.inserted
+
+
+def test_multi_event_turn_writes_suffixed_refs(monkeypatch):
+    ins = _gated_full(
+        monkeypatch,
+        [
+            {
+                "event": "ran a 5K in 27 minutes 12 seconds",
+                "salience": 1,
+                "event_type": "action",
+                "date": None,
+            },
+            {
+                "event": "bought a road bike for $1,450",
+                "salience": 1,
+                "event_type": "action",
+                "date": None,
+            },
+        ],
+    )
+    assert [i["source_ref"] for i in ins] == ["ep:5", "ep:5#2"]
 
 
 def test_resolved_past_date_stamps_t_valid_at_noon(monkeypatch):
