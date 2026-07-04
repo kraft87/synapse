@@ -216,8 +216,7 @@ class Database:
         vlit = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
         with self._conn() as conn:
             rows = conn.execute(
-                # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                f"SELECT id, pref, polarity, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "
+                f"SELECT id, pref, polarity, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "FROM preferences "
                 "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
                 "AND embedding IS NOT NULL "
@@ -247,8 +246,7 @@ class Database:
         )
         with self._conn() as conn:
             row = conn.execute(
-                # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "INSERT INTO preferences "
+                "INSERT INTO preferences "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "(owner_id, group_id, project, pref, polarity, embedding, embed_model, source_ref) "
                 f"VALUES (%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s) RETURNING id",
                 (
