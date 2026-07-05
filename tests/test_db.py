@@ -98,6 +98,46 @@ class TestEpisodeWriter:
         assert span_ids == set()
         assert max_seq == 0
 
+    def test_content_dup_exists_cross_session_same_project(self, db):
+        """A retried session re-ships identical content under a new session id and
+        new span id — the content probe must flag it so /ingest can skip it."""
+        db.upsert_episode(
+            Episode(
+                session_id="db-test-dup-a",
+                sequence=1,
+                project="proj-x",
+                content="identical replayed turn",
+                span_id="jsonl:dup-a1",
+            )
+        )
+        assert db.content_dup_exists("proj-x", "identical replayed turn") is True
+        assert db.content_dup_exists("proj-x", "a different turn") is False
+
+    def test_content_dup_scoped_to_project(self, db):
+        """Identical content in ANOTHER project is not a replay — the probe is
+        project-scoped (NULL project matches only NULL)."""
+        db.upsert_episode(
+            Episode(
+                session_id="db-test-dup-b",
+                sequence=1,
+                project="proj-x",
+                content="same words, other silo",
+                span_id="jsonl:dup-b1",
+            )
+        )
+        assert db.content_dup_exists("proj-y", "same words, other silo") is False
+        assert db.content_dup_exists(None, "same words, other silo") is False
+        db.upsert_episode(
+            Episode(
+                session_id="db-test-dup-c",
+                sequence=1,
+                project=None,
+                content="null-project turn",
+                span_id="jsonl:dup-c1",
+            )
+        )
+        assert db.content_dup_exists(None, "null-project turn") is True
+
 
 class TestIngestionState:
     def test_get_watermark_returns_none_initially(self, db):

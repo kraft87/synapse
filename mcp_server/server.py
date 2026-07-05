@@ -513,6 +513,7 @@ async def ingest_turns(request: Request) -> JSONResponse:
             index: dict[str, tuple[set[str], int]] = {}
             written = 0
             dropped = 0
+            content_dups = 0
             for ep in episodes:
                 # Reject transcribe_ai deposition payloads before they ever land — third-party
                 # PII must not enter memory. Dev conversations about the domain still flow in.
@@ -526,6 +527,14 @@ async def ingest_turns(request: Request) -> JSONResponse:
                 seen, max_seq = index[ep.session_id]
                 if not ep.span_id or ep.span_id in seen:
                     continue  # no identity key, or already stored — skip
+                # Cross-session replay guard (schema 036): a retried session ships the
+                # same turns under a new session id + new span ids, so the span index
+                # above can't see them. SYNAPSE_CONTENT_DEDUP=0 is the kill switch.
+                if os.environ.get("SYNAPSE_CONTENT_DEDUP", "1") != "0" and db.content_dup_exists(
+                    ep.project, ep.content
+                ):
+                    content_dups += 1
+                    continue
                 max_seq += 1
                 ep.sequence = max_seq
                 seen.add(ep.span_id)
@@ -544,6 +553,10 @@ async def ingest_turns(request: Request) -> JSONResponse:
                 written += 1
             if dropped:
                 logger.info("ingest dropped %d transcribe_ai transcript-payload turn(s)", dropped)
+            if content_dups:
+                logger.info(
+                    "ingest skipped %d cross-session content-duplicate turn(s)", content_dups
+                )
             return written
         finally:
             db.close()
