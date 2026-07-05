@@ -782,7 +782,8 @@ class TestStage6bBatchConfirm:
             0: ([{"uuid": "dup-uuid", "fact": "old fact 0"}], []),
             1: ([], [{"uuid": "contra-uuid", "fact": "old fact 1"}]),
         }
-        skip_indices, invalidate, reinforce = pipe._stage6b_batch_confirm(facts, candidates_map)
+        skip_indices, invalidate, reinforce, ok = pipe._stage6b_batch_confirm(facts, candidates_map)
+        assert ok
 
         # ONE LLM call for both facts (the whole point of the PR)
         assert llm_client.messages.create.call_count == 1
@@ -797,7 +798,8 @@ class TestStage6bBatchConfirm:
     def test_empty_candidates_map_short_circuits(self):
         """No candidates anywhere => no LLM call at all."""
         pipe, llm_client = self._pipeline_with_llm("{}")
-        skip_indices, invalidate, reinforce = pipe._stage6b_batch_confirm(self._facts(3), {})
+        skip_indices, invalidate, reinforce, ok = pipe._stage6b_batch_confirm(self._facts(3), {})
+        assert ok  # empty map is a clean no-op, not a failure
         assert skip_indices == set()
         assert invalidate == {}
         assert reinforce == {}
@@ -812,7 +814,7 @@ class TestStage6bBatchConfirm:
         pipe, _ = self._pipeline_with_llm(text)
         facts = self._facts(1)
         cmap = {0: ([], [{"uuid": "u", "fact": "old"}])}
-        _, invalidate, _ = pipe._stage6b_batch_confirm(facts, cmap)
+        _, invalidate, _, _ = pipe._stage6b_batch_confirm(facts, cmap)
         assert invalidate == {0: ["u"]}
 
     def test_missing_fact_in_response_treated_as_no_op(self):
@@ -830,7 +832,7 @@ class TestStage6bBatchConfirm:
             0: ([{"uuid": "a", "fact": "f"}], []),
             1: ([{"uuid": "b", "fact": "g"}], []),
         }
-        skip_indices, invalidate, _ = pipe._stage6b_batch_confirm(facts, cmap)
+        skip_indices, invalidate, _, _ = pipe._stage6b_batch_confirm(facts, cmap)
         # Fact 1 not in response -> not skipped, no contradictions
         assert 1 not in skip_indices
         assert 1 not in invalidate
@@ -840,10 +842,11 @@ class TestStage6bBatchConfirm:
         recoverable on next extraction; blocking writes is not."""
         pipe, llm_client = self._pipeline_with_llm("{}")
         llm_client.messages.create.side_effect = RuntimeError("upstream 500")
-        skip_indices, invalidate, reinforce = pipe._stage6b_batch_confirm(
+        skip_indices, invalidate, reinforce, ok = pipe._stage6b_batch_confirm(
             self._facts(1),
             {0: ([{"uuid": "x", "fact": "y"}], [])},
         )
+        assert ok is False  # the gate's shadow log must not treat this as a verdict
         assert skip_indices == set()
         assert invalidate == {}
         assert reinforce == {}

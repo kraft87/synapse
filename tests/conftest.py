@@ -30,6 +30,7 @@ _DB_FILES = {
     "test_timeline_routes.py",
     "test_preferences_routes.py",
     "test_recall_metrics.py",
+    "test_dedup_gate.py",
 }
 
 
