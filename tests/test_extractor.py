@@ -746,6 +746,7 @@ class TestStage6bBatchConfirm:
         from ingestion.extractor import ExtractionPipeline
 
         pipe = ExtractionPipeline.__new__(ExtractionPipeline)
+        pipe._contradiction_model = "claude-haiku-4-5"
         fake_msg = MagicMock()
         fake_msg.content = [MagicMock(text=llm_text)]
         fake_client = MagicMock()
@@ -868,6 +869,46 @@ class TestStage6aDedup:
         assert {p["uuid"] for p in pair_out} == {"A", "B"}
         # A removed from semantic since it already won the pair check
         assert {s["uuid"] for s in sem_out} == {"C"}
+
+
+# ---------------------------------------------------------------------------
+# Per-stage model resolution (issue #8)
+# ---------------------------------------------------------------------------
+
+
+class TestPerStageModels:
+    """SYNAPSE_<STAGE>_MODEL env overrides reach each stage independently."""
+
+    def _pipeline(self) -> ExtractionPipeline:
+        embedder = MagicMock()
+        embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
+        db = MagicMock()
+        return ExtractionPipeline(
+            db=db,
+            llm_client=MagicMock(),
+            embedder=embedder,
+            kg_client=_mock_falkordb(similar_nodes=[]),
+        )
+
+    def test_stage_envs_reach_their_stages(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_TIMELINE_MODEL", "stage/timeline")
+        monkeypatch.setenv("SYNAPSE_CONTRADICTION_MODEL", "stage/contradiction")
+        pipe = self._pipeline()
+        assert pipe._timeline_gate._model == "stage/timeline"
+        assert pipe._contradiction_model == "stage/contradiction"
+        assert pipe._contradiction_detector._model == "stage/contradiction"
+        # Untouched stages keep the code default.
+        assert pipe._llm._model == "claude-haiku-4-5"
+        assert pipe._preferences_gate._model == "claude-haiku-4-5"
+
+    def test_global_env_covers_every_stage(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
+        pipe = self._pipeline()
+        assert pipe._llm._model == "global/model"
+        assert pipe._timeline_gate._model == "global/model"
+        assert pipe._preferences_gate._model == "global/model"
+        assert pipe._edge_date_extractor._model == "global/model"
+        assert pipe._contradiction_model == "global/model"
 
 
 # ---------------------------------------------------------------------------

@@ -77,7 +77,7 @@ _LLM_CONFIRM_TOP_K = 3
 
 # Default Haiku model for the LLM confirm step. Background-work standard,
 # per PR #11 and the project conventions (~10x cheaper than Sonnet, fine
-# for binary yes/no on short pairs).
+# for binary yes/no on short pairs). Overridable via SYNAPSE_DEDUP_MODEL.
 _DEFAULT_LLM_MODEL = "claude-haiku-4-5"
 
 # --- Canonical identity aliases (task #49) ---------------------------------
@@ -290,14 +290,16 @@ class NodeDeduper:
         group_id: str,
         llm_client: Any | None = None,
         *,
-        llm_model: str = _DEFAULT_LLM_MODEL,
+        llm_model: str | None = None,
         lsh_threshold: float = _LSH_JACCARD_THRESHOLD,
         top_k: int = _LLM_CONFIRM_TOP_K,
     ) -> None:
+        from ingestion.llm_client import stage_model
+
         self._kg = kg_client
         self._group_id = group_id
         self._llm = llm_client
-        self._llm_model = llm_model
+        self._llm_model = llm_model or stage_model("DEDUP", _DEFAULT_LLM_MODEL)
         self._lsh_threshold = lsh_threshold
         self._top_k = top_k
 

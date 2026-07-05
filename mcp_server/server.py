@@ -704,8 +704,10 @@ Return ONLY the SQL, no explanation."""
         from concurrent.futures import ThreadPoolExecutor
 
         def _generate() -> str:
+            from ingestion.llm_client import stage_model
+
             response = llm.messages.create(
-                model="claude-haiku-4-5",
+                model=stage_model("QUERY_GRAPH"),
                 max_tokens=400,
                 messages=[{"role": "user", "content": prompt}],
             )
