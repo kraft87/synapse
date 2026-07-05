@@ -153,7 +153,22 @@ Web-research tool results (WebFetch, Exa, Firecrawl, WebSearch) are captured as 
 
 `kg_entities` rows and bitemporal `kg_relationships` fact edges (migrated out of FalkorDB in #67). The KG is the relational/multi-hop specialist served as side buckets (`facts`, `entities`), never the primary retrieval path. See [§10](#10-postgres-graph-model).
 
-### 3.5 Retired: summaries & dream documents
+### 3.5 Timeline events — the episodic date log
+
+`timeline_events` (schema 033) is the EPISODIC complement to the semantic KG: an append-only, time-ordered log of dated **point-events that happened** ("shipped X", "decided Y", "fixed Z"), distinct from the KG's deduplicated states-with-duration. Two feeders:
+
+- **Chat gate** (`ingestion/timeline_gate.py`): one small LLM call per ingested turn asking "did something actually HAPPEN?" — most turns are discussion and emit nothing. Emitted events are naked past-tense facts (no actor field; the verb carries decides-vs-executes), self-contained, dated to the turn with validated resolution of "last Tuesday"-style mentions.
+- **Git feeder** (plugin `timeline_git.py`): commits pushed as `source='git:<project>'` events, author-dated.
+
+Idempotency rides on `UNIQUE(source, source_ref)`. Three write-time quality mechanisms (all default-on, individually kill-switchable):
+
+- **Confirm-merge dedup** (schema 037): a re-told happening (same real-world event narrated again later, often with a differently-resolved date) merges into its existing row instead of inserting — nearest same-project candidates within ±14d / cosine < 0.20 go to an LLM confirm that reads **both full source turns** and must answer SAME in **both presentation orders**. Non-destructive: `reported_count += 1`, `t_valid = LEAST(...)`, no deletes. Measured before shipping: snippet-only judging is unreliable (79% on 120 stratified pairs — the discriminating info lives in the source turns); the shipped form leaves ~2% residual false-merge, all recoverable. Distance alone cannot be the merge key in either direction (recurring chores sit at d≈0.02; date-split retellings sit further out).
+- **Domain scoping** (schema 038): the gate labels each event `personal` (the user's own life) or `technical` (engineering/work); git events are technical by construction; NULL = unlabeled and fails open. An explicit `group_id="personal"` on the read side filters the timeline to life events. Measured motivation: for a reworded personal query, cross-domain junk sat *closer* in embedding space (0.704) than the true personal events (0.748+), so no relevance floor can do this job — only a domain label can. The default/technical scope stays unfiltered so callers that never set `group_id` lose nothing.
+- **Quoted-material suppression**: happenings narrated inside pasted third-party content (someone else's email, a meeting/interview/legal transcript, an article with first-person narration) are never emitted as the user's events — the gate distinguishes content the user *asserted* from content the user *quoted*. The user's own work on the material, and third-party statements *about* the user, stay eligible. Probed on labeled cases before shipping: third-party leaks 2/8 → 0/8 with no legit-event loss.
+
+**Serving** (`mcp_server/timeline.py`): topical queries fuse BM25 + vector (RRF) then re-sort survivors chronologically — the timeline's value is order, never relevance-score presentation; pure-time queries are a range scan with family-collapse (same-project low-salience runs become one line with count + first/last anchors, so computed durations stay auditable). Served as its own bucket in `recall()` (one cheap parallel leg, every query) and via the `recall_timeline` MCP tool.
+
+### 3.6 Retired: summaries & dream documents
 
 `synth_documents` (`doc_type='summary'|'dream'`) is a **frozen legacy table** (~669 stale rows). Nothing generates new rows, `recall()` never serves them, and they are no longer the KG extraction substrate. Residual scaffolding remains (an embedding leg in the poller that finds nothing, `summary` branches in the extractor, and a count in `list_projects`) pending a snapshot + purge. Treat the summary layer as **dead**; the episode leg and KG facts absorbed both its broad-recall and relational jobs.
 
@@ -204,6 +219,7 @@ for ep in episodes:
 ```
 
 - **Dedup by `span_id`** — a turn's stable last-record UUID. The session's `(seen span_ids, max_seq)` index is loaded once per session. The tail's own positional sequence is discarded (a tail renumbers from 1 and would collide).
+- **Cross-session content guard** (schema 036, `SYNAPSE_CONTENT_DEDUP=0` to disable) — the span guard is per-session, so a retry session or re-import that replays a turn under a *fresh* session/span id sails through it. A second check skips any turn whose content is byte-identical (`md5(content)` index) to an episode already stored in the same project. Measured on a real corpus: ~4.6% of episodes were exact replays (agent re-runs, mid-session forks, re-imports) before this guard.
 - **Append at `max(seq)+1`** — new turns extend the session.
 - **Contamination filter** — `is_transcript_contamination` drops PII-bearing third-party transcript payloads (produced by another agent project sharing the same hooks).
 - Runs in a threadpool so the async route never blocks.
@@ -336,7 +352,7 @@ Contradictions **invalidate the old edge** (an `UPDATE` setting `invalid_at`/`t_
 
 ## 6. Recall Pipeline
 
-`recall()` runs four legs (three concurrent, then a two-leg second wave) over a persistent `ThreadPoolExecutor(max_workers=4)` and returns a **compact, conditionally-populated** result.
+`recall()` fans out over a persistent `ThreadPoolExecutor`: wave 1 runs the episode pool, KG, web, timeline ([§3.5](#35-timeline-events--the-episodic-date-log)), and preferences legs concurrently (the last two are single cheap DB reads reusing the query embedding); wave 2 runs the cross-encoder rerank and the bitemporal history fetch. Returns a **compact, conditionally-populated** result.
 
 ```mermaid
 flowchart TD
@@ -358,12 +374,16 @@ flowchart TD
 
 ```python
 out = {"query": query, "facts": facts}   # always present (facts may be [])
-if episodes_served: out["episodes"]    = [...]   # reranked, cap 5
+if episodes_served: out["episodes"]    = [...]   # reranked passages, cap 5 (see role note)
 if entities_bucket: out["entities"]    = [...]   # {name, summary}, cap 3
 if web_chunks:      out["web"]         = [...]   # {context|excerpt, url?, title?, date?}, cap 3
+if timeline:        out["timeline"]    = [...]   # dated events (§3.5), cap 8
+if preferences:     out["preferences"] = [...]   # standing user preferences, cap 5
 if history:         out["history"]     = [...]   # {previously, now}, cap 2
 return out
 ```
+
+Served episode passages carry a **`role` provenance label** (`"user"` / `"assistant"` / `"mixed"`): episode content is assembled from role-marked parts, but passage compaction slices it into chunks and a mid-block chunk loses its marker — without the label, a reader cannot tell a human-stated fact from the agent's own past output (which may be speculation). The label is recovered deterministically from chunk char-offsets against the parent turn's marker layout; unattributable slices omit the key (fail-open, advisory only). Rank-side provenance *weighting* was deliberately rejected: serve-time rerank score surgery is the historically dead lever here, and most technical needle answers live in assistant halves — a blanket penalty would trade one failure class for a worse one.
 
 `chunks`, `summaries`, and the `communities` bucket are **not** returned (chunks/summaries retired in #63; communities retired with the #67 KG cutover, never measured as contributing). Keys are present only when their bucket is non-empty (`query` and `facts` always present).
 
@@ -457,7 +477,7 @@ Web-research tool results are captured so prior research is recallable, mirrorin
 
 ## 9. Database Schema
 
-Migrations are numbered SQL files applied manually (no runner — small project). Twenty-six migrations to date:
+Migrations are numbered SQL files applied manually (no runner — small project; `scripts/apply_schema.sh` is the single source of truth for order). Thirty-eight migrations to date:
 
 - **001–009** — base: `episodes`, `extraction_queue`, `ingestion_state` (001); `span_id` (002); voyage dims 3072→2048 (003); session embeddings, now deprecated (004); ParadeDB BM25 (005); `retrieval_count` (006); drop old `session_summaries` (007); `chunks` (008); `synth_documents` (009, now legacy).
 - **010 `memory_proposals`** — sink for dream stage-3 auto-memory proposals (status workflow `pending→posted→approved/rejected→applied`, Discord review). Substrate retired, so dormant.
@@ -474,6 +494,15 @@ Migrations are numbered SQL files applied manually (no runner — small project)
 - **021 `recall_metrics`** — fire-and-forget recall telemetry, one row per `recall()` / `recall_episodes()`.
 - **022–023 `skills_lane`** — dream→skills candidate ledger, firing log, skill registry, scan cursor (022); ledger hardening with the grounded-signal CHECK constraint (023).
 - **024–026 skill serving + sync** — `skill_registry` body/scope/status + `skill_files` (024); `content_modified_at` for two-way sync (025); append-only `skill_history` + trigger (026).
+- **027 `skill_registry.proposal_body`** — full proposal text on the registry row.
+- **028–029 episode-validity overlay** — `kg_relationships.invalidated_by` provenance link (028) + partial GIN on superseded episode ids (029), powering the `superseded_by` annotation on served episodes.
+- **030–032 config lane** — mirrored config-file store, scope column, scan cursor.
+- **033 `timeline_events`** — the episodic date log ([§3.5](#35-timeline-events--the-episodic-date-log)).
+- **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot.
+- **035 `preferences`** — standing user-preference store served as a recall bucket.
+- **036 content-md5 index** — `episodes (md5(content))`, the cross-session replay guard ([§4.1](#4-ingestion-pipeline)).
+- **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
+- **038 `timeline_events.domain`** — `personal`/`technical` scoping label ([§3.5](#35-timeline-events--the-episodic-date-log)).
 
 Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` and `memory_proposals` exist but are dormant.
 
@@ -637,6 +666,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
 | `SYNAPSE_SUPERSEDE_MAX_DIST` | `0.45` | cosine-distance gate for surfacing successor facts of superseded edges |
 | `SYNAPSE_RECALL_TIMELINE` | `1` | include the timeline leg in `recall()` (`0` = off) |
+| `SYNAPSE_TIMELINE_GROUP_SCOPE` | `1` | `group_id="personal"` filters timeline serving to personal-domain events (`0` = never filter) |
 | `SYNAPSE_KG_OWNER_ID` | `default` | `owner_id` scope for all KG reads/writes (multi-tenant seam) |
 
 ### Ingestion & extraction
@@ -648,6 +678,8 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_RERANK_MODEL` | `rerank-2.5-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5` to roll back); for `http` the served model id |
 | `SYNAPSE_DEDUP_TYPE_GATE` | `1` | entity-type compatibility gate in fact dedup (`0` = off) |
 | `SYNAPSE_TIMELINE_GATE` | `1` | LLM gate that promotes ingested turns to timeline events (`0` = off) |
+| `SYNAPSE_TIMELINE_DEDUP` | `1` | write-time confirm-merge of re-told timeline events ([§3.5](#35-timeline-events--the-episodic-date-log); `0` = off) |
+| `SYNAPSE_CONTENT_DEDUP` | `1` | cross-session byte-identical replay guard at `/ingest` (`0` = off) |
 | `MEMORY_PROJECT` | empty | explicit project id for ingested episodes (fallback when `.memory-project` / git detection doesn't apply) |
 
 ### Dream, skills lane & config lane
