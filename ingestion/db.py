@@ -20,7 +20,10 @@ _EMBED_DIMS = embed_dims()
 class Database:
     def __init__(self, url: str) -> None:
         self._url = url
-        # Simple synchronous connection — poller runs in a single thread
+        # Simple synchronous connection — ONE thread per instance. The commit/rollback
+        # in _conn() spans the whole connection, so concurrent users would entangle
+        # transactions; the poller's concurrent drain gives each worker thread its own
+        # Database (see Poller._thread_worker) rather than sharing this one.
         self._connection: psycopg.Connection[Any] | None = None
 
     @contextmanager
