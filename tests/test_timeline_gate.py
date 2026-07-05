@@ -19,6 +19,12 @@ def test_gate_prompt_ports_framing_and_date_anchoring():
     assert "authoritative" in GATE_PROMPT
     # In-text date anchoring for a further (non-event-timing) date.
     assert "(meaning 2026-01-31)" in GATE_PROMPT
+    # Quoted-material suppression (issue #24): third-party happenings narrated in
+    # pasted content are not the user's events; relayed-about-user stays eligible.
+    # Probed 2026-07-05 (8 synthetic cases, DeepSeek): leaks 2->0, no legit-event loss.
+    assert "QUOTED MATERIAL" in GATE_PROMPT
+    assert "THEIR event" in GATE_PROMPT
+    assert "still about the user" in GATE_PROMPT
 
 
 def test_parse_gate_null_is_skip():
