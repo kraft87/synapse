@@ -755,7 +755,10 @@ def issue_machine_token() -> dict:
 if __name__ == "__main__":
     import sys
 
+    from ingestion.schema_check import check_schema_version
+
     logging.basicConfig(level=logging.INFO)
+    check_schema_version(DB_URL)
 
     if "--stdio" not in sys.argv:
         _mode = "authenticated" if MACHINE_TOKEN else "OPEN (no auth)"

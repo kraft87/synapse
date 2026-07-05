@@ -46,6 +46,17 @@ def test_table_exists(conn, table):
     assert row is not None, f"Table '{table}' missing"
 
 
+def test_schema_version_stamp_matches_code(conn):
+    """apply_schema.sh must stamp synapse_meta with the newest migration's
+    number — the boot-time guard (ingestion/schema_check.py) compares this
+    stamp against the shipped schema/ directory."""
+    from ingestion.schema_check import expected_schema_version
+
+    row = conn.execute("SELECT value FROM synapse_meta WHERE key = 'schema_version'").fetchone()
+    assert row is not None, "schema_version stamp missing — apply_schema.sh didn't stamp"
+    assert row[0] == expected_schema_version()
+
+
 # ---------------------------------------------------------------------------
 # episodes
 # ---------------------------------------------------------------------------

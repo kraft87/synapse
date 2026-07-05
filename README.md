@@ -197,6 +197,15 @@ First-boot init never re-runs on an existing data volume. To bring an existing d
 to date, run [`scripts/apply_schema.sh`](./scripts/apply_schema.sh) (the single source of
 truth for migration order) against it — see the script's header for caveats.
 
+Every service verifies at boot that the database schema matches the code (the script
+stamps the applied version; a mismatch refuses to start with instructions rather than
+failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, restart.
+`SYNAPSE_SCHEMA_CHECK=0` skips the guard.
+
+Releases are tagged (`v0.8.1`, ...). `main` is kept releasable, but for a known-good
+build check out the latest tag; a change that needs a migration or renames an env var
+gets a release note saying so.
+
 ## MCP tools
 
 - `recall(query, project=None, session_focus=None, group_id="technical")` — the primary

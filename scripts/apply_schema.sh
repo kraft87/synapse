@@ -142,4 +142,16 @@ for f in "${FILES[@]}"; do
   fi
 done
 
-echo "Schema apply complete (${#FILES[@]} files, embed dims ${EMBED_DIMS})."
+# Stamp the applied schema version (synapse_meta is created by 034) so
+# services can verify at boot that the database matches the code — see
+# ingestion/schema_check.py. Value = numeric prefix of the newest migration.
+SCHEMA_VERSION="${FILES[-1]%%_*}"
+STAMP_SQL="INSERT INTO synapse_meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+  ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;"
+if [[ -n "$DSN" ]]; then
+  psql "$DSN" -v ON_ERROR_STOP=1 -c "$STAMP_SQL"
+else
+  psql -v ON_ERROR_STOP=1 -c "$STAMP_SQL"
+fi
+
+echo "Schema apply complete (${#FILES[@]} files, embed dims ${EMBED_DIMS}, stamped schema_version=${SCHEMA_VERSION})."
