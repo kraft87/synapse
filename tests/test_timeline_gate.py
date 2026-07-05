@@ -57,7 +57,7 @@ def test_parse_gate_ignores_nonstring_or_empty_date():
 
 
 def test_parse_gate_domain_field():
-    ok = _parse_gate('{"event": "started taking Trintellix", "domain": "personal"}')
+    ok = _parse_gate('{"event": "started a new gym routine", "domain": "personal"}')
     assert ok[0]["domain"] == "personal"
     # Invalid or missing -> None (unlabeled fails OPEN at read; a wrong default
     # would hide the event from personal-scope serving).
