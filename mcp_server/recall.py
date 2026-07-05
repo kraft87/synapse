@@ -40,6 +40,7 @@ from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row, tuple_row
+from psycopg.types.json import Json as PgJson
 
 from ingestion import embedding as _embedding
 from mcp_server.kg_pg import _vec_literal, search_kg_postgres
@@ -564,7 +565,7 @@ class Recall:
         try:
             rows: list[dict[str, Any]] = conn.execute(
                 # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "SELECT pref, polarity, left(first_seen::text, 10) AS since, assert_count "
+                "SELECT id, pref, polarity, left(first_seen::text, 10) AS since, assert_count "
                 "FROM preferences "
                 "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
                 "AND embedding IS NOT NULL "
@@ -1177,6 +1178,11 @@ class Recall:
         "rerank_model",
         "rerank_top_score",
         "emb_ok",
+        "n_timeline",
+        "ms_timeline",
+        "n_prefs",
+        "ms_prefs",
+        "served_ids",
     )
 
     def _record_metrics(self, m: dict[str, Any]) -> None:
@@ -1191,10 +1197,14 @@ class Recall:
         try:
             cols = self._METRIC_COLS
             placeholders = ",".join(["%s"] * len(cols))
+            vals = [m.get(c) for c in cols]
+            sid_idx = cols.index("served_ids")
+            if vals[sid_idx] is not None:
+                vals[sid_idx] = PgJson(vals[sid_idx])
             with psycopg.connect(self._db_url, autocommit=True) as conn:
                 conn.execute(
                     f"INSERT INTO recall_metrics ({','.join(cols)}) VALUES ({placeholders})",
-                    [m.get(c) for c in cols],
+                    vals,
                 )
         except Exception as e:
             logger.debug("recall_metrics write failed: %s", e)
@@ -1435,6 +1445,18 @@ class Recall:
 
         # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
         # pattern as the retrieval_count bump, so zero read-path latency.
+        # served_ids (issue #10): WHICH results were served, per bucket. Episodes dedupe
+        # because passages share a parent id; timeline mirrors the bucket's event filter.
+        served_ids = {
+            "episodes": list(dict.fromkeys(it["id"] for it in (ep_items or []) if it.get("id"))),
+            "facts": [f["_uuid"] for f in served_facts if f.get("_uuid")],
+            "timeline": [
+                t["_id"]
+                for t in timeline_items
+                if t.get("_id") is not None and t.get("kind", "event") == "event"
+            ],
+            "prefs": [p["id"] for p in prefs_items if p.get("id") is not None],
+        }
         chars = _served_chars(out)
         self._record_metrics(
             {
@@ -1468,6 +1490,7 @@ class Recall:
                 "rerank_model": _embedding._RERANK_MODEL,
                 "rerank_top_score": round(float(rerank_top), 4),
                 "emb_ok": query_emb is not None,
+                "served_ids": served_ids,
             }
         )
         return out
@@ -1523,6 +1546,7 @@ class Recall:
                 "chars": chars,
                 "est_tokens": chars // 4,
                 "emb_ok": query_emb is not None,
+                "served_ids": {"episodes": [r["id"] for r in episodes if r.get("id")]},
             }
         )
         return out
