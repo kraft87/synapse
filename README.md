@@ -52,11 +52,13 @@ compact, ranked result
 
 1. A `Stop` hook pushes the tail of each session transcript to `/ingest` — detached, never
    blocking the turn.
-2. `/ingest` dedups by a stable per-turn id and appends genuinely-new turns as **episodes**.
+2. `/ingest` dedups by a stable per-turn id — and skips byte-identical replays of turns
+   already stored in the project (retry/re-import guard) — then appends genuinely-new
+   turns as **episodes**.
 3. A background poller groups episodes into overlapping **chunks** and mines them for
    entities and bitemporal facts — the **knowledge graph**, in Postgres.
-4. `recall()` runs four legs in parallel (reranked episodes, KG facts, web research, fact
-   history) and returns a compact, ranked result.
+4. `recall()` runs its legs in parallel (reranked episodes, KG facts, timeline events,
+   web research, preferences, fact history) and returns a compact, ranked result.
 
 Architecture, design decisions, and the measurements behind them:
 [ARCHITECTURE.md](./ARCHITECTURE.md).
@@ -69,6 +71,13 @@ Architecture, design decisions, and the measurements behind them:
 - **Knowledge graph** — entities and bitemporal `RELATES_TO` fact edges in Postgres; the
   relational/multi-hop specialist. Facts are never deleted: contradictions invalidate the
   old edge and write a new one, which powers a "what changed" history leg.
+- **Timeline** — an append-only log of dated point-events ("shipped X", "decided Y") mined
+  from turns by an LLM gate and fed by git commits, serving "when / in what order" questions.
+  A re-told happening confirm-merges into its existing row (an LLM reads both source turns,
+  both presentation orders must agree) instead of duplicating; each event carries a
+  `personal`/`technical` domain label so personal-scope queries exclude work noise; and
+  happenings narrated inside quoted third-party material (someone else's email, a pasted
+  transcript, an article) are never logged as the user's own.
 - **Web-research capture** — WebFetch/Exa/Firecrawl/search results are captured and embedded
   so past research is recallable.
 - **MCP server** — FastMCP over streamable HTTP (tool list [below](#mcp-tools)).
@@ -190,11 +199,14 @@ truth for migration order) against it — see the script's header for caveats.
 
 ## MCP tools
 
-- `recall(query, project=None, session_focus=None)` — the primary retrieval tool: reranked
-  episodes + KG facts + web + history.
+- `recall(query, project=None, session_focus=None, group_id="technical")` — the primary
+  retrieval tool: reranked episodes + KG facts + timeline + web + history. Served episode
+  passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can weight a
+  human-stated fact over the agent's own past output.
 - `recall_episodes(query, project=None, limit=5)` — raw episode drill-down.
-- `recall_timeline(query=None, since=None, until=None)` — dated events for "when / in what
-  order" questions.
+- `recall_timeline(query=None, since=None, until=None, group_id=None)` — dated events for
+  "when / in what order" questions; `group_id="personal"` scopes to life events, excluding
+  technical/work noise.
 - `fetch_episode(episode_ids)` — expand full turns by id (from a prior recall).
 - `remember(content, project=None)` — write a manual memory and extract it into the graph.
 - `list_projects()` — per-project episode counts and last activity.
