@@ -381,7 +381,7 @@ def recall_timeline(
         until=until,
         project=project,
     ):
-        return _get_timeline().recall_timeline(
+        res = _get_timeline().recall_timeline(
             query=query,
             since=since,
             until=until,
@@ -390,6 +390,9 @@ def recall_timeline(
             limit=limit,
             group_id=group_id,
         )
+        for it in res.get("items") or []:
+            it.pop("_id", None)  # internal telemetry key (recall served_ids), not for callers
+        return res
 
 
 @mcp.tool()

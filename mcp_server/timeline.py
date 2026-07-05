@@ -94,6 +94,7 @@ def _filters(
 
 def _event(r: dict[str, Any]) -> dict[str, Any]:
     return {
+        "_id": r["id"],  # internal — recall()'s served_ids telemetry; stripped at the MCP boundary
         "kind": "event",
         "t_valid": str(r["t_valid"]),
         "project": r["project"],
