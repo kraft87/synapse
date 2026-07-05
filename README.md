@@ -82,8 +82,8 @@ Architecture, design decisions, and the measurements behind them:
   so past research is recallable.
 - **MCP server** — FastMCP over streamable HTTP (tool list [below](#mcp-tools)).
 - **Claude Code plugin** — ingest + recall wiring, plus a nightly dream→skills lane that
-  mines your transcripts to maintain a self-improving skill library, with two-way skill
-  sync. See [plugin/README.md](./plugin/README.md).
+  mines your transcripts to maintain a self-improving skill library, with opt-in two-way
+  skill sync (`SYNAPSE_SKILLS_SYNC=1`). See [plugin/README.md](./plugin/README.md).
 
 ## Stack
 

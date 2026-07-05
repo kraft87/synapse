@@ -19,7 +19,7 @@ Env vars (all optional):
   SYNAPSE_INGEST_URL    legacy override for /ingest  (else derived from SYNAPSE_URL)
   SYNAPSE_RECALL_URL    legacy override for /recall  (else derived)
   SYNAPSE_MCP_URL       legacy override for /mcp     (else derived)
-  SYNAPSE_SKILLS_SYNC   "0" disables the SessionStart skills sync (default on)
+  SYNAPSE_SKILLS_SYNC   "1" enables the SessionStart skills sync (default OFF — opt-in)
   SYNAPSE_CONFIG_SYNC   "1" enables config-file mirroring (default OFF — opt-in)
 """
 
@@ -148,9 +148,10 @@ SKILLS_URL = BASE_URL + "/skills"
 # env / userConfig wins; else a token fetched by `synapse login`.
 INGEST_TOKEN = _cfg("SYNAPSE_INGEST_TOKEN") or _cred("SYNAPSE_INGEST_TOKEN")
 
-# Skills sync: ON by default (two-way skill sync is a stated plugin feature); set
-# SYNAPSE_SKILLS_SYNC=0 to disable.
-SKILLS_SYNC = _cfg("SYNAPSE_SKILLS_SYNC", "1") != "0"
+# Skills sync: OFF by default — a hook that writes files into ~/.claude/skills on
+# every session start should be opt-in for a public plugin (issue #9). Set
+# SYNAPSE_SKILLS_SYNC=1 to enable two-way skill sync.
+SKILLS_SYNC = _cfg("SYNAPSE_SKILLS_SYNC", "0") not in ("", "0")
 
 # Config lane: OFF by default — mirroring your personal CLAUDE.md + rules/*.md to the server is
 # opt-in (set SYNAPSE_CONFIG_SYNC=1). When enabled, config_sync auto-discovers the well-known
@@ -160,7 +161,7 @@ CONFIG_SYNC = _cfg("SYNAPSE_CONFIG_SYNC", "0") != "0"
 CONFIG_PATHS = [g for g in re.split(r"[,\s]+", _cfg("SYNAPSE_CONFIG_PATHS", "")) if g]
 SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 
-_UA = "synapse-plugin/0.8"
+_UA = "synapse-plugin/0.9"
 
 
 def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:

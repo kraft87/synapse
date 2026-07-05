@@ -19,8 +19,9 @@ Scope routes the target dir:
 
 DSN-FREE: talks to the server's /skills/* HTTP routes (machine-token gated), never Postgres.
 Without a reachable server it is a silent no-op. Fail-open: never blocks/fails session start;
-emits reloadSkills only when something actually synced. Disable with SYNAPSE_SKILLS_SYNC=0
-(default on).
+emits reloadSkills only when something actually synced. OPT-IN: enable with
+SYNAPSE_SKILLS_SYNC=1 (default off — a hook that writes into ~/.claude/skills should
+never be a surprise, issue #9).
 """
 
 from __future__ import annotations
@@ -252,7 +253,7 @@ def _sync(scope: str, target_dir: Path) -> tuple[int, int]:
 
 def main() -> None:
     if not config.SKILLS_SYNC:
-        return  # opted out via SYNAPSE_SKILLS_SYNC=0
+        return  # opt-in feature; off unless SYNAPSE_SKILLS_SYNC=1
     try:
         n = _sync("global", config.SKILLS_DIR)
         proj = os.environ.get("CLAUDE_PROJECT_DIR")

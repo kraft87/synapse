@@ -3,9 +3,10 @@
 Resolution order (per _cfg): explicit env var → CLAUDE_PLUGIN_OPTION_* → the /plugin install
 answers persisted in settings.json (pluginConfigs."synapse@<marketplace>".options) → default.
 
-Privacy defaults (0.8.0): config mirroring — the user's global CLAUDE.md + rules/*.md — is
-OFF unless explicitly opted in (SYNAPSE_CONFIG_SYNC=1); skills sync stays ON (a stated
-feature) but has an off-switch (SYNAPSE_SKILLS_SYNC=0).
+Privacy defaults: config mirroring — the user's global CLAUDE.md + rules/*.md — is
+OFF unless explicitly opted in (SYNAPSE_CONFIG_SYNC=1); skills sync is OFF unless
+explicitly opted in (SYNAPSE_SKILLS_SYNC=1, issue #9 — a hook that writes into
+~/.claude/skills at session start must never be a surprise).
 """
 
 from __future__ import annotations
@@ -105,7 +106,14 @@ def test_config_sync_opt_in_via_settings(monkeypatch, tmp_path):
     assert cfg.CONFIG_SYNC is True
 
 
-def test_skills_sync_defaults_on_with_off_switch(monkeypatch, tmp_path):
-    assert _fresh_config(monkeypatch, tmp_path).SKILLS_SYNC is True
+def test_skills_sync_defaults_off_opt_in(monkeypatch, tmp_path):
+    assert _fresh_config(monkeypatch, tmp_path).SKILLS_SYNC is False
+    on = _fresh_config(monkeypatch, tmp_path, env={"SYNAPSE_SKILLS_SYNC": "1"})
+    assert on.SKILLS_SYNC is True
     off = _fresh_config(monkeypatch, tmp_path, env={"SYNAPSE_SKILLS_SYNC": "0"})
     assert off.SKILLS_SYNC is False
+
+
+def test_skills_sync_opt_in_via_settings(monkeypatch, tmp_path):
+    cfg = _fresh_config(monkeypatch, tmp_path, options={"SYNAPSE_SKILLS_SYNC": "1"})
+    assert cfg.SKILLS_SYNC is True
