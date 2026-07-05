@@ -270,6 +270,13 @@ def recall(
     user's message. Leave `project` unset by default (retrieval scopes itself);
     filter only when results come back noisy with another domain.
 
+    Served episode passages may carry `role`: "user" = the human stated it;
+    "assistant" = the agent's own prior output (assistant text, tool calls and
+    results); "mixed" = both. Old assistant-role text can be speculation or a
+    hypothetical plan that never happened — for "current state of X" questions,
+    weight newer user-stated content and dated timeline events over older
+    assistant-role passages, and treat every passage's `date` as load-bearing.
+
     Follow-ups: fetch_episode(id) expands a promising-but-truncated passage;
     recall_timeline() answers when-did / how-long questions; recall_episodes()
     returns exact raw turn text.

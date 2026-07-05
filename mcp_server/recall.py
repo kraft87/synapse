@@ -284,6 +284,50 @@ def _to_recall_item(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Provenance labeling (issue #17). Episode content is assembled from parts whose first
+# line carries a role marker ([user] .., [assistant] .., [tool:X] .., [result] ..,
+# [context] .., plus [title]/[attachments] on the claude.ai lane). Passage compaction
+# slices that content, so a served passage can lose its marker — and with it the only
+# signal that the text was the assistant's own past output (possibly speculation)
+# rather than something the user stated. _role_spans() recovers the marker layout;
+# _passage_role() maps a served char span back to who produced it: "user"
+# (human-stated, incl. attachments), "assistant" (agent-side: assistant text, tool
+# calls/results, carried [context]), or "mixed". Advisory metadata, fail-soft: text
+# before the first marker or in a marker-free episode gets no label, and chunk-offset
+# drift can only blur a label toward "mixed" — never an error.
+_ROLE_MARKER_RE = re.compile(
+    r"(?m)^\[(user|attachments|assistant|context|result|title|tool:[^\]\n]{0,80})\]"
+)
+_USER_MARKERS = {"user", "attachments"}
+
+
+def _role_spans(content: str) -> list[tuple[int, str]]:
+    """(offset, side) per recognized role marker, in order; side is "user"/"assistant".
+
+    [title] closes the previous region without opening an attributed one (it's a
+    neutral conversation-name header, not speech)."""
+    spans: list[tuple[int, str]] = []
+    for m in _ROLE_MARKER_RE.finditer(content):
+        tag = m.group(1)
+        side = "" if tag == "title" else ("user" if tag in _USER_MARKERS else "assistant")
+        spans.append((m.start(), side))
+    return spans
+
+
+def _passage_role(spans: list[tuple[int, str]], start: int, end: int) -> str | None:
+    """Which side(s) produced content[start:end]. None when unattributable."""
+    if not spans or end <= start:
+        return None
+    seen: set[str] = set()
+    for i, (off, side) in enumerate(spans):
+        nxt = spans[i + 1][0] if i + 1 < len(spans) else math.inf
+        if off < end and nxt > start and side:
+            seen.add(side)
+    if not seen:
+        return None
+    return seen.pop() if len(seen) == 1 else "mixed"
+
+
 _FETCH_MAX = 20  # max episodes fetch_episodes() will expand in one call (bounds the by-id read)
 
 
@@ -767,23 +811,32 @@ class Recall:
 
         passages: list[str] = []
         owner: list[dict[str, Any]] = []
+        bounds: list[tuple[int, int]] = []  # passage char span in its parent's content
+        role_spans: dict[int, list[tuple[int, str]]] = {}  # id(episode) -> marker layout
         for e in episodes:
             content = e.get("content") or ""
             if not content.strip():
                 continue
+            role_spans[id(e)] = _role_spans(content)
             try:
-                chunks = [c.content for c in chunk_markdown(content) if c.content.strip()]
+                chunks = [
+                    (c.content, c.char_start, c.char_end)
+                    for c in chunk_markdown(content)
+                    if c.content.strip()
+                ]
             except Exception:
-                chunks = [content]
-            for ch in chunks:
+                chunks = [(content, 0, len(content))]
+            for ch, lo, hi in chunks:
                 passages.append(ch)
                 owner.append(e)
+                bounds.append((lo, hi))
         if not passages:
             return []
         # Cap the rerank input so a pathologically long episode can't blow up the call.
         if len(passages) > _RECALL_PASSAGE_CAND:
             passages = passages[:_RECALL_PASSAGE_CAND]
             owner = owner[:_RECALL_PASSAGE_CAND]
+            bounds = bounds[:_RECALL_PASSAGE_CAND]
         # EXPERIMENT (env-gated): structural compaction v2.
         # SYNAPSE_PASSAGE_QUOTA=k caps served chunks per parent episode (slot allocation —
         # one loud session can't eat every slot). SYNAPSE_PASSAGE_WINDOW=w merges each
@@ -837,6 +890,10 @@ class Recall:
                 item["project"] = project
             if (ts := ep.get("created_at")) is not None:
                 item["date"] = str(ts)[:10]
+            # Provenance label (issue #17): who produced this slice of the turn —
+            # "user" / "assistant" / "mixed"; omitted when unattributable.
+            if role := _passage_role(role_spans[id(ep)], bounds[span[0]][0], bounds[span[-1]][1]):
+                item["role"] = role
             out.append(item)
         return out
 
