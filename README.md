@@ -25,6 +25,14 @@ knowledge-graph facts with the original episode.
 
 ![Claude Code answering from Synapse memory](docs/media/recall-demo.gif)
 
+## Benchmark
+
+**83.6%** on [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval) (500 questions,
+official gpt-4o reader + judge), using the deployed pipeline end to end — no bench-side
+content injection. Strongest categories: temporal reasoning 82.0%, knowledge-update 83.3%,
+single-session recall 96–100%. For reference, Zep/Graphiti reports 71.2%, Mastra 84.2%
+on the same reader class.
+
 ## How it works
 
 ```
