@@ -345,6 +345,7 @@ def recall_timeline(
     project: str | None = None,
     min_salience: int = 0,
     limit: int = 20,
+    group_id: str | None = None,
 ) -> dict:
     """The personal timeline: dated events that HAPPENED (commits, decisions, ships).
 
@@ -369,6 +370,9 @@ def recall_timeline(
         project: Optional project slug filter (e.g. "synapse").
         min_salience: 0 (all), 1 (skip routine), 2 (milestones only).
         limit: Max items for pure-time queries (post-collapse, default 20).
+        group_id: Scope — pass "personal" for questions about the user's own life
+            (health, appointments, purchases, career) to exclude technical/work
+            events; unset or "technical" serves everything.
     """
     with logfire.span(
         "mcp.recall_timeline {query!r}",
@@ -384,6 +388,7 @@ def recall_timeline(
             project=project,
             min_salience=min_salience,
             limit=limit,
+            group_id=group_id,
         )
 
 
