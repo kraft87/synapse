@@ -898,3 +898,24 @@ class Database:
                 """,
                 (error, queue_id),
             )
+
+    def log_dedup_gate_shadow(self, rows: list[tuple[Any, ...]]) -> None:
+        """Batch-insert Stage-6 gray-zone gate telemetry (schema 040, issue #14).
+
+        Row shape matches ingestion.extractor._gate_shadow_rows: (group_id, fact,
+        candidate_uuid, candidate_fact, pool, sim, decision, llm_duplicate,
+        llm_contradicted, llm_ran). Best-effort analysis data — the caller wraps
+        this in a try/except so a missing table pre-migration never blocks Stage 7.
+        """
+        if not rows:
+            return
+        with self._conn() as conn:
+            conn.cursor().executemany(
+                """
+                INSERT INTO dedup_gate_shadow
+                    (group_id, fact, candidate_uuid, candidate_fact, pool,
+                     sim, decision, llm_duplicate, llm_contradicted, llm_ran)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                rows,
+            )

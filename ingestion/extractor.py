@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import uuid
 from datetime import UTC, datetime
@@ -334,6 +335,137 @@ def dedupe_pools(
     pair_uuids = {item["uuid"] for item in pair_pool}
     filtered_semantic = [item for item in semantic_pool if item["uuid"] not in pair_uuids]
     return pair_pool, filtered_semantic
+
+
+# ---------------------------------------------------------------------------
+# Stage 6 gray-zone gate (issue #14) — embedding-similarity triage BEFORE the
+# stage-6b LLM confirm. Most dedup/contradiction candidate pairs aren't close
+# calls: similarity >= HIGH is an auto-merge, <= LOW an auto-new; only the gray
+# zone needs the LLM (the fattest per-item cost, 1-2 of the 3-6 round-trips).
+# Modes: 'shadow' (default — log would-be decisions vs actual LLM verdicts to
+# dedup_gate_shadow, change NOTHING) -> pick thresholds empirically -> 'enforce'.
+# ---------------------------------------------------------------------------
+
+
+def _dedup_gate_mode() -> str:
+    """SYNAPSE_DEDUP_GATE: 'shadow' (default) | 'enforce' | 'off'."""
+    mode = os.environ.get("SYNAPSE_DEDUP_GATE", "shadow").strip().lower()
+    return mode if mode in ("shadow", "enforce", "off") else "shadow"
+
+
+def _dedup_gate_thresholds() -> tuple[float, float]:
+    """(high, low) similarity bounds; env-tunable so enforcement can adopt the
+    thresholds the shadow window picks without a code change."""
+    try:
+        return (
+            float(os.environ.get("SYNAPSE_DEDUP_GATE_HIGH", "0.95")),
+            float(os.environ.get("SYNAPSE_DEDUP_GATE_LOW", "0.70")),
+        )
+    except ValueError:
+        return 0.95, 0.70
+
+
+def _gate_decisions(
+    pair_pool: list[dict[str, Any]],
+    semantic_pool: list[dict[str, Any]],
+    high: float,
+    low: float,
+) -> list[tuple[dict[str, Any], str, float | None, str]]:
+    """Per-candidate would-be decision from embedding similarity alone.
+
+    Returns (candidate, pool_name, sim, decision) tuples; decision is 'merge'
+    (sim >= high), 'new' (sim <= low) or 'gray'. A candidate with no ``_sim``
+    (BM25-only hit — no embedding signal) is always 'gray': the gate must never
+    silently drop a candidate it has no evidence about.
+    """
+    out: list[tuple[dict[str, Any], str, float | None, str]] = []
+    for pool_name, pool in (("pair", pair_pool), ("semantic", semantic_pool)):
+        for cand in pool:
+            sim = cand.get("_sim")
+            if sim is None:
+                decision = "gray"
+            elif sim >= high:
+                decision = "merge"
+            elif sim <= low:
+                decision = "new"
+            else:
+                decision = "gray"
+            out.append((cand, pool_name, sim, decision))
+    return out
+
+
+def _apply_gate_enforce(
+    gate_info: dict[int, list[tuple[dict[str, Any], str, float | None, str]]],
+) -> tuple[
+    dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    set[int],
+    dict[int, list[str]],
+]:
+    """Enforcement: shrink the LLM confirm to the gray zone.
+
+    A fact with any 'merge' candidate is resolved without the LLM: pre-skipped
+    as a duplicate, reinforcing every merge-zone match (the assert-count bump
+    still fires — Stage 7 consumes the reinforce map exactly as for an LLM-
+    confirmed duplicate, per PR #151). 'new' candidates are dropped from the
+    pools; a fact left with only gray candidates goes to the LLM as usual, and
+    one left with none skips the confirm entirely (auto-new).
+    """
+    gray_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
+    pre_skip: set[int] = set()
+    pre_reinforce: dict[int, list[str]] = {}
+    for idx, decisions in gate_info.items():
+        merged = [c["uuid"] for c, _pool, _sim, d in decisions if d == "merge"]
+        if merged:
+            pre_skip.add(idx)
+            pre_reinforce[idx] = merged
+            continue
+        gray_pair = [c for c, pool, _sim, d in decisions if d == "gray" and pool == "pair"]
+        gray_sem = [c for c, pool, _sim, d in decisions if d == "gray" and pool == "semantic"]
+        if gray_pair or gray_sem:
+            gray_map[idx] = (gray_pair, gray_sem)
+    return gray_map, pre_skip, pre_reinforce
+
+
+def _gate_shadow_rows(
+    facts: list[ExtractedFact],
+    gate_info: dict[int, list[tuple[dict[str, Any], str, float | None, str]]],
+    llm_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    group_id: str,
+    invalidate: dict[int, list[str]],
+    reinforce: dict[int, list[str]],
+    llm_ok: bool,
+) -> list[tuple[Any, ...]]:
+    """dedup_gate_shadow rows: the gate's would-be decision beside the LLM's
+    actual verdict, one row per (fact, candidate). Verdict columns are NULL
+    unless the LLM batch succeeded AND this candidate was in the pools it saw
+    (llm_ran) — failed batches and enforcement-dropped candidates must not
+    pollute the threshold analysis as false "LLM said no" rows."""
+    rows: list[tuple[Any, ...]] = []
+    for idx, decisions in gate_info.items():
+        sent = llm_map.get(idx)
+        sent_uuids = {c["uuid"] for pool in sent for c in pool} if sent else set()
+        dup = set(reinforce.get(idx, []))
+        contra = set(invalidate.get(idx, []))
+        for cand, pool_name, sim, decision in decisions:
+            cand_uuid = cand.get("uuid")
+            if not cand_uuid:
+                continue
+            ran = bool(llm_ok and cand_uuid in sent_uuids)
+            rows.append(
+                (
+                    group_id,
+                    facts[idx].fact[:500],
+                    cand_uuid,
+                    (cand.get("fact") or "")[:500],
+                    pool_name,
+                    round(sim, 4) if sim is not None else None,
+                    decision,
+                    (cand_uuid in dup) if ran else None,
+                    (cand_uuid in contra) if ran else None,
+                    ran,
+                )
+            )
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -1162,12 +1294,23 @@ class ExtractionPipeline:
             pair_pool: list[dict[str, Any]] = []
             if src_uuid and tgt_uuid:
                 pair_pool = list(self._kg.find_edges_by_pair(src_uuid, tgt_uuid, group_id))
+            # Gray-zone gate signal (issue #14): tag every candidate that has an
+            # embedding with its cosine similarity to the new fact. Pair-pool rows
+            # return their stored embedding; computed here, in-process, no extra I/O.
+            for cand in pair_pool:
+                emb = cand.get("fact_embedding")
+                cand["_sim"] = _cosine_similarity(fact_emb, emb) if emb else None
 
             # Semantic pool — RRF over vector + BM25 hits. Pull 2x the eventual
             # cap from each modality so the long tail of moderate-rank entries
             # in both lists has a chance to win the merge.
             _src_limit = _SEMANTIC_POOL_LIMIT * 2
             vector_hits = self._kg.find_similar_edges(fact_emb, group_id, limit=_src_limit)
+            # Vector hits carry cosine DISTANCE as "score" (kg_pg_read) — convert once
+            # here so the gate sees one signal. BM25-only hits stay untagged (_sim
+            # None -> always gray/LLM-confirmed; their score isn't comparable).
+            for cand in vector_hits:
+                cand["_sim"] = 1.0 - float(cand.get("score") or 0.0)
             fulltext_hits = self._kg.find_edges_by_fulltext(fact.fact, group_id, limit=_src_limit)
             semantic_pool = rrf_merge(vector_hits, fulltext_hits, limit=_SEMANTIC_POOL_LIMIT, k=1)
 
@@ -1234,7 +1377,7 @@ class ExtractionPipeline:
         self,
         facts: list[ExtractedFact],
         candidates_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
-    ) -> tuple[set[int], dict[int, list[str]], dict[int, list[str]]]:
+    ) -> tuple[set[int], dict[int, list[str]], dict[int, list[str]], bool]:
         """Batched version of _stage6b_llm_confirm.
 
         Collects every (fact, pools) entry with at least one candidate and
@@ -1244,14 +1387,17 @@ class ExtractionPipeline:
         per-fact version's bare except — a missed contradiction is
         recoverable; blocking the new write is not).
 
-        Returns (skip_indices, invalidate, reinforce): skip_indices = new facts
-        to skip (pure duplicates), invalidate = {new_idx: [contradicted edge
-        uuids]}, reinforce = {new_idx: [matched existing edge uuids]} for the
-        skipped duplicates — the dedup-hit signal Stage 7 uses to bump
+        Returns (skip_indices, invalidate, reinforce, ok): skip_indices = new
+        facts to skip (pure duplicates), invalidate = {new_idx: [contradicted
+        edge uuids]}, reinforce = {new_idx: [matched existing edge uuids]} for
+        the skipped duplicates — the dedup-hit signal Stage 7 uses to bump
         mention_count + union episodes instead of dropping the re-assertion.
+        ok=False means the LLM call/parse failed (fail-closed empties) — the
+        gray-zone gate's shadow log uses it to keep failed batches out of the
+        threshold-analysis data (issue #14).
         """
         if not candidates_map:
-            return set(), {}, {}
+            return set(), {}, {}, True
 
         items = [
             {
@@ -1274,10 +1420,10 @@ class ExtractionPipeline:
             raw = response.content[0].text.strip()
             start = raw.find("{")
             if start < 0:
-                return set(), {}, {}
+                return set(), {}, {}, False
             data, _ = json.JSONDecoder().raw_decode(raw[start:])
         except Exception:
-            return set(), {}, {}
+            return set(), {}, {}, False
 
         skip_indices: set[int] = set()
         invalidate: dict[int, list[str]] = {}
@@ -1299,7 +1445,7 @@ class ExtractionPipeline:
                 reinforce[fid] = pure_duplicates
             if contradicted:
                 invalidate[fid] = contradicted
-        return skip_indices, invalidate, reinforce
+        return skip_indices, invalidate, reinforce, True
 
     def _stage7_write_edges(
         self,
@@ -1761,6 +1907,23 @@ class ExtractionPipeline:
             with logfire.span("stage6a_embedding_filter"):
                 candidates_map = self._stage6a_embedding_filter(facts, uuid_map, group_id)
 
+            # Gray-zone gate (issue #14): triage candidates on the similarity 6a
+            # already computed. shadow = log would-be decisions, change nothing;
+            # enforce = only the gray zone reaches the LLM confirm below.
+            gate_mode = _dedup_gate_mode()
+            gate_info: dict[int, list[tuple[dict[str, Any], str, float | None, str]]] = {}
+            pre_skip: set[int] = set()
+            pre_reinforce: dict[int, list[str]] = {}
+            llm_map = candidates_map
+            if gate_mode != "off" and candidates_map:
+                high, low = _dedup_gate_thresholds()
+                gate_info = {
+                    idx: _gate_decisions(pair_pool, semantic_pool, high, low)
+                    for idx, (pair_pool, semantic_pool) in candidates_map.items()
+                }
+                if gate_mode == "enforce":
+                    llm_map, pre_skip, pre_reinforce = _apply_gate_enforce(gate_info)
+
             # Pre-embed fact texts for Stage 7
             with logfire.span("voyage_embed_facts {n}", n=len(facts)):
                 fact_embeddings_list = self._embedder.embed(
@@ -1773,13 +1936,31 @@ class ExtractionPipeline:
             # for callers that need single-fact confirmation (e.g. dream writes).
             with logfire.span(
                 "stage6b_batch_confirm cands={cands}",
-                cands=len(candidates_map),
+                cands=len(llm_map),
             ) as span:
-                skip_indices, invalidate, reinforce = self._stage6b_batch_confirm(
-                    facts, candidates_map
+                skip_indices, invalidate, reinforce, llm_ok = self._stage6b_batch_confirm(
+                    facts, llm_map
                 )
+                skip_indices |= pre_skip
+                for idx, uuids in pre_reinforce.items():
+                    reinforce[idx] = uuids
                 span.set_attribute("skipped", len(skip_indices))
                 span.set_attribute("invalidated", sum(len(v) for v in invalidate.values()))
+                span.set_attribute("gate_mode", gate_mode)
+                span.set_attribute("gate_pre_skipped", len(pre_skip))
+
+            # Shadow log: one row per (fact, candidate) with the gate's would-be
+            # decision next to the LLM's actual verdict — the threshold-picking
+            # data for enforcement. Best-effort; never blocks the pipeline.
+            if gate_info:
+                try:
+                    self._db.log_dedup_gate_shadow(
+                        _gate_shadow_rows(
+                            facts, gate_info, llm_map, group_id, invalidate, reinforce, llm_ok
+                        )
+                    )
+                except Exception as e:
+                    logger.debug("dedup gate shadow log failed: %s", e)
 
             # Stage 7: write edges
             with logfire.span("stage7_write_edges {n}", n=len(facts)):
