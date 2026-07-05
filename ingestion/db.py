@@ -198,6 +198,61 @@ class Database:
                 ),
             ).rowcount
 
+    def timeline_near_candidates(
+        self,
+        embedding: list[float],
+        project: str | None,
+        t_valid: str,
+        exclude_episode_ref: str,
+        window_days: int = 14,
+        max_dist: float = 0.20,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Nearest same-project chat events within ±window_days of ``t_valid`` and
+        under ``max_dist`` cosine distance — the dedup confirm call's candidate pool.
+        Excludes the new event's own turn (the ``ep:<id>`` base ref and its ``#k``
+        siblings): a turn's multiple events are intentionally distinct, never dups."""
+        vlit = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, fact, t_valid, source_ref, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"       (embedding <=> %s::vector({_EMBED_DIMS})) AS dist "
+                "FROM timeline_events "
+                "WHERE source = 'chat' AND project IS NOT DISTINCT FROM %s "
+                "AND embedding IS NOT NULL "
+                "AND source_ref != %s AND source_ref NOT LIKE %s "
+                "AND t_valid BETWEEN %s::timestamptz - make_interval(days => %s) "
+                "                AND %s::timestamptz + make_interval(days => %s) "
+                f"AND (embedding <=> %s::vector({_EMBED_DIMS})) < %s "
+                "ORDER BY dist LIMIT %s",
+                (
+                    vlit,
+                    project,
+                    exclude_episode_ref,
+                    exclude_episode_ref + "#%",
+                    t_valid,
+                    window_days,
+                    t_valid,
+                    window_days,
+                    vlit,
+                    max_dist,
+                    limit,
+                ),
+            ).fetchall()
+        return cast(list[dict[str, Any]], rows)
+
+    def bump_timeline_reported(self, event_id: int, t_valid: str) -> None:
+        """Record a re-assertion of an existing timeline event (dedup merge outcome):
+        increment reported_count and keep the EARLIEST t_valid — the canonical date of
+        a date-split re-telling is the first-resolved one, and a re-tell that resolves
+        an earlier true date corrects the row."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE timeline_events SET reported_count = reported_count + 1, "
+                "t_valid = LEAST(t_valid, %s::timestamptz) WHERE id = %s",
+                (t_valid, event_id),
+            )
+
     def timeline_ident_exists(
         self, idents: list[str], project: str | None, t_valid: str, window_hours: int
     ) -> bool:

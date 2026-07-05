@@ -274,3 +274,130 @@ def test_future_gate_date_falls_back_to_turn_timestamp(monkeypatch):
         {"event": "shipped it", "salience": 1, "event_type": "action", "date": "2027-01-01"},
     )
     assert ins[0]["t_valid"] == "2026-07-02T10:00:00+00:00"
+
+
+# ---- dedup confirm-merge (write-time, schema 037) ----
+
+
+def test_parse_verdict():
+    from ingestion.timeline_gate import _parse_verdict
+
+    assert _parse_verdict(" same\n") == "SAME"
+    assert _parse_verdict("DISTINCT.") == "DISTINCT"
+    with pytest.raises(MalformedResponseError):
+        _parse_verdict("maybe?")
+
+
+class _DedupDb(_Rec):
+    """_Rec plus the dedup surface: a configurable candidate pool + bump recorder."""
+
+    def __init__(self, cands):
+        super().__init__(exists=False)
+        self._cands = cands
+        self.bumped = []
+
+    def timeline_near_candidates(self, *a, **k):
+        return self._cands
+
+    def bump_timeline_reported(self, event_id, t_valid):
+        self.bumped.append((event_id, t_valid))
+
+    def get_episode(self, episode_id):
+        return {"content": f"full source turn text for ep {episode_id}"}
+
+
+_CAND = [
+    {
+        "id": 42,
+        "fact": "tried a new bread recipe (reported as 'on Tuesday')",
+        "t_valid": "2026-06-30T10:00:00+00:00",
+        "source_ref": "ep:9",
+        "dist": 0.04,
+    }
+]
+
+
+def _dedup_gate(monkeypatch, cands, verdicts, dedup_env="1"):
+    """Drive one gated event through the dedup path with scripted confirm verdicts."""
+    import ingestion.timeline_gate as tg
+
+    monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
+    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", dedup_env)
+    db = _DedupDb(cands)
+    g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
+    monkeypatch.setattr(
+        tg,
+        "parse_with_retry",
+        lambda *a, **k: [
+            {
+                "event": "baked sourdough bread (reported as 'on Tuesday')",
+                "salience": 1,
+                "event_type": None,
+                "date": None,
+            }
+        ],
+    )
+    seq = iter(verdicts)
+    g._confirm_same = lambda a, b: next(seq)  # scripted; StopIteration = unexpected call
+    g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "p"})
+    return db
+
+
+def test_both_orders_same_merges_instead_of_inserting(monkeypatch):
+    db = _dedup_gate(monkeypatch, _CAND, [True, True])
+    assert db.inserted == []
+    assert db.bumped == [(42, "2026-07-02T10:00:00+00:00")]
+
+
+def test_order_flip_keeps_the_event(monkeypatch):
+    db = _dedup_gate(monkeypatch, _CAND, [True, False])
+    assert len(db.inserted) == 1
+    assert db.bumped == []
+
+
+def test_distinct_keeps_the_event(monkeypatch):
+    # first order says DISTINCT -> short-circuits, second call never made
+    db = _dedup_gate(monkeypatch, _CAND, [False])
+    assert len(db.inserted) == 1
+
+
+def test_no_candidates_skips_confirm_entirely(monkeypatch):
+    # empty verdict script: any confirm call would StopIteration -> swallowed -> no insert.
+    db = _dedup_gate(monkeypatch, [], [])
+    assert len(db.inserted) == 1
+
+
+def test_dedup_kill_switch(monkeypatch):
+    # candidates present and confirms would say SAME, but the env gate is off
+    db = _dedup_gate(monkeypatch, _CAND, [True, True], dedup_env="0")
+    assert len(db.inserted) == 1
+    assert db.bumped == []
+
+
+def test_dedup_db_error_fails_soft_to_insert(monkeypatch):
+    # _Rec has no timeline_near_candidates at all -> AttributeError inside the
+    # dedup path -> logged, event inserts normally (dup cheaper than lost event)
+    ins = _gated(monkeypatch, "decided the failure mode is acceptable", exists=False)
+    assert len(ins) == 1
+
+
+def test_missing_candidate_turn_means_no_merge(monkeypatch):
+    class _NoTurn(_DedupDb):
+        def get_episode(self, episode_id):
+            return None
+
+    import ingestion.timeline_gate as tg
+
+    monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
+    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "1")
+    db = _NoTurn(_CAND)
+    g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
+    monkeypatch.setattr(
+        tg,
+        "parse_with_retry",
+        lambda *a, **k: [{"event": "did a thing", "salience": 1, "event_type": None, "date": None}],
+    )
+    g._confirm_same = lambda a, b: (_ for _ in ()).throw(AssertionError("no turn -> no confirm"))
+    g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "p"})
+    assert len(db.inserted) == 1
+    assert db.bumped == []
