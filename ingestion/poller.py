@@ -8,7 +8,11 @@ embeddings, and KG extraction (facts are extracted from chunks)."""
 from __future__ import annotations
 
 import logging
+import os
+import threading
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
 from ingestion.db import Database
@@ -20,14 +24,33 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _drain_concurrency() -> int:
+    """In-worker drain concurrency (issue #13). Per-item extraction time is ~all
+    network wait (3-6 dependent LLM calls), so running the claimed batch
+    concurrently is ~batch_limit-fold throughput per worker at the same RAM. Default 4;
+    SYNAPSE_DRAIN_CONCURRENCY=1 is the serial kill switch."""
+    try:
+        return max(1, int(os.environ.get("SYNAPSE_DRAIN_CONCURRENCY", "4") or "1"))
+    except ValueError:
+        return 1
+
+
 class Poller:
     def __init__(
         self,
         db: Database,
         extraction_pipeline: ExtractionPipeline | None = None,
+        worker_factory: Callable[[], tuple[Database, ExtractionPipeline]] | None = None,
     ) -> None:
         self._db = db
         self._extraction = extraction_pipeline
+        # Per-THREAD (db, pipeline) builder for the concurrent drain path: Database
+        # holds one non-autocommit connection whose commit/rollback would entangle
+        # transactions if shared across threads, so each drain worker thread gets its
+        # own stack (lazily, on its first item). None -> drain always runs serial.
+        self._worker_factory = worker_factory
+        self._worker_local = threading.local()
+        self._drain_pool: ThreadPoolExecutor | None = None
 
     def embed_pending(self, batch_size: int = 96) -> int:
         """Embed unembedded episodes and chunks.
@@ -127,6 +150,12 @@ class Poller:
         of pending items via ``FOR UPDATE SKIP LOCKED`` and the rows flip
         to ``status='processing'`` for the duration.
 
+        The claimed batch itself runs concurrently when a ``worker_factory``
+        was provided and SYNAPSE_DRAIN_CONCURRENCY > 1 (issue #13): per-item
+        work is ~all LLM network wait, so a thread per in-flight item is
+        ~batch_limit-fold throughput at the same RAM. Failure stays item-isolated —
+        one bad item marks failed without touching the rest of the batch.
+
         On UsageLimitError (Claude usage cap hit) the offending item and
         every still-claimed item in the current batch are released back to
         ``pending`` so another replica (or this one on the next cycle) can
@@ -135,14 +164,27 @@ class Poller:
         if self._extraction is None:
             return 0
 
-        import logfire
-
-        from ingestion.llm_client import UsageLimitError
-
         items = self._db.claim_pending_extractions(limit=batch_limit)
         if not items:
             return 0
 
+        concurrency = _drain_concurrency() if self._worker_factory is not None else 1
+        if concurrency > 1 and len(items) > 1:
+            processed = self._drain_concurrent(items, concurrency)
+        else:
+            processed = self._drain_serial(items)
+
+        if processed:
+            logger.info("Drained %d extraction items", processed)
+        return processed
+
+    def _drain_serial(self, items: list[dict[str, Any]]) -> int:
+        """The original strictly-serial batch path (SYNAPSE_DRAIN_CONCURRENCY=1)."""
+        import logfire
+
+        from ingestion.llm_client import UsageLimitError
+
+        assert self._extraction is not None
         unfinished: list[int] = [int(item["id"]) for item in items]
         processed = 0
         for item in items:
@@ -174,10 +216,74 @@ class Poller:
                 logger.error("Extraction failed for queue_id=%d: %s", queue_id, e, exc_info=True)
                 self._db.mark_extraction_failed(queue_id, str(e)[:500])
                 unfinished.remove(queue_id)
-
-        if processed:
-            logger.info("Drained %d extraction items", processed)
         return processed
+
+    def _thread_worker(self) -> tuple[Database, ExtractionPipeline]:
+        """This thread's own (db, pipeline), built lazily on first use. The pool's
+        threads persist across drain cycles, so connections are reused, not churned."""
+        assert self._worker_factory is not None
+        stack = getattr(self._worker_local, "stack", None)
+        if stack is None:
+            stack = self._worker_factory()
+            self._worker_local.stack = stack
+        return stack
+
+    def _drain_concurrent(self, items: list[dict[str, Any]], concurrency: int) -> int:
+        """Run the claimed batch through the persistent drain pool.
+
+        Per-item failure isolation: an ordinary failure marks THAT item failed and
+        never releases the rest of the batch. A UsageLimitError marks the batch's
+        quota_hit event so queued-but-unstarted items skip their LLM attempt; every
+        quota-hit item is released back to ``pending`` and UsageLimitError is
+        re-raised so run_loop backs off — the same contract as the serial path.
+        """
+        import logfire
+
+        from ingestion.llm_client import UsageLimitError
+
+        if self._drain_pool is None:
+            self._drain_pool = ThreadPoolExecutor(
+                max_workers=concurrency, thread_name_prefix="drain"
+            )
+        quota_hit = threading.Event()
+
+        def _one(item: dict[str, Any]) -> tuple[int, str]:
+            queue_id = int(item["id"])
+            if quota_hit.is_set():
+                return queue_id, "quota"  # don't burn an attempt on a known-dead window
+            db, pipeline = self._thread_worker()
+            try:
+                with logfire.span(
+                    "process_item qid={qid} {ct}",
+                    qid=queue_id,
+                    ct=item.get("content_type"),
+                    project=item.get("project"),
+                ):
+                    pipeline.process_item(dict(item))
+                db.mark_extraction_done(queue_id)
+                logger.debug("Extraction done for queue_id=%d", queue_id)
+                return queue_id, "done"
+            except UsageLimitError as e:
+                quota_hit.set()
+                logger.warning("Usage limit hit at queue_id=%d (%s)", queue_id, str(e)[:200])
+                return queue_id, "quota"
+            except Exception as e:
+                logger.error("Extraction failed for queue_id=%d: %s", queue_id, e, exc_info=True)
+                try:
+                    db.mark_extraction_failed(queue_id, str(e)[:500])
+                except Exception:
+                    logger.exception("Could not mark queue_id=%d failed", queue_id)
+                return queue_id, "failed"
+
+        results = list(self._drain_pool.map(_one, items))
+        quota_ids = [qid for qid, status in results if status == "quota"]
+        if quota_ids:
+            logger.warning(
+                "Releasing %d quota-hit item(s) back to pending for retry", len(quota_ids)
+            )
+            self._db.release_claims(quota_ids)
+            raise UsageLimitError(f"usage limit hit on {len(quota_ids)} item(s) in batch")
+        return sum(1 for _, status in results if status == "done")
 
     def run_loop(self, interval_seconds: int = 300, project: str | None = None) -> None:
         """Run continuously.
@@ -221,6 +327,8 @@ class Poller:
         # drains — and (b) keeps legit in-progress rows 'processing' long enough that the
         # stale-claim sweep would wrongly release them. 8 items x ~3-4 min ~= a ~30 min batch:
         # new ingest preempts within one batch, and the 45 min stale threshold stays safe.
+        # In-worker concurrency (issue #13) only shortens the batch wall-clock — both
+        # properties get strictly safer, so the limit stays sized for the serial worst case.
         drain_batch_limit = 8
         prev_drained = 0
         quota_backoff = 0  # seconds; grows while the Max quota window is exhausted, 0 when healthy
@@ -304,4 +412,20 @@ def make_poller(
         kg_client=KGClient(),
         llm_model=llm_model,
     )
-    return Poller(db=db, extraction_pipeline=pipeline)
+
+    def _worker() -> tuple[Database, ExtractionPipeline]:
+        # A drain worker THREAD's own stack (issue #13): Database is single-
+        # connection/non-autocommit and the pipeline writes through it, so neither
+        # can be shared across concurrently-running items. All constructors are
+        # cheap (lazy PG connects, HTTP clients) — built once per pool thread.
+        wdb = Database(db_url)
+        wpipe = ExtractionPipeline(
+            db=wdb,
+            llm_client=create_llm_client(),
+            embedder=create_embedder(voyage_api_key=voyage_api_key, db_url=db_url),
+            kg_client=KGClient(),
+            llm_model=llm_model,
+        )
+        return wdb, wpipe
+
+    return Poller(db=db, extraction_pipeline=pipeline, worker_factory=_worker)
