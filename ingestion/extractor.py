@@ -715,10 +715,13 @@ class EntityResolver:
         similarity_threshold: float = 0.85,
         autoconfirm_threshold: float = 0.95,
     ) -> None:
+        from ingestion.llm_client import stage_model
+
         self._embedder = embedder
         self._llm = llm_client
         self._threshold = similarity_threshold
         self._autoconfirm = autoconfirm_threshold
+        self._confirm_model = stage_model("DEDUP", self._CONFIRM_MODEL)
 
     def resolve(
         self,
@@ -827,6 +830,7 @@ class EntityResolver:
 
     # Binary "same entity?" classification — use Haiku, not Sonnet.
     # ~10x cheaper, accuracy is fine for a short structured decision.
+    # Overridable via SYNAPSE_DEDUP_MODEL (it's a duplicate decision).
     _CONFIRM_MODEL = "claude-haiku-4-5"
 
     def _batch_confirm(
@@ -879,7 +883,7 @@ class EntityResolver:
         max_tokens = min(4096, 128 + 24 * len(pending))
         try:
             response = self._llm.messages.create(
-                model=self._CONFIRM_MODEL,
+                model=self._confirm_model,
                 max_tokens=max_tokens,
                 messages=build_batch_prompt(items),
                 response_format=BATCH_NODE_DEDUP_SCHEMA,
@@ -967,15 +971,22 @@ class ExtractionPipeline:
         llm_client: Any,
         embedder: EmbeddingModel,
         kg_client: Any,
-        llm_model: str = "claude-haiku-4-5",
+        llm_model: str | None = None,
     ) -> None:
         from ingestion.contradiction import ContradictionDetector
         from ingestion.edge_dates import EdgeDateExtractor
+        from ingestion.llm_client import DEFAULT_MODEL, stage_model
+
+        # Per-stage model resolution (issue #8): SYNAPSE_<STAGE>_MODEL env
+        # beats SYNAPSE_LLM_MODEL beats the ``llm_model`` param / code default.
+        base = llm_model or DEFAULT_MODEL
 
         self._db = db
         self._det = DeterministicExtractor()
-        self._llm = LLMExtractor(llm_client=llm_client, model=llm_model)
+        self._llm = LLMExtractor(llm_client=llm_client, model=stage_model("EXTRACTOR", base))
         self._resolver = EntityResolver(embedder=embedder, llm_client=llm_client)
+        # Stage-6b write-time contradiction/duplicate confirm calls.
+        self._contradiction_model = stage_model("CONTRADICTION", base)
         self._kg = kg_client
         self._embedder = embedder
         # Phase 3: writer-side bi-temporal contradiction safety net. Runs
@@ -988,7 +999,7 @@ class ExtractionPipeline:
             kg_client=kg_client,
             embedder=embedder,
             llm_client=llm_client,
-            model=llm_model,
+            model=self._contradiction_model,
         )
         # Phase 4: LLM-driven temporal-bounds extractor (Graphiti verbatim
         # `extract_timestamps`). Reads valid_at / invalid_at out of the
@@ -997,7 +1008,7 @@ class ExtractionPipeline:
         # the write path is never blocked by date extraction.
         self._edge_date_extractor = EdgeDateExtractor(
             llm_client=llm_client,
-            model=llm_model,
+            model=stage_model("EDGE_DATES", base),
         )
         # Timeline chat gate (schema 033): per-turn "did something happen?" check on
         # episode-type items -> naked dated events in timeline_events. Fail-soft and
@@ -1005,7 +1016,7 @@ class ExtractionPipeline:
         from ingestion.timeline_gate import TimelineGate
 
         self._timeline_gate = TimelineGate(
-            db=db, llm_client=llm_client, embedder=embedder, model=llm_model
+            db=db, llm_client=llm_client, embedder=embedder, model=stage_model("TIMELINE", base)
         )
         # Preferences chat gate (schema 035): per-turn "did the user assert a durable
         # preference?" check on episode-type items -> reconciled rows in `preferences`.
@@ -1014,7 +1025,7 @@ class ExtractionPipeline:
         from ingestion.preferences_gate import PreferencesGate
 
         self._preferences_gate = PreferencesGate(
-            db=db, llm_client=llm_client, embedder=embedder, model=llm_model
+            db=db, llm_client=llm_client, embedder=embedder, model=stage_model("PREFERENCES", base)
         )
 
     # ------------------------------------------------------------------
@@ -1195,7 +1206,7 @@ class ExtractionPipeline:
             # Triple classification on short fact pairs — Haiku is sufficient
             # and ~10x cheaper than Sonnet.
             response = self._llm._client.messages.create(
-                model="claude-haiku-4-5",
+                model=self._contradiction_model,
                 max_tokens=300,
                 messages=[{"role": "user", "content": prompt}],
                 response_format=_CONTRADICTION_SCHEMA,
@@ -1255,7 +1266,7 @@ class ExtractionPipeline:
 
         try:
             response = self._llm._client.messages.create(
-                model="claude-haiku-4-5",
+                model=self._contradiction_model,
                 max_tokens=300 * max(1, len(items)),
                 messages=[{"role": "user", "content": prompt}],
                 response_format=_BATCH_CONTRADICTION_SCHEMA,

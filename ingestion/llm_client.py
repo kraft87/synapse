@@ -23,9 +23,13 @@ Plus an alternative backend for users without a Claude subscription:
         SYNAPSE_LLM_API_KEY=...             # blank OK for keyless endpoints (Ollama)
         SYNAPSE_LLM_MODEL=...               # default: anthropic/claude-haiku-4.5
 
-    Single-model mode: ``SYNAPSE_LLM_MODEL`` overrides every per-call
-    model name, because call sites pass Claude-specific ids like
-    ``claude-haiku-4-5`` that other providers don't recognise.
+    Model resolution: every pipeline stage resolves its model through
+    ``stage_model()`` — ``SYNAPSE_<STAGE>_MODEL`` beats ``SYNAPSE_LLM_MODEL``
+    beats the stage's code default. In openai mode a per-call model is
+    honored only when the call site chose one (stage envs produce
+    provider-valid ids); the bare Claude code default falls back to the
+    client's configured model, so legacy call sites can't send an id the
+    provider doesn't recognise.
 
   * ``create_llm_client`` — the factory every construction site goes
     through; picks the backend from ``SYNAPSE_LLM_PROVIDER``.
@@ -546,11 +550,13 @@ class _OpenAIMessagesProxy:
         response_format: dict[str, Any] | None = None,
     ) -> _Response:
         c = self._client
-        # Single-model mode: the configured model ALWAYS wins over the
-        # per-call name. Call sites pass Claude-specific ids
-        # ("claude-haiku-4-5", "claude-opus-4-8") that OpenRouter/Ollama
-        # don't recognise; ``model`` is accepted only for interface parity.
-        del model
+        # Per-call model: honored when the call site chose one explicitly —
+        # stage_model() resolutions are provider-valid by construction. The
+        # bare Claude code default is the "unspecified" sentinel (call sites
+        # that never chose, e.g. parse_with_retry's default) and maps to the
+        # client's single configured model, which this provider recognises.
+        if not model or model == DEFAULT_MODEL:
+            model = c.model
 
         chat_messages: list[dict[str, str]] = []
         if system:
@@ -571,7 +577,7 @@ class _OpenAIMessagesProxy:
             chat_messages.append({"role": role, "content": content})
 
         payload: dict[str, Any] = {
-            "model": c.model,
+            "model": model,
             "messages": chat_messages,
             "max_tokens": max_tokens,
             "stream": False,
@@ -665,6 +671,30 @@ class OpenAIChatClient:
 # ---------------------------------------------------------------------------
 
 
+def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
+    """Resolve the LLM model for a named pipeline stage (issue #8).
+
+    Precedence: ``SYNAPSE_<STAGE>_MODEL`` → ``SYNAPSE_LLM_MODEL`` → *default*
+    (in openai-provider mode the fallback is ``DEFAULT_OPENAI_MODEL``, never a
+    bare Claude id the provider wouldn't recognise).
+
+    Stages: EXTRACTOR, TIMELINE, PREFERENCES, DEDUP, CONTRADICTION,
+    EDGE_DATES, DREAM, QUERY_GRAPH. The A/B work behind this (Flash-vs-Haiku,
+    DeepSeek-vs-Haiku) showed model choice matters per stage — a cheap model
+    can be fine for binary confirms while extraction wants a stronger one.
+    """
+    v = os.environ.get(f"SYNAPSE_{stage.upper()}_MODEL", "").strip()
+    if v:
+        return v
+    v = os.environ.get("SYNAPSE_LLM_MODEL", "").strip()
+    if v:
+        return v
+    provider = os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
+    if provider == "openai":
+        return DEFAULT_OPENAI_MODEL
+    return default
+
+
 def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAIChatClient:
     """Build the extraction LLM client from env. All construction sites route here.
 
@@ -676,9 +706,10 @@ def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAICha
       the per-client default Claude model name.
     * ``openai`` — ``OpenAIChatClient`` against
       ``SYNAPSE_LLM_BASE_URL`` (default OpenRouter) with
-      ``SYNAPSE_LLM_API_KEY``, always using ``SYNAPSE_LLM_MODEL``
-      (single-model mode — the ``model`` argument and all per-call Claude
-      model names are ignored).
+      ``SYNAPSE_LLM_API_KEY``; ``SYNAPSE_LLM_MODEL`` is the configured
+      default model. Per-call models resolved via ``stage_model()``
+      (``SYNAPSE_<STAGE>_MODEL``) are honored; unresolved per-call Claude
+      ids fall back to the configured model.
     """
     provider = os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
     if provider in ("", "claude-code"):

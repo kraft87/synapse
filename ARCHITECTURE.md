@@ -668,6 +668,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_RECALL_TIMELINE` | `1` | include the timeline leg in `recall()` (`0` = off) |
 | `SYNAPSE_TIMELINE_GROUP_SCOPE` | `1` | `group_id="personal"` filters timeline serving to personal-domain events (`0` = never filter) |
 | `SYNAPSE_SCHEMA_CHECK` | `1` | boot-time guard: refuse to start when the database schema is behind the code (`0` = skip) |
+| `SYNAPSE_<STAGE>_MODEL` | unset | per-stage LLM override (stages: `EXTRACTOR`, `TIMELINE`, `PREFERENCES`, `DEDUP`, `CONTRADICTION`, `EDGE_DATES`, `DREAM`, `QUERY_GRAPH`, `SKILLS`); falls back to `SYNAPSE_LLM_MODEL`, then the stage default — see `.env.example` |
 | `SYNAPSE_KG_OWNER_ID` | `default` | `owner_id` scope for all KG reads/writes (multi-tenant seam) |
 
 ### Ingestion & extraction

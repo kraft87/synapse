@@ -36,6 +36,7 @@ from ingestion.llm_client import (
     UsageLimitError,
     create_llm_client,
     parse_with_retry,
+    stage_model,
 )
 
 _API_KEY = "sk-or-test-SECRET-key"
@@ -107,6 +108,31 @@ class TestProviderSelection:
         assert isinstance(client, OpenAIChatClient)
         assert client.model == "qwen2.5:14b"
         assert "localhost:11434" in str(client.http.base_url)
+
+    def test_stage_env_beats_global_env(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_EXTRACTOR_MODEL", "per-stage/model")
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
+        assert stage_model("EXTRACTOR") == "per-stage/model"
+        assert stage_model("extractor") == "per-stage/model"  # case-insensitive stage
+
+    def test_global_env_beats_default(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_EXTRACTOR_MODEL", raising=False)
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
+        assert stage_model("EXTRACTOR", "claude-haiku-4-5") == "global/model"
+
+    def test_default_when_no_env_claude_code(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_EXTRACTOR_MODEL", raising=False)
+        monkeypatch.delenv("SYNAPSE_LLM_MODEL", raising=False)
+        monkeypatch.delenv("SYNAPSE_LLM_PROVIDER", raising=False)
+        assert stage_model("EXTRACTOR", "claude-opus-4-8") == "claude-opus-4-8"
+
+    def test_default_when_no_env_openai_is_provider_valid(self, monkeypatch):
+        # In openai mode an unset stage must never resolve to a bare Claude
+        # id the provider wouldn't recognise.
+        monkeypatch.delenv("SYNAPSE_EXTRACTOR_MODEL", raising=False)
+        monkeypatch.delenv("SYNAPSE_LLM_MODEL", raising=False)
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
+        assert stage_model("EXTRACTOR", "claude-opus-4-8") == DEFAULT_OPENAI_MODEL
 
     def test_unknown_provider_raises(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "bedrock")
@@ -228,12 +254,12 @@ class TestSuccessfulCompletion:
 
 
 # ---------------------------------------------------------------------------
-# Single-model mode — configured model overrides per-call Claude names
+# Model resolution — per-call models honored, Claude code-default remapped
 # ---------------------------------------------------------------------------
 
 
 class TestModelOverride:
-    def test_configured_model_wins_over_per_call_name(self):
+    def test_configured_model_wins_over_default_sentinel(self):
         seen: dict[str, Any] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -242,9 +268,36 @@ class TestModelOverride:
 
         client = _client_with(handler, model="meta-llama/llama-3.3-70b-instruct")
         client.messages.create(
-            model="claude-haiku-4-5",  # Claude-specific id — must NOT hit the wire
+            model="claude-haiku-4-5",  # the bare Claude code default — must NOT hit the wire
             messages=[{"role": "user", "content": "hi"}],
         )
+        assert seen["model"] == "meta-llama/llama-3.3-70b-instruct"
+
+    def test_explicit_per_call_model_is_honored(self):
+        # stage_model() resolutions (SYNAPSE_<STAGE>_MODEL) arrive as explicit
+        # non-default ids and must reach the wire as-is (issue #8).
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["model"] = json.loads(request.content)["model"]
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler, model="meta-llama/llama-3.3-70b-instruct")
+        client.messages.create(
+            model="qwen/qwen-2.5-72b-instruct",
+            messages=[{"role": "user", "content": "hi"}],
+        )
+        assert seen["model"] == "qwen/qwen-2.5-72b-instruct"
+
+    def test_omitted_model_uses_configured(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["model"] = json.loads(request.content)["model"]
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler, model="meta-llama/llama-3.3-70b-instruct")
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert seen["model"] == "meta-llama/llama-3.3-70b-instruct"
 
     def test_default_model_is_openrouter_haiku_id(self):
@@ -255,10 +308,7 @@ class TestModelOverride:
             return httpx.Response(200, json=_completion_body("ok"))
 
         client = _client_with(handler)
-        client.messages.create(
-            model="claude-opus-4-8",
-            messages=[{"role": "user", "content": "hi"}],
-        )
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert seen["model"] == "anthropic/claude-haiku-4.5"
 
 

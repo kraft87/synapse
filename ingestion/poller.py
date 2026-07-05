@@ -287,7 +287,7 @@ class Poller:
 def make_poller(
     db_url: str,
     voyage_api_key: str,
-    llm_model: str = "claude-haiku-4-5",
+    llm_model: str | None = None,
 ) -> Poller:
     from ingestion.embedding import create_embedder
     from ingestion.extractor import ExtractionPipeline
@@ -295,7 +295,7 @@ def make_poller(
     from ingestion.llm_client import create_llm_client
 
     db = Database(db_url)
-    llm = create_llm_client(model=llm_model)
+    llm = create_llm_client()
     embedder = create_embedder(voyage_api_key=voyage_api_key, db_url=db_url)
     pipeline = ExtractionPipeline(
         db=db,

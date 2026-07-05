@@ -291,8 +291,10 @@ def _routing_eval(c, cid: int, name: str) -> str:
         )
 
         def _gen() -> str:
+            from ingestion.llm_client import stage_model
+
             resp = create_llm_client().messages.create(
-                model="claude-opus-4-8",
+                model=stage_model("SKILLS", "claude-opus-4-8"),
                 max_tokens=400,
                 messages=[{"role": "user", "content": prompt}],
             )

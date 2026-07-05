@@ -244,9 +244,12 @@ def mine_proposals(db_url: str, *, dry_run: bool = False) -> int:
         existing = _existing_memory_filenames()
         prompt = _build_prompt(docs, existing)
 
-        llm = create_llm_client(model="claude-haiku-4-5")
+        from ingestion.llm_client import stage_model
+
+        dream_model = stage_model("DREAM")
+        llm = create_llm_client(model=dream_model)
         response = llm.messages.create(
-            model="claude-haiku-4-5",
+            model=dream_model,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
