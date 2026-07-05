@@ -144,10 +144,12 @@ already sit under `~/.claude/projects`. Import them once and recall works on day
 ! synapse-import        # in the Claude prompt — or by full path from any terminal
 ```
 
-It discovers every transcript (oldest-first; `--projects-dir` to override), prints a summary
-— file count, total size, estimated turns — and **asks for confirmation before sending
-anything**: importing runs KG extraction on the server's LLM for every new turn, which
-consumes subscription usage or API credits (`--yes` skips the prompt for scripted runs).
+It discovers every transcript (oldest-first; `--projects-dir` to override), offers an
+optional date range to import (by each file's last-activity date — bound a first import,
+bound the spend), prints a summary — file count, total size, estimated turns — and **asks
+for confirmation before sending anything**: importing runs KG extraction on the server's
+LLM for every new turn, which consumes subscription usage or API credits (`--yes` skips
+all prompts and imports everything, for scripted runs).
 Files ship full-length in turn-aligned batches (`--batch-size`, default 500 records per
 POST). Safe to Ctrl-C and re-run: the server dedups turns by `span_id`, so a re-run resumes
 where it left off, and one bad file never stops the rest.

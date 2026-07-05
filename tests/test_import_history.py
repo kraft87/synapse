@@ -382,3 +382,99 @@ def test_rerun_ships_same_spans_for_server_dedup(monkeypatch, tmp_path):
     calls2 = _capture_posts(monkeypatch, ingested_per_call=0)  # server dedups everything
     assert mod2.main(["--projects-dir", str(root), "--yes"]) == 0
     assert [c[1] for c in calls1] == [c[1] for c in calls2]
+
+
+# ---------------------------------------------------------------------------
+# Interactive date-range prompt (bounds first-import extraction spend)
+# ---------------------------------------------------------------------------
+
+
+def _ts(day: str) -> float:
+    """Local-midnight epoch for YYYY-MM-DD — same parse the prompt uses."""
+    from datetime import datetime
+
+    return datetime.strptime(day, "%Y-%m-%d").timestamp()
+
+
+def _feed_inputs(monkeypatch, answers: list[str]) -> None:
+    it = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda *_: next(it))
+
+
+def test_filter_by_mtime_bounds(monkeypatch, tmp_path):
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "old.jsonl", _turns(1), mtime=_ts("2026-04-01"))
+    _write_transcript(root / "p" / "mid.jsonl", _turns(1), mtime=_ts("2026-05-15"))
+    _write_transcript(root / "p" / "new.jsonl", _turns(1), mtime=_ts("2026-06-15"))
+    files = mod.discover(root)
+    names = lambda fs: [p.name for p in fs]  # noqa: E731
+    assert names(mod.filter_by_mtime(files, _ts("2026-05-01"), None)) == ["mid.jsonl", "new.jsonl"]
+    assert names(mod.filter_by_mtime(files, None, _ts("2026-05-01"))) == ["old.jsonl"]
+    assert names(mod.filter_by_mtime(files, _ts("2026-05-01"), _ts("2026-06-01"))) == ["mid.jsonl"]
+    assert names(mod.filter_by_mtime(files, None, None)) == ["old.jsonl", "mid.jsonl", "new.jsonl"]
+
+
+def test_date_prompt_filters_what_ships(monkeypatch, tmp_path, capsys):
+    """from=2026-05-01, no end, confirm — only the newer file is POSTed."""
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "old.jsonl", _turns(1), mtime=_ts("2026-04-01"))
+    _write_transcript(root / "p" / "new.jsonl", _turns(1), mtime=_ts("2026-06-15"))
+    _feed_inputs(monkeypatch, ["2026-05-01", "", "y"])
+    assert mod.main(["--projects-dir", str(root)]) == 0
+    assert len(calls) == 1
+    out = capsys.readouterr().out
+    assert "1 of 2 file(s) in range" in out
+    assert "new.jsonl" in out and "old.jsonl" not in out
+
+
+def test_date_prompt_enter_enter_imports_everything(monkeypatch, tmp_path):
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "old.jsonl", _turns(1), mtime=_ts("2026-04-01"))
+    _write_transcript(root / "p" / "new.jsonl", _turns(1), mtime=_ts("2026-06-15"))
+    _feed_inputs(monkeypatch, ["", "", "y"])
+    assert mod.main(["--projects-dir", str(root)]) == 0
+    assert len(calls) == 2
+
+
+def test_date_prompt_end_date_is_inclusive(monkeypatch, tmp_path):
+    """A file whose last activity is DURING the end day stays in range."""
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "s.jsonl", _turns(1), mtime=_ts("2026-06-15") + 3600)
+    _feed_inputs(monkeypatch, ["", "2026-06-15", "y"])
+    assert mod.main(["--projects-dir", str(root)]) == 0
+    assert len(calls) == 1
+
+
+def test_date_prompt_empty_range_sends_nothing(monkeypatch, tmp_path, capsys):
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "s.jsonl", _turns(1), mtime=_ts("2026-06-15"))
+    _feed_inputs(monkeypatch, ["2026-07-01", ""])
+    assert mod.main(["--projects-dir", str(root)]) == 0
+    assert calls == []
+    assert "No transcripts in that date range" in capsys.readouterr().out
+
+
+def test_date_prompt_invalid_entries_fall_back_to_no_limit(monkeypatch, tmp_path):
+    """Three junk answers per prompt -> no limit; the y/N confirm still gates."""
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "s.jsonl", _turns(1))
+    monkeypatch.setattr("builtins.input", lambda *_: "n")  # junk dates, then 'n' at confirm
+    assert mod.main(["--projects-dir", str(root)]) == 1
+    assert calls == []
