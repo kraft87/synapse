@@ -17,10 +17,14 @@ explicit env var → plugin userConfig → the /plugin install answers persisted
 settings.json → the http://localhost:8765 default.
 
 Usage:
-    synapse-import                       # interactive: summary, then y/N confirm
-    synapse-import --yes                 # skip the confirmation
+    synapse-import                       # interactive: optional date range, summary, y/N confirm
+    synapse-import --yes                 # scripted: no prompts, import everything
     synapse-import --projects-dir DIR    # transcript root (default ~/.claude/projects)
     synapse-import --batch-size N        # records per POST (default 500)
+
+The interactive run offers a date-range prompt (by each file's last-activity
+date) before the cost summary, so a first import can be bounded — extraction
+spend is roughly proportional to turn count.
 """
 
 from __future__ import annotations
@@ -79,6 +83,57 @@ def discover(projects_dir: Path) -> list[Path]:
         found.append((st.st_mtime, path))
     found.sort(key=lambda t: t[0])
     return [p for _, p in found]
+
+
+def filter_by_mtime(files: list[Path], since: float | None, until: float | None) -> list[Path]:
+    """Keep files whose mtime falls in [since, until) — either bound optional."""
+    return [
+        p
+        for p in files
+        if (since is None or p.stat().st_mtime >= since)
+        and (until is None or p.stat().st_mtime < until)
+    ]
+
+
+def prompt_date_range(files: list[Path]) -> list[Path]:
+    """Ask for an optional date range (by file last-activity date) and filter.
+
+    Enter at both prompts = import everything. A non-interactive stdin
+    (EOFError) also means everything — the flow then hits the main confirm,
+    which requires --yes, so nothing ships silently.
+    """
+    from datetime import datetime
+
+    oldest = datetime.fromtimestamp(files[0].stat().st_mtime)
+    newest = datetime.fromtimestamp(files[-1].stat().st_mtime)
+    print(f"Transcripts span {oldest:%Y-%m-%d} → {newest:%Y-%m-%d} (by last activity).")
+    print("Limit the import by date? Press Enter at both prompts to import everything.")
+
+    def ask(label: str) -> float | None:
+        for _ in range(3):
+            try:
+                raw = input(f"  {label} (YYYY-MM-DD, Enter = no limit): ").strip()
+            except EOFError:
+                return None
+            if not raw:
+                return None
+            try:
+                return datetime.strptime(raw, "%Y-%m-%d").timestamp()
+            except ValueError:
+                print("  Not a date — use YYYY-MM-DD, e.g. 2026-05-01.")
+        print("  Three invalid entries — continuing without this limit.")
+        return None
+
+    since = ask("from")
+    until = ask("up to and including")
+    if until is not None:
+        until += 86400.0  # end date is inclusive: filter is [since, until)
+    if since is None and until is None:
+        return files
+    kept = filter_by_mtime(files, since, until)
+    print(f"  → {len(kept)} of {len(files)} file(s) in range.")
+    print()
+    return kept
 
 
 def _scan(path: Path) -> tuple[int, int]:
@@ -171,6 +226,14 @@ def main(argv: list[str] | None = None) -> int:
     if not files:
         print(f"No transcripts found under {projects_dir} — nothing to import.")
         return 0
+
+    # Interactive date-range narrowing (bounds the extraction spend). --yes is
+    # the scripted path: no prompts, import everything, exactly as before.
+    if not args.yes:
+        files = prompt_date_range(files)
+        if not files:
+            print("No transcripts in that date range — nothing to import.")
+            return 0
 
     total_bytes = sum(p.stat().st_size for p in files)
     total_turns = sum(_scan(p)[1] for p in files)

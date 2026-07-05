@@ -183,10 +183,12 @@ history on day one:
 ! synapse-import        # inside a Claude Code session (the plugin puts it on PATH)
 ```
 
-It prints a summary (file count, size, estimated turns) and asks for confirmation before
-sending anything — importing runs KG extraction on your configured LLM for every new turn,
-which consumes subscription usage or API credits. The server dedups turns by `span_id`, so
-Ctrl-C and re-running are always safe: an interrupted import resumes where it left off.
+It offers an optional date range (by each file's last-activity date), prints a summary
+(file count, size, estimated turns), and asks for confirmation before sending anything —
+importing runs KG extraction on your configured LLM for every new turn, which consumes
+subscription usage or API credits roughly in proportion to the turn count, so bounding a
+first import by date bounds the spend. The server dedups turns by `span_id`, so Ctrl-C
+and re-running are always safe: an interrupted import resumes where it left off.
 
 Cursor history can be imported too, but only as a server-side dev path for now
 (`python -m ingestion.cursor_sqlite_backfill`).
