@@ -81,11 +81,16 @@ def _ingest_events(
 
         inserted = 0
         for e, vec in zip(fresh, vecs, strict=True):
+            # Domain scoping (schema 038): git-sourced events are technical by
+            # construction; other pushers may label explicitly. NULL fails open at read.
+            domain = e.get("domain")
+            if domain not in ("personal", "technical"):
+                domain = "technical" if str(e["source"]).startswith("git:") else None
             inserted += conn.execute(
                 "INSERT INTO timeline_events "
                 "(t_valid, fact, source, source_ref, project, salience, embedding, embed_model, "
-                " event_type) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({embed_dims()}),%s,%s) "
+                " event_type, domain) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({embed_dims()}),%s,%s,%s) "
                 "ON CONFLICT (source, source_ref) DO NOTHING",
                 (
                     e["t_valid"],
@@ -97,6 +102,7 @@ def _ingest_events(
                     _vec_literal(vec) if vec is not None else None,
                     embed_model if vec is not None else None,
                     e.get("event_type"),
+                    domain,
                 ),
             ).rowcount
         return inserted, len(cleaned) - inserted

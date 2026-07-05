@@ -93,8 +93,9 @@ If the event text itself names a FURTHER date that is NOT the event's own timing
 
 salience: 2 = milestone / shipped to prod / major decision or life event; 1 = a normal action, decision, or happening; 0 = minor or routine.
 event_type: "decision" (a choice/direction was reached), "action" (something was executed or done), "finding" (a result/diagnosis/measurement was learned), or "milestone" (a phase completed / shipped / achieved).
+domain: "personal" = the user's OWN life outside engineering work — health, medication, family, appointments, purchases, home, travel, mood, errands, job applications and career moves. "technical" = code, infrastructure, homelab, deployments, benchmarks, research, tooling. Judge by what the event is ABOUT, not who executed it (an agent booking the user's appointment is still personal).
 
-Output ONLY JSON: {"events": [{"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone", "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}]} — at most 3 events, ordered by importance. Most turns: {"events": []}
+Output ONLY JSON: {"events": [{"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone", "domain": "personal"|"technical", "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}]} — at most 3 events, ordered by importance. Most turns: {"events": []}
 """
 
 
@@ -169,11 +170,15 @@ def _parse_gate(text: str) -> list[dict[str, Any]]:
         raw_date = item.get("date")
         # Shape only here (a non-empty string); range/parse validation is _resolve_event_date's job.
         date = raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None
+        dom = item.get("domain")
         out.append(
             {
                 "event": str(ev).strip(),
                 "salience": sal if isinstance(sal, int) and 0 <= sal <= 2 else 1,
                 "event_type": et if et in ("decision", "action", "finding", "milestone") else None,
+                # Invalid/missing -> None (unlabeled fails OPEN at read; a wrong default
+                # would fail closed and hide the event from personal-scope serving).
+                "domain": dom if dom in ("personal", "technical") else None,
                 "date": date,
             }
         )
@@ -276,6 +281,7 @@ class TimelineGate:
                 # fallback covers test stubs that only implement embed().
                 embed_model=getattr(self._embedder, "model_name", None) or "voyage-4-large",
                 event_type=gate.get("event_type"),
+                domain=gate.get("domain"),
             )
             logger.info(
                 "timeline event (s%d) from ep:%s: %s",

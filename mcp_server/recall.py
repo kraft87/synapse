@@ -1273,7 +1273,7 @@ class Recall:
         # (no second Voyage call); the engine owns its own thread-local PG conns.
         def _timeline_leg() -> list[dict[str, Any]]:
             res = self._ensure_timeline().recall_timeline(
-                query=query, project=project, query_emb=query_emb
+                query=query, project=project, query_emb=query_emb, group_id=group_id
             )
             return list(res.get("items") or [])[:_TIMELINE_LIMIT]
 

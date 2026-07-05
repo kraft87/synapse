@@ -21,6 +21,7 @@ review (opus-Oracle + Gemini):
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Any
 
@@ -59,7 +60,11 @@ def _vec_literal(vec: list[float]) -> str:
 
 
 def _filters(
-    since: str | None, until: str | None, project: str | None, min_salience: int
+    since: str | None,
+    until: str | None,
+    project: str | None,
+    min_salience: int,
+    group_id: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     clauses: list[str] = []
     params: list[Any] = []
@@ -75,6 +80,15 @@ def _filters(
     if min_salience:
         clauses.append("salience >= %s")
         params.append(min_salience)
+    # Domain scoping (schema 038, issue #17): an explicit personal scope drops
+    # technical events — measured 2026-07-05 that cross-domain junk can sit CLOSER
+    # in embedding space than the true personal events (0.704 vs 0.748), so no
+    # relevance floor can do this job; only the domain label can. Unlabeled (NULL)
+    # rows FAIL OPEN. The default/technical scope stays unfiltered: most callers
+    # never set group_id, and hiding personal events from them would be a
+    # regression, not hygiene. Kill switch SYNAPSE_TIMELINE_GROUP_SCOPE=0.
+    if group_id == "personal" and os.environ.get("SYNAPSE_TIMELINE_GROUP_SCOPE", "1") != "0":
+        clauses.append("(domain = 'personal' OR domain IS NULL)")
     return clauses, params
 
 
@@ -223,10 +237,11 @@ class TimelineRecall:
         min_salience: int = 0,
         limit: int = _TIME_LIMIT,
         query_emb: list[float] | None = None,
+        group_id: str | None = None,
     ) -> dict[str, Any]:
         try:
             conn = self._ensure_pg()
-            filt, params = _filters(since, until, project, min_salience)
+            filt, params = _filters(since, until, project, min_salience, group_id)
             where = " AND ".join(filt) or "TRUE"
             total = conn.execute(
                 f"SELECT count(*) AS n FROM timeline_events WHERE {where}", params

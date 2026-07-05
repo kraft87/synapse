@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from mcp_server.timeline import _collapse_idents
+from mcp_server.timeline import _collapse_idents, _filters
 
 
 def _e(fact, date="2026-07-01"):
@@ -36,3 +36,35 @@ def test_distinct_idents_stay():
         [_e("committed to synapse: fix #99"), _e("committed to synapse: fix #100")]
     )
     assert len(out) == 2
+
+
+# ---- domain scoping (schema 038, issue #17) ----
+
+
+def test_personal_scope_adds_domain_clause():
+    clauses, params = _filters(None, None, None, 0, group_id="personal")
+    assert clauses == ["(domain = 'personal' OR domain IS NULL)"]  # NULL fails open
+    assert params == []
+
+
+def test_default_and_technical_scope_stay_unfiltered():
+    # Most callers never set group_id; filtering the default would hide personal
+    # events from them — only an EXPLICIT personal scope filters.
+    assert _filters(None, None, None, 0, group_id=None)[0] == []
+    assert _filters(None, None, None, 0, group_id="technical")[0] == []
+
+
+def test_personal_scope_kill_switch(monkeypatch):
+    monkeypatch.setenv("SYNAPSE_TIMELINE_GROUP_SCOPE", "0")
+    assert _filters(None, None, None, 0, group_id="personal")[0] == []
+
+
+def test_domain_clause_composes_with_other_filters():
+    clauses, params = _filters("2026-01-01", None, "neuron", 1, group_id="personal")
+    assert clauses == [
+        "t_valid >= %s",
+        "project = %s",
+        "salience >= %s",
+        "(domain = 'personal' OR domain IS NULL)",
+    ]
+    assert params == ["2026-01-01", "neuron", 1]

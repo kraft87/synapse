@@ -171,6 +171,7 @@ class Database:
         embedding: list[float] | None,
         embed_model: str | None,
         event_type: str | None = None,
+        domain: str | None = None,
     ) -> int:
         """Append one event to the episodic timeline (schema 033). Idempotent on
         UNIQUE(source, source_ref) — re-processing a turn never duplicates. Returns
@@ -182,8 +183,8 @@ class Database:
             return conn.execute(
                 "INSERT INTO timeline_events "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "(t_valid, fact, source, source_ref, project, salience, embedding, embed_model, "
-                " event_type) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s) "
+                " event_type, domain) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s) "
                 "ON CONFLICT (source, source_ref) DO NOTHING",
                 (
                     t_valid,
@@ -195,6 +196,7 @@ class Database:
                     vlit,
                     embed_model if embedding is not None else None,
                     event_type,
+                    domain,
                 ),
             ).rowcount
 

@@ -36,6 +36,7 @@ def test_parse_gate_event_and_salience():
             "event": "fixed the dating bug",
             "salience": 2,
             "event_type": "action",
+            "domain": None,
             "date": None,
         }
     ]
@@ -53,6 +54,15 @@ def test_parse_gate_ignores_nonstring_or_empty_date():
     assert _parse_gate('{"event": "did a thing", "date": 20260620}')[0]["date"] is None
     assert _parse_gate('{"event": "did a thing", "date": ""}')[0]["date"] is None
     assert _parse_gate('{"event": "did a thing"}')[0]["date"] is None
+
+
+def test_parse_gate_domain_field():
+    ok = _parse_gate('{"event": "started taking Trintellix", "domain": "personal"}')
+    assert ok[0]["domain"] == "personal"
+    # Invalid or missing -> None (unlabeled fails OPEN at read; a wrong default
+    # would hide the event from personal-scope serving).
+    assert _parse_gate('{"event": "did a thing", "domain": "work"}')[0]["domain"] is None
+    assert _parse_gate('{"event": "did a thing"}')[0]["domain"] is None
 
 
 def test_parse_gate_bad_event_type_nulls():
@@ -156,6 +166,29 @@ def _gated(monkeypatch, event, exists):
     )
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
     return db.inserted
+
+
+def test_gate_threads_domain_to_insert(monkeypatch):
+    import ingestion.timeline_gate as tg
+
+    monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
+    db = _Rec(exists=False)
+    g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
+    monkeypatch.setattr(
+        tg,
+        "parse_with_retry",
+        lambda *a, **k: [
+            {
+                "event": "booked a dentist appointment",
+                "salience": 1,
+                "event_type": "action",
+                "domain": "personal",
+                "date": None,
+            }
+        ],
+    )
+    g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "neuron"})
+    assert db.inserted[0]["domain"] == "personal"
 
 
 def test_commit_announcement_with_known_ident_skips(monkeypatch):
