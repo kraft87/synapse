@@ -498,7 +498,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **028–029 episode-validity overlay** — `kg_relationships.invalidated_by` provenance link (028) + partial GIN on superseded episode ids (029), powering the `superseded_by` annotation on served episodes.
 - **030–032 config lane** — mirrored config-file store, scope column, scan cursor.
 - **033 `timeline_events`** — the episodic date log ([§3.5](#35-timeline-events--the-episodic-date-log)).
-- **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot.
+- **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot. The same table carries the `schema_version` stamp `apply_schema.sh` writes after a full run — every service checks it at startup (`ingestion/schema_check.py`) and refuses to boot when the database is behind the code's schema, pointing at the upgrade command instead of failing mid-request (`SYNAPSE_SCHEMA_CHECK=0` skips).
 - **035 `preferences`** — standing user-preference store served as a recall bucket.
 - **036 content-md5 index** — `episodes (md5(content))`, the cross-session replay guard ([§4.1](#4-ingestion-pipeline)).
 - **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
@@ -667,6 +667,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_SUPERSEDE_MAX_DIST` | `0.45` | cosine-distance gate for surfacing successor facts of superseded edges |
 | `SYNAPSE_RECALL_TIMELINE` | `1` | include the timeline leg in `recall()` (`0` = off) |
 | `SYNAPSE_TIMELINE_GROUP_SCOPE` | `1` | `group_id="personal"` filters timeline serving to personal-domain events (`0` = never filter) |
+| `SYNAPSE_SCHEMA_CHECK` | `1` | boot-time guard: refuse to start when the database schema is behind the code (`0` = skip) |
 | `SYNAPSE_KG_OWNER_ID` | `default` | `owner_id` scope for all KG reads/writes (multi-tenant seam) |
 
 ### Ingestion & extraction

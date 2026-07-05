@@ -39,8 +39,10 @@ logfire.instrument_httpx()
 
 from ingestion.config import get_settings  # noqa: E402
 from ingestion.poller import make_poller  # noqa: E402
+from ingestion.schema_check import check_schema_version  # noqa: E402
 
 cfg = get_settings()
+check_schema_version(cfg.db_url)
 
 poller = make_poller(
     db_url=cfg.db_url,

@@ -105,6 +105,10 @@ def _seconds_until_2am() -> float:
 
 
 if __name__ == "__main__":
+    from ingestion.schema_check import check_schema_version
+
+    check_schema_version(_load_db_url())
+
     args = set(sys.argv[1:])
 
     # Parse --stage N for selective execution
