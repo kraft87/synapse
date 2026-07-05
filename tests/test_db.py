@@ -139,6 +139,75 @@ class TestEpisodeWriter:
         assert db.content_dup_exists(None, "null-project turn") is True
 
 
+class TestTimelineDedup:
+    """timeline_near_candidates + bump_timeline_reported (schema 037)."""
+
+    PROJ = "db-test-tl-dedup"
+
+    @pytest.fixture(autouse=True)
+    def _clean_timeline(self, conn):
+        conn.execute("DELETE FROM timeline_events WHERE project = %s", (self.PROJ,))
+        yield
+        conn.execute("DELETE FROM timeline_events WHERE project = %s", (self.PROJ,))
+
+    def _vec(self, hot: int):
+        from ingestion.db import _EMBED_DIMS
+
+        v = [0.0] * _EMBED_DIMS
+        v[hot] = 1.0
+        return v
+
+    def _insert(self, db, ref: str, vec, t_valid="2026-07-01T10:00:00+00:00"):
+        db.insert_timeline_event(
+            t_valid=t_valid,
+            fact=f"event {ref}",
+            source="chat",
+            source_ref=ref,
+            project=self.PROJ,
+            salience=1,
+            embedding=vec,
+            embed_model="test",
+        )
+
+    def test_near_candidates_excludes_siblings_and_far(self, db):
+        near = self._vec(0)
+        self._insert(db, "ep:900", near)  # near, different turn -> candidate
+        self._insert(db, "ep:901", near)  # the new event's own turn -> excluded
+        self._insert(db, "ep:901#2", near)  # sibling of the new turn -> excluded
+        self._insert(db, "ep:902", self._vec(1))  # orthogonal (dist 1.0) -> over max_dist
+
+        cands = db.timeline_near_candidates(
+            near, self.PROJ, "2026-07-02T10:00:00+00:00", exclude_episode_ref="ep:901"
+        )
+        assert [c["source_ref"] for c in cands] == ["ep:900"]
+        assert cands[0]["dist"] < 0.01
+
+    def test_near_candidates_respects_time_window(self, db):
+        near = self._vec(0)
+        self._insert(db, "ep:910", near, t_valid="2026-05-01T10:00:00+00:00")  # 2 months back
+        cands = db.timeline_near_candidates(
+            near, self.PROJ, "2026-07-02T10:00:00+00:00", exclude_episode_ref="ep:999"
+        )
+        assert cands == []
+
+    def test_bump_keeps_earliest_t_valid(self, db, conn):
+        self._insert(db, "ep:920", self._vec(0), t_valid="2026-07-01T10:00:00+00:00")
+        row = conn.execute("SELECT id FROM timeline_events WHERE source_ref = 'ep:920'").fetchone()
+        eid = row[0] if not isinstance(row, dict) else row["id"]
+
+        # re-tell resolves an EARLIER date -> t_valid corrects backward
+        db.bump_timeline_reported(eid, "2026-06-28T12:00:00+00:00")
+        # re-tell with a LATER date -> earliest wins, count still increments
+        db.bump_timeline_reported(eid, "2026-07-03T12:00:00+00:00")
+
+        r = conn.execute(
+            "SELECT reported_count, t_valid FROM timeline_events WHERE id = %s", (eid,)
+        ).fetchone()
+        cnt, tv = (r[0], r[1]) if not isinstance(r, dict) else (r["reported_count"], r["t_valid"])
+        assert cnt == 3
+        assert str(tv).startswith("2026-06-28")
+
+
 class TestIngestionState:
     def test_get_watermark_returns_none_initially(self, db):
         wm = db.get_watermark("test-source-new")

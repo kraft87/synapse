@@ -100,6 +100,48 @@ Output ONLY JSON: {"events": [{"event": "<naked past-tense fact>", "salience": 0
 
 _MAX_EVENTS_PER_TURN = 3
 
+# ---------------------------------------------------------------------------
+# Write-time dedup (schema 037): a re-told happening merges into its existing row.
+#
+# Validated 2026-07-04 on 120 stratified real pairs vs a full-context referee:
+# snippet-only judging is unreliable (79%) because the discriminating info lives
+# in the SOURCE TURNS ("cleaned up segments" = N distinct jobs with identical
+# event text). The surviving form — both full turns in the prompt + both-orders
+# SAME consensus — leaves ~2% true false-merge, all recoverable (non-destructive
+# reported_count bump, no deletes). See workspace/timeline-dedup-decision.md.
+# ---------------------------------------------------------------------------
+
+_DEDUP_WINDOW_DAYS = 14
+_DEDUP_MAX_DIST = 0.20
+_DEDUP_TURN_CHARS = 2500
+
+TIMELINE_DEDUP_PROMPT = """Two dated event rows were extracted (by an automated gate) from two conversation turns for a personal timeline. Decide if they record the SAME single real-world happening (one occurrence, told or restated twice) or two DISTINCT happenings (the same kind of thing genuinely occurring again, or different things).
+
+Rules:
+- Recorded dates are UNRELIABLE: date resolution is per-turn and error-prone, so the SAME happening frequently appears under two different dates. Never treat differing dates alone as evidence of DISTINCT.
+- Arc evolution is DISTINCT: a diagnosis and its later fix, a decision and its later revision, an implementation and its replacement are separate happenings even when they concern the same object.
+- Recurrence is DISTINCT: the same chore or action genuinely done again on a different occasion (e.g. after two different restarts) is a new happening.
+- The full source turn of each event is included — use it as ground truth for what actually happened.
+
+EVENT A (dated {da}): {a}
+SOURCE TURN A:
+{ea}
+
+EVENT B (dated {db}): {b}
+SOURCE TURN B:
+{eb}
+
+Answer with exactly one word: SAME or DISTINCT."""
+
+
+def _parse_verdict(text: str) -> str:
+    t = text.strip().upper()
+    if t.startswith("SAME"):
+        return "SAME"
+    if t.startswith("DISTINCT"):
+        return "DISTINCT"
+    raise MalformedResponseError("expected SAME or DISTINCT", text[:100])
+
 
 def _parse_gate(text: str) -> list[dict[str, Any]]:
     """Parser for parse_with_retry: {"events": []} -> [], else validated dicts (capped).
@@ -153,6 +195,7 @@ class TimelineGate:
         self._embedder = embedder
         self._model = model
         self.enabled = os.environ.get("SYNAPSE_TIMELINE_GATE", "1") != "0"
+        self.dedup_enabled = os.environ.get("SYNAPSE_TIMELINE_DEDUP", "1") != "0"
 
     def process(self, item: dict[str, Any]) -> None:
         """Gate one turn. Fail-soft: errors are logged, never raised."""
@@ -213,6 +256,11 @@ class TimelineGate:
                     logger.info("timeline gate skip (ident dup %s) ep:%s", idents, episode_id)
                     continue
 
+            if self.dedup_enabled and self._merge_if_retold(
+                gate["event"], vec, project, t_valid, episode_id, content, turn_date
+            ):
+                continue
+
             self._db.insert_timeline_event(
                 t_valid=t_valid,
                 fact=gate["event"],
@@ -235,3 +283,79 @@ class TimelineGate:
                 episode_id,
                 gate["event"][:80],
             )
+
+    # ------------------------------------------------------------------
+    # Dedup confirm-merge
+    # ------------------------------------------------------------------
+
+    def _merge_if_retold(
+        self,
+        event: str,
+        vec: list[float],
+        project: str | None,
+        t_valid: str,
+        episode_id: Any,
+        turn_content: str,
+        turn_date: str,
+    ) -> bool:
+        """True if ``event`` re-tells an existing timeline row (that row is bumped).
+
+        Fail-soft in the opposite direction from the gate itself: ANY error here
+        means no merge and a normal insert — a surviving duplicate is cheaper than
+        a lost happening. Merge requires SAME from the confirm call in BOTH
+        presentation orders; a flip means uncertainty, which keeps the event."""
+        try:
+            cands = self._db.timeline_near_candidates(
+                vec,
+                project,
+                t_valid,
+                exclude_episode_ref=f"ep:{episode_id}",
+                window_days=_DEDUP_WINDOW_DAYS,
+                max_dist=_DEDUP_MAX_DIST,
+            )
+            if not cands:
+                return False
+            cand = cands[0]
+            cand_turn = self._hydrate_turn(cand["source_ref"])
+            if not cand_turn:
+                return False
+            a = (str(cand["t_valid"])[:10], cand["fact"], cand_turn[:_DEDUP_TURN_CHARS])
+            b = (turn_date, event, turn_content[:_DEDUP_TURN_CHARS])
+            if self._confirm_same(a, b) and self._confirm_same(b, a):
+                self._db.bump_timeline_reported(cand["id"], t_valid)
+                logger.info(
+                    "timeline dedup merge: ep:%s '%s' -> event %s (reported_count+1)",
+                    episode_id,
+                    event[:60],
+                    cand["id"],
+                )
+                return True
+            return False
+        except Exception as e:
+            logger.warning(
+                "timeline dedup check failed for ep:%s (inserting anyway): %s", episode_id, e
+            )
+            return False
+
+    def _hydrate_turn(self, source_ref: str | None) -> str | None:
+        """Full source-turn text behind a chat event's ``ep:<id>`` ref. The confirm
+        call is only trustworthy with both turns in view — snippet-only judging was
+        measured unreliable — so no turn means no merge."""
+        m = re.match(r"ep:(\d+)", source_ref or "")
+        if not m:
+            return None
+        row = self._db.get_episode(int(m.group(1)))
+        return (row or {}).get("content")
+
+    def _confirm_same(self, a: tuple[str, str, str], b: tuple[str, str, str]) -> bool:
+        """One confirm call: (date, fact, turn) pair A vs B -> SAME?"""
+        verdict = parse_with_retry(
+            self._llm_client,
+            base_prompt=TIMELINE_DEDUP_PROMPT.format(
+                da=a[0], a=a[1], ea=a[2], db=b[0], b=b[1], eb=b[2]
+            ),
+            parser=_parse_verdict,
+            model=self._model,
+            max_tokens=8,
+        )
+        return verdict == "SAME"
