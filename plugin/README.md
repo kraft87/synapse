@@ -45,8 +45,9 @@ an unreachable server is a silent no-op.
 - **Transcript ingest** — **on** (the core function). Sends the raw JSONL tail of each
   session transcript — your prompts, Claude's replies, tool calls. No separate toggle: if
   transcripts shouldn't leave the machine, don't install the plugin.
-- **Skill sync** — **on**. Sends skill bodies + bundled files, pulls server versions back.
-  Off: `SYNAPSE_SKILLS_SYNC=0`.
+- **Skill sync** — **off** (opt-in). When enabled, sends skill bodies + bundled files and
+  pulls server versions back into `~/.claude/skills` at session start. On:
+  `SYNAPSE_SKILLS_SYNC=1`.
 - **Config mirroring** — **off** (opt-in). When enabled, sends your `~/.claude/CLAUDE.md` +
   `rules/*.md` and the project's equivalents — these often carry personal instructions,
   which is why it ships off. On: `SYNAPSE_CONFIG_SYNC=1`.
@@ -74,7 +75,7 @@ Prompted at install:
 
 Env / `settings.json` only:
 
-- **`SYNAPSE_SKILLS_SYNC`** — `0` disables two-way skill sync.
+- **`SYNAPSE_SKILLS_SYNC`** — `1` enables two-way skill sync (default off).
 - **`SYNAPSE_TIMELINE_REPOS`** — comma/space-separated repo paths for the timeline feeder.
 - **`SYNAPSE_TIMELINE_MILESTONES`** — `0` disables the milestone block.
 - **`SYNAPSE_INGEST_URL`** — legacy full-endpoint override, still honored.
