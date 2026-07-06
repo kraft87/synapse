@@ -80,23 +80,35 @@ _LLM_CONFIRM_TOP_K = 3
 # for binary yes/no on short pairs). Overridable via SYNAPSE_DEDUP_MODEL.
 _DEFAULT_LLM_MODEL = "claude-haiku-4-5"
 
-# --- Canonical identity aliases (task #49) ---------------------------------
-# The extractor keeps minting fresh 'User' / 'Kyle Doucette' nodes that the
-# write-time dedup can't catch (cos(User, Kyle) = 0.53, far below threshold;
-# names aren't normalized-identical either), re-fragmenting the identity hub
-# that the 2026-05-28 one-shot merge consolidated. Map known aliases to the
-# canonical node name BEFORE resolution so the exact-name short-circuit lands
-# on the existing hub. Keys are _normalize_name() output; values are the
-# canonical entity name as written.
+# --- Canonical identity aliases (task #49, config-driven per issue #41) -----
+# The extractor keeps minting fresh identity nodes ('User' / a full-name
+# spelling) that the write-time dedup can't catch (cosine similarity between
+# alias spellings sits far below threshold; names aren't normalized-identical
+# either), re-fragmenting the identity hub. Map known aliases to the canonical
+# node name BEFORE resolution so the exact-name short-circuit lands on the
+# existing hub. Keys are _normalize_name() output; values are the canonical
+# entity name as written.
 #
-# Deliberately NOT mapped: the assistant cluster (Claude / neuron / Neuron) —
+# The OWNER'S identity is deployment config, never code:
+#   SYNAPSE_OWNER_NAME     canonical identity-hub entity name (default "User")
+#   SYNAPSE_OWNER_ALIASES  comma-separated extra spellings that also resolve to
+#                          the hub (e.g. a full name, a nickname)
+# "user" / "the user" always resolve to the hub.
+#
+# Deliberately NOT mapped: the assistant cluster (Claude / <agent name>) —
 # whether those are one identity is a pending decision, and merging them is
 # not reversible at this layer.
-CANONICAL_ALIASES: dict[str, str] = {
-    "user": "Kyle",
-    "the user": "Kyle",
-    "kyle doucette": "Kyle",
-}
+
+
+def _build_canonical_aliases() -> dict[str, str]:
+    owner = (os.getenv("SYNAPSE_OWNER_NAME") or "User").strip() or "User"
+    aliases = {"user": owner, "the user": owner}
+    for spelling in (os.getenv("SYNAPSE_OWNER_ALIASES") or "").split(","):
+        spelling = _normalize_name(spelling)
+        if spelling:
+            aliases[spelling] = owner
+    return aliases
+
 
 # --- Type-compatibility gate for FUZZY merge candidates (entity taxonomy) -----
 # Once entities carry a supertype (schema 020), drop a fuzzy (non-exact-name) merge
@@ -159,6 +171,11 @@ def _normalize_name(name: str) -> str:
     # Strip leading/trailing whitespace and a handful of punctuation chars
     # that commonly bookend names from extractor output.
     return collapsed.strip(" \t\n\r\f\v.,;:!?\"'()[]{}<>")
+
+
+# Built at import (env is static per process); tests exercise the builder
+# directly under monkeypatched env.
+CANONICAL_ALIASES: dict[str, str] = _build_canonical_aliases()
 
 
 def _name_entropy(normalized_name: str) -> float:

@@ -35,7 +35,7 @@ class TestHasTemporalMarkers:
 
     def test_explicit_dates_and_times_are_temporal(self):
         for fact in [
-            "Kyle joined Acme in 2020",
+            "Alex joined Acme in 2020",
             "The migration ran on 2026-05-12",
             "Standup is at 09:30 every day",
             "Released 5/12/2025",
@@ -48,7 +48,7 @@ class TestHasTemporalMarkers:
         for fact in [
             "User uses cannabis daily for 8-year period",
             "During cannabis withdrawal week 4 he improved",
-            "Kyle quit 3 months ago",
+            "Alex quit 3 months ago",
             "He has worked there since 2019",
             "The role lasted until last year",
             "User takes Vitamin D 5000 IU daily",
@@ -57,7 +57,7 @@ class TestHasTemporalMarkers:
 
     def test_validity_flip_words_are_temporal(self):
         for fact in [
-            "Kyle previously worked at RBC",
+            "Alex previously worked at Initech",
             "The endpoint is no longer supported",
             "She used to manage the team",
             "The feature was deprecated",
@@ -85,7 +85,7 @@ class TestExtractBatchPreFilter:
         ext = EdgeDateExtractor(llm)
         facts = [
             "module.py defines Thing",
-            "Kyle joined Acme in 2020",
+            "Alex joined Acme in 2020",
             "module.py contains helper()",
         ]
         out = ext.extract_batch(facts)
@@ -94,7 +94,7 @@ class TestExtractBatchPreFilter:
         sent = llm.messages.create.call_args.kwargs["messages"]
         payload = sent[-1]["content"]
         assert '"id": 1' in payload
-        assert "Kyle joined Acme" in payload
+        assert "Alex joined Acme" in payload
         assert "module.py defines Thing" not in payload
         # Result mapped back to the right index; non-temporal stay (None, None).
         assert out[0] == (None, None)
@@ -125,5 +125,5 @@ class TestExtractSinglePreFilter:
     def test_temporal_calls_llm(self):
         llm = _mock_llm('{"valid_at": "2021-06-01T00:00:00Z", "invalid_at": null}')
         ext = EdgeDateExtractor(llm)
-        assert ext.extract("Kyle joined in 2021") == ("2021-06-01T00:00:00Z", None)
+        assert ext.extract("Alex joined in 2021") == ("2021-06-01T00:00:00Z", None)
         llm.messages.create.assert_called_once()

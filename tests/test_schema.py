@@ -65,7 +65,7 @@ def test_schema_version_stamp_matches_code(conn):
 def test_episodes_insert_and_bm25(conn):
     conn.execute("""
         INSERT INTO episodes (session_id, sequence, content, platform)
-        VALUES ('sess-1', 1, 'Kyle is building a knowledge graph memory system', 'claude_code')
+        VALUES ('sess-1', 1, 'The user is building a knowledge graph memory system', 'claude_code')
     """)
     # BM25 via ParadeDB pg_search
     row = conn.execute("""

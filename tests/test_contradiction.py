@@ -613,7 +613,7 @@ class TestCreateEdgeBiTemporal:
             source_uuid="src",
             target_uuid="tgt",
             relationship="WORKED_AT",
-            fact="Kyle worked at X from 2020 to 2022",
+            fact="Alex worked at X from 2020 to 2022",
             episode_ids=[],
             group_id="technical",
             t_valid="2020-01-01T00:00:00+00:00",

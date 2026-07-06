@@ -1,5 +1,5 @@
 """The ingest-boundary filter must drop transcribe_ai deposition payloads but keep
-Kyle's dev conversations about the legal-transcription domain."""
+the operator's dev conversations about the legal-transcription domain."""
 
 from __future__ import annotations
 
