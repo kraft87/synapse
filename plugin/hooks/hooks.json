@@ -40,11 +40,6 @@
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/preferences_block.py\"",
             "timeout": 15
-          },
-          {
-            "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/proposals_notice.py\"",
-            "timeout": 15
           }
         ]
       }
