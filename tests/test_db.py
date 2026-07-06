@@ -51,6 +51,27 @@ class TestEpisodeWriter:
         row = db.get_episode(ep_id)
         assert row["content"] == "updated content"
 
+    def test_created_at_is_event_time_not_ingest_time(self, db):
+        """Issue #43: the transcript's own timestamp must survive to the row.
+        Imported/backfilled episodes carry when the conversation HAPPENED;
+        dropping it re-dates history to import day and poisons served dates,
+        recency ranking, and fact t_valid."""
+        when = datetime(2025, 3, 14, 15, 9, 26, tzinfo=UTC)
+        ep = Episode(session_id="db-test-ts", sequence=1, content="old turn", created_at=when)
+        row = db.get_episode(db.upsert_episode(ep))
+        assert row["created_at"] == when
+        # re-upsert with a corrected ts wins; without one the stored ts survives
+        row = db.get_episode(
+            db.upsert_episode(Episode(session_id="db-test-ts", sequence=1, content="old turn v2"))
+        )
+        assert row["created_at"] == when
+
+    def test_created_at_defaults_to_now_for_live_ingest(self, db):
+        row = db.get_episode(
+            db.upsert_episode(Episode(session_id="db-test-now", sequence=1, content="live"))
+        )
+        assert abs((datetime.now(UTC) - row["created_at"]).total_seconds()) < 60
+
     def test_insert_multiple_sequences(self, db):
         for seq in range(1, 6):
             db.upsert_episode(
