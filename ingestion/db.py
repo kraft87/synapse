@@ -71,14 +71,22 @@ class Database:
         return row is not None
 
     def upsert_episode(self, ep: Episode) -> int:
+        # created_at is EVENT time (when the conversation happened), not ingest
+        # time: the parser fills Episode.created_at from the transcript's own
+        # timestamp, and dropping it here silently re-dated every imported
+        # episode to import day — which then poisoned served dates, recency
+        # ranking, and the KG's fact t_valid via get_episodes_valid_at. NULL
+        # (no transcript ts) falls back to now(), right for live ingestion.
         sql = """
             INSERT INTO episodes
                 (session_id, sequence, project, platform, model,
-                 human_turn, assistant_turn, content, span_id, metadata, source)
+                 human_turn, assistant_turn, content, span_id, metadata, source,
+                 created_at)
             VALUES
                 (%(session_id)s, %(sequence)s, %(project)s, %(platform)s, %(model)s,
                  %(human_turn)s, %(assistant_turn)s, %(content)s,
-                 %(span_id)s, %(metadata)s::jsonb, %(source)s)
+                 %(span_id)s, %(metadata)s::jsonb, %(source)s,
+                 COALESCE(%(created_at)s, now()))
             ON CONFLICT (session_id, sequence) DO UPDATE SET
                 content        = EXCLUDED.content,
                 human_turn     = EXCLUDED.human_turn,
@@ -86,7 +94,10 @@ class Database:
                 model          = EXCLUDED.model,
                 span_id        = COALESCE(EXCLUDED.span_id, episodes.span_id),
                 metadata       = EXCLUDED.metadata,
-                project        = COALESCE(EXCLUDED.project, episodes.project)
+                project        = COALESCE(EXCLUDED.project, episodes.project),
+                created_at     = CASE WHEN %(created_at)s IS NOT NULL
+                                      THEN %(created_at)s::timestamptz
+                                      ELSE episodes.created_at END
             RETURNING id
         """
         params = {
@@ -101,6 +112,7 @@ class Database:
             "span_id": ep.span_id,
             "metadata": orjson.dumps(ep.metadata).decode(),
             "source": ep.source,
+            "created_at": ep.created_at,
         }
         with self._conn() as conn:
             row = conn.execute(sql, params).fetchone()
