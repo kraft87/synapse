@@ -25,10 +25,8 @@ def main() -> None:
     if _cfg("SYNAPSE_RECALL_NUDGE", "1") == "0":
         return
     print(
-        "[Synapse] If this prompt involves a device, project, tool, person, purchase, "
-        "or past decision/work, call synapse:recall BEFORE answering from general "
-        "knowledge. When the user asks to remember something durable, call "
-        "synapse:remember."
+        "[Synapse] References past work/projects/devices/people -> synapse:recall "
+        "before answering. Durable facts -> synapse:remember."
     )
 
 
