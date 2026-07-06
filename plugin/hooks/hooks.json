@@ -43,6 +43,18 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
