@@ -7,7 +7,7 @@ case numbers. Those must never enter Synapse's memory. This is the single chokep
 uses the same predicate to exclude contaminated windows.
 
 Keyed on the AGENT'S OWN PROMPT SIGNATURES (high precision), NOT loose domain words like
-"witness" or "transcript" — Kyle's transcribe_ai *dev* conversations legitimately discuss
+"witness" or "transcript" — the operator's transcribe_ai *dev* conversations legitimately discuss
 the legal domain and must keep flowing in. These multi-word signatures appear only in the
 agent's actual transcript-processing calls:
 

@@ -3,7 +3,7 @@ name = "synapse"
 version = "1.0.0"
 description = "Self-hosted long-term memory for AI coding agents — episodic store, knowledge graph, and MCP server"
 license = { text = "MIT" }
-authors = [{ name = "Kyle Doucette" }]
+authors = [{ name = "kraft87" }]
 requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary]>=3.2",

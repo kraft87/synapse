@@ -50,12 +50,25 @@ logger = logging.getLogger(__name__)
 # regexes that identified the post-hoc leakers — so the writer-side classifier
 # matches the cleanup-side classifier.
 
-# Projects whose extraction items default to the personal graph.
-_PERSONAL_PROJECTS: frozenset[str] = frozenset({"jobs", "kyle", "email-templates"})
+# Projects whose extraction items default to the personal graph. Deployment-
+# specific slugs (e.g. a project named after the owner) are config, not code:
+# SYNAPSE_PERSONAL_PROJECTS adds comma-separated slugs (issue #41).
+_PERSONAL_PROJECTS: frozenset[str] = frozenset({"jobs", "personal", "email-templates"}) | frozenset(
+    s.strip().lower()
+    for s in (os.environ.get("SYNAPSE_PERSONAL_PROJECTS") or "").split(",")
+    if s.strip()
+)
+
+# Owner-name possessive ("<name>'s ...") routes content to the personal graph.
+# Derived from SYNAPSE_OWNER_NAME; skipped for the generic default "User" —
+# "user's" is everywhere in technical text and would over-route.
+_OWNER = (os.environ.get("SYNAPSE_OWNER_NAME") or "User").strip() or "User"
+_OWNER_POSSESSIVE = f"{re.escape(_OWNER.lower())}'?s|" if _OWNER.lower() != "user" else ""
 
 _PERSONAL_NAME_PATTERN = re.compile(
     r"\b("
-    r"kyle'?s|family|sister|brother|mom|mother|dad|father|parent|cousin|uncle|aunt|nephew|niece|"
+    + _OWNER_POSSESSIVE
+    + r"family|sister|brother|mom|mother|dad|father|parent|cousin|uncle|aunt|nephew|niece|"
     r"girlfriend|boyfriend|ex[- ]girlfriend|ex[- ]boyfriend|wife|husband|partner|spouse|dating|dated|"
     r"friend|friends|cottage|vacation|holiday|birthday|wedding|"
     r"doctor|dentist|appointment|medication|drinking|gym|exercise|sleep|diet|insurance|"
@@ -562,7 +575,7 @@ Rules:
   choice/config/state, name what it REPLACED in the fact text — "switched the embedder to
   voyage-4-large, replacing voyage-3", not "uses voyage-4-large". Same for moves and
   cancellations ("moved the prod compose to /opt/docker/synapse, no longer at
-  /home/kyle/synapse"). Naming the superseded value is what lets a later reader tell
+  ~/synapse"). Naming the superseded value is what lets a later reader tell
   current state from stale.
 - ANCHOR EVERY DATE. When a fact's text carries a dated reference, append its resolved
   absolute date in parentheses right after the original wording. Resolve an ABSOLUTE
@@ -601,8 +614,8 @@ Output ONLY valid JSON (no explanation, no markdown fence):
 
 Rules:
 - ATTRIBUTION FIREWALL (strict): this is third-party content. NEVER phrase a fact
-  as something the user (Kyle) said, did, decided, owns, or prefers. The source
-  makes claims; the user does not appear in them. BAD: "Kyle uses Trafilatura",
+  as something the user said, did, decided, owns, or prefers. The source
+  makes claims; the user does not appear in them. BAD: "the user uses Trafilatura",
   "the chosen approach is X". GOOD: "Trafilatura achieves F1 0.93 on boilerplate
   removal benchmarks", "Mem0 removed its graph backend in its v3 rewrite".
 - Entity types: use ONLY these — Person, Organization, Product, Technology,
@@ -1056,14 +1069,14 @@ def _apply_canonical_aliases(
 ) -> list[ExtractedEntity]:
     """Rewrite known identity aliases to their canonical entity (task #49).
 
-    Runs BEFORE resolution so 'User' / 'Kyle Doucette' mentions land on the
-    existing 'Kyle' hub via the exact-name short-circuit instead of minting a
+    Runs BEFORE resolution so 'User' / full-name mentions land on the
+    existing owner hub (SYNAPSE_OWNER_NAME) via the exact-name short-circuit instead of minting a
     fresh node that neither LSH (Jaccard too low) nor vector similarity
-    (cos(User, Kyle)=0.53) would ever re-merge. Facts are re-pointed in
+    (alias spellings sit ~0.5 apart) would ever re-merge. Facts are re-pointed in
     place; entities are renamed and collapsed (longest summary wins) when the
     rewrite makes two extracted entities the same name. Facts that become
-    self-loops after the rewrite (e.g. an extracted 'User asked Kyle ...')
-    are dropped — a Kyle->Kyle edge carries no relational signal.
+    self-loops after the rewrite (e.g. an extracted 'User asked <owner> ...')
+    are dropped — a hub->hub edge carries no relational signal.
 
     Returns the (possibly smaller) entity list; mutates entities/facts in place.
     """
@@ -1521,7 +1534,7 @@ class ExtractionPipeline:
         #      semantic ordering from the per-fact create_edge detector path).
         #   3. ``t_invalid_pre`` from the batched edge-date extractor — the
         #      new edge was already-contradicted at extraction time (e.g. the
-        #      fact text said "Kyle worked at X from 2020 to 2022"). Applied
+        #      fact text said "the user worked at X from 2020 to 2022"). Applied
         #      AFTER the create_edges_batch via create_edges_batch's own
         #      follow-up invalidate_edges_batch call.
         # Pre-generate the new edge uuid for each fact that WILL be created (same guards as the
@@ -1717,7 +1730,7 @@ class ExtractionPipeline:
             e for e in llm_result.entities if e.name not in {x.name for x in det_entities}
         ]
 
-        # Task #49: canonicalize identity aliases (User / Kyle Doucette -> Kyle)
+        # Task #49: canonicalize identity aliases (User / full-name spellings -> owner hub)
         # before any filtering or resolution, so every downstream consumer
         # (orphan filter, group classification, embeddings, uuid_map, edges)
         # sees only the canonical name.

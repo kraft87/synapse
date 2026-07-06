@@ -1049,7 +1049,12 @@ class TestStage6aCandidateLimit:
 
 
 class TestCanonicalAliases:
-    """Task #49: identity aliases rewrite to the canonical hub pre-resolution."""
+    """Task #49: identity aliases rewrite to the canonical hub pre-resolution.
+
+    The hub name is deployment config (SYNAPSE_OWNER_NAME, issue #41) — the
+    default install canonicalizes onto a neutral 'User' hub; a configured
+    owner name and extra alias spellings resolve there instead.
+    """
 
     def _ents(self, *names):
         return [ExtractedEntity(name=n, type="Person", summary=f"summary of {n}") for n in names]
@@ -1057,22 +1062,21 @@ class TestCanonicalAliases:
     def test_alias_entity_renamed(self):
         from ingestion.extractor import _apply_canonical_aliases
 
-        ents = self._ents("User")
-        out = _apply_canonical_aliases(ents, [])
-        assert [e.name for e in out] == ["Kyle"]
+        out = _apply_canonical_aliases(self._ents("the user"), [])
+        assert [e.name for e in out] == ["User"]
 
     def test_alias_collapses_into_existing_canonical(self):
         from ingestion.extractor import _apply_canonical_aliases
 
         ents = [
-            ExtractedEntity(name="Kyle", type="Person", summary="short"),
+            ExtractedEntity(name="User", type="Person", summary="short"),
             ExtractedEntity(
-                name="Kyle Doucette", type="Person", summary="much longer summary wins here"
+                name="The User", type="Person", summary="much longer summary wins here"
             ),
         ]
         out = _apply_canonical_aliases(ents, [])
         assert len(out) == 1
-        assert out[0].name == "Kyle"
+        assert out[0].name == "User"
         assert out[0].summary == "much longer summary wins here"
 
     def test_fact_endpoints_repointed(self):
@@ -1080,11 +1084,11 @@ class TestCanonicalAliases:
 
         facts = [
             ExtractedFact(
-                source="User", target="Synapse", relationship="USES", fact="User uses Synapse"
+                source="the user", target="Synapse", relationship="USES", fact="User uses Synapse"
             )
         ]
-        _apply_canonical_aliases(self._ents("User", "Synapse"), facts)
-        assert facts[0].source == "Kyle"
+        _apply_canonical_aliases(self._ents("the user", "Synapse"), facts)
+        assert facts[0].source == "User"
         assert facts[0].target == "Synapse"
 
     def test_self_loop_dropped_after_rewrite(self):
@@ -1093,17 +1097,29 @@ class TestCanonicalAliases:
         facts = [
             ExtractedFact(
                 source="User",
-                target="Kyle Doucette",
+                target="The User",
                 relationship="IS",
-                fact="User is Kyle Doucette",
+                fact="User is The User",
             ),
             ExtractedFact(
                 source="User", target="Axon", relationship="BUILDS", fact="User builds Axon"
             ),
         ]
-        _apply_canonical_aliases(self._ents("User", "Kyle Doucette", "Axon"), facts)
+        _apply_canonical_aliases(self._ents("User", "The User", "Axon"), facts)
         assert len(facts) == 1
         assert facts[0].target == "Axon"
+
+    def test_configured_owner_and_full_name_alias(self, monkeypatch):
+        """SYNAPSE_OWNER_NAME + SYNAPSE_OWNER_ALIASES: a deployment's full-name
+        spelling resolves onto its configured hub, not a hardcoded one."""
+        from ingestion import dedup
+        from ingestion.extractor import _apply_canonical_aliases
+
+        monkeypatch.setenv("SYNAPSE_OWNER_NAME", "Sam")
+        monkeypatch.setenv("SYNAPSE_OWNER_ALIASES", "Sam Smith, sammy")
+        monkeypatch.setattr(dedup, "CANONICAL_ALIASES", dedup._build_canonical_aliases())
+        out = _apply_canonical_aliases(self._ents("User", "Sam Smith", "Sammy"), [])
+        assert [e.name for e in out] == ["Sam"]
 
     def test_assistant_cluster_untouched(self):
         from ingestion.extractor import _apply_canonical_aliases
@@ -1116,7 +1132,7 @@ class TestCanonicalAliases:
         from ingestion.extractor import _apply_canonical_aliases
 
         out = _apply_canonical_aliases(self._ents("  THE USER "), [])
-        assert [e.name for e in out] == ["Kyle"]
+        assert [e.name for e in out] == ["User"]
 
     def test_non_alias_names_pass_through(self):
         from ingestion.extractor import _apply_canonical_aliases

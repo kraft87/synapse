@@ -173,12 +173,12 @@ class TestDedupeEdgesPrompt:
 class TestExtractEdgeDatesPrompt:
     def test_extract_edge_dates_prompt_renders(self):
         context = {
-            "fact": "Kyle joined Acme Corp last week",
+            "fact": "Alex joined Acme Corp last week",
             "reference_time": "2026-05-17T00:00:00Z",
         }
         messages = build_extract_edge_dates_prompt(context)
         assert messages[0]["role"] == "system"
-        assert "Kyle joined Acme Corp last week" in messages[1]["content"]
+        assert "Alex joined Acme Corp last week" in messages[1]["content"]
         assert "2026-05-17T00:00:00Z" in messages[1]["content"]
         # Verbatim Graphiti rule wording preserved.
         assert "Resolve relative expressions" in messages[1]["content"]
@@ -232,7 +232,7 @@ class TestEdgeDateExtractor:
 
         ext = EdgeDateExtractor(llm)
         valid, invalid = ext.extract(
-            "Kyle joined Acme Corp last week",
+            "Alex joined Acme Corp last week",
             reference_time="2026-05-17T00:00:00Z",
         )
         assert valid == "2026-05-10T00:00:00Z"
@@ -240,7 +240,7 @@ class TestEdgeDateExtractor:
         # The prompt the LLM saw must reference the verbatim rule wording.
         prompt = "\n".join(m["content"] for m in llm.messages.create.call_args.kwargs["messages"])
         assert "NEVER hallucinate dates" in prompt
-        assert "Kyle joined Acme Corp last week" in prompt
+        assert "Alex joined Acme Corp last week" in prompt
 
     def test_extractor_returns_none_on_llm_failure(self):
         from unittest.mock import MagicMock
@@ -252,7 +252,7 @@ class TestEdgeDateExtractor:
         ext = EdgeDateExtractor(llm)
         # Graceful degradation: extractor must never raise so create_edge
         # can fall through to its now() default.
-        assert ext.extract("Kyle works at Acme") == (None, None)
+        assert ext.extract("Alex works at Acme") == (None, None)
 
     def test_extractor_returns_none_on_malformed_json(self):
         from unittest.mock import MagicMock
@@ -265,7 +265,7 @@ class TestEdgeDateExtractor:
         llm.messages.create.return_value = response
 
         ext = EdgeDateExtractor(llm)
-        assert ext.extract("Kyle works at Acme") == (None, None)
+        assert ext.extract("Alex works at Acme") == (None, None)
 
     def test_extractor_skips_empty_fact(self):
         from unittest.mock import MagicMock
@@ -307,7 +307,7 @@ class TestEdgeDateExtractorBatch:
         )
         ext = EdgeDateExtractor(llm)
         out = ext.extract_batch(
-            ["Kyle joined Acme last week", "Old contract ended in April"],
+            ["Alex joined Acme last week", "Old contract ended in April"],
             reference_time="2026-05-17T00:00:00Z",
         )
         assert len(out) == 2
@@ -338,15 +338,15 @@ class TestEdgeDateExtractorBatch:
             ]
         )
         ext = EdgeDateExtractor(llm)
-        out = ext.extract_batch(["Kyle joined Acme", "", "Kyle promoted today"])
+        out = ext.extract_batch(["Alex joined Acme", "", "Alex promoted today"])
         # Index alignment preserved — blank slot stays (None, None).
         assert out[0] == ("2026-05-10T00:00:00Z", None)
         assert out[1] == (None, None)
         assert out[2] == ("2026-05-12T00:00:00Z", None)
         # Only the 2 non-blank facts went to the LLM.
         prompt = "\n".join(m["content"] for m in llm.messages.create.call_args.kwargs["messages"])
-        assert "Kyle joined Acme" in prompt
-        assert "Kyle promoted today" in prompt
+        assert "Alex joined Acme" in prompt
+        assert "Alex promoted today" in prompt
 
     def test_tolerates_trailing_prose(self):
         from unittest.mock import MagicMock
@@ -366,7 +366,7 @@ class TestEdgeDateExtractorBatch:
         llm.messages.create.return_value = msg
 
         ext = EdgeDateExtractor(llm)
-        out = ext.extract_batch(["Kyle joined Acme last week"])
+        out = ext.extract_batch(["Alex joined Acme last week"])
         assert out[0] == ("2026-05-10T00:00:00Z", None)
 
     def test_llm_exception_returns_all_none(self):
@@ -381,7 +381,7 @@ class TestEdgeDateExtractorBatch:
         # (failing) LLM — otherwise the pre-filter would short-circuit and we
         # wouldn't be testing the exception path at all.
         out = ext.extract_batch(
-            ["Kyle joined in 2020", "She left last week", "Released on 2026-05-10"]
+            ["Alex joined in 2020", "She left last week", "Released on 2026-05-10"]
         )
         # Conservative posture: an LLM failure must never block writes.
         # Each fact falls back to (None, None) so create_edge uses now().
@@ -402,7 +402,7 @@ class TestEdgeDateExtractorBatch:
         # Temporal facts so all three pass the pre-filter and reach the LLM;
         # the test exercises missing-id handling, not the pre-filter.
         out = ext.extract_batch(
-            ["Kyle joined in 2020", "She left last week", "Released on 2026-05-12"]
+            ["Alex joined in 2020", "She left last week", "Released on 2026-05-12"]
         )
         assert out[0] == ("2026-05-10T00:00:00Z", None)
         assert out[1] == (None, None)
