@@ -50,13 +50,17 @@ def _pool(n: int) -> list[dict]:
     return [{"id": f"e:{i}", "content": f"doc{i}"} for i in range(n)]
 
 
+# _select_episodes now returns (episodes, n_echo_suppressed). These pools carry no
+# created_at (recency multiplier = 1.0, a no-op) and use the short query "q" (below the
+# echo threshold), so recency + echo suppression leave the ordering byte-identical here.
 def test_select_episodes_fixed_k_when_disabled(monkeypatch):
     monkeypatch.setattr(recall_mod, "_EPISODE_CUTOFF_TAU", 0.0)
     r = _bare_recall()
     pool = _pool(10)
-    r._rerank_pool = lambda q, p: p  # identity rerank
-    out = r._select_episodes("q", pool, limit=5)
+    r._rerank_pool_scored = lambda q, p: [(i, 1.0 - i * 0.01) for i in range(len(p))]
+    out, n_echo = r._select_episodes("q", pool, limit=5)
     assert out == pool[:5]
+    assert n_echo == 0
 
 
 def test_select_episodes_cutoff_when_enabled(monkeypatch):
@@ -74,8 +78,9 @@ def test_select_episodes_cutoff_when_enabled(monkeypatch):
         (4, 0.05),
         (5, 0.01),
     ]
-    out = r._select_episodes("q", pool, limit=5)
+    out, n_echo = r._select_episodes("q", pool, limit=5)
     assert [d["id"] for d in out] == ["e:0", "e:1"]
+    assert n_echo == 0
 
 
 def test_select_episodes_falls_back_to_fixed_k_on_degraded_rerank(monkeypatch):
@@ -83,10 +88,11 @@ def test_select_episodes_falls_back_to_fixed_k_on_degraded_rerank(monkeypatch):
     r = _bare_recall()
     pool = _pool(10)
     r._rerank_pool_scored = lambda q, p: [(i, 0.0) for i in range(len(p))]  # degraded
-    out = r._select_episodes("q", pool, limit=5)
+    out, n_echo = r._select_episodes("q", pool, limit=5)
     assert out == pool[:5]
+    assert n_echo == 0
 
 
 def test_select_episodes_empty_pool():
     r = _bare_recall()
-    assert r._select_episodes("q", [], limit=5) == []
+    assert r._select_episodes("q", [], limit=5) == ([], 0)
