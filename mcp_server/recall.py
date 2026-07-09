@@ -130,6 +130,43 @@ def _norm_ws(s: str) -> str:
     return _WS_RE.sub(" ", s).strip().lower()
 
 
+def _echo_lcs_len(content: str, q: str) -> int:
+    """Longest common substring length between a doc and the query (both pre-normalized).
+
+    The exact-but-quadratic CONFIRM step of echo suppression — only reached for docs the
+    shingle pre-filter flags (echoes are rare in the pool, so this almost never runs).
+    Module-level so tests can spy on invocation count."""
+    sm = difflib.SequenceMatcher(autojunk=False)
+    sm.set_seq2(q)
+    sm.set_seq1(content)
+    return sm.find_longest_match(0, len(content), 0, len(q)).size
+
+
+_ECHO_SHINGLE_WORDS = 5
+_ECHO_SHINGLE_MIN_CHARS = 25  # shorter shingles are too match-prone to prune anything
+_ECHO_SHINGLE_CAP = 2000  # bounds the pre-filter cost on a pathological query
+
+
+def _query_shingles(q: str) -> list[str]:
+    """Word shingles of the normalized query — the C-speed pre-filter for echo detection.
+
+    A qualifying verbatim run (>= the 40-60 char echo threshold) spans several consecutive
+    words, so after whitespace normalization it contains a whole _ECHO_SHINGLE_WORDS-word
+    shingle of the query (step 1 word — every alignment is covered; only a pathological
+    all-long-token run can slip through, and a miss just KEEPS the doc, fail-open).
+    ``shingle in content`` is a C-level substring scan, so docs with no hit — the common
+    case — skip the quadratic SequenceMatcher confirm entirely."""
+    words = q.split(" ")
+    out: list[str] = []
+    for i in range(len(words) - _ECHO_SHINGLE_WORDS + 1):
+        sh = " ".join(words[i : i + _ECHO_SHINGLE_WORDS])
+        if len(sh) >= _ECHO_SHINGLE_MIN_CHARS:
+            out.append(sh)
+            if len(out) >= _ECHO_SHINGLE_CAP:
+                break
+    return out
+
+
 def _bm25_tokenize(s: str) -> list[str]:
     return re.findall(r"[a-z0-9_./#+-]+", s.lower())
 
@@ -833,33 +870,52 @@ class Recall:
         adjusted.sort(key=lambda x: x[1], reverse=True)
         return adjusted
 
-    def _echo_suppressed_indices(self, query: str, items: list[dict[str, Any]]) -> list[int]:
-        """Indices of ``items`` to DROP because their content is the query quoting itself.
+    def _filter_query_echo(
+        self, query: str, items: list[dict[str, Any]], need: int
+    ) -> tuple[list[int], int]:
+        """Echo suppression over a ranked list: (indices to keep, echoes dropped).
 
         A served episode whose content shares a long verbatim run with the query is an echo
-        (compaction copy / re-ingested repeat), not recalled memory. Drops items whose longest
-        common substring with the normalized query is >= min(60, max(40, len(query_norm)//2))
-        chars — the heuristic validated in the 2026-07-08 backtest. Uses difflib.SequenceMatcher
-        (autojunk=False) over whitespace-collapsed lowercase, scanning at most _ECHO_CONTENT_CAP
-        chars per doc. Returns [] when disabled, when the query is too short for the threshold to
-        be meaningful (< _ECHO_MIN_QUERY_LEN), or when nothing echoes."""
-        if not _SUPPRESS_QUERY_ECHO or not items:
-            return []
+        (compaction copy / re-ingested repeat), not recalled memory — drop it. Threshold:
+        longest common substring >= min(60, max(40, len(query_norm)//2)) chars (the heuristic
+        validated in the 2026-07-08 backtest), via difflib.SequenceMatcher (autojunk=False)
+        over whitespace-collapsed lowercase, scanning at most _ECHO_CONTENT_CAP chars per doc.
+
+        Cost containment — the pool is ~90 docs and SequenceMatcher is quadratic, so a naive
+        full-pool scan costs seconds on long (800+ char) prompt-sized queries:
+          - LAZY: walk in rank order and stop scanning once ``need`` survivors accumulate —
+            items past that point can never be served, so they're kept unscanned.
+          - Shingle pre-filter (_query_shingles): only docs containing one of the query's
+            word shingles (C-level ``in``) reach the SequenceMatcher confirm (_echo_lcs_len);
+            echoes are rare in the pool, so the confirm almost never runs.
+        Keeps everything when disabled, when the query is too short for the threshold to be
+        meaningful (< _ECHO_MIN_QUERY_LEN), or when the query yields no usable shingles."""
+        keep_all = list(range(len(items)))
+        if not _SUPPRESS_QUERY_ECHO or not items or need <= 0:
+            return keep_all, 0
         q = _norm_ws(query)
         if len(q) < _ECHO_MIN_QUERY_LEN:
-            return []
+            return keep_all, 0
+        shingles = _query_shingles(q)
+        if not shingles:  # all-short-word query — the pre-filter can't attest, fail open
+            return keep_all, 0
         thr = min(60, max(40, len(q) // 2))
-        sm = difflib.SequenceMatcher(autojunk=False)
-        sm.set_seq2(q)  # query is seq b (the reused/cached side)
-        drop: list[int] = []
+        keep: list[int] = []
+        dropped = 0
         for i, it in enumerate(items):
+            if len(keep) >= need:
+                keep.extend(range(i, len(items)))  # unscanned tail — can't be served
+                break
             content = _norm_ws(it.get("content") or "")[:_ECHO_CONTENT_CAP]
-            if not content:
+            if (
+                content
+                and any(sh in content for sh in shingles)
+                and _echo_lcs_len(content, q) >= thr
+            ):
+                dropped += 1
                 continue
-            sm.set_seq1(content)
-            if sm.find_longest_match(0, len(content), 0, len(q)).size >= thr:
-                drop.append(i)
-        return drop
+            keep.append(i)
+        return keep, dropped
 
     def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Drop served facts the cross-encoder scores below _RECALL_FACT_FLOOR (off-topic).
@@ -1002,12 +1058,16 @@ class Recall:
         scored = self._apply_rerank_recency(scored, pool)  # no-op when disabled/degraded
         ranked = [pool[i] for i, _ in scored]
         ranked_scores = [s for _, s in scored]
-        drop = set(self._echo_suppressed_indices(query, ranked))
-        if drop:
-            ranked = [x for i, x in enumerate(ranked) if i not in drop]
-            ranked_scores = [s for i, s in enumerate(ranked_scores) if i not in drop]
-        n_echo = len(drop)
-        if _EPISODE_CUTOFF_TAU <= 0 or degraded:
+        fixed_k = _EPISODE_CUTOFF_TAU <= 0 or degraded
+        # Echo suppression's lazy scan only needs enough survivors to cover the serve
+        # window: `limit` on the fixed-k path, at most _EPISODE_CUTOFF_MAX_K on the tau
+        # path (k is clamped there, so ranked[:k] never reaches past the scanned prefix).
+        need = limit if fixed_k else max(limit, _EPISODE_CUTOFF_MAX_K)
+        keep, n_echo = self._filter_query_echo(query, ranked, need)
+        if n_echo:
+            ranked = [ranked[i] for i in keep]
+            ranked_scores = [ranked_scores[i] for i in keep]
+        if fixed_k:
             return ranked[:limit], n_echo
         k = _cutoff_k(
             ranked_scores,
@@ -1427,11 +1487,13 @@ class Recall:
         # Episodes: pure rerank order (matches recall_episodes / the measured swap).
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
         # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
-        # copies / re-ingested repeats); the slice below backfills freed slots from next-ranked.
-        drop = set(self._echo_suppressed_indices(query, ranked_eps))
-        n_echo_suppressed = len(drop)
-        if drop:
-            ranked_eps = [x for i, x in enumerate(ranked_eps) if i not in drop]
+        # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
+        # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
+        keep, n_echo_suppressed = self._filter_query_echo(
+            query, ranked_eps, max(_RECALL_EPISODE_LIMIT, _RECALL_PASSAGE_SRC_K)
+        )
+        if n_echo_suppressed:
+            ranked_eps = [ranked_eps[i] for i in keep]
         episodes_served = ranked_eps[:_RECALL_EPISODE_LIMIT]
         # Stage 2: serve compact passages of the top reranked episodes instead of whole turns.
         # Falls back to full episodes if compaction yields nothing. Drill-down stays full.

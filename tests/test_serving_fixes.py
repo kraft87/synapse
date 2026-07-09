@@ -3,9 +3,10 @@
   1. Post-rerank recency re-injection (_apply_rerank_recency): the cross-encoder is
      recency-blind, so re-weight the FINAL ordering by created_at (14-day half-life),
      floored so old-but-relevant content is dampened, never annihilated.
-  2. Query-echo suppression (_echo_suppressed_indices): drop served episodes that are
+  2. Query-echo suppression (_filter_query_echo): drop served episodes that are
      the prompt quoting itself (compaction copies / re-ingested repeats), backfilling
-     the freed slots from the next-ranked candidates.
+     the freed slots from the next-ranked candidates. Cost-contained by a C-speed
+     shingle pre-filter and a lazy scan that stops at the needed survivor count.
 
 Both ship ON; each has an env kill switch that restores the prior ordering exactly.
 """
@@ -90,27 +91,77 @@ def test_recency_degraded_rerank_untouched():
 _ECHO_QUERY = "what did we decide about the postgres connection pool sizing for the recall legs"
 
 
-def test_echo_index_flags_verbatim_quote():
+def test_echo_flags_verbatim_quote():
     r = _bare()
     items = [
         {"id": "e:echo", "content": f"[user] {_ECHO_QUERY}\n[assistant] noted"},
         {"id": "e:real", "content": "we sized the pool at four workers after profiling"},
     ]
-    assert r._echo_suppressed_indices(_ECHO_QUERY, items) == [0]
+    keep, n = r._filter_query_echo(_ECHO_QUERY, items, need=len(items))
+    assert (keep, n) == ([1], 1)
 
 
 def test_echo_short_query_untouched():
     # below _ECHO_MIN_QUERY_LEN the heuristic is meaningless — never suppress
     r = _bare()
     items = [{"id": "e:0", "content": "postgres postgres postgres"}]
-    assert r._echo_suppressed_indices("postgres", items) == []
+    assert r._filter_query_echo("postgres", items, need=1) == ([0], 0)
 
 
 def test_echo_kill_switch_disables(monkeypatch):
     monkeypatch.setattr(recall_mod, "_SUPPRESS_QUERY_ECHO", False)
     r = _bare()
     items = [{"id": "e:echo", "content": _ECHO_QUERY}]
-    assert r._echo_suppressed_indices(_ECHO_QUERY, items) == []
+    assert r._filter_query_echo(_ECHO_QUERY, items, need=1) == ([0], 0)
+
+
+# --- Fix 2 cost containment: shingle pre-filter + lazy scan ----------------------
+# Deterministic (spy-based), not timing-based: the quadratic SequenceMatcher confirm
+# (_echo_lcs_len) must run on ZERO docs when nothing shingle-matches, only on the
+# echoing doc when one does, and never past the needed-survivor stop point.
+
+
+def _spy_lcs(monkeypatch):
+    calls: list[str] = []
+    real = recall_mod._echo_lcs_len
+
+    def spy(content: str, q: str) -> int:
+        calls.append(content)
+        return real(content, q)
+
+    monkeypatch.setattr(recall_mod, "_echo_lcs_len", spy)
+    return calls
+
+
+def test_echo_confirm_skipped_without_shingle_hit(monkeypatch):
+    calls = _spy_lcs(monkeypatch)
+    r = _bare()
+    items = [{"id": f"e:{i}", "content": f"unrelated leg latency note {i}"} for i in range(90)]
+    keep, n = r._filter_query_echo(_ECHO_QUERY, items, need=90)
+    assert (keep, n) == (list(range(90)), 0)
+    assert calls == []  # every doc pruned by the C-level shingle scan — no confirm work
+
+
+def test_echo_confirm_runs_only_on_shingle_hit(monkeypatch):
+    calls = _spy_lcs(monkeypatch)
+    r = _bare()
+    items = [{"id": f"e:{i}", "content": f"unrelated leg latency note {i}"} for i in range(10)]
+    items[4] = {"id": "e:echo", "content": f"[user] {_ECHO_QUERY}"}
+    keep, n = r._filter_query_echo(_ECHO_QUERY, items, need=10)
+    assert n == 1 and 4 not in keep
+    assert len(calls) == 1  # only the echoing doc reached SequenceMatcher
+
+
+def test_echo_scan_stops_after_needed_survivors(monkeypatch):
+    # An echo ranked past the serve window is never even scanned: the walk stops as
+    # soon as `need` survivors accumulate, and the unscanned tail can't be served.
+    calls = _spy_lcs(monkeypatch)
+    r = _bare()
+    items = [{"id": f"e:{i}", "content": f"unrelated leg latency note {i}"} for i in range(90)]
+    items[50] = {"id": "e:echo", "content": f"[user] {_ECHO_QUERY}"}
+    keep, n = r._filter_query_echo(_ECHO_QUERY, items, need=5)
+    assert (keep, n) == (list(range(90)), 0)  # tail kept unscanned, nothing dropped
+    assert calls == []  # the rank-50 echo was past the stop point — no confirm ran
 
 
 def test_echo_dropped_and_backfilled_via_select(monkeypatch):
