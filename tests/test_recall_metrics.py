@@ -49,3 +49,15 @@ def test_missing_served_ids_inserts_null(conn, db_url):
     row = conn.execute("SELECT served_ids FROM recall_metrics WHERE source = 'test'").fetchone()
     assert row is not None
     assert row[0] is None
+
+
+def test_served_ids_carries_echo_suppression_count(conn, db_url):
+    # Query-echo suppression records n_echo_suppressed inside the served_ids envelope (no DDL).
+    conn.execute("TRUNCATE recall_metrics RESTART IDENTITY")
+    r = Recall(db_url, "")
+    served = {"episodes": ["e:5"], "facts": [], "n_echo_suppressed": 3}
+    r._do_record({"kind": "recall", "source": "test", "query": "q", "served_ids": served})
+    row = conn.execute("SELECT served_ids FROM recall_metrics WHERE source = 'test'").fetchone()
+    assert row is not None
+    assert row[0] == served
+    assert row[0]["n_echo_suppressed"] == 3

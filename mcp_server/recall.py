@@ -28,6 +28,7 @@ episode leg owns broad/needle, so neither earned its serving slot.
 
 from __future__ import annotations
 
+import difflib
 import json
 import logging
 import math
@@ -76,13 +77,30 @@ _TIMELINE_LIMIT = 8
 _PREFS_IN_RECALL = os.environ.get("SYNAPSE_RECALL_PREFS", "1") != "0"
 _PREFS_LIMIT = 5
 _RECENCY_HALF_LIFE_DAYS = 30  # content this old scores ~50% of today's content
-# Recency re-injection AFTER the cross-encoder rerank. The reranker is
-# recency-blind and an old *definitive* statement ("X is canonical") out-scores
-# a newer *transition* statement ("switched off X to Y"), so stale synth docs
-# eat the limited slots. A shorter half-life here (the corpus churns within a
-# single month) lets a fresh doc reclaim a slot from a marginally-more-relevant
-# stale one. Tunable knob; validate on the staleness probe before changing.
+# Recency re-injection AFTER the cross-encoder rerank (see _apply_rerank_recency). The
+# reranker is recency-blind and an old *definitive* statement ("X is canonical") out-scores
+# a newer *transition* statement ("switched off X to Y"), so upstream RRF-fusion recency is
+# discarded by the rerank and stale content eats the limited slots. A shorter half-life here
+# (the corpus churns within a single month) lets a fresh doc reclaim a slot from a marginally-
+# more-relevant stale one. Tunable knob; validate on the staleness probe before changing.
 _RERANK_RECENCY_HALF_LIFE_DAYS = 14
+# Kill switch for the post-rerank recency re-weighting (validated ON; env var disables it).
+_RERANK_RECENCY = os.getenv("SYNAPSE_RERANK_RECENCY", "1") != "0"
+# Floor on the recency multiplier: a 14-day half-life drives a ~3-month-old episode to ~0.01x,
+# which would BURY old content a query explicitly asks for. Clamp the multiplier to >= floor so
+# old content is dampened at most 1/floor (4x at 0.25), never annihilated — recency breaks ties
+# between comparably-relevant docs without overriding a strong old match. Env-tunable.
+_RERANK_RECENCY_FLOOR = float(os.getenv("SYNAPSE_RERANK_RECENCY_FLOOR", "0.25") or "0.25")
+
+# Query-echo suppression (backtest 2026-07-08, 100 real prompts): 74% served the prompt's own
+# source episode in top-5 (65% at rank 1) — the "memory" was the prompt quoting itself (compaction
+# copies, re-ingested repeats). The server can't know the caller's session id (MCP tools carry no
+# session context), but a served episode whose content contains a long verbatim run of the query is
+# echo, not memory. Drop those and backfill from the next-ranked candidates. Validated ON; env
+# disables. Only meaningful once the query is long enough for the overlap threshold to mean anything.
+_SUPPRESS_QUERY_ECHO = os.getenv("SYNAPSE_SUPPRESS_QUERY_ECHO", "1") != "0"
+_ECHO_MIN_QUERY_LEN = 40  # skip suppression below this normalized-query length (heuristic is noise)
+_ECHO_CONTENT_CAP = 8000  # per-doc chars scanned for the overlap (bounds SequenceMatcher work)
 
 _RERANK_POOL = 6  # candidates per type fed to the reranker
 _RERANK_DOC_CAP = 4000  # per-doc char cap (~1k tokens) sent to the reranker (bounds tokens).
@@ -102,6 +120,14 @@ _RERANK_DOC_CAP = 4000  # per-doc char cap (~1k tokens) sent to the reranker (bo
 # SYNAPSE_RERANK_WINDOW=0.
 _RERANK_WINDOW = os.getenv("SYNAPSE_RERANK_WINDOW", "1") != "0"
 _RERANK_WINDOW_SIZE = 1024  # window granularity for locating the relevant region of a long episode
+
+
+_WS_RE = re.compile(r"\s+")
+
+
+def _norm_ws(s: str) -> str:
+    """Whitespace-collapsed lowercase — the normal form for query-echo overlap matching."""
+    return _WS_RE.sub(" ", s).strip().lower()
 
 
 def _bm25_tokenize(s: str) -> list[str]:
@@ -777,6 +803,64 @@ class Recall:
                     best[oi] = s
         return sorted(best.items(), key=lambda x: x[1], reverse=True)
 
+    def _apply_rerank_recency(
+        self, scored: list[tuple[int, float]], pool: list[dict[str, Any]]
+    ) -> list[tuple[int, float]]:
+        """Re-inject recency into the post-rerank ordering (see _RERANK_RECENCY_HALF_LIFE_DAYS).
+
+        Multiplies each candidate's rerank score by _recency_multiplier(created_at) at the
+        14-day half-life, FLOORED at _RERANK_RECENCY_FLOOR so old-but-relevant content is
+        dampened at most 1/floor rather than annihilated, then re-sorts descending. Any
+        downstream tau cutoff then operates on THESE recency-adjusted scores (that is the
+        intended contract — recency is part of the final relevance, not a post-cut tweak).
+        No-op (returns ``scored`` unchanged) when disabled (SYNAPSE_RERANK_RECENCY=0) or when
+        the reranker degraded to RRF order (top score 0.0 — leave that fallback ordering
+        untouched; a 0.0 top is the same signal _cutoff_k reads)."""
+        if not _RERANK_RECENCY or not scored or scored[0][1] <= 0.0:
+            return scored
+        floor = _RERANK_RECENCY_FLOOR
+        adjusted = [
+            (
+                i,
+                s
+                * max(
+                    floor,
+                    _recency_multiplier(pool[i].get("created_at"), _RERANK_RECENCY_HALF_LIFE_DAYS),
+                ),
+            )
+            for i, s in scored
+        ]
+        adjusted.sort(key=lambda x: x[1], reverse=True)
+        return adjusted
+
+    def _echo_suppressed_indices(self, query: str, items: list[dict[str, Any]]) -> list[int]:
+        """Indices of ``items`` to DROP because their content is the query quoting itself.
+
+        A served episode whose content shares a long verbatim run with the query is an echo
+        (compaction copy / re-ingested repeat), not recalled memory. Drops items whose longest
+        common substring with the normalized query is >= min(60, max(40, len(query_norm)//2))
+        chars — the heuristic validated in the 2026-07-08 backtest. Uses difflib.SequenceMatcher
+        (autojunk=False) over whitespace-collapsed lowercase, scanning at most _ECHO_CONTENT_CAP
+        chars per doc. Returns [] when disabled, when the query is too short for the threshold to
+        be meaningful (< _ECHO_MIN_QUERY_LEN), or when nothing echoes."""
+        if not _SUPPRESS_QUERY_ECHO or not items:
+            return []
+        q = _norm_ws(query)
+        if len(q) < _ECHO_MIN_QUERY_LEN:
+            return []
+        thr = min(60, max(40, len(q) // 2))
+        sm = difflib.SequenceMatcher(autojunk=False)
+        sm.set_seq2(q)  # query is seq b (the reused/cached side)
+        drop: list[int] = []
+        for i, it in enumerate(items):
+            content = _norm_ws(it.get("content") or "")[:_ECHO_CONTENT_CAP]
+            if not content:
+                continue
+            sm.set_seq1(content)
+            if sm.find_longest_match(0, len(content), 0, len(q)).size >= thr:
+                drop.append(i)
+        return drop
+
     def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Drop served facts the cross-encoder scores below _RECALL_FACT_FLOOR (off-topic).
 
@@ -900,28 +984,38 @@ class Recall:
 
     def _select_episodes(
         self, query: str, pool: list[dict[str, Any]], limit: int
-    ) -> list[dict[str, Any]]:
-        """Rerank `pool` and pick which episodes to serve.
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Rerank `pool`, re-inject recency + suppress query echo, and pick what to serve.
 
-        Default (SYNAPSE_EPISODE_CUTOFF_TAU <= 0): fixed top-`limit` in rerank
-        order — byte-identical to the prior `_rerank_pool(...)[:limit]` path.
-        With tau > 0: adaptive relative score-cutoff (keep score >= tau*top,
-        clamped [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K]). Always degrades
-        to RRF order on rerank failure; never hard-fails."""
+        Returns ``(episodes, n_echo_suppressed)``. Default (SYNAPSE_EPISODE_CUTOFF_TAU <= 0):
+        fixed top-`limit` in the recency-adjusted rerank order. With tau > 0: adaptive relative
+        score-cutoff (keep score >= tau*top, clamped [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K])
+        over the recency-adjusted scores. Echoed episodes (the query quoting itself) are dropped
+        BEFORE the final slice/cutoff so the next-ranked candidates backfill the freed slots. Always
+        degrades to RRF order on rerank failure; never hard-fails."""
         if not pool:
-            return []
-        if _EPISODE_CUTOFF_TAU <= 0:
-            return self._rerank_pool(query, pool)[:limit]
+            return [], 0
         scored = self._rerank_pool_scored(query, pool)
-        if not scored or scored[0][1] <= 0.0:  # reranker degraded -> fixed-k, RRF order
-            return pool[:limit]
+        if not scored:
+            return [], 0
+        degraded = scored[0][1] <= 0.0  # reranker down/disabled -> RRF order, fixed-k
+        scored = self._apply_rerank_recency(scored, pool)  # no-op when disabled/degraded
+        ranked = [pool[i] for i, _ in scored]
+        ranked_scores = [s for _, s in scored]
+        drop = set(self._echo_suppressed_indices(query, ranked))
+        if drop:
+            ranked = [x for i, x in enumerate(ranked) if i not in drop]
+            ranked_scores = [s for i, s in enumerate(ranked_scores) if i not in drop]
+        n_echo = len(drop)
+        if _EPISODE_CUTOFF_TAU <= 0 or degraded:
+            return ranked[:limit], n_echo
         k = _cutoff_k(
-            [s for _, s in scored],
+            ranked_scores,
             _EPISODE_CUTOFF_TAU,
             _EPISODE_CUTOFF_MIN_K,
             _EPISODE_CUTOFF_MAX_K,
         )
-        return [pool[i] for i, _ in scored[:k]]
+        return ranked[:k], n_echo
 
     def _episode_pool(
         self,
@@ -1323,11 +1417,21 @@ class Recall:
         )
         scored, ms_rerank = f_rerank.result()
         history = f_history.result()
+        rerank_top = scored[0][1] if scored else 0.0  # RAW top score (telemetry) — pre-recency
+        # Post-rerank recency re-injection: the cross-encoder is recency-blind, so an old
+        # *definitive* claim out-ranks a newer *correction* when both make the pool. Re-weight
+        # the FINAL ordering only; the rerank call, the pool, and rerank_top above are untouched.
+        scored = self._apply_rerank_recency(scored, ep_pool)
         ranked = [ep_pool[i] for i, _ in scored]
-        rerank_top = scored[0][1] if scored else 0.0
 
         # Episodes: pure rerank order (matches recall_episodes / the measured swap).
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
+        # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
+        # copies / re-ingested repeats); the slice below backfills freed slots from next-ranked.
+        drop = set(self._echo_suppressed_indices(query, ranked_eps))
+        n_echo_suppressed = len(drop)
+        if drop:
+            ranked_eps = [x for i, x in enumerate(ranked_eps) if i not in drop]
         episodes_served = ranked_eps[:_RECALL_EPISODE_LIMIT]
         # Stage 2: serve compact passages of the top reranked episodes instead of whole turns.
         # Falls back to full episodes if compaction yields nothing. Drill-down stays full.
@@ -1456,6 +1560,7 @@ class Recall:
                 if t.get("_id") is not None and t.get("kind", "event") == "event"
             ],
             "prefs": [p["id"] for p in prefs_items if p.get("id") is not None],
+            "n_echo_suppressed": n_echo_suppressed,
         }
         chars = _served_chars(out)
         self._record_metrics(
@@ -1518,7 +1623,7 @@ class Recall:
         # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
-        episodes = self._select_episodes(
+        episodes, n_echo_suppressed = self._select_episodes(
             query, self._episode_pool(query, query_emb, project), limit
         )
 
@@ -1546,7 +1651,10 @@ class Recall:
                 "chars": chars,
                 "est_tokens": chars // 4,
                 "emb_ok": query_emb is not None,
-                "served_ids": {"episodes": [r["id"] for r in episodes if r.get("id")]},
+                "served_ids": {
+                    "episodes": [r["id"] for r in episodes if r.get("id")],
+                    "n_echo_suppressed": n_echo_suppressed,
+                },
             }
         )
         return out
