@@ -59,7 +59,13 @@ EMIT a preference when the user asserts, explicitly OR in passing, any of:
 - a standing RULE / instruction ("never suggest contract roles", "always confirm before sending email")
 - a durable STYLE preference (tone, formatting, verbosity, naming).
 
-DO NOT emit for: questions ("should I use tables?"), task-specific one-offs ("make THIS one shorter", "reword this paragraph"), one-time requests with no standing intent, the assistant's own statements, or facts about the world. Only the USER's own assertions count — a user QUESTION is never an assertion. Most turns contain no durable preference — return an empty list for them.
+DO NOT emit for: questions ("should I use tables?"), task-specific one-offs ("make THIS one shorter", "reword this paragraph"), one-time requests with no standing intent, the assistant's own statements, or facts about the world. Only the USER's own assertions count — a user QUESTION is never an assertion.
+
+Two subject traps — both are NEVER preferences:
+- The user DESCRIBING or PREDICTING the assistant's behavior ("you probably default to local", "you always over-explain"). That is an observation about the agent, not a want of the user's. Emit only if the user turns it into a directive ("stop doing X", "I want you to...").
+- DESIGN DISCUSSION about how a system/feature under construction should behave (defaults, storage, architecture: "the server should render it", "direct cut, we can revert"). Stances about the system being built are not personal standing preferences unless the user states one explicitly about their own workflow.
+
+Most turns contain no durable preference — return an empty list for them.
 
 Write each `pref` under these hard rules:
 1. SELF-CONTAINED and THIRD-PERSON-ABOUT-THE-USER. It must make sense a month from now with no other context. Start with "User " and name the concrete thing: "User prefers bullet lists over tables", "User dislikes em-dashes in written drafts", "User never wants contract or temp roles surfaced". NEVER "this", "that approach", "the above".
