@@ -256,30 +256,29 @@ def recall(
     session_focus: list[str] | None = None,
     group_id: str = "technical",
 ) -> dict:
-    """Search the user's long-term memory: reranked past-conversation turns + KG facts.
+    """Search the user's long-term memory: tens of thousands of reranked
+    past-conversation turns, the knowledge-graph facts extracted from them, and a
+    dated event timeline.
 
-    CALL THIS BEFORE ANSWERING whenever the message touches anything with history:
-    a past decision or discussion ("what did we decide", "last time", "have we
-    tried"), any device, purchase, tool, project, or person the user names, their
-    preferences, or any question the current session alone can't answer. Memory
-    spans all of the user's past sessions, so assume it has context — the common
-    failure is not checking, never over-checking. Also fire on the first message
-    of a session and again when the topic shifts.
+    BEFORE answering anything that references past work — a prior decision or
+    discussion ("what did we decide", "last time", "have we tried"), any device,
+    purchase, tool, project, or person the user names, their preferences, or
+    history this session alone can't supply — call this first. WHEN the topic
+    shifts to something plausibly discussed before, call it again. Assume memory
+    has the context; the failure mode is not checking, not over-checking.
 
-    Query with plain natural language carrying the distinctive nouns of the
-    user's message. Leave `project` unset by default (retrieval scopes itself);
-    filter only when results come back noisy with another domain.
+    Do NOT call for facts already visible in the current conversation or context
+    (read those directly), nor for generic-knowledge questions with no
+    user-history angle (definitions, math, general how-tos).
 
-    Served episode passages may carry `role`: "user" = the human stated it;
-    "assistant" = the agent's own prior output (assistant text, tool calls and
-    results); "mixed" = both. Old assistant-role text can be speculation or a
-    hypothetical plan that never happened — for "current state of X" questions,
-    weight newer user-stated content and dated timeline events over older
-    assistant-role passages, and treat every passage's `date` as load-bearing.
+    Query in plain language carrying the message's distinctive nouns; leave
+    `project` unset unless results come back noisy from another domain. Served
+    passages carry `role` (user / assistant / mixed) and a `date`: for "current
+    state of X", weight newer user-stated content over older assistant-role text,
+    which may be speculation or a plan that never happened.
 
-    Follow-ups: fetch_episode(id) expands a promising-but-truncated passage;
-    recall_timeline() answers when-did / how-long questions; recall_episodes()
-    returns exact raw turn text.
+    Follow-ups: fetch_episode(id) expands a truncated passage; recall_timeline()
+    answers when-did / how-long; recall_episodes() returns raw turn text.
 
     Args:
         query: Natural language search query.
@@ -416,12 +415,22 @@ def remember(
     project: str | None = None,
     session_id: str | None = None,
 ) -> dict:
-    """Store a memory that must survive this session.
+    """Persist a memory that must outlive this session — writes an episode and
+    enqueues knowledge-graph extraction.
 
-    Use when the user explicitly asks to remember something, or to bank a 2-3
-    sentence summary of decisions and results before a session ends or is
-    cleared. Routine conversation is ingested automatically — don't call this
-    for ordinary turns. Writes an episode and enqueues KG extraction.
+    WHEN the user states a durable fact, preference, or decision, corrects
+    something you had wrong, or explicitly asks you to remember → call this. If
+    you are about to reply "noted" / "got it" / "I'll remember that," call this
+    FIRST, then reply. Also use it to bank a 2-3 sentence summary of what was
+    decided or built before a session ends or is cleared.
+
+    Do NOT call for transient task state (what you're mid-doing, "running late"),
+    to restate something already stored, or to save your own speculation or an
+    unconfirmed plan. Routine conversation is ingested automatically.
+
+    Content contract: write it specific and self-contained — absolute dates (not
+    "yesterday"), concrete names, and the WHY behind a decision — so it stands
+    alone months later.
 
     Args:
         content: The text to remember.
