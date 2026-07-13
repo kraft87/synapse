@@ -6,11 +6,12 @@ user facts, project state, references), the last week's milestones, and a banner
 what memory exists at all. Bodies stay behind ids; absence from the board means SEARCH
 (recall), not doesn't-exist.
 
-Served two ways, same block (mirrors preferences_routes: the plugin hook is a THIN
-CLIENT with no DSN, the server owns the DB):
-  - MCP tool ``get_context(project)`` in server.py
-  - GET /context?project=X — machine-token auth (custom routes bypass FastMCP's auth
-    middleware by design), PG work in a threadpool, fail-soft JSON.
+Served ONE way: GET /context?project=X — machine-token auth (custom routes bypass
+FastMCP's auth middleware by design), PG work in a threadpool, fail-soft JSON. The
+plugin's SessionStart hook is the thin client (no DSN, the server owns the DB —
+mirrors preferences_routes). There is deliberately no MCP board tool: the hook
+already injects the block, and a listed tool invites a double-inject (Hermes
+pattern — when injection covers the read, ship no read tool).
 
 Pure SQL, no embedding calls, target <100ms: the note list (ingestion/db.py's
 list_board_notes), the timeline milestones (timeline_routes._recent_events — reused,

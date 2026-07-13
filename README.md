@@ -212,23 +212,19 @@ gets a release note saying so.
 
 ## MCP tools
 
-Six tools, listed in the order the server registers them (deliberate — tool-list
-position biases which tool a model picks):
+Five tools, listed in the order the server registers them (deliberate — tool-list
+position biases which tool a model picks). The board is deliberately NOT a tool: the
+plugin's SessionStart hook injects it via `GET /context`, and a listed board tool would
+invite a double-inject of a block the model already has (the Hermes pattern — when
+injection covers the read, ship no read tool).
 
 - `recall(query, project=None, session_focus=None, group_id="technical")` — the primary
   retrieval tool: reranked episodes + KG facts + timeline + web + history. Served episode
   passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can weight a
   human-stated fact over the agent's own past output.
-- `get_context(project=None)` — the board: a small always-current index of explicit
-  memories (rules & feedback, user facts, project state, references), the last week's
-  milestones, and what memory exists at all. Called once at session start, it converts
-  recall into recognition — each line is a note hook with an id, and absence from the
-  board means "search with recall", not "doesn't exist". Hard-capped (~80 lines / ~2K
-  tokens) so it stays an index, never a context tax. Also served over `GET /context`
-  for the plugin's session-start hook.
 - `fetch(ids)` — expand ids into full records: `e:N` episode ids from recall results
-  (bare `N` also accepted) and `n:N` note ids — the board's `n:ID` lines resolve to
-  their full note bodies through this tool. Mixed lists are fine; unknown ids come
+  (bare `N` also accepted) and `n:N` note ids — the session-start board block's `n:ID`
+  lines resolve to their full note bodies through this tool. Mixed lists are fine; unknown ids come
   back under `skipped`, and at most 20 ids expand per call.
 - `remember(content=None, hook=None, body=None, type="project", project=None)` — write a
   curated memory. The preferred form passes `hook` (a one-line index entry, ~120 chars) plus

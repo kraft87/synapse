@@ -1,5 +1,5 @@
-"""Synapse MCP server — recall, get_context, fetch, remember, recall_timeline,
-and recall_episodes as MCP tools (plus issue_machine_token, hidden from listings).
+"""Synapse MCP server — recall, fetch, remember, recall_timeline, and
+recall_episodes as MCP tools (plus issue_machine_token, hidden from listings).
 
 Run with:
     uv run python -m mcp_server.server
@@ -26,8 +26,8 @@ from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-# Logfire spans for the MCP server. Each tool invocation (recall, get_context,
-# fetch, remember, ...) gets a top-level span; auto-instrument
+# Logfire spans for the MCP server. Each tool invocation (recall, fetch,
+# remember, ...) gets a top-level span; auto-instrument
 # picks up any LLM/HTTP/FastMCP work underneath. Emits to whichever project the
 # LOGFIRE_TOKEN env points at (matched to poller/dream via compose override).
 logfire.configure(
@@ -164,7 +164,29 @@ def _build_auth():
 
 
 _auth, _auth_mw = _build_auth()
-mcp = FastMCP("synapse", auth=_auth, middleware=[*_auth_mw, _HiddenToolsList()])
+
+# Server instructions: with tool search on (Claude Code's default) only tool NAMES and
+# this string load at session start — it is the always-loaded orientation surface that
+# tells the model these tools exist and when to reach for them. Claude Code truncates
+# it at 2KB (test_tool_surface.py pins the cap); most other clients ignore the field,
+# which costs nothing.
+_INSTRUCTIONS = (
+    "Synapse is the user's persistent cross-session memory: tens of thousands of "
+    "past conversation turns, knowledge-graph facts extracted from them, a dated "
+    "event timeline, and curated notes. A board of note hooks is injected at "
+    "session start where the client supports it; note bodies expand by id. "
+    "BEFORE answering anything that references past work — a prior decision, "
+    "device, purchase, tool, project, person, or preference — search with "
+    "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
+    "(n:N) from earlier results. recall_timeline answers when-did / how-long "
+    "questions; recall_episodes returns raw turn text. WHEN the user states a "
+    "durable fact or correction, or you are about to say 'noted', call remember "
+    "FIRST, then reply. Absence from results means unknown, not false."
+)
+
+mcp = FastMCP(
+    "synapse", instructions=_INSTRUCTIONS, auth=_auth, middleware=[*_auth_mw, _HiddenToolsList()]
+)
 
 # Serve skills_lane skills as skill:// MCP resources (PG-backed). Clients materialize
 # them into ~/.claude/skills via sync_skills. Guarded on DB_URL so dev/stdio boots open.
@@ -210,7 +232,7 @@ from mcp_server.preferences_routes import register as _register_preferences_rout
 _register_preferences_routes(mcp, DB_URL, _machine_authorized)
 
 # Board read route — GET /context?project=X serves the rendered explicit-memory board
-# (the same block the get_context tool returns) for the plugin's SessionStart hook.
+# for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
 # Same machine-token seam. No-op w/o DB. get_recall is a lazy thunk: _get_recall is
 # defined below and only resolved at request time (telemetry shares its writer).
 from mcp_server.board import register as _register_board_routes  # noqa: E402
@@ -273,10 +295,18 @@ async def health(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Tools — REGISTRATION ORDER IS DELIBERATE. Tool-list position biases which tool
 # a model reaches for (first-listed wins most ties), so the surface reads in
-# intended-use order: recall (the workhorse), get_context (session-start board),
-# fetch (id expansion), remember (the write), then the two specialist reads —
-# recall_timeline, recall_episodes. Hidden plumbing (issue_machine_token, see
-# _HIDDEN_TOOLS) registers last. test_tool_surface.py pins this order.
+# intended-use order: recall (the workhorse), fetch (id expansion), remember (the
+# write), then the two specialist reads — recall_timeline, recall_episodes. Hidden
+# plumbing (issue_machine_token, see _HIDDEN_TOOLS) registers last.
+# test_tool_surface.py pins this order.
+#
+# There is deliberately NO board tool: the board is push-only (the plugin's
+# SessionStart hook injects it via GET /context). A listed get_context tool told the
+# model to "call this once at session start" when the hook had already injected the
+# block — a compliant model double-spends ~2K tokens. The Hermes pattern: when
+# injection covers the read, ship no read tool. Clients without the hook (claude.ai
+# connector) never spontaneously orient anyway; re-registering is a small revert if
+# that changes.
 # ---------------------------------------------------------------------------
 
 
@@ -334,49 +364,15 @@ def recall(
         )
 
 
-# Registered DIRECTLY after recall on purpose: tool-list position biases tool choice,
-# and the board is the session-start companion to recall — the order is deliberate.
-@mcp.tool()
-def get_context(project: str | None = None) -> dict:
-    """The memory board: a small always-current index of the user's explicit
-    memories — curated note hooks (rules & feedback, user facts, project state,
-    references), the last week's milestones, and what memory exists at all.
-
-    WHEN a session starts, or WHEN you are disoriented about what memory exists
-    or what was recently worked on, call this once — it answers "what should I
-    already know here?" before any work begins. Each line is a hook carrying its
-    note id (n:12); when a hook is relevant, expand the full note body with
-    fetch(["n:12"]).
-
-    Do NOT call per-question — recall() covers search; the board is recognition,
-    not retrieval. Do NOT call more than about once per session — its content
-    changes slowly. Do NOT read absence from the board as doesn't-exist —
-    absence means SEARCH (recall).
-
-    Args:
-        project: Optional project slug — scopes the board's project-notes section.
-    """
-    import time as _time
-
-    from mcp_server.board import build_board, record_board_metrics
-
-    with logfire.span("mcp.get_context", project=project):
-        t0 = _time.perf_counter()
-        board = build_board(DB_URL, project)
-        record_board_metrics(_get_recall(), "mcp-tool", (_time.perf_counter() - t0) * 1000.0, board)
-        board.pop("note_ids", None)
-        return board
-
-
 @mcp.tool()
 def fetch(ids: list[str]) -> dict:
     """Expand memory ids into full records: episode ids from recall results
     ("e:227168") and note ids from the board ("n:12"), mixed freely in one call.
 
     WHEN a recall() passage is relevant but truncated and you need the whole
-    turn, or WHEN a board hook (get_context's n:ID lines) matters and you need
-    the note body — pass the ids here. Bare numeric ids are treated as episode
-    ids.
+    turn, or WHEN a hook on the session-start board block (its n:ID lines)
+    matters and you need the note body — pass the ids here. Bare numeric ids
+    are treated as episode ids.
 
     Do NOT search with this — it only expands ids you already hold; recall()
     finds things. Do NOT re-fetch ids already expanded this session. Unknown or
@@ -426,6 +422,10 @@ def _derive_hook(content: str) -> str:
     return first[:120]
 
 
+# Docstring formatting is load-bearing: a bare "Word:" line is parsed as a docstring
+# SECTION and everything from it on is silently dropped from the wire description
+# (that once cost this tool its entire type-semantics block). Em-dash headers
+# survive; test_tool_surface.py pins the tail phrases of every description.
 @mcp.tool()
 async def remember(
     content: str | None = None,
@@ -441,44 +441,39 @@ async def remember(
     extraction.
 
     WHEN the user states a durable fact, preference, or decision, corrects
-    something you had wrong, or explicitly asks you to remember → call this. If
-    you are about to reply "noted" / "got it" / "I'll remember that," call this
-    FIRST, then reply. Also use it to bank a 2-3 sentence summary of what was
-    decided or built before a session ends or is cleared.
+    something you had wrong, or explicitly asks you to remember → call this.
+    If you are about to reply "noted" / "got it" / "I'll remember that," call
+    this FIRST, then reply. Also bank a 2-3 sentence summary of what was
+    decided before a session ends or is cleared.
 
-    Do NOT call for transient task state (what you're mid-doing, "running late"),
-    to restate something already stored, or to save your own speculation or an
-    unconfirmed plan. Routine conversation is ingested automatically.
+    Do NOT call for transient task state, to restate something already stored,
+    or to save your own speculation or an unconfirmed plan. Routine
+    conversation is ingested automatically.
 
-    PREFERRED form — pass hook + body (+ type). `hook` is the one-line index
-    entry (target ~120 chars, hard cap 200; internal newlines/whitespace runs
-    are collapsed to single spaces); `body` is the full note, fetched on demand
-    by id. Passing EITHER hook or body selects this form: both must then be
-    non-empty — there is no silent fallback to legacy (a lone hook would be
-    discarded). If `content` is also given alongside a full hook + body pair it
-    becomes the archived episode text (the note itself stays hook + body);
-    otherwise the episode is "hook\\n\\nbody". The legacy content-only form is
-    kept for compatibility: it derives the hook from the first sentence and
-    files the note as type 'project'.
+    Form — pass hook + body (+ type). `hook` is the one-line index entry
+    (target ~120 chars, hard cap 200, whitespace collapsed); `body` is the
+    full note, fetched on demand by id. Passing either selects this form and
+    both must then be non-empty — a lone hook never falls back to legacy.
+    The legacy content-only form stays for compatibility (hook derived from
+    the first sentence, type 'project'); content alongside a full hook + body
+    pair becomes the archived episode text.
 
-    WRITE CONTRACT — what a note must look like:
-    - Decisions WITH reasons, not changelog lines: "chose X because Y" survives;
-      "merged the fix" / "updated the file" is noise.
-    - DECLARATIVE, not imperative: "User prefers concise responses", never
-      "Always respond concisely" — imperative memory re-reads as a standing
-      directive and overrides live requests.
-    - 7-day staleness blocklist: PR numbers, commit SHAs, "phase N done", file
-      counts — anything stale within a week belongs in the episode archive
-      (written automatically), never in a note.
-    - Absolute dates ("2026-07-12"), never "yesterday" or "last week".
-    - Self-contained body: it must stand alone months later with zero
-      surrounding conversation.
+    Type semantics — user: durable facts about the user, and feedback:
+    corrections to agent behavior (both global — every session); project:
+    scoped to `project`, staleness-managed (the default);
+    reference: pointers to canonical sources.
 
-    Type semantics:
-      user      — durable facts about the user (global — every session).
-      feedback  — corrections to agent behavior (global — every session).
-      project   — scoped to `project`, staleness-managed (the default).
-      reference — pointers to canonical sources (repos, docs, runbooks).
+    The write contract — a good note:
+    - States decisions WITH reasons: "chose X because Y" survives; "merged
+      the fix" is noise.
+    - Is DECLARATIVE, not imperative: "User prefers concise responses",
+      never "Always respond concisely" — imperative memory re-reads as a
+      standing directive.
+    - Has no PR numbers, commit SHAs, "phase N done", file counts — anything
+      week-stale belongs in the episode archive (written automatically),
+      never in a note.
+    - Uses absolute dates ("2026-07-12"), never "yesterday" or "last week".
+    - Is self-contained: the body must stand alone months later.
 
     Args:
         content: Legacy form — full text to remember (hook and type derived).

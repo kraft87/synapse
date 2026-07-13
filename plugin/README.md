@@ -28,7 +28,7 @@ Five hooks (`hooks/hooks.json`) plus MCP wiring:
    Server-rendered and hard-capped (~80 lines / ~2K tokens), scoped to the session's
    project.
 
-MCP tools (`recall`, `get_context`, `fetch`, `remember`, …) are registered automatically —
+MCP tools (`recall`, `fetch`, `remember`, …) are registered automatically —
 no hand-written `.mcp.json`.
 
 The dream→skills lane (mines your transcripts → proposes new skills, retunes triggers,
@@ -161,9 +161,9 @@ Cursor history is importable too, but only as a server-side dev path for now
 
 ### 5. Verify it's working
 
-Run a few turns and end one — the `Stop` hook ships the transcript. Then ask Claude to call
-`get_context`; the board's banner reports the episode count and the most recently active
-projects, so yours should appear with a rising count. Knowledge-graph facts land
+Run a few turns and end one — the `Stop` hook ships the transcript. Then start a fresh
+session; the SessionStart board block's banner reports the episode count and the most
+recently active projects, so yours should appear with a rising count. Knowledge-graph facts land
 a few minutes later, on the poll cycle. Seeing nothing? Hooks fail silently by design —
 check that `curl -fsS $SYNAPSE_URL/health` returns ok and that `SYNAPSE_URL` and any token
 are set (`/plugin` shows the stored values).
@@ -186,10 +186,8 @@ Bundled commands (`!` prefix in a session; full path from an outside terminal):
 MCP tools (registered automatically; Claude calls them during a session):
 
 - **`recall`** — primary retrieval: reranked episodes + KG facts + web + history.
-- **`get_context`** — the board: curated note hooks, last week's milestones, and what
-  memory exists at all.
 - **`fetch`** — expand ids into full records: `e:N` episode ids from recall results and
-  `n:N` note ids from the board (mixed lists fine).
+  `n:N` note ids from the session-start board block (mixed lists fine).
 - **`remember`** — write a curated memory (note + episode + graph extraction).
 - **`recall_timeline`** — dated events for "when / in what order" questions.
 - **`recall_episodes`** — raw episode drill-down.

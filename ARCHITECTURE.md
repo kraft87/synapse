@@ -422,10 +422,9 @@ Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage r
 
 ### 7.1 Tools
 
-Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it.
+Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it. The board is push-only — `GET /context` feeds the plugin's SessionStart hook; there is no MCP board tool (the hook already injects the block).
 
 - **`recall(query, project=None, session_focus=None, group_id="technical")`** — the primary retrieval tool ([§6](#6-recall-pipeline)).
-- **`get_context(project=None)`** — the board: a hard-capped index of curated note hooks + last week's milestones (also served over `GET /context`).
 - **`fetch(ids)`** — expand `e:N` episode ids (bare `N` accepted) and `n:N` note ids into full records; mixed lists fine, unknown ids reported under `skipped`, capped at 20 per call.
 - **`remember(content=None, hook=None, body=None, type="project", project=None, session_id=None)`** — reconciles a note into the notes store and archives the text as a manual `Episode` with KG extraction.
 - **`recall_timeline(query=None, since=None, until=None, project=None, min_salience=0, limit=20, group_id=None)`** — dated what-happened events, chronological.
@@ -734,7 +733,7 @@ synapse/
 │   └── models.py              # Pydantic domain models
 │
 ├── mcp_server/
-│   ├── server.py              # fastmcp: recall/get_context/fetch/remember/recall_timeline/recall_episodes (+hidden issue_machine_token) + /ingest + /recall routes + MultiAuth
+│   ├── server.py              # fastmcp: recall/fetch/remember/recall_timeline/recall_episodes (+hidden issue_machine_token) + /ingest + /recall routes + MultiAuth
 │   ├── recall.py              # Recall engine: episode leg + KG leg + web + history, rerank, fusion
 │   ├── kg_pg.py               # recall-side KG search (vector + BM25 + 1-hop over kg_*)
 │   ├── device_routes.py       # /device/code + /device/token — RFC 8628 device login (proxies GitHub), allowlist-gated

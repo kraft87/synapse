@@ -43,12 +43,16 @@ from mcp_server.recall import Recall  # noqa: E402
 
 _EXPECTED_ORDER = [
     "recall",
-    "get_context",
     "fetch",
     "remember",
     "recall_timeline",
     "recall_episodes",
 ]
+
+# Claude Code hard-truncates tool descriptions AND server instructions at 2KB each —
+# an over-cap description silently loses its tail on the wire (remember's write
+# contract once lost its entire type-semantics block this way).
+_CC_TRUNCATION_CAP = 2048
 
 
 def _listed():
@@ -66,6 +70,43 @@ def test_removed_tools_are_gone():
     assert "query_graph" not in names
     assert "list_projects" not in names
     assert "fetch_episode" not in names  # replaced by fetch (e:/n:)
+    # Board is push-only (SessionStart hook via GET /context) — no read tool, so a
+    # compliant model can't double-inject the block the hook already delivered.
+    assert "get_context" not in names
+
+
+def test_descriptions_and_instructions_fit_claude_code_truncation():
+    """Every wire-visible description AND the server instructions string must fit
+    Claude Code's 2KB truncation, or their tails silently vanish for CC sessions."""
+    for t in _listed():
+        size = len((t.description or "").encode())
+        assert size <= _CC_TRUNCATION_CAP, f"{t.name}: {size} bytes > {_CC_TRUNCATION_CAP}"
+    instructions = server.mcp.instructions or ""
+    assert instructions, "server instructions must be set — the only always-loaded surface"
+    assert len(instructions.encode()) <= _CC_TRUNCATION_CAP
+
+
+# The LAST substantive phrase of each docstring (before Args:). FastMCP parses a bare
+# "Word:" line as a docstring SECTION and silently drops it and everything after it
+# from the wire description — remember once lost its whole type-semantics block this
+# way. Pinning each tail proves no description got section-swallowed.
+_DESCRIPTION_TAILS = {
+    "recall": "recall_episodes() returns raw",
+    "fetch": "at most 20 ids per call",
+    "remember": "must stand alone months later",
+    "recall_timeline": "anchor events' dates the payload gives",
+    "recall_episodes": "the right first call",
+}
+
+
+def test_description_tails_survive_docstring_section_parsing():
+    by_name = {t.name: t.description or "" for t in _listed()}
+    assert set(_DESCRIPTION_TAILS) == set(by_name)
+    for name, tail in _DESCRIPTION_TAILS.items():
+        assert tail in by_name[name], f"{name}: tail phrase missing — description truncated?"
+    # The load-bearing middle of remember's contract, explicitly:
+    assert "reference: pointers to canonical sources" in by_name["remember"]
+    assert "DECLARATIVE, not imperative" in by_name["remember"]
 
 
 def test_issue_machine_token_hidden_from_list_but_callable():
