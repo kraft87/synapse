@@ -1,5 +1,5 @@
-"""Synapse MCP server — recall, recall_episodes, fetch_episode, recall_timeline,
-remember, list_projects, and query_graph as MCP tools.
+"""Synapse MCP server — recall, get_context, recall_episodes, fetch_episode,
+recall_timeline, remember, list_projects, and query_graph as MCP tools.
 
 Run with:
     uv run python -m mcp_server.server
@@ -191,6 +191,14 @@ from mcp_server.preferences_routes import register as _register_preferences_rout
 
 _register_preferences_routes(mcp, DB_URL, _machine_authorized)
 
+# Board read route — GET /context?project=X serves the rendered explicit-memory board
+# (the same block the get_context tool returns) for the plugin's SessionStart hook.
+# Same machine-token seam. No-op w/o DB. get_recall is a lazy thunk: _get_recall is
+# defined below and only resolved at request time (telemetry shares its writer).
+from mcp_server.board import register as _register_board_routes  # noqa: E402
+
+_register_board_routes(mcp, DB_URL, _machine_authorized, get_recall=lambda: _get_recall())
+
 # Device-login lane — RFC 8628 device flow so `synapse login` works browser-free on servers /
 # headless boxes. Proxies GitHub's device flow and gates the machine token by the same GitHub
 # allowlist as the web leg. No-op unless GITHUB_CLIENT_ID + SYNAPSE_MACHINE_TOKEN are set.
@@ -300,6 +308,39 @@ def recall(
             group_id=group_id,
             source="mcp-tool",
         )
+
+
+# Registered DIRECTLY after recall on purpose: tool-list position biases tool choice,
+# and the board is the session-start companion to recall — the order is deliberate.
+@mcp.tool()
+def get_context(project: str | None = None) -> dict:
+    """The memory board: a small always-current index of the user's explicit
+    memories — curated note hooks (rules & feedback, user facts, project state,
+    references), the last week's milestones, and what memory exists at all.
+
+    Call ONCE at session start, or when disoriented about what memory exists /
+    what was recently worked on — it answers "what should I already know here?"
+    before any work begins. Each line is a hook carrying its note id (n:12);
+    when a hook is relevant, fetch the full note body by that id.
+
+    Do NOT call per-question — recall() covers search; the board is recognition,
+    not retrieval. Do NOT call more than about once per session — its content
+    changes slowly. Absence from the board means SEARCH (recall), not
+    doesn't-exist.
+
+    Args:
+        project: Optional project slug — scopes the board's project-notes section.
+    """
+    import time as _time
+
+    from mcp_server.board import build_board, record_board_metrics
+
+    with logfire.span("mcp.get_context", project=project):
+        t0 = _time.perf_counter()
+        board = build_board(DB_URL, project)
+        record_board_metrics(_get_recall(), "mcp-tool", (_time.perf_counter() - t0) * 1000.0, board)
+        board.pop("note_ids", None)
+        return board
 
 
 @mcp.tool()

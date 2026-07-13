@@ -1407,11 +1407,14 @@ class Recall:
         query: str | None = None,
         group_id: str | None = None,
         ms_total: float | None = None,
+        chars: int | None = None,
+        est_tokens: int | None = None,
         served_ids: dict[str, Any] | None = None,
     ) -> None:
         """Public passthrough onto the fire-and-forget recall_metrics writer for
-        non-recall callers (e.g. the remember tool): one telemetry row, background
-        insert, never surfaces a failure. Columns not passed stay NULL."""
+        non-recall callers (the remember tool's kind='remember' rows, the board's
+        kind='board' rows): one telemetry row, background insert, never surfaces
+        a failure. Columns not passed stay NULL."""
         self._record_metrics(
             {
                 "kind": kind,
@@ -1419,6 +1422,8 @@ class Recall:
                 "query": query,
                 "group_id": group_id,
                 "ms_total": ms_total,
+                "chars": chars,
+                "est_tokens": est_tokens,
                 "served_ids": served_ids,
             }
         )
