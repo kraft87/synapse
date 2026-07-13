@@ -247,8 +247,11 @@ def test_telemetry_row_with_outcome_envelope(env):
     # The metrics write is fire-and-forget on a single-worker executor: a no-op
     # barrier submitted after it completes only once the row is in.
     env.engine._async_executor.submit(lambda: None).result(timeout=10)
+    # Newest row only: a stale fire-and-forget write from a prior test's engine
+    # can land after this test's TRUNCATE — never let it win the assertion.
     row = env.conn.execute(
-        "SELECT source, ms_total, served_ids FROM recall_metrics WHERE kind = 'remember'"
+        "SELECT source, ms_total, served_ids FROM recall_metrics"
+        " WHERE kind = 'remember' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     assert row is not None
     assert row[0] == "mcp-tool" and row[1] is not None
@@ -274,3 +277,76 @@ def test_neither_form_returns_error_dict(env):
         out = _remember(**kw)
         assert out["status"] == "error" and "hook + body" in out["detail"]
     assert env.conn.execute("SELECT count(*) FROM episodes").fetchone()[0] == 0
+
+
+def test_blank_inputs_return_error_dicts(env):
+    # Degenerate values must never create junk notes — error dict, zero writes.
+    for kw in (
+        {"hook": "", "body": ""},
+        {"hook": "   ", "body": "b"},
+        {"hook": "h", "body": " \n\t "},
+        {"content": ""},
+        {"content": "   \n "},
+    ):
+        out = _remember(**kw)
+        assert out["status"] == "error", kw
+    assert env.conn.execute("SELECT count(*) FROM episodes").fetchone()[0] == 0
+    assert env.conn.execute("SELECT count(*) FROM notes").fetchone()[0] == 0
+
+
+def test_hook_with_content_but_no_body_errors_not_legacy(env):
+    # hook + content (no body) is the STRUCTURED form with body missing — it
+    # must error, never silently take the legacy path and discard the hook.
+    out = _remember(hook="User prefers dark mode", content="Some content.")
+    assert out["status"] == "error" and "body" in out["detail"]
+    assert env.conn.execute("SELECT count(*) FROM episodes").fetchone()[0] == 0
+    assert env.conn.execute("SELECT count(*) FROM notes").fetchone()[0] == 0
+
+
+def test_multiline_hook_stored_single_line(env):
+    out = _remember(hook="line one\n\tline   two\r\nline three", body="B.", type="user")
+    assert out["status"] == "ok"
+    assert _note_row(env, out["note_id"])[0] == "line one line two line three"
+
+
+def test_structured_values_stored_stripped(env):
+    out = _remember(hook="  User prefers dark mode  ", body="  Full body.\n", type="user")
+    hook, body, *_ = _note_row(env, out["note_id"])
+    assert hook == "User prefers dark mode" and body == "Full body."
+
+
+def test_content_alongside_full_pair_is_episode_text(env):
+    out = _remember(hook="Hook line", body="Body text.", content="Episode text.", type="user")
+    assert out["status"] == "ok"
+    hook, body, *_ = _note_row(env, out["note_id"])
+    assert hook == "Hook line" and body == "Body text."  # note keeps hook + body
+    ep = env.conn.execute(
+        "SELECT content FROM episodes WHERE id = %s", (out["episode_id"],)
+    ).fetchone()
+    assert ep[0] == "Episode text."
+
+
+def test_notes_deps_llm_construction_failure_degrades_to_none(monkeypatch):
+    # A misconfigured provider must degrade to llm=None, never raise out of
+    # _work after the episode write (fail-open confirm design).
+    import ingestion.embedding as emb_mod
+
+    monkeypatch.setattr(emb_mod, "create_embedder", lambda **kw: None)
+    monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "bogus")
+    _, llm = server._notes_deps()
+    assert llm is None
+
+
+def test_llm_none_collapses_confirm_to_update(env, monkeypatch):
+    # End-to-end with the REAL parse_with_retry and llm=None: the confirm call
+    # raises inside _confirm_relation's blanket except and collapses to UPDATE.
+    from ingestion.llm_client import parse_with_retry as _real_parse
+
+    monkeypatch.setattr(notes_mod, "parse_with_retry", _real_parse)
+    monkeypatch.setattr(server, "_notes_deps", lambda: (env.emb, None))
+    old = _seed_note(env, slot=1)
+    env.emb.mapping["User prefers light mode"] = 1
+
+    out = _remember(hook="User prefers light mode", body="B.", type="user")
+    assert out["status"] == "ok"
+    assert out["outcome"] == "updated" and out["note_id"] == old

@@ -412,9 +412,13 @@ def fetch_episode(episode_ids: list[str]) -> dict:
 def _notes_deps() -> tuple:
     """(embedder, llm) for the notes reconcile path — a seam so tests can stub both.
 
-    Embedder construction failure degrades to ``None`` (keyless dev/test):
-    reconcile_note then stores a NULL embedding and skips dedup rather than
-    failing the write (same degrade the timeline ingest route uses)."""
+    BOTH constructions degrade to ``None`` on failure — remember() must never
+    surface a raw exception for a config problem (the episode is already written
+    by the time reconcile runs). Embedder ``None`` (keyless dev/test):
+    reconcile_note stores a NULL embedding and skips dedup rather than failing
+    the write (same degrade the timeline ingest route uses). LLM ``None`` (e.g.
+    a bad SYNAPSE_LLM_PROVIDER): the confirm call fails inside reconcile_note's
+    blanket except and collapses to "same" -> UPDATE (the fail-open design)."""
     from ingestion.embedding import create_embedder
     from ingestion.llm_client import create_llm_client
 
@@ -423,7 +427,12 @@ def _notes_deps() -> tuple:
     except Exception as e:
         logger.warning("notes embedder unavailable (%s); note dedup will be skipped", e)
         embedder = None
-    return embedder, create_llm_client()
+    try:
+        llm = create_llm_client()
+    except Exception as e:
+        logger.warning("notes LLM unavailable (%s); confirm will collapse to update", e)
+        llm = None
+    return embedder, llm
 
 
 def _derive_hook(content: str) -> str:
@@ -462,10 +471,15 @@ async def remember(
     unconfirmed plan. Routine conversation is ingested automatically.
 
     PREFERRED form — pass hook + body (+ type). `hook` is the one-line index
-    entry (target ~120 chars, hard cap 200); `body` is the full note, fetched on
-    demand by id. The legacy content-only form is kept for compatibility: it
-    derives the hook from the first sentence and files the note as type
-    'project'.
+    entry (target ~120 chars, hard cap 200; internal newlines/whitespace runs
+    are collapsed to single spaces); `body` is the full note, fetched on demand
+    by id. Passing EITHER hook or body selects this form: both must then be
+    non-empty — there is no silent fallback to legacy (a lone hook would be
+    discarded). If `content` is also given alongside a full hook + body pair it
+    becomes the archived episode text (the note itself stays hook + body);
+    otherwise the episode is "hook\\n\\nbody". The legacy content-only form is
+    kept for compatibility: it derives the hook from the first sentence and
+    files the note as type 'project'.
 
     WRITE CONTRACT — what a note must look like:
     - Decisions WITH reasons, not changelog lines: "chose X because Y" survives;
@@ -503,8 +517,8 @@ async def remember(
     from ingestion.models import Episode, ExtractionItem
     from ingestion.notes import _VALID_TYPES, reconcile_note
 
-    structured = hook is not None and body is not None
-    if not structured and not content:
+    structured = hook is not None or body is not None
+    if not structured and not (content or "").strip():
         return {
             "status": "error",
             "detail": "provide hook + body (preferred) or content (legacy)",
@@ -516,16 +530,27 @@ async def remember(
         }
 
     if structured:
-        note_hook = str(hook)[:200]  # hard cap; the contract targets ~120
-        note_body = str(body)
+        # Passing either hook or body commits to the structured form — a lone
+        # hook (even with content also present) must NOT silently fall back to
+        # legacy, which would discard the caller's hook. Board lines are
+        # single-line by contract: collapse whitespace runs/newlines BEFORE the
+        # hard cap so a multi-line hook can't smuggle newlines under it.
+        note_hook = " ".join((hook or "").split())[:200]  # hard cap; targets ~120
+        note_body = (body or "").strip()
+        if not note_hook or not note_body:
+            missing = "hook" if not note_hook else "body"
+            return {
+                "status": "error",
+                "detail": f"structured form requires hook + body — {missing} is missing or blank",
+            }
         note_type = type
-        ep_content = content or f"{note_hook}\n\n{note_body}"
+        # content alongside a full pair serves as the archived episode text.
+        ep_content = (content or "").strip() or f"{note_hook}\n\n{note_body}"
     else:
-        assert content is not None  # guaranteed by the form check above
-        note_hook = _derive_hook(content)
-        note_body = content
+        ep_content = (content or "").strip()  # non-empty per the form check above
+        note_hook = _derive_hook(ep_content)
+        note_body = ep_content
         note_type = "project"
-        ep_content = content
 
     sid = session_id or str(_uuid.uuid4())
 
