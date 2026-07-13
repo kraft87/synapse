@@ -62,6 +62,13 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # come across. No uv cache, no tests, no scripts, no .git in the final image.
 FROM base
 
+# Without these, GHCR displays the BASE image's description (uv's) on the
+# package page — OCI labels inherit from the final stage's ancestor.
+LABEL org.opencontainers.image.title="synapse" \
+      org.opencontainers.image.description="Persistent memory for AI agents: conversation episodes, a knowledge graph, and a timeline in Postgres, served over MCP." \
+      org.opencontainers.image.source="https://github.com/kraft87/synapse" \
+      org.opencontainers.image.licenses="MIT"
+
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/ingestion /app/ingestion
 COPY --from=builder /app/mcp_server /app/mcp_server
