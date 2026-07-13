@@ -37,6 +37,7 @@ _DB_FILES = {
     "test_telemetry_kinds.py",
     "test_import_notes.py",
     "test_tool_surface.py",
+    "test_restamp_inherited_dates.py",
 }
 
 
