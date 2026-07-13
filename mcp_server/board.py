@@ -120,7 +120,10 @@ def _render(
         lines.append(_SECTION_TITLES.get(t) or f"## Project: {project or 'all'}")
         lines.extend(_note_line(n) for n in by_type[t])
     if dropped:
-        lines.append(f"(+ {dropped} more notes behind recall)")
+        # "not shown", NOT "behind recall": recall() searches the episode archive, not
+        # the notes store, and fetch() is by-id only — an overflowed note's id appears
+        # nowhere, so pointing at recall would overpromise.
+        lines.append(f"(+ {dropped} older notes not shown)")
 
     if events:
         lines.append("")

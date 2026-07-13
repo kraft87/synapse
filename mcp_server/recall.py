@@ -349,13 +349,13 @@ def _to_web_recall_item(row: dict[str, Any]) -> dict[str, Any]:
 def _to_recall_item(row: dict[str, Any]) -> dict[str, Any]:
     """Slim a SQL row into the minimum shape an LLM caller can act on.
 
-    Keeps the episode id (for fetch_episode drill-down) + content + project (only when
+    Keeps the episode id (for fetch() drill-down) + content + project (only when
     non-null) + date (truncated from full timestamp). Drops everything used only for ranking
     or debug: session_id, doc_type, retrieval_count, vec_distance, bm25_score, etc.
     """
     out: dict[str, Any] = {}
     if (rid := row.get("id")) is not None:
-        out["id"] = rid  # "e:N" — pass to fetch_episode() to expand the full turn
+        out["id"] = rid  # "e:N" — pass to fetch() to expand the full turn
     out["content"] = row.get("content", "")
     if (project := row.get("project")) is not None:
         out["project"] = project
@@ -408,7 +408,7 @@ def _passage_role(spans: list[tuple[int, str]], start: int, end: int) -> str | N
     return seen.pop() if len(seen) == 1 else "mixed"
 
 
-_FETCH_MAX = 20  # max episodes fetch_episodes() will expand in one call (bounds the by-id read)
+_FETCH_MAX = 20  # max records fetch() will expand in one call, across kinds (bounds the read)
 
 
 def _parse_episode_ids(ids: list[Any]) -> list[int]:
@@ -430,6 +430,42 @@ def _parse_episode_ids(ids: list[Any]) -> list[int]:
             seen.add(n)
             out.append(n)
     return out[:_FETCH_MAX]
+
+
+def _parse_fetch_ids(ids: list[Any]) -> tuple[list[int], list[int], list[str], list[str]]:
+    """Split fetch()'s mixed ids into episode ids ("e:N", or bare N / bare int for
+    back-compat) and note ids ("n:N"), each deduped and order-preserving, capped at
+    _FETCH_MAX across BOTH kinds (over-cap ids are silently dropped, matching the old
+    episode-only path). Unknown prefixes and unparseable ids land verbatim in
+    ``skipped``. Also returns the accepted ids, normalized ("e:5" / "n:3"), in request
+    order — the telemetry query field."""
+    eps: list[int] = []
+    notes: list[int] = []
+    skipped: list[str] = []
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for x in ids:
+        kind: str | None = None
+        n: int | None = None
+        if isinstance(x, int) and not isinstance(x, bool):
+            kind, n = "e", x
+        elif isinstance(x, str):
+            s = x.strip()
+            prefix, _, rest = s.partition(":")
+            if not _:  # no colon: bare N is an episode id (back-compat)
+                prefix, rest = "e", s
+            if prefix in ("e", "n") and rest.isdigit():
+                kind, n = prefix, int(rest)
+        if kind is None or n is None:
+            skipped.append(str(x))
+            continue
+        key = f"{kind}:{n}"
+        if key in seen or len(normalized) >= _FETCH_MAX:
+            continue
+        seen.add(key)
+        normalized.append(key)
+        (eps if kind == "e" else notes).append(n)
+    return eps, notes, skipped, normalized
 
 
 def _apply_supersessions(
@@ -1057,7 +1093,7 @@ class Recall:
             used.update(span)
             item: dict[str, Any] = {}
             if (rid := ep.get("id")) is not None:
-                item["id"] = rid  # parent episode — pass to fetch_episode() to expand the full turn
+                item["id"] = rid  # parent episode — pass to fetch() to expand the full turn
             item["content"] = "\n".join(passages[j] for j in span)
             if (project := ep.get("project")) is not None:
                 item["project"] = project
@@ -1795,18 +1831,41 @@ class Recall:
         )
         return out
 
-    def fetch_episodes(self, ids: list[Any], source: str | None = None) -> dict[str, Any]:
-        """Drill-down by id: return the FULL untruncated text of specific episodes.
+    def fetch(self, ids: list[Any], source: str | None = None) -> dict[str, Any]:
+        """Drill-down by id: expand recall()'s compact serves into full records.
 
-        recall() serves compact passages (Stage 2), each tagged with its parent episode ``id``
-        ("e:N"). When a passage looks relevant but you need the whole turn, pass its id(s) here.
-        Accepts the "e:N" ids (or bare ints) from recall()/recall_episodes(); returns the matching
-        episodes in the SAME shape as the other legs ({id, content, project, date}), ordered to
-        match the requested ids. Unknown/unparseable ids are skipped; capped at _FETCH_MAX."""
+        Accepts mixed prefixed ids — "e:N" episodes (bare N / bare int also accepted,
+        the old fetch_episode back-compat) and "n:N" notes (the board's n:ID lines).
+        Episodes come back in the recall-item shape ({id, content, project, date}),
+        notes as {id, hook, body, type, project, updated}; both ordered to match the
+        request. Unknown prefixes / unparseable ids are reported under ``skipped``;
+        the total expanded is capped at _FETCH_MAX across both kinds."""
         t_start = time.perf_counter()
-        parsed = _parse_episode_ids(ids)
-        if not parsed:
-            return {"episodes": []}
+        ep_ids, note_ids, skipped, normalized = _parse_fetch_ids(ids)
+        out: dict[str, Any] = {"episodes": [], "notes": [], "skipped": skipped}
+        if not normalized:
+            return out
+        out["episodes"] = self._fetch_episode_records(ep_ids) if ep_ids else []
+        out["notes"] = self._fetch_note_records(note_ids) if note_ids else []
+        chars = _served_chars({"episodes": out["episodes"]}) + sum(
+            len(n.get("hook") or "") + len(n.get("body") or "") for n in out["notes"]
+        )
+        self._record_metrics(
+            {
+                "kind": "fetch",
+                "source": source or "mcp",
+                "query": ",".join(normalized)[:200],
+                "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
+                "n_episodes": len(out["episodes"]),
+                "chars": chars,
+                "served_ids": {"kinds": {"e": len(out["episodes"]), "n": len(out["notes"])}},
+            }
+        )
+        return out
+
+    def _fetch_episode_records(self, parsed: list[int]) -> list[dict[str, Any]]:
+        """The episodes leg of fetch(): full untruncated turns by int id. Fail-soft —
+        a read error serves an empty leg, never breaks the call."""
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
@@ -1814,24 +1873,42 @@ class Recall:
                 (parsed,),
             ).fetchall()
         except Exception as e:
-            logger.warning("fetch_episodes failed: %s", e)
-            return {"episodes": []}
+            logger.warning("fetch episodes leg failed: %s", e)
+            return []
         by_id = {r["id"]: r for r in rows}
-        episodes = [_to_recall_item({**by_id[n], "id": f"e:{n}"}) for n in parsed if n in by_id]
-        if parsed:
-            self._increment_retrieval_counts([n for n in parsed if n in by_id])
-        out = {"episodes": episodes}
-        self._record_metrics(
+        found = [n for n in parsed if n in by_id]
+        if found:
+            self._increment_retrieval_counts(found)
+        return [_to_recall_item({**by_id[n], "id": f"e:{n}"}) for n in found]
+
+    def _fetch_note_records(self, parsed: list[int]) -> list[dict[str, Any]]:
+        """The notes leg of fetch(): board-note bodies by int id (the on-demand half of
+        the board — hook on the board, body behind the id). Uses a short-lived Database
+        like the other notes-store paths. Fail-soft like the episodes leg."""
+        from ingestion.db import Database
+
+        try:
+            db = Database(self._db_url)
+            try:
+                rows = db.get_notes_by_ids(parsed)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("fetch notes leg failed: %s", e)
+            return []
+        by_id = {r["id"]: r for r in rows}
+        return [
             {
-                "kind": "fetch",
-                "source": source or "mcp",
-                "query": ",".join(str(n) for n in parsed)[:200],
-                "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
-                "n_episodes": len(episodes),
-                "chars": _served_chars(out),
+                "id": f"n:{n}",
+                "hook": r["hook"],
+                "body": r["body"],
+                "type": r["type"],
+                "project": r["project"],
+                "updated": str(r["updated_at"])[:10],
             }
-        )
-        return out
+            for n in parsed
+            if (r := by_id.get(n)) is not None
+        ]
 
     def _episode_supersessions(
         self, episode_ids: list[int], group_id: str, cap: int = 6

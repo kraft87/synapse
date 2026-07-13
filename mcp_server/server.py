@@ -1,5 +1,5 @@
-"""Synapse MCP server — recall, get_context, recall_episodes, fetch_episode,
-recall_timeline, remember, list_projects, and query_graph as MCP tools.
+"""Synapse MCP server — recall, get_context, fetch, remember, recall_timeline,
+and recall_episodes as MCP tools (plus issue_machine_token, hidden from listings).
 
 Run with:
     uv run python -m mcp_server.server
@@ -26,8 +26,8 @@ from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-# Logfire spans for the MCP server. Each tool invocation (recall, recall_episodes,
-# remember, query_graph, list_projects) gets a top-level span; auto-instrument
+# Logfire spans for the MCP server. Each tool invocation (recall, get_context,
+# fetch, remember, ...) gets a top-level span; auto-instrument
 # picks up any LLM/HTTP/FastMCP work underneath. Emits to whichever project the
 # LOGFIRE_TOKEN env points at (matched to poller/dream via compose override).
 logfire.configure(
@@ -112,6 +112,24 @@ class _GitHubAllowlist(Middleware):
         return await call_next(context)
 
 
+# Tools that stay fully callable via tools/call but never appear in tools/list:
+# plumbing that a specific client invokes by name (synapse_login's raw tools/call
+# on issue_machine_token) and that a model browsing the tool list must not see.
+_HIDDEN_TOOLS = {"issue_machine_token"}
+
+
+class _HiddenToolsList(Middleware):
+    """Filter hidden tools out of tools/list responses.
+
+    Listing and calling are separate request paths in FastMCP, so dropping a tool
+    here leaves tools/call untouched — `synapse login` keeps working while the
+    model-facing surface stays the six deliberate tools registered below."""
+
+    async def on_list_tools(self, context, call_next):
+        tools = await call_next(context)
+        return [t for t in tools if t.name not in _HIDDEN_TOOLS]
+
+
 def _build_auth():
     """(auth_provider, middleware). No machine token => open server (dev/stdio/pre-cutover)."""
     if not MACHINE_TOKEN:
@@ -146,7 +164,7 @@ def _build_auth():
 
 
 _auth, _auth_mw = _build_auth()
-mcp = FastMCP("synapse", auth=_auth, middleware=_auth_mw)
+mcp = FastMCP("synapse", auth=_auth, middleware=[*_auth_mw, _HiddenToolsList()])
 
 # Serve skills_lane skills as skill:// MCP resources (PG-backed). Clients materialize
 # them into ~/.claude/skills via sync_skills. Guarded on DB_URL so dev/stdio boots open.
@@ -253,7 +271,12 @@ async def health(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Tools — REGISTRATION ORDER IS DELIBERATE. Tool-list position biases which tool
+# a model reaches for (first-listed wins most ties), so the surface reads in
+# intended-use order: recall (the workhorse), get_context (session-start board),
+# fetch (id expansion), remember (the write), then the two specialist reads —
+# recall_timeline, recall_episodes. Hidden plumbing (issue_machine_token, see
+# _HIDDEN_TOOLS) registers last. test_tool_surface.py pins this order.
 # ---------------------------------------------------------------------------
 
 
@@ -285,8 +308,9 @@ def recall(
     state of X", weight newer user-stated content over older assistant-role text,
     which may be speculation or a plan that never happened.
 
-    Follow-ups: fetch_episode(id) expands a truncated passage; recall_timeline()
-    answers when-did / how-long; recall_episodes() returns raw turn text.
+    Follow-ups: fetch(ids) expands a truncated passage or note body;
+    recall_timeline() answers when-did / how-long; recall_episodes() returns raw
+    turn text.
 
     Args:
         query: Natural language search query.
@@ -318,15 +342,16 @@ def get_context(project: str | None = None) -> dict:
     memories — curated note hooks (rules & feedback, user facts, project state,
     references), the last week's milestones, and what memory exists at all.
 
-    Call ONCE at session start, or when disoriented about what memory exists /
-    what was recently worked on — it answers "what should I already know here?"
-    before any work begins. Each line is a hook carrying its note id (n:12);
-    when a hook is relevant, fetch the full note body by that id.
+    WHEN a session starts, or WHEN you are disoriented about what memory exists
+    or what was recently worked on, call this once — it answers "what should I
+    already know here?" before any work begins. Each line is a hook carrying its
+    note id (n:12); when a hook is relevant, expand the full note body with
+    fetch(["n:12"]).
 
     Do NOT call per-question — recall() covers search; the board is recognition,
     not retrieval. Do NOT call more than about once per session — its content
-    changes slowly. Absence from the board means SEARCH (recall), not
-    doesn't-exist.
+    changes slowly. Do NOT read absence from the board as doesn't-exist —
+    absence means SEARCH (recall).
 
     Args:
         project: Optional project slug — scopes the board's project-notes section.
@@ -344,110 +369,24 @@ def get_context(project: str | None = None) -> dict:
 
 
 @mcp.tool()
-def recall_episodes(
-    query: str,
-    project: str | None = None,
-    limit: int = 5,
-) -> dict:
-    """Raw episode drill-down: individual conversation turns.
+def fetch(ids: list[str]) -> dict:
+    """Expand memory ids into full records: episode ids from recall results
+    ("e:227168") and note ids from the board ("n:12"), mixed freely in one call.
 
-    Use this when you need the exact text of a specific exchange —
-    "what exactly did we say about X?", "show me that debug session".
-    Returns full episode content ranked by relevance + recency.
+    WHEN a recall() passage is relevant but truncated and you need the whole
+    turn, or WHEN a board hook (get_context's n:ID lines) matters and you need
+    the note body — pass the ids here. Bare numeric ids are treated as episode
+    ids.
 
-    For a blended overview (top episodes + KG facts), use recall() instead.
-
-    Args:
-        query: Natural language search query.
-        project: Optional project slug to filter results.
-        limit: Max episodes to return (default 5, max ~10 before it gets noisy).
-    """
-    with logfire.span(
-        "mcp.recall_episodes {query!r}",
-        query=query[:80],
-        project=project,
-        limit=limit,
-    ):
-        engine = _get_recall()
-        return engine.recall_episodes(
-            query=query,
-            project=project,
-            limit=limit,
-            source="mcp-tool",
-        )
-
-
-@mcp.tool()
-def recall_timeline(
-    query: str | None = None,
-    since: str | None = None,
-    until: str | None = None,
-    project: str | None = None,
-    min_salience: int = 0,
-    limit: int = 20,
-    group_id: str | None = None,
-) -> dict:
-    """The personal timeline: dated events that HAPPENED (commits, decisions, ships).
-
-    Use this for "when did I..." / "what did I do last week" / "how long between X and Y"
-    questions — anything about the ORDER or DATES of past work. recall() stays the tool
-    for what-is-true facts; this is the tool for what-happened events.
-
-    Two query shapes:
-      - Topical (query set): "the login work" — hybrid-searches events, returns them
-        in chronological order.
-      - Pure-time (query empty, since/until set): "last week" — returns the window's
-        events, milestones individually and dense runs collapsed to one line with
-        count + first/last anchors (so durations stay auditable).
-
-    Never compute a bare day-count from this yourself without citing the two anchor
-    events' dates the payload gives you.
+    Do NOT search with this — it only expands ids you already hold; recall()
+    finds things. Do NOT re-fetch ids already expanded this session. Unknown or
+    unparseable ids are returned under "skipped"; at most 20 ids per call.
 
     Args:
-        query: Optional topical search ("browser-free login work"). Empty = pure time-range.
-        since: Optional ISO date/timestamp lower bound (inclusive).
-        until: Optional ISO date/timestamp upper bound (exclusive).
-        project: Optional project slug filter (e.g. "synapse").
-        min_salience: 0 (all), 1 (skip routine), 2 (milestones only).
-        limit: Max items for pure-time queries (post-collapse, default 20).
-        group_id: Scope — pass "personal" for questions about the user's own life
-            (health, appointments, purchases, career) to exclude technical/work
-            events; unset or "technical" serves everything.
+        ids: Ids to expand — "e:N" episodes, "n:N" notes, bare N = episode.
     """
-    with logfire.span(
-        "mcp.recall_timeline {query!r}",
-        query=(query or "")[:80],
-        since=since,
-        until=until,
-        project=project,
-    ):
-        res = _get_timeline().recall_timeline(
-            query=query,
-            since=since,
-            until=until,
-            project=project,
-            min_salience=min_salience,
-            limit=limit,
-            group_id=group_id,
-        )
-        for it in res.get("items") or []:
-            it.pop("_id", None)  # internal telemetry key (recall served_ids), not for callers
-        return res
-
-
-@mcp.tool()
-def fetch_episode(episode_ids: list[str]) -> dict:
-    """Drill down to the FULL text of specific episodes by id.
-
-    recall() serves compact passages, each tagged with its parent episode ``id`` (e.g. "e:227168").
-    When a passage looks relevant but you need the whole untruncated turn, pass its id(s) here.
-    Accepts the "e:N" ids from recall()/recall_episodes() results.
-
-    Args:
-        episode_ids: Episode ids to expand (the ``id`` field from recall results), max ~20.
-    """
-    with logfire.span("mcp.fetch_episode", n=len(episode_ids)):
-        return _get_recall().fetch_episodes(episode_ids, source="mcp-tool")
+    with logfire.span("mcp.fetch", n=len(ids)):
+        return _get_recall().fetch(ids, source="mcp-tool")
 
 
 def _notes_deps() -> tuple:
@@ -652,9 +591,113 @@ async def remember(
         }
 
     # reconcile_note does blocking DB I/O + possibly a sync LLM call that runs
-    # asyncio.run() internally — it must live on a worker thread, never on the
-    # FastMCP event loop (same trap query_graph documents).
+    # asyncio.run() internally — asyncio.run() cannot be called from a running
+    # event loop, so it must live on a worker thread, never on FastMCP's loop.
     return await anyio.to_thread.run_sync(_work)
+
+
+@mcp.tool()
+def recall_timeline(
+    query: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    project: str | None = None,
+    min_salience: int = 0,
+    limit: int = 20,
+    group_id: str | None = None,
+) -> dict:
+    """The personal timeline: dated events that happened (commits, decisions,
+    ships), served in chronological order.
+
+    WHEN the question is about dates, order, or duration — "when did I...",
+    "what did I do last week", "how long between X and Y" — call this. Two query
+    shapes: topical (query set: "the login work") hybrid-searches events and
+    returns them chronologically; pure-time (query empty, since/until set:
+    "last week") returns the window's events, milestones individually and dense
+    runs collapsed to one line with count + first/last anchors.
+
+    Do NOT use this for what-is-true facts or preferences — recall() owns those;
+    this tool owns what-happened events. Do NOT compute a bare day-count from
+    the results without citing the two anchor events' dates the payload gives
+    you.
+
+    Args:
+        query: Optional topical search ("browser-free login work"). Empty = pure time-range.
+        since: Optional ISO date/timestamp lower bound (inclusive).
+        until: Optional ISO date/timestamp upper bound (exclusive).
+        project: Optional project slug filter (e.g. "synapse").
+        min_salience: 0 (all), 1 (skip routine), 2 (milestones only).
+        limit: Max items for pure-time queries (post-collapse, default 20).
+        group_id: Scope — pass "personal" for questions about the user's own life
+            (health, appointments, purchases, career) to exclude technical/work
+            events; unset or "technical" serves everything.
+    """
+    import time as _time
+
+    with logfire.span(
+        "mcp.recall_timeline {query!r}",
+        query=(query or "")[:80],
+        since=since,
+        until=until,
+        project=project,
+    ):
+        t0 = _time.perf_counter()
+        res = _get_timeline().recall_timeline(
+            query=query,
+            since=since,
+            until=until,
+            project=project,
+            min_salience=min_salience,
+            limit=limit,
+            group_id=group_id,
+        )
+        items = res.get("items") or []
+        for it in items:
+            it.pop("_id", None)  # internal telemetry key (recall served_ids), not for callers
+        # One recall_metrics row (kind='timeline') per serve, through the recall
+        # engine's fire-and-forget writer — same seam as remember/board telemetry.
+        _get_recall().record_event(
+            "timeline",
+            source="mcp-tool",
+            ms_total=round((_time.perf_counter() - t0) * 1000.0, 1),
+            served_ids={"n_events": len(items)},
+        )
+        return res
+
+
+@mcp.tool()
+def recall_episodes(
+    query: str,
+    project: str | None = None,
+    limit: int = 5,
+) -> dict:
+    """Raw episode drill-down: individual conversation turns.
+
+    Use this when you need the exact text of a specific exchange —
+    "what exactly did we say about X?", "show me that debug session".
+    Returns full episode content ranked by relevance + recency.
+
+    Do NOT use this for a blended overview — recall() serves the top episodes
+    plus KG facts and is the right first call.
+
+    Args:
+        query: Natural language search query.
+        project: Optional project slug to filter results.
+        limit: Max episodes to return (default 5, max ~10 before it gets noisy).
+    """
+    with logfire.span(
+        "mcp.recall_episodes {query!r}",
+        query=query[:80],
+        project=project,
+        limit=limit,
+    ):
+        engine = _get_recall()
+        return engine.recall_episodes(
+            query=query,
+            project=project,
+            limit=limit,
+            source="mcp-tool",
+        )
 
 
 @mcp.custom_route("/ingest", methods=["POST"])
@@ -821,121 +864,9 @@ async def recall_http(request: Request) -> JSONResponse:
     return JSONResponse(out)
 
 
-@mcp.tool()
-def list_projects() -> dict:
-    """List all projects in Synapse with episode counts, summary counts, and last activity.
-
-    Use this to discover what's in the system before running recall() with a project filter.
-    """
-    import psycopg
-    from psycopg.rows import dict_row
-
-    pg = psycopg.connect(DB_URL, row_factory=dict_row, autocommit=True)
-    try:
-        rows = pg.execute("""
-            SELECT
-                e.project,
-                COUNT(DISTINCT e.id)                                        AS episodes,
-                COUNT(DISTINCT sd.id) FILTER (WHERE sd.doc_type = 'summary') AS summaries,
-                COUNT(DISTINCT sd.id) FILTER (WHERE sd.doc_type = 'dream')   AS dreams,
-                MAX(e.created_at)::date                                     AS last_activity
-            FROM episodes e
-            LEFT JOIN synth_documents sd ON sd.project = e.project
-            GROUP BY e.project
-            ORDER BY MAX(e.created_at) DESC
-        """).fetchall()
-    finally:
-        pg.close()
-
-    return {"projects": [dict(r) for r in rows]}
-
-
-@mcp.tool()
-def query_graph(
-    query: str,
-    group_id: str = "technical",
-    limit: int = 20,
-) -> dict:
-    """Experimental: translate a natural language query to SQL over the KG tables.
-
-    WARNING: This is an experimental tool for exploratory use only. Results may be
-    incorrect or slow. Never use in automated pipelines — use recall() instead.
-
-    Args:
-        query: Natural language description of what to find in the graph.
-        group_id: Graph scope — "technical" or "personal".
-        limit: Max results to return.
-    """
-    import psycopg
-
-    from ingestion.llm_client import create_llm_client
-
-    llm = create_llm_client()
-    prompt = f"""You are a SQL query generator for a knowledge graph stored in Postgres.
-
-Generate a single SELECT statement for this request: {query}
-
-The graph lives in two tables:
-- kg_entities(uuid, owner_id, group_id, name, normalized_name, entity_type, summary)
-- kg_relationships(uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact,
-  t_created, t_valid, t_invalid, t_expired)
-  src_uuid / tgt_uuid join to kg_entities.uuid.
-
-Rules:
-- Always filter: owner_id = 'default' AND group_id = '{group_id}' (on every table referenced)
-- Active facts only: kg_relationships.t_invalid IS NULL (unless the request asks for history)
-- LIMIT {limit}
-- SELECT only — never modify data.
-
-Return ONLY the SQL, no explanation."""
-
-    sql = ""
-    try:
-        # ClaudeCLIClient.messages.create calls asyncio.run() internally, which
-        # blows up inside FastMCP's running event loop ("asyncio.run() cannot be
-        # called from a running event loop" — true of the old Cypher version of
-        # this tool too). Run it in a worker thread, where no loop is running.
-        from concurrent.futures import ThreadPoolExecutor
-
-        def _generate() -> str:
-            from ingestion.llm_client import stage_model
-
-            response = llm.messages.create(
-                model=stage_model("QUERY_GRAPH"),
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return str(response.content[0].text).strip()
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            sql = pool.submit(_generate).result(timeout=120)
-        # Strip markdown fences
-        if sql.startswith("```"):
-            sql = sql.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        sql = sql.rstrip(";").strip()
-
-        # Guard: single read-only statement, belt (prefix check) and braces
-        # (read-only transaction) both — the model is untrusted input here.
-        if not sql.lower().startswith("select") or ";" in sql:
-            return {"error": "generated statement is not a single SELECT", "sql": sql}
-
-        with psycopg.connect(DB_URL) as conn:
-            conn.read_only = True
-            with conn.cursor() as cur:
-                cur.execute(sql)
-                cols = [d.name for d in cur.description] if cur.description else []
-                rows = [list(r) for r in cur.fetchmany(limit)]
-
-        return {
-            "sql": sql,
-            "columns": cols,
-            "results": rows,
-            "count": len(rows),
-        }
-    except Exception as e:
-        return {"error": str(e), "sql": sql}
-
-
+# Registered LAST and hidden from tools/list (_HiddenToolsList): infra plumbing,
+# not part of the model-facing surface. The `synapse login` CLI invokes it by
+# name via a raw tools/call, which the listing filter deliberately leaves intact.
 @mcp.tool()
 def issue_machine_token() -> dict:
     """Return this Synapse's shared machine bearer token (auth-gated).

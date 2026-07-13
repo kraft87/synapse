@@ -212,6 +212,9 @@ gets a release note saying so.
 
 ## MCP tools
 
+Six tools, listed in the order the server registers them (deliberate — tool-list
+position biases which tool a model picks):
+
 - `recall(query, project=None, session_focus=None, group_id="technical")` — the primary
   retrieval tool: reranked episodes + KG facts + timeline + web + history. Served episode
   passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can weight a
@@ -223,11 +226,10 @@ gets a release note saying so.
   board means "search with recall", not "doesn't exist". Hard-capped (~80 lines / ~2K
   tokens) so it stays an index, never a context tax. Also served over `GET /context`
   for the plugin's session-start hook.
-- `recall_episodes(query, project=None, limit=5)` — raw episode drill-down.
-- `recall_timeline(query=None, since=None, until=None, group_id=None)` — dated events for
-  "when / in what order" questions; `group_id="personal"` scopes to life events, excluding
-  technical/work noise.
-- `fetch_episode(episode_ids)` — expand full turns by id (from a prior recall).
+- `fetch(ids)` — expand ids into full records: `e:N` episode ids from recall results
+  (bare `N` also accepted) and `n:N` note ids — the board's `n:ID` lines resolve to
+  their full note bodies through this tool. Mixed lists are fine; unknown ids come
+  back under `skipped`, and at most 20 ids expand per call.
 - `remember(content=None, hook=None, body=None, type="project", project=None)` — write a
   curated memory. The preferred form passes `hook` (a one-line index entry, ~120 chars) plus
   `body` (the full self-contained note) and a `type` (`user` / `feedback` / `project` /
@@ -237,8 +239,14 @@ gets a release note saying so.
   restates an existing one updates it in place, and one that contradicts it supersedes the
   old note while keeping the lineage — so the curated set stays small and current instead
   of accumulating duplicates.
-- `list_projects()` — per-project episode counts and last activity.
-- `query_graph(query)` — experimental natural-language graph query.
+- `recall_timeline(query=None, since=None, until=None, group_id=None)` — dated events for
+  "when / in what order" questions; `group_id="personal"` scopes to life events, excluding
+  technical/work noise.
+- `recall_episodes(query, project=None, limit=5)` — raw episode drill-down.
+
+One more tool exists but is hidden from tool listings: `issue_machine_token`, the
+auth-gated plumbing `synapse login` calls to fetch the machine bearer token. It stays
+callable by name (`tools/call`) — it just never competes for a model's attention.
 
 ## Auth
 

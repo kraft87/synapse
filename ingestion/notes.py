@@ -23,8 +23,8 @@ embedding — dedup is silently skipped, never a hard failure (timeline preceden
 Threading note: this function is synchronous and calls the LLM through the sync
 ``messages.create`` surface (which may run ``asyncio.run`` internally, e.g. the
 Agent-SDK client). Inside an async server (FastMCP handlers) it MUST be run in a
-worker thread (``anyio.to_thread.run_sync``), never on the event loop — the same
-asyncio-in-FastMCP trap query_graph documents.
+worker thread (``anyio.to_thread.run_sync``), never on the event loop —
+``asyncio.run()`` cannot be called from a running event loop.
 """
 
 from __future__ import annotations

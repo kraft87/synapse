@@ -170,7 +170,7 @@ Idempotency rides on `UNIQUE(source, source_ref)`. Three write-time quality mech
 
 ### 3.6 Retired: summaries & dream documents
 
-`synth_documents` (`doc_type='summary'|'dream'`) is a **frozen legacy table** (~669 stale rows). Nothing generates new rows, `recall()` never serves them, and they are no longer the KG extraction substrate. Residual scaffolding remains (an embedding leg in the poller that finds nothing, `summary` branches in the extractor, and a count in `list_projects`) pending a snapshot + purge. Treat the summary layer as **dead**; the episode leg and KG facts absorbed both its broad-recall and relational jobs.
+`synth_documents` (`doc_type='summary'|'dream'`) is a **frozen legacy table** (~669 stale rows). Nothing generates new rows, `recall()` never serves them, and they are no longer the KG extraction substrate. Residual scaffolding remains (an embedding leg in the poller that finds nothing, `summary` branches in the extractor) pending a snapshot + purge. Treat the summary layer as **dead**; the episode leg and KG facts absorbed both its broad-recall and relational jobs.
 
 ---
 
@@ -422,12 +422,17 @@ Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage r
 
 ### 7.1 Tools
 
+Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it.
+
 - **`recall(query, project=None, session_focus=None, group_id="technical")`** — the primary retrieval tool ([§6](#6-recall-pipeline)).
+- **`get_context(project=None)`** — the board: a hard-capped index of curated note hooks + last week's milestones (also served over `GET /context`).
+- **`fetch(ids)`** — expand `e:N` episode ids (bare `N` accepted) and `n:N` note ids into full records; mixed lists fine, unknown ids reported under `skipped`, capped at 20 per call.
+- **`remember(content=None, hook=None, body=None, type="project", project=None, session_id=None)`** — reconciles a note into the notes store and archives the text as a manual `Episode` with KG extraction.
+- **`recall_timeline(query=None, since=None, until=None, project=None, min_salience=0, limit=20, group_id=None)`** — dated what-happened events, chronological.
 - **`recall_episodes(query, project=None, limit=5)`** — raw episode drill-down (same deep-fetch + rerank machinery, served to `limit`).
-- **`remember(content, project=None, session_id=None)`** — writes a manual `Episode` (`source="manual"`, `content_type="manual"`) and enqueues full KG extraction. Returns `{status, episode_id, session_id}`.
-- **`list_projects()`** — per-project episode counts + last activity (still reports legacy summary/dream counts).
-- **`query_graph(query, group_id="technical", limit=20)`** — experimental NL→SQL over the KG tables via Haiku (always filters `r.t_invalid IS NULL`), returns `{sql, results, count}`. Not for automated pipelines — use `recall()`.
-- **`issue_machine_token()`** — returns the shared machine bearer token, auth-gated by MultiAuth + the allowlist; lets `synapse login` fetch it over OAuth instead of a manual copy-paste ([§7.4](#74-auth)).
+- **`issue_machine_token()`** — returns the shared machine bearer token, auth-gated by MultiAuth + the allowlist; lets `synapse login` fetch it over OAuth instead of a manual copy-paste ([§7.4](#74-auth)). **Hidden from `tools/list`** by an `on_list_tools` middleware; still callable by name via `tools/call`.
+
+Removed from the surface (git history keeps the code): `list_projects` (the board banner carries per-project activity now) and `query_graph` (experimental NL→SQL; `recall()` owns retrieval).
 
 ### 7.2 Custom HTTP routes (`/ingest`, `/recall`)
 
@@ -729,7 +734,7 @@ synapse/
 │   └── models.py              # Pydantic domain models
 │
 ├── mcp_server/
-│   ├── server.py              # fastmcp: recall/recall_episodes/remember/list_projects/query_graph/issue_machine_token + /ingest + /recall routes + MultiAuth
+│   ├── server.py              # fastmcp: recall/get_context/fetch/remember/recall_timeline/recall_episodes (+hidden issue_machine_token) + /ingest + /recall routes + MultiAuth
 │   ├── recall.py              # Recall engine: episode leg + KG leg + web + history, rerank, fusion
 │   ├── kg_pg.py               # recall-side KG search (vector + BM25 + 1-hop over kg_*)
 │   ├── device_routes.py       # /device/code + /device/token — RFC 8628 device login (proxies GitHub), allowlist-gated
@@ -790,7 +795,7 @@ The field's most under-benchmarked lever. Synapse has the primitives — recency
 
 ### 16.3 Retire the summary residue
 
-`synth_documents` (~669 rows), the poller's synth-doc embedding leg, the extractor's `summary` branch, and `list_projects`' summary count are inert scaffolding. Snapshot + purge.
+`synth_documents` (~669 rows), the poller's synth-doc embedding leg, and the extractor's `summary` branch are inert scaffolding. Snapshot + purge.
 
 ### 16.4 FalkorDB → Postgres — DONE (#67)
 
