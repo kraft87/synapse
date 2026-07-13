@@ -664,6 +664,8 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall_episodes()`: serve turns scoring ≥ tau×top_score |
 | `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |
 | `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
+| `SYNAPSE_RECALL_FLOOR` | `0.58` | **shadow-phase** abstention floor: when the raw (pre-recency) rerank top score is strictly below it, the call's `recall_metrics.served_ids` envelope gains `would_abstain`/`floor` markers — telemetry only, serving is unchanged (`0` = off) |
+| `SYNAPSE_RECALL_FLOOR_ENFORCE` | `0` | read but **inert** this release: actually abstaining below the floor ships in a later release, once the shadow telemetry validates a threshold |
 | `SYNAPSE_SUPERSEDE_MAX_DIST` | `0.45` | cosine-distance gate for surfacing successor facts of superseded edges |
 | `SYNAPSE_RECALL_TIMELINE` | `1` | include the timeline leg in `recall()` (`0` = off) |
 | `SYNAPSE_TIMELINE_GROUP_SCOPE` | `1` | `group_id="personal"` filters timeline serving to personal-domain events (`0` = never filter) |

@@ -176,7 +176,7 @@ def test_echo_dropped_and_backfilled_via_select(monkeypatch):
         {"id": "e:3", "content": "halfvec index on the embedding column"},
     ]
     r._rerank_pool_scored = lambda q, p: [(i, 1.0 - i * 0.01) for i in range(len(p))]
-    out, n_echo = r._select_episodes(_ECHO_QUERY, pool, limit=2)
+    out, n_echo, _top = r._select_episodes(_ECHO_QUERY, pool, limit=2)
     assert n_echo == 1
     assert [d["id"] for d in out] == ["e:1", "e:2"]  # echo gone, backfilled to full count
 
@@ -191,7 +191,7 @@ def test_echo_kill_switch_restores_prior_selection(monkeypatch):
         {"id": "e:2", "content": "hnsw ef_search set to two hundred"},
     ]
     r._rerank_pool_scored = lambda q, p: [(i, 1.0 - i * 0.01) for i in range(len(p))]
-    out, n_echo = r._select_episodes(_ECHO_QUERY, pool, limit=2)
+    out, n_echo, _top = r._select_episodes(_ECHO_QUERY, pool, limit=2)
     assert n_echo == 0
     assert [d["id"] for d in out] == ["e:echo", "e:1"]  # prior behavior: echo served
 
