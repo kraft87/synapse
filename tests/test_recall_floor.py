@@ -246,10 +246,15 @@ def test_recall_episodes_below_floor_marks_envelope(monkeypatch):
 def test_recall_episodes_payload_identical_with_and_without_floor(monkeypatch):
     scores = [0.31, 0.22, 0.11, 0.05]
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r1, _ = _episodes_wired(scores)
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.0)
-    r2, _ = _episodes_wired(scores)
-    assert r1.recall_episodes("q") == r2.recall_episodes("q")
+    r1, c1 = _episodes_wired(scores)
+    out_marked = r1.recall_episodes("q")  # floor still ON — the marked leg
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.0)  # floor off
+    r2, c2 = _episodes_wired(scores)
+    out_plain = r2.recall_episodes("q")
+    assert out_marked == out_plain  # the full response object — byte-identical payload
+    assert c1[0]["served_ids"]["would_abstain"] is True  # marked leg really ran with floor on
+    assert "would_abstain" not in c2[0]["served_ids"]
+    assert "floor" not in c2[0]["served_ids"]
 
 
 def test_recall_episodes_exactly_at_floor_no_marker(monkeypatch):
