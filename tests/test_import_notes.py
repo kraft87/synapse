@@ -352,4 +352,12 @@ def test_high_sim_collision_routes_through_reconcile(conn, db_url, tmp_path, mon
     assert rows[0][0] == existing
     assert rows[0][1] == "User prefers light mode"
     assert rows[0][2] == "Switched with the redesign."
+    # The winning row (remember-written, source_ref NULL) must now carry the seed's
+    # provenance — without the stamp, find_note_by_source_ref would miss on every
+    # subsequent run and this file would reconcile (embed + LLM confirm) forever.
+    assert rows[0][3] == "import:user_display_pref"
+
+    # Re-run: the stamped source_ref makes the idempotency probe hit -> pure skip.
+    counts = imp.run_import(directory=tmp_path, db_url=db_url, apply=True)
+    assert counts == {"create": 0, "update": 0, "skip": 1, "error": 0}
     _wipe(conn)

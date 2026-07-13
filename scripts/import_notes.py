@@ -18,6 +18,9 @@ Idempotency is keyed on ``source_ref = "import:<name>"``:
     against the live set instead of touching the retired row.
   * source_ref miss -> reconcile_note(), so a seed colliding with an existing
     remember-written note (high-sim hook) updates/supersedes instead of duplicating.
+    When reconcile lands as an in-place UPDATE of such a note, the seed's source_ref
+    is stamped onto the winning row (only if it had none) — otherwise the probe would
+    miss on every subsequent run and the file would reconcile forever.
 
 Dry-run is the DEFAULT — per-file verdict lines + a summary, zero writes (the
 database is still read for the idempotency probe). Pass ``--apply`` to execute.
@@ -213,6 +216,55 @@ def _embed_hook(embedder: Any | None, hook: str) -> tuple[list[float] | None, st
 _RECONCILE_VERDICT = {"created": "create", "updated": "update", "superseded": "update"}
 
 
+def _stamp_source_ref(db: Database, note_id: int, source_ref: str) -> None:
+    """Claim the winning row for this seed's idempotency key.
+
+    reconcile_note's "updated" outcome refreshes hook/body on the existing row but
+    leaves its source_ref alone (update_note has no such parameter) — a
+    remember-written winner keeps source_ref NULL, so find_note_by_source_ref would
+    miss on every subsequent run and the same file would reconcile (one embed + one
+    LLM confirm) forever, bumping updated_at and reordering the board each time.
+    Stamping the seed's provenance onto the winner turns the next run into a skip.
+
+    Only a NULL source_ref is claimed — never steal another seed file's provenance
+    (two files converging on one row is that file's problem, not this one's).
+    ingestion/ stays unmodified: this is importer-local bookkeeping SQL issued on
+    the importer's own Database handle."""
+    with db._conn() as conn:
+        conn.execute(
+            "UPDATE notes SET source_ref = %s WHERE id = %s AND source_ref IS NULL",
+            (source_ref, note_id),
+        )
+
+
+def _reconcile_with_provenance(
+    db: Database,
+    embedder: Any | None,
+    llm: Any | None,
+    *,
+    hook: str,
+    body: str,
+    note_type: str,
+    project: str | None,
+    source_ref: str,
+) -> dict[str, Any]:
+    """reconcile_note + source_ref stamping on the "updated" outcome. "created" and
+    "superseded" already carry the source_ref on the inserted row."""
+    result = reconcile_note(
+        db,
+        embedder,
+        llm,
+        hook=hook,
+        body=body,
+        type=note_type,
+        project=project,
+        source_ref=source_ref,
+    )
+    if result["outcome"] == "updated":
+        _stamp_source_ref(db, int(result["note_id"]), source_ref)
+    return result
+
+
 def _import_one(
     db: Database,
     embedder: Any | None,
@@ -240,13 +292,17 @@ def _import_one(
             # assertion — reconcile against the LIVE set, don't touch the retired row.
             if not apply:
                 return "create", "prior import superseded; will reconcile"
-            result = reconcile_note(
+            # Corner left open on purpose: if reconcile updates a live row whose id is
+            # LOWER than the retired seed row's, find_note_by_source_ref (newest id
+            # wins) keeps returning the retired row and re-runs keep reconciling —
+            # fixing that would mean rewriting provenance history in ingestion/.
+            result = _reconcile_with_provenance(
                 db,
                 embedder,
                 llm,
                 hook=hook,
                 body=body,
-                type=note_type,
+                note_type=note_type,
                 project=project,
                 source_ref=source_ref,
             )
@@ -259,13 +315,13 @@ def _import_one(
 
     if not apply:
         return "create", ""
-    result = reconcile_note(
+    result = _reconcile_with_provenance(
         db,
         embedder,
         llm,
         hook=hook,
         body=body,
-        type=note_type,
+        note_type=note_type,
         project=project,
         source_ref=source_ref,
     )
