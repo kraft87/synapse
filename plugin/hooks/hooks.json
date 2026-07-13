@@ -33,8 +33,8 @@
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/timeline_milestones.py\"",
-            "timeout": 15
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
+            "timeout": 10
           },
           {
             "type": "command",
