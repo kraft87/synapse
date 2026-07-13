@@ -383,6 +383,151 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    # ------------------------------------------------------------------
+    # Notes (schema 041) — the EXPLICIT-memory store behind the always-injected
+    # board. Kept out of the KG (same supernode rationale as preferences/timeline)
+    # and out of episodes (episodes are the archive; notes are the index). Live set
+    # = superseded_by IS NULL; contradictions supersede (lineage), restatements
+    # UPDATE in place (updated_at bump). See ingestion/notes.py.
+    # ------------------------------------------------------------------
+
+    def find_live_notes(
+        self, owner_id: str, group_id: str, embedding: list[float], limit: int = 5
+    ) -> list[dict[str, Any]]:
+        """Live notes for one owner/group, nearest to ``embedding`` by cosine (over the
+        HOOK — the embed target). Returns ``[{id, hook, body, type, project, sim}]`` in
+        DESCENDING similarity. The reconcile path's dedup/supersession decision reads this."""
+        vlit = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, hook, body, type, project, 1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                "FROM notes "
+                "WHERE owner_id = %s AND group_id = %s AND superseded_by IS NULL "
+                "AND embedding IS NOT NULL "
+                f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
+                (vlit, owner_id, group_id, vlit, limit),
+            ).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "hook": r["hook"],
+                "body": r["body"],
+                "type": r["type"],
+                "project": r["project"],
+                "sim": float(r["sim"]),
+            }
+            for r in rows
+        ]
+
+    def insert_note(
+        self,
+        *,
+        owner_id: str,
+        group_id: str,
+        project: str | None,
+        type: str,
+        hook: str,
+        body: str,
+        embedding: list[float] | None,
+        embed_model: str | None,
+        source_ref: str | None,
+    ) -> int:
+        """Append one live note. Returns the new row id. NULL embedding is allowed
+        (keyless dev/test; dedup KNN simply skips such rows)."""
+        vlit = (
+            "[" + ",".join(f"{x:.6f}" for x in embedding) + "]" if embedding is not None else None
+        )
+        with self._conn() as conn:
+            row = conn.execute(
+                "INSERT INTO notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                "(owner_id, group_id, project, type, hook, body, embedding, embed_model, source_ref) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s::halfvec({_EMBED_DIMS}),%s,%s) RETURNING id",
+                (
+                    owner_id,
+                    group_id,
+                    project,
+                    type,
+                    hook,
+                    body,
+                    vlit,
+                    embed_model if embedding is not None else None,
+                    source_ref,
+                ),
+            ).fetchone()
+        assert row is not None, "INSERT RETURNING id returned nothing"
+        return cast(int, row["id"])
+
+    def update_note(
+        self,
+        note_id: int,
+        *,
+        hook: str,
+        body: str,
+        embedding: list[float] | None,
+        embed_model: str | None,
+    ) -> None:
+        """A restated note: refresh hook/body/embedding in place and bump updated_at
+        (the note keeps its id — the board line just gets the newer phrasing)."""
+        vlit = (
+            "[" + ",".join(f"{x:.6f}" for x in embedding) + "]" if embedding is not None else None
+        )
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"SET hook = %s, body = %s, embedding = %s::halfvec({_EMBED_DIMS}), "
+                "embed_model = %s, updated_at = now() WHERE id = %s",
+                (hook, body, vlit, embed_model if embedding is not None else None, note_id),
+            )
+
+    def supersede_note(self, old_id: int, new_id: int) -> None:
+        """A contradicting note won: retire the old row (superseded_by = the new row) so
+        the live set carries only the current statement, auditably linked."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE notes SET superseded_by = %s WHERE id = %s",
+                (new_id, old_id),
+            )
+
+    def list_board_notes(self, owner_id: str, project: str | None) -> list[dict[str, Any]]:
+        """Live notes for the board: every global-scope type (user/feedback/reference)
+        plus the current project's project-notes. Ordered feedback -> user -> project ->
+        reference, newest-updated first within each type. ``project=None`` serves the
+        global set only (``project = NULL`` matches nothing)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, hook, type, project, updated_at FROM notes "
+                "WHERE owner_id = %s AND superseded_by IS NULL "
+                "AND (type IN ('user','feedback','reference') OR project = %s) "
+                "ORDER BY CASE type WHEN 'feedback' THEN 0 WHEN 'user' THEN 1 "
+                "WHEN 'project' THEN 2 ELSE 3 END, updated_at DESC",
+                (owner_id, project),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_notes_by_ids(self, ids: list[int]) -> list[dict[str, Any]]:
+        """Fetch note bodies by id — the on-demand half of the board (hook on the board,
+        body behind the id). Silently drops unknown ids."""
+        if not ids:
+            return []
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT id, hook, body, type, project, updated_at FROM notes "
+                "WHERE id = ANY(%s) ORDER BY id",
+                (ids,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_note_by_source_ref(self, source_ref: str) -> dict[str, Any] | None:
+        """Newest note carrying this provenance ref, live or retired — the seed
+        importer's idempotency probe (re-imports must not duplicate)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, hook, body, type, project, superseded_by, updated_at "
+                "FROM notes WHERE source_ref = %s ORDER BY id DESC LIMIT 1",
+                (source_ref,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def get_unembedded_episodes(self, limit: int = 96) -> list[dict[str, Any]]:
         with self._conn() as conn:
             result = conn.execute(

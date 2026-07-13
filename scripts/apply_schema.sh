@@ -82,6 +82,7 @@ FILES=(
   038_timeline_domain.sql
   039_recall_metrics_served_ids.sql
   040_dedup_gate_shadow.sql
+  041_notes.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means
