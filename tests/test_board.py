@@ -2,9 +2,8 @@
 
 Covers the render contract (banner, grouping/order, line format, project scoping,
 superseded exclusion), the hard cap (line overflow drop order + token cap), the
-timeline section, the machine-token route gate, kind='board' telemetry, and the
-deliberate get_context-right-after-recall tool ordering. Skips cleanly when no
-test DB is reachable (mirrors test_notes_store.py)."""
+timeline section, the machine-token route gate, and kind='board' telemetry. Skips
+cleanly when no test DB is reachable (mirrors test_notes_store.py)."""
 
 from __future__ import annotations
 
@@ -336,20 +335,4 @@ def test_record_board_metrics_is_fail_soft():
             raise RuntimeError("nope")
 
     # Must swallow, never raise back into the serve path.
-    record_board_metrics(Boom(), "mcp-tool", 1.0, {"text": "t", "note_ids": [1]})
-
-
-# ---------------------------------------------------------------------------
-# Tool registration order
-# ---------------------------------------------------------------------------
-
-
-def test_get_context_registered_directly_after_recall():
-    """Positional bias is real: the board tool must sit DIRECTLY after recall in the
-    served tool list (see the comment at its registration site)."""
-    import asyncio
-
-    import mcp_server.server as s
-
-    names = [t.name for t in asyncio.run(s.mcp.list_tools())]
-    assert names.index("get_context") == names.index("recall") + 1
+    record_board_metrics(Boom(), "http", 1.0, {"text": "t", "note_ids": [1]})

@@ -38,7 +38,7 @@ except Exception:  # pragma: no cover - environment dependent
 import mcp_server.recall as recall_mod  # noqa: E402
 from ingestion.db import Database  # noqa: E402
 from mcp_server import server  # noqa: E402
-from mcp_server.board import _OWNER  # noqa: E402
+from mcp_server.board import _OWNER, build_board, record_board_metrics  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
 
 
@@ -266,12 +266,13 @@ def test_remember_kind_row_shape(conn, db_url, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# kind='board' — the get_context() MCP tool (the /context route's telemetry is
-# covered in test_board.py; this pins the source='mcp-tool' surface)
+# kind='board' — the /context serve path's writer (record_board_metrics). The
+# route integration is covered in test_board.py; this pins the row SHAPE the
+# only remaining serve source ('http' — the MCP board tool was removed) writes.
 # ---------------------------------------------------------------------------
 
 
-def test_board_kind_row_shape(conn, db_url, monkeypatch):
+def test_board_kind_row_shape(conn, db_url):
     conn.execute("DELETE FROM notes")
     conn.execute("DELETE FROM timeline_events")
     db = Database(db_url)
@@ -289,17 +290,16 @@ def test_board_kind_row_shape(conn, db_url, monkeypatch):
     db.close()
 
     engine = Recall(db_url, "")
-    monkeypatch.setattr(server, "DB_URL", db_url)
-    monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
-    out = server.get_context()
-    assert out["status"] == "ok" and "note_ids" not in out  # popped before serving
+    board = build_board(db_url, None)
+    assert board["status"] == "ok"
+    record_board_metrics(engine, "http", 1.0, board)
 
     row = _newest(conn, engine, "board", "source, ms_total, chars, est_tokens, served_ids", mark)
-    assert row is not None, "get_context() emitted no kind='board' telemetry row"
+    assert row is not None, "board serve emitted no kind='board' telemetry row"
     source, ms_total, chars, est_tokens, served = row
-    assert source == "mcp-tool"
+    assert source == "http"
     assert ms_total is not None and ms_total >= 0
-    assert chars == len(out["text"]) and chars > 0
+    assert chars == len(board["text"]) and chars > 0
     assert est_tokens == chars // 4
     assert served == {"notes": [nid], "n_notes": 1, "overflow": 0}
