@@ -216,6 +216,13 @@ gets a release note saying so.
   retrieval tool: reranked episodes + KG facts + timeline + web + history. Served episode
   passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can weight a
   human-stated fact over the agent's own past output.
+- `get_context(project=None)` — the board: a small always-current index of explicit
+  memories (rules & feedback, user facts, project state, references), the last week's
+  milestones, and what memory exists at all. Called once at session start, it converts
+  recall into recognition — each line is a note hook with an id, and absence from the
+  board means "search with recall", not "doesn't exist". Hard-capped (~80 lines / ~2K
+  tokens) so it stays an index, never a context tax. Also served over `GET /context`
+  for the plugin's session-start hook.
 - `recall_episodes(query, project=None, limit=5)` — raw episode drill-down.
 - `recall_timeline(query=None, since=None, until=None, group_id=None)` — dated events for
   "when / in what order" questions; `group_id="personal"` scopes to life events, excluding

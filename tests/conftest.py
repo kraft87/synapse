@@ -33,6 +33,7 @@ _DB_FILES = {
     "test_dedup_gate.py",
     "test_notes_store.py",
     "test_remember_notes.py",
+    "test_board.py",
 }
 
 
