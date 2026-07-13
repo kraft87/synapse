@@ -23,8 +23,10 @@ Five hooks (`hooks/hooks.json`) plus MCP wiring:
    `rules/*.md` to the server so the dream lane can propose config edits.
 4. **Timeline git feeder** (`SessionStart`, off until configured) — pushes commit subjects
    from repos listed in `SYNAPSE_TIMELINE_REPOS` to the server's timeline.
-5. **Timeline milestones** (`SessionStart`) — prints the last 7 days' high-salience timeline
-   events (max 5 lines) into the session's context.
+5. **Board block** (`SessionStart`) — prints the board (`GET /context`) into the session's
+   context: curated note hooks, the last week's milestones, and what memory exists at all.
+   Server-rendered and hard-capped (~80 lines / ~2K tokens), scoped to the session's
+   project.
 
 MCP tools (`recall`, `remember`, `query_graph`, …) are registered automatically — no
 hand-written `.mcp.json`.
@@ -53,8 +55,8 @@ an unreachable server is a silent no-op.
   which is why it ships off. On: `SYNAPSE_CONFIG_SYNC=1`.
 - **Timeline git feeder** — **off** (opt-in). When `SYNAPSE_TIMELINE_REPOS` is set, sends
   commit subjects, dates, and a coarse salience score from those repos. Unset = nothing runs.
-- **Timeline milestones** — **on**, but it *sends* nothing: it reads `/timeline/recent` and
-  prints up to 5 lines into your context. Off: `SYNAPSE_TIMELINE_MILESTONES=0`.
+- **Board block** — **on**, but it *sends* nothing: it reads `GET /context` and prints one
+  bounded index block into your context. Off: `SYNAPSE_BOARD=0`.
 
 ## Configuration
 
@@ -77,7 +79,7 @@ Env / `settings.json` only:
 
 - **`SYNAPSE_SKILLS_SYNC`** — `1` enables two-way skill sync (default off).
 - **`SYNAPSE_TIMELINE_REPOS`** — comma/space-separated repo paths for the timeline feeder.
-- **`SYNAPSE_TIMELINE_MILESTONES`** — `0` disables the milestone block.
+- **`SYNAPSE_BOARD`** — `0` disables the session-start board block.
 - **`SYNAPSE_INGEST_URL`** — legacy full-endpoint override, still honored.
 
 ## Setup
@@ -208,6 +210,6 @@ MCP tools (registered automatically; Claude calls them during a session):
 
 ## How it talks to Synapse
 
-HTTP only: `/ingest`, `/skills/*`, `/config/publish`, `/timeline/*`, and `/mcp`, all under
-the one `SYNAPSE_URL`, gated by one machine token. The client holds no Postgres credentials,
+HTTP only: `/ingest`, `/skills/*`, `/config/publish`, `/timeline/*`, `/context`, and `/mcp`,
+all under the one `SYNAPSE_URL`, gated by one machine token. The client holds no Postgres credentials,
 and skill/config proposals are only ever applied through your explicit review commands.
