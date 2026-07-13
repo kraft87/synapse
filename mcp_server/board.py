@@ -72,11 +72,14 @@ def _banner_stats(db_url: str) -> tuple[int, list[str]]:
     try:
         row = conn.execute("SELECT count(*) FROM episodes").fetchone()
         n_episodes = int(row[0]) if row else 0
+        # Unlabeled episodes (NULL — and '', defensively) are excluded in SQL so they
+        # never consume one of the 12 LIMIT slots or inflate/deflate the project count.
         rows = conn.execute(
             "SELECT project, max(created_at)::date FROM episodes "
+            "WHERE project IS NOT NULL AND project <> '' "
             "GROUP BY project ORDER BY 2 DESC LIMIT 12"
         ).fetchall()
-        return n_episodes, [r[0] for r in rows if r[0]]
+        return n_episodes, [r[0] for r in rows]
     finally:
         conn.close()
 

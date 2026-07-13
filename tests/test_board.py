@@ -99,6 +99,21 @@ def test_banner_counts_and_recent_projects(conn, db_url):
     assert "3 episodes across 2 projects (most recent: beta, alpha)." in text
 
 
+def test_banner_null_project_episodes_do_not_consume_slots(conn, db_url):
+    """A NULL-project episode group must not eat one of the 12 most-recent slots or
+    skew the project count: 12 real projects + newer project-less episodes -> all 12
+    listed, P counts 12."""
+    _wipe(conn)
+    for i in range(12):
+        _episode(conn, f"s{i}", 1, f"proj{i:02d}", days_ago=i + 1)
+    # Most recent activity of all — would win a LIMIT slot if not excluded in SQL.
+    _episode(conn, "s-null", 1, None, days_ago=0)
+    text = build_board(db_url, None)["text"]
+    assert "13 episodes across 12 projects" in text
+    for i in range(12):
+        assert f"proj{i:02d}" in text
+
+
 def test_grouping_order_and_line_format(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
