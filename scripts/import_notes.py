@@ -27,7 +27,10 @@ database is still read for the idempotency probe). Pass ``--apply`` to execute.
 
 Keyless operation (no Voyage credentials on the default backend) degrades the
 same way ingestion/notes.py does: notes land with NULL embeddings and a warning
-— dedup KNN is skipped, source_ref idempotency still holds. Never a hard failure.
+— dedup KNN is skipped, source_ref idempotency still holds. The one hard failure
+is ``EmbeddingConfigError`` (dims/model mismatch against the target database's
+``synapse_meta``): that target is mis-provisioned, NULL-embedding inserts into it
+would be wrong, so the CLI aborts with a clean error instead of degrading.
 
 Usage:
     python scripts/import_notes.py --dir /path/to/memory [--apply]
@@ -49,7 +52,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ingestion.db import Database
-from ingestion.embedding import create_embedder, embed_provider
+from ingestion.embedding import EmbeddingConfigError, create_embedder, embed_provider
 from ingestion.llm_client import create_llm_client
 from ingestion.notes import reconcile_note
 
@@ -119,11 +122,14 @@ def _parse_frontmatter(lines: list[str]) -> dict[str, Any]:
 
 
 def _first_sentence(body: str) -> str:
-    """Hook fallback: the first sentence of the first non-empty body line,
-    markdown heading markers stripped."""
+    """Hook fallback: the first sentence of the first REAL content line —
+    markdown heading markers stripped; blank and bare-dash lines skipped. An
+    unclosed frontmatter fence leaves its opening ``---`` in the body (fail
+    toward importing), and that fence line must never become the hook; the
+    same skip covers markdown horizontal rules."""
     for line in body.split("\n"):
         line = line.strip().lstrip("#").strip()
-        if line:
+        if line and line.strip("-"):
             return _SENTENCE_END.split(line, 1)[0]
     return ""
 
@@ -175,7 +181,11 @@ def resolve_type(meta_type: str | None, stem: str, type_default: str | None) -> 
 def _make_embedder(db_url: str) -> Any | None:
     """Keyless degrade, same shape as the timeline push route: no Voyage
     credentials on the default backend -> None (NULL-embedding inserts, dedup
-    KNN skipped). Any construction failure also degrades — never a hard fail."""
+    KNN skipped). Other construction failures degrade the same way — EXCEPT
+    ``EmbeddingConfigError``, which embedding.py documents as raised LOUDLY and
+    never swallowed: it signals a dims/model mismatch against the target
+    database's synapse_meta (a mis-provisioned target where NULL-embedding
+    inserts would be wrong), so it propagates to a clean CLI abort."""
     if embed_provider() == "voyage" and not os.environ.get("VOYAGE_API_KEY", ""):
         logger.warning(
             "no Voyage credentials — notes will store NULL embeddings; "
@@ -184,6 +194,8 @@ def _make_embedder(db_url: str) -> Any | None:
         return None
     try:
         return create_embedder(db_url=db_url)
+    except EmbeddingConfigError:
+        raise  # config↔database mismatch — importing would write wrong rows
     except Exception as e:
         logger.warning("embedder unavailable (%s); storing NULL embeddings, dedup skipped", e)
         return None
@@ -410,13 +422,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"not a directory: {directory}")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    counts = run_import(
-        directory=directory,
-        db_url=db_url,
-        apply=args.apply,
-        project=args.project,
-        type_default=args.type_default,
-    )
+    try:
+        counts = run_import(
+            directory=directory,
+            db_url=db_url,
+            apply=args.apply,
+            project=args.project,
+            type_default=args.type_default,
+        )
+    except EmbeddingConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     return 1 if counts["error"] else 0
 
 

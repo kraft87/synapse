@@ -27,7 +27,7 @@ imp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(imp)
 
 from ingestion.db import Database  # noqa: E402
-from ingestion.embedding import embed_dims  # noqa: E402
+from ingestion.embedding import EmbeddingConfigError, embed_dims  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
 
 _DB_URL = os.environ.get(
@@ -106,6 +106,23 @@ def test_unclosed_fence_treated_as_body():
     assert "never closed" in parsed["body"]
 
 
+def test_unclosed_fence_hook_skips_fence_line():
+    """An unclosed fence keeps the opening '---' in the body (fail toward
+    importing), but the hook must come from the first REAL content sentence —
+    never the literal fence line."""
+    text = "---\n\nFirst real sentence here. Second one.\nMore.\n"
+    parsed = imp.parse_memory_file(text, "note_stem")
+    assert parsed["name"] == "note_stem"
+    assert parsed["hook"] == "First real sentence here."
+    assert parsed["body"].startswith("---")  # fence stays in the body
+
+
+def test_horizontal_rule_never_becomes_hook():
+    text = "----\nActual content after a rule. Tail.\n"
+    parsed = imp.parse_memory_file(text, "stem")
+    assert parsed["hook"] == "Actual content after a rule."
+
+
 def test_crlf_tolerated():
     unix = imp.parse_memory_file(_FENCED, "stem")
     dos = imp.parse_memory_file(_FENCED.replace("\n", "\r\n"), "stem")
@@ -137,6 +154,49 @@ def test_type_default_replaces_only_the_fallback():
     assert imp.resolve_type(None, "plain_note", "reference") == "reference"
     # A prefix match is NOT overridden by --type-default.
     assert imp.resolve_type(None, "user_gpu", "reference") == "user"
+
+
+# ---------------------------------------------------------------------------
+# Embedder construction — config errors abort, credential absence degrades
+# ---------------------------------------------------------------------------
+
+
+def test_embedding_config_error_aborts_cli(monkeypatch, tmp_path, capsys):
+    """EmbeddingConfigError (dims/model mismatch vs the target's synapse_meta)
+    is documented as raised LOUDLY, never swallowed: the CLI must exit nonzero
+    with the message instead of degrading to NULL-embedding inserts. No DB is
+    touched — the embedder is constructed before the first connection."""
+    (tmp_path / "user_pref.md").write_text("Short replies preferred. Always.\n", encoding="utf-8")
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")  # get past the keyless gate
+
+    def _boom(db_url):
+        raise EmbeddingConfigError("dims mismatch: config 2048 != database 768")
+
+    monkeypatch.setattr(imp, "create_embedder", _boom)
+    rc = imp.main(["--dir", str(tmp_path), "--apply", "--db-url", "postgresql://unused/unused"])
+    assert rc != 0
+    assert "dims mismatch" in capsys.readouterr().err
+
+
+def test_keyless_still_degrades_to_none(monkeypatch, caplog):
+    """No Voyage credentials on the default backend -> None embedder (NULL
+    embeddings + warning), not an abort."""
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    monkeypatch.delenv("SYNAPSE_EMBED_PROVIDER", raising=False)
+    with caplog.at_level("WARNING", logger="import_notes"):
+        assert imp._make_embedder("postgresql://unused/unused") is None
+    assert "NULL embeddings" in caplog.text
+
+
+def test_other_embedder_failures_still_degrade(monkeypatch):
+    """Non-config construction failures keep the degrade-to-None path."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "test-key")
+
+    def _boom(db_url):
+        raise RuntimeError("transient wire failure")
+
+    monkeypatch.setattr(imp, "create_embedder", _boom)
+    assert imp._make_embedder("postgresql://unused/unused") is None
 
 
 # ---------------------------------------------------------------------------
