@@ -191,6 +191,52 @@ def test_token_cap_on_long_hooks(conn, db_url):
     assert len(out["text"]) // 4 <= 2000
 
 
+def test_long_event_facts_clamped_and_feedback_survives(conn, db_url):
+    """Verbose timeline facts (POST /timeline/events accepts unbounded text) must not
+    bust the hard cap or evict curated notes: event lines are clamped at render, so
+    the fixed section stays bounded and the cap loop never drains feedback."""
+    _wipe(conn)
+    for i in range(5):
+        _event(conn, f"Event {i} " + "y" * 3000, salience=2, days_ago=1, ref=f"tb:long{i}")
+    db = Database(db_url)
+    _note(db, type="feedback", hook="Feedback must survive event floods")
+    db.close()
+    out = build_board(db_url, None)
+    text = out["text"]
+    assert out["overflow"] == 0
+    assert "Feedback must survive event floods" in text
+    assert text.count("\n") + 1 <= 80 and len(text) // 4 <= 2000  # both caps hold
+    assert "y" * 250 not in text  # each event fact clamped, not served whole
+    assert all(len(ln) <= 250 for ln in text.splitlines())
+
+
+def test_cap_loop_keeps_notes_when_floor_over_cap(conn, db_url):
+    """If the fixed portion alone busts the token cap (pathological project names in
+    the banner), dropping notes cannot reach the cap — the loop must keep them all
+    instead of draining the board for zero benefit."""
+    _wipe(conn)
+    for i in range(12):
+        _episode(conn, f"s{i}", 1, f"project-{i}-" + "z" * 800, days_ago=i)
+    db = Database(db_url)
+    _note(db, type="feedback", hook="Keep me")
+    db.close()
+    out = build_board(db_url, None)
+    assert out["overflow"] == 0 and out["n_notes"] == 1
+    assert "Keep me" in out["text"]
+
+
+def test_overflow_line_separated_when_all_notes_dropped(conn, db_url):
+    """A board whose every note was evicted still renders the overflow line with a
+    blank line after the banner, not jammed directly under it."""
+    _wipe(conn)
+    db = Database(db_url)
+    _note(db, type="user", hook="Giant " + "x" * 9000)  # one note, over the cap alone
+    db.close()
+    out = build_board(db_url, None)
+    assert out["n_notes"] == 0 and out["overflow"] == 1
+    assert out["text"].endswith("\n\n(+ 1 more notes behind recall)")
+
+
 # ---------------------------------------------------------------------------
 # Timeline section
 # ---------------------------------------------------------------------------

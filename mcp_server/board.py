@@ -44,6 +44,12 @@ _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 _MAX_LINES = 80
 _MAX_EST_TOKENS = 2000
 
+# Timeline facts are hook-length lines on the board, never full prose: POST
+# /timeline/events accepts unbounded fact text, and the cap loop can only drop NOTES —
+# without this clamp one verbose feeder would both bust the hard cap and evict every
+# curated note for zero benefit. 10 events x ~200 chars stays well under the caps.
+_EVENT_FACT_MAX = 200
+
 # Overflow drop priority (lower = dropped first): project + reference notes are
 # stale-managed here, user notes go next, feedback/rules are NEVER dropped before
 # the others — a standing correction is the board's whole point.
@@ -80,6 +86,10 @@ def _note_line(note: dict[str, Any]) -> str:
     return f"- {note['hook']} (n:{note['id']}, upd {upd})"
 
 
+def _fits(text: str) -> bool:
+    return text.count("\n") + 1 <= _MAX_LINES and len(text) // 4 <= _MAX_EST_TOKENS
+
+
 def _render(
     project: str | None,
     n_episodes: int,
@@ -99,7 +109,7 @@ def _render(
     by_type: dict[str, list[dict[str, Any]]] = {}
     for n in notes:
         by_type.setdefault(n["type"], []).append(n)
-    if notes:
+    if notes or dropped:  # `dropped` alone: the overflow line still gets its blank line
         lines.append("")
     for t in ("feedback", "user", "project", "reference"):  # empty sections omitted
         if t not in by_type:
@@ -114,7 +124,10 @@ def _render(
         lines.append("## Last 7 days")
         for e in events:
             proj = f" ({e['project']})" if e.get("project") else ""
-            lines.append(f"- {str(e['date'])[5:]}{proj}: {e['fact']}")
+            fact = e["fact"]
+            if len(fact) > _EVENT_FACT_MAX:
+                fact = fact[: _EVENT_FACT_MAX - 1] + "…"
+            lines.append(f"- {str(e['date'])[5:]}{proj}: {fact}")
     return "\n".join(lines)
 
 
@@ -145,11 +158,16 @@ def build_board(db_url: str, project: str | None) -> dict[str, Any]:
 
     # Cap loop: drop one note at a time (drop class, then oldest updated_at) and
     # re-render until under both caps. Dozens of notes at most — O(n^2) is fine.
+    # Guard first: if the fixed portion (banner + clamped events) alone busts the caps,
+    # no amount of note-dropping can reach them — keep every note rather than draining
+    # the board for zero benefit. With event facts clamped this is a residual guard.
     kept = list(notes)
     dropped = 0
+    floor = _render(project, n_episodes, project_names, [], len(notes), events)
+    can_reach_cap = _fits(floor)
     while True:
         text = _render(project, n_episodes, project_names, kept, dropped, events)
-        if not kept or (text.count("\n") + 1 <= _MAX_LINES and len(text) // 4 <= _MAX_EST_TOKENS):
+        if not kept or not can_reach_cap or _fits(text):
             break
         victim = min(kept, key=lambda n: (_DROP_CLASS.get(n["type"], 0), n["updated_at"], n["id"]))
         kept.remove(victim)
