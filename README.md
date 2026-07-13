@@ -136,7 +136,9 @@ Required configuration (in `.env`):
 - `CLAUDE_CODE_OAUTH_TOKEN` **or** `ANTHROPIC_API_KEY` — auth for the extraction LLM (the
   subscription token wins if both are set).
 
-Optional knobs (`SYNAPSE_INGEST_TAIL`, `POLL_INTERVAL_SECONDS`, and more) are listed in
+Optional knobs (`SYNAPSE_INGEST_TAIL`, `POLL_INTERVAL_SECONDS`, recall-serving tuning such
+as the shadow-phase `SYNAPSE_RECALL_FLOOR` / `SYNAPSE_RECALL_FLOOR_ENFORCE` abstention
+floor, and more) are listed in
 [ARCHITECTURE.md §13](./ARCHITECTURE.md#13-configuration). If the default ports are taken,
 set `MCP_PORT` and/or `POSTGRES_HOST_PORT` in `.env`. Set `LOGFIRE_TOKEN` to stream traces
 to [Pydantic Logfire](https://logfire.pydantic.dev); leave it blank and telemetry is fully

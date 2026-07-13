@@ -291,6 +291,22 @@ _EPISODE_CUTOFF_MAX_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MAX_K", "8") or "8
 # per recall(), ONLY when enabled. Keeps >=1 fact so a query can't lose its facts bucket.
 _RECALL_FACT_FLOOR = float(os.getenv("SYNAPSE_RECALL_FACT_FLOOR", "0") or "0")
 
+# Abstention-floor SHADOW logging. An 84-run benchmark measured ZERO abstentions and ~30%
+# confidently-wrong answers: when nothing clears relevance, recall serves the least-bad six
+# and the model runs with them. Before ENFORCING a floor, log when one WOULD have fired so
+# the threshold is picked from real data: when real rerank scores exist and the RAW
+# pre-recency-reweight top score (the same value recall_metrics.rerank_top_score records)
+# is strictly below _RECALL_FLOOR, the served_ids telemetry envelope gains
+# {"would_abstain": true, "floor": <float>} — see _floor_shadow(). The served payload is
+# byte-identical either way; this is telemetry only. Default 0.58 ~= p10 of the last 30
+# days' rerank_top_score distribution (p05=0.5039 p10=0.5781 p25=0.6914 p50=0.7891, n=687).
+# 0 disables the marker.
+_RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0.58") or "0.58")
+# Enforcement gate — read but deliberately INERT this release: the shadow distribution must
+# first show the floor abstains on the right calls. Flipping it to 1 today changes nothing;
+# serving-side enforcement ships in a later release once a validated floor exists.
+_RECALL_FLOOR_ENFORCE = os.getenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "0") != "0"
+
 # Supersession surface (2026-06-27): a query that matches a now-INVALID fact should still
 # return the CURRENT answer. When a superseded edge near the query carries a precise successor link
 # (invalidated_by, schema 028), surface that successor's fact in the facts bucket (deduped) instead
@@ -555,6 +571,22 @@ def _cutoff_k(scores: list[float], tau: float, min_k: int, max_k: int) -> int:
         return min(len(scores), max_k)
     keep = sum(1 for s in scores if s >= tau * top)
     return min(max(keep, min_k), max_k, len(scores))
+
+
+def _floor_shadow(served_ids: dict[str, Any], rerank_top: float, emb_ok: bool) -> None:
+    """Shadow abstention-floor marker — telemetry only, never touches the served payload.
+
+    Mutates the recall_metrics ``served_ids`` envelope (same pattern as the existing
+    n_echo_suppressed key) when an enforced floor WOULD have abstained: real rerank scores
+    exist and the RAW pre-recency top score is strictly below _RECALL_FLOOR. No marker when:
+    the floor is disabled (<= 0); the rerank is disabled or degraded (the all-0.0 sentinel —
+    no real scores), which also covers the empty candidate pool (rerank_top 0.0); or the
+    query embedding failed (emb_ok False — a weak top under crippled retrieval says nothing
+    about whether relevant memory exists). _RECALL_FLOOR_ENFORCE is read but inert this
+    release (see the knob's comment); enforcement ships separately."""
+    if emb_ok and 0.0 < rerank_top < _RECALL_FLOOR:
+        served_ids["would_abstain"] = True
+        served_ids["floor"] = _RECALL_FLOOR
 
 
 class Recall:
@@ -1040,21 +1072,25 @@ class Recall:
 
     def _select_episodes(
         self, query: str, pool: list[dict[str, Any]], limit: int
-    ) -> tuple[list[dict[str, Any]], int]:
+    ) -> tuple[list[dict[str, Any]], int, float]:
         """Rerank `pool`, re-inject recency + suppress query echo, and pick what to serve.
 
-        Returns ``(episodes, n_echo_suppressed)``. Default (SYNAPSE_EPISODE_CUTOFF_TAU <= 0):
+        Returns ``(episodes, n_echo_suppressed, rerank_top)``. ``rerank_top`` is the RAW
+        pre-recency top rerank score — the value recall_metrics.rerank_top_score records and
+        the shadow abstention floor compares against — 0.0 when the pool is empty or the
+        rerank degraded/was disabled. Default (SYNAPSE_EPISODE_CUTOFF_TAU <= 0):
         fixed top-`limit` in the recency-adjusted rerank order. With tau > 0: adaptive relative
         score-cutoff (keep score >= tau*top, clamped [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K])
         over the recency-adjusted scores. Echoed episodes (the query quoting itself) are dropped
         BEFORE the final slice/cutoff so the next-ranked candidates backfill the freed slots. Always
         degrades to RRF order on rerank failure; never hard-fails."""
         if not pool:
-            return [], 0
+            return [], 0, 0.0
         scored = self._rerank_pool_scored(query, pool)
         if not scored:
-            return [], 0
-        degraded = scored[0][1] <= 0.0  # reranker down/disabled -> RRF order, fixed-k
+            return [], 0, 0.0
+        rerank_top = scored[0][1]  # RAW top score (telemetry + shadow floor) — pre-recency
+        degraded = rerank_top <= 0.0  # reranker down/disabled -> RRF order, fixed-k
         scored = self._apply_rerank_recency(scored, pool)  # no-op when disabled/degraded
         ranked = [pool[i] for i, _ in scored]
         ranked_scores = [s for _, s in scored]
@@ -1068,14 +1104,14 @@ class Recall:
             ranked = [ranked[i] for i in keep]
             ranked_scores = [ranked_scores[i] for i in keep]
         if fixed_k:
-            return ranked[:limit], n_echo
+            return ranked[:limit], n_echo, rerank_top
         k = _cutoff_k(
             ranked_scores,
             _EPISODE_CUTOFF_TAU,
             _EPISODE_CUTOFF_MIN_K,
             _EPISODE_CUTOFF_MAX_K,
         )
-        return ranked[:k], n_echo
+        return ranked[:k], n_echo, rerank_top
 
     def _episode_pool(
         self,
@@ -1613,7 +1649,7 @@ class Recall:
         # pattern as the retrieval_count bump, so zero read-path latency.
         # served_ids (issue #10): WHICH results were served, per bucket. Episodes dedupe
         # because passages share a parent id; timeline mirrors the bucket's event filter.
-        served_ids = {
+        served_ids: dict[str, Any] = {
             "episodes": list(dict.fromkeys(it["id"] for it in (ep_items or []) if it.get("id"))),
             "facts": [f["_uuid"] for f in served_facts if f.get("_uuid")],
             "timeline": [
@@ -1624,6 +1660,10 @@ class Recall:
             "prefs": [p["id"] for p in prefs_items if p.get("id") is not None],
             "n_echo_suppressed": n_echo_suppressed,
         }
+        # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
+        # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
+        # recency-adjusted ordering — so the marker and rerank_top_score always agree.
+        _floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)
         chars = _served_chars(out)
         self._record_metrics(
             {
@@ -1685,7 +1725,7 @@ class Recall:
         # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
-        episodes, n_echo_suppressed = self._select_episodes(
+        episodes, n_echo_suppressed, rerank_top = self._select_episodes(
             query, self._episode_pool(query, query_emb, project), limit
         )
 
@@ -1702,6 +1742,13 @@ class Recall:
             "query": query,
             "episodes": [_to_recall_item(r) for r in episodes],
         }
+        served_ids: dict[str, Any] = {
+            "episodes": [r["id"] for r in episodes if r.get("id")],
+            "n_echo_suppressed": n_echo_suppressed,
+        }
+        # Shadow abstention floor (telemetry only) — same RAW pre-recency score contract
+        # as recall(); the served episodes above are untouched.
+        _floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)
         chars = _served_chars(out)
         self._record_metrics(
             {
@@ -1712,11 +1759,9 @@ class Recall:
                 "n_episodes": len(episodes),
                 "chars": chars,
                 "est_tokens": chars // 4,
+                "rerank_top_score": round(float(rerank_top), 4),
                 "emb_ok": query_emb is not None,
-                "served_ids": {
-                    "episodes": [r["id"] for r in episodes if r.get("id")],
-                    "n_echo_suppressed": n_echo_suppressed,
-                },
+                "served_ids": served_ids,
             }
         )
         return out
