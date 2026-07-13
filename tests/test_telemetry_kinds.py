@@ -1,8 +1,8 @@
 """Row-shape pins for every recall_metrics ``kind`` — the telemetry contract tests.
 
-One test per kind ('recall', 'episodes', 'fetch', 'remember', 'board') drives the REAL
-emitting surface with the network legs stubbed (the tests/test_recall_floor.py harness;
-the tests/test_remember_notes.py server stubs) and asserts the row that lands in
+One test per kind ('recall', 'episodes', 'fetch', 'remember', 'board', 'timeline') drives
+the REAL emitting surface with the network legs stubbed (the tests/test_recall_floor.py
+harness; the tests/test_remember_notes.py server stubs) and asserts the row that lands in
 recall_metrics carries the columns + served_ids envelope keys that SQL counters rely on.
 A refactor that stops a surface emitting, or renames an envelope key, fails HERE — not
 silently in a dashboard query.
@@ -176,7 +176,7 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# kind='fetch' — Recall.fetch_episodes()
+# kind='fetch' — Recall.fetch()
 # ---------------------------------------------------------------------------
 
 
@@ -187,7 +187,7 @@ def test_fetch_kind_row_shape(conn, db_url):
     ).fetchone()[0]
     engine = Recall(db_url, "")  # fetch path is pure SQL — no leg stubs needed
     mark = _watermark(conn)
-    out = engine.fetch_episodes([f"e:{eid}"], source="mcp-tool")
+    out = engine.fetch([f"e:{eid}"], source="mcp-tool")
     assert [e["id"] for e in out["episodes"]] == [f"e:{eid}"]
 
     row = _newest(
@@ -197,15 +197,47 @@ def test_fetch_kind_row_shape(conn, db_url):
         "source, query, ms_total, n_episodes, chars, est_tokens, served_ids",
         mark,
     )
-    assert row is not None, "fetch_episodes() emitted no kind='fetch' telemetry row"
+    assert row is not None, "fetch() emitted no kind='fetch' telemetry row"
     source, query, ms_total, n_eps, chars, est_tokens, served = row
     assert source == "mcp-tool"
-    assert query == str(eid)  # comma-joined parsed ids
+    assert query == f"e:{eid}"  # comma-joined normalized parsed ids
     assert ms_total is not None and ms_total >= 0
     assert n_eps == 1 and chars > 0
-    # Fetch's row is deliberately minimal: no est_tokens, no served_ids envelope —
-    # the requested ids ARE the serve list and already live in `query`.
-    assert est_tokens is None and served is None
+    # Fetch's row stays lean: no est_tokens (the requested ids already live in `query`);
+    # served_ids carries only the per-kind serve counts (test_tool_surface.py pins the
+    # mixed-kind counts).
+    assert est_tokens is None
+    assert served == {"kinds": {"e": 1, "n": 0}}
+
+
+# ---------------------------------------------------------------------------
+# kind='timeline' — the recall_timeline() MCP tool
+# ---------------------------------------------------------------------------
+
+
+def test_timeline_kind_row_shape(conn, db_url, monkeypatch):
+    engine = Recall(db_url, "")
+    monkeypatch.setattr(server, "_recall_engine", engine)
+
+    class _StubTimelineEngine:
+        def recall_timeline(self, **kwargs):
+            return {
+                "query_shape": "time",
+                "items": [{"_id": 7, "date": "2026-07-01", "fact": "shipped the widget"}],
+            }
+
+    monkeypatch.setattr(server, "_timeline_engine", _StubTimelineEngine())
+    mark = _watermark(conn)
+    out = server.recall_timeline(since="2026-07-01")
+    assert len(out["items"]) == 1
+    assert "_id" not in out["items"][0]  # internal key popped before serving
+
+    row = _newest(conn, engine, "timeline", "source, ms_total, served_ids", mark)
+    assert row is not None, "recall_timeline() emitted no kind='timeline' telemetry row"
+    source, ms_total, served = row
+    assert source == "mcp-tool"
+    assert ms_total is not None and ms_total >= 0
+    assert served == {"n_events": 1}
 
 
 # ---------------------------------------------------------------------------

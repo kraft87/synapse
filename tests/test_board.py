@@ -187,7 +187,7 @@ def test_line_overflow_drops_oldest_project_notes_first(conn, db_url):
     text = out["text"]
     assert out["overflow"] > 0
     assert text.count("\n") + 1 <= 80
-    assert f"(+ {out['overflow']} more notes behind recall)" in text
+    assert f"(+ {out['overflow']} older notes not shown)" in text
     # Oldest-updated project notes dropped first; newest survive; feedback survives.
     assert "Project note 000" not in text
     assert "Project note 089" in text
@@ -249,7 +249,7 @@ def test_overflow_line_separated_when_all_notes_dropped(conn, db_url):
     db.close()
     out = build_board(db_url, None)
     assert out["n_notes"] == 0 and out["overflow"] == 1
-    assert out["text"].endswith("\n\n(+ 1 more notes behind recall)")
+    assert out["text"].endswith("\n\n(+ 1 older notes not shown)")
 
 
 # ---------------------------------------------------------------------------

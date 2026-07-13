@@ -89,7 +89,7 @@ def test_passage_meta_omits_null_project():
 
 
 def test_passage_carries_parent_episode_id():
-    # The passage must carry its parent episode id so fetch_episode() can expand the full turn.
+    # The passage must carry its parent episode id so fetch() can expand the full turn.
     r = Recall("", "")
     r._reranker = _FakeEmb([0])
     ep = {**_ep("a short turn"), "id": "e:42"}
