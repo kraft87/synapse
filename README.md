@@ -221,7 +221,15 @@ gets a release note saying so.
   "when / in what order" questions; `group_id="personal"` scopes to life events, excluding
   technical/work noise.
 - `fetch_episode(episode_ids)` — expand full turns by id (from a prior recall).
-- `remember(content, project=None)` — write a manual memory and extract it into the graph.
+- `remember(content=None, hook=None, body=None, type="project", project=None)` — write a
+  curated memory. The preferred form passes `hook` (a one-line index entry, ~120 chars) plus
+  `body` (the full self-contained note) and a `type` (`user` / `feedback` / `project` /
+  `reference`); the legacy `content`-only form still works and derives the hook from the
+  first sentence. Both forms also archive the text as an episode and enqueue knowledge-graph
+  extraction. Notes land in a dedicated store that is reconciled on write: a new note that
+  restates an existing one updates it in place, and one that contradicts it supersedes the
+  old note while keeping the lineage — so the curated set stays small and current instead
+  of accumulating duplicates.
 - `list_projects()` — per-project episode counts and last activity.
 - `query_graph(query)` — experimental natural-language graph query.
 

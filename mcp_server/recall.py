@@ -1399,6 +1399,30 @@ class Recall:
         except Exception as e:
             logger.debug("recall_metrics write failed: %s", e)
 
+    def record_event(
+        self,
+        kind: str,
+        *,
+        source: str | None = None,
+        query: str | None = None,
+        group_id: str | None = None,
+        ms_total: float | None = None,
+        served_ids: dict[str, Any] | None = None,
+    ) -> None:
+        """Public passthrough onto the fire-and-forget recall_metrics writer for
+        non-recall callers (e.g. the remember tool): one telemetry row, background
+        insert, never surfaces a failure. Columns not passed stay NULL."""
+        self._record_metrics(
+            {
+                "kind": kind,
+                "source": source,
+                "query": query,
+                "group_id": group_id,
+                "ms_total": ms_total,
+                "served_ids": served_ids,
+            }
+        )
+
     # ------------------------------------------------------------------
     # Main entry points
     # ------------------------------------------------------------------

@@ -409,14 +409,47 @@ def fetch_episode(episode_ids: list[str]) -> dict:
         return _get_recall().fetch_episodes(episode_ids, source="mcp-tool")
 
 
+def _notes_deps() -> tuple:
+    """(embedder, llm) for the notes reconcile path — a seam so tests can stub both.
+
+    Embedder construction failure degrades to ``None`` (keyless dev/test):
+    reconcile_note then stores a NULL embedding and skips dedup rather than
+    failing the write (same degrade the timeline ingest route uses)."""
+    from ingestion.embedding import create_embedder
+    from ingestion.llm_client import create_llm_client
+
+    try:
+        embedder = create_embedder(voyage_api_key=VOYAGE_API_KEY, db_url=DB_URL)
+    except Exception as e:
+        logger.warning("notes embedder unavailable (%s); note dedup will be skipped", e)
+        embedder = None
+    return embedder, create_llm_client()
+
+
+def _derive_hook(content: str) -> str:
+    """Legacy-form board line: first sentence of the content, hard-truncated to 120."""
+    import re
+
+    stripped = content.strip()
+    first_line = stripped.splitlines()[0] if stripped else ""
+    m = re.search(r"[.!?](?:\s|$)", first_line)
+    first = first_line[: m.end()].strip() if m else first_line
+    return first[:120]
+
+
 @mcp.tool()
-def remember(
-    content: str,
+async def remember(
+    content: str | None = None,
+    hook: str | None = None,
+    body: str | None = None,
+    type: str = "project",
     project: str | None = None,
     session_id: str | None = None,
 ) -> dict:
-    """Persist a memory that must outlive this session — writes an episode and
-    enqueues knowledge-graph extraction.
+    """Write to the user's curated long-term memory: reconciles a NOTE into the
+    explicit notes store (deduped against the live set, superseded on
+    contradiction) AND archives the text as an episode with knowledge-graph
+    extraction.
 
     WHEN the user states a durable fact, preference, or decision, corrects
     something you had wrong, or explicitly asks you to remember → call this. If
@@ -428,51 +461,134 @@ def remember(
     to restate something already stored, or to save your own speculation or an
     unconfirmed plan. Routine conversation is ingested automatically.
 
-    Content contract: write it specific and self-contained — absolute dates (not
-    "yesterday"), concrete names, and the WHY behind a decision — so it stands
-    alone months later.
+    PREFERRED form — pass hook + body (+ type). `hook` is the one-line index
+    entry (target ~120 chars, hard cap 200); `body` is the full note, fetched on
+    demand by id. The legacy content-only form is kept for compatibility: it
+    derives the hook from the first sentence and files the note as type
+    'project'.
+
+    WRITE CONTRACT — what a note must look like:
+    - Decisions WITH reasons, not changelog lines: "chose X because Y" survives;
+      "merged the fix" / "updated the file" is noise.
+    - DECLARATIVE, not imperative: "User prefers concise responses", never
+      "Always respond concisely" — imperative memory re-reads as a standing
+      directive and overrides live requests.
+    - 7-day staleness blocklist: PR numbers, commit SHAs, "phase N done", file
+      counts — anything stale within a week belongs in the episode archive
+      (written automatically), never in a note.
+    - Absolute dates ("2026-07-12"), never "yesterday" or "last week".
+    - Self-contained body: it must stand alone months later with zero
+      surrounding conversation.
+
+    Type semantics:
+      user      — durable facts about the user (global — every session).
+      feedback  — corrections to agent behavior (global — every session).
+      project   — scoped to `project`, staleness-managed (the default).
+      reference — pointers to canonical sources (repos, docs, runbooks).
 
     Args:
-        content: The text to remember.
-        project: Optional project slug to associate the memory with.
-        session_id: Optional session ID to attach this memory to.
+        content: Legacy form — full text to remember (hook and type derived).
+        hook: Preferred form — one-line note index entry (target ~120 chars).
+        body: Preferred form — the full, self-contained note text.
+        type: Note type — 'user' | 'feedback' | 'project' (default) | 'reference'.
+        project: Optional project slug (scopes 'project' notes and the episode).
+        session_id: Optional session ID to attach the episode to.
     """
+    import time as _time
     import uuid as _uuid
+
+    import anyio.to_thread
 
     from ingestion.db import Database
     from ingestion.models import Episode, ExtractionItem
+    from ingestion.notes import _VALID_TYPES, reconcile_note
 
-    # Use a dedicated short-lived connection for writes — keeps the shared recall
-    # engine's read connection clean and avoids transaction state leakage.
-    db = Database(DB_URL)
+    structured = hook is not None and body is not None
+    if not structured and not content:
+        return {
+            "status": "error",
+            "detail": "provide hook + body (preferred) or content (legacy)",
+        }
+    if type not in _VALID_TYPES:
+        return {
+            "status": "error",
+            "detail": f"invalid type {type!r} — expected one of {_VALID_TYPES}",
+        }
+
+    if structured:
+        note_hook = str(hook)[:200]  # hard cap; the contract targets ~120
+        note_body = str(body)
+        note_type = type
+        ep_content = content or f"{note_hook}\n\n{note_body}"
+    else:
+        assert content is not None  # guaranteed by the form check above
+        note_hook = _derive_hook(content)
+        note_body = content
+        note_type = "project"
+        ep_content = content
+
     sid = session_id or str(_uuid.uuid4())
 
-    try:
-        existing = db.get_session_episodes(sid)
-        seq = (max(e["sequence"] for e in existing) + 1) if existing else 1
+    def _work() -> dict:
+        t0 = _time.perf_counter()
+        # Use a dedicated short-lived connection for writes — keeps the shared
+        # recall engine's read connection clean and avoids transaction leakage.
+        db = Database(DB_URL)
+        try:
+            existing = db.get_session_episodes(sid)
+            seq = (max(e["sequence"] for e in existing) + 1) if existing else 1
 
-        ep = Episode(
-            session_id=sid,
-            sequence=seq,
-            project=project,
-            content=content,
-            source="manual",
-        )
-        episode_id = db.upsert_episode(ep)
-
-        db.enqueue_extraction(
-            ExtractionItem(
-                episode_id=episode_id,
+            ep = Episode(
                 session_id=sid,
-                content=content,
-                content_type="manual",
+                sequence=seq,
                 project=project,
+                content=ep_content,
+                source="manual",
             )
-        )
-    finally:
-        db.close()
+            episode_id = db.upsert_episode(ep)
 
-    return {"status": "ok", "episode_id": episode_id, "session_id": sid}
+            db.enqueue_extraction(
+                ExtractionItem(
+                    episode_id=episode_id,
+                    session_id=sid,
+                    content=ep_content,
+                    content_type="manual",
+                    project=project,
+                )
+            )
+
+            embedder, llm = _notes_deps()
+            res = reconcile_note(
+                db,
+                embedder,
+                llm,
+                hook=note_hook,
+                body=note_body,
+                type=note_type,
+                project=project,
+                source_ref=f"ep:{episode_id}",
+            )
+        finally:
+            db.close()
+
+        _get_recall().record_event(
+            "remember",
+            source="mcp-tool",
+            ms_total=(_time.perf_counter() - t0) * 1000.0,
+            served_ids={"note": res["note_id"], "outcome": res["outcome"], "type": note_type},
+        )
+        return {
+            "status": "ok",
+            "note_id": res["note_id"],
+            "outcome": res["outcome"],
+            "episode_id": episode_id,
+            "session_id": sid,
+        }
+
+    # reconcile_note does blocking DB I/O + possibly a sync LLM call that runs
+    # asyncio.run() internally — it must live on a worker thread, never on the
+    # FastMCP event loop (same trap query_graph documents).
+    return await anyio.to_thread.run_sync(_work)
 
 
 @mcp.custom_route("/ingest", methods=["POST"])
