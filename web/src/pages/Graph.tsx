@@ -23,11 +23,13 @@ import {
   type GraphEntity, type GraphNode, type GraphEdge,
 } from '../api';
 import { useStore } from '../state';
-import { etColor, cssValue, validityLine } from '../tokens';
+import { superColor, cssValue, validityLine } from '../tokens';
 import { openEpisode } from '../hash';
 
 const mono = 'var(--font-data)';
 const NODE_CAP = 150;
+// First render shows a readable subset; the "+N more" cluster chip pages the rest in.
+const INITIAL_RENDER_CAP = 75;
 const CLUSTER_PAGE = 50;
 const SUPERTYPES = ['Person', 'Project', 'Technology', 'Organization', 'Concept', 'Event'];
 
@@ -53,25 +55,27 @@ function buildPalette() {
   const v = cssValue;
   return {
     txt2: v('--txt2'), txt3: v('--txt3'), line2: v('--line2'), acc: v('--acc'), bg3: v('--bg3'),
-    et: (supertype?: string | null) => cssValue(etColor(supertype)),
+    bg1: v('--bg1'),
+    et: (supertype?: string | null) => cssValue(superColor(supertype)),
   };
 }
 const nodeSize = (deg?: number) => 18 + Math.min(34, Math.sqrt(Math.max(1, deg || 1)) * 9);
 
 type Palette = ReturnType<typeof buildPalette>;
 function stylesheet(pal: Palette, sizeRef: { current: number }): cytoscape.StylesheetStyle[] {
-  const labelFor = (ele: cytoscape.NodeSingular): string => {
-    if (ele.data('cluster')) return ele.data('name');
-    if (sizeRef.current <= 100) return ele.data('name');
-    if ((ele.data('degree') || 0) >= 3 || ele.selected() || ele.hasClass('hl')) return ele.data('name');
-    return '';
-  };
+  // Labels are always set; 'min-zoomed-font-size' declutters instead of a node-count
+  // rule (zoomed out they vanish, zoom in and every name appears — the old >100-node
+  // suppression left the fitted view a wall of anonymous dots).
+  const labelFor = (ele: cytoscape.NodeSingular): string => ele.data('name');
+  void sizeRef;
   return [
     { selector: 'node', style: {
       'background-color': (e: cytoscape.NodeSingular) => pal.et(e.data('supertype')),
       width: (e: cytoscape.NodeSingular) => nodeSize(e.data('degree')),
       height: (e: cytoscape.NodeSingular) => nodeSize(e.data('degree')),
       label: labelFor, color: pal.txt2, 'font-family': 'IBM Plex Mono, monospace', 'font-size': 10.5,
+      'min-zoomed-font-size': 9,
+      'text-outline-width': 2, 'text-outline-color': pal.bg1, 'text-outline-opacity': 0.85,
       'text-valign': 'center', 'text-halign': 'right', 'text-margin-x': 4,
       'border-width': 0, 'transition-property': 'opacity', 'transition-duration': 0.15,
     } as unknown as cytoscape.Css.Node },
@@ -93,7 +97,7 @@ function stylesheet(pal: Palette, sizeRef: { current: number }): cytoscape.Style
   ];
 }
 
-const nodeData = (n: GraphNode) => ({ id: n.uuid, name: n.name, supertype: n.entity_type, degree: n.degree });
+const nodeData = (n: GraphNode) => ({ id: n.uuid, name: n.name, supertype: n.supertype ?? n.entity_type, degree: n.degree });
 const edgeData = (e: GraphEdge) => ({
   id: e.uuid, source: e.src, target: e.tgt, name: e.name, rc: e.retrieval_count,
   t_valid: e.t_valid, t_invalid: e.t_invalid,
@@ -124,10 +128,10 @@ export function Graph() {
   const suggestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [model, setModel] = useState<GraphModel>({ nodes: [], edges: [] });
-  const [renderCap, setRenderCap] = useState(NODE_CAP);
+  const [renderCap, setRenderCap] = useState(INITIAL_RENDER_CAP);
   const [seedText, setSeedText] = useState('');
   const [seedUuid, setSeedUuid] = useState<string | null>(null);
-  const [depth, setDepth] = useState<1 | 2>(2);
+  const [depth, setDepth] = useState<1 | 2>(1);
   const [asOfIdx, setAsOfIdx] = useState(24);
   const [selId, setSelId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -175,7 +179,7 @@ export function Graph() {
 
   const runSeed = useCallback((query: string) => {
     if (!query.trim()) return;
-    setRenderCap(NODE_CAP);
+    setRenderCap(INITIAL_RENDER_CAP);
     setSuggest([]); setSuggestIdx(-1);
     loadNeighborhood(query.trim(), { replace: true });
   }, [loadNeighborhood]);
@@ -277,10 +281,10 @@ export function Graph() {
     setCounts({ nodes: vnodes.length, edges: vedges.length });
 
     if (mode === 'full') {
-      cy.layout({ name: 'cose-bilkent', animate: false, randomize: true, fit: true, padding: 40, idealEdgeLength: 95, nodeRepulsion: 5000, tile: true } as cytoscape.LayoutOptions).run();
+      cy.layout({ name: 'cose-bilkent', animate: false, randomize: true, fit: true, padding: 40, idealEdgeLength: 130, nodeRepulsion: 12000, tile: true } as cytoscape.LayoutOptions).run();
     } else if (mode === 'incremental') {
       cy.nodes().forEach((n) => { if (!addedSet.has(n.id())) n.lock(); });
-      const l = cy.layout({ name: 'cose-bilkent', animate: false, randomize: false, fit: false, padding: 40, idealEdgeLength: 95, nodeRepulsion: 5000 } as cytoscape.LayoutOptions);
+      const l = cy.layout({ name: 'cose-bilkent', animate: false, randomize: false, fit: false, padding: 40, idealEdgeLength: 130, nodeRepulsion: 12000 } as cytoscape.LayoutOptions);
       l.one('layoutstop', () => cy.nodes().unlock());
       l.run();
     }
@@ -333,7 +337,7 @@ export function Graph() {
 
   const relayout = () => {
     const cy = cyRef.current; if (!cy) return;
-    cy.layout({ name: 'cose-bilkent', animate: false, randomize: true, fit: true, padding: 40, idealEdgeLength: 95, nodeRepulsion: 5000, tile: true } as cytoscape.LayoutOptions).run();
+    cy.layout({ name: 'cose-bilkent', animate: false, randomize: true, fit: true, padding: 40, idealEdgeLength: 130, nodeRepulsion: 12000, tile: true } as cytoscape.LayoutOptions).run();
   };
 
   // ---- toolbar typeahead ----
@@ -389,7 +393,7 @@ export function Graph() {
                   onMouseEnter={() => setSuggestIdx(i)}
                   style={{ display: 'flex', width: '100%', alignItems: 'center', gap: '8px', textAlign: 'left', border: 'none', borderBottom: '1px solid var(--line)', background: i === suggestIdx ? 'var(--bg2)' : 'transparent', padding: '6px 10px', cursor: 'pointer' }}
                 >
-                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: etColor(e.entity_type), flexShrink: 0 }} />
+                  <span style={{ width: 8, height: 8, borderRadius: '50%', background: superColor(e.supertype ?? e.entity_type), flexShrink: 0 }} />
                   <span style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{e.name}</span>
                   <span style={{ fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)' }}>{e.degree}</span>
                 </button>
@@ -434,7 +438,7 @@ export function Graph() {
           <div style={{ position: 'absolute', left: '12px', bottom: '10px', display: 'flex', gap: '12px', flexWrap: 'wrap', pointerEvents: 'none' }}>
             {SUPERTYPES.map((t) => (
               <span key={t} style={{ display: 'flex', alignItems: 'center', gap: '5px', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)' }}>
-                <span style={{ width: 8, height: 8, borderRadius: '50%', background: etColor(t) }} />{t.toLowerCase()}
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: superColor(t) }} />{t.toLowerCase()}
               </span>
             ))}
           </div>
@@ -455,7 +459,7 @@ export function Graph() {
           {selNode && (
             <>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                <span style={{ width: 10, height: 10, borderRadius: '50%', background: etColor(selNode.entity_type), flexShrink: 0 }} />
+                <span style={{ width: 10, height: 10, borderRadius: '50%', background: superColor(selNode.supertype ?? selNode.entity_type), flexShrink: 0 }} />
                 <span style={{ fontFamily: mono, fontSize: '14px', fontWeight: 500 }}>{selNode.name}</span>
               </div>
               <div style={{ fontFamily: mono, fontSize: '11px', color: 'var(--txt3)', margin: '6px 0 10px' }}>

@@ -1436,15 +1436,18 @@ def _pref_row(
 
 def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name=None):
     """Entity insert that ALSO sets normalized_name (the shared _entity helper doesn't),
-    so the exact-normalized-name seed path is exercisable."""
+    so the exact-normalized-name seed path is exercisable. entity_supertype mirrors
+    entity_type — the graph payloads serve BOTH (client colors by supertype)."""
     return conn.execute(
         "INSERT INTO kg_entities "
-        "(uuid, group_id, name, normalized_name, entity_type, summary, degree, created_at) "
-        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        "(uuid, group_id, name, normalized_name, entity_type, entity_supertype, summary, "
+        " degree, created_at) "
+        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             name,
             normalized_name or name.lower(),
+            entity_type,
             entity_type,
             f"{name} summary",
             degree,
@@ -1857,6 +1860,15 @@ def _mini_graph(conn):
     return ep
 
 
+def test_graph_nodes_carry_supertype(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        nb = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=1", headers=_H).json()
+        assert all("supertype" in n for n in nb["nodes"])
+        ta = client.get("/dash/api/graph/entities?q=Synapse", headers=_H).json()
+        assert all("supertype" in e for e in ta)
+
+
 def test_graph_typeahead(clean, conn, db_url):
     _mini_graph(conn)
     with _client(db_url) as client:
@@ -1865,7 +1877,7 @@ def test_graph_typeahead(clean, conn, db_url):
         assert isinstance(r, list) and len(r) >= 3
         degs = [row["degree"] for row in r]
         assert degs == sorted(degs, reverse=True)  # degree DESC ordering
-        assert set(r[0].keys()) == {"uuid", "name", "entity_type", "degree"}
+        assert set(r[0].keys()) == {"uuid", "name", "entity_type", "supertype", "degree"}
 
         # A precise substring resolves to the one entity.
         pg = client.get("/dash/api/graph/entities?q=Postgres", headers=_H).json()
@@ -1890,7 +1902,14 @@ def test_graph_neighborhood_depth_1_vs_2(clean, conn, db_url):
         assert d1["seed"] == "g-hub" and d1["truncated"] is False
         assert d1["nodes"][0]["uuid"] == "g-hub"  # seed sorted first
         # node payload shape
-        assert set(d1["nodes"][0].keys()) == {"uuid", "name", "entity_type", "degree", "summary"}
+        assert set(d1["nodes"][0].keys()) == {
+            "uuid",
+            "name",
+            "entity_type",
+            "supertype",
+            "degree",
+            "summary",
+        }
         # edge payload shape + provenance resolution
         e1 = next(e for e in d1["edges"] if e["uuid"] == "e1")
         assert e1["src"] == "g-hub" and e1["tgt"] == "g-pg" and e1["provenance_episode_id"] == ep

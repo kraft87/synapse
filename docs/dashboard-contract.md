@@ -530,7 +530,7 @@ nodes / ~2K edges) hangs browser layout, so over the edge cap the server keeps
 seed-adjacent edges first, then most-retrieved, then newest, prunes nodes the cut
 orphaned, and sets `truncated`.
 ```json
-{"nodes": [{"uuid": "…", "name": "…", "entity_type": "…", "degree": 12, "summary": "…"}],
+{"nodes": [{"uuid": "…", "name": "…", "entity_type": "…", "supertype": "…", "degree": 12, "summary": "…"}],
  "edges": [{"uuid": "…", "src": "…", "tgt": "…", "name": "<verb>", "fact": "…",
             "t_valid": "…", "t_invalid": null, "provenance_episode_id": 227001,
             "retrieval_count": 41}],
@@ -540,6 +540,8 @@ orphaned, and sets `truncated`.
   whitespace-collapsed + bookend-punctuation-stripped, mirroring `ingestion.dedup`) → best
   `name ILIKE` match by `degree DESC`. No match → **404** `entity not found`. Missing/empty
   `entity` → **400**.
+- **`supertype`** (nodes + typeahead) is the canonical coarse layer (`kg_entities.entity_supertype`,
+  schema 020) — the client colors by it; `entity_type` stays the fine-grained label.
 - **Truncation:** when the reachable set exceeds `limit`, keep the highest-degree nodes (the
   seed is always kept) and set `truncated: true`. Edges are returned only when BOTH endpoints
   survive truncation. Ranking is best-effort over the scanned candidates (per-level BFS scans
