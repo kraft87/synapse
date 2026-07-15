@@ -228,3 +228,182 @@ export const postProposalDecision = (
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action, note }),
       });
+
+// ---------- live feed stream (phase 3) ----------
+// GET /dash/api/stream is SSE, but EventSource cannot send the Authorization header, so we
+// read it with fetch + a ReadableStream line parser instead (contract §Phase 3). The parser
+// honors event:/data:/id: fields; `id:` rides only on feed events, so lastEventId tracks the
+// resumable feed stream (not processing_status / heartbeats). Manual reconnect with 1s→30s
+// backoff resends Last-Event-ID; after >5 consecutive failures we give up so the caller can
+// fall back to 30s polling (contract §Phase 3, spec §2 reconnect states).
+export interface ProcessingStatus { queue_depth: number; active: boolean; }
+
+const STREAM_EVENTS = new Set(['new_episode', 'new_fact', 'new_timeline_event']);
+const STREAM_MAX_BACKOFF_MS = 30_000;
+const STREAM_GIVE_UP_AFTER = 5;
+
+export interface StreamHandlers {
+  onOpen?: () => void;
+  onItem: (item: FeedItem) => void;
+  onReset: () => void;
+  onStatus: (s: ProcessingStatus) => void;
+  onDisconnect: () => void; // transient loss -> header amber "reconnecting", keep stale items
+  onGiveUp: () => void;     // persistent failure -> caller starts the polling fallback
+}
+export interface StreamHandle { close: () => void; }
+
+export function openFeedStream(handlers: StreamHandlers): StreamHandle {
+  let closed = false;
+  let lastEventId: string | null = null;
+  let failures = 0;
+  let controller: AbortController | null = null;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const dispatch = (event: string, data: string) => {
+    if (event === 'processing_status') {
+      try { handlers.onStatus(JSON.parse(data) as ProcessingStatus); } catch { /* ignore */ }
+    } else if (event === 'reset') {
+      lastEventId = null; // resynced to page 1; a stale id would just force another reset
+      handlers.onReset();
+    } else if (STREAM_EVENTS.has(event)) {
+      try { handlers.onItem(JSON.parse(data) as FeedItem); } catch { /* ignore */ }
+    }
+  };
+
+  const readStream = async (body: ReadableStream<Uint8Array>) => {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let evName = '';
+    let evData: string[] = [];
+    let evId: string | null = null;
+    const flush = () => {
+      if (evData.length || evName) {
+        if (evId !== null) lastEventId = evId;
+        dispatch(evName || 'message', evData.join('\n'));
+      }
+      evName = ''; evData = []; evId = null;
+    };
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        let line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line.endsWith('\r')) line = line.slice(0, -1);
+        if (line === '') { flush(); continue; }
+        if (line.startsWith(':')) continue; // comment / heartbeat
+        const ci = line.indexOf(':');
+        const field = ci < 0 ? line : line.slice(0, ci);
+        let val = ci < 0 ? '' : line.slice(ci + 1);
+        if (val.startsWith(' ')) val = val.slice(1);
+        if (field === 'event') evName = val;
+        else if (field === 'data') evData.push(val);
+        else if (field === 'id') evId = val;
+      }
+    }
+  };
+
+  const scheduleReconnect = () => {
+    if (closed) return;
+    handlers.onDisconnect();
+    failures += 1;
+    if (failures > STREAM_GIVE_UP_AFTER) { handlers.onGiveUp(); return; }
+    const backoff = Math.min(1000 * 2 ** (failures - 1), STREAM_MAX_BACKOFF_MS);
+    retryTimer = setTimeout(connect, backoff);
+  };
+
+  const connect = async () => {
+    if (closed) return;
+    controller = new AbortController();
+    const headers: Record<string, string> = {
+      Authorization: 'Bearer ' + (getToken() ?? ''),
+      Accept: 'text/event-stream',
+    };
+    if (lastEventId) headers['Last-Event-ID'] = lastEventId;
+    try {
+      const res = await fetch(BASE + '/stream', { headers, signal: controller.signal });
+      if (res.status === 401) { closed = true; authFailHandler(); return; }
+      if (!res.ok || !res.body) { scheduleReconnect(); return; }
+      failures = 0;
+      handlers.onOpen?.();
+      await readStream(res.body);
+      if (!closed) scheduleReconnect(); // server closed the stream -> reconnect
+    } catch {
+      if (!closed) scheduleReconnect(); // network error / abort
+    }
+  };
+
+  connect();
+  return {
+    close: () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (controller) controller.abort();
+    },
+  };
+}
+
+// Mirror the server /feed per-type filtering client-side, so a live event only prepends when
+// it passes the CURRENT filter cluster: a filter applies only to types that carry the column
+// (episodes: project+source; facts: group_id; timeline: project + group_id-from-domain).
+export function feedItemPassesFilter(
+  item: FeedItem,
+  f: { project: string; group: string; source: string },
+): boolean {
+  if (f.project !== 'all' && (item.type === 'episode' || item.type === 'timeline_event')) {
+    if ((item.project || 'untagged') !== f.project) return false;
+  }
+  if (f.source !== 'all' && item.type === 'episode') {
+    if ((item.source || 'untagged') !== f.source) return false;
+  }
+  if (f.group !== 'all' && (item.type === 'fact' || item.type === 'timeline_event')) {
+    if ((item.group_id || '') !== f.group) return false;
+  }
+  return true;
+}
+// ---------- metrics (phase 4) ----------
+// Wire shapes pinned in docs/dashboard-contract.md §"Phase 4". Honesty flags carried through:
+// corpus rows can be a pg_class estimate (`rows_estimated`), and ingestion has NO queue-depth
+// history (only enqueue/hour + completed/hour throughput), so the client never plots a fabricated
+// depth series.
+export interface MetricsRecallPoint {
+  t: string; p50: number | null; p95: number | null; calls: number;
+  tokens_p50: number | null; legs_p50: Record<string, number>;
+}
+export interface MetricsRecall {
+  series: MetricsRecallPoint[];
+  slowest: { query: string; ms_total: number | null; created_at: string }[];
+  score_hist: { lo: number; hi: number; n: number }[];
+}
+export interface DreamRun {
+  id: number; started_at: string; finished_at: string | null; duration_s: number | null;
+  ok: boolean | null; stages: Record<string, { ran?: boolean; ok?: boolean }>;
+  counts: Record<string, number>;
+  samples: { proposals?: { id: string; kind: string; name: string }[] };
+  errors: string[];
+}
+export interface MetricsIngestion {
+  queue_depth: number;
+  queue: { pending: number; processing: number; failed: number };
+  throughput: {
+    enqueued_per_hour: { t: string; n: number }[];
+    completed_per_hour: { t: string; n: number }[];
+  };
+  failures: { id: number; episode_id: number | null; error: string; enqueued_at: string; processed_at: string | null; attempts: number }[];
+  last_dream: DreamRun | null;
+}
+export interface MetricsCorpus {
+  tables: { name: string; rows: number; rows_estimated: boolean; spark_30d: number[]; delta_30d: number }[];
+  by_project: { name: string; n: number }[];
+  by_source: { name: string; n: number }[];
+}
+
+export const fetchMetricsRecall = (window = '7d'): Promise<MetricsRecall> =>
+  MOCK ? mockApi('/metrics/recall') : req('/metrics/recall' + qs({ window }));
+export const fetchMetricsIngestion = (window = '48h'): Promise<MetricsIngestion> =>
+  MOCK ? mockApi('/metrics/ingestion') : req('/metrics/ingestion' + qs({ window }));
+export const fetchMetricsCorpus = (): Promise<MetricsCorpus> =>
+  MOCK ? mockApi('/metrics/corpus') : req('/metrics/corpus');

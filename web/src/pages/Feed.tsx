@@ -1,9 +1,10 @@
-// Feed — "watch it remember". Keyset pagination via next_cursor, 30s polling that
-// prepends new writes with the slidein animation, skeleton / empty / error states
-// (companion spec §2). The live dot reflects the last feed poll.
+// Feed — "watch it remember". Keyset pagination via next_cursor; a live SSE stream
+// (phase 3) prepends new writes with the slidein animation, with 30s polling kept as the
+// automatic fallback if the stream fails persistently. Skeleton / empty / error states
+// (companion spec §2). The live dot + queue badge reflect the stream's processing_status.
 import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
-import { fetchFeed, type FeedItem } from '../api';
+import { fetchFeed, openFeedStream, feedItemPassesFilter, MOCK, type FeedItem } from '../api';
 import { useStore } from '../state';
 import { FeedCard } from '../components/FeedCard';
 
@@ -31,7 +32,7 @@ function Skeletons() {
 
 export function Feed() {
   const s = useStore();
-  const { project, group, source, setOnline } = s;
+  const { project, group, source, setOnline, setQueueDepth } = s;
   const [items, setItems] = useState<FeedItem[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -51,10 +52,16 @@ export function Feed() {
       .finally(() => setLoading(false));
   };
 
-  // (re)load page 1 whenever the filters change, and poll while mounted
+  // (re)load page 1 whenever the filters change, then subscribe to the live SSE stream.
+  // The stream prepends new writes that pass the current filter; a persistent stream
+  // failure (>5 reconnect attempts) trips the 30s polling fallback. MOCK has no server,
+  // so it stays on polling.
   useEffect(() => {
     load();
-    const t = setInterval(() => {
+
+    // One incremental poll: fetch page 1 and prepend anything unseen (the fallback path
+    // and the only path in MOCK). Captures the current filters at effect creation.
+    const pollOnce = () => {
       fetchFeed({ ...filters }).then((r) => {
         const seen = new Set(itemsRef.current.map(keyOf));
         const incoming = r.items.filter((it) => !seen.has(keyOf(it)));
@@ -64,8 +71,39 @@ export function Feed() {
           setItems((prev) => incoming.concat(prev));
         }
       }).catch(() => setOnline(false));
-    }, POLL_MS);
-    return () => clearInterval(t);
+    };
+
+    if (MOCK) {
+      const t = setInterval(pollOnce, POLL_MS);
+      return () => clearInterval(t);
+    }
+
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+    const startPolling = () => {
+      if (pollTimer != null) return;
+      pollTimer = setInterval(pollOnce, POLL_MS);
+    };
+
+    const prepend = (item: FeedItem) => {
+      if (!feedItemPassesFilter(item, { project, group, source })) return; // filtered out -> drop
+      const k = keyOf(item);
+      setItems((prev) => (prev.some((it) => keyOf(it) === k) ? prev : [item, ...prev]));
+      setFresh(new Set([k]));
+    };
+
+    const stream = openFeedStream({
+      onOpen: () => setOnline(true),
+      onStatus: (st) => { setOnline(true); setQueueDepth(st.queue_depth); },
+      onItem: (item) => { setOnline(true); prepend(item); },
+      onReset: () => load(),                 // buffer aged out -> refetch page 1
+      onDisconnect: () => setOnline(false),  // transient loss -> amber, keep stale items
+      onGiveUp: () => { setOnline(false); startPolling(); }, // persistent -> 30s polling
+    });
+
+    return () => {
+      stream.close();
+      if (pollTimer != null) clearInterval(pollTimer);
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, group, source]);
 

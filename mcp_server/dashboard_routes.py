@@ -26,11 +26,14 @@ preferences / notes.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -39,7 +42,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -73,6 +76,20 @@ _CATALOG_TTL_S = 300  # ~5 min in-process cache
 
 _FLAG_KINDS = ("episode", "fact", "timeline_event", "preference", "note")
 _SEARCH_TYPES = ("episodes", "facts", "entities", "events")
+
+# Phase 3 (SSE live stream). The LISTEN worker hydrates each NOTIFY into a full FeedItem and
+# appends it to a ring buffer; the /dash/api/stream route replays from it on resume and streams
+# live. Feed-item event names by type; every other tunable for the stream loop.
+_STREAM_EVENT_NAMES = {
+    "episode": "new_episode",
+    "fact": "new_fact",
+    "timeline_event": "new_timeline_event",
+}
+_STREAM_CHANNEL = "dash_feed"  # matches schema/043_dash_notify.sql
+_STREAM_BUFFER_CAP = 512  # ring-buffer slots (contract: 512-event replay window)
+_STREAM_POLL_S = 0.25  # per-connection buffer poll cadence (new-event latency ceiling)
+_STREAM_STATUS_S = 1.0  # processing_status emit cadence (contract: ~1/s)
+_STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the stream
 
 # Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
 # statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals
@@ -240,6 +257,77 @@ def _catalog(db_url: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Feed
 # ---------------------------------------------------------------------------
+#
+# The per-type SELECT column lists and row→FeedItem mappers are shared between the
+# paged /dash/api/feed endpoint (below) and the SSE stream's single-row hydration
+# (Phase 3, further down) so BOTH produce byte-identical wire shapes from ONE code path.
+# The endpoint appends a keyset WHERE + ORDER BY + LIMIT to the SELECT; the stream appends
+# a "WHERE <pk> = %s". The mappers emit the final item minus `flagged` (added after the
+# per-request flag set is loaded) and minus the internal `_ts`/`_idstr` merge-sort keys.
+
+_EP_SELECT = "SELECT id, created_at, project, source, session_id, sequence, content FROM episodes"
+_FACT_SELECT = (
+    "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
+    "       se.name AS src_name, te.name AS tgt_name "
+    "FROM kg_relationships r "
+    "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
+    "LEFT JOIN kg_entities te ON te.uuid = r.tgt_uuid"
+)
+_TL_SELECT = (
+    "SELECT id, ingested_at, project, fact, t_valid, source, source_ref, salience, domain "
+    "FROM timeline_events"
+)
+
+
+def _episode_item(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "episode",
+        "id": str(r["id"]),
+        "ts": _iso(r["created_at"]),
+        "project": r["project"],
+        "source": r["source"],
+        "gist": _gist(r["content"]),
+        "data": {"session_id": r["session_id"], "sequence": r["sequence"]},
+    }
+
+
+def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "fact",
+        "id": r["uuid"],
+        "ts": _iso(r["created_at"]),
+        "group_id": r["group_id"],
+        "gist": _gist(r["fact"]),
+        "data": {
+            "fact": r["fact"],
+            "src_name": r["src_name"],
+            "tgt_name": r["tgt_name"],
+            "t_valid": _iso(r["t_valid"]),
+            "t_invalid": _iso(r["t_invalid"]),
+            "provenance_episode_id": _provenance(r["episodes"]),
+        },
+    }
+
+
+def _timeline_item(r: dict[str, Any]) -> dict[str, Any]:
+    sal = {0: 0.3, 1: 0.6, 2: 0.9}.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6)
+    return {
+        "type": "timeline_event",
+        "id": str(r["id"]),
+        "ts": _iso(r["ingested_at"]),
+        "project": r["project"],
+        # domain is the timeline's group scope (schema 038); exposed as group_id so the live
+        # SSE client can apply the group filter uniformly across all three feed types.
+        "group_id": r["domain"],
+        "sal": sal,
+        "gist": _gist(r["fact"]),
+        "data": {
+            "fact": r["fact"],
+            "t_valid": _iso(r["t_valid"]),
+            "source": r["source"],
+            "episode_id": _episode_id_from_ref(r["source_ref"]),
+        },
+    }
 
 
 def _feed(
@@ -282,25 +370,15 @@ def _feed(
             )
             ep_params += [cts, cts, cid]
         ep_rows = conn.execute(
-            "SELECT id, created_at, project, source, session_id, sequence, content "
-            f"FROM episodes WHERE {' AND '.join(ep_where)} "
+            f"{_EP_SELECT} WHERE {' AND '.join(ep_where)} "
             "ORDER BY created_at DESC, id::text DESC LIMIT %s",
             (*ep_params, limit),
         ).fetchall()
         for r in ep_rows:
-            candidates.append(
-                {
-                    "_ts": r["created_at"],
-                    "_idstr": str(r["id"]),
-                    "type": "episode",
-                    "id": str(r["id"]),
-                    "ts": _iso(r["created_at"]),
-                    "project": r["project"],
-                    "source": r["source"],
-                    "gist": _gist(r["content"]),
-                    "data": {"session_id": r["session_id"], "sequence": r["sequence"]},
-                }
-            )
+            item = _episode_item(r)
+            item["_ts"] = r["created_at"]
+            item["_idstr"] = str(r["id"])
+            candidates.append(item)
 
         # --- facts (ts = created_at). Filter: group_id. No project/source column. ---
         # Columns are r.-qualified: the entity joins below also expose created_at/group_id.
@@ -315,35 +393,15 @@ def _feed(
             )
             f_params += [cts, cts, cid]
         fact_rows = conn.execute(
-            "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
-            "       se.name AS src_name, te.name AS tgt_name "
-            "FROM kg_relationships r "
-            "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
-            "LEFT JOIN kg_entities te ON te.uuid = r.tgt_uuid "
-            f"WHERE {' AND '.join(f_where)} "
+            f"{_FACT_SELECT} WHERE {' AND '.join(f_where)} "
             "ORDER BY r.created_at DESC, r.uuid DESC LIMIT %s",
             (*f_params, limit),
         ).fetchall()
         for r in fact_rows:
-            candidates.append(
-                {
-                    "_ts": r["created_at"],
-                    "_idstr": str(r["uuid"]),
-                    "type": "fact",
-                    "id": r["uuid"],
-                    "ts": _iso(r["created_at"]),
-                    "group_id": r["group_id"],
-                    "gist": _gist(r["fact"]),
-                    "data": {
-                        "fact": r["fact"],
-                        "src_name": r["src_name"],
-                        "tgt_name": r["tgt_name"],
-                        "t_valid": _iso(r["t_valid"]),
-                        "t_invalid": _iso(r["t_invalid"]),
-                        "provenance_episode_id": _provenance(r["episodes"]),
-                    },
-                }
-            )
+            item = _fact_item(r)
+            item["_ts"] = r["created_at"]
+            item["_idstr"] = str(r["uuid"])
+            candidates.append(item)
 
         # --- timeline (ts = ingested_at). Filters: project, and domain for group_id. ---
         t_where = ["1=1"]
@@ -363,33 +421,15 @@ def _feed(
             )
             t_params += [cts, cts, cid]
         tl_rows = conn.execute(
-            "SELECT id, ingested_at, project, fact, t_valid, source, source_ref, salience "
-            f"FROM timeline_events WHERE {' AND '.join(t_where)} "
+            f"{_TL_SELECT} WHERE {' AND '.join(t_where)} "
             "ORDER BY ingested_at DESC, id::text DESC LIMIT %s",
             (*t_params, limit),
         ).fetchall()
         for r in tl_rows:
-            sal = {0: 0.3, 1: 0.6, 2: 0.9}.get(
-                int(r["salience"]) if r["salience"] is not None else 1, 0.6
-            )
-            candidates.append(
-                {
-                    "_ts": r["ingested_at"],
-                    "_idstr": str(r["id"]),
-                    "type": "timeline_event",
-                    "id": str(r["id"]),
-                    "ts": _iso(r["ingested_at"]),
-                    "project": r["project"],
-                    "sal": sal,
-                    "gist": _gist(r["fact"]),
-                    "data": {
-                        "fact": r["fact"],
-                        "t_valid": _iso(r["t_valid"]),
-                        "source": r["source"],
-                        "episode_id": _episode_id_from_ref(r["source_ref"]),
-                    },
-                }
-            )
+            item = _timeline_item(r)
+            item["_ts"] = r["ingested_at"]
+            item["_idstr"] = str(r["id"])
+            candidates.append(item)
 
         # Merge on the same total order the per-type keyset used, cut to limit.
         candidates.sort(key=lambda c: (c["_ts"], c["_idstr"]), reverse=True)
@@ -864,6 +904,293 @@ def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Metrics (phase 4) — Recall / Ingestion / Corpus ops aggregates
+# ---------------------------------------------------------------------------
+#
+# Three read-only aggregate endpoints over the telemetry + queue + corpus tables. The
+# honesty rules (docs/dashboard-contract.md §"Phase 4"):
+#   * recall percentiles come straight from recall_metrics (kind='recall') — the SAME
+#     numbers the engine already logs; no re-instrumentation.
+#   * ingestion series carry ONLY what extraction_queue's real columns support. Historical
+#     queue DEPTH is NOT reconstructable (a row's status is overwritten in place), so we
+#     never fabricate a depth history — we series enqueue/hour (enqueued_at) and
+#     completions/hour (processed_at, the only completion timestamp) and report depth as a
+#     LIVE snapshot only.
+#   * corpus headline counts use pg_class.reltuples (a fast estimate) for large tables and
+#     an exact count(*) for small ones; the estimated flag is surfaced per-table.
+
+_METRICS_WINDOW_MAX_S = 30 * 86400  # window is capped at 30d (contract)
+_RECALL_WINDOW_DEFAULT_S = 7 * 86400  # /metrics/recall default 7d
+_INGEST_WINDOW_DEFAULT_S = 48 * 3600  # /metrics/ingestion default 48h
+# Recall legs timed by the engine (recall_metrics ms_* columns). timeline/prefs are only
+# populated when those legs are enabled — a bucket with none stays absent for that leg.
+_RECALL_LEGS = ("embed", "bm25", "vector", "kg", "web", "rerank", "timeline", "prefs")
+_SLOWEST_CAP = 10
+_SCORE_BINS = 10
+_INGEST_FAILURES_CAP = 20
+_CORPUS_TTL_S = 3600  # 1h in-process cache (row counts over 40K+ rows are the cost)
+# Below this reltuples estimate, count exactly; at/above it, trust the estimate (contract).
+_CORPUS_ESTIMATE_FLOOR = 50000
+# (table, time_column|None) — the corpus tables to report + which column drives spark_30d.
+_CORPUS_TABLES: tuple[tuple[str, str | None], ...] = (
+    ("episodes", "created_at"),
+    ("kg_entities", "created_at"),
+    ("kg_relationships", "created_at"),
+    ("timeline_events", "ingested_at"),
+    ("preferences", "ingested_at"),
+    ("notes", "created_at"),
+    ("chunks", "created_at"),
+)
+
+
+def _parse_window(raw: str | None, default_s: int) -> int:
+    """A window string ('7d' / '48h' / '90m' / a bare seconds int) → seconds, floored at 1h
+    and capped at 30d. Anything unparseable falls back to the endpoint default."""
+    if not raw:
+        return default_s
+    raw = raw.strip().lower()
+    try:
+        if raw.endswith("d"):
+            secs = int(float(raw[:-1]) * 86400)
+        elif raw.endswith("h"):
+            secs = int(float(raw[:-1]) * 3600)
+        elif raw.endswith("m"):
+            secs = int(float(raw[:-1]) * 60)
+        else:
+            secs = int(float(raw))
+    except (TypeError, ValueError):
+        return default_s
+    return max(3600, min(secs, _METRICS_WINDOW_MAX_S))
+
+
+def _r1(v: Any) -> float | None:
+    """Round a numeric to 1 decimal, passing None through."""
+    return round(float(v), 1) if v is not None else None
+
+
+def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
+    """Hourly recall latency percentiles + per-leg p50 + slowest queries + rerank-score
+    histogram, over recall_metrics (kind='recall') within the window. percentile_cont is a
+    true continuous percentile; NULL leg timings are ignored by the aggregate (a disabled
+    leg simply doesn't contribute)."""
+    leg_select = ", ".join(
+        f"percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_{leg}::double precision) AS leg_{leg}"
+        for leg in _RECALL_LEGS
+    )
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        series_rows = conn.execute(
+            "SELECT date_trunc('hour', created_at) AS t, count(*) AS calls, "
+            "  percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_total::double precision) AS p50, "
+            "  percentile_cont(0.95) WITHIN GROUP (ORDER BY ms_total::double precision) AS p95, "
+            "  percentile_cont(0.5) WITHIN GROUP (ORDER BY est_tokens::double precision) AS tok, "
+            f"  {leg_select} "
+            "FROM recall_metrics WHERE kind = 'recall' AND created_at >= now() - %s::interval "
+            "GROUP BY 1 ORDER BY 1",
+            (f"{window_s} seconds",),
+        ).fetchall()
+        series = []
+        for r in series_rows:
+            legs = {
+                leg: _r1(r[f"leg_{leg}"]) for leg in _RECALL_LEGS if r[f"leg_{leg}"] is not None
+            }
+            series.append(
+                {
+                    "t": _iso(r["t"]),
+                    "p50": _r1(r["p50"]),
+                    "p95": _r1(r["p95"]),
+                    "calls": int(r["calls"]),
+                    "tokens_p50": int(r["tok"]) if r["tok"] is not None else None,
+                    "legs_p50": legs,
+                }
+            )
+
+        slow_rows = conn.execute(
+            "SELECT query, ms_total, created_at FROM recall_metrics "
+            "WHERE kind = 'recall' AND ms_total IS NOT NULL AND created_at >= now() - %s::interval "
+            "ORDER BY ms_total DESC, id DESC LIMIT %s",
+            (f"{window_s} seconds", _SLOWEST_CAP),
+        ).fetchall()
+        slowest = [
+            {
+                "query": r["query"],
+                "ms_total": _r1(r["ms_total"]),
+                "created_at": _iso(r["created_at"]),
+            }
+            for r in slow_rows
+        ]
+
+        # width_bucket(x, 0, 1, 10): 1..10 for x in [0,1); 0 for x<0; 11 for x>=1. Fold the
+        # out-of-range edges into the terminal bins so a 1.0 score lands in the top bin.
+        hist_rows = conn.execute(
+            "SELECT width_bucket(rerank_top_score, 0, 1, %s) AS b, count(*) AS n "
+            "FROM recall_metrics WHERE kind = 'recall' AND rerank_top_score IS NOT NULL "
+            "AND created_at >= now() - %s::interval GROUP BY 1",
+            (_SCORE_BINS, f"{window_s} seconds"),
+        ).fetchall()
+        counts_by_bin = [0] * _SCORE_BINS
+        for r in hist_rows:
+            b = int(r["b"])
+            idx = min(max(b - 1, 0), _SCORE_BINS - 1)  # clamp 0→bin0 and 11→bin9
+            counts_by_bin[idx] += int(r["n"])
+        score_hist = [
+            {"lo": round(i / _SCORE_BINS, 2), "hi": round((i + 1) / _SCORE_BINS, 2), "n": n}
+            for i, n in enumerate(counts_by_bin)
+        ]
+        return {"series": series, "slowest": slowest, "score_hist": score_hist}
+    finally:
+        conn.close()
+
+
+def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
+    """Extraction-queue health. queue_depth is a LIVE snapshot (pending/processing/failed
+    right now); throughput series are enqueue/hour (enqueued_at) + completions/hour
+    (processed_at) — the ONLY honest series the columns support. There is no historical
+    depth series because a row's status is overwritten in place (contract §Phase 4)."""
+    interval = f"{window_s} seconds"
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        depth = conn.execute(
+            "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, "
+            "  count(*) FILTER (WHERE status = 'processing') AS processing, "
+            "  count(*) FILTER (WHERE status = 'failed') AS failed "
+            "FROM extraction_queue"
+        ).fetchone() or {"pending": 0, "processing": 0, "failed": 0}
+
+        enq = conn.execute(
+            "SELECT date_trunc('hour', enqueued_at) AS t, count(*) AS n FROM extraction_queue "
+            "WHERE enqueued_at >= now() - %s::interval GROUP BY 1 ORDER BY 1",
+            (interval,),
+        ).fetchall()
+        comp = conn.execute(
+            "SELECT date_trunc('hour', processed_at) AS t, count(*) AS n FROM extraction_queue "
+            "WHERE processed_at IS NOT NULL AND processed_at >= now() - %s::interval "
+            "GROUP BY 1 ORDER BY 1",
+            (interval,),
+        ).fetchall()
+        fails = conn.execute(
+            "SELECT id, episode_id, error, enqueued_at, processed_at, attempts "
+            "FROM extraction_queue WHERE status = 'failed' "
+            "ORDER BY COALESCE(processed_at, enqueued_at) DESC, id DESC LIMIT %s",
+            (_INGEST_FAILURES_CAP,),
+        ).fetchall()
+
+        last = conn.execute(
+            "SELECT id, started_at, finished_at, stages, counts, samples, errors, ok, "
+            "  EXTRACT(EPOCH FROM (finished_at - started_at)) AS duration_s "
+            "FROM dream_runs ORDER BY started_at DESC, id DESC LIMIT 1"
+        ).fetchone()
+
+        return {
+            "queue_depth": int(depth["pending"] or 0),
+            "queue": {
+                "pending": int(depth["pending"] or 0),
+                "processing": int(depth["processing"] or 0),
+                "failed": int(depth["failed"] or 0),
+            },
+            "throughput": {
+                "enqueued_per_hour": [{"t": _iso(r["t"]), "n": int(r["n"])} for r in enq],
+                "completed_per_hour": [{"t": _iso(r["t"]), "n": int(r["n"])} for r in comp],
+            },
+            "failures": [
+                {
+                    "id": r["id"],
+                    "episode_id": r["episode_id"],
+                    "error": (r["error"] or "")[:_SNIPPET_MAX],
+                    "enqueued_at": _iso(r["enqueued_at"]),
+                    "processed_at": _iso(r["processed_at"]),
+                    "attempts": r["attempts"],
+                }
+                for r in fails
+            ],
+            "last_dream": _dream_run_json(last) if last else None,
+        }
+    finally:
+        conn.close()
+
+
+def _dream_run_json(r: dict[str, Any]) -> dict[str, Any]:
+    """Shape a dream_runs row for the wire (used by the ingestion endpoint's last_dream)."""
+    return {
+        "id": r["id"],
+        "started_at": _iso(r["started_at"]),
+        "finished_at": _iso(r["finished_at"]),
+        "duration_s": _r1(r["duration_s"]) if r.get("duration_s") is not None else None,
+        "ok": r["ok"],
+        "stages": r["stages"] or {},
+        "counts": r["counts"] or {},
+        "samples": r["samples"] or {},
+        "errors": r["errors"] or [],
+    }
+
+
+def _spark_30d(conn: psycopg.Connection[dict[str, Any]], table: str, tcol: str) -> list[int]:
+    """30 daily row counts (oldest→newest) off a table's own time column. table/tcol are from
+    the trusted _CORPUS_TABLES constant, never user input (safe to interpolate)."""
+    rows = conn.execute(
+        f"SELECT (date_trunc('day', {tcol}))::date AS d, count(*) AS n FROM {table} "  # nosec B608
+        f"WHERE {tcol} >= (now() - interval '30 days') GROUP BY 1",
+        (),
+    ).fetchall()
+    by_day = {r["d"]: int(r["n"]) for r in rows}
+    today = datetime.now(UTC).date()
+    return [by_day.get(today - timedelta(days=29 - i), 0) for i in range(30)]
+
+
+def _metrics_corpus(db_url: str) -> dict[str, Any]:
+    """Per-table row counts (+ 30-day sparkline + 30d delta) and the episodes-by-project /
+    by-source proportions. Whole response is cached 1h in the route (row counts are the cost).
+    Headline counts are pg_class estimates for big tables, exact for small ones."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        tables = []
+        for name, tcol in _CORPUS_TABLES:
+            present = conn.execute("SELECT to_regclass(%s) AS r", (f"public.{name}",)).fetchone()
+            if not present or present["r"] is None:
+                continue
+            est_row = conn.execute(
+                "SELECT reltuples::bigint AS n FROM pg_class WHERE relname = %s AND relkind = 'r'",
+                (name,),
+            ).fetchone()
+            est = est_row["n"] if est_row else None
+            if est is None or est < _CORPUS_ESTIMATE_FLOOR:
+                exact = conn.execute(f"SELECT count(*) AS c FROM {name}").fetchone()  # nosec B608
+                rows_n = int(exact["c"]) if exact else 0
+                estimated = False
+            else:
+                rows_n = int(est)
+                estimated = True
+            spark = _spark_30d(conn, name, tcol) if tcol else []
+            tables.append(
+                {
+                    "name": name,
+                    "rows": rows_n,
+                    "rows_estimated": estimated,
+                    "spark_30d": spark,
+                    "delta_30d": sum(spark),
+                }
+            )
+
+        by_project = [
+            {"name": r["name"], "n": int(r["n"])}
+            for r in conn.execute(
+                "SELECT COALESCE(NULLIF(project, ''), 'untagged') AS name, count(*) AS n "
+                "FROM episodes GROUP BY 1 ORDER BY n DESC, name LIMIT 12"
+            ).fetchall()
+        ]
+        by_source = [
+            {"name": r["name"], "n": int(r["n"])}
+            for r in conn.execute(
+                "SELECT COALESCE(NULLIF(source, ''), 'untagged') AS name, count(*) AS n "
+                "FROM episodes GROUP BY 1 ORDER BY n DESC, name LIMIT 12"
+            ).fetchall()
+        ]
+        return {"tables": tables, "by_project": by_project, "by_source": by_source}
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
 
@@ -1185,6 +1512,212 @@ def _proposal_decision(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — SSE live stream (LISTEN/NOTIFY + ring buffer)
+# ---------------------------------------------------------------------------
+#
+# schema/043 arms AFTER INSERT triggers on episodes / kg_relationships / timeline_events
+# that pg_notify('dash_feed', {type,id}). A single lazily-started LISTEN worker (one
+# dedicated async psycopg connection, started on the first SSE subscriber and stopped when
+# the last disconnects) hydrates each notification into a full FeedItem — via the SAME
+# per-type SELECT + mapper the /feed endpoint uses — and appends it to a 512-slot ring
+# buffer keyed by a monotonically increasing integer event id. The /dash/api/stream route
+# replays from the buffer on resume (Last-Event-ID) and streams live thereafter.
+
+
+def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | None:
+    """Re-SELECT one feed row by id and map it to the SAME FeedItem shape /feed emits
+    (including `flagged`). Returns None for an unknown type or a row that vanished between
+    the NOTIFY and this read. Reuses _EP_SELECT/_FACT_SELECT/_TL_SELECT + the mappers."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        if type_ == "episode":
+            if not str(id_).isdigit():
+                return None
+            row = conn.execute(f"{_EP_SELECT} WHERE id = %s", (int(id_),)).fetchone()
+            item = _episode_item(row) if row else None
+        elif type_ == "fact":
+            row = conn.execute(f"{_FACT_SELECT} WHERE r.uuid = %s", (str(id_),)).fetchone()
+            item = _fact_item(row) if row else None
+        elif type_ == "timeline_event":
+            if not str(id_).isdigit():
+                return None
+            row = conn.execute(f"{_TL_SELECT} WHERE id = %s", (int(id_),)).fetchone()
+            item = _timeline_item(row) if row else None
+        else:
+            return None
+        if item is None:
+            return None
+        item["flagged"] = (item["type"], item["id"]) in _flag_set(conn)
+        return item
+    finally:
+        conn.close()
+
+
+def _processing_status(db_url: str) -> dict[str, Any]:
+    """Extraction-queue health for the header live badge: {queue_depth, active}. ONE cheap
+    indexed count (extraction_queue_status_idx) — the status refresher runs it once/second,
+    shared across all connected SSE clients, never per-connection."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        row = (
+            conn.execute(
+                "SELECT count(*) FILTER (WHERE status = 'pending') AS queue_depth, "
+                "       count(*) FILTER (WHERE status = 'processing') AS processing "
+                "FROM extraction_queue WHERE status IN ('pending', 'processing')"
+            ).fetchone()
+            or {}
+        )
+        return {
+            "queue_depth": int(row.get("queue_depth") or 0),
+            "active": int(row.get("processing") or 0) > 0,
+        }
+    finally:
+        conn.close()
+
+
+class _FeedEventBuffer:
+    """A fixed-capacity ring of hydrated feed events with monotonically increasing integer
+    ids. Standalone (no I/O) so the replay/reset logic is unit-testable without a DB or HTTP.
+
+    Resume semantics for a client's Last-Event-ID L:
+      * L == head            -> replay []      (already current; stream live from here)
+      * L  > head            -> reset          (client is ahead of us; our buffer was reset,
+                                                e.g. a server restart — client refetches page 1)
+      * L  < oldest - 1      -> reset          (a gap: events L+1..oldest-1 were evicted)
+      * else                 -> replay since L (contiguous; hand back what was missed)
+    """
+
+    def __init__(self, capacity: int = _STREAM_BUFFER_CAP) -> None:
+        self._events: deque[tuple[int, dict[str, Any]]] = deque(maxlen=capacity)
+        self._next_id = 1
+
+    def append(self, item: dict[str, Any]) -> int:
+        eid = self._next_id
+        self._next_id += 1
+        self._events.append((eid, item))
+        return eid
+
+    @property
+    def head(self) -> int:
+        """The last assigned event id (0 when nothing has ever been appended)."""
+        return self._next_id - 1
+
+    def oldest(self) -> int | None:
+        return self._events[0][0] if self._events else None
+
+    def since(self, after_id: int) -> list[tuple[int, dict[str, Any]]]:
+        return [(eid, it) for eid, it in self._events if eid > after_id]
+
+    def resume(self, last_event_id: int) -> tuple[str, list[tuple[int, dict[str, Any]]]]:
+        head = self.head
+        if last_event_id >= head:
+            # Current, or ahead of us (buffer was reset under the client). Ahead -> resync.
+            return ("reset", []) if last_event_id > head else ("replay", [])
+        oldest = self.oldest()
+        if oldest is not None and last_event_id < oldest - 1:
+            return ("reset", [])  # evicted gap between what the client has and what we kept
+        return ("replay", self.since(last_event_id))
+
+
+class _StreamManager:
+    """Owns the lazily-started LISTEN worker + status refresher and the shared ring buffer.
+    Zero background cost with no clients: both tasks start on the first subscriber and are
+    cancelled when the last one disconnects. Everything runs in the server's single event
+    loop, so subscribe/unsubscribe are plain synchronous ref-count flips (no lock needed —
+    asyncio has no preemption between awaits)."""
+
+    def __init__(self, db_url: str) -> None:
+        self._db_url = db_url
+        self.buffer = _FeedEventBuffer()
+        self.status: dict[str, Any] = {"queue_depth": 0, "active": False}
+        # Set once the LISTEN is actually issued — lets a caller (and the tests) know a
+        # NOTIFY inserted from now on will be delivered, not raced against worker startup.
+        self.listening = asyncio.Event()
+        self._subscribers = 0
+        self._tasks: list[asyncio.Task[Any]] = []
+
+    def subscribe(self) -> None:
+        self._subscribers += 1
+        if self._subscribers == 1:
+            loop = asyncio.get_running_loop()
+            self._tasks = [
+                loop.create_task(self._listen_loop()),
+                loop.create_task(self._status_loop()),
+            ]
+
+    def unsubscribe(self) -> None:
+        self._subscribers -= 1
+        if self._subscribers <= 0:
+            self._subscribers = 0
+            for t in self._tasks:
+                t.cancel()
+            self._tasks = []
+            self.listening.clear()
+
+    async def _listen_loop(self) -> None:
+        """One dedicated async connection LISTENing on the dash_feed channel; hydrates each
+        notification off the event loop (a thread executor) and appends it to the ring
+        buffer. run_in_executor (not starlette's run_in_threadpool) keeps this background
+        task off anyio's request-scoped context."""
+        loop = asyncio.get_running_loop()
+        aconn = None
+        try:
+            aconn = await psycopg.AsyncConnection.connect(self._db_url, autocommit=True)
+            await aconn.execute(f"LISTEN {_STREAM_CHANNEL}")
+            self.listening.set()
+            async for notify in aconn.notifies():
+                try:
+                    payload = json.loads(notify.payload)
+                    item = await loop.run_in_executor(
+                        None,
+                        _hydrate_feed_item,
+                        self._db_url,
+                        payload.get("type"),
+                        payload.get("id"),
+                    )
+                    if item is not None:
+                        self.buffer.append(item)
+                except Exception as e:  # one bad notification must not kill the stream
+                    logger.warning("dash stream: hydrate failed: %s", e)
+        except asyncio.CancelledError:
+            pass  # intended shutdown when the last subscriber leaves
+        except Exception as e:  # pragma: no cover - defensive (connect/LISTEN failure)
+            logger.warning("dash stream: listen loop error: %s", e)
+        finally:
+            self.listening.clear()
+            if aconn is not None:
+                try:
+                    await aconn.close()
+                except Exception:  # pragma: no cover - best-effort close during cancel
+                    pass
+
+    async def _status_loop(self) -> None:
+        """Refresh the shared processing_status snapshot once/second (one query total, not
+        per-connection). Connections read self.status and emit it on their own cadence."""
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                try:
+                    self.status = await loop.run_in_executor(None, _processing_status, self._db_url)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("dash stream: status refresh failed: %s", e)
+                await asyncio.sleep(_STREAM_STATUS_S)
+        except asyncio.CancelledError:
+            pass
+
+
+def _sse_frame(event: str, data: str, event_id: int | None = None) -> str:
+    """One SSE frame: an `event:` line, an optional `id:` line (feed events only — so the
+    client's Last-Event-ID tracks the resumable feed stream, not status/heartbeat), a
+    `data:` line, terminated by a blank line."""
+    lines = [f"event: {event}"]
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"data: {data}")
+    return "\n".join(lines) + "\n\n"
+
+
+# ---------------------------------------------------------------------------
 # Static bundle serving
 # ---------------------------------------------------------------------------
 
@@ -1224,6 +1757,12 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     # closure, not a module global, so a fresh register() in tests starts empty — one
     # test's inserts never serve stale counts to another's.
     catalog_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+    # Corpus metrics cache (contract: 1h). Same closure-scoping rationale as the catalog.
+    corpus_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+
+    # Per-register SSE manager (LISTEN worker + ring buffer). One per server; a fresh
+    # register() in tests gets an isolated manager (own buffer/worker), same as the cache.
+    stream_manager = _StreamManager(db_url)
 
     async def _api(request: Request, work: Callable[[], Any]) -> JSONResponse:
         """Shared api boundary: auth gate + threadpool + fail-soft 500."""
@@ -1294,6 +1833,70 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         group_id = qp.get("group_id") or None
         source = qp.get("source") or None
         return await _api(request, lambda: _feed(db_url, cursor, limit, project, group_id, source))
+
+    @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[misc]
+    async def dash_stream(request: Request) -> Response:
+        """SSE live feed (Phase 3). Machine-token gated like every /dash/api/* route — the
+        client uses fetch + a ReadableStream parser (not EventSource) so it CAN send the
+        Authorization header. On connect: if Last-Event-ID (header or ?last_event_id=) is
+        still inside the ring buffer, replay from it; if it aged out or is ahead of us, emit
+        a `reset` event (client refetches page 1). Then stream live feed events
+        (new_episode|new_fact|new_timeline_event, data = the FeedItem JSON) plus a
+        processing_status snapshot ~1/s and a heartbeat comment every 15s."""
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        raw = request.headers.get("last-event-id") or request.query_params.get("last_event_id")
+        last_id = int(raw) if (raw and raw.lstrip("-").isdigit()) else None
+
+        async def gen() -> Any:
+            stream_manager.subscribe()
+            try:
+                buf = stream_manager.buffer
+                if last_id is not None:
+                    mode, events = buf.resume(last_id)
+                    if mode == "reset":
+                        yield _sse_frame("reset", "{}")
+                        sent = buf.head
+                    else:
+                        sent = last_id
+                        for eid, item in events:
+                            yield _sse_frame(
+                                _STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid
+                            )
+                            sent = eid
+                else:
+                    # Fresh connect: the client already has page 1 from /feed, so start live
+                    # from the current head — only genuinely new events stream.
+                    sent = buf.head
+                # Push status immediately so the header live badge is correct on connect.
+                yield _sse_frame("processing_status", json.dumps(stream_manager.status))
+                last_status = last_hb = time.monotonic()
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    for eid, item in buf.since(sent):
+                        yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
+                        sent = eid
+                    now = time.monotonic()
+                    if now - last_status >= _STREAM_STATUS_S:
+                        yield _sse_frame("processing_status", json.dumps(stream_manager.status))
+                        last_status = now
+                    if now - last_hb >= _STREAM_HEARTBEAT_S:
+                        yield ": heartbeat\n\n"
+                        last_hb = now
+                    await asyncio.sleep(_STREAM_POLL_S)
+            finally:
+                stream_manager.unsubscribe()
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # tell nginx/proxies not to buffer the stream
+            },
+        )
 
     @mcp.custom_route("/dash/api/episode/{id}", methods=["GET"])  # type: ignore[misc]
     async def dash_episode(request: Request) -> JSONResponse:
@@ -1367,6 +1970,34 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             request.query_params.get("limit"), _RECALL_HISTORY_DEFAULT, _RECALL_HISTORY_MAX
         )
         return await _api(request, lambda: _recall_history(db_url, limit))
+
+    # ---- metrics (phase 4) ----
+
+    @mcp.custom_route("/dash/api/metrics/recall", methods=["GET"])  # type: ignore[misc]
+    async def dash_metrics_recall(request: Request) -> JSONResponse:
+        window_s = _parse_window(request.query_params.get("window"), _RECALL_WINDOW_DEFAULT_S)
+        return await _api(request, lambda: _metrics_recall(db_url, window_s))
+
+    @mcp.custom_route("/dash/api/metrics/ingestion", methods=["GET"])  # type: ignore[misc]
+    async def dash_metrics_ingestion(request: Request) -> JSONResponse:
+        window_s = _parse_window(request.query_params.get("window"), _INGEST_WINDOW_DEFAULT_S)
+        return await _api(request, lambda: _metrics_ingestion(db_url, window_s))
+
+    @mcp.custom_route("/dash/api/metrics/corpus", methods=["GET"])  # type: ignore[misc]
+    async def dash_metrics_corpus(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        now = time.monotonic()
+        if corpus_cache["data"] is not None and now - corpus_cache["ts"] < _CORPUS_TTL_S:
+            return JSONResponse(corpus_cache["data"])
+        try:
+            data = await run_in_threadpool(_metrics_corpus, db_url)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard corpus metrics failed: %s", e)
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+        corpus_cache["ts"] = now
+        corpus_cache["data"] = data
+        return JSONResponse(data)
 
     @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
     async def dash_flags(request: Request) -> JSONResponse:

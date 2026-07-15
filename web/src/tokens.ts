@@ -44,6 +44,16 @@ export const LEG_COLOR: Record<string, string> = {
   kg: 'var(--leg-kg)', timeline: 'var(--leg-timeline)', prefs: 'var(--leg-prefs)',
   web: 'var(--leg-web)', rerank: 'var(--leg-rerank)',
 };
+
+// Resolve a CSS custom-property reference to its concrete value so it can be painted onto a
+// <canvas> (uPlot draws to canvas, where `var(--x)` is meaningless). Accepts `var(--x)` or a
+// bare `--x`; falls back to the input if the property is unset. Re-resolve on theme change.
+export function cssValue(ref: string): string {
+  if (typeof document === 'undefined') return ref;
+  const name = ref.startsWith('var(') ? ref.slice(4, -1).trim() : ref;
+  if (!name.startsWith('--')) return ref;
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || ref;
+}
 // Fixed render order (spec §5): embed, then the parallel band, then rerank last.
 export const LEG_ORDER = ['embed', 'bm25', 'vector', 'kg', 'timeline', 'prefs', 'web', 'rerank'] as const;
 // Recall-item relevance score → color ramp (spec §5b Served bucket).
