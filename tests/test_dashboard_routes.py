@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 import psycopg
 import pytest
@@ -1427,6 +1428,31 @@ def _pref_row(
     ).fetchone()[0]
 
 
+# ---------------------------------------------------------------------------
+# Graph explorer (phase 6): typeahead + BFS neighborhood, as-of, truncation,
+# name-seed resolution, token gates.
+# ---------------------------------------------------------------------------
+
+
+def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name=None):
+    """Entity insert that ALSO sets normalized_name (the shared _entity helper doesn't),
+    so the exact-normalized-name seed path is exercisable."""
+    return conn.execute(
+        "INSERT INTO kg_entities "
+        "(uuid, group_id, name, normalized_name, entity_type, summary, degree, created_at) "
+        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        (
+            uuid,
+            name,
+            normalized_name or name.lower(),
+            entity_type,
+            f"{name} summary",
+            degree,
+            _t(0),
+        ),
+    ).fetchone()[0]
+
+
 def _config_reg(conn, *, file_key, content, surface_id="hostA", scope="global", updated_at=None):
     import hashlib
 
@@ -1721,6 +1747,229 @@ def test_phase5_routes_require_machine_token(clean, conn, db_url):
             "/dash/api/behavior/file?key=CLAUDE.md",
             "/dash/api/behavior/linkgraph",
         ):
+            r = client.get(path)
+            assert r.status_code == 401
+            assert r.json() == {"status": "error", "detail": "unauthorized"}
+
+
+def _mini_graph(conn):
+    """6-8 entities, ~10 edges, one superseded + one not-yet-valid. Degrees are set so
+    truncation order is deterministic. Returns the seed episode id for provenance checks."""
+    _gent(conn, "g-hub", name="Synapse", degree=10, entity_type="Project")
+    _gent(conn, "g-pg", name="Postgres", degree=8)
+    _gent(conn, "g-cc", name="Claude Code", degree=6)
+    _gent(conn, "g-kg", name="knowledge graph", degree=5, entity_type="Concept")
+    _gent(conn, "g-anthropic", name="Anthropic", degree=4, entity_type="Organization")
+    _gent(conn, "g-nuc", name="homelab NUC", degree=3)  # depth-2 (via g-pg)
+    _gent(conn, "g-sse", name="SSE stream", degree=2)  # depth-2 (via g-cc)
+    _gent(conn, "g-far", name="embedding cache", degree=1)  # depth-2 (via g-pg)
+    _gent(conn, "g-future", name="future thing", degree=0)  # only via a not-yet-valid edge
+
+    ep = _episode(conn, session="g", seq=1, content="synapse stores in postgres")
+    # Depth-1 (from g-hub) live edges.
+    _rel(
+        conn,
+        "e1",
+        src="g-hub",
+        tgt="g-pg",
+        name="stores in",
+        fact="Synapse stores in Postgres",
+        episodes=[ep],
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e2",
+        src="g-hub",
+        tgt="g-cc",
+        name="ingests from",
+        fact="Synapse ingests from Claude Code",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e3",
+        src="g-hub",
+        tgt="g-kg",
+        name="extracts",
+        fact="Synapse extracts a knowledge graph",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e4",
+        src="g-hub",
+        tgt="g-anthropic",
+        name="built by",
+        fact="Synapse built by Anthropic",
+        t_valid=_t(0),
+    )
+    # Depth-2 edges.
+    _rel(
+        conn,
+        "e5",
+        src="g-pg",
+        tgt="g-nuc",
+        name="runs on",
+        fact="Postgres runs on the homelab NUC",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e6",
+        src="g-pg",
+        tgt="g-far",
+        name="caches in",
+        fact="Postgres caches in the embedding cache",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e7",
+        src="g-cc",
+        tgt="g-sse",
+        name="emits",
+        fact="Claude Code emits an SSE stream",
+        t_valid=_t(0),
+    )
+    # Superseded edge (t_valid before base, invalidated before base) — always included when
+    # as_of >= its t_valid; the client dashes it.
+    _rel(
+        conn,
+        "e-super",
+        src="g-hub",
+        tgt="g-pg",
+        name="used",
+        fact="Synapse used SQLite",
+        t_valid=_t(-1000),
+        t_invalid=_t(-10),
+    )
+    # Not-yet-valid edge — hidden when as_of < its t_valid.
+    _rel(
+        conn,
+        "e-future",
+        src="g-hub",
+        tgt="g-future",
+        name="will use",
+        fact="Synapse will use a future thing",
+        t_valid=_t(100),
+    )
+    return ep
+
+
+def test_graph_typeahead(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        # ILIKE on name, degree DESC — matches carrying 'a' come back highest-degree first.
+        r = client.get("/dash/api/graph/entities?q=a", headers=_H).json()
+        assert isinstance(r, list) and len(r) >= 3
+        degs = [row["degree"] for row in r]
+        assert degs == sorted(degs, reverse=True)  # degree DESC ordering
+        assert set(r[0].keys()) == {"uuid", "name", "entity_type", "degree"}
+
+        # A precise substring resolves to the one entity.
+        pg = client.get("/dash/api/graph/entities?q=Postgres", headers=_H).json()
+        assert [row["uuid"] for row in pg] == ["g-pg"]
+
+        # limit caps the result count.
+        capped = client.get("/dash/api/graph/entities?q=a&limit=2", headers=_H).json()
+        assert len(capped) == 2
+
+        # Empty q -> empty list.
+        assert client.get("/dash/api/graph/entities?q=", headers=_H).json() == []
+
+
+def test_graph_neighborhood_depth_1_vs_2(clean, conn, db_url):
+    ep = _mini_graph(conn)
+    with _client(db_url) as client:
+        d1 = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=1", headers=_H).json()
+        d1_nodes = {n["uuid"] for n in d1["nodes"]}
+        # depth 1: seed + its direct neighbors (incl. the not-yet-valid future edge, since
+        # as_of is unset) — but NOT the depth-2 nodes.
+        assert d1_nodes == {"g-hub", "g-pg", "g-cc", "g-kg", "g-anthropic", "g-future"}
+        assert d1["seed"] == "g-hub" and d1["truncated"] is False
+        assert d1["nodes"][0]["uuid"] == "g-hub"  # seed sorted first
+        # node payload shape
+        assert set(d1["nodes"][0].keys()) == {"uuid", "name", "entity_type", "degree", "summary"}
+        # edge payload shape + provenance resolution
+        e1 = next(e for e in d1["edges"] if e["uuid"] == "e1")
+        assert e1["src"] == "g-hub" and e1["tgt"] == "g-pg" and e1["provenance_episode_id"] == ep
+        assert set(e1.keys()) == {
+            "uuid",
+            "src",
+            "tgt",
+            "name",
+            "fact",
+            "t_valid",
+            "t_invalid",
+            "provenance_episode_id",
+            "retrieval_count",
+        }
+
+        d2 = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=2", headers=_H).json()
+        d2_nodes = {n["uuid"] for n in d2["nodes"]}
+        # depth 2 pulls in the second ring via g-pg / g-cc.
+        assert {"g-nuc", "g-far", "g-sse"} <= d2_nodes
+        assert d2["truncated"] is False
+
+
+def test_graph_neighborhood_as_of_filter(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        # quote() so the '+' in the ISO offset survives as an offset, not a decoded space.
+        as_of = quote(_t(50).isoformat())
+        r = client.get(
+            f"/dash/api/graph/neighborhood?entity=g-hub&depth=1&as_of={as_of}", headers=_H
+        ).json()
+        node_ids = {n["uuid"] for n in r["nodes"]}
+        edge_ids = {e["uuid"] for e in r["edges"]}
+        # not-yet-valid edge (t_valid=_t(100) > as_of) is hidden -> its exclusive node drops.
+        assert "g-future" not in node_ids
+        assert "e-future" not in edge_ids
+        # superseded edge (t_valid=_t(-1000) <= as_of, t_invalid set) is INCLUDED, dashed client-side.
+        sup = next(e for e in r["edges"] if e["uuid"] == "e-super")
+        assert sup["t_invalid"] is not None
+        # live edges still present.
+        assert "e1" in edge_ids
+
+
+def test_graph_neighborhood_truncation_keeps_highest_degree(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        r = client.get(
+            "/dash/api/graph/neighborhood?entity=g-hub&depth=2&limit=3", headers=_H
+        ).json()
+        assert r["truncated"] is True
+        kept = {n["uuid"] for n in r["nodes"]}
+        # budget 3 -> seed (always) + the two highest-degree reachable nodes (g-pg=8, g-cc=6).
+        assert kept == {"g-hub", "g-pg", "g-cc"}
+        # every returned edge connects two kept nodes.
+        for e in r["edges"]:
+            assert e["src"] in kept and e["tgt"] in kept
+
+
+def test_graph_neighborhood_name_seed_resolution(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        # exact normalized_name (case-insensitive input).
+        exact = client.get("/dash/api/graph/neighborhood?entity=Synapse", headers=_H).json()
+        assert exact["seed"] == "g-hub"
+        # no exact normalized_name -> best ILIKE match by degree.
+        fuzzy = client.get("/dash/api/graph/neighborhood?entity=postgr", headers=_H).json()
+        assert fuzzy["seed"] == "g-pg"
+        # unknown seed -> 404.
+        assert (
+            client.get("/dash/api/graph/neighborhood?entity=nope-xyz", headers=_H).status_code
+            == 404
+        )
+        # missing entity param -> 400.
+        assert client.get("/dash/api/graph/neighborhood", headers=_H).status_code == 400
+
+
+def test_graph_endpoints_require_machine_token(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        for path in ("/dash/api/graph/entities?q=a", "/dash/api/graph/neighborhood?entity=g-hub"):
             r = client.get(path)
             assert r.status_code == 401
             assert r.json() == {"status": "error", "detail": "unauthorized"}

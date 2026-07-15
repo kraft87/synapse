@@ -228,6 +228,37 @@ const RECALL_HISTORY = {
   ],
 };
 
+// ---- graph explorer fixtures (phase 6) — obviously synthetic ----
+const GRAPH_NODES = [
+  { uuid: 'g-syn', name: 'Synapse', entity_type: 'Project', degree: 10, summary: 'Self-hosted memory server: ingestion, KG extraction, hybrid recall over MCP. The system this dashboard observes.' },
+  { uuid: 'g-pg', name: 'Postgres', entity_type: 'Technology', degree: 8, summary: 'Primary datastore — episodes, KG, timeline all live here.' },
+  { uuid: 'g-cc', name: 'Claude Code', entity_type: 'Technology', degree: 6, summary: 'One ingestion source (JSONL transcripts).' },
+  { uuid: 'g-kg', name: 'knowledge graph', entity_type: 'Concept', degree: 6, summary: 'Entities + bitemporal relationships extracted from episodes.' },
+  { uuid: 'g-anthropic', name: 'Anthropic', entity_type: 'Organization', degree: 4, summary: 'Maker of the Claude models Synapse ingests from.' },
+  { uuid: 'g-nuc', name: 'homelab NUC', entity_type: 'Technology', degree: 3, summary: 'The box the whole stack runs on.' },
+  { uuid: 'g-sse', name: 'SSE stream', entity_type: 'Concept', degree: 2, summary: 'Live feed push channel for the dashboard.' },
+  { uuid: 'g-cache', name: 'embedding cache', entity_type: 'Technology', degree: 2, summary: 'Memoized embeddings to cut recall latency.' },
+  { uuid: 'g-pgvector', name: 'pgvector', entity_type: 'Technology', degree: 3, summary: 'ANN index extension used for the vector leg.' },
+  { uuid: 'g-salience', name: 'salience decay', entity_type: 'Concept', degree: 1, summary: 'Timeline event weighting over time.' },
+  { uuid: 'g-op', name: 'the operator', entity_type: 'Person', degree: 2, summary: 'The single technical user this dashboard serves.' },
+];
+const GH = 24 * 30; // ~1 month in hours, for validity dates
+const GRAPH_EDGES = [
+  { uuid: 'ge1', src: 'g-syn', tgt: 'g-pg', name: 'stores in', fact: 'Synapse stores everything in Postgres', t_valid: iso(GH * 5), t_invalid: null, provenance_episode_id: 87960, retrieval_count: 41 },
+  { uuid: 'ge2', src: 'g-syn', tgt: 'g-cc', name: 'ingests from', fact: 'Synapse ingests conversation history from Claude Code', t_valid: iso(GH * 5), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 33 },
+  { uuid: 'ge3', src: 'g-syn', tgt: 'g-kg', name: 'extracts', fact: 'Synapse extracts a knowledge graph from episodes', t_valid: iso(GH * 4), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 51 },
+  { uuid: 'ge4', src: 'g-syn', tgt: 'g-anthropic', name: 'built on', fact: 'Synapse is built on Anthropic models', t_valid: iso(GH * 4), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 12 },
+  { uuid: 'ge5', src: 'g-pg', tgt: 'g-nuc', name: 'runs on', fact: 'Postgres runs on the homelab NUC', t_valid: iso(GH * 5), t_invalid: null, provenance_episode_id: 87900, retrieval_count: 9 },
+  { uuid: 'ge6', src: 'g-pg', tgt: 'g-pgvector', name: 'uses', fact: 'Postgres uses pgvector for ANN search', t_valid: iso(GH * 3), t_invalid: null, provenance_episode_id: 87901, retrieval_count: 18 },
+  { uuid: 'ge7', src: 'g-syn', tgt: 'g-sse', name: 'emits', fact: 'Synapse emits an SSE stream to the dashboard', t_valid: iso(GH * 2), t_invalid: null, provenance_episode_id: 88200, retrieval_count: 6 },
+  { uuid: 'ge8', src: 'g-syn', tgt: 'g-cache', name: 'uses', fact: 'Synapse uses an embedding cache', t_valid: iso(GH * 2), t_invalid: null, provenance_episode_id: 88210, retrieval_count: 7 },
+  { uuid: 'ge9', src: 'g-syn', tgt: 'g-op', name: 'serves', fact: 'Synapse serves memory to the operator through recall()', t_valid: iso(GH * 6), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 341 },
+  { uuid: 'ge10', src: 'g-syn', tgt: 'g-salience', name: 'weights by', fact: 'Synapse weights timeline events by salience decay', t_valid: iso(GH * 3), t_invalid: null, provenance_episode_id: 88050, retrieval_count: 4 },
+  // superseded: Synapse USED to store in SQLite before Postgres.
+  { uuid: 'ge-sup', src: 'g-syn', tgt: 'g-pg', name: 'used', fact: 'Synapse stored everything in SQLite', t_valid: iso(GH * 10), t_invalid: iso(GH * 6), provenance_episode_id: 80000, retrieval_count: 2 },
+];
+const GRAPH_NEIGHBORHOOD = { nodes: GRAPH_NODES, edges: GRAPH_EDGES, truncated: false, seed: 'g-syn' };
+
 export function mockRecall<T>(query: string): Promise<T> {
   return Promise.resolve({
     query,
@@ -275,6 +306,14 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'behavior/files') out = FIX_P5.behaviorFiles;
   else if (p === 'behavior/file') out = FIX_P5.behaviorFile;
   else if (p === 'behavior/linkgraph') out = FIX_P5.behaviorLinkgraph;
+  else if (p === 'graph/entities') {
+    const q = (path.split('q=')[1] || '').toLowerCase();
+    out = GRAPH_NODES
+      .filter((n) => !q || n.name.toLowerCase().includes(decodeURIComponent(q)))
+      .sort((a, b) => b.degree - a.degree)
+      .slice(0, 10)
+      .map((n) => ({ uuid: n.uuid, name: n.name, entity_type: n.entity_type, degree: n.degree }));
+  } else if (p === 'graph/neighborhood') out = GRAPH_NEIGHBORHOOD;
   else if (p === 'proposals') out = FIX.proposals;
   else if (/^proposals\//.test(p)) out = FIX['proposals/' + p.substring('proposals/'.length)] || {};
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;

@@ -454,3 +454,29 @@ export const fetchBehaviorFile = (key: string, scope = 'global', surface?: strin
   MOCK ? mockApi('/behavior/file') : req('/behavior/file' + qs({ key, scope, surface }));
 export const fetchBehaviorLinkgraph = (): Promise<BehaviorLinkGraph> =>
   MOCK ? mockApi('/behavior/linkgraph') : req('/behavior/linkgraph');
+// ---------- graph explorer (phase 6) ----------
+// Wire shapes pinned in docs/dashboard-contract.md §"Phase 6". The neighborhood is a
+// BFS from a resolved seed (uuid or name), depth ≤ 2, server-capped at 150 nodes
+// (truncation keeps the highest-degree nodes). Edges carry bitemporal validity so the
+// as-of slider scrubs client-side; the client re-queries with as_of only when truncated.
+export interface GraphEntity { uuid: string; name: string; entity_type: string | null; degree: number; }
+export interface GraphNode {
+  uuid: string; name: string; entity_type: string | null; degree: number; summary: string | null;
+}
+export interface GraphEdge {
+  uuid: string; src: string; tgt: string; name: string | null; fact: string | null;
+  t_valid: string | null; t_invalid: string | null;
+  provenance_episode_id: number | null; retrieval_count: number;
+}
+export interface Neighborhood {
+  nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean; seed: string;
+}
+export interface NeighborhoodParams { entity: string; depth?: 1 | 2; as_of?: string | null; limit?: number; }
+
+export const fetchGraphEntities = (q: string, limit = 10): Promise<GraphEntity[]> =>
+  MOCK ? mockApi('/graph/entities?q=' + encodeURIComponent(q)) : req('/graph/entities' + qs({ q, limit }));
+
+export const fetchGraphNeighborhood = (p: NeighborhoodParams): Promise<Neighborhood> =>
+  MOCK
+    ? mockApi('/graph/neighborhood?entity=' + encodeURIComponent(p.entity))
+    : req('/graph/neighborhood' + qs({ entity: p.entity, depth: p.depth ?? 1, as_of: p.as_of, limit: p.limit }));

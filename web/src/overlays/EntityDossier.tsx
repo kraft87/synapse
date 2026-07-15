@@ -7,10 +7,12 @@ import { fetchEntity, type Entity } from '../api';
 import { closeOverlay, openEpisode } from '../hash';
 import { etColor, validityLine } from '../tokens';
 import { Dot, FlagButton, Spinner } from '../components/ui';
+import { useStore } from '../state';
 
 const provBtn: React.CSSProperties = { border: 'none', background: 'none', padding: 0, color: 'var(--acc)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', textDecoration: 'underline', textUnderlineOffset: '2px' };
 
 export function EntityDossier({ id }: { id: string }) {
+  const store = useStore();
   const [data, setData] = useState<Entity | null>(null);
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
   const [offset, setOffset] = useState(0);
@@ -40,7 +42,18 @@ export function EntityDossier({ id }: { id: string }) {
           <span style={{ fontFamily: 'var(--font-data)', fontSize: '18px', fontWeight: 500 }}>{e?.name || '…'}</span>
           {e?.entity_type && <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 8px', borderRadius: '4px', border: '1px solid ' + color, color }}>{e.entity_type}</span>}
           <span style={{ flex: 1 }} />
-          <button disabled title="graph ships in a later phase" style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt3)', borderRadius: '6px', padding: '5px 12px', fontSize: '12px', fontFamily: 'var(--font-data)', cursor: 'not-allowed', opacity: 0.55 }}>view in graph</button>
+          <button
+            className="chipbtn"
+            title="seed the graph explorer with this entity"
+            disabled={!e}
+            onClick={() => {
+              if (!e) return;
+              store.seedGraph(e.uuid, e.name);
+              store.setPage('graph');
+              closeOverlay();
+            }}
+            style={{ border: '1px solid var(--acc)', background: 'var(--acc-bg)', color: 'var(--acc)', borderRadius: '6px', padding: '5px 12px', fontSize: '12px', fontFamily: 'var(--font-data)', cursor: e ? 'pointer' : 'not-allowed', opacity: e ? 1 : 0.55 }}
+          >view in graph</button>
           <button className="iconbtn" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
         </div>
 

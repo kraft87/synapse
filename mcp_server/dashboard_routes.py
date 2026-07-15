@@ -119,6 +119,15 @@ _PREF_SORTS = {
     "recency": "p.last_asserted DESC",
     "assert_count": "p.assert_count DESC, p.last_asserted DESC",
 }
+# Graph explorer (phase 6). Typeahead + BFS neighborhood over kg_relationships. The 150
+# hard cap mirrors the client's render budget (spec §4); when a neighborhood overflows we
+# keep the highest-degree nodes so the important structure survives truncation. Every scan
+# is bounded (LIMIT + a statement_timeout) — no unbounded walks on the ~75K-edge graph.
+_GRAPH_TYPEAHEAD_DEFAULT = 10
+_GRAPH_TYPEAHEAD_MAX = 25
+_GRAPH_NODE_CAP = 150  # hard cap on rendered nodes (contract + spec §4)
+_GRAPH_EDGE_SCAN_CAP = 6000  # per-level BFS + final-edge scan safety valve
+_GRAPH_STMT_TIMEOUT_MS = 5000  # belt-and-suspenders bound on any single graph query
 
 # Long-cache immutable fonts (hashed filenames from the build); no-cache the rest.
 _FONT_EXTS = {".woff2", ".woff", ".ttf", ".otf"}
@@ -697,6 +706,180 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 "limit": _MENTIONS_PAGE,
                 "total": int(total_row.get("total") or 0),
             },
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph explorer (phase 6)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_seed_name(name: str) -> str:
+    """Mirror ingestion.dedup._normalize_name for the exact-name seed lookup:
+    lowercase, collapse internal whitespace, strip bookend whitespace/punctuation."""
+    collapsed = " ".join(name.lower().split())
+    return collapsed.strip(" \t\n\r\f\v.,;:!?\"'()[]{}<>")
+
+
+def _parse_as_of(raw: str | None) -> datetime | None:
+    """Parse the as-of ISO timestamp, or None (unset / unparseable → no time filter)."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
+    """Typeahead over entity names — shares the search endpoint's entity leg SQL
+    (name ILIKE, degree DESC). Global (no group scope): the graph is seeded explicitly."""
+    if not q:
+        return []
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT uuid, name, entity_type, degree FROM kg_entities "
+            "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
+            (f"%{q}%", limit),
+        ).fetchall()
+        return [
+            {
+                "uuid": r["uuid"],
+                "name": r["name"],
+                "entity_type": r["entity_type"],
+                "degree": r["degree"],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
+    """Resolve a seed given a uuid OR a name: exact uuid → exact normalized_name →
+    best ILIKE match (highest degree). None when nothing matches."""
+    cols = "uuid, name, entity_type, degree, summary"
+    row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
+    if row:
+        return row
+    norm = _normalize_seed_name(entity)
+    if norm:
+        row = conn.execute(
+            f"SELECT {cols} FROM kg_entities WHERE normalized_name = %s "
+            "ORDER BY degree DESC LIMIT 1",
+            (norm,),
+        ).fetchone()
+        if row:
+            return row
+    return conn.execute(
+        f"SELECT {cols} FROM kg_entities WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT 1",
+        (f"%{entity}%",),
+    ).fetchone()
+
+
+def _graph_neighborhood(
+    db_url: str, entity: str, depth: int, as_of: datetime | None, limit: int
+) -> dict[str, Any] | None:
+    """BFS from the resolved seed over kg_relationships (both directions), depth ≤ 2,
+    hard-capped at `limit` (≤150) nodes. Truncation keeps the highest-degree nodes (the
+    seed is always kept) and sets truncated=True.
+
+    as_of visibility (traversal AND returned edges use the SAME predicate): when set,
+    exclude edges not-yet-valid (t_valid > as_of) but KEEP superseded edges (the client
+    dashes them); when unset, return live + superseded and let the client scrub. Every
+    scan is LIMIT-bounded and a statement_timeout guards against a pathological hub.
+    """
+    node_budget = max(1, min(limit, _GRAPH_NODE_CAP))
+    depth = 2 if depth >= 2 else 1
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        # Bound every query on this short-lived connection (SET can't bind a param).
+        conn.execute(
+            "SELECT set_config('statement_timeout', %s, false)", (str(_GRAPH_STMT_TIMEOUT_MS),)
+        )
+
+        seed = _resolve_seed(conn, entity)
+        if seed is None:
+            return None
+        seed_uuid = seed["uuid"]
+
+        # Shared as-of edge-visibility fragment (empty when unset).
+        as_of_sql, as_of_params = "", []
+        if as_of is not None:
+            as_of_sql = " AND (t_valid IS NULL OR t_valid <= %s)"
+            as_of_params = [as_of]
+
+        # BFS both directions; one bounded query per level.
+        visited: set[str] = {seed_uuid}
+        frontier: list[str] = [seed_uuid]
+        for _ in range(depth):
+            if not frontier:
+                break
+            rows = conn.execute(
+                "SELECT src_uuid, tgt_uuid FROM kg_relationships "
+                f"WHERE (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} LIMIT %s",
+                (frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+            ).fetchall()
+            nxt: list[str] = []
+            for r in rows:
+                for other in (r["src_uuid"], r["tgt_uuid"]):
+                    if other not in visited:
+                        visited.add(other)
+                        nxt.append(other)
+            frontier = nxt
+
+        # Materialize real entity rows for the reached uuids (edge endpoints without an
+        # entity row are dropped — edges aren't FKs, so a dangling endpoint has no node).
+        ent_rows = conn.execute(
+            "SELECT uuid, name, entity_type, degree, summary FROM kg_entities WHERE uuid = ANY(%s)",
+            (list(visited),),
+        ).fetchall()
+
+        # Rank seed-first, then highest degree; truncate to the budget.
+        ent_rows.sort(key=lambda r: (r["uuid"] != seed_uuid, -(r["degree"] or 0), r["name"] or ""))
+        truncated = len(ent_rows) > node_budget
+        if truncated:
+            ent_rows = ent_rows[:node_budget]
+        kept = [r["uuid"] for r in ent_rows]
+
+        # Edges with BOTH endpoints kept, under the same as-of visibility.
+        edge_rows = conn.execute(
+            "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "
+            "       retrieval_count FROM kg_relationships "
+            f"WHERE src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
+            (kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+        ).fetchall()
+
+        return {
+            "nodes": [
+                {
+                    "uuid": r["uuid"],
+                    "name": r["name"],
+                    "entity_type": r["entity_type"],
+                    "degree": r["degree"],
+                    "summary": r["summary"],
+                }
+                for r in ent_rows
+            ],
+            "edges": [
+                {
+                    "uuid": r["uuid"],
+                    "src": r["src_uuid"],
+                    "tgt": r["tgt_uuid"],
+                    "name": r["name"],
+                    "fact": r["fact"],
+                    "t_valid": _iso(r["t_valid"]),
+                    "t_invalid": _iso(r["t_invalid"]),
+                    "provenance_episode_id": _provenance(r["episodes"]),
+                    "retrieval_count": r["retrieval_count"],
+                }
+                for r in edge_rows
+            ],
+            "truncated": truncated,
+            "seed": seed_uuid,
         }
     finally:
         conn.close()
@@ -2245,6 +2428,38 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             request,
             lambda: _search(db_url, q, type_, offset, limit, project, group_id, source),
         )
+
+    # ---- graph explorer (phase 6) ----
+
+    @mcp.custom_route("/dash/api/graph/entities", methods=["GET"])  # type: ignore[misc]
+    async def dash_graph_entities(request: Request) -> JSONResponse:
+        q = (request.query_params.get("q") or "").strip()
+        limit = _limit(
+            request.query_params.get("limit"), _GRAPH_TYPEAHEAD_DEFAULT, _GRAPH_TYPEAHEAD_MAX
+        )
+        return await _api(request, lambda: _graph_entities(db_url, q, limit))
+
+    @mcp.custom_route("/dash/api/graph/neighborhood", methods=["GET"])  # type: ignore[misc]
+    async def dash_graph_neighborhood(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        qp = request.query_params
+        entity = (qp.get("entity") or "").strip()
+        if not entity:
+            return JSONResponse({"status": "error", "detail": "missing 'entity'"}, status_code=400)
+        depth = 2 if qp.get("depth") == "2" else 1
+        as_of = _parse_as_of(qp.get("as_of"))
+        limit = _limit(qp.get("limit"), _GRAPH_NODE_CAP, _GRAPH_NODE_CAP)
+        try:
+            result = await run_in_threadpool(
+                _graph_neighborhood, db_url, entity, depth, as_of, limit
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard graph neighborhood failed: %s", e)
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+        if result is None:
+            return JSONResponse({"status": "error", "detail": "entity not found"}, status_code=404)
+        return JSONResponse(result)
 
     @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[misc]
     async def dash_recall_history(request: Request) -> JSONResponse:
