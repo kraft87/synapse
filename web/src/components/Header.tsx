@@ -27,6 +27,10 @@ const SCOPE: Record<Page, { group: boolean; project: boolean; source: boolean }>
 const selStyle: CSSProperties = {
   background: 'var(--bg2)', border: '1px solid var(--line2)', borderRadius: '6px',
   padding: '5px 8px', fontSize: '12.5px', fontFamily: 'var(--font-data)', cursor: 'pointer',
+  // Native selects size to their longest <option>; a live catalog carries 70+
+  // project names, so an unclamped select eats the whole filter row and wraps
+  // the source select off the header.
+  maxWidth: '160px', textOverflow: 'ellipsis',
 };
 
 // Review pending-proposal count — 0 in phase 1 (no /proposals endpoint yet), so
