@@ -21,6 +21,9 @@
   --ok:#5bbd8d; --warn:#d9a05b; --err:#e08b7a;
   --src-cc:#d9a05b; --src-cur:#9b87e0; --src-cai:#e08b7a; --src-tr:#5bbd9d;
   --et-person:#e0a1b8; --et-project:#56c8d8; --et-tech:#9b87e0; --et-org:#d9a05b; --et-concept:#7fbf7f; --et-event:#aeb8c2;
+  /* recall waterfall legs — stable across the Recall waterfall + the Metrics stack */
+  --leg-embed:#5a6774; --leg-bm25:#d9a05b; --leg-vector:#56c8d8; --leg-kg:#9b87e0;
+  --leg-timeline:#7fbf7f; --leg-prefs:#e0a1b8; --leg-web:#8b99a6; --leg-rerank:#e08b7a;
   --scrim:rgba(5,8,11,.6);
   --font-prose:'IBM Plex Sans', system-ui, sans-serif;
   --font-data:'IBM Plex Mono', ui-monospace, monospace;
@@ -30,6 +33,7 @@
   --line:#dbe1e6; --line2:#c8d1d8;
   --txt:#1d262e; --txt2:#5a6774; --txt3:#8b99a6;
   --acc:#0f93a8; --acc-bg:rgba(15,147,168,.08);
+  --leg-embed:#8b99a6; /* embed lightens in light theme so its bar stays visible */
   --scrim:rgba(20,26,33,.35);
 }
 
@@ -59,6 +63,12 @@ a { color:var(--acc); }
 @keyframes skeleton { 0%,100%{opacity:.45} 50%{opacity:.8} }
 @keyframes drawerin { from{transform:translateX(24px); opacity:.4} to{transform:none; opacity:1} }
 @keyframes spin { to{transform:rotate(360deg)} }
+/* recall waterfall in-flight sweep — bars fill left→right, staggered per leg */
+@keyframes legsweep { 0%{transform:scaleX(.04); opacity:.35} 50%{transform:scaleX(1); opacity:.75} 100%{transform:scaleX(.04); opacity:.35} }
+.legloading { transform-origin:left center; animation:legsweep 1.1s ease-in-out infinite; }
+.recall-tab:hover { color:var(--txt) !important; }
+.hist-row:hover { background:var(--bg2) !important; }
+.copybtn:hover { color:var(--txt) !important; }
 
 /* ---- interaction states (hover/focus) ---- */
 .navbtn:hover { color:var(--txt) !important; background:var(--bg2) !important; }

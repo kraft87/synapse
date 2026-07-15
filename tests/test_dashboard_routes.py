@@ -45,7 +45,8 @@ def _t(minutes: int) -> datetime:
 def _wipe(conn):
     conn.execute(
         "TRUNCATE episodes, kg_entities, kg_relationships, timeline_events, "
-        "notes, preferences, dashboard_flags, dashboard_audit RESTART IDENTITY CASCADE"
+        "notes, preferences, dashboard_flags, dashboard_audit, recall_metrics "
+        "RESTART IDENTITY CASCADE"
     )
 
 
@@ -183,6 +184,24 @@ def _pref(conn, *, pref="User prefers bullet lists", group_id="technical"):
         "INSERT INTO preferences (owner_id, group_id, pref, polarity) "
         "VALUES ('default',%s,%s,'like') RETURNING id",
         (group_id, pref),
+    ).fetchone()[0]
+
+
+def _metric(
+    conn,
+    *,
+    kind="recall",
+    source="dashboard",
+    query="q",
+    ms_total=100.0,  # float32-exact values only (recall_metrics REAL cols)
+    est_tokens=100,
+    rerank_top_score=0.5,
+    created_at=None,
+):
+    return conn.execute(
+        "INSERT INTO recall_metrics (kind, source, query, ms_total, est_tokens, "
+        " rerank_top_score, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (kind, source, query, ms_total, est_tokens, rerank_top_score, created_at or _t(0)),
     ).fetchone()[0]
 
 
@@ -617,6 +636,78 @@ def test_flag_rejects_bad_input(clean, conn, db_url):
         assert (
             client.post("/dash/api/flag", json={"kind": "note"}, headers=_H).status_code == 400
         )  # missing id
+
+
+# ---------------------------------------------------------------------------
+# Recall history (phase 2) — kind filter, newest-first order, limit cap, token gate
+# ---------------------------------------------------------------------------
+
+
+def test_recall_history_shape_order_and_kind_filter(clean, conn, db_url):
+    # Three recall rows at distinct times + a non-recall row that must be excluded.
+    _metric(
+        conn, query="oldest", ms_total=120.0, est_tokens=400, rerank_top_score=0.5, created_at=_t(1)
+    )
+    _metric(
+        conn,
+        query="newest",
+        ms_total=350.0,
+        est_tokens=1900,
+        rerank_top_score=0.875,
+        created_at=_t(3),
+    )
+    _metric(
+        conn,
+        query="middle",
+        ms_total=210.0,
+        est_tokens=900,
+        rerank_top_score=0.75,
+        created_at=_t(2),
+    )
+    _metric(conn, kind="episodes", query="drilldown", created_at=_t(9))  # excluded by kind filter
+
+    with _client(db_url) as client:
+        body = client.get("/dash/api/recall/history", headers=_H).json()
+    items = body["items"]
+    # Newest first; the kind='episodes' row is filtered out despite being most recent.
+    assert [i["query"] for i in items] == ["newest", "middle", "oldest"]
+    top = items[0]
+    assert top["source"] == "dashboard" and top["ms_total"] == 350.0
+    assert top["est_tokens"] == 1900 and top["rerank_top_score"] == 0.875
+    assert isinstance(top["id"], int) and top["created_at"] is not None
+    # Exactly the contract's column set — no leaked telemetry columns.
+    assert set(top) == {
+        "id",
+        "created_at",
+        "query",
+        "source",
+        "ms_total",
+        "est_tokens",
+        "rerank_top_score",
+    }
+
+
+def test_recall_history_limit_cap_and_default(clean, conn, db_url):
+    for i in range(5):
+        _metric(conn, query=f"q{i}", created_at=_t(i))
+    with _client(db_url) as client:
+        # explicit small limit is honored
+        assert len(client.get("/dash/api/recall/history?limit=2", headers=_H).json()["items"]) == 2
+        # over-cap clamps (all 5 returned, no error) — the 200 cap just bounds the read
+        assert (
+            len(client.get("/dash/api/recall/history?limit=9999", headers=_H).json()["items"]) == 5
+        )
+        # unparseable limit falls back to the default (≥ 5, so all 5 returned)
+        assert (
+            len(client.get("/dash/api/recall/history?limit=abc", headers=_H).json()["items"]) == 5
+        )
+
+
+def test_recall_history_requires_token(clean, conn, db_url):
+    with _client(db_url) as client:
+        r = client.get("/dash/api/recall/history")
+        assert r.status_code == 401
+        assert r.json() == {"status": "error", "detail": "unauthorized"}
 
 
 # ---------------------------------------------------------------------------

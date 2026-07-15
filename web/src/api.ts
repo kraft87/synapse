@@ -2,7 +2,7 @@
 // (owned by the server agent). Everything is Bearer-token authenticated except the
 // static shell. When location.hash contains "mock", the mock dataset is served instead
 // so every screen renders offline.
-import { mockApi, mockFlag, MOCK } from './mock';
+import { mockApi, mockFlag, mockRecall, MOCK } from './mock';
 
 export { MOCK };
 
@@ -19,8 +19,8 @@ export class AuthError extends Error {}
 let authFailHandler: () => void = () => {};
 export const onAuthFail = (fn: () => void) => { authFailHandler = fn; };
 
-async function req<T>(path: string, init?: RequestInit, tokenOverride?: string): Promise<T> {
-  const res = await fetch(BASE + path, {
+async function reqAt<T>(fullPath: string, init?: RequestInit, tokenOverride?: string): Promise<T> {
+  const res = await fetch(fullPath, {
     ...init,
     headers: {
       ...(init?.headers || {}),
@@ -28,9 +28,14 @@ async function req<T>(path: string, init?: RequestInit, tokenOverride?: string):
     },
   });
   if (res.status === 401) { authFailHandler(); throw new AuthError('unauthorized'); }
-  if (!res.ok) throw new Error('request failed (' + res.status + '): ' + path);
+  if (!res.ok) throw new Error('request failed (' + res.status + '): ' + fullPath);
   return res.json() as Promise<T>;
 }
+
+// Most endpoints live under /dash/api; POST /recall is a top-level route (same bearer),
+// so it goes through reqAt with an absolute path.
+const req = <T>(path: string, init?: RequestInit, tokenOverride?: string): Promise<T> =>
+  reqAt<T>(BASE + path, init, tokenOverride);
 
 // ---------- wire types ----------
 export interface Catalog {
@@ -147,3 +152,45 @@ export const postFlag = (kind: string, id: string, note?: string): Promise<{ sta
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind, id, note }),
   });
+
+// ---------- recall debug console (phase 2) ----------
+// The debug envelope surfaces the SAME per-leg timing / pool / rerank numbers the engine
+// already measures for recall_metrics (docs/dashboard-contract.md §Phase 2). legs_ms omits
+// a leg the engine did not time (timeline/prefs when disabled) — the waterfall renders it
+// as skipped. Served items carry no per-item score in the real payload (only the mock adds
+// `score` for demo); the Served column falls back to a muted meta token otherwise.
+export interface RecallDebug {
+  total_ms: number;
+  legs_ms: Record<string, number>;
+  pool_sizes: { bm25: number; vector: number; fused: number; kg_candidates: number };
+  rerank: { model: string; top_score: number };
+  est_tokens: number;
+}
+export interface RecallResult {
+  query: string;
+  facts?: { fact: string; date?: string; score?: number }[];
+  episodes?: { id?: string; content: string; project?: string; date?: string; role?: string; superseded_by?: string[]; score?: number }[];
+  entities?: { name: string; summary: string; score?: number }[];
+  communities?: { name?: string; summary?: string; score?: number }[];
+  timeline?: { date: string; fact: string; type?: string; salience?: number; score?: number }[];
+  preferences?: { pref: string; polarity?: string; since?: string; asserted?: number; score?: number }[];
+  web?: { context?: string; excerpt?: string; url?: string; title?: string; date?: string; score?: number }[];
+  history?: { previously: string; now: string }[];
+  debug?: RecallDebug;
+}
+export interface RecallParams { query: string; project?: string; group_id?: string; }
+export const postRecall = (p: RecallParams): Promise<RecallResult> =>
+  MOCK ? mockRecall(p.query) : reqAt('/recall', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    // write_feedback intentionally omitted — the route defaults it false, and a debug
+    // recall must never bump the retrieval-count feedback signal.
+    body: JSON.stringify({ query: p.query, project: p.project, group_id: p.group_id, debug: true, source: 'dashboard' }),
+  });
+
+export interface RecallHistoryRow {
+  id: number; created_at: string; query: string; source: string | null;
+  ms_total: number | null; est_tokens: number | null; rerank_top_score: number | null;
+}
+export const fetchRecallHistory = (limit = 50): Promise<{ items: RecallHistoryRow[] }> =>
+  MOCK ? mockApi('/recall/history') : req('/recall/history' + qs({ limit }));

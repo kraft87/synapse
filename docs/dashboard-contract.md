@@ -126,6 +126,58 @@ GET  resp: {"flags": [{"id": 3, "kind": "fact", "item_id": "…", "note": null,
 POST toggles: no active row → insert; active row → set `removed_at`. Every toggle appends
 a `dashboard_audit` row. Flag state on feed/entity payloads comes from the active set.
 
+## Phase 2 endpoints (Recall console)
+
+Phase 2 adds the Recall debugging page. It reuses the existing `POST /recall` route
+(the only change to an existing endpoint) and adds one dedicated history endpoint.
+
+### POST /recall — `debug` flag
+
+`POST /recall` already accepts `{query, group_id?, write_feedback?, source?}` (machine-token
+gated, same bearer as `/dash/api/*`). Phase 2 adds two body fields:
+
+- `project?` (string) — scopes the episode legs, same as the MCP `recall(project=…)` arg.
+- `debug?` (bool, default false) — when true the response gains a `debug` envelope.
+
+The dashboard console calls it with `{query, project?, group_id, debug: true, source: "dashboard"}`
+and **never** sets `write_feedback` (it defaults false on this route) — a debug recall must not
+bump the retrieval-count feedback signal.
+
+The `debug` envelope surfaces the SAME numbers the engine already measures for the
+`recall_metrics` telemetry row (no re-instrumentation):
+
+```json
+{"query": "...", "facts": [...], "episodes": [...], "...": "normal recall payload",
+ "debug": {
+   "total_ms": 341.0,
+   "legs_ms": {"embed": 12.0, "bm25": 48.0, "vector": 96.0, "kg": 141.0,
+               "web": 4.0, "rerank": 168.0, "timeline": 33.0, "prefs": 9.0},
+   "pool_sizes": {"bm25": 100, "vector": 100, "fused": 100, "kg_candidates": 12},
+   "rerank": {"model": "rerank-2.5-lite", "top_score": 0.91},
+   "est_tokens": 1874}}
+```
+
+`legs_ms` carries only legs the engine timed. `embed / bm25 / vector / kg / web / rerank`
+are always present; `timeline` / `prefs` appear only when their leg is enabled
+(`SYNAPSE_RECALL_TIMELINE` / `SYNAPSE_RECALL_PREFS` ≠ 0) — an omitted leg renders as
+untimed/skipped in the waterfall. Absent `debug` key ⇒ `debug` was not requested. The waterfall
+UI models the parallel band schematically (all parallel legs start at embed-end, rerank at the
+max parallel end) from these durations; the payload carries durations, not start offsets.
+
+### GET /dash/api/recall/history?limit=50
+
+Recent `recall()` calls from the `recall_metrics` log (`kind = 'recall'`), newest first.
+`limit` ≤ 200 (default 50). Machine-token gated like every `/dash/api/*` route.
+Deviation from spec §8 (which routed history through the phase-4 `/metrics/recall` aggregate):
+a dedicated slim endpoint ships now and can be superseded by the aggregate later.
+
+```json
+{"items": [
+  {"id": 88231, "created_at": "...", "query": "postgres connection pooling decisions",
+   "source": "dashboard", "ms_total": 341.0, "est_tokens": 1874, "rerank_top_score": 0.91}
+]}
+```
+
 ## Schema (migration 042)
 
 `dashboard_flags(id, kind, item_id, note, created_at, removed_at)` — active = `removed_at IS NULL`,
@@ -138,4 +190,4 @@ phase: `flag`, `unflag`. Later phases append proposal decisions.
 `/dash/api/stream` (SSE), `/dash/api/metrics/{recall,ingestion,corpus}`,
 `/dash/api/timeline`, `/dash/api/preferences`, `/dash/api/proposals*`,
 `/dash/api/behavior/*`, `/dash/api/dream/report`, `/dash/api/graph/*`.
-`POST /recall` gains `debug: true` (phase 2) — the only change to an existing endpoint.
+(`POST /recall`'s `debug: true` flag + `/dash/api/recall/history` shipped in phase 2 — see above.)

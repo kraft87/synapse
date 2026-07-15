@@ -47,12 +47,54 @@ const SEARCH: Record<string, unknown[]> = {
   events: [{ type: 'events', id: '10', snippet: 'service A shipped v2', meta: { project: 'service-a', source: 'git:example', ts: iso(48), session_id: 'sess-1', episode_id: 1 } }],
 };
 
+// Recall debug console fixtures (synthetic — mirrors the real recall() + debug shape).
+const RECALL_HISTORY = {
+  items: [
+    { id: 5, created_at: iso(0.03), query: 'postgres connection pooling decisions', source: 'dashboard', ms_total: 341, est_tokens: 1874, rerank_top_score: 0.91 },
+    { id: 4, created_at: iso(1), query: 'what did I decide about rerank pool size', source: 'dashboard', ms_total: 296, est_tokens: 1560, rerank_top_score: 0.94 },
+    { id: 3, created_at: iso(5), query: 'embedding cache implementation history', source: 'mcp', ms_total: 402, est_tokens: 2210, rerank_top_score: 0.87 },
+    { id: 2, created_at: iso(28), query: 'widget cache refactor', source: 'http', ms_total: 164, est_tokens: 388, rerank_top_score: 0.81 },
+  ],
+};
+
+export function mockRecall<T>(query: string): Promise<T> {
+  return Promise.resolve({
+    query,
+    facts: [
+      { fact: 'service A depends on library B', date: '2026-06-30', score: 0.88 },
+      { fact: 'service A used an in-memory store', date: '2026-05-21', score: 0.43 },
+    ],
+    episodes: [
+      { id: 'e:1', content: 'Wired service A to library B; added a shared asyncpg pool (min 2 / max 10) and a smoke test.', project: 'service-a', date: '2026-07-01', role: 'assistant', score: 0.91 },
+      { id: 'e:2', content: 'Refactored the widget cache into a WidgetCache class; hit rate unchanged.', project: 'service-b', date: '2026-06-15', score: 0.71 },
+    ],
+    entities: [
+      { name: 'service A', summary: 'Example project used to demonstrate the recall debug surface.', score: 0.81 },
+    ],
+    timeline: [
+      { date: '2026-06-30', fact: 'service A shipped v2', type: 'milestone', salience: 2, score: 0.74 },
+    ],
+    preferences: [
+      { pref: 'prefers boring, well-understood infra over clever abstractions', polarity: 'like', since: '2026-03-02', asserted: 7, score: 0.62 },
+    ],
+    web: [],
+    debug: {
+      total_ms: 341,
+      legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, timeline: 33, prefs: 9 },
+      pool_sizes: { bm25: 100, vector: 100, fused: 100, kg_candidates: 12 },
+      rerank: { model: 'rerank-2.5-lite', top_score: 0.91 },
+      est_tokens: 1874,
+    },
+  } as T);
+}
+
 export async function mockApi<T>(path: string): Promise<T> {
   const p = path.replace(/^\//, '').split('?')[0];
   let out: unknown;
   if (p === 'catalog') out = FIX.catalog;
   else if (p === 'feed') out = FIX.feed;
   else if (p === 'flags') out = FIX.flags;
+  else if (p === 'recall/history') out = RECALL_HISTORY;
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;
   else if (/^episode\//.test(p)) out = FIX['episode/' + p.split('/')[1]] || FIX['episode/1'];
   else if (/^session\//.test(p)) out = FIX.session;

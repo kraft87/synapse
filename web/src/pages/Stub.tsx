@@ -1,7 +1,6 @@
 // Later-phase pages (Recall/Graph/Timeline/Metrics/Review) render this placeholder
 // in phase 1 — dashed border, mono, txt3, per the build brief.
 const PHASE: Record<string, string> = {
-  recall: 'Recall — the recall() debugging simulator with latency waterfall',
   graph: 'Graph — the knowledge-graph explorer',
   timeline: 'Timeline — the life/work event log and preferences',
   metrics: 'Metrics — recall / ingestion / corpus ops charts',

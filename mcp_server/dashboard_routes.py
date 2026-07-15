@@ -54,6 +54,8 @@ _SEARCH_LIMIT_DEFAULT = 20
 _SEARCH_LIMIT_MAX = 50
 _MENTIONS_PAGE = 20
 _SESSION_CAP = 500
+_RECALL_HISTORY_DEFAULT = 50
+_RECALL_HISTORY_MAX = 200
 _ENTITY_FACTS_CAP = 200  # bound the dossier payload; the example has ~15
 _DERIVED_CAP = 200
 _GIST_MAX = 200
@@ -803,6 +805,46 @@ def _search(
 
 
 # ---------------------------------------------------------------------------
+# Recall history (phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
+    """Recent recall() calls from the recall_metrics telemetry log (kind='recall').
+
+    A dedicated slim endpoint for the Recall console's History tab — newest first,
+    just the columns the table renders. Deviates from spec §8 (which routed history
+    through the phase-4 /metrics/recall aggregate) by shipping now; the aggregate can
+    still supersede it later. recall_episodes / fetch / remember rows are excluded by
+    the kind filter so the console shows only true recall() calls.
+    """
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at, query, source, ms_total, est_tokens, rerank_top_score "
+            "FROM recall_metrics WHERE kind = 'recall' "
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+        return {
+            "items": [
+                {
+                    "id": r["id"],
+                    "created_at": _iso(r["created_at"]),
+                    "query": r["query"],
+                    "source": r["source"],
+                    "ms_total": r["ms_total"],
+                    "est_tokens": r["est_tokens"],
+                    "rerank_top_score": r["rerank_top_score"],
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
 
@@ -1071,6 +1113,13 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             request,
             lambda: _search(db_url, q, type_, offset, limit, project, group_id, source),
         )
+
+    @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[misc]
+    async def dash_recall_history(request: Request) -> JSONResponse:
+        limit = _limit(
+            request.query_params.get("limit"), _RECALL_HISTORY_DEFAULT, _RECALL_HISTORY_MAX
+        )
+        return await _api(request, lambda: _recall_history(db_url, limit))
 
     @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
     async def dash_flags(request: Request) -> JSONResponse:
