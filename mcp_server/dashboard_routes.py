@@ -30,6 +30,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 import time
 from collections import deque
 from collections.abc import Callable
@@ -100,6 +101,33 @@ _PROPOSALS_LANE_CAP = 200
 _SKILL_REVIEW_STATUSES = ("proposed", "accepted", "promoted", "rejected")
 _CONFIG_REVIEW_STATUSES = ("proposed", "accepted", "applied", "rejected")
 _PROVENANCE_CAP = 40  # bound the best-effort session→episode resolution
+
+# Phase 5 (Timeline / Preferences / Dream report / Behavior files).
+_TIMELINE_LIMIT_DEFAULT = 50
+_TIMELINE_LIMIT_MAX = 200
+_PREFERENCES_CAP = 500  # a single owner accrues dozens; this only bounds a runaway read
+_DREAM_REPORT_DEFAULT = 20
+_DREAM_REPORT_MAX = 100
+# Coarse timeline salience (0/1/2) → the 0.3/0.6/0.9 readout the feed + type ramp use.
+_SAL_MAP = {0: 0.3, 1: 0.6, 2: 0.9}
+# Behavior-file grouping by config_registry file_key path shape, in display order.
+_BEHAVIOR_GROUP_ORDER = ("CLAUDE.md", "rules", "memory notes", "other")
+# Obsidian-style [[wikilink]] target (capture up to a '|' alias or the closing ']]').
+_WIKILINK_RE = re.compile(r"\[\[([^\[\]|]+)")
+# Preference sort → ORDER BY fragment (trusted map, never user text — safe to interpolate).
+_PREF_SORTS = {
+    "recency": "p.last_asserted DESC",
+    "assert_count": "p.assert_count DESC, p.last_asserted DESC",
+}
+# Graph explorer (phase 6). Typeahead + BFS neighborhood over kg_relationships. The 150
+# hard cap mirrors the client's render budget (spec §4); when a neighborhood overflows we
+# keep the highest-degree nodes so the important structure survives truncation. Every scan
+# is bounded (LIMIT + a statement_timeout) — no unbounded walks on the ~75K-edge graph.
+_GRAPH_TYPEAHEAD_DEFAULT = 10
+_GRAPH_TYPEAHEAD_MAX = 25
+_GRAPH_NODE_CAP = 150  # hard cap on rendered nodes (contract + spec §4)
+_GRAPH_EDGE_SCAN_CAP = 6000  # per-level BFS + final-edge scan safety valve
+_GRAPH_STMT_TIMEOUT_MS = 5000  # belt-and-suspenders bound on any single graph query
 
 # Long-cache immutable fonts (hashed filenames from the build); no-cache the rest.
 _FONT_EXTS = {".woff2", ".woff", ".ttf", ".otf"}
@@ -678,6 +706,180 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 "limit": _MENTIONS_PAGE,
                 "total": int(total_row.get("total") or 0),
             },
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Graph explorer (phase 6)
+# ---------------------------------------------------------------------------
+
+
+def _normalize_seed_name(name: str) -> str:
+    """Mirror ingestion.dedup._normalize_name for the exact-name seed lookup:
+    lowercase, collapse internal whitespace, strip bookend whitespace/punctuation."""
+    collapsed = " ".join(name.lower().split())
+    return collapsed.strip(" \t\n\r\f\v.,;:!?\"'()[]{}<>")
+
+
+def _parse_as_of(raw: str | None) -> datetime | None:
+    """Parse the as-of ISO timestamp, or None (unset / unparseable → no time filter)."""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
+    """Typeahead over entity names — shares the search endpoint's entity leg SQL
+    (name ILIKE, degree DESC). Global (no group scope): the graph is seeded explicitly."""
+    if not q:
+        return []
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT uuid, name, entity_type, degree FROM kg_entities "
+            "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
+            (f"%{q}%", limit),
+        ).fetchall()
+        return [
+            {
+                "uuid": r["uuid"],
+                "name": r["name"],
+                "entity_type": r["entity_type"],
+                "degree": r["degree"],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
+    """Resolve a seed given a uuid OR a name: exact uuid → exact normalized_name →
+    best ILIKE match (highest degree). None when nothing matches."""
+    cols = "uuid, name, entity_type, degree, summary"
+    row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
+    if row:
+        return row
+    norm = _normalize_seed_name(entity)
+    if norm:
+        row = conn.execute(
+            f"SELECT {cols} FROM kg_entities WHERE normalized_name = %s "
+            "ORDER BY degree DESC LIMIT 1",
+            (norm,),
+        ).fetchone()
+        if row:
+            return row
+    return conn.execute(
+        f"SELECT {cols} FROM kg_entities WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT 1",
+        (f"%{entity}%",),
+    ).fetchone()
+
+
+def _graph_neighborhood(
+    db_url: str, entity: str, depth: int, as_of: datetime | None, limit: int
+) -> dict[str, Any] | None:
+    """BFS from the resolved seed over kg_relationships (both directions), depth ≤ 2,
+    hard-capped at `limit` (≤150) nodes. Truncation keeps the highest-degree nodes (the
+    seed is always kept) and sets truncated=True.
+
+    as_of visibility (traversal AND returned edges use the SAME predicate): when set,
+    exclude edges not-yet-valid (t_valid > as_of) but KEEP superseded edges (the client
+    dashes them); when unset, return live + superseded and let the client scrub. Every
+    scan is LIMIT-bounded and a statement_timeout guards against a pathological hub.
+    """
+    node_budget = max(1, min(limit, _GRAPH_NODE_CAP))
+    depth = 2 if depth >= 2 else 1
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        # Bound every query on this short-lived connection (SET can't bind a param).
+        conn.execute(
+            "SELECT set_config('statement_timeout', %s, false)", (str(_GRAPH_STMT_TIMEOUT_MS),)
+        )
+
+        seed = _resolve_seed(conn, entity)
+        if seed is None:
+            return None
+        seed_uuid = seed["uuid"]
+
+        # Shared as-of edge-visibility fragment (empty when unset).
+        as_of_sql, as_of_params = "", []
+        if as_of is not None:
+            as_of_sql = " AND (t_valid IS NULL OR t_valid <= %s)"
+            as_of_params = [as_of]
+
+        # BFS both directions; one bounded query per level.
+        visited: set[str] = {seed_uuid}
+        frontier: list[str] = [seed_uuid]
+        for _ in range(depth):
+            if not frontier:
+                break
+            rows = conn.execute(
+                "SELECT src_uuid, tgt_uuid FROM kg_relationships "
+                f"WHERE (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} LIMIT %s",
+                (frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+            ).fetchall()
+            nxt: list[str] = []
+            for r in rows:
+                for other in (r["src_uuid"], r["tgt_uuid"]):
+                    if other not in visited:
+                        visited.add(other)
+                        nxt.append(other)
+            frontier = nxt
+
+        # Materialize real entity rows for the reached uuids (edge endpoints without an
+        # entity row are dropped — edges aren't FKs, so a dangling endpoint has no node).
+        ent_rows = conn.execute(
+            "SELECT uuid, name, entity_type, degree, summary FROM kg_entities WHERE uuid = ANY(%s)",
+            (list(visited),),
+        ).fetchall()
+
+        # Rank seed-first, then highest degree; truncate to the budget.
+        ent_rows.sort(key=lambda r: (r["uuid"] != seed_uuid, -(r["degree"] or 0), r["name"] or ""))
+        truncated = len(ent_rows) > node_budget
+        if truncated:
+            ent_rows = ent_rows[:node_budget]
+        kept = [r["uuid"] for r in ent_rows]
+
+        # Edges with BOTH endpoints kept, under the same as-of visibility.
+        edge_rows = conn.execute(
+            "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "
+            "       retrieval_count FROM kg_relationships "
+            f"WHERE src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
+            (kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+        ).fetchall()
+
+        return {
+            "nodes": [
+                {
+                    "uuid": r["uuid"],
+                    "name": r["name"],
+                    "entity_type": r["entity_type"],
+                    "degree": r["degree"],
+                    "summary": r["summary"],
+                }
+                for r in ent_rows
+            ],
+            "edges": [
+                {
+                    "uuid": r["uuid"],
+                    "src": r["src_uuid"],
+                    "tgt": r["tgt_uuid"],
+                    "name": r["name"],
+                    "fact": r["fact"],
+                    "t_valid": _iso(r["t_valid"]),
+                    "t_invalid": _iso(r["t_invalid"]),
+                    "provenance_episode_id": _provenance(r["episodes"]),
+                    "retrieval_count": r["retrieval_count"],
+                }
+                for r in edge_rows
+            ],
+            "truncated": truncated,
+            "seed": seed_uuid,
         }
     finally:
         conn.close()
@@ -1512,6 +1714,269 @@ def _proposal_decision(
 
 
 # ---------------------------------------------------------------------------
+# Phase 5 — Timeline (Events + Preferences), Dream report, Behavior files
+# ---------------------------------------------------------------------------
+#
+# Read-only surfaces over the episodic timeline (033), the preference log (035), the
+# dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as
+# the rest of /dash/api: one short-lived connection per call, bounded, fail-soft. Honesty
+# notes (mirrored into docs/dashboard-contract.md §"Phase 5"):
+#   * timeline_events.event_type is sparsely populated (schema 033 deferred it) — a `type`
+#     chip filter narrows to rows with that exact event_type; UNTYPED events show only when
+#     no chip is active (the default view is the full stream).
+#   * config_lane.config_registry stores the CURRENT file content only (content + hash +
+#     updated_at) — there is NO version history table, so /behavior/file returns no history
+#     and the client's change-history timeline stays hidden. Not fabricated this phase.
+
+
+def _parse_before(before: str | None) -> tuple[str, int | None] | None:
+    """Timeline keyset cursor. A bare ISO timestamp (the jump-to-date case) → (ts, None),
+    read as a strict ``t_valid < ts``. A compound ``ts|id`` (next_before from a prior page)
+    → (ts, id), read as the full (t_valid, id) keyset so ties on t_valid never drop or
+    duplicate a row across a page boundary."""
+    if not before:
+        return None
+    ts, sep, rest = before.partition("|")
+    if sep and rest.isdigit():
+        return ts, int(rest)
+    return before, None
+
+
+def _timeline(
+    db_url: str, before: str | None, limit: int, type_: str | None, group_id: str | None
+) -> dict[str, Any]:
+    """t_valid-DESC keyset page of timeline events. `type` filters event_type (sparse —
+    see honesty note); `group_id` maps to the `domain` column (schema 038). Each event
+    carries the coarse `salience` plus the 0.3/0.6/0.9 `sal` readout the type ramp reads,
+    the resolved `ep:N` episode id, and its flag state."""
+    cur = _parse_before(before)
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        where = ["1=1"]
+        params: list[Any] = []
+        if type_ is not None:
+            where.append("event_type = %s")
+            params.append(type_)
+        if group_id is not None:
+            where.append("domain = %s")
+            params.append(group_id)
+        if cur is not None:
+            ts, cid = cur
+            if cid is not None:
+                where.append(
+                    "(t_valid < %s::timestamptz OR (t_valid = %s::timestamptz AND id < %s))"
+                )
+                params += [ts, ts, cid]
+            else:
+                where.append("t_valid < %s::timestamptz")
+                params.append(ts)
+        rows = conn.execute(
+            "SELECT id, t_valid, fact, source, project, salience, event_type, source_ref, domain "
+            f"FROM timeline_events WHERE {' AND '.join(where)} "
+            "ORDER BY t_valid DESC, id DESC LIMIT %s",
+            (*params, limit),
+        ).fetchall()
+        flags = _flag_set(conn)
+        events = [
+            {
+                "id": r["id"],
+                "t_valid": _iso(r["t_valid"]),
+                "fact": r["fact"],
+                "source": r["source"],
+                "project": r["project"],
+                "salience": r["salience"],
+                "sal": _SAL_MAP.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6),
+                "event_type": r["event_type"],
+                "episode_id": _episode_id_from_ref(r["source_ref"]),
+                "flagged": ("timeline_event", str(r["id"])) in flags,
+            }
+            for r in rows
+        ]
+        next_before = None
+        if len(rows) == limit and rows:
+            last = rows[-1]
+            next_before = f"{_iso(last['t_valid'])}|{last['id']}"
+        return {"events": events, "next_before": next_before}
+    finally:
+        conn.close()
+
+
+def _preferences(db_url: str, sort: str) -> dict[str, Any]:
+    """The full preference log — LIVE rows first, then superseded (struck in the UI), each
+    ordered by the chosen sort. `superseded_by_text` is the replacing row's pref, joined in
+    so the UI can name what won without a second fetch."""
+    order = _PREF_SORTS.get(sort, _PREF_SORTS["recency"])
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT p.id, p.pref, p.polarity, p.first_seen, p.last_asserted, p.assert_count, "
+            "  p.superseded_by, p.t_invalid, sp.pref AS superseded_by_text "
+            "FROM preferences p LEFT JOIN preferences sp ON sp.id = p.superseded_by "
+            f"ORDER BY (p.t_invalid IS NOT NULL), {order}, p.id DESC LIMIT %s",  # nosec B608
+            (_PREFERENCES_CAP,),
+        ).fetchall()
+        flags = _flag_set(conn)
+        return {
+            "preferences": [
+                {
+                    "id": r["id"],
+                    "pref": r["pref"],
+                    "polarity": r["polarity"],
+                    "first_seen": _iso(r["first_seen"]),
+                    "last_asserted": _iso(r["last_asserted"]),
+                    "assert_count": r["assert_count"],
+                    "superseded_by": r["superseded_by"],
+                    "superseded_by_text": r["superseded_by_text"],
+                    "t_invalid": _iso(r["t_invalid"]),
+                    "flagged": ("preference", str(r["id"])) in flags,
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        conn.close()
+
+
+def _dream_report(db_url: str, limit: int) -> dict[str, Any]:
+    """Recent dream_runs (044), newest first — the full per-run drill-in the Dream-report
+    page renders. Reuses the same row shaper the Metrics ingestion endpoint's last_dream
+    uses. Empty table → {"runs": []}."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT id, started_at, finished_at, stages, counts, samples, errors, ok, "
+            "  EXTRACT(EPOCH FROM (finished_at - started_at)) AS duration_s "
+            "FROM dream_runs ORDER BY started_at DESC, id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+        return {"runs": [_dream_run_json(r) for r in rows]}
+    finally:
+        conn.close()
+
+
+def _wikilinks(content: str | None) -> list[str]:
+    """Unique [[wikilink]] targets in first-seen order (alias suffix after '|' dropped)."""
+    if not content:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for m in _WIKILINK_RE.finditer(content):
+        target = m.group(1).strip()
+        if target and target not in seen:
+            seen.add(target)
+            out.append(target)
+    return out
+
+
+def _behavior_group(file_key: str) -> str:
+    """Bucket a config_registry file_key by path shape (the left-list grouping, README §6)."""
+    base = file_key.rsplit("/", 1)[-1]
+    if base == "CLAUDE.md":
+        return "CLAUDE.md"
+    if file_key.startswith("rules/") or "/rules/" in file_key:
+        return "rules"
+    if (
+        file_key.startswith(("memory/", "notes/"))
+        or "/memory/" in file_key
+        or "/notes/" in file_key
+    ):
+        return "memory notes"
+    return "other"
+
+
+def _behavior_files(db_url: str) -> dict[str, Any]:
+    """The config-lane file mirror, grouped for the left list. One entry per registry row
+    (surface_id + scope + file_key is the PK), so the same file_key on two surfaces lists
+    twice — the client disambiguates the detail fetch with scope + surface."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT surface_id, scope, file_key, updated_at, octet_length(content) AS size "
+            "FROM config_lane.config_registry ORDER BY file_key, scope, surface_id"
+        ).fetchall()
+    finally:
+        conn.close()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        grouped.setdefault(_behavior_group(r["file_key"]), []).append(
+            {
+                "file_key": r["file_key"],
+                "surface_id": r["surface_id"],
+                "scope": r["scope"],
+                "updated_at": _iso(r["updated_at"]),
+                "size": int(r["size"] or 0),
+            }
+        )
+    groups = [{"name": g, "files": grouped[g]} for g in _BEHAVIOR_GROUP_ORDER if g in grouped]
+    return {"groups": groups}
+
+
+def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> dict[str, Any] | None:
+    """One mirrored file's content + meta + parsed [[wikilinks]]. Mirrors config_sync_routes'
+    _fetch_config; when `surface` is omitted, the most-recently-updated surface for that
+    (scope, file_key) is served. No history — the registry keeps only the current version
+    (contract §Phase 5)."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        cols = (
+            "surface_id, scope, file_key, abs_path, content, content_hash, modified_at, updated_at"
+        )
+        if surface:
+            row = conn.execute(
+                f"SELECT {cols} FROM config_lane.config_registry "
+                "WHERE file_key = %s AND scope = %s AND surface_id = %s",
+                (key, scope, surface),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                f"SELECT {cols} FROM config_lane.config_registry "
+                "WHERE file_key = %s AND scope = %s ORDER BY updated_at DESC LIMIT 1",
+                (key, scope),
+            ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    content = row["content"]
+    return {
+        "file_key": row["file_key"],
+        "content": content,
+        "meta": {
+            "surface_id": row["surface_id"],
+            "scope": row["scope"],
+            "abs_path": row["abs_path"],
+            "content_hash": row["content_hash"],
+            "modified_at": _iso(row["modified_at"]),
+            "updated_at": _iso(row["updated_at"]),
+            "size": len(content or ""),
+        },
+        "links": _wikilinks(content),
+    }
+
+
+def _behavior_linkgraph(db_url: str) -> dict[str, Any]:
+    """Adjacency over every registry file's [[wikilinks]]. Nodes are keyed by logical
+    file_key (deduped across surfaces); edges are file_key → wikilink target. A target need
+    not be a node (many point at memory notes, which are not mirrored files) — the client
+    resolves what it can and renders the rest as inert leaves."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT scope, file_key, content FROM config_lane.config_registry"
+        ).fetchall()
+    finally:
+        conn.close()
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, str]] = []
+    for r in rows:
+        fk = r["file_key"]
+        nodes.setdefault(fk, {"file_key": fk, "scope": r["scope"], "group": _behavior_group(fk)})
+        for target in _wikilinks(r["content"]):
+            edges.append({"source": fk, "target": target})
+    return {"nodes": list(nodes.values()), "edges": edges}
+
+
+# ---------------------------------------------------------------------------
 # Phase 3 — SSE live stream (LISTEN/NOTIFY + ring buffer)
 # ---------------------------------------------------------------------------
 #
@@ -1964,6 +2429,38 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             lambda: _search(db_url, q, type_, offset, limit, project, group_id, source),
         )
 
+    # ---- graph explorer (phase 6) ----
+
+    @mcp.custom_route("/dash/api/graph/entities", methods=["GET"])  # type: ignore[misc]
+    async def dash_graph_entities(request: Request) -> JSONResponse:
+        q = (request.query_params.get("q") or "").strip()
+        limit = _limit(
+            request.query_params.get("limit"), _GRAPH_TYPEAHEAD_DEFAULT, _GRAPH_TYPEAHEAD_MAX
+        )
+        return await _api(request, lambda: _graph_entities(db_url, q, limit))
+
+    @mcp.custom_route("/dash/api/graph/neighborhood", methods=["GET"])  # type: ignore[misc]
+    async def dash_graph_neighborhood(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        qp = request.query_params
+        entity = (qp.get("entity") or "").strip()
+        if not entity:
+            return JSONResponse({"status": "error", "detail": "missing 'entity'"}, status_code=400)
+        depth = 2 if qp.get("depth") == "2" else 1
+        as_of = _parse_as_of(qp.get("as_of"))
+        limit = _limit(qp.get("limit"), _GRAPH_NODE_CAP, _GRAPH_NODE_CAP)
+        try:
+            result = await run_in_threadpool(
+                _graph_neighborhood, db_url, entity, depth, as_of, limit
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard graph neighborhood failed: %s", e)
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+        if result is None:
+            return JSONResponse({"status": "error", "detail": "entity not found"}, status_code=404)
+        return JSONResponse(result)
+
     @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[misc]
     async def dash_recall_history(request: Request) -> JSONResponse:
         limit = _limit(
@@ -1998,6 +2495,56 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         corpus_cache["ts"] = now
         corpus_cache["data"] = data
         return JSONResponse(data)
+
+    # ---- timeline + preferences (phase 5) ----
+
+    @mcp.custom_route("/dash/api/timeline", methods=["GET"])  # type: ignore[misc]
+    async def dash_timeline(request: Request) -> JSONResponse:
+        qp = request.query_params
+        limit = _limit(qp.get("limit"), _TIMELINE_LIMIT_DEFAULT, _TIMELINE_LIMIT_MAX)
+        before = qp.get("before") or None
+        type_ = qp.get("type") or None
+        group_id = qp.get("group_id") or None
+        return await _api(request, lambda: _timeline(db_url, before, limit, type_, group_id))
+
+    @mcp.custom_route("/dash/api/preferences", methods=["GET"])  # type: ignore[misc]
+    async def dash_preferences(request: Request) -> JSONResponse:
+        sort = request.query_params.get("sort") or "recency"
+        return await _api(request, lambda: _preferences(db_url, sort))
+
+    # ---- dream report + behavior files (phase 5) ----
+
+    @mcp.custom_route("/dash/api/dream/report", methods=["GET"])  # type: ignore[misc]
+    async def dash_dream_report(request: Request) -> JSONResponse:
+        limit = _limit(request.query_params.get("limit"), _DREAM_REPORT_DEFAULT, _DREAM_REPORT_MAX)
+        return await _api(request, lambda: _dream_report(db_url, limit))
+
+    @mcp.custom_route("/dash/api/behavior/files", methods=["GET"])  # type: ignore[misc]
+    async def dash_behavior_files(request: Request) -> JSONResponse:
+        return await _api(request, lambda: _behavior_files(db_url))
+
+    @mcp.custom_route("/dash/api/behavior/file", methods=["GET"])  # type: ignore[misc]
+    async def dash_behavior_file(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        qp = request.query_params
+        key = qp.get("key")
+        if not key:
+            return JSONResponse({"status": "error", "detail": "missing 'key'"}, status_code=400)
+        scope = qp.get("scope") or "global"
+        surface = qp.get("surface") or None
+        try:
+            result = await run_in_threadpool(_behavior_file, db_url, key, scope, surface)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard behavior file failed: %s", e)
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+        if result is None:
+            return JSONResponse({"status": "error", "detail": "file not found"}, status_code=404)
+        return JSONResponse(result)
+
+    @mcp.custom_route("/dash/api/behavior/linkgraph", methods=["GET"])  # type: ignore[misc]
+    async def dash_behavior_linkgraph(request: Request) -> JSONResponse:
+        return await _api(request, lambda: _behavior_linkgraph(db_url))
 
     @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
     async def dash_flags(request: Request) -> JSONResponse:

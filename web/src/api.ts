@@ -407,3 +407,76 @@ export const fetchMetricsIngestion = (window = '48h'): Promise<MetricsIngestion>
   MOCK ? mockApi('/metrics/ingestion') : req('/metrics/ingestion' + qs({ window }));
 export const fetchMetricsCorpus = (): Promise<MetricsCorpus> =>
   MOCK ? mockApi('/metrics/corpus') : req('/metrics/corpus');
+
+// ---------- timeline: events + preferences (phase 5) ----------
+// Wire shapes pinned in docs/dashboard-contract.md §"Phase 5". `sal` is the 0.3/0.6/0.9
+// readout the salience type ramp reads; `event_type` is sparsely populated (a chip filter
+// narrows to it; untyped events show only in the unfiltered view).
+export interface TimelineEvent {
+  id: number; t_valid: string; fact: string; source: string; project: string | null;
+  salience: number | null; sal: number; event_type: string | null;
+  episode_id: number | null; flagged: boolean;
+}
+export interface TimelinePage { events: TimelineEvent[]; next_before: string | null; }
+export interface TimelineParams { before?: string | null; limit?: number; type?: string; group_id?: string; }
+
+export const fetchTimeline = (p: TimelineParams): Promise<TimelinePage> =>
+  MOCK ? mockApi('/timeline') : req('/timeline' + qs({ before: p.before, limit: p.limit ?? 50, type: p.type, group_id: p.group_id }));
+
+export interface Preference {
+  id: number; pref: string; polarity: string; first_seen: string; last_asserted: string;
+  assert_count: number; superseded_by: number | null; superseded_by_text: string | null;
+  t_invalid: string | null; flagged: boolean;
+}
+export const fetchPreferences = (sort: 'recency' | 'assert_count' = 'recency'): Promise<{ preferences: Preference[] }> =>
+  MOCK ? mockApi('/preferences') : req('/preferences' + qs({ sort }));
+
+// ---------- dream report + behavior files (phase 5) ----------
+export interface DreamReport { runs: DreamRun[]; }
+export const fetchDreamReport = (limit = 20): Promise<DreamReport> =>
+  MOCK ? mockApi('/dream/report') : req('/dream/report' + qs({ limit }));
+
+export interface BehaviorFileEntry { file_key: string; surface_id: string; scope: string; updated_at: string; size: number; }
+export interface BehaviorGroup { name: string; files: BehaviorFileEntry[]; }
+export interface BehaviorFiles { groups: BehaviorGroup[]; }
+export interface BehaviorFileMeta {
+  surface_id?: string; scope?: string; abs_path?: string; content_hash?: string;
+  modified_at?: string | null; updated_at?: string | null; size?: number;
+}
+export interface BehaviorFile { file_key: string; content: string; meta: BehaviorFileMeta; links: string[]; }
+export interface BehaviorLinkGraph {
+  nodes: { file_key: string; scope: string; group: string }[];
+  edges: { source: string; target: string }[];
+}
+export const fetchBehaviorFiles = (): Promise<BehaviorFiles> =>
+  MOCK ? mockApi('/behavior/files') : req('/behavior/files');
+export const fetchBehaviorFile = (key: string, scope = 'global', surface?: string): Promise<BehaviorFile> =>
+  MOCK ? mockApi('/behavior/file') : req('/behavior/file' + qs({ key, scope, surface }));
+export const fetchBehaviorLinkgraph = (): Promise<BehaviorLinkGraph> =>
+  MOCK ? mockApi('/behavior/linkgraph') : req('/behavior/linkgraph');
+// ---------- graph explorer (phase 6) ----------
+// Wire shapes pinned in docs/dashboard-contract.md §"Phase 6". The neighborhood is a
+// BFS from a resolved seed (uuid or name), depth ≤ 2, server-capped at 150 nodes
+// (truncation keeps the highest-degree nodes). Edges carry bitemporal validity so the
+// as-of slider scrubs client-side; the client re-queries with as_of only when truncated.
+export interface GraphEntity { uuid: string; name: string; entity_type: string | null; degree: number; }
+export interface GraphNode {
+  uuid: string; name: string; entity_type: string | null; degree: number; summary: string | null;
+}
+export interface GraphEdge {
+  uuid: string; src: string; tgt: string; name: string | null; fact: string | null;
+  t_valid: string | null; t_invalid: string | null;
+  provenance_episode_id: number | null; retrieval_count: number;
+}
+export interface Neighborhood {
+  nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean; seed: string;
+}
+export interface NeighborhoodParams { entity: string; depth?: 1 | 2; as_of?: string | null; limit?: number; }
+
+export const fetchGraphEntities = (q: string, limit = 10): Promise<GraphEntity[]> =>
+  MOCK ? mockApi('/graph/entities?q=' + encodeURIComponent(q)) : req('/graph/entities' + qs({ q, limit }));
+
+export const fetchGraphNeighborhood = (p: NeighborhoodParams): Promise<Neighborhood> =>
+  MOCK
+    ? mockApi('/graph/neighborhood?entity=' + encodeURIComponent(p.entity))
+    : req('/graph/neighborhood' + qs({ entity: p.entity, depth: p.depth ?? 1, as_of: p.as_of, limit: p.limit }));

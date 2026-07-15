@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
+from urllib.parse import quote
 
 import psycopg
 import pytest
@@ -153,13 +154,14 @@ def _event(
     project="synapse",
     salience=2,
     domain="technical",
+    event_type=None,
     t_valid=None,
     ingested_at=None,
 ):
     return conn.execute(
         "INSERT INTO timeline_events "
-        "(t_valid, fact, source, source_ref, project, salience, domain, ingested_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "(t_valid, fact, source, source_ref, project, salience, domain, event_type, ingested_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
             t_valid or _t(0),
             fact,
@@ -168,6 +170,7 @@ def _event(
             project,
             salience,
             domain,
+            event_type,
             ingested_at or _t(0),
         ),
     ).fetchone()[0]
@@ -1389,3 +1392,584 @@ def test_static_serves_bundle_and_rejects_traversal(tmp_path, monkeypatch, db_ur
         assert client.get("/dash/assets/app.js").status_code == 404
         # Encoded traversal never resolves to a real asset.
         assert client.get("/dash/assets/%2e%2e%2fapp.js").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Timeline (Events + Preferences), Dream report, Behavior files
+# ---------------------------------------------------------------------------
+
+
+def _pref_row(
+    conn,
+    *,
+    pref,
+    polarity="like",
+    group_id="technical",
+    assert_count=1,
+    first_seen=None,
+    last_asserted=None,
+    t_invalid=None,
+    superseded_by=None,
+):
+    return conn.execute(
+        "INSERT INTO preferences (owner_id, group_id, pref, polarity, assert_count, "
+        " first_seen, last_asserted, t_invalid, superseded_by) "
+        "VALUES ('default',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (
+            group_id,
+            pref,
+            polarity,
+            assert_count,
+            first_seen or _t(0),
+            last_asserted or _t(0),
+            t_invalid,
+            superseded_by,
+        ),
+    ).fetchone()[0]
+
+
+# ---------------------------------------------------------------------------
+# Graph explorer (phase 6): typeahead + BFS neighborhood, as-of, truncation,
+# name-seed resolution, token gates.
+# ---------------------------------------------------------------------------
+
+
+def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name=None):
+    """Entity insert that ALSO sets normalized_name (the shared _entity helper doesn't),
+    so the exact-normalized-name seed path is exercisable."""
+    return conn.execute(
+        "INSERT INTO kg_entities "
+        "(uuid, group_id, name, normalized_name, entity_type, summary, degree, created_at) "
+        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        (
+            uuid,
+            name,
+            normalized_name or name.lower(),
+            entity_type,
+            f"{name} summary",
+            degree,
+            _t(0),
+        ),
+    ).fetchone()[0]
+
+
+def _config_reg(conn, *, file_key, content, surface_id="hostA", scope="global", updated_at=None):
+    import hashlib
+
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    conn.execute(
+        "INSERT INTO config_lane.config_registry "
+        "(surface_id, scope, file_key, abs_path, content, content_hash, updated_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+        (surface_id, scope, file_key, f"/home/x/{file_key}", content, digest, updated_at or _t(0)),
+    )
+
+
+@pytest.fixture()
+def clean_behavior(conn):
+    """Wipe the config-lane mirror before AND after (the phase-5 behavior tests own it —
+    _wipe doesn't touch config_lane, so this keeps them deterministic and leak-free)."""
+
+    def _w():
+        conn.execute("TRUNCATE config_lane.config_registry RESTART IDENTITY CASCADE")
+
+    _w()
+    yield
+    _w()
+
+
+# ---- Timeline: Events ----
+
+
+def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
+    eid = _episode(conn, session="tl", seq=1, content="the shipping session")
+    # Distinct t_valid; coarse salience 2/1/0 -> sal 0.9/0.6/0.3; ep: ref resolves, sha doesn't.
+    e_hi = _event(
+        conn,
+        fact="rerank pool capped at 96",
+        source="chat",
+        source_ref=f"ep:{eid}",
+        salience=2,
+        domain="technical",
+        event_type="work",
+        t_valid=_t(30),
+    )
+    e_mid = _event(
+        conn,
+        fact="took a rest day",
+        source="chat",
+        source_ref="deadbeef",  # git-style ref -> episode_id None
+        salience=1,
+        domain="personal",
+        event_type="health",
+        t_valid=_t(20),
+    )
+    e_lo = _event(
+        conn,
+        fact="untyped note",
+        source="chat",
+        source_ref="ep:99999",
+        salience=0,
+        domain="technical",
+        event_type=None,  # untyped: shows in the default (no-chip) view
+        t_valid=_t(10),
+    )
+
+    with _client(db_url) as client:
+        body = client.get("/dash/api/timeline", headers=_H).json()
+    ids = [e["id"] for e in body["events"]]
+    assert ids == [e_hi, e_mid, e_lo]  # t_valid DESC
+    by_id = {e["id"]: e for e in body["events"]}
+    assert by_id[e_hi]["sal"] == 0.9 and by_id[e_hi]["salience"] == 2
+    assert by_id[e_hi]["event_type"] == "work" and by_id[e_hi]["episode_id"] == eid
+    assert by_id[e_mid]["sal"] == 0.6 and by_id[e_mid]["episode_id"] is None
+    assert by_id[e_lo]["sal"] == 0.3 and by_id[e_lo]["event_type"] is None  # untyped shown
+    assert by_id[e_hi]["flagged"] is False
+
+
+def test_timeline_keyset_pagination_with_ties(clean, conn, db_url):
+    # Two events share a t_valid (tie); the (t_valid, id) keyset must not drop either.
+    a = _event(conn, fact="tie A", source_ref="tb:a", t_valid=_t(10))
+    b = _event(conn, fact="tie B", source_ref="tb:b", t_valid=_t(10))  # higher id, same t_valid
+    c = _event(conn, fact="older C", source_ref="tb:c", t_valid=_t(5))
+    with _client(db_url) as client:
+        p1 = client.get("/dash/api/timeline", params={"limit": 1}, headers=_H).json()
+        assert [e["id"] for e in p1["events"]] == [b]  # id DESC breaks the tie
+        assert p1["next_before"]
+        # params= lets TestClient URL-encode the cursor's '+' offset (the real client uses
+        # URLSearchParams, which does the same) — a raw f-string would decode '+' to a space.
+        p2 = client.get(
+            "/dash/api/timeline", params={"limit": 1, "before": p1["next_before"]}, headers=_H
+        ).json()
+        assert [e["id"] for e in p2["events"]] == [a]  # tie sibling NOT skipped
+        p3 = client.get(
+            "/dash/api/timeline", params={"limit": 1, "before": p2["next_before"]}, headers=_H
+        ).json()
+        assert [e["id"] for e in p3["events"]] == [c]
+        # A full page (len == limit) always yields a cursor, like the feed; the next fetch
+        # drains the stream (empty page, no further cursor).
+        assert p3["next_before"]
+        p4 = client.get(
+            "/dash/api/timeline", params={"limit": 1, "before": p3["next_before"]}, headers=_H
+        ).json()
+        assert p4["events"] == [] and p4["next_before"] is None
+    # No id appeared twice across the pages.
+    seen = [e["id"] for e in p1["events"] + p2["events"] + p3["events"]]
+    assert sorted(seen) == sorted({a, b, c})
+
+
+def test_timeline_type_and_domain_filters(clean, conn, db_url):
+    work = _event(conn, fact="work event", source_ref="tb:w", event_type="work", domain="technical")
+    life = _event(conn, fact="life event", source_ref="tb:l", event_type="life", domain="personal")
+    untyped = _event(conn, fact="untyped", source_ref="tb:u", event_type=None, domain="technical")
+    with _client(db_url) as client:
+        # type chip narrows to that event_type; untyped rows drop out when a chip is active.
+        only_work = client.get("/dash/api/timeline?type=work", headers=_H).json()
+        assert {e["id"] for e in only_work["events"]} == {work}
+        # group_id maps to the domain column (schema 038).
+        personal = client.get("/dash/api/timeline?group_id=personal", headers=_H).json()
+        assert {e["id"] for e in personal["events"]} == {life}
+        # No filter -> everything, including the untyped row.
+        allrows = client.get("/dash/api/timeline", headers=_H).json()
+        assert {e["id"] for e in allrows["events"]} == {work, life, untyped}
+
+
+def test_timeline_flag_reflection(clean, conn, db_url):
+    ev = _event(conn, fact="flag this event", source_ref="tb:f")
+    with _client(db_url) as client:
+        client.post("/dash/api/flag", json={"kind": "timeline_event", "id": str(ev)}, headers=_H)
+        body = client.get("/dash/api/timeline", headers=_H).json()
+    assert body["events"][0]["flagged"] is True
+
+
+# ---- Timeline: Preferences ----
+
+
+def test_preferences_sort_live_first_and_supersede_join(clean, conn, db_url):
+    live1 = _pref_row(
+        conn, pref="Prefers dark theme", polarity="like", assert_count=5, last_asserted=_t(50)
+    )
+    live2 = _pref_row(
+        conn,
+        pref="Dislikes ORMs — raw SQL only",
+        polarity="dislike",
+        assert_count=9,
+        last_asserted=_t(30),
+    )
+    live_new = _pref_row(
+        conn, pref="self-hosted pgvector", polarity="like", assert_count=2, last_asserted=_t(10)
+    )
+    old = _pref_row(
+        conn,
+        pref="Liked hosted vector DBs",
+        polarity="like",
+        assert_count=3,
+        last_asserted=_t(5),
+        t_invalid=_t(20),
+        superseded_by=live_new,
+    )
+
+    with _client(db_url) as client:
+        rec = client.get("/dash/api/preferences?sort=recency", headers=_H).json()["preferences"]
+        # Live rows first (by last_asserted DESC), superseded last.
+        assert [p["id"] for p in rec] == [live1, live2, live_new, old]
+        ac = client.get("/dash/api/preferences?sort=assert_count", headers=_H).json()["preferences"]
+        # Live rows first (by assert_count DESC) — a different order than recency.
+        assert [p["id"] for p in ac] == [live2, live1, live_new, old]
+
+        row = {p["id"]: p for p in rec}[old]
+        assert row["t_invalid"] is not None
+        assert row["superseded_by"] == live_new
+        assert row["superseded_by_text"] == "self-hosted pgvector"
+        assert row["polarity"] == "like" and row["assert_count"] == 3
+        live_row = {p["id"]: p for p in rec}[live1]
+        assert live_row["superseded_by"] is None and live_row["superseded_by_text"] is None
+
+
+def test_preferences_flag_reflection(clean, conn, db_url):
+    pid = _pref_row(conn, pref="Prefers bullet lists", assert_count=1)
+    with _client(db_url) as client:
+        client.post("/dash/api/flag", json={"kind": "preference", "id": str(pid)}, headers=_H)
+        prefs = client.get("/dash/api/preferences", headers=_H).json()["preferences"]
+    assert {p["id"]: p["flagged"] for p in prefs}[pid] is True
+
+
+# ---- Dream report ----
+
+
+def test_dream_report_off_dream_runs(clean, conn, db_url):
+    r_old = _dream_run(
+        conn,
+        started_at=_t(0),
+        finished_at=_t(1),
+        counts={"proposals_raised": 1},
+        samples={"proposals": [{"id": "skill:1", "kind": "skill", "name": "a"}]},
+        stages={"skills": {"ran": True, "ok": True}},
+        ok=True,
+    )
+    r_new = _dream_run(
+        conn,
+        started_at=_t(120),
+        finished_at=_t(121),
+        counts={"proposals_raised": 3, "config_proposals": 2},
+        samples={"proposals": [{"id": "config:4", "kind": "config-edit", "name": "rules/x.md"}]},
+        stages={"config": {"ran": True, "ok": True}},
+        ok=True,
+    )
+    with _client(db_url) as client:
+        runs = client.get("/dash/api/dream/report", headers=_H).json()["runs"]
+    assert [r["id"] for r in runs] == [r_new, r_old]  # newest first
+    top = runs[0]
+    assert top["counts"]["proposals_raised"] == 3 and top["counts"]["config_proposals"] == 2
+    assert top["samples"]["proposals"][0]["id"] == "config:4"
+    assert top["stages"] == {"config": {"ran": True, "ok": True}}
+    assert round(top["duration_s"]) == 60 and top["ok"] is True and top["errors"] == []
+
+
+def test_dream_report_empty(clean, conn, db_url):
+    with _client(db_url) as client:
+        assert client.get("/dash/api/dream/report", headers=_H).json() == {"runs": []}
+
+
+# ---- Behavior files ----
+
+
+def test_behavior_files_grouping_content_and_linkgraph(clean_behavior, conn, db_url):
+    _config_reg(
+        conn,
+        file_key="CLAUDE.md",
+        content="# CLAUDE\nSee [[voice]] and [[job_crons]].\nAgain [[voice]].",
+    )
+    _config_reg(conn, file_key="rules/voice.md", content="Voice rules. Ref [[CLAUDE]].")
+    _config_reg(conn, file_key="memory/note1.md", content="note body [[voice]]")
+    _config_reg(conn, file_key="AGENTS.md", content="misc, no links")
+
+    with _client(db_url) as client:
+        files = client.get("/dash/api/behavior/files", headers=_H).json()
+        names = [g["name"] for g in files["groups"]]
+        assert names == ["CLAUDE.md", "rules", "memory notes", "other"]  # fixed display order
+        by_group = {g["name"]: g["files"] for g in files["groups"]}
+        assert [f["file_key"] for f in by_group["CLAUDE.md"]] == ["CLAUDE.md"]
+        assert [f["file_key"] for f in by_group["rules"]] == ["rules/voice.md"]
+        assert [f["file_key"] for f in by_group["memory notes"]] == ["memory/note1.md"]
+        assert [f["file_key"] for f in by_group["other"]] == ["AGENTS.md"]
+        cm = by_group["CLAUDE.md"][0]
+        assert cm["surface_id"] == "hostA" and cm["scope"] == "global"
+        assert cm["size"] > 0 and cm["updated_at"] is not None
+
+        # file detail: content + meta + deduped, ordered wikilinks
+        fd = client.get("/dash/api/behavior/file?key=CLAUDE.md&scope=global", headers=_H).json()
+        assert fd["file_key"] == "CLAUDE.md" and "[[voice]]" in fd["content"]
+        assert fd["links"] == ["voice", "job_crons"]  # first-seen order, deduped
+        assert fd["meta"]["surface_id"] == "hostA" and fd["meta"]["scope"] == "global"
+        assert fd["meta"]["content_hash"] and fd["meta"]["size"] == len(fd["content"])
+
+        # missing key -> 400; unknown file -> 404
+        assert client.get("/dash/api/behavior/file", headers=_H).status_code == 400
+        assert (
+            client.get("/dash/api/behavior/file?key=nope.md&scope=global", headers=_H).status_code
+            == 404
+        )
+
+        # linkgraph: node per logical file_key + one edge per [[wikilink]] instance
+        lg = client.get("/dash/api/behavior/linkgraph", headers=_H).json()
+        node_keys = {n["file_key"] for n in lg["nodes"]}
+        assert node_keys == {"CLAUDE.md", "rules/voice.md", "memory/note1.md", "AGENTS.md"}
+        edge_pairs = {(e["source"], e["target"]) for e in lg["edges"]}
+        assert ("CLAUDE.md", "voice") in edge_pairs and ("CLAUDE.md", "job_crons") in edge_pairs
+        assert ("rules/voice.md", "CLAUDE") in edge_pairs
+        assert ("memory/note1.md", "voice") in edge_pairs
+        # CLAUDE.md's duplicate [[voice]] is deduped in links but the edge list holds one 'voice'.
+        assert sum(1 for e in lg["edges"] if e["source"] == "CLAUDE.md") == 2
+
+
+def test_behavior_file_surface_disambiguation(clean_behavior, conn, db_url):
+    # Same file_key on two surfaces (PK includes surface_id) — explicit surface selects one.
+    _config_reg(conn, file_key="CLAUDE.md", content="host A body", surface_id="hostA")
+    _config_reg(conn, file_key="CLAUDE.md", content="host B body", surface_id="hostB")
+    with _client(db_url) as client:
+        a = client.get(
+            "/dash/api/behavior/file?key=CLAUDE.md&scope=global&surface=hostB", headers=_H
+        ).json()
+    assert a["content"] == "host B body" and a["meta"]["surface_id"] == "hostB"
+
+
+# ---- Token gates ----
+
+
+def test_phase5_routes_require_machine_token(clean, conn, db_url):
+    with _client(db_url) as client:
+        for path in (
+            "/dash/api/timeline",
+            "/dash/api/preferences",
+            "/dash/api/dream/report",
+            "/dash/api/behavior/files",
+            "/dash/api/behavior/file?key=CLAUDE.md",
+            "/dash/api/behavior/linkgraph",
+        ):
+            r = client.get(path)
+            assert r.status_code == 401
+            assert r.json() == {"status": "error", "detail": "unauthorized"}
+
+
+def _mini_graph(conn):
+    """6-8 entities, ~10 edges, one superseded + one not-yet-valid. Degrees are set so
+    truncation order is deterministic. Returns the seed episode id for provenance checks."""
+    _gent(conn, "g-hub", name="Synapse", degree=10, entity_type="Project")
+    _gent(conn, "g-pg", name="Postgres", degree=8)
+    _gent(conn, "g-cc", name="Claude Code", degree=6)
+    _gent(conn, "g-kg", name="knowledge graph", degree=5, entity_type="Concept")
+    _gent(conn, "g-anthropic", name="Anthropic", degree=4, entity_type="Organization")
+    _gent(conn, "g-nuc", name="homelab NUC", degree=3)  # depth-2 (via g-pg)
+    _gent(conn, "g-sse", name="SSE stream", degree=2)  # depth-2 (via g-cc)
+    _gent(conn, "g-far", name="embedding cache", degree=1)  # depth-2 (via g-pg)
+    _gent(conn, "g-future", name="future thing", degree=0)  # only via a not-yet-valid edge
+
+    ep = _episode(conn, session="g", seq=1, content="synapse stores in postgres")
+    # Depth-1 (from g-hub) live edges.
+    _rel(
+        conn,
+        "e1",
+        src="g-hub",
+        tgt="g-pg",
+        name="stores in",
+        fact="Synapse stores in Postgres",
+        episodes=[ep],
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e2",
+        src="g-hub",
+        tgt="g-cc",
+        name="ingests from",
+        fact="Synapse ingests from Claude Code",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e3",
+        src="g-hub",
+        tgt="g-kg",
+        name="extracts",
+        fact="Synapse extracts a knowledge graph",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e4",
+        src="g-hub",
+        tgt="g-anthropic",
+        name="built by",
+        fact="Synapse built by Anthropic",
+        t_valid=_t(0),
+    )
+    # Depth-2 edges.
+    _rel(
+        conn,
+        "e5",
+        src="g-pg",
+        tgt="g-nuc",
+        name="runs on",
+        fact="Postgres runs on the homelab NUC",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e6",
+        src="g-pg",
+        tgt="g-far",
+        name="caches in",
+        fact="Postgres caches in the embedding cache",
+        t_valid=_t(0),
+    )
+    _rel(
+        conn,
+        "e7",
+        src="g-cc",
+        tgt="g-sse",
+        name="emits",
+        fact="Claude Code emits an SSE stream",
+        t_valid=_t(0),
+    )
+    # Superseded edge (t_valid before base, invalidated before base) — always included when
+    # as_of >= its t_valid; the client dashes it.
+    _rel(
+        conn,
+        "e-super",
+        src="g-hub",
+        tgt="g-pg",
+        name="used",
+        fact="Synapse used SQLite",
+        t_valid=_t(-1000),
+        t_invalid=_t(-10),
+    )
+    # Not-yet-valid edge — hidden when as_of < its t_valid.
+    _rel(
+        conn,
+        "e-future",
+        src="g-hub",
+        tgt="g-future",
+        name="will use",
+        fact="Synapse will use a future thing",
+        t_valid=_t(100),
+    )
+    return ep
+
+
+def test_graph_typeahead(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        # ILIKE on name, degree DESC — matches carrying 'a' come back highest-degree first.
+        r = client.get("/dash/api/graph/entities?q=a", headers=_H).json()
+        assert isinstance(r, list) and len(r) >= 3
+        degs = [row["degree"] for row in r]
+        assert degs == sorted(degs, reverse=True)  # degree DESC ordering
+        assert set(r[0].keys()) == {"uuid", "name", "entity_type", "degree"}
+
+        # A precise substring resolves to the one entity.
+        pg = client.get("/dash/api/graph/entities?q=Postgres", headers=_H).json()
+        assert [row["uuid"] for row in pg] == ["g-pg"]
+
+        # limit caps the result count.
+        capped = client.get("/dash/api/graph/entities?q=a&limit=2", headers=_H).json()
+        assert len(capped) == 2
+
+        # Empty q -> empty list.
+        assert client.get("/dash/api/graph/entities?q=", headers=_H).json() == []
+
+
+def test_graph_neighborhood_depth_1_vs_2(clean, conn, db_url):
+    ep = _mini_graph(conn)
+    with _client(db_url) as client:
+        d1 = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=1", headers=_H).json()
+        d1_nodes = {n["uuid"] for n in d1["nodes"]}
+        # depth 1: seed + its direct neighbors (incl. the not-yet-valid future edge, since
+        # as_of is unset) — but NOT the depth-2 nodes.
+        assert d1_nodes == {"g-hub", "g-pg", "g-cc", "g-kg", "g-anthropic", "g-future"}
+        assert d1["seed"] == "g-hub" and d1["truncated"] is False
+        assert d1["nodes"][0]["uuid"] == "g-hub"  # seed sorted first
+        # node payload shape
+        assert set(d1["nodes"][0].keys()) == {"uuid", "name", "entity_type", "degree", "summary"}
+        # edge payload shape + provenance resolution
+        e1 = next(e for e in d1["edges"] if e["uuid"] == "e1")
+        assert e1["src"] == "g-hub" and e1["tgt"] == "g-pg" and e1["provenance_episode_id"] == ep
+        assert set(e1.keys()) == {
+            "uuid",
+            "src",
+            "tgt",
+            "name",
+            "fact",
+            "t_valid",
+            "t_invalid",
+            "provenance_episode_id",
+            "retrieval_count",
+        }
+
+        d2 = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=2", headers=_H).json()
+        d2_nodes = {n["uuid"] for n in d2["nodes"]}
+        # depth 2 pulls in the second ring via g-pg / g-cc.
+        assert {"g-nuc", "g-far", "g-sse"} <= d2_nodes
+        assert d2["truncated"] is False
+
+
+def test_graph_neighborhood_as_of_filter(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        # quote() so the '+' in the ISO offset survives as an offset, not a decoded space.
+        as_of = quote(_t(50).isoformat())
+        r = client.get(
+            f"/dash/api/graph/neighborhood?entity=g-hub&depth=1&as_of={as_of}", headers=_H
+        ).json()
+        node_ids = {n["uuid"] for n in r["nodes"]}
+        edge_ids = {e["uuid"] for e in r["edges"]}
+        # not-yet-valid edge (t_valid=_t(100) > as_of) is hidden -> its exclusive node drops.
+        assert "g-future" not in node_ids
+        assert "e-future" not in edge_ids
+        # superseded edge (t_valid=_t(-1000) <= as_of, t_invalid set) is INCLUDED, dashed client-side.
+        sup = next(e for e in r["edges"] if e["uuid"] == "e-super")
+        assert sup["t_invalid"] is not None
+        # live edges still present.
+        assert "e1" in edge_ids
+
+
+def test_graph_neighborhood_truncation_keeps_highest_degree(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        r = client.get(
+            "/dash/api/graph/neighborhood?entity=g-hub&depth=2&limit=3", headers=_H
+        ).json()
+        assert r["truncated"] is True
+        kept = {n["uuid"] for n in r["nodes"]}
+        # budget 3 -> seed (always) + the two highest-degree reachable nodes (g-pg=8, g-cc=6).
+        assert kept == {"g-hub", "g-pg", "g-cc"}
+        # every returned edge connects two kept nodes.
+        for e in r["edges"]:
+            assert e["src"] in kept and e["tgt"] in kept
+
+
+def test_graph_neighborhood_name_seed_resolution(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        # exact normalized_name (case-insensitive input).
+        exact = client.get("/dash/api/graph/neighborhood?entity=Synapse", headers=_H).json()
+        assert exact["seed"] == "g-hub"
+        # no exact normalized_name -> best ILIKE match by degree.
+        fuzzy = client.get("/dash/api/graph/neighborhood?entity=postgr", headers=_H).json()
+        assert fuzzy["seed"] == "g-pg"
+        # unknown seed -> 404.
+        assert (
+            client.get("/dash/api/graph/neighborhood?entity=nope-xyz", headers=_H).status_code
+            == 404
+        )
+        # missing entity param -> 400.
+        assert client.get("/dash/api/graph/neighborhood", headers=_H).status_code == 400
+
+
+def test_graph_endpoints_require_machine_token(clean, conn, db_url):
+    _mini_graph(conn)
+    with _client(db_url) as client:
+        for path in ("/dash/api/graph/entities?q=a", "/dash/api/graph/neighborhood?entity=g-hub"):
+            r = client.get(path)
+            assert r.status_code == 401
+            assert r.json() == {"status": "error", "detail": "unauthorized"}

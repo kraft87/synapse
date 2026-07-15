@@ -138,6 +138,79 @@ const FIX_METRICS = {
   },
 };
 
+// ---- timeline / preferences / dream / behavior fixtures (phase 5) — obviously synthetic ----
+const day = (d: string) => new Date(d + 'T12:00:00Z').toISOString();
+const FIX_P5 = {
+  timeline: {
+    events: [
+      { id: 3, t_valid: day('2026-07-03'), fact: 'Rerank latency regression fixed — candidate pool capped at 96.', source: 'chat', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
+      { id: 2, t_valid: day('2026-07-03'), fact: 'SSE Last-Event-ID resume shipped.', source: 'git:example', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
+      { id: 1, t_valid: day('2026-07-01'), fact: 'Embedding cache moved into Postgres (pgvector table).', source: 'git:example', project: 'synapse', salience: 1, sal: 0.6, event_type: 'work', episode_id: 88101, flagged: false },
+      { id: 0, t_valid: day('2026-06-30'), fact: 'Took a proper rest day.', source: 'chat', project: null, salience: 1, sal: 0.6, event_type: 'health', episode_id: null, flagged: true },
+    ],
+    next_before: null,
+  },
+  preferences: {
+    preferences: [
+      { id: 1, pref: 'Wants recall() debug output on by default in dev', polarity: 'like', first_seen: day('2026-06-18'), last_asserted: day('2026-07-10'), assert_count: 3, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 2, pref: 'Avoid CDN dependencies — everything self-hosted', polarity: 'dislike', first_seen: day('2026-04-11'), last_asserted: day('2026-07-02'), assert_count: 6, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 3, pref: 'Prefers boring, well-understood infra over clever abstractions', polarity: 'like', first_seen: day('2026-03-02'), last_asserted: day('2026-06-20'), assert_count: 7, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 4, pref: 'Dislikes ORMs for this project — raw SQL only', polarity: 'dislike', first_seen: day('2026-02-14'), last_asserted: day('2026-06-01'), assert_count: 5, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 5, pref: 'Prefers dark theme everywhere', polarity: 'rule', first_seen: day('2026-01-20'), last_asserted: day('2026-05-11'), assert_count: 9, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 6, pref: 'Liked hosted vector DBs', polarity: 'like', first_seen: day('2025-11-08'), last_asserted: day('2026-01-02'), assert_count: 2, superseded_by: 3, superseded_by_text: 'self-hosted pgvector', t_invalid: day('2026-02-15'), flagged: false },
+    ],
+  },
+  dreamReport: {
+    runs: [
+      {
+        id: 6, started_at: day('2026-07-03'), finished_at: day('2026-07-03'), duration_s: 2460, ok: true,
+        stages: { skills: { ran: true, ok: true }, config: { ran: true, ok: true } },
+        counts: { facts_extracted: 128, superseded: 14, dedup_merges: 1882, timeline_events: 9, proposals_raised: 3 },
+        samples: { proposals: [{ id: 'config:4', kind: 'config-edit', name: 'rules/learned.md' }], facts_extracted: [{ text: 'SSE endpoint — supports → Last-Event-ID resume' }, { text: 'recall() — has parameter → RERANK_POOL_CAP (default 96)' }, { text: 'embedding cache — stored in → embeddings_cache (Postgres)' }] },
+        errors: [],
+      },
+      {
+        id: 5, started_at: day('2026-07-02'), finished_at: day('2026-07-02'), duration_s: 1980, ok: true,
+        stages: { skills: { ran: true, ok: true }, config: { ran: true, ok: false } },
+        counts: { proposals_raised: 1, config_proposals: 1 },
+        samples: { proposals: [{ id: 'skill:12', kind: 'skill', name: 'latency-triage' }] },
+        errors: ['config lane: proposer LLM call timed out'],
+      },
+    ],
+  },
+  behaviorFiles: {
+    groups: [
+      { name: 'CLAUDE.md', files: [{ file_key: 'CLAUDE.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-07-10'), size: 4120 }] },
+      { name: 'rules', files: [
+        { file_key: 'rules/voice.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-07-08'), size: 980 },
+        { file_key: 'rules/memory-protocol.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-06-30'), size: 1450 },
+      ] },
+      { name: 'memory notes', files: [{ file_key: 'memory/project_briefing.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-07-05'), size: 720 }] },
+      { name: 'other', files: [{ file_key: 'AGENTS.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-05-01'), size: 300 }] },
+    ],
+  },
+  behaviorFile: {
+    file_key: 'CLAUDE.md',
+    content: '# CLAUDE.md\n\nYou are an example operator persona.\n\n- Prefer raw SQL over the ORM (see [[rules/voice.md]]).\n- Memory protocol lives in [[rules/memory-protocol.md]].\n- Standing crons: [[memory/project_briefing.md]].\n',
+    meta: { surface_id: 'cortex', scope: 'global', abs_path: '/home/example/.claude/CLAUDE.md', content_hash: 'deadbeef', modified_at: day('2026-07-10'), updated_at: day('2026-07-10'), size: 4120 },
+    links: ['rules/voice.md', 'rules/memory-protocol.md', 'memory/project_briefing.md'],
+  },
+  behaviorLinkgraph: {
+    nodes: [
+      { file_key: 'CLAUDE.md', scope: 'global', group: 'CLAUDE.md' },
+      { file_key: 'rules/voice.md', scope: 'global', group: 'rules' },
+      { file_key: 'rules/memory-protocol.md', scope: 'global', group: 'rules' },
+      { file_key: 'memory/project_briefing.md', scope: 'global', group: 'memory notes' },
+    ],
+    edges: [
+      { source: 'CLAUDE.md', target: 'rules/voice.md' },
+      { source: 'CLAUDE.md', target: 'rules/memory-protocol.md' },
+      { source: 'CLAUDE.md', target: 'memory/project_briefing.md' },
+      { source: 'rules/memory-protocol.md', target: 'rules/voice.md' },
+    ],
+  },
+};
+
 const SEARCH: Record<string, unknown[]> = {
   episodes: [{ type: 'episodes', id: '1', snippet: 'wired service A to library B', meta: { project: 'service-a', source: 'claude-code', ts: iso(0.4), session_id: 'sess-1', episode_id: 1 } }],
   facts: [{ type: 'facts', id: 'ent-edge-1', snippet: 'service A depends on library B', meta: { project: 'service-a', source: 'claude-code', ts: iso(24), session_id: 'sess-1', episode_id: 1 } }],
@@ -154,6 +227,37 @@ const RECALL_HISTORY = {
     { id: 2, created_at: iso(28), query: 'widget cache refactor', source: 'http', ms_total: 164, est_tokens: 388, rerank_top_score: 0.81 },
   ],
 };
+
+// ---- graph explorer fixtures (phase 6) — obviously synthetic ----
+const GRAPH_NODES = [
+  { uuid: 'g-syn', name: 'Synapse', entity_type: 'Project', degree: 10, summary: 'Self-hosted memory server: ingestion, KG extraction, hybrid recall over MCP. The system this dashboard observes.' },
+  { uuid: 'g-pg', name: 'Postgres', entity_type: 'Technology', degree: 8, summary: 'Primary datastore — episodes, KG, timeline all live here.' },
+  { uuid: 'g-cc', name: 'Claude Code', entity_type: 'Technology', degree: 6, summary: 'One ingestion source (JSONL transcripts).' },
+  { uuid: 'g-kg', name: 'knowledge graph', entity_type: 'Concept', degree: 6, summary: 'Entities + bitemporal relationships extracted from episodes.' },
+  { uuid: 'g-anthropic', name: 'Anthropic', entity_type: 'Organization', degree: 4, summary: 'Maker of the Claude models Synapse ingests from.' },
+  { uuid: 'g-nuc', name: 'homelab NUC', entity_type: 'Technology', degree: 3, summary: 'The box the whole stack runs on.' },
+  { uuid: 'g-sse', name: 'SSE stream', entity_type: 'Concept', degree: 2, summary: 'Live feed push channel for the dashboard.' },
+  { uuid: 'g-cache', name: 'embedding cache', entity_type: 'Technology', degree: 2, summary: 'Memoized embeddings to cut recall latency.' },
+  { uuid: 'g-pgvector', name: 'pgvector', entity_type: 'Technology', degree: 3, summary: 'ANN index extension used for the vector leg.' },
+  { uuid: 'g-salience', name: 'salience decay', entity_type: 'Concept', degree: 1, summary: 'Timeline event weighting over time.' },
+  { uuid: 'g-op', name: 'the operator', entity_type: 'Person', degree: 2, summary: 'The single technical user this dashboard serves.' },
+];
+const GH = 24 * 30; // ~1 month in hours, for validity dates
+const GRAPH_EDGES = [
+  { uuid: 'ge1', src: 'g-syn', tgt: 'g-pg', name: 'stores in', fact: 'Synapse stores everything in Postgres', t_valid: iso(GH * 5), t_invalid: null, provenance_episode_id: 87960, retrieval_count: 41 },
+  { uuid: 'ge2', src: 'g-syn', tgt: 'g-cc', name: 'ingests from', fact: 'Synapse ingests conversation history from Claude Code', t_valid: iso(GH * 5), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 33 },
+  { uuid: 'ge3', src: 'g-syn', tgt: 'g-kg', name: 'extracts', fact: 'Synapse extracts a knowledge graph from episodes', t_valid: iso(GH * 4), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 51 },
+  { uuid: 'ge4', src: 'g-syn', tgt: 'g-anthropic', name: 'built on', fact: 'Synapse is built on Anthropic models', t_valid: iso(GH * 4), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 12 },
+  { uuid: 'ge5', src: 'g-pg', tgt: 'g-nuc', name: 'runs on', fact: 'Postgres runs on the homelab NUC', t_valid: iso(GH * 5), t_invalid: null, provenance_episode_id: 87900, retrieval_count: 9 },
+  { uuid: 'ge6', src: 'g-pg', tgt: 'g-pgvector', name: 'uses', fact: 'Postgres uses pgvector for ANN search', t_valid: iso(GH * 3), t_invalid: null, provenance_episode_id: 87901, retrieval_count: 18 },
+  { uuid: 'ge7', src: 'g-syn', tgt: 'g-sse', name: 'emits', fact: 'Synapse emits an SSE stream to the dashboard', t_valid: iso(GH * 2), t_invalid: null, provenance_episode_id: 88200, retrieval_count: 6 },
+  { uuid: 'ge8', src: 'g-syn', tgt: 'g-cache', name: 'uses', fact: 'Synapse uses an embedding cache', t_valid: iso(GH * 2), t_invalid: null, provenance_episode_id: 88210, retrieval_count: 7 },
+  { uuid: 'ge9', src: 'g-syn', tgt: 'g-op', name: 'serves', fact: 'Synapse serves memory to the operator through recall()', t_valid: iso(GH * 6), t_invalid: null, provenance_episode_id: 88101, retrieval_count: 341 },
+  { uuid: 'ge10', src: 'g-syn', tgt: 'g-salience', name: 'weights by', fact: 'Synapse weights timeline events by salience decay', t_valid: iso(GH * 3), t_invalid: null, provenance_episode_id: 88050, retrieval_count: 4 },
+  // superseded: Synapse USED to store in SQLite before Postgres.
+  { uuid: 'ge-sup', src: 'g-syn', tgt: 'g-pg', name: 'used', fact: 'Synapse stored everything in SQLite', t_valid: iso(GH * 10), t_invalid: iso(GH * 6), provenance_episode_id: 80000, retrieval_count: 2 },
+];
+const GRAPH_NEIGHBORHOOD = { nodes: GRAPH_NODES, edges: GRAPH_EDGES, truncated: false, seed: 'g-syn' };
 
 export function mockRecall<T>(query: string): Promise<T> {
   return Promise.resolve({
@@ -196,6 +300,20 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'metrics/recall') out = FIX_METRICS.recall;
   else if (p === 'metrics/ingestion') out = FIX_METRICS.ingestion;
   else if (p === 'metrics/corpus') out = FIX_METRICS.corpus;
+  else if (p === 'timeline') out = FIX_P5.timeline;
+  else if (p === 'preferences') out = FIX_P5.preferences;
+  else if (p === 'dream/report') out = FIX_P5.dreamReport;
+  else if (p === 'behavior/files') out = FIX_P5.behaviorFiles;
+  else if (p === 'behavior/file') out = FIX_P5.behaviorFile;
+  else if (p === 'behavior/linkgraph') out = FIX_P5.behaviorLinkgraph;
+  else if (p === 'graph/entities') {
+    const q = (path.split('q=')[1] || '').toLowerCase();
+    out = GRAPH_NODES
+      .filter((n) => !q || n.name.toLowerCase().includes(decodeURIComponent(q)))
+      .sort((a, b) => b.degree - a.degree)
+      .slice(0, 10)
+      .map((n) => ({ uuid: n.uuid, name: n.name, entity_type: n.entity_type, degree: n.degree }));
+  } else if (p === 'graph/neighborhood') out = GRAPH_NEIGHBORHOOD;
   else if (p === 'proposals') out = FIX.proposals;
   else if (/^proposals\//.test(p)) out = FIX['proposals/' + p.substring('proposals/'.length)] || {};
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;

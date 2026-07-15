@@ -10,11 +10,14 @@
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.1.1",
     "@fontsource/ibm-plex-sans": "^5.1.1",
+    "cytoscape": "^3.34.0",
+    "cytoscape-cose-bilkent": "^4.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "uplot": "^1.6.32"
   },
   "devDependencies": {
+    "@types/cytoscape": "^3.21.9",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "esbuild": "^0.24.2",
