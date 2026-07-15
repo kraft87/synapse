@@ -364,3 +364,46 @@ export function feedItemPassesFilter(
   }
   return true;
 }
+// ---------- metrics (phase 4) ----------
+// Wire shapes pinned in docs/dashboard-contract.md §"Phase 4". Honesty flags carried through:
+// corpus rows can be a pg_class estimate (`rows_estimated`), and ingestion has NO queue-depth
+// history (only enqueue/hour + completed/hour throughput), so the client never plots a fabricated
+// depth series.
+export interface MetricsRecallPoint {
+  t: string; p50: number | null; p95: number | null; calls: number;
+  tokens_p50: number | null; legs_p50: Record<string, number>;
+}
+export interface MetricsRecall {
+  series: MetricsRecallPoint[];
+  slowest: { query: string; ms_total: number | null; created_at: string }[];
+  score_hist: { lo: number; hi: number; n: number }[];
+}
+export interface DreamRun {
+  id: number; started_at: string; finished_at: string | null; duration_s: number | null;
+  ok: boolean | null; stages: Record<string, { ran?: boolean; ok?: boolean }>;
+  counts: Record<string, number>;
+  samples: { proposals?: { id: string; kind: string; name: string }[] };
+  errors: string[];
+}
+export interface MetricsIngestion {
+  queue_depth: number;
+  queue: { pending: number; processing: number; failed: number };
+  throughput: {
+    enqueued_per_hour: { t: string; n: number }[];
+    completed_per_hour: { t: string; n: number }[];
+  };
+  failures: { id: number; episode_id: number | null; error: string; enqueued_at: string; processed_at: string | null; attempts: number }[];
+  last_dream: DreamRun | null;
+}
+export interface MetricsCorpus {
+  tables: { name: string; rows: number; rows_estimated: boolean; spark_30d: number[]; delta_30d: number }[];
+  by_project: { name: string; n: number }[];
+  by_source: { name: string; n: number }[];
+}
+
+export const fetchMetricsRecall = (window = '7d'): Promise<MetricsRecall> =>
+  MOCK ? mockApi('/metrics/recall') : req('/metrics/recall' + qs({ window }));
+export const fetchMetricsIngestion = (window = '48h'): Promise<MetricsIngestion> =>
+  MOCK ? mockApi('/metrics/ingestion') : req('/metrics/ingestion' + qs({ window }));
+export const fetchMetricsCorpus = (): Promise<MetricsCorpus> =>
+  MOCK ? mockApi('/metrics/corpus') : req('/metrics/corpus');

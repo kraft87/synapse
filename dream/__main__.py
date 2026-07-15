@@ -20,6 +20,7 @@ import sys
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 logging.basicConfig(
     level=logging.INFO,
@@ -54,6 +55,16 @@ def run_once(stages: set[int] | None = None) -> None:
 
     logger.info("Dream pipeline starting (stages=%s)", sorted(stages))
 
+    # dream_runs bookkeeping (schema 044): one row per run, feeds the Metrics ops page's
+    # "last nightly-dream run" panel + the phase-5 Dream-report page. ALL of it is fail-soft:
+    # a bookkeeping error can never crash the pipeline (see _dream_* helpers). run_id is None
+    # when the start-insert failed, in which case the finish-update no-ops.
+    run_id = _dream_record_start(db_url)
+    run_stages: dict[str, Any] = {}
+    counts: dict[str, Any] = {}
+    errors: list[str] = []
+    overall_ok = True
+
     # dream→skills lane. Lazy import + try/except so a lane error can't crash the dream loop,
     # and gated on SKILLS_LANE_ENABLED so the image can ship inert until the cutover flips it on
     # (deploy → verify a manual pass → set the flag → retire the client cron).
@@ -62,8 +73,12 @@ def run_once(stages: set[int] | None = None) -> None:
             from dream.skills.nightly import run_lane
 
             run_lane(limit=int(os.environ.get("SKILLS_LANE_LIMIT", "30")))
+            run_stages["skills"] = {"ran": True, "ok": True}
         except Exception as e:
             logger.error("dream→skills lane failed: %s", e, exc_info=True)
+            run_stages["skills"] = {"ran": True, "ok": False}
+            errors.append(f"skills lane: {e}")
+            overall_ok = False
 
     # dream→config lane (mines behavioral corrections -> config_proposals). ON by default; the env
     # var is a KILL SWITCH (CONFIG_LANE_ENABLED=0 to disable), not an enable gate. Propose-only and
@@ -72,14 +87,142 @@ def run_once(stages: set[int] | None = None) -> None:
         try:
             from dream.config.nightly import run_lane as run_config_lane
 
-            run_config_lane(limit=int(os.environ.get("CONFIG_LANE_LIMIT", "30")))
+            res = run_config_lane(limit=int(os.environ.get("CONFIG_LANE_LIMIT", "30")))
+            run_stages["config"] = {"ran": True, "ok": True}
+            # The config lane returns {"sessions", "found", "proposed"} — the ONLY counts a
+            # lane exposes cheaply today. Record what it gives; leave the rest absent.
+            if isinstance(res, dict):
+                if res.get("sessions") is not None:
+                    counts["config_sessions_scanned"] = res["sessions"]
+                if res.get("found") is not None:
+                    counts["config_corrections_found"] = res["found"]
+                if res.get("proposed") is not None:
+                    counts["config_proposals"] = res["proposed"]
         except Exception as e:
             logger.error("dream→config lane failed: %s", e, exc_info=True)
+            run_stages["config"] = {"ran": True, "ok": False}
+            errors.append(f"config lane: {e}")
+            overall_ok = False
 
     if 3 in stages:
         _stage3_memory_proposals(db_url)
 
+    # Aggregate the proposals actually raised this run + a few bounded samples (cheap DB reads;
+    # fail-soft) so the report panel has drill-in material without re-architecting the lanes.
+    samples = _dream_collect_proposals(db_url, run_id, counts)
+    _dream_record_finish(db_url, run_id, run_stages, counts, samples, errors, overall_ok)
+
     logger.info("Dream pipeline complete")
+
+
+# ---------------------------------------------------------------------------
+# dream_runs bookkeeping (schema 044) — every function is fail-soft: a bookkeeping
+# error is logged and swallowed so it can NEVER break the pipeline.
+# ---------------------------------------------------------------------------
+
+_SAMPLE_CAP = 10  # bound per-count sample arrays (schema 044 header)
+
+
+def _dream_record_start(db_url: str) -> int | None:
+    """INSERT the run row (ok NULL, finished_at NULL) and return its id, or None on any error."""
+    try:
+        import psycopg
+
+        with psycopg.connect(db_url, autocommit=True) as conn:
+            row = conn.execute(
+                "INSERT INTO dream_runs (started_at) VALUES (now()) RETURNING id"
+            ).fetchone()
+            return int(row[0]) if row else None
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("dream_runs start-insert failed (bookkeeping only): %s", e)
+        return None
+
+
+def _dream_collect_proposals(
+    db_url: str, run_id: int | None, counts: dict[str, Any]
+) -> dict[str, Any]:
+    """Best-effort, cheap: count + sample the proposals raised since this run started, across
+    both lanes. Sets counts['proposals_raised'] and returns {"proposals": [...]} (bounded).
+    Each sub-query is independently fail-soft — a missing lane schema just yields nothing."""
+    samples: dict[str, Any] = {}
+    if run_id is None:
+        return samples
+    try:
+        import psycopg
+
+        with psycopg.connect(db_url, autocommit=True, row_factory=None) as conn:
+            started = conn.execute(
+                "SELECT started_at FROM dream_runs WHERE id = %s", (run_id,)
+            ).fetchone()
+            if not started:
+                return samples
+            since = started[0]
+            proposals: list[dict[str, Any]] = []
+            total = 0
+            # skills lane — status 'proposed', created since the run began.
+            try:
+                for pid, name in conn.execute(
+                    "SELECT id, name FROM skills_lane.skill_gap_candidates "
+                    "WHERE status = 'proposed' AND created_at >= %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (since, _SAMPLE_CAP),
+                ).fetchall():
+                    proposals.append({"id": f"skill:{pid}", "kind": "skill", "name": name})
+                total += conn.execute(
+                    "SELECT count(*) FROM skills_lane.skill_gap_candidates "
+                    "WHERE status = 'proposed' AND created_at >= %s",
+                    (since,),
+                ).fetchone()[0]
+            except Exception as e:  # pragma: no cover - lane may be absent
+                logger.debug("dream_runs skills sample skipped: %s", e)
+            # config lane — status 'proposed', created since the run began.
+            try:
+                for pid, fkey in conn.execute(
+                    "SELECT id, file_key FROM config_lane.config_proposals "
+                    "WHERE status = 'proposed' AND created_at >= %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (since, _SAMPLE_CAP),
+                ).fetchall():
+                    proposals.append({"id": f"config:{pid}", "kind": "config-edit", "name": fkey})
+                total += conn.execute(
+                    "SELECT count(*) FROM config_lane.config_proposals "
+                    "WHERE status = 'proposed' AND created_at >= %s",
+                    (since,),
+                ).fetchone()[0]
+            except Exception as e:  # pragma: no cover - lane may be absent
+                logger.debug("dream_runs config sample skipped: %s", e)
+            counts["proposals_raised"] = total
+            if proposals:
+                samples["proposals"] = proposals[:_SAMPLE_CAP]
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("dream_runs proposal aggregation failed (bookkeeping only): %s", e)
+    return samples
+
+
+def _dream_record_finish(
+    db_url: str,
+    run_id: int | None,
+    run_stages: dict[str, Any],
+    counts: dict[str, Any],
+    samples: dict[str, Any],
+    errors: list[str],
+    ok: bool,
+) -> None:
+    """UPDATE the run row with finished_at + the collected outcome. No-op if run_id is None."""
+    if run_id is None:
+        return
+    try:
+        import psycopg
+        from psycopg.types.json import Json
+
+        with psycopg.connect(db_url, autocommit=True) as conn:
+            conn.execute(
+                "UPDATE dream_runs SET finished_at = now(), stages = %s, counts = %s, "
+                "samples = %s, errors = %s, ok = %s WHERE id = %s",
+                (Json(run_stages), Json(counts), Json(samples), Json(errors), ok, run_id),
+            )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("dream_runs finish-update failed (bookkeeping only): %s", e)
 
 
 def _stage3_memory_proposals(db_url: str) -> None:

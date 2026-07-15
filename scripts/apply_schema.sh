@@ -85,6 +85,7 @@ FILES=(
   041_notes.sql
   042_dashboard.sql
   043_dash_notify.sql
+  044_dream_runs.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

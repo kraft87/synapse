@@ -46,7 +46,8 @@ def _t(minutes: int) -> datetime:
 def _wipe(conn):
     conn.execute(
         "TRUNCATE episodes, kg_entities, kg_relationships, timeline_events, "
-        "notes, preferences, dashboard_flags, dashboard_audit, recall_metrics "
+        "notes, preferences, chunks, extraction_queue, dream_runs, "
+        "dashboard_flags, dashboard_audit, recall_metrics "
         "RESTART IDENTITY CASCADE"
     )
 
@@ -198,11 +199,65 @@ def _metric(
     est_tokens=100,
     rerank_top_score=0.5,
     created_at=None,
+    legs=None,  # optional {embed,bm25,vector,kg,web,rerank,timeline,prefs} → ms_* columns
 ):
+    legs = legs or {}
     return conn.execute(
         "INSERT INTO recall_metrics (kind, source, query, ms_total, est_tokens, "
-        " rerank_top_score, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-        (kind, source, query, ms_total, est_tokens, rerank_top_score, created_at or _t(0)),
+        " rerank_top_score, created_at, ms_embed, ms_bm25, ms_vector, ms_kg, ms_web, "
+        " ms_rerank, ms_timeline, ms_prefs) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (
+            kind,
+            source,
+            query,
+            ms_total,
+            est_tokens,
+            rerank_top_score,
+            created_at or _t(0),
+            legs.get("embed"),
+            legs.get("bm25"),
+            legs.get("vector"),
+            legs.get("kg"),
+            legs.get("web"),
+            legs.get("rerank"),
+            legs.get("timeline"),
+            legs.get("prefs"),
+        ),
+    ).fetchone()[0]
+
+
+def _queue(
+    conn,
+    *,
+    content="turn body",
+    status="pending",
+    episode_id=None,
+    error=None,
+    attempts=0,
+    enqueued_at=None,
+    processed_at=None,
+):
+    return conn.execute(
+        "INSERT INTO extraction_queue "
+        "(episode_id, content, status, error, attempts, enqueued_at, processed_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (episode_id, content, status, error, attempts, enqueued_at, processed_at),
+    ).fetchone()[0]
+
+
+def _dream_run(conn, *, started_at, finished_at, counts, samples=None, stages=None, ok=True):
+    return conn.execute(
+        "INSERT INTO dream_runs (started_at, finished_at, stages, counts, samples, ok) "
+        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id",
+        (
+            started_at,
+            finished_at,
+            Json(stages or {}),
+            Json(counts),
+            Json(samples or {}),
+            ok,
+        ),
     ).fetchone()[0]
 
 
@@ -1065,6 +1120,227 @@ def test_sse_frame_format():
     assert st == 'event: processing_status\ndata: {"queue_depth":3,"active":true}\n\n'
     assert "id:" not in st
     assert _sse_frame("reset", "{}").endswith("\n\n")
+
+
+# Metrics (phase 4) — recall percentiles / ingestion / corpus
+# ---------------------------------------------------------------------------
+
+
+def test_parse_window_caps_and_defaults():
+    """Pure-function window parsing: unit suffixes, 1h floor, 30d cap, safe fallback."""
+    from mcp_server.dashboard_routes import _parse_window
+
+    assert _parse_window(None, 7 * 86400) == 7 * 86400
+    assert _parse_window("48h", 7 * 86400) == 48 * 3600
+    assert _parse_window("2d", 7 * 86400) == 2 * 86400
+    assert _parse_window("90d", 7 * 86400) == 30 * 86400  # capped at 30d
+    assert _parse_window("30m", 7 * 86400) == 3600  # floored at 1h
+    assert _parse_window("garbage", 111) == 111
+
+
+def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url):
+    now = datetime.now(UTC)
+    h = now.replace(minute=0, second=0, microsecond=0)  # current hour-bucket start
+    legs = {"embed": 10.0, "bm25": 20.0, "vector": 30.0, "kg": 40.0, "web": 5.0, "rerank": 50.0}
+    # bucket A (current hour): three recall rows, ms 100/200/300 (float32-exact)
+    _metric(
+        conn,
+        query="q-slow",
+        ms_total=300.0,
+        est_tokens=1200,
+        rerank_top_score=0.95,
+        created_at=h + timedelta(minutes=1),
+        legs=legs,
+    )
+    _metric(
+        conn,
+        query="q-mid",
+        ms_total=200.0,
+        est_tokens=1000,
+        rerank_top_score=0.55,
+        created_at=h + timedelta(minutes=2),
+        legs=legs,
+    )
+    _metric(
+        conn,
+        query="q-fast",
+        ms_total=100.0,
+        est_tokens=800,
+        rerank_top_score=0.35,
+        created_at=h + timedelta(minutes=3),
+        legs=legs,
+    )
+    # bucket B (previous hour): one recall row
+    _metric(
+        conn,
+        query="q-prev",
+        ms_total=150.0,
+        est_tokens=500,
+        rerank_top_score=0.72,
+        created_at=h - timedelta(minutes=55),
+    )
+    # a non-recall row (kind='episodes') must be EXCLUDED from every recall aggregate
+    _metric(
+        conn,
+        kind="episodes",
+        query="q-episodes",
+        ms_total=9999.0,
+        created_at=h + timedelta(minutes=4),
+    )
+
+    with _client(db_url) as client:
+        r = client.get("/dash/api/metrics/recall?window=7d", headers=_H)
+    assert r.status_code == 200
+    body = r.json()
+
+    assert len(body["series"]) == 2  # two distinct hour buckets
+    big = next(b for b in body["series"] if b["calls"] == 3)
+    assert big["p50"] == 200.0  # percentile_cont(0.5) over [100,200,300]
+    assert big["p95"] == 290.0  # percentile_cont(0.95) interpolates 200→300
+    assert big["tokens_p50"] == 1000
+    # only timed legs appear; timeline/prefs were NULL so they're absent
+    assert big["legs_p50"] == {
+        "embed": 10.0,
+        "bm25": 20.0,
+        "vector": 30.0,
+        "kg": 40.0,
+        "web": 5.0,
+        "rerank": 50.0,
+    }
+
+    slow = body["slowest"]
+    assert slow[0]["query"] == "q-slow" and slow[0]["ms_total"] == 300.0
+    assert all(s["ms_total"] != 9999.0 for s in slow)  # episodes row excluded
+    assert len(slow) <= 10
+
+    hist = body["score_hist"]
+    assert len(hist) == 10
+    by_lo = {round(b["lo"], 1): b["n"] for b in hist}
+    # 0.35→[0.3,0.4), 0.55→[0.5,0.6), 0.72→[0.7,0.8), 0.95→[0.9,1.0)
+    assert by_lo[0.3] == 1 and by_lo[0.5] == 1 and by_lo[0.7] == 1 and by_lo[0.9] == 1
+    assert sum(b["n"] for b in hist) == 4
+
+
+def test_metrics_ingestion_shape(clean, conn, db_url):
+    now = datetime.now(UTC)
+    # live snapshot: 2 recent pending + 1 stale pending (5d old) = 3 pending; 1 processing; 1 failed
+    _queue(conn, status="pending", enqueued_at=now - timedelta(minutes=10))
+    _queue(conn, status="pending", enqueued_at=now - timedelta(minutes=20))
+    _queue(conn, status="pending", enqueued_at=now - timedelta(days=5))  # outside the 48h series
+    _queue(conn, status="processing", enqueued_at=now - timedelta(minutes=30))
+    _queue(
+        conn,
+        status="failed",
+        error="boom timeout",
+        attempts=3,
+        enqueued_at=now - timedelta(hours=2),
+        processed_at=now - timedelta(hours=1),
+    )
+    _queue(
+        conn,
+        status="done",
+        enqueued_at=now - timedelta(hours=3),
+        processed_at=now - timedelta(hours=2, minutes=30),
+    )
+    run_id = _dream_run(
+        conn,
+        started_at=now - timedelta(hours=9),
+        finished_at=now - timedelta(hours=9) + timedelta(seconds=41),
+        counts={"proposals_raised": 2, "config_proposals": 1},
+        samples={
+            "proposals": [{"id": "config:4", "kind": "config-edit", "name": "rules/learned.md"}]
+        },
+        stages={"config": {"ran": True, "ok": True}},
+    )
+
+    with _client(db_url) as client:
+        r = client.get("/dash/api/metrics/ingestion?window=48h", headers=_H)
+    assert r.status_code == 200
+    b = r.json()
+
+    assert b["queue_depth"] == 3  # live pending count (incl the stale one)
+    assert b["queue"] == {"pending": 3, "processing": 1, "failed": 1}
+    # enqueued/hour: only rows enqueued within 48h (5 of 6; the 5-day-old one is out)
+    assert sum(p["n"] for p in b["throughput"]["enqueued_per_hour"]) == 5
+    # completed/hour: rows with processed_at within 48h (failed + done)
+    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 2
+    assert len(b["failures"]) == 1
+    assert b["failures"][0]["error"] == "boom timeout" and b["failures"][0]["attempts"] == 3
+    assert b["last_dream"]["id"] == run_id
+    assert b["last_dream"]["counts"]["proposals_raised"] == 2
+    assert round(b["last_dream"]["duration_s"]) == 41
+    assert b["last_dream"]["samples"]["proposals"][0]["id"] == "config:4"
+
+
+def test_metrics_ingestion_empty_last_dream(clean, conn, db_url):
+    """Fresh install: no dream runs recorded, empty queue → null last_dream, empty series."""
+    with _client(db_url) as client:
+        b = client.get("/dash/api/metrics/ingestion?window=48h", headers=_H).json()
+    assert b["last_dream"] is None
+    assert b["queue_depth"] == 0
+    assert b["throughput"]["enqueued_per_hour"] == []
+
+
+def test_metrics_corpus_shape_and_cache(clean, conn, db_url):
+    now = datetime.now(UTC)
+    _episode(
+        conn,
+        session="s1",
+        seq=1,
+        project="alpha",
+        source="claude-code",
+        created_at=now - timedelta(days=1),
+    )
+    _episode(
+        conn,
+        session="s1",
+        seq=2,
+        project="alpha",
+        source="cursor",
+        created_at=now - timedelta(days=2),
+    )
+    _episode(
+        conn,
+        session="s2",
+        seq=1,
+        project="beta",
+        source="claude-code",
+        created_at=now - timedelta(days=40),
+    )  # outside the 30d sparkline
+    _note(conn)
+    _pref(conn)
+
+    with _client(db_url) as client:
+        first = client.get("/dash/api/metrics/corpus", headers=_H).json()
+        # Insert MORE after the first call; the 1h in-process cache must serve the SAME body.
+        _episode(
+            conn,
+            session="s3",
+            seq=1,
+            project="alpha",
+            source="claude-code",
+            created_at=now - timedelta(hours=1),
+        )
+        second = client.get("/dash/api/metrics/corpus", headers=_H).json()
+    assert second == first  # served from cache (else episodes would read 4 rows)
+
+    tables = {t["name"]: t for t in first["tables"]}
+    assert {"episodes", "notes", "chunks"} <= set(tables)
+    ep = tables["episodes"]
+    assert ep["rows"] == 3 and ep["rows_estimated"] is False  # exact count on a small table
+    assert len(ep["spark_30d"]) == 30
+    assert ep["delta_30d"] == 2  # only the two within 30d
+    proj = {p["name"]: p["n"] for p in first["by_project"]}
+    assert proj["alpha"] == 2 and proj["beta"] == 1
+    src = {p["name"]: p["n"] for p in first["by_source"]}
+    assert src["claude-code"] == 2 and src["cursor"] == 1
+
+
+def test_metrics_require_machine_token(clean, conn, db_url):
+    with _client(db_url) as client:
+        assert client.get("/dash/api/metrics/recall").status_code == 401
+        assert client.get("/dash/api/metrics/ingestion").status_code == 401
+        assert client.get("/dash/api/metrics/corpus").status_code == 401
 
 
 # ---------------------------------------------------------------------------
