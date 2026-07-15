@@ -57,6 +57,22 @@ COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev
 
+# --- Web bundle stage -------------------------------------------------------
+# Builds the operator dashboard's single ESM bundle (issue #12). The dashboard
+# ships as ONE self-contained bundle — web/dist/{index.html,app.js,assets/*} —
+# served by the MCP server's /dash routes; there is no separate web server and
+# no CDN, so the client must be baked into this image at build time. A Node
+# stage does that here and only the built dist crosses into runtime (no
+# node_modules, no toolchain). `npm run build` is tsc --noEmit + the esbuild
+# script defined in web/package.json.
+FROM node:22-bookworm-slim AS webbuild
+WORKDIR /app/web
+# Copy manifests first so `npm ci` caches on lockfile changes, not source edits.
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
 # --- Runtime stage ----------------------------------------------------------
 # Fresh from the base. Only the built .venv and the production source dirs
 # come across. No uv cache, no tests, no scripts, no .git in the final image.
@@ -75,6 +91,8 @@ COPY --from=builder /app/mcp_server /app/mcp_server
 COPY --from=builder /app/dream /app/dream
 COPY --from=builder /app/schema /app/schema
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
+# The prebuilt dashboard bundle — the /dash routes serve it from here.
+COPY --from=webbuild /app/web/dist /app/web/dist
 
 ENV PATH="/app/.venv/bin:$PATH"
 
