@@ -31,14 +31,16 @@ Response:
  "sources":  [{"name": "claude-code", "count": 31000}],
  "group_ids": ["technical", "personal"]}
 ```
-Projects/sources aggregated from episodes (NULL project → name "untagged"). Cached
-in-process ~5 min.
+Projects/sources aggregated from episodes (NULL project or source → name "untagged").
+`group_ids` = distinct scopes across kg_relationships/kg_entities group_id ∪
+timeline_events.domain. Cached in-process ~5 min.
 
 ### GET /dash/api/feed?cursor&limit=30&project&group_id&source
 Reverse-chronological merge of episodes + KG facts + timeline events, keyset-paged.
 - `cursor`: opaque string from a previous response (`next_cursor`); absent = newest.
 - `limit` ≤ 100. Filters apply where the column exists (episodes: project+source;
-  facts: group_id; timeline: project) — a filter a type lacks does not exclude that type.
+  facts: group_id; timeline: project + group_id via its `domain` column, schema 038) —
+  a filter a type lacks does not exclude that type.
 - Feed timestamps: episode `created_at`, fact `created_at`, timeline `ingested_at`
   (the feed shows when memory was WRITTEN; the event's own date is `t_valid` in data).
 
@@ -109,6 +111,8 @@ ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE. NOT
 ```
 `total_by_type` is always computed for all four types (tab counts); `hits` only for the
 requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`.
+Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
+resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link.
 
 ### GET /dash/api/flags · POST /dash/api/flag
 Flag kinds: `episode | fact | timeline_event | preference | note`.
