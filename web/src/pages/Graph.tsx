@@ -250,7 +250,11 @@ export function Graph() {
     if (overflow > 0) wantNodes.add('__cluster');
     const wantEdges = new Set(vedges.map((e) => e.uuid));
 
-    const seedPos = seedUuid ? cy.getElementById(seedUuid).position() : { x: 0, y: 0 };
+    // On a fresh seed the node isn't in cy yet — .position() on an empty
+    // collection returns undefined, and touching .x then crashes the commit
+    // (React unmounts the whole tree; there was no boundary to stop it).
+    const seedEl = seedUuid ? cy.getElementById(seedUuid) : null;
+    const seedPos = seedEl && !seedEl.empty() ? seedEl.position() : { x: 0, y: 0 };
     const addedSet = new Set(added);
     cy.batch(() => {
       cy.nodes().forEach((n) => { if (!wantNodes.has(n.id())) n.remove(); });
