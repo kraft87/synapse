@@ -35,6 +35,11 @@ interface Store {
   setQueueDepth: (n: number) => void;
   reviewPending: number;
   setReviewPending: (n: number) => void;
+  // Graph seed handoff (phase 6): the entity dossier's "view in graph" sets this, then
+  // navigates to the Graph page, which consumes it on mount and clears it.
+  graphSeed: { uuid: string; name: string } | null;
+  seedGraph: (uuid: string, name: string) => void;
+  clearGraphSeed: () => void;
 }
 
 const Ctx = createContext<Store | null>(null);
@@ -56,6 +61,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [online, setOnline] = useState(true);
   const [queueDepth, setQueueDepth] = useState(0);
   const [reviewPending, setReviewPending] = useState(0);
+  const [graphSeed, setGraphSeed] = useState<{ uuid: string; name: string } | null>(null);
 
   // theme -> <html data-theme> + persistence
   useEffect(() => { document.documentElement.dataset.theme = theme; ls.set('synapse.theme', theme); }, [theme]);
@@ -79,12 +85,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const setGroup = useCallback((g: Group) => { setGroupState(g); ls.set('synapse.group', g); }, []);
   const setProject = useCallback((p: string) => { setProjectState(p); ls.set('synapse.project', p); }, []);
   const setSource = useCallback((s: string) => { setSourceState(s); ls.set('synapse.source', s); }, []);
+  const seedGraph = useCallback((uuid: string, name: string) => setGraphSeed({ uuid, name }), []);
+  const clearGraphSeed = useCallback(() => setGraphSeed(null), []);
 
   const value = useMemo<Store>(() => ({
     token, setTokenValue, theme, toggleTheme, group, setGroup, project, setProject,
     source, setSource, page, setPage, searchQuery, setSearchQuery, catalog, online, setOnline,
-    queueDepth, setQueueDepth, reviewPending, setReviewPending,
-  }), [token, theme, group, project, source, page, searchQuery, catalog, online, queueDepth, reviewPending, setTokenValue, toggleTheme, setGroup, setProject, setSource]);
+    queueDepth, setQueueDepth, reviewPending, setReviewPending, graphSeed, seedGraph, clearGraphSeed,
+  }), [token, theme, group, project, source, page, searchQuery, catalog, online, queueDepth, reviewPending, graphSeed, setTokenValue, toggleTheme, setGroup, setProject, setSource, seedGraph, clearGraphSeed]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

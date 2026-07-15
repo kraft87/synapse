@@ -1,5 +1,6 @@
 // Root: token gate -> shell (header + active page + overlay layer). Page
 // selection is React state; overlays live in the URL hash.
+import { Suspense, lazy } from 'react';
 import { StoreProvider, useStore } from './state';
 import { MOCK } from './mock';
 import { Header } from './components/Header';
@@ -12,6 +13,15 @@ import { Metrics } from './pages/Metrics';
 import { Stub } from './pages/Stub';
 import { Overlays } from './overlays/Overlays';
 
+// Graph pulls in cytoscape + cose-bilkent (~500KB) — lazy so that weight loads only on
+// the first Graph visit and code-splits into its own chunk (see web/build.mjs).
+const Graph = lazy(() => import('./pages/Graph').then((m) => ({ default: m.Graph })));
+const GraphFallback = () => (
+  <main style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--txt3)', fontFamily: 'var(--font-data)', fontSize: '12.5px' }}>
+    loading graph explorer…
+  </main>
+);
+
 function Shell() {
   const s = useStore();
   if (!MOCK && !s.token) return <Login />;
@@ -23,6 +33,7 @@ function Shell() {
         : s.page === 'recall' ? <Recall />
         : s.page === 'review' ? <Review />
         : s.page === 'metrics' ? <Metrics />
+        : s.page === 'graph' ? <Suspense fallback={<GraphFallback />}><Graph /></Suspense>
         : <Stub page={s.page} />}
       <Overlays />
     </>

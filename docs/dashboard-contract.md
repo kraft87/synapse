@@ -402,6 +402,49 @@ are the expensive part).
 - `rows_estimated` — see the honesty note. `by_project`/`by_source` are exact, top 12,
   `untagged` for NULL/empty.
 
+## Phase 6 endpoints (Graph explorer)
+
+Two read-only endpoints backing the KG explorer page (README §3, spec §4). Machine-token
+gated, threadpool, bounded — same posture as every `/dash/api/*` route. No migration:
+they read `kg_entities` / `kg_relationships` (schema 017 + 020 supertype + 028/029
+supersession) directly. `src_uuid`/`tgt_uuid` are NOT FKs — edges match endpoints by
+uuid; an edge to a uuid with no `kg_entities` row is simply dropped (no phantom node).
+
+### GET /dash/api/graph/entities?q&limit=10
+Seed typeahead — shares the search endpoint's entity leg SQL (`name ILIKE '%q%'`, `degree
+DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
+Empty `q` → `[]`. Returns a bare array:
+```json
+[{"uuid": "…", "name": "Synapse", "entity_type": "Project", "degree": 10}]
+```
+
+### GET /dash/api/graph/neighborhood?entity=<uuid|name>&depth=1|2&as_of=<iso?>&limit=150
+BFS from the resolved seed over `kg_relationships` (both directions), depth ≤ 2, hard-capped
+at `limit` (≤150, default 150) nodes.
+```json
+{"nodes": [{"uuid": "…", "name": "…", "entity_type": "…", "degree": 12, "summary": "…"}],
+ "edges": [{"uuid": "…", "src": "…", "tgt": "…", "name": "<verb>", "fact": "…",
+            "t_valid": "…", "t_invalid": null, "provenance_episode_id": 227001,
+            "retrieval_count": 41}],
+ "truncated": false, "seed": "<resolved uuid>"}
+```
+- **Seed resolution:** exact `uuid` → exact `normalized_name` (input lowercased +
+  whitespace-collapsed + bookend-punctuation-stripped, mirroring `ingestion.dedup`) → best
+  `name ILIKE` match by `degree DESC`. No match → **404** `entity not found`. Missing/empty
+  `entity` → **400**.
+- **Truncation:** when the reachable set exceeds `limit`, keep the highest-degree nodes (the
+  seed is always kept) and set `truncated: true`. Edges are returned only when BOTH endpoints
+  survive truncation. Ranking is best-effort over the scanned candidates (per-level BFS scans
+  are `LIMIT`-bounded at 6000 rows and a 5s `statement_timeout` guards any single query).
+- **`as_of`** (ISO-8601; applies to BOTH traversal and returned edges): when set, exclude
+  not-yet-valid edges (`t_valid > as_of`) but INCLUDE superseded edges
+  (`t_invalid ≤ as_of`) — the client renders those dashed (spec §4). When unset, return live
+  + superseded and let the client scrub client-side; the client re-queries with `as_of` only
+  when a neighborhood was `truncated`. Edges with `t_valid IS NULL` are always visible.
+- Bounded end to end: `kg_rel_src`/`kg_rel_tgt` make per-node expansion cheap; no unbounded
+  scan touches the ~75K-edge table. `node.color` is by `entity_type` (client `etColor`,
+  matching the dossier/search surfaces); the legend shows the six supertype colors.
+
 ## Schema (migrations 042, 044)
 
 `dashboard_flags(id, kind, item_id, note, created_at, removed_at)` — active = `removed_at IS NULL`,
@@ -419,14 +462,9 @@ Migration 043 (`043_dash_notify.sql`) adds `dash_notify_feed()` + AFTER INSERT t
 
 ## Later phases (reserved paths)
 
-`/dash/api/metrics/{recall,ingestion,corpus}`,
 `/dash/api/timeline`, `/dash/api/preferences`,
-`/dash/api/behavior/*`, `/dash/api/dream/report`, `/dash/api/graph/*`.
+`/dash/api/behavior/*`, `/dash/api/dream/report`.
 (`POST /recall`'s `debug: true` flag + `/dash/api/recall/history` shipped in phase 2;
-`/dash/api/proposals*` shipped in phase 2b; `/dash/api/stream` (SSE) shipped in phase 3 —
-see above.)
-`/dash/api/stream` (SSE), `/dash/api/timeline`, `/dash/api/preferences`,
-`/dash/api/behavior/*`, `/dash/api/dream/report`, `/dash/api/graph/*`.
-(`POST /recall`'s `debug: true` flag + `/dash/api/recall/history` shipped in phase 2;
-`/dash/api/proposals*` shipped in phase 2b; `/dash/api/metrics/{recall,ingestion,corpus}`
-shipped in phase 4 — see above.)
+`/dash/api/proposals*` shipped in phase 2b; `/dash/api/stream` (SSE) shipped in phase 3;
+`/dash/api/metrics/{recall,ingestion,corpus}` shipped in phase 4;
+`/dash/api/graph/{entities,neighborhood}` shipped in phase 6 — see above.)
