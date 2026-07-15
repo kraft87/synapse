@@ -239,6 +239,13 @@ from mcp_server.board import register as _register_board_routes  # noqa: E402
 
 _register_board_routes(mcp, DB_URL, _machine_authorized, get_recall=lambda: _get_recall())
 
+# Operator dashboard — static React bundle at /dash + read/flag API at /dash/api/* (issue #12,
+# contract docs/dashboard-contract.md). Static routes are unauthenticated (public bundle, no
+# data); every api route rides the same machine-token seam. No-op w/o DB_URL, like the siblings.
+from mcp_server.dashboard_routes import register as _register_dashboard_routes  # noqa: E402
+
+_register_dashboard_routes(mcp, DB_URL, _machine_authorized)
+
 # Device-login lane — RFC 8628 device flow so `synapse login` works browser-free on servers /
 # headless boxes. Proxies GitHub's device flow and gates the machine token by the same GitHub
 # allowlist as the web leg. No-op unless GITHUB_CLIENT_ID + SYNAPSE_MACHINE_TOKEN are set.

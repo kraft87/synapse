@@ -55,6 +55,24 @@ jobs:
       - name: Bandit
         run: bandit -r ingestion/ -ll -ii
 
+  web:
+    name: Web bundle
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # tsc --noEmit + esbuild (web/package.json's "build"). A broken bundle fails
+      # here and, via the push job's needs, can never ship in an image.
+      - name: Install and build
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
   test:
     name: Pytest
     runs-on: ubuntu-latest
@@ -151,7 +169,7 @@ jobs:
     # Publishes the app image to GHCR on every green main build. Deployment is
     # pull-based: hosts running this stack watch ghcr.io/<repo>:latest and update
     # themselves (e.g. Watchtower), so CI never reaches into any host.
-    needs: [ruff, mypy, bandit, test, build]
+    needs: [ruff, mypy, bandit, web, test, build]
     # Repository guard: forks have no GHCR push rights under this owner.
     if: github.repository == 'kraft87/synapse' && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest

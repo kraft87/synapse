@@ -34,6 +34,7 @@ _DB_FILES = {
     "test_notes_store.py",
     "test_remember_notes.py",
     "test_board.py",
+    "test_dashboard_routes.py",
     "test_telemetry_kinds.py",
     "test_import_notes.py",
     "test_tool_surface.py",
