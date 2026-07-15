@@ -217,7 +217,7 @@ function PolarityChip({ polarity }: { polarity: string }) {
   return <span style={{ fontFamily: mono, fontSize: '10.5px', border: '1px solid ' + c, color: c, borderRadius: '4px', padding: '2px 8px', justifySelf: 'start' }}>{polarity}</span>;
 }
 
-const PREF_GRID = '1fr 74px 96px 74px';
+const PREF_GRID = 'minmax(0,1fr) 74px 96px 74px';
 
 function PrefRow({ p }: { p: Preference }) {
   const superseded = p.t_invalid != null;

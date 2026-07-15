@@ -257,7 +257,7 @@ export function Recall() {
           {/* history */}
           {tab === 'history' && (
             <div className="scrollx" style={{ marginTop: '14px', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '10px', overflow: 'hidden' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 76px 76px 70px 90px', gap: '10px', padding: '8px 14px', borderBottom: '1px solid var(--line)', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 76px 76px 70px 90px', gap: '10px', padding: '8px 14px', borderBottom: '1px solid var(--line)', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
                 <div>query</div><div style={{ textAlign: 'right' }}>total</div><div style={{ textAlign: 'right' }}>tokens</div><div style={{ textAlign: 'right' }}>top</div><div style={{ textAlign: 'right' }}>when</div>
               </div>
               {histErr && <div style={{ padding: '12px 14px', color: 'var(--err)', fontFamily: mono, fontSize: '12px' }}>history request failed.</div>}
@@ -265,7 +265,7 @@ export function Recall() {
               {!histErr && history?.length === 0 && <div style={{ padding: '12px 14px', color: 'var(--txt3)', fontFamily: mono, fontSize: '12px' }}>no recalls recorded yet.</div>}
               {history?.map((h) => (
                 <button key={h.id} className="hist-row" onClick={() => run(h.query)}
-                  style={{ display: 'grid', gridTemplateColumns: '1fr 76px 76px 70px 90px', gap: '10px', padding: '9px 14px', border: 'none', borderBottom: '1px solid var(--line)', background: 'none', width: '100%', textAlign: 'left', cursor: 'pointer', alignItems: 'center' }}>
+                  style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 76px 76px 70px 90px', gap: '10px', padding: '9px 14px', border: 'none', borderBottom: '1px solid var(--line)', background: 'none', width: '100%', textAlign: 'left', cursor: 'pointer', alignItems: 'center' }}>
                   <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{h.query}</div>
                   <div style={{ fontFamily: mono, fontSize: '12px', color: (h.ms_total ?? 0) > 380 ? 'var(--err)' : 'var(--txt2)', textAlign: 'right' }}>{h.ms_total != null ? Math.round(h.ms_total) + ' ms' : '—'}</div>
                   <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt2)', textAlign: 'right' }}>{h.est_tokens ?? '—'}</div>
