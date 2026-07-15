@@ -38,6 +38,46 @@ const FIX: Record<string, unknown> = {
     mentions: { items: [{ episode_id: 1, created_at: iso(0.4), gist: 'wired service A to library B' }, { episode_id: 2, created_at: iso(30), gist: 'refactored the widget cache' }], offset: 0, limit: 20, total: 2 },
   },
   flags: { flags: [{ id: 1, kind: 'timeline_event', item_id: '10', note: null, created_at: iso(2), gist: 'example event: service A shipped v2' }] },
+  proposals: {
+    pending_count: 2,
+    proposals: [
+      { id: 'skill:1', kind: 'skill', name: 'latency-triage', gist: 'Recurring recall latency debugging with no reusable playbook.', status: 'proposed', age_days: 0, created_at: iso(9) },
+      { id: 'config:1', kind: 'config-edit', name: 'CLAUDE.md', gist: 'Add the raw-SQL / no-ORM rule the operator restated 5x.', status: 'proposed', age_days: 1, created_at: iso(30) },
+      { id: 'skill:2', kind: 'skill', name: 'graph-inspect', gist: 'Two overlapping skills — merge into one.', status: 'accepted', age_days: 2, created_at: iso(52) },
+      { id: 'config:2', kind: 'config-edit', name: 'rules/testing.md', gist: 'Proposed mandatory 90% coverage gate.', status: 'rejected', age_days: 4, created_at: iso(100) },
+    ],
+  },
+  'proposals/skill:1': {
+    id: 'skill:1', kind: 'skill', name: 'latency-triage', status: 'proposed',
+    evidence: [
+      { session_id: 'sess-1', class: 'grounded', signal: 'explicit_request', why: 'operator asked for a reusable recall-latency playbook' },
+      { session_id: 'sess-2', class: 'grounded', signal: 'user_correction', why: 'repeated the same waterfall read-through by hand' },
+    ],
+    provenance_episodes: [1, 2],
+    payload: { type: 'markdown', content: '# latency-triage\n\nWhen recall p95 regresses, read the waterfall leg-by-leg. Dominant leg → known remedy:\n\n- **rerank** → cap candidate pool (`RERANK_POOL_CAP`)\n- **kg** → depth-limit the neighborhood expand\n- **vector** → check `pgvector` index / cache hit rate\n- **bm25** → review tokenizer + stopwords\n\n```\nrecall --debug "<query>" | jq .legs\n```' },
+    audit_log: [],
+  },
+  'proposals/config:1': {
+    id: 'config:1', kind: 'config-edit', name: 'CLAUDE.md', status: 'proposed',
+    evidence: [{ session_id: 'sess-3', signal: 'correction', why: 'operator restated "prefer raw SQL over the ORM" five times' }],
+    provenance_episodes: [2],
+    payload: { type: 'diff', content: '--- a/CLAUDE.md\n+++ b/CLAUDE.md\n@@ -12,3 +12,4 @@\n ## Conventions\n Keep functions small.\n+Prefer raw SQL over the ORM for hot-path reads.\n Log every migration.' },
+    audit_log: [],
+  },
+  'proposals/skill:2': {
+    id: 'skill:2', kind: 'skill', name: 'graph-inspect', status: 'accepted',
+    evidence: [{ session_id: 'sess-4', class: 'grounded', signal: 'accept', why: 'operator accepted the merge' }],
+    provenance_episodes: [],
+    payload: { type: 'markdown', content: '# graph-inspect\n\nMerged from **graph-explore** + **kg-inspect** — one skill for reading the KG.' },
+    audit_log: [{ ts: iso(48), action: 'proposal_approve', note: 'clear overlap; merge is right' }],
+  },
+  'proposals/config:2': {
+    id: 'config:2', kind: 'config-edit', name: 'rules/testing.md', status: 'rejected',
+    evidence: [{ session_id: 'sess-5', signal: 'correction', why: 'proposed a hard coverage gate' }],
+    provenance_episodes: [],
+    payload: { type: 'diff', content: '--- a/rules/testing.md\n+++ b/rules/testing.md\n@@ -1 +1,2 @@\n # Testing\n+Every PR must hit 90% line coverage.' },
+    audit_log: [{ ts: iso(96), action: 'proposal_reject', note: 'too rigid — coverage is a lagging signal' }],
+  },
 };
 
 const SEARCH: Record<string, unknown[]> = {
@@ -47,12 +87,56 @@ const SEARCH: Record<string, unknown[]> = {
   events: [{ type: 'events', id: '10', snippet: 'service A shipped v2', meta: { project: 'service-a', source: 'git:example', ts: iso(48), session_id: 'sess-1', episode_id: 1 } }],
 };
 
+// Recall debug console fixtures (synthetic — mirrors the real recall() + debug shape).
+const RECALL_HISTORY = {
+  items: [
+    { id: 5, created_at: iso(0.03), query: 'postgres connection pooling decisions', source: 'dashboard', ms_total: 341, est_tokens: 1874, rerank_top_score: 0.91 },
+    { id: 4, created_at: iso(1), query: 'what did I decide about rerank pool size', source: 'dashboard', ms_total: 296, est_tokens: 1560, rerank_top_score: 0.94 },
+    { id: 3, created_at: iso(5), query: 'embedding cache implementation history', source: 'mcp', ms_total: 402, est_tokens: 2210, rerank_top_score: 0.87 },
+    { id: 2, created_at: iso(28), query: 'widget cache refactor', source: 'http', ms_total: 164, est_tokens: 388, rerank_top_score: 0.81 },
+  ],
+};
+
+export function mockRecall<T>(query: string): Promise<T> {
+  return Promise.resolve({
+    query,
+    facts: [
+      { fact: 'service A depends on library B', date: '2026-06-30', score: 0.88 },
+      { fact: 'service A used an in-memory store', date: '2026-05-21', score: 0.43 },
+    ],
+    episodes: [
+      { id: 'e:1', content: 'Wired service A to library B; added a shared asyncpg pool (min 2 / max 10) and a smoke test.', project: 'service-a', date: '2026-07-01', role: 'assistant', score: 0.91 },
+      { id: 'e:2', content: 'Refactored the widget cache into a WidgetCache class; hit rate unchanged.', project: 'service-b', date: '2026-06-15', score: 0.71 },
+    ],
+    entities: [
+      { name: 'service A', summary: 'Example project used to demonstrate the recall debug surface.', score: 0.81 },
+    ],
+    timeline: [
+      { date: '2026-06-30', fact: 'service A shipped v2', type: 'milestone', salience: 2, score: 0.74 },
+    ],
+    preferences: [
+      { pref: 'prefers boring, well-understood infra over clever abstractions', polarity: 'like', since: '2026-03-02', asserted: 7, score: 0.62 },
+    ],
+    web: [],
+    debug: {
+      total_ms: 341,
+      legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, timeline: 33, prefs: 9 },
+      pool_sizes: { bm25: 100, vector: 100, fused: 100, kg_candidates: 12 },
+      rerank: { model: 'rerank-2.5-lite', top_score: 0.91 },
+      est_tokens: 1874,
+    },
+  } as T);
+}
+
 export async function mockApi<T>(path: string): Promise<T> {
   const p = path.replace(/^\//, '').split('?')[0];
   let out: unknown;
   if (p === 'catalog') out = FIX.catalog;
   else if (p === 'feed') out = FIX.feed;
   else if (p === 'flags') out = FIX.flags;
+  else if (p === 'recall/history') out = RECALL_HISTORY;
+  else if (p === 'proposals') out = FIX.proposals;
+  else if (/^proposals\//.test(p)) out = FIX['proposals/' + p.substring('proposals/'.length)] || {};
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;
   else if (/^episode\//.test(p)) out = FIX['episode/' + p.split('/')[1]] || FIX['episode/1'];
   else if (/^session\//.test(p)) out = FIX.session;

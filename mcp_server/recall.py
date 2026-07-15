@@ -1476,6 +1476,7 @@ class Recall:
         group_id: str = "technical",
         write_feedback: bool = True,
         source: str | None = None,
+        debug: bool = False,
     ) -> dict[str, Any]:
         """Overview retrieval: reranked episodes + KG facts (+ entities, web).
 
@@ -1493,6 +1494,12 @@ class Recall:
         The episode bucket serves compact passages (markdown chunks) of the top reranked episodes
         instead of whole turns (Stage 2 — see _RECALL_PASSAGE_N). For raw full-episode drill-down,
         use recall_episodes(). Facts carry their t_valid "as-of" date for currency weighting.
+
+        ``debug`` (phase-2 dashboard console) attaches a ``debug`` key to the response SURFACING
+        the SAME numbers already measured for the recall_metrics telemetry row — no extra
+        instrumentation, no extra work. Off by default so every non-dashboard call is byte-identical
+        in behavior AND in the telemetry it records (a live call-rate A/B depends on that). See the
+        debug-dict assembly just below the metrics write for the exact shape.
         """
         t_start = time.perf_counter()
         web_n = _WEB_LIMIT * 4  # depth for dedup-by-artifact to have headroom
@@ -1730,41 +1737,72 @@ class Recall:
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.
         _floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)
         chars = _served_chars(out)
-        self._record_metrics(
-            {
-                "kind": "recall",
-                "source": source or "mcp",
-                "query": query[:200],
-                "group_id": group_id,
-                "write_feedback": write_feedback,
-                "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
-                "ms_embed": round(ms_embed, 1),
-                "ms_bm25": round(ms_bm25, 1),
-                "ms_vector": round(ms_vec, 1),
-                "ms_kg": round(ms_kg, 1),
-                "ms_web": round(ms_web, 1),
-                "ms_rerank": round(ms_rerank, 1),
-                "n_facts": len(facts),
-                "n_episodes": len(out.get("episodes", [])),
-                "n_entities": len(entities_bucket),
-                "n_web": len(web_chunks),
-                "n_history": len(history),
-                "n_timeline": len(out.get("timeline", [])),
-                "ms_timeline": round(ms_timeline, 1),
-                "n_prefs": len(out.get("preferences", [])),
-                "ms_prefs": round(ms_prefs, 1),
-                "chars": chars,
-                "est_tokens": chars // 4,
-                "pool_bm25": len(bm25_eps),
-                "pool_vector": len(vec_eps),
-                "pool_fused": len(ep_pool),
-                "kg_candidates": len(kg_results),
-                "rerank_model": _embedding._RERANK_MODEL,
-                "rerank_top_score": round(float(rerank_top), 4),
-                "emb_ok": query_emb is not None,
-                "served_ids": served_ids,
+        metrics: dict[str, Any] = {
+            "kind": "recall",
+            "source": source or "mcp",
+            "query": query[:200],
+            "group_id": group_id,
+            "write_feedback": write_feedback,
+            "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
+            "ms_embed": round(ms_embed, 1),
+            "ms_bm25": round(ms_bm25, 1),
+            "ms_vector": round(ms_vec, 1),
+            "ms_kg": round(ms_kg, 1),
+            "ms_web": round(ms_web, 1),
+            "ms_rerank": round(ms_rerank, 1),
+            "n_facts": len(facts),
+            "n_episodes": len(out.get("episodes", [])),
+            "n_entities": len(entities_bucket),
+            "n_web": len(web_chunks),
+            "n_history": len(history),
+            "n_timeline": len(out.get("timeline", [])),
+            "ms_timeline": round(ms_timeline, 1),
+            "n_prefs": len(out.get("preferences", [])),
+            "ms_prefs": round(ms_prefs, 1),
+            "chars": chars,
+            "est_tokens": chars // 4,
+            "pool_bm25": len(bm25_eps),
+            "pool_vector": len(vec_eps),
+            "pool_fused": len(ep_pool),
+            "kg_candidates": len(kg_results),
+            "rerank_model": _embedding._RERANK_MODEL,
+            "rerank_top_score": round(float(rerank_top), 4),
+            "emb_ok": query_emb is not None,
+            "served_ids": served_ids,
+        }
+        self._record_metrics(metrics)
+        # Phase-2 dashboard debug envelope: surface the SAME numbers just recorded (no
+        # re-instrumentation). Only the timed legs are exposed; timeline/prefs keys are
+        # OMITTED when their leg is disabled (future f_* is None), so the console renders
+        # those as untimed/skipped rather than a spurious 0ms. Byte-identical when off.
+        if debug:
+            legs_ms: dict[str, Any] = {
+                "embed": metrics["ms_embed"],
+                "bm25": metrics["ms_bm25"],
+                "vector": metrics["ms_vector"],
+                "kg": metrics["ms_kg"],
+                "web": metrics["ms_web"],
+                "rerank": metrics["ms_rerank"],
             }
-        )
+            if f_timeline is not None:
+                legs_ms["timeline"] = metrics["ms_timeline"]
+            if f_prefs is not None:
+                legs_ms["prefs"] = metrics["ms_prefs"]
+            out["debug"] = {
+                "total_ms": metrics["ms_total"],
+                "legs_ms": legs_ms,
+                "pool_sizes": {
+                    "bm25": metrics["pool_bm25"],
+                    "vector": metrics["pool_vector"],
+                    "fused": metrics["pool_fused"],
+                    "kg_candidates": metrics["kg_candidates"],
+                },
+                "rerank": {
+                    "model": metrics["rerank_model"],
+                    "top_score": metrics["rerank_top_score"],
+                },
+                "est_tokens": metrics["est_tokens"],
+            }
         return out
 
     def recall_episodes(

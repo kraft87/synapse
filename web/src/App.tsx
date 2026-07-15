@@ -6,6 +6,8 @@ import { Header } from './components/Header';
 import { Login } from './components/Login';
 import { Feed } from './pages/Feed';
 import { Search } from './pages/Search';
+import { Recall } from './pages/Recall';
+import { Review } from './pages/Review';
 import { Stub } from './pages/Stub';
 import { Overlays } from './overlays/Overlays';
 
@@ -15,7 +17,11 @@ function Shell() {
   return (
     <>
       <Header />
-      {s.page === 'feed' ? <Feed /> : s.page === 'search' ? <Search /> : <Stub page={s.page} />}
+      {s.page === 'feed' ? <Feed />
+        : s.page === 'search' ? <Search />
+        : s.page === 'recall' ? <Recall />
+        : s.page === 'review' ? <Review />
+        : <Stub page={s.page} />}
       <Overlays />
     </>
   );

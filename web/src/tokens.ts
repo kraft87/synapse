@@ -37,6 +37,19 @@ export const typeLabel: Record<string, string> = {
   episode: 'episode', fact: 'fact', timeline_event: 'timeline',
 };
 
+// Recall waterfall leg colors — stable across the Recall waterfall AND the Metrics
+// per-leg stack (README leg token table). CSS vars so themes switch automatically.
+export const LEG_COLOR: Record<string, string> = {
+  embed: 'var(--leg-embed)', bm25: 'var(--leg-bm25)', vector: 'var(--leg-vector)',
+  kg: 'var(--leg-kg)', timeline: 'var(--leg-timeline)', prefs: 'var(--leg-prefs)',
+  web: 'var(--leg-web)', rerank: 'var(--leg-rerank)',
+};
+// Fixed render order (spec §5): embed, then the parallel band, then rerank last.
+export const LEG_ORDER = ['embed', 'bm25', 'vector', 'kg', 'timeline', 'prefs', 'web', 'rerank'] as const;
+// Recall-item relevance score → color ramp (spec §5b Served bucket).
+export const scoreColor = (score?: number): string =>
+  score == null ? 'var(--txt3)' : score > 0.8 ? 'var(--acc)' : score > 0.6 ? 'var(--txt2)' : 'var(--txt3)';
+
 export function relTime(ts?: string): string {
   if (!ts) return '';
   const then = new Date(ts).getTime();

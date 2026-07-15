@@ -33,13 +33,11 @@ const selStyle: CSSProperties = {
   maxWidth: '160px', textOverflow: 'ellipsis',
 };
 
-// Review pending-proposal count — 0 in phase 1 (no /proposals endpoint yet), so
-// the badge slot stays hidden.
-const REVIEW_BADGE = 0;
-
 export function Header() {
   const s = useStore();
   const scope = SCOPE[s.page];
+  // Review pending-proposal count (phase 2b) — accent pill, dark text; hidden at 0.
+  const reviewBadge = s.reviewPending;
   const dim = (applies: boolean): CSSProperties =>
     applies ? {} : { opacity: 0.4 };
   const dimTitle = (applies: boolean) => (applies ? undefined : 'not scoped on this page');
@@ -79,8 +77,8 @@ export function Header() {
                 fontSize: '13.5px', fontWeight: 500, display: 'flex', alignItems: 'center', gap: '6px',
               }}>
               {n.label}
-              {n.key === 'review' && REVIEW_BADGE > 0 && (
-                <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', background: 'var(--acc)', color: '#0d1116', borderRadius: '9px', padding: '0 6px', lineHeight: '16px', fontWeight: 600 }}>{REVIEW_BADGE}</span>
+              {n.key === 'review' && reviewBadge > 0 && (
+                <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', background: 'var(--acc)', color: '#0d1116', borderRadius: '9px', padding: '0 6px', lineHeight: '16px', fontWeight: 600 }}>{reviewBadge}</span>
               )}
             </button>
           );

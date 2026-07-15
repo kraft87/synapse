@@ -830,10 +830,14 @@ async def recall_http(request: Request) -> JSONResponse:
     (loaded embedder + pooled PG connections + warm HNSW cache) so a per-turn hook
     stays fast instead of cold-starting the pipeline each call.
 
-    Body: {"query": str, "group_id"?: str, "write_feedback"?: bool}.
+    Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
+           "source"?: str, "debug"?: bool}.
     write_feedback defaults FALSE here: automatic recalls must not bump the
-    retrieval-count feedback signal (bench-grade discipline). Fail-soft like
-    /ingest — never raises past the JSONResponse boundary.
+    retrieval-count feedback signal (bench-grade discipline) — and the phase-2
+    dashboard debug console relies on this default staying false so its diagnostic
+    recalls never pollute the feedback signal. ``debug`` attaches the per-leg timing /
+    pool-size / rerank envelope the engine already measures (see recall(debug=...)).
+    Fail-soft like /ingest — never raises past the JSONResponse boundary.
     """
     if not _machine_authorized(request):
         return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
@@ -848,13 +852,20 @@ async def recall_http(request: Request) -> JSONResponse:
     query = (body.get("query") or "").strip()
     if not query:
         return JSONResponse({"status": "error", "detail": "missing 'query'"}, status_code=400)
+    project = body.get("project") or None
     group_id = body.get("group_id") or "technical"
     write_feedback = bool(body.get("write_feedback", False))
     source = body.get("source") or "http"
+    debug = bool(body.get("debug", False))
 
     def _work() -> dict:
         return _get_recall().recall(
-            query=query, group_id=group_id, write_feedback=write_feedback, source=source
+            query=query,
+            project=project,
+            group_id=group_id,
+            write_feedback=write_feedback,
+            source=source,
+            debug=debug,
         )
 
     try:

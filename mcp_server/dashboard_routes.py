@@ -30,6 +30,7 @@ import base64
 import logging
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,14 @@ from psycopg.types.json import Json
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response
+
+# Phase 2b: the two proposal lanes own their state transitions + side effects; the
+# dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
+# them (see docs/dashboard-contract.md §"Phase 2b").
+from mcp_server.config_sync_routes import _proposal_act as _config_proposal_act
+from mcp_server.config_sync_routes import _proposal_detail as _config_proposal_detail
+from mcp_server.skill_sync_routes import _proposal_act as _skill_proposal_act
+from mcp_server.skill_sync_routes import _proposal_detail as _skill_proposal_detail
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +63,8 @@ _SEARCH_LIMIT_DEFAULT = 20
 _SEARCH_LIMIT_MAX = 50
 _MENTIONS_PAGE = 20
 _SESSION_CAP = 500
+_RECALL_HISTORY_DEFAULT = 50
+_RECALL_HISTORY_MAX = 200
 _ENTITY_FACTS_CAP = 200  # bound the dossier payload; the example has ~15
 _DERIVED_CAP = 200
 _GIST_MAX = 200
@@ -62,6 +73,16 @@ _CATALOG_TTL_S = 300  # ~5 min in-process cache
 
 _FLAG_KINDS = ("episode", "fact", "timeline_event", "preference", "note")
 _SEARCH_TYPES = ("episodes", "facts", "entities", "events")
+
+# Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
+# statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals
+# an operator reviews, so the unified list excludes them (the nav badge still only counts
+# 'proposed'). skills terminal = 'promoted' (fs mv), config terminal = 'applied' (disk write) —
+# both reached OUTSIDE the dashboard; the dashboard only moves proposed→accepted / →rejected.
+_PROPOSALS_LANE_CAP = 200
+_SKILL_REVIEW_STATUSES = ("proposed", "accepted", "promoted", "rejected")
+_CONFIG_REVIEW_STATUSES = ("proposed", "accepted", "applied", "rejected")
+_PROVENANCE_CAP = 40  # bound the best-effort session→episode resolution
 
 # Long-cache immutable fonts (hashed filenames from the build); no-cache the rest.
 _FONT_EXTS = {".woff2", ".woff", ".ttf", ".otf"}
@@ -803,6 +824,46 @@ def _search(
 
 
 # ---------------------------------------------------------------------------
+# Recall history (phase 2)
+# ---------------------------------------------------------------------------
+
+
+def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
+    """Recent recall() calls from the recall_metrics telemetry log (kind='recall').
+
+    A dedicated slim endpoint for the Recall console's History tab — newest first,
+    just the columns the table renders. Deviates from spec §8 (which routed history
+    through the phase-4 /metrics/recall aggregate) by shipping now; the aggregate can
+    still supersede it later. recall_episodes / fetch / remember rows are excluded by
+    the kind filter so the console shows only true recall() calls.
+    """
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        rows = conn.execute(
+            "SELECT id, created_at, query, source, ms_total, est_tokens, rerank_top_score "
+            "FROM recall_metrics WHERE kind = 'recall' "
+            "ORDER BY created_at DESC, id DESC LIMIT %s",
+            (limit,),
+        ).fetchall()
+        return {
+            "items": [
+                {
+                    "id": r["id"],
+                    "created_at": _iso(r["created_at"]),
+                    "query": r["query"],
+                    "source": r["source"],
+                    "ms_total": r["ms_total"],
+                    "est_tokens": r["est_tokens"],
+                    "rerank_top_score": r["rerank_top_score"],
+                }
+                for r in rows
+            ]
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Flags
 # ---------------------------------------------------------------------------
 
@@ -893,6 +954,234 @@ def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool
         return True
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Proposals (phase 2b) — unified review over the skills + config lanes
+# ---------------------------------------------------------------------------
+#
+# The dashboard is a THIN review console over two independent lanes. It reuses each
+# lane's own _proposal_act (the state transition + side effects) and _proposal_detail
+# (the row read), and adds three things on top: a lane-merged list, a normalized detail
+# envelope, and a dashboard_audit trail keyed by the namespaced id ("skill:<n>" /
+# "config:<n>"). It never materializes an accepted change — promote (skills) and apply
+# (config) stay with the lanes. See docs/dashboard-contract.md §"Phase 2b".
+
+
+def _skill_routing_eval_stub(_conn: Any, _cid: int, _name: str) -> str:
+    """The skills lane's accept path takes an advisory ``llm`` callable that runs a
+    routing-eval on RETUNE candidates — an Anthropic API call that only annotates the
+    accept result. The dashboard decision path is contracted to write ONLY state + notes,
+    so it passes THIS stub in place of the real ``_routing_eval``: accept still flips
+    status→accepted and records the grounded 'accept' signal, but no LLM call is made from
+    the request path. Running the eval stays with the skills review CLI."""
+    return "routing-eval: skipped (dashboard decision path — advisory eval runs in the skills CLI)"
+
+
+def _parse_proposal_id(pid: str) -> tuple[str, int] | None:
+    """'skill:<n>' | 'config:<n>' -> ('skill'|'config', n); None if malformed."""
+    lane, _, rest = pid.partition(":")
+    if lane not in ("skill", "config") or not rest.isdigit():
+        return None
+    return lane, int(rest)
+
+
+def _norm_kind(lane: str) -> str:
+    return "skill" if lane == "skill" else "config-edit"
+
+
+def _age_days(created: Any) -> int:
+    if not isinstance(created, datetime):
+        return 0
+    now = datetime.now(created.tzinfo) if created.tzinfo else datetime.now(UTC).replace(tzinfo=None)
+    return max(0, int((now - created).total_seconds() // 86400))
+
+
+def _provenance_episodes(conn: psycopg.Connection[dict[str, Any]], evidence: Any) -> list[int]:
+    """Best-effort episode ids behind a proposal, from its evidence entries. Two sources:
+    an explicit episode ref on an entry (``episode_id`` / an ``ep:<id>`` ``source_ref``),
+    and — since lane evidence is keyed by session, not episode — the episodes of each
+    distinct evidence ``session_id`` (bounded). Empty list when nothing resolves."""
+    if not isinstance(evidence, list):
+        return []
+    explicit: set[int] = set()
+    sessions: set[str] = set()
+    for e in evidence:
+        if not isinstance(e, dict):
+            continue
+        v = e.get("episode_id")
+        if isinstance(v, bool):
+            v = None
+        if isinstance(v, int):
+            explicit.add(v)
+        elif isinstance(v, str) and v.isdigit():
+            explicit.add(int(v))
+        rid = _episode_id_from_ref(e.get("source_ref") or e.get("ref"))
+        if rid is not None:
+            explicit.add(rid)
+        sid = e.get("session_id")
+        if isinstance(sid, str) and sid:
+            sessions.add(sid)
+    ids = set(explicit)
+    if sessions:
+        rows = conn.execute(
+            "SELECT id FROM episodes WHERE session_id = ANY(%s) ORDER BY id LIMIT %s",
+            (list(sessions), _PROVENANCE_CAP),
+        ).fetchall()
+        ids.update(int(r["id"]) for r in rows)
+    return sorted(ids)
+
+
+def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dict[str, Any]:
+    """Lane-merged proposal list + the nav-badge pending_count. Bounded per lane (newest
+    first), then merged and re-sorted by created_at. ``status``/``kind`` narrow the view;
+    ``pending_count`` is always both lanes' 'proposed' rows, independent of the view."""
+    want_skill = kind in (None, "skill")
+    want_config = kind in (None, "config-edit")
+
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        out: list[dict[str, Any]] = []
+        if want_skill:
+            for r in conn.execute(
+                "SELECT id, name, summary, status, created_at "
+                "FROM skills_lane.skill_gap_candidates WHERE status = ANY(%s) "
+                "ORDER BY created_at DESC, id DESC LIMIT %s",
+                (list(_SKILL_REVIEW_STATUSES), _PROPOSALS_LANE_CAP),
+            ).fetchall():
+                if status and r["status"] != status:
+                    continue
+                out.append(
+                    {
+                        "id": f"skill:{r['id']}",
+                        "kind": "skill",
+                        "name": r["name"],
+                        "gist": _gist(r["summary"]),
+                        "status": r["status"],
+                        "age_days": _age_days(r["created_at"]),
+                        "created_at": _iso(r["created_at"]),
+                    }
+                )
+        if want_config:
+            for r in conn.execute(
+                "SELECT id, file_key, summary, status, created_at "
+                "FROM config_lane.config_proposals WHERE status = ANY(%s) "
+                "ORDER BY created_at DESC, id DESC LIMIT %s",
+                (list(_CONFIG_REVIEW_STATUSES), _PROPOSALS_LANE_CAP),
+            ).fetchall():
+                if status and r["status"] != status:
+                    continue
+                out.append(
+                    {
+                        "id": f"config:{r['id']}",
+                        "kind": "config-edit",
+                        "name": r["file_key"],
+                        "gist": _gist(r["summary"]),
+                        "status": r["status"],
+                        "age_days": _age_days(r["created_at"]),
+                        "created_at": _iso(r["created_at"]),
+                    }
+                )
+        out.sort(key=lambda p: p["created_at"] or "", reverse=True)
+        pending = _count(
+            conn,
+            "SELECT (SELECT count(*) FROM skills_lane.skill_gap_candidates WHERE status='proposed') "
+            "+ (SELECT count(*) FROM config_lane.config_proposals WHERE status='proposed') AS c",
+            None,
+        )
+        return {"proposals": out, "pending_count": pending}
+    finally:
+        conn.close()
+
+
+def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
+    """Normalized detail envelope over a lane's own _proposal_detail. payload is markdown
+    (skills SKILL.md draft) or diff (config unified diff); audit_log is the dashboard_audit
+    trail for this id, plus the lane's own reject_reason when a decision left no audit row."""
+    if lane == "skill":
+        d = _skill_proposal_detail(db_url, n)
+        if not d.get("found"):
+            return None
+        kind, name, status = "skill", d.get("name") or "", d.get("status") or ""
+        evidence = d.get("evidence") or []
+        payload = {"type": "markdown", "content": d.get("proposal_body") or d.get("summary") or ""}
+        rr_sql = "SELECT reject_reason FROM skills_lane.skill_gap_candidates WHERE id=%s"
+    else:
+        d = _config_proposal_detail(db_url, n)
+        if not d.get("found"):
+            return None
+        kind, name, status = "config-edit", d.get("file_key") or "", d.get("status") or ""
+        evidence = d.get("evidence") or []
+        payload = {"type": "diff", "content": d.get("diff") or ""}
+        rr_sql = "SELECT reject_reason FROM config_lane.config_proposals WHERE id=%s"
+
+    full_id = f"{lane}:{n}"
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        provenance = _provenance_episodes(conn, evidence)
+        audit_rows = conn.execute(
+            "SELECT ts, action, detail FROM dashboard_audit WHERE item_id = %s ORDER BY ts, id",
+            (full_id,),
+        ).fetchall()
+        audit_log = [
+            {
+                "ts": _iso(r["ts"]),
+                "action": r["action"],
+                "note": r["detail"].get("note") if isinstance(r["detail"], dict) else None,
+            }
+            for r in audit_rows
+        ]
+        rr = conn.execute(rr_sql, (n,)).fetchone()
+        reject_reason = rr["reject_reason"] if rr else None
+        # Surface a lane-side reject reason (e.g. a CLI reject) only if no dashboard reject
+        # row already carries it, so a dashboard reject isn't shown twice.
+        if reject_reason and not any(a["action"] == "proposal_reject" for a in audit_log):
+            audit_log.append({"ts": None, "action": "reject_reason", "note": reject_reason})
+    finally:
+        conn.close()
+
+    return {
+        "id": full_id,
+        "kind": kind,
+        "name": name,
+        "status": status,
+        "evidence": evidence,
+        "provenance_episodes": provenance,
+        "payload": payload,
+        "audit_log": audit_log,
+    }
+
+
+def _proposal_decision(
+    db_url: str, lane: str, n: int, action: str, note: str | None
+) -> dict[str, Any] | None:
+    """Delegate to the lane's _proposal_act (approve→accept, reject→reject-with-reason),
+    then append a dashboard_audit row. Returns the lane result, or None if the row is gone."""
+    lane_action = "accept" if action == "approve" else "reject"
+    if lane == "skill":
+        result = _skill_proposal_act(db_url, n, lane_action, note, _skill_routing_eval_stub)
+    else:
+        # config accept takes an optional scope override; the dashboard never re-scopes,
+        # so pass None (the lane keeps the proposal's stored blast radius).
+        result = _config_proposal_act(db_url, n, lane_action, note, None)
+    if isinstance(result, dict) and result.get("found") is False:
+        return None
+
+    audit_action = "proposal_approve" if action == "approve" else "proposal_reject"
+    conn = psycopg.connect(db_url, autocommit=True)
+    try:
+        conn.execute(
+            "INSERT INTO dashboard_audit (action, kind, item_id, detail) VALUES (%s,%s,%s,%s)",
+            (
+                audit_action,
+                _norm_kind(lane),
+                f"{lane}:{n}",
+                Json({"note": note, "lane_result": result}),
+            ),
+        )
+    finally:
+        conn.close()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1361,13 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             lambda: _search(db_url, q, type_, offset, limit, project, group_id, source),
         )
 
+    @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[misc]
+    async def dash_recall_history(request: Request) -> JSONResponse:
+        limit = _limit(
+            request.query_params.get("limit"), _RECALL_HISTORY_DEFAULT, _RECALL_HISTORY_MAX
+        )
+        return await _api(request, lambda: _recall_history(db_url, limit))
+
     @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
     async def dash_flags(request: Request) -> JSONResponse:
         return await _api(request, lambda: _flags_list(db_url))
@@ -1105,3 +1401,74 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             logger.warning("dashboard flag failed: %s", e)
             return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
         return JSONResponse({"status": "ok", "flagged": flagged})
+
+    # ---- proposals (phase 2b) ----
+
+    @mcp.custom_route("/dash/api/proposals", methods=["GET"])  # type: ignore[misc]
+    async def dash_proposals(request: Request) -> JSONResponse:
+        qp = request.query_params
+        status = qp.get("status") or None
+        if status == "all":
+            status = None
+        kind = qp.get("kind") or None
+        if kind not in (None, "skill", "config-edit"):
+            kind = None
+        return await _api(request, lambda: _proposals_unified(db_url, status, kind))
+
+    @mcp.custom_route("/dash/api/proposals/{id}", methods=["GET"])  # type: ignore[misc]
+    async def dash_proposal_detail(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        parsed = _parse_proposal_id(request.path_params["id"])
+        if parsed is None:
+            return JSONResponse({"status": "error", "detail": "bad proposal id"}, status_code=400)
+        lane, n = parsed
+        try:
+            result = await run_in_threadpool(_proposal_detail, db_url, lane, n)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard proposal detail failed: %s", e)
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+        if result is None:
+            return JSONResponse(
+                {"status": "error", "detail": "proposal not found"}, status_code=404
+            )
+        return JSONResponse(result)
+
+    @mcp.custom_route("/dash/api/proposals/{id}/decision", methods=["POST"])  # type: ignore[misc]
+    async def dash_proposal_decision(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        parsed = _parse_proposal_id(request.path_params["id"])
+        if parsed is None:
+            return JSONResponse({"status": "error", "detail": "bad proposal id"}, status_code=400)
+        lane, n = parsed
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+        action = body.get("action")
+        note = body.get("note")
+        if action not in ("approve", "reject"):
+            return JSONResponse(
+                {"status": "error", "detail": "action must be 'approve' or 'reject'"},
+                status_code=400,
+            )
+        if note is not None and not isinstance(note, str):
+            return JSONResponse(
+                {"status": "error", "detail": "'note' must be a string"}, status_code=400
+            )
+        # A reject must carry a reason — it's the lane's reject_reason and the audit note.
+        if action == "reject" and not (note and note.strip()):
+            return JSONResponse(
+                {"status": "error", "detail": "reject requires a non-empty note"}, status_code=400
+            )
+        try:
+            result = await run_in_threadpool(_proposal_decision, db_url, lane, n, action, note)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard proposal decision failed: %s", e)
+            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+        if result is None:
+            return JSONResponse(
+                {"status": "error", "detail": "proposal not found"}, status_code=404
+            )
+        return JSONResponse(result)
