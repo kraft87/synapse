@@ -165,18 +165,18 @@ function RecallTab() {
         {chart ? <UPlotChart opts={chart.opts} data={chart.chartData} height={150} /> : <Empty>not enough data in window</Empty>}
       </section>
 
-      {/* minmax(0,1fr): a bare 1fr track can't shrink below the nowrap query text's
-          min-content width, so long queries blew the row past the page column and
-          shoved the histogram out of the container. */}
-      <div className="duo" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: '14px' }}>
+      {/* Stacked full-width (operator request): side-by-side halved the query panel
+          and forced ellipsis on exactly the text this panel exists to show. Queries
+          wrap to their full text; the histogram sits below. */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
         <section style={panel()}>
           <div style={panelHead}>top slowest queries</div>
           {data && data.slowest.length > 0 ? (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '9px' }}>
               {data.slowest.map((sq, i) => (
-                <div key={i} style={{ display: 'flex', gap: '10px', alignItems: 'baseline' }}>
+                <div key={i} style={{ display: 'flex', gap: '10px', alignItems: 'flex-start' }}>
                   <span style={{ fontFamily: mono, fontSize: '12px', color: 'var(--err)', minWidth: '64px', textAlign: 'right', flexShrink: 0 }}>{sq.ms_total == null ? '—' : Math.round(sq.ms_total) + ' ms'}</span>
-                  <span style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt2)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={sq.query || undefined}>{sq.query || '(no query text)'}</span>
+                  <span style={{ fontFamily: mono, fontSize: '12px', lineHeight: 1.55, color: 'var(--txt2)', flex: 1, minWidth: 0, overflowWrap: 'anywhere', whiteSpace: 'pre-wrap' }}>{sq.query || '(no query text)'}</span>
                 </div>
               ))}
             </div>
