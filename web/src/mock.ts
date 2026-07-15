@@ -80,6 +80,64 @@ const FIX: Record<string, unknown> = {
   },
 };
 
+// ---- metrics fixtures (phase 4) — obviously synthetic ----
+const LEGS = ['embed', 'bm25', 'vector', 'kg', 'timeline', 'prefs', 'web', 'rerank'];
+const metricsSeries = Array.from({ length: 24 }, (_, i) => {
+  const legs: Record<string, number> = {};
+  for (const l of LEGS) legs[l] = Math.round((4 + Math.random() * 40) * (l === 'rerank' ? 3 : l === 'kg' ? 2 : 1));
+  const p50 = 140 + Math.round(Math.random() * 120);
+  return { t: iso((23 - i) * 2), p50, p95: p50 + 120 + Math.round(Math.random() * 90), calls: 8 + Math.round(Math.random() * 20), tokens_p50: 1200 + Math.round(Math.random() * 900), legs_p50: legs };
+});
+const FIX_METRICS = {
+  recall: {
+    series: metricsSeries,
+    slowest: [
+      { query: 'everything I know about the lisbon trip planning and who is coming', ms_total: 612, created_at: iso(3) },
+      { query: 'postgres connection pooling decisions across services', ms_total: 548, created_at: iso(7) },
+      { query: 'what did I decide about the rerank pool cap', ms_total: 501, created_at: iso(11) },
+      { query: 'embedding backend migration history and dims', ms_total: 470, created_at: iso(19) },
+      { query: 'timeline of the homelab disk upgrades', ms_total: 442, created_at: iso(26) },
+    ],
+    score_hist: [0, 0, 1, 2, 4, 7, 12, 21, 33, 18].map((n, i) => ({ lo: i / 10, hi: (i + 1) / 10, n })),
+  },
+  ingestion: {
+    queue_depth: 6,
+    queue: { pending: 6, processing: 1, failed: 2 },
+    throughput: {
+      enqueued_per_hour: Array.from({ length: 48 }, (_, i) => ({ t: iso(47 - i), n: Math.round(Math.random() * 40) })),
+      completed_per_hour: Array.from({ length: 48 }, (_, i) => ({ t: iso(47 - i), n: Math.round(Math.random() * 38) })),
+    },
+    failures: [
+      { id: 91, episode_id: 227168, error: 'extractor timeout after 3 attempts', enqueued_at: iso(5), processed_at: iso(4), attempts: 3 },
+      { id: 88, episode_id: 227101, error: 'malformed tool trace — JSON parse error', enqueued_at: iso(9), processed_at: iso(9), attempts: 2 },
+    ],
+    last_dream: {
+      id: 5, started_at: iso(9), finished_at: iso(8.6), duration_s: 41.2, ok: true,
+      stages: { skills: { ran: true, ok: true }, config: { ran: true, ok: true } },
+      counts: { proposals_raised: 2, config_proposals: 1, config_corrections_found: 4, config_sessions_scanned: 12 },
+      samples: { proposals: [{ id: 'skill:12', kind: 'skill', name: 'latency-triage' }, { id: 'config:4', kind: 'config-edit', name: 'rules/learned.md' }] },
+      errors: [],
+    },
+  },
+  corpus: {
+    tables: [
+      { name: 'episodes', rows: 44210, rows_estimated: true, spark_30d: Array.from({ length: 30 }, () => 4 + Math.round(Math.random() * 40)), delta_30d: 640 },
+      { name: 'kg_entities', rows: 8123, rows_estimated: false, spark_30d: Array.from({ length: 30 }, () => Math.round(Math.random() * 20)), delta_30d: 210 },
+      { name: 'kg_relationships', rows: 15980, rows_estimated: false, spark_30d: Array.from({ length: 30 }, () => Math.round(Math.random() * 30)), delta_30d: 402 },
+      { name: 'timeline_events', rows: 1204, rows_estimated: false, spark_30d: Array.from({ length: 30 }, () => Math.round(Math.random() * 8)), delta_30d: 74 },
+      { name: 'preferences', rows: 96, rows_estimated: false, spark_30d: Array.from({ length: 30 }, () => Math.round(Math.random() * 2)), delta_30d: 9 },
+      { name: 'notes', rows: 41, rows_estimated: false, spark_30d: Array.from({ length: 30 }, () => Math.round(Math.random() * 2)), delta_30d: 6 },
+      { name: 'chunks', rows: 10740, rows_estimated: false, spark_30d: Array.from({ length: 30 }, () => Math.round(Math.random() * 24)), delta_30d: 318 },
+    ],
+    by_project: [
+      { name: 'synapse', n: 3403 }, { name: 'homelab', n: 1290 }, { name: 'transcribe-ai', n: 840 }, { name: 'untagged', n: 512 },
+    ],
+    by_source: [
+      { name: 'claude-code', n: 31000 }, { name: 'cursor', n: 9200 }, { name: 'claude-ai', n: 3600 }, { name: 'transcribe-ai', n: 410 },
+    ],
+  },
+};
+
 const SEARCH: Record<string, unknown[]> = {
   episodes: [{ type: 'episodes', id: '1', snippet: 'wired service A to library B', meta: { project: 'service-a', source: 'claude-code', ts: iso(0.4), session_id: 'sess-1', episode_id: 1 } }],
   facts: [{ type: 'facts', id: 'ent-edge-1', snippet: 'service A depends on library B', meta: { project: 'service-a', source: 'claude-code', ts: iso(24), session_id: 'sess-1', episode_id: 1 } }],
@@ -135,6 +193,9 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'feed') out = FIX.feed;
   else if (p === 'flags') out = FIX.flags;
   else if (p === 'recall/history') out = RECALL_HISTORY;
+  else if (p === 'metrics/recall') out = FIX_METRICS.recall;
+  else if (p === 'metrics/ingestion') out = FIX_METRICS.ingestion;
+  else if (p === 'metrics/corpus') out = FIX_METRICS.corpus;
   else if (p === 'proposals') out = FIX.proposals;
   else if (/^proposals\//.test(p)) out = FIX['proposals/' + p.substring('proposals/'.length)] || {};
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;
