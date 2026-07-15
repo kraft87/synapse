@@ -1948,6 +1948,29 @@ def test_graph_neighborhood_truncation_keeps_highest_degree(clean, conn, db_url)
             assert e["src"] in kept and e["tgt"] in kept
 
 
+def test_graph_neighborhood_edge_cap_prunes_orphans(clean, conn, db_url):
+    """A dense hub must not ship an unbounded hairball: over edge_cap, seed-adjacent +
+    most-retrieved edges win, truncated flips, and nodes the cut orphaned are pruned
+    (regression: the live 707-degree hub returned 150 nodes / ~2K edges and hung the
+    browser in layout)."""
+    _gent(conn, "ec-hub", name="Hub", degree=9)
+    for i in range(4):
+        _gent(conn, f"ec-n{i}", name=f"Node {i}", degree=4 - i)
+    # 4 seed-adjacent edges with distinct retrieval_counts + 2 leaf-leaf edges.
+    for i in range(4):
+        _rel(conn, f"ec-e{i}", src="ec-hub", tgt=f"ec-n{i}", retrieval_count=10 - i)
+    _rel(conn, "ec-x1", src="ec-n0", tgt="ec-n1", retrieval_count=99)
+    _rel(conn, "ec-x2", src="ec-n2", tgt="ec-n3", retrieval_count=98)
+
+    out = dr._graph_neighborhood(db_url, "ec-hub", 1, None, 150, edge_cap=3)
+    assert out is not None and out["truncated"] is True
+    # Seed-adjacent edges beat the higher-retrieval leaf-leaf edges; within the
+    # adjacent set, retrieval_count orders the cut.
+    assert {e["uuid"] for e in out["edges"]} == {"ec-e0", "ec-e1", "ec-e2"}
+    kept = {n["uuid"] for n in out["nodes"]}
+    assert kept == {"ec-hub", "ec-n0", "ec-n1", "ec-n2"}  # ec-n3 orphaned -> pruned
+
+
 def test_graph_neighborhood_name_seed_resolution(clean, conn, db_url):
     _mini_graph(conn)
     with _client(db_url) as client:

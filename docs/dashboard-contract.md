@@ -525,7 +525,10 @@ Empty `q` → `[]`. Returns a bare array:
 
 ### GET /dash/api/graph/neighborhood?entity=<uuid|name>&depth=1|2&as_of=<iso?>&limit=150
 BFS from the resolved seed over `kg_relationships` (both directions), depth ≤ 2, hard-capped
-at `limit` (≤150, default 150) nodes.
+at `limit` (≤150, default 150) nodes AND 500 edges — a dense hub (the live seed hit 150
+nodes / ~2K edges) hangs browser layout, so over the edge cap the server keeps
+seed-adjacent edges first, then most-retrieved, then newest, prunes nodes the cut
+orphaned, and sets `truncated`.
 ```json
 {"nodes": [{"uuid": "…", "name": "…", "entity_type": "…", "degree": 12, "summary": "…"}],
  "edges": [{"uuid": "…", "src": "…", "tgt": "…", "name": "<verb>", "fact": "…",
