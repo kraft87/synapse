@@ -326,7 +326,7 @@ function Proposals() {
   }
 
   return (
-    <div className="proposals-grid" style={{ display: 'grid', gridTemplateColumns: '340px 1fr', gap: '16px', alignItems: 'start' }}>
+    <div className="proposals-grid" style={{ display: 'grid', gridTemplateColumns: '340px minmax(0,1fr)', gap: '16px', alignItems: 'start' }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
         {list.map((p) => <ProposalCard key={p.id} p={p} selected={p.id === sel} onClick={() => setSel(p.id)} />)}
       </div>
@@ -509,7 +509,7 @@ function BehaviorTab() {
   }
 
   return (
-    <div className="proposals-grid" style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: '16px', alignItems: 'start' }}>
+    <div className="proposals-grid" style={{ display: 'grid', gridTemplateColumns: '260px minmax(0,1fr)', gap: '16px', alignItems: 'start' }}>
       {/* left: grouped file list */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
         {groups.map((g) => (
