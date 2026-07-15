@@ -1,0 +1,80 @@
+/* Synapse dashboard — design tokens + base + interaction states.
+   Tokens are verbatim from the design handoff (README §Design Tokens).
+   This file is inlined into dist/index.html at build time; the JS bundle
+   never imports it. Component layout uses inline styles referencing these
+   custom properties; classes here carry the :hover/:focus states inline
+   styles can't express. */
+
+/* ---- self-hosted fonts (served at /dash/assets by the MCP server) ---- */
+@font-face { font-family:'IBM Plex Sans'; font-style:normal; font-weight:400; font-display:swap; src:url('/dash/assets/ibm-plex-sans-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family:'IBM Plex Sans'; font-style:normal; font-weight:500; font-display:swap; src:url('/dash/assets/ibm-plex-sans-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family:'IBM Plex Sans'; font-style:normal; font-weight:600; font-display:swap; src:url('/dash/assets/ibm-plex-sans-latin-600-normal.woff2') format('woff2'); }
+@font-face { font-family:'IBM Plex Mono'; font-style:normal; font-weight:400; font-display:swap; src:url('/dash/assets/ibm-plex-mono-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family:'IBM Plex Mono'; font-style:normal; font-weight:500; font-display:swap; src:url('/dash/assets/ibm-plex-mono-latin-500-normal.woff2') format('woff2'); }
+
+/* ---- tokens: dark is the default (no attr / [data-theme="dark"]) ---- */
+:root, :root[data-theme="dark"] {
+  --bg0:#0d1116; --bg1:#141a21; --bg2:#1a222b; --bg3:#212b36;
+  --line:#232d38; --line2:#2e3a47;
+  --txt:#d4dde5; --txt2:#8b99a6; --txt3:#5a6774;
+  --acc:#56c8d8; --acc-bg:rgba(86,200,216,.10);
+  --ok:#5bbd8d; --warn:#d9a05b; --err:#e08b7a;
+  --src-cc:#d9a05b; --src-cur:#9b87e0; --src-cai:#e08b7a; --src-tr:#5bbd9d;
+  --et-person:#e0a1b8; --et-project:#56c8d8; --et-tech:#9b87e0; --et-org:#d9a05b; --et-concept:#7fbf7f; --et-event:#aeb8c2;
+  --scrim:rgba(5,8,11,.6);
+  --font-prose:'IBM Plex Sans', system-ui, sans-serif;
+  --font-data:'IBM Plex Mono', ui-monospace, monospace;
+}
+:root[data-theme="light"] {
+  --bg0:#f2f4f5; --bg1:#ffffff; --bg2:#eef1f3; --bg3:#e4e9ec;
+  --line:#dbe1e6; --line2:#c8d1d8;
+  --txt:#1d262e; --txt2:#5a6774; --txt3:#8b99a6;
+  --acc:#0f93a8; --acc-bg:rgba(15,147,168,.08);
+  --scrim:rgba(20,26,33,.35);
+}
+
+/* ---- base ---- */
+* { box-sizing:border-box; }
+html, body { margin:0; padding:0; }
+body {
+  background:var(--bg0); color:var(--txt);
+  font-family:var(--font-prose); font-size:14px;
+  -webkit-font-smoothing:antialiased;
+}
+#root { min-height:100vh; display:flex; flex-direction:column; }
+.mono { font-family:var(--font-data); }
+select, input, button, textarea { font:inherit; color:inherit; }
+button { cursor:pointer; }
+::selection { background:rgba(86,200,216,.25); }
+a { color:var(--acc); }
+
+/* scrollbars */
+*::-webkit-scrollbar { width:10px; height:10px; }
+*::-webkit-scrollbar-thumb { background:var(--line2); border-radius:5px; }
+*::-webkit-scrollbar-track { background:transparent; }
+
+/* ---- animations ---- */
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+@keyframes slidein { from{opacity:0; transform:translateY(-6px)} to{opacity:1; transform:none} }
+@keyframes skeleton { 0%,100%{opacity:.45} 50%{opacity:.8} }
+@keyframes drawerin { from{transform:translateX(24px); opacity:.4} to{transform:none; opacity:1} }
+@keyframes spin { to{transform:rotate(360deg)} }
+
+/* ---- interaction states (hover/focus) ---- */
+.navbtn:hover { color:var(--txt) !important; background:var(--bg2) !important; }
+.iconbtn:hover { color:var(--txt) !important; }
+.softbtn:hover { color:var(--txt) !important; border-color:var(--line2) !important; }
+.linkbtn:hover { color:var(--acc) !important; }
+.result:hover { border-color:var(--line2) !important; background:var(--bg2) !important; }
+.flagbtn:hover { color:var(--warn) !important; }
+.field:focus { border-color:var(--acc) !important; outline:none; }
+.field:focus.field-err { border-color:var(--err) !important; }
+.gbtn:hover { border-color:var(--line2) !important; }
+
+/* ---- responsive ---- */
+@media (max-width:720px) {
+  .duo { grid-template-columns:1fr !important; }
+  .scrollx { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .hdr-filters { order:3; }
+  .search-tabs { overflow-x:auto; }
+}
