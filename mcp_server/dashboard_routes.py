@@ -126,6 +126,11 @@ _PREF_SORTS = {
 _GRAPH_TYPEAHEAD_DEFAULT = 10
 _GRAPH_TYPEAHEAD_MAX = 25
 _GRAPH_NODE_CAP = 150  # hard cap on rendered nodes (contract + spec §4)
+# Edges need their own cap: the node cap alone let a dense hub return 150 nodes with
+# ~2K interconnecting edges (the live "Synapse" entity, degree 707), which hung the
+# browser tab in cose-bilkent layout. Rank seed-adjacent first, then most-retrieved,
+# then newest; nodes orphaned by the cut are pruned (the seed always stays).
+_GRAPH_EDGE_CAP = 500
 _GRAPH_EDGE_SCAN_CAP = 6000  # per-level BFS + final-edge scan safety valve
 _GRAPH_STMT_TIMEOUT_MS = 5000  # belt-and-suspenders bound on any single graph query
 
@@ -781,11 +786,17 @@ def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict
 
 
 def _graph_neighborhood(
-    db_url: str, entity: str, depth: int, as_of: datetime | None, limit: int
+    db_url: str,
+    entity: str,
+    depth: int,
+    as_of: datetime | None,
+    limit: int,
+    edge_cap: int = _GRAPH_EDGE_CAP,
 ) -> dict[str, Any] | None:
     """BFS from the resolved seed over kg_relationships (both directions), depth ≤ 2,
-    hard-capped at `limit` (≤150) nodes. Truncation keeps the highest-degree nodes (the
-    seed is always kept) and sets truncated=True.
+    hard-capped at `limit` (≤150) nodes AND `edge_cap` edges. Truncation keeps the
+    highest-degree nodes / best-ranked edges (the seed is always kept) and sets
+    truncated=True; nodes orphaned by the edge cut are pruned.
 
     as_of visibility (traversal AND returned edges use the SAME predicate): when set,
     exclude edges not-yet-valid (t_valid > as_of) but KEEP superseded edges (the client
@@ -852,6 +863,25 @@ def _graph_neighborhood(
             f"WHERE src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
             (kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
         ).fetchall()
+
+        # Edge cap (see _GRAPH_EDGE_CAP): keep seed-adjacent edges first, then the
+        # most-retrieved, then the newest; prune nodes the cut left edgeless.
+        if len(edge_rows) > edge_cap:
+            _epoch = datetime(1970, 1, 1, tzinfo=UTC)
+            edge_rows.sort(
+                key=lambda r: (
+                    seed_uuid not in (r["src_uuid"], r["tgt_uuid"]),
+                    -(r["retrieval_count"] or 0),
+                    -(r["t_valid"] or _epoch).timestamp(),
+                )
+            )
+            edge_rows = edge_rows[:edge_cap]
+            connected = {seed_uuid}
+            for r in edge_rows:
+                connected.add(r["src_uuid"])
+                connected.add(r["tgt_uuid"])
+            ent_rows = [r for r in ent_rows if r["uuid"] in connected]
+            truncated = True
 
         return {
             "nodes": [
