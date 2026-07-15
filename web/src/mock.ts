@@ -38,6 +38,46 @@ const FIX: Record<string, unknown> = {
     mentions: { items: [{ episode_id: 1, created_at: iso(0.4), gist: 'wired service A to library B' }, { episode_id: 2, created_at: iso(30), gist: 'refactored the widget cache' }], offset: 0, limit: 20, total: 2 },
   },
   flags: { flags: [{ id: 1, kind: 'timeline_event', item_id: '10', note: null, created_at: iso(2), gist: 'example event: service A shipped v2' }] },
+  proposals: {
+    pending_count: 2,
+    proposals: [
+      { id: 'skill:1', kind: 'skill', name: 'latency-triage', gist: 'Recurring recall latency debugging with no reusable playbook.', status: 'proposed', age_days: 0, created_at: iso(9) },
+      { id: 'config:1', kind: 'config-edit', name: 'CLAUDE.md', gist: 'Add the raw-SQL / no-ORM rule the operator restated 5x.', status: 'proposed', age_days: 1, created_at: iso(30) },
+      { id: 'skill:2', kind: 'skill', name: 'graph-inspect', gist: 'Two overlapping skills — merge into one.', status: 'accepted', age_days: 2, created_at: iso(52) },
+      { id: 'config:2', kind: 'config-edit', name: 'rules/testing.md', gist: 'Proposed mandatory 90% coverage gate.', status: 'rejected', age_days: 4, created_at: iso(100) },
+    ],
+  },
+  'proposals/skill:1': {
+    id: 'skill:1', kind: 'skill', name: 'latency-triage', status: 'proposed',
+    evidence: [
+      { session_id: 'sess-1', class: 'grounded', signal: 'explicit_request', why: 'operator asked for a reusable recall-latency playbook' },
+      { session_id: 'sess-2', class: 'grounded', signal: 'user_correction', why: 'repeated the same waterfall read-through by hand' },
+    ],
+    provenance_episodes: [1, 2],
+    payload: { type: 'markdown', content: '# latency-triage\n\nWhen recall p95 regresses, read the waterfall leg-by-leg. Dominant leg → known remedy:\n\n- **rerank** → cap candidate pool (`RERANK_POOL_CAP`)\n- **kg** → depth-limit the neighborhood expand\n- **vector** → check `pgvector` index / cache hit rate\n- **bm25** → review tokenizer + stopwords\n\n```\nrecall --debug "<query>" | jq .legs\n```' },
+    audit_log: [],
+  },
+  'proposals/config:1': {
+    id: 'config:1', kind: 'config-edit', name: 'CLAUDE.md', status: 'proposed',
+    evidence: [{ session_id: 'sess-3', signal: 'correction', why: 'operator restated "prefer raw SQL over the ORM" five times' }],
+    provenance_episodes: [2],
+    payload: { type: 'diff', content: '--- a/CLAUDE.md\n+++ b/CLAUDE.md\n@@ -12,3 +12,4 @@\n ## Conventions\n Keep functions small.\n+Prefer raw SQL over the ORM for hot-path reads.\n Log every migration.' },
+    audit_log: [],
+  },
+  'proposals/skill:2': {
+    id: 'skill:2', kind: 'skill', name: 'graph-inspect', status: 'accepted',
+    evidence: [{ session_id: 'sess-4', class: 'grounded', signal: 'accept', why: 'operator accepted the merge' }],
+    provenance_episodes: [],
+    payload: { type: 'markdown', content: '# graph-inspect\n\nMerged from **graph-explore** + **kg-inspect** — one skill for reading the KG.' },
+    audit_log: [{ ts: iso(48), action: 'proposal_approve', note: 'clear overlap; merge is right' }],
+  },
+  'proposals/config:2': {
+    id: 'config:2', kind: 'config-edit', name: 'rules/testing.md', status: 'rejected',
+    evidence: [{ session_id: 'sess-5', signal: 'correction', why: 'proposed a hard coverage gate' }],
+    provenance_episodes: [],
+    payload: { type: 'diff', content: '--- a/rules/testing.md\n+++ b/rules/testing.md\n@@ -1 +1,2 @@\n # Testing\n+Every PR must hit 90% line coverage.' },
+    audit_log: [{ ts: iso(96), action: 'proposal_reject', note: 'too rigid — coverage is a lagging signal' }],
+  },
 };
 
 const SEARCH: Record<string, unknown[]> = {
@@ -53,6 +93,8 @@ export async function mockApi<T>(path: string): Promise<T> {
   if (p === 'catalog') out = FIX.catalog;
   else if (p === 'feed') out = FIX.feed;
   else if (p === 'flags') out = FIX.flags;
+  else if (p === 'proposals') out = FIX.proposals;
+  else if (/^proposals\//.test(p)) out = FIX['proposals/' + p.substring('proposals/'.length)] || {};
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;
   else if (/^episode\//.test(p)) out = FIX['episode/' + p.split('/')[1]] || FIX['episode/1'];
   else if (/^session\//.test(p)) out = FIX.session;

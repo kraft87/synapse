@@ -1,3 +1,7 @@
+# mypy: ignore-errors
+# Deliberately untyped route-handler module (FastMCP @custom_route decorators are inherently
+# untyped) — already in the mypy pre-commit exclude; the pragma keeps it clean when a typed
+# module (mcp_server/dashboard_routes.py) imports its _proposal_* helpers via follow-imports.
 """Plain-HTTP skill sync + review routes — the DB seam that lets the plugin stay DSN-free.
 
 The Claude Code plugin used to reach Postgres directly (SYNAPSE_DB_URL) for two things:

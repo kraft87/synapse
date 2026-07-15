@@ -2,7 +2,7 @@
 // to localStorage (README §State Management). Catalog + live status live here so
 // the header can render them on every page.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { fetchCatalog, getToken, clearToken, onAuthFail, type Catalog } from './api';
+import { fetchCatalog, fetchProposals, getToken, clearToken, onAuthFail, type Catalog } from './api';
 import { MOCK } from './mock';
 
 export type Group = 'all' | 'technical' | 'personal';
@@ -31,6 +31,8 @@ interface Store {
   catalog: Catalog | null;
   online: boolean;
   setOnline: (b: boolean) => void;
+  reviewPending: number;
+  setReviewPending: (n: number) => void;
 }
 
 const Ctx = createContext<Store | null>(null);
@@ -50,6 +52,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [online, setOnline] = useState(true);
+  const [reviewPending, setReviewPending] = useState(0);
 
   // theme -> <html data-theme> + persistence
   useEffect(() => { document.documentElement.dataset.theme = theme; ls.set('synapse.theme', theme); }, [theme]);
@@ -57,11 +60,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // a 401 anywhere clears the token and returns to the login screen
   useEffect(() => { onAuthFail(() => { clearToken(); setToken(null); }); }, []);
 
-  // load the catalog once we have a token (or in mock)
+  // load the catalog + the Review pending-proposal count once we have a token (or in
+  // mock). The count seeds the nav badge before Review is ever opened; the Review page
+  // keeps it in sync after decisions.
   useEffect(() => {
     if (!MOCK && !token) return;
     let live = true;
     fetchCatalog().then((c) => { if (live) { setCatalog(c); setOnline(true); } }).catch(() => {});
+    fetchProposals().then((r) => { if (live) setReviewPending(r.pending_count || 0); }).catch(() => {});
     return () => { live = false; };
   }, [token]);
 
@@ -74,7 +80,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const value = useMemo<Store>(() => ({
     token, setTokenValue, theme, toggleTheme, group, setGroup, project, setProject,
     source, setSource, page, setPage, searchQuery, setSearchQuery, catalog, online, setOnline,
-  }), [token, theme, group, project, source, page, searchQuery, catalog, online, setTokenValue, toggleTheme, setGroup, setProject, setSource]);
+    reviewPending, setReviewPending,
+  }), [token, theme, group, project, source, page, searchQuery, catalog, online, reviewPending, setTokenValue, toggleTheme, setGroup, setProject, setSource]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
