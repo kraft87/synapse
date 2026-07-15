@@ -138,6 +138,79 @@ const FIX_METRICS = {
   },
 };
 
+// ---- timeline / preferences / dream / behavior fixtures (phase 5) — obviously synthetic ----
+const day = (d: string) => new Date(d + 'T12:00:00Z').toISOString();
+const FIX_P5 = {
+  timeline: {
+    events: [
+      { id: 3, t_valid: day('2026-07-03'), fact: 'Rerank latency regression fixed — candidate pool capped at 96.', source: 'chat', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
+      { id: 2, t_valid: day('2026-07-03'), fact: 'SSE Last-Event-ID resume shipped.', source: 'git:example', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
+      { id: 1, t_valid: day('2026-07-01'), fact: 'Embedding cache moved into Postgres (pgvector table).', source: 'git:example', project: 'synapse', salience: 1, sal: 0.6, event_type: 'work', episode_id: 88101, flagged: false },
+      { id: 0, t_valid: day('2026-06-30'), fact: 'Took a proper rest day.', source: 'chat', project: null, salience: 1, sal: 0.6, event_type: 'health', episode_id: null, flagged: true },
+    ],
+    next_before: null,
+  },
+  preferences: {
+    preferences: [
+      { id: 1, pref: 'Wants recall() debug output on by default in dev', polarity: 'like', first_seen: day('2026-06-18'), last_asserted: day('2026-07-10'), assert_count: 3, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 2, pref: 'Avoid CDN dependencies — everything self-hosted', polarity: 'dislike', first_seen: day('2026-04-11'), last_asserted: day('2026-07-02'), assert_count: 6, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 3, pref: 'Prefers boring, well-understood infra over clever abstractions', polarity: 'like', first_seen: day('2026-03-02'), last_asserted: day('2026-06-20'), assert_count: 7, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 4, pref: 'Dislikes ORMs for this project — raw SQL only', polarity: 'dislike', first_seen: day('2026-02-14'), last_asserted: day('2026-06-01'), assert_count: 5, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 5, pref: 'Prefers dark theme everywhere', polarity: 'rule', first_seen: day('2026-01-20'), last_asserted: day('2026-05-11'), assert_count: 9, superseded_by: null, superseded_by_text: null, t_invalid: null, flagged: false },
+      { id: 6, pref: 'Liked hosted vector DBs', polarity: 'like', first_seen: day('2025-11-08'), last_asserted: day('2026-01-02'), assert_count: 2, superseded_by: 3, superseded_by_text: 'self-hosted pgvector', t_invalid: day('2026-02-15'), flagged: false },
+    ],
+  },
+  dreamReport: {
+    runs: [
+      {
+        id: 6, started_at: day('2026-07-03'), finished_at: day('2026-07-03'), duration_s: 2460, ok: true,
+        stages: { skills: { ran: true, ok: true }, config: { ran: true, ok: true } },
+        counts: { facts_extracted: 128, superseded: 14, dedup_merges: 1882, timeline_events: 9, proposals_raised: 3 },
+        samples: { proposals: [{ id: 'config:4', kind: 'config-edit', name: 'rules/learned.md' }], facts_extracted: [{ text: 'SSE endpoint — supports → Last-Event-ID resume' }, { text: 'recall() — has parameter → RERANK_POOL_CAP (default 96)' }, { text: 'embedding cache — stored in → embeddings_cache (Postgres)' }] },
+        errors: [],
+      },
+      {
+        id: 5, started_at: day('2026-07-02'), finished_at: day('2026-07-02'), duration_s: 1980, ok: true,
+        stages: { skills: { ran: true, ok: true }, config: { ran: true, ok: false } },
+        counts: { proposals_raised: 1, config_proposals: 1 },
+        samples: { proposals: [{ id: 'skill:12', kind: 'skill', name: 'latency-triage' }] },
+        errors: ['config lane: proposer LLM call timed out'],
+      },
+    ],
+  },
+  behaviorFiles: {
+    groups: [
+      { name: 'CLAUDE.md', files: [{ file_key: 'CLAUDE.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-07-10'), size: 4120 }] },
+      { name: 'rules', files: [
+        { file_key: 'rules/voice.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-07-08'), size: 980 },
+        { file_key: 'rules/memory-protocol.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-06-30'), size: 1450 },
+      ] },
+      { name: 'memory notes', files: [{ file_key: 'memory/project_briefing.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-07-05'), size: 720 }] },
+      { name: 'other', files: [{ file_key: 'AGENTS.md', surface_id: 'cortex', scope: 'global', updated_at: day('2026-05-01'), size: 300 }] },
+    ],
+  },
+  behaviorFile: {
+    file_key: 'CLAUDE.md',
+    content: '# CLAUDE.md\n\nYou are an example operator persona.\n\n- Prefer raw SQL over the ORM (see [[rules/voice.md]]).\n- Memory protocol lives in [[rules/memory-protocol.md]].\n- Standing crons: [[memory/project_briefing.md]].\n',
+    meta: { surface_id: 'cortex', scope: 'global', abs_path: '/home/example/.claude/CLAUDE.md', content_hash: 'deadbeef', modified_at: day('2026-07-10'), updated_at: day('2026-07-10'), size: 4120 },
+    links: ['rules/voice.md', 'rules/memory-protocol.md', 'memory/project_briefing.md'],
+  },
+  behaviorLinkgraph: {
+    nodes: [
+      { file_key: 'CLAUDE.md', scope: 'global', group: 'CLAUDE.md' },
+      { file_key: 'rules/voice.md', scope: 'global', group: 'rules' },
+      { file_key: 'rules/memory-protocol.md', scope: 'global', group: 'rules' },
+      { file_key: 'memory/project_briefing.md', scope: 'global', group: 'memory notes' },
+    ],
+    edges: [
+      { source: 'CLAUDE.md', target: 'rules/voice.md' },
+      { source: 'CLAUDE.md', target: 'rules/memory-protocol.md' },
+      { source: 'CLAUDE.md', target: 'memory/project_briefing.md' },
+      { source: 'rules/memory-protocol.md', target: 'rules/voice.md' },
+    ],
+  },
+};
+
 const SEARCH: Record<string, unknown[]> = {
   episodes: [{ type: 'episodes', id: '1', snippet: 'wired service A to library B', meta: { project: 'service-a', source: 'claude-code', ts: iso(0.4), session_id: 'sess-1', episode_id: 1 } }],
   facts: [{ type: 'facts', id: 'ent-edge-1', snippet: 'service A depends on library B', meta: { project: 'service-a', source: 'claude-code', ts: iso(24), session_id: 'sess-1', episode_id: 1 } }],
@@ -196,6 +269,12 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'metrics/recall') out = FIX_METRICS.recall;
   else if (p === 'metrics/ingestion') out = FIX_METRICS.ingestion;
   else if (p === 'metrics/corpus') out = FIX_METRICS.corpus;
+  else if (p === 'timeline') out = FIX_P5.timeline;
+  else if (p === 'preferences') out = FIX_P5.preferences;
+  else if (p === 'dream/report') out = FIX_P5.dreamReport;
+  else if (p === 'behavior/files') out = FIX_P5.behaviorFiles;
+  else if (p === 'behavior/file') out = FIX_P5.behaviorFile;
+  else if (p === 'behavior/linkgraph') out = FIX_P5.behaviorLinkgraph;
   else if (p === 'proposals') out = FIX.proposals;
   else if (/^proposals\//.test(p)) out = FIX['proposals/' + p.substring('proposals/'.length)] || {};
   else if (/^episode\/[^/]+\/derived$/.test(p)) out = FIX.derived;

@@ -402,6 +402,112 @@ are the expensive part).
 - `rows_estimated` — see the honesty note. `by_project`/`by_source` are exact, top 12,
   `untagged` for NULL/empty.
 
+## Phase 5 endpoints (Timeline · Preferences · Dream report · Behavior files)
+
+Read-only surfaces over the episodic timeline (schema 033), the preference log (035), the
+dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as every
+`/dash/api/*` route: machine-token gated, threadpool, one short-lived connection, bounded,
+fail-soft. No new migration — these read existing tables.
+
+**Honesty notes (read before consuming a payload):**
+- **`timeline_events.event_type` is sparse.** Schema 033 deferred typed events, so most rows
+  have `event_type = NULL`. A `type` chip filter narrows to rows with that exact `event_type`;
+  **untyped events show only in the unfiltered view** (the default). This is why the type
+  filter is single-select and the default Events view is the whole stream.
+- **No behavior-file history.** `config_lane.config_registry` keeps only the CURRENT version of
+  a file (`content` + `content_hash` + `updated_at`); there is NO versions table. So
+  `/behavior/file` returns no history and the client's change-history timeline stays hidden —
+  it is NOT fabricated. Adding a versions store is a later phase.
+
+### GET /dash/api/timeline?before&limit=50&type&group_id
+`t_valid`-DESC keyset page of timeline events (the Events tab).
+```json
+{"events": [
+  {"id": 8841, "t_valid": "2026-07-03T…", "fact": "rerank pool capped at 96",
+   "source": "chat", "project": "synapse", "salience": 2, "sal": 0.9,
+   "event_type": "work", "episode_id": 88412, "flagged": false}],
+ "next_before": "2026-07-03T…|8841"}
+```
+- `limit` ≤ 200 (default 50). `sal` maps salience `0/1/2 → 0.3/0.6/0.9` (the feed mapping); the
+  salience type ramp reads `sal`. `episode_id` is the resolved `ep:N` `source_ref` (git SHAs → null).
+- `type` filters `event_type` (see honesty note). `group_id` filters the `domain` column (schema 038).
+- `before` is the keyset cursor: a **bare ISO timestamp** (the jump-to-date case → strict
+  `t_valid < ts`) OR a compound **`ts|id`** (a prior `next_before` → the full `(t_valid, id)`
+  keyset, so ties on `t_valid` never drop or duplicate a row). `next_before` is set whenever a
+  full page (`len == limit`) is returned — the next fetch drains the stream (empty page, no
+  cursor), exactly like `/feed`.
+
+### GET /dash/api/preferences?sort=recency|assert_count
+The full standing-preference log (the Preferences tab). LIVE rows first, then superseded
+(struck in the UI), each ordered by the chosen sort.
+```json
+{"preferences": [
+  {"id": 1, "pref": "Wants recall() debug on by default in dev", "polarity": "like",
+   "first_seen": "2026-06-18T…", "last_asserted": "2026-07-10T…", "assert_count": 3,
+   "superseded_by": null, "superseded_by_text": null, "t_invalid": null, "flagged": false}]}
+```
+- `polarity` ∈ `like|dislike|rule`. `sort=recency` → `last_asserted DESC`; `sort=assert_count`
+  → `assert_count DESC, last_asserted DESC`. Live-first is applied before the sort in both.
+- Superseded rows carry `t_invalid` + `superseded_by` + `superseded_by_text` (the replacing
+  row's pref text, joined in) so the UI names what won. Capped at 500 (a single owner accrues
+  dozens). No group filter — preferences are cross-domain (spec §1).
+
+### GET /dash/api/dream/report?limit=20
+Recent `dream_runs` (044), newest first — the Dream-report page's drill-in source. Same row
+shape as `/metrics/ingestion`'s `last_dream`. `limit` ≤ 100. Empty table → `{"runs": []}`.
+```json
+{"runs": [
+  {"id": 6, "started_at": "…", "finished_at": "…", "duration_s": 2460.0, "ok": true,
+   "stages": {"config": {"ran": true, "ok": true}},
+   "counts": {"proposals_raised": 3, "config_proposals": 2},
+   "samples": {"proposals": [{"id": "config:4", "kind": "config-edit", "name": "rules/x.md"}]},
+   "errors": []}]}
+```
+- The 5 stat cards read `counts.{facts_extracted, superseded, dedup_merges, timeline_events,
+  proposals_raised}`; an **absent** count renders "—" (the dream lanes propose, they do not
+  extract facts, so most of these are honestly absent today — see the Phase 4 honesty note).
+  Each card drills into the matching `samples` bucket (`proposals_raised` → `samples.proposals`).
+
+### GET /dash/api/behavior/files
+The config-lane file mirror, grouped for the Behavior-files left list.
+```json
+{"groups": [
+  {"name": "CLAUDE.md", "files": [
+    {"file_key": "CLAUDE.md", "surface_id": "cortex", "scope": "global",
+     "updated_at": "…", "size": 4120}]},
+  {"name": "rules", "files": [...]}, {"name": "memory notes", "files": [...]},
+  {"name": "other", "files": [...]}]}
+```
+- Grouping by `file_key` path shape, fixed display order: **CLAUDE.md** (basename `CLAUDE.md`)
+  · **rules** (`rules/…`) · **memory notes** (`memory/…` / `notes/…`) · **other**. Only
+  non-empty groups appear. One entry per registry row — `(surface_id, scope, file_key)` is the
+  PK — so the same `file_key` on two surfaces lists twice; the client disambiguates the detail
+  fetch with `scope` + `surface`. `size` is `octet_length(content)`.
+
+### GET /dash/api/behavior/file?key=…&scope=global&surface=
+One mirrored file's content + meta + parsed `[[wikilinks]]`. Reuses the `_fetch_config` seam.
+```json
+{"file_key": "CLAUDE.md", "content": "…full text…",
+ "meta": {"surface_id": "cortex", "scope": "global", "abs_path": "…",
+          "content_hash": "…", "modified_at": "…", "updated_at": "…", "size": 4120},
+ "links": ["rules/voice.md", "memory/project_briefing.md"]}
+```
+- `scope` defaults to `global`. `surface` optional — when omitted, the most-recently-updated
+  surface for that `(scope, file_key)` is served. Missing `key` → 400; no such row → 404.
+- `links` = unique `[[target]]` values in first-seen order (an `|alias` suffix is dropped).
+  **No history** (honesty note) — the response carries no versions.
+
+### GET /dash/api/behavior/linkgraph
+Adjacency over every registry file's `[[wikilinks]]`.
+```json
+{"nodes": [{"file_key": "CLAUDE.md", "scope": "global", "group": "CLAUDE.md"}],
+ "edges": [{"source": "CLAUDE.md", "target": "rules/voice.md"}]}
+```
+- Nodes are keyed by logical `file_key` (deduped across surfaces). Edges are
+  `file_key → wikilink target`; a target need not be a node (many point at memory notes, which
+  are not mirrored files) — the client resolves what it can (exact `file_key`, or basename
+  without extension) and renders the rest as inert leaves.
+
 ## Schema (migrations 042, 044)
 
 `dashboard_flags(id, kind, item_id, note, created_at, removed_at)` — active = `removed_at IS NULL`,
@@ -419,14 +525,9 @@ Migration 043 (`043_dash_notify.sql`) adds `dash_notify_feed()` + AFTER INSERT t
 
 ## Later phases (reserved paths)
 
-`/dash/api/metrics/{recall,ingestion,corpus}`,
-`/dash/api/timeline`, `/dash/api/preferences`,
-`/dash/api/behavior/*`, `/dash/api/dream/report`, `/dash/api/graph/*`.
-(`POST /recall`'s `debug: true` flag + `/dash/api/recall/history` shipped in phase 2;
-`/dash/api/proposals*` shipped in phase 2b; `/dash/api/stream` (SSE) shipped in phase 3 —
-see above.)
-`/dash/api/stream` (SSE), `/dash/api/timeline`, `/dash/api/preferences`,
-`/dash/api/behavior/*`, `/dash/api/dream/report`, `/dash/api/graph/*`.
-(`POST /recall`'s `debug: true` flag + `/dash/api/recall/history` shipped in phase 2;
-`/dash/api/proposals*` shipped in phase 2b; `/dash/api/metrics/{recall,ingestion,corpus}`
-shipped in phase 4 — see above.)
+`/dash/api/graph/*` (the Graph KG-explorer page) is the only reserved path left.
+Shipped so far: `POST /recall`'s `debug: true` flag + `/dash/api/recall/history` (phase 2);
+`/dash/api/proposals*` (phase 2b); `/dash/api/stream` SSE (phase 3);
+`/dash/api/metrics/{recall,ingestion,corpus}` (phase 4);
+`/dash/api/timeline`, `/dash/api/preferences`, `/dash/api/dream/report`,
+`/dash/api/behavior/{files,file,linkgraph}` (phase 5) — all documented above.

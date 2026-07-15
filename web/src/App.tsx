@@ -9,6 +9,7 @@ import { Search } from './pages/Search';
 import { Recall } from './pages/Recall';
 import { Review } from './pages/Review';
 import { Metrics } from './pages/Metrics';
+import { Timeline } from './pages/Timeline';
 import { Stub } from './pages/Stub';
 import { Overlays } from './overlays/Overlays';
 
@@ -23,6 +24,7 @@ function Shell() {
         : s.page === 'recall' ? <Recall />
         : s.page === 'review' ? <Review />
         : s.page === 'metrics' ? <Metrics />
+        : s.page === 'timeline' ? <Timeline />
         : <Stub page={s.page} />}
       <Overlays />
     </>
