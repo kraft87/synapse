@@ -25,6 +25,31 @@ export const etColor = (t?: string | null): string => {
   return ET_COLOR[key] || 'var(--txt3)';
 };
 
+// The live KG carries ~32 canonical supertypes (kg_supertypes, schema 020) but the
+// design has six color families — without this mapping ~80% of graph nodes fell
+// through to gray (the "useless gray blob" report, 2026-07-15). Curated, not
+// heuristic, so a new supertype lands gray until deliberately placed.
+const SUPER_FAMILY: Record<string, string> = {
+  Person: 'var(--et-person)',
+  Project: 'var(--et-project)',
+  Organization: 'var(--et-org)',
+  Event: 'var(--et-event)', Activity: 'var(--et-event)', Issue: 'var(--et-event)', Decision: 'var(--et-event)',
+  Agent: 'var(--et-tech)', Architecture: 'var(--et-tech)', Config: 'var(--et-tech)',
+  Database: 'var(--et-tech)', Datastructure: 'var(--et-tech)', Feature: 'var(--et-tech)',
+  File: 'var(--et-tech)', Function: 'var(--et-tech)', Hardware: 'var(--et-tech)',
+  Library: 'var(--et-tech)', Model: 'var(--et-tech)', Product: 'var(--et-tech)',
+  Service: 'var(--et-tech)', Technology: 'var(--et-tech)', Tool: 'var(--et-tech)', Url: 'var(--et-tech)',
+  Concept: 'var(--et-concept)', Food: 'var(--et-concept)', Location: 'var(--et-concept)',
+  Medical: 'var(--et-concept)', Metric: 'var(--et-concept)', Pattern: 'var(--et-concept)',
+  Process: 'var(--et-concept)', Publication: 'var(--et-concept)', Technique: 'var(--et-concept)',
+  Other: 'var(--et-concept)',
+};
+export const superColor = (t?: string | null): string => {
+  if (!t) return 'var(--txt3)';
+  const key = t.charAt(0).toUpperCase() + t.slice(1).toLowerCase();
+  return SUPER_FAMILY[key] || 'var(--txt3)';
+};
+
 // Search-tab / feed type chip color keys (README §3 badge taxonomy).
 export const typeColor: Record<string, string> = {
   episode: 'var(--txt2)', episodes: 'var(--txt2)',

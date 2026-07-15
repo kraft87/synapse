@@ -459,9 +459,9 @@ export const fetchBehaviorLinkgraph = (): Promise<BehaviorLinkGraph> =>
 // BFS from a resolved seed (uuid or name), depth ≤ 2, server-capped at 150 nodes
 // (truncation keeps the highest-degree nodes). Edges carry bitemporal validity so the
 // as-of slider scrubs client-side; the client re-queries with as_of only when truncated.
-export interface GraphEntity { uuid: string; name: string; entity_type: string | null; degree: number; }
+export interface GraphEntity { uuid: string; name: string; entity_type: string | null; supertype?: string | null; degree: number; }
 export interface GraphNode {
-  uuid: string; name: string; entity_type: string | null; degree: number; summary: string | null;
+  uuid: string; name: string; entity_type: string | null; supertype?: string | null; degree: number; summary: string | null;
 }
 export interface GraphEdge {
   uuid: string; src: string; tgt: string; name: string | null; fact: string | null;

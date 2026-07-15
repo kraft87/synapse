@@ -746,7 +746,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
     conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
     try:
         rows = conn.execute(
-            "SELECT uuid, name, entity_type, degree FROM kg_entities "
+            "SELECT uuid, name, entity_type, entity_supertype, degree FROM kg_entities "
             "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
             (f"%{q}%", limit),
         ).fetchall()
@@ -755,6 +755,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
                 "uuid": r["uuid"],
                 "name": r["name"],
                 "entity_type": r["entity_type"],
+                "supertype": r["entity_supertype"],
                 "degree": r["degree"],
             }
             for r in rows
@@ -845,7 +846,8 @@ def _graph_neighborhood(
         # Materialize real entity rows for the reached uuids (edge endpoints without an
         # entity row are dropped — edges aren't FKs, so a dangling endpoint has no node).
         ent_rows = conn.execute(
-            "SELECT uuid, name, entity_type, degree, summary FROM kg_entities WHERE uuid = ANY(%s)",
+            "SELECT uuid, name, entity_type, entity_supertype, degree, summary "
+            "FROM kg_entities WHERE uuid = ANY(%s)",
             (list(visited),),
         ).fetchall()
 
@@ -889,6 +891,8 @@ def _graph_neighborhood(
                     "uuid": r["uuid"],
                     "name": r["name"],
                     "entity_type": r["entity_type"],
+                    # canonical coarse layer (020) — the client colors by this
+                    "supertype": r["entity_supertype"],
                     "degree": r["degree"],
                     "summary": r["summary"],
                 }
