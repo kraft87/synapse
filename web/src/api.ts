@@ -109,6 +109,24 @@ export interface SearchResult {
 }
 export interface FlagRow { id: number; kind: string; item_id: string; note: string | null; created_at: string; gist: string; }
 
+// ---------- proposals (phase 2b) ----------
+export type ProposalKind = 'skill' | 'config-edit';
+export interface ProposalSummary {
+  id: string; kind: ProposalKind; name: string; gist: string;
+  status: string; age_days: number; created_at: string;
+}
+export interface ProposalList { proposals: ProposalSummary[]; pending_count: number; }
+export interface EvidenceItem {
+  session_id?: string; ts?: string; class?: string; signal?: string;
+  why?: string; phrasing?: string; quote?: string; note?: string; [k: string]: unknown;
+}
+export interface ProposalDetail {
+  id: string; kind: ProposalKind; name: string; status: string;
+  evidence: string | EvidenceItem[]; provenance_episodes: number[];
+  payload: { type: 'markdown' | 'diff'; content: string };
+  audit_log: { ts: string | null; action: string; note: string | null }[];
+}
+
 const qs = (params: Record<string, string | number | undefined | null>): string => {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -194,3 +212,19 @@ export interface RecallHistoryRow {
 }
 export const fetchRecallHistory = (limit = 50): Promise<{ items: RecallHistoryRow[] }> =>
   MOCK ? mockApi('/recall/history') : req('/recall/history' + qs({ limit }));
+export const fetchProposals = (params?: { status?: string; kind?: string }): Promise<ProposalList> =>
+  MOCK ? mockApi('/proposals') : req('/proposals' + qs({ status: params?.status, kind: params?.kind }));
+
+export const fetchProposal = (id: string): Promise<ProposalDetail> =>
+  MOCK ? mockApi('/proposals/' + id) : req('/proposals/' + encodeURIComponent(id));
+
+export const postProposalDecision = (
+  id: string, action: 'approve' | 'reject', note?: string,
+): Promise<Record<string, unknown>> =>
+  MOCK
+    ? Promise.resolve({ status: action === 'approve' ? 'accepted' : 'rejected' })
+    : req('/proposals/' + encodeURIComponent(id) + '/decision', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, note }),
+      });

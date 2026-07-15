@@ -7,6 +7,7 @@ import { Login } from './components/Login';
 import { Feed } from './pages/Feed';
 import { Search } from './pages/Search';
 import { Recall } from './pages/Recall';
+import { Review } from './pages/Review';
 import { Stub } from './pages/Stub';
 import { Overlays } from './overlays/Overlays';
 
@@ -19,6 +20,7 @@ function Shell() {
       {s.page === 'feed' ? <Feed />
         : s.page === 'search' ? <Search />
         : s.page === 'recall' ? <Recall />
+        : s.page === 'review' ? <Review />
         : <Stub page={s.page} />}
       <Overlays />
     </>

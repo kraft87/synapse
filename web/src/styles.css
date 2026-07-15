@@ -77,6 +77,7 @@ a { color:var(--acc); }
 .linkbtn:hover { color:var(--acc) !important; }
 .result:hover { border-color:var(--line2) !important; background:var(--bg2) !important; }
 .flagbtn:hover { color:var(--warn) !important; }
+.chipbtn:hover { border-color:var(--acc) !important; }
 .field:focus { border-color:var(--acc) !important; outline:none; }
 .field:focus.field-err { border-color:var(--err) !important; }
 .gbtn:hover { border-color:var(--line2) !important; }
@@ -84,6 +85,7 @@ a { color:var(--acc); }
 /* ---- responsive ---- */
 @media (max-width:720px) {
   .duo { grid-template-columns:1fr !important; }
+  .proposals-grid { grid-template-columns:1fr !important; }
   .scrollx { overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .hdr-filters { order:3; }
   .search-tabs { overflow-x:auto; }

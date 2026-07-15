@@ -710,6 +710,253 @@ def test_recall_history_requires_token(clean, conn, db_url):
         assert r.json() == {"status": "error", "detail": "unauthorized"}
 
 
+# Proposals (phase 2b) — unified skills + config review
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def clean_proposals(conn):
+    """Wipe the public tables these tests touch (episodes for provenance) + both lane
+    proposal tables + dashboard_audit, before AND after — deterministic ids for a serial
+    DB-group run, and no synthetic row (proposal OR episode) leaks past the test."""
+
+    def _w():
+        _wipe(conn)  # episodes, kg, timeline, notes, prefs, dashboard_flags/audit
+        conn.execute("TRUNCATE skills_lane.skill_gap_candidates RESTART IDENTITY CASCADE")
+        conn.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY CASCADE")
+
+    _w()
+    yield
+    _w()
+
+
+def _skill_proposal(
+    conn,
+    *,
+    kind="derive",
+    name="latency-triage",
+    status="proposed",
+    summary="Recurring recall latency debugging with no reusable playbook.",
+    proposal_body="# latency-triage\n\nWhen recall p95 regresses, read the waterfall.\n\n- rerank\n- kg",
+    evidence=None,
+    created_at=None,
+):
+    ev = (
+        evidence
+        if evidence is not None
+        else [
+            {
+                "session_id": "sess-sk",
+                "class": "grounded",
+                "signal": "explicit_request",
+                "why": "operator asked for a reusable playbook",
+            }
+        ]
+    )
+    # schema/023 constraint: an accepted/promoted candidate must carry grounded_weight > 0.
+    gw = 3.0 if status in ("accepted", "promoted") else 0.0
+    gs = 1 if status in ("accepted", "promoted") else 0
+    return conn.execute(
+        "INSERT INTO skills_lane.skill_gap_candidates "
+        "(kind, name, status, summary, proposal_body, evidence, grounded_weight, "
+        " grounded_sessions, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (kind, name, status, summary, proposal_body, Json(ev), gw, gs, created_at or _t(0)),
+    ).fetchone()[0]
+
+
+def _config_proposal(
+    conn,
+    *,
+    kind="edit",
+    file_key="CLAUDE.md",
+    scope="general",
+    status="proposed",
+    summary="Add the raw-SQL / no-ORM rule the operator restated 5x.",
+    diff="--- a/CLAUDE.md\n+++ b/CLAUDE.md\n@@ -1 +1,2 @@\n context\n+Prefer raw SQL over the ORM.",
+    evidence=None,
+    created_at=None,
+):
+    ev = (
+        evidence
+        if evidence is not None
+        else [{"session_id": "sess-cf", "signal": "correction", "why": "restated the rule 5 times"}]
+    )
+    return conn.execute(
+        "INSERT INTO config_lane.config_proposals "
+        "(kind, file_key, scope, status, summary, diff, evidence, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (kind, file_key, scope, status, summary, diff, Json(ev), created_at or _t(0)),
+    ).fetchone()[0]
+
+
+def test_proposals_unified_list_and_pending_count(clean_proposals, conn, db_url):
+    sk_prop = _skill_proposal(conn, name="latency-triage", status="proposed", created_at=_t(5))
+    cf_prop = _config_proposal(conn, file_key="CLAUDE.md", status="proposed", created_at=_t(4))
+    _skill_proposal(conn, name="graph-inspect", status="accepted", created_at=_t(3))
+    _config_proposal(conn, file_key="rules/testing.md", status="rejected", created_at=_t(2))
+    _skill_proposal(conn, name="not-yet", status="observe", created_at=_t(1))  # excluded
+
+    with _client(db_url) as client:
+        body = client.get("/dash/api/proposals", headers=_H).json()
+        # pending_count = both lanes' 'proposed' rows; nav badge reads this.
+        assert body["pending_count"] == 2
+        rows = body["proposals"]
+        ids = [r["id"] for r in rows]
+        assert f"skill:{sk_prop}" in ids and f"config:{cf_prop}" in ids
+        assert "observe" not in {r["status"] for r in rows}  # observe not a proposal
+        # namespaced ids + normalized kinds + names (config uses file_key).
+        by_id = {r["id"]: r for r in rows}
+        assert by_id[f"skill:{sk_prop}"]["kind"] == "skill"
+        assert by_id[f"skill:{sk_prop}"]["gist"].startswith("Recurring recall latency")
+        assert by_id[f"config:{cf_prop}"]["kind"] == "config-edit"
+        assert by_id[f"config:{cf_prop}"]["name"] == "CLAUDE.md"
+        assert all("age_days" in r and "created_at" in r for r in rows)
+        # merged newest-first across lanes (created_at DESC).
+        assert ids == sorted(ids, key=lambda i: by_id[i]["created_at"], reverse=True)
+
+        # status filter narrows the view (pending_count unchanged).
+        only_prop = client.get("/dash/api/proposals?status=proposed", headers=_H).json()
+        assert {r["status"] for r in only_prop["proposals"]} == {"proposed"}
+        assert only_prop["pending_count"] == 2
+
+        # kind filter narrows to one lane.
+        only_skill = client.get("/dash/api/proposals?kind=skill", headers=_H).json()
+        assert {r["kind"] for r in only_skill["proposals"]} == {"skill"}
+
+
+def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_url):
+    # Episode sharing the skill evidence's session_id → best-effort provenance resolves.
+    ep = _episode(conn, session="sess-sk", seq=1, content="the p95 regression session")
+    sk = _skill_proposal(conn, name="latency-triage", status="proposed")
+    cf = _config_proposal(conn, file_key="CLAUDE.md", status="proposed")
+
+    with _client(db_url) as client:
+        sd = client.get(f"/dash/api/proposals/skill:{sk}", headers=_H).json()
+        assert sd["id"] == f"skill:{sk}" and sd["kind"] == "skill"
+        assert sd["payload"]["type"] == "markdown"
+        assert sd["payload"]["content"].startswith("# latency-triage")
+        assert (
+            isinstance(sd["evidence"], list) and sd["evidence"][0]["signal"] == "explicit_request"
+        )
+        assert ep in sd["provenance_episodes"]  # resolved from evidence session_id
+        assert sd["audit_log"] == []  # not decided yet
+
+        cd = client.get(f"/dash/api/proposals/config:{cf}", headers=_H).json()
+        assert cd["kind"] == "config-edit" and cd["name"] == "CLAUDE.md"
+        assert cd["payload"]["type"] == "diff"
+        assert "+++ b/CLAUDE.md" in cd["payload"]["content"]
+
+        # malformed id -> 400, missing -> 404.
+        assert client.get("/dash/api/proposals/bogus", headers=_H).status_code == 400
+        assert client.get("/dash/api/proposals/skill:999999", headers=_H).status_code == 404
+
+
+def test_proposal_decision_approve_writes_state_and_audit(clean_proposals, conn, db_url):
+    sk = _skill_proposal(conn, name="latency-triage", status="proposed")
+    with _client(db_url) as client:
+        r = client.post(
+            f"/dash/api/proposals/skill:{sk}/decision",
+            json={"action": "approve", "note": "clear win"},
+            headers=_H,
+        )
+        assert r.status_code == 200
+        # dashboard approve maps to the skills lane's 'accept' (NOT promote — materializing
+        # stays with the lane); the lane returns status 'accepted'.
+        assert r.json()["status"] == "accepted"
+
+    # Lane row transitioned; dashboard_audit carries the namespaced id + note.
+    row = conn.execute(
+        "SELECT status FROM skills_lane.skill_gap_candidates WHERE id=%s", (sk,)
+    ).fetchone()
+    assert row[0] == "accepted"
+    audit = conn.execute(
+        "SELECT action, kind, item_id, detail FROM dashboard_audit WHERE item_id=%s",
+        (f"skill:{sk}",),
+    ).fetchone()
+    assert audit[0] == "proposal_approve" and audit[1] == "skill" and audit[2] == f"skill:{sk}"
+    assert audit[3]["note"] == "clear win"
+
+    # Detail's audit_log reflects the decision.
+    with _client(db_url) as client:
+        detail = client.get(f"/dash/api/proposals/skill:{sk}", headers=_H).json()
+    assert [a["action"] for a in detail["audit_log"]] == ["proposal_approve"]
+    assert detail["audit_log"][0]["note"] == "clear win"
+
+
+def test_proposal_reject_requires_note_and_records_reason(clean_proposals, conn, db_url):
+    cf = _config_proposal(conn, file_key="rules/testing.md", status="proposed")
+    with _client(db_url) as client:
+        # reject with no note -> 400, row untouched.
+        no_note = client.post(
+            f"/dash/api/proposals/config:{cf}/decision", json={"action": "reject"}, headers=_H
+        )
+        assert no_note.status_code == 400
+        blank = client.post(
+            f"/dash/api/proposals/config:{cf}/decision",
+            json={"action": "reject", "note": "   "},
+            headers=_H,
+        )
+        assert blank.status_code == 400
+        assert (
+            conn.execute(
+                "SELECT status FROM config_lane.config_proposals WHERE id=%s", (cf,)
+            ).fetchone()[0]
+            == "proposed"
+        )
+        # reject with a reason -> lane 'rejected', reason stored + audited.
+        ok = client.post(
+            f"/dash/api/proposals/config:{cf}/decision",
+            json={"action": "reject", "note": "too generic"},
+            headers=_H,
+        )
+        assert ok.status_code == 200 and ok.json()["status"] == "rejected"
+
+    row = conn.execute(
+        "SELECT status, reject_reason FROM config_lane.config_proposals WHERE id=%s", (cf,)
+    ).fetchone()
+    assert row[0] == "rejected" and row[1] == "too generic"
+    audit = conn.execute(
+        "SELECT action, detail FROM dashboard_audit WHERE item_id=%s", (f"config:{cf}",)
+    ).fetchone()
+    assert audit[0] == "proposal_reject" and audit[1]["note"] == "too generic"
+
+
+def test_skill_reject_sets_30day_cooldown(clean_proposals, conn, db_url):
+    """The skills lane implements a 30-day reject cooldown (rejected_until); the dashboard
+    reject surfaces it via the lane's own act. The config lane has no such column (gap noted
+    in docs/dashboard-contract.md)."""
+    sk = _skill_proposal(conn, name="latency-triage", status="proposed")
+    with _client(db_url) as client:
+        client.post(
+            f"/dash/api/proposals/skill:{sk}/decision",
+            json={"action": "reject", "note": "one-off, not worth a skill"},
+            headers=_H,
+        )
+    row = conn.execute(
+        "SELECT status, reject_reason, rejected_until FROM skills_lane.skill_gap_candidates "
+        "WHERE id=%s",
+        (sk,),
+    ).fetchone()
+    assert row[0] == "rejected" and row[1] == "one-off, not worth a skill"
+    assert row[2] is not None  # cooldown set ~30 days out
+    days = (row[2] - datetime.now(UTC)).days
+    assert 27 <= days <= 30
+
+
+def test_proposals_require_machine_token(clean_proposals, conn, db_url):
+    sk = _skill_proposal(conn, status="proposed")
+    with _client(db_url) as client:
+        assert client.get("/dash/api/proposals").status_code == 401
+        assert client.get(f"/dash/api/proposals/skill:{sk}").status_code == 401
+        assert (
+            client.post(
+                f"/dash/api/proposals/skill:{sk}/decision", json={"action": "approve"}
+            ).status_code
+            == 401
+        )
+
+
 # ---------------------------------------------------------------------------
 # Static bundle routes (UNAUTHENTICATED) — 503 without a build, 200 + traversal reject
 # ---------------------------------------------------------------------------

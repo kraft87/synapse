@@ -1,3 +1,7 @@
+# mypy: ignore-errors
+# Deliberately untyped route-handler module (FastMCP @custom_route decorators are inherently
+# untyped) — already in the mypy pre-commit exclude; the pragma keeps it clean when a typed
+# module (mcp_server/dashboard_routes.py) imports its _proposal_* helpers via follow-imports.
 """Plain-HTTP config-lane routes — the DB seam that mirrors a machine's config into Postgres.
 
 Same shape as skill_sync_routes: machine-token-gated custom routes (they bypass FastMCP's auth
