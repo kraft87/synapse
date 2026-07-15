@@ -31,6 +31,8 @@ interface Store {
   catalog: Catalog | null;
   online: boolean;
   setOnline: (b: boolean) => void;
+  queueDepth: number;
+  setQueueDepth: (n: number) => void;
   reviewPending: number;
   setReviewPending: (n: number) => void;
 }
@@ -52,6 +54,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [online, setOnline] = useState(true);
+  const [queueDepth, setQueueDepth] = useState(0);
   const [reviewPending, setReviewPending] = useState(0);
 
   // theme -> <html data-theme> + persistence
@@ -80,8 +83,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const value = useMemo<Store>(() => ({
     token, setTokenValue, theme, toggleTheme, group, setGroup, project, setProject,
     source, setSource, page, setPage, searchQuery, setSearchQuery, catalog, online, setOnline,
-    reviewPending, setReviewPending,
-  }), [token, theme, group, project, source, page, searchQuery, catalog, online, reviewPending, setTokenValue, toggleTheme, setGroup, setProject, setSource]);
+    queueDepth, setQueueDepth, reviewPending, setReviewPending,
+  }), [token, theme, group, project, source, page, searchQuery, catalog, online, queueDepth, reviewPending, setTokenValue, toggleTheme, setGroup, setProject, setSource]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

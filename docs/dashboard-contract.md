@@ -261,17 +261,80 @@ left to the config lane to add rather than bolted onto the dashboard.
 - `dashboard_audit.action` gains `proposal_approve` / `proposal_reject` (the column is
   intentionally CHECK-free — schema 042 — so no migration is needed to widen it).
 
-## Schema (migration 042)
+## Phase 3 — Live stream (SSE)
+
+Phase 3 replaces the Feed's 30s polling with a Server-Sent-Events live stream. A NOTIFY
+trigger (schema 043) fires on every insert into the three feed source tables; a single
+server-side LISTEN worker hydrates each notification into a full FeedItem and fans it out
+to connected clients over `GET /dash/api/stream`.
+
+### GET /dash/api/stream
+Machine-token gated like every `/dash/api/*` route, `Content-Type: text/event-stream`.
+
+**Auth is why the client uses `fetch`, not `EventSource`.** `EventSource` cannot set the
+`Authorization` header, and this route requires the same `Bearer` token as the rest of the
+API. So the client reads the stream with `fetch` + a `ReadableStream` line parser (honoring
+`event:` / `data:` / `id:` fields) rather than the native `EventSource`. Unauthorized → the
+usual 401 `{"status":"error","detail":"unauthorized"}` (a plain JSON body, not a stream).
+
+**Events**
+- `new_episode` | `new_fact` | `new_timeline_event` — `data` is the FeedItem JSON, the SAME
+  shape `/dash/api/feed` items carry (produced by the same hydration code path). Each carries
+  an `id:` — a monotonically increasing integer event id.
+- `processing_status` — `data` is `{"queue_depth": N, "active": bool}` from `extraction_queue`
+  (pending count + whether anything is processing). Emitted on connect and then ~1/s. It has
+  **no `id:`** (only feed events advance Last-Event-ID). The refresh is a single shared query
+  throttled to ~1/s across ALL connected clients — never a per-connection query.
+- Heartbeat — a `: heartbeat` SSE comment every 15s so idle proxies don't kill the stream.
+
+**Resume / reset (Last-Event-ID).** The server keeps the last 512 feed events in an
+in-process ring buffer. On connect the client may present its last seen event id via the
+`Last-Event-ID` request header (or `?last_event_id=`):
+- still inside the buffer → the server **replays** every event after it, then streams live;
+- aged out of the buffer, or ahead of the server (buffer was reset, e.g. a server restart) →
+  the server sends a `reset` event (`data: {}`, no id) and the client **refetches page 1**
+  (`GET /feed`) to resync, then resumes live;
+- absent → the client already has page 1 from its initial `/feed` fetch, so the server
+  streams live only (from the current buffer head).
+
+**Client reconnect (spec §2).** The reader reconnects manually with 1s→30s exponential
+backoff, resending `Last-Event-ID`. A transient loss turns the header live dot amber
+("reconnecting") and keeps the stale items on screen. After >5 consecutive failed
+reconnects the client gives up on the stream and falls back to the original 30s `/feed`
+polling automatically. New items that pass the CURRENT filter cluster prepend with the
+slidein animation; items filtered out client-side are dropped (they reappear correctly on
+the next full reload). `MOCK` mode has no server and stays on polling.
+
+**Zero cost when idle.** The LISTEN worker (one dedicated psycopg connection) starts lazily
+on the first subscriber and stops when the last disconnects; with no client connected there
+is no LISTEN connection and NOTIFY is discarded by Postgres.
+
+**Deviations from spec §7.**
+- Timeline FeedItems now carry a top-level `group_id` (mirroring the `domain` column, schema
+  038) so the live client can apply the group filter uniformly across all three feed types.
+  Additive — episodes/facts are unchanged; `/feed` timeline items gain the same field.
+- `processing_status` is a plain event with no event id (ids track only the resumable feed
+  events); spec §7 lists it among the stream's event names, which it is.
+- The NOTIFY payload is `{type, id}` only (NOTIFY's 8KB cap) — the server re-SELECTs the full
+  row via the id, so the wire FeedItem is produced by ONE code path (`/feed`'s hydration),
+  never duplicated in SQL.
+
+## Schema (migrations 042, 043)
 
 `dashboard_flags(id, kind, item_id, note, created_at, removed_at)` — active = `removed_at IS NULL`,
 partial-unique on (kind, item_id) where active.
 `dashboard_audit(id, ts, action, kind, item_id, detail jsonb)` — append-only; actions this
 phase: `flag`, `unflag`. Later phases append proposal decisions.
 
+Migration 043 (`043_dash_notify.sql`) adds `dash_notify_feed()` + AFTER INSERT triggers on
+`episodes` / `kg_relationships` / `timeline_events` that `pg_notify('dash_feed', {type,id})`
+— the source of the Phase 3 live stream above. No new tables.
+
 ## Later phases (reserved paths)
 
-`/dash/api/stream` (SSE), `/dash/api/metrics/{recall,ingestion,corpus}`,
+`/dash/api/metrics/{recall,ingestion,corpus}`,
 `/dash/api/timeline`, `/dash/api/preferences`,
 `/dash/api/behavior/*`, `/dash/api/dream/report`, `/dash/api/graph/*`.
 (`POST /recall`'s `debug: true` flag + `/dash/api/recall/history` shipped in phase 2;
-`/dash/api/proposals*` shipped in phase 2b — see above.)
+`/dash/api/proposals*` shipped in phase 2b; `/dash/api/stream` (SSE) shipped in phase 3 —
+see above.)

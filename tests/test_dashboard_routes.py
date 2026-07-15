@@ -10,6 +10,7 @@ test_board.py). ALL fixture data is synthetic — this repo is public.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import UTC, datetime, timedelta
 
@@ -955,6 +956,115 @@ def test_proposals_require_machine_token(clean_proposals, conn, db_url):
             ).status_code
             == 401
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3 — SSE live stream (043 NOTIFY trigger + ring buffer + /dash/api/stream)
+# ---------------------------------------------------------------------------
+
+
+def test_dash_notify_trigger_fires_on_insert(clean, conn, db_url):
+    """schema/043 arms AFTER INSERT triggers that pg_notify('dash_feed', {type,id}). LISTEN
+    on a side connection, insert one of each feed type, assert the tiny payloads arrive with
+    the right id kind (episode/timeline -> numeric id, fact -> uuid string)."""
+    import json as _json
+
+    listener = psycopg.connect(db_url, autocommit=True)
+    try:
+        listener.execute("LISTEN dash_feed")
+        eid = _episode(conn, session="n", seq=1, content="notify me")
+        _rel(conn, "nf", src="a", tgt="b", fact="notify fact")
+        evid = _event(conn, fact="notify event", source_ref="tb:n")
+        got: dict[str, object] = {}
+        for n in listener.notifies(timeout=10, stop_after=3):
+            p = _json.loads(n.payload)
+            got[p["type"]] = p["id"]
+        assert got["episode"] == eid  # bigint id -> JSON number -> int
+        assert got["fact"] == "nf"  # uuid -> JSON string
+        assert got["timeline_event"] == evid
+    finally:
+        listener.close()
+
+
+def test_feed_event_buffer_replay_and_reset():
+    """Pure-unit: the ring buffer's resume() replay/reset logic — no DB, no HTTP."""
+    from mcp_server.dashboard_routes import _FeedEventBuffer
+
+    buf = _FeedEventBuffer(capacity=3)
+    ids = [buf.append({"type": "episode", "id": str(i)}) for i in (1, 2, 3)]
+    assert ids == [1, 2, 3]
+    assert buf.head == 3 and buf.oldest() == 1
+
+    mode, ev = buf.resume(1)  # still present -> replay the missed tail
+    assert mode == "replay" and [e[0] for e in ev] == [2, 3]
+    assert buf.resume(3) == ("replay", [])  # exactly current -> nothing to replay
+    assert buf.resume(99)[0] == "reset"  # client ahead of us (buffer reset) -> resync
+
+    buf.append({"type": "episode", "id": "4"})
+    buf.append({"type": "episode", "id": "5"})  # capacity 3 -> evicts ids 1,2; keeps 3,4,5
+    assert buf.oldest() == 3 and buf.head == 5
+    assert buf.resume(1)[0] == "reset"  # gap: id 2 was evicted -> reset
+    mode, ev = buf.resume(2)  # contiguous (3 is the next kept id) -> replay 3,4,5
+    assert mode == "replay" and [e[0] for e in ev] == [3, 4, 5]
+
+
+def test_stream_requires_token(clean, conn, db_url):
+    with _client(db_url) as client:
+        r = client.get("/dash/api/stream")
+        assert r.status_code == 401
+        assert r.json() == {"status": "error", "detail": "unauthorized"}
+
+
+async def test_stream_manager_hydrates_notify_into_buffer(clean, conn, db_url):
+    """The LISTEN worker + hydration seam (the flake-proof core of the feature): subscribe
+    starts the worker, an insert fires NOTIFY, the worker hydrates the row into the ring
+    buffer as a full FeedItem. Deterministic — waits for the worker's `listening` event
+    before inserting, so the NOTIFY is never raced against worker startup."""
+    from mcp_server.dashboard_routes import _StreamManager
+
+    mgr = _StreamManager(db_url)
+    mgr.subscribe()
+    try:
+        await asyncio.wait_for(mgr.listening.wait(), timeout=10)
+        eid = _episode(conn, session="strm", seq=1, content="stream me", project="synapse")
+        for _ in range(100):  # up to ~10s for the hydrated item to land in the buffer
+            if mgr.buffer.head >= 1:
+                break
+            await asyncio.sleep(0.1)
+        assert mgr.buffer.head >= 1, "worker did not hydrate the NOTIFY into the buffer"
+        _, item = mgr.buffer._events[-1]
+        assert item["type"] == "episode" and item["id"] == str(eid)
+        assert item["gist"] == "stream me" and item["flagged"] is False
+        assert item["project"] == "synapse"
+        # The status refresher populated the shared snapshot the header badge reads.
+        assert set(mgr.status) == {"queue_depth", "active"}
+        assert isinstance(mgr.status["queue_depth"], int)
+    finally:
+        mgr.unsubscribe()
+
+
+def test_sse_frame_format():
+    """The wire framing helper: `event:` line, optional `id:` line (feed events only), a
+    `data:` line, blank-line terminated. This + the manager-seam test above cover the SSE
+    route's moving parts without an HTTP body read.
+
+    NOTE: there is deliberately NO end-to-end TestClient streaming test. Starlette's
+    TestClient (httpx ASGITransport) BUFFERS the response body, so it never yields frames
+    from an unbounded text/event-stream and a `client.stream(...).iter_lines()` read hangs
+    forever. Per the build brief, the route is instead proven at the seam: the trigger fires
+    NOTIFY (test_dash_notify_trigger_fires_on_insert), the LISTEN worker hydrates it into the
+    ring buffer (test_stream_manager_hydrates_notify_into_buffer), the buffer replay/reset
+    logic (test_feed_event_buffer_replay_and_reset), the auth gate (test_stream_requires_token),
+    and the frame format (here)."""
+    from mcp_server.dashboard_routes import _sse_frame
+
+    ep = _sse_frame("new_episode", '{"type":"episode","id":"42"}', 7)
+    assert ep == 'event: new_episode\nid: 7\ndata: {"type":"episode","id":"42"}\n\n'
+    # processing_status / reset carry no id (only feed events advance Last-Event-ID).
+    st = _sse_frame("processing_status", '{"queue_depth":3,"active":true}')
+    assert st == 'event: processing_status\ndata: {"queue_depth":3,"active":true}\n\n'
+    assert "id:" not in st
+    assert _sse_frame("reset", "{}").endswith("\n\n")
 
 
 # ---------------------------------------------------------------------------

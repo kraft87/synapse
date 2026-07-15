@@ -26,9 +26,12 @@ preferences / notes.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import json
 import logging
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,7 +42,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -73,6 +76,20 @@ _CATALOG_TTL_S = 300  # ~5 min in-process cache
 
 _FLAG_KINDS = ("episode", "fact", "timeline_event", "preference", "note")
 _SEARCH_TYPES = ("episodes", "facts", "entities", "events")
+
+# Phase 3 (SSE live stream). The LISTEN worker hydrates each NOTIFY into a full FeedItem and
+# appends it to a ring buffer; the /dash/api/stream route replays from it on resume and streams
+# live. Feed-item event names by type; every other tunable for the stream loop.
+_STREAM_EVENT_NAMES = {
+    "episode": "new_episode",
+    "fact": "new_fact",
+    "timeline_event": "new_timeline_event",
+}
+_STREAM_CHANNEL = "dash_feed"  # matches schema/043_dash_notify.sql
+_STREAM_BUFFER_CAP = 512  # ring-buffer slots (contract: 512-event replay window)
+_STREAM_POLL_S = 0.25  # per-connection buffer poll cadence (new-event latency ceiling)
+_STREAM_STATUS_S = 1.0  # processing_status emit cadence (contract: ~1/s)
+_STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the stream
 
 # Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
 # statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals
@@ -240,6 +257,77 @@ def _catalog(db_url: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Feed
 # ---------------------------------------------------------------------------
+#
+# The per-type SELECT column lists and row→FeedItem mappers are shared between the
+# paged /dash/api/feed endpoint (below) and the SSE stream's single-row hydration
+# (Phase 3, further down) so BOTH produce byte-identical wire shapes from ONE code path.
+# The endpoint appends a keyset WHERE + ORDER BY + LIMIT to the SELECT; the stream appends
+# a "WHERE <pk> = %s". The mappers emit the final item minus `flagged` (added after the
+# per-request flag set is loaded) and minus the internal `_ts`/`_idstr` merge-sort keys.
+
+_EP_SELECT = "SELECT id, created_at, project, source, session_id, sequence, content FROM episodes"
+_FACT_SELECT = (
+    "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
+    "       se.name AS src_name, te.name AS tgt_name "
+    "FROM kg_relationships r "
+    "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
+    "LEFT JOIN kg_entities te ON te.uuid = r.tgt_uuid"
+)
+_TL_SELECT = (
+    "SELECT id, ingested_at, project, fact, t_valid, source, source_ref, salience, domain "
+    "FROM timeline_events"
+)
+
+
+def _episode_item(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "episode",
+        "id": str(r["id"]),
+        "ts": _iso(r["created_at"]),
+        "project": r["project"],
+        "source": r["source"],
+        "gist": _gist(r["content"]),
+        "data": {"session_id": r["session_id"], "sequence": r["sequence"]},
+    }
+
+
+def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "fact",
+        "id": r["uuid"],
+        "ts": _iso(r["created_at"]),
+        "group_id": r["group_id"],
+        "gist": _gist(r["fact"]),
+        "data": {
+            "fact": r["fact"],
+            "src_name": r["src_name"],
+            "tgt_name": r["tgt_name"],
+            "t_valid": _iso(r["t_valid"]),
+            "t_invalid": _iso(r["t_invalid"]),
+            "provenance_episode_id": _provenance(r["episodes"]),
+        },
+    }
+
+
+def _timeline_item(r: dict[str, Any]) -> dict[str, Any]:
+    sal = {0: 0.3, 1: 0.6, 2: 0.9}.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6)
+    return {
+        "type": "timeline_event",
+        "id": str(r["id"]),
+        "ts": _iso(r["ingested_at"]),
+        "project": r["project"],
+        # domain is the timeline's group scope (schema 038); exposed as group_id so the live
+        # SSE client can apply the group filter uniformly across all three feed types.
+        "group_id": r["domain"],
+        "sal": sal,
+        "gist": _gist(r["fact"]),
+        "data": {
+            "fact": r["fact"],
+            "t_valid": _iso(r["t_valid"]),
+            "source": r["source"],
+            "episode_id": _episode_id_from_ref(r["source_ref"]),
+        },
+    }
 
 
 def _feed(
@@ -282,25 +370,15 @@ def _feed(
             )
             ep_params += [cts, cts, cid]
         ep_rows = conn.execute(
-            "SELECT id, created_at, project, source, session_id, sequence, content "
-            f"FROM episodes WHERE {' AND '.join(ep_where)} "
+            f"{_EP_SELECT} WHERE {' AND '.join(ep_where)} "
             "ORDER BY created_at DESC, id::text DESC LIMIT %s",
             (*ep_params, limit),
         ).fetchall()
         for r in ep_rows:
-            candidates.append(
-                {
-                    "_ts": r["created_at"],
-                    "_idstr": str(r["id"]),
-                    "type": "episode",
-                    "id": str(r["id"]),
-                    "ts": _iso(r["created_at"]),
-                    "project": r["project"],
-                    "source": r["source"],
-                    "gist": _gist(r["content"]),
-                    "data": {"session_id": r["session_id"], "sequence": r["sequence"]},
-                }
-            )
+            item = _episode_item(r)
+            item["_ts"] = r["created_at"]
+            item["_idstr"] = str(r["id"])
+            candidates.append(item)
 
         # --- facts (ts = created_at). Filter: group_id. No project/source column. ---
         # Columns are r.-qualified: the entity joins below also expose created_at/group_id.
@@ -315,35 +393,15 @@ def _feed(
             )
             f_params += [cts, cts, cid]
         fact_rows = conn.execute(
-            "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
-            "       se.name AS src_name, te.name AS tgt_name "
-            "FROM kg_relationships r "
-            "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
-            "LEFT JOIN kg_entities te ON te.uuid = r.tgt_uuid "
-            f"WHERE {' AND '.join(f_where)} "
+            f"{_FACT_SELECT} WHERE {' AND '.join(f_where)} "
             "ORDER BY r.created_at DESC, r.uuid DESC LIMIT %s",
             (*f_params, limit),
         ).fetchall()
         for r in fact_rows:
-            candidates.append(
-                {
-                    "_ts": r["created_at"],
-                    "_idstr": str(r["uuid"]),
-                    "type": "fact",
-                    "id": r["uuid"],
-                    "ts": _iso(r["created_at"]),
-                    "group_id": r["group_id"],
-                    "gist": _gist(r["fact"]),
-                    "data": {
-                        "fact": r["fact"],
-                        "src_name": r["src_name"],
-                        "tgt_name": r["tgt_name"],
-                        "t_valid": _iso(r["t_valid"]),
-                        "t_invalid": _iso(r["t_invalid"]),
-                        "provenance_episode_id": _provenance(r["episodes"]),
-                    },
-                }
-            )
+            item = _fact_item(r)
+            item["_ts"] = r["created_at"]
+            item["_idstr"] = str(r["uuid"])
+            candidates.append(item)
 
         # --- timeline (ts = ingested_at). Filters: project, and domain for group_id. ---
         t_where = ["1=1"]
@@ -363,33 +421,15 @@ def _feed(
             )
             t_params += [cts, cts, cid]
         tl_rows = conn.execute(
-            "SELECT id, ingested_at, project, fact, t_valid, source, source_ref, salience "
-            f"FROM timeline_events WHERE {' AND '.join(t_where)} "
+            f"{_TL_SELECT} WHERE {' AND '.join(t_where)} "
             "ORDER BY ingested_at DESC, id::text DESC LIMIT %s",
             (*t_params, limit),
         ).fetchall()
         for r in tl_rows:
-            sal = {0: 0.3, 1: 0.6, 2: 0.9}.get(
-                int(r["salience"]) if r["salience"] is not None else 1, 0.6
-            )
-            candidates.append(
-                {
-                    "_ts": r["ingested_at"],
-                    "_idstr": str(r["id"]),
-                    "type": "timeline_event",
-                    "id": str(r["id"]),
-                    "ts": _iso(r["ingested_at"]),
-                    "project": r["project"],
-                    "sal": sal,
-                    "gist": _gist(r["fact"]),
-                    "data": {
-                        "fact": r["fact"],
-                        "t_valid": _iso(r["t_valid"]),
-                        "source": r["source"],
-                        "episode_id": _episode_id_from_ref(r["source_ref"]),
-                    },
-                }
-            )
+            item = _timeline_item(r)
+            item["_ts"] = r["ingested_at"]
+            item["_idstr"] = str(r["id"])
+            candidates.append(item)
 
         # Merge on the same total order the per-type keyset used, cut to limit.
         candidates.sort(key=lambda c: (c["_ts"], c["_idstr"]), reverse=True)
@@ -1185,6 +1225,212 @@ def _proposal_decision(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3 — SSE live stream (LISTEN/NOTIFY + ring buffer)
+# ---------------------------------------------------------------------------
+#
+# schema/043 arms AFTER INSERT triggers on episodes / kg_relationships / timeline_events
+# that pg_notify('dash_feed', {type,id}). A single lazily-started LISTEN worker (one
+# dedicated async psycopg connection, started on the first SSE subscriber and stopped when
+# the last disconnects) hydrates each notification into a full FeedItem — via the SAME
+# per-type SELECT + mapper the /feed endpoint uses — and appends it to a 512-slot ring
+# buffer keyed by a monotonically increasing integer event id. The /dash/api/stream route
+# replays from the buffer on resume (Last-Event-ID) and streams live thereafter.
+
+
+def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | None:
+    """Re-SELECT one feed row by id and map it to the SAME FeedItem shape /feed emits
+    (including `flagged`). Returns None for an unknown type or a row that vanished between
+    the NOTIFY and this read. Reuses _EP_SELECT/_FACT_SELECT/_TL_SELECT + the mappers."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        if type_ == "episode":
+            if not str(id_).isdigit():
+                return None
+            row = conn.execute(f"{_EP_SELECT} WHERE id = %s", (int(id_),)).fetchone()
+            item = _episode_item(row) if row else None
+        elif type_ == "fact":
+            row = conn.execute(f"{_FACT_SELECT} WHERE r.uuid = %s", (str(id_),)).fetchone()
+            item = _fact_item(row) if row else None
+        elif type_ == "timeline_event":
+            if not str(id_).isdigit():
+                return None
+            row = conn.execute(f"{_TL_SELECT} WHERE id = %s", (int(id_),)).fetchone()
+            item = _timeline_item(row) if row else None
+        else:
+            return None
+        if item is None:
+            return None
+        item["flagged"] = (item["type"], item["id"]) in _flag_set(conn)
+        return item
+    finally:
+        conn.close()
+
+
+def _processing_status(db_url: str) -> dict[str, Any]:
+    """Extraction-queue health for the header live badge: {queue_depth, active}. ONE cheap
+    indexed count (extraction_queue_status_idx) — the status refresher runs it once/second,
+    shared across all connected SSE clients, never per-connection."""
+    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    try:
+        row = (
+            conn.execute(
+                "SELECT count(*) FILTER (WHERE status = 'pending') AS queue_depth, "
+                "       count(*) FILTER (WHERE status = 'processing') AS processing "
+                "FROM extraction_queue WHERE status IN ('pending', 'processing')"
+            ).fetchone()
+            or {}
+        )
+        return {
+            "queue_depth": int(row.get("queue_depth") or 0),
+            "active": int(row.get("processing") or 0) > 0,
+        }
+    finally:
+        conn.close()
+
+
+class _FeedEventBuffer:
+    """A fixed-capacity ring of hydrated feed events with monotonically increasing integer
+    ids. Standalone (no I/O) so the replay/reset logic is unit-testable without a DB or HTTP.
+
+    Resume semantics for a client's Last-Event-ID L:
+      * L == head            -> replay []      (already current; stream live from here)
+      * L  > head            -> reset          (client is ahead of us; our buffer was reset,
+                                                e.g. a server restart — client refetches page 1)
+      * L  < oldest - 1      -> reset          (a gap: events L+1..oldest-1 were evicted)
+      * else                 -> replay since L (contiguous; hand back what was missed)
+    """
+
+    def __init__(self, capacity: int = _STREAM_BUFFER_CAP) -> None:
+        self._events: deque[tuple[int, dict[str, Any]]] = deque(maxlen=capacity)
+        self._next_id = 1
+
+    def append(self, item: dict[str, Any]) -> int:
+        eid = self._next_id
+        self._next_id += 1
+        self._events.append((eid, item))
+        return eid
+
+    @property
+    def head(self) -> int:
+        """The last assigned event id (0 when nothing has ever been appended)."""
+        return self._next_id - 1
+
+    def oldest(self) -> int | None:
+        return self._events[0][0] if self._events else None
+
+    def since(self, after_id: int) -> list[tuple[int, dict[str, Any]]]:
+        return [(eid, it) for eid, it in self._events if eid > after_id]
+
+    def resume(self, last_event_id: int) -> tuple[str, list[tuple[int, dict[str, Any]]]]:
+        head = self.head
+        if last_event_id >= head:
+            # Current, or ahead of us (buffer was reset under the client). Ahead -> resync.
+            return ("reset", []) if last_event_id > head else ("replay", [])
+        oldest = self.oldest()
+        if oldest is not None and last_event_id < oldest - 1:
+            return ("reset", [])  # evicted gap between what the client has and what we kept
+        return ("replay", self.since(last_event_id))
+
+
+class _StreamManager:
+    """Owns the lazily-started LISTEN worker + status refresher and the shared ring buffer.
+    Zero background cost with no clients: both tasks start on the first subscriber and are
+    cancelled when the last one disconnects. Everything runs in the server's single event
+    loop, so subscribe/unsubscribe are plain synchronous ref-count flips (no lock needed —
+    asyncio has no preemption between awaits)."""
+
+    def __init__(self, db_url: str) -> None:
+        self._db_url = db_url
+        self.buffer = _FeedEventBuffer()
+        self.status: dict[str, Any] = {"queue_depth": 0, "active": False}
+        # Set once the LISTEN is actually issued — lets a caller (and the tests) know a
+        # NOTIFY inserted from now on will be delivered, not raced against worker startup.
+        self.listening = asyncio.Event()
+        self._subscribers = 0
+        self._tasks: list[asyncio.Task[Any]] = []
+
+    def subscribe(self) -> None:
+        self._subscribers += 1
+        if self._subscribers == 1:
+            loop = asyncio.get_running_loop()
+            self._tasks = [
+                loop.create_task(self._listen_loop()),
+                loop.create_task(self._status_loop()),
+            ]
+
+    def unsubscribe(self) -> None:
+        self._subscribers -= 1
+        if self._subscribers <= 0:
+            self._subscribers = 0
+            for t in self._tasks:
+                t.cancel()
+            self._tasks = []
+            self.listening.clear()
+
+    async def _listen_loop(self) -> None:
+        """One dedicated async connection LISTENing on the dash_feed channel; hydrates each
+        notification off the event loop (a thread executor) and appends it to the ring
+        buffer. run_in_executor (not starlette's run_in_threadpool) keeps this background
+        task off anyio's request-scoped context."""
+        loop = asyncio.get_running_loop()
+        aconn = None
+        try:
+            aconn = await psycopg.AsyncConnection.connect(self._db_url, autocommit=True)
+            await aconn.execute(f"LISTEN {_STREAM_CHANNEL}")
+            self.listening.set()
+            async for notify in aconn.notifies():
+                try:
+                    payload = json.loads(notify.payload)
+                    item = await loop.run_in_executor(
+                        None,
+                        _hydrate_feed_item,
+                        self._db_url,
+                        payload.get("type"),
+                        payload.get("id"),
+                    )
+                    if item is not None:
+                        self.buffer.append(item)
+                except Exception as e:  # one bad notification must not kill the stream
+                    logger.warning("dash stream: hydrate failed: %s", e)
+        except asyncio.CancelledError:
+            pass  # intended shutdown when the last subscriber leaves
+        except Exception as e:  # pragma: no cover - defensive (connect/LISTEN failure)
+            logger.warning("dash stream: listen loop error: %s", e)
+        finally:
+            self.listening.clear()
+            if aconn is not None:
+                try:
+                    await aconn.close()
+                except Exception:  # pragma: no cover - best-effort close during cancel
+                    pass
+
+    async def _status_loop(self) -> None:
+        """Refresh the shared processing_status snapshot once/second (one query total, not
+        per-connection). Connections read self.status and emit it on their own cadence."""
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                try:
+                    self.status = await loop.run_in_executor(None, _processing_status, self._db_url)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning("dash stream: status refresh failed: %s", e)
+                await asyncio.sleep(_STREAM_STATUS_S)
+        except asyncio.CancelledError:
+            pass
+
+
+def _sse_frame(event: str, data: str, event_id: int | None = None) -> str:
+    """One SSE frame: an `event:` line, an optional `id:` line (feed events only — so the
+    client's Last-Event-ID tracks the resumable feed stream, not status/heartbeat), a
+    `data:` line, terminated by a blank line."""
+    lines = [f"event: {event}"]
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"data: {data}")
+    return "\n".join(lines) + "\n\n"
+
+
+# ---------------------------------------------------------------------------
 # Static bundle serving
 # ---------------------------------------------------------------------------
 
@@ -1224,6 +1470,10 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     # closure, not a module global, so a fresh register() in tests starts empty — one
     # test's inserts never serve stale counts to another's.
     catalog_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+
+    # Per-register SSE manager (LISTEN worker + ring buffer). One per server; a fresh
+    # register() in tests gets an isolated manager (own buffer/worker), same as the cache.
+    stream_manager = _StreamManager(db_url)
 
     async def _api(request: Request, work: Callable[[], Any]) -> JSONResponse:
         """Shared api boundary: auth gate + threadpool + fail-soft 500."""
@@ -1294,6 +1544,70 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         group_id = qp.get("group_id") or None
         source = qp.get("source") or None
         return await _api(request, lambda: _feed(db_url, cursor, limit, project, group_id, source))
+
+    @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[misc]
+    async def dash_stream(request: Request) -> Response:
+        """SSE live feed (Phase 3). Machine-token gated like every /dash/api/* route — the
+        client uses fetch + a ReadableStream parser (not EventSource) so it CAN send the
+        Authorization header. On connect: if Last-Event-ID (header or ?last_event_id=) is
+        still inside the ring buffer, replay from it; if it aged out or is ahead of us, emit
+        a `reset` event (client refetches page 1). Then stream live feed events
+        (new_episode|new_fact|new_timeline_event, data = the FeedItem JSON) plus a
+        processing_status snapshot ~1/s and a heartbeat comment every 15s."""
+        if not authorized(request):
+            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        raw = request.headers.get("last-event-id") or request.query_params.get("last_event_id")
+        last_id = int(raw) if (raw and raw.lstrip("-").isdigit()) else None
+
+        async def gen() -> Any:
+            stream_manager.subscribe()
+            try:
+                buf = stream_manager.buffer
+                if last_id is not None:
+                    mode, events = buf.resume(last_id)
+                    if mode == "reset":
+                        yield _sse_frame("reset", "{}")
+                        sent = buf.head
+                    else:
+                        sent = last_id
+                        for eid, item in events:
+                            yield _sse_frame(
+                                _STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid
+                            )
+                            sent = eid
+                else:
+                    # Fresh connect: the client already has page 1 from /feed, so start live
+                    # from the current head — only genuinely new events stream.
+                    sent = buf.head
+                # Push status immediately so the header live badge is correct on connect.
+                yield _sse_frame("processing_status", json.dumps(stream_manager.status))
+                last_status = last_hb = time.monotonic()
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    for eid, item in buf.since(sent):
+                        yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
+                        sent = eid
+                    now = time.monotonic()
+                    if now - last_status >= _STREAM_STATUS_S:
+                        yield _sse_frame("processing_status", json.dumps(stream_manager.status))
+                        last_status = now
+                    if now - last_hb >= _STREAM_HEARTBEAT_S:
+                        yield ": heartbeat\n\n"
+                        last_hb = now
+                    await asyncio.sleep(_STREAM_POLL_S)
+            finally:
+                stream_manager.unsubscribe()
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # tell nginx/proxies not to buffer the stream
+            },
+        )
 
     @mcp.custom_route("/dash/api/episode/{id}", methods=["GET"])  # type: ignore[misc]
     async def dash_episode(request: Request) -> JSONResponse:

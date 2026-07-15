@@ -113,9 +113,9 @@ export function Header() {
 
       {/* live status + theme */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-        <div title={s.online ? 'polling — last feed poll ok' : 'reconnecting'} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt2)' }}>
+        <div title={s.online ? 'live stream connected — extraction queue depth' : 'stream lost — reconnecting (showing last loaded items)'} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt2)' }}>
           <span style={{ width: 7, height: 7, borderRadius: '50%', background: s.online ? 'var(--ok)' : 'var(--warn)', animation: s.online ? 'pulse 1.6s ease-in-out infinite' : 'none' }} />
-          <span>{s.online ? 'queue —' : 'reconnecting'}</span>
+          <span>{s.online ? `queue ${s.queueDepth}` : 'reconnecting'}</span>
         </div>
         <button className="iconbtn" onClick={s.toggleTheme} title="Toggle theme"
           style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', borderRadius: '6px', width: 28, height: 28, color: 'var(--txt2)', fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
