@@ -43,7 +43,13 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import (
+    FileResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -2275,6 +2281,12 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         return JSONResponse(result)
 
     # ---- static (UNAUTHENTICATED) ----
+
+    # The server has no other browser-facing root — a bare vhost hit (Caddy proxies
+    # the whole port) 404'd. Send humans to the dashboard; machine paths unaffected.
+    @mcp.custom_route("/", methods=["GET"])  # type: ignore[misc]
+    async def root_redirect(request: Request) -> Response:
+        return RedirectResponse("/dash", status_code=302)
 
     @mcp.custom_route("/dash", methods=["GET"])  # type: ignore[misc]
     async def dash_index(request: Request) -> Response:

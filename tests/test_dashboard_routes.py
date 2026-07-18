@@ -1860,6 +1860,12 @@ def _mini_graph(conn):
     return ep
 
 
+def test_root_redirects_to_dash(clean, conn, db_url):
+    with _client(db_url) as client:
+        r = client.get("/", follow_redirects=False)
+        assert r.status_code == 302 and r.headers["location"] == "/dash"
+
+
 def test_graph_nodes_carry_supertype(clean, conn, db_url):
     _mini_graph(conn)
     with _client(db_url) as client:
