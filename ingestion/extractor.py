@@ -747,10 +747,12 @@ class LLMExtractor:
                 parser=self._parse_response,
                 model=self._model,
                 # No fixed fact cap (content sets the count) + the anti-filler
-                # quality bar; dense turns can run 15-25 facts. 3072 gives the
-                # JSON array headroom so it never truncates mid-array — a
-                # truncated tail silently drops the last facts.
-                max_tokens=3072,
+                # quality bar; dense turns can run 15-25 facts. Dense infra
+                # chunks proved 3072 too small — outputs truncated mid-array
+                # at ~12K chars and failed all parse retries (2026-07-17), so
+                # the headroom is 8192; a truncated tail silently drops the
+                # last facts.
+                max_tokens=8192,
                 max_attempts=self._MAX_ATTEMPTS,
             )
         except MalformedResponseError as exc:
