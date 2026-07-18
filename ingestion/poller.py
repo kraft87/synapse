@@ -51,6 +51,15 @@ class Poller:
         self._worker_factory = worker_factory
         self._worker_local = threading.local()
         self._drain_pool: ThreadPoolExecutor | None = None
+        # SIGTERM/SIGINT set this (see run_loop): the drain finishes its
+        # in-flight item, releases the rest of the claimed batch back to
+        # pending, and run_loop exits instead of sleeping — so `docker stop`
+        # doesn't force-kill a worker mid-item.
+        self._stop_requested = threading.Event()
+
+    def request_stop(self) -> None:
+        """Ask the loop to exit at the next item boundary."""
+        self._stop_requested.set()
 
     def embed_pending(self, batch_size: int = 96) -> int:
         """Embed unembedded episodes and chunks.
@@ -188,6 +197,13 @@ class Poller:
         unfinished: list[int] = [int(item["id"]) for item in items]
         processed = 0
         for item in items:
+            if self._stop_requested.is_set():
+                logger.info(
+                    "Stop requested — releasing %d unstarted claim(s) back to pending",
+                    len(unfinished),
+                )
+                self._db.release_claims(unfinished)
+                break
             queue_id = int(item["id"])
             try:
                 with logfire.span(
@@ -249,6 +265,8 @@ class Poller:
 
         def _one(item: dict[str, Any]) -> tuple[int, str]:
             queue_id = int(item["id"])
+            if self._stop_requested.is_set():
+                return queue_id, "stopped"  # release below; exit at the batch boundary
             if quota_hit.is_set():
                 return queue_id, "quota"  # don't burn an attempt on a known-dead window
             db, pipeline = self._thread_worker()
@@ -276,6 +294,13 @@ class Poller:
                 return queue_id, "failed"
 
         results = list(self._drain_pool.map(_one, items))
+        stopped_ids = [qid for qid, status in results if status == "stopped"]
+        if stopped_ids:
+            logger.info(
+                "Stop requested — releasing %d unstarted claim(s) back to pending",
+                len(stopped_ids),
+            )
+            self._db.release_claims(stopped_ids)
         quota_ids = [qid for qid, status in results if status == "quota"]
         if quota_ids:
             logger.warning(
@@ -303,8 +328,24 @@ class Poller:
         """
         import os as _os
         import random as _random
+        import signal as _signal
 
         from ingestion.llm_client import UsageLimitError
+
+        def _on_signal(signum: int, _frame: Any) -> None:
+            logger.info(
+                "Signal %d received — finishing the in-flight item, then exiting cleanly",
+                signum,
+            )
+            self.request_stop()
+
+        try:
+            _signal.signal(_signal.SIGTERM, _on_signal)
+            _signal.signal(_signal.SIGINT, _on_signal)
+        except ValueError:
+            # Signal registration only works on the main thread; callers that
+            # run the loop elsewhere (tests) drive request_stop() directly.
+            pass
 
         drain_only = _os.environ.get("SYNAPSE_DRAIN_ONLY", "").strip() in ("1", "true", "yes")
         logger.info(
@@ -333,6 +374,9 @@ class Poller:
         prev_drained = 0
         quota_backoff = 0  # seconds; grows while the Max quota window is exhausted, 0 when healthy
         while True:
+            if self._stop_requested.is_set():
+                logger.info("Maintenance loop stopped cleanly")
+                return
             drained = 0
             now_mono = time.monotonic()
             if not drain_only:
@@ -373,7 +417,7 @@ class Poller:
                     quota_backoff,
                     str(e)[:120],
                 )
-                time.sleep(quota_backoff + _random.uniform(0, 30))
+                self._stop_requested.wait(quota_backoff + _random.uniform(0, 30))
                 continue
             except Exception as e:
                 logger.error("Extraction drain failed: %s", e, exc_info=True)
@@ -388,8 +432,9 @@ class Poller:
                 except Exception as e:
                     logger.error("Stale-claim sweep failed: %s", e, exc_info=True)
                 last_stale_sweep = now_mono
-            # Fast loop when extraction has likely-more-pending, slow loop otherwise.
-            time.sleep(3 if drained >= drain_batch_limit else 60)
+            # Fast loop when extraction has likely-more-pending, slow loop
+            # otherwise. Event.wait so a stop request interrupts the sleep.
+            self._stop_requested.wait(3 if drained >= drain_batch_limit else 60)
 
 
 def make_poller(
