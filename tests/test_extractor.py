@@ -795,6 +795,35 @@ class TestStage6bBatchConfirm:
         assert 1 not in skip_indices
         assert invalidate[1] == ["contra-uuid"]
 
+    def test_wrapped_and_stringified_indices_are_coerced(self):
+        """Smaller models return {"index": N} objects or digit strings where the
+        schema asks for bare ints (deepseek-v4-flash, 2026-07-18) — a raw dict
+        crashed the membership test with TypeError: unhashable."""
+        import json as _json
+
+        llm_payload = _json.dumps(
+            {
+                "results": [
+                    {"id": 0, "duplicate_facts": [{"index": 0}], "contradicted_facts": []},
+                    {
+                        "id": 1,
+                        "duplicate_facts": [],
+                        "contradicted_facts": ["0", {"bogus": True}, None],
+                    },
+                ]
+            }
+        )
+        pipe, _ = self._pipeline_with_llm(llm_payload)
+        facts = self._facts(2)
+        candidates_map = {
+            0: ([{"uuid": "dup-uuid", "fact": "old fact 0"}], []),
+            1: ([], [{"uuid": "contra-uuid", "fact": "old fact 1"}]),
+        }
+        skip_indices, invalidate, reinforce, ok = pipe._stage6b_batch_confirm(facts, candidates_map)
+        assert ok
+        assert 0 in skip_indices and reinforce[0] == ["dup-uuid"]
+        assert invalidate[1] == ["contra-uuid"]  # "0" coerced; junk entries dropped
+
     def test_empty_candidates_map_short_circuits(self):
         """No candidates anywhere => no LLM call at all."""
         pipe, llm_client = self._pipeline_with_llm("{}")

@@ -1446,6 +1446,28 @@ class ExtractionPipeline:
         except Exception:
             return set(), {}, {}, False
 
+        def _as_indices(val: Any) -> list[int]:
+            """Coerce a model-returned index list to ints.
+
+            The schema asks for bare ints, but smaller models (seen on
+            deepseek-v4-flash, 2026-07-18) return digit strings or wrap
+            each index in an object ({"index": 3} / {"id": 3}); a raw
+            dict crashed the `in` test with TypeError: unhashable.
+            Unrecognized shapes are dropped, matching the conservative
+            no-op default of the whole confirm stage.
+            """
+            out: list[int] = []
+            for v in val if isinstance(val, list) else []:
+                if isinstance(v, dict):
+                    v = v.get("index", v.get("id", v.get("fact_index")))
+                if isinstance(v, bool):
+                    continue
+                if isinstance(v, int):
+                    out.append(v)
+                elif isinstance(v, str) and v.strip().lstrip("-").isdigit():
+                    out.append(int(v.strip()))
+            return out
+
         skip_indices: set[int] = set()
         invalidate: dict[int, list[str]] = {}
         reinforce: dict[int, list[str]] = {}
@@ -1454,8 +1476,10 @@ class ExtractionPipeline:
             if not isinstance(fid, int) or fid not in per_item_maps:
                 continue
             idx_to_uuid = per_item_maps[fid]
-            dup_idx = [i for i in r.get("duplicate_facts", []) if i in idx_to_uuid]
-            contradicted_idx = [i for i in r.get("contradicted_facts", []) if i in idx_to_uuid]
+            dup_idx = [i for i in _as_indices(r.get("duplicate_facts")) if i in idx_to_uuid]
+            contradicted_idx = [
+                i for i in _as_indices(r.get("contradicted_facts")) if i in idx_to_uuid
+            ]
             dup_uuids = [idx_to_uuid[i] for i in dup_idx]
             contradicted = [idx_to_uuid[i] for i in contradicted_idx]
             pure_duplicates = [u for u in dup_uuids if u not in contradicted]
