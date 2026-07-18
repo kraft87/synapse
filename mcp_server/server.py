@@ -255,6 +255,15 @@ _register_device_routes(
     mcp, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, ALLOWED_GITHUB_USERS, MACHINE_TOKEN
 )
 
+# Browser-login lane — authorization-code flow for the dashboard login screen (redirect UX;
+# the device flow stays for `synapse login`). Same GitHub identity + allowlist gate; return
+# origins restricted via SYNAPSE_DASH_ORIGINS. Same enablement condition as the device flow.
+from mcp_server.web_login_routes import register as _register_web_login_routes  # noqa: E402
+
+_register_web_login_routes(
+    mcp, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, ALLOWED_GITHUB_USERS, MACHINE_TOKEN, PUBLIC_URL
+)
+
 
 # Lazy-init recall engine (one per process)
 _recall_engine: Recall | None = None  # type: ignore[name-defined,unused-ignore]  # noqa: F821
