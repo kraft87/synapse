@@ -72,6 +72,8 @@ _LSH_JACCARD_THRESHOLD = 0.7
 
 # Number of MinHash permutations — direct port of Graphiti's value.
 _MINHASH_PERMUTATIONS = 128
+# Process-wide MinHash permutation array — see NodeDeduper._minhash.
+_SHARED_MINHASH_PERMS: Any = None
 
 # Number of top LSH candidates passed to the LLM confirm pass.
 _LLM_CONFIRM_TOP_K = 3
@@ -600,10 +602,20 @@ class NodeDeduper:
         )
 
     def _minhash(self, shingles: set[str]) -> Any:
-        """Construct a MinHash for a shingle set (datasketch import-deferred)."""
+        """Construct a MinHash for a shingle set (datasketch import-deferred).
+
+        The 128 hash permutations are seed-deterministic, so every MinHash
+        object computes the identical array — but datasketch regenerates it
+        per object, which dominated the O(all entities) LSH build (~17x of
+        its cost). Compute once per process and share; fingerprints are
+        bit-identical either way.
+        """
+        global _SHARED_MINHASH_PERMS
         from datasketch import MinHash
 
-        mh = MinHash(num_perm=_MINHASH_PERMUTATIONS)
+        if _SHARED_MINHASH_PERMS is None:
+            _SHARED_MINHASH_PERMS = MinHash(num_perm=_MINHASH_PERMUTATIONS).permutations
+        mh = MinHash(num_perm=_MINHASH_PERMUTATIONS, permutations=_SHARED_MINHASH_PERMS)
         for shingle in shingles:
             mh.update(shingle.encode("utf-8"))
         return mh
