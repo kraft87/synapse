@@ -590,6 +590,11 @@ class _OpenAIMessagesProxy:
             # completion with ``finish_reason='length'`` — 196 queue items
             # failed exactly that way on deepseek-v4-pro (2026-07-17).
             payload["reasoning"] = {"enabled": False}
+            if c.openrouter_providers:
+                # Prefer these providers in order; OpenRouter still falls
+                # back to others if none are available, so a provider
+                # outage degrades to slower/pricier routing, not failure.
+                payload["provider"] = {"order": c.openrouter_providers}
 
         response = c.http.post("/chat/completions", json=payload)
         _raise_for_openai_status(response)
@@ -669,6 +674,13 @@ class OpenAIChatClient:
         # other OpenAI-compatible servers (OpenAI proper, Ollama, vLLM) may
         # reject unknown params, so the flag gates on the URL.
         self.is_openrouter = "openrouter" in base_url.lower()
+        # SYNAPSE_OPENROUTER_PROVIDERS: comma-separated provider slugs to
+        # prefer (e.g. "fireworks,deepinfra"). OpenRouter-only.
+        self.openrouter_providers = [
+            p.strip()
+            for p in os.environ.get("SYNAPSE_OPENROUTER_PROVIDERS", "").split(",")
+            if p.strip()
+        ]
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
