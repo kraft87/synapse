@@ -10,7 +10,8 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
   3. DERIVE         — gap scan -> cluster -> ledger (judge evidence); draft SKILL.md for proposed
   4. RETUNE         — under-trigger judge -> ledger retune/widen (judge evidence)
   5. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
-  6. decay + digest — bump unseen, retire stale; Discord digest of proposed candidates
+  6. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
+                      throttled Discord digest (top 5, pings only on NEW proposals)
 Incremental via skill_scan_cursor (whole-session scan since last_scan_at). --backfill ignores the watermark.
 
 The LLM finders honor SKILL_MEASURE_MODEL (deepseek for cheap backfill); drafting uses Opus.
@@ -253,22 +254,49 @@ def _draft_if_needed(conn, cid, cluster):
 
 
 # --------------------------------------------------------------------- 6. digest
+DIGEST_CAP = 5  # proposals shown per digest — flood control, the rest is a "+N pending" footer
+
+
 def discord_digest(conn, no_discord):
+    """Throttled review digest. Shows the top-DIGEST_CAP proposals (salience DESC, then
+    score), and PINGS only when there are proposals not covered by the previous digest —
+    a nightly re-wall of the same pending list is how review queues rot. The seen-ids
+    watermark lives in skill_scan_cursor.config['digest_ids'] (update_cursor merges,
+    never clobbers)."""
     cur = conn.cursor()
     cur.execute(
-        """SELECT kind, name, score, grounded_sessions, judge_sessions, proposal_path
+        """SELECT id, kind, name, score, grounded_sessions, judge_sessions, salience, source_detector
              FROM skills_lane.skill_gap_candidates WHERE status='proposed'
-             ORDER BY score DESC LIMIT 15"""
+             ORDER BY salience DESC NULLS LAST, score DESC, id"""
     )
     rows = cur.fetchall()
     if not rows:
-        return {"proposed": 0}
+        return {"proposed": 0, "new": 0}
+    ids = [r[0] for r in rows]
+    prev = set((L.get_cursor(conn).get("config") or {}).get("digest_ids") or [])
+    new = [i for i in ids if i not in prev]
+
     lines = [f"**dream→skills — {len(rows)} proposal(s) awaiting review**"]
-    for kind, name, score, gs, js, _pp in rows:
+    for _id, kind, name, score, gs, js, sal, det in rows[:DIGEST_CAP]:
         g = f" · {gs} grounded" if gs else ""
-        lines.append(f"- `{kind}` **{name}** (score {score:.1f}, {js} judge{g})")
+        s = f" · sal {sal}" if sal is not None else ""
+        v = f" · {det}" if det else ""
+        lines.append(f"- `{kind}` **{name}** (score {score:.1f}, {js} judge{g}{s}{v})")
+    if len(rows) > DIGEST_CAP:
+        lines.append(f"+{len(rows) - DIGEST_CAP} more pending (skill_review list)")
     lines.append("\nReview: `/skill-review` (or skill_review.py list) · accept/reject/promote <id>")
     msg = "\n".join(lines)
+
+    cur.execute(
+        "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
+        "updated_at=now() WHERE id=1",
+        (json.dumps({"digest_ids": ids}),),
+    )
+    conn.commit()
+
+    if not new:
+        print(f"(digest: {len(rows)} pending, none new since last digest — not pinging)")
+        return {"proposed": len(rows), "new": 0}
     # Notifier: POST to a Discord webhook if configured; otherwise just print (default).
     if not no_discord and config.DISCORD_WEBHOOK:
         try:
@@ -281,7 +309,7 @@ def discord_digest(conn, no_discord):
             print(f"(notifier failed: {e})\n{msg}")
     else:
         print(msg)
-    return {"proposed": len(rows)}
+    return {"proposed": len(rows), "new": len(new)}
 
 
 def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) -> None:

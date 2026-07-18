@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from datetime import datetime
 
 from . import config
 
@@ -142,6 +143,17 @@ _SKILL_MARK = re.compile(r"^\[tool:Skill\]\s*(.*)$")
 _SKILL_NAME = re.compile(r"skill'?\s*[:=]\s*'?([\w-]+)")
 
 
+def _event_time(meta_ts, created_at):
+    """The episode's event time: the transcript's own timestamp when the parser recorded one
+    (metadata.ts), else created_at. Guards fired_at against ingest-wall-clock stamping."""
+    if meta_ts:
+        try:
+            return datetime.fromisoformat(str(meta_ts).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            pass
+    return created_at
+
+
 def sessions_since(
     last_scan_at,
     max_sessions: int = 80,
@@ -183,19 +195,26 @@ def fire_events(
     exclude_projects: tuple[str, ...] = config.EXCLUDE_PROJECTS,
 ) -> list[dict]:
     """Skill-fire events from episode [tool:Skill] markers, with dismissal detection from the
-    NEXT user turn. Returns [{skill, session_id, fired_at, via, dismissed}]. Powers skill_usage."""
+    NEXT user turn. Returns [{skill, session_id, fired_at, via, dismissed}]. Powers skill_usage.
+
+    fired_at is the fire-position episode's EVENT time: the transcript's own timestamp
+    (metadata->>'ts', stamped by the JSONL parser on the episode carrying the skill-invocation
+    marker), falling back to created_at. created_at alone lied for backfilled sessions — it was
+    the ingest wall clock, which stamped week-old fires with import day."""
     conn = _connect(_dsn())
     cur = conn.cursor()
     if last_scan_at is not None:
         cur.execute(
-            "SELECT session_id, sequence, created_at, human_turn, content FROM episodes "
+            "SELECT session_id, sequence, created_at, human_turn, content, metadata->>'ts' "
+            "FROM episodes "
             "WHERE platform=%s AND created_at > %s AND (project IS NULL OR project <> ALL(%s)) "
             "ORDER BY session_id, sequence",
             (platform, last_scan_at, list(exclude_projects)),
         )
     else:
         cur.execute(
-            "SELECT session_id, sequence, created_at, human_turn, content FROM episodes "
+            "SELECT session_id, sequence, created_at, human_turn, content, metadata->>'ts' "
+            "FROM episodes "
             "WHERE platform=%s AND created_at > now() - (%s||' days')::interval "
             "AND (project IS NULL OR project <> ALL(%s)) ORDER BY session_id, sequence",
             (platform, str(days), list(exclude_projects)),
@@ -203,7 +222,8 @@ def fire_events(
     rows = cur.fetchall()
     conn.close()
     events = []
-    for i, (sid, _seq, ts, _human, content) in enumerate(rows):
+    for i, (sid, _seq, created_at, _human, content, meta_ts) in enumerate(rows):
+        ts = _event_time(meta_ts, created_at)
         for line in (content or "").splitlines():
             m = _SKILL_MARK.match(line)
             if not m:

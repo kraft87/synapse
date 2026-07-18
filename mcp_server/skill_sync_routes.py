@@ -176,7 +176,8 @@ def _proposals_list(db_url: str) -> dict:
     with psycopg.connect(db_url, row_factory=dict_row) as c:
         rows = c.execute(
             """SELECT id, kind, name, direction, target_skills, status, score,
-                      grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings
+                      grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings,
+                      salience, source_detector
                  FROM skills_lane.skill_gap_candidates
                 WHERE status='proposed' AND (rejected_until IS NULL OR rejected_until < now())
                 ORDER BY score DESC""",
@@ -188,7 +189,8 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
     with psycopg.connect(db_url, row_factory=dict_row) as c:
         r = c.execute(
             "SELECT id, kind, name, direction, target_skills, status, score, evidence, "
-            "proposal_path, proposal_body, summary FROM skills_lane.skill_gap_candidates WHERE id=%s",
+            "proposal_path, proposal_body, summary, salience, source_detector, proposed_patch "
+            "FROM skills_lane.skill_gap_candidates WHERE id=%s",
             (cid,),
         ).fetchone()
     if not r:
