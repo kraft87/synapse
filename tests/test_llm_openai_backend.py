@@ -202,6 +202,31 @@ class TestSuccessfulCompletion:
         client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert seen["payload"]["reasoning"] == {"enabled": False}
 
+    def test_openrouter_provider_order_from_env(self, monkeypatch):
+        """SYNAPSE_OPENROUTER_PROVIDERS pins preferred providers in order."""
+        monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "fireworks, deepinfra")
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert seen["payload"]["provider"] == {"order": ["fireworks", "deepinfra"]}
+
+    def test_no_provider_field_when_env_unset(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_OPENROUTER_PROVIDERS", raising=False)
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert "provider" not in seen["payload"]
+
     def test_non_openrouter_payload_has_no_reasoning_field(self):
         """Other OpenAI-compatible servers may reject unknown params."""
         seen: dict[str, Any] = {}
