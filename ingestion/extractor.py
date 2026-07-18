@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -1157,6 +1158,11 @@ class ExtractionPipeline:
             llm_client=llm_client,
             model=stage_model("EDGE_DATES", base),
         )
+        # Per-group NodeDeduper cache — the fuzzy-name LSH inside it is an
+        # O(all entities) MinHash build, far too expensive to redo per item.
+        # See _deduper_for for the refresh policy.
+        self._dedupers: dict[str, Any] = {}
+        self._dedupers_built_at: dict[str, float] = {}
         # Timeline chat gate (schema 033): per-turn "did something happen?" check on
         # episode-type items -> naked dated events in timeline_events. Fail-soft and
         # env-gated (SYNAPSE_TIMELINE_GATE=0); orthogonal to KG extraction.
@@ -1635,6 +1641,32 @@ class ExtractionPipeline:
             if reinforce_items:
                 self._kg.reinforce_edges(reinforce_items, group_id)
 
+    def _deduper_for(self, group_id: str) -> Any:
+        """Cached per-group NodeDeduper, rebuilt only when the TTL lapses.
+
+        Constructing a NodeDeduper per item rebuilt its LSH index — an
+        O(all entities) MinHash pass — every time, which came to dominate
+        item latency once extraction reliably produced entities (~24 min/item
+        at 44K entities, 2026-07-17). One deduper per worker keeps the index
+        warm; ``register`` folds in this worker's own writes as they happen.
+        The TTL bounds staleness from OTHER workers' writes — and only for
+        the fuzzy-name assist, since the exact-name short-circuit and the
+        embedding-similarity candidates always query the live DB.
+        """
+        from ingestion.dedup import NodeDeduper
+
+        ttl = float(os.environ.get("SYNAPSE_DEDUP_CACHE_TTL_SECONDS", "900"))
+        now = time.monotonic()
+        built = self._dedupers_built_at.get(group_id)
+        if group_id not in self._dedupers or built is None or now - built > ttl:
+            self._dedupers[group_id] = NodeDeduper(
+                kg_client=self._kg,
+                group_id=group_id,
+                llm_client=self._llm._client,
+            )
+            self._dedupers_built_at[group_id] = now
+        return self._dedupers[group_id]
+
     # ------------------------------------------------------------------
     # Orchestrator
     # ------------------------------------------------------------------
@@ -1776,14 +1808,12 @@ class ExtractionPipeline:
         # orphan-drop pass below. Resolving (Stage 4) first is safe — it only
         # reads from the graph. Writing (Stage 5) is what we need to gate.
         #
-        # Per-group ``NodeDeduper`` instances are built lazily inside the
-        # loop so the LSH/Cypher state is scoped to a single graph and
-        # reused across Stage 4 + Stage 5 of one item. Surviving for the
-        # whole ``process_item`` call lets ``register`` keep the in-memory
-        # index in sync after Stage 5 writes the new node — that way if
-        # the same name is extracted twice (rare across one item, but
-        # possible for det+LLM overlap) the second occurrence dedupes
-        # against the freshly-inserted node instead of duplicating it.
+        # Per-group ``NodeDeduper`` instances are cached on the Extractor
+        # (``_deduper_for``) so the LSH index — an O(all entities) MinHash
+        # build — is constructed once per worker and reused across items.
+        # ``register`` keeps the in-memory index in sync after Stage 5
+        # writes each new node, so repeat names dedupe against
+        # freshly-inserted nodes both within an item and across items.
         from ingestion.dedup import NodeDeduper
 
         uuid_map: dict[str, str] = {}
@@ -1793,11 +1823,7 @@ class ExtractionPipeline:
             grp_entities = [e for e in all_entities if entity_groups[e.name] == grp]
             if not grp_entities:
                 continue
-            dedupers[grp] = NodeDeduper(
-                kg_client=self._kg,
-                group_id=grp,
-                llm_client=self._llm._client,
-            )
+            dedupers[grp] = self._deduper_for(grp)
             grp_uuid_map = self._stage4_resolve(grp_entities, grp, deduper=dedupers[grp])
             uuid_map.update(grp_uuid_map)
             grp_entities_map[grp] = grp_entities

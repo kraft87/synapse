@@ -1140,3 +1140,39 @@ class TestCanonicalAliases:
         ents = self._ents("FalkorDB", "Postgres")
         out = _apply_canonical_aliases(ents, [])
         assert {e.name for e in out} == {"FalkorDB", "Postgres"}
+
+
+# ---------------------------------------------------------------------------
+# Per-worker NodeDeduper cache (LSH rebuilt per item regression)
+# ---------------------------------------------------------------------------
+
+
+class TestDeduperCache:
+    """_deduper_for must reuse dedupers across items — the LSH build is O(all
+    entities) and rebuilding it per process_item call dominated item latency."""
+
+    def _pipeline(self) -> ExtractionPipeline:
+        embedder = MagicMock()
+        embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
+        return ExtractionPipeline(
+            db=MagicMock(),
+            llm_client=MagicMock(),
+            embedder=embedder,
+            kg_client=_mock_falkordb(similar_nodes=[]),
+        )
+
+    def test_same_group_reuses_instance(self):
+        pipe = self._pipeline()
+        assert pipe._deduper_for("technical") is pipe._deduper_for("technical")
+
+    def test_groups_get_distinct_dedupers(self):
+        pipe = self._pipeline()
+        assert pipe._deduper_for("technical") is not pipe._deduper_for("personal")
+
+    def test_ttl_expiry_rebuilds(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_DEDUP_CACHE_TTL_SECONDS", "300")
+        pipe = self._pipeline()
+        first = pipe._deduper_for("technical")
+        # Age the cache entry past the TTL; next call must build fresh.
+        pipe._dedupers_built_at["technical"] -= 301
+        assert pipe._deduper_for("technical") is not first

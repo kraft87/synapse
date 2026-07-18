@@ -42,6 +42,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, cast
 
@@ -541,6 +542,7 @@ class NodeDeduper:
         """
         if self._lsh is not None:
             return
+        build_start = time.monotonic()
 
         try:
             from datasketch import MinHashLSH
@@ -590,6 +592,12 @@ class NodeDeduper:
             except Exception as exc:
                 logger.debug("dedup: skipping %s in LSH (%s)", node_uuid[:8], exc)
         self._lsh = lsh
+        logger.info(
+            "dedup: LSH built for %s — %d entities in %.1fs",
+            self._group_id,
+            len(rows),
+            time.monotonic() - build_start,
+        )
 
     def _minhash(self, shingles: set[str]) -> Any:
         """Construct a MinHash for a shingle set (datasketch import-deferred)."""
