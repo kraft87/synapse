@@ -193,7 +193,7 @@ export interface RecallResult {
   timeline?: { date: string; fact: string; type?: string; salience?: number; score?: number }[];
   preferences?: { pref: string; polarity?: string; since?: string; asserted?: number; score?: number }[];
   web?: { context?: string; excerpt?: string; url?: string; title?: string; date?: string; score?: number }[];
-  history?: { previously: string; now: string }[];
+  superseded_facts?: { fact: string; superseded_by: string }[];
   debug?: RecallDebug;
 }
 export interface RecallParams { query: string; project?: string; group_id?: string; }

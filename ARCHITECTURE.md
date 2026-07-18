@@ -379,7 +379,7 @@ if entities_bucket: out["entities"]    = [...]   # {name, summary}, cap 3
 if web_chunks:      out["web"]         = [...]   # {context|excerpt, url?, title?, date?}, cap 3
 if timeline:        out["timeline"]    = [...]   # dated events (§3.5), cap 8
 if preferences:     out["preferences"] = [...]   # standing user preferences, cap 5
-if history:         out["history"]     = [...]   # {previously, now}, cap 2
+if superseded:      out["superseded_facts"] = [...]  # {fact: old, superseded_by: current}, cap 2
 return out
 ```
 

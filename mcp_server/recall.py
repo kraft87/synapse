@@ -260,7 +260,7 @@ _RECALL_PASSAGE_SRC_K = 10  # top reranked episodes to mine passages from
 _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds the extra call)
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
-_HISTORY_LIMIT = 2  # bi-temporal history pairs returned by recall()
+_SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
 _WEB_LIMIT = 3  # web_chunks (deduped by parent page) returned by recall()
 
 # Adaptive episode serving (variable-k) for recall_episodes() — OFF by default.
@@ -575,7 +575,7 @@ def _timed(fn: Any, *args: Any) -> tuple[Any, float]:
 def _served_chars(out: dict[str, Any]) -> int:
     """Total characters of the SERVED payload — the context cost recall() imposes
     on the caller's window. ``est_tokens`` ~= chars/4. Counts every answer-bearing
-    bucket (facts/episodes/entities/web/history), not the ranking-only fields."""
+    bucket (facts/episodes/entities/web/superseded_facts), not the ranking-only fields."""
     n = len(out.get("query") or "")
     for f in out.get("facts", []):
         n += len(f.get("fact") or "")
@@ -589,8 +589,8 @@ def _served_chars(out: dict[str, Any]) -> int:
         n += len(t.get("fact") or "") + len(str(t.get("date") or ""))
     for p in out.get("preferences", []):
         n += len(p.get("pref") or "") + len(str(p.get("polarity") or ""))
-    for h in out.get("history", []):
-        n += len(str(h.get("previously") or "")) + len(str(h.get("now") or ""))
+    for h in out.get("superseded_facts", []):
+        n += len(str(h.get("fact") or "")) + len(str(h.get("superseded_by") or ""))
     return n
 
 
@@ -1278,13 +1278,14 @@ class Recall:
             logger.warning("KG search failed: %s", e)
             return [], []
 
-    def _fetch_history_pairs_pg(
+    def _fetch_superseded_pairs_pg(
         self,
         group_id: str,
         active_edge_uuids: list[str],
         cap: int,
     ) -> list[dict[str, Any]]:
-        """Postgres port of _fetch_history_pairs over kg_relationships.
+        """Superseded-fact pairs for served edges (Postgres port of the old
+        FalkorDB _fetch_history_pairs).
 
         DISTINCT ON picks the most recently invalidated predecessor per active
         edge in SQL (the FalkorDB path does this dedup in Python).
@@ -1310,7 +1311,7 @@ class Recall:
                 (_KG_OWNER, group_id, active_edge_uuids),
             ).fetchall()
         except Exception as e:
-            logger.debug("PG history query failed: %s", e)
+            logger.debug("PG superseded-pairs query failed: %s", e)
             return []
         by_uid = {r["uid"]: r for r in rows}
         out: list[dict[str, Any]] = []
@@ -1318,7 +1319,7 @@ class Recall:
             r = by_uid.get(uid)
             if r is None:
                 continue
-            out.append({"previously": r["old_fact"], "now": r["now_fact"]})
+            out.append({"fact": r["old_fact"], "superseded_by": r["now_fact"]})
             if len(out) >= cap:
                 break
         return out
@@ -1568,7 +1569,7 @@ class Recall:
         vec_web, ms_web = f_web.result()
         (kg_results, seed_entities), ms_kg = f_kg.result()
 
-        facts_internal = kg_results[:_FACT_LIMIT]  # carry _uuid for bump + history
+        facts_internal = kg_results[:_FACT_LIMIT]  # carry _uuid for bump + superseded pairs
         # Feedback loop: bump retrieval_count on every surfaced edge so frequent hits
         # float higher next time. Already fire-and-forget — never blocks the response.
         surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
@@ -1576,15 +1577,15 @@ class Recall:
             self._increment_fact_retrieval_counts(surfaced_edge_uuids, group_id)
 
         # Second wave, also concurrent: the cross-encoder rerank (Voyage HTTP) and the
-        # bi-temporal history fetch hit different backends. Use the SCORED rerank — same
+        # bi-temporal superseded-pairs fetch hit different backends. Use the SCORED rerank — same
         # ordering as _rerank_pool, but it also yields the top relevance score (a recall-
         # confidence signal, and the basis for an eventual inject-only-if-relevant gate).
         f_rerank = ex.submit(_timed, self._rerank_pool_scored, query, ep_pool)
-        f_history = ex.submit(
-            self._fetch_history_pairs_pg, group_id, surfaced_edge_uuids, _HISTORY_LIMIT
+        f_superseded = ex.submit(
+            self._fetch_superseded_pairs_pg, group_id, surfaced_edge_uuids, _SUPERSEDED_LIMIT
         )
         scored, ms_rerank = f_rerank.result()
-        history = f_history.result()
+        superseded_facts = f_superseded.result()
         rerank_top = scored[0][1] if scored else 0.0  # RAW top score (telemetry) — pre-recency
         # Post-rerank recency re-injection: the cross-encoder is recency-blind, so an old
         # *definitive* claim out-ranks a newer *correction* when both make the pool. Re-weight
@@ -1674,8 +1675,10 @@ class Recall:
             out["entities"] = entities_bucket  # {name, summary}
         if web_chunks:
             out["web"] = [_to_web_recall_item(r) for r in web_chunks]
-        if history:
-            out["history"] = history  # {previously, now}
+        if superseded_facts:
+            # Renamed from "history" 2026-07-18 — the displaced version of each served
+            # fact, keyed like the superseded_by columns elsewhere in the system.
+            out["superseded_facts"] = superseded_facts  # {fact: old, superseded_by: current}
         timeline_items: list[dict[str, Any]] = []
         ms_timeline = 0.0
         if f_timeline is not None:
@@ -1754,7 +1757,7 @@ class Recall:
             "n_episodes": len(out.get("episodes", [])),
             "n_entities": len(entities_bucket),
             "n_web": len(web_chunks),
-            "n_history": len(history),
+            "n_history": len(superseded_facts),
             "n_timeline": len(out.get("timeline", [])),
             "ms_timeline": round(ms_timeline, 1),
             "n_prefs": len(out.get("preferences", [])),

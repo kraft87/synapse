@@ -88,16 +88,16 @@ function bucketItems(name: string, r: RecallResult): Item[] {
         key: 'w' + i, score: w.score, meta: w.date,
         head: (w.title || w.url || 'web') + ' —', rest: w.context || w.excerpt || '',
       }));
-    case 'history':
-      return (r.history || []).map((h, i) => ({
-        key: 'h' + i, head: 'now —',
-        rest: h.now + (h.previously ? '   (was: ' + h.previously + ')' : ''),
+    case 'superseded_facts':
+      return (r.superseded_facts || []).map((h, i) => ({
+        key: 'h' + i, head: 'superseded —',
+        rest: h.fact + (h.superseded_by ? '   (now: ' + h.superseded_by + ')' : ''),
       }));
     default:
       return [];
   }
 }
-// Canonical order (spec §2). history only shows when the payload carries it.
+// Canonical order (spec §2). superseded_facts only shows when the payload carries it.
 const BUCKETS = ['episodes', 'facts', 'entities', 'communities', 'timeline', 'preferences', 'web'];
 
 const mono = 'var(--font-data)';
@@ -215,7 +215,7 @@ export function Recall() {
           {tab === 'served' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
               {loading && !result && <div style={{ color: 'var(--txt3)', fontFamily: mono, fontSize: '12.5px' }}>running recall…</div>}
-              {result && [...BUCKETS, ...(result.history?.length ? ['history'] : [])].map((name) => {
+              {result && [...BUCKETS, ...(result.superseded_facts?.length ? ['superseded_facts'] : [])].map((name) => {
                 const items = bucketItems(name, result);
                 return (
                   <section key={name}>
