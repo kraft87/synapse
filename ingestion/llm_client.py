@@ -80,6 +80,7 @@ import json
 import logging
 import os
 import re
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -580,6 +581,25 @@ def _last_response_text(messages: list[Any]) -> str:
     return ""
 
 
+_LOOP_TLS = threading.local()
+
+
+def _thread_loop() -> asyncio.AbstractEventLoop:
+    """One persistent event loop per worker thread.
+
+    pydantic-ai's ``run_sync`` creates a fresh loop per call; httpx
+    keepalive connections created under one loop error on reuse from the
+    next ("Connection error." storm, 2026-07-18). Pinning a loop to each
+    long-lived worker thread keeps the thread-local connection pool (see
+    ``OpenAIChatClient._provider``) on the loop that created it.
+    """
+    loop = getattr(_LOOP_TLS, "loop", None)
+    if loop is None or loop.is_closed():
+        loop = asyncio.new_event_loop()
+        _LOOP_TLS.loop = loop
+    return loop
+
+
 def _run_agent_sync(
     agent: Any,
     user_prompt: str,
@@ -626,7 +646,13 @@ def _run_agent_sync(
     def _attempt() -> Any:
         with capture_run_messages() as captured:
             try:
-                return agent.run_sync(user_prompt, instructions=instructions)
+                # NOT run_sync: that spins a fresh event loop per call,
+                # divorcing pooled httpx connections from the loop that
+                # created them (APIConnectionError storm, 2026-07-18).
+                # Each worker thread keeps one persistent loop instead.
+                return _thread_loop().run_until_complete(
+                    agent.run(user_prompt, instructions=instructions)
+                )
             except PydanticAIModelHTTPError as exc:
                 raise _map_model_http_error(exc) from exc
             except UnexpectedModelBehavior as exc:
@@ -728,8 +754,6 @@ class OpenAIChatClient:
         model: str = DEFAULT_OPENAI_MODEL,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        from openai import AsyncOpenAI
-        from pydantic_ai.providers.openai import OpenAIProvider
 
         self.model = model
         self.base_url = base_url.rstrip("/")
@@ -744,21 +768,42 @@ class OpenAIChatClient:
             for p in os.environ.get("SYNAPSE_OPENROUTER_PROVIDERS", "").split(",")
             if p.strip()
         ]
-        inner = transport if transport is not None else httpx.AsyncHTTPTransport()
-        http_client = httpx.AsyncClient(
-            transport=_ErrorBodyStatusTransport(inner), timeout=_HTTP_TIMEOUT
-        )
-        # max_retries=0: retry policy lives in tenacity (_run_agent_sync),
-        # not the OpenAI SDK, so attempt counts stay deterministic.
-        self._openai = AsyncOpenAI(
-            base_url=base_url.rstrip("/"),
-            api_key=api_key or "EMPTY",
-            http_client=http_client,
-            max_retries=0,
-            timeout=_HTTP_TIMEOUT,
-        )
-        self._provider = OpenAIProvider(openai_client=self._openai)
+        self._api_key = api_key
+        self._transport = transport
+        # Connection state is THREAD-LOCAL, built lazily per worker thread.
+        # A process-wide httpx.AsyncClient looked fine under MockTransport
+        # tests but broke in prod (2026-07-18): each _run_agent_sync call
+        # runs in its own short-lived event loop, and pooled keepalive
+        # connections created under one loop fail with APIConnectionError
+        # ("Connection error.") when reused from the next — ~570 failures
+        # in 10 min. One loop + one pool per long-lived worker thread
+        # (see _thread_loop) keeps connections and loops married for life.
+        self._tls = threading.local()
         self.messages = _OpenAIMessagesProxy(self)
+
+    @property
+    def _provider(self) -> Any:
+        from openai import AsyncOpenAI
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        provider = getattr(self._tls, "provider", None)
+        if provider is None:
+            inner = self._transport if self._transport is not None else httpx.AsyncHTTPTransport()
+            http_client = httpx.AsyncClient(
+                transport=_ErrorBodyStatusTransport(inner), timeout=_HTTP_TIMEOUT
+            )
+            # max_retries=0: retry policy lives in tenacity (_run_agent_sync),
+            # not the OpenAI SDK, so attempt counts stay deterministic.
+            openai_client = AsyncOpenAI(
+                base_url=self.base_url,
+                api_key=self._api_key or "EMPTY",
+                http_client=http_client,
+                max_retries=0,
+                timeout=_HTTP_TIMEOUT,
+            )
+            provider = OpenAIProvider(openai_client=openai_client)
+            self._tls.provider = provider
+        return provider
 
     def resolve_model(self, model: str | None) -> str:
         """Per-call model: honored when the call site chose one explicitly —
