@@ -20,6 +20,7 @@ dependencies = [
     "tenacity>=8.0",
     "datasketch>=1.6",
     "fastmcp>=3.4",
+    "pydantic-ai-slim[openai]>=2.13.0",
 ]
 
 [project.optional-dependencies]

@@ -6,7 +6,13 @@ from __future__ import annotations
 import pytest
 
 from ingestion.llm_client import MalformedResponseError
+from ingestion.llm_schemas import TimelineGateEvents
 from ingestion.timeline_gate import TimelineGate, _parse_gate
+
+
+def _gate_events(events):
+    """Wrap raw event dicts the way structured_call now returns them."""
+    return TimelineGateEvents.model_validate({"events": events})
 
 
 def test_gate_prompt_ports_framing_and_date_anchoring():
@@ -167,8 +173,10 @@ def _gated(monkeypatch, event, exists):
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
         tg,
-        "parse_with_retry",
-        lambda *a, **k: [{"event": event, "salience": 1, "event_type": None, "date": None}],
+        "structured_call",
+        lambda *a, **k: _gate_events(
+            [{"event": event, "salience": 1, "event_type": None, "date": None}]
+        ),
     )
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
     return db.inserted
@@ -182,16 +190,18 @@ def test_gate_threads_domain_to_insert(monkeypatch):
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
         tg,
-        "parse_with_retry",
-        lambda *a, **k: [
-            {
-                "event": "booked a dentist appointment",
-                "salience": 1,
-                "event_type": "action",
-                "domain": "personal",
-                "date": None,
-            }
-        ],
+        "structured_call",
+        lambda *a, **k: _gate_events(
+            [
+                {
+                    "event": "booked a dentist appointment",
+                    "salience": 1,
+                    "event_type": "action",
+                    "domain": "personal",
+                    "date": None,
+                }
+            ]
+        ),
     )
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "neuron"})
     assert db.inserted[0]["domain"] == "personal"
@@ -256,8 +266,8 @@ def _gated_full(monkeypatch, gate_ret, exists=False):
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
         tg,
-        "parse_with_retry",
-        lambda *a, **k: gate_ret if isinstance(gate_ret, list) else [gate_ret],
+        "structured_call",
+        lambda *a, **k: _gate_events(gate_ret if isinstance(gate_ret, list) else [gate_ret]),
     )
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
     return db.inserted
@@ -366,15 +376,17 @@ def _dedup_gate(monkeypatch, cands, verdicts, dedup_env="1"):
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
         tg,
-        "parse_with_retry",
-        lambda *a, **k: [
-            {
-                "event": "baked sourdough bread (reported as 'on Tuesday')",
-                "salience": 1,
-                "event_type": None,
-                "date": None,
-            }
-        ],
+        "structured_call",
+        lambda *a, **k: _gate_events(
+            [
+                {
+                    "event": "baked sourdough bread (reported as 'on Tuesday')",
+                    "salience": 1,
+                    "event_type": None,
+                    "date": None,
+                }
+            ]
+        ),
     )
     seq = iter(verdicts)
     g._confirm_same = lambda a, b: next(seq)  # scripted; StopIteration = unexpected call
@@ -433,8 +445,10 @@ def test_missing_candidate_turn_means_no_merge(monkeypatch):
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
         tg,
-        "parse_with_retry",
-        lambda *a, **k: [{"event": "did a thing", "salience": 1, "event_type": None, "date": None}],
+        "structured_call",
+        lambda *a, **k: _gate_events(
+            [{"event": "did a thing", "salience": 1, "event_type": None, "date": None}]
+        ),
     )
     g._confirm_same = lambda a, b: (_ for _ in ()).throw(AssertionError("no turn -> no confirm"))
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "p"})

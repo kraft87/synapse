@@ -21,7 +21,6 @@ from ingestion.extractor import (
     ExtractionPipeline,
     LLMExtractor,
     _cosine_similarity,
-    _MalformedExtractionResponse,
 )
 from ingestion.models import (
     CombinedExtraction,
@@ -145,15 +144,21 @@ class TestDeterministicExtractor:
 
 
 class TestLLMExtractorParsing:
-    """``_parse_response`` returns a validated ``CombinedExtraction`` (Phase 1).
-
-    Post-Phase-1 it raises ``_MalformedExtractionResponse`` on bad JSON so the
-    tenacity retry loop in ``extract()`` can re-prompt with feedback. Tests
-    here exercise the parser directly; retry behavior is covered in
-    ``TestLLMExtractorRetry``.
+    """The stage-3 parse/validation pathway (``llm_schemas.ExtractionOutput``
+    via ``structured_call``): fenced or prose-wrapped JSON is tolerated, bad
+    rows are skipped (never fatal), and garbage degrades to an empty
+    ``ExtractionResult`` after the retry budget. Retry mechanics are covered
+    in ``TestLLMExtractorRetry``.
     """
 
-    extractor = LLMExtractor.__new__(LLMExtractor)
+    @staticmethod
+    def _extract(raw: str) -> ExtractionResult:
+        msg = MagicMock()
+        msg.content = [MagicMock(text=raw)]
+        client = MagicMock()
+        client.messages.create.return_value = msg
+        extractor = LLMExtractor(llm_client=client, model="claude-haiku-4-5")
+        return extractor.extract(summary="anything", context_entities=[])
 
     def test_parse_valid_json(self):
         raw = """
@@ -165,13 +170,10 @@ class TestLLMExtractorParsing:
           "facts": [{"source": "Synapse", "target": "FalkorDB", "relationship": "USES", "fact": "Synapse uses FalkorDB as its knowledge graph store"}]
         }
         """
-        result = LLMExtractor._parse_response(raw)
-        assert isinstance(result, CombinedExtraction)
+        result = self._extract(raw)
         assert {e.name for e in result.entities} == {"FalkorDB", "Synapse"}
         assert len(result.facts) == 1
         assert result.facts[0].relationship == "USES"
-        # Both endpoints declared → no facts dropped.
-        assert result.dropped_facts == []
 
     def test_parse_json_in_markdown_block(self):
         raw = """
@@ -180,29 +182,31 @@ Here is the extraction:
 {"entities": [{"name": "voyage-4-large", "type": "Tool", "summary": "Embedding model"}], "facts": []}
 ```
 """
-        result = LLMExtractor._parse_response(raw)
+        result = self._extract(raw)
         assert result.entities[0].name == "voyage-4-large"
 
-    def test_parse_invalid_json_raises(self):
-        with pytest.raises(_MalformedExtractionResponse):
-            LLMExtractor._parse_response("This is not JSON at all.")
+    def test_parse_invalid_json_returns_empty(self):
+        result = self._extract("This is not JSON at all.")
+        assert result.entities == []
+        assert result.facts == []
 
     def test_parse_partial_json_missing_facts(self):
         raw = '{"entities": [{"name": "Synapse", "type": "Project", "summary": "Memory layer"}]}'
-        result = LLMExtractor._parse_response(raw)
+        result = self._extract(raw)
         assert result.entities[0].name == "Synapse"
         assert result.facts == []
 
     def test_parse_entities_missing_required_fields(self):
         raw = '{"entities": [{"name": "X"}], "facts": []}'
-        result = LLMExtractor._parse_response(raw)
+        result = self._extract(raw)
         # Missing type defaults gracefully (type has a fallback)
         assert len(result.entities) == 1
         assert result.entities[0].name == "X"
+        assert result.entities[0].type == "Topic"
 
     def test_parse_empty_result(self):
         raw = '{"entities": [], "facts": []}'
-        result = LLMExtractor._parse_response(raw)
+        result = self._extract(raw)
         assert result.entities == []
         assert result.facts == []
 
@@ -357,11 +361,12 @@ class TestLLMExtractorRetry:
         assert [e.name for e in result.entities] == ["Synapse"]
         # Both attempts should have been called.
         assert client.messages.create.call_count == 2
-        # Second call's prompt should include the feedback string verbatim.
+        # Second call's prompt should include pydantic-ai's validation
+        # feedback (the retry-with-feedback contract, new wording).
         second_call_prompt = client.messages.create.call_args_list[1].kwargs["messages"][0][
             "content"
         ]
-        assert "Your last response failed to parse" in second_call_prompt
+        assert "Fix the errors and try again" in second_call_prompt
 
     def test_returns_empty_after_all_attempts_fail(self):
         bad = self._mock_response("not json at all")

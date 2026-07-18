@@ -23,11 +23,8 @@ import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-import orjson
-from pydantic import ValidationError
-
 from ingestion.kg_client import rrf_merge
-from ingestion.llm_client import MalformedResponseError, parse_with_retry
+from ingestion.llm_client import MalformedResponseError
 from ingestion.models import (
     CombinedExtraction,
     ExtractedEntity,
@@ -191,18 +188,8 @@ Rules:
 - Both lists may be empty if the NEW FACT is genuinely novel.
 """
 
-_CONTRADICTION_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "duplicate_facts": {"type": "array", "items": {"type": "integer"}},
-            "contradicted_facts": {"type": "array", "items": {"type": "integer"}},
-        },
-        "required": ["duplicate_facts", "contradicted_facts"],
-        "additionalProperties": False,
-    },
-}
+# Response shape enforced via pydantic-ai structured outputs — see
+# ``ingestion.llm_schemas.ResolutionResult``.
 
 
 def build_resolution_prompt(
@@ -262,29 +249,8 @@ Rules (apply per-fact):
 Return exactly one result object per new fact `id`.
 """
 
-_BATCH_CONTRADICTION_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "duplicate_facts": {"type": "array", "items": {"type": "integer"}},
-                        "contradicted_facts": {"type": "array", "items": {"type": "integer"}},
-                    },
-                    "required": ["id", "duplicate_facts", "contradicted_facts"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["results"],
-        "additionalProperties": False,
-    },
-}
+# Response shape enforced via pydantic-ai structured outputs — see
+# ``ingestion.llm_schemas.BatchResolutionResult``.
 
 
 def build_batch_resolution_prompt(
@@ -642,14 +608,6 @@ ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
 """
 
 
-# Phase 5: the previous ``_MalformedExtractionResponse`` shim has been
-# consolidated into ``ingestion.llm_client.MalformedResponseError`` — same
-# semantics (carries the raw response text), but reused by every caller
-# that opts into ``parse_with_retry``. Kept as a module-local alias so
-# existing test imports continue to work.
-_MalformedExtractionResponse = MalformedResponseError
-
-
 class LLMExtractor:
     """Extract entities + facts from session summaries via LLM call."""
 
@@ -672,18 +630,17 @@ class LLMExtractor:
         anchor the prompt resolves in-text date mentions against; None renders
         "unknown" and the prompt leaves relative dates unanchored.
 
-        Phase 5 consolidation: the tenacity ``@retry`` wrapper that used to
-        live inline here is gone. Two retry concerns now compose at separate
-        layers:
+        Two retry concerns compose at separate layers inside
+        ``structured_call``:
 
-        * Transient wire errors (rate-limit, timeout) → handled by tenacity
-          inside ``_MessagesProxy.create`` (see ``ingestion.llm_client``).
-        * Malformed JSON / Pydantic validation errors → handled by
-          ``parse_with_retry``'s feedback loop.
+        * Transient wire errors (rate-limit, timeout) → tenacity around the
+          pydantic-ai run (see ``ingestion.llm_client._run_agent_sync``).
+        * Malformed / schema-violating output → pydantic-ai's
+          retry-with-validation-feedback loop (``max_attempts`` total tries).
 
         The load-bearing Phase 1 logic — the Pydantic ``CombinedExtraction``
         cross-reference validator that drops facts referencing undeclared
-        entities — survives untouched in ``_parse_response`` below.
+        entities — survives untouched in ``_run`` below.
         """
         context_str = (
             ", ".join(f"{e.name} ({e.type})" for e in context_entities)
@@ -741,11 +698,14 @@ class LLMExtractor:
         return self._run(base_prompt)
 
     def _run(self, base_prompt: str) -> ExtractionResult:
+        from ingestion.llm_client import structured_call
+        from ingestion.llm_schemas import ExtractionOutput
+
         try:
-            combined = parse_with_retry(
+            output = structured_call(
                 self._client,
+                output_model=ExtractionOutput,
                 base_prompt=base_prompt,
-                parser=self._parse_response,
                 model=self._model,
                 # No fixed fact cap (content sets the count) + the anti-filler
                 # quality bar; dense turns can run 15-25 facts. Dense infra
@@ -764,6 +724,24 @@ class LLMExtractor:
             )
             return ExtractionResult()
 
+        # Cross-reference validation (facts pointing at undeclared entities
+        # are dropped, never raised) — the load-bearing Phase 1 invariant.
+        combined = CombinedExtraction(
+            entities=[
+                ExtractedEntity(name=e.name, type=e.type, summary=e.summary)
+                for e in output.entities
+            ],
+            facts=[
+                ExtractedFact(
+                    source=f.source,
+                    target=f.target,
+                    relationship=f.relationship,
+                    fact=f.fact,
+                )
+                for f in output.facts
+            ],
+        )
+
         if combined.dropped_facts:
             logger.info(
                 "Dropped %d fact(s) referencing entities not in extractor output",
@@ -776,71 +754,6 @@ class LLMExtractor:
             )
 
         return ExtractionResult(entities=combined.entities, facts=combined.facts)
-
-    @staticmethod
-    def _parse_response(raw: str) -> CombinedExtraction:
-        """Parse the LLM response into a validated ``CombinedExtraction``.
-
-        Raises ``MalformedResponseError`` when the response isn't valid
-        JSON or doesn't satisfy the schema; ``parse_with_retry`` catches
-        that exception and re-fires the call with the failure quoted back
-        as feedback.
-        """
-        stripped = raw.strip()
-        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
-        if fence_match:
-            stripped = fence_match.group(1)
-        else:
-            start = stripped.find("{")
-            end = stripped.rfind("}")
-            if start == -1 or end == -1:
-                raise MalformedResponseError("no JSON object found in response", raw_response=raw)
-            stripped = stripped[start : end + 1]
-
-        try:
-            data = orjson.loads(stripped)
-        except (orjson.JSONDecodeError, ValueError) as exc:
-            raise MalformedResponseError(f"JSON decode error: {exc}", raw_response=raw) from exc
-
-        if not isinstance(data, dict):
-            raise MalformedResponseError("top-level JSON value must be an object", raw_response=raw)
-
-        # Coerce each entity/fact row independently — bad rows are skipped, not
-        # fatal — then hand the cleaned lists to the Pydantic model so the
-        # cross-ref validator can drop facts pointing at undeclared entities.
-        entities: list[ExtractedEntity] = []
-        for item in data.get("entities", []) or []:
-            if not isinstance(item, dict) or "name" not in item:
-                continue
-            entities.append(
-                ExtractedEntity(
-                    name=item["name"],
-                    type=item.get("type", "Topic"),
-                    summary=item.get("summary", ""),
-                )
-            )
-
-        facts: list[ExtractedFact] = []
-        for item in data.get("facts", []) or []:
-            if not isinstance(item, dict):
-                continue
-            if not all(k in item for k in ("source", "target", "relationship", "fact")):
-                continue
-            facts.append(
-                ExtractedFact(
-                    source=item["source"],
-                    target=item["target"],
-                    relationship=item["relationship"],
-                    fact=item["fact"],
-                )
-            )
-
-        try:
-            return CombinedExtraction(entities=entities, facts=facts)
-        except ValidationError as exc:
-            raise MalformedResponseError(
-                f"schema validation error: {exc}", raw_response=raw
-            ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1005,10 +918,9 @@ class EntityResolver:
         if self._llm is None:
             return {e.name: c[0]["uuid"] for e, c in pending if c}
 
-        from ingestion.prompts.dedupe_nodes import (
-            BATCH_NODE_DEDUP_SCHEMA,
-            build_batch_prompt,
-        )
+        from ingestion.llm_client import structured_call
+        from ingestion.llm_schemas import BatchNodeDedupResult
+        from ingestion.prompts.dedupe_nodes import build_batch_prompt
 
         items: list[dict[str, Any]] = []
         for i, (entity, cands) in enumerate(pending):
@@ -1030,14 +942,13 @@ class EntityResolver:
 
         max_tokens = min(4096, 128 + 24 * len(pending))
         try:
-            response = self._llm.messages.create(
+            batch = structured_call(
+                self._llm,
+                output_model=BatchNodeDedupResult,
+                messages=build_batch_prompt(items),
                 model=self._confirm_model,
                 max_tokens=max_tokens,
-                messages=build_batch_prompt(items),
-                response_format=BATCH_NODE_DEDUP_SCHEMA,
             )
-            data = json.loads(str(response.content[0].text))
-            results = data.get("results", []) if isinstance(data, dict) else []
         except Exception as e:
             logger.warning(
                 "batch dedup confirm failed for %d entit%s (%s); treating all as distinct",
@@ -1048,17 +959,12 @@ class EntityResolver:
             return {}
 
         decided: dict[str, str] = {}
-        for r in results:
-            try:
-                idx = int(r["id"])
-                cid = int(r["duplicate_candidate_id"])
-            except (KeyError, TypeError, ValueError):
+        for r in batch.results:
+            if not (0 <= r.id < len(pending)):
                 continue
-            if not (0 <= idx < len(pending)):
-                continue
-            entity, cands = pending[idx]
-            if 0 <= cid < len(cands):
-                decided[entity.name] = cands[cid]["uuid"]
+            entity, cands = pending[r.id]
+            if 0 <= r.duplicate_candidate_id < len(cands):
+                decided[entity.name] = cands[r.duplicate_candidate_id]["uuid"]
         return decided
 
 
@@ -1363,25 +1269,24 @@ class ExtractionPipeline:
         duplicate_facts and contradicted_facts is treated as a drop-in
         replacement (skip nothing, invalidate the old).
         """
+        from ingestion.llm_client import structured_call
+        from ingestion.llm_schemas import ResolutionResult
+
         prompt, idx_to_uuid = build_resolution_prompt(fact.fact, pair_pool, semantic_pool)
         if not idx_to_uuid:
             return False, []
         try:
             # Triple classification on short fact pairs — Haiku is sufficient
             # and ~10x cheaper than Sonnet.
-            response = self._llm._client.messages.create(
+            resolution = structured_call(
+                self._llm._client,
+                output_model=ResolutionResult,
+                base_prompt=prompt,
                 model=self._contradiction_model,
                 max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
-                response_format=_CONTRADICTION_SCHEMA,
             )
-            raw = response.content[0].text.strip()
-            start = raw.find("{")
-            if start < 0:
-                return False, []
-            data, _ = json.JSONDecoder().raw_decode(raw[start:])
-            dup_idx = [i for i in data.get("duplicate_facts", []) if i in idx_to_uuid]
-            contradicted_idx = [i for i in data.get("contradicted_facts", []) if i in idx_to_uuid]
+            dup_idx = [i for i in resolution.duplicate_facts if i in idx_to_uuid]
+            contradicted_idx = [i for i in resolution.contradicted_facts if i in idx_to_uuid]
         except Exception:
             return False, []
         dup_uuids = [idx_to_uuid[i] for i in dup_idx]
@@ -1429,57 +1334,35 @@ class ExtractionPipeline:
             }
             for idx, (pair_pool, semantic_pool) in candidates_map.items()
         ]
+        from ingestion.llm_client import structured_call
+        from ingestion.llm_schemas import BatchResolutionResult
+
         prompt, per_item_maps = build_batch_resolution_prompt(items)
 
         try:
-            response = self._llm._client.messages.create(
+            batch = structured_call(
+                self._llm._client,
+                output_model=BatchResolutionResult,
+                base_prompt=prompt,
                 model=self._contradiction_model,
                 max_tokens=300 * max(1, len(items)),
-                messages=[{"role": "user", "content": prompt}],
-                response_format=_BATCH_CONTRADICTION_SCHEMA,
             )
-            raw = response.content[0].text.strip()
-            start = raw.find("{")
-            if start < 0:
-                return set(), {}, {}, False
-            data, _ = json.JSONDecoder().raw_decode(raw[start:])
         except Exception:
             return set(), {}, {}, False
 
-        def _as_indices(val: Any) -> list[int]:
-            """Coerce a model-returned index list to ints.
-
-            The schema asks for bare ints, but smaller models (seen on
-            deepseek-v4-flash, 2026-07-18) return digit strings or wrap
-            each index in an object ({"index": 3} / {"id": 3}); a raw
-            dict crashed the `in` test with TypeError: unhashable.
-            Unrecognized shapes are dropped, matching the conservative
-            no-op default of the whole confirm stage.
-            """
-            out: list[int] = []
-            for v in val if isinstance(val, list) else []:
-                if isinstance(v, dict):
-                    v = v.get("index", v.get("id", v.get("fact_index")))
-                if isinstance(v, bool):
-                    continue
-                if isinstance(v, int):
-                    out.append(v)
-                elif isinstance(v, str) and v.strip().lstrip("-").isdigit():
-                    out.append(int(v.strip()))
-            return out
-
+        # Index coercion (digit strings, {"index": N} wrappers — seen on
+        # deepseek-v4-flash 2026-07-18) happens inside BatchResolutionResult's
+        # tolerant validators; by here every idx is a bare int.
         skip_indices: set[int] = set()
         invalidate: dict[int, list[str]] = {}
         reinforce: dict[int, list[str]] = {}
-        for r in data.get("results", []):
-            fid = r.get("id")
-            if not isinstance(fid, int) or fid not in per_item_maps:
+        for r in batch.results:
+            fid = r.id
+            if fid not in per_item_maps:
                 continue
             idx_to_uuid = per_item_maps[fid]
-            dup_idx = [i for i in _as_indices(r.get("duplicate_facts")) if i in idx_to_uuid]
-            contradicted_idx = [
-                i for i in _as_indices(r.get("contradicted_facts")) if i in idx_to_uuid
-            ]
+            dup_idx = [i for i in r.duplicate_facts if i in idx_to_uuid]
+            contradicted_idx = [i for i in r.contradicted_facts if i in idx_to_uuid]
             dup_uuids = [idx_to_uuid[i] for i in dup_idx]
             contradicted = [idx_to_uuid[i] for i in contradicted_idx]
             pure_duplicates = [u for u in dup_uuids if u not in contradicted]

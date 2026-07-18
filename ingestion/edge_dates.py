@@ -15,7 +15,6 @@ obvious and prevents one regression from masking another.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from datetime import UTC, datetime
@@ -76,44 +75,9 @@ def _has_temporal_markers(fact: str) -> bool:
     return bool(_TEMPORAL_RE.search(fact))
 
 
-# Structured-response schema mirroring ``ingestion.prompts.models.EdgeDates``.
-# Sent as `response_format` to constrain Haiku's output.
-_EDGE_DATES_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "valid_at": {"type": ["string", "null"]},
-            "invalid_at": {"type": ["string", "null"]},
-        },
-        "required": ["valid_at", "invalid_at"],
-        "additionalProperties": False,
-    },
-}
-
-_BATCH_EDGE_DATES_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "valid_at": {"type": ["string", "null"]},
-                        "invalid_at": {"type": ["string", "null"]},
-                    },
-                    "required": ["id", "valid_at", "invalid_at"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["results"],
-        "additionalProperties": False,
-    },
-}
+# Response shapes (mirroring ``ingestion.prompts.models.EdgeDates``) are
+# enforced via pydantic-ai structured outputs — see
+# ``ingestion.llm_schemas.EdgeDatesResult`` / ``BatchEdgeDatesResult``.
 
 _DEFAULT_MODEL = "claude-haiku-4-5"
 
@@ -150,24 +114,22 @@ class EdgeDateExtractor:
             return (None, None)
         ref = reference_time or datetime.now(UTC).isoformat()
         try:
+            from ingestion.llm_client import structured_call
+            from ingestion.llm_schemas import EdgeDatesResult
+
             from .prompts.extract_edge_dates import build_prompt
 
             messages = build_prompt({"fact": fact, "reference_time": ref})
-            response = self._llm.messages.create(
+            # Empty strings normalize to None inside the model — some LLM
+            # responses come back with "" instead of null even with the schema.
+            dates = structured_call(
+                self._llm,
+                output_model=EdgeDatesResult,
+                messages=messages,
                 model=self._model,
                 max_tokens=200,
-                messages=messages,
-                response_format=_EDGE_DATES_SCHEMA,
             )
-            raw = response.content[0].text.strip()
-            if not raw:
-                return (None, None)
-            data = json.loads(raw)
-            valid_at = data.get("valid_at")
-            invalid_at = data.get("invalid_at")
-            # Normalize empty strings to None — some LLM responses come back
-            # with "" instead of null even with the schema.
-            return (valid_at or None, invalid_at or None)
+            return (dates.valid_at, dates.invalid_at)
         except Exception as exc:
             logger.debug("EdgeDateExtractor failed for fact=%r: %s", (fact or "")[:80], exc)
             return (None, None)
@@ -205,37 +167,29 @@ class EdgeDateExtractor:
 
         ref = reference_time or datetime.now(UTC).isoformat()
         try:
+            from ingestion.llm_client import structured_call
+            from ingestion.llm_schemas import BatchEdgeDatesResult
+
             from .prompts.extract_edge_dates import build_batch_prompt
 
             messages = build_batch_prompt(items, ref)
-            response = self._llm.messages.create(
+            batch = structured_call(
+                self._llm,
+                output_model=BatchEdgeDatesResult,
+                messages=messages,
                 model=self._model,
                 # Allow headroom per fact for two ISO timestamps + the
                 # wrapping JSON. 80 tokens/fact is generous.
                 max_tokens=max(200, 80 * len(items)),
-                messages=messages,
-                response_format=_BATCH_EDGE_DATES_SCHEMA,
             )
-            raw = response.content[0].text.strip()
-            if not raw:
-                return out
-            # Tolerate trailing prose / code fences (same pattern as the
-            # batched stage 6b path).
-            start = raw.find("{")
-            if start < 0:
-                return out
-            data, _ = json.JSONDecoder().raw_decode(raw[start:])
         except Exception as exc:
             logger.debug("EdgeDateExtractor.extract_batch failed (n=%d): %s", len(items), exc)
             return out
 
-        for r in data.get("results", []):
-            fid = r.get("id")
-            if not isinstance(fid, int) or fid < 0 or fid >= n:
+        for r in batch.results:
+            if r.id < 0 or r.id >= n:
                 continue
-            valid = r.get("valid_at") or None
-            invalid = r.get("invalid_at") or None
-            out[fid] = (valid, invalid)
+            out[r.id] = (r.valid_at, r.invalid_at)
         return out
 
 

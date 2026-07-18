@@ -36,7 +36,6 @@ the extractor (dream pipeline, manual writes, future ingestion sources).
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 from typing import TYPE_CHECKING, Any
@@ -76,44 +75,9 @@ def _cosine(a: list[float], b: list[float]) -> float:
 
 # Phase 4: the hand-rolled stub prompt has been replaced with the
 # verbatim Graphiti-ported contradiction prompt
-# (``ingestion.prompts.invalidate_edges``). The structured-response schema
-# below matches Graphiti's `EdgeDuplicate.contradicted_facts` shape and is
-# used as `response_format` to constrain Haiku's output.
-
-_CONTRADICTION_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "contradicted_facts": {"type": "array", "items": {"type": "integer"}},
-        },
-        "required": ["contradicted_facts"],
-        "additionalProperties": False,
-    },
-}
-
-_BATCH_CONTRADICTION_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "contradicted_facts": {"type": "array", "items": {"type": "integer"}},
-                    },
-                    "required": ["id", "contradicted_facts"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["results"],
-        "additionalProperties": False,
-    },
-}
+# (``ingestion.prompts.invalidate_edges``). The response shape (Graphiti's
+# `EdgeDuplicate.contradicted_facts` subset) is enforced via pydantic-ai
+# structured outputs — see ``ingestion.llm_schemas.ContradictionVerdict``.
 
 
 class ContradictionDetector:
@@ -211,19 +175,17 @@ class ContradictionDetector:
                 }
             )
 
-            response = self._llm.messages.create(
+            from ingestion.llm_client import structured_call
+            from ingestion.llm_schemas import ContradictionVerdict
+
+            verdict = structured_call(
+                self._llm,
+                output_model=ContradictionVerdict,
+                messages=messages,
                 model=self._model,
                 max_tokens=200,
-                messages=messages,
-                response_format=_CONTRADICTION_SCHEMA,
             )
-            raw = response.content[0].text.strip()
-            start = raw.find("{")
-            if start < 0:
-                raise ValueError(f"no JSON object in response: {raw[:200]!r}")
-            data, _ = json.JSONDecoder().raw_decode(raw[start:])
-            contradicted_idx = data.get("contradicted_facts", [])
-            return [idx_to_uuid[i] for i in contradicted_idx if i in idx_to_uuid]
+            return [idx_to_uuid[i] for i in verdict.contradicted_facts if i in idx_to_uuid]
         except Exception as exc:
             # Never let a detector failure block the write. Log and return [].
             logger.warning(
@@ -330,22 +292,19 @@ class ContradictionDetector:
 
         # Single batched LLM call covering every surviving fact's candidates.
         try:
-            import json as _json
+            from ingestion.llm_client import structured_call
+            from ingestion.llm_schemas import BatchContradictionResult
 
             from .prompts.invalidate_edges import build_batch_prompt
 
             messages = build_batch_prompt(items_for_prompt)
-            response = self._llm.messages.create(
+            batch = structured_call(
+                self._llm,
+                output_model=BatchContradictionResult,
+                messages=messages,
                 model=self._model,
                 max_tokens=max(300, 80 * len(items_for_prompt)),
-                messages=messages,
-                response_format=_BATCH_CONTRADICTION_SCHEMA,
             )
-            raw = response.content[0].text.strip()
-            start = raw.find("{")
-            if start < 0:
-                return out
-            data, _ = _json.JSONDecoder().raw_decode(raw[start:])
         except Exception as exc:
             logger.warning(
                 "ContradictionDetector.batch LLM call failed group=%s n=%d: %s",
@@ -355,11 +314,10 @@ class ContradictionDetector:
             )
             return out
 
-        for r in data.get("results", []):
-            fid = r.get("id")
-            if not isinstance(fid, int) or not (0 <= fid < n) or per_fact[fid] is None:
+        for r in batch.results:
+            fid = r.id
+            if not (0 <= fid < n) or per_fact[fid] is None:
                 continue
             _, _fact, _top, idx_to_uuid = per_fact[fid]  # type: ignore[misc]
-            contradicted_idx = r.get("contradicted_facts", [])
-            out[fid] = [idx_to_uuid[j] for j in contradicted_idx if j in idx_to_uuid]
+            out[fid] = [idx_to_uuid[j] for j in r.contradicted_facts if j in idx_to_uuid]
         return out

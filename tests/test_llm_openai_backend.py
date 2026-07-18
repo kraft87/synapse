@@ -25,18 +25,21 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from pydantic import BaseModel
 
 from ingestion.llm_client import (
     DEFAULT_OPENAI_BASE_URL,
     DEFAULT_OPENAI_MODEL,
     ClaudeCLIClient,
     LLMHTTPError,
+    MalformedResponseError,
     OpenAIChatClient,
     TransientLLMHTTPError,
     UsageLimitError,
     create_llm_client,
     parse_with_retry,
     stage_model,
+    structured_call,
 )
 
 _API_KEY = "sk-or-test-SECRET-key"
@@ -45,8 +48,15 @@ _API_KEY = "sk-or-test-SECRET-key"
 def _completion_body(text: str, finish_reason: str = "stop") -> dict[str, Any]:
     return {
         "id": "gen-123",
+        "object": "chat.completion",
+        "created": 1700000000,
+        "model": "test-model",
         "choices": [
-            {"message": {"role": "assistant", "content": text}, "finish_reason": finish_reason}
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": finish_reason,
+            }
         ],
     }
 
@@ -98,7 +108,7 @@ class TestProviderSelection:
         client = create_llm_client()
         assert isinstance(client, OpenAIChatClient)
         assert client.model == DEFAULT_OPENAI_MODEL
-        assert str(client.http.base_url).rstrip("/") == DEFAULT_OPENAI_BASE_URL
+        assert client.base_url == DEFAULT_OPENAI_BASE_URL
 
     def test_openai_env_overrides(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
@@ -107,7 +117,7 @@ class TestProviderSelection:
         client = create_llm_client()
         assert isinstance(client, OpenAIChatClient)
         assert client.model == "qwen2.5:14b"
-        assert "localhost:11434" in str(client.http.base_url)
+        assert "localhost:11434" in client.base_url
 
     def test_stage_env_beats_global_env(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_EXTRACTOR_MODEL", "per-stage/model")
@@ -244,8 +254,11 @@ class TestSuccessfulCompletion:
         client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert "reasoning" not in seen["payload"]
 
-    def test_no_auth_header_when_key_blank(self):
-        """Keyless endpoints (local Ollama) must not get an empty bearer."""
+    def test_blank_key_sends_placeholder_bearer(self):
+        """Keyless endpoints (local Ollama) still work: the OpenAI SDK
+        requires *a* key, so a blank env key becomes the ``EMPTY``
+        placeholder (vLLM convention) — never an empty bearer, and the real
+        env key is never fabricated."""
         seen: dict[str, Any] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -254,7 +267,7 @@ class TestSuccessfulCompletion:
 
         client = _client_with(handler, api_key="")
         client.messages.create(messages=[{"role": "user", "content": "hi"}])
-        assert seen["auth"] is None
+        assert seen["auth"] == "Bearer EMPTY"
 
     def test_parse_with_retry_happy_path(self):
         def handler(request: httpx.Request) -> httpx.Response:
@@ -493,7 +506,7 @@ class TestHTTPErrors:
             return httpx.Response(200, json=_completion_body("", finish_reason="length"))
 
         client = _client_with(handler)
-        with pytest.raises(LLMHTTPError, match="empty completion"):
+        with pytest.raises(LLMHTTPError, match="empty or invalid completion"):
             client.messages.create(messages=[{"role": "user", "content": "hi"}])
 
     def test_non_json_2xx_body_raises(self):
@@ -501,8 +514,21 @@ class TestHTTPErrors:
             return httpx.Response(200, text="<html>login page</html>")
 
         client = _client_with(handler)
-        with pytest.raises(LLMHTTPError, match="non-JSON"):
+        with pytest.raises(LLMHTTPError, match="empty or invalid completion"):
             client.messages.create(messages=[{"role": "user", "content": "hi"}])
+
+    def test_200_wrapped_unknown_error_code_is_not_retried(self):
+        """Error bodies without a usable code map to a non-transient 400."""
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(200, json={"error": {"message": "weird failure"}})
+
+        client = _client_with(handler)
+        with pytest.raises(LLMHTTPError):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert len(calls) == 1
 
     def test_usage_limit_text_in_completion_is_returned(self):
         """No content sniffing on the HTTP path: quota errors are status
@@ -518,3 +544,119 @@ class TestHTTPErrors:
         client = _client_with(handler)
         resp = client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert "credit balance" in resp.content[0].text
+
+
+# ---------------------------------------------------------------------------
+# structured_call — native structured outputs over the HTTP backend
+# ---------------------------------------------------------------------------
+
+
+class _StrictVerdict(BaseModel):
+    """Local strict model: no defaults, no coercion — used to exercise the
+    validation-failure paths (the tolerant production models in
+    ``ingestion.llm_schemas`` rarely fail validation by design)."""
+
+    contradicted_facts: list[int]
+
+
+class TestStructuredCall:
+    def test_native_response_format_and_extra_body_sent(self, monkeypatch):
+        """The core of the migration: OpenRouter gets the provider-native
+        strict json_schema response_format, plus the incident-hardened
+        extra_body fields (reasoning off, provider pinning)."""
+        monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "fireworks")
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body('{"contradicted_facts": [1]}'))
+
+        client = _client_with(handler, model="deepseek/deepseek-v4-flash")
+        result = structured_call(
+            client, output_model=_StrictVerdict, base_prompt="judge", max_tokens=333
+        )
+        assert result.contradicted_facts == [1]
+
+        payload = seen["payload"]
+        rf = payload["response_format"]
+        assert rf["type"] == "json_schema"
+        assert rf["json_schema"]["name"] == "strict_verdict"
+        assert rf["json_schema"]["strict"] is True
+        schema = rf["json_schema"]["schema"]
+        assert schema["additionalProperties"] is False
+        assert schema["required"] == ["contradicted_facts"]
+        # Incident must-haves survive on the structured path too.
+        assert payload["reasoning"] == {"enabled": False}
+        assert payload["provider"] == {"order": ["fireworks"]}
+        assert payload["max_tokens"] == 333
+        # Belt and braces: the schema ALSO travels in-prompt for providers
+        # that ignore response_format.
+        system_text = " ".join(m["content"] for m in payload["messages"] if m["role"] == "system")
+        assert "contradicted_facts" in system_text
+
+    def test_wrapped_indices_coerced_over_http(self):
+        from ingestion.llm_schemas import ContradictionVerdict
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=_completion_body('{"contradicted_facts": [{"index": 2}, "3", null]}'),
+            )
+
+        client = _client_with(handler)
+        result = structured_call(client, output_model=ContradictionVerdict, base_prompt="judge")
+        assert result.contradicted_facts == [2, 3]
+
+    def test_default_model_sentinel_resolves_to_configured(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["model"] = json.loads(request.content)["model"]
+            return httpx.Response(200, json=_completion_body('{"contradicted_facts": []}'))
+
+        client = _client_with(handler, model="meta-llama/llama-3.3-70b-instruct")
+        structured_call(
+            client, output_model=_StrictVerdict, base_prompt="x", model="claude-haiku-4-5"
+        )
+        assert seen["model"] == "meta-llama/llama-3.3-70b-instruct"
+
+    def test_402_maps_to_usage_limit(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                402, json={"error": {"code": 402, "message": "Insufficient credits"}}
+            )
+
+        client = _client_with(handler)
+        with pytest.raises(UsageLimitError):
+            structured_call(client, output_model=_StrictVerdict, base_prompt="x")
+
+    def test_validation_failure_degrades_to_malformed_with_raw(self):
+        """A response that never validates raises MalformedResponseError —
+        the signal every call site maps onto its conservative no-op — with
+        the raw text attached (the dedup yes/no legacy path reads it)."""
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(200, json=_completion_body('{"events": "wrong shape"}'))
+
+        client = _client_with(handler)
+        with pytest.raises(MalformedResponseError) as exc_info:
+            structured_call(client, output_model=_StrictVerdict, base_prompt="x", max_attempts=2)
+        assert len(calls) == 2  # one validation-feedback retry, then raise
+        assert "wrong shape" in exc_info.value.raw_response
+
+    def test_validation_retry_recovers(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            text = "garbage" if len(calls) == 1 else '{"contradicted_facts": [0]}'
+            return httpx.Response(200, json=_completion_body(text))
+
+        client = _client_with(handler)
+        result = structured_call(
+            client, output_model=_StrictVerdict, base_prompt="x", max_attempts=3
+        )
+        assert result.contradicted_facts == [0]
+        assert len(calls) == 2

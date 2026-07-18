@@ -15,6 +15,7 @@ repos:
           - pgvector>=0.3
           - pydantic>=2.10
           - pydantic-settings>=2.7
+          - pydantic-ai-slim[openai]>=2.13
           - voyageai>=0.3
         args: [--ignore-missing-imports]
         # mcp_server/server.py + skill_sync_routes.py: FastMCP @custom_route decorators
