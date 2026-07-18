@@ -660,3 +660,47 @@ class TestStructuredCall:
         )
         assert result.contradicted_facts == [0]
         assert len(calls) == 2
+
+
+class TestThreadLocalConnectionState:
+    """One event loop + one connection pool per worker thread — a process-wide
+    AsyncClient driven by per-call event loops broke in prod with an
+    APIConnectionError storm (2026-07-18): pooled keepalive connections die
+    with the loop that created them."""
+
+    def test_provider_is_thread_local(self):
+        import threading as _threading
+
+        from ingestion.llm_client import OpenAIChatClient
+
+        client = OpenAIChatClient(api_key="k")
+        main_provider = client._provider
+        assert client._provider is main_provider  # stable within a thread
+
+        seen: dict[str, Any] = {}
+
+        def worker():
+            seen["provider"] = client._provider
+
+        t = _threading.Thread(target=worker)
+        t.start()
+        t.join()
+        assert seen["provider"] is not main_provider
+
+    def test_thread_loop_is_persistent_per_thread(self):
+        import threading as _threading
+
+        from ingestion.llm_client import _thread_loop
+
+        loop = _thread_loop()
+        assert _thread_loop() is loop  # reused, not per-call
+
+        seen: dict[str, Any] = {}
+
+        def worker():
+            seen["loop"] = _thread_loop()
+
+        t = _threading.Thread(target=worker)
+        t.start()
+        t.join()
+        assert seen["loop"] is not loop
