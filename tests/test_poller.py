@@ -117,3 +117,32 @@ def test_concurrency_1_stays_serial(conn, db_url, monkeypatch):
     assert p.drain_extraction_queue(batch_limit=8) == 3
     assert factory_calls == []  # serial path never builds per-thread workers
     assert set(_statuses(conn).values()) == {"done"}
+
+
+def test_stop_request_releases_unstarted_serial_items(conn, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "1")
+    ids = _seed(conn, 3)
+    stop_after = ids[0]
+    p_holder: list[Poller] = []
+
+    def behavior(item):
+        # First item requests the stop mid-flight; it must still complete,
+        # and the remaining claimed items must go back to pending.
+        if int(item["id"]) == stop_after:
+            p_holder[0].request_stop()
+
+    p = _poller(db_url, behavior)
+    p_holder.append(p)
+    assert p.drain_extraction_queue(batch_limit=8) == 1
+    st = _statuses(conn)
+    assert st[stop_after] == "done"
+    assert [st[i] for i in ids[1:]] == ["pending", "pending"]
+
+
+def test_stop_request_releases_unstarted_concurrent_items(conn, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "2")
+    _seed(conn, 4)
+    p = _poller(db_url, lambda item: None)
+    p.request_stop()  # stop before dispatch: every item releases, none run
+    assert p.drain_extraction_queue(batch_limit=8) == 0
+    assert set(_statuses(conn).values()) == {"pending"}
