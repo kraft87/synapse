@@ -479,8 +479,11 @@ class TestHTTPErrors:
         with pytest.raises(LLMHTTPError, match="non-JSON"):
             client.messages.create(messages=[{"role": "user", "content": "hi"}])
 
-    def test_usage_limit_text_in_completion_raises(self):
-        """Content-based detector parity with the Claude SDK path."""
+    def test_usage_limit_text_in_completion_is_returned(self):
+        """No content sniffing on the HTTP path: quota errors are status
+        402/429 here, and completion TEXT legitimately contains phrases like
+        "credit balance" when the extraction subject discusses usage limits
+        (a real KG-entity completion misfired as UsageLimitError, 2026-07-17)."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
@@ -488,5 +491,5 @@ class TestHTTPErrors:
             )
 
         client = _client_with(handler)
-        with pytest.raises(UsageLimitError):
-            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        resp = client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert "credit balance" in resp.content[0].text

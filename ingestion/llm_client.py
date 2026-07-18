@@ -635,8 +635,11 @@ class _OpenAIMessagesProxy:
             )
 
         text = str(text)
-        if _is_usage_limit(text):
-            raise UsageLimitError(text.strip()[:300])
+        # No _is_usage_limit(text) sniffing here: on the HTTP path real quota
+        # errors arrive as status 402/429 (mapped above). Scanning completion
+        # CONTENT misfires when the extraction subject itself discusses usage
+        # limits — a KG entity list containing "usage limit" raised a false
+        # UsageLimitError and a 5-minute backoff (seen live 2026-07-17).
         if response_format is not None:
             return _Response(_strip_json_fence(text))
         return _Response(text)
