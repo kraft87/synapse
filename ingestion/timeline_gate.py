@@ -29,7 +29,8 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from ingestion.llm_client import MalformedResponseError, parse_with_retry
+from ingestion.llm_client import MalformedResponseError, parse_with_retry, structured_call
+from ingestion.llm_schemas import TimelineGateEvents
 
 logger = logging.getLogger(__name__)
 
@@ -147,44 +148,29 @@ def _parse_verdict(text: str) -> str:
 
 
 def _parse_gate(text: str) -> list[dict[str, Any]]:
-    """Parser for parse_with_retry: {"events": []} -> [], else validated dicts (capped).
+    """Parse a raw gate response into validated event dicts (capped).
 
-    Also accepts the legacy single-event shape ({"event": ...}) so a model that
-    regresses to the old contract degrades to one event instead of a retry loop."""
+    All tolerance (legacy single-event shape, salience clamping, unknown
+    event_type/domain → None, non-string dates → None, junk items dropped)
+    lives in ``ingestion.llm_schemas.TimelineGateEvents``; a non-list
+    ``events`` value raises ``MalformedResponseError`` so the retry loop can
+    correct it. Kept as the text-path parser and the single source of the
+    model → dict conversion."""
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise MalformedResponseError("no JSON object in response", text[:200])
-    d = json.loads(text[start : end + 1])
-    raw = d.get("events")
-    if raw is None:
-        raw = [d] if d.get("event") else []
-    if not isinstance(raw, list):
-        raise MalformedResponseError("'events' is not a list", text[:200])
-    out: list[dict[str, Any]] = []
-    for item in raw[:_MAX_EVENTS_PER_TURN]:
-        if not isinstance(item, dict):
-            continue
-        ev = item.get("event")
-        if not ev:
-            continue
-        sal = item.get("salience", 1)
-        et = item.get("event_type")
-        raw_date = item.get("date")
-        # Shape only here (a non-empty string); range/parse validation is _resolve_event_date's job.
-        date = raw_date.strip() if isinstance(raw_date, str) and raw_date.strip() else None
-        dom = item.get("domain")
-        out.append(
-            {
-                "event": str(ev).strip(),
-                "salience": sal if isinstance(sal, int) and 0 <= sal <= 2 else 1,
-                "event_type": et if et in ("decision", "action", "finding", "milestone") else None,
-                # Invalid/missing -> None (unlabeled fails OPEN at read; a wrong default
-                # would fail closed and hide the event from personal-scope serving).
-                "domain": dom if dom in ("personal", "technical") else None,
-                "date": date,
-            }
-        )
-    return out
+    try:
+        parsed = TimelineGateEvents.model_validate(json.loads(text[start : end + 1]))
+    except json.JSONDecodeError as exc:
+        raise MalformedResponseError(f"JSON decode error: {exc}", text[:200]) from exc
+    except ValueError as exc:  # pydantic ValidationError included
+        raise MalformedResponseError(str(exc)[:200], text[:200]) from exc
+    return _events_to_dicts(parsed)
+
+
+def _events_to_dicts(parsed: Any) -> list[dict[str, Any]]:
+    """``TimelineGateEvents`` → the legacy list-of-dicts the gate consumes."""
+    return [e.model_dump() for e in parsed.events[:_MAX_EVENTS_PER_TURN]]
 
 
 class TimelineGate:
@@ -227,15 +213,17 @@ class TimelineGate:
             return
         turn_date = turn_ts[:10]  # YYYY-MM-DD
 
-        events = parse_with_retry(
+        gated = structured_call(
             self._llm_client,
+            output_model=TimelineGateEvents,
             base_prompt=(
                 f"{GATE_PROMPT}\nThis turn happened on {turn_date}.\n\nTHE TURN:\n{content[:6000]}"
             ),
-            parser=_parse_gate,
             model=self._model,
             max_tokens=512,
+            max_attempts=3,
         )
+        events = _events_to_dicts(gated)
         if not events:
             return
 

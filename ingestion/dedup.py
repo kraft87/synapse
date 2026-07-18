@@ -261,26 +261,12 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return intersection / union if union else 0.0
 
 
-# --- Optional LLM confirm response schema ----------------------------------
+# --- Optional LLM confirm ---------------------------------------------------
 # Phase 4: the legacy "yes/no/uncertain" mini-prompt has been retired in
 # favor of Graphiti's verbatim NodeDuplicate prompt. The prompt body lives
-# in `ingestion/prompts/dedupe_nodes.py`; the structured-response schema
-# below mirrors Graphiti's `NodeDuplicate` shape and is sent as
-# `response_format` to constrain Haiku's output.
-
-_NODE_DEDUP_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "id": {"type": "integer"},
-            "name": {"type": "string"},
-            "duplicate_candidate_id": {"type": "integer"},
-        },
-        "required": ["id", "name", "duplicate_candidate_id"],
-        "additionalProperties": False,
-    },
-}
+# in `ingestion/prompts/dedupe_nodes.py`; the response shape (Graphiti's
+# `NodeDuplicate`) is enforced via pydantic-ai structured outputs — see
+# ``ingestion.llm_schemas.NodeDedupVerdict``.
 
 
 # ---------------------------------------------------------------------------
@@ -704,32 +690,29 @@ class NodeDeduper:
             }
         )
 
-        response = self._llm.messages.create(
-            model=self._llm_model,
-            max_tokens=200,
-            messages=messages,
-            response_format=_NODE_DEDUP_SCHEMA,
-        )
-        text = str(response.content[0].text).strip()
-
-        # Two parse paths: structured JSON (the new normal) and the legacy
-        # yes/no/uncertain plain-text shape (the test fixtures still produce
-        # this; we keep the parser tolerant so we don't break them).
-        if text.lower().startswith("yes"):
-            return "yes"
-        if text.lower().startswith("no"):
-            return "no"
-        try:
-            import json as _json
-
-            data = _json.loads(text)
-        except Exception:
-            return "uncertain"
+        from ingestion.llm_client import MalformedResponseError, structured_call
+        from ingestion.llm_schemas import NodeDedupVerdict
 
         try:
-            cid = int(data.get("duplicate_candidate_id", -1))
-        except (TypeError, ValueError):
+            verdict = structured_call(
+                self._llm,
+                output_model=NodeDedupVerdict,
+                messages=messages,
+                model=self._llm_model,
+                max_tokens=200,
+            )
+        except MalformedResponseError as exc:
+            # Legacy yes/no/uncertain plain-text shape (the test fixtures
+            # still produce this; keep the tolerant mapping so we don't
+            # break them). Anything else unparseable is a miss.
+            text = (exc.raw_response or "").strip().lower()
+            if text.startswith("yes"):
+                return "yes"
+            if text.startswith("no"):
+                return "no"
             return "uncertain"
+
+        cid = verdict.duplicate_candidate_id
         if cid == 0:
             return "yes"
         if cid == -1:

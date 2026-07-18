@@ -238,7 +238,10 @@ class TestEdgeDateExtractor:
         assert valid == "2026-05-10T00:00:00Z"
         assert invalid is None
         # The prompt the LLM saw must reference the verbatim rule wording.
-        prompt = "\n".join(m["content"] for m in llm.messages.create.call_args.kwargs["messages"])
+        # System-role prompt parts now arrive via the ``system`` kwarg
+        # (structured_call flattens roles); the rule text lives there.
+        kwargs = llm.messages.create.call_args.kwargs
+        prompt = (kwargs.get("system") or "") + "\n".join(m["content"] for m in kwargs["messages"])
         assert "NEVER hallucinate dates" in prompt
         assert "Alex joined Acme Corp last week" in prompt
 

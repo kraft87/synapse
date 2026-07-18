@@ -14,9 +14,10 @@ Single module providing two interfaces over the Claude Code Agent SDK
 
 Plus an alternative backend for users without a Claude subscription:
 
-  * ``OpenAIChatClient`` — same ``messages.create()`` shape, but speaks
-    the plain OpenAI ``/chat/completions`` protocol over HTTP (OpenRouter,
-    Ollama, vLLM, or any compatible endpoint). Selected via env:
+  * ``OpenAIChatClient`` — same ``messages.create()`` shape, driven by
+    pydantic-ai (``OpenAIChatModel`` over the OpenAI SDK) against any
+    ``/chat/completions``-compatible endpoint (OpenRouter, Ollama, vLLM).
+    Selected via env:
 
         SYNAPSE_LLM_PROVIDER=openai         # default: claude-code
         SYNAPSE_LLM_BASE_URL=...            # default: https://openrouter.ai/api/v1
@@ -33,6 +34,14 @@ Plus an alternative backend for users without a Claude subscription:
 
   * ``create_llm_client`` — the factory every construction site goes
     through; picks the backend from ``SYNAPSE_LLM_PROVIDER``.
+
+  * ``structured_call`` — the ONE structured-output surface: builds a
+    pydantic-ai Agent (``NativeOutput`` + a stage model from
+    ``ingestion.llm_schemas``) on whichever backend the client selects —
+    ``OpenAIChatModel`` for the HTTP path, ``ClaudeAgentSDKModel``
+    (``ingestion.pydantic_ai_claude_sdk``) for the subscription CLI, and a
+    legacy duck-type adapter for anything else — and returns a validated
+    model instance.
 
 Follows the same Agent-SDK client pattern used across the Synapse stack
 for Claude Code interaction at scale.
@@ -77,6 +86,11 @@ from typing import Any, cast
 
 import httpx
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
+from pydantic import BaseModel
+from pydantic_ai import UnexpectedModelBehavior
+from pydantic_ai.exceptions import ModelAPIError as PydanticAIModelAPIError
+from pydantic_ai.exceptions import ModelHTTPError as PydanticAIModelHTTPError
+from pydantic_ai.models import Model as PydanticAIModel
 from tenacity import (
     before_sleep_log,
     retry,
@@ -476,7 +490,7 @@ class ClaudeCLIClient:
 
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible backend — chat completions over plain HTTP
+# OpenAI-compatible backend — pydantic-ai over chat completions
 # ---------------------------------------------------------------------------
 
 DEFAULT_OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
@@ -485,21 +499,52 @@ DEFAULT_OPENAI_MODEL = "anthropic/claude-haiku-4.5"  # OpenRouter id for Haiku 4
 _HTTP_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 _BODY_SNIPPET_LEN = 300
 
+# Profile overrides for every model driven through this client:
+# * ``max_tokens`` must go on the wire as ``max_tokens`` (OpenRouter and most
+#   OpenAI-compatible servers), not OpenAI-proper's ``max_completion_tokens``.
+# * When a call uses native structured output, pydantic-ai ALSO injects the
+#   JSON schema into the instructions — providers that ignore
+#   ``response_format`` still see the contract in-prompt (belt and braces,
+#   preserving the pre-pydantic-ai schema-in-prompt behavior).
+_OPENAI_COMPAT_PROFILE: dict[str, Any] = {
+    "openai_chat_supports_max_completion_tokens": False,
+    "native_output_requires_schema_in_instructions": True,
+}
 
-def _body_snippet(response: httpx.Response) -> str:
-    """First ``_BODY_SNIPPET_LEN`` chars of the response body, for errors.
 
-    Only ever reads the response BODY — never request headers — so the
-    Authorization bearer cannot appear in the message.
+class _ErrorBodyStatusTransport(httpx.AsyncBaseTransport):
+    """OpenRouter quirk shim: some failures arrive as HTTP 200 carrying an
+    ``{"error": {...}}`` body and no ``choices``. Rewrite those onto their
+    real status code so the OpenAI SDK raises ``APIStatusError`` and the
+    normal status-based taxonomy applies — a 200-wrapped 402 must still STOP
+    the cycle (``UsageLimitError``), never turn into empty text.
     """
-    try:
-        return response.text[:_BODY_SNIPPET_LEN]
-    except Exception:  # pragma: no cover - undecodable body
-        return "<undecodable body>"
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self._inner = inner
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        response = await self._inner.handle_async_request(request)
+        if response.status_code != 200:
+            return response
+        body = await response.aread()
+        await response.aclose()
+        status = 200
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict) and "error" in data and "choices" not in data:
+            err = data.get("error") or {}
+            code = err.get("code") if isinstance(err, dict) else None
+            # Real HTTP-ish codes keep their semantics (402 → usage limit,
+            # 429/5xx → transient); anything else becomes a non-transient 400.
+            status = code if isinstance(code, int) and 400 <= code < 600 else 400
+        return httpx.Response(status, headers=response.headers, content=body, request=request)
 
 
-def _raise_for_openai_status(response: httpx.Response) -> None:
-    """Map non-2xx chat-completions responses onto the module's error types.
+def _map_model_http_error(exc: PydanticAIModelHTTPError) -> Exception:
+    """Map pydantic-ai's ``ModelHTTPError`` onto the module's error taxonomy.
 
     * 402 (payment required / out of credits) → ``UsageLimitError`` — the
       caller must STOP the cycle, exactly like a Claude Max window
@@ -507,40 +552,108 @@ def _raise_for_openai_status(response: httpx.Response) -> None:
     * 429 / 5xx → ``TransientLLMHTTPError`` — retried by tenacity, raised
       after retries exhaust.
     * Other 4xx → ``LLMHTTPError`` — non-transient, raised immediately.
+
+    Only the response BODY is quoted — never request headers — so the
+    Authorization bearer cannot appear in the message.
     """
-    status = response.status_code
-    if 200 <= status < 300:
-        return
-    snippet = _body_snippet(response)
+    status = exc.status_code
+    snippet = str(exc.body)[:_BODY_SNIPPET_LEN]
     message = f"chat completions HTTP {status}: {snippet}"
     if status == 402:
-        raise UsageLimitError(message)
+        return UsageLimitError(message)
     if status == 429 or status >= 500:
-        raise TransientLLMHTTPError(message, status_code=status)
-    raise LLMHTTPError(message, status_code=status)
+        return TransientLLMHTTPError(message, status_code=status)
+    return LLMHTTPError(message, status_code=status)
+
+
+def _last_response_text(messages: list[Any]) -> str:
+    """Last assistant text in a captured pydantic-ai run, for
+    ``MalformedResponseError.raw_response``."""
+    from pydantic_ai.messages import ModelResponse as _MR
+    from pydantic_ai.messages import TextPart as _TP
+
+    for message in reversed(messages):
+        if isinstance(message, _MR):
+            for part in message.parts:
+                if isinstance(part, _TP) and part.content:
+                    return str(part.content)
+    return ""
+
+
+def _run_agent_sync(
+    agent: Any,
+    user_prompt: str,
+    *,
+    instructions: str | None,
+    structured: bool,
+) -> Any:
+    """Run a pydantic-ai agent with the module's retry + error taxonomy.
+
+    tenacity mirrors the pre-pydantic-ai config (3 attempts, exp backoff
+    2s → 4s → 8s, cap 30s) and keys on transients only: mapped 429/5xx
+    (``TransientLLMHTTPError``), connection-level ``ModelAPIError``, and raw
+    ``httpx.TransportError``. ``UsageLimitError`` (402) and plain
+    ``LLMHTTPError`` (other 4xx) are never retried.
+
+    ``UnexpectedModelBehavior`` — pydantic-ai's content-level failure — maps
+    by mode:
+    * structured runs whose output validation retries are exhausted →
+      ``MalformedResponseError`` (the parse-failure signal call sites already
+      degrade on), with the last raw response attached;
+    * everything else (empty completion, token-limit-before-output, malformed
+      200 body) → ``LLMHTTPError``. Empty completions are an error, never a
+      result — the OpenRouter-credits incident started with empties being
+      treated as "the model found nothing".
+
+    No ``_is_usage_limit(text)`` sniffing on this path: real quota errors
+    arrive as status 402/429 (mapped above). Scanning completion CONTENT
+    misfires when the extraction subject itself discusses usage limits (a KG
+    entity list containing "usage limit" raised a false UsageLimitError and a
+    5-minute backoff, seen live 2026-07-17). The Claude-CLI backend keeps its
+    sniffing inside ``agent_call`` — text is the only quota signal there.
+    """
+    from pydantic_ai import capture_run_messages
+
+    @retry(
+        stop=_RETRY_STOP,
+        wait=_RETRY_WAIT,
+        retry=retry_if_exception_type(
+            (TransientLLMHTTPError, PydanticAIModelAPIError, httpx.TransportError)
+        ),
+        before_sleep=before_sleep_log(cast(Any, logger), logging.WARNING),
+        reraise=True,
+    )
+    def _attempt() -> Any:
+        with capture_run_messages() as captured:
+            try:
+                return agent.run_sync(user_prompt, instructions=instructions)
+            except PydanticAIModelHTTPError as exc:
+                raise _map_model_http_error(exc) from exc
+            except UnexpectedModelBehavior as exc:
+                if structured and "output retries" in str(exc).lower():
+                    raise MalformedResponseError(
+                        str(exc), raw_response=_last_response_text(list(captured))
+                    ) from exc
+                raise LLMHTTPError(f"empty or invalid completion: {exc}") from exc
+
+    return _attempt()
 
 
 class _OpenAIMessagesProxy:
-    """``OpenAIChatClient.messages`` — same shape as ``_MessagesProxy``.
+    """``OpenAIChatClient.messages`` — same call shape as ``_MessagesProxy``.
 
-    One plain (non-streaming) POST to ``{base_url}/chat/completions`` per
-    ``create``. The tenacity retry mirrors ``_MessagesProxy.create``'s
-    config (3 attempts, exp backoff 2s → 4s → 8s, cap 30s) but keys on
-    HTTP-level transients: ``httpx.TransportError`` (connect/read/timeout)
-    and ``TransientLLMHTTPError`` (429, 5xx). ``UsageLimitError`` (402)
-    and plain ``LLMHTTPError`` (other 4xx) are never retried.
+    Each ``create`` runs one plain-text pydantic-ai Agent against the
+    client's chat-completions model, preserving the legacy text surface for
+    callers that haven't moved to ``structured_call`` (dream/*, notes,
+    preferences gate, ``parse_with_retry``). Legacy ``response_format``
+    dicts still travel in-prompt as schema text — same wording as the SDK
+    path — because arbitrary hand-written dicts can't be trusted to satisfy
+    a provider's strict json_schema mode.
     """
 
     def __init__(self, client: OpenAIChatClient) -> None:
         self._client = client
 
-    @retry(
-        stop=_RETRY_STOP,
-        wait=_RETRY_WAIT,
-        retry=retry_if_exception_type((httpx.TransportError, TransientLLMHTTPError)),
-        before_sleep=before_sleep_log(cast(Any, logger), logging.WARNING),
-        reraise=True,
-    )
     def create(
         self,
         model: str | None = None,
@@ -549,21 +662,17 @@ class _OpenAIMessagesProxy:
         system: str | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> _Response:
-        c = self._client
-        # Per-call model: honored when the call site chose one explicitly —
-        # stage_model() resolutions are provider-valid by construction. The
-        # bare Claude code default is the "unspecified" sentinel (call sites
-        # that never chose, e.g. parse_with_retry's default) and maps to the
-        # client's single configured model, which this provider recognises.
-        if not model or model == DEFAULT_MODEL:
-            model = c.model
+        from pydantic_ai import Agent
 
-        chat_messages: list[dict[str, str]] = []
-        if system:
-            chat_messages.append({"role": "system", "content": system})
+        c = self._client
+        instruction_parts: list[str] = [system] if system else []
+        user_parts: list[str] = []
         for msg in messages or []:
             role = str(msg.get("role", "user"))
             content = str(msg.get("content", ""))
+            if role == "system":
+                instruction_parts.append(content)
+                continue
             if response_format is not None and role == "user":
                 # Providers disagree on structured-output support, so the
                 # schema constraint travels in-prompt — same wording as
@@ -574,92 +683,42 @@ class _OpenAIMessagesProxy:
                     f"Respond with ONLY valid JSON matching this schema — "
                     f"no markdown, no explanation:\n{schema_str}"
                 )
-            chat_messages.append({"role": role, "content": content})
+            user_parts.append(content)
 
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": chat_messages,
-            "max_tokens": max_tokens,
-            "stream": False,
-        }
-        if c.is_openrouter:
-            # Every call through this client is an extraction-shaped task
-            # that wants the completion, not chain-of-thought. Reasoning
-            # models (DeepSeek V4, o-series) can spend the entire
-            # ``max_tokens`` budget on reasoning tokens and return an EMPTY
-            # completion with ``finish_reason='length'`` — 196 queue items
-            # failed exactly that way on deepseek-v4-pro (2026-07-17).
-            payload["reasoning"] = {"enabled": False}
-            if c.openrouter_providers:
-                # Prefer these providers in order; OpenRouter still falls
-                # back to others if none are available, so a provider
-                # outage degrades to slower/pricier routing, not failure.
-                payload["provider"] = {"order": c.openrouter_providers}
-
-        response = c.http.post("/chat/completions", json=payload)
-        _raise_for_openai_status(response)
-
-        try:
-            data = response.json()
-        except (json.JSONDecodeError, ValueError) as exc:
-            raise LLMHTTPError(
-                f"chat completions: non-JSON 2xx body: {_body_snippet(response)}",
-                status_code=response.status_code,
-            ) from exc
-
-        # OpenRouter quirk: some failures arrive as HTTP 200 with an
-        # ``{"error": {...}}`` body. Map those onto the same error types
-        # as their status-code twins — a 200-wrapped 402 must still STOP
-        # the cycle, not turn into empty text.
-        if isinstance(data, dict) and "error" in data and "choices" not in data:
-            err = data.get("error") or {}
-            code = err.get("code") if isinstance(err, dict) else None
-            err_msg = f"chat completions error body: {json.dumps(err)[:_BODY_SNIPPET_LEN]}"
-            if code == 402:
-                raise UsageLimitError(err_msg)
-            if code == 429 or (isinstance(code, int) and code >= 500):
-                raise TransientLLMHTTPError(err_msg, status_code=code)
-            raise LLMHTTPError(err_msg, status_code=code if isinstance(code, int) else None)
-
-        try:
-            text = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise LLMHTTPError(
-                f"chat completions: malformed response shape: {_body_snippet(response)}",
-                status_code=response.status_code,
-            ) from exc
-
-        if not text or not str(text).strip():
-            # Empty completions are an error, never a result — the
-            # OpenRouter-credits incident started with empties being
-            # treated as "the model found nothing".
-            raise LLMHTTPError(
-                "chat completions: empty completion text "
-                f"(finish_reason={data['choices'][0].get('finish_reason')!r})",
-                status_code=response.status_code,
-            )
-
-        text = str(text)
-        # No _is_usage_limit(text) sniffing here: on the HTTP path real quota
-        # errors arrive as status 402/429 (mapped above). Scanning completion
-        # CONTENT misfires when the extraction subject itself discusses usage
-        # limits — a KG entity list containing "usage limit" raised a false
-        # UsageLimitError and a 5-minute backoff (seen live 2026-07-17).
+        # retries=0: this surface has no output validation, so pydantic-ai
+        # retries could only re-fire empty completions — the legacy client
+        # raised on the first empty, keep that.
+        agent = Agent(
+            c.pydantic_ai_model(model),
+            output_type=str,
+            model_settings=c.model_settings(max_tokens),
+            retries=0,
+        )
+        result = _run_agent_sync(
+            agent,
+            "\n\n".join(user_parts),
+            instructions="\n\n".join(instruction_parts) or None,
+            structured=False,
+        )
+        text = str(result.output)
         if response_format is not None:
             return _Response(_strip_json_fence(text))
         return _Response(text)
 
 
 class OpenAIChatClient:
-    """OpenAI-compatible chat-completions backend, same shape as ``ClaudeCLIClient``.
+    """OpenAI-compatible chat-completions backend, driven by pydantic-ai.
 
     ``messages.create(model=..., max_tokens=..., messages=..., system=...,
     response_format=...)`` returns an object with ``.content[0].text`` —
-    so ``parse_with_retry`` and every existing call site work unchanged.
+    so ``parse_with_retry`` and every legacy call site work unchanged.
+    Structured call sites go through :func:`structured_call`, which builds a
+    pydantic-ai Agent with ``NativeOutput`` on this client's model.
 
-    Auth: bearer token in the ``Authorization`` header (omitted when the
-    key is blank, e.g. a local Ollama). The key is never logged and never
-    appears in raised errors.
+    Auth: bearer token via the OpenAI SDK (an ``"EMPTY"`` placeholder is
+    substituted when the key is blank — the SDK requires one; keyless
+    endpoints like a local Ollama ignore it). The key is never logged and
+    never appears in raised errors.
     """
 
     def __init__(
@@ -667,12 +726,16 @@ class OpenAIChatClient:
         base_url: str = DEFAULT_OPENAI_BASE_URL,
         api_key: str = "",
         model: str = DEFAULT_OPENAI_MODEL,
-        transport: httpx.BaseTransport | None = None,
+        transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
+        from openai import AsyncOpenAI
+        from pydantic_ai.providers.openai import OpenAIProvider
+
         self.model = model
-        # OpenRouter accepts a vendor-specific ``reasoning`` request field;
-        # other OpenAI-compatible servers (OpenAI proper, Ollama, vLLM) may
-        # reject unknown params, so the flag gates on the URL.
+        self.base_url = base_url.rstrip("/")
+        # OpenRouter accepts vendor-specific ``reasoning`` / ``provider``
+        # request fields; other OpenAI-compatible servers (OpenAI proper,
+        # Ollama, vLLM) may reject unknown params, so gate on the URL.
         self.is_openrouter = "openrouter" in base_url.lower()
         # SYNAPSE_OPENROUTER_PROVIDERS: comma-separated provider slugs to
         # prefer (e.g. "fireworks,deepinfra"). OpenRouter-only.
@@ -681,16 +744,64 @@ class OpenAIChatClient:
             for p in os.environ.get("SYNAPSE_OPENROUTER_PROVIDERS", "").split(",")
             if p.strip()
         ]
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        self.http = httpx.Client(
-            base_url=base_url.rstrip("/"),
-            headers=headers,
-            timeout=_HTTP_TIMEOUT,
-            transport=transport,
+        inner = transport if transport is not None else httpx.AsyncHTTPTransport()
+        http_client = httpx.AsyncClient(
+            transport=_ErrorBodyStatusTransport(inner), timeout=_HTTP_TIMEOUT
         )
+        # max_retries=0: retry policy lives in tenacity (_run_agent_sync),
+        # not the OpenAI SDK, so attempt counts stay deterministic.
+        self._openai = AsyncOpenAI(
+            base_url=base_url.rstrip("/"),
+            api_key=api_key or "EMPTY",
+            http_client=http_client,
+            max_retries=0,
+            timeout=_HTTP_TIMEOUT,
+        )
+        self._provider = OpenAIProvider(openai_client=self._openai)
         self.messages = _OpenAIMessagesProxy(self)
+
+    def resolve_model(self, model: str | None) -> str:
+        """Per-call model: honored when the call site chose one explicitly —
+        ``stage_model()`` resolutions are provider-valid by construction. The
+        bare Claude code default is the "unspecified" sentinel (call sites
+        that never chose, e.g. ``parse_with_retry``'s default) and maps to
+        the client's single configured model, which this provider recognises.
+        """
+        if not model or model == DEFAULT_MODEL:
+            return self.model
+        return model
+
+    def pydantic_ai_model(self, model: str | None = None) -> Any:
+        """A pydantic-ai ``OpenAIChatModel`` over this client's connection."""
+        from pydantic_ai.models.openai import OpenAIChatModel
+
+        return OpenAIChatModel(
+            self.resolve_model(model),
+            provider=self._provider,
+            profile=cast(Any, _OPENAI_COMPAT_PROFILE),
+        )
+
+    def model_settings(self, max_tokens: int) -> Any:
+        """Per-call model settings, carrying the OpenRouter must-haves."""
+        from pydantic_ai.models.openai import OpenAIChatModelSettings
+
+        settings = OpenAIChatModelSettings(max_tokens=max_tokens)
+        if self.is_openrouter:
+            extra: dict[str, Any] = {}
+            # Every call through this client is an extraction-shaped task
+            # that wants the completion, not chain-of-thought. Reasoning
+            # models (DeepSeek V4, o-series) can spend the entire
+            # ``max_tokens`` budget on reasoning tokens and return an EMPTY
+            # completion with ``finish_reason='length'`` — 196 queue items
+            # failed exactly that way on deepseek-v4-pro (2026-07-17).
+            extra["reasoning"] = {"enabled": False}
+            if self.openrouter_providers:
+                # Prefer these providers in order; OpenRouter still falls
+                # back to others if none are available, so a provider
+                # outage degrades to slower/pricier routing, not failure.
+                extra["provider"] = {"order": self.openrouter_providers}
+            settings["extra_body"] = extra
+        return settings
 
 
 # ---------------------------------------------------------------------------
@@ -751,6 +862,182 @@ def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAICha
     raise ValueError(
         f"Unknown SYNAPSE_LLM_PROVIDER={provider!r} — expected 'claude-code' or 'openai'"
     )
+
+
+# ---------------------------------------------------------------------------
+# structured_call — backend-agnostic structured outputs via pydantic-ai
+# ---------------------------------------------------------------------------
+
+
+def _snake_name(name: str) -> str:
+    """CamelCase → snake_case for the json_schema ``name`` field."""
+    return re.sub(r"(?<!^)(?=[A-Z])", "_", name.lstrip("_")).lower()
+
+
+def _resolve_pydantic_ai_model(llm_client: Any, model: str) -> Any:
+    """Pick the pydantic-ai Model behind a Synapse LLM client.
+
+    The same env selection that picks the backend today
+    (``SYNAPSE_LLM_PROVIDER`` → ``create_llm_client``) transitively picks the
+    pydantic-ai Model here: ``OpenAIChatClient`` → ``OpenAIChatModel`` over
+    its OpenRouter/OpenAI-compatible connection, ``ClaudeCLIClient`` →
+    ``ClaudeAgentSDKModel`` over the subscription CLI. Anything else (test
+    doubles, third-party clients with the ``messages.create`` duck type) is
+    adapted via ``_LegacyClientModel``.
+    """
+    if isinstance(llm_client, OpenAIChatClient):
+        return llm_client.pydantic_ai_model(model)
+    if isinstance(llm_client, ClaudeCLIClient):
+        from ingestion.pydantic_ai_claude_sdk import ClaudeAgentSDKModel
+
+        return ClaudeAgentSDKModel(model)
+    return _LegacyClientModel(llm_client, model)
+
+
+def structured_call[M: BaseModel](
+    llm_client: Any,
+    *,
+    output_model: type[M],
+    base_prompt: str | None = None,
+    messages: list[dict[str, Any]] | None = None,
+    system: str | None = None,
+    model: str = DEFAULT_MODEL,
+    max_tokens: int = 1024,
+    max_attempts: int = 1,
+) -> M:
+    """One structured-output LLM call → a validated ``output_model`` instance.
+
+    The single structured path for every pipeline stage: builds a pydantic-ai
+    ``Agent`` with ``NativeOutput(output_model, strict=True)`` on whichever
+    backend ``llm_client`` selects (see ``_resolve_pydantic_ai_model``). On
+    the OpenRouter path this sends the provider-native
+    ``response_format={"type": "json_schema", ...}`` (strict json_schema —
+    Fireworks supports it) AND the schema in-prompt for providers that ignore
+    ``response_format``; on the Claude-CLI path it maps to the Agent SDK's
+    ``output_format``.
+
+    ``max_attempts`` bounds output-validation attempts (``max_attempts - 1``
+    pydantic-ai retries with the validation error quoted back — the same
+    retry-with-feedback contract ``parse_with_retry`` provides for text).
+
+    Raises:
+      * ``MalformedResponseError`` — response never validated (call sites map
+        this onto their stage's conservative no-op fallback).
+      * ``UsageLimitError`` / ``TransientLLMHTTPError`` / ``LLMHTTPError`` —
+        same wire-level taxonomy as ``messages.create``.
+    """
+    from pydantic_ai import Agent, NativeOutput
+    from pydantic_ai.settings import ModelSettings
+
+    instruction_parts: list[str] = [system] if system else []
+    user_parts: list[str] = [base_prompt] if base_prompt else []
+    for msg in messages or []:
+        role = str(msg.get("role", "user"))
+        content = str(msg.get("content", ""))
+        if role == "system":
+            instruction_parts.append(content)
+        else:
+            user_parts.append(content)
+
+    if isinstance(llm_client, OpenAIChatClient):
+        settings: Any = llm_client.model_settings(max_tokens)
+    else:
+        settings = ModelSettings(max_tokens=max_tokens)
+
+    agent = Agent(
+        _resolve_pydantic_ai_model(llm_client, model),
+        output_type=NativeOutput(
+            output_model, name=_snake_name(output_model.__name__), strict=True
+        ),
+        model_settings=settings,
+        retries=max(0, max_attempts - 1),
+    )
+    result = _run_agent_sync(
+        agent,
+        "\n\n".join(user_parts),
+        instructions="\n\n".join(instruction_parts) or None,
+        structured=True,
+    )
+    return cast(M, result.output)
+
+
+class _LegacyClientModel(PydanticAIModel):
+    """pydantic-ai Model adapter over any duck-typed legacy client.
+
+    Anything exposing ``messages.create(model=..., max_tokens=...,
+    messages=..., system=..., response_format=...) -> .content[0].text``
+    (test doubles, MagicMocks, third-party shims) keeps working with
+    ``structured_call`` through this adapter: the pydantic-ai message history
+    is flattened to the legacy call shape and the text response is handed
+    back for output validation. Native structured output is delivered as the
+    legacy ``{"type": "json", "schema": ...}`` response_format.
+    """
+
+    def __init__(self, client: Any, model_name: str) -> None:
+        from pydantic_ai.profiles import ModelProfile
+
+        super().__init__(
+            profile=ModelProfile(
+                supports_json_schema_output=True,
+                default_structured_output_mode="native",
+                supports_tools=False,
+            )
+        )
+        self._client = client
+        self._model_name = model_name
+
+    @property
+    def model_name(self) -> str:
+        return str(self._model_name)
+
+    @property
+    def system(self) -> str:
+        return "legacy-client"
+
+    async def request(
+        self,
+        messages: list[Any],
+        model_settings: Any,
+        model_request_parameters: Any,
+    ) -> Any:
+        from pydantic_ai.messages import ModelResponse, TextPart
+
+        from ingestion.llm_schemas import first_json_object
+        from ingestion.pydantic_ai_claude_sdk import flatten_messages
+
+        system, prompt = flatten_messages(messages)
+        instructions = "\n\n".join(
+            p.content for p in (model_request_parameters.instruction_parts or []) if p.content
+        )
+        if instructions:
+            system = f"{system}\n\n{instructions}" if system else instructions
+        response_format = None
+        output_object = model_request_parameters.output_object
+        if model_request_parameters.output_mode == "native" and output_object is not None:
+            response_format = {"type": "json", "schema": output_object.json_schema}
+        max_tokens = (model_settings or {}).get("max_tokens", 1024)
+        response = self._client.messages.create(
+            model=self._model_name,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+            system=system,
+            response_format=response_format,
+        )
+        text = str(response.content[0].text)
+        if response_format is not None:
+            # Tolerate fenced / prose-wrapped JSON (raw_decode parses the
+            # first object; models can ramble after it) — the posture the
+            # legacy dict-walking call sites had.
+            try:
+                text = first_json_object(_strip_json_fence(text))
+            except ValueError:
+                pass  # leave as-is; output validation will retry/fail
+        return ModelResponse(parts=[TextPart(text)], model_name=str(self._model_name))
+
+    async def request_stream(  # type: ignore[override]
+        self, *args: Any, **kwargs: Any
+    ) -> Any:
+        raise NotImplementedError("legacy client adapter does not stream")
 
 
 # ---------------------------------------------------------------------------
