@@ -2,7 +2,7 @@
 
 Covers:
 
-* ``strict_schema`` — OpenAI-strict shape: every object closed
+* strict wire schemas — OpenAI-strict shape: every object closed
   (``additionalProperties: false``), every property required, ``$defs``
   inlined, Optional fields nullable-but-required.
 * The tolerant index validator (deepseek-v4-flash wraps indices in
@@ -11,7 +11,7 @@ Covers:
 * ``TimelineGateEvents`` — legacy single-event shape, cap, per-field
   degradation mirroring the old ``_parse_gate`` behavior.
 * ``ExtractionOutput`` — bad rows skipped, defaults applied.
-* ``first_json_object`` / ``validate_model_json`` prose tolerance.
+* ``first_json_object`` prose tolerance.
 """
 
 from __future__ import annotations
@@ -32,8 +32,6 @@ from ingestion.llm_schemas import (
     ResolutionResult,
     TimelineGateEvents,
     first_json_object,
-    strict_schema,
-    validate_model_json,
 )
 
 
@@ -52,6 +50,16 @@ def _walk_objects(schema: dict) -> list[dict]:
     return found
 
 
+def _strict_schema(model_cls):
+    """The strict transform the OpenAI path applies natively (NativeOutput
+    strict=True) — reproduced here to pin the wire-schema invariants."""
+    from pydantic_ai import InlineDefsJsonSchemaTransformer
+    from pydantic_ai.profiles.openai import OpenAIJsonSchemaTransformer
+
+    inlined = InlineDefsJsonSchemaTransformer(model_cls.model_json_schema()).walk()
+    return OpenAIJsonSchemaTransformer(inlined, strict=True).walk()
+
+
 class TestStrictSchema:
     def test_every_object_is_closed_and_fully_required(self):
         for model in (
@@ -65,7 +73,7 @@ class TestStrictSchema:
             TimelineGateEvents,
             ExtractionOutput,
         ):
-            schema = strict_schema(model)
+            schema = _strict_schema(model)
             objects = _walk_objects(schema)
             assert objects, f"{model.__name__}: no object schemas found"
             for obj in objects:
@@ -75,12 +83,12 @@ class TestStrictSchema:
                 assert sorted(obj.get("required", [])) == sorted(props), model.__name__
 
     def test_defs_are_inlined(self):
-        schema = strict_schema(BatchResolutionResult)
+        schema = _strict_schema(BatchResolutionResult)
         assert "$defs" not in json.dumps(schema)
         assert "$ref" not in json.dumps(schema)
 
     def test_optional_fields_are_nullable_but_required(self):
-        schema = strict_schema(EdgeDatesResult)
+        schema = _strict_schema(EdgeDatesResult)
         assert sorted(schema["required"]) == ["invalid_at", "valid_at"]
         valid_at = schema["properties"]["valid_at"]
         rendered = json.dumps(valid_at)
@@ -88,7 +96,7 @@ class TestStrictSchema:
 
     def test_index_lists_are_plain_integer_arrays(self):
         # The wire schema asks for the CLEAN shape; tolerance is python-side.
-        schema = strict_schema(ResolutionResult)
+        schema = _strict_schema(ResolutionResult)
         assert schema["properties"]["duplicate_facts"]["items"] == {"type": "integer"}
 
 
@@ -244,7 +252,7 @@ class TestJsonExtraction:
         with pytest.raises(ValueError):
             first_json_object("nothing here")
 
-    def test_validate_model_json_end_to_end(self):
+    def test_prose_wrapped_model_validation_end_to_end(self):
         raw = 'prefix {"contradicted_facts": [{"index": 2}]} suffix'
-        v = validate_model_json(ContradictionVerdict, raw)
+        v = ContradictionVerdict.model_validate_json(first_json_object(raw))
         assert v.contradicted_facts == [2]
