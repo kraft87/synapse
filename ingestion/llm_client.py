@@ -50,27 +50,21 @@ Auth: a Claude subscription OAuth token or ``ANTHROPIC_API_KEY``, consumed
 by the spawned ``claude`` CLI (or an OpenAI-compatible endpoint via
 ``SYNAPSE_LLM_PROVIDER=openai``).
 
-Resilience (Phase 5)
---------------------
-Every ``messages.create`` call is wrapped in a ``tenacity`` retry that
-mirrors Graphiti's client-layer pattern (``graphiti_core/llm_client/
-client.py``): exponential backoff on transient SDK errors (rate limits,
-network blips, timeouts) so EVERY caller — dedup, contradiction, edge
-dates, extractor, dream/* — inherits resilience for free without
-repeating the boilerplate at each call site.
+Resilience
+----------
+Retries are layered by failure mode, at the client so every caller —
+dedup, contradiction, edge dates, extractor, dream/* — inherits them:
 
-What's retried, and what isn't:
-  * Retried — ``anthropic.RateLimitError``, ``APIConnectionError``,
-    ``APITimeoutError``, and the SDK's untyped transient ``Exception``s
-    that bubble out of the lower-level ``agent_call`` retry loop.
-  * NOT retried — ``BadRequestError`` (prompt is malformed; retrying
-    burns budget), ``AuthenticationError``, and the custom
-    ``UsageLimitError`` (Max-subscription window exhausted; the caller
+  * Transport transients (429/5xx, connection errors, timeouts) — a
+    ``tenacity`` exponential backoff around each call
+    (``_run_agent_sync`` on the structured path, the ``messages.create``
+    proxies on the text path).
+  * Content failures (schema-invalid output) — pydantic-ai's output
+    validation retries on the structured path; ``parse_with_retry``'s
+    retry-with-feedback loop on the legacy text path.
+  * NOT retried — malformed-prompt 4xx (retrying burns budget), auth
+    errors, and ``UsageLimitError`` (quota window exhausted; the caller
     needs to STOP the cycle, not retry).
-
-For structured-output JSON validation, ``parse_with_retry`` re-fires the
-call with the malformed response appended to the prompt as feedback —
-mirrors Graphiti's ``generate_response`` retry-with-validation-error loop.
 """
 
 from __future__ import annotations
@@ -123,10 +117,9 @@ _MAX_RETRIES = 2
 # entity-equivalence cases while killing the runaway reasoning. Tune here.
 _MAX_THINKING_TOKENS = 2048
 
-# Tenacity retry config — direct port of Graphiti's defaults
-# (``client.py::_generate_response_with_retry``). 3 attempts total,
-# exponential 2s → 4s → 8s capped at 30s. Tight enough to recover from
-# a transient rate-limit blip; bounded enough not to stall the pipeline.
+# Tenacity retry config: 3 attempts total, exponential 2s → 4s → 8s capped
+# at 30s. Tight enough to recover from a transient rate-limit blip; bounded
+# enough not to stall the pipeline.
 _RETRY_STOP = stop_after_attempt(3)
 _RETRY_WAIT = wait_exponential(multiplier=1, min=2, max=30)
 
@@ -500,6 +493,7 @@ DEFAULT_OPENAI_MODEL = "anthropic/claude-haiku-4.5"  # OpenRouter id for Haiku 4
 _HTTP_TIMEOUT = httpx.Timeout(300.0, connect=10.0)
 _BODY_SNIPPET_LEN = 300
 
+
 # Profile overrides for every model driven through this client:
 # * ``max_tokens`` must go on the wire as ``max_tokens`` (OpenRouter and most
 #   OpenAI-compatible servers), not OpenAI-proper's ``max_completion_tokens``.
@@ -507,10 +501,13 @@ _BODY_SNIPPET_LEN = 300
 #   JSON schema into the instructions — providers that ignore
 #   ``response_format`` still see the contract in-prompt (belt and braces,
 #   preserving the pre-pydantic-ai schema-in-prompt behavior).
-_OPENAI_COMPAT_PROFILE: dict[str, Any] = {
-    "openai_chat_supports_max_completion_tokens": False,
-    "native_output_requires_schema_in_instructions": True,
-}
+def _openai_compat_profile() -> Any:
+    from pydantic_ai.profiles.openai import OpenAIModelProfile
+
+    return OpenAIModelProfile(
+        openai_chat_supports_max_completion_tokens=False,
+        native_output_requires_schema_in_instructions=True,
+    )
 
 
 class _ErrorBodyStatusTransport(httpx.AsyncBaseTransport):
@@ -587,11 +584,13 @@ _LOOP_TLS = threading.local()
 def _thread_loop() -> asyncio.AbstractEventLoop:
     """One persistent event loop per worker thread.
 
-    pydantic-ai's ``run_sync`` creates a fresh loop per call; httpx
-    keepalive connections created under one loop error on reuse from the
-    next ("Connection error." storm, 2026-07-18). Pinning a loop to each
-    long-lived worker thread keeps the thread-local connection pool (see
-    ``OpenAIChatClient._provider``) on the loop that created it.
+    The 2026-07-18 "Connection error." storm was a process-wide httpx
+    pool shared across worker threads whose event loops differ — fixed by
+    the thread-local provider (``OpenAIChatClient._provider``). This loop
+    pin complements it: one loop per thread for the pool to live on, plus
+    a guard against a CLOSED loop left on the thread by other sync-async
+    bridges (``asyncio.run`` in the SDK path), which ``get_event_loop``
+    wouldn't recover from.
     """
     loop = getattr(_LOOP_TLS, "loop", None)
     if loop is None or loop.is_closed():
@@ -646,10 +645,10 @@ def _run_agent_sync(
     def _attempt() -> Any:
         with capture_run_messages() as captured:
             try:
-                # NOT run_sync: that spins a fresh event loop per call,
-                # divorcing pooled httpx connections from the loop that
-                # created them (APIConnectionError storm, 2026-07-18).
-                # Each worker thread keeps one persistent loop instead.
+                # One persistent loop per worker thread (see _thread_loop)
+                # so the thread-local connection pool always runs on the
+                # loop that created it, even if another sync-async bridge
+                # left a closed loop on this thread.
                 return _thread_loop().run_until_complete(
                     agent.run(user_prompt, instructions=instructions)
                 )
@@ -823,7 +822,7 @@ class OpenAIChatClient:
         return OpenAIChatModel(
             self.resolve_model(model),
             provider=self._provider,
-            profile=cast(Any, _OPENAI_COMPAT_PROFILE),
+            profile=_openai_compat_profile(),
         )
 
     def model_settings(self, max_tokens: int) -> Any:
@@ -1103,8 +1102,6 @@ def parse_with_retry[T](
 ) -> T:
     """Call the LLM and parse the response, retrying with feedback on parse failure.
 
-    Mirrors Graphiti's ``generate_response`` retry-with-feedback loop
-    (``graphiti_core/llm_client/anthropic_client.py::generate_response``).
     Behaviour:
 
     1. Send ``base_prompt`` to the LLM.

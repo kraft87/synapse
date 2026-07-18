@@ -127,7 +127,7 @@ class BatchResolutionResult(BaseModel):
 
 
 class ContradictionVerdict(BaseModel):
-    """Contradiction-only verdict (Graphiti's ``EdgeDuplicate`` subset)."""
+    """Contradiction-only verdict for a single fact pair."""
 
     contradicted_facts: IndexList = []
 
@@ -197,7 +197,7 @@ class BatchEdgeDatesResult(BaseModel):
 
 
 class NodeDedupVerdict(BaseModel):
-    """Graphiti ``NodeDuplicate`` response. Defaults keep partial responses
+    """Node-dedup verdict. Defaults keep partial responses
     parseable (the legacy parser only ever read ``duplicate_candidate_id``);
     the strict wire schema still requires every key."""
 
@@ -364,28 +364,6 @@ class ExtractionOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def strict_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
-    """OpenAI-strict JSON schema for a model: ``$defs`` inlined, every object
-    ``additionalProperties: false`` with all properties required, titles
-    stripped. Uses pydantic-ai's own transformers so the Claude-SDK /
-    legacy text path advertises the same schema semantics the OpenAI path
-    sends as native ``response_format`` (which keeps ``$defs`` — OpenAI
-    strict mode supports them; the SDK's ``output_format`` gets the
-    self-contained inlined form).
-    """
-    from pydantic_ai import InlineDefsJsonSchemaTransformer
-    from pydantic_ai.profiles.openai import OpenAIJsonSchemaTransformer
-
-    inlined = InlineDefsJsonSchemaTransformer(model_cls.model_json_schema()).walk()
-    return OpenAIJsonSchemaTransformer(inlined, strict=True).walk()
-
-
-def legacy_response_format(model_cls: type[BaseModel]) -> dict[str, Any]:
-    """The ``{"type": "json", "schema": ...}`` dict the Claude Agent SDK path
-    (``agent_call`` / ``ClaudeCLIClient``) consumes as ``response_format``."""
-    return {"type": "json", "schema": strict_schema(model_cls)}
-
-
 def first_json_object(raw: str) -> str:
     """Extract the first JSON object from ``raw``, tolerating leading and
     trailing prose (``raw_decode`` parses the first object; models can ramble
@@ -396,16 +374,6 @@ def first_json_object(raw: str) -> str:
         raise ValueError(f"no JSON object in response: {raw[:200]!r}")
     data, _ = json.JSONDecoder().raw_decode(raw[start:])
     return json.dumps(data)
-
-
-def validate_model_json[M: BaseModel](model_cls: type[M], raw: str) -> M:
-    """Tolerantly parse ``raw`` (prose-wrapped JSON allowed) into ``model_cls``.
-
-    Raises ``ValueError`` (or pydantic ``ValidationError``, a ``ValueError``
-    subclass) on failure — callers map that onto their stage's conservative
-    no-op fallback.
-    """
-    return model_cls.model_validate_json(first_json_object(raw))
 
 
 __all__ = [
@@ -428,7 +396,4 @@ __all__ = [
     "TimelineGateEvent",
     "TimelineGateEvents",
     "first_json_object",
-    "legacy_response_format",
-    "strict_schema",
-    "validate_model_json",
 ]
