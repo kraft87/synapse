@@ -188,6 +188,37 @@ class TestSuccessfulCompletion:
         }
         assert seen["payload"]["messages"][1]["content"] == "extract facts"
 
+    def test_openrouter_payload_disables_reasoning(self):
+        """Reasoning models can burn the whole max_tokens budget on
+        chain-of-thought and return an empty completion with
+        finish_reason='length'; extraction wants the completion only."""
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert seen["payload"]["reasoning"] == {"enabled": False}
+
+    def test_non_openrouter_payload_has_no_reasoning_field(self):
+        """Other OpenAI-compatible servers may reject unknown params."""
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = OpenAIChatClient(
+            base_url="http://localhost:11434/v1",
+            api_key="",
+            model=DEFAULT_OPENAI_MODEL,
+            transport=httpx.MockTransport(handler),
+        )
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert "reasoning" not in seen["payload"]
+
     def test_no_auth_header_when_key_blank(self):
         """Keyless endpoints (local Ollama) must not get an empty bearer."""
         seen: dict[str, Any] = {}

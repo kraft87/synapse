@@ -582,6 +582,14 @@ class _OpenAIMessagesProxy:
             "max_tokens": max_tokens,
             "stream": False,
         }
+        if c.is_openrouter:
+            # Every call through this client is an extraction-shaped task
+            # that wants the completion, not chain-of-thought. Reasoning
+            # models (DeepSeek V4, o-series) can spend the entire
+            # ``max_tokens`` budget on reasoning tokens and return an EMPTY
+            # completion with ``finish_reason='length'`` — 196 queue items
+            # failed exactly that way on deepseek-v4-pro (2026-07-17).
+            payload["reasoning"] = {"enabled": False}
 
         response = c.http.post("/chat/completions", json=payload)
         _raise_for_openai_status(response)
@@ -654,6 +662,10 @@ class OpenAIChatClient:
         transport: httpx.BaseTransport | None = None,
     ) -> None:
         self.model = model
+        # OpenRouter accepts a vendor-specific ``reasoning`` request field;
+        # other OpenAI-compatible servers (OpenAI proper, Ollama, vLLM) may
+        # reject unknown params, so the flag gates on the URL.
+        self.is_openrouter = "openrouter" in base_url.lower()
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
