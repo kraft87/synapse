@@ -100,7 +100,7 @@ export interface Entity {
 export type SearchTab = 'episodes' | 'facts' | 'entities' | 'events';
 export interface SearchHit {
   type: SearchTab; id: string; snippet: string;
-  meta: { project?: string; source?: string; ts?: string; session_id?: string; episode_id?: number | null; name?: string; entity_type?: string; degree?: number };
+  meta: { project?: string; source?: string; ts?: string; t_valid?: string; session_id?: string; episode_id?: number | null; name?: string; entity_type?: string; degree?: number };
 }
 export interface SearchResult {
   hits: SearchHit[];

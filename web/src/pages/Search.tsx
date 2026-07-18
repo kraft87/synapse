@@ -18,7 +18,10 @@ const LIMIT = 20;
 
 function metaLine(h: SearchHit): string {
   if (h.type === 'entities') return [h.meta.entity_type, h.meta.degree != null ? h.meta.degree + ' edges' : ''].filter(Boolean).join(' · ');
-  return [h.meta.project, h.meta.source, relTime(h.meta.ts)].filter(Boolean).join(' · ');
+  // Events: show when the event happened (t_valid), not when the row was
+  // ingested — backfills stamp thousands of events with one ingested_at.
+  const ts = h.type === 'events' ? (h.meta.t_valid ?? h.meta.ts) : h.meta.ts;
+  return [h.meta.project, h.meta.source, relTime(ts)].filter(Boolean).join(' · ');
 }
 function openHit(h: SearchHit) {
   if (h.type === 'entities') return openEntity(h.id);
