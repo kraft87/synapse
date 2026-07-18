@@ -124,6 +124,11 @@ class KGPostgresReader:
         with conn.transaction():
             cur = conn.cursor()
             cur.execute("SET LOCAL hnsw.ef_search = 200")
+            # The planner costs the seq scan as cheap (it can't see the
+            # per-row detoast + halfvec-cast + distance work) and skips the
+            # HNSW index: ~2.5s/lookup at 44K entities vs ~10ms indexed.
+            # This scope only ever runs the ANN lookup, so force the index.
+            cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
                 "SELECT uuid, name, dist FROM ("  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "  SELECT uuid, name, owner_id, group_id, "
@@ -191,6 +196,11 @@ class KGPostgresReader:
         with conn.transaction():
             cur = conn.cursor()
             cur.execute("SET LOCAL hnsw.ef_search = 200")
+            # The planner costs the seq scan as cheap (it can't see the
+            # per-row detoast + halfvec-cast + distance work) and skips the
+            # HNSW index: ~2.5s/lookup at 44K entities vs ~10ms indexed.
+            # This scope only ever runs the ANN lookup, so force the index.
+            cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
                 "SELECT uuid, fact, valid_at, dist FROM ("  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "  SELECT uuid, fact, valid_at, owner_id, group_id, "
