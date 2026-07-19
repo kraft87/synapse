@@ -26,7 +26,7 @@ import os
 import re
 import urllib.request
 
-from . import config
+from . import config, post_fire, procedure_miner, struggle_arc
 from . import skill_db_source as DB
 from . import skill_derive as SD
 from . import skill_ledger as L
@@ -338,6 +338,23 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     print("derive:", run_derive(conn, substantive, catalog, seen))
     print("retune:", run_retune(conn, substantive, catalog, seen))
     print("grounded:", capture_grounded(conn, last, seen))
+
+    # v2 detectors — on by default; SYNAPSE_SKILLS_DETECTORS is the kill switch
+    # (comma list to run a subset, empty string to disable all).
+    detectors = {
+        d.strip()
+        for d in os.environ.get(
+            "SYNAPSE_SKILLS_DETECTORS", "struggle_arc,post_fire,procedure_miner"
+        ).split(",")
+        if d.strip()
+    }
+    if "struggle_arc" in detectors:
+        print("struggle_arc:", struggle_arc.run(conn, since=last))
+    if "post_fire" in detectors:
+        print("post_fire:", post_fire.run(conn, since=last))
+    if "procedure_miner" in detectors and procedure_miner.due(conn):
+        print("procedure_miner:", procedure_miner.run(conn))
+
     print("decay:", L.decay_stale(conn))
     print("digest:", discord_digest(conn, no_discord))
 
