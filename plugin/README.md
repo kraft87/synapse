@@ -191,6 +191,8 @@ MCP tools (registered automatically; Claude calls them during a session):
 - **`remember`** — write a curated memory (note + episode + graph extraction).
 - **`recall_timeline`** — dated events for "when / in what order" questions.
 - **`recall_episodes`** — raw episode drill-down.
+- **`recall_feedback`** — after using a recall's results, report which served ids helped,
+  which were noise, and what was missing (offline labeled data; never changes ranking).
 
 ## Troubleshooting
 

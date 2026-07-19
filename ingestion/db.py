@@ -528,6 +528,43 @@ class Database:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    # ------------------------------------------------------------------
+    # Recall feedback (schema 046)
+    # ------------------------------------------------------------------
+
+    def insert_recall_feedback(
+        self,
+        *,
+        query: str,
+        helpful: list[str],
+        noise: list[str],
+        missing: str | None,
+        note: str | None,
+        session_id: str | None,
+        project: str | None,
+    ) -> int:
+        """One labeled retrieval-quality report (the recall_feedback tool).
+
+        Offline data only — never read by live ranking; ids are pre-validated
+        served forms ("e:N" / "n:N") at the tool boundary."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "INSERT INTO recall_feedback "
+                "    (query, helpful, noise, missing, note, session_id, project) "
+                "VALUES (%s, %s::jsonb, %s::jsonb, %s, %s, %s, %s) RETURNING id",
+                (
+                    query,
+                    orjson.dumps(helpful).decode(),
+                    orjson.dumps(noise).decode(),
+                    missing,
+                    note,
+                    session_id,
+                    project,
+                ),
+            ).fetchone()
+        assert row is not None, "INSERT RETURNING id returned nothing"
+        return cast(int, row["id"])
+
     def get_unembedded_episodes(self, limit: int = 96) -> list[dict[str, Any]]:
         with self._conn() as conn:
             result = conn.execute(

@@ -429,6 +429,7 @@ Registration order is deliberate (tool-list position biases model tool choice); 
 - **`remember(content=None, hook=None, body=None, type="project", project=None, session_id=None)`** — reconciles a note into the notes store and archives the text as a manual `Episode` with KG extraction.
 - **`recall_timeline(query=None, since=None, until=None, project=None, min_salience=0, limit=20, group_id=None)`** — dated what-happened events, chronological.
 - **`recall_episodes(query, project=None, limit=5)`** — raw episode drill-down (same deep-fetch + rerank machinery, served to `limit`).
+- **`recall_feedback(query, helpful=None, noise=None, missing=None, note=None, session_id=None, project=None)`** — after-the-fact retrieval-quality report: which served ids (`e:N`/`n:N`, validated) were load-bearing vs noise, plus what was missing. Writes one `recall_feedback` row (schema 046) — offline labeled data for eval goldens and reranker tuning, deliberately not wired into live ranking.
 - **`issue_machine_token()`** — returns the shared machine bearer token, auth-gated by MultiAuth + the allowlist; lets `synapse login` fetch it over OAuth instead of a manual copy-paste ([§7.4](#74-auth)). **Hidden from `tools/list`** by an `on_list_tools` middleware; still callable by name via `tools/call`.
 
 Removed from the surface (git history keeps the code): `list_projects` (the board banner carries per-project activity now) and `query_graph` (experimental NL→SQL; `recall()` owns retrieval).
