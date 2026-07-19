@@ -514,9 +514,7 @@ class TestHTTPErrors:
 
         def handler(request: httpx.Request) -> httpx.Response:
             body = gzip.compress(
-                json.dumps(
-                    {"error": {"code": 402, "message": "Insufficient credits"}}
-                ).encode()
+                json.dumps({"error": {"code": 402, "message": "Insufficient credits"}}).encode()
             )
             return httpx.Response(
                 200,
