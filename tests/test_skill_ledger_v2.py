@@ -123,3 +123,52 @@ def test_derive_proposes_on_salience():
 def test_legacy_score_gate_still_applies_to_all_kinds():
     for kind in ("derive", "retune", "consolidate"):
         assert _passes_gate(kind, [_ev()], PROPOSE_SCORE, None)
+
+
+# --------------------------------------------------------- derive identity resolution
+class _FakeCur:
+    """Minimal cursor: _resolve_id only calls execute() + fetchall() on the derive path."""
+
+    def __init__(self, rows):
+        self._rows = rows
+
+    def execute(self, *args):
+        pass
+
+    def fetchall(self):
+        return self._rows
+
+
+def _row(cid, session, sigkey):
+    return (cid, [{"session_id": session, "class": "judge", "signal": "gap_scan"}], sigkey)
+
+
+def test_shared_session_with_disagreeing_signatures_is_not_identity():
+    from dream.skills.skill_ledger import _resolve_id
+
+    # one long session routinely contains several distinct gaps: a shared session id
+    # with an unrelated signature must not merge (and clobber) the existing row
+    cur = _FakeCur([_row(1, "s1", "lan discovery recon nmap sweep")])
+    got = _resolve_id(
+        cur, "derive", "media-admin", None, None, "media preferences subtitles playback", {"s1"}
+    )
+    assert got is None
+
+
+def test_shared_session_with_agreeing_signature_merges():
+    from dream.skills.skill_ledger import _resolve_id
+
+    cur = _FakeCur([_row(1, "s1", "media preferences subtitles playback config")])
+    got = _resolve_id(
+        cur, "derive", "media-admin", None, None, "media preferences subtitles playback", {"s1"}
+    )
+    assert got is not None and got[0] == 1
+
+
+def test_shared_session_without_signatures_still_merges():
+    from dream.skills.skill_ledger import _resolve_id
+
+    # legacy rows carry no signature_key; session overlap alone still resolves there
+    cur = _FakeCur([_row(1, "s1", "")])
+    got = _resolve_id(cur, "derive", "media-admin", None, None, "media preferences", {"s1"})
+    assert got is not None and got[0] == 1

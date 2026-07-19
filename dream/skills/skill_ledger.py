@@ -31,6 +31,7 @@ from . import config
 # identity / classification knobs (Oracle-reviewed defaults)
 SESSION_JACCARD = 0.4  # derive identity: evidence-session overlap (ground truth, primary)
 SIGNATURE_JACCARD = 0.6  # derive identity: signature-token overlap (secondary)
+SIGNATURE_VETO_FLOOR = 0.15  # session-overlap match vetoed when both signatures exist below this
 PROPOSE_SCORE = 1.5  # legacy observe -> proposed gate (3 judge sessions, or 1 grounded + 1 judge)
 PROPOSE_SALIENCE = 4  # derive: propose when detector-rated pain/severity reaches this (1-5)
 PROPOSE_SCAN_NIGHTS = 2  # derive: propose when seen on this many distinct nightly scans
@@ -197,7 +198,13 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         old_toks = set((rk or "").split())
         sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
         tj = _jaccard(new_toks, old_toks) if new_toks and old_toks else 0.0
-        if sj >= SESSION_JACCARD or tj >= SIGNATURE_JACCARD:
+        # Signature disagreement vetoes session-overlap identity: one long session
+        # routinely contains several distinct gaps, so a shared session alone is not
+        # identity when both sides carry signatures that don't resemble each other.
+        session_match = sj >= SESSION_JACCARD and not (
+            new_toks and old_toks and tj < SIGNATURE_VETO_FLOOR
+        )
+        if session_match or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
                 best, best_score = (cid, ev or []), rank
