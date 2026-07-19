@@ -24,6 +24,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
+_KIND_BADGE = {"retune": "RETUNE", "consolidate": "MERGE", "derive": "DERIVE"}
+
 
 def cmd_list() -> None:
     rows = config.post_json("/skills/proposals", {}).get("proposals", [])
@@ -32,9 +34,12 @@ def cmd_list() -> None:
         return
     for r in rows:
         d = f"/{r['direction']}" if r.get("direction") else ""
+        badge = _KIND_BADGE.get(r["kind"], r["kind"].upper())
+        sal = f"  sal={r['salience']}" if r.get("salience") is not None else ""
+        det = f"  via={r['source_detector']}" if r.get("source_detector") else ""
         print(
-            f"[{r['id']}] {r['kind']}{d} {r['name']}  score={r['score']:.1f} "
-            f"(g{r['grounded_sessions']}/j{r['judge_sessions']})"
+            f"[{r['id']}] [{badge}{d}] {r['name']}  score={r['score']:.1f} "
+            f"(g{r['grounded_sessions']}/j{r['judge_sessions']}){sal}{det}"
         )
         print(f"      {(r.get('summary') or '')[:110]}")
         if r.get("proposal_path"):
@@ -46,18 +51,29 @@ def cmd_show(cid: int) -> None:
     if not r.get("found"):
         print("not found")
         return
+    sal = f" salience={r['salience']}" if r.get("salience") is not None else ""
+    det = f" via={r['source_detector']}" if r.get("source_detector") else ""
     print(
         f"[{r['id']}] {r['kind']} {r['name']} {r.get('direction') or ''}  "
-        f"status={r['status']} score={r['score']:.2f}"
+        f"status={r['status']} score={r['score']:.2f}{sal}{det}"
     )
     print(f"summary: {r.get('summary')}\ntargets: {r.get('target_skills')}")
     ev = r.get("evidence") or []
+    nights = sorted({e.get("scan_night") for e in ev if e.get("scan_night")})
+    if nights:
+        print(f"scan nights ({len(nights)}): {', '.join(nights)}")
     print(f"evidence ({len(ev)}):")
     for e in ev[:20]:
+        night = f" night={e['scan_night']}" if e.get("scan_night") else ""
         print(
-            f"  - {e.get('class')}/{e.get('signal')} sess={str(e.get('session_id'))[:8]} "
+            f"  - {e.get('class')}/{e.get('signal')} sess={str(e.get('session_id'))[:8]}{night} "
             f"{e.get('skill') or ''} {e.get('why') or e.get('phrasing') or ''}".rstrip()
         )
+        if e.get("quote"):
+            print(f'      "{e["quote"][:200]}"')
+    patch = r.get("proposed_patch")
+    if patch:
+        print(f"\n--- proposed patch ---\n{patch[:1500]}")
     body = r.get("proposal_body")
     if body:
         print(f"\n--- drafted SKILL.md ---\n{body[:1500]}")

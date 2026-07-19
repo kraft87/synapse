@@ -23,6 +23,7 @@ _DB_FILES = {
     "test_kg_pg_write.py",
     "test_kg_pg_read.py",
     "test_skills_provider.py",
+    "test_skills_lane_v2.py",
     "test_supersede_leg.py",
     "test_config_lane.py",
     "test_config_proposer_db.py",

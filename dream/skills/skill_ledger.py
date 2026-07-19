@@ -7,10 +7,17 @@ Run under the synapse venv (needs psycopg + voyageai):
 
 Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name;
 retune/consolidate = (name,direction)/target), evidence accumulation (dedup by
-session+signal, recompute weights from the FULL evidence every merge — never
-incrementally), the 0.5x judge discount (the score column does it), observe->proposed
-classification on score, and decay of unseen candidates. Grounded signals advance;
-the LLM judge only nominates. promoted is NEVER set here (filesystem-accept path only).
+(session, signal, class, scan_night), recompute weights from the FULL evidence every
+merge — never incrementally), the 0.5x judge discount (the score column does it),
+observe->proposed classification (v2 gates: retune proposes on one quote-carrying
+instance; derive on recurrence across scan nights, high salience, or the legacy
+score), and decay of unseen 'observe' candidates ('proposed' rows wait for human
+review). Grounded signals advance; the LLM judge only nominates. promoted is NEVER
+set here (filesystem-accept path only).
+
+Evidence entry shape (all fields beyond class/signal optional, backward compatible):
+    {"class": "judge"|"grounded", "signal": str, "session_id": str|None,
+     "quote": str|None, "scan_night": "YYYY-MM-DD"|None, "date": "YYYY-MM-DD"|None}
 """
 
 from __future__ import annotations
@@ -24,7 +31,9 @@ from . import config
 # identity / classification knobs (Oracle-reviewed defaults)
 SESSION_JACCARD = 0.4  # derive identity: evidence-session overlap (ground truth, primary)
 SIGNATURE_JACCARD = 0.6  # derive identity: signature-token overlap (secondary)
-PROPOSE_SCORE = 1.5  # observe -> proposed gate (3 judge sessions, or 1 grounded + 1 judge)
+PROPOSE_SCORE = 1.5  # legacy observe -> proposed gate (3 judge sessions, or 1 grounded + 1 judge)
+PROPOSE_SALIENCE = 4  # derive: propose when detector-rated pain/severity reaches this (1-5)
+PROPOSE_SCAN_NIGHTS = 2  # derive: propose when seen on this many distinct nightly scans
 DECAY_TTL_DAYS = 28  # last_seen older than this -> retired (time-based; no nightly mass-bump)
 EVIDENCE_CAP = 60  # bound the JSONB
 
@@ -126,15 +135,24 @@ def _ev_sessions(evidence: list[dict]) -> set[str]:
 
 
 def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
-    """Append new, dedup by (session_id, signal, class) — keeps distinct-session counting honest."""
+    """Append new, dedup by (session_id, signal, class, scan_night): a re-sighting on a LATER
+    scan night counts as fresh recurrence evidence, while same-night duplicates still collapse.
+    Legacy entries without scan_night all key to one bucket (scan_night=None) — same collapse
+    behavior they had before scan nights existed."""
     out, seen = [], set()
     for e in list(old) + list(new):
-        k = (e.get("session_id"), e.get("signal"), e.get("class"))
+        k = (e.get("session_id"), e.get("signal"), e.get("class"), e.get("scan_night"))
         if k in seen:
             continue
         seen.add(k)
         out.append(e)
     return out[-EVIDENCE_CAP:]
+
+
+def _scan_nights(evidence: list[dict]) -> int:
+    """DISTINCT scan nights across the evidence — the v2 recurrence unit. All legacy entries
+    (no scan_night) collectively count as ONE bucket (None is one set element)."""
+    return len({e.get("scan_night") for e in evidence}) if evidence else 0
 
 
 def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
@@ -165,20 +183,45 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         )
         r = cur.fetchone()
         return (r[0], r[1]) if r else None
-    # derive: semantic identity over active rows
+    # derive: semantic identity over active rows. Empty-vs-empty is NOT identity: a candidate
+    # submitted without session ids / signature must never wildcard-match (and clobber) an
+    # existing empty-keyed row — each leg only counts when BOTH sides are non-empty.
     cur.execute(
         "SELECT id, evidence, signature_key FROM skills_lane.skill_gap_candidates "
         "WHERE kind='derive' AND status IN ('observe','proposed')"
     )
     best, best_score = None, 0.0
+    new_toks = set((sigkey or "").split())
     for cid, ev, rk in cur.fetchall():
-        sj = _jaccard(new_sessions, _ev_sessions(ev or []))
-        tj = _jaccard((sigkey or "").split(), (rk or "").split())
+        old_sessions = _ev_sessions(ev or [])
+        old_toks = set((rk or "").split())
+        sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
+        tj = _jaccard(new_toks, old_toks) if new_toks and old_toks else 0.0
         if sj >= SESSION_JACCARD or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
                 best, best_score = (cid, ev or []), rank
     return best
+
+
+def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
+    """v2 observe -> proposed gates (design 00: §3). The legacy score bar stays for every
+    kind (compat with existing rows/config); the new per-kind gates are ADDITIVE looseners:
+      - retune: ONE strong instance — an evidence entry carrying a verbatim quote (the
+        deviation/correction moment). Cheap to review, high prior.
+      - derive: recurrence (distinct scan nights) OR high detector salience.
+      - consolidate: legacy score path only (overlap nominations carry no quotes; one
+        cosine sighting is not review-worthy on its own).
+    Junk is controlled downstream (candidate decay + human review), not at this gate."""
+    if score is not None and score >= PROPOSE_SCORE:
+        return True
+    if kind == "retune":
+        return any((e.get("quote") or "").strip() for e in evidence)
+    if kind == "derive":
+        if salience is not None and salience >= PROPOSE_SALIENCE:
+            return True
+        return _scan_nights(evidence) >= PROPOSE_SCAN_NIGHTS
+    return False
 
 
 def merge_candidate(
@@ -193,9 +236,15 @@ def merge_candidate(
     trigger_phrasings=None,
     target_skills=None,
     direction=None,
+    salience=None,
+    source_detector=None,
+    proposed_patch=None,
     do_embed=True,
 ) -> dict:
-    """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}."""
+    """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
+
+    salience persists as max(existing, new) — a candidate's pain rating only ratchets up.
+    source_detector / proposed_patch: latest non-null wins (a fresh patch draft supersedes)."""
     cur = conn.cursor()
     sigkey = signature_key(signature, tools) if kind == "derive" else None
     new_sessions = _ev_sessions(evidence_entries)
@@ -228,19 +277,39 @@ def merge_candidate(
                  signature=COALESCE(%s, signature), signature_key=COALESCE(%s, signature_key),
                  trigger_phrasings=%s::jsonb, target_skills=%s,
                  summary_embedding=COALESCE(%s::halfvec, summary_embedding),
+                 salience=GREATEST(salience, %s::smallint),
+                 source_detector=COALESCE(%s, source_detector),
+                 proposed_patch=COALESCE(%s, proposed_patch),
                  last_seen=now(), runs_since_seen=0, updated_at=now()
                WHERE id=%s
-               RETURNING id, status, score""",
-            (ev_json, js, gs, jw, gw, summary, signature, sigkey, phr, tgt, emb_lit, cid),
+               RETURNING id, status, score, salience""",
+            (
+                ev_json,
+                js,
+                gs,
+                jw,
+                gw,
+                summary,
+                signature,
+                sigkey,
+                phr,
+                tgt,
+                emb_lit,
+                salience,
+                source_detector,
+                proposed_patch,
+                cid,
+            ),
         )
     else:
         cur.execute(
             """INSERT INTO skills_lane.skill_gap_candidates
                  (kind, name, signature_key, target_skills, direction, summary, signature,
                   trigger_phrasings, summary_embedding, evidence,
-                  judge_sessions, grounded_sessions, judge_weight, grounded_weight)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::halfvec,%s::jsonb,%s,%s,%s,%s)
-               RETURNING id, status, score""",
+                  judge_sessions, grounded_sessions, judge_weight, grounded_weight,
+                  salience, source_detector, proposed_patch)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::halfvec,%s::jsonb,%s,%s,%s,%s,%s,%s,%s)
+               RETURNING id, status, score, salience""",
             (
                 kind,
                 name,
@@ -256,12 +325,15 @@ def merge_candidate(
                 gs,
                 jw,
                 gw,
+                salience,
+                source_detector,
+                proposed_patch,
             ),
         )
-    rid, status, score = cur.fetchone()
+    rid, status, score, row_salience = cur.fetchone()
 
-    # observe -> proposed once the (discounted) score clears the bar; grounded->accepted is the review path's job
-    if status == "observe" and score is not None and score >= PROPOSE_SCORE:
+    # observe -> proposed via the v2 gates; grounded->accepted is the review path's job
+    if status == "observe" and _passes_gate(kind, evidence, score, row_salience):
         cur.execute(
             "UPDATE skills_lane.skill_gap_candidates SET status='proposed', updated_at=now() WHERE id=%s",
             (rid,),
@@ -272,14 +344,16 @@ def merge_candidate(
 
 
 def decay_stale(conn, ttl_days: int = DECAY_TTL_DAYS) -> dict:
-    """Retire candidates whose last_seen aged past the TTL (time-based; no nightly mass-bump of
-    inactive rows). Re-seen candidates get last_seen=now() in merge_candidate, so only the
-    genuinely stale age out — only the actually-retiring rows are written (no dead-tuple bloat)."""
+    """Retire 'observe' candidates whose last_seen aged past the TTL (time-based; no nightly
+    mass-bump of inactive rows). Re-seen candidates get last_seen=now() in merge_candidate, so
+    only the genuinely stale age out — only the actually-retiring rows are written (no
+    dead-tuple bloat). 'proposed' rows are EXEMPT: they wait for human review and never
+    silently decay (v2 — proposals were being lost to this)."""
     cur = conn.cursor()
     cur.execute(
         """UPDATE skills_lane.skill_gap_candidates
              SET status='retired', reject_reason='stale', updated_at=now()
-           WHERE status IN ('observe','proposed') AND last_seen < now() - (%s || ' days')::interval""",
+           WHERE status='observe' AND last_seen < now() - (%s || ' days')::interval""",
         (str(ttl_days),),
     )
     retired = cur.rowcount
@@ -297,12 +371,16 @@ def get_cursor(conn) -> dict:
 
 
 def update_cursor(conn, last_scan_at, config=None) -> None:
+    """Advance the scan watermark. config keys MERGE into the stored JSONB (never replace
+    wholesale): other stages park their own state there — e.g. the digest's seen-ids —
+    and a run-config write must not clobber it."""
     cur = conn.cursor()
     cur.execute(
         """UPDATE skills_lane.skill_scan_cursor
              SET last_scan_at=GREATEST(COALESCE(last_scan_at, %s), %s),
                  last_run_at=now(), runs=runs+1,
-                 config=COALESCE(%s::jsonb, config), updated_at=now()
+                 config=COALESCE(config, '{}'::jsonb) || COALESCE(%s::jsonb, '{}'::jsonb),
+                 updated_at=now()
            WHERE id=1""",
         (last_scan_at, last_scan_at, json.dumps(config) if config is not None else None),
     )
@@ -381,9 +459,11 @@ def _selftest() -> None:
     print(
         f"after explicit_request: status={r3['status']} score={r3['score']} (grounded should push score up)"
     )
-    # decay: age ONLY the selftest rows, run the normal 28d decay (fresh real rows stay safe), confirm retire
+    # decay: age ONLY the selftest rows, run the normal 28d decay (fresh real rows stay safe),
+    # confirm retire. Reset to 'observe' first — 'proposed' rows are decay-exempt by design.
     cur.execute(
-        "UPDATE skills_lane.skill_gap_candidates SET last_seen = now() - interval '60 days' WHERE name LIKE 'selftest-%'"
+        "UPDATE skills_lane.skill_gap_candidates SET status='observe', "
+        "last_seen = now() - interval '60 days' WHERE name LIKE 'selftest-%'"
     )
     conn.commit()
     d = decay_stale(conn)
