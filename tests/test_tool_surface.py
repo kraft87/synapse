@@ -47,6 +47,7 @@ _EXPECTED_ORDER = [
     "remember",
     "recall_timeline",
     "recall_episodes",
+    "recall_feedback",
 ]
 
 # Claude Code hard-truncates tool descriptions AND server instructions at 2KB each —
@@ -96,6 +97,7 @@ _DESCRIPTION_TAILS = {
     "remember": "must stand alone months later",
     "recall_timeline": "anchor events' dates the payload gives",
     "recall_episodes": "the right first call",
+    "recall_feedback": "recall actually served",
 }
 
 

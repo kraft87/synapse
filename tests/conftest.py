@@ -40,6 +40,7 @@ _DB_FILES = {
     "test_import_notes.py",
     "test_tool_surface.py",
     "test_restamp_inherited_dates.py",
+    "test_recall_feedback.py",
 }
 
 

@@ -1,5 +1,5 @@
-"""Synapse MCP server — recall, fetch, remember, recall_timeline, and
-recall_episodes as MCP tools (plus issue_machine_token, hidden from listings).
+"""Synapse MCP server — recall, fetch, remember, recall_timeline, recall_episodes,
+and recall_feedback as MCP tools (plus issue_machine_token, hidden from listings).
 
 Run with:
     uv run python -m mcp_server.server
@@ -13,6 +13,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import re
 from pathlib import Path
 
 import logfire
@@ -181,7 +182,9 @@ _INSTRUCTIONS = (
     "(n:N) from earlier results. recall_timeline answers when-did / how-long "
     "questions; recall_episodes returns raw turn text. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "
-    "FIRST, then reply. Absence from results means unknown, not false."
+    "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "
+    "reports which served ids helped, which were noise, and what was missing. "
+    "Absence from results means unknown, not false."
 )
 
 mcp = FastMCP(
@@ -312,8 +315,9 @@ async def health(request: Request) -> JSONResponse:
 # Tools — REGISTRATION ORDER IS DELIBERATE. Tool-list position biases which tool
 # a model reaches for (first-listed wins most ties), so the surface reads in
 # intended-use order: recall (the workhorse), fetch (id expansion), remember (the
-# write), then the two specialist reads — recall_timeline, recall_episodes. Hidden
-# plumbing (issue_machine_token, see _HIDDEN_TOOLS) registers last.
+# write), the two specialist reads — recall_timeline, recall_episodes — then
+# recall_feedback (the after-the-fact quality report). Hidden plumbing
+# (issue_machine_token, see _HIDDEN_TOOLS) registers last.
 # test_tool_surface.py pins this order.
 #
 # There is deliberately NO board tool: the board is push-only (the plugin's
@@ -711,6 +715,112 @@ def recall_episodes(
         )
 
 
+# --- recall_feedback: offline labeled retrieval-quality capture (schema 046) ------
+# One row per rated recall. Deliberately NOT wired into live scoring — no ranking
+# boost, no retrieval_count bump, nothing feeds _merge_rrf. The rows are goldens
+# for offline eval + reranker tuning, so the id validation is strict: downstream
+# tooling must be able to trust "e:N"/"n:N" without re-parsing.
+
+_FEEDBACK_ID_RE = re.compile(r"^[en]:\d+$")
+
+
+def _feedback_ids_error(field: str, ids: list[str] | None) -> str | None:
+    """Validation error for recall_feedback's helpful/noise lists, or None if valid.
+
+    Accepts None or a list of served-id strings — "e:N" (episode) / "n:N" (note),
+    exactly as recall() serves them. Anything else is rejected."""
+    if ids is None:
+        return None
+    if not isinstance(ids, list):
+        return f"{field} must be a list of served ids like ['e:123', 'n:45']"
+    bad = [i for i in ids if not (isinstance(i, str) and _FEEDBACK_ID_RE.fullmatch(i))]
+    if bad:
+        return (
+            f"{field} contains invalid ids {bad!r} — expected recall-served ids "
+            'matching "e:N" (episode) or "n:N" (note)'
+        )
+    return None
+
+
+def _file_recall_feedback(
+    query: str,
+    helpful: list[str] | None,
+    noise: list[str] | None,
+    missing: str | None,
+    note: str | None,
+    session_id: str | None,
+    project: str | None,
+) -> dict:
+    """Validate + INSERT one recall_feedback row — shared by the MCP tool and
+    POST /feedback. Returns the tool-shaped result dict (never raises for bad
+    input; DB errors propagate to the caller's boundary)."""
+    from ingestion.db import Database
+
+    q = (query or "").strip()
+    if not q:
+        return {"status": "error", "detail": "missing 'query' — pass the recall query being rated"}
+    for field, ids in (("helpful", helpful), ("noise", noise)):
+        err = _feedback_ids_error(field, ids)
+        if err:
+            return {"status": "error", "detail": err}
+
+    db = Database(DB_URL)
+    try:
+        feedback_id = db.insert_recall_feedback(
+            query=q,
+            helpful=helpful or [],
+            noise=noise or [],
+            missing=missing,
+            note=note,
+            session_id=session_id,
+            project=project,
+        )
+    finally:
+        db.close()
+    return {"status": "ok", "feedback_id": feedback_id}
+
+
+@mcp.tool()
+def recall_feedback(
+    query: str,
+    helpful: list[str] | None = None,
+    noise: list[str] | None = None,
+    missing: str | None = None,
+    note: str | None = None,
+    session_id: str | None = None,
+    project: str | None = None,
+) -> dict:
+    """Report retrieval quality after a recall() whose results you used: which
+    served ids genuinely helped, which were noise, and what was missing.
+
+    AFTER acting on a recall's results — you answered from them, or found they
+    lacked what you needed — call this ONCE with that recall's query string.
+    `helpful` = served ids that were load-bearing for your answer; `noise` =
+    served ids that were irrelevant or distracting; `missing` = one line on
+    what you needed but were not served. Ids come from the recall response —
+    "e:N" episodes, "n:N" notes. A report with only `missing` set is still
+    valuable; file it when a recall came back empty-handed.
+
+    This is offline labeled data (eval goldens, reranker tuning). It never
+    changes live ranking, so honest negatives are safe and wanted.
+
+    Do NOT file more than one report per recall query, do NOT rate recalls
+    whose results you never used, and do NOT invent ids — report only ids the
+    recall actually served.
+
+    Args:
+        query: The recall query being rated, verbatim.
+        helpful: Served ids that were load-bearing ("e:123", "n:45").
+        noise: Served ids that were irrelevant or distracting.
+        missing: What you needed that the recall did not return.
+        note: Free-form idea for improving this retrieval.
+        session_id: Optional session id for grouping reports.
+        project: Optional project slug the recall was scoped to.
+    """
+    with logfire.span("mcp.recall_feedback {query!r}", query=query[:80], project=project):
+        return _file_recall_feedback(query, helpful, noise, missing, note, session_id, project)
+
+
 @mcp.custom_route("/ingest", methods=["POST"])
 async def ingest_turns(request: Request) -> JSONResponse:
     """Direct-push ingest endpoint — replaces the Logfire poll for Claude Code.
@@ -884,6 +994,48 @@ async def recall_http(request: Request) -> JSONResponse:
         logger.exception("http recall failed")
         return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
     return JSONResponse(out)
+
+
+@mcp.custom_route("/feedback", methods=["POST"])
+async def feedback_http(request: Request) -> JSONResponse:
+    """Plain-HTTP recall_feedback for non-MCP callers — the /recall sibling.
+
+    Hooks and the dashboard talk to /recall over plain HTTP (no MCP client), so
+    the labeled-feedback write needs the same seam or those callers could never
+    file a report. Same validation + insert as the recall_feedback tool
+    (_file_recall_feedback); same machine-token gate; fail-soft like /ingest.
+
+    Body: {"query": str, "helpful"?: [..], "noise"?: [..], "missing"?: str,
+           "note"?: str, "session_id"?: str, "project"?: str}.
+    """
+    if not _machine_authorized(request):
+        return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+
+    from starlette.concurrency import run_in_threadpool
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+
+    def _work() -> dict:
+        return _file_recall_feedback(
+            query=body.get("query") or "",
+            helpful=body.get("helpful"),
+            noise=body.get("noise"),
+            missing=body.get("missing"),
+            note=body.get("note"),
+            session_id=body.get("session_id"),
+            project=body.get("project"),
+        )
+
+    try:
+        with logfire.span("http.feedback"):
+            out = await run_in_threadpool(_work)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("http feedback failed")
+        return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
+    return JSONResponse(out, status_code=200 if out.get("status") == "ok" else 400)
 
 
 # Registered LAST and hidden from tools/list (_HiddenToolsList): infra plumbing,
