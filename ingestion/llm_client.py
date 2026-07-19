@@ -538,7 +538,19 @@ class _ErrorBodyStatusTransport(httpx.AsyncBaseTransport):
             # Real HTTP-ish codes keep their semantics (402 → usage limit,
             # 429/5xx → transient); anything else becomes a non-transient 400.
             status = code if isinstance(code, int) and 400 <= code < 600 else 400
-        return httpx.Response(status, headers=response.headers, content=body, request=request)
+        # ``aread()`` above returned the DECODED body. If the origin response
+        # was compressed, re-attaching its headers verbatim makes httpx decode
+        # the already-decompressed bytes a second time — every gzipped
+        # 200-wrapped error surfaced as ``DecodingError: incorrect header
+        # check`` → ``APIConnectionError`` instead of its real status (the
+        # 2026-07-18 "Connection error" storms during upstream 429 windows).
+        # Drop the stale encoding/length headers; httpx recomputes length.
+        headers = [
+            (k, v)
+            for k, v in response.headers.raw
+            if k.lower() not in (b"content-encoding", b"content-length")
+        ]
+        return httpx.Response(status, headers=headers, content=body, request=request)
 
 
 def _map_model_http_error(exc: PydanticAIModelHTTPError) -> Exception:

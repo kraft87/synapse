@@ -19,6 +19,7 @@ No network: every test uses ``httpx.MockTransport``.
 
 from __future__ import annotations
 
+import gzip
 import json
 from typing import Any
 from unittest.mock import patch
@@ -500,6 +501,51 @@ class TestHTTPErrors:
         client = _client_with(handler)
         with pytest.raises(UsageLimitError, match="Insufficient credits"):
             client.messages.create(messages=[{"role": "user", "content": "hi"}])
+
+    def test_200_wrapped_gzip_error_body_keeps_real_status(self):
+        """Compressed 200-wrapped errors must not double-decode.
+
+        The shim reads the DECODED body via ``aread()``; rebuilding the
+        response with the origin's ``content-encoding: gzip`` header made
+        httpx decompress a second time (``DecodingError: incorrect header
+        check``), so every gzipped error surfaced as ``APIConnectionError``
+        instead of its real status — the 2026-07-18 Connection-error storms.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = gzip.compress(
+                json.dumps(
+                    {"error": {"code": 402, "message": "Insufficient credits"}}
+                ).encode()
+            )
+            return httpx.Response(
+                200,
+                headers={
+                    "content-encoding": "gzip",
+                    "content-type": "application/json",
+                },
+                content=body,
+            )
+
+        client = _client_with(handler)
+        with pytest.raises(UsageLimitError, match="Insufficient credits"):
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+
+    def test_gzip_success_body_decodes_once(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = gzip.compress(json.dumps(_completion_body("ok")).encode())
+            return httpx.Response(
+                200,
+                headers={
+                    "content-encoding": "gzip",
+                    "content-type": "application/json",
+                },
+                content=body,
+            )
+
+        client = _client_with(handler)
+        resp = client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert resp.content[0].text == "ok"
 
     def test_empty_completion_raises_not_returns(self):
         def handler(request: httpx.Request) -> httpx.Response:
