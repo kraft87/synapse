@@ -72,3 +72,20 @@ def test_machine_authorized_constant_time_check(monkeypatch):
     assert s._machine_authorized(_Req({"authorization": "Bearer wrong"})) is False
     assert s._machine_authorized(_Req({"authorization": "tok"})) is False  # no Bearer prefix
     assert s._machine_authorized(_Req({})) is False  # no header
+
+
+def test_oauth_storage_persists_to_db_when_configured(monkeypatch):
+    # DB_URL + signing key => OAuth-proxy state lands in Postgres (survives container
+    # recreates), Fernet-wrapped so upstream tokens aren't plaintext in the served DB.
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    monkeypatch.setenv("SYNAPSE_DB_URL", "postgresql://u:p@127.0.0.1:5432/x")
+    s = _reload(monkeypatch, {"SYNAPSE_OAUTH_SIGNING_KEY": "k" * 32})
+    assert isinstance(s._oauth_client_storage(), FernetEncryptionWrapper)
+
+
+def test_oauth_storage_none_without_db_or_key(monkeypatch):
+    # Missing either => None => FastMCP's encrypted disk default (dev/stdio path).
+    monkeypatch.setenv("SYNAPSE_DB_URL", "")
+    s = _reload(monkeypatch, {"SYNAPSE_OAUTH_SIGNING_KEY": "k" * 32})
+    assert s._oauth_client_storage() is None

@@ -131,6 +131,43 @@ class _HiddenToolsList(Middleware):
         return [t for t in tools if t.name not in _HIDDEN_TOOLS]
 
 
+def _oauth_client_storage():
+    """Where the OAuth proxy keeps its state: DCR client registrations, upstream GitHub
+    tokens, and JTI mappings.
+
+    FastMCP's default is a FileTree store under ~/.local/share/fastmcp/oauth-proxy. In a
+    container with no volume that path is on the ephemeral layer, so every recreate
+    (watchtower redeploy, reboot) wipes it — the claude.ai connector's registered client
+    then vanishes and its next token refresh fails, forcing a full re-auth. Persist in
+    Postgres instead (the DB already survives on its own volume).
+
+    FastMCP only Fernet-wraps the state in its disk-default branch; a bare backend stores
+    the upstream GitHub tokens as plaintext. Since this is the same DB recall() serves, we
+    wrap it ourselves with a key deterministically derived from the signing key — matching
+    the default's encryption-at-rest. Returns None (=> FastMCP's encrypted disk default)
+    when there's no DB or signing key, e.g. dev/stdio.
+    """
+    if not (DB_URL and OAUTH_SIGNING_KEY):
+        return None
+    import base64
+    import hashlib
+
+    from cryptography.fernet import Fernet
+    from key_value.aio.stores.postgresql import PostgreSQLStore
+    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
+
+    # Deterministic 32-byte Fernet key from the (stable) signing key. Self-contained: it
+    # does not have to match FastMCP's internal derivation, only be stable across restarts
+    # so the same ciphertext decrypts after a redeploy.
+    fernet_key = base64.urlsafe_b64encode(
+        hashlib.sha256(f"synapse-oauth-store::{OAUTH_SIGNING_KEY}".encode()).digest()
+    )
+    store = PostgreSQLStore(url=DB_URL, table_name="oauth_proxy_kv")
+    return FernetEncryptionWrapper(
+        key_value=store, fernet=Fernet(fernet_key), raise_on_decryption_error=False
+    )
+
+
 def _build_auth():
     """(auth_provider, middleware). No machine token => open server (dev/stdio/pre-cutover)."""
     if not MACHINE_TOKEN:
@@ -147,6 +184,7 @@ def _build_auth():
         client_secret=GITHUB_CLIENT_SECRET,
         base_url=PUBLIC_URL,
         jwt_signing_key=OAUTH_SIGNING_KEY or None,
+        client_storage=_oauth_client_storage(),
         allowed_client_redirect_uris=[
             "https://claude.ai/api/mcp/auth_callback",
             "https://claude.com/api/mcp/auth_callback",
