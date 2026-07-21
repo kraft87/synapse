@@ -21,6 +21,10 @@ dependencies = [
     "datasketch>=1.6",
     "fastmcp>=3.4",
     "pydantic-ai-slim[openai]>=2.13.0",
+    # Postgres-backed OAuth-proxy state store (asyncpg). fastmcp already pulls
+    # py-key-value-aio; we add the postgresql extra so the OAuth state survives
+    # container recreates in Postgres instead of the ephemeral disk default.
+    "py-key-value-aio[postgresql]>=0.4.5",
 ]
 
 [project.optional-dependencies]
