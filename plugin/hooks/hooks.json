@@ -55,6 +55,18 @@
           }
         ]
       }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "mcp__plugin_synapse_synapse__recall$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
