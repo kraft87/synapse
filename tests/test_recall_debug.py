@@ -55,7 +55,9 @@ def _wire_stubs(r: Recall) -> None:
     r._search_preferences = lambda emb, g, n: []  # type: ignore[method-assign]
     r._rerank_pool_scored = lambda q, pool: [(i, 0.9 - 0.1 * i) for i in range(len(pool))]  # type: ignore[method-assign]
     r._fetch_history_pairs_pg = lambda g, uuids, cap: []  # type: ignore[method-assign]
-    # Force the full-episode fallback so no chunker/reranker runs in the passage stage.
+    # Stub compaction empty so no chunker/reranker runs in the passage stage. There's no
+    # full-episode fallback anymore, so the episode bucket is omitted — these tests assert
+    # on the debug envelope + est_tokens self-consistency, not on episode presence.
     r._compact_to_passages = lambda q, eps, n: []  # type: ignore[method-assign]
     r._surface_supersessions = lambda emb, g, served, cap=None: []  # type: ignore[method-assign]
     r._episode_supersessions = lambda ids, g, cap=6: {}  # type: ignore[method-assign]

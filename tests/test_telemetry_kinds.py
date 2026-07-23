@@ -81,7 +81,11 @@ def _wired(db_url: str, scores: list[float]) -> Recall:
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
-    r._compact_to_passages = lambda q, eps, n: []  # fall back to full-episode items
+    # Compaction serves compact passages of the top reranked eps; stub returns them
+    # directly (no more full-episode fallback — an empty return omits the bucket).
+    r._compact_to_passages = lambda q, eps, n: [
+        {"id": e["id"], "content": f"passage {e['id']}"} for e in eps[:n]
+    ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
     r._increment_retrieval_counts = lambda ids: None
     r._rerank_pool_scored = lambda q, pl: [(i, scores[i]) for i in range(min(len(scores), len(pl)))]
