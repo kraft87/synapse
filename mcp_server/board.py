@@ -66,13 +66,22 @@ _SECTION_TITLES = {
 def _banner_stats(db_url: str) -> tuple[int, list[str]]:
     """(total episodes, project names newest-activity first, capped at 12).
 
-    If count(*) ever gets slow at scale, switch to pg_class.reltuples (approximate
-    but O(1)); at current volumes the exact count is milliseconds.
+    The episode total comes from pg_class.reltuples (approximate but O(1)) rather
+    than count(*): at ~40K rows / 1.5GB the exact count degrades to ~650ms of
+    index-only scan on every session start, and a banner headline doesn't need the
+    precise figure. reltuples is -1 until the table's first ANALYZE/VACUUM (fresh
+    deploy, or a truncated test fixture), so fall back to an exact count while it's
+    unpopulated — which also keeps the exact-count board tests green.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
-        row = conn.execute("SELECT count(*) FROM episodes").fetchone()
-        n_episodes = int(row[0]) if row else 0
+        row = conn.execute(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'episodes'::regclass"
+        ).fetchone()
+        n_episodes = int(row[0]) if row and row[0] is not None else 0
+        if n_episodes <= 0:  # never analyzed (reltuples = -1) or genuinely empty
+            row = conn.execute("SELECT count(*) FROM episodes").fetchone()
+            n_episodes = int(row[0]) if row else 0
         # Unlabeled episodes (NULL — and '', defensively) are excluded in SQL so they
         # never consume one of the 12 LIMIT slots or inflate/deflate the project count.
         rows = conn.execute(
