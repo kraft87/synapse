@@ -1648,8 +1648,13 @@ class Recall:
         # (see _RECALL_BM25_FUSE). Skipped on the degraded path (rerank_top <= 0): the pool is
         # already RRF(bm25, vector) there, so re-fusing BM25 would double-count it.
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
+        n_bm25_lifted = 0  # telemetry: episodes fusion pulled INTO the src_k serving window
         if _RECALL_BM25_FUSE and rerank_top > 0.0:
+            pre_fuse = {e.get("id") for e in ranked_eps[:_RECALL_PASSAGE_SRC_K]}
             ranked_eps = self._fuse_bm25_order(ranked_eps)
+            n_bm25_lifted = len(
+                {e.get("id") for e in ranked_eps[:_RECALL_PASSAGE_SRC_K]} - pre_fuse
+            )
         # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
         # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
         # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
@@ -1800,6 +1805,7 @@ class Recall:
             ],
             "prefs": [p["id"] for p in prefs_items if p.get("id") is not None],
             "n_echo_suppressed": n_echo_suppressed,
+            "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
         }
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
