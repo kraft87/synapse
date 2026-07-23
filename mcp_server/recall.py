@@ -1302,7 +1302,7 @@ class Recall:
             rows = conn.execute(
                 """
                 SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
-                       o.fact AS old_fact
+                       o.uuid AS old_uid, o.fact AS old_fact
                 FROM kg_relationships a
                 JOIN kg_relationships o
                   ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
@@ -1324,7 +1324,17 @@ class Recall:
             r = by_uid.get(uid)
             if r is None:
                 continue
-            out.append({"fact": r["old_fact"], "superseded_by": r["now_fact"]})
+            # id is the invalidated (old) edge's uuid, "f:<uuid>" like a regular fact.
+            # Collision-free: the facts bucket serves the CURRENT edge (a.uuid), never
+            # the superseded predecessor (o.uuid, enforced <> a.uuid above). Lets the
+            # stale pair be cited in recall_feedback.
+            out.append(
+                {
+                    "id": f"f:{r['old_uid']}",
+                    "fact": r["old_fact"],
+                    "superseded_by": r["now_fact"],
+                }
+            )
             if len(out) >= cap:
                 break
         return out
