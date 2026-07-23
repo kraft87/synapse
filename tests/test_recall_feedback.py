@@ -59,6 +59,18 @@ def test_validator_accepts_all_bucket_id_forms():
     )
 
 
+def test_web_item_id_is_single_prefixed_and_ratable():
+    # Regression: web rows already carry the served "w:N" form (assigned at query
+    # time), so _to_web_recall_item must pass it through, not re-wrap it. A double
+    # prefix ("w:w:7") would fail the feedback validator, making web uncitable.
+    from mcp_server.recall import _to_web_recall_item
+
+    assert _to_web_recall_item({"id": "w:7"})["id"] == "w:7"  # already prefixed
+    assert _to_web_recall_item({"id": 7})["id"] == "w:7"  # bare id, defensively
+    # and the surfaced id round-trips through the recall_feedback validator
+    assert _feedback_ids_error("helpful", [_to_web_recall_item({"id": "w:7"})["id"]]) is None
+
+
 @pytest.mark.parametrize(
     "bad",
     [

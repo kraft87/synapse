@@ -331,7 +331,10 @@ def _to_web_recall_item(row: dict[str, Any]) -> dict[str, Any]:
     """
     out: dict[str, Any] = {}
     if (rid := row.get("id")) is not None:
-        out["id"] = f"w:{rid}"  # web chunk id — cite in recall_feedback (not fetch())
+        # Web rows already carry the served "w:N" form (assigned at query time,
+        # _search_web) — pass it through; re-wrapping would double the prefix to
+        # "w:w:N" and fail recall_feedback's validator. Guard covers a bare id too.
+        out["id"] = str(rid) if str(rid).startswith("w:") else f"w:{rid}"
     context = (row.get("context_prefix") or "").strip()
     if context:
         out["context"] = context
