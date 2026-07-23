@@ -252,11 +252,15 @@ _RECALL_EPISODE_LIMIT = 5  # direct episode turns served by recall()
 # ~5000 for full episodes; scripts/passage_bench_v*, 2026-06-26). recall_episodes() (drill-down) stays
 # on FULL episodes. Passages are picked by a SECOND cross-encoder rerank over the markdown chunks of
 # the top _RECALL_PASSAGE_SRC_K episodes. The bench's hybrid->rerank cascade collapses to a DIRECT
-# rerank here because the chunk count is bounded (~10-40 from 10 episodes) and a direct rerank IS that
-# cascade's quality ceiling — and rerank-only (no live passage embedding) keeps the second pass ~0.2s,
-# not the ~2.2s a cosine leg would add.
+# rerank here because the chunk count is bounded (~20-80 from 20 episodes, capped at
+# _RECALL_PASSAGE_CAND) and a direct rerank IS that cascade's quality ceiling — and rerank-only
+# (no live passage embedding) keeps the second pass ~0.2s, not the ~2.2s a cosine leg would add.
 _RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "3") or "3")  # passages served
-_RECALL_PASSAGE_SRC_K = 10  # top reranked episodes to mine passages from
+# 10→20 (2026-07-23): a funnel decomposition on the _seglen golden found the answer episode is
+# in the RRF pool 92% of the time but the reranker ranks ~11% of answers at position 11-20 — just
+# outside the mining window. Mining the top 20 recovers them: served answer-recall 0.583→0.667,
+# no full-episode/token cost (still serves _RECALL_PASSAGE_N passages, capped at _RECALL_PASSAGE_CAND).
+_RECALL_PASSAGE_SRC_K = 20  # top reranked episodes to mine passages from
 _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds the extra call)
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
