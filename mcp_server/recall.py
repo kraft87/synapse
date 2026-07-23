@@ -759,8 +759,11 @@ class Recall:
         # columns (source_ids, sequence ranges, synth_type) are dropped — caller
         # never sees them, so don't waste DB→Python wire bytes.
         # retrieval_count IS kept for episodes because _feedback_multiplier reads it.
+        # session_id IS kept for episodes because the passage serve-cap reads it to break
+        # self/recency domination (one session monopolising the served bucket). It is still
+        # dropped from the caller-facing item by _to_recall_item — internal ranking use only.
         if table == "episodes":
-            return ", retrieval_count"
+            return ", retrieval_count, session_id"
         if table == "chunks":
             return ", episode_ids"  # chunk = retrieval signal; serve its episodes
         return ""
@@ -1073,6 +1076,15 @@ class Recall:
         # connective context that makes fragments summable). Both 0/off by default.
         _quota = int(os.environ.get("SYNAPSE_PASSAGE_QUOTA", "0") or "0")
         _window = int(os.environ.get("SYNAPSE_PASSAGE_WINDOW", "0") or "0")
+        # Session-diversity cap on the SERVED passages: at most _sess_cap of the n served may
+        # share a session_id. Fixes self/recency domination — the live session's freshly ingested
+        # turns are topically dense AND the recency leg boosts them, so uncapped all n served come
+        # from the current session, crowding out older real history (the top recall_feedback noise
+        # driver, measured 2026-07-23). Backfills from lower-ranked passages so a genuinely
+        # single-session result still serves n — the cap trims domination, never costs recall.
+        # ON by default (=2); disable with SYNAPSE_RECALL_SESSION_CAP=0.
+        _sess_cap = int(os.environ.get("SYNAPSE_RECALL_SESSION_CAP", "2") or "2")
+        _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
         else:
@@ -1080,21 +1092,37 @@ class Recall:
             if reranker is None:  # rerank disabled — no selection signal, serve full episodes
                 return []
             try:
-                scored = reranker.rerank_scored(query, passages, top_k=None if _quota else n)
+                scored = reranker.rerank_scored(query, passages, top_k=None if _capped else n)
             except Exception as e:
                 logger.warning("Passage rerank failed, serving full episodes: %s", e)
                 return []
-            if _quota:
-                per: dict[int, int] = {}
+            if _capped:
+                per_ep: dict[int, int] = {}
+                per_sess: dict[Any, int] = {}
                 chosen = []
                 for i, _s in scored:
-                    k = id(owner[i])
-                    if per.get(k, 0) >= _quota:
+                    ep = owner[i]
+                    if _quota and per_ep.get(id(ep), 0) >= _quota:
                         continue
-                    per[k] = per.get(k, 0) + 1
+                    sid = ep.get("session_id")
+                    if _sess_cap and sid is not None and per_sess.get(sid, 0) >= _sess_cap:
+                        continue
+                    per_ep[id(ep)] = per_ep.get(id(ep), 0) + 1
+                    if sid is not None:
+                        per_sess[sid] = per_sess.get(sid, 0) + 1
                     chosen.append(i)
                     if len(chosen) >= n:
                         break
+                # Backfill: caps starved us below n (pool is genuinely one session / one episode) —
+                # relax and take the next-best passages in score order so diversity-trimming never
+                # reduces the served count when nothing more diverse exists to serve.
+                if len(chosen) < n:
+                    seen = set(chosen)
+                    for i, _s in scored:
+                        if i not in seen:
+                            chosen.append(i)
+                            if len(chosen) >= n:
+                                break
             else:
                 chosen = [i for i, _ in scored[:n]]
         out: list[dict[str, Any]] = []
