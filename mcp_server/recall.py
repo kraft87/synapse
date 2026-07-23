@@ -1618,9 +1618,13 @@ class Recall:
         )
         if n_echo_suppressed:
             ranked_eps = [ranked_eps[i] for i in keep]
-        episodes_served = ranked_eps[:_RECALL_EPISODE_LIMIT]
-        # Stage 2: serve compact passages of the top reranked episodes instead of whole turns.
-        # Falls back to full episodes if compaction yields nothing. Drill-down stays full.
+        # Stage 2: serve compact passages of the top reranked episodes instead of whole
+        # turns. NO fallback: compaction yielding nothing means no passage cleared the
+        # bar — LOW relevance — and low relevance must cost FEWER tokens, not more. The
+        # old fallback dumped whole turns here, so a no-match query circular-matched the
+        # current session's own freshly-ingested turns and blew est_tokens up to ~25k.
+        # When compaction is empty the bucket is simply omitted (empty container); the
+        # drill-down paths (recall_episodes / fetch) still return full turns on demand.
         ep_items: list[dict[str, Any]] | None = None
         if ranked_eps:
             ep_items = (
@@ -1629,8 +1633,6 @@ class Recall:
                 )
                 or None
             )
-        if ep_items is None and episodes_served:
-            ep_items = [_to_recall_item(r) for r in episodes_served]
         # Web bucket: vector-only, dedupe by parent page. BM25 over this corpus produces
         # cross-domain token collisions; the bi-encoder captures topic over surface tokens.
         web_chunks = self._dedupe_by_artifact(vec_web, _WEB_LIMIT)

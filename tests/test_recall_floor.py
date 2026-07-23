@@ -66,7 +66,13 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
-    r._compact_to_passages = lambda q, eps, n: []  # fall back to full-episode items
+    # Compaction serves compact passages of the top reranked eps (the real path mines
+    # them from chunks). Stub returns them directly so the payload-invariance tests run
+    # against a non-empty episode bucket; the empty-return case is exercised explicitly
+    # by test_recall_no_passages_yields_empty_episode_bucket.
+    r._compact_to_passages = lambda q, eps, n: [
+        {"id": e["id"], "content": f"passage {e['id']}"} for e in eps[:n]
+    ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
     r._increment_retrieval_counts = lambda ids: None
     r._rerank_pool_scored = lambda q, pl: [(i, scores[i]) for i in range(min(len(scores), len(pl)))]
@@ -123,6 +129,20 @@ def test_recall_below_floor_marks_envelope(monkeypatch):
     assert m["rerank_top_score"] == 0.31
     assert m["served_ids"]["would_abstain"] is True
     assert m["served_ids"]["floor"] == 0.58
+
+
+def test_recall_no_passages_yields_empty_episode_bucket(monkeypatch):
+    # New contract (2026-07-23): when passage compaction yields nothing, recall() does
+    # NOT fall back to full episodes. Compaction-empty means no passage cleared the bar
+    # (low relevance), and low relevance must cost FEWER tokens, not a full-turn dump —
+    # so the episode bucket is omitted (empty container). Drill-down still returns full.
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+    r, captured = _wired([0.31, 0.22, 0.11, 0.05])
+    r._compact_to_passages = lambda q, eps, n: []  # no passage clears the bar
+    out = r.recall("q")
+    assert "episodes" not in out  # empty container, NOT a full-episode fallback dump
+    assert captured[0]["served_ids"]["episodes"] == []  # telemetry agrees: nothing served
+    assert captured[0]["served_ids"]["would_abstain"] is True  # shadow marker still fires
 
 
 def test_recall_payload_identical_with_and_without_floor(monkeypatch):
