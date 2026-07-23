@@ -396,11 +396,10 @@ def recall(
     state of X", weight newer user-stated content over older assistant-role text,
     which may be speculation or a plan that never happened.
 
-    Most served items carry an `id` (e:N episode, n:N note, f:<uuid> fact — also
+    Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact — also
     the superseded_facts pairs, t:N timeline, w:N web, p:N preference) — copy it
     into recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
-    rest are feedback-only. The `entities` bucket is the exception: name-keyed
-    side summaries, not individually rated, so they carry no id.
+    rest are feedback-only.
 
     Follow-ups: fetch(ids) expands a truncated passage or note body;
     recall_timeline() answers when-did / how-long; recall_episodes() returns raw
@@ -764,8 +763,7 @@ def recall_episodes(
 # boost, no retrieval_count bump, nothing feeds _merge_rrf. The rows are goldens
 # for offline eval + reranker tuning, so the id validation is strict: downstream
 # tooling must be able to trust the served id forms without re-parsing. Every recall
-# bucket EXCEPT entities (name-keyed side summaries) carries an id, so all but that
-# one are ratable:
+# bucket carries an id, so all are ratable:
 #   e:N episode  n:N note  f:<uuid> fact  t:N timeline  w:N web  p:N preference
 # The numeric kinds share one shape; facts (and superseded_facts) carry the KG edge uuid.
 
@@ -847,11 +845,10 @@ def recall_feedback(
     lacked what you needed — call this ONCE with that recall's query string.
     `helpful` = served ids that were load-bearing for your answer; `noise` =
     served ids that were irrelevant or distracting; `missing` = one line on
-    what you needed but were not served. Nearly every recall bucket carries an
-    `id` you can copy here verbatim — "e:N" episodes, "n:N" notes, "f:<uuid>"
-    facts (and superseded_facts), "t:N" timeline, "w:N" web, "p:N" preferences;
-    only the entities bucket has none. A report with only `missing` set is still
-    valuable; file it when a recall came back empty-handed.
+    what you needed but were not served. Every recall bucket carries an `id` you
+    can copy here verbatim — "e:N" episodes, "n:N" notes, "f:<uuid>" facts (and
+    superseded_facts), "t:N" timeline, "w:N" web, "p:N" preferences. A report with
+    only `missing` set is still valuable; file it when a recall came back empty-handed.
 
     This is offline labeled data (eval goldens, reranker tuning). It never
     changes live ranking, so honest negatives are safe and wanted.

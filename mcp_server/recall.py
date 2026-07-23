@@ -1582,7 +1582,7 @@ class Recall:
         vec_eps, ms_vec = f_vec.result() if f_vec is not None else ([], 0.0)
         ep_pool = _merge_rrf(bm25_eps, vec_eps, id_key="id")[:_EPISODE_RERANK_POOL]
         vec_web, ms_web = f_web.result()
-        (kg_results, seed_entities), ms_kg = f_kg.result()
+        (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
 
         facts_internal = kg_results[:_FACT_LIMIT]  # carry _uuid for bump + superseded pairs
         # Feedback loop: bump retrieval_count on every surfaced edge so frequent hits
@@ -1673,24 +1673,17 @@ class Recall:
             if sup:
                 _apply_supersessions(ep_items, sup, {f["fact"] for f in facts})
 
-        # Entity bucket: top-N seed entities with non-trivial summaries.
-        # Skip when summary is missing or just echoes the entity name.
-        entities_bucket: list[dict[str, Any]] = []
-        for s in seed_entities[:_ENTITY_LIMIT]:
-            summary = (s.get("summary") or "").strip()
-            name = (s.get("name") or "").strip()
-            if not summary or summary.lower() == name.lower():
-                continue
-            entities_bucket.append({"name": name, "summary": summary})
-
+        # Entity DISPLAY bucket retired 2026-07-23: seed entities are name-keyed
+        # side summaries (often just filenames), uninstrumented and uncitable, and
+        # only ever displayed — the KG leg already consumed them internally to seed
+        # fact retrieval before returning. Dropping the display costs no recall
+        # quality and reclaims the tokens. seed_entities is now unused (see above).
         out: dict[str, Any] = {
             "query": query,
             "facts": facts,  # slim {fact: ...}
         }
         if ep_items:
             out["episodes"] = ep_items
-        if entities_bucket:
-            out["entities"] = entities_bucket  # {name, summary}
         if web_chunks:
             out["web"] = [_to_web_recall_item(r) for r in web_chunks]
         if superseded_facts:
@@ -1778,7 +1771,6 @@ class Recall:
             "ms_rerank": round(ms_rerank, 1),
             "n_facts": len(facts),
             "n_episodes": len(out.get("episodes", [])),
-            "n_entities": len(entities_bucket),
             "n_web": len(web_chunks),
             "n_history": len(superseded_facts),
             "n_timeline": len(out.get("timeline", [])),
