@@ -262,6 +262,15 @@ _RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "3") or "3")  # pa
 # no full-episode/token cost (still serves _RECALL_PASSAGE_N passages, capped at _RECALL_PASSAGE_CAND).
 _RECALL_PASSAGE_SRC_K = 20  # top reranked episodes to mine passages from
 _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds the extra call)
+# Lexical-fusion of the FINAL episode order. The web-search-trained cross-encoder systematically
+# under-ranks answer episodes that are exact lexical matches (query keyword/entity verbatim in the
+# turn) — measured 2026-07-23 as ~31% of pooled answers stuck at rank 21-50. BM25 nails those, so
+# RRF-fusing the rerank order with the pool's BM25 order for the SERVING order recovers them:
+# answer-episode hit@10 0.636->0.909 (exact-fact golden) / 0.762->0.905 (natural), no regression,
+# and it is BM25 specifically (rerank+vector was WORSE — vector shares the reranker's semantic bias).
+# Reorders ranked_eps only; the rerank call, rerank_top telemetry, and the abstention floor are all
+# untouched. Off with SYNAPSE_RECALL_BM25_FUSE=0.
+_RECALL_BM25_FUSE = os.getenv("SYNAPSE_RECALL_BM25_FUSE", "1") != "0"
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
@@ -1117,6 +1126,27 @@ class Recall:
             out.append(item)
         return out
 
+    @staticmethod
+    def _fuse_bm25_order(ranked_eps: list[dict[str, Any]], k: int = 60) -> list[dict[str, Any]]:
+        """RRF-fuse the rerank order of ``ranked_eps`` with the pool's BM25 order.
+
+        The web-trained cross-encoder under-ranks exact lexical matches; BM25 (already scored on
+        the pool items as ``bm25_score``) ranks them high. Reciprocal-rank-fuse the two orders
+        (k=60) so a strong lexical hit the reranker buried is lifted back into the served window.
+        Only episodes that were BM25 hits (carry a ``bm25_score``) contribute a lexical term —
+        vector-only episodes keep their rerank position. Validated 2026-07-23; see _RECALL_BM25_FUSE."""
+        if len(ranked_eps) < 2:
+            return ranked_eps
+        fused: dict[int, float] = {i: 1.0 / (k + i + 1) for i in range(len(ranked_eps))}
+        bm = sorted(
+            (i for i, e in enumerate(ranked_eps) if e.get("bm25_score") is not None),
+            key=lambda i: ranked_eps[i]["bm25_score"],
+            reverse=True,
+        )
+        for pos, i in enumerate(bm):
+            fused[i] += 1.0 / (k + pos + 1)
+        return [ranked_eps[i] for i in sorted(fused, key=lambda i: fused[i], reverse=True)]
+
     def _select_episodes(
         self, query: str, pool: list[dict[str, Any]], limit: int
     ) -> tuple[list[dict[str, Any]], int, float]:
@@ -1614,8 +1644,12 @@ class Recall:
         scored = self._apply_rerank_recency(scored, ep_pool)
         ranked = [ep_pool[i] for i, _ in scored]
 
-        # Episodes: pure rerank order (matches recall_episodes / the measured swap).
+        # Episodes: rerank order, then RRF-fused with the pool's BM25 order for lexical recovery
+        # (see _RECALL_BM25_FUSE). Skipped on the degraded path (rerank_top <= 0): the pool is
+        # already RRF(bm25, vector) there, so re-fusing BM25 would double-count it.
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
+        if _RECALL_BM25_FUSE and rerank_top > 0.0:
+            ranked_eps = self._fuse_bm25_order(ranked_eps)
         # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
         # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
         # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
