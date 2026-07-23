@@ -136,10 +136,18 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
     assert n_eps == len(out["episodes"]) and chars > 0 and est_tokens == chars // 4
     # served_ids envelope contract: per-bucket serve lists + the echo counter. Above the
     # floor there is no shadow marker — the key set is exactly this.
-    assert set(served) == {"episodes", "facts", "timeline", "prefs", "n_echo_suppressed"}
+    assert set(served) == {
+        "episodes",
+        "facts",
+        "timeline",
+        "prefs",
+        "n_echo_suppressed",
+        "n_bm25_lifted",
+    }
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
     assert served["facts"] == [] and served["timeline"] == [] and served["prefs"] == []
     assert served["n_echo_suppressed"] == 0
+    assert served["n_bm25_lifted"] == 0  # stub pool has no bm25_score -> fusion is a no-op
 
 
 # ---------------------------------------------------------------------------
