@@ -396,6 +396,10 @@ def recall(
     state of X", weight newer user-stated content over older assistant-role text,
     which may be speculation or a plan that never happened.
 
+    Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact,
+    t:N timeline, w:N web, p:N preference) — copy it into recall_feedback to rate
+    that result. Only e:/n: ids are fetch()-able; the rest are feedback-only.
+
     Follow-ups: fetch(ids) expands a truncated passage or note body;
     recall_timeline() answers when-did / how-long; recall_episodes() returns raw
     turn text.
@@ -757,25 +761,30 @@ def recall_episodes(
 # One row per rated recall. Deliberately NOT wired into live scoring — no ranking
 # boost, no retrieval_count bump, nothing feeds _merge_rrf. The rows are goldens
 # for offline eval + reranker tuning, so the id validation is strict: downstream
-# tooling must be able to trust "e:N"/"n:N" without re-parsing.
+# tooling must be able to trust the served id forms without re-parsing. Every recall
+# bucket now carries an id, so all of them are ratable:
+#   e:N episode  n:N note  f:<uuid> fact  t:N timeline  w:N web  p:N preference
+# The numeric kinds share one shape; facts carry the KG edge uuid.
 
-_FEEDBACK_ID_RE = re.compile(r"^[en]:\d+$")
+_FEEDBACK_ID_RE = re.compile(r"^(?:[enptw]:\d+|f:[0-9a-fA-F-]{8,})$")
 
 
 def _feedback_ids_error(field: str, ids: list[str] | None) -> str | None:
     """Validation error for recall_feedback's helpful/noise lists, or None if valid.
 
-    Accepts None or a list of served-id strings — "e:N" (episode) / "n:N" (note),
-    exactly as recall() serves them. Anything else is rejected."""
+    Accepts None or a list of served-id strings — "e:N" episode, "n:N" note,
+    "f:<uuid>" fact, "t:N" timeline, "w:N" web, "p:N" preference — exactly as
+    recall() serves them. Anything else is rejected."""
     if ids is None:
         return None
     if not isinstance(ids, list):
-        return f"{field} must be a list of served ids like ['e:123', 'n:45']"
+        return f"{field} must be a list of served ids like ['e:123', 'f:<uuid>']"
     bad = [i for i in ids if not (isinstance(i, str) and _FEEDBACK_ID_RE.fullmatch(i))]
     if bad:
         return (
-            f"{field} contains invalid ids {bad!r} — expected recall-served ids "
-            'matching "e:N" (episode) or "n:N" (note)'
+            f"{field} contains invalid ids {bad!r} — expected recall-served ids: "
+            '"e:N" episode, "n:N" note, "f:<uuid>" fact, "t:N" timeline, '
+            '"w:N" web, "p:N" preference'
         )
     return None
 
@@ -835,9 +844,10 @@ def recall_feedback(
     lacked what you needed — call this ONCE with that recall's query string.
     `helpful` = served ids that were load-bearing for your answer; `noise` =
     served ids that were irrelevant or distracting; `missing` = one line on
-    what you needed but were not served. Ids come from the recall response —
-    "e:N" episodes, "n:N" notes. A report with only `missing` set is still
-    valuable; file it when a recall came back empty-handed.
+    what you needed but were not served. Every recall bucket carries an `id` you
+    can copy here verbatim — "e:N" episodes, "n:N" notes, "f:<uuid>" facts,
+    "t:N" timeline, "w:N" web, "p:N" preferences. A report with only `missing`
+    set is still valuable; file it when a recall came back empty-handed.
 
     This is offline labeled data (eval goldens, reranker tuning). It never
     changes live ranking, so honest negatives are safe and wanted.
@@ -848,7 +858,7 @@ def recall_feedback(
 
     Args:
         query: The recall query being rated, verbatim.
-        helpful: Served ids that were load-bearing ("e:123", "n:45").
+        helpful: Served ids that were load-bearing ("e:123", "f:<uuid>", "w:7").
         noise: Served ids that were irrelevant or distracting.
         missing: What you needed that the recall did not return.
         note: Free-form idea for improving this retrieval.

@@ -330,6 +330,8 @@ def _to_web_recall_item(row: dict[str, Any]) -> dict[str, Any]:
     haven't been contextualized yet.
     """
     out: dict[str, Any] = {}
+    if (rid := row.get("id")) is not None:
+        out["id"] = f"w:{rid}"  # web chunk id — cite in recall_feedback (not fetch())
     context = (row.get("context_prefix") or "").strip()
     if context:
         out["context"] = context
@@ -1620,7 +1622,8 @@ class Recall:
         # cross-domain token collisions; the bi-encoder captures topic over surface tokens.
         web_chunks = self._dedupe_by_artifact(vec_web, _WEB_LIMIT)
 
-        # Strip internal _uuid before exposing facts to caller (slim contract).
+        # Surface the internal _uuid to the caller as a "f:<uuid>" id (below) so facts
+        # are citable in recall_feedback, same as episodes carry "e:N".
         # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
         # default (adds one rerank of the served facts), so this is a no-op until enabled.
@@ -1639,6 +1642,8 @@ class Recall:
         facts: list[dict[str, Any]] = []
         for f in served_facts:
             item: dict[str, Any] = {"fact": f["fact"]}
+            if (uid := f.get("_uuid")) is not None:
+                item["id"] = f"f:{uid}"  # KG edge uuid — cite in recall_feedback (not fetch())
             if (d := f.get("_date")) is not None:
                 item["date"] = str(d)[:10]
             facts.append(item)
@@ -1689,16 +1694,20 @@ class Recall:
         if timeline_items:
             # Slim chronological bucket: date + fact (+type/salience). The dates make
             # interval questions answerable AND auditable (anchor events, never a bare N).
-            out["timeline"] = [
-                {
+            tl: list[dict[str, Any]] = []
+            for t in timeline_items:
+                if t.get("kind", "event") != "event":
+                    continue
+                item = {
                     "date": str(t.get("t_valid"))[:10],
                     "fact": t.get("fact"),
                     "type": t.get("event_type"),
                     "salience": t.get("salience"),
                 }
-                for t in timeline_items
-                if t.get("kind", "event") == "event"
-            ]
+                if (tid := t.get("_id")) is not None:
+                    item = {"id": f"t:{tid}", **item}  # cite in recall_feedback (not fetch())
+                tl.append(item)
+            out["timeline"] = tl
 
         prefs_items: list[dict[str, Any]] = []
         ms_prefs = 0.0
@@ -1712,6 +1721,7 @@ class Recall:
             # reader can weight a long-standing, oft-repeated preference over a one-off.
             out["preferences"] = [
                 {
+                    **({"id": f"p:{p['id']}"} if p.get("id") is not None else {}),
                     "pref": p.get("pref"),
                     "polarity": p.get("polarity"),
                     "since": p.get("since"),

@@ -41,6 +41,24 @@ def test_validator_accepts_none_empty_and_served_forms():
     assert _feedback_ids_error("helpful", ["e:1", "n:45", "e:227168"]) is None
 
 
+def test_validator_accepts_all_bucket_id_forms():
+    # Every recall bucket now carries an id; all forms are ratable.
+    assert (
+        _feedback_ids_error(
+            "helpful",
+            [
+                "e:1",  # episode
+                "n:45",  # note
+                "t:9",  # timeline
+                "w:7",  # web
+                "p:3",  # preference
+                "f:0b3c1d2e-4f56-7890-abcd-ef0123456789",  # fact (KG edge uuid)
+            ],
+        )
+        is None
+    )
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -53,6 +71,10 @@ def test_validator_accepts_none_empty_and_served_forms():
         ["n:"],  # empty numeric part
         ["e:1\n"],  # fullmatch, not match — trailing newline rejected
         [123],  # non-string entries rejected, not coerced
+        ["f:1"],  # fact id is a uuid, not an int
+        ["f:short"],  # non-hex / too-short uuid rejected
+        ["t:abc"],  # timeline id must be numeric
+        ["g:1"],  # unknown numeric kind
     ],
 )
 def test_validator_rejects_malformed_ids(bad):

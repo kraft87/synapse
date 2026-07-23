@@ -4,8 +4,9 @@
 -- MCP tool (or POST /feedback): which served ids were load-bearing (`helpful`),
 -- which were irrelevant or distracting (`noise`), what the caller needed but was
 -- never served (`missing`), plus a free-form improvement idea (`note`). The id
--- arrays hold the served forms "e:N" (episode) / "n:N" (note), validated at the
--- tool boundary so eval tooling can trust them without re-parsing.
+-- arrays hold the served forms — "e:N" episode, "n:N" note, "f:<uuid>" fact,
+-- "t:N" timeline, "w:N" web, "p:N" preference — validated at the tool boundary
+-- so eval tooling can trust them without re-parsing.
 --
 -- OFFLINE labeled data only — eval goldens and reranker tuning. Deliberately NOT
 -- wired into live scoring: no ranking boost, no retrieval_count bump (that stays
