@@ -12,6 +12,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from ingestion.kg_client import KGClient, rrf_merge
+from tests.helpers.kg import make_edge_row
 
 
 class TestRRFMerge:
@@ -67,20 +68,10 @@ def _client_with_mock_writer() -> tuple[KGClient, MagicMock]:
 
 class TestCreateEdgesBatch:
     def _row(self, uuid: str, **over):
-        base = {
-            "src": "s",
-            "tgt": "t",
-            "edge_uuid": uuid,
-            "name": "USES",
-            "fact": f"fact {uuid}",
-            "episodes": [1],
-            "created_at": "2026-06-01T00:00:00+00:00",
-            "t_created": "2026-06-01T00:00:00+00:00",
-            "valid_at": "2026-06-01T00:00:00+00:00",
-            "t_valid": "2026-06-01T00:00:00+00:00",
-        }
-        base.update(over)
-        return base
+        # Batch path: src/tgt "s"/"t", single episode, no embedding column.
+        return make_edge_row(
+            uuid, src="s", tgt="t", fact=f"fact {uuid}", episodes=[1], drop=("emb",), **over
+        )
 
     def test_returns_uuids_in_input_order(self):
         client, writer = _client_with_mock_writer()

@@ -14,15 +14,8 @@ from __future__ import annotations
 import pytest
 
 from ingestion.kg_pg_write import KGPostgresWriter, _ts, _vec
-
-GROUP = "technical"
-DIM = 2048
-
-
-def _axis_list(i: int) -> list[float]:
-    v = [0.0] * DIM
-    v[i] = 1.0
-    return v
+from tests.helpers.embed import GROUP
+from tests.helpers.kg import _axis_list, make_edge_row
 
 
 @pytest.fixture()
@@ -135,21 +128,8 @@ class TestUpsertNode:
 
 class TestCreateEdges:
     def _row(self, uuid: str, **over):
-        base = {
-            "src": "e-s",
-            "tgt": "e-t",
-            "edge_uuid": uuid,
-            "name": "USES",
-            "fact": f"fact for {uuid}",
-            "episodes": [1, 2],
-            "created_at": "2026-06-01T00:00:00+00:00",
-            "t_created": "2026-06-01T00:00:00+00:00",
-            "valid_at": "2026-06-01T00:00:00+00:00",
-            "t_valid": "2026-06-01T00:00:00+00:00",
-            "emb": _axis_list(0),
-        }
-        base.update(over)
-        return base
+        # Create path uses the full row contract verbatim (incl. emb).
+        return make_edge_row(uuid, **over)
 
     def test_nul_bytes_stripped_from_fact(self, kg_writer, conn):
         kg_writer.create_edges([self._row("r-nul", fact="a\x00fact")], GROUP)
@@ -270,18 +250,9 @@ class TestInvalidateEdges:
 
 class TestReinforceEdges:
     def _row(self, uuid: str, **over):
-        base = {
-            "src": "e-s",
-            "tgt": "e-t",
-            "edge_uuid": uuid,
-            "name": "USES",
-            "fact": f"fact for {uuid}",
-            "episodes": [1, 2],
-            "created_at": "2026-06-01T00:00:00+00:00",
-            "valid_at": "2026-06-01T00:00:00+00:00",
-        }
-        base.update(over)
-        return base
+        # Reinforce path carries only src/tgt/fact/episodes + created_at/valid_at;
+        # it drops the create-time embedding and the t_created/t_valid columns.
+        return make_edge_row(uuid, drop=("t_created", "t_valid", "emb"), **over)
 
     def test_bumps_count_and_unions_episodes(self, kg_writer, conn):
         kg_writer.create_edges([self._row("r-1")], GROUP)  # episodes [1,2], mention_count default 1

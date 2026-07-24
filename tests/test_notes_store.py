@@ -27,19 +27,8 @@ except Exception:  # pragma: no cover - environment dependent
 
 import ingestion.notes as notes_mod  # noqa: E402
 from ingestion.db import Database  # noqa: E402
-from ingestion.embedding import embed_dims  # noqa: E402
 from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-
-_DIMS = embed_dims()
-GROUP = "technical"
-
-
-def _vec(slot: int) -> list[float]:
-    """A one-hot unit vector: identical slots -> cosine sim 1, distinct -> 0.
-    Lets the KNN ordering be asserted deterministically without a real embedder."""
-    v = [0.0] * _DIMS
-    v[slot % _DIMS] = 1.0
-    return v
+from tests.helpers.embed import GROUP, onehot  # noqa: E402
 
 
 def _wipe(conn):
@@ -51,7 +40,7 @@ def _insert(db, *, type="user", hook="User prefers X", body="Body.", slot=1, **k
         "owner_id": _OWNER,
         "group_id": GROUP,
         "project": None,
-        "embedding": _vec(slot),
+        "embedding": onehot(slot),
         "embed_model": "test",
         "source_ref": None,
     }
@@ -69,7 +58,7 @@ def test_insert_and_cosine_knn(conn, db_url):
     db = Database(db_url)
     a = _insert(db, hook="User prefers bullet lists", slot=1, source_ref="ep:1")
     _insert(db, hook="User dislikes em-dashes", slot=2, source_ref="ep:2")
-    hits = db.find_live_notes(_OWNER, GROUP, _vec(1), limit=5)
+    hits = db.find_live_notes(_OWNER, GROUP, onehot(1), limit=5)
     assert hits[0]["id"] == a
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-3)
@@ -83,14 +72,14 @@ def test_update_refreshes_hook_body_and_updated_at(conn, db_url):
     db = Database(db_url)
     nid = _insert(db, hook="Old hook", body="Old body.", slot=3)
     before = conn.execute("SELECT updated_at FROM notes WHERE id = %s", (nid,)).fetchone()[0]
-    db.update_note(nid, hook="New hook", body="New body.", embedding=_vec(4), embed_model="test2")
+    db.update_note(nid, hook="New hook", body="New body.", embedding=onehot(4), embed_model="test2")
     row = conn.execute(
         "SELECT hook, body, embed_model, updated_at FROM notes WHERE id = %s", (nid,)
     ).fetchone()
     assert row[0] == "New hook" and row[1] == "New body." and row[2] == "test2"
     assert row[3] > before
     # The refreshed embedding moved the note to slot 4 in KNN space.
-    hits = db.find_live_notes(_OWNER, GROUP, _vec(4), limit=1)
+    hits = db.find_live_notes(_OWNER, GROUP, onehot(4), limit=1)
     assert hits[0]["id"] == nid and hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     db.close()
     _wipe(conn)
@@ -104,7 +93,7 @@ def test_supersede_retires_old_and_links_lineage(conn, db_url):
     db.supersede_note(old, new)
     row = conn.execute("SELECT superseded_by FROM notes WHERE id = %s", (old,)).fetchone()
     assert row[0] == new  # lineage FK points at the replacement
-    live_ids = {h["id"] for h in db.find_live_notes(_OWNER, GROUP, _vec(5), limit=5)}
+    live_ids = {h["id"] for h in db.find_live_notes(_OWNER, GROUP, onehot(5), limit=5)}
     assert new in live_ids and old not in live_ids
     db.close()
     _wipe(conn)
@@ -125,7 +114,7 @@ def test_group_and_owner_scoping(conn, db_url):
     mine = _insert(db, hook="Mine, technical", slot=6)
     _insert(db, hook="Mine, personal", group_id="personal", slot=6)
     _insert(db, hook="Someone else's", owner_id="other", slot=6)
-    hits = db.find_live_notes(_OWNER, GROUP, _vec(6), limit=5)
+    hits = db.find_live_notes(_OWNER, GROUP, onehot(6), limit=5)
     assert [h["id"] for h in hits] == [mine]
     db.close()
     _wipe(conn)
@@ -137,7 +126,7 @@ def test_null_embedding_insert_ok_and_skipped_by_knn(conn, db_url):
     nid = _insert(db, hook="Keyless note", embedding=None, embed_model="ignored")
     row = conn.execute("SELECT embedding, embed_model FROM notes WHERE id = %s", (nid,)).fetchone()
     assert row[0] is None and row[1] is None  # embed_model nulled alongside the vector
-    assert db.find_live_notes(_OWNER, GROUP, _vec(1), limit=5) == []
+    assert db.find_live_notes(_OWNER, GROUP, onehot(1), limit=5) == []
     db.close()
     _wipe(conn)
 

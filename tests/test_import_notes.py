@@ -29,6 +29,7 @@ _spec.loader.exec_module(imp)
 from ingestion.db import Database  # noqa: E402
 from ingestion.embedding import EmbeddingConfigError, embed_dims  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
+from tests.helpers.embed import onehot  # noqa: E402
 
 _DB_URL = os.environ.get(
     "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
@@ -219,12 +220,6 @@ class _StubEmb:
         return [list(v) for _ in texts]
 
 
-def _vec(slot: int) -> list[float]:
-    v = [0.0] * _DIMS
-    v[slot] = 1.0
-    return v
-
-
 def _wipe(conn):
     conn.execute("DELETE FROM notes")
 
@@ -393,7 +388,7 @@ def test_high_sim_collision_routes_through_reconcile(conn, db_url, tmp_path, mon
         type="user",
         hook="User prefers dark mode",
         body="Set everything to dark.",
-        embedding=_vec(1),
+        embedding=onehot(1),
         embed_model="stub",
         source_ref=None,  # written by remember(), no import provenance
     )

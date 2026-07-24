@@ -24,19 +24,8 @@ except Exception:  # pragma: no cover - environment dependent
     pytest.skip("no test DB reachable", allow_module_level=True)
 
 from ingestion.db import Database  # noqa: E402
-from ingestion.embedding import embed_dims  # noqa: E402
 from mcp_server.preferences_routes import _OWNER, _top_preferences  # noqa: E402
-
-_DIMS = embed_dims()
-GROUP = "technical"
-
-
-def _vec(slot: int) -> list[float]:
-    """A one-hot 2048-dim unit vector: identical slots -> cosine sim 1, distinct -> 0.
-    Lets the KNN ordering be asserted deterministically without a real embedder."""
-    v = [0.0] * _DIMS
-    v[slot % _DIMS] = 1.0
-    return v
+from tests.helpers.embed import GROUP, onehot  # noqa: E402
 
 
 def _wipe(conn):
@@ -52,7 +41,7 @@ def test_insert_and_cosine_knn(conn, db_url):
         project="synapse",
         pref="User prefers bullet lists over tables",
         polarity="like",
-        embedding=_vec(1),
+        embedding=onehot(1),
         embed_model="test",
         source_ref="ep:1",
     )
@@ -62,12 +51,12 @@ def test_insert_and_cosine_knn(conn, db_url):
         project="synapse",
         pref="User dislikes em-dashes",
         polarity="dislike",
-        embedding=_vec(2),
+        embedding=onehot(2),
         embed_model="test",
         source_ref="ep:2",
     )
     # Query nearest to slot-1: the matching pref comes back with sim ~1, ahead of the other.
-    hits = db.find_live_preferences(_OWNER, GROUP, _vec(1), limit=5)
+    hits = db.find_live_preferences(_OWNER, GROUP, onehot(1), limit=5)
     assert hits[0]["id"] == a
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-4)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-4)
@@ -84,7 +73,7 @@ def test_reassert_bumps_count_and_keeps_text(conn, db_url):
         project=None,
         pref="User prefers concise answers",
         polarity="like",
-        embedding=_vec(3),
+        embedding=onehot(3),
         embed_model="test",
         source_ref="ep:3",
     )
@@ -108,7 +97,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
         project=None,
         pref="User prefers dark mode",
         polarity="like",
-        embedding=_vec(4),
+        embedding=onehot(4),
         embed_model="test",
         source_ref="ep:4",
     )
@@ -118,7 +107,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
         project=None,
         pref="User now prefers light mode",
         polarity="dislike",
-        embedding=_vec(4),
+        embedding=onehot(4),
         embed_model="test",
         source_ref="ep:5",
     )
@@ -128,7 +117,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
         "SELECT t_invalid, superseded_by FROM preferences WHERE id = %s", (old,)
     ).fetchone()
     assert row[0] is not None and row[1] == new
-    live_ids = {h["id"] for h in db.find_live_preferences(_OWNER, GROUP, _vec(4), limit=5)}
+    live_ids = {h["id"] for h in db.find_live_preferences(_OWNER, GROUP, onehot(4), limit=5)}
     assert new in live_ids and old not in live_ids
     db.close()
     _wipe(conn)
@@ -143,7 +132,7 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
         project=None,
         pref="User likes short commit messages",
         polarity="like",
-        embedding=_vec(6),
+        embedding=onehot(6),
         embed_model="test",
         source_ref="ep:6",
     )
@@ -153,7 +142,7 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
         project=None,
         pref="User never wants contract roles surfaced",
         polarity="rule",
-        embedding=_vec(7),
+        embedding=onehot(7),
         embed_model="test",
         source_ref="ep:7",
     )
@@ -164,7 +153,7 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
         project=None,
         pref="User prefers tabs",
         polarity="like",
-        embedding=_vec(8),
+        embedding=onehot(8),
         embed_model="test",
         source_ref="ep:8",
     )

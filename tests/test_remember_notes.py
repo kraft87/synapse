@@ -30,20 +30,12 @@ except Exception:  # pragma: no cover - environment dependent
 
 import ingestion.notes as notes_mod  # noqa: E402
 from ingestion.db import Database  # noqa: E402
-from ingestion.embedding import embed_dims  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
 from mcp_server import server  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
+from tests.helpers.embed import GROUP, onehot  # noqa: E402
 
-_DIMS = embed_dims()
-GROUP = "technical"  # _group_for(None) routes project-less notes here
-
-
-def _vec(slot: int) -> list[float]:
-    """One-hot unit vector: identical slots -> cosine sim 1, distinct -> 0."""
-    v = [0.0] * _DIMS
-    v[slot % _DIMS] = 1.0
-    return v
+# GROUP ("technical") is where _group_for(None) routes project-less notes.
 
 
 class _SlotEmb:
@@ -55,7 +47,7 @@ class _SlotEmb:
         self.mapping: dict[str, int] = {}
 
     def embed(self, texts, task):
-        return [_vec(self.mapping.get(t, 0)) for t in texts]
+        return [onehot(self.mapping.get(t, 0)) for t in texts]
 
 
 def _remember(**kw):
@@ -102,7 +94,7 @@ def _seed_note(env, *, hook="User prefers dark mode", type="user", slot=1, proje
         type=type,
         hook=hook,
         body="Existing body.",
-        embedding=_vec(slot),
+        embedding=onehot(slot),
         embed_model="test-embed",
         source_ref=None,
     )

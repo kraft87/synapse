@@ -17,11 +17,11 @@ Five cases mirror the spec:
 from __future__ import annotations
 
 import json
-from typing import Any
 from unittest.mock import MagicMock
 
 from ingestion.contradiction import ContradictionDetector
 from ingestion.models import ExtractedFact
+from tests.helpers.llm import mock_llm_message
 
 
 def _fact() -> ExtractedFact:
@@ -31,12 +31,6 @@ def _fact() -> ExtractedFact:
         relationship="USES",
         fact="Synapse uses FalkorDB on port 6379",
     )
-
-
-def _llm_response(text: str) -> Any:
-    msg = MagicMock()
-    msg.content = [MagicMock(text=text)]
-    return msg
 
 
 def _mock_embedder(vector: list[float]) -> MagicMock:
@@ -130,7 +124,7 @@ class TestLLMConfirm:
             }
         ]
         llm = MagicMock()
-        llm.messages.create.return_value = _llm_response(json.dumps({"contradicted_facts": [0]}))
+        llm.messages.create.return_value = mock_llm_message(json.dumps({"contradicted_facts": [0]}))
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
@@ -163,7 +157,7 @@ class TestLLMConfirm:
             }
         ]
         llm = MagicMock()
-        llm.messages.create.return_value = _llm_response(json.dumps({"contradicted_facts": []}))
+        llm.messages.create.return_value = mock_llm_message(json.dumps({"contradicted_facts": []}))
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
@@ -218,7 +212,7 @@ class TestCandidatePoolLiveness:
             }
         ]
         llm = MagicMock()
-        llm.messages.create.return_value = _llm_response(json.dumps({"contradicted_facts": [0]}))
+        llm.messages.create.return_value = mock_llm_message(json.dumps({"contradicted_facts": [0]}))
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
@@ -251,7 +245,7 @@ class TestTopKCap:
         falkordb = MagicMock()
         falkordb.find_edges_by_pair.return_value = candidates
         llm = MagicMock()
-        llm.messages.create.return_value = _llm_response(json.dumps({"contradicted_facts": []}))
+        llm.messages.create.return_value = mock_llm_message(json.dumps({"contradicted_facts": []}))
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm, top_k=3)
@@ -281,7 +275,7 @@ class TestMissingEmbeddingConservative:
             }
         ]
         llm = MagicMock()
-        llm.messages.create.return_value = _llm_response(json.dumps({"contradicted_facts": [0]}))
+        llm.messages.create.return_value = mock_llm_message(json.dumps({"contradicted_facts": [0]}))
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
@@ -308,7 +302,7 @@ class TestTolerantJSONParse:
             }
         ]
         llm = MagicMock()
-        llm.messages.create.return_value = _llm_response(llm_text)
+        llm.messages.create.return_value = mock_llm_message(llm_text)
         embedder = _mock_embedder(_unit_vec(1.0))
         return ContradictionDetector(falkordb, embedder, llm)
 

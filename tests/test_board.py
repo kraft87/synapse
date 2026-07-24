@@ -28,8 +28,7 @@ from starlette.testclient import TestClient  # noqa: E402
 
 from ingestion.db import Database  # noqa: E402
 from mcp_server.board import _OWNER, build_board, record_board_metrics, register  # noqa: E402
-
-GROUP = "technical"
+from tests.helpers.embed import GROUP  # noqa: E402
 
 
 def _wipe(conn):

@@ -12,9 +12,8 @@ from __future__ import annotations
 import pytest
 
 from ingestion.kg_pg_read import KGPostgresReader, _emb_list, _iso
-
-GROUP = "technical"
-DIM = 2048
+from tests.helpers.embed import GROUP
+from tests.helpers.kg import DIM, _axis_list
 
 
 def _axis(i: int) -> str:
@@ -22,12 +21,6 @@ def _axis(i: int) -> str:
     v = [0.0] * DIM
     v[i] = 1.0
     return "[" + ",".join(map(str, v)) + "]"
-
-
-def _axis_list(i: int) -> list[float]:
-    v = [0.0] * DIM
-    v[i] = 1.0
-    return v
 
 
 @pytest.fixture()
