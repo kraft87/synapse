@@ -248,6 +248,10 @@ def _machine_authorized(request: Request) -> bool:
     return hmac.compare_digest(authz[len("Bearer ") :].strip(), MACHINE_TOKEN)
 
 
+# Shared error-envelope helpers for the machine-token custom routes below (imports only
+# starlette/stdlib, so no cycle with this module).
+from mcp_server.http_helpers import err, unauthorized  # noqa: E402
+
 # Skill sync + review over plain HTTP — lets the Claude Code plugin stay DSN-free (it talks to
 # these machine-token-gated routes instead of reaching Postgres directly). No-op without DB_URL.
 from mcp_server.skill_sync_routes import register as _register_skill_routes  # noqa: E402
@@ -887,21 +891,18 @@ async def ingest_turns(request: Request) -> JSONResponse:
     Body: {"records": [...], "project": optional, "source": optional}.
     """
     if not _machine_authorized(request):
-        return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        return unauthorized()
 
     from starlette.concurrency import run_in_threadpool
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+        return err("invalid JSON body", 400)
 
     records = body.get("records")
     if not isinstance(records, list):
-        return JSONResponse(
-            {"status": "error", "detail": "body must contain a 'records' list"},
-            status_code=400,
-        )
+        return err("body must contain a 'records' list", 400)
     source_label = body.get("source") or "hook"
     project_override = body.get("project")
 
@@ -984,7 +985,7 @@ async def ingest_turns(request: Request) -> JSONResponse:
         n = await run_in_threadpool(_work)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("ingest failed")
-        return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
+        return err(str(exc)[:200], 500)
     return JSONResponse({"status": "ok", "ingested": n})
 
 
@@ -1008,18 +1009,18 @@ async def recall_http(request: Request) -> JSONResponse:
     Fail-soft like /ingest — never raises past the JSONResponse boundary.
     """
     if not _machine_authorized(request):
-        return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        return unauthorized()
 
     from starlette.concurrency import run_in_threadpool
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+        return err("invalid JSON body", 400)
 
     query = (body.get("query") or "").strip()
     if not query:
-        return JSONResponse({"status": "error", "detail": "missing 'query'"}, status_code=400)
+        return err("missing 'query'", 400)
     project = body.get("project") or None
     group_id = body.get("group_id") or "technical"
     write_feedback = bool(body.get("write_feedback", False))
@@ -1041,7 +1042,7 @@ async def recall_http(request: Request) -> JSONResponse:
             out = await run_in_threadpool(_work)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("http recall failed")
-        return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
+        return err(str(exc)[:200], 500)
     return JSONResponse(out)
 
 
@@ -1058,14 +1059,14 @@ async def feedback_http(request: Request) -> JSONResponse:
            "note"?: str, "session_id"?: str, "project"?: str}.
     """
     if not _machine_authorized(request):
-        return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+        return unauthorized()
 
     from starlette.concurrency import run_in_threadpool
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+        return err("invalid JSON body", 400)
 
     def _work() -> dict:
         return _file_recall_feedback(
@@ -1083,7 +1084,7 @@ async def feedback_http(request: Request) -> JSONResponse:
             out = await run_in_threadpool(_work)
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("http feedback failed")
-        return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
+        return err(str(exc)[:200], 500)
     return JSONResponse(out, status_code=200 if out.get("status") == "ok" else 400)
 
 

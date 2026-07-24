@@ -30,9 +30,10 @@ from datetime import datetime
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from mcp_server.http_helpers import _iso, guarded_json
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +45,6 @@ def _dt(iso: str | None) -> datetime | None:
         return datetime.fromisoformat(iso)
     except (TypeError, ValueError):
         return None
-
-
-def _iso(dt) -> str | None:
-    return dt.isoformat() if dt else None
 
 
 # --------------------------------------------------------------------------- sync
@@ -327,18 +324,7 @@ def register(mcp, db_url: str, machine_authorized: Callable[[Request], bool]) ->
         return
 
     async def _guarded(request: Request, work):
-        if not machine_authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"status": "error", "detail": "invalid JSON"}, status_code=400)
-        try:
-            out = await run_in_threadpool(work, body)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("skill route failed")
-            return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
-        return JSONResponse(out)
+        return await guarded_json(request, machine_authorized, work, label="skill route")
 
     @mcp.custom_route("/skills/list", methods=["POST"])
     async def _list(request: Request) -> JSONResponse:

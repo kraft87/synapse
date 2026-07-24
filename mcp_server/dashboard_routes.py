@@ -56,6 +56,9 @@ from starlette.responses import (
 # them (see docs/dashboard-contract.md §"Phase 2b").
 from mcp_server.config_sync_routes import _proposal_act as _config_proposal_act
 from mcp_server.config_sync_routes import _proposal_detail as _config_proposal_detail
+from mcp_server.http_helpers import _iso
+from mcp_server.http_helpers import err as _err
+from mcp_server.http_helpers import unauthorized as _unauthorized
 from mcp_server.skill_sync_routes import _proposal_act as _skill_proposal_act
 from mcp_server.skill_sync_routes import _proposal_detail as _skill_proposal_detail
 
@@ -163,20 +166,8 @@ _CONTENT_TYPES = {
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-
-
-def _err(detail: str, status: int) -> JSONResponse:
-    """The contract's error envelope: {"status":"error","detail":...} at `status`."""
-    return JSONResponse({"status": "error", "detail": detail}, status_code=status)
-
-
-def _unauthorized() -> JSONResponse:
-    """The 401 every /dash/api/* route returns when the machine token is absent/wrong."""
-    return _err("unauthorized", 401)
-
-
-def _iso(dt: Any) -> str | None:
-    return dt.isoformat() if dt is not None else None
+# The error envelope (_err/_unauthorized) and _iso now live in mcp_server.http_helpers,
+# imported above (aliased to the historical private names so call sites are unchanged).
 
 
 def _gist(text: str | None) -> str:
@@ -2300,6 +2291,31 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             return _err(not_found, 404)
         return JSONResponse(result)
 
+    async def _api_cached(
+        request: Request,
+        cache: dict[str, Any],
+        ttl: float,
+        work: Callable[[], Any],
+        *,
+        label: str,
+    ) -> JSONResponse:
+        """``_api`` with a monotonic-TTL in-process cache: serve ``cache["data"]`` while it's
+        younger than ``ttl`` (seconds since ``cache["ts"]``), else recompute via ``work()`` and
+        refresh the cache. ``label`` names the handler in the 500 log line."""
+        if not authorized(request):
+            return _unauthorized()
+        now = time.monotonic()
+        if cache["data"] is not None and now - cache["ts"] < ttl:
+            return JSONResponse(cache["data"])
+        try:
+            data = await run_in_threadpool(work)
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("dashboard %s failed: %s", label, e)
+            return _err(str(e)[:200], 500)
+        cache["ts"] = now
+        cache["data"] = data
+        return JSONResponse(data)
+
     # ---- static (UNAUTHENTICATED) ----
 
     # The server has no other browser-facing root — a bare vhost hit (Caddy proxies
@@ -2341,19 +2357,9 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/catalog", methods=["GET"])  # type: ignore[misc]
     async def dash_catalog(request: Request) -> JSONResponse:
-        if not authorized(request):
-            return _unauthorized()
-        now = time.monotonic()
-        if catalog_cache["data"] is not None and now - catalog_cache["ts"] < _CATALOG_TTL_S:
-            return JSONResponse(catalog_cache["data"])
-        try:
-            data = await run_in_threadpool(_catalog, db_url)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard catalog failed: %s", e)
-            return _err(str(e)[:200], 500)
-        catalog_cache["ts"] = now
-        catalog_cache["data"] = data
-        return JSONResponse(data)
+        return await _api_cached(
+            request, catalog_cache, _CATALOG_TTL_S, lambda: _catalog(db_url), label="catalog"
+        )
 
     @mcp.custom_route("/dash/api/feed", methods=["GET"])  # type: ignore[misc]
     async def dash_feed(request: Request) -> JSONResponse:
@@ -2540,19 +2546,13 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/metrics/corpus", methods=["GET"])  # type: ignore[misc]
     async def dash_metrics_corpus(request: Request) -> JSONResponse:
-        if not authorized(request):
-            return _unauthorized()
-        now = time.monotonic()
-        if corpus_cache["data"] is not None and now - corpus_cache["ts"] < _CORPUS_TTL_S:
-            return JSONResponse(corpus_cache["data"])
-        try:
-            data = await run_in_threadpool(_metrics_corpus, db_url)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard corpus metrics failed: %s", e)
-            return _err(str(e)[:200], 500)
-        corpus_cache["ts"] = now
-        corpus_cache["data"] = data
-        return JSONResponse(data)
+        return await _api_cached(
+            request,
+            corpus_cache,
+            _CORPUS_TTL_S,
+            lambda: _metrics_corpus(db_url),
+            label="corpus metrics",
+        )
 
     # ---- timeline + preferences (phase 5) ----
 

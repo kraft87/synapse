@@ -27,6 +27,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
+from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +150,7 @@ def register(
         Body: {days?=7, min_salience?=2, limit?=5, project?}. Time-scoped and tiny by
         design — this is a bounded factual block, not query-blind recall injection."""
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return unauthorized()
         try:
             body = await request.json()
         except Exception:
@@ -163,40 +164,29 @@ def register(
             )
         except Exception as e:
             logger.warning("timeline recent failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return err(str(e)[:200], 500)
         return JSONResponse({"status": "ok", "items": items})
 
     @mcp.custom_route("/timeline/events", methods=["POST"])  # type: ignore[misc]
     async def timeline_events(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return unauthorized()
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+            return err("invalid JSON body", 400)
         events = body.get("events")
         if not isinstance(events, list) or not events:
-            return JSONResponse(
-                {"status": "error", "detail": "body must contain a non-empty 'events' list"},
-                status_code=400,
-            )
+            return err("body must contain a non-empty 'events' list", 400)
         if len(events) > _MAX_BATCH:
-            return JSONResponse(
-                {"status": "error", "detail": f"max {_MAX_BATCH} events per call"},
-                status_code=400,
-            )
+            return err(f"max {_MAX_BATCH} events per call", 400)
         cleaned: list[dict[str, Any]] = []
         for i, e in enumerate(events):
             if not isinstance(e, dict):
-                return JSONResponse(
-                    {"status": "error", "detail": f"events[{i}] not an object"}, status_code=400
-                )
+                return err(f"events[{i}] not an object", 400)
             missing = [k for k in ("t_valid", "fact", "source", "source_ref") if not e.get(k)]
             if missing:
-                return JSONResponse(
-                    {"status": "error", "detail": f"events[{i}] missing {missing}"},
-                    status_code=400,
-                )
+                return err(f"events[{i}] missing {missing}", 400)
             sal = e.get("salience", 1)
             et = e.get("event_type")
             cleaned.append(
@@ -218,11 +208,8 @@ def register(
                 _ingest_events, db_url, voyage_api_key, cleaned
             )
         except psycopg.errors.UndefinedTable:
-            return JSONResponse(
-                {"status": "error", "detail": "timeline_events missing (apply schema/033)"},
-                status_code=503,
-            )
+            return err("timeline_events missing (apply schema/033)", 503)
         except Exception as e:
             logger.warning("timeline ingest failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return err(str(e)[:200], 500)
         return JSONResponse({"status": "ok", "inserted": inserted, "skipped": skipped})
