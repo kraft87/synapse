@@ -11,7 +11,6 @@ import { Recall } from './pages/Recall';
 import { Review } from './pages/Review';
 import { Metrics } from './pages/Metrics';
 import { Timeline } from './pages/Timeline';
-import { Stub } from './pages/Stub';
 import { Overlays } from './overlays/Overlays';
 
 // Graph pulls in cytoscape + cose-bilkent (~500KB) — lazy so that weight loads only on
@@ -64,8 +63,7 @@ function Shell() {
           : s.page === 'review' ? <Review />
           : s.page === 'metrics' ? <Metrics />
           : s.page === 'timeline' ? <Timeline />
-          : s.page === 'graph' ? <Suspense fallback={<GraphFallback />}><Graph /></Suspense>
-          : <Stub page={s.page} />}
+          : <Suspense fallback={<GraphFallback />}><Graph /></Suspense>}
       </PageBoundary>
       <Overlays />
     </>

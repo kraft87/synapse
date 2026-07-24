@@ -1,6 +1,15 @@
 // Shared color maps + small formatters. Colors reference the CSS custom
 // properties defined in styles.css (README §Design Tokens), so themes switch
 // automatically.
+import type { CSSProperties } from 'react';
+
+// The data (monospace) font-family token + the shared uppercase mono section-head
+// style, reused by the page tab bars / panel heads. Feed keeps a local 12px variant.
+export const mono = 'var(--font-data)';
+export const monoHead: CSSProperties = {
+  fontFamily: mono, fontSize: '11px', color: 'var(--txt3)',
+  textTransform: 'uppercase', letterSpacing: '.08em',
+};
 
 export const SRC_COLOR: Record<string, string> = {
   'claude-code': 'var(--src-cc)',

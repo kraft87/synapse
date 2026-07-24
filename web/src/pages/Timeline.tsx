@@ -13,11 +13,11 @@ import {
 } from '../api';
 import { useStore } from '../state';
 import { openEpisode } from '../hash';
-import { FlagButton } from '../components/ui';
+import { mono, monoHead } from '../tokens';
+import { FlagButton, ErrorBox, EmptyState } from '../components/ui';
+import { useAsync } from '../hooks';
 
-const mono = 'var(--font-data)';
 const wrap: CSSProperties = { flex: 1, maxWidth: '900px', width: '100%', margin: '0 auto', padding: '18px 16px 80px', boxSizing: 'border-box' };
-const monoHead: CSSProperties = { fontSize: '11px', fontFamily: mono, color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.08em' };
 
 const TABS = [
   { key: 'events', label: 'Events' },
@@ -54,13 +54,6 @@ const monthAfter = (key: string): string => {
   const nm = m === 12 ? 1 : m + 1;
   return `${ny}-${String(nm).padStart(2, '0')}-01T00:00:00+00:00`;
 };
-
-const errBox = (msg: string, retry?: () => void) => (
-  <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-    <span style={{ color: 'var(--err)', fontSize: '13px', flex: 1 }}>{msg}</span>
-    {retry && <button className="softbtn" style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '5px', padding: '4px 10px', fontSize: '11.5px', fontFamily: mono, cursor: 'pointer' }} onClick={retry}>retry</button>}
-  </div>
-);
 
 // =====================================================================================
 // Events tab
@@ -175,13 +168,10 @@ function Events() {
         </select>
       </div>
 
-      {error && <div style={{ marginBottom: '12px' }}>{errBox('Timeline request failed.', () => load())}</div>}
+      {error && <ErrorBox onRetry={() => load()} style={{ marginBottom: '12px' }}>Timeline request failed.</ErrorBox>}
       {loading && events.length === 0 && <div style={{ color: 'var(--txt3)', fontFamily: mono, fontSize: '12px', padding: '20px 0' }}>loading events…</div>}
       {!loading && events.length === 0 && !error && (
-        <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-          <div style={{ fontFamily: mono, fontSize: '13px', marginBottom: '6px' }}>no events{activeType ? ` of type "${activeType}"` : ''}</div>
-          <div style={{ fontSize: '13px', color: 'var(--txt3)' }}>the timeline records dated happenings — shipped, decided, committed.</div>
-        </div>
+        <EmptyState title={`no events${activeType ? ` of type "${activeType}"` : ''}`} subtitle="the timeline records dated happenings — shipped, decided, committed." />
       )}
 
       {buckets.map(([key, evs]) => (
@@ -198,7 +188,7 @@ function Events() {
       {nextBefore && (
         <div style={{ textAlign: 'center', marginTop: '10px' }}>
           <button className="softbtn" onClick={loadMore} disabled={loadingMore}
-            style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: mono, cursor: 'pointer' }}>
+            style={{ borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: mono }}>
             {loadingMore ? 'loading…' : 'load more'}
           </button>
         </div>
@@ -240,14 +230,8 @@ function PrefRow({ p }: { p: Preference }) {
 
 function Preferences() {
   const [sort, setSort] = useState<'recency' | 'assert_count'>('recency');
-  const [prefs, setPrefs] = useState<Preference[] | null>(null);
-  const [error, setError] = useState(false);
-
-  const load = () => {
-    setError(false);
-    fetchPreferences(sort).then((r) => setPrefs(r.preferences)).catch(() => setError(true));
-  };
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [sort]);
+  const { data, error, reload } = useAsync(() => fetchPreferences(sort), [sort]);
+  const prefs = data?.preferences ?? null;
 
   const segBtn = (key: 'recency' | 'assert_count', label: string) => (
     <button onClick={() => setSort(key)}
@@ -268,12 +252,10 @@ function Preferences() {
         </div>
       </div>
 
-      {error && errBox('Preferences request failed.', load)}
+      {error && <ErrorBox onRetry={reload}>Preferences request failed.</ErrorBox>}
       {!error && prefs === null && <div style={{ color: 'var(--txt3)', fontFamily: mono, fontSize: '12px', padding: '20px 0' }}>loading preferences…</div>}
       {!error && prefs !== null && prefs.length === 0 && (
-        <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-          <div style={{ fontFamily: mono, fontSize: '13px' }}>no preferences recorded yet</div>
-        </div>
+        <EmptyState title="no preferences recorded yet" />
       )}
       {!error && prefs !== null && prefs.length > 0 && (
         <div style={{ border: '1px solid var(--line)', borderRadius: '10px', background: 'var(--bg1)', overflow: 'hidden' }}>

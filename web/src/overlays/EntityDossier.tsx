@@ -8,23 +8,21 @@ import { closeOverlay, openEpisode } from '../hash';
 import { etColor, validityLine } from '../tokens';
 import { Dot, FlagButton, Spinner } from '../components/ui';
 import { useStore } from '../state';
+import { useAsync } from '../hooks';
 
 const provBtn: React.CSSProperties = { border: 'none', background: 'none', padding: 0, color: 'var(--acc)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', textDecoration: 'underline', textUnderlineOffset: '2px' };
 
 export function EntityDossier({ id }: { id: string }) {
   const store = useStore();
-  const [data, setData] = useState<Entity | null>(null);
+  const { data, error } = useAsync(() => fetchEntity(id, 0), [id]);
+  const err = error != null;
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
   const [offset, setOffset] = useState(0);
-  const [err, setErr] = useState(false);
 
+  // seed the paginated mentions list from the base fetch; "load more" appends past this.
   useEffect(() => {
-    let live = true;
-    setData(null); setMentions([]); setOffset(0); setErr(false);
-    fetchEntity(id, 0).then((d) => { if (live) { setData(d); setMentions(d.mentions.items); setOffset(d.mentions.items.length); } })
-      .catch(() => { if (live) setErr(true); });
-    return () => { live = false; };
-  }, [id]);
+    if (data) { setMentions(data.mentions.items); setOffset(data.mentions.items.length); }
+  }, [data]);
 
   const loadMoreMentions = () => {
     fetchEntity(id, offset).then((d) => { setMentions((prev) => prev.concat(d.mentions.items)); setOffset((o) => o + d.mentions.items.length); }).catch(() => {});
@@ -96,7 +94,7 @@ export function EntityDossier({ id }: { id: string }) {
             </div>
             {mentions.length < total && (
               <div style={{ textAlign: 'center', marginTop: '10px' }}>
-                <button className="softbtn" onClick={loadMoreMentions} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)', cursor: 'pointer' }}>load more mentions</button>
+                <button className="softbtn" onClick={loadMoreMentions} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>load more mentions</button>
               </div>
             )}
           </>

@@ -195,20 +195,6 @@ const FIX_P5 = {
     meta: { surface_id: 'cortex', scope: 'global', abs_path: '/home/example/.claude/CLAUDE.md', content_hash: 'deadbeef', modified_at: day('2026-07-10'), updated_at: day('2026-07-10'), size: 4120 },
     links: ['rules/voice.md', 'rules/memory-protocol.md', 'memory/project_briefing.md'],
   },
-  behaviorLinkgraph: {
-    nodes: [
-      { file_key: 'CLAUDE.md', scope: 'global', group: 'CLAUDE.md' },
-      { file_key: 'rules/voice.md', scope: 'global', group: 'rules' },
-      { file_key: 'rules/memory-protocol.md', scope: 'global', group: 'rules' },
-      { file_key: 'memory/project_briefing.md', scope: 'global', group: 'memory notes' },
-    ],
-    edges: [
-      { source: 'CLAUDE.md', target: 'rules/voice.md' },
-      { source: 'CLAUDE.md', target: 'rules/memory-protocol.md' },
-      { source: 'CLAUDE.md', target: 'memory/project_briefing.md' },
-      { source: 'rules/memory-protocol.md', target: 'rules/voice.md' },
-    ],
-  },
 };
 
 const SEARCH: Record<string, unknown[]> = {
@@ -305,7 +291,6 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'dream/report') out = FIX_P5.dreamReport;
   else if (p === 'behavior/files') out = FIX_P5.behaviorFiles;
   else if (p === 'behavior/file') out = FIX_P5.behaviorFile;
-  else if (p === 'behavior/linkgraph') out = FIX_P5.behaviorLinkgraph;
   else if (p === 'graph/entities') {
     const q = (path.split('q=')[1] || '').toLowerCase();
     out = GRAPH_NODES

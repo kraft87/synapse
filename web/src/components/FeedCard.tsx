@@ -1,19 +1,19 @@
 // One card shell, three card types (README §Feed / §3). Episodes expand by
 // fetching /episode/:id (+ /derived); fact & timeline items expand inline from
 // the feed payload. All expansion is in place — provenance opens overlays.
-import { useEffect, useState, type CSSProperties } from 'react';
-import { fetchDerived, fetchEpisode, type Derived, type Episode, type FeedItem } from '../api';
+import { useState, type CSSProperties } from 'react';
+import { fetchDerived, fetchEpisode, type Derived, type FeedItem } from '../api';
 import { hasToolTrace, relTime, validityLine } from '../tokens';
 import { openEpisode, openSession } from '../hash';
 import { FlagButton, ProjectChip, SalLabel, SourceChip, TypeChip } from './ui';
+import { useAsync } from '../hooks';
 
 const provBtn: CSSProperties = {
   border: 'none', background: 'none', padding: 0, color: 'var(--acc)', cursor: 'pointer',
   fontFamily: 'inherit', fontSize: 'inherit', textDecoration: 'underline', textUnderlineOffset: '3px',
 };
 const softBtn: CSSProperties = {
-  marginTop: '8px', border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)',
-  borderRadius: '5px', padding: '3px 9px', fontSize: '11.5px', fontFamily: 'var(--font-data)', cursor: 'pointer',
+  marginTop: '8px', borderRadius: '5px', padding: '3px 9px', fontSize: '11.5px', fontFamily: 'var(--font-data)',
 };
 
 export function DerivedBlock({ derived, heading = 'extracted from this episode', bare = false }: { derived: Derived; heading?: string; bare?: boolean }) {
@@ -42,20 +42,15 @@ export function DerivedBlock({ derived, heading = 'extracted from this episode',
 }
 
 function EpisodeExpansion({ item }: { item: FeedItem }) {
-  const [ep, setEp] = useState<Episode | null>(null);
-  const [derived, setDerived] = useState<Derived | null>(null);
-  const [err, setErr] = useState(false);
+  const { data, error } = useAsync(() => Promise.all([
+    fetchEpisode(item.id),
+    fetchDerived(item.id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
+  ]).then(([e, d]) => ({ ep: e, derived: d })), [item.id]);
   const [traceOpen, setTraceOpen] = useState(false);
+  const ep = data?.ep ?? null;
+  const derived = data?.derived ?? null;
 
-  useEffect(() => {
-    let live = true;
-    Promise.all([fetchEpisode(item.id), fetchDerived(item.id).catch(() => ({ facts: [], timeline_events: [] } as Derived))])
-      .then(([e, d]) => { if (live) { setEp(e); setDerived(d); } })
-      .catch(() => { if (live) setErr(true); });
-    return () => { live = false; };
-  }, [item.id]);
-
-  if (err) return <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--line)', color: 'var(--err)', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>couldn't load episode</div>;
+  if (error) return <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--line)', color: 'var(--err)', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>couldn't load episode</div>;
   if (!ep) return <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--line)', color: 'var(--txt3)', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>loading…</div>;
 
   const body = [ep.human_turn && 'user: ' + ep.human_turn, ep.assistant_turn && 'assistant: ' + ep.assistant_turn].filter(Boolean).join('\n\n');

@@ -5,35 +5,18 @@
 // proportion bars are CSS bars per the prototype. Each tab loads from one endpoint and
 // renders its own loading skeleton / "not enough data" empty / error chip; within a tab,
 // each panel shows its own empty state when its slice is empty.
-import { useEffect, useMemo, useState, type CSSProperties, type ReactNode } from 'react';
+import { useMemo, useState, type CSSProperties, type ReactNode } from 'react';
 import uPlot from 'uplot';
 import {
   fetchMetricsRecall, fetchMetricsIngestion, fetchMetricsCorpus,
   type MetricsRecall, type MetricsIngestion, type MetricsCorpus, type DreamRun,
 } from '../api';
 import { useStore } from '../state';
-import { LEG_COLOR, LEG_ORDER, cssValue, srcColor, relTime } from '../tokens';
+import { LEG_COLOR, LEG_ORDER, cssValue, srcColor, relTime, mono } from '../tokens';
 import { UPlotChart } from '../components/UPlotChart';
+import { useAsync } from '../hooks';
 
-const mono = 'var(--font-data)';
 type Tab = 'recall' | 'ingestion' | 'corpus';
-
-// ---- tiny async hook: loading / data / error, runs fn once (and on dep change) ----
-function useAsync<T>(fn: () => Promise<T>, deps: unknown[]): { data: T | null; loading: boolean; error: string | null } {
-  const [state, setState] = useState<{ data: T | null; loading: boolean; error: string | null }>({
-    data: null, loading: true, error: null,
-  });
-  useEffect(() => {
-    let live = true;
-    setState((s) => ({ ...s, loading: true, error: null }));
-    fn()
-      .then((d) => { if (live) setState({ data: d, loading: false, error: null }); })
-      .catch((e) => { if (live) setState({ data: null, loading: false, error: String(e?.message || e) }); });
-    return () => { live = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, deps);
-  return state;
-}
 
 // ---- shared shells ----
 const panel = (extra?: CSSProperties): CSSProperties => ({

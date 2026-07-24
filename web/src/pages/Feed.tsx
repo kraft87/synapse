@@ -7,6 +7,7 @@ import { useEffect, useRef, useState } from 'react';
 import { fetchFeed, openFeedStream, feedItemPassesFilter, MOCK, type FeedItem } from '../api';
 import { useStore } from '../state';
 import { FeedCard } from '../components/FeedCard';
+import { ErrorBox, EmptyState } from '../components/ui';
 
 const keyOf = (it: FeedItem) => it.type + ':' + it.id;
 const POLL_MS = 30_000;
@@ -134,26 +135,19 @@ export function Feed() {
       </div>
 
       {error && (
-        <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', marginBottom: '10px', display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <span style={{ color: 'var(--err)', fontSize: '13px', flex: 1 }}>Feed request failed — showing the last loaded items.</span>
-          <button className="softbtn" style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '5px', padding: '4px 10px', fontSize: '11.5px', fontFamily: 'var(--font-data)', cursor: 'pointer' }} onClick={() => load()}>retry</button>
-        </div>
+        <ErrorBox onRetry={() => load()} style={{ marginBottom: '10px' }}>Feed request failed — showing the last loaded items.</ErrorBox>
       )}
 
       {loading && items.length === 0 && <Skeletons />}
 
       {empty && (
         filtersActive ? (
-          <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-            <div style={{ fontFamily: 'var(--font-data)', fontSize: '13px', marginBottom: '6px' }}>no items match the current filters</div>
+          <EmptyState title="no items match the current filters">
             <button className="linkbtn" style={{ border: 'none', background: 'none', color: 'var(--acc)', cursor: 'pointer', fontSize: '13px', textDecoration: 'underline', textUnderlineOffset: '3px' }}
               onClick={() => { s.setGroup('all'); s.setProject('all'); s.setSource('all'); }}>reset filters</button>
-          </div>
+          </EmptyState>
         ) : (
-          <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-            <div style={{ fontFamily: 'var(--font-data)', fontSize: '13px', marginBottom: '6px' }}>no memories yet — connect an ingestion source</div>
-            <div style={{ fontSize: '13px', color: 'var(--txt3)' }}>claude-code · cursor · claude-ai · transcribe-ai</div>
-          </div>
+          <EmptyState title="no memories yet — connect an ingestion source" subtitle="claude-code · cursor · claude-ai · transcribe-ai" />
         )
       )}
 
@@ -166,7 +160,7 @@ export function Feed() {
       {cursor && (
         <div style={{ textAlign: 'center', marginTop: '18px' }}>
           <button className="softbtn" onClick={loadMore} disabled={loadingMore}
-            style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: 'var(--font-data)', cursor: 'pointer' }}>
+            style={{ borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>
             {loadingMore ? 'loading…' : 'load more'}
           </button>
         </div>
