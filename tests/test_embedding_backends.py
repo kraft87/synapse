@@ -35,6 +35,7 @@ from ingestion.embedding import (
     OpenAIEmbeddingModel,
     TransientEmbeddingHTTPError,
     VoyageEmbeddingModel,
+    _pack_batches,
     check_embedding_meta,
     create_embedder,
     create_reranker,
@@ -56,6 +57,29 @@ _EMBED_ENV = (
     "SYNAPSE_RERANK_API_KEY",
     "SYNAPSE_RERANK_MODEL",
 )
+
+
+class TestPackBatches:
+    """Shared greedy batch-packer used by both embed backends."""
+
+    def test_empty_yields_nothing(self):
+        assert list(_pack_batches([], [], 128, 1000)) == []
+
+    def test_splits_on_count(self):
+        items = [f"i{n}" for n in range(300)]
+        batches = list(_pack_batches(items, [1] * 300, 128, 10_000))
+        assert [len(b) for b in batches] == [128, 128, 44]
+
+    def test_splits_on_size_before_overflow(self):
+        # sizes 40,40,40 with cap 100 → [40+40], then [40]
+        batches = list(_pack_batches(["a", "b", "c"], [40, 40, 40], 128, 100))
+        assert [len(b) for b in batches] == [2, 1]
+
+    def test_oversized_single_item_admitted(self):
+        # An item alone exceeding max_size is never dropped: it lands in its own
+        # batch (the "always admit at least one" guard).
+        batches = list(_pack_batches(["big", "x"], [500, 10], 128, 100))
+        assert batches == [["big"], ["x"]]
 
 
 @pytest.fixture(autouse=True)
