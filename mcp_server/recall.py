@@ -70,6 +70,15 @@ _RRF_K = 60
 # nothing. Kill switch SYNAPSE_RECALL_TIMELINE=0.
 _TIMELINE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_TIMELINE", "1") != "0"
 _TIMELINE_LIMIT = 8
+# Absolute cross-encoder floor on the INLINE timeline leg (2026-07-24). The timeline bucket
+# served ~23% precision (feedback); the noise is OFF-TOPIC events, not routine ones — salience
+# gating was measured useless (47/49 labeled-noise events are salience>=1), so min_salience is
+# the wrong lever. A relevance floor is the right one: validated on 64 labeled events, floor 0.40
+# gives 86% noise suppression at 87% helpful retention (~23%->~65% precision). Overlap is real
+# (helpful min 0.264, noise max 0.555), so this is not the clean 100/100 web got. No keep->=1
+# backstop: an all-subfloor result serves [] (self-gates, like web). The STANDALONE
+# recall_timeline() deep path stays unfloored. 0 disables. Applies only when the leg fires.
+_TIMELINE_FLOOR = float(os.getenv("SYNAPSE_RECALL_TIMELINE_FLOOR", "0.40") or "0.40")
 # Preferences leg (schema 035): the standing USER-preference bucket. Like the timeline
 # leg, one cheap parallel DB read on every query — top-5 live prefs by cosine to the
 # query embedding — reusing this call's query_emb (no extra Voyage round-trip). Kept out
@@ -275,6 +284,17 @@ _RECALL_BM25_FUSE = os.getenv("SYNAPSE_RECALL_BM25_FUSE", "1") != "0"
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
 _WEB_LIMIT = 3  # web_chunks (deduped by parent page) returned by recall()
+_WEB_FETCH = int(os.getenv("SYNAPSE_RECALL_WEB_FETCH", "50") or "50")  # per-leg (bm25+vector) depth
+_WEB_RERANK_POOL = int(os.getenv("SYNAPSE_RECALL_WEB_POOL", "60") or "60")  # fused cands reranked
+# Absolute cross-encoder floor on the WEB bucket (2026-07-24). Web chunks are external and topical,
+# so an off-topic embedding/token collision scores genuinely low under the cross-encoder even when
+# the bi-encoder/BM25 ranked it high on surface tokens. UNLIKE the fact floor there is NO keep->=1
+# backstop: the bucket may serve ZERO, which SELF-GATES web on intent — it surfaces only when a
+# scraped page is genuinely on-query. Validated on 42 feedback-labeled web ids: all 41 noise scored
+# <=0.559 and the lone helpful id 0.914, so 0.60 gave 100% noise suppression at 100% helpful
+# retention, collapsing web from 3.0 to ~0.07 chunks/query (n_helpful=1 — revisit as labels grow).
+# 0 disables the floor (still fuses BM25+vector and reranks, just serves the top-_WEB_LIMIT).
+_WEB_FLOOR = float(os.getenv("SYNAPSE_RECALL_WEB_FLOOR", "0.60") or "0.60")
 
 # Adaptive episode serving (variable-k) for recall_episodes() — OFF by default.
 # When SYNAPSE_EPISODE_CUTOFF_TAU > 0, recall_episodes() serves the reranked turns
@@ -1033,6 +1053,25 @@ class Recall:
         kept = [facts[i] for i, s in scored if s >= _RECALL_FACT_FLOOR]
         return kept or [facts[i] for i, _ in scored[:1]]
 
+    def _floor_timeline(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop inline timeline events the cross-encoder scores below _TIMELINE_FLOOR.
+
+        Timeline noise is OFF-TOPIC events (salience gating proved useless — the labeled noise is
+        on-salience), so a relevance floor is the lever. UNLIKE _floor_facts there is NO keep->=1
+        backstop: an all-subfloor result serves [] (self-gates, like the web bucket). Events are
+        short, so they score at full length; degrades to keeping all on rerank failure. Caller
+        gates on _TIMELINE_FLOOR > 0. The standalone recall_timeline() deep path is NOT floored."""
+        reranker = self._ensure_reranker()
+        if reranker is None:  # rerank disabled — no floor signal, keep all
+            return items
+        texts = [(t.get("fact") or "")[:_RERANK_DOC_CAP] for t in items]
+        try:
+            scored = reranker.rerank_scored(query, texts)
+        except Exception as e:
+            logger.warning("Timeline-floor rerank failed, keeping all: %s", e)
+            return items
+        return [items[i] for i, s in scored if s >= _TIMELINE_FLOOR]
+
     def _compact_to_passages(
         self, query: str, episodes: list[dict[str, Any]], n: int
     ) -> list[dict[str, Any]]:
@@ -1320,6 +1359,28 @@ class Recall:
                 break
         return out
 
+    def _search_web_reranked(self, query: str, query_emb: list[float]) -> list[dict[str, Any]]:
+        """Web bucket (2026-07-24): fuse BM25 + vector via RRF, cross-encoder rerank the pool,
+        DROP chunks below _WEB_FLOOR (off-topic collisions), dedupe by parent page, cap to
+        _WEB_LIMIT. May return [] when nothing clears the floor — that self-gates web on intent.
+
+        Replaces the old vector-only leg: BM25 was written (_search_bm25_web) but never wired,
+        and the raw bi-encoder ranking served ~2.6% precision (feedback). The rerank is the active
+        ingredient (it reads content topicality, not surface tokens); fusion widens the candidate
+        pool the reranker sees. Degrades safe: on reranker outage/disable (top score 0.0) it serves
+        the fused RRF order deduped rather than blanking the bucket or hard-failing."""
+        bm25 = self._search_bm25_web(query, _WEB_FETCH)
+        vec = self._search_vector_web(query_emb, _WEB_FETCH)
+        fused = _merge_rrf(bm25, vec, id_key="id")[:_WEB_RERANK_POOL]
+        if not fused:
+            return []
+        scored = self._rerank_pool_scored(query, fused)
+        if _WEB_FLOOR > 0 and scored and scored[0][1] > 0.0:
+            ranked = [fused[i] for i, s in scored if s >= _WEB_FLOOR]
+        else:  # floor disabled, or reranker degraded to RRF order (no score signal)
+            ranked = [fused[i] for i, _ in scored] if scored else fused
+        return self._dedupe_by_artifact(ranked, _WEB_LIMIT)
+
     # ------------------------------------------------------------------
     # KG traversal (Postgres)
     # ------------------------------------------------------------------
@@ -1591,7 +1652,6 @@ class Recall:
         debug-dict assembly just below the metrics write for the exact shape.
         """
         t_start = time.perf_counter()
-        web_n = _WEB_LIMIT * 4  # depth for dedup-by-artifact to have headroom
         ex = self._leg_executor
 
         # BM25 is pure text search — it does NOT need the query embedding. Start it
@@ -1613,7 +1673,7 @@ class Recall:
         # no-op when it's unavailable). Summaries were retired (task #63): the KG owns
         # facts and the wide episode leg owns broad/needle, so no synth_documents leg.
         def _web_leg() -> list[dict[str, Any]]:
-            return self._search_vector_web(query_emb, web_n) if query_emb is not None else []
+            return self._search_web_reranked(query, query_emb) if query_emb is not None else []
 
         def _kg_leg() -> tuple[list[Any], list[Any]]:
             if query_emb is None:
@@ -1636,7 +1696,10 @@ class Recall:
             res = self._ensure_timeline().recall_timeline(
                 query=query, project=project, query_emb=query_emb, group_id=group_id
             )
-            return list(res.get("items") or [])[:_TIMELINE_LIMIT]
+            items = list(res.get("items") or [])[:_TIMELINE_LIMIT]
+            if _TIMELINE_FLOOR > 0 and items:
+                items = self._floor_timeline(query, items)
+            return items
 
         f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
 
@@ -1654,7 +1717,7 @@ class Recall:
         bm25_eps, ms_bm25 = f_bm25.result()
         vec_eps, ms_vec = f_vec.result() if f_vec is not None else ([], 0.0)
         ep_pool = _merge_rrf(bm25_eps, vec_eps, id_key="id")[:_EPISODE_RERANK_POOL]
-        vec_web, ms_web = f_web.result()
+        web_ranked, ms_web = f_web.result()
         (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
 
         facts_internal = kg_results[:_FACT_LIMIT]  # carry _uuid for bump + superseded pairs
@@ -1723,9 +1786,9 @@ class Recall:
         # recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
         if _RECALL_FLOOR_ENFORCE and query_emb is not None and 0.0 < rerank_top < _RECALL_FLOOR:
             ep_items = None
-        # Web bucket: vector-only, dedupe by parent page. BM25 over this corpus produces
-        # cross-domain token collisions; the bi-encoder captures topic over surface tokens.
-        web_chunks = self._dedupe_by_artifact(vec_web, _WEB_LIMIT)
+        # Web bucket: fused (BM25+vector) -> cross-encoder rerank -> _WEB_FLOOR -> dedupe, all done
+        # in _web_leg (_search_web_reranked). Floor self-gates on intent, so this is often empty.
+        web_chunks = web_ranked
 
         # Surface the internal _uuid to the caller as a "f:<uuid>" id (below) so facts
         # are citable in recall_feedback, same as episodes carry "e:N".
@@ -1835,6 +1898,7 @@ class Recall:
         served_ids: dict[str, Any] = {
             "episodes": list(dict.fromkeys(it["id"] for it in (ep_items or []) if it.get("id"))),
             "facts": [f["_uuid"] for f in served_facts if f.get("_uuid")],
+            "web": [c["id"] for c in web_chunks if c.get("id")],
             "timeline": [
                 t["_id"]
                 for t in timeline_items
