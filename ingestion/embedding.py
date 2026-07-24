@@ -187,9 +187,7 @@ class VoyageEmbeddingModel:
             return []
         item_tokens = [self._client.count_tokens([t], model=self.model_name) for t in capped]
         out: list[list[float]] = []
-        for batch in _pack_batches(
-            capped, item_tokens, self._MAX_BATCH, self._TARGET_BATCH_TOKENS
-        ):
+        for batch in _pack_batches(capped, item_tokens, self._MAX_BATCH, self._TARGET_BATCH_TOKENS):
             result = self._embed_batch(batch, input_type)
             out.extend(result.embeddings)
         return out
