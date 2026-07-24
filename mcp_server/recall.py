@@ -904,7 +904,7 @@ class Recall:
     def _search_vector_episodes(
         self, query_emb: list[float], project: str | None, limit: int
     ) -> list[dict[str, Any]]:
-        emb_literal = "[" + ",".join(str(x) for x in query_emb) + "]"
+        emb_literal = _vec_literal(query_emb)
         return self._vector_table("episodes", emb_literal, project, limit, "episode")
 
     # ------------------------------------------------------------------
@@ -1339,7 +1339,7 @@ class Recall:
 
     def _search_vector_web(self, query_emb: list[float], limit: int) -> list[dict[str, Any]]:
         pg = self._ensure_pg()
-        emb_literal = "[" + ",".join(str(x) for x in query_emb) + "]"
+        emb_literal = _vec_literal(query_emb)
         try:
             rows = pg.execute(
                 """
