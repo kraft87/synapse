@@ -57,3 +57,24 @@ def test_floor_facts_keeps_all_on_rerank_failure(monkeypatch):
 def test_fact_floor_default_off():
     # the prod default must be OFF (0) — recall() only gates when > 0
     assert recall_mod._RECALL_FACT_FLOOR == 0.0
+
+
+# --- shared helper _floor_by_rerank: the generalized contract both wrappers delegate to ---
+
+
+def test_floor_by_rerank_custom_text_key_and_keep_min():
+    r = _bare()
+    items = [{"body": f"i{i}"} for i in range(4)]
+    r._reranker = _Emb([(0, 0.7), (1, 0.5), (2, 0.3), (3, 0.1)])
+    # non-default text_key + keep_min=0 -> pure floor, may return fewer
+    out = r._floor_by_rerank("q", items, 0.45, text_key="body", keep_min=0)
+    assert [i["body"] for i in out] == ["i0", "i1"]
+
+
+def test_floor_by_rerank_keep_min_backstops_empty():
+    r = _bare()
+    items = [{"fact": f"f{i}"} for i in range(3)]
+    r._reranker = _Emb([(0, 0.3), (1, 0.2), (2, 0.1)])  # all below floor
+    # keep_min=0 -> [] ; keep_min=2 -> top 2 survive the blanket
+    assert r._floor_by_rerank("q", items, 0.5, keep_min=0) == []
+    assert [i["fact"] for i in r._floor_by_rerank("q", items, 0.5, keep_min=2)] == ["f0", "f1"]

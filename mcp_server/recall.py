@@ -312,6 +312,20 @@ _EPISODE_CUTOFF_TAU = float(os.getenv("SYNAPSE_EPISODE_CUTOFF_TAU", "0") or "0")
 _EPISODE_CUTOFF_MIN_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MIN_K", "3") or "3")
 _EPISODE_CUTOFF_MAX_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MAX_K", "8") or "8")
 
+# ── Relevance gates map ────────────────────────────────────────────────────────────────────
+# recall() has SEVERAL independent relevance gates. They fall into two shapes; before adding a
+# sixth, reuse the right shape rather than copy-pasting:
+#   PER-ITEM rerank floors (drop individual served items below a score) — share _floor_by_rerank:
+#     • FACTS    _RECALL_FACT_FLOOR (below, default 0/off, keep_min=1 — never blanks)
+#     • TIMELINE _TIMELINE_FLOOR    (line ~81, 0.40, keep_min=0 — self-gates to [])
+#     • WEB      _WEB_FLOOR         (line ~297, 0.60) — applied inline in _search_web_reranked on
+#                                    the pool it ALREADY reranked for ordering, so it does not call
+#                                    _floor_by_rerank (that would double-rerank); same idea, keep_min=0.
+#   WHOLE-BUCKET abstention gate (drop the bucket when its TOP score is weak, not per item):
+#     • EPISODES _RECALL_FLOOR / _RECALL_FLOOR_ENFORCE (line ~336) — episodes score flat-high so a
+#                                    per-item floor is a no-op; the confidence gate is a top-score cut.
+# (_RERANK_RECENCY_FLOOR at line ~102 is NOT a relevance gate — it floors the recency multiplier.)
+# ───────────────────────────────────────────────────────────────────────────────────────────
 # Absolute relevance gate on KG FACTS (default 0 = OFF). When SYNAPSE_RECALL_FACT_FLOOR > 0,
 # cross-encoder-score the served facts against the query and DROP those below the floor — the
 # genuine off-topic facts the vector/BM25/graph legs surface (e.g. a "Mattermost decommission"
@@ -1034,43 +1048,49 @@ class Recall:
             keep.append(i)
         return keep, dropped
 
-    def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Drop served facts the cross-encoder scores below _RECALL_FACT_FLOOR (off-topic).
+    def _floor_by_rerank(
+        self,
+        query: str,
+        items: list[dict[str, Any]],
+        floor: float,
+        *,
+        text_key: str = "fact",
+        keep_min: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Shared per-item relevance gate: drop served items the cross-encoder scores below
+        ``floor`` (off-topic). Backs _floor_facts and _floor_timeline — one of several recall()
+        relevance gates (see the "Relevance gates" map by _RECALL_FACT_FLOOR).
 
-        Facts are short, so they're scored at full length — unlike episodes (flat-high at
-        full length), off-topic facts genuinely score low here, so an absolute floor works.
-        Degrades to keeping all facts on rerank failure; keeps >=1 so the bucket is never
-        blanked. Caller gates on _RECALL_FACT_FLOOR > 0 so this runs only when enabled."""
+        These buckets hold SHORT items (facts/events), scored at full length — unlike episodes
+        (flat-high at full length), off-topic short items genuinely score low, so an absolute
+        floor separates. ``keep_min`` > 0 backstops the bucket to its top-N when everything is
+        subfloor (facts: never blank the bucket); keep_min=0 lets it serve [] (timeline/web:
+        self-gate on intent). Degrades to keeping ALL items on reranker outage/disable — a floor
+        must never hard-fail recall. Callers gate on ``floor`` > 0, so this runs only when armed."""
         reranker = self._ensure_reranker()
-        if reranker is None:  # rerank disabled — no floor, keep all facts
-            return facts
-        texts = [(f.get("fact") or "")[:_RERANK_DOC_CAP] for f in facts]
+        if reranker is None:  # rerank disabled — no score signal, keep all
+            return items
+        texts = [(it.get(text_key) or "")[:_RERANK_DOC_CAP] for it in items]
         try:
             scored = reranker.rerank_scored(query, texts)
         except Exception as e:
-            logger.warning("Fact-floor rerank failed, keeping all facts: %s", e)
-            return facts
-        kept = [facts[i] for i, s in scored if s >= _RECALL_FACT_FLOOR]
-        return kept or [facts[i] for i, _ in scored[:1]]
+            logger.warning("Relevance-floor rerank failed, keeping all items: %s", e)
+            return items
+        kept = [items[i] for i, s in scored if s >= floor]
+        if not kept and keep_min > 0:
+            kept = [items[i] for i, _ in scored[:keep_min]]
+        return kept
+
+    def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fact relevance gate (_RECALL_FACT_FLOOR): drop off-topic facts, keep >=1 so the bucket
+        is never blanked. Thin wrapper over _floor_by_rerank; caller gates on the floor > 0."""
+        return self._floor_by_rerank(query, facts, _RECALL_FACT_FLOOR, keep_min=1)
 
     def _floor_timeline(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Drop inline timeline events the cross-encoder scores below _TIMELINE_FLOOR.
-
-        Timeline noise is OFF-TOPIC events (salience gating proved useless — the labeled noise is
-        on-salience), so a relevance floor is the lever. UNLIKE _floor_facts there is NO keep->=1
-        backstop: an all-subfloor result serves [] (self-gates, like the web bucket). Events are
-        short, so they score at full length; degrades to keeping all on rerank failure. Caller
-        gates on _TIMELINE_FLOOR > 0. The standalone recall_timeline() deep path is NOT floored."""
-        reranker = self._ensure_reranker()
-        if reranker is None:  # rerank disabled — no floor signal, keep all
-            return items
-        texts = [(t.get("fact") or "")[:_RERANK_DOC_CAP] for t in items]
-        try:
-            scored = reranker.rerank_scored(query, texts)
-        except Exception as e:
-            logger.warning("Timeline-floor rerank failed, keeping all: %s", e)
-            return items
-        return [items[i] for i, s in scored if s >= _TIMELINE_FLOOR]
+        """Inline timeline relevance gate (_TIMELINE_FLOOR): drop off-topic events (salience gating
+        proved useless — the labeled noise is on-salience). NO keep->=1, so an all-subfloor result
+        serves [] (self-gates like web); the standalone recall_timeline() deep path is NOT floored."""
+        return self._floor_by_rerank(query, items, _TIMELINE_FLOOR)
 
     def _compact_to_passages(
         self, query: str, episodes: list[dict[str, Any]], n: int
