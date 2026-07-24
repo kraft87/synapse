@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, cast
@@ -16,6 +16,15 @@ from ingestion.textsafe import strip_nul
 # Embedding width for the vector casts below — matches the provisioned schema.
 # Default 2048 (Voyage prod, unchanged).
 _EMBED_DIMS = embed_dims()
+
+
+def _vector_literal(embedding: Sequence[float] | None) -> str | None:
+    """Format an embedding as a pgvector text literal. The ``.6f`` precision is a
+    correctness invariant: the write literal must match the query-cast literal
+    byte-for-byte, or vector comparisons drift. Returns ``None`` for a NULL embedding."""
+    if embedding is None:
+        return None
+    return "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
 
 
 class Database:
@@ -195,9 +204,7 @@ class Database:
         """Append one event to the episodic timeline (schema 033). Idempotent on
         UNIQUE(source, source_ref) — re-processing a turn never duplicates. Returns
         rows inserted (0 = already present)."""
-        vlit = (
-            "[" + ",".join(f"{x:.6f}" for x in embedding) + "]" if embedding is not None else None
-        )
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             return conn.execute(
                 "INSERT INTO timeline_events "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -233,7 +240,7 @@ class Database:
         under ``max_dist`` cosine distance — the dedup confirm call's candidate pool.
         Excludes the new event's own turn (the ``ep:<id>`` base ref and its ``#k``
         siblings): a turn's multiple events are intentionally distinct, never dups."""
-        vlit = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT id, fact, t_valid, source_ref, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -306,7 +313,7 @@ class Database:
         """Live preferences for one owner/group, nearest to ``embedding`` by cosine.
         Returns ``[{id, pref, polarity, sim}]`` in DESCENDING similarity (sim = 1 -
         cosine_distance in [0, 2]). The gate's dedup/supersession decision reads this."""
-        vlit = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT id, pref, polarity, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -334,9 +341,7 @@ class Database:
         source_ref: str | None,
     ) -> int:
         """Append one live preference (assert_count=1). Returns the new row id."""
-        vlit = (
-            "[" + ",".join(f"{x:.6f}" for x in embedding) + "]" if embedding is not None else None
-        )
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO preferences "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -401,7 +406,7 @@ class Database:
         """Live notes for one owner/group, nearest to ``embedding`` by cosine (over the
         HOOK — the embed target). Returns ``[{id, hook, body, type, project, sim}]`` in
         DESCENDING similarity. The reconcile path's dedup/supersession decision reads this."""
-        vlit = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT id, hook, body, type, project, 1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -438,9 +443,7 @@ class Database:
     ) -> int:
         """Append one live note. Returns the new row id. NULL embedding is allowed
         (keyless dev/test; dedup KNN simply skips such rows)."""
-        vlit = (
-            "[" + ",".join(f"{x:.6f}" for x in embedding) + "]" if embedding is not None else None
-        )
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -472,9 +475,7 @@ class Database:
     ) -> None:
         """A restated note: refresh hook/body/embedding in place and bump updated_at
         (the note keeps its id — the board line just gets the newer phrasing)."""
-        vlit = (
-            "[" + ",".join(f"{x:.6f}" for x in embedding) + "]" if embedding is not None else None
-        )
+        vlit = _vector_literal(embedding)
         with self._conn() as conn:
             conn.execute(
                 "UPDATE notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -904,80 +905,48 @@ class Database:
 
     def enqueue_extraction(self, item: ExtractionItem) -> None:
         """Enqueue an item for KG extraction. Idempotent — ignores duplicates."""
+        # Each path dedups on a different predicate against still-live rows
+        # (status pending/processing); the exists-check + INSERT are otherwise
+        # identical, so compute (where, params) per path and share the rest.
         if item.episode_id is not None:
             # Deduplicate by episode_id (pending or processing only)
-            with self._conn() as conn:
-                exists = conn.execute(
-                    """
-                    SELECT id FROM extraction_queue
-                    WHERE episode_id = %s AND status IN ('pending', 'processing')
-                    """,
-                    (item.episode_id,),
-                ).fetchone()
-                if exists:
-                    return
-                conn.execute(
-                    """
-                    INSERT INTO extraction_queue
-                        (episode_id, session_id, content, content_type, project)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        item.episode_id,
-                        item.session_id,
-                        item.content,
-                        item.content_type,
-                        item.project,
-                    ),
-                )
-
+            where = "episode_id = %s"
+            params: tuple[Any, ...] = (item.episode_id,)
         elif item.content_type == "chunk":
             # Chunks: MANY per session (unlike a single summary), so dedup by
             # exact content, not (session_id, content_type) — the latter would
             # collapse every chunk of a session into one queue row. Enqueued
             # once at birth (ingestion.chunks.rebuild_chunks on_new), this guards
             # only against a double-run re-enqueuing a still-pending chunk.
-            with self._conn() as conn:
-                exists = conn.execute(
-                    """
-                    SELECT id FROM extraction_queue
-                    WHERE session_id = %s AND content_type = 'chunk' AND content = %s
-                      AND status IN ('pending', 'processing')
-                    """,
-                    (item.session_id, item.content),
-                ).fetchone()
-                if exists:
-                    return
-                conn.execute(
-                    """
-                    INSERT INTO extraction_queue
-                        (episode_id, session_id, content, content_type, project)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (None, item.session_id, item.content, item.content_type, item.project),
-                )
-
+            where = "session_id = %s AND content_type = 'chunk' AND content = %s"
+            params = (item.session_id, item.content)
         else:
             # Summary or manual — deduplicate by session_id + content_type
-            with self._conn() as conn:
-                exists = conn.execute(
-                    """
-                    SELECT id FROM extraction_queue
-                    WHERE session_id = %s AND content_type = %s
-                      AND status IN ('pending', 'processing')
-                    """,
-                    (item.session_id, item.content_type),
-                ).fetchone()
-                if exists:
-                    return
-                conn.execute(
-                    """
-                    INSERT INTO extraction_queue
-                        (episode_id, session_id, content, content_type, project)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (None, item.session_id, item.content, item.content_type, item.project),
-                )
+            where = "session_id = %s AND content_type = %s"
+            params = (item.session_id, item.content_type)
+
+        with self._conn() as conn:
+            exists = conn.execute(
+                "SELECT id FROM extraction_queue "  # nosec B608 — where is built from static literals, not user input
+                f"WHERE {where} AND status IN ('pending', 'processing')",
+                params,
+            ).fetchone()
+            if exists:
+                return
+            conn.execute(
+                """
+                INSERT INTO extraction_queue
+                    (episode_id, session_id, content, content_type, project)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (
+                    item.episode_id,
+                    item.session_id,
+                    item.content,
+                    item.content_type,
+                    item.project,
+                ),
+            )
 
     def get_pending_extractions(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._conn() as conn:
