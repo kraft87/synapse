@@ -29,17 +29,13 @@ Two data-quality rules learned the hard way (2026-07-18 audit):
 
 from __future__ import annotations
 
-import subprocess
-from datetime import UTC, datetime
-
 from . import skill_db_source as DB
 from . import skill_ledger as L
 from . import skill_measure as SM
-from .skill_derive import _extract_json
+from .skill_measure import _clamp_salience, _excerpt, _extract_json
 from .struggle_arc import NEGATIVE_LIST
 
 WINDOW_EPISODES = 10  # aftermath the judge reads
-EXCERPT_CHARS = 700  # per-episode cap in the judge prompt
 BODY_CHARS = 4000  # skill-body cap in the judge prompt
 
 OUTCOMES = ("clean", "deviation", "fight", "unassessable")
@@ -198,29 +194,10 @@ def _load_skill_doc(conn, name: str) -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------ judge
-def _excerpt(episodes: list[dict]) -> str:
-    lines = []
-    for ep in episodes:
-        text = (ep.get("content") or "").strip() or (ep.get("human_turn") or "").strip()
-        if len(text) > EXCERPT_CHARS:
-            text = text[:EXCERPT_CHARS] + " …"
-        lines.append(f"[seq {ep['sequence']}]\n{text}")
-    return "\n\n".join(lines)
-
-
 def _judge_call(prompt: str, model: str | None = None) -> str:
-    """Same plumbing as struggle_arc: the lane's judge backend, explicit-model override."""
-    if model:
-        if model in ("deepseek", "openrouter"):
-            return SM._openrouter_judge(prompt)
-        r = subprocess.run(
-            ["claude", "-p", prompt, "--model", model],
-            capture_output=True,
-            text=True,
-            timeout=240,
-        )
-        return r.stdout
-    return SM._run_judge(prompt)
+    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
+    Kept as a named seam so tests can stub the LLM out."""
+    return SM.run_judge(prompt, model)
 
 
 def judge_fire(
@@ -251,13 +228,6 @@ def _patch_text(patch) -> str | None:
     return None
 
 
-def _clamp_salience(v) -> int | None:
-    try:
-        return max(1, min(5, int(v)))
-    except (TypeError, ValueError):
-        return None
-
-
 # ------------------------------------------------------------------ entry
 def run(conn, *, since, model: str | None = None) -> dict:
     """Judge every skill fire recorded after `since`; deviations/fights become retune
@@ -278,7 +248,7 @@ def run(conn, *, since, model: str | None = None) -> dict:
     if not fires:
         return stats
 
-    scan_night = datetime.now(UTC).date().isoformat()
+    scan_night = SM.scan_night()
     sessions: dict[str, list[dict]] = {}
     for fire in fires:
         sid = fire["session_id"]

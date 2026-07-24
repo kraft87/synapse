@@ -42,6 +42,7 @@ parse_session = skill_measure.parse_session
 is_substantive = skill_measure.is_substantive
 _sample = skill_measure._sample
 _run_judge = skill_measure._run_judge
+_extract_json = skill_measure._extract_json
 
 PROJECTS_DIR = config.PROJECTS_DIR
 OUT_DIR = config.DATA_DIR
@@ -202,19 +203,6 @@ def draft_skill(c: dict) -> str:
         if raw.rstrip().endswith("```"):
             raw = raw.rstrip()[:-3]
     return raw.strip() + "\n"
-
-
-# --------------------------------------------------------------------------- util
-
-
-def _extract_json(raw: str) -> dict | None:
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < 0:
-        return None
-    try:
-        return json.loads(raw[start : end + 1])
-    except Exception:
-        return None
 
 
 def main() -> None:

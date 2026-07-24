@@ -36,14 +36,12 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-from datetime import UTC, datetime
 
 from . import config
 from . import skill_db_source as DB
 from . import skill_ledger as L
 from . import skill_measure as SM
-from .skill_derive import _extract_json
+from .skill_measure import _clamp_salience, _excerpt, _extract_json
 
 # ------------------------------------------------------------------ Stage A knobs
 # Marker sets from the 2026-07-18 struggle-mining pass (hard markers precision-tested
@@ -80,7 +78,6 @@ SOFT_MAX_WORDS = 80  # real corrections are terse; a long fresh request isn't on
 ARC_GAP = 6  # max sequence gap between flagged episodes in one arc
 WINDOW_PAD = 3  # judge reads the arc +/- this many episodes
 MAX_WINDOW_EPISODES = 24
-EXCERPT_CHARS = 700  # per-episode cap in the judge prompt
 
 # Transcript machinery that must never count as a user correction: task-notification
 # turns and session-continuation summaries quote error text verbatim ("same error",
@@ -273,37 +270,10 @@ def _load_catalog(conn) -> list[tuple[str, str]]:
     return [(n, d) for n, d in cur.fetchall()]
 
 
-def _excerpt(episodes: list[dict]) -> str:
-    lines = []
-    for ep in episodes:
-        text = (ep.get("content") or "").strip() or (ep.get("human_turn") or "").strip()
-        if len(text) > EXCERPT_CHARS:
-            text = text[:EXCERPT_CHARS] + " …"
-        lines.append(f"[seq {ep['sequence']}]\n{text}")
-    return "\n\n".join(lines)
-
-
 def _judge_call(prompt: str, model: str | None = None) -> str:
-    """The lane's existing LLM plumbing (skill_measure), with an explicit-model escape
-    hatch mirroring skill_derive._draft_call."""
-    if model:
-        if model in ("deepseek", "openrouter"):
-            return SM._openrouter_judge(prompt)
-        r = subprocess.run(
-            ["claude", "-p", prompt, "--model", model],
-            capture_output=True,
-            text=True,
-            timeout=240,
-        )
-        return r.stdout
-    return SM._run_judge(prompt)
-
-
-def _clamp_salience(v) -> int | None:
-    try:
-        return max(1, min(5, int(v)))
-    except (TypeError, ValueError):
-        return None
+    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
+    Kept as a named seam so tests can stub the LLM out."""
+    return SM.run_judge(prompt, model)
 
 
 def judge_arc(window: list[dict], catalog_text: str, model: str | None = None) -> dict | None:
@@ -325,7 +295,7 @@ def _emit(
     conn, arc: dict, window: list[dict], verdict: dict, skill_names: set[str]
 ) -> tuple[dict, str]:
     """Merge one judged arc into the ledger. Returns (merge result, resolved kind)."""
-    scan_night = datetime.now(UTC).date().isoformat()
+    scan_night = SM.scan_night()
     date = arc.get("date")
     # explicit "make this a skill" in the window -> grounded evidence (design §1)
     grounded = any(DB._EXPLICIT_SKILL.search(ep.get("human_turn") or "") for ep in window)

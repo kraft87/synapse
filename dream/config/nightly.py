@@ -24,7 +24,7 @@ import psycopg
 from dream.skills import skill_db_source as DB
 from dream.skills import skill_measure as SM
 from dream.skills.config import db_url
-from dream.skills.skill_derive import _extract_json
+from dream.skills.skill_measure import _extract_json
 
 LEARNED_FILE = os.environ.get("CONFIG_LEARNED_FILE", "rules/learned.md")
 PROPOSE_SESSIONS = int(

@@ -27,6 +27,7 @@ import re
 import subprocess
 import time
 from collections import Counter
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import config
@@ -290,18 +291,33 @@ Output ONLY a JSON object, no prose:
 {{"would_have_helped": [{{"skill": "name", "why": "one sentence"}}], "dismissed": [{{"skill": "name", "why": "one sentence"}}]}}"""
 
 
-def _run_judge(prompt: str) -> str:
-    backend = os.environ.get("SKILL_MEASURE_MODEL", config.JUDGE_BACKEND)
-    if backend in ("deepseek", "openrouter"):
+def run_judge(prompt: str, model: str | None = None, timeout: int = 240) -> str:
+    """The lane-wide LLM judge dispatch (shared by every dream->skills detector).
+
+    model=None -> the default backend: env SKILL_MEASURE_MODEL or config.JUDGE_BACKEND;
+    a "deepseek"/"openrouter" backend goes to OpenRouter, otherwise the claude CLI on
+    config.JUDGE_MODEL (no API key, runs on the Max subscription; nightly volume is tiny).
+    An explicit `model` overrides: "deepseek"/"openrouter" -> OpenRouter, anything else ->
+    the claude CLI with that model. `timeout` bounds the subprocess call."""
+    if model is None:
+        backend = os.environ.get("SKILL_MEASURE_MODEL", config.JUDGE_BACKEND)
+        if backend in ("deepseek", "openrouter"):
+            return _openrouter_judge(prompt)
+        model = config.JUDGE_MODEL
+    elif model in ("deepseek", "openrouter"):
         return _openrouter_judge(prompt)
-    # default: claude CLI (no API key, runs on the Max subscription; nightly volume is tiny)
     r = subprocess.run(
-        ["claude", "-p", prompt, "--model", config.JUDGE_MODEL],
+        ["claude", "-p", prompt, "--model", model],
         capture_output=True,
         text=True,
-        timeout=240,
+        timeout=timeout,
     )
     return r.stdout
+
+
+def _run_judge(prompt: str) -> str:
+    """Back-compat alias: the default-backend judge path. Delegates to run_judge()."""
+    return run_judge(prompt)
 
 
 def _openrouter_judge(prompt: str) -> str:
@@ -319,6 +335,43 @@ def _openrouter_judge(prompt: str) -> str:
     return json.loads(urllib.request.urlopen(req, timeout=240).read())["choices"][0]["message"][
         "content"
     ]
+
+
+def _extract_json(raw: str) -> dict | None:
+    """Lenient JSON extraction from a judge response: the first `{` .. last `}` slice.
+    None on no-brace or parse failure. Shared by every dream->skills detector."""
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end < 0:
+        return None
+    try:
+        return json.loads(raw[start : end + 1])
+    except Exception:
+        return None
+
+
+def _excerpt(episodes: list[dict], excerpt_chars: int = 700) -> str:
+    """Render a transcript window for a judge prompt: one `[seq N]` block per episode
+    (content, else human_turn), each capped at `excerpt_chars`. Shared leaf helper."""
+    lines = []
+    for ep in episodes:
+        text = (ep.get("content") or "").strip() or (ep.get("human_turn") or "").strip()
+        if len(text) > excerpt_chars:
+            text = text[:excerpt_chars] + " …"
+        lines.append(f"[seq {ep['sequence']}]\n{text}")
+    return "\n\n".join(lines)
+
+
+def _clamp_salience(v) -> int | None:
+    """Coerce a judge-provided salience to 1..5; None when unparseable. Shared leaf helper."""
+    try:
+        return max(1, min(5, int(v)))
+    except (TypeError, ValueError):
+        return None
+
+
+def scan_night() -> str:
+    """The UTC scan-night stamp (YYYY-MM-DD) every detector tags its evidence with."""
+    return datetime.now(UTC).date().isoformat()
 
 
 def _sample(msgs: list[str], cap: int = 40) -> str:
@@ -342,14 +395,7 @@ def judge_session(s: dict, catalog: str) -> dict | None:
     except Exception as e:
         print(f"  judge failed for {s['session'][:8]}: {e}")
         return None
-    start = raw.find("{")
-    end = raw.rfind("}")
-    if start < 0 or end < 0:
-        return None
-    try:
-        return json.loads(raw[start : end + 1])
-    except Exception:
-        return None
+    return _extract_json(raw)
 
 
 if __name__ == "__main__":
