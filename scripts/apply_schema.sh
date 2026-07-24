@@ -34,9 +34,8 @@ DSN="${1:-${SYNAPSE_DB_URL:-}}"
 #   007  drops session_summaries        — real migration (001 creates it, 004
 #                                         alters it, 007 retires it)
 #   008  chunks                         — written by the poller (ingestion/db.py)
-#   009  synth_documents                — joined by mcp_server + dream/stage3
+#   009  synth_documents                — joined by mcp_server
 #                                         (generation retired, table still read)
-#   010  memory_proposals               — written by dream stage 3
 #   014  halfvec HNSW indexes           — instant on an empty DB; IF NOT EXISTS
 #                                         no-op where already built. On a large
 #                                         populated DB build CONCURRENTLY by
@@ -51,7 +50,6 @@ FILES=(
   007_drop_summaries.sql
   008_chunks.sql
   009_synth_documents.sql
-  010_memory_proposals.sql
   011_web_artifacts.sql
   012_web_chunks.sql
   013_web_chunk_context.sql
@@ -88,6 +86,7 @@ FILES=(
   044_dream_runs.sql
   045_skills_v2_foundation.sql
   046_recall_feedback.sql
+  047_drop_memory_proposals.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means
