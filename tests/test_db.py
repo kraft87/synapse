@@ -37,6 +37,22 @@ class TestEpisodeWriter:
         assert isinstance(ep_id, int)
         assert ep_id > 0
 
+    def test_nul_bytes_stripped_before_insert(self, db):
+        # TEXT columns reject NUL bytes and jsonb rejects the u0000 escape —
+        # a stray NUL in a transcript must not fail the INSERT.
+        ep = Episode(
+            session_id="db-test-nul",
+            sequence=1,
+            content="clean\x00text",
+            human_turn="a\x00b",
+            metadata={"k": "v\x00w", "nested": ["x\x00y"]},
+        )
+        ep_id = db.upsert_episode(ep)
+        row = db.get_episode(ep_id)
+        assert row["content"] == "cleantext"
+        assert row["human_turn"] == "ab"
+        assert row["metadata"] == {"k": "vw", "nested": ["xy"]}
+
     def test_upsert_is_idempotent(self, db):
         ep = Episode(session_id="db-test-2", sequence=1, content="idempotent test")
         id1 = db.upsert_episode(ep)

@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from ingestion.embedding import embed_dims
+from ingestion.textsafe import strip_nul
 
 logger = logging.getLogger(__name__)
 
@@ -143,10 +144,10 @@ class KGPostgresWriter:
                     OWNER,
                     group_id,
                     project or "",
-                    name or "",
-                    normalized_name or "",
+                    strip_nul(name or ""),
+                    strip_nul(normalized_name or ""),
                     entity_type or "",
-                    summary or "",
+                    strip_nul(summary or ""),
                     _vec(embedding),
                     created,
                     created,
@@ -183,8 +184,8 @@ class KGPostgresWriter:
                     group_id,
                     r["src"],
                     r["tgt"],
-                    r.get("name") or "",
-                    r.get("fact") or "",
+                    strip_nul(r.get("name") or ""),
+                    strip_nul(r.get("fact") or ""),
                     _vec(r.get("emb")),
                     json.dumps(eps) if eps is not None else None,
                     0,
