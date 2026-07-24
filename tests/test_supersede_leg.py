@@ -9,8 +9,8 @@ fact itself.
 from __future__ import annotations
 
 from mcp_server.recall import Recall
+from tests.helpers.embed import GROUP
 
-GROUP = "technical"
 DIM = 2048
 
 

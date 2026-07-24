@@ -13,7 +13,6 @@ production (#67 PR 2).
 from __future__ import annotations
 
 from typing import Any
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -25,6 +24,7 @@ from ingestion.dedup import (
     _shingles,
     has_high_entropy,
 )
+from tests.helpers.llm import mock_llm_client
 
 # ---------------------------------------------------------------------------
 # Mock-KG helper
@@ -87,15 +87,6 @@ class _FakeKGClient:
 
     def load_type_map(self) -> dict[str, str]:
         return dict(self._graph_obj._type_map)
-
-
-def _make_llm(answer: str) -> MagicMock:
-    """Mock LLM client returning ``answer`` (one of yes/no/uncertain)."""
-    client = MagicMock()
-    msg = MagicMock()
-    msg.content = [MagicMock(text=answer)]
-    client.messages.create.return_value = msg
-    return client
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +298,7 @@ class TestLLMConfirm:
             exact_match={},
         )
         client = _FakeKGClient(graph)
-        llm = _make_llm("yes")
+        llm = mock_llm_client("yes")
         deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
 
         result = deduper.find_or_none("synapse poller", summary="...")
@@ -320,7 +311,7 @@ class TestLLMConfirm:
             exact_match={},
         )
         client = _FakeKGClient(graph)
-        llm = _make_llm("no")
+        llm = mock_llm_client("no")
         deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
 
         result = deduper.find_or_none("synapse poller", summary="...")
@@ -332,7 +323,7 @@ class TestLLMConfirm:
             exact_match={},
         )
         client = _FakeKGClient(graph)
-        llm = _make_llm("uncertain")
+        llm = mock_llm_client("uncertain")
         deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
         # "uncertain" answers don't accept the merge — return None so the
         # caller writes a new node and the nightly pipeline can re-evaluate.

@@ -1,4 +1,5 @@
 import os
+from unittest.mock import patch
 
 import psycopg
 import pytest
@@ -50,6 +51,16 @@ def pytest_collection_modifyitems(config, items):
         if file_name in _DB_FILES:
             item.add_marker(pytest.mark.xdist_group(name="db"))
             item.add_marker(pytest.mark.db)
+
+
+@pytest.fixture()
+def no_retry_sleep():
+    """Short-circuit tenacity's backoff sleep so retry tests don't stall.
+
+    Opt-in (NOT autouse): request it directly, or via a local autouse shim in
+    files that want it applied to every test."""
+    with patch("tenacity.nap.time.sleep"):
+        yield
 
 
 @pytest.fixture(scope="session")

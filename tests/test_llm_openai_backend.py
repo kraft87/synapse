@@ -22,7 +22,6 @@ from __future__ import annotations
 import gzip
 import json
 from typing import Any
-from unittest.mock import patch
 
 import httpx
 import pytest
@@ -77,10 +76,9 @@ def _client_with(
 
 
 @pytest.fixture(autouse=True)
-def _no_retry_sleep():
-    """Short-circuit tenacity's backoff sleep so retry tests don't stall."""
-    with patch("tenacity.nap.time.sleep"):
-        yield
+def _no_retry_sleep(no_retry_sleep):
+    """Auto-apply the shared conftest no_retry_sleep patch to every test here."""
+    yield
 
 
 # ---------------------------------------------------------------------------

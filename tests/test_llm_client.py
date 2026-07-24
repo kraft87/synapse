@@ -44,6 +44,7 @@ from ingestion.llm_client import (
     agent_call,
     parse_with_retry,
 )
+from tests.helpers.llm import mock_llm_message
 
 # ---------------------------------------------------------------------------
 # Helpers for constructing the structured ``anthropic`` exceptions.
@@ -77,12 +78,6 @@ def _timeout_error() -> APITimeoutError:
     return APITimeoutError(request=_FAKE_REQUEST)
 
 
-def _mock_response(text: str) -> Any:
-    msg = MagicMock()
-    msg.content = [MagicMock(text=text)]
-    return msg
-
-
 # ---------------------------------------------------------------------------
 # _MessagesProxy.create — retry on transient errors
 # ---------------------------------------------------------------------------
@@ -99,17 +94,13 @@ class TestMessagesProxyRetry:
     spin up a real CLI.
     """
 
-    def setup_method(self) -> None:
-        # Short-circuit the tenacity wait so retries don't actually
-        # sleep — we still want to verify the call_count, not the wait.
-        # ``_MessagesProxy.create`` references ``_RETRY_WAIT`` at decorator
-        # creation time, so we have to patch ``time.sleep`` inside
-        # tenacity. Easier: patch sleep on the tenacity nap helper.
-        self._sleep_patcher = patch("tenacity.nap.time.sleep")
-        self._sleep_patcher.start()
-
-    def teardown_method(self) -> None:
-        self._sleep_patcher.stop()
+    @pytest.fixture(autouse=True)
+    def _no_retry_sleep(self, no_retry_sleep):
+        # Short-circuit the tenacity wait so retries don't actually sleep — we
+        # still want to verify the call_count, not the wait. The shared conftest
+        # fixture patches ``tenacity.nap.time.sleep``; this autouse shim applies
+        # it to every method in the class.
+        yield
 
     def test_retries_on_rate_limit_error(self):
         """RateLimitError raised twice, success on third → 3 calls total."""
@@ -271,8 +262,8 @@ class TestParseWithRetry:
         """First call returns malformed JSON, second returns valid → result."""
         client = MagicMock()
         client.messages.create.side_effect = [
-            _mock_response("not json"),
-            _mock_response('{"ok": true}'),
+            mock_llm_message("not json"),
+            mock_llm_message('{"ok": true}'),
         ]
 
         result = parse_with_retry(
@@ -294,7 +285,7 @@ class TestParseWithRetry:
     def test_gives_up_after_max_attempts(self):
         """Bad JSON every attempt → raises MalformedResponseError, N calls made."""
         client = MagicMock()
-        client.messages.create.return_value = _mock_response("not json ever")
+        client.messages.create.return_value = mock_llm_message("not json ever")
 
         with pytest.raises(MalformedResponseError):
             parse_with_retry(
@@ -309,7 +300,7 @@ class TestParseWithRetry:
     def test_no_retry_on_first_success(self):
         """Valid JSON first time → 1 call, no feedback appended."""
         client = MagicMock()
-        client.messages.create.return_value = _mock_response('{"ok": true}')
+        client.messages.create.return_value = mock_llm_message('{"ok": true}')
 
         result = parse_with_retry(
             client,
@@ -328,7 +319,7 @@ class TestParseWithRetry:
         the retry loop and ultimately surfaces a ``MalformedResponseError``.
         """
         client = MagicMock()
-        client.messages.create.return_value = _mock_response("garbage")
+        client.messages.create.return_value = mock_llm_message("garbage")
 
         def strict_parser(raw: str) -> dict[str, Any]:
             # Raise the raw library exception instead of MalformedResponseError.
