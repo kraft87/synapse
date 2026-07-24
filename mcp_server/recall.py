@@ -70,6 +70,15 @@ _RRF_K = 60
 # nothing. Kill switch SYNAPSE_RECALL_TIMELINE=0.
 _TIMELINE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_TIMELINE", "1") != "0"
 _TIMELINE_LIMIT = 8
+# Absolute cross-encoder floor on the INLINE timeline leg (2026-07-24). The timeline bucket
+# served ~23% precision (feedback); the noise is OFF-TOPIC events, not routine ones — salience
+# gating was measured useless (47/49 labeled-noise events are salience>=1), so min_salience is
+# the wrong lever. A relevance floor is the right one: validated on 64 labeled events, floor 0.40
+# gives 86% noise suppression at 87% helpful retention (~23%->~65% precision). Overlap is real
+# (helpful min 0.264, noise max 0.555), so this is not the clean 100/100 web got. No keep->=1
+# backstop: an all-subfloor result serves [] (self-gates, like web). The STANDALONE
+# recall_timeline() deep path stays unfloored. 0 disables. Applies only when the leg fires.
+_TIMELINE_FLOOR = float(os.getenv("SYNAPSE_RECALL_TIMELINE_FLOOR", "0.40") or "0.40")
 # Preferences leg (schema 035): the standing USER-preference bucket. Like the timeline
 # leg, one cheap parallel DB read on every query — top-5 live prefs by cosine to the
 # query embedding — reusing this call's query_emb (no extra Voyage round-trip). Kept out
@@ -1044,6 +1053,25 @@ class Recall:
         kept = [facts[i] for i, s in scored if s >= _RECALL_FACT_FLOOR]
         return kept or [facts[i] for i, _ in scored[:1]]
 
+    def _floor_timeline(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Drop inline timeline events the cross-encoder scores below _TIMELINE_FLOOR.
+
+        Timeline noise is OFF-TOPIC events (salience gating proved useless — the labeled noise is
+        on-salience), so a relevance floor is the lever. UNLIKE _floor_facts there is NO keep->=1
+        backstop: an all-subfloor result serves [] (self-gates, like the web bucket). Events are
+        short, so they score at full length; degrades to keeping all on rerank failure. Caller
+        gates on _TIMELINE_FLOOR > 0. The standalone recall_timeline() deep path is NOT floored."""
+        reranker = self._ensure_reranker()
+        if reranker is None:  # rerank disabled — no floor signal, keep all
+            return items
+        texts = [(t.get("fact") or "")[:_RERANK_DOC_CAP] for t in items]
+        try:
+            scored = reranker.rerank_scored(query, texts)
+        except Exception as e:
+            logger.warning("Timeline-floor rerank failed, keeping all: %s", e)
+            return items
+        return [items[i] for i, s in scored if s >= _TIMELINE_FLOOR]
+
     def _compact_to_passages(
         self, query: str, episodes: list[dict[str, Any]], n: int
     ) -> list[dict[str, Any]]:
@@ -1668,7 +1696,10 @@ class Recall:
             res = self._ensure_timeline().recall_timeline(
                 query=query, project=project, query_emb=query_emb, group_id=group_id
             )
-            return list(res.get("items") or [])[:_TIMELINE_LIMIT]
+            items = list(res.get("items") or [])[:_TIMELINE_LIMIT]
+            if _TIMELINE_FLOOR > 0 and items:
+                items = self._floor_timeline(query, items)
+            return items
 
         f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
 
