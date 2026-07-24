@@ -66,6 +66,26 @@ class TestHelpers:
 
 
 class TestUpsertNode:
+    def test_nul_bytes_stripped_from_text_fields(self, kg_writer, conn):
+        # Postgres TEXT rejects NUL bytes — an LLM response carrying one must
+        # not fail the write (and the queue-item retry loop behind it).
+        kg_writer.upsert_node(
+            uuid="e-nul",
+            name="Name\x00X",
+            normalized_name="name\x00x",
+            entity_type="Tool",
+            summary="sum\x00mary",
+            group_id=GROUP,
+            project=None,
+            created_at=None,
+            valid_at=None,
+            embedding=None,
+        )
+        row = conn.execute(
+            "SELECT name, normalized_name, summary FROM kg_entities WHERE uuid = 'e-nul'"
+        ).fetchone()
+        assert row == ("NameX", "namex", "summary")
+
     def test_insert_then_update_semantics(self, kg_writer, conn):
         kg_writer.upsert_node(
             uuid="e-1",
@@ -130,6 +150,11 @@ class TestCreateEdges:
         }
         base.update(over)
         return base
+
+    def test_nul_bytes_stripped_from_fact(self, kg_writer, conn):
+        kg_writer.create_edges([self._row("r-nul", fact="a\x00fact")], GROUP)
+        row = conn.execute("SELECT fact FROM kg_relationships WHERE uuid = 'r-nul'").fetchone()
+        assert row == ("afact",)
 
     def test_insert_round_trip(self, kg_writer, conn):
         kg_writer.create_edges(

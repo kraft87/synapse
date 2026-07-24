@@ -771,6 +771,12 @@ class Recall:
     def _bm25_table(
         self, table: str, query: str, project: str | None, limit: int, doc_type: str
     ) -> list[dict[str, Any]]:
+        # A query with no alphanumeric content tokenizes to nothing — skip the
+        # round-trip instead of burning it on a guaranteed-empty (or erroring)
+        # match. Same "no tokens -> no candidates" semantics as the KG BM25
+        # legs' sanitize-then-empty check.
+        if not any(c.isalnum() for c in query):
+            return []
         pg = self._ensure_pg()
         ts = self._ts_col(table)
         extra = self._extra_cols(table)
@@ -1249,6 +1255,9 @@ class Recall:
     # the merge layer so a single page never takes more than one slot.
 
     def _search_bm25_web(self, query: str, limit: int) -> list[dict[str, Any]]:
+        # Same no-alphanumeric-tokens short-circuit as _bm25_table.
+        if not any(c.isalnum() for c in query):
+            return []
         pg = self._ensure_pg()
         try:
             rows = pg.execute(

@@ -11,6 +11,7 @@ from psycopg.rows import dict_row
 
 from ingestion.embedding import embed_dims
 from ingestion.models import Episode, ExtractionItem
+from ingestion.textsafe import strip_nul
 
 # Embedding width for the vector casts below — matches the provisioned schema.
 # Default 2048 (Voyage prod, unchanged).
@@ -100,17 +101,20 @@ class Database:
                                       ELSE episodes.created_at END
             RETURNING id
         """
+        # strip_nul on the text/metadata fields: TEXT columns reject NUL bytes
+        # and jsonb rejects the u0000 escape, so one stray byte in a transcript
+        # would fail the whole INSERT.
         params = {
             "session_id": ep.session_id,
             "sequence": ep.sequence,
             "project": ep.project,
             "platform": ep.platform,
             "model": ep.model,
-            "human_turn": ep.human_turn,
-            "assistant_turn": ep.assistant_turn,
-            "content": ep.content,
+            "human_turn": strip_nul(ep.human_turn),
+            "assistant_turn": strip_nul(ep.assistant_turn),
+            "content": strip_nul(ep.content),
             "span_id": ep.span_id,
-            "metadata": orjson.dumps(ep.metadata).decode(),
+            "metadata": orjson.dumps(strip_nul(ep.metadata)).decode(),
             "source": ep.source,
             "created_at": ep.created_at,
         }

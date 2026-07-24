@@ -204,3 +204,20 @@ def test_serving_fix_defaults_on():
     assert recall_mod._RERANK_RECENCY is True
     assert recall_mod._SUPPRESS_QUERY_ECHO is True
     assert recall_mod._RERANK_RECENCY_FLOOR == 0.25
+
+
+# --- BM25 empty-query short-circuit ---------------------------------------------
+
+
+def test_bm25_table_short_circuits_no_alnum_query():
+    # A query with no alphanumeric content tokenizes to nothing — the leg must
+    # return "no candidates" without touching Postgres. _bare() has no pg, so
+    # reaching _ensure_pg would blow up the test.
+    r = _bare()
+    assert r._bm25_table("episodes", "?!... ---", None, 10, "episode") == []
+    assert r._bm25_table("episodes", "", None, 10, "episode") == []
+
+
+def test_bm25_web_short_circuits_no_alnum_query():
+    r = _bare()
+    assert r._search_bm25_web("(((", 10) == []
