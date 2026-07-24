@@ -19,8 +19,9 @@ import os
 import sys
 import time
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
+
+from dream.skills import config as skills_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,20 +30,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Config from env / defaults
-_DB_URL = os.environ.get("SYNAPSE_DB_URL", "")
 
-
-def _load_db_url() -> str:
-    if _DB_URL:
-        return _DB_URL
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("SYNAPSE_DB_URL="):
-                return line.split("=", 1)[1].strip()
-    raise RuntimeError("SYNAPSE_DB_URL not set")
+def _require_db_url() -> str:
+    """The Postgres DSN, resolved via the skills-lane config (env, then .env fallback).
+    Hard-fails if unset — the pipeline cannot run without a database."""
+    url = skills_config.db_url()
+    if not url:
+        raise RuntimeError("SYNAPSE_DB_URL not set")
+    return url
 
 
 def run_once(stages: set[int] | None = None) -> None:
@@ -51,7 +46,7 @@ def run_once(stages: set[int] | None = None) -> None:
     # future dream rework on a better substrate, but run_once no longer invokes
     # it by default (pass an explicit stage set to run it deliberately).
     stages = stages or set()
-    db_url = _load_db_url()
+    db_url = _require_db_url()
 
     logger.info("Dream pipeline starting (stages=%s)", sorted(stages))
 
@@ -250,7 +245,7 @@ def _seconds_until_2am() -> float:
 if __name__ == "__main__":
     from ingestion.schema_check import check_schema_version
 
-    check_schema_version(_load_db_url())
+    check_schema_version(_require_db_url())
 
     args = set(sys.argv[1:])
 

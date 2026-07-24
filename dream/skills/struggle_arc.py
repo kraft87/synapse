@@ -262,12 +262,8 @@ def _fetch_window(conn, session_id: str, lo: int, hi: int) -> list[dict]:
 
 
 def _load_catalog(conn) -> list[tuple[str, str]]:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
-        "WHERE status = 'active' ORDER BY name"
-    )
-    return [(n, d) for n, d in cur.fetchall()]
+    """(name, description) for ACTIVE skills, name-ordered — the lane's shared load_catalog."""
+    return SM.load_catalog(conn)
 
 
 def _judge_call(prompt: str, model: str | None = None) -> str:
@@ -411,7 +407,7 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
         return stats
 
     catalog = _load_catalog(conn)
-    catalog_text = "\n".join(f"- {n}: {d}" for n, d in catalog)
+    catalog_text = SM.format_catalog(catalog)
     skill_names = {n for n, _ in catalog}
 
     for arc in arcs:

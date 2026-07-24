@@ -64,22 +64,34 @@ def skill_description(text: str) -> str:
     return ""
 
 
+def load_catalog(conn) -> list[tuple[str, str]]:
+    """(name, description) for ACTIVE skills, ordered by name — the lane-wide registry read
+    every detector shares. Server-side the registry IS the catalog (the dream container has no
+    ~/.claude/skills); the client's skills_sync owns the disk<->registry publish. `description`
+    is the trigger surface."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
+        "WHERE status = 'active' ORDER BY name"
+    )
+    return [(name, desc) for name, desc in cur.fetchall()]
+
+
+def format_catalog(items) -> str:
+    """Render a skill catalog for a judge prompt: one `- {name}: {desc}` line per entry,
+    "(none)" when the catalog is empty."""
+    return "\n".join(f"- {n}: {d}" for n, d in items) or "(none)"
+
+
 def load_skills() -> dict[str, str]:
-    """name -> description for ACTIVE skills, read from the skill_registry table.
+    """name -> description for ACTIVE skills — the connection-owning wrapper over load_catalog.
 
     Server-side the catalog IS the registry (the dream container has no ~/.claude/skills); the
     client's skills_sync owns the disk<->registry publish. `description` is the trigger surface."""
     import psycopg
 
-    skills: dict[str, str] = {}
-    with psycopg.connect(config.db_url(), connect_timeout=10) as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
-            "WHERE status = 'active'"
-        )
-        for name, desc in cur.fetchall():
-            skills[name] = desc
-    return skills
+    with psycopg.connect(config.db_url(), connect_timeout=10) as conn:
+        return dict(load_catalog(conn))
 
 
 def _content_blocks(rec: dict) -> list:

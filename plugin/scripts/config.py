@@ -198,6 +198,17 @@ def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> di
         return json.loads(r.read() or b"{}")
 
 
+def act(endpoint: str, cid: int, action: str, *, expect: str, **extra) -> dict | None:
+    """POST an accept/reject/promote to `<endpoint>/proposals/act` and gate on the expected
+    status. Returns the response dict when status == expect; otherwise prints (detail or
+    "not found") and returns None. `extra` carries per-action fields (reason, scope, ...)."""
+    r = post_json(f"{endpoint}/proposals/act", {"id": cid, "action": action, **extra})
+    if r.get("status") != expect:
+        print(r.get("detail") or "not found")
+        return None
+    return r
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)

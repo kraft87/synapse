@@ -90,9 +90,8 @@ def _write_draft(name: str, body: str) -> str | None:
 
 
 def cmd_accept(cid: int) -> None:
-    r = config.post_json("/skills/proposals/act", {"id": cid, "action": "accept"})
-    if not r.get("found", True) or r.get("status") != "accepted":
-        print(r.get("detail") or "not found")
+    r = config.act("/skills", cid, "accept", expect="accepted")
+    if r is None:
         return
     if r.get("routing_eval"):
         print(r["routing_eval"])
@@ -107,9 +106,8 @@ def cmd_accept(cid: int) -> None:
 
 
 def cmd_reject(cid: int, reason: str | None) -> None:
-    r = config.post_json("/skills/proposals/act", {"id": cid, "action": "reject", "reason": reason})
-    if r.get("status") != "rejected":
-        print(r.get("detail") or "not found")
+    r = config.act("/skills", cid, "reject", expect="rejected", reason=reason)
+    if r is None:
         return
     print(f"rejected [{cid}] ({r.get('reason')}); suppressed 30d.")
 
