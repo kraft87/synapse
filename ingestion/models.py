@@ -9,6 +9,18 @@ from pydantic import BaseModel, Field, model_validator
 logger = logging.getLogger(__name__)
 
 
+# Field-length caps for LLM-extracted free-form strings. A structural backstop
+# against meta-reasoning or schema-description text bleeding into a field the
+# prompt could not fully guard: models have been observed dumping multi-KB
+# deliberation into "summary"-shaped fields. Caps sit far above anything a
+# legitimate extraction produces (a dense date-anchored fact runs ~400 chars),
+# so a breach means bleed, not a long-but-real value.
+MAX_ENTITY_NAME_LEN = 200
+MAX_RELATIONSHIP_LEN = 100
+MAX_ENTITY_SUMMARY_LEN = 1200
+MAX_FACT_LEN = 2000
+
+
 def _normalize_entity_name(name: str) -> str:
     """Case-insensitive, whitespace-collapsed normalization for cross-ref matching.
 
@@ -110,14 +122,37 @@ class CombinedExtraction(BaseModel):
         empty-named entities are recorded on ``dropped_facts`` /
         ``dropped_entities`` so the caller can log counts without re-walking
         the raw response.
+
+        Also applies the field-length caps (module constants above), graceful
+        degradation style: an over-cap entity name drops the entity (a
+        200+-char "name" is never a real referent — and its facts fall out via
+        the cross-reference pass), an over-cap summary is blanked (the entity
+        itself is still real), and an over-cap fact or relationship drops the
+        fact. Lengths are logged; content is not.
         """
-        # Filter out empty-named entities up front; they can't be referenced.
+        # Filter out empty- and pathological-named entities up front; blank
+        # over-cap summaries in place.
         valid_entities: list[ExtractedEntity] = []
         dropped_entities: list[ExtractedEntity] = []
         for entity in self.entities:
             if not entity.name or not entity.name.strip():
                 dropped_entities.append(entity)
                 continue
+            if len(entity.name) > MAX_ENTITY_NAME_LEN:
+                logger.info(
+                    "Dropped entity with over-cap name (len=%d cap=%d)",
+                    len(entity.name),
+                    MAX_ENTITY_NAME_LEN,
+                )
+                dropped_entities.append(entity)
+                continue
+            if len(entity.summary) > MAX_ENTITY_SUMMARY_LEN:
+                logger.info(
+                    "Blanked over-cap entity summary (len=%d cap=%d)",
+                    len(entity.summary),
+                    MAX_ENTITY_SUMMARY_LEN,
+                )
+                entity.summary = ""
             valid_entities.append(entity)
 
         entity_name_keys: set[str] = {_normalize_entity_name(e.name) for e in valid_entities}
@@ -131,6 +166,14 @@ class CombinedExtraction(BaseModel):
                 dropped_facts.append(fact)
                 continue
             if src_key not in entity_name_keys or tgt_key not in entity_name_keys:
+                dropped_facts.append(fact)
+                continue
+            if len(fact.fact) > MAX_FACT_LEN or len(fact.relationship) > MAX_RELATIONSHIP_LEN:
+                logger.info(
+                    "Dropped over-cap fact (fact_len=%d relationship_len=%d)",
+                    len(fact.fact),
+                    len(fact.relationship),
+                )
                 dropped_facts.append(fact)
                 continue
             kept_facts.append(fact)
