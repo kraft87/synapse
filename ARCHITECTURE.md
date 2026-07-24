@@ -561,7 +561,7 @@ The real KG-hygiene and web-capture work runs as **independent entry points** (s
 
 - **Semantic identity merge** (#48, [§5.3](#53-entity-resolution)) — exact-name and moderate (name-gated) pairs auto-merge on the write path; the lexically-different semantic lane is detection-only, surfaced for human review (the #49 gap). The former standalone `dream/entity_dedup` pass was removed in #67.
 - **Communities** — **legacy/retired.** `Community` clusters (Raghavan label propagation) and `HAS_MEMBER` edges lived in FalkorDB; the bucket was retired with the #67 KG cutover (never measured as contributing), so there is no runnable module and no Postgres target.
-- **Cursor ingest** — the live path is `ingestion/cursor_sqlite_client.py` (`CursorSQLiteParser`) + `cursor_sqlite_backfill.py`, emitting real `Episode` rows (`platform="cursor"`). Note: `dream/cursor_parser.py` is **legacy/dead** (no caller) — don't cite it.
+- **Cursor ingest** — the live path is `ingestion/cursor_sqlite_client.py` (`CursorSQLiteParser`) + `cursor_sqlite_backfill.py`, emitting real `Episode` rows (`platform="cursor"`). (The old `dream/cursor_parser.py` was **deleted** — it had no caller.)
 
 **Stage 2's one live side-effect** (only if explicitly invoked, which the schedule never does): `_refresh_entity_summaries` rewrites the top-20 dense `Entity.summary` per group from connected facts. Worth knowing it exists; it is dormant in practice.
 
@@ -744,8 +744,7 @@ synapse/
 │
 ├── dream/
 │   ├── __main__.py            # nightly orchestrator — currently a NO-OP (stages retired)
-│   ├── stage3.py              # dream docs / memory proposals — DEFINED, OFF
-│   └── cursor_parser.py       # LEGACY/dead (use ingestion/cursor_sqlite_client.py)
+│   └── stage3.py              # dream docs / memory proposals — DEFINED, OFF
 │
 ├── scripts/
 │   ├── synapse_ingest_hook.py # the Stop hook (tail shipper)

@@ -380,12 +380,9 @@ _STRUCTURAL_TOKENS = frozenset(
 
 
 def _load_registry(conn) -> dict[str, str]:
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
-        "WHERE status = 'active'"
-    )
-    return {name: desc for name, desc in cur.fetchall()}
+    """name -> description for ACTIVE skills (dict view over the lane's shared load_catalog).
+    _covered_by_registry wants the dict; the catalog formatter re-sorts the items itself."""
+    return dict(skill_measure.load_catalog(conn))
 
 
 def _covered_by_registry(steps: list[str], registry: dict[str, str]) -> str | None:
@@ -546,7 +543,7 @@ def run(conn, *, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, model=None)
     fp_sessions = _fp_sessions(sess_fp_pos)
     clusters = _cluster(_pairs(sess_fp_pos), fp_sessions, min_sessions)
     registry = _load_registry(conn)
-    catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(registry.items())) or "(none)"
+    catalog = skill_measure.format_catalog(sorted(registry.items()))
 
     stats = {
         "scan_night": scan_night,

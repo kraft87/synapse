@@ -75,9 +75,8 @@ def _apply_rule(file_key: str, rule: str) -> tuple[str, bool]:
 
 def cmd_accept(cid: int, local: bool) -> None:
     scope = "local" if local else None  # None -> keep the proposal's stored scope (general)
-    r = config.post_json("/config/proposals/act", {"id": cid, "action": "accept", "scope": scope})
-    if r.get("status") != "accepted":
-        print(r.get("detail") or "not found")
+    r = config.act("/config", cid, "accept", expect="accepted", scope=scope)
+    if r is None:
         return
     path, wrote = _apply_rule(r["file_key"], r.get("rule") or r.get("summary") or "")
     done = config.post_json("/config/proposals/act", {"id": cid, "action": "apply"})
@@ -94,9 +93,8 @@ def cmd_accept(cid: int, local: bool) -> None:
 
 
 def cmd_reject(cid: int, reason: str | None) -> None:
-    r = config.post_json("/config/proposals/act", {"id": cid, "action": "reject", "reason": reason})
-    if r.get("status") != "rejected":
-        print(r.get("detail") or "not found")
+    r = config.act("/config", cid, "reject", expect="rejected", reason=reason)
+    if r is None:
         return
     print(f"rejected [{cid}] ({r.get('reason')}).")
 
