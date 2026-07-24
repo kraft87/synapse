@@ -29,9 +29,10 @@ from datetime import datetime
 
 import psycopg
 from psycopg.rows import dict_row
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from mcp_server.http_helpers import _iso, guarded_json
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,6 @@ def _dt(iso: str | None) -> datetime | None:
         return datetime.fromisoformat(iso.replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-def _iso(dt: datetime | None) -> str | None:
-    return dt.isoformat() if dt else None
 
 
 def _publish_config(db_url: str, p: dict) -> dict:
@@ -227,18 +224,7 @@ def register(mcp, db_url: str, machine_authorized: Callable[[Request], bool]) ->
         return
 
     async def _guarded(request: Request, work):
-        if not machine_authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"status": "error", "detail": "invalid JSON"}, status_code=400)
-        try:
-            out = await run_in_threadpool(work, body)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("config route failed")
-            return JSONResponse({"status": "error", "detail": str(exc)[:200]}, status_code=500)
-        return JSONResponse(out)
+        return await guarded_json(request, machine_authorized, work, label="config route")
 
     @mcp.custom_route("/config/publish", methods=["POST"])
     async def _publish(request: Request) -> JSONResponse:

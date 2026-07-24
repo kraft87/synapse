@@ -25,6 +25,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from mcp_server.http_helpers import err, unauthorized
+
 logger = logging.getLogger(__name__)
 
 # Single-owner constant, mirroring kg_pg_write.OWNER / the recall leg.
@@ -60,7 +62,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         """Top standing user preferences for the plugin's session-start block. Bounded
         and time-agnostic by design — a small factual block, not query-blind recall."""
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return unauthorized()
         try:
             limit = min(int(request.query_params.get("limit", "8")), _MAX_LIMIT)
         except (TypeError, ValueError):
@@ -70,5 +72,5 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             items = await run_in_threadpool(_top_preferences, db_url, limit)
         except Exception as e:
             logger.warning("preferences top failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return err(str(e)[:200], 500)
         return JSONResponse({"status": "ok", "items": items})

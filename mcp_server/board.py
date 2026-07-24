@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.db import Database
+from mcp_server.http_helpers import err, unauthorized
 from mcp_server.timeline_routes import _recent_events
 
 logger = logging.getLogger(__name__)
@@ -237,14 +238,14 @@ def register(
         """The rendered board for the plugin's SessionStart hook (follow-up PR): one
         bounded always-relevant index block, not query-blind recall injection."""
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return unauthorized()
         project = request.query_params.get("project") or None
         t0 = time.perf_counter()
         try:
             board = await run_in_threadpool(build_board, db_url, project)
         except Exception as e:
             logger.warning("board build failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return err(str(e)[:200], 500)
         if get_recall is not None:
             record_board_metrics(get_recall(), "http", (time.perf_counter() - t0) * 1000.0, board)
         board.pop("note_ids", None)
