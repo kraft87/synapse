@@ -139,6 +139,7 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
     assert set(served) == {
         "episodes",
         "facts",
+        "web",
         "timeline",
         "prefs",
         "n_echo_suppressed",
@@ -146,6 +147,7 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
     }
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
     assert served["facts"] == [] and served["timeline"] == [] and served["prefs"] == []
+    assert served["web"] == []
     assert served["n_echo_suppressed"] == 0
     assert served["n_bm25_lifted"] == 0  # stub pool has no bm25_score -> fusion is a no-op
 
