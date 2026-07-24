@@ -73,6 +73,8 @@ a { color:var(--acc); }
 /* ---- interaction states (hover/focus) ---- */
 .navbtn:hover { color:var(--txt) !important; background:var(--bg2) !important; }
 .iconbtn:hover { color:var(--txt) !important; }
+/* base shared by every softbtn call site (radius/padding/font stay inline — they vary) */
+.softbtn { border:1px solid var(--line2); background:var(--bg2); color:var(--txt2); cursor:pointer; }
 .softbtn:hover { color:var(--txt) !important; border-color:var(--line2) !important; }
 .linkbtn:hover { color:var(--acc) !important; }
 .result:hover { border-color:var(--line2) !important; background:var(--bg2) !important; }

@@ -23,10 +23,9 @@ import {
   type GraphEntity, type GraphNode, type GraphEdge,
 } from '../api';
 import { useStore } from '../state';
-import { superColor, cssValue, validityLine } from '../tokens';
+import { superColor, cssValue, validityLine, mono } from '../tokens';
 import { openEpisode } from '../hash';
 
-const mono = 'var(--font-data)';
 const NODE_CAP = 150;
 // First render shows a readable subset; the "+N more" cluster chip pages the rest in.
 const INITIAL_RENDER_CAP = 75;

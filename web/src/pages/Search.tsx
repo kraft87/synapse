@@ -100,7 +100,7 @@ export function Search() {
         <div style={{ textAlign: 'center', marginTop: '16px' }}>
           {canPage ? (
             <button className="softbtn" onClick={() => run(hits.length)}
-              style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: 'var(--font-data)', cursor: 'pointer' }}>load more</button>
+              style={{ borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>load more</button>
           ) : (
             <span style={{ fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt3)' }}>{hits.length} of {total} · end of results</span>
           )}

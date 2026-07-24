@@ -1,30 +1,25 @@
 // Episode detail overlay (#/episode/:id). Turn cards + the derived-from block —
 // both-directions provenance for verifying extraction (spec §IA).
 import type React from 'react';
-import { useEffect, useState } from 'react';
-import { fetchDerived, fetchEpisode, type Derived, type Episode } from '../api';
+import { fetchDerived, fetchEpisode, type Derived } from '../api';
 import { closeOverlay } from '../hash';
 import { srcColor } from '../tokens';
 import { DerivedBlock } from '../components/FeedCard';
 import { Spinner } from '../components/ui';
+import { useAsync } from '../hooks';
 
 const chip = (bg: string, color: string, border?: string): React.CSSProperties => ({
   fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 7px', borderRadius: '4px', background: bg, color, border: border || 'none',
 });
 
 export function EpisodeModal({ id }: { id: string }) {
-  const [ep, setEp] = useState<Episode | null>(null);
-  const [derived, setDerived] = useState<Derived | null>(null);
-  const [err, setErr] = useState(false);
-
-  useEffect(() => {
-    let live = true;
-    setEp(null); setDerived(null); setErr(false);
-    Promise.all([fetchEpisode(id), fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived))])
-      .then(([e, d]) => { if (live) { setEp(e); setDerived(d); } })
-      .catch(() => { if (live) setErr(true); });
-    return () => { live = false; };
-  }, [id]);
+  const { data, error } = useAsync(() => Promise.all([
+    fetchEpisode(id),
+    fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
+  ]).then(([e, d]) => ({ ep: e, derived: d })), [id]);
+  const ep = data?.ep ?? null;
+  const derived = data?.derived ?? null;
+  const err = error != null;
 
   const turns = ep ? [
     ep.human_turn && { role: 'user', text: ep.human_turn, user: true },

@@ -13,7 +13,9 @@ import {
 } from '../api';
 import { useStore } from '../state';
 import { openEpisode } from '../hash';
-import { relTime } from '../tokens';
+import { relTime, monoHead } from '../tokens';
+import { ErrorBox, EmptyState } from '../components/ui';
+import { useAsync } from '../hooks';
 
 const TABS = [
   { key: 'proposals', label: 'Proposals' },
@@ -27,7 +29,6 @@ type ReviewTab = (typeof TABS)[number]['key'];
 const kindColor = (k: string): string => (k === 'skill' ? 'var(--et-tech)' : 'var(--et-org)');
 
 const mono: CSSProperties = { fontFamily: 'var(--font-data)' };
-const monoHead: CSSProperties = { ...mono, fontSize: '11px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.08em' };
 
 // ---------------------------------------------------------------------------
 // Tiny markdown renderer (headings, bold/code spans, lists, fenced code) — no deps.
@@ -173,25 +174,19 @@ function summaryText(d: ProposalDetail): string {
 }
 
 function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
-  const [detail, setDetail] = useState<ProposalDetail | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(false);
+  const { data: detail, loading, error, reload } = useAsync(() => fetchProposal(id), [id]);
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
 
-  const load = () => {
-    setLoading(true); setError(false);
-    fetchProposal(id).then((d) => setDetail(d)).catch(() => setError(true)).finally(() => setLoading(false));
-  };
-  useEffect(() => { setRejecting(false); setReason(''); load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [id]);
+  useEffect(() => { setRejecting(false); setReason(''); }, [id]);
 
   const decide = (action: 'approve' | 'reject', note?: string) => {
     setBusy(true);
     postProposalDecision(id, action, note)
-      .then(() => { setRejecting(false); setReason(''); load(); onDecided(); })
-      .catch(() => setError(true))
+      .then(() => { setRejecting(false); setReason(''); reload(); onDecided(); })
+      .catch(() => {})
       .finally(() => setBusy(false));
   };
 
@@ -203,7 +198,7 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
   };
 
   if (loading && !detail) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading proposal…</div>;
-  if (error && !detail) return <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', color: 'var(--err)', fontSize: '13px' }}>failed to load this proposal.</div>;
+  if (error && !detail) return <ErrorBox>failed to load this proposal.</ErrorBox>;
   if (!detail) return null;
 
   const decided = detail.status !== 'proposed';
@@ -249,10 +244,10 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
               <button disabled={busy} onClick={() => decide('approve')}
                 style={{ border: 'none', background: 'var(--ok)', color: '#0d1116', borderRadius: '6px', padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: 'pointer', opacity: busy ? 0.6 : 1 }}>approve</button>
               <button className="softbtn" disabled={busy} onClick={() => setRejecting(true)}
-                style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '13px', cursor: 'pointer' }}>reject…</button>
+                style={{ borderRadius: '6px', padding: '7px 14px', fontSize: '13px' }}>reject…</button>
               <span style={{ flex: 1 }} />
               <button className="softbtn" onClick={() => discuss(detail)}
-                style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: copied ? 'var(--ok)' : 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '12.5px', ...mono, cursor: 'pointer' }}>{copied ? 'copied for chat ✓' : 'discuss →'}</button>
+                style={{ color: copied ? 'var(--ok)' : 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '12.5px', ...mono }}>{copied ? 'copied for chat ✓' : 'discuss →'}</button>
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -266,7 +261,7 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
                 <button disabled={busy || !reason.trim()} onClick={() => decide('reject', reason.trim())}
                   style={{ border: 'none', background: 'var(--err)', color: '#0d1116', borderRadius: '6px', padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: reason.trim() ? 'pointer' : 'not-allowed', opacity: (busy || !reason.trim()) ? 0.55 : 1 }}>confirm reject</button>
                 <button className="softbtn" onClick={() => { setRejecting(false); setReason(''); }}
-                  style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '13px', cursor: 'pointer' }}>cancel</button>
+                  style={{ borderRadius: '6px', padding: '7px 14px', fontSize: '13px' }}>cancel</button>
               </div>
             </div>
           )}
@@ -300,29 +295,22 @@ function ProposalCard({ p, selected, onClick }: { p: ProposalSummary; selected: 
 
 function Proposals() {
   const s = useStore();
-  const [list, setList] = useState<ProposalSummary[] | null>(null);
-  const [error, setError] = useState(false);
+  const { data, error, reload } = useAsync(() => fetchProposals(), []);
+  const list = data?.proposals ?? null;
   const [sel, setSel] = useState<string | null>(null);
 
-  const load = () => {
-    setError(false);
-    fetchProposals().then((r) => {
-      setList(r.proposals);
-      s.setReviewPending(r.pending_count || 0);
-      setSel((cur) => (cur && r.proposals.some((p) => p.id === cur) ? cur : (r.proposals[0]?.id ?? null)));
-    }).catch(() => setError(true));
-  };
-  useEffect(() => { load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, []);
+  // side effects of a (re)load: sync the nav badge + keep the selection valid.
+  useEffect(() => {
+    if (!data) return;
+    s.setReviewPending(data.pending_count || 0);
+    setSel((cur) => (cur && data.proposals.some((p) => p.id === cur) ? cur : (data.proposals[0]?.id ?? null)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data]);
 
-  if (error && !list) return <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', color: 'var(--err)', fontSize: '13px' }}>failed to load proposals.</div>;
+  if (error && !list) return <ErrorBox>failed to load proposals.</ErrorBox>;
   if (!list) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading proposals…</div>;
   if (list.length === 0) {
-    return (
-      <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-        <div style={{ ...mono, fontSize: '13px', marginBottom: '6px' }}>no proposals</div>
-        <div style={{ fontSize: '13px', color: 'var(--txt3)' }}>the dream pipeline hasn't raised anything to review.</div>
-      </div>
-    );
+    return <EmptyState title="no proposals" subtitle="the dream pipeline hasn't raised anything to review." />;
   }
 
   return (
@@ -331,7 +319,7 @@ function Proposals() {
         {list.map((p) => <ProposalCard key={p.id} p={p} selected={p.id === sel} onClick={() => setSel(p.id)} />)}
       </div>
       <div style={{ border: '1px solid var(--line)', borderRadius: '11px', background: 'var(--bg1)', padding: '16px 18px', minWidth: 0 }}>
-        {sel ? <Detail id={sel} onDecided={load} /> : <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)' }}>select a proposal.</div>}
+        {sel ? <Detail id={sel} onDecided={reload} /> : <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)' }}>select a proposal.</div>}
       </div>
     </div>
   );
@@ -363,29 +351,19 @@ const sampleText = (s: unknown): string => {
 };
 
 function DreamTab() {
-  const [runs, setRuns] = useState<DreamRun[] | null>(null);
-  const [error, setError] = useState(false);
-  const [sel, setSel] = useState<number | null>(null);
+  const { data, error } = useAsync(() => fetchDreamReport(), []);
+  const runs = data?.runs ?? null;
+  // default-select the newest run without an effect (avoids an empty-state flash on load).
+  const [selRaw, setSel] = useState<number | null>(null);
+  const sel = selRaw ?? runs?.[0]?.id ?? null;
   const [drill, setDrill] = useState<string>('proposals_raised');
-
-  useEffect(() => {
-    fetchDreamReport().then((r) => {
-      setRuns(r.runs);
-      setSel(r.runs[0]?.id ?? null);
-    }).catch(() => setError(true));
-  }, []);
 
   const run = useMemo(() => runs?.find((r) => r.id === sel) || null, [runs, sel]);
 
-  if (error && !runs) return <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', color: 'var(--err)', fontSize: '13px' }}>failed to load dream runs.</div>;
+  if (error && !runs) return <ErrorBox>failed to load dream runs.</ErrorBox>;
   if (!runs) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading dream runs…</div>;
   if (runs.length === 0 || !run) {
-    return (
-      <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-        <div style={{ ...mono, fontSize: '13px' }}>no runs recorded yet</div>
-        <div style={{ fontSize: '13px', color: 'var(--txt3)', marginTop: '6px' }}>the nightly dream pipeline writes a row per run.</div>
-      </div>
-    );
+    return <EmptyState title="no runs recorded yet" subtitle="the nightly dream pipeline writes a row per run." />;
   }
 
   const mins = run.duration_s != null ? Math.round(run.duration_s / 60) : null;
@@ -497,15 +475,10 @@ function BehaviorTab() {
     return byBase?.file ?? null;
   };
 
-  if (error && !entries) return <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', color: 'var(--err)', fontSize: '13px' }}>failed to load behavior files.</div>;
+  if (error && !entries) return <ErrorBox>failed to load behavior files.</ErrorBox>;
   if (!entries) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading behavior files…</div>;
   if (entries.length === 0) {
-    return (
-      <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-        <div style={{ ...mono, fontSize: '13px' }}>no behavior files mirrored</div>
-        <div style={{ fontSize: '13px', color: 'var(--txt3)', marginTop: '6px' }}>the config lane publishes CLAUDE.md / rules / notes here.</div>
-      </div>
-    );
+    return <EmptyState title="no behavior files mirrored" subtitle="the config lane publishes CLAUDE.md / rules / notes here." />;
   }
 
   return (
@@ -603,15 +576,10 @@ function FlagsTab() {
     postFlag(f.kind, f.item_id).then(() => load()).catch(() => setError(true)).finally(() => setBusy(null));
   };
 
-  if (error && !flags) return <div style={{ border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px', color: 'var(--err)', fontSize: '13px' }}>failed to load flags.</div>;
+  if (error && !flags) return <ErrorBox>failed to load flags.</ErrorBox>;
   if (!flags) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading flags…</div>;
   if (flags.length === 0) {
-    return (
-      <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)' }}>
-        <div style={{ ...mono, fontSize: '13px' }}>nothing flagged</div>
-        <div style={{ fontSize: '13px', color: 'var(--txt3)', marginTop: '6px' }}>flag an item anywhere (⚑) to queue it for review here.</div>
-      </div>
-    );
+    return <EmptyState title="nothing flagged" subtitle="flag an item anywhere (⚑) to queue it for review here." />;
   }
 
   return (
@@ -627,7 +595,7 @@ function FlagsTab() {
             <button className="linkbtn" onClick={() => jump(f)}
               style={{ border: 'none', background: 'none', color: 'var(--acc)', cursor: 'pointer', ...mono, fontSize: '11.5px' }}>jump ↗</button>
             <button className="softbtn" disabled={busy === k} onClick={() => unflag(f)}
-              style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '5px', padding: '4px 10px', ...mono, fontSize: '11px', cursor: 'pointer', opacity: busy === k ? 0.6 : 1 }}>unflag</button>
+              style={{ borderRadius: '5px', padding: '4px 10px', ...mono, fontSize: '11px', opacity: busy === k ? 0.6 : 1 }}>unflag</button>
           </div>
         );
       })}

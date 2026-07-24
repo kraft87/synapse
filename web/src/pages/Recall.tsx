@@ -9,7 +9,7 @@ import {
   type RecallResult, type RecallDebug, type RecallHistoryRow,
 } from '../api';
 import { useStore } from '../state';
-import { LEG_COLOR, LEG_ORDER, scoreColor, relTime } from '../tokens';
+import { LEG_COLOR, LEG_ORDER, scoreColor, relTime, mono } from '../tokens';
 
 type Tab = 'served' | 'raw' | 'history';
 
@@ -99,8 +99,6 @@ function bucketItems(name: string, r: RecallResult): Item[] {
 }
 // Canonical order (spec §2). superseded_facts only shows when the payload carries it.
 const BUCKETS = ['episodes', 'facts', 'entities', 'communities', 'timeline', 'preferences', 'web'];
-
-const mono = 'var(--font-data)';
 
 export function Recall() {
   const store = useStore();

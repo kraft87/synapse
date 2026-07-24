@@ -444,16 +444,10 @@ export interface BehaviorFileMeta {
   modified_at?: string | null; updated_at?: string | null; size?: number;
 }
 export interface BehaviorFile { file_key: string; content: string; meta: BehaviorFileMeta; links: string[]; }
-export interface BehaviorLinkGraph {
-  nodes: { file_key: string; scope: string; group: string }[];
-  edges: { source: string; target: string }[];
-}
 export const fetchBehaviorFiles = (): Promise<BehaviorFiles> =>
   MOCK ? mockApi('/behavior/files') : req('/behavior/files');
 export const fetchBehaviorFile = (key: string, scope = 'global', surface?: string): Promise<BehaviorFile> =>
   MOCK ? mockApi('/behavior/file') : req('/behavior/file' + qs({ key, scope, surface }));
-export const fetchBehaviorLinkgraph = (): Promise<BehaviorLinkGraph> =>
-  MOCK ? mockApi('/behavior/linkgraph') : req('/behavior/linkgraph');
 // ---------- graph explorer (phase 6) ----------
 // Wire shapes pinned in docs/dashboard-contract.md §"Phase 6". The neighborhood is a
 // BFS from a resolved seed (uuid or name), depth ≤ 2, server-capped at 150 nodes

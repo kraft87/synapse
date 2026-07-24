@@ -66,3 +66,31 @@ export const Spinner = ({ label }: { label?: string }) => (
     {label}
   </div>
 );
+
+// The err-tinted failure box (spec §2). Without onRetry it's a plain text box; with it,
+// the message sits left with a softbtn retry on the right (Feed / Timeline pattern).
+export function ErrorBox({ children, onRetry, style }: { children: React.ReactNode; onRetry?: () => void; style?: CSSProperties }) {
+  const box: CSSProperties = { border: '1px solid var(--err)', background: 'rgba(224,139,122,.08)', borderRadius: '8px', padding: '10px 13px' };
+  if (onRetry) {
+    return (
+      <div style={{ ...box, display: 'flex', alignItems: 'center', gap: '12px', ...style }}>
+        <span style={{ color: 'var(--err)', fontSize: '13px', flex: 1 }}>{children}</span>
+        <button className="softbtn" style={{ borderRadius: '5px', padding: '4px 10px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }} onClick={onRetry}>retry</button>
+      </div>
+    );
+  }
+  return <div style={{ ...box, color: 'var(--err)', fontSize: '13px', ...style }}>{children}</div>;
+}
+
+// The dashed "nothing here yet" box: mono title + optional txt3 subtitle (or custom
+// children below the title). Rendered layout matches the hand-rolled copies verbatim.
+export function EmptyState({ title, subtitle, children, style }: { title: React.ReactNode; subtitle?: React.ReactNode; children?: React.ReactNode; style?: CSSProperties }) {
+  const hasBody = subtitle != null || children != null;
+  return (
+    <div style={{ border: '1px dashed var(--line2)', borderRadius: '10px', padding: '48px 24px', textAlign: 'center', color: 'var(--txt2)', ...style }}>
+      <div style={{ fontFamily: 'var(--font-data)', fontSize: '13px', marginBottom: hasBody ? '6px' : 0 }}>{title}</div>
+      {subtitle != null && <div style={{ fontSize: '13px', color: 'var(--txt3)' }}>{subtitle}</div>}
+      {children}
+    </div>
+  );
+}

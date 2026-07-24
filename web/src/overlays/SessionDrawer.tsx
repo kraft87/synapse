@@ -1,21 +1,15 @@
 // Session drawer (#/session/:id?highlight=) — the whole session as a readable
 // transcript, right-hand, target episode highlighted with a "viewing" chip.
-import { useEffect, useRef, useState } from 'react';
-import { fetchSession, type Session } from '../api';
+import { useEffect, useRef } from 'react';
+import { fetchSession } from '../api';
 import { closeOverlay } from '../hash';
 import { Spinner } from '../components/ui';
+import { useAsync } from '../hooks';
 
 export function SessionDrawer({ id, highlight }: { id: string; highlight?: string }) {
-  const [sess, setSess] = useState<Session | null>(null);
-  const [err, setErr] = useState(false);
+  const { data: sess, error } = useAsync(() => fetchSession(id, highlight), [id, highlight]);
+  const err = error != null;
   const targetRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    let live = true;
-    setSess(null); setErr(false);
-    fetchSession(id, highlight).then((d) => { if (live) setSess(d); }).catch(() => { if (live) setErr(true); });
-    return () => { live = false; };
-  }, [id, highlight]);
 
   useEffect(() => {
     if (sess && targetRef.current) targetRef.current.scrollIntoView({ block: 'center' });
