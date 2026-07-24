@@ -1,15 +1,15 @@
 """Dream mode — unified nightly memory consolidation pipeline.
 
-Stages run sequentially (numbering preserved; the old Logfire-review stage 1
-was removed when Logfire ingestion was ripped out, and stage 2 — dream docs
-over segment summaries — was deleted with the summary layer + FalkorDB
-decommission, #67 PR 3):
-  3. Memory proposals: mine recent dreams for behavioral patterns → memory_proposals table
+The numbered stages are all gone: stage 1 (Logfire review) left with the
+Logfire-ingestion rip-out, stage 2 (dream docs over segment summaries) with the
+summary layer + FalkorDB decommission (#67 PR 3), and stage 3 (memory-proposal
+mining) was deleted 2026-07-24 — its substrate (summaries) and sink (auto-memory
+files) were both retired, and the concept shipped for real as the dream→skills
+and dream→config proposal lanes, which are what run_once() runs today.
 
 Usage:
     python -m dream               # run once immediately
     python -m dream --schedule    # loop, fire at 2am UTC daily
-    python -m dream --stage 3     # run only stage 3 (useful for testing)
 """
 
 from __future__ import annotations
@@ -40,15 +40,10 @@ def _require_db_url() -> str:
     return url
 
 
-def run_once(stages: set[int] | None = None) -> None:
-    # Stage 3 (memory proposals) is RETIRED with summaries (task #63): it reads
-    # doc_type='summary', which is no longer generated. It stays defined for a
-    # future dream rework on a better substrate, but run_once no longer invokes
-    # it by default (pass an explicit stage set to run it deliberately).
-    stages = stages or set()
+def run_once() -> None:
     db_url = _require_db_url()
 
-    logger.info("Dream pipeline starting (stages=%s)", sorted(stages))
+    logger.info("Dream pipeline starting")
 
     # dream_runs bookkeeping (schema 044): one row per run, feeds the Metrics ops page's
     # "last nightly-dream run" panel + the phase-5 Dream-report page. ALL of it is fail-soft:
@@ -98,9 +93,6 @@ def run_once(stages: set[int] | None = None) -> None:
             run_stages["config"] = {"ran": True, "ok": False}
             errors.append(f"config lane: {e}")
             overall_ok = False
-
-    if 3 in stages:
-        _stage3_memory_proposals(db_url)
 
     # Aggregate the proposals actually raised this run + a few bounded samples (cheap DB reads;
     # fail-soft) so the report panel has drill-in material without re-architecting the lanes.
@@ -220,18 +212,6 @@ def _dream_record_finish(
         logger.warning("dream_runs finish-update failed (bookkeeping only): %s", e)
 
 
-def _stage3_memory_proposals(db_url: str) -> None:
-    """Mine behavioral patterns from recent dreams → memory_proposals rows."""
-    logger.info("Stage 3: Memory-proposal mining starting")
-    try:
-        from dream.stage3 import mine_proposals
-
-        n = mine_proposals(db_url)
-        logger.info("Stage 3: %d memory proposal(s) inserted", n)
-    except Exception as e:
-        logger.error("Stage 3 failed: %s", e, exc_info=True)
-
-
 def _seconds_until_2am() -> float:
     now = datetime.now(UTC)
     target = now.replace(hour=2, minute=3, second=0, microsecond=0)
@@ -249,13 +229,6 @@ if __name__ == "__main__":
 
     args = set(sys.argv[1:])
 
-    # Parse --stage N for selective execution
-    stages: set[int] | None = None
-    if "--stage" in sys.argv:
-        idx = sys.argv.index("--stage")
-        if idx + 1 < len(sys.argv):
-            stages = {int(sys.argv[idx + 1])}
-
     if "--schedule" in args:
         logger.info("Dream scheduler — will fire at 2:03am UTC daily")
         while True:
@@ -263,8 +236,8 @@ if __name__ == "__main__":
             logger.info("Next dream in %.0fs (%.1fh)", wait, wait / 3600)
             time.sleep(wait)
             try:
-                run_once(stages)
+                run_once()
             except Exception as e:
                 logger.error("Dream pipeline failed: %s", e, exc_info=True)
     else:
-        run_once(stages)
+        run_once()

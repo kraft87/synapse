@@ -485,7 +485,7 @@ Web-research tool results are captured so prior research is recallable, mirrorin
 Migrations are numbered SQL files applied manually (no runner — small project; `scripts/apply_schema.sh` is the single source of truth for order). Thirty-eight migrations to date:
 
 - **001–009** — base: `episodes`, `extraction_queue`, `ingestion_state` (001); `span_id` (002); voyage dims 3072→2048 (003); session embeddings, now deprecated (004); ParadeDB BM25 (005); `retrieval_count` (006); drop old `session_summaries` (007); `chunks` (008); `synth_documents` (009, now legacy).
-- **010 `memory_proposals`** — sink for dream stage-3 auto-memory proposals (status workflow `pending→posted→approved/rejected→applied`, Discord review). Substrate retired, so dormant.
+- **010 `memory_proposals`** — was the dream stage-3 auto-memory-proposal sink; stage 3 was deleted 2026-07-24 and 047 drops the table (010 removed from the apply list).
 - **011 `web_artifacts`** — web-research capture ([§8](#8-web-research-subsystem)).
 - **012 `web_chunks`** — embedded web slices.
 - **013 `web_chunk_context`** — contextual-retrieval prefix column.
@@ -509,7 +509,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **038 `timeline_events.domain`** — `personal`/`technical` scoping label ([§3.5](#35-timeline-events--the-episodic-date-log)).
 
-Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` and `memory_proposals` exist but are dormant.
+Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` exists but is dormant (`memory_proposals` was dropped by 047).
 
 ---
 
@@ -555,7 +555,7 @@ kg_relationships (
 
 ## 11. Nightly Maintenance & Dream Pipeline
 
-> **Honest status:** the `dream` container's daily `run_once()` now runs the **dream→skills lane** (`dream/skills/`, gated on `SKILLS_LANE_ENABLED=1`): mine episodes → judge → candidate ledger + drafts → consolidate-overlap nominations, reading its catalog from `skills_lane.skill_registry` (no disk). The lane moved here from the plugin so the server owns it (the plugin is now a thin client that publishes skills to the registry + reviews proposals). The legacy memory-proposal stages 2/3 remain **retired** (they read `doc_type='summary'`, no longer generated) and only run with an explicit `--stage`. The lane import is lazy + guarded so a lane error can't crash the loop.
+> **Honest status:** the `dream` container's daily `run_once()` now runs the **dream→skills lane** (`dream/skills/`, gated on `SKILLS_LANE_ENABLED=1`): mine episodes → judge → candidate ledger + drafts → consolidate-overlap nominations, reading its catalog from `skills_lane.skill_registry` (no disk). The lane moved here from the plugin so the server owns it (the plugin is now a thin client that publishes skills to the registry + reviews proposals). The legacy memory-proposal stages are gone entirely (stage 3 and its `--stage` plumbing were deleted 2026-07-24; the substrate — `doc_type='summary'` — and the auto-memory-file sink were both already retired). The lane import is lazy + guarded so a lane error can't crash the loop.
 
 The real KG-hygiene and web-capture work runs as **independent entry points** (scheduled externally — a client-machine cron for the web-capture lane, plus server-host systemd timers), not orchestrated by `dream/__main__`:
 
@@ -710,8 +710,6 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SKILLS_DISCORD_WEBHOOK` | empty | optional webhook for lane notifications |
 | `SKILLS_EXCLUDE_PROJECTS` | empty | comma-separated project ids the lanes skip |
 | `SYNAPSE_ENV_FILE` | `/app/.env` | .env fallback path inside the dream container |
-| `MEMORY_FILES_LIST` | empty | legacy stage-3: colon-separated existing memory filenames (avoids re-proposals) |
-| `MEMORY_FILES_PATH` | unset | legacy stage-3: local memory dir to list when `MEMORY_FILES_LIST` is unset |
 
 ---
 
@@ -743,8 +741,7 @@ synapse/
 │   └── skills_provider.py     # PgSkillsProvider — serves skill:// resources from skills_lane
 │
 ├── dream/
-│   ├── __main__.py            # nightly orchestrator — currently a NO-OP (stages retired)
-│   └── stage3.py              # dream docs / memory proposals — DEFINED, OFF
+│   └── __main__.py            # nightly orchestrator — runs the skills + config lanes
 │
 ├── scripts/
 │   ├── synapse_ingest_hook.py # the Stop hook (tail shipper)

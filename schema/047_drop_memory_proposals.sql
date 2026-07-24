@@ -1,0 +1,11 @@
+-- Drop the dormant memory_proposals table (was 010).
+--
+-- Stage 3 (dream memory-proposal mining) was retired with summaries (#63): its
+-- input substrate (doc_type='summary'/'dream' synth_documents) is no longer
+-- generated, and its sink — auto-memory-file proposals reviewed over Discord —
+-- was itself retired 2026-07-13 in favor of Synapse notes. The concept shipped
+-- for real as the dream→skills and dream→config proposal lanes (skills_lane.*,
+-- config_lane.*). dream/stage3.py is deleted in the same change; 010 is removed
+-- from the ordered apply list, so fresh databases never create the table and
+-- this DROP is a no-op there.
+DROP TABLE IF EXISTS memory_proposals;
