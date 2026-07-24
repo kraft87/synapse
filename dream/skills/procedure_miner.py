@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 from collections import defaultdict
 from datetime import date
 
@@ -449,26 +448,9 @@ Output ONLY a JSON object, no prose:
 
 
 def _confirm_llm(prompt: str, model: str | None) -> str:
-    """Same plumbing as the rest of the lane (skill_measure._run_judge): claude CLI on the
-    subscription by default, OpenRouter for the cheap backends. `model` overrides per-run."""
-    if model is None:
-        return skill_measure._run_judge(prompt)
-    if model in ("deepseek", "openrouter"):
-        return skill_measure._openrouter_judge(prompt)
-    r = subprocess.run(
-        ["claude", "-p", prompt, "--model", model], capture_output=True, text=True, timeout=240
-    )
-    return r.stdout
-
-
-def _extract_json(raw: str) -> dict | None:
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < 0:
-        return None
-    try:
-        return json.loads(raw[start : end + 1])
-    except Exception:
-        return None
+    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
+    Kept as a named seam so tests can stub the LLM out."""
+    return skill_measure.run_judge(prompt, model)
 
 
 def _confirm(cluster, sess_fp_pos, fp_sessions, examples, catalog, window_days, model):
@@ -496,7 +478,7 @@ def _confirm(cluster, sess_fp_pos, fp_sessions, examples, catalog, window_days, 
         raw = _confirm_llm(prompt, model)
     except Exception:
         return None
-    return _extract_json(raw)
+    return skill_measure._extract_json(raw)
 
 
 # --------------------------------------------------------------------- evidence
@@ -558,7 +540,7 @@ def _stamp_watermark(conn, scan_night: str) -> None:
 # -------------------------------------------------------------------------- run
 def run(conn, *, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, model=None) -> dict:
     """One weekly pass: fingerprint -> cluster -> confirm -> merge_candidate. Returns stats."""
-    scan_night = date.today().isoformat()
+    scan_night = skill_measure.scan_night()
     rows = _fetch_rows(conn, window_days)
     sess_fp_pos, sess_date, examples = _occurrences(rows)
     fp_sessions = _fp_sessions(sess_fp_pos)

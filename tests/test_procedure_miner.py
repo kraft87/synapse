@@ -8,13 +8,15 @@ are stubbed. All transcript text is synthetic.
 from __future__ import annotations
 
 import json
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 
 from dream.skills import procedure_miner as pm
 
-TODAY = date.today().isoformat()
+# scan_night is now UTC-based across all detectors (unified with struggle_arc / post_fire),
+# so the expected scan-night / watermark stamp is the UTC date, not the local one.
+TODAY = datetime.now(UTC).date().isoformat()
 
 
 # --------------------------------------------------------------------------- helpers
