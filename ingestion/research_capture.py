@@ -36,6 +36,8 @@ from typing import Any
 
 import psycopg
 
+from ingestion.checkpoints import checkpoint_get, checkpoint_set
+
 DDL = """
 CREATE TABLE IF NOT EXISTS research_archive (
     id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -224,25 +226,10 @@ class ResearchArchiveCapture:
         self._conn.execute(DDL)
 
     def _checkpoint_get(self, source: str) -> datetime | None:
-        row = self._conn.execute(
-            "SELECT last_ingested_at FROM ingestion_state WHERE source = %s", (source,)
-        ).fetchone()
-        if not row:
-            return None
-        val = row["last_ingested_at"] if isinstance(row, dict) else row[0]
-        if not isinstance(val, datetime):
-            return None
-        return val.replace(tzinfo=UTC) if val.tzinfo is None else val
+        return checkpoint_get(self._conn, source)
 
     def _checkpoint_set(self, source: str, ts: datetime) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO ingestion_state (source, last_ingested_at)
-            VALUES (%s, %s)
-            ON CONFLICT (source) DO UPDATE SET last_ingested_at = EXCLUDED.last_ingested_at
-            """,
-            (source, ts),
-        )
+        checkpoint_set(self._conn, source, ts)
 
     def capture_one(self, jsonl_path: Path, stats: CaptureStats | None = None) -> CaptureStats:
         stats = stats or CaptureStats()

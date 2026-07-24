@@ -27,6 +27,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 
+from ingestion.checkpoints import checkpoint_get, checkpoint_set
 from ingestion.web_extractors import (
     WEB_TOOLS_ALL,
     ExtractError,
@@ -324,29 +325,10 @@ class WebArtifactsIngester:
         self._conn = conn
 
     def _checkpoint_get(self, source: str) -> datetime | None:
-        row = self._conn.execute(
-            "SELECT last_ingested_at FROM ingestion_state WHERE source = %s",
-            (source,),
-        ).fetchone()
-        if not row:
-            return None
-        # dict_row vs tuple-row
-        val = row["last_ingested_at"] if isinstance(row, dict) else row[0]
-        if not isinstance(val, datetime):
-            return None
-        if val.tzinfo is None:
-            val = val.replace(tzinfo=UTC)
-        return val
+        return checkpoint_get(self._conn, source)
 
     def _checkpoint_set(self, source: str, ts: datetime) -> None:
-        self._conn.execute(
-            """
-            INSERT INTO ingestion_state (source, last_ingested_at)
-            VALUES (%s, %s)
-            ON CONFLICT (source) DO UPDATE SET last_ingested_at = EXCLUDED.last_ingested_at
-            """,
-            (source, ts),
-        )
+        checkpoint_set(self._conn, source, ts)
 
     def _insert(self, row: dict[str, Any]) -> bool:
         """Return True if a new row was inserted, False on conflict."""

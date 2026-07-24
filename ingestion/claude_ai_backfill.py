@@ -12,36 +12,14 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+from ingestion.backfill import write_backfill_session
 from ingestion.chunks import rebuild_chunks
 from ingestion.claude_ai_client import parse_export
 from ingestion.config import get_settings
 from ingestion.db import Database
-from ingestion.models import Episode, ExtractionItem
+from ingestion.models import Episode
 
 logger = logging.getLogger(__name__)
-
-
-def _write_session(db: Database, session_id: str, eps: list[Episode]) -> int:
-    existing = db.get_session_episodes(session_id)
-    next_seq = (max((e["sequence"] for e in existing), default=0)) + 1
-    written = 0
-    for ep in sorted(eps, key=lambda e: e.sequence):
-        if ep.span_id and db.span_id_exists(ep.span_id):
-            continue
-        ep_to_write = ep.model_copy(update={"sequence": next_seq + written})
-        episode_id = db.upsert_episode(ep_to_write)
-        written += 1
-        if episode_id and ep_to_write.content.strip():
-            db.enqueue_extraction(
-                ExtractionItem(
-                    episode_id=episode_id,
-                    session_id=ep_to_write.session_id,
-                    content=ep_to_write.content,
-                    content_type="episode",
-                    project=ep_to_write.project,
-                )
-            )
-    return written
 
 
 def main() -> int:
@@ -79,7 +57,7 @@ def main() -> int:
     written = 0
     try:
         for i, (session_id, session_eps) in enumerate(by_session.items(), start=1):
-            written += _write_session(db, session_id, session_eps)
+            written += write_backfill_session(db, session_id, session_eps)
             rebuild_chunks(db, session_id)
             if i % 200 == 0:
                 logger.info("Progress: %d / %d conversations", i, len(by_session))

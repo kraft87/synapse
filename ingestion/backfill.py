@@ -26,6 +26,37 @@ from ingestion.models import Episode, ExtractionItem
 logger = logging.getLogger(__name__)
 
 
+def write_backfill_session(db: Database, session_id: str, eps: list[Episode]) -> int:
+    """Append one session's episodes: span_id-dedup against what's already stored,
+    renumber sequences past the existing high-water mark, and enqueue extraction
+    for each written non-empty episode.
+
+    Shared by the claude.ai and Cursor-SQLite backfill CLIs (their _write_session
+    was a byte-identical copy of this). The Claude Code JSONL path uses
+    _write_session_episodes below instead — same skeleton plus the contamination/
+    harness guards and project defaulting that source needs."""
+    existing = db.get_session_episodes(session_id)
+    next_seq = (max((e["sequence"] for e in existing), default=0)) + 1
+    written = 0
+    for ep in sorted(eps, key=lambda e: e.sequence):
+        if ep.span_id and db.span_id_exists(ep.span_id):
+            continue
+        ep_to_write = ep.model_copy(update={"sequence": next_seq + written})
+        episode_id = db.upsert_episode(ep_to_write)
+        written += 1
+        if episode_id and ep_to_write.content.strip():
+            db.enqueue_extraction(
+                ExtractionItem(
+                    episode_id=episode_id,
+                    session_id=ep_to_write.session_id,
+                    content=ep_to_write.content,
+                    content_type="episode",
+                    project=ep_to_write.project,
+                )
+            )
+    return written
+
+
 def _write_session_episodes(
     db: Database,
     session_id: str,
