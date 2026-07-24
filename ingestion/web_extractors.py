@@ -190,6 +190,20 @@ def _is_pure_error(text: str) -> str | None:
     return None
 
 
+def _error_guard(tool_name: str, result_text: str) -> ExtractError | None:
+    """Shared pure-error guard for the text-format parsers. Returns an
+    ``ExtractError`` when `result_text` is a tool-error response, else None."""
+    err = _is_pure_error(result_text)
+    if err:
+        return ExtractError(
+            tool_name=tool_name,
+            reason=err,
+            detail=(result_text or "")[:400],
+            raw_chars=len(result_text or ""),
+        )
+    return None
+
+
 def _parse_datetime(s: str | None) -> datetime | None:
     if not s or not isinstance(s, str):
         return None
@@ -269,14 +283,8 @@ def _strip_firecrawl_boilerplate(md: str) -> str:
 
 def parse_firecrawl_scrape(tool_input: dict[str, Any], result_text: str) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name="mcp__claude_ai_firecrawl__firecrawl_scrape",
-            reason=err,
-            detail=(result_text or "")[:400],
-            raw_chars=raw_chars,
-        )
+    if e := _error_guard("mcp__claude_ai_firecrawl__firecrawl_scrape", result_text):
+        return e
     url = (tool_input or {}).get("url") or ""
     text = result_text or ""
     md = text
@@ -311,14 +319,8 @@ _EXA_HEADER_RE = re.compile(
 
 def parse_crawling_exa(tool_input: dict[str, Any], result_text: str) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name="mcp__claude_ai_Exa_search__crawling_exa",
-            reason=err,
-            detail=(result_text or "")[:400],
-            raw_chars=raw_chars,
-        )
+    if e := _error_guard("mcp__claude_ai_Exa_search__crawling_exa", result_text):
+        return e
     text = result_text or ""
     m = _EXA_HEADER_RE.search(text[:1000])
     url = ""
@@ -364,11 +366,8 @@ _WEBSEARCH_LINKS_RE = re.compile(r"Links:\s*(\[.+?\])\s*(?:\n|$)", re.DOTALL)
 
 def parse_websearch(tool_input: dict[str, Any], result_text: str) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name="WebSearch", reason=err, detail=(result_text or "")[:400], raw_chars=raw_chars
-        )
+    if e := _error_guard("WebSearch", result_text):
+        return e
     query = (tool_input or {}).get("query")
     items: list[SearchResultItem] = []
     m = _WEBSEARCH_LINKS_RE.search(result_text or "")
@@ -395,14 +394,8 @@ def parse_websearch(tool_input: dict[str, Any], result_text: str) -> ExtractResu
 
 def parse_firecrawl_search(tool_input: dict[str, Any], result_text: str) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name="mcp__claude_ai_firecrawl__firecrawl_search",
-            reason=err,
-            detail=(result_text or "")[:400],
-            raw_chars=raw_chars,
-        )
+    if e := _error_guard("mcp__claude_ai_firecrawl__firecrawl_search", result_text):
+        return e
     query = (tool_input or {}).get("query")
     items: list[SearchResultItem] = []
     text = (result_text or "").strip()
@@ -479,11 +472,8 @@ def parse_exa_text_blocks(
     tool_name: str, tool_input: dict[str, Any], result_text: str
 ) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name=tool_name, reason=err, detail=(result_text or "")[:400], raw_chars=raw_chars
-        )
+    if e := _error_guard(tool_name, result_text):
+        return e
     query = (tool_input or {}).get("query")
     text = result_text or ""
     items: list[SearchResultItem] = []
@@ -506,14 +496,8 @@ def parse_exa_text_blocks(
 
 def parse_exa_advanced(tool_input: dict[str, Any], result_text: str) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name="mcp__claude_ai_Exa_search__web_search_advanced_exa",
-            reason=err,
-            detail=(result_text or "")[:400],
-            raw_chars=raw_chars,
-        )
+    if e := _error_guard("mcp__claude_ai_Exa_search__web_search_advanced_exa", result_text):
+        return e
     query = (tool_input or {}).get("query")
     items: list[SearchResultItem] = []
     text = (result_text or "").strip()
@@ -559,14 +543,8 @@ _DEEP_SEARCH_ITEM_RE = re.compile(
 
 def parse_deep_search(tool_input: dict[str, Any], result_text: str) -> ExtractResult:
     raw_chars = len(result_text or "")
-    err = _is_pure_error(result_text)
-    if err:
-        return ExtractError(
-            tool_name="mcp__claude_ai_Exa_search__deep_search_exa",
-            reason=err,
-            detail=(result_text or "")[:400],
-            raw_chars=raw_chars,
-        )
+    if e := _error_guard("mcp__claude_ai_Exa_search__deep_search_exa", result_text):
+        return e
     query = (tool_input or {}).get("objective") or (tool_input or {}).get("query")
     items: list[SearchResultItem] = []
     text = result_text or ""

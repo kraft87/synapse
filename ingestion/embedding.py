@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any, Literal, Protocol, cast
 
 import httpx
@@ -113,6 +113,27 @@ _voyage_retry = retry(
 )
 
 
+def _pack_batches(
+    items: list[str], sizes: list[int], max_count: int, max_size: int
+) -> Iterator[list[str]]:
+    """Greedy batch packing shared by the embedding backends: fill a batch up to
+    `max_count` items or `max_size` total weight, whichever comes first. Always
+    admits at least one item per batch even if it alone exceeds `max_size` (the
+    ``if batch and ...`` guard), so an oversized single item is never dropped."""
+    i = 0
+    while i < len(items):
+        batch: list[str] = []
+        total = 0
+        while i < len(items) and len(batch) < max_count:
+            s = sizes[i]
+            if batch and total + s > max_size:
+                break
+            batch.append(items[i])
+            total += s
+            i += 1
+        yield batch
+
+
 class EmbeddingModel(Protocol):
     @property
     def dimensions(self) -> int: ...
@@ -166,17 +187,7 @@ class VoyageEmbeddingModel:
             return []
         item_tokens = [self._client.count_tokens([t], model=self.model_name) for t in capped]
         out: list[list[float]] = []
-        i = 0
-        while i < len(capped):
-            batch: list[str] = []
-            batch_tokens = 0
-            while i < len(capped) and len(batch) < self._MAX_BATCH:
-                tt = item_tokens[i]
-                if batch and batch_tokens + tt > self._TARGET_BATCH_TOKENS:
-                    break
-                batch.append(capped[i])
-                batch_tokens += tt
-                i += 1
+        for batch in _pack_batches(capped, item_tokens, self._MAX_BATCH, self._TARGET_BATCH_TOKENS):
             result = self._embed_batch(batch, input_type)
             out.extend(result.embeddings)
         return out
@@ -379,17 +390,9 @@ class OpenAIEmbeddingModel:
             t[: self._PER_ITEM_CHAR_CAP] if len(t) > self._PER_ITEM_CHAR_CAP else t for t in texts
         ]
         out: list[list[float]] = []
-        i = 0
-        while i < len(capped):
-            batch: list[str] = []
-            batch_chars = 0
-            while i < len(capped) and len(batch) < self._MAX_BATCH:
-                n = len(capped[i])
-                if batch and batch_chars + n > self._TARGET_BATCH_CHARS:
-                    break
-                batch.append(capped[i])
-                batch_chars += n
-                i += 1
+        for batch in _pack_batches(
+            capped, [len(t) for t in capped], self._MAX_BATCH, self._TARGET_BATCH_CHARS
+        ):
             out.extend(self._embed_batch(batch))
         return out
 
