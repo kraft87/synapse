@@ -165,6 +165,16 @@ _CONTENT_TYPES = {
 # ---------------------------------------------------------------------------
 
 
+def _err(detail: str, status: int) -> JSONResponse:
+    """The contract's error envelope: {"status":"error","detail":...} at `status`."""
+    return JSONResponse({"status": "error", "detail": detail}, status_code=status)
+
+
+def _unauthorized() -> JSONResponse:
+    """The 401 every /dash/api/* route returns when the machine token is absent/wrong."""
+    return _err("unauthorized", 401)
+
+
 def _iso(dt: Any) -> str | None:
     return dt.isoformat() if dt is not None else None
 
@@ -2239,7 +2249,7 @@ def _serve_static_file(name: str) -> Response:
     absent — the deployment shipped without a built web/dist (contract)."""
     path = _DIST_DIR / name
     if not path.is_file():
-        return JSONResponse({"status": "error", "detail": "bundle not built"}, status_code=503)
+        return _err("bundle not built", 503)
     media = _CONTENT_TYPES.get(path.suffix, "application/octet-stream")
     if name == "index.html":
         media = "text/html; charset=utf-8"
@@ -2269,15 +2279,25 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     # register() in tests gets an isolated manager (own buffer/worker), same as the cache.
     stream_manager = _StreamManager(db_url)
 
-    async def _api(request: Request, work: Callable[[], Any]) -> JSONResponse:
-        """Shared api boundary: auth gate + threadpool + fail-soft 500."""
+    async def _api(
+        request: Request,
+        work: Callable[[], Any],
+        *,
+        not_found: str | None = None,
+        label: str = "api",
+    ) -> JSONResponse:
+        """Shared api boundary: auth gate + threadpool + fail-soft 500. When ``not_found``
+        is given and ``work()`` returns None, emit the contract's 404 with that detail.
+        ``label`` names the handler in the 500 log line (e.g. 'episode')."""
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         try:
             result = await run_in_threadpool(work)
         except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard api failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            logger.warning("dashboard %s failed: %s", label, e)
+            return _err(str(e)[:200], 500)
+        if not_found is not None and result is None:
+            return _err(not_found, 404)
         return JSONResponse(result)
 
     # ---- static (UNAUTHENTICATED) ----
@@ -2301,13 +2321,13 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         name = request.path_params["name"]
         assets_dir = _DIST_DIR / "assets"
         if not assets_dir.is_dir():
-            return JSONResponse({"status": "error", "detail": "not found"}, status_code=404)
+            return _err("not found", 404)
         # Whitelist by exact basename against the directory listing — never join a raw
         # user path. A traversal attempt ("../x", an absolute/encoded path) simply won't
         # be a member of the listed set, so it 404s.
         allowed = {p.name for p in assets_dir.iterdir() if p.is_file()}
         if name not in allowed:
-            return JSONResponse({"status": "error", "detail": "not found"}, status_code=404)
+            return _err("not found", 404)
         path = assets_dir / name
         media = _CONTENT_TYPES.get(path.suffix, "application/octet-stream")
         headers = (
@@ -2322,7 +2342,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/catalog", methods=["GET"])  # type: ignore[misc]
     async def dash_catalog(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         now = time.monotonic()
         if catalog_cache["data"] is not None and now - catalog_cache["ts"] < _CATALOG_TTL_S:
             return JSONResponse(catalog_cache["data"])
@@ -2330,7 +2350,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             data = await run_in_threadpool(_catalog, db_url)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("dashboard catalog failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return _err(str(e)[:200], 500)
         catalog_cache["ts"] = now
         catalog_cache["data"] = data
         return JSONResponse(data)
@@ -2355,7 +2375,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         (new_episode|new_fact|new_timeline_event, data = the FeedItem JSON) plus a
         processing_status snapshot ~1/s and a heartbeat comment every 15s."""
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         raw = request.headers.get("last-event-id") or request.query_params.get("last_event_id")
         last_id = int(raw) if (raw and raw.lstrip("-").isdigit()) else None
 
@@ -2412,26 +2432,24 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/episode/{id}", methods=["GET"])  # type: ignore[misc]
     async def dash_episode(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         raw = request.path_params["id"]
         if not str(raw).isdigit():
-            return JSONResponse({"status": "error", "detail": "bad episode id"}, status_code=400)
-        try:
-            result = await run_in_threadpool(_episode, db_url, int(raw))
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard episode failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
-        if result is None:
-            return JSONResponse({"status": "error", "detail": "episode not found"}, status_code=404)
-        return JSONResponse(result)
+            return _err("bad episode id", 400)
+        return await _api(
+            request,
+            lambda: _episode(db_url, int(raw)),
+            not_found="episode not found",
+            label="episode",
+        )
 
     @mcp.custom_route("/dash/api/episode/{id}/derived", methods=["GET"])  # type: ignore[misc]
     async def dash_episode_derived(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         raw = request.path_params["id"]
         if not str(raw).isdigit():
-            return JSONResponse({"status": "error", "detail": "bad episode id"}, status_code=400)
+            return _err("bad episode id", 400)
         return await _api(request, lambda: _episode_derived(db_url, int(raw)))
 
     @mcp.custom_route("/dash/api/session/{id}", methods=["GET"])  # type: ignore[misc]
@@ -2446,17 +2464,15 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/entity/{uuid}", methods=["GET"])  # type: ignore[misc]
     async def dash_entity(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         uuid = request.path_params["uuid"]
         m_off = _offset(request.query_params.get("mentions_offset"))
-        try:
-            result = await run_in_threadpool(_entity, db_url, uuid, m_off)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard entity failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
-        if result is None:
-            return JSONResponse({"status": "error", "detail": "entity not found"}, status_code=404)
-        return JSONResponse(result)
+        return await _api(
+            request,
+            lambda: _entity(db_url, uuid, m_off),
+            not_found="entity not found",
+            label="entity",
+        )
 
     @mcp.custom_route("/dash/api/search", methods=["GET"])  # type: ignore[misc]
     async def dash_search(request: Request) -> JSONResponse:
@@ -2488,24 +2504,20 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/graph/neighborhood", methods=["GET"])  # type: ignore[misc]
     async def dash_graph_neighborhood(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         qp = request.query_params
         entity = (qp.get("entity") or "").strip()
         if not entity:
-            return JSONResponse({"status": "error", "detail": "missing 'entity'"}, status_code=400)
+            return _err("missing 'entity'", 400)
         depth = 2 if qp.get("depth") == "2" else 1
         as_of = _parse_as_of(qp.get("as_of"))
         limit = _limit(qp.get("limit"), _GRAPH_NODE_CAP, _GRAPH_NODE_CAP)
-        try:
-            result = await run_in_threadpool(
-                _graph_neighborhood, db_url, entity, depth, as_of, limit
-            )
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard graph neighborhood failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
-        if result is None:
-            return JSONResponse({"status": "error", "detail": "entity not found"}, status_code=404)
-        return JSONResponse(result)
+        return await _api(
+            request,
+            lambda: _graph_neighborhood(db_url, entity, depth, as_of, limit),
+            not_found="entity not found",
+            label="graph neighborhood",
+        )
 
     @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[misc]
     async def dash_recall_history(request: Request) -> JSONResponse:
@@ -2529,7 +2541,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/metrics/corpus", methods=["GET"])  # type: ignore[misc]
     async def dash_metrics_corpus(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         now = time.monotonic()
         if corpus_cache["data"] is not None and now - corpus_cache["ts"] < _CORPUS_TTL_S:
             return JSONResponse(corpus_cache["data"])
@@ -2537,7 +2549,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             data = await run_in_threadpool(_metrics_corpus, db_url)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("dashboard corpus metrics failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return _err(str(e)[:200], 500)
         corpus_cache["ts"] = now
         corpus_cache["data"] = data
         return JSONResponse(data)
@@ -2572,21 +2584,19 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/behavior/file", methods=["GET"])  # type: ignore[misc]
     async def dash_behavior_file(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         qp = request.query_params
         key = qp.get("key")
         if not key:
-            return JSONResponse({"status": "error", "detail": "missing 'key'"}, status_code=400)
+            return _err("missing 'key'", 400)
         scope = qp.get("scope") or "global"
         surface = qp.get("surface") or None
-        try:
-            result = await run_in_threadpool(_behavior_file, db_url, key, scope, surface)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard behavior file failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
-        if result is None:
-            return JSONResponse({"status": "error", "detail": "file not found"}, status_code=404)
-        return JSONResponse(result)
+        return await _api(
+            request,
+            lambda: _behavior_file(db_url, key, scope, surface),
+            not_found="file not found",
+            label="behavior file",
+        )
 
     @mcp.custom_route("/dash/api/behavior/linkgraph", methods=["GET"])  # type: ignore[misc]
     async def dash_behavior_linkgraph(request: Request) -> JSONResponse:
@@ -2599,31 +2609,25 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/flag", methods=["POST"])  # type: ignore[misc]
     async def dash_flag(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+            return _err("invalid JSON body", 400)
         kind = body.get("kind")
         item_id = body.get("id")
         note = body.get("note")
         if kind not in _FLAG_KINDS:
-            return JSONResponse(
-                {"status": "error", "detail": f"invalid kind {kind!r}"}, status_code=400
-            )
+            return _err(f"invalid kind {kind!r}", 400)
         if not item_id or not isinstance(item_id, str):
-            return JSONResponse(
-                {"status": "error", "detail": "missing 'id' (item_id string)"}, status_code=400
-            )
+            return _err("missing 'id' (item_id string)", 400)
         if note is not None and not isinstance(note, str):
-            return JSONResponse(
-                {"status": "error", "detail": "'note' must be a string"}, status_code=400
-            )
+            return _err("'note' must be a string", 400)
         try:
             flagged = await run_in_threadpool(_flag_toggle, db_url, kind, item_id, note)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("dashboard flag failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
+            return _err(str(e)[:200], 500)
         return JSONResponse({"status": "ok", "flagged": flagged})
 
     # ---- proposals (phase 2b) ----
@@ -2642,57 +2646,42 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     @mcp.custom_route("/dash/api/proposals/{id}", methods=["GET"])  # type: ignore[misc]
     async def dash_proposal_detail(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         parsed = _parse_proposal_id(request.path_params["id"])
         if parsed is None:
-            return JSONResponse({"status": "error", "detail": "bad proposal id"}, status_code=400)
+            return _err("bad proposal id", 400)
         lane, n = parsed
-        try:
-            result = await run_in_threadpool(_proposal_detail, db_url, lane, n)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard proposal detail failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
-        if result is None:
-            return JSONResponse(
-                {"status": "error", "detail": "proposal not found"}, status_code=404
-            )
-        return JSONResponse(result)
+        return await _api(
+            request,
+            lambda: _proposal_detail(db_url, lane, n),
+            not_found="proposal not found",
+            label="proposal detail",
+        )
 
     @mcp.custom_route("/dash/api/proposals/{id}/decision", methods=["POST"])  # type: ignore[misc]
     async def dash_proposal_decision(request: Request) -> JSONResponse:
         if not authorized(request):
-            return JSONResponse({"status": "error", "detail": "unauthorized"}, status_code=401)
+            return _unauthorized()
         parsed = _parse_proposal_id(request.path_params["id"])
         if parsed is None:
-            return JSONResponse({"status": "error", "detail": "bad proposal id"}, status_code=400)
+            return _err("bad proposal id", 400)
         lane, n = parsed
         try:
             body = await request.json()
         except Exception:
-            return JSONResponse({"status": "error", "detail": "invalid JSON body"}, status_code=400)
+            return _err("invalid JSON body", 400)
         action = body.get("action")
         note = body.get("note")
         if action not in ("approve", "reject"):
-            return JSONResponse(
-                {"status": "error", "detail": "action must be 'approve' or 'reject'"},
-                status_code=400,
-            )
+            return _err("action must be 'approve' or 'reject'", 400)
         if note is not None and not isinstance(note, str):
-            return JSONResponse(
-                {"status": "error", "detail": "'note' must be a string"}, status_code=400
-            )
+            return _err("'note' must be a string", 400)
         # A reject must carry a reason — it's the lane's reject_reason and the audit note.
         if action == "reject" and not (note and note.strip()):
-            return JSONResponse(
-                {"status": "error", "detail": "reject requires a non-empty note"}, status_code=400
-            )
-        try:
-            result = await run_in_threadpool(_proposal_decision, db_url, lane, n, action, note)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("dashboard proposal decision failed: %s", e)
-            return JSONResponse({"status": "error", "detail": str(e)[:200]}, status_code=500)
-        if result is None:
-            return JSONResponse(
-                {"status": "error", "detail": "proposal not found"}, status_code=404
-            )
-        return JSONResponse(result)
+            return _err("reject requires a non-empty note", 400)
+        return await _api(
+            request,
+            lambda: _proposal_decision(db_url, lane, n, action, note),
+            not_found="proposal not found",
+            label="proposal decision",
+        )
