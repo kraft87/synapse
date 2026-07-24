@@ -554,6 +554,30 @@ Rules:
   ("recently", "a while ago"), leave it unanchored. When one statement carries SEVERAL
   dated events, SPLIT it into one fact per event so each fact carries exactly one date.
 
+ENTITY NAMES are short noun phrases (5 words or fewer) naming a discrete thing in the
+user's world — never a full sentence, goal statement, action item, or quoted phrase.
+For "decided to expand the recall bench to 200 questions", the entity is "recall
+bench", not the whole proposition. NEVER mint an entity from:
+- a clock time or bare date ("5:54 am", "January 15") — dates ride inside fact text
+- a bare quantity, price, percentage, or duration ("7-8 hours", "$150/hour", "20%")
+  — figures are properties of the thing they measure, keep them in the fact
+- an imperative tip-list header ("Buy in bulk", "Plan your meals") — name the topical
+  noun ("bulk buying") if it's worth keeping at all
+- a quoted slogan, idiom, or definitional phrase — not retrievable referents
+CONNECT FACTS DIRECTLY between the people, projects, and tools involved — never route
+a relationship through scenery or observation nouns. GOOD: "User -> MIGRATED ->
+synapse". BAD: "the migration log -> MENTIONS -> synapse". Descriptive detail
+belongs inside the fact text of the direct edge.
+
+OUTPUT DISCIPLINE:
+- `fact` and `summary` are plain declarative statements. NEVER include hedging
+  ("appears to", "possibly"), your own reasoning, alternatives you considered, or
+  text echoed from these instructions or the output schema.
+- If you have nothing real for a `summary`, use "" — never a sentence explaining
+  the absence ("no additional information available").
+- `relationship` is a short UPPER_SNAKE_CASE label ("USES", "DECIDED_ON"), never a
+  sentence.
+
 ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
 - Every entity you list in `entities` MUST appear as the `source` or `target` of at
   least one fact. Every fact's `source` and `target` MUST exactly match the `name`
@@ -591,7 +615,9 @@ Rules:
 - SALIENCE BAR: extract only entities that would plausibly matter beyond this one
   page — named tools, products, techniques, organizations, people, measured results.
   Skip page furniture (bylines, categories, related-article titles), code variable
-  names, and generic concepts ("performance", "users", "the team").
+  names, and generic concepts ("performance", "users", "the team"). Bare quantities,
+  clock times, and coordinates are never entities — a figure like "F1 0.93" or
+  "7.5 hours" stays inside the fact text of the thing it measures.
 - fact text must be a self-contained searchable claim ("X achieves Y on Z",
   "X replaced Y because Z"). Include numbers, versions, and dates verbatim when
   the source states them.

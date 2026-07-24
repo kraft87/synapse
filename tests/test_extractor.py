@@ -325,6 +325,91 @@ class TestCombinedExtractionValidator:
         )
         assert {e.name for e in ce.entities} == {"Synapse", "Lonely"}
 
+    # -- field-length caps: backstop against meta-reasoning bleed ----------
+
+    def test_over_cap_fact_dropped(self):
+        ce = CombinedExtraction(
+            entities=[ExtractedEntity(name="Synapse", type="Project")],
+            facts=[
+                ExtractedFact(
+                    source="Synapse",
+                    target="Synapse",
+                    relationship="IS",
+                    fact="reasoning dump " * 200,  # ~3000 chars, over MAX_FACT_LEN
+                ),
+                ExtractedFact(
+                    source="Synapse",
+                    target="Synapse",
+                    relationship="IS",
+                    fact="Synapse is the memory layer",
+                ),
+            ],
+        )
+        assert len(ce.facts) == 1
+        assert ce.facts[0].fact == "Synapse is the memory layer"
+        assert len(ce.dropped_facts) == 1
+
+    def test_over_cap_relationship_drops_fact(self):
+        ce = CombinedExtraction(
+            entities=[ExtractedEntity(name="Synapse", type="Project")],
+            facts=[
+                ExtractedFact(
+                    source="Synapse",
+                    target="Synapse",
+                    relationship="THE MODEL CONSIDERED SEVERAL OPTIONS " * 5,
+                    fact="Synapse is the memory layer",
+                )
+            ],
+        )
+        assert ce.facts == []
+        assert len(ce.dropped_facts) == 1
+
+    def test_over_cap_summary_blanked_entity_kept(self):
+        ce = CombinedExtraction(
+            entities=[
+                ExtractedEntity(name="Synapse", type="Project", summary="x" * 5000),
+            ],
+            facts=[
+                ExtractedFact(
+                    source="Synapse",
+                    target="Synapse",
+                    relationship="IS",
+                    fact="Synapse is the memory layer",
+                )
+            ],
+        )
+        assert len(ce.entities) == 1
+        assert ce.entities[0].summary == ""
+        assert len(ce.facts) == 1
+
+    def test_over_cap_entity_name_drops_entity_and_its_facts(self):
+        long_name = "Establish a firm training and onboarding program " * 10
+        ce = CombinedExtraction(
+            entities=[
+                ExtractedEntity(name=long_name, type="Decision"),
+                ExtractedEntity(name="Synapse", type="Project"),
+            ],
+            facts=[
+                ExtractedFact(
+                    source=long_name,
+                    target="Synapse",
+                    relationship="RELATES_TO",
+                    fact="over-cap name endpoint",
+                ),
+                ExtractedFact(
+                    source="Synapse",
+                    target="Synapse",
+                    relationship="IS",
+                    fact="Synapse is the memory layer",
+                ),
+            ],
+        )
+        assert [e.name for e in ce.entities] == ["Synapse"]
+        assert len(ce.dropped_entities) == 1
+        # The fact referencing the dropped entity falls out via cross-ref.
+        assert len(ce.facts) == 1
+        assert ce.facts[0].relationship == "IS"
+
 
 # ---------------------------------------------------------------------------
 # LLMExtractor retry-on-malformed-JSON (Phase 1)
@@ -417,6 +502,13 @@ class TestExtractionPromptDisciplines:
         assert "(meaning" in prompt
         # Supersession naming.
         assert "NAME WHAT CHANGED" in prompt
+        # Entity-name discipline + skip classes (times/quantities/slogans).
+        assert "ENTITY NAMES" in prompt
+        assert "NEVER mint an entity" in prompt
+        # Direct edges, not scenery intermediaries.
+        assert "CONNECT FACTS DIRECTLY" in prompt
+        # No hedging/reasoning/schema-echo bleed into fact or summary text.
+        assert "OUTPUT DISCIPLINE" in prompt
 
 
 # ---------------------------------------------------------------------------
