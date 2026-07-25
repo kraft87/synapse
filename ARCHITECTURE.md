@@ -424,15 +424,14 @@ Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage r
 
 Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it. The board is push-only — `GET /context` feeds the plugin's SessionStart hook; there is no MCP board tool (the hook already injects the block).
 
-- **`recall(query, project=None, session_focus=None, group_id="technical")`** — the primary retrieval tool ([§6](#6-recall-pipeline)).
+- **`recall(query, project=None, session_focus=None, group_id="technical", mode="overview")`** — the primary retrieval tool ([§6](#6-recall-pipeline)). `mode="turns"` is the raw-episode drill-down (full turns, same deep-fetch + rerank machinery) — it absorbed the standalone `recall_episodes` tool (item 6 tool-surface audit; telemetry keeps `kind='episodes'`).
 - **`fetch(ids)`** — expand `e:N` episode ids (bare `N` accepted) and `n:N` note ids into full records; mixed lists fine, unknown ids reported under `skipped`, capped at 20 per call.
 - **`remember(content=None, hook=None, body=None, type="project", project=None, session_id=None)`** — reconciles a note into the notes store and archives the text as a manual `Episode` with KG extraction.
 - **`recall_timeline(query=None, since=None, until=None, project=None, min_salience=0, limit=20, group_id=None)`** — dated what-happened events, chronological.
-- **`recall_episodes(query, project=None, limit=5)`** — raw episode drill-down (same deep-fetch + rerank machinery, served to `limit`).
 - **`recall_feedback(query, helpful=None, noise=None, missing=None, note=None, session_id=None, project=None)`** — after-the-fact retrieval-quality report: which served ids (`e:N`/`n:N`, validated) were load-bearing vs noise, plus what was missing. Writes one `recall_feedback` row (schema 046) — offline labeled data for eval goldens and reranker tuning, deliberately not wired into live ranking.
 - **`issue_machine_token()`** — returns the shared machine bearer token, auth-gated by MultiAuth + the allowlist; lets `synapse login` fetch it over OAuth instead of a manual copy-paste ([§7.4](#74-auth)). **Hidden from `tools/list`** by an `on_list_tools` middleware; still callable by name via `tools/call`.
 
-Removed from the surface (git history keeps the code): `list_projects` (the board banner carries per-project activity now) and `query_graph` (experimental NL→SQL; `recall()` owns retrieval).
+Removed from the surface (git history keeps the code): `list_projects` (the board banner carries per-project activity now), `query_graph` (experimental NL→SQL; `recall()` owns retrieval), and `recall_episodes` (~4% of recall-family calls — merged into `recall(mode="turns")`).
 
 ### 7.2 Custom HTTP routes (`/ingest`, `/recall`)
 
@@ -496,7 +495,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **018 web→KG lane** — web-artifact extraction into the KG.
 - **019 `kg_relationships.mention_count`** — fact re-assertion signal, bumped at the Stage-7 dedup-skip.
 - **020 entity-type taxonomy** — data-driven 2-level supertype/subtype (`kg_supertypes`, `kg_entity_types` tables + `entity_supertype`/`entity_subtype` columns).
-- **021 `recall_metrics`** — fire-and-forget recall telemetry, one row per `recall()` / `recall_episodes()`.
+- **021 `recall_metrics`** — fire-and-forget recall telemetry, one row per `recall()` serve (overview `kind='recall'`, turns-mode `kind='episodes'`).
 - **022–023 `skills_lane`** — dream→skills candidate ledger, firing log, skill registry, scan cursor (022); ledger hardening with the grounded-signal CHECK constraint (023).
 - **024–026 skill serving + sync** — `skill_registry` body/scope/status + `skill_files` (024); `content_modified_at` for two-way sync (025); append-only `skill_history` + trigger (026).
 - **027 `skill_registry.proposal_body`** — full proposal text on the registry row.
@@ -666,7 +665,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 |----------|---------|-------------|
 | `SYNAPSE_RECALL_PASSAGE_N` | `3` | passages served per `recall()` from the second-pass passage rerank |
 | `SYNAPSE_RERANK_WINDOW` | `1` | relevance-windowed truncation of long episodes before rerank (`0` = full episodes) |
-| `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall_episodes()`: serve turns scoring ≥ tau×top_score |
+| `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall(mode="turns")`: serve turns scoring ≥ tau×top_score |
 | `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |
 | `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
 | `SYNAPSE_RECALL_FLOOR` | `0.58` | **shadow-phase** abstention floor: when the raw (pre-recency) rerank top score is strictly below it, the call's `recall_metrics.served_ids` envelope gains `would_abstain`/`floor` markers — telemetry only, serving is unchanged (`0` = off) |
@@ -732,7 +731,7 @@ synapse/
 │   └── models.py              # Pydantic domain models
 │
 ├── mcp_server/
-│   ├── server.py              # fastmcp: recall/fetch/remember/recall_timeline/recall_episodes (+hidden issue_machine_token) + /ingest + /recall routes + MultiAuth
+│   ├── server.py              # fastmcp: recall/fetch/remember/recall_timeline/recall_feedback (+hidden issue_machine_token) + /ingest + /recall routes + MultiAuth
 │   ├── recall.py              # Recall engine: episode leg + KG leg + web + history, rerank, fusion
 │   ├── kg_pg.py               # recall-side KG search (vector + BM25 + 1-hop over kg_*)
 │   ├── device_routes.py       # /device/code + /device/token — RFC 8628 device login (proxies GitHub), allowlist-gated

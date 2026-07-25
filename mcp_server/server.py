@@ -1,5 +1,5 @@
-"""Synapse MCP server — recall, fetch, remember, recall_timeline, recall_episodes,
-and recall_feedback as MCP tools (plus issue_machine_token, hidden from listings).
+"""Synapse MCP server — recall, fetch, remember, recall_timeline, and
+recall_feedback as MCP tools (plus issue_machine_token, hidden from listings).
 
 Run with:
     uv run python -m mcp_server.server
@@ -303,7 +303,7 @@ _INSTRUCTIONS = (
     "device, purchase, tool, project, person, or preference — search with "
     "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
     "(n:N) from earlier results. recall_timeline answers when-did / how-long "
-    "questions; recall_episodes returns raw turn text. WHEN the user states a "
+    'questions; recall(mode="turns") returns raw turn text. WHEN the user states a '
     "durable fact or correction, or you are about to say 'noted', call remember "
     "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "
     "reports which served ids helped, which were noise, and what was missing. "
@@ -437,9 +437,10 @@ async def health(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Tools — REGISTRATION ORDER IS DELIBERATE. Tool-list position biases which tool
 # a model reaches for (first-listed wins most ties), so the surface reads in
-# intended-use order: recall (the workhorse), fetch (id expansion), remember (the
-# write), the two specialist reads — recall_timeline, recall_episodes — then
-# recall_feedback (the after-the-fact quality report). Hidden plumbing
+# intended-use order: recall (the workhorse; mode="turns" absorbed the retired
+# recall_episodes drill-down — item 6 audit, ~4% of recall-family calls), fetch
+# (id expansion), remember (the write), the specialist read — recall_timeline —
+# then recall_feedback (the after-the-fact quality report). Hidden plumbing
 # (issue_machine_token, see _HIDDEN_TOOLS) registers last.
 # test_tool_surface.py pins this order.
 #
@@ -459,6 +460,7 @@ def recall(
     project: str | None = None,
     session_focus: list[str] | None = None,
     group_id: str = "technical",
+    mode: str = "overview",
 ) -> dict:
     """Search the user's long-term memory: tens of thousands of reranked
     past-conversation turns, the knowledge-graph facts extracted from them, and a
@@ -475,6 +477,12 @@ def recall(
     (read those directly), nor for generic-knowledge questions with no
     user-history angle (definitions, math, general how-tos).
 
+    Two modes — "overview" (default) serves the blended buckets below and is the
+    right first call. "turns" is the raw-episode drill-down: WHEN you need the
+    exact wording of a specific exchange — "what exactly did we say about X",
+    "show me the actual conversation", the raw turn text — it returns full
+    conversation turns ranked by relevance + recency.
+
     Query in plain language carrying the message's distinctive nouns; leave
     `project` unset unless results come back noisy from another domain. Served
     passages carry `role` (user / assistant / mixed) and a `date`: for "current
@@ -487,22 +495,33 @@ def recall(
     rest are feedback-only.
 
     Follow-ups: fetch(ids) expands a truncated passage or note body;
-    recall_timeline() answers when-did / how-long; recall_episodes() returns raw
-    turn text.
+    recall_timeline() answers when-did / how-long.
 
     Args:
         query: Natural language search query.
         project: Optional project slug to filter results (e.g. "synapse").
         session_focus: Entity names active in current conversation for KG bias.
         group_id: Knowledge graph scope — "technical" (default) or "personal".
+        mode: "overview" (default, blended buckets) or "turns" (raw turn drill-down).
     """
+    if mode not in ("overview", "turns"):
+        return {
+            "status": "error",
+            "detail": f'invalid mode {mode!r} — expected "overview" or "turns"',
+        }
     with logfire.span(
         "mcp.recall {query!r}",
         query=query[:80],
         project=project,
         group_id=group_id,
+        mode=mode,
     ):
         engine = _get_recall()
+        if mode == "turns":
+            # The absorbed recall_episodes drill-down (item 6 tool-surface audit).
+            # Same engine path, so telemetry keeps kind='episodes' and historical
+            # per-tool metrics stay comparable.
+            return engine.recall_episodes(query=query, project=project, source="mcp-tool")
         return engine.recall(
             query=query,
             project=project,
@@ -808,40 +827,9 @@ def recall_timeline(
         return res
 
 
-@mcp.tool()
-def recall_episodes(
-    query: str,
-    project: str | None = None,
-    limit: int = 5,
-) -> dict:
-    """Raw episode drill-down: individual conversation turns.
-
-    Use this when you need the exact text of a specific exchange —
-    "what exactly did we say about X?", "show me that debug session".
-    Returns full episode content ranked by relevance + recency.
-
-    Do NOT use this for a blended overview — recall() serves the top episodes
-    plus KG facts and is the right first call.
-
-    Args:
-        query: Natural language search query.
-        project: Optional project slug to filter results.
-        limit: Max episodes to return (default 5, max ~10 before it gets noisy).
-    """
-    with logfire.span(
-        "mcp.recall_episodes {query!r}",
-        query=query[:80],
-        project=project,
-        limit=limit,
-    ):
-        engine = _get_recall()
-        return engine.recall_episodes(
-            query=query,
-            project=project,
-            limit=limit,
-            source="mcp-tool",
-        )
-
+# recall_episodes was retired as a standalone tool (item 6 tool-surface audit:
+# 12 of ~325 recall-family mcp-tool calls over 5 weeks, under the pre-registered
+# 5% merge threshold) — recall(mode="turns") now routes to the same engine path.
 
 # --- recall_feedback: offline labeled retrieval-quality capture (schema 046) ------
 # One row per rated recall. Deliberately NOT wired into live scoring — no ranking
@@ -931,16 +919,18 @@ def recall_feedback(
     `helpful` = served ids that were load-bearing for your answer; `noise` =
     served ids that were irrelevant or distracting; `missing` = one line on
     what you needed but were not served. Every recall bucket carries an `id` you
-    can copy here verbatim — "e:N" episodes, "n:N" notes, "f:<uuid>" facts (and
-    superseded_facts), "t:N" timeline, "w:N" web, "p:N" preferences. A report with
-    only `missing` set is still valuable; file it when a recall came back empty-handed.
+    can copy here verbatim — "e:N" episodes, "f:<uuid>" facts (and
+    superseded_facts), "t:N" timeline, "w:N" web, "p:N" preferences — and "n:N"
+    note ids from the session-start board or fetch(): WHEN a board note shaped
+    your answer (or misled it), rate its n:N here too. A report with only
+    `missing` set is still valuable; file it when a recall came back empty-handed.
 
     This is offline labeled data (eval goldens, reranker tuning). It never
     changes live ranking, so honest negatives are safe and wanted.
 
-    Do NOT file more than one report per recall query, do NOT rate recalls
-    whose results you never used, and do NOT invent ids — report only ids the
-    recall actually served.
+    Do NOT file more than one report per recall query, do NOT rate results you
+    never used, and do NOT invent ids — report only ids actually served to you
+    by recall, the board, or fetch.
 
     Args:
         query: The recall query being rated, verbatim.

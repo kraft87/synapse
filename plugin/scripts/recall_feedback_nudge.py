@@ -11,8 +11,9 @@ in the plugin captures organic feedback from every install, not just the author'
 Mirrors recall_nudge.py (the UserPromptSubmit "use Synapse" reminder): a static ~60-token
 directive, zero latency, zero API calls — the model still decides which ids were load-bearing.
 
-The anchored matcher (mcp__..._recall$) in hooks.json ensures this fires ONLY on recall(),
-NOT on recall_feedback / recall_episodes / recall_timeline.
+The anchored matcher (mcp__..._recall$) in hooks.json ensures this fires ONLY on recall()
+(both modes, since mode="turns" absorbed recall_episodes), NOT on recall_feedback /
+recall_timeline / fetch.
 
 Kill switch: SYNAPSE_RECALL_FEEDBACK_NUDGE=0 (env or plugin install options).
 """
