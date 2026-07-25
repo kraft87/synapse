@@ -257,6 +257,17 @@ can share one server:
   (`--browser` keeps the legacy loopback flow). Access is gated to an allowlist of GitHub
   users (`ALLOWED_GITHUB_USERS`); the GitHub OAuth App needs "Enable Device Flow" on.
 
+Instead of GitHub, any OIDC-compliant IdP (Authelia, Keycloak, Pocket ID, ...) can back the
+same three interactive flows — set `OIDC_CONFIG_URL` (the provider's
+`/.well-known/openid-configuration`), `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, and
+`ALLOWED_OIDC_USERS` (matched against `preferred_username`, then `email`). MCP discovery can
+only advertise one authorization server, so this replaces GitHub for that deployment; leave
+the OIDC vars unset to keep the GitHub default. Register both `{base_url}/auth/callback` and
+`{base_url}/auth/callback/dash` as redirect URIs on the OIDC client, grant
+`openid profile email offline_access`, and (for the MCP leg's allowlist) configure the IdP to
+put `preferred_username`/`email` in the id_token — e.g. an Authelia claims policy. The device
+flow needs the IdP to support the device authorization grant.
+
 With no token configured the server runs open, which is fine for a purely local instance. A
 central instance can be exposed to claude.ai over a Cloudflare tunnel; the MCP server
 handles auth itself, so no separate proxy is needed.

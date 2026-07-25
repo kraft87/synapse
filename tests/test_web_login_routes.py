@@ -1,7 +1,7 @@
 """Tests for mcp_server/web_login_routes.py — the dashboard's browser OAuth login.
 
-Pure-Python (no DB): GitHub calls are stubbed at the module seams
-(_exchange_code / _fetch_login). Covers the origin allowlist on /dash/oauth/start,
+Pure-Python (no DB): IdP calls are stubbed on the injected provider object
+(exchange_code / fetch_identity). Covers the origin allowlist on /dash/oauth/start,
 authorize-URL construction, state sign/verify (forged + expired), and the
 callback's allowlist gate + fragment handoffs.
 """
@@ -16,6 +16,7 @@ from fastmcp import FastMCP
 from starlette.testclient import TestClient
 
 import mcp_server.web_login_routes as wl
+from mcp_server.idp import GitHubIdP
 
 _MT = "test-machine-token"
 _PUB = "https://synapse.example.net"
@@ -23,10 +24,15 @@ _LAN = "https://synapse.lan.example.net"
 
 
 @pytest.fixture()
-def client(monkeypatch):
+def idp():
+    return GitHubIdP("cid", "csecret", {"alloweduser"})
+
+
+@pytest.fixture()
+def client(idp, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DASH_ORIGINS", _LAN)
     mcp = FastMCP("t")
-    wl.register(mcp, "cid", "csecret", {"alloweduser"}, _MT, _PUB)
+    wl.register(mcp, idp, _MT, _PUB)
     with TestClient(mcp.http_app(), base_url=_PUB) as c:
         yield c
 
@@ -89,32 +95,32 @@ def test_callback_rejects_forged_and_expired_state(client):
     assert r.status_code == 400
 
 
-def test_callback_happy_path_hands_token_to_origin(client, monkeypatch):
-    async def fake_exchange(cid, cs, code, ruri):
+def test_callback_happy_path_hands_token_to_origin(client, idp, monkeypatch):
+    async def fake_exchange(code, ruri):
         assert code == "goodcode" and ruri == f"{_PUB}/auth/callback/dash"
         return "gh-access"
 
-    async def fake_login(access):
+    async def fake_identity(access):
         assert access == "gh-access"
         return "alloweduser"
 
-    monkeypatch.setattr(wl, "_exchange_code", fake_exchange)
-    monkeypatch.setattr(wl, "_fetch_login", fake_login)
+    monkeypatch.setattr(idp, "exchange_code", fake_exchange)
+    monkeypatch.setattr(idp, "fetch_identity", fake_identity)
     state = wl._sign_state(_MT, _LAN)
     r = client.get(f"/auth/callback/dash?code=goodcode&state={state}", follow_redirects=False)
     assert r.status_code == 302
     assert r.headers["location"] == f"{_LAN}/dash#token={_MT}"
 
 
-def test_callback_rejects_unlisted_github_user(client, monkeypatch):
-    async def fake_exchange(cid, cs, code, ruri):
+def test_callback_rejects_unlisted_github_user(client, idp, monkeypatch):
+    async def fake_exchange(code, ruri):
         return "gh-access"
 
-    async def fake_login(access):
+    async def fake_identity(access):
         return "stranger"
 
-    monkeypatch.setattr(wl, "_exchange_code", fake_exchange)
-    monkeypatch.setattr(wl, "_fetch_login", fake_login)
+    monkeypatch.setattr(idp, "exchange_code", fake_exchange)
+    monkeypatch.setattr(idp, "fetch_identity", fake_identity)
     state = wl._sign_state(_MT, _LAN)
     r = client.get(f"/auth/callback/dash?code=c&state={state}", follow_redirects=False)
     assert r.status_code == 302

@@ -80,6 +80,16 @@ OAUTH_SIGNING_KEY = _cfg(
 ALLOWED_GITHUB_USERS = {
     u.strip().lower() for u in _cfg("ALLOWED_GITHUB_USERS").split(",") if u.strip()
 }
+# Alternative interactive IdP: any OIDC-compliant provider (e.g. self-hosted Authelia or
+# Keycloak). When set it REPLACES GitHub for all three interactive flows (MCP OAuth,
+# dashboard login, device login) — MCP discovery can only advertise one authorization
+# server, so "alternative" is a per-deployment choice, not a login picker. Leave unset to
+# keep the GitHub default; the machine-bearer leg is unaffected either way.
+OIDC_CONFIG_URL = _cfg("OIDC_CONFIG_URL")  # .../.well-known/openid-configuration
+OIDC_CLIENT_ID = _cfg("OIDC_CLIENT_ID")
+OIDC_CLIENT_SECRET = _cfg("OIDC_CLIENT_SECRET")
+# Matched against userinfo/id_token preferred_username, then email (lowercased).
+ALLOWED_OIDC_USERS = {u.strip().lower() for u in _cfg("ALLOWED_OIDC_USERS").split(",") if u.strip()}
 _MACHINE_CLIENT_ID = "synapse-machine"  # marks the bearer leg so the GitHub allowlist skips it
 
 # ---------------------------------------------------------------------------
@@ -93,23 +103,29 @@ _mcp_host = "0.0.0.0" if _use_http else "127.0.0.1"
 _mcp_port = int(os.environ.get("MCP_PORT", "8765"))
 
 
-class _GitHubAllowlist(Middleware):
-    """Gate tool calls so the GitHub OAuth leg can't expose memory to the world.
+class _UserAllowlist(Middleware):
+    """Gate tool calls so the interactive OAuth leg can't expose memory to the world.
 
-    GitHubProvider admits ANY GitHub account by default; without this, anyone who
+    The OAuth proxies admit ANY upstream account by default; without this, anyone who
     completes the OAuth flow could read this instance's memory. The machine bearer
-    leg carries client_id ``synapse-machine`` and skips the login check.
+    leg carries client_id ``synapse-machine`` and skips the identity check. The
+    identity claim differs by provider: GitHub tokens carry ``login``, OIDC id_tokens
+    carry ``preferred_username``/``email`` (the IdP's claims config must put them in
+    the id_token — e.g. an Authelia claims policy).
     """
 
-    def __init__(self, allowed_logins: set[str]) -> None:
-        self._allowed = allowed_logins
+    def __init__(self, allowed_users: set[str], claim_keys: tuple[str, ...], label: str) -> None:
+        self._allowed = allowed_users
+        self._claim_keys = claim_keys
+        self._label = label
 
     async def on_call_tool(self, context, call_next):
         token = get_access_token()
         if token is not None and token.client_id != _MACHINE_CLIENT_ID:
-            login = str((token.claims or {}).get("login", "")).lower()
-            if login not in self._allowed:
-                raise AuthorizationError(f"github user {login!r} not in allowlist")
+            claims = token.claims or {}
+            user = next((str(claims[k]).lower() for k in self._claim_keys if claims.get(k)), "")
+            if user not in self._allowed:
+                raise AuthorizationError(f"{self._label} user {user!r} not in allowlist")
         return await call_next(context)
 
 
@@ -168,15 +184,54 @@ def _oauth_client_storage():
     )
 
 
+# Scopes the OIDC leg advertises/requires (offline_access => the IdP issues refresh
+# tokens, which the claude.ai connector needs to survive its token rotations).
+_OIDC_SCOPES = ["openid", "profile", "email", "offline_access"]
+_ALLOWED_CLIENT_REDIRECTS = [
+    "https://claude.ai/api/mcp/auth_callback",
+    "https://claude.com/api/mcp/auth_callback",
+    # `synapse login` (RFC 8252): an ephemeral loopback redirect on a random
+    # port. Without these patterns the OAuthProxy 400s the authorize step
+    # ("does not match allowed patterns") and the CLI login can never complete.
+    "http://localhost:*",
+    "http://127.0.0.1:*",
+]
+
+
 def _build_auth():
     """(auth_provider, middleware). No machine token => open server (dev/stdio/pre-cutover)."""
     if not MACHINE_TOKEN:
         return None, []
-    # scopes=["user"] so the machine token clears the GitHub leg's required scope on /mcp
-    # (GitHubProvider defaults required_scopes=["user"], and MultiAuth applies it to /mcp).
+    # The bearer's scopes must clear whichever interactive leg is active (MultiAuth
+    # applies the server's required scopes to /mcp): "user" for GitHub, the OIDC set
+    # otherwise. Carrying both is harmless.
     bearer = StaticTokenVerifier(
-        {MACHINE_TOKEN: {"client_id": _MACHINE_CLIENT_ID, "scopes": ["user"]}}
+        {MACHINE_TOKEN: {"client_id": _MACHINE_CLIENT_ID, "scopes": ["user", *_OIDC_SCOPES]}}
     )
+    if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
+        from fastmcp.server.auth.oidc_proxy import OIDCProxy
+
+        oidc = OIDCProxy(
+            config_url=OIDC_CONFIG_URL,
+            client_id=OIDC_CLIENT_ID,
+            client_secret=OIDC_CLIENT_SECRET,
+            base_url=PUBLIC_URL,
+            jwt_signing_key=OAUTH_SIGNING_KEY or None,
+            client_storage=_oauth_client_storage(),
+            # Self-hosted IdPs (Authelia et al.) issue opaque access tokens; the
+            # id_token is the JWT the discovery JWKS can verify.
+            verify_id_token=True,
+            required_scopes=list(_OIDC_SCOPES),
+            allowed_client_redirect_uris=_ALLOWED_CLIENT_REDIRECTS,
+        )
+        if not ALLOWED_OIDC_USERS:
+            logger.warning(
+                "OIDC auth on but ALLOWED_OIDC_USERS empty -> all human logins DENIED (fail-closed)"
+            )
+        return (
+            MultiAuth(server=oidc, verifiers=[bearer]),
+            [_UserAllowlist(ALLOWED_OIDC_USERS, ("preferred_username", "email"), "oidc")],
+        )
     if not GITHUB_CLIENT_ID:
         return bearer, []  # bearer-only: hooks + Claude Code --header; no claude.ai-web connector
     github = GitHubProvider(
@@ -185,24 +240,42 @@ def _build_auth():
         base_url=PUBLIC_URL,
         jwt_signing_key=OAUTH_SIGNING_KEY or None,
         client_storage=_oauth_client_storage(),
-        allowed_client_redirect_uris=[
-            "https://claude.ai/api/mcp/auth_callback",
-            "https://claude.com/api/mcp/auth_callback",
-            # `synapse login` (RFC 8252): an ephemeral loopback redirect on a random
-            # port. Without these patterns the OAuthProxy 400s the authorize step
-            # ("does not match allowed patterns") and the CLI login can never complete.
-            "http://localhost:*",
-            "http://127.0.0.1:*",
-        ],
+        allowed_client_redirect_uris=_ALLOWED_CLIENT_REDIRECTS,
     )
     if not ALLOWED_GITHUB_USERS:
         logger.warning(
             "GitHub OAuth on but ALLOWED_GITHUB_USERS empty -> all human logins DENIED (fail-closed)"
         )
-    return MultiAuth(server=github, verifiers=[bearer]), [_GitHubAllowlist(ALLOWED_GITHUB_USERS)]
+    return (
+        MultiAuth(server=github, verifiers=[bearer]),
+        [_UserAllowlist(ALLOWED_GITHUB_USERS, ("login",), "github")],
+    )
+
+
+def _build_idp():
+    """IdP for the custom login flows (dashboard + device) — same selection as _build_auth."""
+    if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
+        from mcp_server.idp import OIDCIdP
+
+        return OIDCIdP(
+            config_url=OIDC_CONFIG_URL,
+            client_id=OIDC_CLIENT_ID,
+            client_secret=OIDC_CLIENT_SECRET,
+            allowed=ALLOWED_OIDC_USERS,
+        )
+    if GITHUB_CLIENT_ID:
+        from mcp_server.idp import GitHubIdP
+
+        return GitHubIdP(
+            client_id=GITHUB_CLIENT_ID,
+            client_secret=GITHUB_CLIENT_SECRET,
+            allowed=ALLOWED_GITHUB_USERS,
+        )
+    return None
 
 
 _auth, _auth_mw = _build_auth()
+_idp = _build_idp()
 
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
 # this string load at session start — it is the always-loaded orientation surface that
@@ -292,22 +365,18 @@ from mcp_server.dashboard_routes import register as _register_dashboard_routes  
 _register_dashboard_routes(mcp, DB_URL, _machine_authorized)
 
 # Device-login lane — RFC 8628 device flow so `synapse login` works browser-free on servers /
-# headless boxes. Proxies GitHub's device flow and gates the machine token by the same GitHub
-# allowlist as the web leg. No-op unless GITHUB_CLIENT_ID + SYNAPSE_MACHINE_TOKEN are set.
+# headless boxes. Proxies the configured IdP's device flow (GitHub or OIDC) and gates the
+# machine token by the same allowlist as the web leg. No-op without an IdP + machine token.
 from mcp_server.device_routes import register as _register_device_routes  # noqa: E402
 
-_register_device_routes(
-    mcp, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, ALLOWED_GITHUB_USERS, MACHINE_TOKEN
-)
+_register_device_routes(mcp, _idp, MACHINE_TOKEN)
 
 # Browser-login lane — authorization-code flow for the dashboard login screen (redirect UX;
-# the device flow stays for `synapse login`). Same GitHub identity + allowlist gate; return
+# the device flow stays for `synapse login`). Same IdP identity + allowlist gate; return
 # origins restricted via SYNAPSE_DASH_ORIGINS. Same enablement condition as the device flow.
 from mcp_server.web_login_routes import register as _register_web_login_routes  # noqa: E402
 
-_register_web_login_routes(
-    mcp, GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET, ALLOWED_GITHUB_USERS, MACHINE_TOKEN, PUBLIC_URL
-)
+_register_web_login_routes(mcp, _idp, MACHINE_TOKEN, PUBLIC_URL)
 
 
 # Lazy-init recall engine (one per process)

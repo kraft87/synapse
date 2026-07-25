@@ -1,20 +1,23 @@
 """Browser (authorization-code) login for the dashboard — the redirect UX.
 
-The dashboard is served on hosts GitHub can't redirect to (the OAuth app's single
-registered callback lives on the PUBLIC base URL), but GitHub accepts redirect
-URIs that are SUBPATHS of the registered callback. So the flow bounces:
+The dashboard is served on hosts the IdP can't redirect to (the registered callback
+lives on the PUBLIC base URL), so the flow bounces:
 
-  LAN /dash → GET /dash/oauth/start            (302 to github.com/authorize;
+  LAN /dash → GET /dash/oauth/start            (302 to the IdP's authorize endpoint;
                                                  signed state carries the return origin)
-  → GitHub approves → PUBLIC /auth/callback/dash (code→token exchange, allowlist gate)
-  → 302 {origin}/dash#token=<machine token>     (the app's existing fragment bootstrap)
+  → IdP approves → PUBLIC /auth/callback/dash  (code→token exchange, allowlist gate)
+  → 302 {origin}/dash#token=<machine token>    (the app's existing fragment bootstrap)
 
-Identity + authorization are the SAME gate as the MCP web leg and `synapse login`:
-GitHub confirms the account, ALLOWED_GITHUB_USERS authorizes it, and what's handed
-back is the machine token. The state is HMAC-signed (key = machine token, never
-sent) with a 10-minute TTL, and the return origin must be in SYNAPSE_DASH_ORIGINS
-(plus the public base) — without that check the cross-host bounce would be an open
-redirect that exfiltrates the token to an attacker-supplied Host header.
+GitHub accepts redirect URIs that are SUBPATHS of the registered callback, which is
+how /auth/callback/dash coexists with the MCP leg on one OAuth App; OIDC providers
+match exactly, so register both /auth/callback and /auth/callback/dash on the client.
+
+Identity + authorization are the SAME gate as the MCP leg and `synapse login`: the
+IdP confirms the account, the allowlist authorizes it, and what's handed back is the
+machine token. The state is HMAC-signed (key = machine token, never sent) with a
+10-minute TTL, and the return origin must be in SYNAPSE_DASH_ORIGINS (plus the public
+base) — without that check the cross-host bounce would be an open redirect that
+exfiltrates the token to an attacker-supplied Host header.
 """
 
 from __future__ import annotations
@@ -27,24 +30,15 @@ import logging
 import os
 import time
 from typing import Any
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
-import httpx
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
 
 logger = logging.getLogger(__name__)
 
-_GH_AUTHORIZE = "https://github.com/login/oauth/authorize"
-_GH_TOKEN = "https://github.com/login/oauth/access_token"
-_GH_USER = "https://api.github.com/user"
-_SCOPE = "read:user"  # enough to read the login for the allowlist check
-_UA = "synapse-web-login/1.0"
-_TIMEOUT = 15.0
 _STATE_TTL_S = 600
-# Subpath of the OAuth app's registered callback (the FastMCP OAuthProxy's
-# {base_url}/auth/callback) — GitHub allows subdirectory redirect URIs, which is
-# what lets this flow coexist with the MCP leg on one registered app.
+# Subpath of the registered callback (the FastMCP OAuthProxy's {base_url}/auth/callback).
 _CALLBACK_PATH = "/auth/callback/dash"
 
 
@@ -77,47 +71,15 @@ def _verify_state(key: str, state: str) -> str | None:
         return None
 
 
-async def _exchange_code(client_id: str, client_secret: str, code: str, redirect_uri: str) -> str:
-    """code → GitHub access token ('' on failure). Module-level so tests can stub it."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.post(
-            _GH_TOKEN,
-            data={
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "code": code,
-                "redirect_uri": redirect_uri,
-            },
-            headers={"Accept": "application/json", "User-Agent": _UA},
-        )
-    return str(resp.json().get("access_token") or "")
-
-
-async def _fetch_login(access_token: str) -> str:
-    """GitHub access token → lowercase login ('' on failure). Stubbable seam."""
-    async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-        resp = await client.get(
-            _GH_USER,
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/vnd.github+json",
-                "User-Agent": _UA,
-            },
-        )
-    return str(resp.json().get("login", "")).lower()
-
-
 def register(
     mcp: Any,
-    client_id: str,
-    client_secret: str,
-    allowed: set[str],
+    idp: Any,
     machine_token: str,
     public_url: str,
 ) -> None:
     """Wire the browser-login routes. Same enablement condition as the device flow."""
-    if not (client_id and machine_token):
-        logger.info("web-login routes disabled (need GITHUB_CLIENT_ID + SYNAPSE_MACHINE_TOKEN)")
+    if not (idp and machine_token):
+        logger.info("web-login routes disabled (need an identity provider + SYNAPSE_MACHINE_TOKEN)")
         return
 
     public_origin = public_url.rstrip("/")
@@ -143,16 +105,14 @@ def register(
                 {"status": "error", "detail": f"origin {origin!r} not allowed for dashboard login"},
                 status_code=403,
             )
-        params = urlencode(
-            {
-                "client_id": client_id,
-                "redirect_uri": redirect_uri,
-                "scope": _SCOPE,
-                "state": _sign_state(machine_token, origin),
-                "allow_signup": "false",
-            }
-        )
-        return RedirectResponse(f"{_GH_AUTHORIZE}?{params}", status_code=302)
+        try:
+            target = await idp.authorize_url(redirect_uri, _sign_state(machine_token, origin))
+        except Exception as e:  # e.g. OIDC discovery unreachable
+            logger.warning("web-login: could not build authorize URL: %s", e)
+            return JSONResponse(
+                {"status": "error", "detail": "identity provider unavailable"}, status_code=502
+            )
+        return RedirectResponse(target, status_code=302)
 
     @mcp.custom_route(_CALLBACK_PATH, methods=["GET"])  # type: ignore[misc]
     async def oauth_callback(request: Request) -> Response:
@@ -168,27 +128,29 @@ def register(
             return RedirectResponse(f"{origin}/dash#login_error={quote(msg)}", status_code=302)
 
         if request.query_params.get("error"):
-            return fail(request.query_params.get("error_description") or "GitHub sign-in cancelled")
+            return fail(request.query_params.get("error_description") or "sign-in cancelled")
         code = request.query_params.get("code") or ""
         if not code:
             return fail("missing authorization code")
 
         try:
-            access = await _exchange_code(client_id, client_secret, code, redirect_uri)
+            access = await idp.exchange_code(code, redirect_uri)
         except Exception as e:
             logger.warning("web-login: code exchange failed: %s", e)
-            return fail("GitHub token exchange failed")
+            return fail(f"{idp.label} token exchange failed")
         if not access:
-            return fail("GitHub rejected the authorization code")
+            return fail(f"{idp.label} rejected the authorization code")
 
         try:
-            login = await _fetch_login(access)
+            identity = await idp.fetch_identity(access)
         except Exception as e:
-            logger.warning("web-login: /user lookup failed: %s", e)
-            return fail("GitHub user lookup failed")
-        if not login or login not in allowed:
-            logger.warning("web-login: github user %r not in allowlist", login)
-            return fail(f"github user {login!r} not in allowlist")
+            logger.warning("web-login: identity lookup failed: %s", e)
+            return fail(f"{idp.label} user lookup failed")
+        if not identity or identity not in idp.allowed:
+            logger.warning("web-login: %s user %r not in allowlist", idp.label, identity)
+            return fail(f"{idp.label} user {identity!r} not in allowlist")
 
-        logger.info("web-login: issued machine token to github user %r via %s", login, origin)
+        logger.info(
+            "web-login: issued machine token to %s user %r via %s", idp.label, identity, origin
+        )
         return RedirectResponse(f"{origin}/dash#token={quote(machine_token)}", status_code=302)
