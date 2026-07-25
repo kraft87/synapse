@@ -287,6 +287,13 @@ _RECALL_BM25_FUSE = os.getenv("SYNAPSE_RECALL_BM25_FUSE", "1") != "0"
 # cross-session semantic spread is a count problem, not a magnitude one.
 _RECALL_BM25_FUSE_W = float(os.getenv("SYNAPSE_RECALL_BM25_FUSE_W", "1.0") or "1.0")
 _RECALL_BM25_LIFT_CAP = int(os.getenv("SYNAPSE_RECALL_BM25_LIFT_CAP", "0") or "0")
+# Reserved-slot fusion (LME sweep 2026-07-25): weight/cap shaping failed — RRF's flat
+# 1/(k+pos) curve lifts a strong lexical hit past the head even at w=0.25, and the top 1-2
+# lifts displace the most load-bearing passages. Fusion's validated win was getting the
+# lexical hit INTO the mining window at all (hit@10 0.64->0.91), not ranking it first: with
+# _RESERVE=N>0, the window head stays pure rerank order and the last N window slots are
+# guaranteed to the best BM25 hits not already inside. Replaces RRF reordering when set.
+_RECALL_BM25_RESERVE = int(os.getenv("SYNAPSE_RECALL_BM25_RESERVE", "0") or "0")
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
@@ -1242,12 +1249,23 @@ class Recall:
         vector-only episodes keep their rerank position. Validated 2026-07-23; see _RECALL_BM25_FUSE."""
         if len(ranked_eps) < 2:
             return ranked_eps
-        fused: dict[int, float] = {i: 1.0 / (k + i + 1) for i in range(len(ranked_eps))}
         bm = sorted(
             (i for i, e in enumerate(ranked_eps) if e.get("bm25_score") is not None),
             key=lambda i: ranked_eps[i]["bm25_score"],
             reverse=True,
         )
+        if _RECALL_BM25_RESERVE > 0:
+            # Reserved-slot mode: keep the mining-window head in pure rerank order and
+            # guarantee the last _RESERVE window slots to the best BM25 hits not already
+            # inside the window. Lexical recovery without displacing the semantic head.
+            window = _RECALL_PASSAGE_SRC_K
+            head = min(max(window - _RECALL_BM25_RESERVE, 0), len(ranked_eps))
+            in_head = set(range(head))
+            lifted = [i for i in bm if i not in in_head][:_RECALL_BM25_RESERVE]
+            rest = [i for i in range(len(ranked_eps)) if i >= head and i not in lifted]
+            order = list(range(head)) + lifted + rest
+            return [ranked_eps[i] for i in order]
+        fused: dict[int, float] = {i: 1.0 / (k + i + 1) for i in range(len(ranked_eps))}
         if _RECALL_BM25_LIFT_CAP > 0:
             bm = bm[:_RECALL_BM25_LIFT_CAP]
         for pos, i in enumerate(bm):
