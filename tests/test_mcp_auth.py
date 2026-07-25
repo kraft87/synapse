@@ -117,6 +117,28 @@ def test_oidc_mode_replaces_github(monkeypatch):
     assert isinstance(s._idp, OIDCIdP)  # custom flows follow the same selection
 
 
+def test_oidc_scopes_and_claims_are_configurable(monkeypatch):
+    # Different IdPs grant different scopes/claims (e.g. Google: no offline_access,
+    # identity in "email") — both knobs must come from env, not code.
+    _stub_oidc_discovery(monkeypatch)
+    monkeypatch.setenv("OIDC_SCOPES", "openid email")
+    monkeypatch.setenv("OIDC_USER_CLAIMS", "email")
+    s = _reload(
+        monkeypatch,
+        {
+            "SYNAPSE_MACHINE_TOKEN": "tok",
+            "OIDC_CONFIG_URL": "https://idp.example.net/.well-known/openid-configuration",
+            "OIDC_CLIENT_ID": "synapse",
+            "OIDC_CLIENT_SECRET": "sec",
+            "ALLOWED_OIDC_USERS": "kyle@example.net",
+        },
+    )
+    assert s.OIDC_SCOPES == ["openid", "email"]
+    assert s._auth_mw[0]._claim_keys == ("email",)
+    assert s._idp.scope == "openid email"
+    assert s._idp.identity_claims == ("email",)
+
+
 def test_github_mode_builds_github_idp(monkeypatch):
     from mcp_server.idp import GitHubIdP
 

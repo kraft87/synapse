@@ -116,22 +116,29 @@ class OIDCIdP:
     """Any OIDC-compliant IdP, located by its discovery document.
 
     Discovery is fetched lazily and cached, so the MCP server still boots while the IdP
-    is briefly down (self-hosted, they often share a box). Identity = userinfo's
-    preferred_username, falling back to email then sub, lowercased — write the
+    is briefly down (self-hosted, they often share a box). Identity = the first
+    non-empty of ``identity_claims`` in userinfo (then ``sub``), lowercased — write the
     allowlist to match. Userinfo works with opaque access tokens, so no claims/JWT
     requirements land on this path."""
 
     label = "oidc"
     device_disabled_hint = "The IdP's discovery document has no device_authorization_endpoint."
-    _SCOPE = "openid profile email"
 
     def __init__(
-        self, config_url: str, client_id: str, client_secret: str, allowed: set[str]
+        self,
+        config_url: str,
+        client_id: str,
+        client_secret: str,
+        allowed: set[str],
+        scope: str = "openid profile email",
+        identity_claims: tuple[str, ...] = ("preferred_username", "email"),
     ) -> None:
         self.config_url = config_url
         self.client_id = client_id
         self.client_secret = client_secret
         self.allowed = allowed
+        self.scope = scope
+        self.identity_claims = identity_claims
         self._config: dict[str, Any] | None = None
 
     async def _endpoints(self) -> dict[str, Any]:
@@ -153,7 +160,7 @@ class OIDCIdP:
                 "response_type": "code",
                 "client_id": self.client_id,
                 "redirect_uri": redirect_uri,
-                "scope": self._SCOPE,
+                "scope": self.scope,
                 "state": state,
             }
         )
@@ -171,7 +178,7 @@ class OIDCIdP:
     async def fetch_identity(self, access_token: str) -> str:
         cfg = await self._endpoints()
         claims = await _get_json(cfg["userinfo_endpoint"], access_token)
-        for key in ("preferred_username", "email", "sub"):
+        for key in (*self.identity_claims, "sub"):
             value = claims.get(key)
             if value:
                 return str(value).lower()
@@ -182,7 +189,7 @@ class OIDCIdP:
         endpoint = cfg.get("device_authorization_endpoint")
         if not endpoint:
             return {"error": "device_flow_disabled"}
-        return await _post_form(endpoint, {"scope": self._SCOPE}, auth=self._auth())
+        return await _post_form(endpoint, {"scope": self.scope}, auth=self._auth())
 
     async def device_poll(self, device_code: str) -> dict[str, Any]:
         cfg = await self._endpoints()

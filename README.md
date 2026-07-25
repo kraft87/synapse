@@ -266,7 +266,11 @@ the OIDC vars unset to keep the GitHub default. Register both `{base_url}/auth/c
 `{base_url}/auth/callback/dash` as redirect URIs on the OIDC client, grant
 `openid profile email offline_access`, and (for the MCP leg's allowlist) configure the IdP to
 put `preferred_username`/`email` in the id_token — e.g. an Authelia claims policy. The device
-flow needs the IdP to support the device authorization grant.
+flow needs the IdP to support the device authorization grant. Two knobs adapt to IdP
+differences: `OIDC_SCOPES` (default `openid profile email offline_access`; trim
+`offline_access` for IdPs that reject the scope, like Google, at the cost of short-lived
+connector sessions) and `OIDC_USER_CLAIMS` (default `preferred_username,email`; the ordered
+claims read for the user's identity).
 
 With no token configured the server runs open, which is fine for a purely local instance. A
 central instance can be exposed to claude.ai over a Cloudflare tunnel; the MCP server
