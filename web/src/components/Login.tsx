@@ -50,7 +50,7 @@ export function Login() {
         </div>
         <a href="/dash/oauth/start"
           style={{ display: 'block', textAlign: 'center', textDecoration: 'none', border: 'none', background: 'var(--acc)', color: '#0d1116', fontWeight: 600, borderRadius: '8px', padding: '10px 0', fontSize: '13.5px', marginBottom: '14px' }}>
-          sign in with GitHub
+          sign in
         </a>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', margin: '0 0 12px', color: 'var(--txt3)', fontFamily: 'var(--font-data)', fontSize: '10.5px' }}>
           <span style={{ flex: 1, borderTop: '1px solid var(--line)' }} /> or <span style={{ flex: 1, borderTop: '1px solid var(--line)' }} />
