@@ -74,9 +74,11 @@ async def test_oidc_device_calls_use_client_auth(oidc, monkeypatch):
     await oidc.device_start()
     await oidc.device_poll("dc")
     assert seen[0][0] == _CFG["device_authorization_endpoint"]
+    assert seen[0][1]["client_id"] == "synapse"  # body param per RFC 8628 §3.1
     assert seen[0][2] == ("synapse", "sec")
     assert seen[1][0] == _CFG["token_endpoint"]
     assert seen[1][1]["grant_type"] == "urn:ietf:params:oauth:grant-type:device_code"
+    assert seen[1][1]["client_id"] == "synapse"
     assert seen[1][2] == ("synapse", "sec")
 
 
