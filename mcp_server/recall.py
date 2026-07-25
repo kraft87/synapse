@@ -280,6 +280,13 @@ _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds t
 # Reorders ranked_eps only; the rerank call, rerank_top telemetry, and the abstention floor are all
 # untouched. Off with SYNAPSE_RECALL_BM25_FUSE=0.
 _RECALL_BM25_FUSE = os.getenv("SYNAPSE_RECALL_BM25_FUSE", "1") != "0"
+# Fusion shaping (LME 2026-07-25: unweighted full-order fusion cost multi-session -4.6pts —
+# lexical hits colonize the served window on queries whose terms recur across many sessions).
+# _W scales the BM25 term's RRF contribution (1.0 = original equal-weight fusion).
+# _LIFT_CAP bounds how MANY episodes get a lexical lift (0 = uncapped): displacement of the
+# cross-session semantic spread is a count problem, not a magnitude one.
+_RECALL_BM25_FUSE_W = float(os.getenv("SYNAPSE_RECALL_BM25_FUSE_W", "1.0") or "1.0")
+_RECALL_BM25_LIFT_CAP = int(os.getenv("SYNAPSE_RECALL_BM25_LIFT_CAP", "0") or "0")
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
@@ -355,6 +362,11 @@ _RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0.58") or "0.58")
 # Facts/prefs/timeline are unaffected (own gates); recall_episodes() drill-down never enforces.
 # SYNAPSE_RECALL_FLOOR_ENFORCE=0 disables. SYNAPSE_RECALL_FLOOR=0 disables both marker + enforce.
 _RECALL_FLOOR_ENFORCE = os.getenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "1") != "0"
+# Keep-min under enforcement (LME 2026-07-25: blanking the bucket cost multi-session -8pts at
+# the enforce commit — synthesis questions have flat score spreads, so a low TOP score doesn't
+# mean no evidence). >0 serves that many top passages instead of none when the floor fires,
+# mirroring the facts gate's keep_min=1 discipline; 0 preserves the blanking behavior.
+_RECALL_FLOOR_KEEP_MIN = int(os.getenv("SYNAPSE_RECALL_FLOOR_KEEP_MIN", "0") or "0")
 
 # Supersession surface (2026-06-27): a query that matches a now-INVALID fact should still
 # return the CURRENT answer. When a superseded edge near the query carries a precise successor link
@@ -1236,8 +1248,10 @@ class Recall:
             key=lambda i: ranked_eps[i]["bm25_score"],
             reverse=True,
         )
+        if _RECALL_BM25_LIFT_CAP > 0:
+            bm = bm[:_RECALL_BM25_LIFT_CAP]
         for pos, i in enumerate(bm):
-            fused[i] += 1.0 / (k + pos + 1)
+            fused[i] += _RECALL_BM25_FUSE_W / (k + pos + 1)
         return [ranked_eps[i] for i in sorted(fused, key=lambda i: fused[i], reverse=True)]
 
     def _select_episodes(
@@ -1806,7 +1820,10 @@ class Recall:
         # relevance gates). The same condition is still shadow-marked in served_ids below.
         # recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
         if _RECALL_FLOOR_ENFORCE and query_emb is not None and 0.0 < rerank_top < _RECALL_FLOOR:
-            ep_items = None
+            if _RECALL_FLOOR_KEEP_MIN > 0 and ep_items:
+                ep_items = ep_items[:_RECALL_FLOOR_KEEP_MIN] or None
+            else:
+                ep_items = None
         # Web bucket: fused (BM25+vector) -> cross-encoder rerank -> _WEB_FLOOR -> dedupe, all done
         # in _web_leg (_search_web_reranked). Floor self-gates on intent, so this is often empty.
         web_chunks = web_ranked
