@@ -97,3 +97,81 @@ def test_null_session_never_capped(monkeypatch):
     r._reranker = _FakeEmb([0, 1, 2, 3])
     out = r._compact_to_passages("q", eps, n=3)
     assert _ids(out) == {"e:0", "e:1", "e:2"}  # top-3, no cap applied on null sessions
+
+
+class _FakeScoredEmb:
+    """rerank_scored with caller-specified absolute scores (for slack-gate tests)."""
+
+    def __init__(self, scored: list[tuple[int, float]]) -> None:
+        self._scored = scored
+
+    def rerank_scored(self, query, documents, top_k=None):
+        return self._scored[: (top_k or len(self._scored))]
+
+
+def test_slack_keeps_dominant_session_when_alternative_is_weak(monkeypatch):
+    # Third S1 passage outscores the best S2 alternative by 0.43 > slack=0.1:
+    # forcing diversity would cost real relevance, so S1 keeps the slot.
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0.1")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    r = Recall("", "")
+    r._reranker = _FakeScoredEmb([(0, 0.95), (1, 0.94), (2, 0.93), (3, 0.50)])
+    out = r._compact_to_passages("q", _EPS, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:3"}
+
+
+def test_slack_defers_to_diversity_on_near_tie(monkeypatch):
+    # Best S2 alternative is within slack of the third S1 passage: diversity wins.
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0.1")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    r = Recall("", "")
+    r._reranker = _FakeScoredEmb([(0, 0.95), (1, 0.94), (2, 0.93), (3, 0.90)])
+    out = r._compact_to_passages("q", _EPS, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:4"}
+
+
+def test_slack_zero_is_hard_cap(monkeypatch):
+    # Default slack=0 preserves the shipped hard-cap behavior even with a huge score gap.
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    r = Recall("", "")
+    r._reranker = _FakeScoredEmb([(0, 0.95), (1, 0.94), (2, 0.93), (3, 0.10)])
+    out = r._compact_to_passages("q", _EPS, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:4"}
+
+
+def test_fresh_scope_exempts_stale_sessions(monkeypatch):
+    # FRESH_H=48: _EPS timestamps (2026-06-01) are stale -> the cap never fires,
+    # a stale session may monopolize the bucket (LME multi-session evidence case).
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "48")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    monkeypatch.delenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", raising=False)
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 1, 2, 3])
+    out = r._compact_to_passages("q", _EPS, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:3"}  # all S1, uncapped because stale
+
+
+def test_fresh_scope_still_caps_live_session(monkeypatch):
+    # FRESH_H=48 with a just-ingested session: the live-session domination fix stays.
+    from datetime import UTC, datetime
+
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "48")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    monkeypatch.delenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", raising=False)
+    now = datetime.now(UTC).isoformat()
+    eps = [
+        dict(_ep("alpha one", "S1", "e:1"), created_at=now),
+        dict(_ep("alpha two", "S1", "e:2"), created_at=now),
+        dict(_ep("alpha three", "S1", "e:3"), created_at=now),
+        _ep("bravo one", "S2", "e:4"),
+    ]
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 1, 2, 3])
+    out = r._compact_to_passages("q", eps, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:4"}  # live S1 capped at 2, S2 pulled in

@@ -280,6 +280,20 @@ _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds t
 # Reorders ranked_eps only; the rerank call, rerank_top telemetry, and the abstention floor are all
 # untouched. Off with SYNAPSE_RECALL_BM25_FUSE=0.
 _RECALL_BM25_FUSE = os.getenv("SYNAPSE_RECALL_BM25_FUSE", "1") != "0"
+# Fusion shaping (LME 2026-07-25: unweighted full-order fusion cost multi-session -4.6pts —
+# lexical hits colonize the served window on queries whose terms recur across many sessions).
+# _W scales the BM25 term's RRF contribution (1.0 = original equal-weight fusion).
+# _LIFT_CAP bounds how MANY episodes get a lexical lift (0 = uncapped): displacement of the
+# cross-session semantic spread is a count problem, not a magnitude one.
+_RECALL_BM25_FUSE_W = float(os.getenv("SYNAPSE_RECALL_BM25_FUSE_W", "1.0") or "1.0")
+_RECALL_BM25_LIFT_CAP = int(os.getenv("SYNAPSE_RECALL_BM25_LIFT_CAP", "0") or "0")
+# Reserved-slot fusion (LME sweep 2026-07-25): weight/cap shaping failed — RRF's flat
+# 1/(k+pos) curve lifts a strong lexical hit past the head even at w=0.25, and the top 1-2
+# lifts displace the most load-bearing passages. Fusion's validated win was getting the
+# lexical hit INTO the mining window at all (hit@10 0.64->0.91), not ranking it first: with
+# _RESERVE=N>0, the window head stays pure rerank order and the last N window slots are
+# guaranteed to the best BM25 hits not already inside. Replaces RRF reordering when set.
+_RECALL_BM25_RESERVE = int(os.getenv("SYNAPSE_RECALL_BM25_RESERVE", "0") or "0")
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
@@ -355,6 +369,11 @@ _RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0.58") or "0.58")
 # Facts/prefs/timeline are unaffected (own gates); recall_episodes() drill-down never enforces.
 # SYNAPSE_RECALL_FLOOR_ENFORCE=0 disables. SYNAPSE_RECALL_FLOOR=0 disables both marker + enforce.
 _RECALL_FLOOR_ENFORCE = os.getenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "1") != "0"
+# Keep-min under enforcement (LME 2026-07-25: blanking the bucket cost multi-session -8pts at
+# the enforce commit — synthesis questions have flat score spreads, so a low TOP score doesn't
+# mean no evidence). >0 serves that many top passages instead of none when the floor fires,
+# mirroring the facts gate's keep_min=1 discipline; 0 preserves the blanking behavior.
+_RECALL_FLOOR_KEEP_MIN = int(os.getenv("SYNAPSE_RECALL_FLOOR_KEEP_MIN", "0") or "0")
 
 # Supersession surface (2026-06-27): a query that matches a now-INVALID fact should still
 # return the CURRENT answer. When a superseded edge near the query carries a precise successor link
@@ -1149,6 +1168,21 @@ class Recall:
         # single-session result still serves n — the cap trims domination, never costs recall.
         # ON by default (=2); disable with SYNAPSE_RECALL_SESSION_CAP=0.
         _sess_cap = int(os.environ.get("SYNAPSE_RECALL_SESSION_CAP", "2") or "2")
+        # Slack gate on the cap: a capped session's passage still serves when every
+        # alternative from an under-served session scores more than _sess_slack below it —
+        # diversity acts as a near-tie tiebreak instead of a hard constraint. The hard cap
+        # (slack=0) measurably starves multi-hop questions whose evidence lives in 1-2
+        # sessions: LME multi-session served-precision drops 0.88->0.72 (2026-07-25).
+        # Rerank scores are 0-1 relevance; 0 (default) keeps the hard-cap behavior.
+        _sess_slack = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0") or "0")
+        # Freshness scope on the cap: >0 restricts the cap to sessions whose newest pooled
+        # episode is within this many hours of now. The measured noise pattern the cap fixes
+        # is specifically the LIVE session's turns crowding the bucket (prod replay 2026-07-25:
+        # 11 of 27 dominations were <6h-old sessions at query time); an OLD session serving
+        # multiple slots usually means the evidence genuinely lives there (LME multi-session:
+        # capping those drops served-precision 0.88->0.72). Unparseable timestamps count as
+        # fresh (cap applies — the conservative, shipped-behavior side). 0 = cap all sessions.
+        _sess_fresh_h = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0")
         _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
@@ -1162,16 +1196,57 @@ class Recall:
                 logger.warning("Passage rerank failed, serving full episodes: %s", e)
                 return []
             if _capped:
+                sess_fresh: dict[Any, bool] = {}
+                if _sess_fresh_h > 0:
+                    from datetime import UTC, datetime
+
+                    _now = datetime.now(UTC)
+                    for f_ep in episodes:
+                        e_sid = f_ep.get("session_id")
+                        if e_sid is None:
+                            continue
+                        try:
+                            ts = f_ep.get("created_at")
+                            dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=UTC)
+                            fresh = (_now - dt).total_seconds() <= _sess_fresh_h * 3600
+                        except Exception:
+                            fresh = True  # unknown age -> treat as fresh, cap applies
+                        sess_fresh[e_sid] = sess_fresh.get(e_sid, False) or fresh
                 per_ep: dict[int, int] = {}
                 per_sess: dict[Any, int] = {}
                 chosen = []
-                for i, _s in scored:
+                for pos, (i, _s) in enumerate(scored):
                     ep = owner[i]
                     if _quota and per_ep.get(id(ep), 0) >= _quota:
                         continue
                     sid = ep.get("session_id")
-                    if _sess_cap and sid is not None and per_sess.get(sid, 0) >= _sess_cap:
-                        continue
+                    if (
+                        _sess_cap
+                        and sid is not None
+                        and per_sess.get(sid, 0) >= _sess_cap
+                        and (_sess_fresh_h <= 0 or sess_fresh.get(sid, True))
+                    ):
+                        if _sess_slack <= 0:
+                            continue
+                        alt = next(
+                            (
+                                s2
+                                for i2, s2 in scored[pos + 1 :]
+                                if owner[i2].get("session_id") != sid
+                                and not (_quota and per_ep.get(id(owner[i2]), 0) >= _quota)
+                                and not (
+                                    owner[i2].get("session_id") is not None
+                                    and per_sess.get(owner[i2].get("session_id"), 0) >= _sess_cap
+                                )
+                            ),
+                            None,
+                        )
+                        if alt is not None and (_s - alt) <= _sess_slack:
+                            continue  # near-tie: diversity wins the slot
+                        # No alternative within slack — serving diversity here would cost
+                        # real relevance, so the capped session keeps the slot.
                     per_ep[id(ep)] = per_ep.get(id(ep), 0) + 1
                     if sid is not None:
                         per_sess[sid] = per_sess.get(sid, 0) + 1
@@ -1230,14 +1305,27 @@ class Recall:
         vector-only episodes keep their rerank position. Validated 2026-07-23; see _RECALL_BM25_FUSE."""
         if len(ranked_eps) < 2:
             return ranked_eps
-        fused: dict[int, float] = {i: 1.0 / (k + i + 1) for i in range(len(ranked_eps))}
         bm = sorted(
             (i for i, e in enumerate(ranked_eps) if e.get("bm25_score") is not None),
             key=lambda i: ranked_eps[i]["bm25_score"],
             reverse=True,
         )
+        if _RECALL_BM25_RESERVE > 0:
+            # Reserved-slot mode: keep the mining-window head in pure rerank order and
+            # guarantee the last _RESERVE window slots to the best BM25 hits not already
+            # inside the window. Lexical recovery without displacing the semantic head.
+            window = _RECALL_PASSAGE_SRC_K
+            head = min(max(window - _RECALL_BM25_RESERVE, 0), len(ranked_eps))
+            in_head = set(range(head))
+            lifted = [i for i in bm if i not in in_head][:_RECALL_BM25_RESERVE]
+            rest = [i for i in range(len(ranked_eps)) if i >= head and i not in lifted]
+            order = list(range(head)) + lifted + rest
+            return [ranked_eps[i] for i in order]
+        fused: dict[int, float] = {i: 1.0 / (k + i + 1) for i in range(len(ranked_eps))}
+        if _RECALL_BM25_LIFT_CAP > 0:
+            bm = bm[:_RECALL_BM25_LIFT_CAP]
         for pos, i in enumerate(bm):
-            fused[i] += 1.0 / (k + pos + 1)
+            fused[i] += _RECALL_BM25_FUSE_W / (k + pos + 1)
         return [ranked_eps[i] for i in sorted(fused, key=lambda i: fused[i], reverse=True)]
 
     def _select_episodes(
@@ -1806,7 +1894,10 @@ class Recall:
         # relevance gates). The same condition is still shadow-marked in served_ids below.
         # recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
         if _RECALL_FLOOR_ENFORCE and query_emb is not None and 0.0 < rerank_top < _RECALL_FLOOR:
-            ep_items = None
+            if _RECALL_FLOOR_KEEP_MIN > 0 and ep_items:
+                ep_items = ep_items[:_RECALL_FLOOR_KEEP_MIN] or None
+            else:
+                ep_items = None
         # Web bucket: fused (BM25+vector) -> cross-encoder rerank -> _WEB_FLOOR -> dedupe, all done
         # in _web_leg (_search_web_reranked). Floor self-gates on intent, so this is often empty.
         web_chunks = web_ranked
