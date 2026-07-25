@@ -189,12 +189,16 @@ class OIDCIdP:
         endpoint = cfg.get("device_authorization_endpoint")
         if not endpoint:
             return {"error": "device_flow_disabled"}
-        return await _post_form(endpoint, {"scope": self.scope}, auth=self._auth())
+        # client_id rides in the body per RFC 8628 §3.1 — basic auth alone is not
+        # enough (Authelia, for one, rejects the request as "client ''" without it).
+        return await _post_form(
+            endpoint, {"client_id": self.client_id, "scope": self.scope}, auth=self._auth()
+        )
 
     async def device_poll(self, device_code: str) -> dict[str, Any]:
         cfg = await self._endpoints()
         return await _post_form(
             cfg["token_endpoint"],
-            {"grant_type": _DEVICE_GRANT, "device_code": device_code},
+            {"grant_type": _DEVICE_GRANT, "device_code": device_code, "client_id": self.client_id},
             auth=self._auth(),
         )
