@@ -174,16 +174,22 @@ def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
 
 
 def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions):
-    """Return (id, evidence) of the matching active candidate, or None."""
+    """Return (id, evidence, cooling) of the matching candidate, or None. `cooling` is True
+    when the row is rejected inside its 30d suppression window (rejected_until)."""
     if kind in ("retune", "consolidate"):
+        # Match the skill_gap_named_idx unique key EXACTLY — no status filter. A row in a
+        # terminal state (promoted/rejected/retired) still occupies (kind, name, direction);
+        # filtering it out here sent merge_candidate down the INSERT path straight into a
+        # UniqueViolation every night the lane re-derived the same candidate.
         cur.execute(
-            "SELECT id, evidence FROM skills_lane.skill_gap_candidates "
-            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') "
-            "AND status IN ('observe','proposed','accepted') LIMIT 1",
+            "SELECT id, evidence, "
+            "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
+            "FROM skills_lane.skill_gap_candidates "
+            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') LIMIT 1",
             (kind, name, direction),
         )
         r = cur.fetchone()
-        return (r[0], r[1]) if r else None
+        return (r[0], r[1], r[2]) if r else None
     # derive: semantic identity over active rows. Empty-vs-empty is NOT identity: a candidate
     # submitted without session ids / signature must never wildcard-match (and clobber) an
     # existing empty-keyed row — each leg only counts when BOTH sides are non-empty.
@@ -207,7 +213,7 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         if session_match or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
-                best, best_score = (cid, ev or []), rank
+                best, best_score = (cid, ev or [], False), rank
     return best
 
 
@@ -250,6 +256,13 @@ def merge_candidate(
 ) -> dict:
     """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
 
+    Re-sighting a row in a terminal state (retune/consolidate share one unique key per
+    (kind, name, direction) regardless of status):
+      - rejected inside its 30d cooldown: skipped silently, no write;
+      - rejected past cooldown / retired: evidence merges and the row REOPENS to 'observe';
+      - accepted / promoted: evidence merges (the sighting is recorded) but status never
+        changes here — the observe->proposed gate below only fires on 'observe'.
+
     salience persists as max(existing, new) — a candidate's pain rating only ratchets up.
     source_detector / proposed_patch: latest non-null wins (a fresh patch draft supersedes)."""
     cur = conn.cursor()
@@ -258,7 +271,12 @@ def merge_candidate(
     match = _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
 
     if match:
-        cid, old_ev = match
+        cid, old_ev, cooling = match
+        if cooling:
+            # rejected within the 30d suppression window: respect the cooldown — no
+            # evidence merge, no write, and no fresh INSERT against the occupied key.
+            conn.commit()
+            return {"id": cid, "status": "rejected", "score": None, "merged": False}
         evidence = _union_evidence(old_ev, evidence_entries)
         merged = True
     else:
@@ -316,6 +334,8 @@ def merge_candidate(
                   judge_sessions, grounded_sessions, judge_weight, grounded_weight,
                   salience, source_detector, proposed_patch)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::halfvec,%s::jsonb,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (kind, name, COALESCE(direction, '-'))
+                 WHERE kind IN ('retune', 'consolidate') DO NOTHING
                RETURNING id, status, score, salience""",
             (
                 kind,
@@ -337,7 +357,36 @@ def merge_candidate(
                 proposed_patch,
             ),
         )
-    rid, status, score, row_salience = cur.fetchone()
+    row = cur.fetchone()
+    if row is None:
+        # ON CONFLICT backstop fired: the unique key is occupied by a row the resolver
+        # didn't see (e.g. a concurrent writer landed it between resolve and insert).
+        # Never crash the lane — report the occupying row, untouched.
+        conn.commit()
+        cur.execute(
+            "SELECT id, status, score FROM skills_lane.skill_gap_candidates "
+            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-')",
+            (kind, name, direction),
+        )
+        r = cur.fetchone()
+        return {
+            "id": r[0] if r else None,
+            "status": r[1] if r else None,
+            "score": r[2] if r else None,
+            "merged": False,
+        }
+    rid, status, score, row_salience = row
+
+    # A re-sighted terminal row REOPENS (rejected past its cooldown, or retired-stale):
+    # back to 'observe' so the gates below re-decide. The old reject evidence merged in
+    # above still weighs against it (-3 grounded), so reopening stays conservative.
+    if status in ("rejected", "retired"):
+        cur.execute(
+            "UPDATE skills_lane.skill_gap_candidates SET status='observe', "
+            "reject_reason=NULL, rejected_until=NULL, updated_at=now() WHERE id=%s",
+            (rid,),
+        )
+        status = "observe"
 
     # observe -> proposed via the v2 gates; grounded->accepted is the review path's job
     if status == "observe" and _passes_gate(kind, evidence, score, row_salience):
