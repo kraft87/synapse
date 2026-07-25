@@ -186,11 +186,11 @@ Bundled commands (`!` prefix in a session; full path from an outside terminal):
 MCP tools (registered automatically; Claude calls them during a session):
 
 - **`recall`** — primary retrieval: reranked episodes + KG facts + web + history.
+  `mode="turns"` is the raw-episode drill-down (formerly the `recall_episodes` tool).
 - **`fetch`** — expand ids into full records: `e:N` episode ids from recall results and
   `n:N` note ids from the session-start board block (mixed lists fine).
 - **`remember`** — write a curated memory (note + episode + graph extraction).
 - **`recall_timeline`** — dated events for "when / in what order" questions.
-- **`recall_episodes`** — raw episode drill-down.
 - **`recall_feedback`** — after using a recall's results, report which served ids helped,
   which were noise, and what was missing (offline labeled data; never changes ranking).
 

@@ -46,7 +46,6 @@ _EXPECTED_ORDER = [
     "fetch",
     "remember",
     "recall_timeline",
-    "recall_episodes",
     "recall_feedback",
 ]
 
@@ -71,6 +70,7 @@ def test_removed_tools_are_gone():
     assert "query_graph" not in names
     assert "list_projects" not in names
     assert "fetch_episode" not in names  # replaced by fetch (e:/n:)
+    assert "recall_episodes" not in names  # merged into recall(mode="turns") — item 6 audit
     # Board is push-only (SessionStart hook via GET /context) — no read tool, so a
     # compliant model can't double-inject the block the hook already delivered.
     assert "get_context" not in names
@@ -92,12 +92,11 @@ def test_descriptions_and_instructions_fit_claude_code_truncation():
 # from the wire description — remember once lost its whole type-semantics block this
 # way. Pinning each tail proves no description got section-swallowed.
 _DESCRIPTION_TAILS = {
-    "recall": "recall_episodes() returns raw",
+    "recall": "answers when-did / how-long",
     "fetch": "at most 20 ids per call",
     "remember": "must stand alone months later",
     "recall_timeline": "anchor events' dates the payload gives",
-    "recall_episodes": "the right first call",
-    "recall_feedback": "recall actually served",
+    "recall_feedback": "the board, or fetch",
 }
 
 
@@ -109,6 +108,10 @@ def test_description_tails_survive_docstring_section_parsing():
     # The load-bearing middle of remember's contract, explicitly:
     assert "reference: pointers to canonical sources" in by_name["remember"]
     assert "DECLARATIVE, not imperative" in by_name["remember"]
+    # recall's turns-mode trigger inventory (the absorbed recall_episodes drill-down):
+    assert '"turns" is the raw-episode drill-down' in by_name["recall"]
+    # recall_feedback must invite board note ids, or n: feedback never gets filed:
+    assert "note ids from the session-start board" in by_name["recall_feedback"]
 
 
 def test_issue_machine_token_hidden_from_list_but_callable():
@@ -224,8 +227,10 @@ def test_fetch_cap_applies_across_kinds(conn, db_url):
 
 
 def test_fetch_kinds_telemetry_counts(conn, db_url):
-    """The kind='fetch' telemetry row carries per-kind serve counts in served_ids
-    (the single-kind row shape is pinned in test_telemetry_kinds.py)."""
+    """The kind='fetch' telemetry row carries per-kind serve counts plus the served
+    note ids ("n:N" — notes have no retrieval_count column, so this envelope is the
+    only per-note serve record) in served_ids (the single-kind row shape is pinned
+    in test_telemetry_kinds.py)."""
     e1 = _episode(conn, "telemetry mixed turn")
     n1 = _note(db_url, "Telemetry hook A", "Body.")
     n2 = _note(db_url, "Telemetry hook B", "Body.")
@@ -241,4 +246,51 @@ def test_fetch_kinds_telemetry_counts(conn, db_url):
     assert row is not None, "fetch() emitted no kind='fetch' telemetry row"
     query, served = row
     assert query == f"e:{e1},n:{n1},n:{n2}"  # normalized accepted ids; skipped ids absent
-    assert served == {"kinds": {"e": 1, "n": 2}}
+    assert served == {"kinds": {"e": 1, "n": 2}, "notes": [f"n:{n1}", f"n:{n2}"]}
+
+
+# ---------------------------------------------------------------------------
+# recall mode routing: "turns" is the absorbed recall_episodes drill-down
+# ---------------------------------------------------------------------------
+
+
+class _StubEngine:
+    """Records which engine path the recall tool routed to."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+
+    def recall(self, **kwargs):
+        self.calls.append(("recall", kwargs))
+        return {"query": kwargs.get("query"), "facts": []}
+
+    def recall_episodes(self, **kwargs):
+        self.calls.append(("episodes", kwargs))
+        return {"query": kwargs.get("query"), "episodes": []}
+
+
+def test_recall_mode_turns_routes_to_episode_drilldown(monkeypatch):
+    """mode="turns" hits the engine's recall_episodes path (kind='episodes'
+    telemetry — the continuity contract lives in test_telemetry_kinds.py)."""
+    stub = _StubEngine()
+    monkeypatch.setattr(server, "_recall_engine", stub)
+    out = server.recall("show me the raw turns", project="synapse", mode="turns")
+    assert out == {"query": "show me the raw turns", "episodes": []}
+    assert stub.calls == [
+        ("episodes", {"query": "show me the raw turns", "project": "synapse", "source": "mcp-tool"})
+    ]
+
+
+def test_recall_mode_defaults_to_overview(monkeypatch):
+    stub = _StubEngine()
+    monkeypatch.setattr(server, "_recall_engine", stub)
+    server.recall("state of X")
+    assert [name for name, _ in stub.calls] == ["recall"]
+
+
+def test_recall_invalid_mode_is_an_error_not_a_search(monkeypatch):
+    stub = _StubEngine()
+    monkeypatch.setattr(server, "_recall_engine", stub)
+    out = server.recall("q", mode="episodes")
+    assert out["status"] == "error" and "mode" in out["detail"]
+    assert stub.calls == []  # rejected before any engine work

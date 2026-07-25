@@ -153,7 +153,9 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# kind='episodes' — Recall.recall_episodes() (+ the abstention-shadow keys)
+# kind='episodes' — recall(mode="turns"), the absorbed recall_episodes drill-down
+# (+ the abstention-shadow keys). Driven through the MCP tool so the pin also
+# proves the mode routing keeps the historical kind='episodes' telemetry.
 # ---------------------------------------------------------------------------
 
 
@@ -163,8 +165,9 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
     p = _pool()
     engine = _wired(db_url, [0.31, 0.22, 0.11, 0.05])  # real scores, below the floor
     engine._episode_pool = lambda q_, emb, proj: list(p)
+    monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
-    out = engine.recall_episodes(q, source="mcp-tool")
+    out = server.recall(q, mode="turns")  # the MCP surface path since the item-6 merge
     assert len(out["episodes"]) == 4  # shadow only — served in full
 
     row = _newest(
@@ -218,10 +221,11 @@ def test_fetch_kind_row_shape(conn, db_url):
     assert ms_total is not None and ms_total >= 0
     assert n_eps == 1 and chars > 0
     # Fetch's row stays lean: no est_tokens (the requested ids already live in `query`);
-    # served_ids carries only the per-kind serve counts (test_tool_surface.py pins the
-    # mixed-kind counts).
+    # served_ids carries the per-kind serve counts plus the served note ids — notes
+    # have no retrieval_count column, so the envelope is their only serve record
+    # (test_tool_surface.py pins the mixed-kind counts).
     assert est_tokens is None
-    assert served == {"kinds": {"e": 1, "n": 0}}
+    assert served == {"kinds": {"e": 1, "n": 0}, "notes": []}
 
 
 # ---------------------------------------------------------------------------
@@ -316,4 +320,5 @@ def test_board_kind_row_shape(conn, db_url):
     assert ms_total is not None and ms_total >= 0
     assert chars == len(board["text"]) and chars > 0
     assert est_tokens == chars // 4
-    assert served == {"notes": [nid], "n_notes": 1, "overflow": 0}
+    # Note ids in served ("n:N") form — joinable against recall_feedback's id lists.
+    assert served == {"notes": [f"n:{nid}"], "n_notes": 1, "overflow": 0}

@@ -218,10 +218,12 @@ plugin's SessionStart hook injects it via `GET /context`, and a listed board too
 invite a double-inject of a block the model already has (the Hermes pattern — when
 injection covers the read, ship no read tool).
 
-- `recall(query, project=None, session_focus=None, group_id="technical")` — the primary
-  retrieval tool: reranked episodes + KG facts + timeline + web + history. Served episode
-  passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can weight a
-  human-stated fact over the agent's own past output.
+- `recall(query, project=None, session_focus=None, group_id="technical", mode="overview")` —
+  the primary retrieval tool: reranked episodes + KG facts + timeline + web + history. Served
+  episode passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can
+  weight a human-stated fact over the agent's own past output. `mode="turns"` is the
+  raw-episode drill-down (full conversation turns, relevance + recency ranked) — it absorbed
+  the former standalone `recall_episodes` tool.
 - `fetch(ids)` — expand ids into full records: `e:N` episode ids from recall results
   (bare `N` also accepted) and `n:N` note ids — the session-start board block's `n:ID`
   lines resolve to their full note bodies through this tool. Mixed lists are fine; unknown ids come
@@ -238,7 +240,6 @@ injection covers the read, ship no read tool).
 - `recall_timeline(query=None, since=None, until=None, group_id=None)` — dated events for
   "when / in what order" questions; `group_id="personal"` scopes to life events, excluding
   technical/work noise.
-- `recall_episodes(query, project=None, limit=5)` — raw episode drill-down.
 
 One more tool exists but is hidden from tool listings: `issue_machine_token`, the
 auth-gated plumbing `synapse login` calls to fetch the machine bearer token. It stays

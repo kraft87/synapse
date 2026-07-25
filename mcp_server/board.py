@@ -202,7 +202,9 @@ def build_board(db_url: str, project: str | None) -> dict[str, Any]:
 def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[str, Any]) -> None:
     """One recall_metrics row (kind='board') per serve, through Recall's fire-and-forget
     writer (record_event). served_ids is the existing free-form JSONB envelope — no new
-    DDL. Fail-soft: telemetry must never break a serve."""
+    DDL. Note ids are recorded in served form ("n:N") so board serves join directly
+    against recall_feedback's helpful/noise ids (item 6: notes must be measurable).
+    Fail-soft: telemetry must never break a serve."""
     try:
         text = board.get("text") or ""
         engine.record_event(
@@ -212,7 +214,7 @@ def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[
             chars=len(text),
             est_tokens=len(text) // 4,
             served_ids={
-                "notes": board.get("note_ids") or [],
+                "notes": [f"n:{i}" for i in (board.get("note_ids") or [])],
                 "n_notes": board.get("n_notes", 0),
                 "overflow": board.get("overflow", 0),
             },

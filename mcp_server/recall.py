@@ -1663,7 +1663,8 @@ class Recall:
 
         The episode bucket serves compact passages (markdown chunks) of the top reranked episodes
         instead of whole turns (Stage 2 — see _RECALL_PASSAGE_N). For raw full-episode drill-down,
-        use recall_episodes(). Facts carry their t_valid "as-of" date for currency weighting.
+        use recall_episodes() (the recall tool's mode="turns"). Facts carry their t_valid "as-of"
+        date for currency weighting.
 
         ``debug`` (phase-2 dashboard console) attaches a ``debug`` key to the response SURFACING
         the SAME numbers already measured for the recall_metrics telemetry row — no extra
@@ -2011,6 +2012,10 @@ class Recall:
 
         Best for 'show me exactly what was said about X' queries.
         Returns full episode content ranked by relevance + recency.
+
+        Served on the MCP surface as recall(mode="turns") since the item-6 audit
+        retired the standalone recall_episodes tool; the telemetry kind stays
+        'episodes' so historical per-tool metrics remain comparable.
         """
         t_start = time.perf_counter()
         try:
@@ -2083,6 +2088,10 @@ class Recall:
         chars = _served_chars({"episodes": out["episodes"]}) + sum(
             len(n.get("hook") or "") + len(n.get("body") or "") for n in out["notes"]
         )
+        # served_ids carries the per-kind counts plus the served note ids ("n:N").
+        # Notes are the one bucket with NO retrieval_count column (episodes bump
+        # theirs in _fetch_episode_records), so this envelope is the only record of
+        # WHICH notes get expanded — the item-6 measurability fix, zero new DDL.
         self._record_metrics(
             {
                 "kind": "fetch",
@@ -2091,7 +2100,10 @@ class Recall:
                 "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
                 "n_episodes": len(out["episodes"]),
                 "chars": chars,
-                "served_ids": {"kinds": {"e": len(out["episodes"]), "n": len(out["notes"])}},
+                "served_ids": {
+                    "kinds": {"e": len(out["episodes"]), "n": len(out["notes"])},
+                    "notes": [n["id"] for n in out["notes"]],
+                },
             }
         )
         return out

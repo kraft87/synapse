@@ -324,7 +324,8 @@ def test_route_records_board_telemetry(conn, db_url):
     source, ms_total, chars, est_tokens, served_ids = row
     assert source == "http"
     assert ms_total is not None and chars > 0 and est_tokens == chars // 4
-    assert served_ids["notes"] == [kept]
+    # Served form ("n:N") — joinable against recall_feedback's helpful/noise ids.
+    assert served_ids["notes"] == [f"n:{kept}"]
     assert served_ids["n_notes"] == 1 and served_ids["overflow"] == 0
 
 

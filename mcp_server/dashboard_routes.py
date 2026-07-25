@@ -1117,8 +1117,8 @@ def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
     A dedicated slim endpoint for the Recall console's History tab — newest first,
     just the columns the table renders. Deviates from spec §8 (which routed history
     through the phase-4 /metrics/recall aggregate) by shipping now; the aggregate can
-    still supersede it later. recall_episodes / fetch / remember rows are excluded by
-    the kind filter so the console shows only true recall() calls.
+    still supersede it later. Turns-mode (kind='episodes') / fetch / remember rows are
+    excluded by the kind filter so the console shows only overview recall() calls.
     """
     conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
     try:
