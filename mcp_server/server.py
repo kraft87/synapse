@@ -88,8 +88,19 @@ ALLOWED_GITHUB_USERS = {
 OIDC_CONFIG_URL = _cfg("OIDC_CONFIG_URL")  # .../.well-known/openid-configuration
 OIDC_CLIENT_ID = _cfg("OIDC_CLIENT_ID")
 OIDC_CLIENT_SECRET = _cfg("OIDC_CLIENT_SECRET")
-# Matched against userinfo/id_token preferred_username, then email (lowercased).
+# Matched against the identity claims below (lowercased).
 ALLOWED_OIDC_USERS = {u.strip().lower() for u in _cfg("ALLOWED_OIDC_USERS").split(",") if u.strip()}
+# Scopes requested/advertised/enforced on the MCP leg (space- or comma-separated).
+# offline_access is what makes the IdP issue refresh tokens (long-lived connector
+# sessions) — trim it if the IdP rejects the scope (e.g. Google).
+OIDC_SCOPES = [
+    s for s in re.split(r"[ ,]+", _cfg("OIDC_SCOPES", "openid profile email offline_access")) if s
+]
+# Claims consulted (in order) for the user's identity, in both the id_token (MCP leg)
+# and userinfo (dashboard/device flows). Adjust per IdP, e.g. "email" for Google.
+OIDC_USER_CLAIMS = tuple(
+    c for c in re.split(r"[ ,]+", _cfg("OIDC_USER_CLAIMS", "preferred_username,email")) if c
+)
 _MACHINE_CLIENT_ID = "synapse-machine"  # marks the bearer leg so the GitHub allowlist skips it
 
 # ---------------------------------------------------------------------------
@@ -184,9 +195,6 @@ def _oauth_client_storage():
     )
 
 
-# Scopes the OIDC leg advertises/requires (offline_access => the IdP issues refresh
-# tokens, which the claude.ai connector needs to survive its token rotations).
-_OIDC_SCOPES = ["openid", "profile", "email", "offline_access"]
 _ALLOWED_CLIENT_REDIRECTS = [
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
@@ -206,7 +214,7 @@ def _build_auth():
     # applies the server's required scopes to /mcp): "user" for GitHub, the OIDC set
     # otherwise. Carrying both is harmless.
     bearer = StaticTokenVerifier(
-        {MACHINE_TOKEN: {"client_id": _MACHINE_CLIENT_ID, "scopes": ["user", *_OIDC_SCOPES]}}
+        {MACHINE_TOKEN: {"client_id": _MACHINE_CLIENT_ID, "scopes": ["user", *OIDC_SCOPES]}}
     )
     if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
         from fastmcp.server.auth.oidc_proxy import OIDCProxy
@@ -221,7 +229,7 @@ def _build_auth():
             # Self-hosted IdPs (Authelia et al.) issue opaque access tokens; the
             # id_token is the JWT the discovery JWKS can verify.
             verify_id_token=True,
-            required_scopes=list(_OIDC_SCOPES),
+            required_scopes=list(OIDC_SCOPES),
             allowed_client_redirect_uris=_ALLOWED_CLIENT_REDIRECTS,
         )
         if not ALLOWED_OIDC_USERS:
@@ -230,7 +238,7 @@ def _build_auth():
             )
         return (
             MultiAuth(server=oidc, verifiers=[bearer]),
-            [_UserAllowlist(ALLOWED_OIDC_USERS, ("preferred_username", "email"), "oidc")],
+            [_UserAllowlist(ALLOWED_OIDC_USERS, OIDC_USER_CLAIMS, "oidc")],
         )
     if not GITHUB_CLIENT_ID:
         return bearer, []  # bearer-only: hooks + Claude Code --header; no claude.ai-web connector
@@ -257,11 +265,15 @@ def _build_idp():
     if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
         from mcp_server.idp import OIDCIdP
 
+        # The custom flows discard the upstream tokens after the identity check, so
+        # they never need offline_access/refresh — request the trimmed scope set.
         return OIDCIdP(
             config_url=OIDC_CONFIG_URL,
             client_id=OIDC_CLIENT_ID,
             client_secret=OIDC_CLIENT_SECRET,
             allowed=ALLOWED_OIDC_USERS,
+            scope=" ".join(s for s in OIDC_SCOPES if s != "offline_access"),
+            identity_claims=OIDC_USER_CLAIMS,
         )
     if GITHUB_CLIENT_ID:
         from mcp_server.idp import GitHubIdP
