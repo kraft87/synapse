@@ -1168,6 +1168,13 @@ class Recall:
         # single-session result still serves n — the cap trims domination, never costs recall.
         # ON by default (=2); disable with SYNAPSE_RECALL_SESSION_CAP=0.
         _sess_cap = int(os.environ.get("SYNAPSE_RECALL_SESSION_CAP", "2") or "2")
+        # Slack gate on the cap: a capped session's passage still serves when every
+        # alternative from an under-served session scores more than _sess_slack below it —
+        # diversity acts as a near-tie tiebreak instead of a hard constraint. The hard cap
+        # (slack=0) measurably starves multi-hop questions whose evidence lives in 1-2
+        # sessions: LME multi-session served-precision drops 0.88->0.72 (2026-07-25).
+        # Rerank scores are 0-1 relevance; 0 (default) keeps the hard-cap behavior.
+        _sess_slack = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0") or "0")
         _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
@@ -1184,13 +1191,34 @@ class Recall:
                 per_ep: dict[int, int] = {}
                 per_sess: dict[Any, int] = {}
                 chosen = []
-                for i, _s in scored:
+                for pos, (i, _s) in enumerate(scored):
                     ep = owner[i]
                     if _quota and per_ep.get(id(ep), 0) >= _quota:
                         continue
                     sid = ep.get("session_id")
                     if _sess_cap and sid is not None and per_sess.get(sid, 0) >= _sess_cap:
-                        continue
+                        if _sess_slack <= 0:
+                            continue
+                        alt = next(
+                            (
+                                s2
+                                for i2, s2 in scored[pos + 1 :]
+                                if owner[i2].get("session_id") != sid
+                                and not (
+                                    _quota and per_ep.get(id(owner[i2]), 0) >= _quota
+                                )
+                                and not (
+                                    owner[i2].get("session_id") is not None
+                                    and per_sess.get(owner[i2].get("session_id"), 0)
+                                    >= _sess_cap
+                                )
+                            ),
+                            None,
+                        )
+                        if alt is not None and (_s - alt) <= _sess_slack:
+                            continue  # near-tie: diversity wins the slot
+                        # No alternative within slack — serving diversity here would cost
+                        # real relevance, so the capped session keeps the slot.
                     per_ep[id(ep)] = per_ep.get(id(ep), 0) + 1
                     if sid is not None:
                         per_sess[sid] = per_sess.get(sid, 0) + 1
