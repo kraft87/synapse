@@ -249,6 +249,92 @@ def test_empty_keys_never_wildcard_merge(lane):
     assert stray2["id"] != stray["id"]
 
 
+# ------------------------------------------- terminal-state re-sightings (unique key)
+# retune/consolidate share ONE row per (kind, name, direction) regardless of status
+# (skill_gap_named_idx has no status filter): a nightly re-derivation of a candidate
+# whose row went terminal must merge/skip, never INSERT into a UniqueViolation.
+
+
+def _under_trigger(sid):
+    return [{"session_id": sid, "class": "judge", "signal": "under_trigger"}]
+
+
+def _retune(conn, sid, name="v2t-terminal-skill"):
+    return _mc(
+        conn,
+        "retune",
+        name,
+        _under_trigger(sid),
+        direction="widen",
+        target_skills=[name],
+        summary="under-fires: synthetic",
+    )
+
+
+def test_resighting_promoted_row_records_evidence_without_insert(lane):
+    r1 = _retune(lane, "v2t-sess-t1")
+    # promote the way the review path does: grounded 'accept' evidence first, then the
+    # status flip (grounded_required_to_apply needs grounded_weight > 0 on promoted rows)
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='promoted', "
+        'evidence = evidence || \'[{"session_id": null, "class": "grounded", '
+        '"signal": "accept"}]\'::jsonb, grounded_weight=3.0 WHERE id=%s',
+        (r1["id"],),
+    )
+    # the nightly lane re-derives the same (kind, name, direction) candidate
+    r2 = _retune(lane, "v2t-sess-t2")
+    assert r2["id"] == r1["id"] and r2["merged"] is True
+    assert r2["status"] == "promoted"  # sighting recorded, never re-proposed
+    status, ev, gw, n = lane.execute(
+        "SELECT status, evidence, grounded_weight, "
+        "(SELECT count(*) FROM skills_lane.skill_gap_candidates "
+        "WHERE name='v2t-terminal-skill') FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (r1["id"],),
+    ).fetchone()
+    assert status == "promoted" and n == 1
+    assert gw > 0  # full-evidence rollup kept the grounded 'accept' — constraint holds
+    assert {e["session_id"] for e in ev} == {"v2t-sess-t1", "v2t-sess-t2", None}
+
+
+def test_resighting_rejected_row_in_cooldown_skips_silently(lane):
+    r1 = _retune(lane, "v2t-sess-t1")
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', "
+        "reject_reason='user_rejected', rejected_until=now() + interval '30 days' "
+        "WHERE id=%s",
+        (r1["id"],),
+    )
+    r2 = _retune(lane, "v2t-sess-t2")
+    assert r2["id"] == r1["id"] and r2["merged"] is False
+    assert r2["status"] == "rejected"
+    status, reason, ev = lane.execute(
+        "SELECT status, reject_reason, evidence FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (r1["id"],),
+    ).fetchone()
+    # untouched: still rejected, cooldown intact, the new sighting NOT merged in
+    assert (status, reason) == ("rejected", "user_rejected")
+    assert {e["session_id"] for e in ev} == {"v2t-sess-t1"}
+
+
+def test_resighting_rejected_row_past_cooldown_reopens(lane):
+    r1 = _retune(lane, "v2t-sess-t1")
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', "
+        "reject_reason='user_rejected', rejected_until=now() - interval '1 day' "
+        "WHERE id=%s",
+        (r1["id"],),
+    )
+    r2 = _retune(lane, "v2t-sess-t2")
+    assert r2["id"] == r1["id"] and r2["merged"] is True
+    assert r2["status"] == "observe"  # reopened; gates re-decide from here
+    status, reason, until = lane.execute(
+        "SELECT status, reject_reason, rejected_until FROM skills_lane.skill_gap_candidates "
+        "WHERE id=%s",
+        (r1["id"],),
+    ).fetchone()
+    assert (status, reason, until) == ("observe", None, None)
+
+
 # --------------------------------------------------------------------- decay
 
 
