@@ -16,6 +16,10 @@ _AUTH_KEYS = (
     "GITHUB_CLIENT_SECRET",
     "ALLOWED_GITHUB_USERS",
     "SYNAPSE_OAUTH_SIGNING_KEY",
+    "OIDC_CONFIG_URL",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
+    "ALLOWED_OIDC_USERS",
 )
 
 
@@ -64,6 +68,97 @@ def test_multiauth_with_allowlist(monkeypatch):
     assert isinstance(s._auth, MultiAuth)
     assert len(s._auth_mw) == 1
     assert s._auth_mw[0]._allowed == {"alice", "bob"}  # normalized lower, trimmed
+
+
+def _stub_oidc_discovery(monkeypatch):
+    """Make OIDCProxy construction network-free: pin the discovery doc it would fetch."""
+    from fastmcp.server.auth import oidc_proxy as op
+
+    cfg = op.OIDCConfiguration.model_validate(
+        {
+            "strict": False,
+            "issuer": "https://idp.example.net",
+            "authorization_endpoint": "https://idp.example.net/authorize",
+            "token_endpoint": "https://idp.example.net/token",
+            "userinfo_endpoint": "https://idp.example.net/userinfo",
+            "jwks_uri": "https://idp.example.net/jwks.json",
+        }
+    )
+    monkeypatch.setattr(
+        op.OIDCProxy, "get_oidc_configuration", lambda self, url, strict, timeout: cfg
+    )
+
+
+def test_oidc_mode_replaces_github(monkeypatch):
+    # OIDC env set => the OIDC leg is the interactive provider, even with GitHub also
+    # configured (MCP discovery can only advertise one authorization server).
+    from fastmcp.server.auth import MultiAuth
+
+    from mcp_server.idp import OIDCIdP
+
+    _stub_oidc_discovery(monkeypatch)
+    s = _reload(
+        monkeypatch,
+        {
+            "SYNAPSE_MACHINE_TOKEN": "tok",
+            "GITHUB_CLIENT_ID": "ghid",
+            "GITHUB_CLIENT_SECRET": "ghsec",
+            "ALLOWED_GITHUB_USERS": "somegithubuser",
+            "OIDC_CONFIG_URL": "https://idp.example.net/.well-known/openid-configuration",
+            "OIDC_CLIENT_ID": "synapse",
+            "OIDC_CLIENT_SECRET": "sec",
+            "ALLOWED_OIDC_USERS": "Kyle",
+        },
+    )
+    assert isinstance(s._auth, MultiAuth)
+    assert len(s._auth_mw) == 1
+    assert s._auth_mw[0]._allowed == {"kyle"}  # OIDC allowlist, not the GitHub one
+    assert s._auth_mw[0]._claim_keys == ("preferred_username", "email")
+    assert isinstance(s._idp, OIDCIdP)  # custom flows follow the same selection
+
+
+def test_github_mode_builds_github_idp(monkeypatch):
+    from mcp_server.idp import GitHubIdP
+
+    s = _reload(
+        monkeypatch,
+        {
+            "SYNAPSE_MACHINE_TOKEN": "tok",
+            "GITHUB_CLIENT_ID": "id",
+            "GITHUB_CLIENT_SECRET": "sec",
+            "ALLOWED_GITHUB_USERS": "alice",
+        },
+    )
+    assert s._auth_mw[0]._claim_keys == ("login",)
+    assert isinstance(s._idp, GitHubIdP)
+    assert s._idp.allowed == {"alice"}
+
+
+async def test_allowlist_middleware_claim_fallback(monkeypatch):
+    # OIDC leg: preferred_username wins, email is the fallback, unknown users are refused.
+    s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
+    mw = s._UserAllowlist({"kyle", "kyle@example.net"}, ("preferred_username", "email"), "oidc")
+
+    class _Tok:
+        def __init__(self, claims):
+            self.client_id = "some-oauth-client"
+            self.claims = claims
+
+    import fastmcp.exceptions as fe
+
+    async def _next(_ctx):
+        return "ok"
+
+    for claims in ({"preferred_username": "Kyle"}, {"email": "Kyle@Example.net"}):
+        monkeypatch.setattr(s, "get_access_token", lambda c=claims: _Tok(c))
+        assert await mw.on_call_tool(None, _next) == "ok"
+
+    monkeypatch.setattr(s, "get_access_token", lambda: _Tok({"preferred_username": "mallory"}))
+    try:
+        await mw.on_call_tool(None, _next)
+        raise AssertionError("expected AuthorizationError")
+    except fe.AuthorizationError as e:
+        assert "mallory" in str(e)
 
 
 def test_machine_authorized_constant_time_check(monkeypatch):
