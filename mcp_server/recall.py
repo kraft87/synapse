@@ -1175,6 +1175,16 @@ class Recall:
         # sessions: LME multi-session served-precision drops 0.88->0.72 (2026-07-25).
         # Rerank scores are 0-1 relevance; 0 (default) keeps the hard-cap behavior.
         _sess_slack = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0") or "0")
+        # Freshness scope on the cap: >0 restricts the cap to sessions whose newest pooled
+        # episode is within this many hours of now. The measured noise pattern the cap fixes
+        # is specifically the LIVE session's turns crowding the bucket (prod replay 2026-07-25:
+        # 11 of 27 dominations were <6h-old sessions at query time); an OLD session serving
+        # multiple slots usually means the evidence genuinely lives there (LME multi-session:
+        # capping those drops served-precision 0.88->0.72). Unparseable timestamps count as
+        # fresh (cap applies — the conservative, shipped-behavior side). 0 = cap all sessions.
+        _sess_fresh_h = float(
+            os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0"
+        )
         _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
@@ -1188,6 +1198,28 @@ class Recall:
                 logger.warning("Passage rerank failed, serving full episodes: %s", e)
                 return []
             if _capped:
+                sess_fresh: dict[Any, bool] = {}
+                if _sess_fresh_h > 0:
+                    from datetime import UTC, datetime
+
+                    _now = datetime.now(UTC)
+                    for e in episodes:
+                        e_sid = e.get("session_id")
+                        if e_sid is None:
+                            continue
+                        try:
+                            ts = e.get("created_at")
+                            dt = (
+                                ts
+                                if isinstance(ts, datetime)
+                                else datetime.fromisoformat(str(ts))
+                            )
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=UTC)
+                            fresh = (_now - dt).total_seconds() <= _sess_fresh_h * 3600
+                        except Exception:
+                            fresh = True  # unknown age -> treat as fresh, cap applies
+                        sess_fresh[e_sid] = sess_fresh.get(e_sid, False) or fresh
                 per_ep: dict[int, int] = {}
                 per_sess: dict[Any, int] = {}
                 chosen = []
@@ -1196,7 +1228,12 @@ class Recall:
                     if _quota and per_ep.get(id(ep), 0) >= _quota:
                         continue
                     sid = ep.get("session_id")
-                    if _sess_cap and sid is not None and per_sess.get(sid, 0) >= _sess_cap:
+                    if (
+                        _sess_cap
+                        and sid is not None
+                        and per_sess.get(sid, 0) >= _sess_cap
+                        and (_sess_fresh_h <= 0 or sess_fresh.get(sid, True))
+                    ):
                         if _sess_slack <= 0:
                             continue
                         alt = next(

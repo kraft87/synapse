@@ -141,3 +141,37 @@ def test_slack_zero_is_hard_cap(monkeypatch):
     r._reranker = _FakeScoredEmb([(0, 0.95), (1, 0.94), (2, 0.93), (3, 0.10)])
     out = r._compact_to_passages("q", _EPS, n=3)
     assert _ids(out) == {"e:1", "e:2", "e:4"}
+
+
+def test_fresh_scope_exempts_stale_sessions(monkeypatch):
+    # FRESH_H=48: _EPS timestamps (2026-06-01) are stale -> the cap never fires,
+    # a stale session may monopolize the bucket (LME multi-session evidence case).
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "48")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    monkeypatch.delenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", raising=False)
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 1, 2, 3])
+    out = r._compact_to_passages("q", _EPS, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:3"}  # all S1, uncapped because stale
+
+
+def test_fresh_scope_still_caps_live_session(monkeypatch):
+    # FRESH_H=48 with a just-ingested session: the live-session domination fix stays.
+    from datetime import UTC, datetime
+
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
+    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "48")
+    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
+    monkeypatch.delenv("SYNAPSE_RECALL_SESSION_CAP_SLACK", raising=False)
+    now = datetime.now(UTC).isoformat()
+    eps = [
+        dict(_ep("alpha one", "S1", "e:1"), created_at=now),
+        dict(_ep("alpha two", "S1", "e:2"), created_at=now),
+        dict(_ep("alpha three", "S1", "e:3"), created_at=now),
+        _ep("bravo one", "S2", "e:4"),
+    ]
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 1, 2, 3])
+    out = r._compact_to_passages("q", eps, n=3)
+    assert _ids(out) == {"e:1", "e:2", "e:4"}  # live S1 capped at 2, S2 pulled in
