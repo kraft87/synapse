@@ -1182,9 +1182,7 @@ class Recall:
         # multiple slots usually means the evidence genuinely lives there (LME multi-session:
         # capping those drops served-precision 0.88->0.72). Unparseable timestamps count as
         # fresh (cap applies — the conservative, shipped-behavior side). 0 = cap all sessions.
-        _sess_fresh_h = float(
-            os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0"
-        )
+        _sess_fresh_h = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0")
         _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
@@ -1203,17 +1201,13 @@ class Recall:
                     from datetime import UTC, datetime
 
                     _now = datetime.now(UTC)
-                    for e in episodes:
-                        e_sid = e.get("session_id")
+                    for f_ep in episodes:
+                        e_sid = f_ep.get("session_id")
                         if e_sid is None:
                             continue
                         try:
-                            ts = e.get("created_at")
-                            dt = (
-                                ts
-                                if isinstance(ts, datetime)
-                                else datetime.fromisoformat(str(ts))
-                            )
+                            ts = f_ep.get("created_at")
+                            dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
                             if dt.tzinfo is None:
                                 dt = dt.replace(tzinfo=UTC)
                             fresh = (_now - dt).total_seconds() <= _sess_fresh_h * 3600
@@ -1241,13 +1235,10 @@ class Recall:
                                 s2
                                 for i2, s2 in scored[pos + 1 :]
                                 if owner[i2].get("session_id") != sid
-                                and not (
-                                    _quota and per_ep.get(id(owner[i2]), 0) >= _quota
-                                )
+                                and not (_quota and per_ep.get(id(owner[i2]), 0) >= _quota)
                                 and not (
                                     owner[i2].get("session_id") is not None
-                                    and per_sess.get(owner[i2].get("session_id"), 0)
-                                    >= _sess_cap
+                                    and per_sess.get(owner[i2].get("session_id"), 0) >= _sess_cap
                                 )
                             ),
                             None,
