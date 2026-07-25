@@ -28,8 +28,8 @@ knowledge-graph facts with the original episode.
 ## Benchmark
 
 **84.8%** on [LongMemEval-S](https://github.com/xiaowu0162/LongMemEval) (500 questions,
-official gpt-4o reader + judge), using the deployed pipeline end to end — no bench-side
-content injection. Strongest categories: temporal reasoning 82.7%, knowledge-update 84.6%,
+official gpt-4o reader + judge), using the deployed pipeline end to end.
+Strongest categories: temporal reasoning 82.7%, knowledge-update 84.6%,
 single-session recall 95–97%. For reference, Zep/Graphiti reports 71.2%, Mastra 84.2%
 on the same reader class.
 
