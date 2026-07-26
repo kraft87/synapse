@@ -1875,8 +1875,11 @@ class Recall:
         # (see _RECALL_BM25_FUSE). Skipped on the degraded path (rerank_top <= 0): the pool is
         # already RRF(bm25, vector) there, so re-fusing BM25 would double-count it.
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
+        n_self_excluded = 0
         if _RECALL_SELF_EXCLUDE and self_session:
+            pre_excl = len(ranked_eps)
             ranked_eps = self._exclude_self(ranked_eps, self_session)
+            n_self_excluded = pre_excl - len(ranked_eps)
         n_bm25_lifted = 0  # telemetry: episodes fusion pulled INTO the src_k serving window
         if _RECALL_BM25_FUSE and rerank_top > 0.0:
             pre_fuse = {e.get("id") for e in ranked_eps[:_RECALL_PASSAGE_SRC_K]}
@@ -2040,6 +2043,13 @@ class Recall:
             "n_echo_suppressed": n_echo_suppressed,
             "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
         }
+        # Self-exclusion observability: keys present ONLY when the hook delivered a
+        # session id, so hookless traffic (bench, dashboard) keeps the lean envelope
+        # and "exclusion active but dropped nothing" (count 0) stays distinguishable
+        # from "exclusion never ran" (keys absent).
+        if self_session:
+            served_ids["self_session"] = self_session
+            served_ids["n_self_excluded"] = n_self_excluded
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.
@@ -2144,8 +2154,11 @@ class Recall:
         pool = self._episode_pool(query, query_emb, project)
         # Same self-exclusion as recall(): the caller's own turns are already in
         # its context window. Pool-level so excluded slots backfill before rerank.
+        n_self_excluded = 0
         if _RECALL_SELF_EXCLUDE and self_session:
+            pre_excl = len(pool)
             pool = self._exclude_self(pool, self_session)
+            n_self_excluded = pre_excl - len(pool)
         episodes, n_echo_suppressed, rerank_top = self._select_episodes(query, pool, limit)
 
         # Increment feedback counts BEFORE slimming (we lose the parseable id afterwards)
@@ -2164,7 +2177,12 @@ class Recall:
         served_ids: dict[str, Any] = {
             "episodes": [r["id"] for r in episodes if r.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
+            "limit": limit,  # requested ceiling — its distribution tunes the default
         }
+        # Same conditional envelope as recall(): keys only when the hook delivered an id.
+        if self_session:
+            served_ids["self_session"] = self_session
+            served_ids["n_self_excluded"] = n_self_excluded
         # Shadow abstention floor (telemetry only) — same RAW pre-recency score contract
         # as recall(); the served episodes above are untouched.
         _floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)

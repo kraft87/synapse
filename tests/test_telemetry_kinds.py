@@ -186,10 +186,35 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
     assert emb_ok is True
     assert n_eps == 4 and chars > 0 and est_tokens == chars // 4
     # Below the floor the envelope gains the shadow keys alongside the serve list.
-    assert set(served) == {"episodes", "n_echo_suppressed", "would_abstain", "floor"}
+    assert set(served) == {"episodes", "n_echo_suppressed", "limit", "would_abstain", "floor"}
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
+    assert served["limit"] == 5  # the tool's default ceiling, always recorded
     assert served["would_abstain"] is True
     assert served["floor"] == pytest.approx(0.58)
+
+
+def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
+    """With a hook-injected self_session, the envelope gains self_session +
+    n_self_excluded and the caller's own turns never serve; hookless calls
+    (the test above) keep the lean key set."""
+    monkeypatch.setattr(recall_mod, "_RECALL_SELF_EXCLUDE", 1)
+    q = f"telemetry self exclusion {uuid.uuid4().hex[:8]}"
+    p = _pool()
+    for i, ep in enumerate(p):
+        ep["session_id"] = "MY-SESSION" if i < 2 else f"other-{i}"
+    engine = _wired(db_url, [0.9, 0.8])  # scores for the 2 survivors
+    engine._episode_pool = lambda q_, emb, proj: [dict(e) for e in p]
+    monkeypatch.setattr(server, "_recall_engine", engine)
+    mark = _watermark(conn)
+    out = server.recall_full_turns(q, self_session="MY-SESSION")
+    assert [it["id"] for it in out["episodes"]] == ["e:2", "e:3"]
+
+    row = _newest(conn, engine, "episodes", "served_ids", mark)
+    assert row is not None
+    (served,) = row
+    assert served["self_session"] == "MY-SESSION"
+    assert served["n_self_excluded"] == 2
+    assert served["limit"] == 5
 
 
 # ---------------------------------------------------------------------------

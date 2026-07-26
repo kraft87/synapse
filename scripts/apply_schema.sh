@@ -87,6 +87,7 @@ FILES=(
   045_skills_v2_foundation.sql
   046_recall_feedback.sql
   047_drop_memory_proposals.sql
+  048_feedback_found_via.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

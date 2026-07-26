@@ -544,6 +544,7 @@ class Database:
         helpful: list[str],
         noise: list[str],
         missing: str | None,
+        found_via: str | None,
         note: str | None,
         session_id: str | None,
         project: str | None,
@@ -556,13 +557,14 @@ class Database:
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO recall_feedback "
-                "    (query, helpful, noise, missing, note, session_id, project) "
-                "VALUES (%s, %s::jsonb, %s::jsonb, %s, %s, %s, %s) RETURNING id",
+                "    (query, helpful, noise, missing, found_via, note, session_id, project) "
+                "VALUES (%s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s) RETURNING id",
                 (
                     query,
                     orjson.dumps(helpful).decode(),
                     orjson.dumps(noise).decode(),
                     missing,
+                    found_via,
                     note,
                     session_id,
                     project,

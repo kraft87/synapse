@@ -919,6 +919,7 @@ def _file_recall_feedback(
     helpful: list[str] | None,
     noise: list[str] | None,
     missing: str | None,
+    found_via: str | None,
     note: str | None,
     session_id: str | None,
     project: str | None,
@@ -943,6 +944,9 @@ def _file_recall_feedback(
             helpful=helpful or [],
             noise=noise or [],
             missing=missing,
+            # One short token ("full_turns", "filesystem", ...) — whitespace-collapsed
+            # and capped, free text by design (see schema 048).
+            found_via=" ".join((found_via or "").split())[:60] or None,
             note=note,
             session_id=session_id,
             project=project,
@@ -958,6 +962,7 @@ def recall_feedback(
     helpful: list[str] | None = None,
     noise: list[str] | None = None,
     missing: str | None = None,
+    found_via: str | None = None,
     note: str | None = None,
     session_id: str | None = None,
     project: str | None = None,
@@ -969,7 +974,11 @@ def recall_feedback(
     lacked what you needed — call this ONCE with that recall's query string.
     `helpful` = served ids that were load-bearing for your answer; `noise` =
     served ids that were irrelevant or distracting; `missing` = one line on
-    what you needed but were not served. Every recall bucket carries an `id` you
+    what you needed but were not served. WHEN you set `missing` and later got
+    the information anyway, set `found_via` = where, one token: "full_turns" /
+    "fetch" / "another_recall" (memory HAD it — a serving miss, the highest-value
+    signal) vs "filesystem" / "live_system" / "web" / "user" (memory never had
+    it) vs "nowhere" (still unresolved). Every recall bucket carries an `id` you
     can copy here verbatim — "e:N" episodes, "f:<uuid>" facts (and
     superseded_facts), "t:N" timeline, "w:N" web, "p:N" preferences — and "n:N"
     note ids from the session-start board or fetch(): WHEN a board note shaped
@@ -988,12 +997,16 @@ def recall_feedback(
         helpful: Served ids that were load-bearing ("e:123", "f:<uuid>", "w:7").
         noise: Served ids that were irrelevant or distracting.
         missing: What you needed that the recall did not return.
+        found_via: Where the missing info turned up ("full_turns", "filesystem",
+            "user", "nowhere", ...) — only meaningful alongside `missing`.
         note: Free-form idea for improving this retrieval.
         session_id: Optional session id for grouping reports.
         project: Optional project slug the recall was scoped to.
     """
     with logfire.span("mcp.recall_feedback {query!r}", query=query[:80], project=project):
-        return _file_recall_feedback(query, helpful, noise, missing, note, session_id, project)
+        return _file_recall_feedback(
+            query, helpful, noise, missing, found_via, note, session_id, project
+        )
 
 
 @mcp.custom_route("/ingest", methods=["POST"])
@@ -1178,7 +1191,7 @@ async def feedback_http(request: Request) -> JSONResponse:
     (_file_recall_feedback); same machine-token gate; fail-soft like /ingest.
 
     Body: {"query": str, "helpful"?: [..], "noise"?: [..], "missing"?: str,
-           "note"?: str, "session_id"?: str, "project"?: str}.
+           "found_via"?: str, "note"?: str, "session_id"?: str, "project"?: str}.
     """
     if not _machine_authorized(request):
         return unauthorized()
@@ -1196,6 +1209,7 @@ async def feedback_http(request: Request) -> JSONResponse:
             helpful=body.get("helpful"),
             noise=body.get("noise"),
             missing=body.get("missing"),
+            found_via=body.get("found_via"),
             note=body.get("note"),
             session_id=body.get("session_id"),
             project=body.get("project"),
