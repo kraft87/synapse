@@ -36,7 +36,8 @@ def main() -> None:
         "in your answer, call recall_feedback(query=<verbatim query>, helpful=[...], "
         'noise=[...], missing="...") ONCE to close the retrieval-quality loop: '
         "helpful=load-bearing ids, noise=irrelevant ids, missing=one line on what was not "
-        "served. Skip only if you used none of the results."
+        "served (+ found_via=where you eventually got it, e.g. full_turns/filesystem/"
+        "nowhere). Skip only if you used none of the results."
     )
     print(
         json.dumps(

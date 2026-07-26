@@ -139,6 +139,7 @@ def test_tool_round_trip_inserts_labeled_row(conn, _test_db):
         helpful=["e:1", "n:2"],
         noise=["e:3"],
         missing="the frobnication config file path",
+        found_via="  filesystem \n grep  ",  # whitespace collapses on the way in
         note="serve config-file chunks for widget queries",
         session_id="synthetic-session-0001",
         project="demo",
@@ -146,16 +147,17 @@ def test_tool_round_trip_inserts_labeled_row(conn, _test_db):
     assert out["status"] == "ok" and isinstance(out["feedback_id"], int)
 
     row = conn.execute(
-        "SELECT query, helpful, noise, missing, note, session_id, project, created_at "
-        "FROM recall_feedback WHERE id = %s",
+        "SELECT query, helpful, noise, missing, found_via, note, session_id, project, "
+        "created_at FROM recall_feedback WHERE id = %s",
         (out["feedback_id"],),
     ).fetchone()
     assert row is not None
-    query, helpful, noise, missing, note, session_id, project, created_at = row
+    query, helpful, noise, missing, found_via, note, session_id, project, created_at = row
     assert query == "synthetic: how does the widget frobnicate"
     assert helpful == ["e:1", "n:2"]  # jsonb round-trips as a real list
     assert noise == ["e:3"]
     assert missing == "the frobnication config file path"
+    assert found_via == "filesystem grep"
     assert note == "serve config-file chunks for widget queries"
     assert session_id == "synthetic-session-0001" and project == "demo"
     assert created_at is not None
@@ -166,11 +168,11 @@ def test_tool_defaults_store_empty_lists_and_nulls(conn, _test_db):
     out = server.recall_feedback(query="synthetic: bare minimum report")
     assert out["status"] == "ok"
     row = conn.execute(
-        "SELECT helpful, noise, missing, note, session_id, project "
+        "SELECT helpful, noise, missing, found_via, note, session_id, project "
         "FROM recall_feedback WHERE id = %s",
         (out["feedback_id"],),
     ).fetchone()
-    assert row == ([], [], None, None, None, None)
+    assert row == ([], [], None, None, None, None, None)
 
 
 @_needs_db
@@ -179,11 +181,11 @@ def test_http_worker_shares_tool_validation_and_insert(conn, _test_db):
     same insert, so the seams cannot drift."""
     from mcp_server.server import _file_recall_feedback
 
-    bad = _file_recall_feedback("synthetic q", ["nope"], None, None, None, None, None)
+    bad = _file_recall_feedback("synthetic q", ["nope"], None, None, None, None, None, None)
     assert bad["status"] == "error"
     assert conn.execute("SELECT count(*) FROM recall_feedback").fetchone()[0] == 0
 
-    ok = _file_recall_feedback("synthetic q", ["e:7"], None, "nothing", None, None, None)
+    ok = _file_recall_feedback("synthetic q", ["e:7"], None, "nothing", None, None, None, None)
     assert ok["status"] == "ok"
     assert conn.execute(
         "SELECT helpful FROM recall_feedback WHERE id = %s", (ok["feedback_id"],)
