@@ -303,7 +303,8 @@ _INSTRUCTIONS = (
     "device, purchase, tool, project, person, or preference — search with "
     "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
     "(n:N) from earlier results. recall_timeline answers when-did / how-long "
-    'questions; recall(mode="turns") returns raw turn text. WHEN the user states a '
+    'questions; recall(mode="turns") searches raw turn text — the retry when an '
+    "overview recall comes back thin. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "
     "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "
     "reports which served ids helped, which were noise, and what was missing. "
@@ -479,10 +480,12 @@ def recall(
     user-history angle (definitions, math, general how-tos).
 
     Two modes — "overview" (default) serves the blended buckets below and is the
-    right first call. "turns" is the raw-episode drill-down: WHEN you need the
-    exact wording of a specific exchange — "what exactly did we say about X",
-    "show me the actual conversation", the raw turn text — it returns full
-    conversation turns ranked by relevance + recency.
+    right first call. "turns" is the raw-episode drill-down: full conversation
+    turns ranked by relevance + recency. Use it WHEN you need the exact wording
+    of a specific exchange ("what exactly did we say about X"), and as the RETRY
+    when overview comes back thin for something plausibly discussed before —
+    re-query in "turns" with the distinctive keywords BEFORE reaching for files
+    or the live system.
 
     Query in plain language carrying the message's distinctive nouns; leave
     `project` unset unless results come back noisy from another domain. Served
