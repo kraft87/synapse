@@ -177,34 +177,16 @@ def test_fresh_scope_still_caps_live_session(monkeypatch):
     assert _ids(out) == {"e:1", "e:2", "e:4"}  # live S1 capped at 2, S2 pulled in
 
 
-def test_self_scope_caps_only_the_calling_session(monkeypatch):
-    # scope=self: S1 dominates but is NOT the caller -> uncapped, serves top-3.
-    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
-    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_SCOPE", "self")
-    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
-    r = Recall("", "")
-    r._reranker = _FakeEmb([0, 1, 2, 3])
-    out = r._compact_to_passages("q", _EPS, n=3, self_session="OTHER")
-    assert _ids(out) == {"e:1", "e:2", "e:3"}
+def test_self_exclude_drops_calling_session_entirely():
+    # Full exclusion: no counting, no cap — the caller's own turns never serve.
+    from mcp_server.recall import Recall
+
+    out = Recall._exclude_self(_EPS, "S1")
+    assert [e["id"] for e in out] == ["e:4"]
 
 
-def test_self_scope_caps_the_calling_session(monkeypatch):
-    # scope=self with S1 as the caller: its 3rd passage is capped out, S2 pulled in.
-    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
-    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_SCOPE", "self")
-    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
-    r = Recall("", "")
-    r._reranker = _FakeEmb([0, 1, 2, 3])
-    out = r._compact_to_passages("q", _EPS, n=3, self_session="S1")
-    assert _ids(out) == {"e:1", "e:2", "e:4"}
+def test_self_exclude_leaves_other_sessions_untouched():
+    from mcp_server.recall import Recall
 
-
-def test_self_scope_without_session_never_caps(monkeypatch):
-    # scope=self and no self_session (bench, dashboard, hookless client) -> no cap.
-    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP", "2")
-    monkeypatch.setenv("SYNAPSE_RECALL_SESSION_CAP_SCOPE", "self")
-    monkeypatch.delenv("SYNAPSE_PASSAGE_QUOTA", raising=False)
-    r = Recall("", "")
-    r._reranker = _FakeEmb([0, 1, 2, 3])
-    out = r._compact_to_passages("q", _EPS, n=3)
-    assert _ids(out) == {"e:1", "e:2", "e:3"}
+    out = Recall._exclude_self(_EPS, "OTHER")
+    assert [e["id"] for e in out] == ["e:1", "e:2", "e:3", "e:4"]

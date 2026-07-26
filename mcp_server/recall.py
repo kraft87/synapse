@@ -295,6 +295,14 @@ _RECALL_BM25_LIFT_CAP = int(os.getenv("SYNAPSE_RECALL_BM25_LIFT_CAP", "0") or "0
 # guaranteed to the best BM25 hits not already inside. Replaces RRF reordering when set.
 _RECALL_BM25_RESERVE = int(os.getenv("SYNAPSE_RECALL_BM25_RESERVE", "0") or "0")
 
+# Self-exclusion: when the recall call carries the calling session's id (injected by
+# the client's PreToolUse hook as self_session), drop that session's episodes from the
+# served pool entirely. The caller's own turns are already in its context window, and
+# they were the top measured recall_feedback noise driver (2026-07-23). Full exclusion
+# replaces the per-session serving cap for this purpose; drill-down (mode="turns",
+# fetch) is unaffected. OFF by default.
+_RECALL_SELF_EXCLUDE = int(os.getenv("SYNAPSE_RECALL_SELF_EXCLUDE", "0") or "0")
+
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
 _WEB_LIMIT = 3  # web_chunks (deduped by parent page) returned by recall()
@@ -1112,11 +1120,7 @@ class Recall:
         return self._floor_by_rerank(query, items, _TIMELINE_FLOOR)
 
     def _compact_to_passages(
-        self,
-        query: str,
-        episodes: list[dict[str, Any]],
-        n: int,
-        self_session: str | None = None,
+        self, query: str, episodes: list[dict[str, Any]], n: int
     ) -> list[dict[str, Any]]:
         """Compact the top reranked episodes into the n most query-relevant PASSAGES (Stage 2).
 
@@ -1187,14 +1191,6 @@ class Recall:
         # capping those drops served-precision 0.88->0.72). Unparseable timestamps count as
         # fresh (cap applies — the conservative, shipped-behavior side). 0 = cap all sessions.
         _sess_fresh_h = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0")
-        # Cap scope. "all" (default) = shipped behavior: every session is subject to the
-        # cap (freshness-modulated when FRESH_H > 0). "self" = the cap applies ONLY to the
-        # calling session (self_session, injected by the client's PreToolUse hook): the
-        # measured failure mode is a conversation's own just-ingested turns crowding its
-        # recall (that content is already in the model's context), while ANY other session
-        # dominating usually means the evidence genuinely lives there. Under "self", a call
-        # with no self_session applies no session cap at all.
-        _sess_scope = os.environ.get("SYNAPSE_RECALL_SESSION_CAP_SCOPE", "all") or "all"
         _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
@@ -1238,7 +1234,6 @@ class Recall:
                         _sess_cap
                         and sid is not None
                         and per_sess.get(sid, 0) >= _sess_cap
-                        and (_sess_scope != "self" or sid == self_session)
                         and (_sess_fresh_h <= 0 or sess_fresh.get(sid, True))
                     ):
                         if _sess_slack <= 0:
@@ -1306,6 +1301,15 @@ class Recall:
                 item["role"] = role
             out.append(item)
         return out
+
+    @staticmethod
+    def _exclude_self(ranked_eps: list[dict[str, Any]], self_session: str) -> list[dict[str, Any]]:
+        """Drop the calling session's own episodes from the serving pool.
+
+        The caller already holds its own turns in context; serving them back both
+        wastes tokens and crowds out older real history (see _RECALL_SELF_EXCLUDE).
+        """
+        return [e for e in ranked_eps if e.get("session_id") != self_session]
 
     @staticmethod
     def _fuse_bm25_order(ranked_eps: list[dict[str, Any]], k: int = 60) -> list[dict[str, Any]]:
@@ -1871,6 +1875,8 @@ class Recall:
         # (see _RECALL_BM25_FUSE). Skipped on the degraded path (rerank_top <= 0): the pool is
         # already RRF(bm25, vector) there, so re-fusing BM25 would double-count it.
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
+        if _RECALL_SELF_EXCLUDE and self_session:
+            ranked_eps = self._exclude_self(ranked_eps, self_session)
         n_bm25_lifted = 0  # telemetry: episodes fusion pulled INTO the src_k serving window
         if _RECALL_BM25_FUSE and rerank_top > 0.0:
             pre_fuse = {e.get("id") for e in ranked_eps[:_RECALL_PASSAGE_SRC_K]}
@@ -1897,10 +1903,7 @@ class Recall:
         if ranked_eps:
             ep_items = (
                 self._compact_to_passages(
-                    query,
-                    ranked_eps[:_RECALL_PASSAGE_SRC_K],
-                    _RECALL_PASSAGE_N,
-                    self_session=self_session,
+                    query, ranked_eps[:_RECALL_PASSAGE_SRC_K], _RECALL_PASSAGE_N
                 )
                 or None
             )
