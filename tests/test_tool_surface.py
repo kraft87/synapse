@@ -110,6 +110,10 @@ def test_description_tails_survive_docstring_section_parsing():
     assert "DECLARATIVE, not imperative" in by_name["remember"]
     # recall's turns-mode trigger inventory (the absorbed recall_episodes drill-down):
     assert '"turns" is the raw-episode drill-down' in by_name["recall"]
+    # ...and its retry framing — the fallback path when overview under-serves
+    # (2026-07-26: organic turns usage was 7 calls vs 244 overview in 21 days
+    # because no surface said when to reach for it):
+    assert "as the RETRY" in by_name["recall"]
     # recall_feedback must invite board note ids, or n: feedback never gets filed:
     assert "note ids from the session-start board" in by_name["recall_feedback"]
 
