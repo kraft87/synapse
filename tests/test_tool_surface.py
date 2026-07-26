@@ -43,6 +43,7 @@ from mcp_server.recall import Recall  # noqa: E402
 
 _EXPECTED_ORDER = [
     "recall",
+    "recall_full_turns",
     "fetch",
     "remember",
     "recall_timeline",
@@ -70,7 +71,9 @@ def test_removed_tools_are_gone():
     assert "query_graph" not in names
     assert "list_projects" not in names
     assert "fetch_episode" not in names  # replaced by fetch (e:/n:)
-    assert "recall_episodes" not in names  # merged into recall(mode="turns") — item 6 audit
+    # merged into recall(mode="turns") by the item-6 audit, then re-split under a
+    # trigger-carrying name (2026-07-26) — the old name stays retired either way:
+    assert "recall_episodes" not in names
     # Board is push-only (SessionStart hook via GET /context) — no read tool, so a
     # compliant model can't double-inject the block the hook already delivered.
     assert "get_context" not in names
@@ -93,6 +96,7 @@ def test_descriptions_and_instructions_fit_claude_code_truncation():
 # way. Pinning each tail proves no description got section-swallowed.
 _DESCRIPTION_TAILS = {
     "recall": "answers when-did / how-long",
+    "recall_full_turns": "rateable in recall_feedback",
     "fetch": "at most 20 ids per call",
     "remember": "must stand alone months later",
     "recall_timeline": "anchor events' dates the payload gives",
@@ -108,12 +112,13 @@ def test_description_tails_survive_docstring_section_parsing():
     # The load-bearing middle of remember's contract, explicitly:
     assert "reference: pointers to canonical sources" in by_name["remember"]
     assert "DECLARATIVE, not imperative" in by_name["remember"]
-    # recall's turns-mode trigger inventory (the absorbed recall_episodes drill-down):
-    assert '"turns" is the raw-episode drill-down' in by_name["recall"]
-    # ...and its retry framing — the fallback path when overview under-serves
-    # (2026-07-26: organic turns usage was 7 calls vs 244 overview in 21 days
-    # because no surface said when to reach for it):
-    assert "as the RETRY" in by_name["recall"]
+    # recall must point at its drill-down sibling, and the sibling must carry the
+    # retry framing — the fallback path when overview under-serves (2026-07-26:
+    # organic drill-down usage was ~0.6 calls/day in BOTH the standalone-tool and
+    # mode="turns" eras because no surface said when to reach for it):
+    assert "recall_full_turns" in by_name["recall"]
+    assert "The retry:" in by_name["recall_full_turns"]
+    assert "BEFORE falling back to files" in by_name["recall_full_turns"]
     # recall_feedback must invite board note ids, or n: feedback never gets filed:
     assert "note ids from the session-start board" in by_name["recall_feedback"]
 
@@ -254,7 +259,7 @@ def test_fetch_kinds_telemetry_counts(conn, db_url):
 
 
 # ---------------------------------------------------------------------------
-# recall mode routing: "turns" is the absorbed recall_episodes drill-down
+# recall-family routing: recall_full_turns is the raw-episode drill-down
 # ---------------------------------------------------------------------------
 
 
@@ -273,28 +278,29 @@ class _StubEngine:
         return {"query": kwargs.get("query"), "episodes": []}
 
 
-def test_recall_mode_turns_routes_to_episode_drilldown(monkeypatch):
-    """mode="turns" hits the engine's recall_episodes path (kind='episodes'
-    telemetry — the continuity contract lives in test_telemetry_kinds.py)."""
+def test_recall_full_turns_routes_to_episode_drilldown(monkeypatch):
+    """recall_full_turns hits the engine's recall_episodes path (kind='episodes'
+    telemetry — the continuity contract lives in test_telemetry_kinds.py) and
+    forwards self_session so the drill-down self-excludes like recall does."""
     stub = _StubEngine()
     monkeypatch.setattr(server, "_recall_engine", stub)
-    out = server.recall("show me the raw turns", project="synapse", mode="turns")
+    out = server.recall_full_turns("show me the raw turns", project="synapse")
     assert out == {"query": "show me the raw turns", "episodes": []}
     assert stub.calls == [
-        ("episodes", {"query": "show me the raw turns", "project": "synapse", "source": "mcp-tool"})
+        (
+            "episodes",
+            {
+                "query": "show me the raw turns",
+                "project": "synapse",
+                "source": "mcp-tool",
+                "self_session": None,
+            },
+        )
     ]
 
 
-def test_recall_mode_defaults_to_overview(monkeypatch):
+def test_recall_routes_to_overview(monkeypatch):
     stub = _StubEngine()
     monkeypatch.setattr(server, "_recall_engine", stub)
     server.recall("state of X")
     assert [name for name, _ in stub.calls] == ["recall"]
-
-
-def test_recall_invalid_mode_is_an_error_not_a_search(monkeypatch):
-    stub = _StubEngine()
-    monkeypatch.setattr(server, "_recall_engine", stub)
-    out = server.recall("q", mode="episodes")
-    assert out["status"] == "error" and "mode" in out["detail"]
-    assert stub.calls == []  # rejected before any engine work

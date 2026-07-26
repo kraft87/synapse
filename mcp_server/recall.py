@@ -2118,15 +2118,17 @@ class Recall:
         project: str | None = None,
         limit: int = _EPISODE_LIMIT,
         source: str | None = None,
+        self_session: str | None = None,
     ) -> dict[str, Any]:
         """Raw episode drill-down: individual conversation turns.
 
         Best for 'show me exactly what was said about X' queries.
         Returns full episode content ranked by relevance + recency.
 
-        Served on the MCP surface as recall(mode="turns") since the item-6 audit
-        retired the standalone recall_episodes tool; the telemetry kind stays
-        'episodes' so historical per-tool metrics remain comparable.
+        Served on the MCP surface as the recall_full_turns tool (standalone again
+        since 2026-07-26 — its docstring needed more room than a mode inside
+        recall's 2KB budget allowed); the telemetry kind stays 'episodes' so
+        historical per-tool metrics remain comparable.
         """
         t_start = time.perf_counter()
         try:
@@ -2139,9 +2141,12 @@ class Recall:
         # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
-        episodes, n_echo_suppressed, rerank_top = self._select_episodes(
-            query, self._episode_pool(query, query_emb, project), limit
-        )
+        pool = self._episode_pool(query, query_emb, project)
+        # Same self-exclusion as recall(): the caller's own turns are already in
+        # its context window. Pool-level so excluded slots backfill before rerank.
+        if _RECALL_SELF_EXCLUDE and self_session:
+            pool = self._exclude_self(pool, self_session)
+        episodes, n_echo_suppressed, rerank_top = self._select_episodes(query, pool, limit)
 
         # Increment feedback counts BEFORE slimming (we lose the parseable id afterwards)
         ep_ids = [

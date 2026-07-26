@@ -2,11 +2,11 @@
 # mypy: ignore-errors
 """Claude Code `PreToolUse` hook → inject the calling session's id into synapse tools.
 
-recall: serving excludes the calling session's own episodes entirely
-(SYNAPSE_RECALL_SELF_EXCLUDE) — that content is already in the model's context
-window. The model cannot know its own session id, so this hook adds it to the
-tool input as `self_session` via the PreToolUse `updatedInput` mechanism; the
-exclusion is keyed to exactly that id, so two concurrent sessions never
+recall / recall_full_turns: serving excludes the calling session's own episodes
+entirely (SYNAPSE_RECALL_SELF_EXCLUDE) — that content is already in the model's
+context window. The model cannot know its own session id, so this hook adds it
+to the tool input as `self_session` via the PreToolUse `updatedInput` mechanism;
+the exclusion is keyed to exactly that id, so two concurrent sessions never
 suppress each other's genuinely relevant content.
 
 recall_feedback: the same id lands in the existing `session_id` param so
