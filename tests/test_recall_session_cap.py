@@ -175,3 +175,18 @@ def test_fresh_scope_still_caps_live_session(monkeypatch):
     r._reranker = _FakeEmb([0, 1, 2, 3])
     out = r._compact_to_passages("q", eps, n=3)
     assert _ids(out) == {"e:1", "e:2", "e:4"}  # live S1 capped at 2, S2 pulled in
+
+
+def test_self_exclude_drops_calling_session_entirely():
+    # Full exclusion: no counting, no cap — the caller's own turns never serve.
+    from mcp_server.recall import Recall
+
+    out = Recall._exclude_self(_EPS, "S1")
+    assert [e["id"] for e in out] == ["e:4"]
+
+
+def test_self_exclude_leaves_other_sessions_untouched():
+    from mcp_server.recall import Recall
+
+    out = Recall._exclude_self(_EPS, "OTHER")
+    assert [e["id"] for e in out] == ["e:1", "e:2", "e:3", "e:4"]
