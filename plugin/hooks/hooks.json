@@ -58,7 +58,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_synapse_synapse__recall$",
+        "matcher": "mcp__plugin_synapse_synapse__(recall|recall_full_turns)$",
         "hooks": [
           {
             "type": "command",
@@ -70,7 +70,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__.*__(recall|recall_feedback)$",
+        "matcher": "mcp__.*__(recall|recall_full_turns|recall_feedback)$",
         "hooks": [
           {
             "type": "command",

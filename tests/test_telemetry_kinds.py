@@ -153,9 +153,9 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# kind='episodes' — recall(mode="turns"), the absorbed recall_episodes drill-down
-# (+ the abstention-shadow keys). Driven through the MCP tool so the pin also
-# proves the mode routing keeps the historical kind='episodes' telemetry.
+# kind='episodes' — recall_full_turns, the raw-episode drill-down (+ the
+# abstention-shadow keys). Driven through the MCP tool so the pin also proves
+# the tool routing keeps the historical kind='episodes' telemetry.
 # ---------------------------------------------------------------------------
 
 
@@ -167,7 +167,7 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
     engine._episode_pool = lambda q_, emb, proj: list(p)
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
-    out = server.recall(q, mode="turns")  # the MCP surface path since the item-6 merge
+    out = server.recall_full_turns(q)  # the MCP surface path for the drill-down
     assert len(out["episodes"]) == 4  # shadow only — served in full
 
     row = _newest(

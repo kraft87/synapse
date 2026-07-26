@@ -151,7 +151,7 @@ class _HiddenToolsList(Middleware):
 
     Listing and calling are separate request paths in FastMCP, so dropping a tool
     here leaves tools/call untouched — `synapse login` keeps working while the
-    model-facing surface stays the six deliberate tools registered below."""
+    model-facing surface stays the deliberate tools registered below."""
 
     async def on_list_tools(self, context, call_next):
         tools = await call_next(context)
@@ -303,7 +303,7 @@ _INSTRUCTIONS = (
     "device, purchase, tool, project, person, or preference — search with "
     "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
     "(n:N) from earlier results. recall_timeline answers when-did / how-long "
-    'questions; recall(mode="turns") searches raw turn text — the retry when an '
+    "questions; recall_full_turns searches complete raw turns — the retry when an "
     "overview recall comes back thin. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "
     "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "
@@ -438,8 +438,9 @@ async def health(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Tools — REGISTRATION ORDER IS DELIBERATE. Tool-list position biases which tool
 # a model reaches for (first-listed wins most ties), so the surface reads in
-# intended-use order: recall (the workhorse; mode="turns" absorbed the retired
-# recall_episodes drill-down — item 6 audit, ~4% of recall-family calls), fetch
+# intended-use order: recall (the workhorse), recall_full_turns (its drill-down /
+# retry sibling — re-split from mode="turns" on 2026-07-26 so its trigger
+# inventory gets a full 2KB description instead of a corner of recall's), fetch
 # (id expansion), remember (the write), the specialist read — recall_timeline —
 # then recall_feedback (the after-the-fact quality report). Hidden plumbing
 # (issue_machine_token, see _HIDDEN_TOOLS) registers last.
@@ -461,7 +462,6 @@ def recall(
     project: str | None = None,
     session_focus: list[str] | None = None,
     group_id: str = "technical",
-    mode: str = "overview",
     self_session: str | None = None,
 ) -> dict:
     """Search the user's long-term memory: tens of thousands of reranked
@@ -479,13 +479,10 @@ def recall(
     (read those directly), nor for generic-knowledge questions with no
     user-history angle (definitions, math, general how-tos).
 
-    Two modes — "overview" (default) serves the blended buckets below and is the
-    right first call. "turns" is the raw-episode drill-down: full conversation
-    turns ranked by relevance + recency. Use it WHEN you need the exact wording
-    of a specific exchange ("what exactly did we say about X"), and as the RETRY
-    when overview comes back thin for something plausibly discussed before —
-    re-query in "turns" with the distinctive keywords BEFORE reaching for files
-    or the live system.
+    This is the overview — compressed passages blended with the buckets below,
+    the right first call. Its drill-down sibling recall_full_turns serves
+    complete raw turns: the follow-up when a passage is truncated mid-thought,
+    and the retry when this overview comes back thin.
 
     Query in plain language carrying the message's distinctive nouns; leave
     `project` unset unless results come back noisy from another domain. Served
@@ -506,36 +503,71 @@ def recall(
         project: Optional project slug to filter results (e.g. "synapse").
         session_focus: Entity names active in current conversation for KG bias.
         group_id: Knowledge graph scope — "technical" (default) or "personal".
-        mode: "overview" (default, blended buckets) or "turns" (raw turn drill-down).
         self_session: NEVER set this yourself. The client's PreToolUse hook injects
             the calling session's id so serving can suppress self-session domination;
             calls without it simply skip that suppression.
     """
-    if mode not in ("overview", "turns"):
-        return {
-            "status": "error",
-            "detail": f'invalid mode {mode!r} — expected "overview" or "turns"',
-        }
     with logfire.span(
         "mcp.recall {query!r}",
         query=query[:80],
         project=project,
         group_id=group_id,
-        mode=mode,
     ):
-        engine = _get_recall()
-        if mode == "turns":
-            # The absorbed recall_episodes drill-down (item 6 tool-surface audit).
-            # Same engine path, so telemetry keeps kind='episodes' and historical
-            # per-tool metrics stay comparable.
-            return engine.recall_episodes(query=query, project=project, source="mcp-tool")
-        return engine.recall(
+        return _get_recall().recall(
             query=query,
             project=project,
             session_focus=session_focus or [],
             group_id=group_id,
             source="mcp-tool",
             self_session=self_session,
+        )
+
+
+@mcp.tool()
+def recall_full_turns(
+    query: str,
+    project: str | None = None,
+    self_session: str | None = None,
+) -> dict:
+    """Search the complete, unabridged text of past conversation turns — the
+    drill-down and retry sibling of recall().
+
+    recall() serves compressed ~1400-char passage slices blended with facts and
+    timeline; this serves WHOLE turns and nothing else, ranked by relevance +
+    recency (keyword + semantic search + rerank over the full archive). Expect
+    long results — a single served turn can run thousands of tokens.
+
+    Three triggers —
+    - Exact wording: "what exactly did we say about X", quoting the actual
+      exchange, reconstructing how a specific conversation went.
+    - The retry: an overview recall came back thin or off-topic for something
+      plausibly discussed before. Re-query here with the message's distinctive
+      keywords BEFORE falling back to files, grep, or the live system — if it
+      was ever said in a session, this is the tool that finds the saying.
+    - Full context: an overview passage hit but the ~1400-char slice cut off
+      what you need and you want the surrounding discussion.
+
+    Do NOT open with this for general past-work questions — recall() is the
+    right first call (cheaper, blended, usually sufficient). Do NOT use it to
+    expand an id you already hold — fetch(ids) does that directly. Do NOT
+    query it for live system state (ports, configs, processes) — it returns
+    what was SAID, which may be stale; the box is ground truth for that.
+
+    Served turns carry e:N ids — fetch()-able and rateable in recall_feedback.
+
+    Args:
+        query: Plain-language query carrying the distinctive nouns/keywords.
+        project: Optional project slug to filter results (e.g. "synapse").
+        self_session: NEVER set this yourself. The client's PreToolUse hook
+            injects the calling session's id so your own session's turns are
+            excluded; calls without it simply skip that exclusion.
+    """
+    with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
+        # Same engine path as the retired recall_episodes tool and the interim
+        # recall(mode="turns") — telemetry keeps kind='episodes' so historical
+        # per-tool metrics stay comparable.
+        return _get_recall().recall_episodes(
+            query=query, project=project, source="mcp-tool", self_session=self_session
         )
 
 
@@ -837,7 +869,11 @@ def recall_timeline(
 
 # recall_episodes was retired as a standalone tool (item 6 tool-surface audit:
 # 12 of ~325 recall-family mcp-tool calls over 5 weeks, under the pre-registered
-# 5% merge threshold) — recall(mode="turns") now routes to the same engine path.
+# 5% merge threshold), lived as recall(mode="turns") 07-13..07-26, then re-split
+# as recall_full_turns: usage stayed flat (~0.6 calls/day) across the merge, so
+# packaging wasn't the lever — the under-specified description was, and a mode
+# buried in recall's near-full 2KB docstring couldn't grow a real trigger
+# inventory. recall_full_turns routes to the same engine path (kind='episodes').
 
 # --- recall_feedback: offline labeled retrieval-quality capture (schema 046) ------
 # One row per rated recall. Deliberately NOT wired into live scoring — no ranking
