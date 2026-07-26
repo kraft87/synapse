@@ -67,6 +67,18 @@
           }
         ]
       }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*__recall$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }

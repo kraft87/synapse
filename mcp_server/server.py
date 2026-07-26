@@ -461,6 +461,7 @@ def recall(
     session_focus: list[str] | None = None,
     group_id: str = "technical",
     mode: str = "overview",
+    self_session: str | None = None,
 ) -> dict:
     """Search the user's long-term memory: tens of thousands of reranked
     past-conversation turns, the knowledge-graph facts extracted from them, and a
@@ -503,6 +504,9 @@ def recall(
         session_focus: Entity names active in current conversation for KG bias.
         group_id: Knowledge graph scope — "technical" (default) or "personal".
         mode: "overview" (default, blended buckets) or "turns" (raw turn drill-down).
+        self_session: NEVER set this yourself. The client's PreToolUse hook injects
+            the calling session's id so serving can suppress self-session domination;
+            calls without it simply skip that suppression.
     """
     if mode not in ("overview", "turns"):
         return {
@@ -528,6 +532,7 @@ def recall(
             session_focus=session_focus or [],
             group_id=group_id,
             source="mcp-tool",
+            self_session=self_session,
         )
 
 

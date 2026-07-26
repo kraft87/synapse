@@ -1112,7 +1112,11 @@ class Recall:
         return self._floor_by_rerank(query, items, _TIMELINE_FLOOR)
 
     def _compact_to_passages(
-        self, query: str, episodes: list[dict[str, Any]], n: int
+        self,
+        query: str,
+        episodes: list[dict[str, Any]],
+        n: int,
+        self_session: str | None = None,
     ) -> list[dict[str, Any]]:
         """Compact the top reranked episodes into the n most query-relevant PASSAGES (Stage 2).
 
@@ -1183,6 +1187,14 @@ class Recall:
         # capping those drops served-precision 0.88->0.72). Unparseable timestamps count as
         # fresh (cap applies — the conservative, shipped-behavior side). 0 = cap all sessions.
         _sess_fresh_h = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0")
+        # Cap scope. "all" (default) = shipped behavior: every session is subject to the
+        # cap (freshness-modulated when FRESH_H > 0). "self" = the cap applies ONLY to the
+        # calling session (self_session, injected by the client's PreToolUse hook): the
+        # measured failure mode is a conversation's own just-ingested turns crowding its
+        # recall (that content is already in the model's context), while ANY other session
+        # dominating usually means the evidence genuinely lives there. Under "self", a call
+        # with no self_session applies no session cap at all.
+        _sess_scope = os.environ.get("SYNAPSE_RECALL_SESSION_CAP_SCOPE", "all") or "all"
         _capped = bool(_quota or _sess_cap)  # either cap walks the full ranking + backfills
         if len(passages) <= n:
             chosen = list(range(len(passages)))  # already in episode-rerank order
@@ -1226,6 +1238,7 @@ class Recall:
                         _sess_cap
                         and sid is not None
                         and per_sess.get(sid, 0) >= _sess_cap
+                        and (_sess_scope != "self" or sid == self_session)
                         and (_sess_fresh_h <= 0 or sess_fresh.get(sid, True))
                     ):
                         if _sess_slack <= 0:
@@ -1735,6 +1748,7 @@ class Recall:
         write_feedback: bool = True,
         source: str | None = None,
         debug: bool = False,
+        self_session: str | None = None,
     ) -> dict[str, Any]:
         """Overview retrieval: reranked episodes + KG facts (+ entities, web).
 
@@ -1883,7 +1897,10 @@ class Recall:
         if ranked_eps:
             ep_items = (
                 self._compact_to_passages(
-                    query, ranked_eps[:_RECALL_PASSAGE_SRC_K], _RECALL_PASSAGE_N
+                    query,
+                    ranked_eps[:_RECALL_PASSAGE_SRC_K],
+                    _RECALL_PASSAGE_N,
+                    self_session=self_session,
                 )
                 or None
             )
