@@ -527,6 +527,7 @@ def recall(
 def recall_full_turns(
     query: str,
     project: str | None = None,
+    limit: int = 5,
     self_session: str | None = None,
 ) -> dict:
     """Search the complete, unabridged text of past conversation turns — the
@@ -534,8 +535,9 @@ def recall_full_turns(
 
     recall() serves compressed ~1400-char passage slices blended with facts and
     timeline; this serves WHOLE turns and nothing else, ranked by relevance +
-    recency (keyword + semantic search + rerank over the full archive). Expect
-    long results — a single served turn can run thousands of tokens.
+    recency (keyword + semantic search + rerank over the full archive). `limit`
+    sizes the response: 1-2 turns for a pinpoint quote, the default 5 to
+    reconstruct a discussion (weak trailing matches drop automatically).
 
     Three triggers —
     - Exact wording: "what exactly did we say about X", quoting the actual
@@ -558,6 +560,7 @@ def recall_full_turns(
     Args:
         query: Plain-language query carrying the distinctive nouns/keywords.
         project: Optional project slug to filter results (e.g. "synapse").
+        limit: Max turns returned (1-10, default 5).
         self_session: NEVER set this yourself. The client's PreToolUse hook
             injects the calling session's id so your own session's turns are
             excluded; calls without it simply skip that exclusion.
@@ -567,7 +570,11 @@ def recall_full_turns(
         # recall(mode="turns") — telemetry keeps kind='episodes' so historical
         # per-tool metrics stay comparable.
         return _get_recall().recall_episodes(
-            query=query, project=project, source="mcp-tool", self_session=self_session
+            query=query,
+            project=project,
+            limit=max(1, min(int(limit), 10)),
+            source="mcp-tool",
+            self_session=self_session,
         )
 
 

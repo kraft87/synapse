@@ -292,11 +292,22 @@ def test_recall_full_turns_routes_to_episode_drilldown(monkeypatch):
             {
                 "query": "show me the raw turns",
                 "project": "synapse",
+                "limit": 5,
                 "source": "mcp-tool",
                 "self_session": None,
             },
         )
     ]
+
+
+def test_recall_full_turns_clamps_limit(monkeypatch):
+    """The model-facing limit is bounded 1-10 regardless of what gets passed —
+    a hallucinated limit=100 must not turn the drill-down into a context bomb."""
+    stub = _StubEngine()
+    monkeypatch.setattr(server, "_recall_engine", stub)
+    server.recall_full_turns("q", limit=100)
+    server.recall_full_turns("q", limit=0)
+    assert [kw["limit"] for _, kw in stub.calls] == [10, 1]
 
 
 def test_recall_routes_to_overview(monkeypatch):
