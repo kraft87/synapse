@@ -1,5 +1,6 @@
 import os
 from unittest.mock import patch
+from urllib.parse import urlsplit
 
 import psycopg
 import pytest
@@ -7,6 +8,31 @@ import pytest
 DB_URL = os.environ.get(
     "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
 )
+
+
+def _refuse_production(url: str) -> None:
+    """Abort the run if the test DSN names anything but a scratch database.
+
+    The fixtures below TRUNCATE episodes, kg_entities, notes and friends. pytest.ini
+    loads .env, which carries the production SYNAPSE_DB_URL beside SYNAPSE_TEST_URL, so
+    one typo (or a copy-pasted export) is the whole distance between a test run and
+    wiping live memory. Allowlist the shapes that are disposable by construction --
+    `*_test` locally, `ci_<run>_<attempt>` in CI -- and refuse everything else."""
+    name = urlsplit(url).path.lstrip("/")
+    if not name.endswith("_test") and not name.startswith("ci_"):
+        raise RuntimeError(
+            f"SYNAPSE_TEST_URL points at database {name!r}, which is not a scratch "
+            "database (expected a name ending in '_test' or starting with 'ci_'). "
+            "The DB fixtures TRUNCATE real tables -- refusing to run."
+        )
+
+
+_refuse_production(DB_URL)
+
+# Code under test that reads SYNAPSE_DB_URL directly (ingestion.kg_pg_read/kg_pg_write)
+# would otherwise pick up the production DSN that .env just loaded into this process.
+# Pin it to the test database so a missing monkeypatch cannot reach prod.
+os.environ["SYNAPSE_DB_URL"] = DB_URL
 
 # Files whose tests touch the shared Postgres test DB. The collection hook below
 # auto-tags every test in these files with `xdist_group="db"`, which pins them
