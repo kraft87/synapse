@@ -77,7 +77,6 @@ def _wired(db_url: str, scores: list[float]) -> Recall:
     r._search_vector_episodes = lambda emb, proj, limit: []
     r._search_vector_web = lambda emb, n: []
     r._search_kg = lambda *a, **k: ([], [])
-    r._search_preferences = lambda emb, gid, limit: []
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
@@ -136,17 +135,18 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
     assert n_eps == len(out["episodes"]) and chars > 0 and est_tokens == chars // 4
     # served_ids envelope contract: per-bucket serve lists + the echo counter. Above the
     # floor there is no shadow marker — the key set is exactly this.
+    # "prefs" is gone for good — the preferences leg was removed 2026-07-27.
     assert set(served) == {
         "episodes",
         "facts",
         "web",
         "timeline",
-        "prefs",
         "n_echo_suppressed",
         "n_bm25_lifted",
     }
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
-    assert served["facts"] == [] and served["timeline"] == [] and served["prefs"] == []
+    assert served["facts"] == [] and served["timeline"] == []
+    assert "prefs" not in served and "preferences" not in out
     assert served["web"] == []
     assert served["n_echo_suppressed"] == 0
     assert served["n_bm25_lifted"] == 0  # stub pool has no bm25_score -> fusion is a no-op

@@ -352,7 +352,7 @@ Contradictions **invalidate the old edge** (an `UPDATE` setting `invalid_at`/`t_
 
 ## 6. Recall Pipeline
 
-`recall()` fans out over a persistent `ThreadPoolExecutor`: wave 1 runs the episode pool, KG, web, timeline ([§3.5](#35-timeline-events--the-episodic-date-log)), and preferences legs concurrently (the last two are single cheap DB reads reusing the query embedding); wave 2 runs the cross-encoder rerank and the bitemporal history fetch. Returns a **compact, conditionally-populated** result.
+`recall()` fans out over a persistent `ThreadPoolExecutor`: wave 1 runs the episode pool, KG, web, and timeline ([§3.5](#35-timeline-events--the-episodic-date-log)) legs concurrently (the last is a single cheap DB read reusing the query embedding); wave 2 runs the cross-encoder rerank and the bitemporal history fetch. Returns a **compact, conditionally-populated** result.
 
 ```mermaid
 flowchart TD
@@ -378,7 +378,6 @@ if episodes_served: out["episodes"]    = [...]   # reranked passages, cap 5 (see
 if entities_bucket: out["entities"]    = [...]   # {name, summary}, cap 3
 if web_chunks:      out["web"]         = [...]   # {context|excerpt, url?, title?, date?}, cap 3
 if timeline:        out["timeline"]    = [...]   # dated events (§3.5), cap 8
-if preferences:     out["preferences"] = [...]   # standing user preferences, cap 5
 if superseded:      out["superseded_facts"] = [...]  # {fact: old, superseded_by: current}, cap 2
 return out
 ```
@@ -503,7 +502,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **030–032 config lane** — mirrored config-file store, scope column, scan cursor.
 - **033 `timeline_events`** — the episodic date log ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot. The same table carries the `schema_version` stamp `apply_schema.sh` writes after a full run — every service checks it at startup (`ingestion/schema_check.py`) and refuses to boot when the database is behind the code's schema, pointing at the upgrade command instead of failing mid-request (`SYNAPSE_SCHEMA_CHECK=0` skips).
-- **035 `preferences`** — standing user-preference store served as a recall bucket.
+- **035 `preferences`** — standing user-preference store. Fed by the ingestion preferences gate and read by `/preferences/top` (the SessionStart block) and the dashboard. It was ALSO a `recall()` bucket until 2026-07-27, when the leg was removed: measured on `recall_feedback` since all six buckets became citable, prefs served 380 rows for 6 helpful citations (1.6% of served, 11.1% of the rated subset) against episodes 39.0% / facts 16.8% / timeline 8.2% — ~2.68 items of context cost on nearly every recall for nothing.
 - **036 content-md5 index** — `episodes (md5(content))`, the cross-session replay guard ([§4.1](#4-ingestion-pipeline)).
 - **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **038 `timeline_events.domain`** — `personal`/`technical` scoping label ([§3.5](#35-timeline-events--the-episodic-date-log)).

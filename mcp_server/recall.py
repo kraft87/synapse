@@ -79,12 +79,13 @@ _TIMELINE_LIMIT = 8
 # backstop: an all-subfloor result serves [] (self-gates, like web). The STANDALONE
 # recall_timeline() deep path stays unfloored. 0 disables. Applies only when the leg fires.
 _TIMELINE_FLOOR = float(os.getenv("SYNAPSE_RECALL_TIMELINE_FLOOR", "0.40") or "0.40")
-# Preferences leg (schema 035): the standing USER-preference bucket. Like the timeline
-# leg, one cheap parallel DB read on every query — top-5 live prefs by cosine to the
-# query embedding — reusing this call's query_emb (no extra Voyage round-trip). Kept out
-# of the KG so preferences don't rebuild the User-supernode. Kill switch SYNAPSE_RECALL_PREFS=0.
-_PREFS_IN_RECALL = os.environ.get("SYNAPSE_RECALL_PREFS", "1") != "0"
-_PREFS_LIMIT = 5
+# The preferences leg (schema 035) was REMOVED from recall on 2026-07-27. Measured on
+# recall_feedback + recall_metrics since b6dcaf3 (2026-07-22, when all six buckets became
+# citable): prefs served 380 rows across rated queries for 6 helpful citations — 1.6% of
+# served, 11.1% of the rated subset, against episodes 39.0% / facts 16.8% / timeline 8.2%.
+# It cost ~2.68 items on essentially every recall and bought nothing. The `preferences`
+# table and its other consumers (the ingestion gate, /preferences/top + the SessionStart
+# block, the dashboard) are untouched — only the recall serving path is gone.
 _RECENCY_HALF_LIFE_DAYS = 30  # content this old scores ~50% of today's content
 # Recency re-injection AFTER the cross-encoder rerank (see _apply_rerank_recency). The
 # reranker is recency-blind and an old *definitive* statement ("X is canonical") out-scores
@@ -374,7 +375,7 @@ _RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0.58") or "0.58")
 # on ~9% of real recalls (the bottom ~p10 by episode-rerank strength). When enforced, recall()
 # drops the EPISODE bucket if the RAW top rerank score is in (0, floor) under working
 # retrieval — low relevance costs fewer tokens instead of serving the least-bad passages.
-# Facts/prefs/timeline are unaffected (own gates); recall_episodes() drill-down never enforces.
+# Facts/timeline are unaffected (own gates); recall_episodes() drill-down never enforces.
 # SYNAPSE_RECALL_FLOOR_ENFORCE=0 disables. SYNAPSE_RECALL_FLOOR=0 disables both marker + enforce.
 _RECALL_FLOOR_ENFORCE = os.getenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "1") != "0"
 # Keep-min under enforcement (LME 2026-07-25: blanking the bucket cost multi-session -8pts at
@@ -668,8 +669,6 @@ def _served_chars(out: dict[str, Any]) -> int:
         n += len(w.get("context") or "") + len(w.get("excerpt") or "") + len(w.get("title") or "")
     for t in out.get("timeline", []):
         n += len(t.get("fact") or "") + len(str(t.get("date") or ""))
-    for p in out.get("preferences", []):
-        n += len(p.get("pref") or "") + len(str(p.get("polarity") or ""))
     for h in out.get("superseded_facts", []):
         n += len(str(h.get("fact") or "")) + len(str(h.get("superseded_by") or ""))
     return n
@@ -762,34 +761,6 @@ class Recall:
                 db_url=self._db_url, voyage_api_key=self._voyage_key
             )
         return self._timeline_engine
-
-    def _search_preferences(
-        self, query_emb: list[float] | None, group_id: str, limit: int
-    ) -> list[dict[str, Any]]:
-        """The preferences leg (schema 035): top-N LIVE user preferences for this
-        owner/group, nearest to the query embedding by cosine. Reuses the query_emb
-        recall already computed — no extra Voyage call. Thread-local PG (leg executor).
-        Degrades to [] if the table isn't present or the embedding is unavailable."""
-        if query_emb is None:
-            return []
-        conn = self._ensure_pg()
-        vlit = _vec_literal(query_emb)
-        try:
-            rows: list[dict[str, Any]] = conn.execute(
-                # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "SELECT id, pref, polarity, left(first_seen::text, 10) AS since, assert_count "
-                "FROM preferences "
-                "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-                "AND embedding IS NOT NULL "
-                f"ORDER BY embedding <=> %s::vector({_EMBED_DIMS}) ASC LIMIT %s",
-                (_KG_OWNER, group_id, vlit, limit),
-            ).fetchall()
-        except psycopg.errors.UndefinedTable:
-            return []  # migration 035 not applied on this deployment yet — degrade
-        except Exception as e:
-            logger.warning("preferences leg failed: %s", e)
-            return []
-        return rows
 
     def _ensure_embedder(self) -> Any:
         if self._embedder is None:
@@ -1651,7 +1622,10 @@ class Recall:
     # recall_metrics (schema/021) — timing per leg, served-payload tokens, pool
     # sizes, rerank model + top score, origin. NOT logfire: this is local,
     # SQL-queryable, and reuses the existing background-write pattern. A recall_
-    # episodes row leaves the recall-only columns NULL.
+    # episodes row leaves the recall-only columns NULL. n_prefs/ms_prefs are LEGACY
+    # (schema 039): the preferences leg was removed from recall on 2026-07-27, so
+    # nothing populates them and they now insert NULL on every row. The columns stay
+    # for the historical rows written before the removal — no migration.
     _METRIC_COLS = (
         "kind",
         "source",
@@ -1830,15 +1804,6 @@ class Recall:
 
         f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
 
-        # Preferences leg: top-5 live user preferences by cosine to this query. One cheap
-        # parallel read reusing query_emb; empty result = no payload change (kill switch
-        # SYNAPSE_RECALL_PREFS=0). Group-scoped like the KG; owner is the single-user const.
-        f_prefs = (
-            ex.submit(_timed, self._search_preferences, query_emb, group_id, _PREFS_LIMIT)
-            if _PREFS_IN_RECALL
-            else None
-        )
-
         # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
         # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
         bm25_eps, ms_bm25 = f_bm25.result()
@@ -1913,7 +1878,7 @@ class Recall:
         # Floor enforcement: when even the top episode passage is below the floor — a weak
         # match under WORKING retrieval (query_emb present, a real score in (0, floor)) —
         # drop the episode bucket. Complements the compaction gate above at a harder
-        # threshold and keeps low relevance cheap. Facts/prefs/timeline stay (their own
+        # threshold and keeps low relevance cheap. Facts/timeline stay (their own
         # relevance gates). The same condition is still shadow-marked in served_ids below.
         # recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
         if _RECALL_FLOOR_ENFORCE and query_emb is not None and 0.0 < rerank_top < _RECALL_FLOOR:
@@ -2005,27 +1970,6 @@ class Recall:
                 tl.append(item)
             out["timeline"] = tl
 
-        prefs_items: list[dict[str, Any]] = []
-        ms_prefs = 0.0
-        if f_prefs is not None:
-            try:
-                prefs_items, ms_prefs = f_prefs.result()
-            except Exception as e:
-                logger.warning("preferences leg failed: %s", e)
-        if prefs_items:
-            # Slim preference bucket: the pref text + polarity, plus since/asserted so the
-            # reader can weight a long-standing, oft-repeated preference over a one-off.
-            out["preferences"] = [
-                {
-                    **({"id": f"p:{p['id']}"} if p.get("id") is not None else {}),
-                    "pref": p.get("pref"),
-                    "polarity": p.get("polarity"),
-                    "since": p.get("since"),
-                    "asserted": p.get("assert_count"),
-                }
-                for p in prefs_items
-            ]
-
         # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
         # pattern as the retrieval_count bump, so zero read-path latency.
         # served_ids (issue #10): WHICH results were served, per bucket. Episodes dedupe
@@ -2039,7 +1983,6 @@ class Recall:
                 for t in timeline_items
                 if t.get("_id") is not None and t.get("kind", "event") == "event"
             ],
-            "prefs": [p["id"] for p in prefs_items if p.get("id") is not None],
             "n_echo_suppressed": n_echo_suppressed,
             "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
         }
@@ -2074,8 +2017,6 @@ class Recall:
             "n_history": len(superseded_facts),
             "n_timeline": len(out.get("timeline", [])),
             "ms_timeline": round(ms_timeline, 1),
-            "n_prefs": len(out.get("preferences", [])),
-            "ms_prefs": round(ms_prefs, 1),
             "chars": chars,
             "est_tokens": chars // 4,
             "pool_bm25": len(bm25_eps),
@@ -2089,9 +2030,9 @@ class Recall:
         }
         self._record_metrics(metrics)
         # Phase-2 dashboard debug envelope: surface the SAME numbers just recorded (no
-        # re-instrumentation). Only the timed legs are exposed; timeline/prefs keys are
-        # OMITTED when their leg is disabled (future f_* is None), so the console renders
-        # those as untimed/skipped rather than a spurious 0ms. Byte-identical when off.
+        # re-instrumentation). Only the timed legs are exposed; the timeline key is
+        # OMITTED when its leg is disabled (f_timeline is None), so the console renders
+        # it as untimed/skipped rather than a spurious 0ms. Byte-identical when off.
         if debug:
             legs_ms: dict[str, Any] = {
                 "embed": metrics["ms_embed"],
@@ -2103,8 +2044,6 @@ class Recall:
             }
             if f_timeline is not None:
                 legs_ms["timeline"] = metrics["ms_timeline"]
-            if f_prefs is not None:
-                legs_ms["prefs"] = metrics["ms_prefs"]
             out["debug"] = {
                 "total_ms": metrics["ms_total"],
                 "legs_ms": legs_ms,

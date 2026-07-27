@@ -52,7 +52,6 @@ def _wire_stubs(r: Recall) -> None:
     r._search_vector_episodes = lambda emb, p, n: [_episode(2, "beta episode body")]  # type: ignore[method-assign]
     r._search_vector_web = lambda emb, n: []  # type: ignore[method-assign]
     r._search_kg = lambda q, emb, g, sf, fact_limit: ([], [])  # type: ignore[method-assign]
-    r._search_preferences = lambda emb, g, n: []  # type: ignore[method-assign]
     r._rerank_pool_scored = lambda q, pool: [(i, 0.9 - 0.1 * i) for i in range(len(pool))]  # type: ignore[method-assign]
     r._fetch_history_pairs_pg = lambda g, uuids, cap: []  # type: ignore[method-assign]
     # Stub compaction empty so no chunker/reranker runs in the passage stage. There's no
@@ -72,7 +71,8 @@ def test_debug_true_attaches_envelope():
     assert "debug" in out
     d = out["debug"]
     assert isinstance(d["total_ms"], float)
-    # Timed legs: the six always-on legs plus timeline+prefs (both enabled by default).
+    # Timed legs: the six always-on legs plus timeline (enabled by default). The prefs
+    # leg was removed 2026-07-27 — it must never reappear in the waterfall.
     assert set(d["legs_ms"]) == {
         "embed",
         "bm25",
@@ -81,8 +81,8 @@ def test_debug_true_attaches_envelope():
         "web",
         "rerank",
         "timeline",
-        "prefs",
     }
+    assert "preferences" not in out  # the prefs bucket is gone from the served payload
     assert all(isinstance(v, float) for v in d["legs_ms"].values())
     # Pool sizes mirror the fused bm25(1)+vector(1)=2 pool; KG stub served no candidates.
     assert d["pool_sizes"] == {"bm25": 1, "vector": 1, "fused": 2, "kg_candidates": 0}
@@ -106,10 +106,9 @@ def test_debug_false_omits_key_and_is_byte_identical():
 
 
 def test_disabled_legs_are_omitted_from_legs_ms(monkeypatch):
-    # A disabled timeline/prefs leg has no timed future, so its key is dropped — the
+    # A disabled timeline leg has no timed future, so its key is dropped — the
     # console renders it as untimed/skipped rather than a spurious 0 ms bar.
     monkeypatch.setattr(recall_module, "_TIMELINE_IN_RECALL", False)
-    monkeypatch.setattr(recall_module, "_PREFS_IN_RECALL", False)
     r = Recall("", "")
     _wire_stubs(r)
     d = r.recall("q", debug=True)["debug"]

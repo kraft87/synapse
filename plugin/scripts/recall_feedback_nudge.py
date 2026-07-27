@@ -32,7 +32,7 @@ def main() -> None:
     if _cfg("SYNAPSE_RECALL_FEEDBACK_NUDGE", "1") == "0":
         return
     msg = (
-        "[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:/p:) "
+        "[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:) "
         "in your answer, call recall_feedback(query=<verbatim query>, helpful=[...], "
         'noise=[...], missing="...") ONCE to close the retrieval-quality loop: '
         "helpful=load-bearing ids, noise=irrelevant ids, missing=one line on what was not "

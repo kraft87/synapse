@@ -3,6 +3,11 @@
 Covers issue #10 (served_ids JSONB round-trips per bucket) and the schema-039 repair:
 n_timeline / ms_timeline / n_prefs / ms_prefs were passed by the writer since the
 033/035 legs shipped but silently dropped because _METRIC_COLS never gained them.
+
+n_prefs / ms_prefs are LEGACY as of 2026-07-27 — the preferences recall leg was removed,
+so recall() no longer passes them and live rows carry NULL. These tests drive _do_record
+directly, pinning that the WRITER still maps the columns (historical rows stay readable);
+that the recall path stops populating them is pinned in test_telemetry_kinds.py.
 """
 
 from __future__ import annotations
