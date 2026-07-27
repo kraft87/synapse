@@ -16,6 +16,12 @@ from typing import Any
 import mcp_server.recall as recall_module
 from mcp_server.recall import Recall
 
+# Poison DSN, not "": libpq reads its PG* env vars for an empty conninfo, so an
+# unstubbed leg would quietly connect on any host that has them set (that is exactly
+# how CI hid the unstubbed _search_bm25_web leg while it failed on dev boxes). A
+# refused port turns a missing stub into an immediate, obvious failure everywhere.
+_NO_DB = "postgresql://synapse@127.0.0.1:1/nonexistent"
+
 
 class _FakeEmbedder:
     def embed(self, texts: list[str], task: str | None = None) -> list[list[float]]:
@@ -50,7 +56,10 @@ def _wire_stubs(r: Recall) -> None:
     r._timeline_engine = _FakeTimeline()
     r._search_bm25_episodes = lambda q, p, n: [_episode(1, "alpha episode body")]  # type: ignore[method-assign]
     r._search_vector_episodes = lambda emb, p, n: [_episode(2, "beta episode body")]  # type: ignore[method-assign]
+    # BOTH halves of the web leg: _search_web_reranked fuses BM25 + vector, so stubbing
+    # only the vector half leaves _search_bm25_web reaching for a real connection.
     r._search_vector_web = lambda emb, n: []  # type: ignore[method-assign]
+    r._search_bm25_web = lambda q, n: []  # type: ignore[method-assign]
     r._search_kg = lambda q, emb, g, sf, fact_limit: ([], [])  # type: ignore[method-assign]
     r._rerank_pool_scored = lambda q, pool: [(i, 0.9 - 0.1 * i) for i in range(len(pool))]  # type: ignore[method-assign]
     r._fetch_history_pairs_pg = lambda g, uuids, cap: []  # type: ignore[method-assign]
@@ -64,7 +73,7 @@ def _wire_stubs(r: Recall) -> None:
 
 
 def test_debug_true_attaches_envelope():
-    r = Recall("", "")
+    r = Recall(_NO_DB, "")
     _wire_stubs(r)
     out = r.recall("connection pooling decisions", debug=True)
 
@@ -95,7 +104,7 @@ def test_debug_true_attaches_envelope():
 
 
 def test_debug_false_omits_key_and_is_byte_identical():
-    r = Recall("", "")
+    r = Recall(_NO_DB, "")
     _wire_stubs(r)
     with_dbg = r.recall("connection pooling decisions", debug=True)
     without = r.recall("connection pooling decisions", debug=False)
@@ -109,7 +118,7 @@ def test_disabled_legs_are_omitted_from_legs_ms(monkeypatch):
     # A disabled timeline leg has no timed future, so its key is dropped — the
     # console renders it as untimed/skipped rather than a spurious 0 ms bar.
     monkeypatch.setattr(recall_module, "_TIMELINE_IN_RECALL", False)
-    r = Recall("", "")
+    r = Recall(_NO_DB, "")
     _wire_stubs(r)
     d = r.recall("q", debug=True)["debug"]
     assert set(d["legs_ms"]) == {"embed", "bm25", "vector", "kg", "web", "rerank"}

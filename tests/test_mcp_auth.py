@@ -24,6 +24,11 @@ _AUTH_KEYS = (
 
 
 def _reload(monkeypatch, env):
+    # Point the module's dotenv fallback at a path that doesn't exist. Setting a key to
+    # "" is not enough on its own: _cfg reads `os.environ.get(k) or _env.get(k)`, so an
+    # empty env var falls through to the repo-root .env and a developer's local config
+    # leaks into these assertions (CI passed only because it has no .env).
+    monkeypatch.setenv("SYNAPSE_ENV_FILE", "/nonexistent/synapse-test.env")
     # Neutralize any inherited/.env auth config, then apply the case's env.
     for k in _AUTH_KEYS:
         monkeypatch.setenv(k, env.get(k, ""))

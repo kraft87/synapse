@@ -21,6 +21,12 @@ from datetime import UTC, datetime, timedelta
 import mcp_server.recall as recall_mod
 from mcp_server.recall import Recall, _floor_shadow
 
+# Poison DSN, not "": libpq reads its PG* env vars for an empty conninfo, so an
+# unstubbed leg would quietly connect on any host that has them set (that is exactly
+# how CI hid the unstubbed _search_bm25_web leg while it failed on dev boxes). A
+# refused port turns a missing stub into an immediate, obvious failure everywhere.
+_NO_DB = "postgresql://synapse@127.0.0.1:1/nonexistent"
+
 
 class _FakeEmbedder:
     def __init__(self, fail: bool = False) -> None:
@@ -57,13 +63,16 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
     ``scores`` are the raw rerank scores handed back for the pool, by pool index (extra
     entries ignored when the pool is shorter).
     """
-    r = Recall("", "")
+    r = Recall(_NO_DB, "")
     p = _pool() if pool is None else pool
     r._ensure_embedder = lambda: _FakeEmbedder(fail=embed_fail)
     r._ensure_timeline = lambda: _FakeTimeline()
     r._search_bm25_episodes = lambda q, proj, limit: list(p)
     r._search_vector_episodes = lambda emb, proj, limit: []
+    # BOTH halves of the web leg: _search_web_reranked fuses BM25 + vector, so stubbing
+    # only the vector half leaves _search_bm25_web reaching for a real connection.
     r._search_vector_web = lambda emb, n: []
+    r._search_bm25_web = lambda q, n: []
     r._search_kg = lambda *a, **k: ([], [])
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
