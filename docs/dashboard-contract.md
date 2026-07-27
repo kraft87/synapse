@@ -151,15 +151,15 @@ The `debug` envelope surfaces the SAME numbers the engine already measures for t
  "debug": {
    "total_ms": 341.0,
    "legs_ms": {"embed": 12.0, "bm25": 48.0, "vector": 96.0, "kg": 141.0,
-               "web": 4.0, "rerank": 168.0, "timeline": 33.0, "prefs": 9.0},
+               "web": 4.0, "rerank": 168.0, "timeline": 33.0},
    "pool_sizes": {"bm25": 100, "vector": 100, "fused": 100, "kg_candidates": 12},
    "rerank": {"model": "rerank-2.5-lite", "top_score": 0.91},
    "est_tokens": 1874}}
 ```
 
 `legs_ms` carries only legs the engine timed. `embed / bm25 / vector / kg / web / rerank`
-are always present; `timeline` / `prefs` appear only when their leg is enabled
-(`SYNAPSE_RECALL_TIMELINE` / `SYNAPSE_RECALL_PREFS` ≠ 0) — an omitted leg renders as
+are always present; `timeline` appears only when its leg is enabled
+(`SYNAPSE_RECALL_TIMELINE` ≠ 0) — an omitted leg renders as
 untimed/skipped in the waterfall. Absent `debug` key ⇒ `debug` was not requested. The waterfall
 UI models the parallel band schematically (all parallel legs start at embed-end, rerank at the
 max parallel end) from these durations; the payload carries durations, not start offsets.

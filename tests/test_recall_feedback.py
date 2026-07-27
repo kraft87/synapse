@@ -42,7 +42,7 @@ def test_validator_accepts_none_empty_and_served_forms():
 
 
 def test_validator_accepts_all_bucket_id_forms():
-    # Every recall bucket now carries an id; all forms are ratable.
+    # Every recall bucket carries an id; all served forms are ratable.
     assert (
         _feedback_ids_error(
             "helpful",
@@ -51,12 +51,19 @@ def test_validator_accepts_all_bucket_id_forms():
                 "n:45",  # note
                 "t:9",  # timeline
                 "w:7",  # web
-                "p:3",  # preference
                 "f:0b3c1d2e-4f56-7890-abcd-ef0123456789",  # fact (KG edge uuid)
             ],
         )
         is None
     )
+
+
+def test_validator_rejects_retired_preference_ids():
+    # The preferences bucket was removed from recall() on 2026-07-27, so recall can no
+    # longer serve a p:N id and nothing may legitimately cite one. Historical rows keep
+    # theirs; new reports are rejected at the tool boundary.
+    err = _feedback_ids_error("helpful", ["e:1", "p:3"])
+    assert err is not None and "p:3" in err
 
 
 def test_web_item_id_is_single_prefixed_and_ratable():

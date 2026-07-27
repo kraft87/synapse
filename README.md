@@ -58,7 +58,7 @@ compact, ranked result
 3. A background poller groups episodes into overlapping **chunks** and mines them for
    entities and bitemporal facts — the **knowledge graph**, in Postgres.
 4. `recall()` runs its legs in parallel (reranked episodes, KG facts, timeline events,
-   web research, preferences, fact history) and returns a compact, ranked result.
+   web research, fact history) and returns a compact, ranked result.
 
 Architecture, design decisions, and the measurements behind them:
 [ARCHITECTURE.md](./ARCHITECTURE.md).

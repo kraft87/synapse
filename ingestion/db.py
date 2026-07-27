@@ -552,8 +552,9 @@ class Database:
         """One labeled retrieval-quality report (the recall_feedback tool).
 
         Offline data only — never read by live ranking; ids are pre-validated
-        served forms ("e:N", "n:N", "f:<uuid>", "t:N", "w:N", "p:N") at the tool
-        boundary."""
+        served forms ("e:N", "n:N", "f:<uuid>", "t:N", "w:N") at the tool
+        boundary. Historical rows may also carry "p:N" preference ids, served
+        before the preferences recall leg was removed (2026-07-27)."""
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO recall_feedback "

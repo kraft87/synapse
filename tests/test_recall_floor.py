@@ -5,7 +5,7 @@ the floor, the recall_metrics served_ids envelope gains {"would_abstain": true,
 "floor": <float>} — recorded regardless of enforcement.
 
 Enforcement (ON by default as of 2026-07-23): recall() drops the EPISODE bucket when the raw
-top rerank score is in (0, floor) under working retrieval (query_emb present). Facts / prefs /
+top rerank score is in (0, floor) under working retrieval (query_emb present). Facts and
 timeline are unaffected. recall_episodes() (drill-down) never enforces — the caller asked for
 turns. The marker still fires either way, so telemetry and payload agree on WHEN a recall was
 below the floor.
@@ -65,7 +65,6 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
     r._search_vector_episodes = lambda emb, proj, limit: []
     r._search_vector_web = lambda emb, n: []
     r._search_kg = lambda *a, **k: ([], [])
-    r._search_preferences = lambda emb, gid, limit: []
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}

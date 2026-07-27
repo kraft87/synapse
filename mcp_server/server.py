@@ -491,8 +491,8 @@ def recall(
     which may be speculation or a plan that never happened.
 
     Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact — also
-    the superseded_facts pairs, t:N timeline, w:N web, p:N preference) — copy it
-    into recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
+    the superseded_facts pairs, t:N timeline, w:N web) — copy it into
+    recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
     rest are feedback-only.
 
     Follow-ups: fetch(ids) expands a truncated passage or note body;
@@ -888,18 +888,20 @@ def recall_timeline(
 # for offline eval + reranker tuning, so the id validation is strict: downstream
 # tooling must be able to trust the served id forms without re-parsing. Every recall
 # bucket carries an id, so all are ratable:
-#   e:N episode  n:N note  f:<uuid> fact  t:N timeline  w:N web  p:N preference
+#   e:N episode  n:N note  f:<uuid> fact  t:N timeline  w:N web
 # The numeric kinds share one shape; facts (and superseded_facts) carry the KG edge uuid.
+# "p:N" preference was dropped on 2026-07-27 with the preferences recall leg — recall no
+# longer serves that bucket, so no p:N id can be legitimately cited and it is now rejected.
 
-_FEEDBACK_ID_RE = re.compile(r"^(?:[enptw]:\d+|f:[0-9a-fA-F-]{8,})$")
+_FEEDBACK_ID_RE = re.compile(r"^(?:[entw]:\d+|f:[0-9a-fA-F-]{8,})$")
 
 
 def _feedback_ids_error(field: str, ids: list[str] | None) -> str | None:
     """Validation error for recall_feedback's helpful/noise lists, or None if valid.
 
     Accepts None or a list of served-id strings — "e:N" episode, "n:N" note,
-    "f:<uuid>" fact, "t:N" timeline, "w:N" web, "p:N" preference — exactly as
-    recall() serves them. Anything else is rejected."""
+    "f:<uuid>" fact, "t:N" timeline, "w:N" web — exactly as recall() serves them.
+    Anything else is rejected."""
     if ids is None:
         return None
     if not isinstance(ids, list):
@@ -908,8 +910,7 @@ def _feedback_ids_error(field: str, ids: list[str] | None) -> str | None:
     if bad:
         return (
             f"{field} contains invalid ids {bad!r} — expected recall-served ids: "
-            '"e:N" episode, "n:N" note, "f:<uuid>" fact, "t:N" timeline, '
-            '"w:N" web, "p:N" preference'
+            '"e:N" episode, "n:N" note, "f:<uuid>" fact, "t:N" timeline, "w:N" web'
         )
     return None
 
@@ -980,7 +981,7 @@ def recall_feedback(
     signal) vs "filesystem" / "live_system" / "web" / "user" (memory never had
     it) vs "nowhere" (still unresolved). Every recall bucket carries an `id` you
     can copy here verbatim — "e:N" episodes, "f:<uuid>" facts (and
-    superseded_facts), "t:N" timeline, "w:N" web, "p:N" preferences — and "n:N"
+    superseded_facts), "t:N" timeline, "w:N" web — and "n:N"
     note ids from the session-start board or fetch(): WHEN a board note shaped
     your answer (or misled it), rate its n:N here too. A report with only
     `missing` set is still valuable; file it when a recall came back empty-handed.
