@@ -52,10 +52,10 @@ def main() -> None:
         params = {"project": project} if project else {}
         r = get_json("/context", params, timeout=10)
         text = r.get("text") if r.get("status") == "ok" else None
+        if text:
+            print(text)  # inside the guard: a print that raises must not break the session
     except Exception:
         return  # fail-open: no block, no noise
-    if text:
-        print(text)
 
 
 if __name__ == "__main__":

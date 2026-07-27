@@ -12,10 +12,13 @@ explicitly opted in (SYNAPSE_SKILLS_SYNC=1, issue #9 — a hook that writes into
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 from pathlib import Path
 from types import ModuleType
+
+import pytest
 
 _CONFIG_PY = Path(__file__).resolve().parents[1] / "plugin" / "scripts" / "config.py"
 
@@ -117,3 +120,22 @@ def test_skills_sync_defaults_off_opt_in(monkeypatch, tmp_path):
 def test_skills_sync_opt_in_via_settings(monkeypatch, tmp_path):
     cfg = _fresh_config(monkeypatch, tmp_path, options={"SYNAPSE_SKILLS_SYNC": "1"})
     assert cfg.SKILLS_SYNC is True
+
+
+def test_importing_config_makes_stdout_utf8(monkeypatch, tmp_path):
+    """Windows Python defaults stdout to the ANSI codepage (cp1252), which cannot encode
+    the `→` the server renders into the board — the SessionStart hook died with a
+    UnicodeEncodeError traceback instead of printing. Importing config re-wraps stdout as
+    UTF-8, so every hook script that imports it is covered."""
+    trap = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", trap)
+    with pytest.raises(UnicodeEncodeError):  # the bug, without the fix
+        print("→")
+        sys.stdout.flush()
+
+    out = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(out, encoding="cp1252"))
+    _fresh_config(monkeypatch, tmp_path)  # import-time _force_utf8_stdio()
+    print("→")
+    sys.stdout.flush()
+    assert out.getvalue() == "→\n".encode()

@@ -31,19 +31,19 @@ def main() -> None:
     try:
         r = get_json("/preferences/top", {"limit": 8}, timeout=10)
         items = r.get("items") or []
+        if not items:
+            return
+        lines = ["[Synapse preferences]"]
+        for it in items[:_MAX_LINES]:
+            pref = it.get("pref")
+            if not pref:
+                continue
+            tag = _MARK.get(it.get("polarity"), it.get("polarity") or "")
+            lines.append(f"  - ({tag}) {pref}")
+        if len(lines) > 1:
+            print("\n".join(lines))  # inside the guard: rendering must not break the session
     except Exception:
         return  # fail-open: no block, no noise
-    if not items:
-        return
-    lines = ["[Synapse preferences]"]
-    for it in items[:_MAX_LINES]:
-        pref = it.get("pref")
-        if not pref:
-            continue
-        tag = _MARK.get(it.get("polarity"), it.get("polarity") or "")
-        lines.append(f"  - ({tag}) {pref}")
-    if len(lines) > 1:
-        print("\n".join(lines))
 
 
 if __name__ == "__main__":
