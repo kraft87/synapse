@@ -46,7 +46,15 @@ logger = logging.getLogger(__name__)
 
 
 def _load_env() -> dict[str, str]:
-    env_path = Path(__file__).resolve().parent.parent / ".env"
+    """Parse the dotenv fallback layer. Real env vars always win over this (see _cfg).
+
+    SYNAPSE_ENV_FILE overrides the path. Tests that reload this module point it at a
+    nonexistent path so a developer's repo-root .env can't leak into an assertion about
+    unset config — `monkeypatch.setenv(k, "")` alone does NOT neutralize this layer,
+    because _cfg treats an empty env var as absent and falls through to it.
+    """
+    override = os.environ.get("SYNAPSE_ENV_FILE")
+    env_path = Path(override) if override else Path(__file__).resolve().parent.parent / ".env"
     env: dict[str, str] = {}
     if env_path.exists():
         for line in env_path.read_text().splitlines():

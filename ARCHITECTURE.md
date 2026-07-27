@@ -631,6 +631,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `POLL_INTERVAL_SECONDS` | `300` | poller full-cycle cadence |
 | `LOGFIRE_TOKEN` | optional | telemetry **emit** only |
 | `LOGFIRE_SERVICE_NAME` | `synapse-mcp` / `synapse-poller` | service name on emitted spans (set per container) |
+| `SYNAPSE_ENV_FILE` | `<repo>/.env` | path to the MCP server's `.env` fallback file. Real env vars always win over it; tests that reload `mcp_server.server` point this at a nonexistent path so a developer's local `.env` can't satisfy an assertion about *unset* config |
 
 `CLAUDE_CODE_OAUTH_TOKEN` (Max-subscription auth) or `ANTHROPIC_API_KEY` must be present in the environment for extraction, but neither is read by Synapse code — they are consumed by the spawned `claude` CLI that `claude-agent-sdk` drives ([§2](#the-llm-call-path-claude-agent-sdk)).
 
