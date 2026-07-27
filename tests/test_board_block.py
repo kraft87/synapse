@@ -158,6 +158,22 @@ def test_project_derived_from_hook_cwd(monkeypatch, tmp_path, capsys, cwd, expec
     assert capsys.readouterr().out == "b\n"
 
 
+def test_unprintable_board_is_silent(monkeypatch, tmp_path):
+    """Fail-open covers the print, not just the fetch: a stdout that rejects a character
+    (a Windows cp1252 console meeting the board's `→`) must not turn a SessionStart hook
+    into a traceback. config re-wraps stdout as UTF-8 so this shouldn't happen — this is
+    the belt to that suspenders."""
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+
+    class _RejectingStdout(io.StringIO):
+        def write(self, s: str) -> int:
+            raise UnicodeEncodeError("charmap", s, 0, 1, "character maps to <undefined>")
+
+    monkeypatch.setattr(sys, "stdout", _RejectingStdout())
+    _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/synapse"}), {"status": "ok", "text": "→"})
+
+
 @pytest.mark.parametrize(
     "stdin",
     ["", "not json {", json.dumps({}), json.dumps({"cwd": "/"})],

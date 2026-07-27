@@ -29,10 +29,27 @@ import json
 import os
 import re
 import socket
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+
+def _force_utf8_stdio() -> None:
+    """Hook output is UTF-8 — the server renders arrows and box-drawing into the board.
+    Windows Python defaults stdout to the ANSI codepage (cp1252), where a bare `→` raises
+    UnicodeEncodeError and the hook dies with a traceback instead of printing its block.
+    Every hook script imports this module, so reconfiguring here covers all of them, and
+    errors="replace" keeps a still-exotic character from turning into a crash."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass  # not a TextIOWrapper (redirected / detached) — nothing to fix
+
+
+_force_utf8_stdio()
 
 
 def _path(env: str, default: str) -> Path:
