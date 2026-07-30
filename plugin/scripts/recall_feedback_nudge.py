@@ -34,10 +34,11 @@ def main() -> None:
     msg = (
         "[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:) "
         "in your answer, call recall_feedback(query=<verbatim query>, helpful=[...], "
-        'noise=[...], missing="...") ONCE to close the retrieval-quality loop: '
-        "helpful=load-bearing ids, noise=irrelevant ids, missing=one line on what was not "
-        "served (+ found_via=where you eventually got it, e.g. full_turns/filesystem/"
-        "nowhere). Skip only if you used none of the results."
+        'noise=[...], missing="...", comment="...") ONCE to close the retrieval-quality '
+        "loop: helpful=load-bearing ids, noise=irrelevant ids, missing=one line on content "
+        "not served (+ found_via=where you eventually got it, e.g. full_turns/filesystem/"
+        "nowhere), comment=free text for anything else (too much served, buried hit, bad "
+        "ordering). Skip only if you used none of the results."
     )
     print(
         json.dumps(

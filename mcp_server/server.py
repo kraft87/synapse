@@ -929,7 +929,7 @@ def _file_recall_feedback(
     noise: list[str] | None,
     missing: str | None,
     found_via: str | None,
-    note: str | None,
+    comment: str | None,
     session_id: str | None,
     project: str | None,
 ) -> dict:
@@ -956,7 +956,9 @@ def _file_recall_feedback(
             # One short token ("full_turns", "filesystem", ...) — whitespace-collapsed
             # and capped, free text by design (see schema 048).
             found_via=" ".join((found_via or "").split())[:60] or None,
-            note=note,
+            # The model-facing name is `comment` (general free-text spot); the
+            # column stays `note` from schema 046 — no migration for a rename.
+            note=comment,
             session_id=session_id,
             project=project,
         )
@@ -972,27 +974,36 @@ def recall_feedback(
     noise: list[str] | None = None,
     missing: str | None = None,
     found_via: str | None = None,
-    note: str | None = None,
+    comment: str | None = None,
     session_id: str | None = None,
     project: str | None = None,
 ) -> dict:
     """Report retrieval quality after a recall() whose results you used: which
-    served ids genuinely helped, which were noise, and what was missing.
+    served ids genuinely helped, which were noise, what was missing, plus any
+    free-text comment on how the serving itself went.
 
     AFTER acting on a recall's results — you answered from them, or found they
     lacked what you needed — call this ONCE with that recall's query string.
     `helpful` = served ids that were load-bearing for your answer; `noise` =
     served ids that were irrelevant or distracting; `missing` = one line on
-    what you needed but were not served. WHEN you set `missing` and later got
-    the information anyway, set `found_via` = where, one token: "full_turns" /
-    "fetch" / "another_recall" (memory HAD it — a serving miss, the highest-value
-    signal) vs "filesystem" / "live_system" / "web" / "user" (memory never had
-    it) vs "nowhere" (still unresolved). Every recall bucket carries an `id` you
-    can copy here verbatim — "e:N" episodes, "f:<uuid>" facts (and
-    superseded_facts), "t:N" timeline, "w:N" web — and "n:N"
-    note ids from the session-start board or fetch(): WHEN a board note shaped
-    your answer (or misled it), rate its n:N here too. A report with only
-    `missing` set is still valuable; file it when a recall came back empty-handed.
+    CONTENT you needed but were not served, strictly absence and nothing else.
+    Everything else worth saying goes in `comment`, free text: too much was
+    dumped at once, the load-bearing hit was buried under filler, wrong
+    granularity or ordering, a passage that misled you, an idea for improving
+    this retrieval. If the serving experience was off in a way the id lists
+    can't express, say so in `comment` — do NOT stretch `missing` to carry it.
+
+    WHEN you set `missing` and later got the information anyway, set
+    `found_via` = where, one token: "full_turns" / "fetch" / "another_recall"
+    (memory HAD it — a serving miss, the highest-value signal) vs "filesystem" /
+    "live_system" / "web" / "user" (memory never had it) vs "nowhere" (still
+    unresolved). Every recall bucket carries an `id` you can copy here verbatim
+    — "e:N" episodes, "f:<uuid>" facts (and superseded_facts), "t:N" timeline,
+    "w:N" web — and "n:N" note ids from the session-start board or fetch():
+    WHEN a board note shaped your answer (or misled it), rate its n:N here too.
+    A report with only `missing` or only `comment` set is still valuable; file
+    it when a recall came back empty-handed or the serving itself was the
+    problem.
 
     This is offline labeled data (eval goldens, reranker tuning). It never
     changes live ranking, so honest negatives are safe and wanted.
@@ -1005,16 +1016,17 @@ def recall_feedback(
         query: The recall query being rated, verbatim.
         helpful: Served ids that were load-bearing ("e:123", "f:<uuid>", "w:7").
         noise: Served ids that were irrelevant or distracting.
-        missing: What you needed that the recall did not return.
+        missing: One line on content you needed that was not served.
         found_via: Where the missing info turned up ("full_turns", "filesystem",
             "user", "nowhere", ...) — only meaningful alongside `missing`.
-        note: Free-form idea for improving this retrieval.
+        comment: Free text for anything the other fields can't say — serving
+            volume, ordering, presentation, misleading results, improvement ideas.
         session_id: Optional session id for grouping reports.
         project: Optional project slug the recall was scoped to.
     """
     with logfire.span("mcp.recall_feedback {query!r}", query=query[:80], project=project):
         return _file_recall_feedback(
-            query, helpful, noise, missing, found_via, note, session_id, project
+            query, helpful, noise, missing, found_via, comment, session_id, project
         )
 
 
@@ -1200,7 +1212,8 @@ async def feedback_http(request: Request) -> JSONResponse:
     (_file_recall_feedback); same machine-token gate; fail-soft like /ingest.
 
     Body: {"query": str, "helpful"?: [..], "noise"?: [..], "missing"?: str,
-           "found_via"?: str, "note"?: str, "session_id"?: str, "project"?: str}.
+           "found_via"?: str, "comment"?: str, "session_id"?: str, "project"?: str}.
+    "note" is accepted as a legacy alias for "comment" (pre-1.0.1 callers).
     """
     if not _machine_authorized(request):
         return unauthorized()
@@ -1219,7 +1232,7 @@ async def feedback_http(request: Request) -> JSONResponse:
             noise=body.get("noise"),
             missing=body.get("missing"),
             found_via=body.get("found_via"),
-            note=body.get("note"),
+            comment=body.get("comment") or body.get("note"),
             session_id=body.get("session_id"),
             project=body.get("project"),
         )
