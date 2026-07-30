@@ -147,7 +147,7 @@ def test_tool_round_trip_inserts_labeled_row(conn, _test_db):
         noise=["e:3"],
         missing="the frobnication config file path",
         found_via="  filesystem \n grep  ",  # whitespace collapses on the way in
-        note="serve config-file chunks for widget queries",
+        comment="serve config-file chunks for widget queries",
         session_id="synthetic-session-0001",
         project="demo",
     )

@@ -1,6 +1,6 @@
 [project]
 name = "synapse"
-version = "1.0.0"
+version = "1.0.1"
 description = "Self-hosted long-term memory for AI coding agents — episodic store, knowledge graph, and MCP server"
 license = { text = "MIT" }
 authors = [{ name = "kraft87" }]
