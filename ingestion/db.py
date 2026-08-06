@@ -428,6 +428,27 @@ class Database:
             for r in rows
         ]
 
+    def search_live_notes(
+        self, owner_id: str, project: str | None, embedding: list[float], limit: int = 24
+    ) -> list[dict[str, Any]]:
+        """Live notes nearest to ``embedding`` (hook KNN), scoped like the board: global
+        types (user/feedback/reference) always in, project notes only for the caller's
+        project (``project = NULL`` matches global types only). No group filter — notes
+        span groups and the board doesn't filter either. recall()'s notes leg reads this;
+        ``find_live_notes`` (above) stays the reconcile path's owner/group-exact probe."""
+        vlit = _vector_literal(embedding)
+        with self._conn() as conn:
+            rows = conn.execute(
+                f"SELECT id, hook, body, type, project, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "
+                "FROM notes "
+                "WHERE owner_id = %s AND superseded_by IS NULL AND embedding IS NOT NULL "
+                "AND (type IN ('user','feedback','reference') OR project = %s) "
+                f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
+                (vlit, owner_id, project, vlit, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def insert_note(
         self,
         *,

@@ -319,6 +319,22 @@ _WEB_RERANK_POOL = int(os.getenv("SYNAPSE_RECALL_WEB_POOL", "60") or "60")  # fu
 # 0 disables the floor (still fuses BM25+vector and reranks, just serves the top-_WEB_LIMIT).
 _WEB_FLOOR = float(os.getenv("SYNAPSE_RECALL_WEB_FLOOR", "0.60") or "0.60")
 
+# Notes leg (2026-08-05). The board injects ~39 hooks a session; every other live note
+# (414 at ship time, growing ~17/day) was unreachable by search — hook embeddings have
+# been written since schema 041 but nothing read them except the remember() dedup KNN.
+# This serves the query-relevant notes as their own bucket: hook-embedding KNN over the
+# live set (board scoping: global types + the caller's project) -> cross-encoder floor
+# on "hook — body" text -> top _NOTES_LIMIT. The floor self-gates like web/timeline (an
+# all-subfloor result serves NO bucket), so notes only appear on genuine hits. A note
+# already on the board may be served again — accepted 2026-07-26; board-dedup needs the
+# session hook to pass served ids and is a later, measured step. n: ids flow through
+# served_ids/recall_feedback (#121), so helpful/noise labels accumulate from day one.
+_NOTES_IN_RECALL = os.getenv("SYNAPSE_RECALL_NOTES", "1") != "0"
+_NOTES_FLOOR = float(os.getenv("SYNAPSE_RECALL_NOTES_FLOOR", "0.60") or "0.60")
+_NOTES_LIMIT = int(os.getenv("SYNAPSE_RECALL_NOTES_LIMIT", "3") or "3")
+_NOTES_FETCH = int(os.getenv("SYNAPSE_RECALL_NOTES_FETCH", "24") or "24")
+_NOTES_BODY_CAP = 700  # serve capped bodies; fetch("n:N") returns the full note
+
 # Adaptive episode serving (variable-k) for recall_episodes() — OFF by default.
 # When SYNAPSE_EPISODE_CUTOFF_TAU > 0, recall_episodes() serves the reranked turns
 # scoring >= tau*top_score instead of a fixed top-`limit`, clamped to [MIN_K, MAX_K]:
@@ -731,7 +747,7 @@ class Recall:
         # web, KG) concurrently. Persistent so each worker's thread-local PG connection
         # is reused across calls. Legs never submit here, so concurrent recalls queue
         # rather than deadlock.
-        self._leg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="recall-leg")
+        self._leg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="recall-leg")
         self._timeline_engine: Any = None  # lazy TimelineRecall (timeline leg)
 
     def _ensure_pg(self) -> Any:
@@ -1477,6 +1493,41 @@ class Recall:
             ranked = [fused[i] for i, _ in scored] if scored else fused
         return self._dedupe_by_artifact(ranked, _WEB_LIMIT)
 
+    def _search_notes(
+        self, query: str, query_emb: list[float], project: str | None
+    ) -> list[dict[str, Any]]:
+        """Notes bucket: hook-KNN top-_NOTES_FETCH live notes (global types + this
+        project's), floored by the cross-encoder on "hook — body" text, top
+        _NOTES_LIMIT served. May return [] when nothing clears the floor — notes
+        self-gate on relevance like web. Fail-soft: any error serves no bucket.
+        Uses a short-lived Database like the other notes-store paths."""
+        from ingestion.db import Database
+
+        try:
+            db = Database(self._db_url)
+            try:
+                rows = db.search_live_notes(_KG_OWNER, project, query_emb, limit=_NOTES_FETCH)
+            finally:
+                db.close()
+        except Exception as e:
+            logger.warning("notes leg fetch failed: %s", e)
+            return []
+        if not rows:
+            return []
+        if _NOTES_FLOOR > 0:
+            docs = [{"fact": f"{r['hook']} — {r['body']}"[:_RERANK_DOC_CAP], "_r": r} for r in rows]
+            rows = [d["_r"] for d in self._floor_by_rerank(query, docs, _NOTES_FLOOR)]
+        served = []
+        for r in rows[:_NOTES_LIMIT]:
+            body = r["body"]
+            if len(body) > _NOTES_BODY_CAP:
+                body = body[:_NOTES_BODY_CAP] + "…"
+            item: dict[str, Any] = {"id": f"n:{r['id']}", "hook": r["hook"], "note": body}
+            if r.get("project"):
+                item["project"] = r["project"]
+            served.append(item)
+        return served
+
     # ------------------------------------------------------------------
     # KG traversal (Postgres)
     # ------------------------------------------------------------------
@@ -1657,6 +1708,8 @@ class Recall:
         "ms_timeline",
         "n_prefs",
         "ms_prefs",
+        "n_notes",
+        "ms_notes",
         "served_ids",
     )
 
@@ -1803,6 +1856,13 @@ class Recall:
             return items
 
         f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
+
+        # Notes leg: hook-KNN + rerank floor over the curated notes store (the board's
+        # searchable other half). Reuses this call's query embedding; no-ops without it.
+        def _notes_leg() -> list[dict[str, Any]]:
+            return self._search_notes(query, query_emb, project) if query_emb is not None else []
+
+        f_notes = ex.submit(_timed, _notes_leg) if _NOTES_IN_RECALL else None
 
         # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
         # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
@@ -1969,6 +2029,15 @@ class Recall:
                     item = {"id": f"t:{tid}", **item}  # cite in recall_feedback (not fetch())
                 tl.append(item)
             out["timeline"] = tl
+        note_items: list[dict[str, Any]] = []
+        ms_notes = 0.0
+        if f_notes is not None:
+            try:
+                note_items, ms_notes = f_notes.result()
+            except Exception as e:
+                logger.warning("notes leg failed: %s", e)
+        if note_items:
+            out["notes"] = note_items
 
         # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
         # pattern as the retrieval_count bump, so zero read-path latency.
@@ -1983,6 +2052,7 @@ class Recall:
                 for t in timeline_items
                 if t.get("_id") is not None and t.get("kind", "event") == "event"
             ],
+            "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
             "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
         }
@@ -2017,6 +2087,8 @@ class Recall:
             "n_history": len(superseded_facts),
             "n_timeline": len(out.get("timeline", [])),
             "ms_timeline": round(ms_timeline, 1),
+            "n_notes": len(note_items),
+            "ms_notes": round(ms_notes, 1),
             "chars": chars,
             "est_tokens": chars // 4,
             "pool_bm25": len(bm25_eps),
@@ -2044,6 +2116,8 @@ class Recall:
             }
             if f_timeline is not None:
                 legs_ms["timeline"] = metrics["ms_timeline"]
+            if f_notes is not None:
+                legs_ms["notes"] = metrics["ms_notes"]
             out["debug"] = {
                 "total_ms": metrics["ms_total"],
                 "legs_ms": legs_ms,
