@@ -141,11 +141,13 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
         "facts",
         "web",
         "timeline",
+        "notes",
         "n_echo_suppressed",
         "n_bm25_lifted",
     }
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
     assert served["facts"] == [] and served["timeline"] == []
+    assert served["notes"] == []
     assert "prefs" not in served and "preferences" not in out
     assert served["web"] == []
     assert served["n_echo_suppressed"] == 0

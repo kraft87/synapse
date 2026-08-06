@@ -90,6 +90,7 @@ def test_debug_true_attaches_envelope():
         "web",
         "rerank",
         "timeline",
+        "notes",
     }
     assert "preferences" not in out  # the prefs bucket is gone from the served payload
     assert all(isinstance(v, float) for v in d["legs_ms"].values())
@@ -118,8 +119,10 @@ def test_disabled_legs_are_omitted_from_legs_ms(monkeypatch):
     # A disabled timeline leg has no timed future, so its key is dropped — the
     # console renders it as untimed/skipped rather than a spurious 0 ms bar.
     monkeypatch.setattr(recall_module, "_TIMELINE_IN_RECALL", False)
+    monkeypatch.setattr(recall_module, "_NOTES_IN_RECALL", False)
     r = Recall(_NO_DB, "")
     _wire_stubs(r)
     d = r.recall("q", debug=True)["debug"]
     assert set(d["legs_ms"]) == {"embed", "bm25", "vector", "kg", "web", "rerank"}
     assert "timeline" not in d["legs_ms"] and "prefs" not in d["legs_ms"]
+    assert "notes" not in d["legs_ms"]

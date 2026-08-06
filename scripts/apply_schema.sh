@@ -88,6 +88,7 @@ FILES=(
   046_recall_feedback.sql
   047_drop_memory_proposals.sql
   048_feedback_found_via.sql
+  049_recall_metrics_notes.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means
