@@ -75,7 +75,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__.*__(recall|recall_full_turns|recall_feedback)$",
+        "matcher": "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session)$",
         "hooks": [
           {
             "type": "command",

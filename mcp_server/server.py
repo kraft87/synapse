@@ -537,6 +537,7 @@ def recall_full_turns(
     project: str | None = None,
     limit: int = 5,
     self_session: str | None = None,
+    session_id: str | None = None,
 ) -> dict:
     """Search the complete, unabridged text of past conversation turns — the
     drill-down and retry sibling of recall().
@@ -572,8 +573,16 @@ def recall_full_turns(
         self_session: NEVER set this yourself. The client's PreToolUse hook
             injects the calling session's id so your own session's turns are
             excluded; calls without it simply skip that exclusion.
+        session_id: Scope to ONE conversation — the `session` field from a
+            recall/fetch result, or "self" for the current session.
     """
     with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
+        if session_id == "self":
+            if not self_session:  # no hook injection — refuse loudly, don't search globally
+                return {
+                    "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
+                }
+            session_id = self_session
         # Same engine path as the retired recall_episodes tool and the interim
         # recall(mode="turns") — telemetry keeps kind='episodes' so historical
         # per-tool metrics stay comparable.
@@ -583,6 +592,7 @@ def recall_full_turns(
             limit=max(1, min(int(limit), 10)),
             source="mcp-tool",
             self_session=self_session,
+            session_id=session_id,
         )
 
 
@@ -605,6 +615,57 @@ def fetch(ids: list[str]) -> dict:
     """
     with logfire.span("mcp.fetch", n=len(ids)):
         return _get_recall().fetch(ids, source="mcp-tool")
+
+
+@mcp.tool()
+def fetch_session(
+    session_id: str,
+    around: str | None = None,
+    radius: int = 3,
+    offset: int = 0,
+    limit: int = 10,
+    self_session: str | None = None,
+) -> dict:
+    """Read one conversation sequentially — like opening the transcript file at
+    a spot, instead of searching. Every recall/fetch episode carries a `session`
+    field; pass it here to see what surrounded that turn.
+
+    WHEN a recalled turn is the middle of a discussion and you need how it
+    started or what was decided after — pass its e:N id as `around`: that anchor
+    comes back FULL, ±`radius` neighbors as 500-char heads with `full_chars`
+    (expand interesting ones via fetch()). WHEN you want to skim a whole
+    session, page it with offset/limit (heads only). Use "self" as session_id
+    for the current conversation.
+
+    Do NOT search with this — recall_full_turns(query, session_id=...) greps
+    within a session; this reads it in order. An unindexed session returns an
+    explicit error — THAT is the signal to read the on-disk transcript instead.
+
+    Args:
+        session_id: Session to read — the `session` field from a recall/fetch
+            episode, or "self" for the current conversation.
+        around: Anchor episode id ("e:N") to center the window on.
+        radius: Neighbors per side around the anchor (0-10, default 3).
+        offset: Anchorless paging — turn index to start from (default 0).
+        limit: Anchorless paging — turns per page (1-25, default 10).
+        self_session: NEVER set this yourself; the client hook injects it to
+            resolve session_id="self".
+    """
+    with logfire.span("mcp.fetch_session {sid}", sid=session_id[:40], around=around):
+        if session_id == "self":
+            if not self_session:  # no hook injection — refuse loudly
+                return {
+                    "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
+                }
+            session_id = self_session
+        return _get_recall().fetch_session(
+            session_id=session_id,
+            around=around,
+            radius=radius,
+            offset=offset,
+            limit=limit,
+            source="mcp-tool",
+        )
 
 
 def _notes_deps() -> tuple:

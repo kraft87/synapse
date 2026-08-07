@@ -96,7 +96,7 @@ def _episodes_wired(scores: list[float], *, pool: list[dict] | None = None):
     """Same harness routed through recall_episodes()' pool primitive."""
     p = _pool() if pool is None else pool
     r, captured = _wired(scores, pool=p)
-    r._episode_pool = lambda q, emb, proj: list(p)
+    r._episode_pool = lambda q, emb, proj, session_id=None: list(p)
     return r, captured
 
 
