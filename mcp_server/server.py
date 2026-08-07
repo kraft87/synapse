@@ -573,9 +573,8 @@ def recall_full_turns(
         self_session: NEVER set this yourself. The client's PreToolUse hook
             injects the calling session's id so your own session's turns are
             excluded; calls without it simply skip that exclusion.
-        session_id: Scope the search to ONE conversation — grep-within-a-session.
-            Use the `session` field a recall/fetch result carried, or "self" for
-            the current session (self-exclusion is skipped for scoped calls).
+        session_id: Scope to ONE conversation — the `session` field from a
+            recall/fetch result, or "self" for the current session.
     """
     with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
         if session_id == "self":

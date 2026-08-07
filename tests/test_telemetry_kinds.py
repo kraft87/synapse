@@ -166,7 +166,7 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
     q = f"telemetry shape pin episodes {uuid.uuid4().hex[:8]}"
     p = _pool()
     engine = _wired(db_url, [0.31, 0.22, 0.11, 0.05])  # real scores, below the floor
-    engine._episode_pool = lambda q_, emb, proj: list(p)
+    engine._episode_pool = lambda q_, emb, proj, session_id=None: list(p)
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q)  # the MCP surface path for the drill-down
@@ -205,7 +205,7 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
     for i, ep in enumerate(p):
         ep["session_id"] = "MY-SESSION" if i < 2 else f"other-{i}"
     engine = _wired(db_url, [0.9, 0.8])  # scores for the 2 survivors
-    engine._episode_pool = lambda q_, emb, proj: [dict(e) for e in p]
+    engine._episode_pool = lambda q_, emb, proj, session_id=None: [dict(e) for e in p]
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q, self_session="MY-SESSION")
