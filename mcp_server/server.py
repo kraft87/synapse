@@ -1,4 +1,4 @@
-"""Synapse MCP server — recall, fetch, remember, recall_timeline, and
+"""Synapse MCP server — recall, fetch, remember, and
 recall_feedback as MCP tools (plus issue_machine_token, hidden from listings).
 
 Run with:
@@ -310,7 +310,7 @@ _INSTRUCTIONS = (
     "BEFORE answering anything that references past work — a prior decision, "
     "device, purchase, tool, project, person, or preference — search with "
     "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
-    "(n:N) from earlier results. recall_timeline answers when-did / how-long "
+    "(n:N) from earlier results. "
     "questions; recall_full_turns searches complete raw turns — the retry when an "
     "overview recall comes back thin. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "
@@ -413,19 +413,6 @@ def _get_recall() -> Recall:  # type: ignore[name-defined,unused-ignore]  # noqa
     return _recall_engine
 
 
-# Lazy-init timeline engine (one per process)
-_timeline_engine: TimelineRecall | None = None  # type: ignore[name-defined,unused-ignore]  # noqa: F821
-
-
-def _get_timeline() -> TimelineRecall:  # type: ignore[name-defined,unused-ignore]  # noqa: F821
-    global _timeline_engine
-    if _timeline_engine is None:
-        from mcp_server.timeline import TimelineRecall
-
-        _timeline_engine = TimelineRecall(db_url=DB_URL, voyage_api_key=VOYAGE_API_KEY)
-    return _timeline_engine
-
-
 def app_health_check() -> dict:
     """Health check callable — used by /health endpoint and container probes."""
     return {"status": "ok", "service": "synapse"}
@@ -449,7 +436,7 @@ async def health(request: Request) -> JSONResponse:
 # intended-use order: recall (the workhorse), recall_full_turns (its drill-down /
 # retry sibling — re-split from mode="turns" on 2026-07-26 so its trigger
 # inventory gets a full 2KB description instead of a corner of recall's), fetch
-# (id expansion), remember (the write), the specialist read — recall_timeline —
+# (id expansion), remember (the write),
 # then recall_feedback (the after-the-fact quality report). Hidden plumbing
 # (issue_machine_token, see _HIDDEN_TOOLS) registers last.
 # test_tool_surface.py pins this order.
@@ -504,7 +491,6 @@ def recall(
     rest are feedback-only.
 
     Follow-ups: fetch(ids) expands a truncated passage or note body;
-    recall_timeline() answers when-did / how-long.
 
     Args:
         query: Natural language search query.
@@ -872,75 +858,6 @@ async def remember(
     # asyncio.run() internally — asyncio.run() cannot be called from a running
     # event loop, so it must live on a worker thread, never on FastMCP's loop.
     return await anyio.to_thread.run_sync(_work)
-
-
-@mcp.tool()
-def recall_timeline(
-    query: str | None = None,
-    since: str | None = None,
-    until: str | None = None,
-    project: str | None = None,
-    min_salience: int = 0,
-    limit: int = 20,
-    group_id: str | None = None,
-) -> dict:
-    """The personal timeline: dated events that happened (commits, decisions,
-    ships), served in chronological order.
-
-    WHEN the question is about dates, order, or duration — "when did I...",
-    "what did I do last week", "how long between X and Y" — call this. Two query
-    shapes: topical (query set: "the login work") hybrid-searches events and
-    returns them chronologically; pure-time (query empty, since/until set:
-    "last week") returns the window's events, milestones individually and dense
-    runs collapsed to one line with count + first/last anchors.
-
-    Do NOT use this for what-is-true facts or preferences — recall() owns those;
-    this tool owns what-happened events. Do NOT compute a bare day-count from
-    the results without citing the two anchor events' dates the payload gives
-    you.
-
-    Args:
-        query: Optional topical search ("browser-free login work"). Empty = pure time-range.
-        since: Optional ISO date/timestamp lower bound (inclusive).
-        until: Optional ISO date/timestamp upper bound (exclusive).
-        project: Optional project slug filter (e.g. "synapse").
-        min_salience: 0 (all), 1 (skip routine), 2 (milestones only).
-        limit: Max items for pure-time queries (post-collapse, default 20).
-        group_id: Scope — pass "personal" for questions about the user's own life
-            (health, appointments, purchases, career) to exclude technical/work
-            events; unset or "technical" serves everything.
-    """
-    import time as _time
-
-    with logfire.span(
-        "mcp.recall_timeline {query!r}",
-        query=(query or "")[:80],
-        since=since,
-        until=until,
-        project=project,
-    ):
-        t0 = _time.perf_counter()
-        res = _get_timeline().recall_timeline(
-            query=query,
-            since=since,
-            until=until,
-            project=project,
-            min_salience=min_salience,
-            limit=limit,
-            group_id=group_id,
-        )
-        items = res.get("items") or []
-        for it in items:
-            it.pop("_id", None)  # internal telemetry key (recall served_ids), not for callers
-        # One recall_metrics row (kind='timeline') per serve, through the recall
-        # engine's fire-and-forget writer — same seam as remember/board telemetry.
-        _get_recall().record_event(
-            "timeline",
-            source="mcp-tool",
-            ms_total=round((_time.perf_counter() - t0) * 1000.0, 1),
-            served_ids={"n_events": len(items)},
-        )
-        return res
 
 
 # recall_episodes was retired as a standalone tool (item 6 tool-surface audit:

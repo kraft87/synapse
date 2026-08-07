@@ -62,23 +62,13 @@ _RERANKER_UNSET = object()
 
 _KG_CANDIDATE_LIMIT = 30
 _RRF_K = 60
-# Timeline leg (schema 033). recall() fuses a compact chronological event list into the
-# payload on EVERY query. It originally fired behind a temporal-intent regex, but the
-# regex missed 41% of dated questions on LongMemEval (ordering phrasings like "which
-# came first, X or Y" carry no temporal keyword), and the leg is one cheap parallel DB
-# read serving <=8 events (~0.5KB; empty result = no payload change) — a gate buys
-# nothing. Kill switch SYNAPSE_RECALL_TIMELINE=0.
-_TIMELINE_IN_RECALL = os.environ.get("SYNAPSE_RECALL_TIMELINE", "1") != "0"
-_TIMELINE_LIMIT = 8
-# Absolute cross-encoder floor on the INLINE timeline leg (2026-07-24). The timeline bucket
-# served ~23% precision (feedback); the noise is OFF-TOPIC events, not routine ones — salience
-# gating was measured useless (47/49 labeled-noise events are salience>=1), so min_salience is
-# the wrong lever. A relevance floor is the right one: validated on 64 labeled events, floor 0.40
-# gives 86% noise suppression at 87% helpful retention (~23%->~65% precision). Overlap is real
-# (helpful min 0.264, noise max 0.555), so this is not the clean 100/100 web got. No keep->=1
-# backstop: an all-subfloor result serves [] (self-gates, like web). The STANDALONE
-# recall_timeline() deep path stays unfloored. 0 disables. Applies only when the leg fires.
-_TIMELINE_FLOOR = float(os.getenv("SYNAPSE_RECALL_TIMELINE_FLOOR", "0.40") or "0.40")
+# The inline timeline leg (schema 033) was REMOVED from recall() on 2026-08-07 along
+# with the standalone recall_timeline tool. Prod ran the leg off (SYNAPSE_RECALL_TIMELINE=0)
+# from 2026-07-28: 0 helpful citations in 100 rated recalls while eating 524 served slots,
+# and no chronology gaps appeared in feedback missing-reports during the off-window.
+# Lifetime t: citations: 39 helpful / 92 noise (30% precision, below facts). The
+# timeline_events store, its ingestion gate, and the board's "Last 7 days" block
+# (timeline_routes._recent_events) are untouched — only retrieval is gone.
 # The preferences leg (schema 035) was REMOVED from recall on 2026-07-27. Measured on
 # recall_feedback + recall_metrics since b6dcaf3 (2026-07-22, when all six buckets became
 # citable): prefs served 380 rows across rated queries for 6 helpful citations — 1.6% of
@@ -364,7 +354,6 @@ _EPISODE_CUTOFF_MAX_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MAX_K", "8") or "8
 # sixth, reuse the right shape rather than copy-pasting:
 #   PER-ITEM rerank floors (drop individual served items below a score) — share _floor_by_rerank:
 #     • FACTS    _RECALL_FACT_FLOOR (below, default 0/off, keep_min=1 — never blanks)
-#     • TIMELINE _TIMELINE_FLOOR    (line ~81, 0.40, keep_min=0 — self-gates to [])
 #     • WEB      _WEB_FLOOR         (line ~297, 0.60) — applied inline in _search_web_reranked on
 #                                    the pool it ALREADY reranked for ordering, so it does not call
 #                                    _floor_by_rerank (that would double-rerank); same idea, keep_min=0.
@@ -695,8 +684,6 @@ def _served_chars(out: dict[str, Any]) -> int:
         n += len(e.get("name") or "") + len(e.get("summary") or "")
     for w in out.get("web", []):
         n += len(w.get("context") or "") + len(w.get("excerpt") or "") + len(w.get("title") or "")
-    for t in out.get("timeline", []):
-        n += len(t.get("fact") or "") + len(str(t.get("date") or ""))
     for h in out.get("superseded_facts", []):
         n += len(str(h.get("fact") or "")) + len(str(h.get("superseded_by") or ""))
     return n
@@ -760,7 +747,6 @@ class Recall:
         # is reused across calls. Legs never submit here, so concurrent recalls queue
         # rather than deadlock.
         self._leg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="recall-leg")
-        self._timeline_engine: Any = None  # lazy TimelineRecall (timeline leg)
 
     def _ensure_pg(self) -> Any:
         # Thread-local: each thread (the caller + every leg-executor worker) owns its
@@ -780,15 +766,6 @@ class Recall:
         conn.execute("SET hnsw.ef_search = 200")
         self._pg_local.conn = conn
         return conn
-
-    def _ensure_timeline(self) -> Any:
-        if self._timeline_engine is None:
-            from mcp_server.timeline import TimelineRecall
-
-            self._timeline_engine = TimelineRecall(
-                db_url=self._db_url, voyage_api_key=self._voyage_key
-            )
-        return self._timeline_engine
 
     def _ensure_embedder(self) -> Any:
         if self._embedder is None:
@@ -1086,7 +1063,7 @@ class Recall:
         keep_min: int = 0,
     ) -> list[dict[str, Any]]:
         """Shared per-item relevance gate: drop served items the cross-encoder scores below
-        ``floor`` (off-topic). Backs _floor_facts and _floor_timeline — one of several recall()
+        ``floor`` (off-topic). Backs _floor_facts and the notes leg — one of several recall()
         relevance gates (see the "Relevance gates" map by _RECALL_FACT_FLOOR).
 
         These buckets hold SHORT items (facts/events), scored at full length — unlike episodes
@@ -1113,12 +1090,6 @@ class Recall:
         """Fact relevance gate (_RECALL_FACT_FLOOR): drop off-topic facts, keep >=1 so the bucket
         is never blanked. Thin wrapper over _floor_by_rerank; caller gates on the floor > 0."""
         return self._floor_by_rerank(query, facts, _RECALL_FACT_FLOOR, keep_min=1)
-
-    def _floor_timeline(self, query: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Inline timeline relevance gate (_TIMELINE_FLOOR): drop off-topic events (salience gating
-        proved useless — the labeled noise is on-salience). NO keep->=1, so an all-subfloor result
-        serves [] (self-gates like web); the standalone recall_timeline() deep path is NOT floored."""
-        return self._floor_by_rerank(query, items, _TIMELINE_FLOOR)
 
     def _compact_to_passages(
         self, query: str, episodes: list[dict[str, Any]], n: int
@@ -1862,19 +1833,6 @@ class Recall:
         f_web = ex.submit(_timed, _web_leg)
         f_kg = ex.submit(_timed, _kg_leg)
 
-        # Timeline leg: only on temporal intent. Reuses this call's query embedding
-        # (no second Voyage call); the engine owns its own thread-local PG conns.
-        def _timeline_leg() -> list[dict[str, Any]]:
-            res = self._ensure_timeline().recall_timeline(
-                query=query, project=project, query_emb=query_emb, group_id=group_id
-            )
-            items = list(res.get("items") or [])[:_TIMELINE_LIMIT]
-            if _TIMELINE_FLOOR > 0 and items:
-                items = self._floor_timeline(query, items)
-            return items
-
-        f_timeline = ex.submit(_timed, _timeline_leg) if _TIMELINE_IN_RECALL else None
-
         # Notes leg: hook-KNN + rerank floor over the curated notes store (the board's
         # searchable other half). Reuses this call's query embedding; no-ops without it.
         def _notes_leg() -> list[dict[str, Any]]:
@@ -2023,30 +1981,6 @@ class Recall:
             # Renamed from "history" 2026-07-18 — the displaced version of each served
             # fact, keyed like the superseded_by columns elsewhere in the system.
             out["superseded_facts"] = superseded_facts  # {fact: old, superseded_by: current}
-        timeline_items: list[dict[str, Any]] = []
-        ms_timeline = 0.0
-        if f_timeline is not None:
-            try:
-                timeline_items, ms_timeline = f_timeline.result()
-            except Exception as e:
-                logger.warning("timeline leg failed: %s", e)
-        if timeline_items:
-            # Slim chronological bucket: date + fact (+type/salience). The dates make
-            # interval questions answerable AND auditable (anchor events, never a bare N).
-            tl: list[dict[str, Any]] = []
-            for t in timeline_items:
-                if t.get("kind", "event") != "event":
-                    continue
-                item = {
-                    "date": str(t.get("t_valid"))[:10],
-                    "fact": t.get("fact"),
-                    "type": t.get("event_type"),
-                    "salience": t.get("salience"),
-                }
-                if (tid := t.get("_id")) is not None:
-                    item = {"id": f"t:{tid}", **item}  # cite in recall_feedback (not fetch())
-                tl.append(item)
-            out["timeline"] = tl
         note_items: list[dict[str, Any]] = []
         ms_notes = 0.0
         if f_notes is not None:
@@ -2060,16 +1994,11 @@ class Recall:
         # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
         # pattern as the retrieval_count bump, so zero read-path latency.
         # served_ids (issue #10): WHICH results were served, per bucket. Episodes dedupe
-        # because passages share a parent id; timeline mirrors the bucket's event filter.
+        # because passages share a parent id.
         served_ids: dict[str, Any] = {
             "episodes": list(dict.fromkeys(it["id"] for it in (ep_items or []) if it.get("id"))),
             "facts": [f["_uuid"] for f in served_facts if f.get("_uuid")],
             "web": [c["id"] for c in web_chunks if c.get("id")],
-            "timeline": [
-                t["_id"]
-                for t in timeline_items
-                if t.get("_id") is not None and t.get("kind", "event") == "event"
-            ],
             "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
             "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
@@ -2103,8 +2032,6 @@ class Recall:
             "n_episodes": len(out.get("episodes", [])),
             "n_web": len(web_chunks),
             "n_history": len(superseded_facts),
-            "n_timeline": len(out.get("timeline", [])),
-            "ms_timeline": round(ms_timeline, 1),
             "n_notes": len(note_items),
             "ms_notes": round(ms_notes, 1),
             "chars": chars,
@@ -2132,8 +2059,6 @@ class Recall:
                 "web": metrics["ms_web"],
                 "rerank": metrics["ms_rerank"],
             }
-            if f_timeline is not None:
-                legs_ms["timeline"] = metrics["ms_timeline"]
             if f_notes is not None:
                 legs_ms["notes"] = metrics["ms_notes"]
             out["debug"] = {
