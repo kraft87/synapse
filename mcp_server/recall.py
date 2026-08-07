@@ -229,6 +229,14 @@ _FACT_LIMIT = 12  # KG facts returned by recall()
 # A wide-pool fact reranker added only +0.01-0.03 more for a per-recall API call — not
 # worth it; just serving more is the win. Costs ~+200 fact-tokens/recall (facts are short).
 _EPISODE_LIMIT = 5  # episodes returned by recall_episodes()
+
+# fetch_session — sequential session read (the Read analog; spec 2026-08-07,
+# shapes from the July-08 primitives draft: anchor full, neighbors as heads).
+_SESSION_RADIUS_DEFAULT = 3  # neighbors per side around the anchor
+_SESSION_RADIUS_MAX = 10
+_SESSION_PAGE_DEFAULT = 10  # anchorless paging: turns per page
+_SESSION_PAGE_MAX = 25
+_SESSION_HEAD_CHARS = 500  # neighbor preview size; full_chars says what fetch() expands to
 # WIN1 (2026-06-03, episode_pool_rerank): exact-fact misses were pure truncation —
 # golds rank 16-88 in a leg but prod fetched only _EPISODE_LIMIT*3=15, so they never
 # entered the served pool. Deep-fetch + WIDE-pool cross-encoder recovers them:
@@ -448,8 +456,10 @@ def _to_recall_item(row: dict[str, Any]) -> dict[str, Any]:
     """Slim a SQL row into the minimum shape an LLM caller can act on.
 
     Keeps the episode id (for fetch() drill-down) + content + project (only when
-    non-null) + date (truncated from full timestamp). Drops everything used only for ranking
-    or debug: session_id, doc_type, retrieval_count, vec_distance, bm25_score, etc.
+    non-null) + date (truncated from full timestamp) + session (the pivot key for
+    fetch_session / recall_full_turns(session_id=...) drill-down). Drops
+    everything used only for ranking or debug: doc_type, retrieval_count,
+    vec_distance, bm25_score, etc.
     """
     out: dict[str, Any] = {}
     if (rid := row.get("id")) is not None:
@@ -459,6 +469,8 @@ def _to_recall_item(row: dict[str, Any]) -> dict[str, Any]:
         out["project"] = project
     if (ts := row.get("created_at")) is not None:
         out["date"] = str(ts)[:10]
+    if (sid := row.get("session_id")) is not None:
+        out["session"] = sid  # pass to fetch_session to read the surrounding turns
     return out
 
 
@@ -817,7 +829,13 @@ class Recall:
         return ""
 
     def _bm25_table(
-        self, table: str, query: str, project: str | None, limit: int, doc_type: str
+        self,
+        table: str,
+        query: str,
+        project: str | None,
+        limit: int,
+        doc_type: str,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         # A query with no alphanumeric content tokenizes to nothing — skip the
         # round-trip instead of burning it on a guaranteed-empty (or erroring)
@@ -828,31 +846,26 @@ class Recall:
         pg = self._ensure_pg()
         ts = self._ts_col(table)
         extra = self._extra_cols(table)
+        where = ["id @@@ paradedb.match('content', %s)"]
+        params: list[Any] = [query]
+        if project:
+            where.append("project = %s")
+            params.append(project)
+        if session_id:  # episodes only — the session-scoped drill-down filter
+            where.append("session_id = %s")
+            params.append(session_id)
         try:
-            if project:
-                rows = pg.execute(
-                    f"""
-                    SELECT id, content, project,
-                           {ts} AS created_at{extra},
-                           paradedb.score(id) AS bm25_score
-                    FROM {table}
-                    WHERE id @@@ paradedb.match('content', %s) AND project = %s
-                    ORDER BY bm25_score DESC LIMIT %s
-                    """,
-                    (query, project, limit),
-                ).fetchall()
-            else:
-                rows = pg.execute(
-                    f"""
-                    SELECT id, content, project,
-                           {ts} AS created_at{extra},
-                           paradedb.score(id) AS bm25_score
-                    FROM {table}
-                    WHERE id @@@ paradedb.match('content', %s)
-                    ORDER BY bm25_score DESC LIMIT %s
-                    """,
-                    (query, limit),
-                ).fetchall()
+            rows = pg.execute(
+                f"""
+                SELECT id, content, project,
+                       {ts} AS created_at{extra},
+                       paradedb.score(id) AS bm25_score
+                FROM {table}
+                WHERE {" AND ".join(where)}
+                ORDER BY bm25_score DESC LIMIT %s
+                """,
+                (*params, limit),
+            ).fetchall()
             return [
                 {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
             ]
@@ -861,16 +874,22 @@ class Recall:
             return []
 
     def _search_bm25_episodes(
-        self, query: str, project: str | None, limit: int
+        self, query: str, project: str | None, limit: int, session_id: str | None = None
     ) -> list[dict[str, Any]]:
-        return self._bm25_table("episodes", query, project, limit, "episode")
+        return self._bm25_table("episodes", query, project, limit, "episode", session_id)
 
     # ------------------------------------------------------------------
     # Vector search — episodes
     # ------------------------------------------------------------------
 
     def _vector_table(
-        self, table: str, emb_literal: str, project: str | None, limit: int, doc_type: str
+        self,
+        table: str,
+        emb_literal: str,
+        project: str | None,
+        limit: int,
+        doc_type: str,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         pg = self._ensure_pg()
         ts = self._ts_col(table)
@@ -883,31 +902,26 @@ class Recall:
         # from it; the alias form is NOT index-eligible.
         # Half precision is loss-free for what's served: recall@10 vs exact scan = 1.000,
         # recall@100 = 0.981 (and the reranker re-scores the pool). 878ms -> 23ms on episodes.
+        where = ["is_embedded = TRUE"]
+        params: list[Any] = [emb_literal]
+        if project:
+            where.append("project = %s")
+            params.append(project)
+        if session_id:  # episodes only — the session-scoped drill-down filter
+            where.append("session_id = %s")
+            params.append(session_id)
         try:
-            if project:
-                rows = pg.execute(
-                    f"""
-                    SELECT id, content, project,
-                           {ts} AS created_at{extra},
-                           (embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})) AS vec_distance
-                    FROM {table}
-                    WHERE is_embedded = TRUE AND project = %s
-                    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s
-                    """,
-                    (emb_literal, project, emb_literal, limit),
-                ).fetchall()
-            else:
-                rows = pg.execute(
-                    f"""
-                    SELECT id, content, project,
-                           {ts} AS created_at{extra},
-                           (embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})) AS vec_distance
-                    FROM {table}
-                    WHERE is_embedded = TRUE
-                    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s
-                    """,
-                    (emb_literal, emb_literal, limit),
-                ).fetchall()
+            rows = pg.execute(
+                f"""
+                SELECT id, content, project,
+                       {ts} AS created_at{extra},
+                       (embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})) AS vec_distance
+                FROM {table}
+                WHERE {" AND ".join(where)}
+                ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s
+                """,
+                (*params, emb_literal, limit),
+            ).fetchall()
             return [
                 {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
             ]
@@ -916,10 +930,10 @@ class Recall:
             return []
 
     def _search_vector_episodes(
-        self, query_emb: list[float], project: str | None, limit: int
+        self, query_emb: list[float], project: str | None, limit: int, session_id: str | None = None
     ) -> list[dict[str, Any]]:
         emb_literal = _vec_literal(query_emb)
-        return self._vector_table("episodes", emb_literal, project, limit, "episode")
+        return self._vector_table("episodes", emb_literal, project, limit, "episode", session_id)
 
     # ------------------------------------------------------------------
     # Reranking + episode leg
@@ -1282,6 +1296,8 @@ class Recall:
                 item["project"] = project
             if (ts := ep.get("created_at")) is not None:
                 item["date"] = str(ts)[:10]
+            if (sid := ep.get("session_id")) is not None:
+                item["session"] = sid  # pivot key for fetch_session drill-down
             # Provenance label (issue #17): who produced this slice of the turn —
             # "user" / "assistant" / "mixed"; omitted when unattributable.
             if role := _passage_role(role_spans[id(ep)], bounds[span[0]][0], bounds[span[-1]][1]):
@@ -1382,6 +1398,7 @@ class Recall:
         project: str | None,
         fetch: int = _EPISODE_FETCH,
         pool_size: int = _EPISODE_RERANK_POOL,
+        session_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fused BM25+vector episode candidate pool, PRE-rerank (WIN1 deep-fetch).
 
@@ -1389,11 +1406,12 @@ class Recall:
         drill-down); recall() merges it with the summary candidates and co-reranks
         in a single cross-encoder pass, then partitions by doc_type. The deep fetch
         is what lets the reranker recover a rank-16..88 gold; plain RRF can't.
-        BM25-only when the query embedding is unavailable."""
-        bm25_eps = self._search_bm25_episodes(query, project, fetch)
+        BM25-only when the query embedding is unavailable. ``session_id`` scopes
+        both legs to one conversation (the fetch_session/Grep drill-down)."""
+        bm25_eps = self._search_bm25_episodes(query, project, fetch, session_id)
         vec_eps: list[dict[str, Any]] = []
         if query_emb is not None:
-            vec_eps = self._search_vector_episodes(query_emb, project, fetch)
+            vec_eps = self._search_vector_episodes(query_emb, project, fetch, session_id)
         return _merge_rrf(bm25_eps, vec_eps, id_key="id")[:pool_size]
 
     # ------------------------------------------------------------------
@@ -2142,11 +2160,17 @@ class Recall:
         limit: int = _EPISODE_LIMIT,
         source: str | None = None,
         self_session: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, Any]:
         """Raw episode drill-down: individual conversation turns.
 
         Best for 'show me exactly what was said about X' queries.
         Returns full episode content ranked by relevance + recency.
+
+        ``session_id`` scopes the search to ONE conversation (the Grep-within-a-
+        session drill-down): same BM25+vector+rerank pipeline, pool restricted to
+        that session, and self-exclusion is skipped — an explicit session ask
+        must never be suppressed, even for the caller's own session.
 
         Served on the MCP surface as the recall_full_turns tool (standalone again
         since 2026-07-26 — its docstring needed more room than a mode inside
@@ -2164,11 +2188,13 @@ class Recall:
         # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
-        pool = self._episode_pool(query, query_emb, project)
+        pool = self._episode_pool(query, query_emb, project, session_id=session_id)
         # Same self-exclusion as recall(): the caller's own turns are already in
         # its context window. Pool-level so excluded slots backfill before rerank.
+        # Skipped under a session filter — the caller explicitly asked for that
+        # session's turns, including when it is its own.
         n_self_excluded = 0
-        if _RECALL_SELF_EXCLUDE and self_session:
+        if _RECALL_SELF_EXCLUDE and self_session and not session_id:
             pre_excl = len(pool)
             pool = self._exclude_self(pool, self_session)
             n_self_excluded = pre_excl - len(pool)
@@ -2196,6 +2222,8 @@ class Recall:
         if self_session:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
+        if session_id:
+            served_ids["session_id"] = session_id  # session-scoped drill-down call
         # Shadow abstention floor (telemetry only) — same RAW pre-recency score contract
         # as recall(); the served episodes above are untouched.
         _floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)
@@ -2255,13 +2283,140 @@ class Recall:
         )
         return out
 
+    def fetch_session(
+        self,
+        session_id: str,
+        around: str | None = None,
+        radius: int = _SESSION_RADIUS_DEFAULT,
+        offset: int = 0,
+        limit: int = _SESSION_PAGE_DEFAULT,
+        source: str | None = None,
+    ) -> dict[str, Any]:
+        """Sequential read of one session's turns — the Read analog of the
+        session drill-down (recall_episodes(session_id=...) is the Grep analog).
+
+        Two modes:
+          * ``around="e:N"``: the anchor turn full, ±``radius`` neighbors as
+            _SESSION_HEAD_CHARS-char heads (cap _SESSION_RADIUS_MAX/side).
+          * anchorless: ``offset``/``limit`` paging over the whole session,
+            heads only (cap _SESSION_PAGE_MAX/page) — skim, then fetch() ids.
+
+        Pure indexed read (episodes_session_idx + the (session_id, sequence)
+        unique pair): no embedding, no rerank. An unknown session returns an
+        explicit ``error`` — never a silent empty — so the caller knows to fall
+        back to the on-disk transcript rather than concluding "nothing there".
+        """
+        t_start = time.perf_counter()
+        radius = max(0, min(int(radius), _SESSION_RADIUS_MAX))
+        offset = max(0, int(offset))
+        limit = max(1, min(int(limit), _SESSION_PAGE_MAX))
+        out: dict[str, Any] = {"session_id": session_id}
+
+        try:
+            pg = self._ensure_pg()
+            meta = pg.execute(
+                "SELECT count(*) AS n, min(created_at) AS first, max(created_at) AS last,"
+                " min(project) AS project FROM episodes WHERE session_id = %s",
+                (session_id,),
+            ).fetchone()
+            if not meta or not meta["n"]:
+                out["error"] = (
+                    "session not indexed — no ingested turns under this id. If the session is"
+                    " recent or ran headless, its transcript may still be on disk"
+                    " (~/.claude/projects/*/<session_id>.jsonl); read it there."
+                )
+                return out
+            out["project"] = meta["project"]
+            out["total_turns"] = meta["n"]
+            out["first_date"] = str(meta["first"])[:10]
+            out["last_date"] = str(meta["last"])[:10]
+
+            anchor_id: int | None = None
+            if around:
+                try:
+                    anchor_id = int(str(around).split(":")[-1])
+                except ValueError:
+                    out["error"] = f"unparseable anchor id {around!r} — expected 'e:N'"
+                    return out
+                anchor = pg.execute(
+                    "SELECT sequence FROM episodes WHERE id = %s AND session_id = %s",
+                    (anchor_id, session_id),
+                ).fetchone()
+                if anchor is None:
+                    out["error"] = f"episode {around} is not in session {session_id}"
+                    return out
+                rows = pg.execute(
+                    "SELECT id, sequence, content, created_at,"
+                    " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
+                    " FROM episodes WHERE session_id = %s AND sequence BETWEEN %s AND %s"
+                    " ORDER BY sequence",
+                    (session_id, anchor["sequence"] - radius, anchor["sequence"] + radius),
+                ).fetchall()
+            else:
+                rows = pg.execute(
+                    "SELECT id, sequence, content, created_at,"
+                    " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
+                    " FROM episodes WHERE session_id = %s"
+                    " ORDER BY sequence LIMIT %s OFFSET %s",
+                    (session_id, limit, offset),
+                ).fetchall()
+
+            turns: list[dict[str, Any]] = []
+            for r in rows:
+                content = r["content"] or ""
+                item: dict[str, Any] = {
+                    "id": f"e:{r['id']}",
+                    "seq": r["sequence"],
+                    "date": str(r["created_at"])[:10],
+                    "role": (
+                        "mixed"
+                        if r["has_h"] and r["has_a"]
+                        else "user"
+                        if r["has_h"]
+                        else "assistant"
+                    ),
+                }
+                if anchor_id is not None and r["id"] == anchor_id:
+                    item["content"] = content  # the anchor — served whole
+                else:
+                    item["head"] = content[:_SESSION_HEAD_CHARS]
+                    item["full_chars"] = len(content)  # what fetch(e:N) would expand to
+                turns.append(item)
+            out["turns"] = turns
+            if anchor_id is not None:
+                self._increment_retrieval_counts([anchor_id])
+            return out
+        except Exception as e:
+            logger.warning("fetch_session failed: %s", e)
+            out["error"] = f"fetch_session failed: {type(e).__name__}"
+            return out
+        finally:
+            served = out.get("turns") or []
+            chars = sum(len(t.get("content") or t.get("head") or "") for t in served)
+            self._record_metrics(
+                {
+                    "kind": "fetch_session",
+                    "source": source or "mcp",
+                    "query": f"{session_id} around={around} r={radius} off={offset}"[:200],
+                    "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
+                    "n_episodes": len(served),
+                    "chars": chars,
+                    "est_tokens": chars // 4,
+                    "served_ids": {
+                        "episodes": [t["id"] for t in served],
+                        "error": out.get("error"),
+                    },
+                }
+            )
+
     def _fetch_episode_records(self, parsed: list[int]) -> list[dict[str, Any]]:
         """The episodes leg of fetch(): full untruncated turns by int id. Fail-soft —
         a read error serves an empty leg, never breaks the call."""
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
-                "SELECT id, content, project, created_at FROM episodes WHERE id = ANY(%s)",
+                "SELECT id, content, project, created_at, session_id"
+                " FROM episodes WHERE id = ANY(%s)",
                 (parsed,),
             ).fetchall()
         except Exception as e:
