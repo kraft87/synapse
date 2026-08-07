@@ -540,6 +540,59 @@ Rules:
   ("User received a crystal chandelier from their aunt"). The line: "checked the
   inbox" recurs and teaches nothing; "gave spider plant cuttings to Mrs. Johnson"
   happened once and is the answer to a future when-question.
+- EDGES CONNECT THE REAL PARTICIPANTS — the user is NOT the default source. The user
+  narrates nearly every turn, so routing every happening through a "User" node collapses
+  the graph into one hub that no longer discriminates. When an event or statement has a
+  real counterparty or object (a person, org, place, thing), the EDGE joins THOSE, and
+  the user survives in the `fact` TEXT.
+  BAD:  source "User", target "Mrs. Johnson", GAVE
+        fact "User gave Mrs. Johnson spider plant cuttings on 2023-03-18 (meaning 2023-03-18)"
+  GOOD: source "spider plant cuttings", target "Mrs. Johnson", GIVEN_TO
+        fact "User gave Mrs. Johnson spider plant cuttings on 2023-03-18 (meaning 2023-03-18)"
+  BAD:  source "User", target "voyage-4-large", SWITCHED_TO
+        fact "User switched the embedder to voyage-4-large, replacing voyage-3"
+  GOOD: source "synapse", target "voyage-4-large", USES_EMBEDDER
+        fact "User switched synapse's embedder to voyage-4-large, replacing voyage-3"
+- A DECISION, APPROVAL, REQUEST, PURCHASE, or CLAIM IS A DOING — same rule. Connect
+  WHAT WAS CHOSEN to WHAT IT AFFECTS (or what it replaced), and never invent an
+  abstraction node ("the X decision", "the plan", "the approach") to receive the edge.
+  BAD:  source "User", target "ship decision", DECIDED
+        fact "User reversed and greenlit shipping episode rerank to production on 2026-06-03"
+  GOOD: source "episode rerank", target "production recall()", SHIPPED_TO
+        fact "User greenlit shipping episode rerank into production recall() on 2026-06-03
+        (meaning 2026-06-03), reversing an earlier hold-as-findings-only decision"
+  BAD:  source "User", target "MokerLink 2G05110GSM switch", BUYING
+        fact "User is buying the MokerLink 2G05110GSM switch for $40 CAD"
+  GOOD: source "MokerLink 2G05110GSM switch", target "homelab network", PURCHASED_FOR
+        fact "User is buying the MokerLink 2G05110GSM switch for $40 CAD for the homelab network"
+- REIFY a participant-less happening as its own event entity. When the happening has no
+  real counterparty to connect (a trip, a wedding, an appointment, a milestone), mint a
+  short noun-phrase entity for the EVENT itself and hang its participants, roles, dates,
+  and attributes off THAT node — one fact per attribute.
+  BAD:  source "User", target "cousin's wedding", ATTENDED
+        fact "User attended their cousin's wedding as a bridesmaid on 2025-06-14"
+  GOOD: source "cousin's wedding", target "bridesmaid", HAD_ROLE
+        fact "User was a bridesmaid at their cousin's wedding on 2025-06-14"
+        plus e.g. source "cousin's wedding", target "Niagara-on-the-Lake", HELD_AT
+        fact "User's cousin's wedding was held in Niagara-on-the-Lake on 2025-06-14"
+- THE FACT TEXT LOSES NOTHING. Rerouting an edge NEVER removes the user or the date from
+  the sentence — the text is what retrieval searches. Every fact about something the user
+  did, owns, received, or attended still SAYS so ("User ...", "User's ..."), and still
+  carries its date exactly as the date rule requires. A fact that reads "spider plant
+  cuttings were given to Mrs. Johnson" with the user erased is a FAILED extraction.
+- The user IS still a legitimate `source`/`target` for a STANDING PROPERTY of the user —
+  something that is true of them between sessions, with no date and no event behind it:
+  a preference, trait, condition, skill, employment, or human relationship ("User has
+  ADHD", "User prefers Postgres over MySQL", "User is Mrs. Johnson's neighbour", "User
+  works as a Security Playbook Engineer"). Do not contort those into object-first edges.
+  This carve-out does NOT cover anything that HAPPENED — a decision, approval, request,
+  purchase, report, complaint, assertion, action item, or a status the user is merely
+  waiting on. If the fact would carry a date, it is a happening: reroute it.
+  BAD:  source "Coinbase application", target "User", PENDING
+  GOOD: source "Coinbase application", target "Coinbase", AWAITING_REPLY_FROM
+        fact "User's Coinbase application was ~4 days old with no reply as of 2026-05-01
+        (meaning 2026-05-01)"
+  The rule bans the user as a HUB for doings and happenings, not as an entity.
 - PRESERVE EXACT QUANTITIES. A fact carrying a number, price, percentage, count, or
   duration MUST keep the figure VERBATIM in the fact text ("Women hold 20% of
   leadership positions at User's company", "User spent $120 on a helmet"). Never
@@ -572,9 +625,9 @@ bench", not the whole proposition. NEVER mint an entity from:
 - an imperative tip-list header ("Buy in bulk", "Plan your meals") — name the topical
   noun ("bulk buying") if it's worth keeping at all
 - a quoted slogan, idiom, or definitional phrase — not retrievable referents
-CONNECT FACTS DIRECTLY between the people, projects, and tools involved — never route
-a relationship through scenery or observation nouns. GOOD: "User -> MIGRATED ->
-synapse". BAD: "the migration log -> MENTIONS -> synapse". Descriptive detail
+CONNECT FACTS DIRECTLY between the people, projects, tools, and events involved — never
+route a relationship through scenery or observation nouns. GOOD: "synapse -> MIGRATED_TO
+-> Postgres 17". BAD: "the migration log -> MENTIONS -> synapse". Descriptive detail
 belongs inside the fact text of the direct edge.
 
 OUTPUT DISCIPLINE:
