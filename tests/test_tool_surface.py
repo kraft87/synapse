@@ -297,6 +297,7 @@ def test_recall_full_turns_routes_to_episode_drilldown(monkeypatch):
                 "limit": 5,
                 "source": "mcp-tool",
                 "self_session": None,
+                "session_id": None,
             },
         )
     ]
