@@ -532,6 +532,14 @@ Rules:
   "the inbox was checked and found empty", "discord-send.sh was used to post the
   briefing", "the calendar was clear", "X was run". GOOD: "the briefing pipeline posts
   to Discord #briefings via discord-send.sh", "Voyage embeddings are 2048-dim".
+- DATED HAPPENINGS ARE FACTS, not operational chatter. The ban above is for
+  routine tool churn, NOT for events someone would later ask "when did..." about.
+  DO emit first-person life events ("User attended their cousin's wedding as a
+  bridesmaid", "User repotted the spider plant"), shipped milestones ("the notes
+  store shipped to production"), and one-time occurrences with a date anchor
+  ("User received a crystal chandelier from their aunt"). The line: "checked the
+  inbox" recurs and teaches nothing; "gave spider plant cuttings to Mrs. Johnson"
+  happened once and is the answer to a future when-question.
 - PRESERVE EXACT QUANTITIES. A fact carrying a number, price, percentage, count, or
   duration MUST keep the figure VERBATIM in the fact text ("Women hold 20% of
   leadership positions at User's company", "User spent $120 on a helmet"). Never
