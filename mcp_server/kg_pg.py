@@ -170,9 +170,13 @@ def search_kg_postgres(
     hop_uuids: list[str] = []
     for sd in seed_uuids:
         cur.execute(
+            # ORDER BY t_valid DESC (2026-08-07): an unordered LIMIT 8 was fine when every
+            # entity had a handful of edges, but a supernode seed (the User node, live
+            # degree ~3.4k and growing with event facts) turned it into 8 arbitrary edges.
+            # Recency is the least-wrong single ordering for a "what about X" hop sample.
             "SELECT uuid, fact, t_valid FROM kg_relationships "
             "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-            "  AND (src_uuid = %s OR tgt_uuid = %s) LIMIT 8",
+            "  AND (src_uuid = %s OR tgt_uuid = %s) ORDER BY t_valid DESC LIMIT 8",
             (owner_id, group_id, sd, sd),
         )
         for u, f, tv in cur.fetchall():
