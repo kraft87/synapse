@@ -118,7 +118,7 @@ def _recent_events(
     conn = psycopg.connect(db_url, autocommit=True)
     try:
         q = (
-            "SELECT left(t_valid::text, 10) AS date, fact, project, salience, event_type "
+            "SELECT id, left(t_valid::text, 10) AS date, fact, project, salience, event_type "
             "FROM timeline_events "
             "WHERE t_valid > now() - make_interval(days => %s) AND salience >= %s "
         )
@@ -130,7 +130,14 @@ def _recent_events(
         params.append(limit)
         rows = conn.execute(q, params).fetchall()
         return [
-            {"date": r[0], "fact": r[1], "project": r[2], "salience": r[3], "event_type": r[4]}
+            {
+                "id": r[0],
+                "date": r[1],
+                "fact": r[2],
+                "project": r[3],
+                "salience": r[4],
+                "event_type": r[5],
+            }
             for r in rows
         ]
     finally:
