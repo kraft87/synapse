@@ -13,7 +13,7 @@ directive, zero latency, zero API calls — the model still decides which ids we
 
 The anchored matcher in hooks.json ensures this fires ONLY on recall() and
 recall_full_turns() (both serve rateable ids), NOT on recall_feedback /
-recall_timeline / fetch.
+fetch.
 
 Kill switch: SYNAPSE_RECALL_FEEDBACK_NUDGE=0 (env or plugin install options).
 """

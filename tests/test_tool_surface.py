@@ -47,7 +47,6 @@ _EXPECTED_ORDER = [
     "fetch",
     "fetch_session",
     "remember",
-    "recall_timeline",
     "recall_feedback",
 ]
 
@@ -96,12 +95,11 @@ def test_descriptions_and_instructions_fit_claude_code_truncation():
 # from the wire description — remember once lost its whole type-semantics block this
 # way. Pinning each tail proves no description got section-swallowed.
 _DESCRIPTION_TAILS = {
-    "recall": "answers when-did / how-long",
+    "recall": "expands a truncated passage or note body;",
     "recall_full_turns": "rateable in recall_feedback",
     "fetch": "at most 20 ids per call",
     "fetch_session": "read the on-disk transcript instead",
     "remember": "must stand alone months later",
-    "recall_timeline": "anchor events' dates the payload gives",
     "recall_feedback": "the board, or fetch",
 }
 

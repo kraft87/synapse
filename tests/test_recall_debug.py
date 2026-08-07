@@ -89,7 +89,6 @@ def test_debug_true_attaches_envelope():
         "kg",
         "web",
         "rerank",
-        "timeline",
         "notes",
     }
     assert "preferences" not in out  # the prefs bucket is gone from the served payload
@@ -118,7 +117,6 @@ def test_debug_false_omits_key_and_is_byte_identical():
 def test_disabled_legs_are_omitted_from_legs_ms(monkeypatch):
     # A disabled timeline leg has no timed future, so its key is dropped — the
     # console renders it as untimed/skipped rather than a spurious 0 ms bar.
-    monkeypatch.setattr(recall_module, "_TIMELINE_IN_RECALL", False)
     monkeypatch.setattr(recall_module, "_NOTES_IN_RECALL", False)
     r = Recall(_NO_DB, "")
     _wire_stubs(r)

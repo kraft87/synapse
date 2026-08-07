@@ -140,13 +140,12 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
         "episodes",
         "facts",
         "web",
-        "timeline",
         "notes",
         "n_echo_suppressed",
         "n_bm25_lifted",
     }
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
-    assert served["facts"] == [] and served["timeline"] == []
+    assert served["facts"] == []
     assert served["notes"] == []
     assert "prefs" not in served and "preferences" not in out
     assert served["web"] == []
@@ -255,38 +254,6 @@ def test_fetch_kind_row_shape(conn, db_url):
     assert served == {"kinds": {"e": 1, "n": 0}, "notes": []}
 
 
-# ---------------------------------------------------------------------------
-# kind='timeline' — the recall_timeline() MCP tool
-# ---------------------------------------------------------------------------
-
-
-def test_timeline_kind_row_shape(conn, db_url, monkeypatch):
-    engine = Recall(db_url, "")
-    monkeypatch.setattr(server, "_recall_engine", engine)
-
-    class _StubTimelineEngine:
-        def recall_timeline(self, **kwargs):
-            return {
-                "query_shape": "time",
-                "items": [{"_id": 7, "date": "2026-07-01", "fact": "shipped the widget"}],
-            }
-
-    monkeypatch.setattr(server, "_timeline_engine", _StubTimelineEngine())
-    mark = _watermark(conn)
-    out = server.recall_timeline(since="2026-07-01")
-    assert len(out["items"]) == 1
-    assert "_id" not in out["items"][0]  # internal key popped before serving
-
-    row = _newest(conn, engine, "timeline", "source, ms_total, served_ids", mark)
-    assert row is not None, "recall_timeline() emitted no kind='timeline' telemetry row"
-    source, ms_total, served = row
-    assert source == "mcp-tool"
-    assert ms_total is not None and ms_total >= 0
-    assert served == {"n_events": 1}
-
-
-# ---------------------------------------------------------------------------
-# kind='remember' — the remember() MCP tool
 # ---------------------------------------------------------------------------
 
 
