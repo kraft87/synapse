@@ -144,7 +144,8 @@ def _render(
             fact = e["fact"]
             if len(fact) > _EVENT_FACT_MAX:
                 fact = fact[: _EVENT_FACT_MAX - 1] + "…"
-            lines.append(f"- {str(e['date'])[5:]}{proj}: {fact}")
+            tid = f" (t:{e['id']})" if e.get("id") is not None else ""
+            lines.append(f"- {str(e['date'])[5:]}{proj}: {fact}{tid}")
     return "\n".join(lines)
 
 

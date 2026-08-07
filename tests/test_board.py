@@ -260,7 +260,7 @@ def test_timeline_section_present_and_absent(conn, db_url):
     _event(conn, "Shipped the board", salience=2, days_ago=1, ref="tb:1")
     text = build_board(db_url, None)["text"]
     assert "## Last 7 days" in text
-    assert re.search(r"- \d{2}-\d{2} \(alpha\): Shipped the board", text)
+    assert re.search(r"- \d{2}-\d{2} \(alpha\): Shipped the board.* \(t:\d+\)", text)
 
     _wipe(conn)
     _event(conn, "Routine tweak", salience=1, days_ago=1, ref="tb:2")  # below min_salience
