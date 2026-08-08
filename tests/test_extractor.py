@@ -27,6 +27,7 @@ from ingestion.models import (
     ExtractedEntity,
     ExtractedFact,
     ExtractionResult,
+    banned_name,
 )
 
 # ---------------------------------------------------------------------------
@@ -409,6 +410,150 @@ class TestCombinedExtractionValidator:
         # The fact referencing the dropped entity falls out via cross-ref.
         assert len(ce.facts) == 1
         assert ce.facts[0].relationship == "IS"
+
+
+# ---------------------------------------------------------------------------
+# Banned entity names (figure names + abstraction nodes)
+# ---------------------------------------------------------------------------
+
+
+class TestBannedName:
+    """``banned_name`` is the structural backstop for two ENTITY NAMES rules the
+    prompt states but the model still violates. The survivor cases are the
+    regression suite: the filter earns its keep only if it kills the junk
+    WITHOUT eating real names that happen to start with a digit or end in an
+    abstract-sounding word.
+    """
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "$10,000 premium",
+            "$150/hour",
+            "210 lbs deadlift",
+            "6 PM",
+            "7 business days",
+            "20%",
+            "7-8 hours",
+            "3 candidates",
+            "2nd place",
+        ],
+    )
+    def test_figure_names_banned(self, name):
+        assert banned_name(name) == "figure-name"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "hiring decision",
+            "exit strategy",
+            "fit question",
+            "the plan",
+            "ship decision",
+            "architectural approach",
+            "open questions",
+            "pricing assumptions",
+        ],
+    )
+    def test_abstraction_names_banned(self, name):
+        assert banned_name(name) == "abstraction-name"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # leading 4-digit year is a real referent, not a figure
+            "2025 World Series",
+            "2021 Canada Benefits Summary PDF",
+            # leading digit glued into a word is part of a product name
+            "1Password GRC",
+            "3M respirator",
+            # abstraction is judged on the HEAD noun, so these survive
+            "Statement of Defence",
+            "Certificate of Insurance",
+            "Notice of Assessment",
+            # ordinary names
+            "Synapse",
+            "voyage-4-large",
+            "Mrs. Johnson",
+            "cousin's wedding",
+            "~/scripts/discord-send.sh",
+        ],
+    )
+    def test_real_names_survive(self, name):
+        assert banned_name(name) is None
+
+    def test_empty_name(self):
+        assert banned_name("") == "empty"
+        assert banned_name("   ") == "empty"
+
+
+class TestBannedNameInValidator:
+    """Drop semantics match every other drop in the validator: the entity goes to
+    ``dropped_entities``, facts using it as an ENDPOINT fall out via the
+    cross-reference pass, and a fact that merely mentions the string in its text
+    is untouched."""
+
+    def test_banned_entity_dropped_with_its_edge_but_not_the_text(self):
+        ce = CombinedExtraction(
+            entities=[
+                ExtractedEntity(name="$10,000 premium", type="Amount"),
+                ExtractedEntity(name="hiring decision", type="Decision"),
+                ExtractedEntity(name="Synapse", type="Project"),
+                ExtractedEntity(name="Voyage", type="Tool"),
+            ],
+            facts=[
+                ExtractedFact(
+                    source="Synapse",
+                    target="$10,000 premium",
+                    relationship="COSTS",
+                    fact="Synapse costs a $10,000 premium",
+                ),
+                ExtractedFact(
+                    source="hiring decision",
+                    target="Synapse",
+                    relationship="AFFECTS",
+                    fact="the hiring decision affects Synapse",
+                ),
+                # Same figure, but only inside the fact TEXT — this one survives.
+                ExtractedFact(
+                    source="Synapse",
+                    target="Voyage",
+                    relationship="PAYS",
+                    fact="Synapse pays Voyage a $10,000 premium per year",
+                ),
+            ],
+        )
+        assert [e.name for e in ce.entities] == ["Synapse", "Voyage"]
+        assert {e.name for e in ce.dropped_entities} == {"$10,000 premium", "hiring decision"}
+        assert len(ce.facts) == 1
+        assert ce.facts[0].relationship == "PAYS"
+        assert len(ce.dropped_facts) == 2
+
+    def test_filter_can_be_disabled(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_BANNED_NAME_FILTER", "0")
+        ce = CombinedExtraction(
+            entities=[
+                ExtractedEntity(name="$10,000 premium", type="Amount"),
+                ExtractedEntity(name="Synapse", type="Project"),
+            ],
+            facts=[
+                ExtractedFact(
+                    source="Synapse",
+                    target="$10,000 premium",
+                    relationship="COSTS",
+                    fact="Synapse costs a $10,000 premium",
+                )
+            ],
+        )
+        assert len(ce.entities) == 2
+        assert len(ce.facts) == 1
+
+    def test_flag_is_read_per_call_not_at_import(self, monkeypatch):
+        # The A/B harness flips the flag between arms inside one process.
+        monkeypatch.setenv("SYNAPSE_BANNED_NAME_FILTER", "0")
+        assert len(CombinedExtraction(entities=[_entity("6 PM", "Time")], facts=[]).entities) == 1
+        monkeypatch.setenv("SYNAPSE_BANNED_NAME_FILTER", "1")
+        assert CombinedExtraction(entities=[_entity("6 PM", "Time")], facts=[]).entities == []
 
 
 # ---------------------------------------------------------------------------

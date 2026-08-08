@@ -4,13 +4,17 @@
 ONE model (z-ai/glm-5.2 via OpenRouter), TWO arms that differ ONLY in the
 extraction prompt:
 
-  control — ``_EXTRACTION_PROMPT`` as it stands on ``origin/main`` (read out of
-            git with ``ast.literal_eval``, so the arm can never drift from what
-            prod actually ships)
-  dehub   — ``_EXTRACTION_PROMPT`` from the working tree (branch
-            ``feat/dehub-extraction``): edges connect the real participants,
-            participant-less happenings get reified as event nodes, and the
-            fact sentence always keeps the user mention + the date.
+  control   — ``_EXTRACTION_PROMPT`` as it stands on ``origin/main`` (read out of
+              git with ``ast.literal_eval``, so the arm can never drift from what
+              prod actually ships), with the banned-name filter OFF, which is also
+              main's behaviour.
+  treatment — ``_EXTRACTION_PROMPT`` from the working tree, banned-name filter ON.
+
+Originally the de-hub prompt A/B (2026-08-07): edges connect the real
+participants, participant-less happenings get reified as event nodes, and the
+fact sentence always keeps the user mention + the date. Reused since for any
+change to the extraction path — the arm definition is "prompt + validation
+behaviour on this branch" vs "whatever main ships".
 
 Everything else is the Jun-16 frozen-chunk methodology, unchanged: seed=7
 PII-free chunks, prod ``LLMExtractor``/``structured_call`` path,
@@ -29,6 +33,10 @@ raw extractions — the thing the revision is actually trying to move:
   user-mention rate   share of facts whose text mentions the user at all — the
                       guardrail: rerouting the edge must not delete the user
   date-anchor rate    share of facts carrying a date — the other guardrail
+  banned-name rate    share of surviving entities that fail ``banned_name()``
+                      (figure names, abstraction nodes) — ~0 is the gate for the
+                      filter arm; the paired "filtered" row counts how many the
+                      model still proposed and the validator killed
 
 WRITE-FREE: never touches the KG or any prod table (one read-only SELECT for the
 frozen chunks). Sequential arms (shared drop-counter), parallel chunks.
@@ -66,7 +74,7 @@ from ingestion.extractor import (  # noqa: E402
     LLMExtractor,
 )
 from ingestion.llm_client import OpenAIChatClient  # noqa: E402
-from ingestion.models import ExtractionResult  # noqa: E402
+from ingestion.models import ExtractionResult, banned_name  # noqa: E402
 
 OR_BASE = "https://openrouter.ai/api/v1"
 JUDGE_MODEL = "anthropic/claude-haiku-4.5"
@@ -204,6 +212,7 @@ class DropCounter(logging.Handler):
         super().__init__()
         self.dropped_facts = 0
         self.full_failures = 0
+        self.banned_names = 0
         self._lock = threading.Lock()
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -213,6 +222,10 @@ class DropCounter(logging.Handler):
                 self.dropped_facts += int(record.args[0])
             elif msg.startswith("LLM extraction failed"):
                 self.full_failures += 1
+            elif msg.startswith("Dropped banned entity name"):
+                # one line per killed entity — measures how hard the model still
+                # pushes against the ENTITY NAMES rules, not just what survives
+                self.banned_names += 1
 
 
 def _dedup_count(vecs, thr) -> int:
@@ -282,10 +295,19 @@ def structural_metrics(recs: list[dict], ents: list[dict]) -> dict:
             key = (f["chunk"], _norm_node(nd))
             if key in ev_names:
                 deg[key] += 1
+    # banned names that SURVIVED into the arm's output — the gate metric. In the
+    # treatment arm the filter should drive this to 0; in control it measures how
+    # often the model violates the ENTITY NAMES rules with nothing to catch it.
+    banned = [e for e in ents if banned_name(e["name"])]
+    banned_reasons = Counter(banned_name(e["name"]) for e in banned)
     return {
         "user_edge_rate": user_edge / n_f,
         "user_source_rate": user_src / n_f,
         "user_edges": user_edge,
+        "banned_name_rate": (len(banned) / len(ents)) if ents else 0.0,
+        "banned_names_kept": len(banned),
+        "banned_reasons": dict(banned_reasons),
+        "banned_examples": [e["name"] for e in banned[:12]],
         "text_user_rate": txt_user / n_f,
         "dehubbed_rate": dehubbed / n_f,
         "dated_rate": dated / n_f,
@@ -314,6 +336,7 @@ def side_by_side(results: dict, chunk_ids: list[str], limit: int = 10) -> list[t
     Content-matched rather than index-matched: the two arms emit different fact
     counts per chunk, so position carries no meaning.
     """
+    arms = list(results)
     per_arm = {
         arm: {c: [f for f in r["facts"] if f["chunk"] == c] for c in chunk_ids}
         for arm, r in results.items()
@@ -321,12 +344,12 @@ def side_by_side(results: dict, chunk_ids: list[str], limit: int = 10) -> list[t
     out: list[tuple] = []
     for cid in chunk_ids:
         picked = 0
-        for a in per_arm["control"].get(cid, []):
+        for a in per_arm[arms[0]].get(cid, []):
             if not (is_user_node(a["source"]) or is_user_node(a["target"])):
                 continue
             ba = _bag(a["fact"])
             best, best_ov = None, 0.0
-            for b in per_arm["dehub"].get(cid, []):
+            for b in per_arm[arms[1]].get(cid, []):
                 bb = _bag(b["fact"])
                 ov = len(ba & bb) / max(1, len(ba | bb))
                 if ov > best_ov:
@@ -388,6 +411,10 @@ def build_table(results: dict, n: int, seed: int) -> str:
     row("event nodes (total)", lambda r: s(r, "event_nodes"), "{}")
     row("event hubs (>=2 edges)", lambda r: s(r, "event_hubs_2plus"), "{}")
     row("event-edge share", lambda r: s(r, "event_edge_share"))
+    lines.append("-- banned entity names --")
+    row("banned-name rate (kept)", lambda r: s(r, "banned_name_rate"))
+    row("banned names kept", lambda r: s(r, "banned_names_kept"), "{}")
+    row("banned names filtered", lambda r: r.get("banned_dropped"), "{}")
     lines.append("-- retrieval guardrails --")
     row("text mentions user", lambda r: s(r, "text_user_rate"))
     row("fact carries a date", lambda r: s(r, "dated_rate"))
@@ -463,6 +490,11 @@ def main() -> None:
     ap.add_argument("--dup-thr", type=float, default=0.84)
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--control-ref", default=CONTROL_REF)
+    ap.add_argument(
+        "--control-filter",
+        action="store_true",
+        help="run the banned-name filter in the control arm too (isolates the prompt)",
+    )
     ap.add_argument("--out", default=None)
     ap.add_argument(
         "--paired",
@@ -481,12 +513,17 @@ def main() -> None:
         raise SystemExit("need OPENROUTER_API_KEY (or SYNAPSE_LLM_API_KEY)")
     os.environ.pop("SYNAPSE_OPENROUTER_PROVIDERS", None)
 
-    prompts = {"control": prompt_at_ref(args.control_ref), "dehub": _EXTRACTION_PROMPT}
-    if prompts["control"] == prompts["dehub"]:
-        raise SystemExit("control and dehub prompts are identical — nothing to A/B")
+    # arm -> (prompt template, banned-name filter on?). The control arm runs the
+    # ref's prompt AND its filter behaviour: the filter is code, so it must be
+    # switched off for control or the arms would differ in two places minus one.
+    prompts = {"control": prompt_at_ref(args.control_ref), "treatment": _EXTRACTION_PROMPT}
+    filters = {"control": args.control_filter, "treatment": True}
+    if prompts["control"] == prompts["treatment"] and not args.control_filter:
+        raise SystemExit("control and treatment prompts are identical — nothing to A/B")
     print(
-        f"prompts: control={len(prompts['control'])} chars ({args.control_ref}), "
-        f"dehub={len(prompts['dehub'])} chars (working tree)",
+        f"prompts: control={len(prompts['control'])} chars ({args.control_ref}, "
+        f"filter={'on' if filters['control'] else 'off'}), "
+        f"treatment={len(prompts['treatment'])} chars (working tree, filter=on)",
         flush=True,
     )
 
@@ -520,16 +557,23 @@ def main() -> None:
         ch["det"] = det.extract(ch["eps"]) if ch["eps"] else []
 
     drop_counter = DropCounter()
-    exlog = logging.getLogger("ingestion.extractor")
-    exlog.addHandler(drop_counter)
-    exlog.setLevel(logging.INFO)
+    # dropped-fact + failure lines come from ingestion.extractor; the banned-name
+    # drop is logged by the validator in ingestion.models.
+    for logger_name in ("ingestion.extractor", "ingestion.models"):
+        lg = logging.getLogger(logger_name)
+        lg.addHandler(drop_counter)
+        lg.setLevel(logging.INFO)
 
     usage_start = or_usage(key)
     results: dict[str, dict] = {}
     for arm, template in prompts.items():
+        # Arms run sequentially, so a process-wide env flip is safe; the model
+        # layer re-reads it per validation call (see ingestion.models._name_filter_on).
+        os.environ["SYNAPSE_BANNED_NAME_FILTER"] = "1" if filters[arm] else "0"
         client = OpenAIChatClient(base_url=OR_BASE, api_key=key, model=args.model)
         ex = PromptExtractor(llm_client=client, model=args.model, template=template)
         d0, f0 = drop_counter.dropped_facts, drop_counter.full_failures
+        b0 = drop_counter.banned_names
         lats: list[float] = []
         lat_lock = threading.Lock()
 
@@ -593,6 +637,8 @@ def main() -> None:
             "entities": ents,
             "n_facts": len(recs),
             "ents": len(ents),
+            "banned_dropped": drop_counter.banned_names - b0,
+            "filter_on": filters[arm],
             "dropped_facts": drop_counter.dropped_facts - d0,
             "full_failures": drop_counter.full_failures - f0,
             "est_in_tok": est_in,

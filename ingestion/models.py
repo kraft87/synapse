@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -19,6 +21,103 @@ MAX_ENTITY_NAME_LEN = 200
 MAX_RELATIONSHIP_LEN = 100
 MAX_ENTITY_SUMMARY_LEN = 1200
 MAX_FACT_LEN = 2000
+
+
+# --- Banned entity names (structural backstop for the ENTITY NAMES prompt rules) ---
+# The prompt already forbids two name shapes, and the model still mints them a few
+# times per hundred entities. Both produce nodes nothing can ever retrieve:
+#
+#   figure names       "$10,000 premium", "210 lbs deadlift", "6 PM", "7 business days"
+#                      — a figure is a PROPERTY of the thing it measures; it belongs in
+#                        the fact text, not in a node.
+#   abstraction names  "hiring decision", "exit strategy", "fit question" — proposition
+#                      stand-ins minted to receive an edge, with no referent in the
+#                      user's world.
+#
+# Ported from the 2026-08-07 graph-reification pass (~/workspace/reify/build_plan.py),
+# where it gated every reparent endpoint; the audit of that run is in
+# backup_dehub.reify_ops. Two deliberate escapes keep real names alive:
+#   * a leading 4-digit year is not a figure — "2025 World Series", "2021 Canada
+#     Benefits Summary PDF", and a leading digit that is part of a word ("1Password GRC")
+#     all survive.
+#   * abstraction is judged on the HEAD noun (the LAST word), so "Statement of Defence"
+#     and "Certificate of Insurance" survive while a bare "statement" does not.
+#
+# SYNAPSE_BANNED_NAME_FILTER=0 disables the drop for instant rollback (and lets the
+# prompt A/B harness run a filter-free control arm against the same code).
+_UNIT = (
+    r"%|am|pm|lbs?|kgs?|kms?|mb|gb|tb|hours?|hrs?|min(?:ute)?s?|days?|weeks?|months?|"
+    r"years?|business\s+days?|cases|applicants|reps?|pipelines?|candidates?|"
+    r"place|st|nd|rd|th"
+)
+# (?!\w) rather than the port's \b: "%" is not a word char, so "\b" never matched a
+# name ENDING in a percent sign and the bare "20%" the prompt explicitly bans sailed
+# through. (?!\w) is satisfied at end-of-string and before punctuation/space, and
+# leaves every survivor case intact ("1Password GRC", "3M respirator", "2nd place").
+_FIGURE = re.compile(rf"^\s*(?:[\$€£]|\d[\d,.\-+/]*\s*(?:{_UNIT})(?!\w))", re.I)
+_YEAR_LEAD = re.compile(r"^\s*(?:19|20)\d\d\b")
+_ABSTRACT_HEAD = frozenset(
+    {
+        "decision",
+        "decisions",
+        "plan",
+        "plans",
+        "approach",
+        "approaches",
+        "issue",
+        "issues",
+        "question",
+        "questions",
+        "request",
+        "requests",
+        "strategy",
+        "strategies",
+        "statement",
+        "statements",
+        "claim",
+        "claims",
+        "preference",
+        "preferences",
+        "discussion",
+        "discussions",
+        "idea",
+        "ideas",
+        "proposal",
+        "proposals",
+        "concern",
+        "concerns",
+        "expectation",
+        "expectations",
+        "conclusion",
+        "assumption",
+        "assumptions",
+    }
+)
+
+
+def banned_name(name: str) -> str | None:
+    """Return a short reason if ``name`` is a policy-banned entity name, else None.
+
+    Pure and side-effect free — the caller decides what to do with the verdict.
+    """
+    s = (name or "").strip()
+    if not s:
+        return "empty"
+    if not _YEAR_LEAD.match(s) and _FIGURE.match(s):
+        return "figure-name"
+    head = re.sub(r"[^a-z]", "", s.split()[-1].lower())
+    if head in _ABSTRACT_HEAD:
+        return "abstraction-name"
+    return None
+
+
+def _name_filter_on() -> bool:
+    """Read the rollback flag per call, not at import.
+
+    The A/B harness flips it between arms inside one process; a module-level
+    constant would freeze whichever value happened to be set at import time.
+    """
+    return os.getenv("SYNAPSE_BANNED_NAME_FILTER", "1") not in ("0", "false", "")
 
 
 def _normalize_entity_name(name: str) -> str:
@@ -123,6 +222,13 @@ class CombinedExtraction(BaseModel):
         ``dropped_entities`` so the caller can log counts without re-walking
         the raw response.
 
+        Also drops policy-banned entity names (see :func:`banned_name` — bare
+        figures and abstraction nodes), which the prompt forbids but the model
+        still emits occasionally. Same drop semantics as everything else here:
+        the entity goes to ``dropped_entities`` and any fact using it as an
+        ENDPOINT falls out via the cross-reference pass below; a fact that only
+        mentions the banned string inside its text is kept.
+
         Also applies the field-length caps (module constants above), graceful
         degradation style: an over-cap entity name drops the entity (a
         200+-char "name" is never a real referent — and its facts fall out via
@@ -144,6 +250,15 @@ class CombinedExtraction(BaseModel):
                     len(entity.name),
                     MAX_ENTITY_NAME_LEN,
                 )
+                dropped_entities.append(entity)
+                continue
+            reason = banned_name(entity.name) if _name_filter_on() else None
+            if reason:
+                # Facts using this entity as an endpoint fall out below via the
+                # cross-reference pass (an edge cannot survive a missing
+                # endpoint); facts that merely MENTION the name in their text
+                # are untouched.
+                logger.info("Dropped banned entity name (%s)", reason)
                 dropped_entities.append(entity)
                 continue
             if len(entity.summary) > MAX_ENTITY_SUMMARY_LEN:
