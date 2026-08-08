@@ -461,6 +461,30 @@ class TestBannedName:
     @pytest.mark.parametrize(
         "name",
         [
+            # branded-product exemption: a capitalized NON-FIRST token marks a real
+            # product/subscription, not an abstraction node
+            "Rogers BYOD Plan",
+            "Claude Max 5x plan",
+            "Sophos MDR Response strategy",
+        ],
+    )
+    def test_branded_abstraction_heads_survive(self, name):
+        assert banned_name(name) is None
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            # sentence-case first word alone is NOT a brand marker
+            "Disk consolidation plan",
+            "playWEB defense-in-depth plan",
+        ],
+    )
+    def test_unbranded_plans_still_banned(self, name):
+        assert banned_name(name) == "abstraction-name"
+
+    @pytest.mark.parametrize(
+        "name",
+        [
             # leading 4-digit year is a real referent, not a figure
             "2025 World Series",
             "2021 Canada Benefits Summary PDF",

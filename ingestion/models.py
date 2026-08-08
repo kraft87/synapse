@@ -105,8 +105,16 @@ def banned_name(name: str) -> str | None:
         return "empty"
     if not _YEAR_LEAD.match(s) and _FIGURE.match(s):
         return "figure-name"
-    head = re.sub(r"[^a-z]", "", s.split()[-1].lower())
+    words = s.split()
+    head = re.sub(r"[^a-z]", "", words[-1].lower())
     if head in _ABSTRACT_HEAD:
+        # Branded-product exemption: "Rogers BYOD Plan" / "Claude Max 5x plan" are real
+        # subscription entities, "disk consolidation plan" is an abstraction node. A
+        # capitalized NON-FIRST token is the brand marker that separates them (measured
+        # on the 95 existing plan-headed entities, 2026-08-07). First word stays exempt
+        # from the check — sentence-case abstractions capitalize it too.
+        if any(w[:1].isupper() for w in words[1:-1]):
+            return None
         return "abstraction-name"
     return None
 
