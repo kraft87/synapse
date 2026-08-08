@@ -592,6 +592,19 @@ Rules:
   GOOD: source "Coinbase application", target "Coinbase", AWAITING_REPLY_FROM
         fact "User's Coinbase application was ~4 days old with no reply as of 2026-05-01
         (meaning 2026-05-01)"
+  ACQUIRING something is not the same as HAVING it: a purchase, gift, delivery, or any
+  one-time acquisition is a DOING, even though it leaves the user owning a thing. Same
+  for a complaint or a symptom report — the user reporting it is an event, and the
+  standing condition (if there is one) is a separate fact.
+  BAD:  source "User", target "Carex Day-Light Elite", PURCHASED
+        fact "User purchased a Carex Day-Light Elite lamp on 2026-01-08"
+  GOOD: source "Carex Day-Light Elite", target "seasonal affective disorder", BOUGHT_FOR
+        fact "User purchased a Carex Day-Light Elite light therapy lamp on 2026-01-08
+        (meaning 2026-01-08) to treat seasonal affective disorder"
+  BAD:  source "User", target "left knee pain", REPORTED
+  GOOD: source "left knee pain", target "half marathon", STARTED_AFTER
+        fact "User reported left knee pain starting after the half marathon on 2026-03-02
+        (meaning 2026-03-02)"
   The rule bans the user as a HUB for doings and happenings, not as an entity.
 - PRESERVE EXACT QUANTITIES. A fact carrying a number, price, percentage, count, or
   duration MUST keep the figure VERBATIM in the fact text ("Women hold 20% of
@@ -836,7 +849,8 @@ class LLMExtractor:
             )
         if combined.dropped_entities:
             logger.debug(
-                "Dropped %d entity row(s) with empty name during validation",
+                "Dropped %d entity row(s) during validation (empty, over-cap, or "
+                "policy-banned name)",
                 len(combined.dropped_entities),
             )
 
