@@ -475,3 +475,11 @@ def test_status_reports_both_halves(toggle, stub_server, capsys):
     capsys.readouterr()
     assert toggle.main(["status", sid]) == 0
     assert "marker=yes server=yes" in capsys.readouterr().out
+
+
+def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys):
+    # `off --forget s-abc` (flag before id) must not no-op against a session
+    # literally named "--forget" while s-abc silently stays private.
+    assert toggle.main(["off", "--forget", "s-abc"]) == 1
+    assert "looks like a flag" in capsys.readouterr().err
+    assert stub_server.calls == []

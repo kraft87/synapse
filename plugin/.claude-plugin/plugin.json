@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Point it at a local or central Synapse.",
   "author": {
     "name": "kraft87"
@@ -21,12 +21,12 @@
     "SYNAPSE_SKILLS_SYNC": {
       "type": "string",
       "title": "Two-way skill sync",
-      "description": "Opt-in: set to 1 to sync your ~/.claude/skills library with Synapse at session start (dream\u2192skills lane). OFF by default \u2014 nothing writes into your skills directory unless you enable it."
+      "description": "Opt-in: set to 1 to sync your ~/.claude/skills library with Synapse at session start (dream→skills lane). OFF by default — nothing writes into your skills directory unless you enable it."
     },
     "SYNAPSE_CONFIG_SYNC": {
       "type": "string",
       "title": "Mirror config files",
-      "description": "Opt-in: mirror your config into Synapse for the dream lane. OFF by default \u2014 your CLAUDE.md + rules/*.md stay on this machine unless you set this to 1, which auto-grabs them from ~/.claude and the current project's .claude."
+      "description": "Opt-in: mirror your config into Synapse for the dream lane. OFF by default — your CLAUDE.md + rules/*.md stay on this machine unless you set this to 1, which auto-grabs them from ~/.claude and the current project's .claude."
     },
     "SYNAPSE_CONFIG_PATHS": {
       "type": "string",
