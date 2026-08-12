@@ -560,7 +560,9 @@ orphaned, and sets `truncated`.
 `dashboard_flags(id, kind, item_id, note, created_at, removed_at)` — active = `removed_at IS NULL`,
 partial-unique on (kind, item_id) where active.
 `dashboard_audit(id, ts, action, kind, item_id, detail jsonb)` — append-only; actions this
-phase: `flag`, `unflag`. Later phases append proposal decisions.
+phase: `flag`, `unflag`. Later phases append proposal decisions (`proposal_approve` /
+`proposal_reject`) and the phase-7 deletes (`delete_episode` / `delete_fact`); the column
+is intentionally CHECK-free so widening it needs no migration.
 `dream_runs(id, started_at, finished_at, stages jsonb, counts jsonb, samples jsonb,
 errors jsonb, ok bool)` (migration 044) — one row per nightly dream-pipeline run, written
 fail-soft by `dream/__main__.py` (insert at start with `ok=NULL`, update at finish). Backs
@@ -570,6 +572,101 @@ Migration 043 (`043_dash_notify.sql`) adds `dash_notify_feed()` + AFTER INSERT t
 `episodes` / `kg_relationships` / `timeline_events` that `pg_notify('dash_feed', {type,id})`
 — the source of the Phase 3 live stream above. No new tables.
 
+## Phase 7 endpoints (Delete from memory)
+
+The first DESTRUCTIVE surface the dashboard adds. Everything before this phase was
+read-only plus the `dashboard_flags` soft-flag (schema 042 explicitly called itself
+"deliberately NOT a delete"); phase 7 adds the real thing, because a flag does not
+satisfy "get this out of my memory". Both routes are **hard deletes** (no tombstone, no
+soft-delete column) and each runs in ONE transaction — a partial cascade is never
+committed. Machine-token gated like every `/dash/api/*` route.
+
+Route naming note: these are `/dash/api/episodes/{id}` and `/dash/api/facts/{id}`
+(**plural**), while the phase-1 read routes are `/dash/api/episode/{id}` (singular) and a
+fact is read through `/dash/api/entity/{uuid}`. The plural forms are the resource
+collections the DELETE verb acts on; the singular read routes are unchanged.
+
+### DELETE /dash/api/episodes/{id}
+Deletes the episode row and everything that carries ITS CONTENT. Non-numeric id → 400;
+no such episode → 404 `episode not found`.
+```json
+{"episode_id": 227168, "chunks_deleted": 3, "chunks_mixed_deleted": 1,
+ "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1}
+```
+
+**Cascade semantics (the sole-vs-shared rule).** Provenance that names ONLY the deleted
+episode is deleted; provenance SHARED with surviving episodes is unlinked, not deleted.
+This is not a style preference — a 2026-06 KG cleanup that deleted by blanket provenance
+match would have destroyed 1467 legitimate facts to remove 330 bad ones.
+
+- **chunks** (`chunks.episode_ids`, an ordered JSONB list — a chunk spans 3-5 consecutive
+  episodes). A chunk's `content` is the concatenated verbatim text of every episode in its
+  window, so a chunk that cites the deleted episode CANNOT be kept: there is no way to
+  excise one turn from the stored text. Both cases are deleted:
+  - `chunks_deleted` — total chunks removed.
+  - `chunks_mixed_deleted` — the subset whose `episode_ids` also named OTHER (surviving)
+    episodes. Reported separately because it is real collateral: verbatim text of episodes
+    the operator did NOT delete leaves the chunk index with it (the episodes themselves,
+    and their other chunks, are untouched — this only costs chunk-level retrieval recall
+    until the poller rebuilds a window). The UI says so.
+- **KG facts** (`kg_relationships.episodes`, the provenance array):
+  - sole provenance (the array contains this id and nothing else) → row DELETED
+    (`facts_deleted`);
+  - shared provenance (the array also names surviving episodes) → the id is REMOVED from
+    the array and the fact SURVIVES (`facts_unlinked`).
+  - Both id forms are matched (JSON number and, defensively, numeric string) — the
+    extractor's array element type is not guaranteed.
+  - `kg_relationships.invalidated_by` (schema 028) pointers aimed at a deleted edge are
+    NULLed so no edge cites a uuid that no longer exists.
+- **timeline events** (`timeline_events.source_ref` = `ep:<id>` or `ep:<id>#<k>` — the
+  multi-event-per-turn form written by `ingestion/timeline_gate.py`) → DELETED
+  (`events_deleted`). `UNIQUE (source, source_ref)` makes a chat event sole-provenance by
+  construction, so the sole-vs-shared rule resolves to "delete"; leaving them would keep
+  serving the deleted turn's content out of `recall()`'s timeline leg.
+- **extraction_queue** rows (`episode_id` FK, `ON DELETE CASCADE`, schema 001) carry a
+  verbatim copy of `episodes.content`, so they must go — the existing FK already does it.
+  Not counted in the response (the operator never sees the queue as memory).
+- **dashboard_flags**: an ACTIVE flag on the deleted item is retired (`removed_at`) so the
+  Flags list can't point at a row that no longer exists. `dashboard_audit` gains a
+  `delete_episode` row carrying the cascade summary as `detail` (append-only; the audit
+  log deliberately OUTLIVES the content — it records that a delete happened, not what was
+  deleted).
+
+**Deliberately NOT touched** (documented so the omission reads as a decision, not a miss):
+- `preferences` (`source_ref = 'ep:<id>'`) and `notes` (`source_ref = 'ep:<id>'`) —
+  reconciled, standing rows. `source_ref` names the FIRST asserting turn and is never
+  rewritten on re-assertion (`ingestion/preferences_gate.py` bumps `assert_count` instead),
+  so it is a birth certificate, not ownership; a preference asserted across nine turns
+  would be destroyed by one episode delete. This is exactly the blanket-provenance
+  deletion the sole-vs-shared rule exists to prevent. Both are individually deletable from
+  their own surfaces (a later phase) and both hold a distilled RULE, not the turn's text.
+- `recall_metrics` (incl. `served_ids`) and `recall_feedback` — analytics logs that
+  reference ids historically; they hold no episode content and rewriting them would
+  falsify the retrieval history.
+- `web_artifacts.parent_episode_id` — a soft pointer (no FK, by design) to independently
+  ingested WEB content, which is not the episode's content.
+- `synth_documents.source_ids` — generation is retired and the table is empty; left alone
+  rather than given untested cascade code. **Known gap**: if segment-summary generation is
+  ever revived, a summary of a deleted episode would retain its content and this route
+  must grow a fourth cascade leg.
+- `kg_entities` — an entity is a shared name, not the episode's content. Deleting sole
+  facts can leave a zero-degree orphan entity; that is graph hygiene for a sweeper, not
+  for this route.
+
+### DELETE /dash/api/facts/{id}
+Deletes ONE KG edge by uuid — no cascade, no provenance arithmetic (a fact is the leaf).
+No such uuid → 404 `fact not found`.
+```json
+{"fact_id": "<edge-uuid>", "deleted": true, "successors_unlinked": 0}
+```
+- `successors_unlinked` = retired edges whose `invalidated_by` pointed at this uuid and
+  were NULLed (same dangling-pointer cleanup as the episode cascade).
+- Retires an active `dashboard_flags` row for the uuid; appends a `delete_fact`
+  `dashboard_audit` row.
+- The entity endpoints are NOT touched: `kg_entities.degree` is a denormalized counter
+  that the KG backfill recomputes; this route does not try to keep it in sync (it is
+  already stale by design on the dual-write path — schema 017).
+
 ## Shipped surface
 
 All spec §8 phases are shipped; no reserved paths remain. `POST /recall`'s `debug: true`
@@ -577,4 +674,6 @@ flag + `/dash/api/recall/history` (phase 2); `/dash/api/proposals*` (phase 2b);
 `/dash/api/stream` SSE (phase 3); `/dash/api/metrics/{recall,ingestion,corpus}` (phase 4);
 `/dash/api/timeline`, `/dash/api/preferences`, `/dash/api/dream/report`,
 `/dash/api/behavior/{files,file,linkgraph}` (phase 5);
-`/dash/api/graph/{entities,neighborhood}` (phase 6) — all documented above.
+`/dash/api/graph/{entities,neighborhood}` (phase 6);
+`DELETE /dash/api/episodes/{id}` + `DELETE /dash/api/facts/{id}` (phase 7) — all
+documented above.
