@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# synapse-private — toggle private mode ("off the record") for a Claude Code session.
+#
+# Claude Code puts a plugin's bin/ on PATH, so this is just `synapse-private on <session-id>`
+# in any terminal (or `! synapse-private on <session-id>` inside a session). It locates the
+# toggle relative to itself and reads config from settings.json, so it needs NO environment
+# variables and NO $CLAUDE_PLUGIN_ROOT. Exits nonzero if either write fails — only exit 0
+# means the session is genuinely off the record.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$DIR/../scripts/private_mode.py"
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "synapse-private: need python3 or python on PATH" >&2
+  exit 1
+fi
+exec "$PY" "$SCRIPT" "$@"

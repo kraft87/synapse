@@ -27,6 +27,8 @@ Env:
   SYNAPSE_INGEST_URL   default http://localhost:8765/ingest
   SYNAPSE_INGEST_LOG   default /tmp/synapse-ingest-hook.log
   SYNAPSE_INGEST_TAIL  default 400 (raw records kept in the tail window)
+  SYNAPSE_PRIVATE_DIR  default ~/.synapse/private (private-mode marker files)
+  SYNAPSE_PRIVATE_TTL_HOURS  default 12 (marker lifetime; stale ones are deleted)
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import UTC, datetime
 from typing import Any
@@ -43,6 +46,10 @@ INGEST_URL = os.environ.get("SYNAPSE_INGEST_URL", "http://localhost:8765/ingest"
 LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", "/tmp/synapse-ingest-hook.log")
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
 TAIL_RECORDS = int(os.environ.get("SYNAPSE_INGEST_TAIL", "400"))
+# Private mode: one marker file per off-the-record session (name = session id), written
+# by plugin/scripts/private_mode.py. Same default path as the plugin config layer.
+PRIVATE_DIR = os.path.expanduser(os.environ.get("SYNAPSE_PRIVATE_DIR", "~/.synapse/private"))
+_PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -112,8 +119,42 @@ def _select_tail(raw_lines: list[bytes]) -> tuple[list[dict[str, Any]], str]:
     return _parse_lines(raw_lines), "full-fallback"
 
 
+def _is_private(session_id: str) -> bool:
+    """True if `session_id` is in private mode → ship NOTHING for it.
+
+    Mirror of the plugin hook's check (plugin/scripts/ingest_hook.py), kept inline so
+    this copy stays dependency-free. A marker file at PRIVATE_DIR/<session_id> is
+    written by the toggle (plugin/scripts/private_mode.py), which also sets the durable
+    server-side flag. Markers older than _PRIVATE_TTL_HOURS are ignored AND deleted; an
+    unreadable marker directory counts as PRIVATE, because silently capturing a session
+    the user believes is off the record is the unacceptable failure and a dropped turn
+    is not (the server re-ingests it from disk later if the skip was wrong)."""
+    if not session_id:
+        return False
+    marker = os.path.join(PRIVATE_DIR, session_id)
+    try:
+        age = time.time() - os.stat(marker).st_mtime
+    except FileNotFoundError:
+        return False
+    except OSError as e:
+        _log(f"PRIVATE unreadable {session_id}: {type(e).__name__} — skipping ingestion")
+        return True
+    if age > _PRIVATE_TTL_HOURS * 3600:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        _log(f"PRIVATE stale marker removed {session_id} (age {int(age)}s)")
+        return False
+    return True
+
+
 def _ship(transcript_path: str) -> None:
     """Read the transcript and POST a bounded tail to /ingest. Runs detached."""
+    session_id = os.path.splitext(os.path.basename(transcript_path))[0]
+    if _is_private(session_id):
+        _log(f"PRIVATE skip {os.path.basename(transcript_path)}")
+        return
     try:
         raw_lines: list[bytes] = []
         with open(transcript_path, "rb") as f:
