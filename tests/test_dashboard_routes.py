@@ -176,19 +176,27 @@ def _event(
     ).fetchone()[0]
 
 
-def _note(conn, *, hook="User prefers X", group_id="technical"):
+def _note(conn, *, hook="User prefers X", group_id="technical", source_ref=None):
     return conn.execute(
-        "INSERT INTO notes (owner_id, group_id, type, hook, body) "
-        "VALUES ('default',%s,'user',%s,'body') RETURNING id",
-        (group_id, hook),
+        "INSERT INTO notes (owner_id, group_id, type, hook, body, source_ref) "
+        "VALUES ('default',%s,'user',%s,'body',%s) RETURNING id",
+        (group_id, hook, source_ref),
     ).fetchone()[0]
 
 
-def _pref(conn, *, pref="User prefers bullet lists", group_id="technical"):
+def _pref(conn, *, pref="User prefers bullet lists", group_id="technical", source_ref=None):
     return conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, pref, polarity) "
-        "VALUES ('default',%s,%s,'like') RETURNING id",
-        (group_id, pref),
+        "INSERT INTO preferences (owner_id, group_id, pref, polarity, source_ref) "
+        "VALUES ('default',%s,%s,'like',%s) RETURNING id",
+        (group_id, pref, source_ref),
+    ).fetchone()[0]
+
+
+def _chunk(conn, *, session="s-dash", start=1, end=3, episode_ids, content="chunk body"):
+    return conn.execute(
+        "INSERT INTO chunks (session_id, start_sequence, end_sequence, episode_ids, "
+        " project, content) VALUES (%s,%s,%s,%s,'synapse',%s) RETURNING id",
+        (session, start, end, Json(episode_ids), content),
     ).fetchone()[0]
 
 
@@ -2021,3 +2029,157 @@ def test_graph_endpoints_require_machine_token(clean, conn, db_url):
             r = client.get(path)
             assert r.status_code == 401
             assert r.json() == {"status": "error", "detail": "unauthorized"}
+
+
+# ---------------------------------------------------------------------------
+# Delete (phase 7) — cascade semantics, non-cascade, audit
+# ---------------------------------------------------------------------------
+
+
+def test_delete_episode_facts_sole_vs_shared_provenance(clean, conn, db_url):
+    """THE rule (contract §Phase 7): a fact whose provenance names ONLY the deleted
+    episode dies; a fact sharing provenance with a surviving episode loses the id from
+    its array and lives. Regression guard for the 2026-06 cleanup, where deleting by
+    blanket provenance match would have taken 1467 legitimate facts out with 330 bad ones."""
+    keep = _episode(conn, session="d1", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d1", seq=2, content="doomed turn")
+    _entity(conn, "d-e1", name="Widget")
+    _rel(conn, "d-sole", src="d-e1", tgt="d-e1", fact="sole fact", episodes=[doomed])
+    _rel(conn, "d-shared", src="d-e1", tgt="d-e1", fact="shared fact", episodes=[keep, doomed])
+    _rel(conn, "d-other", src="d-e1", tgt="d-e1", fact="unrelated fact", episodes=[keep])
+    # Defensive: the extractor's array element type isn't guaranteed, so the numeric
+    # STRING form must be matched by the same cascade.
+    _rel(conn, "d-str", src="d-e1", tgt="d-e1", fact="string-provenance", episodes=[str(doomed)])
+
+    with _client(db_url) as client:
+        r = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H)
+        assert r.status_code == 200
+        body = r.json()
+    assert body["episode_id"] == doomed
+    assert body["facts_deleted"] == 2  # d-sole + d-str
+    assert body["facts_unlinked"] == 1  # d-shared
+
+    live = dict(
+        conn.execute("SELECT uuid, episodes FROM kg_relationships ORDER BY uuid").fetchall()
+    )
+    assert set(live) == {"d-other", "d-shared"}
+    assert live["d-shared"] == [keep]  # the deleted id is gone, the survivor's stays
+    assert live["d-other"] == [keep]
+    assert conn.execute("SELECT count(*) FROM episodes").fetchone()[0] == 1
+
+
+def test_delete_episode_removes_chunks_including_mixed_windows(clean, conn, db_url):
+    """A chunk's content is the verbatim concatenation of its episode window, so a chunk
+    citing the deleted episode CANNOT be kept — mixed windows go too, and their count is
+    reported separately so the UI can admit to the collateral."""
+    keep = _episode(conn, session="d2", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d2", seq=2, content="doomed turn")
+    _chunk(conn, session="d2", start=1, end=1, episode_ids=[doomed], content="pure window")
+    _chunk(conn, session="d2", start=1, end=2, episode_ids=[keep, doomed], content="mixed window")
+    _chunk(conn, session="d2", start=2, end=3, episode_ids=[keep], content="untouched window")
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["chunks_deleted"] == 2
+    assert body["chunks_mixed_deleted"] == 1
+    rows = conn.execute("SELECT content FROM chunks").fetchall()
+    assert [r[0] for r in rows] == ["untouched window"]
+
+
+def test_delete_episode_removes_timeline_events_and_queue_rows(clean, conn, db_url):
+    """Chat timeline events (`ep:<id>` / `ep:<id>#<k>`) are sole-provenance by
+    construction — they go. Events for other episodes, and the id-prefix near-miss
+    `ep:<id>9`, must survive. extraction_queue rows follow the schema-001 FK."""
+    doomed = _episode(conn, session="d3", seq=1, content="doomed turn")
+    keep = _episode(conn, session="d3", seq=2, content="survivor turn")
+    _event(conn, fact="event one", source="chat", source_ref=f"ep:{doomed}")
+    _event(conn, fact="event two", source="chat", source_ref=f"ep:{doomed}#2")
+    _event(conn, fact="other episode", source="chat", source_ref=f"ep:{keep}")
+    _event(conn, fact="prefix near-miss", source="chat", source_ref=f"ep:{doomed}9")
+    _event(conn, fact="a commit", source="git:synapse", source_ref="deadbeef")
+    _queue(conn, content="doomed turn", episode_id=doomed, enqueued_at=_t(0))
+    _queue(conn, content="survivor turn", episode_id=keep, enqueued_at=_t(0))
+    _queue(conn, content="session summary", episode_id=None, enqueued_at=_t(0))
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["events_deleted"] == 2
+    facts = {r[0] for r in conn.execute("SELECT fact FROM timeline_events").fetchall()}
+    assert facts == {"other episode", "prefix near-miss", "a commit"}
+    # The FK cascade took only the doomed episode's queue row.
+    left = {r[0] for r in conn.execute("SELECT content FROM extraction_queue").fetchall()}
+    assert left == {"survivor turn", "session summary"}
+
+
+def test_delete_episode_leaves_standing_rows_and_analytics_alone(clean, conn, db_url):
+    """Deliberate non-cascade (contract §Phase 7): preferences/notes are reconciled
+    standing rows whose source_ref is a birth certificate, not ownership; recall_metrics
+    is a historical log. Deleting them on one episode delete IS the blanket-provenance
+    mistake the sole-vs-shared rule exists to prevent."""
+    doomed = _episode(conn, session="d4", seq=1, content="doomed turn")
+    pid = _pref(conn, pref="User prefers bullet lists", source_ref=f"ep:{doomed}")
+    nid = _note(conn, hook="User prefers bullet lists", source_ref=f"ep:{doomed}")
+    mid = _metric(conn, query="a past recall")
+
+    with _client(db_url) as client:
+        assert (
+            client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).status_code == 200
+        )
+    assert conn.execute("SELECT count(*) FROM preferences WHERE id=%s", (pid,)).fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM notes WHERE id=%s", (nid,)).fetchone()[0] == 1
+    assert (
+        conn.execute("SELECT count(*) FROM recall_metrics WHERE id=%s", (mid,)).fetchone()[0] == 1
+    )
+
+
+def test_delete_episode_retires_flag_and_audits(clean, conn, db_url):
+    doomed = _episode(conn, session="d5", seq=1, content="doomed turn")
+    with _client(db_url) as client:
+        client.post("/dash/api/flag", json={"kind": "episode", "id": str(doomed)}, headers=_H)
+        assert client.get("/dash/api/flags", headers=_H).json()["flags"] != []
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+        # No dangling flag pointing at a row that no longer exists.
+        assert client.get("/dash/api/flags", headers=_H).json()["flags"] == []
+    audit = conn.execute(
+        "SELECT action, kind, detail FROM dashboard_audit WHERE item_id=%s ORDER BY id",
+        (str(doomed),),
+    ).fetchall()
+    assert [a[0] for a in audit] == ["flag", "delete_episode"]
+    assert audit[1][1] == "episode"
+    assert audit[1][2] == body  # the cascade summary IS the audit detail
+
+
+def test_delete_bad_id_missing_row_and_auth(clean, conn, db_url):
+    with _client(db_url) as client:
+        assert client.request("DELETE", "/dash/api/episodes/1").status_code == 401
+        assert client.request("DELETE", "/dash/api/facts/x").status_code == 401
+        assert client.request("DELETE", "/dash/api/episodes/abc", headers=_H).status_code == 400
+        r = client.request("DELETE", "/dash/api/episodes/999999", headers=_H)
+        assert r.status_code == 404
+        assert r.json() == {"status": "error", "detail": "episode not found"}
+        r = client.request("DELETE", "/dash/api/facts/no-such-uuid", headers=_H)
+        assert r.status_code == 404
+        assert r.json() == {"status": "error", "detail": "fact not found"}
+
+
+def test_delete_fact_single_edge_and_supersession_pointer(clean, conn, db_url):
+    """A fact is a leaf: no cascade, only the dangling schema-028 pointer cleanup on the
+    retired edges this one had superseded."""
+    _entity(conn, "f-e1", name="Widget")
+    _rel(conn, "f-old", src="f-e1", tgt="f-e1", fact="old fact", t_invalid=_t(2))
+    _rel(conn, "f-new", src="f-e1", tgt="f-e1", fact="new fact")
+    _rel(conn, "f-keep", src="f-e1", tgt="f-e1", fact="untouched fact")
+    conn.execute("UPDATE kg_relationships SET invalidated_by='f-new' WHERE uuid='f-old'")
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", "/dash/api/facts/f-new", headers=_H).json()
+    assert body == {"fact_id": "f-new", "deleted": True, "supersession_links_cleared": 1}
+    rows = dict(
+        conn.execute("SELECT uuid, invalidated_by FROM kg_relationships ORDER BY uuid").fetchall()
+    )
+    assert set(rows) == {"f-keep", "f-old"}
+    assert rows["f-old"] is None  # no edge cites a uuid that no longer exists
+    audit = conn.execute(
+        "SELECT action, kind FROM dashboard_audit WHERE item_id='f-new'"
+    ).fetchall()
+    assert audit == [("delete_fact", "fact")]

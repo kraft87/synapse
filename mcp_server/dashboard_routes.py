@@ -19,9 +19,10 @@ psycopg connection per request, and the boundary is fail-soft — an exception b
 (an operator sees the whole store); the only group_id/project/source scoping is the
 per-endpoint filtering the contract spells out.
 
-This is the ONLY writable surface the dashboard adds: dashboard_flags + dashboard_audit
-(schema 042). Everything else is read-only over episodes / the KG / timeline /
-preferences / notes.
+Writable surfaces: dashboard_flags + dashboard_audit (schema 042, the soft-flag), and —
+since phase 7 — the two DELETE routes that hard-delete an episode (with its content
+cascade) or a single KG edge. Everything else is read-only over episodes / the KG /
+timeline / preferences / notes.
 """
 
 from __future__ import annotations
@@ -1527,6 +1528,196 @@ def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool
 
 
 # ---------------------------------------------------------------------------
+# Deletion (phase 7) — the only DESTRUCTIVE routes on this surface
+# ---------------------------------------------------------------------------
+#
+# Real deletes, not tombstones: the operator's intent is "gone from memory", so a
+# soft-delete column that recall() would have to learn to skip is the wrong shape.
+# Each route runs in ONE transaction (autocommit is OFF here, unlike every read above)
+# so a partial cascade is never committed.
+#
+# THE rule, from a 2026-06 KG cleanup that nearly went wrong: provenance naming ONLY the
+# deleted episode is deleted; provenance SHARED with surviving episodes is UNLINKED. A
+# blanket "delete every fact whose provenance mentions these episodes" would have taken
+# 1467 legitimate facts out with the 330 bad ones. See docs/dashboard-contract.md §Phase 7
+# for the full cascade table, including what is deliberately left alone (preferences,
+# notes, recall_metrics/recall_feedback, web_artifacts, kg_entities) and why.
+#
+# Note the NOTIFY trigger (schema 043) is AFTER INSERT only, so a delete does not push
+# anything down the SSE stream; the deleting client drops the row locally and other
+# clients see it gone on their next full fetch.
+
+
+def _is_episode_ref(elem: Any, episode_id: int) -> bool:
+    """True when a provenance-array element names ``episode_id``.
+
+    Matches the JSON number and (defensively) the numeric-string form — the extractor's
+    array element type isn't guaranteed, which is why every read path here checks both.
+    bool is an int subclass, so it's excluded explicitly."""
+    if isinstance(elem, bool):
+        return False
+    if isinstance(elem, int):
+        return elem == episode_id
+    if isinstance(elem, str):
+        return elem.strip().isdigit() and int(elem) == episode_id
+    return False
+
+
+def _other_episode_refs(raw: Any, episode_id: int) -> list[Any]:
+    """The provenance elements that are NOT ``episode_id`` (order preserved).
+
+    Empty ⇒ SOLE provenance (delete the row). Non-empty ⇒ SHARED (unlink and keep). A
+    malformed / non-array ``episodes`` value counts as sole: it names nothing that would
+    survive."""
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if not _is_episode_ref(e, episode_id)]
+
+
+def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[str]) -> int:
+    """NULL the schema-028 supersession pointers aimed at edges we're deleting, so no
+    surviving edge cites a uuid that no longer exists. Returns rows touched."""
+    if not uuids:
+        return 0
+    cur = conn.execute(
+        "UPDATE kg_relationships SET invalidated_by = NULL WHERE invalidated_by = ANY(%s)",
+        (uuids,),
+    )
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
+    """Hard-delete an episode and everything carrying ITS content, in one transaction.
+
+    Returns the cascade summary the contract pins, or None when the episode doesn't
+    exist (the route turns that into the 404)."""
+    conn = psycopg.connect(db_url, row_factory=dict_row)
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT id FROM episodes WHERE id = %s FOR UPDATE", (episode_id,)
+            ).fetchone()
+            if row is None:
+                return None
+
+            # --- chunks -------------------------------------------------------------
+            # A chunk's `content` is the verbatim concatenation of its 3-5 episode window
+            # (schema 008), so there is no way to excise one turn from it: every chunk
+            # citing this episode goes. Chunks whose window ALSO named surviving episodes
+            # are counted separately — that's real collateral the UI has to admit to.
+            chunk_rows = conn.execute(
+                "SELECT id, episode_ids FROM chunks "
+                "WHERE episode_ids @> to_jsonb(%s::bigint) "
+                "   OR episode_ids @> to_jsonb(%s::text) "
+                "FOR UPDATE",
+                (episode_id, str(episode_id)),
+            ).fetchall()
+            chunk_ids = [r["id"] for r in chunk_rows]
+            chunks_mixed = sum(
+                1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], episode_id)
+            )
+            if chunk_ids:
+                conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
+
+            # --- KG facts (sole vs shared provenance) --------------------------------
+            fact_rows = conn.execute(
+                "SELECT uuid, episodes FROM kg_relationships "
+                "WHERE episodes @> to_jsonb(%s::bigint) "
+                "   OR episodes @> to_jsonb(%s::text) "
+                "FOR UPDATE",
+                (episode_id, str(episode_id)),
+            ).fetchall()
+            sole: list[str] = []
+            shared: list[tuple[str, list[Any]]] = []
+            for r in fact_rows:
+                others = _other_episode_refs(r["episodes"], episode_id)
+                if others:
+                    shared.append((r["uuid"], others))
+                else:
+                    sole.append(r["uuid"])
+            for uuid, others in shared:
+                conn.execute(
+                    "UPDATE kg_relationships SET episodes = %s WHERE uuid = %s",
+                    (Json(others), uuid),
+                )
+            if sole:
+                _clear_invalidated_by(conn, sole)
+                conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
+
+            # --- timeline events -----------------------------------------------------
+            # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
+            # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
+            # makes them sole-provenance by construction, so the rule resolves to delete;
+            # keeping them would go on serving the deleted turn from recall()'s timeline leg.
+            ev = conn.execute(
+                "DELETE FROM timeline_events WHERE source_ref = %s OR source_ref LIKE %s",
+                (f"ep:{episode_id}", f"ep:{episode_id}#%"),
+            )
+            events_deleted = ev.rowcount if ev.rowcount and ev.rowcount > 0 else 0
+
+            # --- the episode itself (extraction_queue rows follow via the 001 FK) -----
+            conn.execute("DELETE FROM episodes WHERE id = %s", (episode_id,))
+
+            summary = {
+                "episode_id": episode_id,
+                "chunks_deleted": len(chunk_ids),
+                "chunks_mixed_deleted": chunks_mixed,
+                "facts_deleted": len(sole),
+                "facts_unlinked": len(shared),
+                "events_deleted": events_deleted,
+            }
+            _retire_flag(conn, "episode", str(episode_id))
+            conn.execute(
+                "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
+                "VALUES ('delete_episode', 'episode', %s, %s)",
+                (str(episode_id), Json(summary)),
+            )
+            return summary
+    finally:
+        conn.close()
+
+
+def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
+    """Hard-delete ONE KG edge by uuid. No cascade — a fact is a leaf; the only cleanup is
+    the dangling supersession pointer. None when the uuid doesn't exist (→ 404)."""
+    conn = psycopg.connect(db_url, row_factory=dict_row)
+    try:
+        with conn.transaction():
+            row = conn.execute(
+                "SELECT uuid FROM kg_relationships WHERE uuid = %s FOR UPDATE", (uuid,)
+            ).fetchone()
+            if row is None:
+                return None
+            links_cleared = _clear_invalidated_by(conn, [uuid])
+            conn.execute("DELETE FROM kg_relationships WHERE uuid = %s", (uuid,))
+            result = {
+                "fact_id": uuid,
+                "deleted": True,
+                "supersession_links_cleared": links_cleared,
+            }
+            _retire_flag(conn, "fact", uuid)
+            conn.execute(
+                "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
+                "VALUES ('delete_fact', 'fact', %s, %s)",
+                (uuid, Json(result)),
+            )
+            return result
+    finally:
+        conn.close()
+
+
+def _retire_flag(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str) -> None:
+    """Retire the active flag (if any) on an item we just deleted, so the Flags list can't
+    point at a row that no longer exists. The dashboard_audit trail is NOT touched — it is
+    append-only and deliberately outlives the content."""
+    conn.execute(
+        "UPDATE dashboard_flags SET removed_at = now() "
+        "WHERE kind = %s AND item_id = %s AND removed_at IS NULL",
+        (kind, item_id),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Proposals (phase 2b) — unified review over the skills + config lanes
 # ---------------------------------------------------------------------------
 #
@@ -2629,6 +2820,38 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             logger.warning("dashboard flag failed: %s", e)
             return _err(str(e)[:200], 500)
         return JSONResponse({"status": "ok", "flagged": flagged})
+
+    # ---- delete (phase 7) ----
+    # Plural collection paths, unlike the singular phase-1 read routes — the DELETE verb
+    # acts on the collection member. Contract §Phase 7 has the cascade table.
+
+    @mcp.custom_route("/dash/api/episodes/{id}", methods=["DELETE"])  # type: ignore[misc]
+    async def dash_delete_episode(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _unauthorized()
+        raw = request.path_params["id"]
+        if not str(raw).isdigit():
+            return _err("bad episode id", 400)
+        return await _api(
+            request,
+            lambda: _delete_episode(db_url, int(raw)),
+            not_found="episode not found",
+            label="delete episode",
+        )
+
+    @mcp.custom_route("/dash/api/facts/{id}", methods=["DELETE"])  # type: ignore[misc]
+    async def dash_delete_fact(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _unauthorized()
+        uuid = request.path_params["id"]
+        if not uuid:
+            return _err("missing fact id", 400)
+        return await _api(
+            request,
+            lambda: _delete_fact(db_url, uuid),
+            not_found="fact not found",
+            label="delete fact",
+        )
 
     # ---- proposals (phase 2b) ----
 

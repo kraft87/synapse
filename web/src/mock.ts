@@ -313,3 +313,23 @@ export async function mockApi<T>(path: string): Promise<T> {
 }
 
 export const mockFlag = (_kind: string, _id: string) => ({ status: 'ok', flagged: true });
+
+// ---- delete (phase 7) ----
+// Fixed non-zero counts so #mock exercises the interesting readout: a mixed chunk (text of
+// episodes that were NOT deleted went with it) and a shared-provenance fact that survived
+// with the id unlinked. Nothing is actually removed from the fixtures — the pages drop the
+// row from their own list off the response, which is exactly what the real path does.
+export function mockDeleteEpisode<T>(id: string): Promise<T> {
+  return Promise.resolve({
+    episode_id: Number(id) || 0,
+    chunks_deleted: 3,
+    chunks_mixed_deleted: 1,
+    facts_deleted: 2,
+    facts_unlinked: 1,
+    events_deleted: 1,
+  } as T);
+}
+
+export function mockDeleteFact<T>(id: string): Promise<T> {
+  return Promise.resolve({ fact_id: id, deleted: true, supersession_links_cleared: 0 } as T);
+}

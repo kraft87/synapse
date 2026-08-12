@@ -1,11 +1,12 @@
 // Episode detail overlay (#/episode/:id). Turn cards + the derived-from block —
 // both-directions provenance for verifying extraction (spec §IA).
 import type React from 'react';
-import { fetchDerived, fetchEpisode, type Derived } from '../api';
+import { useState } from 'react';
+import { cascadeSummary, deleteEpisode, fetchDerived, fetchEpisode, type Derived } from '../api';
 import { closeOverlay } from '../hash';
 import { srcColor } from '../tokens';
 import { DerivedBlock } from '../components/FeedCard';
-import { Spinner } from '../components/ui';
+import { DeleteButton, Spinner } from '../components/ui';
 import { useAsync } from '../hooks';
 
 const chip = (bg: string, color: string, border?: string): React.CSSProperties => ({
@@ -17,6 +18,11 @@ export function EpisodeModal({ id }: { id: string }) {
     fetchEpisode(id),
     fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
   ]).then(([e, d]) => ({ ep: e, derived: d })), [id]);
+  // After a successful delete the episode no longer exists, so the overlay stops showing
+  // it and shows the cascade summary instead — closing straight away would hide the one
+  // line that says what else went (mixed chunks, unlinked facts). Dismiss closes.
+  const [deleted, setDeleted] = useState<string | null>(null);
+  const [delErr, setDelErr] = useState(false);
   const ep = data?.ep ?? null;
   const derived = data?.derived ?? null;
   const err = error != null;
@@ -35,13 +41,28 @@ export function EpisodeModal({ id }: { id: string }) {
           {ep?.project && <span style={chip('var(--acc-bg)', 'var(--acc)')}>{ep.project}</span>}
           {ep?.source && <span style={chip('transparent', srcColor(ep.source), '1px solid ' + srcColor(ep.source))}>{ep.source}</span>}
           <span style={{ flex: 1 }} />
+          {ep && !deleted && (
+            <DeleteButton
+              label="delete episode"
+              onDelete={() => deleteEpisode(id).then((r) => { setDelErr(false); setDeleted(cascadeSummary(r)); })}
+              onError={() => setDelErr(true)}
+            />
+          )}
           <button className="iconbtn" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
         </div>
 
-        {err && <div style={{ color: 'var(--err)', fontSize: '13px', fontFamily: 'var(--font-data)', marginTop: '14px' }}>couldn't load episode.</div>}
-        {!ep && !err && <Spinner label="loading episode…" />}
+        {delErr && <div style={{ color: 'var(--err)', fontSize: '13px', fontFamily: 'var(--font-data)', marginTop: '14px' }}>delete failed — the episode is still in memory.</div>}
+        {deleted && (
+          <div style={{ marginTop: '14px', border: '1px solid var(--line2)', background: 'var(--bg2)', borderRadius: '9px', padding: '14px 16px' }}>
+            <div style={{ fontFamily: 'var(--font-data)', fontSize: '12px', color: 'var(--txt2)', lineHeight: 1.6 }}>{deleted}</div>
+            <button className="softbtn" onClick={closeOverlay} style={{ marginTop: '12px', borderRadius: '6px', padding: '5px 12px', fontSize: '12px', fontFamily: 'var(--font-data)' }}>close</button>
+          </div>
+        )}
 
-        {ep && (
+        {err && !deleted && <div style={{ color: 'var(--err)', fontSize: '13px', fontFamily: 'var(--font-data)', marginTop: '14px' }}>couldn't load episode.</div>}
+        {!ep && !err && !deleted && <Spinner label="loading episode…" />}
+
+        {ep && !deleted && (
           <>
             <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', margin: '8px 0 14px' }}>{meta}</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>

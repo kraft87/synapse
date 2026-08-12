@@ -1,7 +1,7 @@
 // Small shared primitives: the badge chips (README §3 badge taxonomy) and the
 // optimistic ⚑ flag toggle (spec §5c — quiet, txt3 at rest, warn when set).
 import type React from 'react';
-import { useState, type CSSProperties } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { postFlag } from '../api';
 import { srcColor, typeColor, typeLabel } from '../tokens';
 
@@ -56,6 +56,57 @@ export function FlagButton({ kind, itemId, initial, size = 12 }: { kind: string;
       style={{ border: 'none', background: 'none', padding: '2px 4px', cursor: 'pointer', color: on ? 'var(--warn)' : 'var(--txt3)', fontSize: size + 'px', lineHeight: 1 }}
     >
       ⚑
+    </button>
+  );
+}
+
+// Two-click destructive confirm (phase 7). There is no modal-confirm primitive on this
+// surface and a native confirm() dialog would be the only OS chrome in the app, so the
+// button arms itself instead: "delete" → "confirm delete?" → fires. The armed state
+// expires after 4s so a stray click never leaves a live delete trigger sitting on screen.
+// Unlike FlagButton this is NOT optimistic — nothing is removed until the server says the
+// row is gone. Errors go to `onError`; the caller owns the message surface.
+const ARM_TIMEOUT_MS = 4000;
+
+export function DeleteButton({ onDelete, onError, label = 'delete', size = 11, style }: {
+  onDelete: () => Promise<unknown>;
+  onError?: (e: unknown) => void;
+  label?: string;
+  size?: number;
+  style?: CSSProperties;
+}) {
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (!armed || busy) return;
+    const t = setTimeout(() => setArmed(false), ARM_TIMEOUT_MS);
+    return () => clearTimeout(t);
+  }, [armed, busy]);
+
+  const click = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (busy) return;
+    if (!armed) { setArmed(true); return; }
+    setBusy(true);
+    onDelete()
+      .catch((err) => { onError?.(err); })
+      .finally(() => { setBusy(false); setArmed(false); });
+  };
+
+  return (
+    <button
+      className="delbtn"
+      onClick={click}
+      disabled={busy}
+      title={armed ? 'click again to permanently delete — this cannot be undone' : 'delete from memory'}
+      style={{
+        border: '1px solid ' + (armed ? 'var(--err)' : 'transparent'), borderRadius: '4px',
+        background: 'none', padding: '1px 6px', cursor: busy ? 'default' : 'pointer',
+        color: armed ? 'var(--err)' : 'var(--txt3)', fontFamily: 'var(--font-data)',
+        fontSize: size + 'px', lineHeight: 1.5, whiteSpace: 'nowrap', ...style,
+      }}
+    >
+      {busy ? 'deleting…' : armed ? 'confirm delete?' : label}
     </button>
   );
 }
