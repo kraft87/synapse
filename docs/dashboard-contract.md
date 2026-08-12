@@ -657,10 +657,11 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
 Deletes ONE KG edge by uuid — no cascade, no provenance arithmetic (a fact is the leaf).
 No such uuid → 404 `fact not found`.
 ```json
-{"fact_id": "<edge-uuid>", "deleted": true, "successors_unlinked": 0}
+{"fact_id": "<edge-uuid>", "deleted": true, "supersession_links_cleared": 0}
 ```
-- `successors_unlinked` = retired edges whose `invalidated_by` pointed at this uuid and
-  were NULLed (same dangling-pointer cleanup as the episode cascade).
+- `supersession_links_cleared` = retired edges this one had SUPERSEDED (their
+  `invalidated_by`, schema 028, pointed at this uuid) whose pointer was NULLed — the same
+  dangling-pointer cleanup the episode cascade does for its sole-provenance deletes.
 - Retires an active `dashboard_flags` row for the uuid; appends a `delete_fact`
   `dashboard_audit` row.
 - The entity endpoints are NOT touched: `kg_entities.degree` is a denormalized counter
