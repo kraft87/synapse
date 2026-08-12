@@ -79,6 +79,8 @@ a { color:var(--acc); }
 .linkbtn:hover { color:var(--acc) !important; }
 .result:hover { border-color:var(--line2) !important; background:var(--bg2) !important; }
 .flagbtn:hover { color:var(--warn) !important; }
+/* destructive: quiet at rest (txt3, like the flag), err on hover and while armed */
+.delbtn:hover { color:var(--err) !important; border-color:var(--line2) !important; }
 .chipbtn:hover { border-color:var(--acc) !important; }
 .field:focus { border-color:var(--acc) !important; outline:none; }
 .field:focus.field-err { border-color:var(--err) !important; }

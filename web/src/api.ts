@@ -2,7 +2,7 @@
 // (owned by the server agent). Everything is Bearer-token authenticated except the
 // static shell. When location.hash contains "mock", the mock dataset is served instead
 // so every screen renders offline.
-import { mockApi, mockFlag, mockRecall, MOCK } from './mock';
+import { mockApi, mockDeleteEpisode, mockDeleteFact, mockFlag, mockRecall, MOCK } from './mock';
 
 export { MOCK };
 
@@ -170,6 +170,75 @@ export const postFlag = (kind: string, id: string, note?: string): Promise<{ sta
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind, id, note }),
   });
+
+// ---------- delete (phase 7) ----------
+// The ONLY destructive calls in this client. Wire shapes pinned in
+// docs/dashboard-contract.md §Phase 7. Deleting an episode cascades server-side into the
+// content derived from it, and the summary says exactly what went — including the mixed
+// chunks, which carry text of episodes the operator did NOT delete. The UI repeats that
+// verbatim rather than reporting a bare "deleted".
+export interface DeleteEpisodeResult {
+  episode_id: number;
+  chunks_deleted: number;
+  chunks_mixed_deleted: number;
+  facts_deleted: number;
+  facts_unlinked: number;
+  events_deleted: number;
+}
+export interface DeleteFactResult {
+  fact_id: string;
+  deleted: boolean;
+  supersession_links_cleared: number;
+}
+
+// A delete can fire from a search hit or from the episode overlay, and the list showing
+// the item is often not the component that deleted it. One DOM CustomEvent keeps them in
+// sync without threading state through the hash router.
+export interface DeletedDetail { kind: 'episodes' | 'facts'; id: string }
+const DELETED_EVENT = 'synapse:deleted';
+export const onDeleted = (fn: (d: DeletedDetail) => void): (() => void) => {
+  const h = (e: Event) => fn((e as CustomEvent<DeletedDetail>).detail);
+  window.addEventListener(DELETED_EVENT, h);
+  return () => window.removeEventListener(DELETED_EVENT, h);
+};
+const announceDeleted = (kind: DeletedDetail['kind'], id: string) =>
+  window.dispatchEvent(new CustomEvent<DeletedDetail>(DELETED_EVENT, { detail: { kind, id } }));
+
+export const deleteEpisode = async (id: string): Promise<DeleteEpisodeResult> => {
+  const r: DeleteEpisodeResult = MOCK
+    ? await mockDeleteEpisode(id)
+    : await req('/episodes/' + encodeURIComponent(id), { method: 'DELETE' });
+  announceDeleted('episodes', id);
+  return r;
+};
+
+export const deleteFact = async (id: string): Promise<DeleteFactResult> => {
+  const r: DeleteFactResult = MOCK
+    ? await mockDeleteFact(id)
+    : await req('/facts/' + encodeURIComponent(id), { method: 'DELETE' });
+  announceDeleted('facts', id);
+  return r;
+};
+
+const plural = (n: number, one: string) => n + ' ' + one + (n === 1 ? '' : 's');
+
+// "deleted: 3 chunks, 2 facts, 1 event · 1 fact unlinked (shared provenance) · 1 chunk
+// also spanned other episodes" — the honest readout, collateral included.
+export function cascadeSummary(r: DeleteEpisodeResult): string {
+  const gone: string[] = [];
+  if (r.chunks_deleted) gone.push(plural(r.chunks_deleted, 'chunk'));
+  if (r.facts_deleted) gone.push(plural(r.facts_deleted, 'fact'));
+  if (r.events_deleted) gone.push(plural(r.events_deleted, 'event'));
+  const parts = ['episode deleted' + (gone.length ? ': ' + gone.join(', ') : '')];
+  if (r.facts_unlinked) parts.push(plural(r.facts_unlinked, 'fact') + ' unlinked (shared provenance)');
+  if (r.chunks_mixed_deleted) parts.push(plural(r.chunks_mixed_deleted, 'chunk') + ' also spanned other episodes');
+  return parts.join(' · ');
+}
+
+export const factDeleteSummary = (r: DeleteFactResult): string =>
+  'fact deleted' + (r.supersession_links_cleared
+    ? ' · ' + plural(r.supersession_links_cleared, 'supersession link') + ' cleared'
+    : '');
 
 // ---------- recall debug console (phase 2) ----------
 // The debug envelope surfaces the SAME per-leg timing / pool / rerank numbers the engine
