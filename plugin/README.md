@@ -9,7 +9,7 @@ and the dream→skills lane all run server-side.
 
 ## What it does
 
-Five hooks (`hooks/hooks.json`) plus MCP wiring:
+Six hooks (`hooks/hooks.json`) plus MCP wiring:
 
 1. **Transcript ingest** (`Stop`) — after every turn, pushes a bounded tail of the session
    transcript to `/ingest`. This is how sessions become memory, and it works over the
@@ -27,6 +27,9 @@ Five hooks (`hooks/hooks.json`) plus MCP wiring:
    context: curated note hooks, the last week's milestones, and what memory exists at all.
    Server-rendered and hard-capped (~80 lines / ~2K tokens), scoped to the session's
    project.
+6. **Private-mode cleanup** (`SessionEnd`) — removes the local private-mode marker for the
+   session that just ended (see [Private mode](#private-mode)). The server-side flag is
+   left in place on purpose.
 
 MCP tools (`recall`, `fetch`, `remember`, …) are registered automatically —
 no hand-written `.mcp.json`.
@@ -45,8 +48,9 @@ Everything below goes only to the Synapse URL **you** configure. All hooks are f
 an unreachable server is a silent no-op.
 
 - **Transcript ingest** — **on** (the core function). Sends the raw JSONL tail of each
-  session transcript — your prompts, Claude's replies, tool calls. No separate toggle: if
-  transcripts shouldn't leave the machine, don't install the plugin.
+  session transcript — your prompts, Claude's replies, tool calls. Per-session opt-out:
+  [private mode](#private-mode). No global toggle: if transcripts shouldn't leave the
+  machine at all, don't install the plugin.
 - **Skill sync** — **off** (opt-in). When enabled, sends skill bodies + bundled files and
   pulls server versions back into `~/.claude/skills` at session start. On:
   `SYNAPSE_SKILLS_SYNC=1`.
@@ -182,6 +186,32 @@ Bundled commands (`!` prefix in a session; full path from an outside terminal):
 
 - **`! synapse-login`** — fetch a machine token via GitHub device flow (or `--browser`).
 - **`! synapse-import`** — backfill your existing history (step 4).
+- **`! synapse-private on|off|status <session-id>`** — private mode (below).
+
+## Private mode
+
+Take one session off the record — nothing from it becomes memory, ever:
+
+```
+! synapse-private on <session-id>
+```
+
+Two writes, both required, both verified — the command exits nonzero and says so if either
+fails, so "off the record" is never claimed on a half-write:
+
+- a marker file at `~/.synapse/private/<session-id>` — the `Stop` hook stats it before every
+  POST, so the turns never leave the machine even with the server down. It expires after 12h
+  and the `SessionEnd` hook removes it;
+- a row in `private_sessions` on the server — the durable half. Your transcript stays on disk
+  after the marker is gone, so this row is what stops a later catch-up sweep or
+  `synapse-import` from ingesting the very turns the hook skipped.
+
+`off` removes the marker and **keeps** the row: private turns already spoken stay
+uningestable, which is the only honest reading of "we were off the record". `--forget`
+deletes the row too, deliberately re-exposing that session to future imports.
+
+Server requirement: schema 050 (`private_sessions`). Against an older server the toggle
+fails loudly with `503 apply schema/050` rather than half-enabling.
 
 MCP tools (registered automatically; Claude calls them during a session):
 
