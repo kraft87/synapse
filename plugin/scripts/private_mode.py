@@ -152,6 +152,13 @@ def main(argv: list[str]) -> int:
     action, session_id = argv[0], argv[1].strip()
     if not session_id or "/" in session_id or session_id in (".", ".."):
         return _fail(f"invalid session id {session_id!r}")
+    if session_id.startswith("-"):
+        # `off --forget <id>` would otherwise read the flag as the id and
+        # no-op against a session named "--forget" while the real one stays
+        # untouched.
+        return _fail(
+            f"session id {session_id!r} looks like a flag — usage: on|off|status <session_id> [--forget]"
+        )
     if action == "on":
         return _on(session_id)
     if action == "off":
