@@ -83,6 +83,8 @@ ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
 CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted)
+PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
+_PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -272,6 +274,43 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
 # ---------------------------------------------------------------------------
 
 
+def _is_private(session_id: str) -> bool:
+    """True if `session_id` is in private mode → ship NOTHING for it.
+
+    Private mode is a marker file at PRIVATE_DIR/<session_id>, written by
+    private_mode.py (which also sets the durable server-side flag). This local check
+    is the fast half: it keeps the turns from ever leaving the machine, and it works
+    while the server is unreachable.
+
+    Two deliberate behaviours:
+      * STALE markers (older than _PRIVATE_TTL_HOURS) are ignored AND deleted. A
+        marker outlives its session — a crashed SessionEnd hook leaves one behind, and
+        Claude Code reuses no session id, so an orphan would otherwise sit there
+        forever. The server-side row is the durable record; the marker is a live flag.
+      * UNREADABLE marker dir → treated as PRIVATE. If we can't prove a session is not
+        private, silently capturing it is the unacceptable failure; a deferred turn is
+        not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
+    """
+    if not session_id:
+        return False
+    marker = os.path.join(str(PRIVATE_DIR), session_id)
+    try:
+        age = time.time() - os.stat(marker).st_mtime
+    except FileNotFoundError:
+        return False  # no marker (or no private dir at all) — normal case
+    except OSError as e:
+        _log(f"PRIVATE unreadable {session_id}: {type(e).__name__} — skipping ingestion")
+        return True
+    if age > _PRIVATE_TTL_HOURS * 3600:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        _log(f"PRIVATE stale marker removed {session_id} (age {int(age)}s)")
+        return False
+    return True
+
+
 def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     """POST a batch of raw transcript records to /ingest; returns the (truncated)
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
@@ -294,11 +333,30 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
     already shipped that session turn-by-turn); catchup mode ships from byte 0 —
     recovering never-shipped files is its entire point. A failed POST leaves the
     cursor at the failure point, so the next Stop or sweep resumes there.
+
+    Private mode short-circuits everything: a session with a live marker file posts
+    nothing, on either path (the catch-up sweep calls this per file, so it inherits
+    the same check per session). The cursor is left alone, so if the marker later
+    expires the turns are still shippable — the server's private_sessions row, not
+    this cursor, is what keeps them out of memory for good.
     """
+    # Cheap check first: the transcript's own name is the session id.
+    session_id = os.path.splitext(os.path.basename(transcript_path))[0]
+    if _is_private(session_id):
+        _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)}")
+        return (0, 0)
     try:
         offset_recs, eof = _read_offset_records(transcript_path)
         if not offset_recs:
             return (0, 0)
+
+        # Belt and braces: a resumed/compacted transcript can carry records whose
+        # sessionId differs from the filename, and it's the record's id that the
+        # server stores (and that private_mode.py marked).
+        for sid in {str(r.get("sessionId") or "") for _, r in offset_recs} - {"", session_id}:
+            if _is_private(sid):
+                _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (record sid)")
+                return (0, 0)
 
         ent = _load_state().get(transcript_path)
         cursor: int | None = None

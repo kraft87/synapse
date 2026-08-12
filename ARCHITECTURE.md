@@ -222,11 +222,14 @@ for ep in episodes:
 - **Cross-session content guard** (schema 036, `SYNAPSE_CONTENT_DEDUP=0` to disable) — the span guard is per-session, so a retry session or re-import that replays a turn under a *fresh* session/span id sails through it. A second check skips any turn whose content is byte-identical (`md5(content)` index) to an episode already stored in the same project. Measured on a real corpus: ~4.6% of episodes were exact replays (agent re-runs, mid-session forks, re-imports) before this guard.
 - **Append at `max(seq)+1`** — new turns extend the session.
 - **Contamination filter** — `is_transcript_contamination` drops PII-bearing third-party transcript payloads (produced by another agent project sharing the same hooks).
+- **Private-mode filter** (schema 050) — `PrivateSessions.is_private` drops every turn whose `session_id` sits in `private_sessions`. Same chokepoint, same shape as the contamination predicate, and `ingestion/backfill.py` applies it too, so a session taken off the record can't be ingested by a path that bypasses the hook (catch-up sweep, disk backfill, a re-import months later). Rows are permanent by design: the transcript survives on disk, so deleting the row would re-expose exactly the turns the user hid.
 - Runs in a threadpool so the async route never blocks.
 
 ### 4.2 The Stop hook
 
 `scripts/synapse_ingest_hook.py` fires on every turn. It ships a **bounded tail** (default `SYNAPSE_INGEST_TAIL=400` raw records), trimmed to start at a real turn boundary; if the window holds no boundary (one mega-turn) it falls back to the full file. It POSTs detached (`start_new_session=True`) and always `sys.exit(0)` — **it never blocks or fails a turn**. A disk-sweep backstop re-ingests anything a failed POST drops. Shipping a tail (not the full transcript) plus enqueue-gating on new `(session, span_id)` fixed an earlier O(turns²) re-extraction loop (#61, #105, #106).
+
+**Private mode** short-circuits the hook before any POST: `private_mode.py on <session_id>` writes a marker file at `~/.synapse/private/<session_id>`, and `_ship` skips the whole transcript while that marker is live — on the Stop path and the catch-up sweep alike. Markers expire after 12h (ignored *and* deleted) and are removed by a `SessionEnd` hook, because a session id is never reused and an orphaned marker would otherwise be permanent. The check is fail-safe in one direction: a marker directory that exists but can't be read counts as private, since silently capturing a session the user believes is off the record is the unacceptable failure and a deferred turn is not (the cursor doesn't advance). The marker is only the fast local half — the durable half is the `private_sessions` row the same CLI writes over `PUT /private-sessions/{session_id}`, which is what §4.1 enforces.
 
 ### 4.3 Chunk construction
 

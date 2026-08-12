@@ -22,6 +22,7 @@ from ingestion.contamination import is_harness_call, is_transcript_contamination
 from ingestion.db import Database
 from ingestion.jsonl_client import JSONLParser
 from ingestion.models import Episode, ExtractionItem
+from ingestion.private_sessions import PrivateSessions
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,9 @@ def write_backfill_session(db: Database, session_id: str, eps: list[Episode]) ->
     was a byte-identical copy of this). The Claude Code JSONL path uses
     _write_session_episodes below instead — same skeleton plus the contamination/
     harness guards and project defaulting that source needs."""
+    if PrivateSessions(db).is_private(session_id):
+        logger.info("skipping private session %s (schema/050)", session_id)
+        return 0
     existing = db.get_session_episodes(session_id)
     next_seq = (max((e["sequence"] for e in existing), default=0)) + 1
     written = 0
@@ -64,6 +68,12 @@ def _write_session_episodes(
     project_default: str | None,
 ) -> int:
     """Write episodes for one session, preserving existing sequence offsets."""
+    # Private mode (schema/050) is session-scoped, so it drops the whole session before
+    # any per-episode work. The marker file only stops the LIVE hook; the transcript is
+    # still on disk, and this sweep is exactly the path that would ingest it later.
+    if PrivateSessions(db).is_private(session_id):
+        logger.info("skipping private session %s (schema/050)", session_id)
+        return 0
     existing = db.get_session_episodes(session_id)
     existing_uuids = {e["span_id"] for e in existing if e.get("span_id", "").startswith("jsonl:")}
     next_seq = (max((e["sequence"] for e in existing), default=0)) + 1

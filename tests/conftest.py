@@ -68,6 +68,7 @@ _DB_FILES = {
     "test_tool_surface.py",
     "test_restamp_inherited_dates.py",
     "test_recall_feedback.py",
+    "test_private_session_routes.py",
 }
 
 

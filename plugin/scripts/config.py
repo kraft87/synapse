@@ -61,6 +61,11 @@ PROJECTS_DIR = _path("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
 DATA_DIR = _path("SYNAPSE_DATA_DIR", "~/.local/share/synapse-skills")
 PROPOSALS_DIR = DATA_DIR / "proposals"
 
+# Private mode: one marker file per off-the-record session (name = session id). The Stop
+# hook stats this directory before every POST, so it lives outside DATA_DIR on a short,
+# obvious path the user can inspect (and `rm`) without knowing plugin internals.
+PRIVATE_DIR = _path("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")
+
 # Config lane: the root the mirrored config files live under (file_key = path relative to it), and
 # the opt-in manifest of globs to mirror (default none -> the lane is off until the user opts in).
 CONFIG_DIR = _path("CLAUDE_CONFIG_DIR", "~/.claude")
@@ -211,6 +216,26 @@ def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> di
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(url, method="GET", headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def request_json(
+    method: str, path: str, payload: dict | None = None, timeout: float = 30.0
+) -> dict:
+    """Send an arbitrary-verb JSON request to a Synapse endpoint under BASE_URL.
+
+    The sibling helpers cover the POST/GET lanes; private mode's routes are PUT/DELETE
+    (the session id is the resource, not a body field), which urllib only reaches through
+    an explicit method. Same bearer + error contract: raises on transport / HTTP error."""
+    url = path if path.startswith("http") else BASE_URL + path
+    headers = {"User-Agent": _UA}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    if INGEST_TOKEN:
+        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 

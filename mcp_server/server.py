@@ -370,6 +370,14 @@ from mcp_server.preferences_routes import register as _register_preferences_rout
 
 _register_preferences_routes(mcp, DB_URL, _machine_authorized)
 
+# Private mode — the plugin's toggle CLI flips a session's "off the record" flag here
+# (schema 050). The flag is what ingest_turns/backfill check, so a session marked private
+# can never be ingested by ANY path, including one that bypasses the plugin's hook.
+# Same machine-token seam. No-op w/o DB.
+from mcp_server.private_session_routes import register as _register_private_routes  # noqa: E402
+
+_register_private_routes(mcp, DB_URL, _machine_authorized)
+
 # Board read route — GET /context?project=X serves the rendered explicit-memory board
 # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
 # Same machine-token seam. No-op w/o DB. get_recall is a lazy thunk: _get_recall is
@@ -1045,11 +1053,13 @@ async def ingest_turns(request: Request) -> JSONResponse:
         from ingestion.db import Database
         from ingestion.jsonl_client import JSONLParser
         from ingestion.models import ExtractionItem
+        from ingestion.private_sessions import PrivateSessions
 
         episodes = JSONLParser().parse_records(records, source_label, project_override)
         if not episodes:
             return 0
         db = Database(DB_URL)
+        private = PrivateSessions(db)  # per-batch memo; schema/050
         try:
             # The hook ships a bounded TAIL of the transcript, so the parser's
             # positional sequence is meaningless here — turn 50 arrives numbered 1
@@ -1067,6 +1077,7 @@ async def ingest_turns(request: Request) -> JSONResponse:
             index: dict[str, tuple[set[str], int]] = {}
             written = 0
             dropped = 0
+            private_dropped = 0
             content_dups = 0
             for ep in episodes:
                 # Reject transcribe_ai deposition payloads before they ever land — third-party
@@ -1075,6 +1086,13 @@ async def ingest_turns(request: Request) -> JSONResponse:
                 # eat itself — see contamination.is_harness_call).
                 if is_transcript_contamination(ep.content) or is_harness_call(ep.content):
                     dropped += 1
+                    continue
+                # Private mode (schema/050): the user took this session off the record.
+                # The plugin's hook already stops posting while its local marker exists;
+                # this is the durable half, so a catch-up sweep or a backfill months
+                # later can't ingest what the hook skipped.
+                if private.is_private(ep.session_id):
+                    private_dropped += 1
                     continue
                 if ep.session_id not in index:
                     index[ep.session_id] = db.get_session_span_index(ep.session_id)
@@ -1107,6 +1125,8 @@ async def ingest_turns(request: Request) -> JSONResponse:
                 written += 1
             if dropped:
                 logger.info("ingest dropped %d transcribe_ai transcript-payload turn(s)", dropped)
+            if private_dropped:
+                logger.info("ingest dropped %d private-session turn(s)", private_dropped)
             if content_dups:
                 logger.info(
                     "ingest skipped %d cross-session content-duplicate turn(s)", content_dups
