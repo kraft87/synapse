@@ -80,6 +80,23 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def is_private_session(self, session_id: str) -> bool:
+        """True if this session is flagged private (schema/050) — its turns must never
+        become episodes, on ANY path (live /ingest, catch-up sweep, bulk backfill).
+
+        The one tolerated failure is a missing table: a deployment that has not applied
+        schema/050 has no private sessions to honour, so it reads as not-private rather
+        than blocking all ingestion. Every other error propagates — see
+        ``ingestion.private_sessions.PrivateSessions`` for why this leg fails closed."""
+        try:
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
+                ).fetchone()
+        except psycopg.errors.UndefinedTable:
+            return False
+        return row is not None
+
     def upsert_episode(self, ep: Episode) -> int:
         # created_at is EVENT time (when the conversation happened), not ingest
         # time: the parser fills Episode.created_at from the transcript's own
