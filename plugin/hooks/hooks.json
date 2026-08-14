@@ -28,7 +28,7 @@
           },
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/timeline_git.py\"",
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
             "timeout": 30
           },
           {

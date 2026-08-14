@@ -40,8 +40,7 @@ _HOOK_BLOCKS: list[tuple[str, str]] = [
         "[[hooks.Stop.hooks]]\n"
         'type = "command"\n'
         f'command = "python3 {HOOKS_DIR}/synapse_stop_hook.py"\n'
-        "timeout = 30\n"
-        'statusMessage = "Syncing to Synapse"\n',
+        "timeout = 30\n",
     ),
     (
         "session_start.py",

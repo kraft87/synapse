@@ -16,7 +16,7 @@ the Claude Code plugin (`../plugin/`) for the per-session surface:
 
 Not ported (machine-level curation lanes, run them from Claude Code; running
 them from both hosts would double-sync): skills_sync, config_sync,
-timeline_git, and the `/synapse:skill-review` / `/synapse:config-review`
+git_feeder (board git feeder), and the `/synapse:skill-review` / `/synapse:config-review`
 commands.
 
 ## Install

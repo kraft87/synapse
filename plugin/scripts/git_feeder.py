@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # mypy: ignore-errors
-"""Claude Code ``SessionStart`` hook → push git commits to the Synapse timeline.
+"""Claude Code ``SessionStart`` hook → push git commits into the board's feed.
 
-The timeline's git feeder: one naked event per commit ("committed to <project>:
-<subject>", author-dated), POSTed to the machine-token-gated ``/timeline/events``
-route. The SERVER embeds and upserts — this script holds no DSN and no Voyage key,
+(Formerly ``timeline_git.py``. Timeline RETRIEVAL was retired 2026-08-07 — this
+feeder survived it because the ``timeline_events`` store's real consumer is the
+session-start board's "Last 7 days" block, and commits are that block's
+milestones.)
+
+One naked event per commit ("committed to <project>: <subject>", author-dated),
+POSTed to the machine-token-gated ``/timeline/events`` route. The SERVER embeds and upserts — this script holds no DSN and no Voyage key,
 same thin-client seam as ingest_hook / skills_sync / config_sync.
 
 OFF until repos are configured: set ``SYNAPSE_TIMELINE_REPOS`` (env or plugin option)

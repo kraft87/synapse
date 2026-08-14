@@ -48,10 +48,11 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "suppressOutput": True,
                 "hookSpecificOutput": {
                     "hookEventName": "PostToolUse",
                     "additionalContext": _NUDGE,
-                }
+                },
             }
         )
     )

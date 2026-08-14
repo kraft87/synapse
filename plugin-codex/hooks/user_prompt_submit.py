@@ -35,10 +35,11 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "suppressOutput": True,
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
                     "additionalContext": _NUDGE,
-                }
+                },
             }
         )
     )
