@@ -28,31 +28,82 @@ import sys
 from pathlib import Path
 
 CONFIG_PATH = Path(os.path.expanduser("~/.codex/config.toml"))
-HOOK_SCRIPT = (Path(__file__).parent / "hooks" / "synapse_stop_hook.py").resolve()
-MARKER = "synapse_stop_hook.py"
+HOOKS_DIR = (Path(__file__).parent / "hooks").resolve()
+SCRIPTS_DIR = (Path(__file__).parent / "scripts").resolve()
+
+# One entry per hook block; the marker (the script filename) doubles as the
+# idempotency check so re-running after an upgrade appends only what's new.
+_HOOK_BLOCKS: list[tuple[str, str]] = [
+    (
+        "synapse_stop_hook.py",
+        "[[hooks.Stop]]\n"
+        "[[hooks.Stop.hooks]]\n"
+        'type = "command"\n'
+        f'command = "python3 {HOOKS_DIR}/synapse_stop_hook.py"\n'
+        "timeout = 30\n"
+        'statusMessage = "Syncing to Synapse"\n',
+    ),
+    (
+        "session_start.py",
+        "[[hooks.SessionStart]]\n"
+        "[[hooks.SessionStart.hooks]]\n"
+        'type = "command"\n'
+        f'command = "python3 {HOOKS_DIR}/session_start.py"\n'
+        "timeout = 20\n",
+    ),
+    (
+        "user_prompt_submit.py",
+        "[[hooks.UserPromptSubmit]]\n"
+        "[[hooks.UserPromptSubmit.hooks]]\n"
+        'type = "command"\n'
+        f'command = "python3 {HOOKS_DIR}/user_prompt_submit.py"\n'
+        "timeout = 5\n",
+    ),
+    (
+        "pre_tool_use.py",
+        "[[hooks.PreToolUse]]\n"
+        'matcher = "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session)$"\n'
+        "[[hooks.PreToolUse.hooks]]\n"
+        'type = "command"\n'
+        f'command = "python3 {HOOKS_DIR}/pre_tool_use.py"\n'
+        "timeout = 5\n",
+    ),
+    (
+        "post_tool_use.py",
+        "[[hooks.PostToolUse]]\n"
+        'matcher = "mcp__.*__(recall|recall_full_turns)$"\n'
+        "[[hooks.PostToolUse.hooks]]\n"
+        'type = "command"\n'
+        f'command = "python3 {HOOKS_DIR}/post_tool_use.py"\n'
+        "timeout = 5\n",
+    ),
+    (
+        "private_mode.py --session-end",
+        "[[hooks.SessionEnd]]\n"
+        "[[hooks.SessionEnd.hooks]]\n"
+        'type = "command"\n'
+        f'command = "python3 {SCRIPTS_DIR}/private_mode.py --session-end"\n'
+        "timeout = 3\n",
+    ),
+]
 
 
 def install_hook(dry_run: bool) -> None:
     existing = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else ""
-    if MARKER in existing:
-        print(f"hook: already present in {CONFIG_PATH} — skipping")
+    missing = [(m, b) for m, b in _HOOK_BLOCKS if m.split()[0] not in existing]
+    if not missing:
+        print(f"hooks: all {len(_HOOK_BLOCKS)} blocks already present in {CONFIG_PATH} — skipping")
         return
-    block = (
-        "\n# Synapse ingest hook (installed by synapse plugin-codex/install.py)\n"
-        "[[hooks.Stop]]\n"
-        "[[hooks.Stop.hooks]]\n"
-        'type = "command"\n'
-        f'command = "python3 {HOOK_SCRIPT}"\n'
-        "timeout = 30\n"
-        'statusMessage = "Syncing to Synapse"\n'
+    text = "\n# Synapse hooks (installed by synapse plugin-codex/install.py)\n" + "\n".join(
+        b for _, b in missing
     )
     if dry_run:
-        print(f"hook: would append to {CONFIG_PATH}:\n{block}")
+        print(f"hooks: would append to {CONFIG_PATH}:\n{text}")
         return
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "a", encoding="utf-8") as f:
-        f.write(block)
-    print(f"hook: appended Stop hook to {CONFIG_PATH}")
+        f.write(text)
+    print(f"hooks: appended {len(missing)} hook block(s) to {CONFIG_PATH}")
 
 
 def install_mcp(synapse_url: str, dry_run: bool) -> None:
@@ -94,8 +145,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
-    if not HOOK_SCRIPT.exists():
-        print(f"error: {HOOK_SCRIPT} not found", file=sys.stderr)
+    if not (HOOKS_DIR / "synapse_stop_hook.py").exists():
+        print(f"error: hook scripts not found under {HOOKS_DIR}", file=sys.stderr)
         return 2
 
     install_hook(args.dry_run)
