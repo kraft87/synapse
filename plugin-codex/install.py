@@ -44,7 +44,6 @@ def install_hook(dry_run: bool) -> None:
         'type = "command"\n'
         f'command = "python3 {HOOK_SCRIPT}"\n'
         "timeout = 30\n"
-        "async = true\n"
         'statusMessage = "Syncing to Synapse"\n'
     )
     if dry_run:
