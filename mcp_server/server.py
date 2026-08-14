@@ -1030,7 +1030,14 @@ async def ingest_turns(request: Request) -> JSONResponse:
     skip), so this is backward compatible with the pre-tail hook.
 
     Any client that runs the real ``claude`` CLI fires this same hook.
-    Body: {"records": [...], "project": optional, "source": optional}.
+    Body: {"records": [...], "project": optional, "source": optional,
+    "format": optional ("claude_code" default | "codex"), "session_id": optional}.
+
+    ``format: "codex"`` parses the records as Codex CLI rollout lines via
+    ``CodexRolloutParser`` instead. A pushed tail usually lacks the rollout's
+    session_meta line, so the Codex hook passes ``session_id`` (from the
+    rollout filename) as a fallback identity hint. Everything downstream —
+    span_id dedup, private sessions, contamination guards — is shared.
     """
     if not _machine_authorized(request):
         return unauthorized()
@@ -1047,6 +1054,10 @@ async def ingest_turns(request: Request) -> JSONResponse:
         return err("body must contain a 'records' list", 400)
     source_label = body.get("source") or "hook"
     project_override = body.get("project")
+    record_format = body.get("format") or "claude_code"
+    session_id_hint = body.get("session_id")
+    if record_format not in ("claude_code", "codex"):
+        return err(f"unknown format {record_format!r}", 400)
 
     def _work() -> int:
         from ingestion.contamination import is_harness_call, is_transcript_contamination
@@ -1055,7 +1066,14 @@ async def ingest_turns(request: Request) -> JSONResponse:
         from ingestion.models import ExtractionItem
         from ingestion.private_sessions import PrivateSessions
 
-        episodes = JSONLParser().parse_records(records, source_label, project_override)
+        if record_format == "codex":
+            from ingestion.codex_client import CodexRolloutParser
+
+            episodes = CodexRolloutParser().parse_records(
+                records, source_label, project_override, session_id_hint=session_id_hint
+            )
+        else:
+            episodes = JSONLParser().parse_records(records, source_label, project_override)
         if not episodes:
             return 0
         db = Database(DB_URL)
