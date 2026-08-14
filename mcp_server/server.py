@@ -984,15 +984,16 @@ def recall_feedback(
     "web" / "user" (memory never had it) vs "nowhere" (still unresolved).
 
     Rate any served id verbatim — "e:N" episodes, "f:<uuid>" facts (and
-    superseded_facts), "t:N" timeline, "w:N" web, "n:N" note ids from the
-    session-start board or fetch(): WHEN a board note shaped your answer (or
-    misled it), rate it too. A comment-only report is still valuable when the
-    serving itself was the problem.
+    superseded_facts), "t:N" timeline, "w:N" web — plus
+    "n:N" note ids from the session-start board or fetch(): WHEN a board
+    note shaped your answer (or misled it), rate it too. A comment-only
+    report is still valuable when the serving itself was the problem.
 
     This is offline labeled data (eval goldens, reranker tuning); it never
-    changes live ranking, so honest negatives are safe and wanted. File at
-    most one report per recall query, rate only results you used, and never
-    invent ids — only ids actually served by recall, the board, or fetch.
+    changes live ranking, so honest negatives are safe and wanted. Do NOT
+    file more than one report per recall query, do NOT rate results you
+    never used, and do NOT invent ids — report only ids actually served to
+    you by recall, the board, or fetch.
 
     Args:
         query: The recall query being rated, verbatim.
