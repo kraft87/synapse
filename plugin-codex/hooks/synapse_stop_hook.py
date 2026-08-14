@@ -246,7 +246,33 @@ def _ship(payload: dict[str, Any]) -> None:
     _log(f"shipped {len(records)} records for {session_id} -> ingested={resp.get('ingested')}")
 
 
+def _catchup() -> None:
+    """Backstop sweep: ship the tail of every recently-modified rollout.
+
+    Spawned detached by the SessionStart hook. Cursors make re-shipping cheap
+    and server-side span dedup makes it idempotent, so overlap with the live
+    Stop hook is a no-op. Window: SYNAPSE_CODEX_CATCHUP_DAYS (default 3).
+    """
+    days = float(os.environ.get("SYNAPSE_CODEX_CATCHUP_DAYS", "3"))
+    cutoff = time.time() - days * 86400
+    from re import search
+
+    for path in sorted(SESSIONS_ROOT.rglob("rollout-*.jsonl")):
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        m = search(r"rollout-.*-([0-9a-f-]{36})\.jsonl$", path.name)
+        if not m:
+            continue
+        _ship({"session_id": m.group(1), "transcript_path": str(path)})
+
+
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--catchup":
+        _catchup()
+        return 0
     if len(sys.argv) >= 3 and sys.argv[1] == "--ship":
         _ship(json.loads(sys.argv[2]))
         return 0
