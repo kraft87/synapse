@@ -158,7 +158,7 @@ Web-research tool results (WebFetch, Exa, Firecrawl, WebSearch) are captured as 
 `timeline_events` (schema 033) is the EPISODIC complement to the semantic KG: an append-only, time-ordered log of dated **point-events that happened** ("shipped X", "decided Y", "fixed Z"), distinct from the KG's deduplicated states-with-duration. Two feeders:
 
 - **Chat gate** (`ingestion/timeline_gate.py`): one small LLM call per ingested turn asking "did something actually HAPPEN?" — most turns are discussion and emit nothing. Emitted events are naked past-tense facts (no actor field; the verb carries decides-vs-executes), self-contained, dated to the turn with validated resolution of "last Tuesday"-style mentions.
-- **Git feeder** (plugin `timeline_git.py`): commits pushed as `source='git:<project>'` events, author-dated.
+- **Git feeder** (plugin `git_feeder.py`): commits pushed as `source='git:<project>'` events, author-dated.
 
 Idempotency rides on `UNIQUE(source, source_ref)`. Three write-time quality mechanisms (all default-on, individually kill-switchable):
 

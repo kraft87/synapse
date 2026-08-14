@@ -93,10 +93,11 @@ def main() -> None:
     print(
         json.dumps(
             {
+                "suppressOutput": True,
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
                     "additionalContext": "\n\n".join(parts),
-                }
+                },
             }
         )
     )
