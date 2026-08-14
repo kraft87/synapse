@@ -44,9 +44,37 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-BASE_URL = (os.environ.get("SYNAPSE_URL") or "http://localhost:8765").rstrip("/")
-INGEST_URL = os.environ.get("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
-TOKEN = os.environ.get("SYNAPSE_INGEST_TOKEN", "")
+
+def _claude_plugin_options() -> dict[str, str]:
+    """Fallback config source: the Synapse *Claude Code* plugin persists
+    SYNAPSE_URL / SYNAPSE_INGEST_TOKEN in ~/.claude/settings.json at install
+    time. Codex hooks only inherit plain env, so on a machine running both
+    plugins this reuses that config instead of requiring duplicate env vars.
+    Env always wins."""
+    try:
+        data = json.loads(
+            Path(os.path.expanduser("~/.claude/settings.json")).read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return {}
+    merged: dict[str, str] = {}
+    for cfg_key, cfg in (data.get("pluginConfigs") or {}).items():
+        if str(cfg_key).split("@", 1)[0] == "synapse":
+            opts = cfg.get("options") or {}
+            merged.update({k: str(v) for k, v in opts.items() if v not in (None, "")})
+    return merged
+
+
+_FALLBACK = _claude_plugin_options()
+
+
+def _cfg(key: str, default: str = "") -> str:
+    return os.environ.get(key) or _FALLBACK.get(key) or default
+
+
+BASE_URL = _cfg("SYNAPSE_URL", "http://localhost:8765").rstrip("/")
+INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
+TOKEN = _cfg("SYNAPSE_INGEST_TOKEN")
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
 LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
 CURSORS_PATH = Path(
