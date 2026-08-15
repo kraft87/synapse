@@ -176,9 +176,17 @@ _SEMANTIC_POOL_LIMIT = 8
 # _SATURATION_MIN of a fact's pool, retrieval re-runs excluding every
 # candidate already judged and another contradiction round fires, until a
 # round comes back below the threshold or _SATURATION_MAX_ROUNDS extra
-# rounds have run (worst case 8 + 3*8 = 32 invalidations per fact).
+# rounds have run (worst case 8 + 8*8 = 72 invalidations per fact).
+#
+# Rounds cap sized empirically (2026-08-14): replaying the real teardown fact
+# against the reconstructed pre-teardown graph (44 live adult-stack edges),
+# the loop needed ~5 continuation rounds to go dry — it invalidated 40/44,
+# caught all 17 facts prod had missed, and correctly spared the 4
+# product-knowledge facts. A cap of 3 truncated the same replay at 28/44
+# with the fact still saturating. 8 covers the worst observed sweep with
+# ~2x margin; _SATURATION_MIN remains the real stop condition.
 _SATURATION_MIN = 4
-_SATURATION_MAX_ROUNDS = 3
+_SATURATION_MAX_ROUNDS = 8
 
 _CONTRADICTION_PROMPT = """\
 You are a knowledge graph deduplication assistant. Decide which existing facts the NEW FACT duplicates and which it contradicts. A single existing fact CAN be both — e.g. "X uses A" supersedes "X uses A (v1)" (duplicate predicate, but the new one updates/replaces).
