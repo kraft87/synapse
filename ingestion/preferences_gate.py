@@ -92,7 +92,7 @@ Output ONLY JSON: {"preferences": [{"pref": "User ...", "polarity": "like"|"disl
 """
 
 
-CONFIRM_PROMPT = """Two standing user preferences are stored in a long-term memory. Decide whether the NEW one is the SAME standing preference as the EXISTING one, just restated, or a DISTINCT preference that deserves its own row.
+CONFIRM_PROMPT = """Two standing user preferences are stored in a long-term memory. Decide whether the NEW one is the SAME standing preference as the EXISTING one, just restated, or a DISTINCT preference that deserves its own row. When it is the same preference but the NEW statement carries real information the EXISTING text lacks, also produce an updated text that folds it in.
 
 EXISTING: {existing_pref}
 NEW: {new_pref}
@@ -102,11 +102,17 @@ NEW: {new_pref}
 
 If the two could both be true at once and constrain different things, they are DISTINCT.
 
-Output ONLY JSON: {{"duplicate": true}} or {{"duplicate": false}}"""
+updated_pref (only meaningful when duplicate = true; otherwise null):
+- null when the NEW statement adds nothing the EXISTING text does not already say — the common case.
+- Otherwise ONE self-contained third-person sentence starting with "User " that preserves everything the EXISTING text asserts and folds in the genuinely new detail. Never drop or weaken existing content, never import content stated in neither text, keep it under ~60 words.
+
+Output ONLY JSON: {{"duplicate": true|false, "updated_pref": "User ..." or null}}"""
 
 
-def _parse_confirm(text: str) -> bool:
-    """Parser for parse_with_retry: extract {"duplicate": true|false}."""
+def _parse_confirm(text: str) -> dict[str, Any]:
+    """Parser for parse_with_retry: ``{"duplicate": bool, "updated_pref": str|None}``.
+    ``updated_pref`` is normalized to None unless duplicate is true and it is a
+    non-empty string — the judge's merge offer only exists on the duplicate path."""
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise MalformedResponseError("no JSON object in response", text[:200])
@@ -114,7 +120,19 @@ def _parse_confirm(text: str) -> bool:
     dup = d.get("duplicate")
     if not isinstance(dup, bool):
         raise MalformedResponseError("'duplicate' must be a boolean", text[:200])
-    return dup
+    upd = d.get("updated_pref")
+    if not dup or not isinstance(upd, str) or not upd.strip():
+        return {"duplicate": dup, "updated_pref": None}
+    return {"duplicate": dup, "updated_pref": upd.strip()}
+
+
+# Sanity gate on a judge-produced merged text before it replaces the stored anchor:
+# shaped like a pref, actually different, and not ballooning past hook length.
+_MERGE_MAX_CHARS = 500
+
+
+def _valid_merged_pref(updated: str, existing: str) -> bool:
+    return updated.startswith("User ") and updated != existing and len(updated) <= _MERGE_MAX_CHARS
 
 
 def _parse_prefs(text: str) -> list[dict[str, Any]]:
@@ -241,9 +259,11 @@ class PreferencesGate:
         for p in prefs:
             self._store_one(p, project, group_id, source_ref)
 
-    def _confirm_duplicate(self, new_pref: str, existing_pref: str) -> bool:
+    def _confirm_duplicate(self, new_pref: str, existing_pref: str) -> dict[str, Any]:
         """One small LLM call: is ``new_pref`` the same standing preference as
-        ``existing_pref``, restated? Fail-soft toward False — an insert costs a duplicate
+        ``existing_pref``, restated — and if so, does it add information worth folding
+        into the stored text (``updated_pref``)? Fail-soft toward
+        ``{"duplicate": False, "updated_pref": None}`` — an insert costs a duplicate
         row, a wrong re-assert silently drops a preference the user actually stated."""
         try:
             verdict = parse_with_retry(
@@ -253,18 +273,35 @@ class PreferencesGate:
                 ),
                 parser=_parse_confirm,
                 model=self._model,
-                max_tokens=64,
+                max_tokens=256,
             )
         except Exception as e:
             logger.warning("preference confirm LLM failed (%s); inserting as new", e)
-            return False
+            return {"duplicate": False, "updated_pref": None}
         logger.info(
-            "preference gray-band confirm: duplicate=%s for %r vs %r",
-            verdict,
+            "preference gray-band confirm: duplicate=%s merge=%s for %r vs %r",
+            verdict["duplicate"],
+            bool(verdict["updated_pref"]),
             new_pref[:80],
             existing_pref[:80],
         )
         return verdict
+
+    def _merge_into(self, pref_id: int, updated_pref: str) -> bool:
+        """Replace the stored anchor text of ``pref_id`` with the judge's merged text,
+        re-embedded so the dedup KNN keeps comparing like-with-like, counting the
+        re-assertion in the same write. False on any failure — the caller falls back
+        to a plain reassert, keeping the old text/embedding pair intact (the two must
+        never diverge, so a text update without a fresh embedding is not an option)."""
+        try:
+            vec = list(self._embedder.embed([updated_pref], task="document")[0])
+            embed_model = getattr(self._embedder, "model_name", None) or "voyage-4-large"
+            self._db.merge_preference_text(pref_id, updated_pref, vec, embed_model)
+        except Exception as e:
+            logger.warning("preference merge failed (%s); plain reassert instead", e)
+            return False
+        logger.info("preference #%s text merged: %s", pref_id, updated_pref[:80])
+        return True
 
     def _store_one(
         self, p: dict[str, Any], project: str | None, group_id: str, source_ref: str
@@ -280,7 +317,19 @@ class PreferencesGate:
         if action["action"] == "confirm":
             # Gray band: cosine says "close", structure says nothing. One cheap call decides.
             existing = _candidate_text(candidates, action["target_id"])
-            if existing and self._confirm_duplicate(p["pref"], existing):
+            verdict = (
+                self._confirm_duplicate(p["pref"], existing)
+                if existing
+                else {"duplicate": False, "updated_pref": None}
+            )
+            if verdict["duplicate"]:
+                upd = verdict["updated_pref"]
+                if (
+                    isinstance(upd, str)
+                    and _valid_merged_pref(upd, existing)
+                    and self._merge_into(action["target_id"], upd)
+                ):
+                    return  # merge already counted the re-assertion
                 action = {"action": "reassert", "target_id": action["target_id"]}
             else:
                 action = {"action": "insert", "target_id": None}
