@@ -378,6 +378,22 @@ class Database:
         assert row is not None, "INSERT RETURNING id returned nothing"
         return cast(int, row["id"])
 
+    def merge_preference_text(
+        self, pref_id: int, pref: str, embedding: list[float], embed_model: str
+    ) -> None:
+        """The gray-band judge folded NEW information into an existing preference:
+        replace the anchor text and its embedding (the pair must never diverge) and
+        count the re-assertion in the same write. Deliberately departs from
+        ``reassert_preference``'s keep-the-older-text rule: the merged text IS the
+        older anchor plus the newly stated detail."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE preferences "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"SET pref = %s, embedding = %s::vector({_EMBED_DIMS}), embed_model = %s, "
+                "assert_count = assert_count + 1, last_asserted = now() WHERE id = %s",
+                (pref, _vector_literal(embedding), embed_model, pref_id),
+            )
+
     def reassert_preference(self, pref_id: int) -> None:
         """A restated preference: bump assert_count + last_asserted, keep the older text
         (the first phrasing is the anchor; recurrence is the strength signal)."""

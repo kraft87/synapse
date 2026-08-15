@@ -63,8 +63,11 @@ def test_parse_prefs_no_json_raises():
 
 
 def test_parse_confirm_true_and_false():
-    assert _parse_confirm('{"duplicate": true}') is True
-    assert _parse_confirm('prose {"duplicate": false} tail') is False
+    assert _parse_confirm('{"duplicate": true}') == {"duplicate": True, "updated_pref": None}
+    assert _parse_confirm('prose {"duplicate": false} tail') == {
+        "duplicate": False,
+        "updated_pref": None,
+    }
 
 
 def test_parse_confirm_non_bool_raises():
@@ -211,6 +214,7 @@ class _RecDB:
         self.inserted: list[dict] = []
         self.reasserted: list[int] = []
         self.superseded: list[tuple[int, int]] = []
+        self.merged: list[tuple[int, str, str]] = []
         self._next_id = 100
 
     def find_live_preferences(self, owner_id, group_id, embedding, limit=5):
@@ -227,18 +231,29 @@ class _RecDB:
     def supersede_preference(self, old_id, new_id):
         self.superseded.append((old_id, new_id))
 
+    def merge_preference_text(self, pref_id, pref, embedding, embed_model):
+        self.merged.append((pref_id, pref, embed_model))
+
 
 class _StubEmb:
     model_name = "voyage-4-large"
 
+    def __init__(self, fail_after=None):
+        self._fail_after = fail_after  # embed calls before raising (None = never)
+        self.calls = 0
+
     def embed(self, texts, task):
+        self.calls += 1
+        if self._fail_after is not None and self.calls > self._fail_after:
+            raise RuntimeError("embed backend down")
         return [[0.0] * 4 for _ in texts]
 
 
-def _run_flow(monkeypatch, prefs, candidates, confirm=None):
-    """Run the gate end to end over stubs. ``confirm`` drives the gray-band call: True /
-    False is the verdict, an Exception instance is raised from it, None means the test
-    doesn't expect a confirm at all (one fires -> AssertionError)."""
+def _run_flow(monkeypatch, prefs, candidates, confirm=None, embedder=None):
+    """Run the gate end to end over stubs. ``confirm`` drives the gray-band call: a
+    verdict dict is returned as-is, bare True/False is shorthand for a no-merge verdict,
+    an Exception instance is raised from it, None means the test doesn't expect a
+    confirm at all (one fires -> AssertionError)."""
     import ingestion.preferences_gate as pg
 
     monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
@@ -251,12 +266,14 @@ def _run_flow(monkeypatch, prefs, candidates, confirm=None):
                 raise confirm
             assert confirm is not None, "unexpected gray-band confirm call"
             assert "EXISTING:" in k["base_prompt"] and "NEW:" in k["base_prompt"]
+            if isinstance(confirm, bool):
+                return {"duplicate": confirm, "updated_pref": None}
             return confirm
         return prefs
 
     monkeypatch.setattr(pg, "parse_with_retry", _fake_parse_with_retry)
     db = _RecDB(candidates)
-    g = pg.PreferencesGate(db=db, llm_client=object(), embedder=_StubEmb())
+    g = pg.PreferencesGate(db=db, llm_client=object(), embedder=embedder or _StubEmb())
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
     return db
 
@@ -393,3 +410,71 @@ def test_flow_above_band_skips_the_llm(monkeypatch):
     )
     assert db.reasserted == [42]
     assert db.inserted == []
+
+
+# ---- gray-band merge (duplicate + updated_pref folds new info into the anchor) ----
+
+_MERGED = "User dislikes em-dashes in written drafts and in Discord messages"
+
+
+def test_parse_confirm_updated_pref_kept_on_duplicate():
+    from ingestion.preferences_gate import _parse_confirm
+
+    v = _parse_confirm('{"duplicate": true, "updated_pref": "User wants X and Y"}')
+    assert v == {"duplicate": True, "updated_pref": "User wants X and Y"}
+
+
+def test_parse_confirm_updated_pref_nulled_when_distinct_or_junk():
+    from ingestion.preferences_gate import _parse_confirm
+
+    assert _parse_confirm('{"duplicate": false, "updated_pref": "User wants X"}') == {
+        "duplicate": False,
+        "updated_pref": None,
+    }
+    assert _parse_confirm('{"duplicate": true, "updated_pref": 7}')["updated_pref"] is None
+    assert _parse_confirm('{"duplicate": true, "updated_pref": "  "}')["updated_pref"] is None
+    assert _parse_confirm('{"duplicate": true}')["updated_pref"] is None
+
+
+def test_valid_merged_pref_guardrails():
+    from ingestion.preferences_gate import _valid_merged_pref
+
+    existing = "User dislikes em-dashes in written drafts"
+    assert _valid_merged_pref(_MERGED, existing)
+    assert not _valid_merged_pref(existing, existing)  # unchanged -> plain reassert
+    assert not _valid_merged_pref("Always avoid em-dashes", existing)  # not pref-shaped
+    assert not _valid_merged_pref("User " + "x" * 600, existing)  # ballooned
+
+
+def test_flow_confirm_merge_updates_anchor(monkeypatch):
+    db = _run_flow(
+        monkeypatch,
+        [{"pref": "User dislikes em-dashes in Discord messages", "polarity": "dislike"}],
+        candidates=_BAND_CANDIDATE,
+        confirm={"duplicate": True, "updated_pref": _MERGED},
+    )
+    assert db.merged == [(42, _MERGED, "voyage-4-large")]
+    # the merge write counts the re-assertion itself — no separate bump, no new row
+    assert db.reasserted == [] and db.inserted == [] and db.superseded == []
+
+
+def test_flow_confirm_merge_invalid_text_falls_back_to_reassert(monkeypatch):
+    db = _run_flow(
+        monkeypatch,
+        [{"pref": "User dislikes em-dashes in Discord messages", "polarity": "dislike"}],
+        candidates=_BAND_CANDIDATE,
+        confirm={"duplicate": True, "updated_pref": "avoid em-dashes everywhere"},
+    )
+    assert db.merged == [] and db.reasserted == [42] and db.inserted == []
+
+
+def test_flow_confirm_merge_embed_failure_falls_back_to_reassert(monkeypatch):
+    # first embed call (the new pref) succeeds; the merge re-embed raises
+    db = _run_flow(
+        monkeypatch,
+        [{"pref": "User dislikes em-dashes in Discord messages", "polarity": "dislike"}],
+        candidates=_BAND_CANDIDATE,
+        confirm={"duplicate": True, "updated_pref": _MERGED},
+        embedder=_StubEmb(fail_after=1),
+    )
+    assert db.merged == [] and db.reasserted == [42] and db.inserted == []
