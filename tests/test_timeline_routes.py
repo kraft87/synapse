@@ -98,3 +98,29 @@ def test_timeline_ident_exists_window(conn, db_url):
     assert hit and not miss_ident and not miss_window
     db.close()
     _wipe(conn)
+
+
+def test_recent_events_per_project_day_cap(conn, db_url):
+    from mcp_server.timeline_routes import _recent_events
+
+    _wipe(conn)
+    # One intense day: five same-project events; a quieter earlier day: one event.
+    burst = [
+        dict(
+            _ev(f"b{i}", f"shipped burst change {i}", 2, "milestone"),
+            t_valid=f"2026-07-02T1{i}:00:00+00:00",
+        )
+        for i in range(5)
+    ]
+    burst[0]["salience"] = 1  # loses its slot to higher-salience same-day events
+    older = [_ev("old1", "decided the quiet-day thing", 2, "decision")]
+    _ingest_events(db_url, "", burst + older)
+
+    items = _recent_events(db_url, days=36500, min_salience=1, limit=10, project="demo")
+    facts = [i["fact"] for i in items]
+    # burst day capped at 3, chosen by salience first — the sal-1 event is out
+    assert len([f for f in facts if f.startswith("shipped burst")]) == 3
+    assert "shipped burst change 0" not in facts
+    # the quiet day survives instead of being pushed out by the burst
+    assert "decided the quiet-day thing" in facts
+    _wipe(conn)
