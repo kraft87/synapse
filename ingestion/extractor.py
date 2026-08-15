@@ -540,6 +540,20 @@ Rules:
   ("User received a crystal chandelier from their aunt"). The line: "checked the
   inbox" recurs and teaches nothing; "gave spider plant cuttings to Mrs. Johnson"
   happened once and is the answer to a future when-question.
+- PLANNED IS NOT DONE. Never assert completion of an action the text only plans,
+  books, schedules, requests, intends, or lists as a component of a plan, workup,
+  agenda, or checklist. A noun phrase naming a plan's parts ("the 2026 workup
+  (MRI, blood panel, referral)") describes INTENDED work: extract the plan AS a
+  plan, keeping the pending status in the fact text. Emit "was performed / was
+  done / was sent / underwent" ONLY when the text states the action already
+  happened. The meta-act is separate and may itself be complete: booking an MRI
+  is a completed BOOKING ("the MRI was booked for June 16"), not a completed MRI.
+  BAD:  fact "An MRI was performed as part of User's mother's memory workup"
+        (source only listed the MRI as a planned workup component)
+  GOOD: fact "An MRI is a planned component of User's mother's memory workup,
+        booked for June 16 (meaning 2026-06-16)"
+  When completion status is genuinely ambiguous in the text, phrase the fact with
+  the weaker claim (planned/underway), never the stronger one.
 - EDGES CONNECT THE REAL PARTICIPANTS — the user is NOT the default source. The user
   narrates nearly every turn, so routing every happening through a "User" node collapses
   the graph into one hub that no longer discriminates. When an event or statement has a
