@@ -111,6 +111,14 @@ def _ingest_events(
         conn.close()
 
 
+# Diversity cap on the digest: max N events per (project, day). Recency-only
+# selection lets one intense work session monopolize every slot — observed
+# 2026-08-15, when a single day's PR arc filled 7 of the board's 10 lines and
+# pushed the rest of the week out entirely. Within a day, higher salience wins
+# a slot before recency. The cap trades arc completeness for week coverage.
+_PER_PROJECT_DAY = 3
+
+
 def _recent_events(
     db_url: str, days: int, min_salience: int, limit: int, project: str | None
 ) -> list[dict[str, Any]]:
@@ -118,16 +126,20 @@ def _recent_events(
     conn = psycopg.connect(db_url, autocommit=True)
     try:
         q = (
-            "SELECT id, left(t_valid::text, 10) AS date, fact, project, salience, event_type "
-            "FROM timeline_events "
-            "WHERE t_valid > now() - make_interval(days => %s) AND salience >= %s "
+            "SELECT id, date, fact, project, salience, event_type FROM ("
+            "  SELECT id, left(t_valid::text, 10) AS date, fact, project, salience, "
+            "         event_type, t_valid, row_number() OVER ("
+            "           PARTITION BY project, t_valid::date "
+            "           ORDER BY salience DESC, t_valid DESC) AS day_rank "
+            "  FROM timeline_events "
+            "  WHERE t_valid > now() - make_interval(days => %s) AND salience >= %s "
         )
         params: list[Any] = [days, min_salience]
         if project:
             q += "AND project = %s "
             params.append(project)
-        q += "ORDER BY t_valid DESC LIMIT %s"
-        params.append(limit)
+        q += ") ranked WHERE day_rank <= %s ORDER BY t_valid DESC LIMIT %s"
+        params.extend([_PER_PROJECT_DAY, limit])
         rows = conn.execute(q, params).fetchall()
         return [
             {
