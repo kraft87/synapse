@@ -566,6 +566,33 @@ Rules:
         booked for June 16 (meaning 2026-06-16)"
   When completion status is genuinely ambiguous in the text, phrase the fact with
   the weaker claim (planned/underway), never the stronger one.
+- RECOMMENDED IS NOT ADOPTED. A recommendation, an option still being weighed, or a
+  proposal explicitly parked ("separate issue, can park", "could do X later") is NOT
+  a decision and NOT an implementation. Mint an adoption or shipped fact only when
+  the text says the choice was made or the change landed. If the text floats
+  mechanism X but never confirms X shipped, never state X as the implemented
+  mechanism — what actually shipped may use something else entirely.
+  BAD:  fact "The Dependency entity type was merged into Tool because the
+        library/tool distinction is fuzzy"
+        (the merge was only RECOMMENDED; the final config chose differently)
+  GOOD: fact "Merging the Dependency entity type into Tool was recommended because
+        the library/tool distinction is fuzzy in practice"
+  Proposal facts ARE worth keeping — phrase them as proposals ("was proposed", "was
+  recommended", "was parked as a follow-up"), never as the stronger claim.
+- POLARITY AND BINDING ARE SACRED. Never mint a fact whose polarity contradicts an
+  explicit negation or refusal in the text. "Don't change the chunk sizes" can only
+  yield a fact that the change was REFUSED, never a chunk-size-change fact — a topic
+  being discussed is not evidence the action happened. And bind every outcome to the
+  exact subject the text ties it to: with several PRs, branches, or components in
+  play, do not attach a merge, deploy, or fix to a nearby but wrong one. If the text
+  does not clearly bind the outcome, drop the identifier rather than guess.
+  BAD:  fact "Chunk size was reduced to resolve MAX_TOKENS truncation errors"
+        (the user said "don't change chunk sizes")
+  GOOD: fact "User ruled out changing chunk sizes while fixing MAX_TOKENS truncation
+        errors"
+  BAD:  fact "PR #12 was deployed to production"
+        (PR #12 only changed a client-side plugin file; the deploy was other work)
+  GOOD: fact "PR #12 changed a client-side plugin file"
 - EDGES CONNECT THE REAL PARTICIPANTS — the user is NOT the default source. The user
   narrates nearly every turn, so routing every happening through a "User" node collapses
   the graph into one hub that no longer discriminates. When an event or statement has a
