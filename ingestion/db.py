@@ -572,6 +572,151 @@ class Database:
         return dict(row) if row is not None else None
 
     # ------------------------------------------------------------------
+    # Notes curation (schema 051) — the read/write surface for the nightly
+    # dream→notes lane (dream/notes/). The lane owns the policy (what counts as
+    # a duplicate, which note wins, the caps); these accessors own the SQL only.
+    # notes_curation doubles as the memo (a judged pair is never re-sent to the
+    # LLM) and the audit log, so every candidate query LEFT JOINs it and treats
+    # `judged_at < updated_at` as "the note changed, judge it again".
+    # ------------------------------------------------------------------
+
+    def find_note_pair_candidates(
+        self, owner_id: str, *, sim_floor: float, limit: int
+    ) -> list[dict[str, Any]]:
+        """Unjudged (or stale-judged) live note pairs whose HOOK embeddings are within
+        ``sim_floor`` cosine, most-similar first.
+
+        Pure SQL over the vectors already stored by the write path — the lane adds no
+        embedding calls. The ``b.id > a.id`` join condition yields each unordered pair
+        exactly once AND normalizes it to (least, greatest), which is the shape the
+        memo index keys on. The floor is deliberately permissive (corrections often
+        share little hook wording); the LLM judge downstream is the precision layer.
+
+        Returns ``[{a: {...}, b: {...}, sim: float}]`` where each side carries
+        ``id, hook, body, type, project, updated_at``."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT a.id AS a_id, a.hook AS a_hook, a.body AS a_body, a.type AS a_type, "
+                "       a.project AS a_project, a.updated_at AS a_updated_at, "
+                "       b.id AS b_id, b.hook AS b_hook, b.body AS b_body, b.type AS b_type, "
+                "       b.project AS b_project, b.updated_at AS b_updated_at, "
+                "       1 - (a.embedding <=> b.embedding) AS sim "
+                "FROM notes a "
+                "JOIN notes b ON b.owner_id = a.owner_id AND b.id > a.id "
+                "            AND b.superseded_by IS NULL AND b.embedding IS NOT NULL "
+                "LEFT JOIN notes_curation c ON c.op = 'pair' "
+                "            AND least(c.note_a, c.note_b) = a.id "
+                "            AND greatest(c.note_a, c.note_b) = b.id "
+                "WHERE a.owner_id = %s AND a.superseded_by IS NULL AND a.embedding IS NOT NULL "
+                "  AND 1 - (a.embedding <=> b.embedding) >= %s "
+                "  AND (c.id IS NULL OR c.judged_at < greatest(a.updated_at, b.updated_at)) "
+                "ORDER BY sim DESC, a.id, b.id LIMIT %s",
+                (owner_id, sim_floor, limit),
+            ).fetchall()
+        return [
+            {
+                "a": {k: r[f"a_{k}"] for k in ("id", "hook", "body", "type", "project")}
+                | {"updated_at": r["a_updated_at"]},
+                "b": {k: r[f"b_{k}"] for k in ("id", "hook", "body", "type", "project")}
+                | {"updated_at": r["b_updated_at"]},
+                "sim": float(r["sim"]),
+            }
+            for r in rows
+        ]
+
+    def find_retype_candidates(self, owner_id: str, *, limit: int) -> list[dict[str, Any]]:
+        """Live GLOBAL notes (type user/feedback) not yet scope-judged, oldest id first.
+
+        The memo doubles as the cursor: once a note is judged it drops out of this
+        query, so successive runs walk forward through the global set without any
+        separate watermark row. An edit to the note (updated_at past judged_at) puts
+        it back in the queue."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT n.id, n.hook, n.body, n.type, n.project, n.updated_at FROM notes n "
+                "LEFT JOIN notes_curation c ON c.op = 'retype' AND c.note_a = n.id "
+                "WHERE n.owner_id = %s AND n.superseded_by IS NULL "
+                "  AND n.type IN ('user','feedback') "
+                "  AND (c.id IS NULL OR c.judged_at < n.updated_at) "
+                "ORDER BY n.id LIMIT %s",
+                (owner_id, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def known_project_slugs(self, limit: int = 40) -> list[str]:
+        """The project ids that actually exist in this store — notes first (a project
+        already carrying curated memory is the likeliest target), then episode projects
+        by volume. Handed to the retype judge as a closed vocabulary, which is what
+        keeps it from inventing a plausible-looking slug nothing is filed under."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT project FROM ("
+                "  SELECT project, 0 AS tier, count(*) AS n FROM notes "
+                "    WHERE project IS NOT NULL AND superseded_by IS NULL GROUP BY project "
+                "  UNION ALL "
+                "  SELECT project, 1 AS tier, count(*) AS n FROM episodes "
+                "    WHERE project IS NOT NULL GROUP BY project"
+                ") s GROUP BY project ORDER BY min(tier), max(n) DESC, project LIMIT %s",
+                (limit,),
+            ).fetchall()
+        return [cast(str, r["project"]) for r in rows]
+
+    def project_slug_exists(self, slug: str) -> bool:
+        """True if ``slug`` is already a known project id — either on a note or on an
+        episode. The retype apply is gated on this so a hallucinated slug can only ever
+        be recorded, never written into the store as a new (unreachable) scope."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM notes WHERE project = %s) "
+                "    OR EXISTS (SELECT 1 FROM episodes WHERE project = %s) AS found",
+                (slug, slug),
+            ).fetchone()
+        return bool(row is not None and row["found"])
+
+    def retype_note(self, note_id: int, *, type: str, project: str | None) -> None:
+        """Re-scope one note (global -> project). Reversible and content-preserving:
+        hook/body/embedding are untouched, and ``updated_at`` is deliberately NOT
+        bumped — the note did not change, only its shelf, and a bump would invalidate
+        the memo row the lane is about to write."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE notes SET type = %s, project = %s WHERE id = %s",
+                (type, project, note_id),
+            )
+
+    def record_curation(
+        self,
+        *,
+        op: str,
+        note_a: int,
+        note_b: int | None,
+        verdict: str,
+        applied: bool,
+        detail: dict[str, Any] | None = None,
+    ) -> int:
+        """Upsert one audit/memo row. Re-judging an already-judged pair or note
+        overwrites the verdict in place (and refreshes judged_at) — the row is the
+        current answer, not an append-only history. Returns the row id."""
+        payload = orjson.dumps(detail).decode() if detail is not None else None
+        target = (
+            "(least(note_a, note_b), greatest(note_a, note_b)) WHERE op = 'pair'"
+            if op == "pair"
+            else "(note_a) WHERE op = 'retype'"
+        )
+        with self._conn() as conn:
+            row = conn.execute(
+                "INSERT INTO notes_curation (op, note_a, note_b, verdict, applied, detail) "  # nosec B608 — `target` is a literal chosen by `op`, never interpolated user input
+                "VALUES (%s, %s, %s, %s, %s, %s::jsonb) "
+                f"ON CONFLICT {target} DO UPDATE SET "
+                "  verdict = EXCLUDED.verdict, applied = EXCLUDED.applied, "
+                "  detail = EXCLUDED.detail, judged_at = now() "
+                "RETURNING id",
+                (op, note_a, note_b, verdict, applied, payload),
+            ).fetchone()
+        assert row is not None, "INSERT ... RETURNING id returned nothing"
+        return cast(int, row["id"])
+
+    # ------------------------------------------------------------------
     # Recall feedback (schema 046)
     # ------------------------------------------------------------------
 

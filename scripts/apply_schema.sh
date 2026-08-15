@@ -90,6 +90,7 @@ FILES=(
   048_feedback_found_via.sql
   049_recall_metrics_notes.sql
   050_private_sessions.sql
+  051_notes_curation.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

@@ -94,9 +94,40 @@ def run_once() -> None:
             errors.append(f"config lane: {e}")
             overall_ok = False
 
+    # dream→notes curation lane (merges duplicates, retires corrected notes, re-scopes global
+    # notes that are really about one project). ON by default; SYNAPSE_NOTES_LANE=0 is a KILL
+    # SWITCH. Unlike the two lanes above it AUTO-APPLIES — no proposals, no review queue, by
+    # explicit user decision. Its safety model is structural instead: every op is reversible
+    # (superseded_by / type+project, nothing deleted), judgements need a both-orders consensus,
+    # per-night caps bound the blast radius, and every verdict lands in notes_curation (051).
+    notes_samples: list[str] = []
+    if os.environ.get("SYNAPSE_NOTES_LANE", "1") != "0":
+        try:
+            from dream.notes.nightly import run_lane as run_notes_lane
+
+            nres = run_notes_lane()
+            run_stages["notes"] = {"ran": True, "ok": True}
+            if isinstance(nres, dict):
+                counts.update(nres.get("counts") or {})
+                notes_samples = list(nres.get("samples") or [])[:_SAMPLE_CAP]
+                # Per-item judge failures are fail-soft by design (the item is simply
+                # re-queued tomorrow), so they are reported as a count + samples rather
+                # than as stage errors — `errors`/`ok` stay reserved for a stage that blew up.
+                lane_errors = list(nres.get("errors") or [])
+                if lane_errors:
+                    counts["notes_judge_errors"] = len(lane_errors)
+                    notes_samples += [f"error: {e}" for e in lane_errors[:_SAMPLE_CAP]]
+        except Exception as e:
+            logger.error("dream→notes lane failed: %s", e, exc_info=True)
+            run_stages["notes"] = {"ran": True, "ok": False}
+            errors.append(f"notes lane: {e}")
+            overall_ok = False
+
     # Aggregate the proposals actually raised this run + a few bounded samples (cheap DB reads;
     # fail-soft) so the report panel has drill-in material without re-architecting the lanes.
     samples = _dream_collect_proposals(db_url, run_id, counts)
+    if notes_samples:
+        samples["notes"] = notes_samples[: _SAMPLE_CAP * 2]
     _dream_record_finish(db_url, run_id, run_stages, counts, samples, errors, overall_ok)
 
     logger.info("Dream pipeline complete")
