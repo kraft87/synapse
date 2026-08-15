@@ -168,6 +168,18 @@ _KNOWN_TOOLS = frozenset(
 # choose from. Tune here.
 _SEMANTIC_POOL_LIMIT = 8
 
+# Saturation continuation (2026-08-14): a sweeping supersession fact ("the
+# entire X stack was torn down") can contradict far more live edges than fit
+# in one pool — the 2026-08-08 adult-stack teardown fact invalidated 7 of its
+# 8 candidates and left 17 stale facts live because they never ranked top-8
+# for ANY of the note's facts. When a round contradicts at least
+# _SATURATION_MIN of a fact's pool, retrieval re-runs excluding every
+# candidate already judged and another contradiction round fires, until a
+# round comes back below the threshold or _SATURATION_MAX_ROUNDS extra
+# rounds have run (worst case 8 + 3*8 = 32 invalidations per fact).
+_SATURATION_MIN = 4
+_SATURATION_MAX_ROUNDS = 3
+
 _CONTRADICTION_PROMPT = """\
 You are a knowledge graph deduplication assistant. Decide which existing facts the NEW FACT duplicates and which it contradicts. A single existing fact CAN be both — e.g. "X uses A" supersedes "X uses A (v1)" (duplicate predicate, but the new one updates/replaces).
 
@@ -1490,6 +1502,91 @@ class ExtractionPipeline:
                 invalidate[fid] = contradicted
         return skip_indices, invalidate, reinforce, True
 
+    def _stage6b_saturation_rounds(
+        self,
+        facts: list[ExtractedFact],
+        candidates_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+        invalidate: dict[int, list[str]],
+        fact_embeddings: list[list[float]],
+        group_id: str,
+    ) -> int:
+        """Continuation rounds for facts whose verdict saturated their pool.
+
+        A fact that contradicts >= _SATURATION_MIN of its candidates is very
+        likely a sweeping supersession whose true contradiction set exceeds
+        _SEMANTIC_POOL_LIMIT. For each such fact, re-run retrieval excluding
+        every candidate already judged (contradicted edges aren't invalidated
+        in the DB until Stage 7, so exclusion must be by seen-set, not by
+        retrieval filters) and issue further contradiction-only confirms
+        until a round returns fewer than _SATURATION_MIN fresh hits or
+        _SATURATION_MAX_ROUNDS extra rounds have run.
+
+        Only ``contradicted`` verdicts are consumed from continuation rounds;
+        duplicate/skip verdicts are ignored — the write decision was already
+        made against the (higher-ranked) round-1 pools, and dropping a new
+        edge on a rank-9+ "duplicate" would be trusting a weaker signal.
+
+        Mutates ``invalidate`` in place. Returns the number of extra edges
+        marked for invalidation (for span attributes). Never raises.
+        """
+        seen: dict[int, set[str]] = {}
+        active: list[int] = []
+        for idx, uuids in invalidate.items():
+            pools = candidates_map.get(idx)
+            if not pools or len(uuids) < _SATURATION_MIN:
+                continue
+            pair_pool, semantic_pool = pools
+            seen[idx] = {c["uuid"] for c in pair_pool} | {c["uuid"] for c in semantic_pool}
+            active.append(idx)
+        if not active:
+            return 0
+
+        extra = 0
+        try:
+            for _round in range(_SATURATION_MAX_ROUNDS):
+                round_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
+                for idx in active:
+                    # Over-fetch by the seen-set size so exclusion can't
+                    # starve the pool while earlier hits still dominate
+                    # the ranking.
+                    src_limit = _SEMANTIC_POOL_LIMIT * 2 + len(seen[idx])
+                    vector_hits = self._kg.find_similar_edges(
+                        fact_embeddings[idx], group_id, limit=src_limit
+                    )
+                    fulltext_hits = self._kg.find_edges_by_fulltext(
+                        facts[idx].fact, group_id, limit=src_limit
+                    )
+                    pool = [
+                        c
+                        for c in rrf_merge(vector_hits, fulltext_hits, limit=src_limit, k=1)
+                        if c["uuid"] not in seen[idx]
+                    ][:_SEMANTIC_POOL_LIMIT]
+                    if pool:
+                        seen[idx].update(c["uuid"] for c in pool)
+                        round_map[idx] = ([], pool)
+                if not round_map:
+                    break
+                _, round_invalidate, _, ok = self._stage6b_batch_confirm(facts, round_map)
+                if not ok:
+                    break
+                next_active: list[int] = []
+                for idx, uuids in round_invalidate.items():
+                    fresh = [u for u in uuids if u not in invalidate.get(idx, [])]
+                    if not fresh:
+                        continue
+                    invalidate.setdefault(idx, []).extend(fresh)
+                    extra += len(fresh)
+                    if len(fresh) >= _SATURATION_MIN:
+                        next_active.append(idx)
+                active = next_active
+                if not active:
+                    break
+        except Exception as exc:
+            # Same posture as the writer-side detector: a missed
+            # contradiction is recoverable, blocking the write path is not.
+            logger.warning("stage6b saturation rounds failed group=%s: %s", group_id, exc)
+        return extra
+
     def _stage7_write_edges(
         self,
         facts: list[ExtractedFact],
@@ -2011,6 +2108,18 @@ class ExtractionPipeline:
                 span.set_attribute("invalidated", sum(len(v) for v in invalidate.values()))
                 span.set_attribute("gate_mode", gate_mode)
                 span.set_attribute("gate_pre_skipped", len(pre_skip))
+
+            # Saturation continuation: facts that contradicted most of their
+            # pool get fresh retrieval rounds so a sweeping supersession can
+            # invalidate beyond the _SEMANTIC_POOL_LIMIT cap. Uses the FULL
+            # round-1 pools (candidates_map, not the gate-shrunk llm_map) for
+            # its seen-set so enforcement-dropped candidates aren't re-judged.
+            if llm_ok and invalidate:
+                with logfire.span("stage6b_saturation_rounds") as sat_span:
+                    extra = self._stage6b_saturation_rounds(
+                        facts, candidates_map, invalidate, fact_embeddings_list, group_id
+                    )
+                    sat_span.set_attribute("extra_invalidated", extra)
 
             # Shadow log: one row per (fact, candidate) with the gate's would-be
             # decision next to the LLM's actual verdict — the threshold-picking
