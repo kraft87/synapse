@@ -1147,6 +1147,120 @@ class TestStage6bBatchConfirm:
         assert reinforce == {}
 
 
+class TestStage6bSaturationRounds:
+    """A sweeping supersession fact ("the entire stack was torn down") can
+    contradict more live edges than fit in one _SEMANTIC_POOL_LIMIT pool.
+    When the round-1 verdict saturates (>= _SATURATION_MIN contradicted),
+    continuation rounds re-retrieve excluding already-judged candidates so
+    the tail gets invalidated too, instead of surviving as stale truth.
+    """
+
+    def _pipeline(self, llm_texts: list[str], edge_pool: list[dict]):
+        from ingestion.extractor import ExtractionPipeline
+
+        pipe = ExtractionPipeline.__new__(ExtractionPipeline)
+        pipe._contradiction_model = "claude-haiku-4-5"
+        fake_client = MagicMock()
+        fake_client.messages.create.side_effect = [
+            MagicMock(content=[MagicMock(text=t)]) for t in llm_texts
+        ]
+        pipe._llm = MagicMock()
+        pipe._llm._client = fake_client
+        pipe._kg = MagicMock()
+        pipe._kg.find_similar_edges.return_value = edge_pool
+        pipe._kg.find_edges_by_fulltext.return_value = []
+        return pipe, fake_client
+
+    def _fact(self):
+        from ingestion.models import ExtractedFact
+
+        return [
+            ExtractedFact(
+                source="Kyle", target="stack", relationship="REMOVED", fact="stack torn down"
+            )
+        ]
+
+    @staticmethod
+    def _edges(prefix: str, n: int, start_score: float = 0.05) -> list[dict]:
+        # score = cosine distance; keep every candidate well-ranked.
+        return [
+            {"uuid": f"{prefix}{i}", "fact": f"{prefix}{i} is configured", "score": start_score}
+            for i in range(n)
+        ]
+
+    def test_saturated_fact_gets_continuation_round(self):
+        import json as _json
+
+        round1_pool = self._edges("s", 8)
+        tail = self._edges("n", 6)
+        # Retrieval always returns everything; the seen-set must carve out
+        # the unjudged tail for round 2.
+        llm = _json.dumps(
+            {"results": [{"id": 0, "duplicate_facts": [], "contradicted_facts": [0, 1, 2]}]}
+        )
+        pipe, client = self._pipeline([llm], round1_pool + tail)
+        invalidate = {0: [f"s{i}" for i in range(5)]}  # round 1 saturated (5 >= 4)
+        candidates_map = {0: ([], round1_pool)}
+
+        extra = pipe._stage6b_saturation_rounds(
+            self._fact(), candidates_map, invalidate, [[0.1, 0.2]], "technical"
+        )
+
+        # Continuation pool was the unseen tail only; 3 fresh contradictions
+        # landed (below _SATURATION_MIN, so no third round / second LLM call).
+        assert extra == 3
+        assert invalidate[0] == [f"s{i}" for i in range(5)] + ["n0", "n1", "n2"]
+        assert client.messages.create.call_count == 1
+        prompt = client.messages.create.call_args_list[0].kwargs.get(
+            "messages"
+        ) or client.messages.create.call_args_list[0][1].get("messages")
+        assert "n0 is configured" in str(prompt)
+        assert "s0 is configured" not in str(prompt)  # already judged, excluded
+
+    def test_below_threshold_never_fires(self):
+        pipe, client = self._pipeline([], self._edges("s", 8))
+        invalidate = {0: ["s0", "s1"]}  # 2 < _SATURATION_MIN
+        extra = pipe._stage6b_saturation_rounds(
+            self._fact(), {0: ([], self._edges("s", 8))}, invalidate, [[0.1, 0.2]], "technical"
+        )
+        assert extra == 0
+        assert invalidate == {0: ["s0", "s1"]}
+        client.messages.create.assert_not_called()
+        pipe._kg.find_similar_edges.assert_not_called()
+
+    def test_rounds_stop_when_retrieval_runs_dry(self):
+        import json as _json
+
+        from ingestion.extractor import _SATURATION_MAX_ROUNDS
+
+        round1_pool = self._edges("s", 8)
+        tail = self._edges("n", 6)
+        # Round 2 contradicts >= _SATURATION_MIN so a round 3 is attempted,
+        # but every candidate is now in the seen-set -> empty pool -> stop.
+        llm = _json.dumps(
+            {"results": [{"id": 0, "duplicate_facts": [], "contradicted_facts": [0, 1, 2, 3]}]}
+        )
+        pipe, client = self._pipeline([llm] * _SATURATION_MAX_ROUNDS, round1_pool + tail)
+        invalidate = {0: [f"s{i}" for i in range(6)]}
+
+        extra = pipe._stage6b_saturation_rounds(
+            self._fact(), {0: ([], round1_pool)}, invalidate, [[0.1, 0.2]], "technical"
+        )
+
+        assert extra == 4
+        assert client.messages.create.call_count == 1  # dry retrieval, no wasted call
+
+    def test_failure_is_swallowed(self):
+        pipe, _client = self._pipeline([], self._edges("s", 8))
+        pipe._kg.find_similar_edges.side_effect = RuntimeError("db down")
+        invalidate = {0: [f"s{i}" for i in range(5)]}
+        extra = pipe._stage6b_saturation_rounds(
+            self._fact(), {0: ([], self._edges("s", 8))}, invalidate, [[0.1, 0.2]], "technical"
+        )
+        assert extra == 0  # never raises, invalidate keeps round-1 verdicts
+        assert invalidate[0] == [f"s{i}" for i in range(5)]
+
+
 class TestStage6aDedup:
     """The pair-pool and semantic-pool overlap when an edge clears both checks.
     The pair entry wins (stronger prior — same endpoints implies duplicate
