@@ -558,6 +558,10 @@ kg_relationships (
 
 > **Honest status:** the `dream` container's daily `run_once()` now runs the **dream→skills lane** (`dream/skills/`, gated on `SKILLS_LANE_ENABLED=1`): mine episodes → judge → candidate ledger + drafts → consolidate-overlap nominations, reading its catalog from `skills_lane.skill_registry` (no disk). The lane moved here from the plugin so the server owns it (the plugin is now a thin client that publishes skills to the registry + reviews proposals). The legacy memory-proposal stages are gone entirely (stage 3 and its `--stage` plumbing were deleted 2026-07-24; the substrate — `doc_type='summary'` — and the auto-memory-file sink were both already retired). The lane import is lazy + guarded so a lane error can't crash the loop.
 
+**dream→notes curation lane** (`dream/notes/`, kill switch `SYNAPSE_NOTES_LANE=0`, ON by default) — the notes store's missing outflow. `remember()` was the only thing that ever wrote a note, so paraphrase duplicates, notes a later correction had already replaced, and project-specific content typed as global `feedback` all accumulated on a board that is injected into every session. The lane runs three stages nightly: (A) candidate pairs from a pure-SQL self-join of live notes on the cosine similarity of their **stored hook embeddings** (no new embedding calls; floor 0.60, permissive because a correction often shares little wording with what it corrects); (B) a pair judge that merges DUPLICATEs (older `updated_at` loses) and retires the note a CORRECTION replaces; (C) a scope judge that re-types a global note to `project` when its content is specific to one named codebase.
+
+Unlike the skills and config lanes it **auto-applies** — no proposals, no review queue, no review command, by explicit user decision (curation should happen silently as a self-improvement step, not as a second inbox). The safety model is structural instead: every write is reversible and non-destructive (`superseded_by` keeps the row and the lineage; retype changes only `type`/`project`), every judgement is made in **both orders** with consensus required and disagreement collapsing to the safe verdict, both prompts carry an explicit under-report bias, per-night caps bound the blast radius (40 pairs / 10 scopes / 10 applied ops), a retype applies only for a project slug that already exists in the store, and every verdict — applied or not — is written to `notes_curation` (schema 051), which doubles as the memo that stops re-judging and the staleness cursor (`judged_at` vs `notes.updated_at`).
+
 The real KG-hygiene and web-capture work runs as **independent entry points** (scheduled externally — a client-machine cron for the web-capture lane, plus server-host systemd timers), not orchestrated by `dream/__main__`:
 
 - **Semantic identity merge** (#48, [§5.3](#53-entity-resolution)) — exact-name and moderate (name-gated) pairs auto-merge on the write path; the lexically-different semantic lane is detection-only, surfaced for human review (the #49 gap). The former standalone `dream/entity_dedup` pass was removed in #67.
@@ -711,6 +715,12 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SKILL_DERIVE_DRAFT_MODEL` | `claude-opus-4-8` | model for drafting new skill proposals |
 | `SKILLS_DISCORD_WEBHOOK` | empty | optional webhook for lane notifications |
 | `SKILLS_EXCLUDE_PROJECTS` | empty | comma-separated project ids the lanes skip |
+| `SYNAPSE_NOTES_LANE` | `1` | nightly dream→notes curation lane (`0` = off) |
+| `NOTES_LANE_SIM_FLOOR` | `0.60` | hook-embedding cosine floor for note-pair candidacy |
+| `NOTES_LANE_MAX_JUDGE` | `40` | note pairs judged per run |
+| `NOTES_LANE_MAX_RETYPE_JUDGE` | `10` | global notes scope-judged per run |
+| `NOTES_LANE_MAX_APPLY` | `10` | operations APPLIED per run, across merges and retypes |
+| `SYNAPSE_NOTES_CURATE_MODEL` | `SYNAPSE_LLM_MODEL` | judge model for the notes curation lane (`stage_model("NOTES_CURATE")`) |
 | `SYNAPSE_ENV_FILE` | `/app/.env` | .env fallback path inside the dream container |
 
 ---
