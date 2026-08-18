@@ -12,9 +12,9 @@ The strategies, tried in order, return the first match:
    ``_MIN_NAME_LENGTH`` characters short-circuit *out* of fuzzy matching.
    Two distinct "api" entities should stay distinct; the LSH+Jaccard
    shingles on a 3-letter string are too unreliable to trust.
-3. **MinHash/LSH Jaccard** — character-3-gram MinHash signatures + LSH
-   keyed on entity names produce a candidate set, then Jaccard is
-   recomputed exactly on the shingles. Default threshold 0.7.
+3. **MinHash/LSH Jaccard** — character-3-gram MinHash signatures (64-perm,
+   packed numpy banding — see ``_PackedLSH``) produce a candidate set,
+   then Jaccard is recomputed exactly on the shingles. Default threshold 0.7.
 4. **LLM confirm** — top-K (default 3) LSH candidates that survive the
    entropy filter are sent to Haiku 4.5 with a "are these the same
    entity? yes/no/uncertain" prompt, one pair per call. Returns the
@@ -38,6 +38,7 @@ task #49 alias-normalization work.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import os
@@ -71,10 +72,17 @@ _MIN_TOKEN_COUNT = 2
 # silently; at or above it we send to the LLM for a final confirm.
 _LSH_JACCARD_THRESHOLD = 0.7
 
-# Number of MinHash permutations — direct port of Graphiti's value.
-_MINHASH_PERMUTATIONS = 128
-# Process-wide MinHash permutation array — see NodeDeduper._minhash.
-_SHARED_MINHASH_PERMS: Any = None
+# Number of MinHash permutations. Graphiti/datasketch used 128; the packed
+# index runs 64 — banding below is candidate-generous and every candidate is
+# exact-Jaccard rescored, so the coarser fingerprint only costs a sliver of
+# candidate recall at the margin while halving signature work and memory.
+_MINHASH_PERMUTATIONS = 64
+# LSH banding: bands x rows must equal _MINHASH_PERMUTATIONS. b=16/r=4 puts
+# the candidate-generation knee near Jaccard 0.5 ((1/16)^(1/4)) — deliberately
+# below _LSH_JACCARD_THRESHOLD, since false candidates are cheap (one exact
+# Jaccard each) and missed candidates are unrecoverable.
+_LSH_BANDS = 16
+_LSH_ROWS = 4
 
 # Number of top LSH candidates passed to the LLM confirm pass.
 _LLM_CONFIRM_TOP_K = 3
@@ -517,10 +525,8 @@ class NodeDeduper:
             idx.summary_by_uuid[node_uuid] = summary or ""
             if not isinstance(idx.lsh, _NullLSH):
                 try:
-                    mh = self._minhash(_shingles(_normalize_for_fuzzy(name)))
-                    # MinHashLSH requires unique keys; skip if already present.
-                    if node_uuid not in idx.lsh:
-                        idx.lsh.insert(node_uuid, mh)
+                    # insert() no-ops on already-known keys and empty shingles.
+                    idx.lsh.insert(node_uuid, _shingles(_normalize_for_fuzzy(name)))
                 except Exception as exc:
                     logger.debug("dedup: register %s failed to update LSH: %s", node_uuid[:8], exc)
 
@@ -621,11 +627,11 @@ class NodeDeduper:
         build_start = time.monotonic()
 
         try:
-            from datasketch import MinHashLSH
+            lsh = _PackedLSH()
         except ImportError as exc:
-            # No datasketch → skip fuzzy strategy. Exact-name short-circuit
+            # No numpy → skip fuzzy strategy. Exact-name short-circuit
             # still works.
-            logger.warning("dedup: datasketch unavailable (%s); skipping LSH", exc)
+            logger.warning("dedup: numpy unavailable (%s); skipping LSH", exc)
             return _GroupIndex(_NullLSH())
 
         try:
@@ -634,7 +640,7 @@ class NodeDeduper:
             logger.warning("dedup: failed to load entities for LSH (%s); skipping", exc)
             return _GroupIndex(_NullLSH())
 
-        idx = _GroupIndex(MinHashLSH(threshold=self._lsh_threshold, num_perm=_MINHASH_PERMUTATIONS))
+        idx = _GroupIndex(lsh)
 
         # Taxonomy map for the type-compatibility gate (empty if unseeded -> gate no-ops).
         if _TYPE_GATE_ON:
@@ -659,12 +665,12 @@ class NodeDeduper:
             if not shingles:
                 continue
             try:
-                mh = self._minhash(shingles)
-                # Tolerate duplicate keys from any stragglers (already-merged).
-                if node_uuid not in idx.lsh:
-                    idx.lsh.insert(node_uuid, mh)
+                # insert() itself tolerates duplicate keys from any
+                # stragglers (already-merged rows).
+                idx.lsh.insert(node_uuid, shingles)
             except Exception as exc:
                 logger.debug("dedup: skipping %s in LSH (%s)", node_uuid[:8], exc)
+        lsh.finalize()
         logger.info(
             "dedup: LSH built for %s — %d entities in %.1fs",
             self._group_id,
@@ -672,25 +678,6 @@ class NodeDeduper:
             time.monotonic() - build_start,
         )
         return idx
-
-    def _minhash(self, shingles: set[str]) -> Any:
-        """Construct a MinHash for a shingle set (datasketch import-deferred).
-
-        The 128 hash permutations are seed-deterministic, so every MinHash
-        object computes the identical array — but datasketch regenerates it
-        per object, which dominated the O(all entities) LSH build (~17x of
-        its cost). Compute once per process and share; fingerprints are
-        bit-identical either way.
-        """
-        global _SHARED_MINHASH_PERMS
-        from datasketch import MinHash
-
-        if _SHARED_MINHASH_PERMS is None:
-            _SHARED_MINHASH_PERMS = MinHash(num_perm=_MINHASH_PERMUTATIONS).permutations
-        mh = MinHash(num_perm=_MINHASH_PERMUTATIONS, permutations=_SHARED_MINHASH_PERMS)
-        for shingle in shingles:
-            mh.update(shingle.encode("utf-8"))
-        return mh
 
     def _lsh_candidates(self, normalized: str, idx: _GroupIndex) -> list[tuple[str, float]]:
         """Return [(uuid, jaccard), ...] sorted by descending Jaccard.
@@ -709,9 +696,8 @@ class NodeDeduper:
         if not query_shingles:
             return []
         try:
-            mh = self._minhash(query_shingles)
             with idx.lock:
-                keys = list(idx.lsh.query(mh))
+                keys = list(idx.lsh.query(query_shingles))
         except Exception as exc:
             logger.debug("dedup: LSH query failed: %s", exc)
             return []
@@ -815,7 +801,7 @@ class NodeDeduper:
 
 
 class _NullLSH:
-    """Sentinel for "datasketch unavailable / graph load failed."
+    """Sentinel for "numpy unavailable / graph load failed."
 
     ``find_or_none`` treats this as "no LSH candidates ever" so the
     pipeline degrades gracefully to exact-name-only matching.
@@ -824,11 +810,127 @@ class _NullLSH:
     def __contains__(self, key: str) -> bool:  # pragma: no cover - trivial
         return False
 
-    def insert(self, key: str, mh: Any) -> None:  # pragma: no cover - trivial
+    def insert(self, key: str, shingles: set[str]) -> None:  # pragma: no cover - trivial
         return None
 
-    def query(self, mh: Any) -> list[str]:  # pragma: no cover - trivial
+    def query(self, shingles: set[str]) -> list[str]:  # pragma: no cover - trivial
         return []
+
+
+class _PackedLSH:
+    """MinHash/LSH over numpy arrays instead of datasketch's per-key dicts.
+
+    datasketch's MinHashLSH cost ~5.5KB per key at 128 perms (~262MB at 48K
+    entities — the bulk of the shared dedup index). This packs the same
+    banding scheme into sorted arrays: per band, a sorted uint64 key column
+    plus the argsort index, queried by binary search. ~15MB at 48K entities.
+
+    Signatures are 64-perm MinHash over sha1-derived 32-bit shingle hashes
+    with multiply-shift universal hashing ((a*h + b) >> 32, a odd), seeded —
+    deterministic across processes and rebuilds. Full signatures are NOT
+    retained; only the 16 band keys per entity survive ``finalize``.
+
+    Lifecycle: bulk ``insert`` during hydration, one ``finalize`` to pack,
+    then ``insert`` routes to a small per-band overflow dict (this process's
+    post-build ``register`` writes — folded into the packed arrays at the
+    next TTL rebuild). ``query`` checks packed + overflow. Callers hold the
+    index lock around insert/query, matching the datasketch contract.
+    """
+
+    def __init__(self) -> None:
+        import numpy as np
+
+        self._np = np
+        rng = np.random.RandomState(0x5EED)
+        self._a = rng.randint(1, 2**32, size=_MINHASH_PERMUTATIONS).astype(np.uint64) | np.uint64(1)
+        self._b = rng.randint(0, 2**32, size=_MINHASH_PERMUTATIONS).astype(np.uint64)
+        self._uuids: list[str] = []
+        self._known: set[str] = set()
+        self._pending_sigs: list[Any] = []
+        # Per-band packed state (filled by finalize) + post-finalize overflow.
+        self._sorted_keys: list[Any] = []
+        self._sorted_idx: list[Any] = []
+        self._overflow: list[dict[int, list[int]]] = [{} for _ in range(_LSH_BANDS)]
+
+    def _signature(self, shingles: set[str]) -> Any:
+        np = self._np
+        hv = np.fromiter(
+            (
+                # Not a security hash — a stable 32-bit shingle fingerprint.
+                int.from_bytes(
+                    hashlib.sha1(s.encode("utf-8"), usedforsecurity=False).digest()[:4], "big"
+                )
+                for s in shingles
+            ),
+            dtype=np.uint64,
+            count=len(shingles),
+        )
+        # (S, P) multiply-shift, uint64 wraparound intended; min over shingles.
+        prod = hv[:, None] * self._a[None, :] + self._b[None, :]
+        return (prod >> np.uint64(32)).min(axis=0)
+
+    def _band_keys(self, sig: Any) -> Any:
+        """Fold each band's ``_LSH_ROWS`` signature slots into one uint64 key."""
+        np = self._np
+        s = sig.reshape(_LSH_BANDS, _LSH_ROWS)
+        key = s[:, 0].copy()
+        for j in range(1, _LSH_ROWS):
+            key = key * np.uint64(1099511628211) ^ s[:, j]
+        return key
+
+    def insert(self, key: str, shingles: set[str]) -> None:
+        if key in self._known or not shingles:
+            return
+        sig = self._signature(shingles)
+        self._known.add(key)
+        row = len(self._uuids)
+        self._uuids.append(key)
+        if self._sorted_keys:
+            band_keys = self._band_keys(sig)
+            for band in range(_LSH_BANDS):
+                self._overflow[band].setdefault(int(band_keys[band]), []).append(row)
+        else:
+            self._pending_sigs.append(sig)
+
+    def finalize(self) -> None:
+        """Pack pending signatures into per-band sorted (key, row) arrays."""
+        np = self._np
+        if not self._pending_sigs:
+            self._sorted_keys = [np.empty(0, dtype=np.uint64) for _ in range(_LSH_BANDS)]
+            self._sorted_idx = [np.empty(0, dtype=np.int32) for _ in range(_LSH_BANDS)]
+            return
+        sigs = np.stack(self._pending_sigs).reshape(-1, _LSH_BANDS, _LSH_ROWS)
+        self._pending_sigs = []
+        keys = sigs[:, :, 0].copy()
+        for j in range(1, _LSH_ROWS):
+            keys = keys * np.uint64(1099511628211) ^ sigs[:, :, j]
+        for band in range(_LSH_BANDS):
+            col = keys[:, band]
+            order = np.argsort(col, kind="stable").astype(np.int32)
+            self._sorted_keys.append(col[order])
+            self._sorted_idx.append(order)
+
+    def query(self, shingles: set[str]) -> list[str]:
+        np = self._np
+        if not shingles or not self._sorted_keys:
+            return []
+        band_keys = self._band_keys(self._signature(shingles))
+        rows: set[int] = set()
+        for band in range(_LSH_BANDS):
+            k = band_keys[band]
+            packed = self._sorted_keys[band]
+            if len(packed):
+                lo = int(np.searchsorted(packed, k, side="left"))
+                hi = int(np.searchsorted(packed, k, side="right"))
+                if hi > lo:
+                    rows.update(int(r) for r in self._sorted_idx[band][lo:hi])
+            extra = self._overflow[band].get(int(k))
+            if extra:
+                rows.update(extra)
+        return [self._uuids[r] for r in rows]
+
+    def __contains__(self, key: str) -> bool:
+        return key in self._known
 
 
 # ---------------------------------------------------------------------------

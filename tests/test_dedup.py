@@ -394,3 +394,60 @@ class TestClassify:
         assert cand_uuid == "uuid-sp"
         assert cand_name == "synapse poller"
         assert 0.0 <= jacc <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# _PackedLSH — the numpy-packed MinHash/LSH index
+# ---------------------------------------------------------------------------
+
+
+class TestPackedLSH:
+    """Unit tests for the packed index that replaced datasketch (memory:
+    ~5.5KB/key -> ~300B/key at 48K entities). Deterministic: seeded perms."""
+
+    def _lsh(self):
+        from ingestion.dedup import _PackedLSH
+
+        return _PackedLSH()
+
+    def test_near_duplicates_collide_dissimilar_do_not(self):
+        lsh = self._lsh()
+        lsh.insert("uuid-a", _shingles("synapsepoller"))
+        lsh.insert("uuid-b", _shingles("grandstreamrouter"))
+        lsh.finalize()
+        # Identical shingle set -> identical signature -> every band matches.
+        hits = lsh.query(_shingles("synapsepoller"))
+        assert "uuid-a" in hits
+        assert "uuid-b" not in hits
+        # Unrelated name -> no bands match.
+        assert lsh.query(_shingles("postgresdatabase")) == []
+
+    def test_high_jaccard_variant_found(self):
+        # One-character suffix difference on a long name keeps Jaccard high;
+        # 16 bands of 4 rows at 64 perms must surface it as a candidate.
+        lsh = self._lsh()
+        lsh.insert("uuid-a", _shingles("synapsearchitecture"))
+        lsh.finalize()
+        assert "uuid-a" in lsh.query(_shingles("synapsearchitectures"))
+
+    def test_overflow_insert_after_finalize_is_queryable(self):
+        lsh = self._lsh()
+        lsh.insert("uuid-a", _shingles("synapsepoller"))
+        lsh.finalize()
+        lsh.insert("uuid-new", _shingles("freshlyregistered"))
+        assert "uuid-new" in lsh
+        assert "uuid-new" in lsh.query(_shingles("freshlyregistered"))
+
+    def test_duplicate_and_empty_inserts_noop(self):
+        lsh = self._lsh()
+        lsh.insert("uuid-a", _shingles("synapsepoller"))
+        lsh.insert("uuid-a", _shingles("synapsepoller"))
+        lsh.insert("uuid-empty", set())
+        lsh.finalize()
+        assert lsh.query(_shingles("synapsepoller")) == ["uuid-a"]
+        assert "uuid-empty" not in lsh
+
+    def test_empty_index_query(self):
+        lsh = self._lsh()
+        lsh.finalize()
+        assert lsh.query(_shingles("anything")) == []

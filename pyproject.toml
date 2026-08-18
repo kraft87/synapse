@@ -18,7 +18,7 @@ dependencies = [
     "voyageai>=0.3",
     "claude-agent-sdk>=0.1.72",
     "tenacity>=8.0",
-    "datasketch>=1.6",
+    "numpy>=1.26",
     "fastmcp>=3.4",
     "pydantic-ai-slim[openai]>=2.13.0",
     # Postgres-backed OAuth-proxy state store (asyncpg). fastmcp already pulls
