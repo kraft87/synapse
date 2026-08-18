@@ -1578,10 +1578,32 @@ class TestDeduperCache:
         pipe = self._pipeline()
         assert pipe._deduper_for("technical") is not pipe._deduper_for("personal")
 
-    def test_ttl_expiry_rebuilds(self, monkeypatch):
+    def test_ttl_expiry_rebuilds_shared_index_not_shell(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_DEDUP_CACHE_TTL_SECONDS", "300")
         pipe = self._pipeline()
-        first = pipe._deduper_for("technical")
-        # Age the cache entry past the TTL; next call must build fresh.
-        pipe._dedupers_built_at["technical"] -= 301
-        assert pipe._deduper_for("technical") is not first
+        deduper = pipe._deduper_for("technical")
+        first_idx = deduper._index()
+        # Age the shared index past the TTL; next call must build fresh,
+        # while the deduper shell itself is reused.
+        first_idx.built_at -= 301
+        assert deduper._index() is not first_idx
+        assert pipe._deduper_for("technical") is deduper
+
+    def test_index_shared_across_deduper_instances(self):
+        # Two pipelines (as two worker threads would have) share one hydrated
+        # index per group — the per-thread copies were the poller OOM source.
+        pipe_a, pipe_b = self._pipeline(), self._pipeline()
+        ded_a = pipe_a._deduper_for("technical")
+        ded_b = pipe_b._deduper_for("technical")
+        assert ded_a is not ded_b
+        assert ded_a._index() is ded_b._index()
+
+    def test_register_visible_across_instances(self):
+        pipe_a, pipe_b = self._pipeline(), self._pipeline()
+        pipe_a._deduper_for("technical").register(
+            "Shared Register Probe", "uuid-shared-probe", summary="s"
+        )
+        assert (
+            pipe_b._deduper_for("technical").find_or_none("shared register probe")
+            == "uuid-shared-probe"
+        )
