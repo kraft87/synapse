@@ -855,7 +855,13 @@ class _PackedLSH:
     def _signature(self, shingles: set[str]) -> Any:
         np = self._np
         hv = np.fromiter(
-            (int.from_bytes(hashlib.sha1(s.encode("utf-8")).digest()[:4], "big") for s in shingles),
+            (
+                # Not a security hash — a stable 32-bit shingle fingerprint.
+                int.from_bytes(
+                    hashlib.sha1(s.encode("utf-8"), usedforsecurity=False).digest()[:4], "big"
+                )
+                for s in shingles
+            ),
             dtype=np.uint64,
             count=len(shingles),
         )
