@@ -110,3 +110,16 @@ def clean_tables(conn):
                  ingestion_state, extraction_queue RESTART IDENTITY CASCADE
     """)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _reset_dedup_index_cache():
+    """The dedup module caches hydrated group indexes process-wide (one shared
+    copy per group instead of one per worker thread). Tests build indexes from
+    per-test fake KG clients under the same group ids, so the cache must be
+    dropped between tests or one test's entities leak into the next."""
+    from ingestion import dedup
+
+    dedup._index_cache_reset()
+    yield
+    dedup._index_cache_reset()

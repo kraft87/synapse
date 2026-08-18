@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import re
-import time
 import uuid
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -1226,11 +1225,11 @@ class ExtractionPipeline:
             llm_client=llm_client,
             model=stage_model("EDGE_DATES", base),
         )
-        # Per-group NodeDeduper cache — the fuzzy-name LSH inside it is an
-        # O(all entities) MinHash build, far too expensive to redo per item.
-        # See _deduper_for for the refresh policy.
+        # Per-group NodeDeduper cache. Dedupers are thin shells over a
+        # process-shared hydrated index (see ingestion.dedup._GroupIndex),
+        # so this cache only avoids re-constructing the shell per item;
+        # index build/TTL policy lives in the dedup module.
         self._dedupers: dict[str, Any] = {}
-        self._dedupers_built_at: dict[str, float] = {}
         # Timeline chat gate (schema 033): per-turn "did something happen?" check on
         # episode-type items -> naked dated events in timeline_events. Fail-soft and
         # env-gated (SYNAPSE_TIMELINE_GATE=0); orthogonal to KG extraction.
@@ -1322,15 +1321,16 @@ class ExtractionPipeline:
             if not is_new:
                 existing_summary = ""
                 if deduper is not None:
-                    existing_summary = deduper._summary_by_uuid.get(clean_uuid, "")
+                    existing_summary = deduper.summary_of(clean_uuid)
                 summary_to_write = NodeDeduper.merge_summary(existing_summary, entity.summary)
 
             # Auto-type: roll the extracted subtype up to a canonical supertype via the
             # taxonomy map (already loaded on the deduper). Unknown subtype -> 'other'
             # (queryable as the to-map backlog); no map -> None (backfill fills later).
             supertype = None
-            if deduper is not None and deduper._type_map:
-                supertype = deduper._type_map.get(entity.type, "other")
+            type_map = deduper.type_map if deduper is not None else {}
+            if type_map:
+                supertype = type_map.get(entity.type, "other")
             self._kg.upsert_node(
                 node_uuid=clean_uuid,
                 name=entity.name,
@@ -1796,29 +1796,27 @@ class ExtractionPipeline:
                 self._kg.reinforce_edges(reinforce_items, group_id)
 
     def _deduper_for(self, group_id: str) -> Any:
-        """Cached per-group NodeDeduper, rebuilt only when the TTL lapses.
+        """Cached per-group NodeDeduper (thin shell; see ingestion.dedup).
 
-        Constructing a NodeDeduper per item rebuilt its LSH index — an
-        O(all entities) MinHash pass — every time, which came to dominate
-        item latency once extraction reliably produced entities (~24 min/item
-        at 44K entities, 2026-07-17). One deduper per worker keeps the index
-        warm; ``register`` folds in this worker's own writes as they happen.
-        The TTL bounds staleness from OTHER workers' writes — and only for
-        the fuzzy-name assist, since the exact-name short-circuit and the
-        embedding-similarity candidates always query the live DB.
+        The expensive part — the O(all entities) LSH index — is no longer
+        on the deduper: it lives in a process-shared cache inside the dedup
+        module, one copy per group per PROCESS instead of one per worker
+        thread (4 threads x ~366MB of index copies is what OOM-killed the
+        pollers against their 1GiB caps). The shared index carries its own
+        TTL (SYNAPSE_DEDUP_CACHE_TTL_SECONDS) bounding staleness from other
+        processes' writes — and only for the fuzzy-name assist, since the
+        exact-name short-circuit and the embedding-similarity candidates
+        always query the live DB. This per-pipeline cache just avoids
+        re-constructing the shell (client refs + config) per item.
         """
         from ingestion.dedup import NodeDeduper
 
-        ttl = float(os.environ.get("SYNAPSE_DEDUP_CACHE_TTL_SECONDS", "900"))
-        now = time.monotonic()
-        built = self._dedupers_built_at.get(group_id)
-        if group_id not in self._dedupers or built is None or now - built > ttl:
+        if group_id not in self._dedupers:
             self._dedupers[group_id] = NodeDeduper(
                 kg_client=self._kg,
                 group_id=group_id,
                 llm_client=self._llm._client,
             )
-            self._dedupers_built_at[group_id] = now
         return self._dedupers[group_id]
 
     # ------------------------------------------------------------------
