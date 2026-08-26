@@ -84,6 +84,10 @@ Env / `settings.json` only:
 - **`SYNAPSE_SKILLS_SYNC`** — `1` enables two-way skill sync (default off).
 - **`SYNAPSE_TIMELINE_REPOS`** — comma/space-separated repo paths for the timeline feeder.
 - **`SYNAPSE_BOARD`** — `0` disables the session-start board block.
+- **`SYNAPSE_RECALL_NUDGE`** — `0` disables the per-prompt recall/remember reminder.
+- **`SYNAPSE_PROMPT_TIMESTAMP`** — `0` disables the per-prompt timestamp line
+  (`[Wed 2026-08-26 15:55:01 EDT]`, host-local time; on by default so remember()
+  and timeline references know the current moment, weekday included).
 - **`SYNAPSE_INGEST_URL`** — legacy full-endpoint override, still honored.
 
 ## Setup
