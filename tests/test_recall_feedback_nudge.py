@@ -13,9 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-_HOOK_PY = (
-    Path(__file__).resolve().parents[1] / "plugin" / "scripts" / "recall_feedback_nudge.py"
-)
+_HOOK_PY = Path(__file__).resolve().parents[1] / "plugin" / "scripts" / "recall_feedback_nudge.py"
 
 
 def _run(tmp_path, env: dict | None = None) -> str:
