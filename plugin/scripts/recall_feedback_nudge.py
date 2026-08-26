@@ -4,9 +4,11 @@
 
 Injects a one-line reminder to close the retrieval-quality loop with recall_feedback().
 recall_feedback is offline labeled data (eval goldens, reranker tuning) that never changes
-live ranking, so the model has no in-band reason to call it and won't unprompted — which
-means feedback only ever gets captured on machines that wire this nudge by hand. Shipping it
-in the plugin captures organic feedback from every install, not just the author's box.
+live ranking, so the model has no in-band reason to call it and won't unprompted.
+
+OFF by default since 2026-08-26 (was on): the labeled data only serves whoever tunes the
+retrieval stack — for everyone else it's ~60 tokens of noise after every recall plus an
+extra tool call. Dev boxes opt in with SYNAPSE_RECALL_FEEDBACK_NUDGE=1.
 
 Mirrors recall_nudge.py (the UserPromptSubmit "use Synapse" reminder): a static ~60-token
 directive, zero latency, zero API calls — the model still decides which ids were load-bearing.
@@ -15,7 +17,7 @@ The anchored matcher in hooks.json ensures this fires ONLY on recall() and
 recall_full_turns() (both serve rateable ids), NOT on recall_feedback /
 fetch.
 
-Kill switch: SYNAPSE_RECALL_FEEDBACK_NUDGE=0 (env or plugin install options).
+Opt-in: SYNAPSE_RECALL_FEEDBACK_NUDGE=1 (env or plugin install options).
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ from config import _cfg
 
 
 def main() -> None:
-    if _cfg("SYNAPSE_RECALL_FEEDBACK_NUDGE", "1") == "0":
+    if _cfg("SYNAPSE_RECALL_FEEDBACK_NUDGE", "0") != "1":
         return
     msg = (
         "[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:) "
