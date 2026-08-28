@@ -45,6 +45,11 @@
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start",
+            "timeout": 20
           }
         ]
       }
@@ -80,6 +85,16 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
+        "matcher": "mcp__.*__remember$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use",
             "timeout": 5
           }
         ]

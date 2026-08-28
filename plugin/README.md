@@ -9,7 +9,7 @@ and the dream→skills lane all run server-side.
 
 ## What it does
 
-Six hooks (`hooks/hooks.json`) plus MCP wiring:
+Seven hooks (`hooks/hooks.json`) plus MCP wiring:
 
 1. **Transcript ingest** (`Stop`) — after every turn, pushes a bounded tail of the session
    transcript to `/ingest`. This is how sessions become memory, and it works over the
@@ -30,6 +30,9 @@ Six hooks (`hooks/hooks.json`) plus MCP wiring:
 6. **Private-mode cleanup** (`SessionEnd`) — removes the local private-mode marker for the
    session that just ended (see [Private mode](#private-mode)). The server-side flag is
    left in place on purpose.
+7. **Memory-write spool** (`PostToolUse` + `SessionStart`) — a `remember()` that fails is
+   queued to local disk and replayed when the server is back, so a memory write is never
+   silently lost (see [Memory-write spool](#memory-write-spool)).
 
 MCP tools (`recall`, `fetch`, `remember`, …) are registered automatically —
 no hand-written `.mcp.json`.
@@ -61,6 +64,9 @@ an unreachable server is a silent no-op.
   commit subjects, dates, and a coarse salience score from those repos. Unset = nothing runs.
 - **Board block** — **on**, but it *sends* nothing: it reads `GET /context` and prints one
   bounded index block into your context. Off: `SYNAPSE_BOARD=0`.
+- **Memory-write spool** — **on**. Sends nothing extra: it replays a `remember()` you already
+  asked for but that failed to reach the server. Until it succeeds the note sits in a local
+  jsonl file, and you can inspect or drop it (`remember_spool.py list`, or delete the file).
 
 ## Configuration
 
@@ -195,6 +201,11 @@ Bundled commands (`!` prefix in a session; full path from an outside terminal):
 - **`! synapse-import`** — backfill your existing history (step 4).
 - **`! synapse-private on|off|status <session-id>`** — private mode (below).
 
+Scripts (run by full path; see [Memory-write spool](#memory-write-spool)):
+
+- **`scripts/remember_spool.py add|list|flush`** — queue a memory write while the server (or
+  the MCP transport) is down, and replay it when it's back.
+
 ## Private mode
 
 Take one session off the record — nothing from it becomes memory, ever:
@@ -219,6 +230,34 @@ deletes the row too, deliberately re-exposing that session to future imports.
 
 Server requirement: schema 050 (`private_sessions`). Against an older server the toggle
 fails loudly with `503 apply schema/050` rather than half-enabling.
+
+## Memory-write spool
+
+A `remember()` that can't reach the server used to be a lost memory — the model said "noted"
+and nothing was written. Now the intent is queued to `~/.local/share/synapse-skills/remember_spool.jsonl`
+(`SYNAPSE_DATA_DIR`) and replayed automatically:
+
+- **`PostToolUse`** — when `remember()` comes back without a confirmed write, the intent is
+  spooled and the model is told it is *queued*, not saved.
+- **`SessionStart`** — probes the write lane. Server up and the spool non-empty → it flushes
+  and prints `[Synapse] flushed N spooled memory write(s): …`. Server down → it prints one
+  line telling the model to route memory writes through the CLI below until it recovers
+  (this covers the case where the MCP server never connected at all, so no tool call — and
+  no `PostToolUse` hook — ever fires).
+
+```
+python3 <plugin>/scripts/remember_spool.py add --hook "<one-line hook>" --body "<full note>" --type user
+python3 <plugin>/scripts/remember_spool.py list      # what's queued
+python3 <plugin>/scripts/remember_spool.py flush     # replay now
+```
+
+`add` also accepts the same fields as JSON on stdin, and tries an immediate write-through
+before queueing. Nothing leaves the spool until the server confirms, and each intent carries
+a client-generated id the server dedups on — so a flush interrupted mid-way neither loses an
+intent nor writes one twice. Log: `/tmp/synapse-remember-spool.log` (`SYNAPSE_SPOOL_LOG`).
+
+Server requirement: schema 052 (`remember_intents`) and the `/remember/spool` route. Against
+an older server the flush fails loudly into the log and the spool simply keeps its intents.
 
 MCP tools (registered automatically; Claude calls them during a session):
 
@@ -250,6 +289,7 @@ MCP tools (registered automatically; Claude calls them during a session):
 
 ## How it talks to Synapse
 
-HTTP only: `/ingest`, `/skills/*`, `/config/publish`, `/timeline/*`, `/context`, and `/mcp`,
+HTTP only: `/ingest`, `/skills/*`, `/config/publish`, `/timeline/*`, `/context`,
+`/remember/spool`, and `/mcp`,
 all under the one `SYNAPSE_URL`, gated by one machine token. The client holds no Postgres credentials,
 and skill/config proposals are only ever applied through your explicit review commands.

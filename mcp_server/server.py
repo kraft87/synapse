@@ -868,6 +868,17 @@ async def remember(
     return await anyio.to_thread.run_sync(_work)
 
 
+# Spooled-remember replay — the plugin queues a memory write to local disk whenever the
+# remember() MCP tool is unavailable (OAuth down, server never connected) and replays it
+# here over the machine-token lane, which is a different transport and stayed up through
+# the 2026-08-25 outage. Registered HERE, not with the sibling routes above, because it
+# takes `remember` itself as its writer — same code path as the tool, no drift possible.
+# Idempotent on the client's intent id (schema 052). No-op w/o DB_URL, like the siblings.
+from mcp_server.remember_routes import register as _register_remember_routes  # noqa: E402
+
+_register_remember_routes(mcp, DB_URL, _machine_authorized, remember)
+
+
 # recall_episodes was retired as a standalone tool (item 6 tool-surface audit:
 # 12 of ~325 recall-family mcp-tool calls over 5 weeks, under the pre-registered
 # 5% merge threshold), lived as recall(mode="turns") 07-13..07-26, then re-split
