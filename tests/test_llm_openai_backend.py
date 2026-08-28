@@ -27,6 +27,7 @@ import httpx
 import pytest
 from pydantic import BaseModel
 
+from ingestion import llm_client as llm_client_mod
 from ingestion.llm_client import (
     DEFAULT_OPENAI_BASE_URL,
     DEFAULT_OPENAI_MODEL,
@@ -235,6 +236,94 @@ class TestSuccessfulCompletion:
         client = _client_with(handler)
         client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert "provider" not in seen["payload"]
+
+    def test_auto_provider_order_ranks_cheapest_first(self, monkeypatch):
+        """SYNAPSE_OPENROUTER_PROVIDERS=auto orders providers by blended price,
+        skipping deranked endpoints, unpriced rows, and dupe-slug pricier rows."""
+        monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
+        llm_client_mod._provider_rank_cache.clear()
+        endpoints = [
+            {
+                "tag": "pricey/fp8",
+                "status": 0,
+                "pricing": {"prompt": "0.0000014", "completion": "0.0000044"},
+            },
+            {
+                "tag": "cheap/fp8",
+                "status": 0,
+                "pricing": {"prompt": "0.0000004", "completion": "0.0000013"},
+            },
+            {
+                "tag": "cheap/fp4",
+                "status": 0,
+                "pricing": {"prompt": "0.0000009", "completion": "0.0000028"},
+            },
+            {
+                "tag": "broken/fp8",
+                "status": -5,
+                "pricing": {"prompt": "0.0000001", "completion": "0.0000001"},
+            },
+            {"tag": "free/fp8", "status": 0, "pricing": {"prompt": "0", "completion": "0"}},
+            {
+                "tag": "mid/fp8",
+                "status": 0,
+                "pricing": {"prompt": "0.0000006", "completion": "0.0000020"},
+            },
+        ]
+        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", lambda model: endpoints)
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert seen["payload"]["provider"] == {"order": ["cheap", "mid", "pricey"]}
+
+    def test_auto_provider_order_fail_soft(self, monkeypatch):
+        """A ranking-fetch failure degrades to default routing, not an error."""
+        monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
+        llm_client_mod._provider_rank_cache.clear()
+
+        def boom(model: str) -> list[dict[str, Any]]:
+            raise httpx.ConnectError("down")
+
+        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", boom)
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert "provider" not in seen["payload"]
+
+    def test_auto_provider_ranking_cached_across_calls(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
+        llm_client_mod._provider_rank_cache.clear()
+        calls = {"n": 0}
+
+        def fetch(model: str) -> list[dict[str, Any]]:
+            calls["n"] += 1
+            return [
+                {
+                    "tag": "solo/fp8",
+                    "status": 0,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000003"},
+                }
+            ]
+
+        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", fetch)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_completion_body("ok"))
+
+        client = _client_with(handler)
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert calls["n"] == 1
 
     def test_non_openrouter_payload_has_no_reasoning_field(self):
         """Other OpenAI-compatible servers may reject unknown params."""
