@@ -75,6 +75,7 @@ import logging
 import os
 import re
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -103,6 +104,61 @@ def _strip_json_fence(text: str) -> str:
 
 
 logger = logging.getLogger(__name__)
+
+# --- SYNAPSE_OPENROUTER_PROVIDERS=auto: cheapest-first provider ranking -------
+# OpenRouter sale pricing moves daily, and (measured 2026-08-27) neither
+# default routing nor ``sort: "price"`` reaches the discounted endpoints — an
+# unpinned glm-5.2 call billed at full list ($1.40/M) while 70%-off endpoints
+# sat healthy. An explicit ``provider.order`` preference is the only way to
+# capture sale pricing, so ``auto`` rebuilds that order from the live endpoint
+# listing instead of a hardcoded list that rots when a promo ends.
+# Blend weights ~4:1 input:output (extraction-shaped traffic). Fail-soft: any
+# fetch problem falls back to no preference (default routing) and retries
+# sooner than the normal TTL.
+_PROVIDER_RANK_TTL_S = 6 * 3600.0
+_PROVIDER_RANK_RETRY_S = 600.0
+_PROVIDER_RANK_TOP_N = 8
+_provider_rank_cache: dict[str, tuple[float, list[str]]] = {}
+_provider_rank_lock = threading.Lock()
+
+
+def _fetch_model_endpoints(model: str) -> list[dict[str, Any]]:
+    resp = httpx.get(f"https://openrouter.ai/api/v1/models/{model}/endpoints", timeout=10.0)
+    resp.raise_for_status()
+    return list((resp.json().get("data") or {}).get("endpoints") or [])
+
+
+def _ranked_openrouter_providers(model: str) -> list[str]:
+    """Provider slugs for ``model``, cheapest blended price first (cached)."""
+    now = time.monotonic()
+    with _provider_rank_lock:
+        hit = _provider_rank_cache.get(model)
+        if hit and now < hit[0]:
+            return hit[1]
+    try:
+        cheapest: dict[str, float] = {}
+        for ep in _fetch_model_endpoints(model):
+            slug = str(ep.get("tag") or "").split("/")[0]
+            status = ep.get("status")
+            if not slug or (isinstance(status, int | float) and status < 0):
+                continue  # deranked/broken endpoint
+            pricing = ep.get("pricing") or {}
+            blend = (
+                4 * float(pricing.get("prompt") or 0) + float(pricing.get("completion") or 0)
+            ) / 5
+            if blend <= 0:  # free/unpriced rows are stale listings, not wins
+                continue
+            if slug not in cheapest or blend < cheapest[slug]:
+                cheapest[slug] = blend
+        order = sorted(cheapest, key=cheapest.__getitem__)[:_PROVIDER_RANK_TOP_N]
+        expires = now + _PROVIDER_RANK_TTL_S
+    except Exception as e:
+        logger.warning("OpenRouter provider ranking failed for %s: %s", model, e)
+        order, expires = [], now + _PROVIDER_RANK_RETRY_S
+    with _provider_rank_lock:
+        _provider_rank_cache[model] = (expires, order)
+    return order
+
 
 DEFAULT_MODEL = "claude-haiku-4-5"
 _MAX_RETRIES = 2
@@ -773,12 +829,16 @@ class OpenAIChatClient:
         # Ollama, vLLM) may reject unknown params, so gate on the URL.
         self.is_openrouter = "openrouter" in base_url.lower()
         # SYNAPSE_OPENROUTER_PROVIDERS: comma-separated provider slugs to
-        # prefer (e.g. "fireworks,deepinfra"). OpenRouter-only.
-        self.openrouter_providers = [
-            p.strip()
-            for p in os.environ.get("SYNAPSE_OPENROUTER_PROVIDERS", "").split(",")
-            if p.strip()
-        ]
+        # prefer (e.g. "fireworks,deepinfra"), or "auto" to rank providers
+        # cheapest-first from the live endpoint listing (see
+        # _ranked_openrouter_providers). OpenRouter-only.
+        raw_providers = os.environ.get("SYNAPSE_OPENROUTER_PROVIDERS", "").strip()
+        self.openrouter_providers_auto = raw_providers.lower() == "auto"
+        self.openrouter_providers = (
+            []
+            if self.openrouter_providers_auto
+            else [p.strip() for p in raw_providers.split(",") if p.strip()]
+        )
         self._api_key = api_key
         self._transport = transport
         # Connection state is THREAD-LOCAL, built lazily per worker thread.
@@ -851,11 +911,16 @@ class OpenAIChatClient:
             # completion with ``finish_reason='length'`` — 196 queue items
             # failed exactly that way on deepseek-v4-pro (2026-07-17).
             extra["reasoning"] = {"enabled": False}
-            if self.openrouter_providers:
+            providers = (
+                _ranked_openrouter_providers(self.model)
+                if self.openrouter_providers_auto
+                else self.openrouter_providers
+            )
+            if providers:
                 # Prefer these providers in order; OpenRouter still falls
                 # back to others if none are available, so a provider
                 # outage degrades to slower/pricier routing, not failure.
-                extra["provider"] = {"order": self.openrouter_providers}
+                extra["provider"] = {"order": providers}
             settings["extra_body"] = extra
         return settings
 
