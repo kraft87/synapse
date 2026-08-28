@@ -439,6 +439,8 @@ Removed from the surface (git history keeps the code): `list_projects` (the boar
 
 `/ingest` and `/recall` are Starlette **custom routes**, not MCP tools (they won't appear in the tool list), so the hook scripts can hit them with a one-shot `urllib` POST instead of an MCP handshake. `/ingest` is the Stop-hook push endpoint ([§4.1](#41-the-ingest-endpoint)); `/recall` serves non-MCP HTTP callers that want recall results without an MCP handshake (same engine as the `recall` tool, `write_feedback=False`). fastmcp's auth deliberately does **not** gate custom routes (they're intended for unauthenticated ops endpoints — [issue #3704](https://github.com/jlowin/fastmcp/issues/3704)), so each handler does its own constant-time bearer check against `SYNAPSE_MACHINE_TOKEN` ([§7.4](#74-auth)). A health helper returns `{"status": "ok"}` for container probes.
 
+**`/remember/spool`** (schema 052) is the durability seam for memory writes. On 2026-08-25 the MCP transport's OAuth failed mid-session: `remember()` could not be called at all, so a user correction was silently lost for two days while the poisoned note it was meant to replace kept re-injecting at every session start — the plain-HTTP lane (`/ingest`, bearer token) worked the whole time. The plugin now spools an unwritable intent to `DATA_DIR/remember_spool.jsonl` and replays it here, and this route calls **`remember` itself** (injected into `mcp_server/remember_routes.register`, not imported — no cycle, and no chance of the replay drifting from the tool it replays). The client generates the intent id once and re-posts it until the server confirms; the route CLAIMS that id in `remember_intents` before writing, so an already-`done` id short-circuits to the recorded note (`outcome: "duplicate"`) instead of minting a second one, while a row still `pending` — a prior attempt that died mid-write — is re-run, because `reconcile_note` converges on the same live note but a skip would lose it entirely. A `probe: true` body answers "reachable AND authorized" without writing: that is what the plugin's SessionStart step calls, since a `/health` ping would report "up" with a dead bearer.
+
 ### 7.3 Lazy init & connection resilience
 
 The `Recall` engine and its Postgres/Voyage clients initialize lazily on first call. `_ensure_pg()` probes live connections with `SELECT 1` before trusting `conn.closed=False`, so half-open TCP connections (PG restart, network blip) are detected and reconnected transparently.
@@ -750,6 +752,7 @@ synapse/
 │   ├── device_routes.py       # /device/code + /device/token — RFC 8628 device login (proxies GitHub), allowlist-gated
 │   ├── skill_sync_routes.py   # machine-token-gated /skills/* HTTP routes (DSN-free skill sync + review)
 │   ├── config_sync_routes.py  # machine-token-gated /config/* HTTP routes (config-lane mirror for dream)
+│   ├── remember_routes.py     # machine-token-gated /remember/spool — replays a memory write the MCP tool couldn't make, idempotent on the client's intent id
 │   └── skills_provider.py     # PgSkillsProvider — serves skill:// resources from skills_lane
 │
 ├── dream/
