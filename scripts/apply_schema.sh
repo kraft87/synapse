@@ -92,6 +92,7 @@ FILES=(
   050_private_sessions.sql
   051_notes_curation.sql
   052_remember_intents.sql
+  053_audience_scoping.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means
