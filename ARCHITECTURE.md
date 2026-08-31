@@ -8,7 +8,7 @@ Synapse is a persistent episodic memory layer for AI assistants. It captures Cla
 
 > **Status note (2026-06-05):** This document was reconciled against the live code after a large architectural drift. The headline changes from the previous version: (1) ingestion moved from Logfire SQL-API polling to a Stop-hook `/ingest` push; (2) KG facts are extracted from **chunks**, not summaries; (3) the **summary/synth-document layer is retired**; (4) the **chunk bucket is no longer served** by `recall()` — episodes are served via a deep-fetch + cross-encoder rerank; (5) a **web-research ingestion subsystem** was added; (6) halfvec HNSW vector indexes shipped; (7) edges are **bitemporal** (`t_created`/`t_valid`/`t_invalid`); (8) the Docker migration is done — all services run in Docker on the server host.
 >
-> **Status note (2026-06-24):** Reconciled again for the FalkorDB→Postgres KG cutover and the public-release plumbing. (1) the **knowledge graph moved into Postgres** (`kg_entities`/`kg_relationships`), FalkorDB decommissioned (#67) — §10 rewritten; (2) the **communities bucket was retired** with that cutover; (3) the MCP server runs **standalone `fastmcp` 3.4.2 with MultiAuth** (machine bearer + GitHub OAuth), which replaced the hand-rolled OAuth proxy (#166); (4) skills are **hosted in Postgres and served as `skill://` resources** with two-way sync (§7.5); (5) **26 migrations** (was 16); (6) a Claude Code **plugin + marketplace** is the distribution path.
+> **Status note (2026-06-24):** Reconciled again for the FalkorDB→Postgres KG cutover and the public-release plumbing. (1) the **knowledge graph moved into Postgres** (`kg_entities`/`kg_relationships`), FalkorDB decommissioned (#67) — §10 rewritten; (2) the **communities bucket was retired** with that cutover; (3) the MCP server runs **standalone `fastmcp` 3.4.2 with MultiAuth** (machine bearer + GitHub OAuth), which replaced the hand-rolled OAuth proxy (#166); (4) skills are **hosted in Postgres and served as `skill://` resources** with two-way sync (§7.6); (5) **26 migrations** (was 16); (6) a Claude Code **plugin + marketplace** is the distribution path.
 
 ---
 
@@ -420,7 +420,7 @@ Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage r
 
 ## 7. MCP Server
 
-**Standalone `fastmcp` 3.4.2** (migrated off the SDK-bundled `mcp.server.fastmcp` in 2026-06, PR #166), HTTP transport with `stateless_http=True`, bound `0.0.0.0:8765`, MCP at `/mcp`. A `--stdio` flag switches to stdio on localhost. Stateless HTTP means each call is a short-lived request with no state to lose on container restart or client sleep/wake. The standalone package brought first-class **auth** ([§7.4](#74-auth)) and a **skills provider** ([§7.5](#75-skills-serving)) that the bundled one lacked.
+**Standalone `fastmcp` 3.4.2** (migrated off the SDK-bundled `mcp.server.fastmcp` in 2026-06, PR #166), HTTP transport with `stateless_http=True`, bound `0.0.0.0:8765`, MCP at `/mcp`. A `--stdio` flag switches to stdio on localhost. Stateless HTTP means each call is a short-lived request with no state to lose on container restart or client sleep/wake. The standalone package brought first-class **auth** ([§7.4](#74-auth)) and a **skills provider** ([§7.6](#76-skills-serving)) that the bundled one lacked.
 
 ### 7.1 Tools
 
@@ -461,7 +461,38 @@ Auth is **env-gated**: with no `SYNAPSE_MACHINE_TOKEN` the server runs open (dev
 
 The user approves at `github.com/login/device` on **any device**; no same-host browser. Requires "Enable Device Flow" on the GitHub OAuth App. The legacy browser flow remains behind `synapse login --browser`. **Client config needs no env vars**: `plugin/scripts/config.py` resolves `SYNAPSE_URL`/token in order — explicit env → `CLAUDE_PLUGIN_OPTION_*` (injected for hooks/MCP, *not* for command-run scripts) → the install-prompt value in `settings.json` (`pluginConfigs."synapse@<marketplace>".options`) → default. The plugin also ships a `bin/synapse-login` launcher (on Claude Code's session PATH) so `! synapse-login` runs it with no model in the loop.
 
-### 7.5 Skills serving
+### 7.5 Audience scoping — per-host trust on the serving routes (schema 053)
+
+Private mode ([§4.1](#41-the-ingest-endpoint)) controls what gets **captured**. Nothing controlled what gets **served**: the board injected the whole curated note set into every session on every machine running the plugin, and `recall()` searched the whole corpus regardless of where the query came from. A work laptop ingesting into the same Synapse therefore got personal notes injected into transcripts on employer-owned hardware — and the board's recency weighting meant whatever was most personally urgent floated to the top. **Serving is the leak, so the filter goes at serving** — one enforcement chokepoint, the same call as private mode's drop-at-ingest inverted.
+
+Two pieces:
+
+- **`notes.audience`** — `personal` (default) or `work-safe`. Two tiers, not N: every extra tier is a per-note decision someone has to make, and a rich taxonomy nobody maintains fails silently. The `personal` default is fail-closed *in the schema*, so a note inserted by any path that forgets the column never leaves a trusted host.
+- **`surfaces`** — one row per host, keyed on the plugin's `SYNAPSE_SURFACE`/hostname constant, carrying `trust IN ('full','restricted')` and a `allowed_projects` TEXT[]. The column default is `restricted` too, so promotion to `full` is always an explicit act rather than something an `INSERT` can do by omission. `mcp_server/surface_routes.py` is the machine-token CRUD (`GET /surfaces`, `PUT|DELETE /surfaces/{id}`); a PUT **replaces** trust + allowlist rather than patching, because a partial update of a security allowlist is how a stale grant survives a demotion.
+
+`ingestion/surfaces.lookup_surface` is the single resolution point and it **never fails open**: no surface id, no row, missing table, unreachable database, malformed row — all return restricted with an empty allowlist. `project = ANY('{}')` is false for every row, NULL project included, so an unknown surface serves *nothing* rather than everything. There is no code path that turns an error into `full`, and callers must not "handle" a lookup failure by skipping the filter.
+
+What a `restricted` surface gets:
+
+| Path | Notes | Episodes / timeline | KG facts |
+| --- | --- | --- | --- |
+| `GET /context` (board) | `audience='work-safe'` | digest + banner filtered to `allowed_projects`, NULL project excluded | n/a |
+| `recall` / `POST /recall` | `audience='work-safe'` | BM25 + vector legs `project = ANY(allowed)` | **leg skipped entirely** |
+| `recall_full_turns` | n/a | same allowlist on the pool | n/a |
+| `fetch(ids)` | `audience='work-safe'` | same allowlist | n/a |
+| `fetch_session` | n/a | allowlist on the metadata probe *and* both row reads | n/a |
+
+The **KG leg is skipped, not filtered**: `kg_relationships` has no `project` column and joining back through source episodes isn't worth the per-query cost yet, so serving zero facts is the only fail-closed answer available. **`fetch` and `fetch_session` enforcement is not belt-and-braces** — `e:N`/`n:N` ids are sequential integers, so an unfiltered drill-down would let a restricted caller enumerate exactly what the board withholds. A session outside the allowlist reports the same "not indexed" answer an unknown id does, deliberately indistinguishable: a distinct "exists but forbidden" reply would itself disclose the project map.
+
+**Timeline gets no `audience` column.** `timeline_events` already carries `domain IN ('personal','technical')` (schema 038) which fails *open* (NULL); a second overlapping label with the opposite fail semantics invites drift. The project allowlist is the filter instead.
+
+**Write-side tagging** happens at the single note chokepoint (`ingestion/notes.reconcile_note`), in precedence order: (1) an explicit `audience` argument on `remember()`; (2) a write from a **registered** restricted surface defaults `work-safe`, symmetric with what that host may read (else notes written at work vanish from the work board next session); (3) the note's `project` is in the union of restricted surfaces' allowlists ⇒ `work-safe`; (4) otherwise `personal`. Rule 2 requires a *registered* surface on purpose — an unknown surface restricts reads, but must never widen a write. A **restatement preserves** the stored tier (`COALESCE(%s, audience)`), so rephrasing is never reclassification; a **contradiction derives** its own, so a personal statement can't arrive work-safe merely by reversing a work-safe one. The dream→notes lane re-derives by rule 3 when a retype changes a note's project.
+
+The plugin stays a thin client and never sees what it isn't served: `board_block.py` sends `?surface=`, and the PreToolUse hook (`self_session_inject.py`, mirrored in `plugin-codex/hooks/pre_tool_use.py`) injects `surface` into `recall`, `recall_full_turns`, `fetch`, `fetch_session` and `remember`. Injecting *below* the model is the point — a hallucinated `"surface": "<trusted-host>"` would otherwise widen what a session can read. Surface ids are self-reported under the shared machine token: the threat model is an employer **reading** a transcript, not attacking the API; per-surface tokens through the device-flow lane are the answer if that changes.
+
+**Rollout is enforcement-first, no feature flag.** Unknown surfaces are restricted from the moment of deploy, so untrusted hosts are protected before their plugins update — the cost of a stale registration is a filtered board, not a leak. Every pre-053 note is `personal`, so restricted boards run empty but safe until `scripts/audience_backfill.py --propose` writes a review table (to a path **outside the repo** — it lists every note hook, and this repository is public), a human edits the audience column, and `--apply` writes it back.
+
+### 7.6 Skills serving
 
 The server hosts the skill library in Postgres (`skills_lane.skill_registry.body` + `skill_files`). The **Synapse plugin** reaches it over machine-token-gated **HTTP routes** — `mcp_server/skill_sync_routes.py`: `/skills/list`, `/skills/fetch`, `/skills/publish`, `/skills/overwrite` (sync) and `/skills/proposals[/act]` (review). This is the **DSN-free seam**: a client needs one base URL + a bearer, never a database connection. The same content is *also* exposed as native fastmcp **`skill://` resources** via `PgSkillsProvider` (`mcp_server/skills_provider.py`) for any generic fastmcp client (`skill://{name}/SKILL.md`, `/_manifest`, `/{path}`).
 
