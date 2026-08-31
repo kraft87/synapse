@@ -44,6 +44,7 @@ from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Json as PgJson
 
 from ingestion import embedding as _embedding
+from ingestion.surfaces import lookup_surface
 from mcp_server.kg_pg import _vec_literal, search_kg_postgres
 
 logger = logging.getLogger(__name__)
@@ -813,6 +814,7 @@ class Recall:
         limit: int,
         doc_type: str,
         session_id: str | None = None,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         # A query with no alphanumeric content tokenizes to nothing — skip the
         # round-trip instead of burning it on a guaranteed-empty (or erroring)
@@ -831,6 +833,12 @@ class Recall:
         if session_id:  # episodes only — the session-scoped drill-down filter
             where.append("session_id = %s")
             params.append(session_id)
+        if allowed_projects is not None:  # restricted surface (schema 053)
+            # ANY('{}') is false for every row, NULL project included — an unknown
+            # surface serves nothing rather than everything. That is the fail-closed
+            # serve, not a bug to "fix" with an emptiness special case.
+            where.append("project = ANY(%s)")
+            params.append(allowed_projects)
         try:
             rows = pg.execute(
                 f"""
@@ -851,9 +859,16 @@ class Recall:
             return []
 
     def _search_bm25_episodes(
-        self, query: str, project: str | None, limit: int, session_id: str | None = None
+        self,
+        query: str,
+        project: str | None,
+        limit: int,
+        session_id: str | None = None,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        return self._bm25_table("episodes", query, project, limit, "episode", session_id)
+        return self._bm25_table(
+            "episodes", query, project, limit, "episode", session_id, allowed_projects
+        )
 
     # ------------------------------------------------------------------
     # Vector search — episodes
@@ -867,6 +882,7 @@ class Recall:
         limit: int,
         doc_type: str,
         session_id: str | None = None,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         pg = self._ensure_pg()
         ts = self._ts_col(table)
@@ -887,6 +903,9 @@ class Recall:
         if session_id:  # episodes only — the session-scoped drill-down filter
             where.append("session_id = %s")
             params.append(session_id)
+        if allowed_projects is not None:  # restricted surface (schema 053) — see _bm25_table
+            where.append("project = ANY(%s)")
+            params.append(allowed_projects)
         try:
             rows = pg.execute(
                 f"""
@@ -907,10 +926,17 @@ class Recall:
             return []
 
     def _search_vector_episodes(
-        self, query_emb: list[float], project: str | None, limit: int, session_id: str | None = None
+        self,
+        query_emb: list[float],
+        project: str | None,
+        limit: int,
+        session_id: str | None = None,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         emb_literal = _vec_literal(query_emb)
-        return self._vector_table("episodes", emb_literal, project, limit, "episode", session_id)
+        return self._vector_table(
+            "episodes", emb_literal, project, limit, "episode", session_id, allowed_projects
+        )
 
     # ------------------------------------------------------------------
     # Reranking + episode leg
@@ -1370,6 +1396,7 @@ class Recall:
         fetch: int = _EPISODE_FETCH,
         pool_size: int = _EPISODE_RERANK_POOL,
         session_id: str | None = None,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Fused BM25+vector episode candidate pool, PRE-rerank (WIN1 deep-fetch).
 
@@ -1378,11 +1405,16 @@ class Recall:
         in a single cross-encoder pass, then partitions by doc_type. The deep fetch
         is what lets the reranker recover a rank-16..88 gold; plain RRF can't.
         BM25-only when the query embedding is unavailable. ``session_id`` scopes
-        both legs to one conversation (the fetch_session/Grep drill-down)."""
-        bm25_eps = self._search_bm25_episodes(query, project, fetch, session_id)
+        both legs to one conversation (the fetch_session/Grep drill-down).
+        ``allowed_projects`` applies a restricted surface's project allowlist to BOTH
+        legs — filtering the pool, not the served slice, so the allowlisted content
+        still gets the full deep-fetch width."""
+        bm25_eps = self._search_bm25_episodes(query, project, fetch, session_id, allowed_projects)
         vec_eps: list[dict[str, Any]] = []
         if query_emb is not None:
-            vec_eps = self._search_vector_episodes(query_emb, project, fetch, session_id)
+            vec_eps = self._search_vector_episodes(
+                query_emb, project, fetch, session_id, allowed_projects
+            )
         return _merge_rrf(bm25_eps, vec_eps, id_key="id")[:pool_size]
 
     # ------------------------------------------------------------------
@@ -1483,19 +1515,30 @@ class Recall:
         return self._dedupe_by_artifact(ranked, _WEB_LIMIT)
 
     def _search_notes(
-        self, query: str, query_emb: list[float], project: str | None
+        self,
+        query: str,
+        query_emb: list[float],
+        project: str | None,
+        audience: str | None = None,
     ) -> list[dict[str, Any]]:
         """Notes bucket: hook-KNN top-_NOTES_FETCH live notes (global types + this
         project's), floored by the cross-encoder on "hook — body" text, top
         _NOTES_LIMIT served. May return [] when nothing clears the floor — notes
         self-gate on relevance like web. Fail-soft: any error serves no bucket.
-        Uses a short-lived Database like the other notes-store paths."""
+        Uses a short-lived Database like the other notes-store paths.
+
+        ``audience`` is the restricted surface's tier filter (schema 053) — 'work-safe'
+        for a restricted caller, None for full trust. Fail-soft here means an EMPTY
+        bucket, which is also the fail-closed answer; there is no path where the filter
+        is dropped and the leg still serves."""
         from ingestion.db import Database
 
         try:
             db = Database(self._db_url)
             try:
-                rows = db.search_live_notes(_KG_OWNER, project, query_emb, limit=_NOTES_FETCH)
+                rows = db.search_live_notes(
+                    _KG_OWNER, project, query_emb, limit=_NOTES_FETCH, audience=audience
+                )
             finally:
                 db.close()
         except Exception as e:
@@ -1769,6 +1812,7 @@ class Recall:
         source: str | None = None,
         debug: bool = False,
         self_session: str | None = None,
+        surface: str | None = None,
     ) -> dict[str, Any]:
         """Overview retrieval: reranked episodes + KG facts (+ entities, web).
 
@@ -1793,16 +1837,28 @@ class Recall:
         instrumentation, no extra work. Off by default so every non-dashboard call is byte-identical
         in behavior AND in the telemetry it records (a live call-rate A/B depends on that). See the
         debug-dict assembly just below the metrics write for the exact shape.
+
+        ``surface`` is the calling host's id (schema 053). Anything but a surface
+        registered ``trust='full'`` — including a missing one — is RESTRICTED: episodes
+        are filtered to the surface's project allowlist, notes to
+        ``audience='work-safe'``, and the KG facts leg is skipped entirely (v1:
+        kg_relationships has no project column, so serving zero facts is the only
+        fail-closed answer available). Bare calls with no surface therefore serve a
+        narrow result on purpose; that is the design, not a regression.
         """
         t_start = time.perf_counter()
         ex = self._leg_executor
+        st = lookup_surface(self._db_url, surface)
+        allowed = st.project_filter
 
         # BM25 is pure text search — it does NOT need the query embedding. Start it
         # FIRST so its ~165ms fetch overlaps the ~170ms Voyage query-embedding call
         # below, instead of running after it (the embed gates the vector/KG/web legs,
         # but not BM25). Each leg owns a thread-local PG connection, so concurrent
         # psycopg use is safe. Legs run through _timed for per-leg latency telemetry.
-        f_bm25 = ex.submit(_timed, self._search_bm25_episodes, query, project, _EPISODE_FETCH)
+        f_bm25 = ex.submit(
+            _timed, self._search_bm25_episodes, query, project, _EPISODE_FETCH, None, allowed
+        )
 
         t_emb = time.perf_counter()
         try:
@@ -1819,14 +1875,26 @@ class Recall:
             return self._search_web_reranked(query, query_emb) if query_emb is not None else []
 
         def _kg_leg() -> tuple[list[Any], list[Any]]:
-            if query_emb is None:
+            # v1 KG posture on a restricted surface: SKIP. kg_relationships carries no
+            # project column, and joining back through source episodes to derive one
+            # isn't worth the per-query cost yet — so there is no way to filter facts,
+            # and serving none is the only fail-closed option.
+            if query_emb is None or st.restricted:
                 return [], []
             return self._search_kg(
                 query, query_emb, group_id, session_focus or [], fact_limit=_FACT_LIMIT
             )
 
         f_vec = (
-            ex.submit(_timed, self._search_vector_episodes, query_emb, project, _EPISODE_FETCH)
+            ex.submit(
+                _timed,
+                self._search_vector_episodes,
+                query_emb,
+                project,
+                _EPISODE_FETCH,
+                None,
+                allowed,
+            )
             if query_emb is not None
             else None
         )
@@ -1836,7 +1904,9 @@ class Recall:
         # Notes leg: hook-KNN + rerank floor over the curated notes store (the board's
         # searchable other half). Reuses this call's query embedding; no-ops without it.
         def _notes_leg() -> list[dict[str, Any]]:
-            return self._search_notes(query, query_emb, project) if query_emb is not None else []
+            if query_emb is None:
+                return []
+            return self._search_notes(query, query_emb, project, audience=st.audience_filter)
 
         f_notes = ex.submit(_timed, _notes_leg) if _NOTES_IN_RECALL else None
 
@@ -2002,6 +2072,9 @@ class Recall:
             "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
             "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
+            # Trust verdict (schema 053): a restricted serve is narrower by design, so
+            # the metrics have to say which regime produced these numbers.
+            "trust": st.trust,
         }
         # Self-exclusion observability: keys present ONLY when the hook delivered a
         # session id, so hookless traffic (bench, dashboard) keeps the lean envelope
@@ -2086,6 +2159,7 @@ class Recall:
         source: str | None = None,
         self_session: str | None = None,
         session_id: str | None = None,
+        surface: str | None = None,
     ) -> dict[str, Any]:
         """Raw episode drill-down: individual conversation turns.
 
@@ -2101,8 +2175,12 @@ class Recall:
         since 2026-07-26 — its docstring needed more room than a mode inside
         recall's 2KB budget allowed); the telemetry kind stays 'episodes' so
         historical per-tool metrics remain comparable.
+
+        ``surface`` applies the same project allowlist recall() does (schema 053): a
+        restricted caller must not reach whole turns it cannot reach passages of.
         """
         t_start = time.perf_counter()
+        allowed = lookup_surface(self._db_url, surface).project_filter
         try:
             query_emb = self._ensure_embedder().embed([query], task="query")[0]
         except Exception as e:
@@ -2113,7 +2191,9 @@ class Recall:
         # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
-        pool = self._episode_pool(query, query_emb, project, session_id=session_id)
+        pool = self._episode_pool(
+            query, query_emb, project, session_id=session_id, allowed_projects=allowed
+        )
         # Same self-exclusion as recall(): the caller's own turns are already in
         # its context window. Pool-level so excluded slots backfill before rerank.
         # Skipped under a session filter — the caller explicitly asked for that
@@ -2169,7 +2249,9 @@ class Recall:
         )
         return out
 
-    def fetch(self, ids: list[Any], source: str | None = None) -> dict[str, Any]:
+    def fetch(
+        self, ids: list[Any], source: str | None = None, surface: str | None = None
+    ) -> dict[str, Any]:
         """Drill-down by id: expand recall()'s compact serves into full records.
 
         Accepts mixed prefixed ids — "e:N" episodes (bare N / bare int also accepted,
@@ -2177,14 +2259,22 @@ class Recall:
         Episodes come back in the recall-item shape ({id, content, project, date}),
         notes as {id, hook, body, type, project, updated}; both ordered to match the
         request. Unknown prefixes / unparseable ids are reported under ``skipped``;
-        the total expanded is capped at _FETCH_MAX across both kinds."""
+        the total expanded is capped at _FETCH_MAX across both kinds.
+
+        ``surface`` applies the calling host's filters (schema 053). This is not
+        belt-and-braces: e:N / n:N ids are sequential integers, so an unfiltered fetch
+        would let a restricted caller enumerate exactly what the board and recall were
+        built to withhold."""
         t_start = time.perf_counter()
+        st = lookup_surface(self._db_url, surface)
         ep_ids, note_ids, skipped, normalized = _parse_fetch_ids(ids)
         out: dict[str, Any] = {"episodes": [], "notes": [], "skipped": skipped}
         if not normalized:
             return out
-        out["episodes"] = self._fetch_episode_records(ep_ids) if ep_ids else []
-        out["notes"] = self._fetch_note_records(note_ids) if note_ids else []
+        out["episodes"] = self._fetch_episode_records(ep_ids, st.project_filter) if ep_ids else []
+        out["notes"] = (
+            self._fetch_note_records(note_ids, audience=st.audience_filter) if note_ids else []
+        )
         chars = _served_chars({"episodes": out["episodes"]}) + sum(
             len(n.get("hook") or "") + len(n.get("body") or "") for n in out["notes"]
         )
@@ -2216,6 +2306,7 @@ class Recall:
         offset: int = 0,
         limit: int = _SESSION_PAGE_DEFAULT,
         source: str | None = None,
+        surface: str | None = None,
     ) -> dict[str, Any]:
         """Sequential read of one session's turns — the Read analog of the
         session drill-down (recall_episodes(session_id=...) is the Grep analog).
@@ -2230,19 +2321,28 @@ class Recall:
         unique pair): no embedding, no rerank. An unknown session returns an
         explicit ``error`` — never a silent empty — so the caller knows to fall
         back to the on-disk transcript rather than concluding "nothing there".
+
+        ``surface`` applies the restricted project allowlist (schema 053) to every read
+        below, including the metadata probe — so a session outside the allowlist reports
+        the same "not indexed" answer an unknown id does. Deliberately indistinguishable:
+        a distinct "exists but forbidden" reply would itself disclose the project map.
         """
         t_start = time.perf_counter()
         radius = max(0, min(int(radius), _SESSION_RADIUS_MAX))
         offset = max(0, int(offset))
         limit = max(1, min(int(limit), _SESSION_PAGE_MAX))
         out: dict[str, Any] = {"session_id": session_id}
+        allowed = lookup_surface(self._db_url, surface).project_filter
+        # Appended to every query in this method; empty string on a full-trust surface.
+        proj_sql = " AND project = ANY(%s)" if allowed is not None else ""
+        proj_args: tuple[Any, ...] = (allowed,) if allowed is not None else ()
 
         try:
             pg = self._ensure_pg()
             meta = pg.execute(
-                "SELECT count(*) AS n, min(created_at) AS first, max(created_at) AS last,"
-                " min(project) AS project FROM episodes WHERE session_id = %s",
-                (session_id,),
+                "SELECT count(*) AS n, min(created_at) AS first, max(created_at) AS last,"  # nosec B608 — proj_sql is a literal, its value is bound
+                f" min(project) AS project FROM episodes WHERE session_id = %s{proj_sql}",
+                (session_id, *proj_args),
             ).fetchone()
             if not meta or not meta["n"]:
                 out["error"] = (
@@ -2264,26 +2364,32 @@ class Recall:
                     out["error"] = f"unparseable anchor id {around!r} — expected 'e:N'"
                     return out
                 anchor = pg.execute(
-                    "SELECT sequence FROM episodes WHERE id = %s AND session_id = %s",
-                    (anchor_id, session_id),
+                    "SELECT sequence FROM episodes "  # nosec B608 — proj_sql is a literal, its value is bound
+                    f"WHERE id = %s AND session_id = %s{proj_sql}",
+                    (anchor_id, session_id, *proj_args),
                 ).fetchone()
                 if anchor is None:
                     out["error"] = f"episode {around} is not in session {session_id}"
                     return out
                 rows = pg.execute(
-                    "SELECT id, sequence, content, created_at,"
+                    "SELECT id, sequence, content, created_at,"  # nosec B608 — proj_sql is a literal, its value is bound
                     " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
-                    " FROM episodes WHERE session_id = %s AND sequence BETWEEN %s AND %s"
+                    f" FROM episodes WHERE session_id = %s AND sequence BETWEEN %s AND %s{proj_sql}"
                     " ORDER BY sequence",
-                    (session_id, anchor["sequence"] - radius, anchor["sequence"] + radius),
+                    (
+                        session_id,
+                        anchor["sequence"] - radius,
+                        anchor["sequence"] + radius,
+                        *proj_args,
+                    ),
                 ).fetchall()
             else:
                 rows = pg.execute(
-                    "SELECT id, sequence, content, created_at,"
+                    "SELECT id, sequence, content, created_at,"  # nosec B608 — proj_sql is a literal, its value is bound
                     " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
-                    " FROM episodes WHERE session_id = %s"
+                    f" FROM episodes WHERE session_id = %s{proj_sql}"
                     " ORDER BY sequence LIMIT %s OFFSET %s",
-                    (session_id, limit, offset),
+                    (session_id, *proj_args, limit, offset),
                 ).fetchall()
 
             turns: list[dict[str, Any]] = []
@@ -2334,16 +2440,27 @@ class Recall:
                 }
             )
 
-    def _fetch_episode_records(self, parsed: list[int]) -> list[dict[str, Any]]:
+    def _fetch_episode_records(
+        self, parsed: list[int], allowed_projects: list[str] | None = None
+    ) -> list[dict[str, Any]]:
         """The episodes leg of fetch(): full untruncated turns by int id. Fail-soft —
-        a read error serves an empty leg, never breaks the call."""
+        a read error serves an empty leg, never breaks the call.
+
+        ``allowed_projects`` carries the restricted surface's allowlist. Ids are small
+        integers and therefore guessable, so drill-down enforces the SAME predicate the
+        overview does — otherwise fetch() would be a trivial bypass of every filter
+        recall() applies."""
         try:
             conn = self._ensure_pg()
-            rows = conn.execute(
+            sql = (
                 "SELECT id, content, project, created_at, session_id"
-                " FROM episodes WHERE id = ANY(%s)",
-                (parsed,),
-            ).fetchall()
+                " FROM episodes WHERE id = ANY(%s)"
+            )
+            params: list[Any] = [parsed]
+            if allowed_projects is not None:
+                sql += " AND project = ANY(%s)"
+                params.append(allowed_projects)
+            rows = conn.execute(sql, params).fetchall()
         except Exception as e:
             logger.warning("fetch episodes leg failed: %s", e)
             return []
@@ -2353,16 +2470,22 @@ class Recall:
             self._increment_retrieval_counts(found)
         return [_to_recall_item({**by_id[n], "id": f"e:{n}"}) for n in found]
 
-    def _fetch_note_records(self, parsed: list[int]) -> list[dict[str, Any]]:
+    def _fetch_note_records(
+        self, parsed: list[int], audience: str | None = None
+    ) -> list[dict[str, Any]]:
         """The notes leg of fetch(): board-note bodies by int id (the on-demand half of
         the board — hook on the board, body behind the id). Uses a short-lived Database
-        like the other notes-store paths. Fail-soft like the episodes leg."""
+        like the other notes-store paths. Fail-soft like the episodes leg.
+
+        ``audience`` applies the restricted surface's tier filter — same reason as the
+        episodes leg: n:N ids are guessable, so the drill-down cannot be looser than the
+        board that served them."""
         from ingestion.db import Database
 
         try:
             db = Database(self._db_url)
             try:
-                rows = db.get_notes_by_ids(parsed)
+                rows = db.get_notes_by_ids(parsed, audience=audience)
             finally:
                 db.close()
         except Exception as e:

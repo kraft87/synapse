@@ -54,8 +54,12 @@ def _wire_stubs(r: Recall) -> None:
     r._embedder = _FakeEmbedder()
     r._reranker = _FakeReranker()
     r._timeline_engine = _FakeTimeline()
-    r._search_bm25_episodes = lambda q, p, n: [_episode(1, "alpha episode body")]  # type: ignore[method-assign]
-    r._search_vector_episodes = lambda emb, p, n: [_episode(2, "beta episode body")]  # type: ignore[method-assign]
+    r._search_bm25_episodes = lambda q, p, n, sid=None, allowed=None: [
+        _episode(1, "alpha episode body")
+    ]  # type: ignore[method-assign]
+    r._search_vector_episodes = lambda emb, p, n, sid=None, allowed=None: [
+        _episode(2, "beta episode body")
+    ]  # type: ignore[method-assign]
     # BOTH halves of the web leg: _search_web_reranked fuses BM25 + vector, so stubbing
     # only the vector half leaves _search_bm25_web reaching for a real connection.
     r._search_vector_web = lambda emb, n: []  # type: ignore[method-assign]

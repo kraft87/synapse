@@ -222,3 +222,44 @@ def test_extraction_queue_cascade_delete(conn):
     conn.execute("DELETE FROM episodes WHERE id=%s", (ep_id,))
     row = conn.execute("SELECT id FROM extraction_queue WHERE episode_id=%s", (ep_id,)).fetchone()
     assert row is None, "cascade delete should remove queue entry"
+
+
+# ---------------------------------------------------------------------------
+# 053 — audience scoping
+# ---------------------------------------------------------------------------
+
+
+def test_notes_audience_defaults_personal_and_is_constrained(conn):
+    """Fail-closed in the SCHEMA, not just in the application: a note inserted by any
+    path that forgets the column lands on the tier that never leaves a trusted host."""
+    conn.execute(
+        "INSERT INTO notes (owner_id, group_id, type, hook, body) "
+        "VALUES ('t', 'technical', 'user', 'h', 'b')"
+    )
+    row = conn.execute(
+        "SELECT audience FROM notes WHERE owner_id = 't' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row[0] == "personal"
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO notes (owner_id, group_id, type, hook, body, audience) "
+            "VALUES ('t', 'technical', 'user', 'h', 'b', 'public')"
+        )
+    conn.execute("DELETE FROM notes WHERE owner_id = 't'")
+
+
+def test_surfaces_defaults_to_restricted_with_an_empty_allowlist(conn):
+    """Promotion to 'full' must always be an explicit act — an INSERT that omits the
+    column cannot grant trust by accident."""
+    conn.execute("INSERT INTO surfaces (surface_id) VALUES ('schema-test-host')")
+    row = conn.execute(
+        "SELECT trust, allowed_projects FROM surfaces WHERE surface_id = 'schema-test-host'"
+    ).fetchone()
+    assert row[0] == "restricted" and list(row[1]) == []
+
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(
+            "INSERT INTO surfaces (surface_id, trust) VALUES ('bad-trust-host', 'partial')"
+        )
+    conn.execute("DELETE FROM surfaces WHERE surface_id LIKE '%-host'")

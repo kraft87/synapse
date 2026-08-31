@@ -176,18 +176,18 @@ def _note(db_url: str, hook: str, body: str) -> int:
         db.close()
 
 
-def test_fetch_episode_ids_only(conn, db_url):
+def test_fetch_episode_ids_only(conn, db_url, full_surface):
     e1 = _episode(conn, "turn one full text")
     e2 = _episode(conn, "turn two full text")
-    out = Recall(db_url, "").fetch([f"e:{e1}", f"e:{e2}"])
+    out = Recall(db_url, "").fetch([f"e:{e1}", f"e:{e2}"], surface=full_surface)
     assert [e["id"] for e in out["episodes"]] == [f"e:{e1}", f"e:{e2}"]
     assert out["episodes"][0]["content"] == "turn one full text"
     assert out["notes"] == [] and out["skipped"] == []
 
 
-def test_fetch_note_ids_only(conn, db_url):
+def test_fetch_note_ids_only(conn, db_url, full_surface):
     n1 = _note(db_url, "Hook one", "Body one.")
-    out = Recall(db_url, "").fetch([f"n:{n1}"])
+    out = Recall(db_url, "").fetch([f"n:{n1}"], surface=full_surface)
     assert out["episodes"] == []
     (note,) = out["notes"]
     # The served note shape, pinned: {id, hook, body, type, project, updated}.
@@ -197,45 +197,45 @@ def test_fetch_note_ids_only(conn, db_url):
     assert len(note["updated"]) == 10  # ISO date, not a full timestamp
 
 
-def test_fetch_mixed_ids(conn, db_url):
+def test_fetch_mixed_ids(conn, db_url, full_surface):
     e1 = _episode(conn, "mixed-fetch turn")
     n1 = _note(db_url, "Mixed hook", "Mixed body.")
-    out = Recall(db_url, "").fetch([f"n:{n1}", f"e:{e1}"])
+    out = Recall(db_url, "").fetch([f"n:{n1}", f"e:{e1}"], surface=full_surface)
     assert [e["id"] for e in out["episodes"]] == [f"e:{e1}"]
     assert [n["id"] for n in out["notes"]] == [f"n:{n1}"]
     assert out["skipped"] == []
 
 
-def test_fetch_bare_ids_are_episodes_backcompat(conn, db_url):
+def test_fetch_bare_ids_are_episodes_backcompat(conn, db_url, full_surface):
     """Bare "N" strings and bare ints stay episode ids (the old fetch_episode inputs),
     and dedupe against their prefixed form."""
     e1 = _episode(conn, "bare-id turn")
-    out = Recall(db_url, "").fetch([str(e1), e1, f"e:{e1}"])
+    out = Recall(db_url, "").fetch([str(e1), e1, f"e:{e1}"], surface=full_surface)
     assert [e["id"] for e in out["episodes"]] == [f"e:{e1}"]
     assert out["skipped"] == []
 
 
-def test_fetch_unknown_ids_reported_as_skipped(conn, db_url):
+def test_fetch_unknown_ids_reported_as_skipped(conn, db_url, full_surface):
     e1 = _episode(conn, "the one good id")
-    out = Recall(db_url, "").fetch(["x:5", "e:abc", "wat", f"e:{e1}"])
+    out = Recall(db_url, "").fetch(["x:5", "e:abc", "wat", f"e:{e1}"], surface=full_surface)
     assert out["skipped"] == ["x:5", "e:abc", "wat"]
     assert [e["id"] for e in out["episodes"]] == [f"e:{e1}"]
 
 
-def test_fetch_cap_applies_across_kinds(conn, db_url):
+def test_fetch_cap_applies_across_kinds(conn, db_url, full_surface):
     """_FETCH_MAX bounds the TOTAL expanded across kinds, first-come: 18 episodes +
     4 notes requested -> 18 episodes + 2 notes served. Over-cap ids drop silently
     (matching the old episode-only path), never into `skipped`."""
     eps = [_episode(conn, f"cap turn {i}") for i in range(18)]
     notes = [_note(db_url, f"Cap hook {i}", "Body.") for i in range(4)]
     ids = [f"e:{e}" for e in eps] + [f"n:{n}" for n in notes]
-    out = Recall(db_url, "").fetch(ids)
+    out = Recall(db_url, "").fetch(ids, surface=full_surface)
     assert len(out["episodes"]) == 18
     assert [n["id"] for n in out["notes"]] == [f"n:{notes[0]}", f"n:{notes[1]}"]
     assert out["skipped"] == []
 
 
-def test_fetch_kinds_telemetry_counts(conn, db_url):
+def test_fetch_kinds_telemetry_counts(conn, db_url, full_surface):
     """The kind='fetch' telemetry row carries per-kind serve counts plus the served
     note ids ("n:N" — notes have no retrieval_count column, so this envelope is the
     only per-note serve record) in served_ids (the single-kind row shape is pinned
@@ -245,7 +245,7 @@ def test_fetch_kinds_telemetry_counts(conn, db_url):
     n2 = _note(db_url, "Telemetry hook B", "Body.")
     engine = Recall(db_url, "")
     mark = conn.execute("SELECT coalesce(max(id), 0) FROM recall_metrics").fetchone()[0]
-    engine.fetch([f"e:{e1}", f"n:{n1}", f"n:{n2}", "x:1"], source="mcp-tool")
+    engine.fetch([f"e:{e1}", f"n:{n1}", f"n:{n2}", "x:1"], source="mcp-tool", surface=full_surface)
     engine._async_executor.submit(lambda: None).result(timeout=10)  # barrier the writer
     row = conn.execute(
         "SELECT query, served_ids FROM recall_metrics "
@@ -296,6 +296,7 @@ def test_recall_full_turns_routes_to_episode_drilldown(monkeypatch):
                 "source": "mcp-tool",
                 "self_session": None,
                 "session_id": None,
+                "surface": None,
             },
         )
     ]

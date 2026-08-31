@@ -71,6 +71,8 @@ _DB_FILES = {
     "test_restamp_inherited_dates.py",
     "test_recall_feedback.py",
     "test_private_session_routes.py",
+    "test_audience_scoping.py",
+    "test_surface_routes.py",
 }
 
 
@@ -111,6 +113,23 @@ def clean_tables(conn):
                  ingestion_state, extraction_queue RESTART IDENTITY CASCADE
     """)
     yield
+
+
+@pytest.fixture()
+def full_surface(conn):
+    """A registered trust='full' surface id (schema 053), for tests that are about
+    something other than audience scoping.
+
+    Serving is fail-closed: no surface means restricted means empty. Tests that exercise
+    ordinary full-corpus serving must therefore name a trusted host explicitly — pass
+    this fixture's value as ``surface=``. Registrations are torn down after each test so
+    one test's grant can never widen the next one's."""
+    from tests.helpers.surfaces import clear_surfaces, register_full
+
+    clear_surfaces(conn)
+    sid = register_full(conn)
+    yield sid
+    clear_surfaces(conn)
 
 
 @pytest.fixture(autouse=True)

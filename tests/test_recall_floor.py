@@ -67,8 +67,8 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
     p = _pool() if pool is None else pool
     r._ensure_embedder = lambda: _FakeEmbedder(fail=embed_fail)
     r._ensure_timeline = lambda: _FakeTimeline()
-    r._search_bm25_episodes = lambda q, proj, limit: list(p)
-    r._search_vector_episodes = lambda emb, proj, limit: []
+    r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None: list(p)
+    r._search_vector_episodes = lambda emb, proj, limit, sid=None, allowed=None: []
     # BOTH halves of the web leg: _search_web_reranked fuses BM25 + vector, so stubbing
     # only the vector half leaves _search_bm25_web reaching for a real connection.
     r._search_vector_web = lambda emb, n: []
@@ -96,7 +96,7 @@ def _episodes_wired(scores: list[float], *, pool: list[dict] | None = None):
     """Same harness routed through recall_episodes()' pool primitive."""
     p = _pool() if pool is None else pool
     r, captured = _wired(scores, pool=p)
-    r._episode_pool = lambda q, emb, proj, session_id=None: list(p)
+    r._episode_pool = lambda q, emb, proj, session_id=None, allowed_projects=None: list(p)
     return r, captured
 
 

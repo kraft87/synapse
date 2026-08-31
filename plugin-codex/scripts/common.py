@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -51,6 +52,10 @@ BASE_URL = _base_url()
 INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
 TOKEN = _cfg("SYNAPSE_INGEST_TOKEN")
 PRIVATE_DIR = Path(os.path.expanduser(_cfg("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
+# This host's id for audience scoping (schema 053) — same env-override + hostname
+# fallback as plugin/scripts/config.py, so a machine running both plugins registers
+# ONE surface rather than two that drift apart.
+SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 
 _UA = "synapse-codex-plugin/0.1"
 

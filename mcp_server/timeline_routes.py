@@ -120,9 +120,22 @@ _PER_PROJECT_DAY = 3
 
 
 def _recent_events(
-    db_url: str, days: int, min_salience: int, limit: int, project: str | None
+    db_url: str,
+    days: int,
+    min_salience: int,
+    limit: int,
+    project: str | None,
+    allowed_projects: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Pure time-window read (no embeddings): the session-start milestones feed."""
+    """Pure time-window read (no embeddings): the session-start milestones feed.
+
+    ``allowed_projects`` (schema 053) is the board's restricted-surface filter. There is
+    deliberately no ``audience`` column on timeline_events — it already carries `domain`
+    (038), which fails OPEN, and a second overlapping label with the opposite fail
+    semantics would drift. The project allowlist is the filter instead, and
+    ``project = ANY(...)`` excludes NULL-project events by construction: an unlabeled
+    event has no provenance to clear it, so it stays off restricted boards.
+    """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
         q = (
@@ -138,6 +151,9 @@ def _recent_events(
         if project:
             q += "AND project = %s "
             params.append(project)
+        if allowed_projects is not None:
+            q += "AND project = ANY(%s) "
+            params.append(allowed_projects)
         q += ") ranked WHERE day_rank <= %s ORDER BY t_valid DESC LIMIT %s"
         params.extend([_PER_PROJECT_DAY, limit])
         rows = conn.execute(q, params).fetchall()

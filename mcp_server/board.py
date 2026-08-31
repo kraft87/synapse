@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.db import Database
+from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.timeline_routes import _recent_events
 
@@ -64,7 +65,7 @@ _SECTION_TITLES = {
 }
 
 
-def _banner_stats(db_url: str) -> tuple[int, list[str]]:
+def _banner_stats(db_url: str, allowed_projects: list[str] | None = None) -> tuple[int, list[str]]:
     """(total episodes, project names newest-activity first, capped at 12).
 
     The episode total comes from pg_class.reltuples (approximate but O(1)) rather
@@ -73,9 +74,28 @@ def _banner_stats(db_url: str) -> tuple[int, list[str]]:
     precise figure. reltuples is -1 until the table's first ANALYZE/VACUUM (fresh
     deploy, or a truncated test fixture), so fall back to an exact count while it's
     unpopulated — which also keeps the exact-count board tests green.
+
+    ``allowed_projects`` (a restricted surface, schema 053) narrows BOTH numbers to the
+    allowlist: the project names are the leak that matters ("most recent: family-health"
+    on a work laptop is exactly the disclosure this feature exists to stop), and a
+    corpus-wide episode count next to an allowlisted project list would misdescribe what
+    the caller can actually reach. The reltuples shortcut is skipped in that branch —
+    it cannot answer a filtered question — but the filtered count is over a small slice.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
+        if allowed_projects is not None:
+            row = conn.execute(
+                "SELECT count(*) FROM episodes WHERE project = ANY(%s)", (allowed_projects,)
+            ).fetchone()
+            n_episodes = int(row[0]) if row else 0
+            rows = conn.execute(
+                "SELECT project, max(created_at)::date FROM episodes "
+                "WHERE project = ANY(%s) AND project IS NOT NULL AND project <> '' "
+                "GROUP BY project ORDER BY 2 DESC LIMIT 12",
+                (allowed_projects,),
+            ).fetchall()
+            return n_episodes, [r[0] for r in rows]
         row = conn.execute(
             "SELECT reltuples::bigint FROM pg_class WHERE oid = 'episodes'::regclass"
         ).fetchone()
@@ -149,30 +169,53 @@ def _render(
     return "\n".join(lines)
 
 
-def build_board(db_url: str, project: str | None) -> dict[str, Any]:
+def build_board(
+    db_url: str, project: str | None, surface: str | None = None, trust: SurfaceTrust | None = None
+) -> dict[str, Any]:
     """Build the rendered board block. Pure SQL, no embedding calls.
 
-    Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids"}`` —
+    Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids", "trust"}`` —
     ``note_ids`` is the telemetry envelope's serve list; serve paths pop it before
     returning the block to callers (the ids the caller needs are inline as ``n:ID``).
 
+    ``surface`` is the calling host's id (schema 053). It is resolved to a trust verdict
+    that is FAIL-CLOSED at every step: absent, unregistered, or unreadable all mean
+    restricted with an empty allowlist. On a restricted surface the notes section is
+    filtered to ``audience='work-safe'``, and the digest + banner are filtered to the
+    surface's project allowlist. ``trust`` is a pre-resolved verdict (tests, and callers
+    that already looked it up); passing it skips the lookup.
+
     Missing tables (a deployment behind migration 033/041) degrade that section to
     empty rather than failing the whole board — same posture as preferences_routes.
+    Degrading to EMPTY is the only acceptable degradation here: a filtered section that
+    errors must never come back unfiltered, which is why the filters are applied inside
+    the queries rather than as a post-pass a failure could skip.
     """
+    st = trust if trust is not None else lookup_surface(db_url, surface)
+    audience = st.audience_filter
+    allowed = st.project_filter
+
     db = Database(db_url)
     try:
-        notes = db.list_board_notes(_OWNER, project)
-    except psycopg.errors.UndefinedTable:
+        notes = db.list_board_notes(_OWNER, project, audience=audience)
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
         notes = []
     finally:
         db.close()
 
     try:
-        events = _recent_events(db_url, days=7, min_salience=2, limit=10, project=None)
+        events = _recent_events(
+            db_url,
+            days=7,
+            min_salience=2,
+            limit=10,
+            project=None,
+            allowed_projects=allowed,
+        )
     except psycopg.errors.UndefinedTable:
         events = []
 
-    n_episodes, project_names = _banner_stats(db_url)
+    n_episodes, project_names = _banner_stats(db_url, allowed_projects=allowed)
 
     # Cap loop: drop one note at a time (drop class, then oldest updated_at) and
     # re-render until under both caps. Dozens of notes at most — O(n^2) is fine.
@@ -197,6 +240,9 @@ def build_board(db_url: str, project: str | None) -> dict[str, Any]:
         "n_notes": len(kept),
         "overflow": dropped,
         "note_ids": [n["id"] for n in kept],
+        # Told to the caller so an unexpectedly thin board is diagnosable as "this host
+        # isn't registered" instead of "memory is empty". It reveals nothing filtered.
+        "trust": st.trust,
     }
 
 
@@ -218,6 +264,9 @@ def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[
                 "notes": [f"n:{i}" for i in (board.get("note_ids") or [])],
                 "n_notes": board.get("n_notes", 0),
                 "overflow": board.get("overflow", 0),
+                # Restricted serves are expected to be thinner; without this the metrics
+                # read as an unexplained drop in board size after the 053 rollout.
+                "trust": board.get("trust"),
             },
         )
     except Exception as e:  # pragma: no cover - defensive
@@ -243,9 +292,10 @@ def register(
         if not authorized(request):
             return unauthorized()
         project = request.query_params.get("project") or None
+        surface = request.query_params.get("surface") or None
         t0 = time.perf_counter()
         try:
-            board = await run_in_threadpool(build_board, db_url, project)
+            board = await run_in_threadpool(build_board, db_url, project, surface)
         except Exception as e:
             logger.warning("board build failed: %s", e)
             return err(str(e)[:200], 500)

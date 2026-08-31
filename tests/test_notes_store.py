@@ -145,7 +145,7 @@ def test_list_board_notes_ordering_and_project_filter(conn, db_url):
     rows = db.list_board_notes(_OWNER, "proj-a")
     # feedback -> user -> project (only proj-a's) -> reference; the retired row is gone.
     assert [r["id"] for r in rows] == [fb, usr, pa, ref]
-    assert set(rows[0]) == {"id", "hook", "type", "project", "updated_at"}
+    assert set(rows[0]) == {"id", "hook", "type", "project", "audience", "updated_at"}
 
     # No project scope: the global set only (project = NULL matches nothing).
     assert [r["id"] for r in db.list_board_notes(_OWNER, None)] == [fb, usr, ref]
@@ -161,7 +161,7 @@ def test_get_notes_by_ids(conn, db_url):
     rows = db.get_notes_by_ids([a, b, 999999999])
     assert [r["id"] for r in rows] == [a, b]  # unknown ids silently dropped
     assert rows[0]["body"] == "Body one."
-    assert set(rows[0]) == {"id", "hook", "body", "type", "project", "updated_at"}
+    assert set(rows[0]) == {"id", "hook", "body", "type", "project", "audience", "updated_at"}
     assert db.get_notes_by_ids([]) == []
     db.close()
     _wipe(conn)
@@ -205,11 +205,16 @@ class _NotesDB:
         self._next_id += 1
         return self._next_id
 
-    def update_note(self, note_id, *, hook, body, embedding, embed_model):
-        self.updated.append({"note_id": note_id, "hook": hook, "body": body})
+    def update_note(self, note_id, *, hook, body, embedding, embed_model, audience=None):
+        self.updated.append({"note_id": note_id, "hook": hook, "body": body, "audience": audience})
 
     def supersede_note(self, old_id, new_id):
         self.superseded.append((old_id, new_id))
+
+    def restricted_surface_projects(self):
+        """No registered restricted surface -> audience derivation falls to 'personal'.
+        The precedence rules themselves are exercised in test_audience_scoping.py."""
+        return []
 
 
 class _StubEmb:
@@ -265,7 +270,12 @@ def _run(monkeypatch, *, candidates=(), relation="same", type="user", raise_llm=
 
 def test_reconcile_creates_when_no_candidates(monkeypatch):
     result, db, llm_calls = _run(monkeypatch, candidates=[])
-    assert result == {"outcome": "created", "note_id": 501, "prev_id": None}
+    assert result == {
+        "outcome": "created",
+        "note_id": 501,
+        "prev_id": None,
+        "audience": "personal",
+    }
     assert len(db.inserted) == 1 and db.updated == [] and db.superseded == []
     assert db.inserted[0]["source_ref"] == "ep:9"
     assert llm_calls == []  # no candidate -> no confirm call
@@ -279,15 +289,28 @@ def test_reconcile_creates_below_threshold(monkeypatch):
 
 def test_reconcile_updates_on_high_sim_same_type_same(monkeypatch):
     result, db, llm_calls = _run(monkeypatch, candidates=[_cand(0.92)], relation="same")
-    assert result == {"outcome": "updated", "note_id": 42, "prev_id": None}
-    assert db.updated == [{"note_id": 42, "hook": "User prefers light mode", "body": "New body."}]
+    assert result == {"outcome": "updated", "note_id": 42, "prev_id": None, "audience": None}
+    # audience=None on the UPDATE: a restatement preserves the note's stored tier.
+    assert db.updated == [
+        {
+            "note_id": 42,
+            "hook": "User prefers light mode",
+            "body": "New body.",
+            "audience": None,
+        }
+    ]
     assert db.inserted == [] and db.superseded == []
     assert len(llm_calls) == 1
 
 
 def test_reconcile_supersedes_on_contradicts(monkeypatch):
     result, db, llm_calls = _run(monkeypatch, candidates=[_cand(0.92)], relation="contradicts")
-    assert result == {"outcome": "superseded", "note_id": 501, "prev_id": 42}
+    assert result == {
+        "outcome": "superseded",
+        "note_id": 501,
+        "prev_id": 42,
+        "audience": "personal",
+    }
     assert len(db.inserted) == 1
     assert db.superseded == [(42, 501)]  # old retired, pointed at the fresh row
     assert db.updated == [] and len(llm_calls) == 1

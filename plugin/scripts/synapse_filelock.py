@@ -4,6 +4,13 @@ POSIX has fcntl.flock; Windows has msvcrt.locking (byte-range, so we lock the
 first byte — every caller locks a dedicated lock file, never a data file, so a
 1-byte range is equivalent to a whole-file lock). Callers treat OSError from a
 non-blocking acquire as "someone else holds it", which both backends raise.
+
+Named ``synapse_filelock`` rather than ``filelock``: the hooks run by inserting
+this directory onto sys.path, so a module here named after a real PyPI package
+SHADOWS it process-wide once imported. As ``filelock`` it broke huggingface_hub
+(``from filelock import BaseFileLock``) in any process that had loaded a plugin
+script first — which in the test suite is whichever worker happened to draw both
+files. Keep plugin-script module names prefixed for that reason.
 """
 
 from __future__ import annotations

@@ -171,6 +171,11 @@ def register(
             "type": body.get("type") or "project",
             "project": body.get("project") or None,
             "session_id": body.get("session_id") or None,
+            # A spooled write must classify the same way the live tool would have: the
+            # spool exists because the MCP transport was down, not because the note came
+            # from a different host. Omitted -> derived by project rule, still fail-closed.
+            "surface": body.get("surface") or None,
+            "audience": body.get("audience") or None,
         }
         if str(body.get("hook") or "").strip() and str(body.get("body") or "").strip():
             kwargs["hook"] = body["hook"]

@@ -193,6 +193,7 @@ class _FakeDB:
         self.projects = list(projects)
         self.superseded: list[tuple[int, int]] = []
         self.retyped: list[tuple[int, str, str]] = []
+        self.retyped_audience: list[str | None] = []
         self.curation: list[dict] = []
         self.closed = False
 
@@ -211,8 +212,13 @@ class _FakeDB:
     def supersede_note(self, old_id, new_id):
         self.superseded.append((old_id, new_id))
 
-    def retype_note(self, note_id, *, type, project):
+    def retype_note(self, note_id, *, type, project, audience=None):
         self.retyped.append((note_id, type, project))
+        self.retyped_audience.append(audience)
+
+    def restricted_surface_projects(self):
+        """No registered restricted surface -> every re-project derives 'personal'."""
+        return []
 
     def record_curation(self, **kw):
         self.curation.append(kw)
@@ -334,11 +340,18 @@ def test_retype_applies_for_a_known_project(monkeypatch):
     db = _FakeDB(retypes=[_note(7, type="feedback", hook="demo-api runs migrations on boot")])
     res = run_lane(db=db, llm=object())
     assert db.retyped == [(7, "project", "demo-api")]
+    # A re-project re-derives audience by the project rule (schema 053). No restricted
+    # surface allows 'demo-api' here, so it lands back on the fail-closed tier.
+    assert db.retyped_audience == ["personal"]
     assert res["counts"]["applied_retype"] == 1
     assert res["samples"] == ["n:7 feedback -> project:demo-api"]
     (row,) = db.curation
     assert row["verdict"] == "PROJECT" and row["applied"] is True
-    assert row["detail"] == {"from_type": "feedback", "project": "demo-api"}
+    assert row["detail"] == {
+        "from_type": "feedback",
+        "project": "demo-api",
+        "audience": "personal",
+    }
 
 
 def test_retype_skips_an_unknown_project_slug_but_records_it(monkeypatch):

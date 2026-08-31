@@ -462,23 +462,42 @@ class Database:
         ]
 
     def search_live_notes(
-        self, owner_id: str, project: str | None, embedding: list[float], limit: int = 24
+        self,
+        owner_id: str,
+        project: str | None,
+        embedding: list[float],
+        limit: int = 24,
+        audience: str | None = None,
     ) -> list[dict[str, Any]]:
         """Live notes nearest to ``embedding`` (hook KNN), scoped like the board: global
         types (user/feedback/reference) always in, project notes only for the caller's
         project (``project = NULL`` matches global types only). No group filter — notes
         span groups and the board doesn't filter either. recall()'s notes leg reads this;
-        ``find_live_notes`` (above) stays the reconcile path's owner/group-exact probe."""
+        ``find_live_notes`` (above) stays the reconcile path's owner/group-exact probe.
+
+        ``audience`` (schema 053) narrows to one tier — recall passes 'work-safe' for a
+        restricted surface, None for a full-trust one. Filtering here rather than after
+        the KNN keeps a restricted caller's serve at full width instead of spending its
+        _NOTES_FETCH budget on rows it can never see."""
         vlit = _vector_literal(embedding)
+        clauses = [
+            "owner_id = %s",
+            "superseded_by IS NULL",
+            "embedding IS NOT NULL",
+            "(type IN ('user','feedback','reference') OR project = %s)",
+        ]
+        params: list[Any] = [vlit, owner_id, project]
+        if audience is not None:
+            clauses.append("audience = %s")
+            params.append(audience)
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT id, hook, body, type, project, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"SELECT id, hook, body, type, project, audience, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int; the WHERE clauses are literals with bound params
                 f"1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "
                 "FROM notes "
-                "WHERE owner_id = %s AND superseded_by IS NULL AND embedding IS NOT NULL "
-                "AND (type IN ('user','feedback','reference') OR project = %s) "
+                f"WHERE {' AND '.join(clauses)} "
                 f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
-                (vlit, owner_id, project, vlit, limit),
+                (*params, vlit, limit),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -494,15 +513,22 @@ class Database:
         embedding: list[float] | None,
         embed_model: str | None,
         source_ref: str | None,
+        audience: str | None = None,
     ) -> int:
         """Append one live note. Returns the new row id. NULL embedding is allowed
-        (keyless dev/test; dedup KNN simply skips such rows)."""
+        (keyless dev/test; dedup KNN simply skips such rows).
+
+        ``audience=None`` leaves the column at its schema default ('personal') — the
+        fail-closed tier. Callers that know better (remember(), the backfill apply)
+        pass it explicitly; see ingestion/surfaces.derive_audience for the rule."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "(owner_id, group_id, project, type, hook, body, embedding, embed_model, source_ref) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s::halfvec({_EMBED_DIMS}),%s,%s) RETURNING id",
+                "(owner_id, group_id, project, type, hook, body, embedding, embed_model, "
+                " source_ref, audience) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s::halfvec({_EMBED_DIMS}),%s,%s,"
+                "COALESCE(%s,'personal')) RETURNING id",
                 (
                     owner_id,
                     group_id,
@@ -513,6 +539,7 @@ class Database:
                     vlit,
                     embed_model if embedding is not None else None,
                     source_ref,
+                    audience,
                 ),
             ).fetchone()
         assert row is not None, "INSERT RETURNING id returned nothing"
@@ -526,16 +553,29 @@ class Database:
         body: str,
         embedding: list[float] | None,
         embed_model: str | None,
+        audience: str | None = None,
     ) -> None:
         """A restated note: refresh hook/body/embedding in place and bump updated_at
-        (the note keeps its id — the board line just gets the newer phrasing)."""
+        (the note keeps its id — the board line just gets the newer phrasing).
+
+        ``audience=None`` PRESERVES the stored tier. A restatement must never silently
+        re-classify a note: the only thing that moves an existing note between audiences
+        is an explicit override (COALESCE keeps the current value otherwise)."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
             conn.execute(
                 "UPDATE notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 f"SET hook = %s, body = %s, embedding = %s::halfvec({_EMBED_DIMS}), "
-                "embed_model = %s, updated_at = now() WHERE id = %s",
-                (hook, body, vlit, embed_model if embedding is not None else None, note_id),
+                "embed_model = %s, audience = COALESCE(%s, audience), updated_at = now() "
+                "WHERE id = %s",
+                (
+                    hook,
+                    body,
+                    vlit,
+                    embed_model if embedding is not None else None,
+                    audience,
+                    note_id,
+                ),
             )
 
     def supersede_note(self, old_id: int, new_id: int) -> None:
@@ -547,34 +587,68 @@ class Database:
                 (new_id, old_id),
             )
 
-    def list_board_notes(self, owner_id: str, project: str | None) -> list[dict[str, Any]]:
+    def list_board_notes(
+        self, owner_id: str, project: str | None, audience: str | None = None
+    ) -> list[dict[str, Any]]:
         """Live notes for the board: every global-scope type (user/feedback/reference)
         plus the current project's project-notes. Ordered feedback -> user -> project ->
         reference, newest-updated first within each type. ``project=None`` serves the
-        global set only (``project = NULL`` matches nothing)."""
+        global set only (``project = NULL`` matches nothing).
+
+        ``audience`` (schema 053) narrows to one tier — the board passes 'work-safe' for
+        a restricted surface, None for a full-trust one."""
+        clauses = [
+            "owner_id = %s",
+            "superseded_by IS NULL",
+            "(type IN ('user','feedback','reference') OR project = %s)",
+        ]
+        params: list[Any] = [owner_id, project]
+        if audience is not None:
+            clauses.append("audience = %s")
+            params.append(audience)
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, hook, type, project, updated_at FROM notes "
-                "WHERE owner_id = %s AND superseded_by IS NULL "
-                "AND (type IN ('user','feedback','reference') OR project = %s) "
+                "SELECT id, hook, type, project, audience, updated_at FROM notes "  # nosec B608 — clause list is literal, values are bound
+                f"WHERE {' AND '.join(clauses)} "
                 "ORDER BY CASE type WHEN 'feedback' THEN 0 WHEN 'user' THEN 1 "
                 "WHEN 'project' THEN 2 ELSE 3 END, updated_at DESC",
-                (owner_id, project),
+                params,
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_notes_by_ids(self, ids: list[int]) -> list[dict[str, Any]]:
+    def get_notes_by_ids(self, ids: list[int], audience: str | None = None) -> list[dict[str, Any]]:
         """Fetch note bodies by id — the on-demand half of the board (hook on the board,
-        body behind the id). Silently drops unknown ids."""
+        body behind the id). Silently drops unknown ids.
+
+        ``audience`` applies the same tier filter the overview paths use. Ids are
+        guessable, so drill-down MUST NOT be a way around the board's filter: a
+        restricted caller asking for an id it was never served simply gets nothing."""
         if not ids:
             return []
+        clauses = ["id = ANY(%s)"]
+        params: list[Any] = [ids]
+        if audience is not None:
+            clauses.append("audience = %s")
+            params.append(audience)
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, hook, body, type, project, updated_at FROM notes "
-                "WHERE id = ANY(%s) ORDER BY id",
-                (ids,),
+                "SELECT id, hook, body, type, project, audience, updated_at FROM notes "  # nosec B608 — clause list is literal, values are bound
+                f"WHERE {' AND '.join(clauses)} ORDER BY id",
+                params,
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def restricted_surface_projects(self) -> list[str]:
+        """Every project any REGISTERED restricted surface may read (schema 053).
+
+        The provenance half of audience derivation: a note filed under a project some
+        work host already reads episodes from is work-safe by construction."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT unnest(allowed_projects) AS project FROM surfaces "
+                "WHERE trust = 'restricted'"
+            ).fetchall()
+        return [cast(str, r["project"]) for r in rows if r["project"]]
 
     def find_note_by_source_ref(self, source_ref: str) -> dict[str, Any] | None:
         """Newest note carrying this provenance ref, live or retired — the seed
@@ -689,15 +763,22 @@ class Database:
             ).fetchone()
         return bool(row is not None and row["found"])
 
-    def retype_note(self, note_id: int, *, type: str, project: str | None) -> None:
+    def retype_note(
+        self, note_id: int, *, type: str, project: str | None, audience: str | None = None
+    ) -> None:
         """Re-scope one note (global -> project). Reversible and content-preserving:
         hook/body/embedding are untouched, and ``updated_at`` is deliberately NOT
         bumped — the note did not change, only its shelf, and a bump would invalidate
-        the memo row the lane is about to write."""
+        the memo row the lane is about to write.
+
+        ``audience`` re-derives the tier when the note's PROJECT moves (spec §1: the
+        project rule is what decides an unclassified note's audience, so changing the
+        project changes the answer). ``None`` preserves the stored tier."""
         with self._conn() as conn:
             conn.execute(
-                "UPDATE notes SET type = %s, project = %s WHERE id = %s",
-                (type, project, note_id),
+                "UPDATE notes SET type = %s, project = %s, "
+                "audience = COALESCE(%s, audience) WHERE id = %s",
+                (type, project, audience, note_id),
             )
 
     def record_curation(
