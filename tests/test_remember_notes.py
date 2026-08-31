@@ -247,7 +247,13 @@ def test_telemetry_row_with_outcome_envelope(env):
     ).fetchone()
     assert row is not None
     assert row[0] == "mcp-tool" and row[1] is not None
-    assert row[2] == {"note": out["note_id"], "outcome": "created", "type": "user"}
+    assert row[2] == {
+        "note": out["note_id"],
+        "outcome": "created",
+        "type": "user",
+        # No surface and no restricted-project match -> the fail-closed default tier.
+        "audience": "personal",
+    }
 
 
 def test_hook_over_200_chars_is_capped(env):

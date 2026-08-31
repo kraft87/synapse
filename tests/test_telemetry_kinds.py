@@ -73,8 +73,8 @@ def _wired(db_url: str, scores: list[float]) -> Recall:
     p = _pool()
     r._ensure_embedder = lambda: _FakeEmbedder()
     r._ensure_timeline = lambda: _FakeTimeline()
-    r._search_bm25_episodes = lambda q, proj, limit: list(p)
-    r._search_vector_episodes = lambda emb, proj, limit: []
+    r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None: list(p)
+    r._search_vector_episodes = lambda emb, proj, limit, sid=None, allowed=None: []
     r._search_vector_web = lambda emb, n: []
     r._search_kg = lambda *a, **k: ([], [])
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
@@ -110,12 +110,12 @@ def _newest(conn, engine: Recall, kind: str, cols: str, after: int):
 # ---------------------------------------------------------------------------
 
 
-def test_recall_kind_row_shape(conn, db_url, monkeypatch):
+def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry shape pin recall {uuid.uuid4().hex[:8]}"
     engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])  # real scores, above the floor
     mark = _watermark(conn)
-    out = engine.recall(q, source="mcp-tool")
+    out = engine.recall(q, source="mcp-tool", surface=full_surface)
     assert out["episodes"]
 
     row = _newest(
@@ -143,7 +143,9 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch):
         "notes",
         "n_echo_suppressed",
         "n_bm25_lifted",
+        "trust",  # schema 053 — which trust regime produced these numbers
     }
+    assert served["trust"] == "full"
     assert served["episodes"] == [it["id"] for it in out["episodes"]]
     assert served["facts"] == []
     assert served["notes"] == []
@@ -165,7 +167,7 @@ def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeyp
     q = f"telemetry shape pin episodes {uuid.uuid4().hex[:8]}"
     p = _pool()
     engine = _wired(db_url, [0.31, 0.22, 0.11, 0.05])  # real scores, below the floor
-    engine._episode_pool = lambda q_, emb, proj, session_id=None: list(p)
+    engine._episode_pool = lambda q_, emb, proj, session_id=None, allowed_projects=None: list(p)
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q)  # the MCP surface path for the drill-down
@@ -204,7 +206,9 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
     for i, ep in enumerate(p):
         ep["session_id"] = "MY-SESSION" if i < 2 else f"other-{i}"
     engine = _wired(db_url, [0.9, 0.8])  # scores for the 2 survivors
-    engine._episode_pool = lambda q_, emb, proj, session_id=None: [dict(e) for e in p]
+    engine._episode_pool = lambda q_, emb, proj, session_id=None, allowed_projects=None: [
+        dict(e) for e in p
+    ]
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q, self_session="MY-SESSION")
@@ -223,14 +227,14 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_kind_row_shape(conn, db_url):
+def test_fetch_kind_row_shape(conn, db_url, full_surface):
     eid = conn.execute(
         "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, %s) RETURNING id",
         (f"telemetry-kinds-{uuid.uuid4().hex[:8]}", "full text of the fetched turn"),
     ).fetchone()[0]
     engine = Recall(db_url, "")  # fetch path is pure SQL — no leg stubs needed
     mark = _watermark(conn)
-    out = engine.fetch([f"e:{eid}"], source="mcp-tool")
+    out = engine.fetch([f"e:{eid}"], source="mcp-tool", surface=full_surface)
     assert [e["id"] for e in out["episodes"]] == [f"e:{eid}"]
 
     row = _newest(
@@ -274,7 +278,12 @@ def test_remember_kind_row_shape(conn, db_url, monkeypatch):
     source, ms_total, served = row
     assert source == "mcp-tool"
     assert ms_total is not None and ms_total >= 0
-    assert served == {"note": out["note_id"], "outcome": "created", "type": "user"}
+    assert served == {
+        "note": out["note_id"],
+        "outcome": "created",
+        "type": "user",
+        "audience": "personal",  # no surface, no restricted-project match
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -284,7 +293,7 @@ def test_remember_kind_row_shape(conn, db_url, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_board_kind_row_shape(conn, db_url):
+def test_board_kind_row_shape(conn, db_url, full_surface):
     conn.execute("DELETE FROM notes")
     conn.execute("DELETE FROM timeline_events")
     db = Database(db_url)
@@ -303,7 +312,7 @@ def test_board_kind_row_shape(conn, db_url):
 
     engine = Recall(db_url, "")
     mark = _watermark(conn)
-    board = build_board(db_url, None)
+    board = build_board(db_url, None, full_surface)
     assert board["status"] == "ok"
     record_board_metrics(engine, "http", 1.0, board)
 
@@ -315,4 +324,4 @@ def test_board_kind_row_shape(conn, db_url):
     assert chars == len(board["text"]) and chars > 0
     assert est_tokens == chars // 4
     # Note ids in served ("n:N") form — joinable against recall_feedback's id lists.
-    assert served == {"notes": [f"n:{nid}"], "n_notes": 1, "overflow": 0}
+    assert served == {"notes": [f"n:{nid}"], "n_notes": 1, "overflow": 0, "trust": "full"}

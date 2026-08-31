@@ -48,6 +48,9 @@ _BOARD_TEXT = (
 )
 
 
+_SURFACE = "test-board-block-host"
+
+
 def _isolated_env(monkeypatch, tmp_path) -> None:
     """Point the plugin config layer at a scratch config dir: no real env vars,
     no settings.json options, no credentials file, no project .claude."""
@@ -55,6 +58,9 @@ def _isolated_env(monkeypatch, tmp_path) -> None:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
+    # Pin the surface (schema 053) so the asserted params don't depend on the
+    # hostname of whatever machine runs the suite.
+    monkeypatch.setenv("SYNAPSE_SURFACE", _SURFACE)
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
@@ -97,7 +103,9 @@ def test_board_text_printed_verbatim(monkeypatch, tmp_path, capsys):
     payload = {"status": "ok", "text": _BOARD_TEXT, "n_notes": 1, "overflow": 0}
     calls = _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/services/synapse"}), payload)
     assert capsys.readouterr().out == _BOARD_TEXT + "\n"
-    assert calls == [("/context", {"project": "synapse"})]
+    # The board request always names this host: the server, not the plugin, decides
+    # what a given surface may see (schema 053).
+    assert calls == [("/context", {"project": "synapse", "surface": _SURFACE})]
 
 
 def test_kill_switch_no_output_no_http(monkeypatch, tmp_path, capsys):
@@ -154,7 +162,7 @@ def test_project_derived_from_hook_cwd(monkeypatch, tmp_path, capsys, cwd, expec
     _isolated_env(monkeypatch, tmp_path)
     mod = _load_hook()
     calls = _run(monkeypatch, mod, json.dumps({"cwd": cwd}), {"status": "ok", "text": "b"})
-    assert calls == [("/context", {"project": expected})]
+    assert calls == [("/context", {"project": expected, "surface": _SURFACE})]
     assert capsys.readouterr().out == "b\n"
 
 
@@ -183,4 +191,4 @@ def test_project_falls_back_to_process_cwd(monkeypatch, tmp_path, stdin):
     _isolated_env(monkeypatch, tmp_path)  # chdirs to tmp_path
     mod = _load_hook()
     calls = _run(monkeypatch, mod, stdin, {"status": "ok", "text": "b"})
-    assert calls == [("/context", {"project": tmp_path.name})]
+    assert calls == [("/context", {"project": tmp_path.name, "surface": _SURFACE})]

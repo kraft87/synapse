@@ -48,8 +48,13 @@ class _DB:
         if _DB.fail:
             raise RuntimeError("db down")
 
-    def search_live_notes(self, owner_id, project, embedding, limit=24):
-        _DB.last_kwargs = {"owner_id": owner_id, "project": project, "limit": limit}
+    def search_live_notes(self, owner_id, project, embedding, limit=24, audience=None):
+        _DB.last_kwargs = {
+            "owner_id": owner_id,
+            "project": project,
+            "limit": limit,
+            "audience": audience,
+        }
         return list(_DB.rows)
 
     def close(self):
@@ -126,3 +131,16 @@ def test_notes_floor_disabled_serves_knn_order(monkeypatch):
     monkeypatch.setattr(recall_mod, "_NOTES_FLOOR", 0.0)
     out = r._search_notes("q", [0.0], None)
     assert [it["id"] for it in out] == ["n:1", "n:2"]
+
+
+def test_notes_audience_filter_reaches_the_store(monkeypatch):
+    """The restricted tier filter is pushed into SQL, not applied after the KNN.
+
+    Filtering post-hoc would spend the fetch budget on rows the caller can never see,
+    so a restricted surface's notes bucket would thin out for the wrong reason."""
+    r = _wire(monkeypatch, [_note(1)], [(0, 0.9)])
+    r._search_notes("q", [0.0], None, audience="work-safe")
+    assert _DB.last_kwargs["audience"] == "work-safe"
+    # Full trust passes None — no filter at all, not "both tiers" spelled out.
+    r._search_notes("q", [0.0], None)
+    assert _DB.last_kwargs["audience"] is None

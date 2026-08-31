@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+import mcp_server.recall as recall_mod
+from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server.recall import Recall, _to_recall_item
 
 
@@ -23,6 +25,15 @@ def _bare() -> Recall:
     r = object.__new__(Recall)
     r._db_url = "postgresql://stub"
     return r
+
+
+def _trust(monkeypatch, verdict: SurfaceTrust = FULL_TRUST) -> None:
+    """Pin the trust verdict for these pure-logic tests.
+
+    There is no reachable database here, so the real lookup would fail closed to
+    RESTRICTED and every paging assertion below would be reading a filtered query. The
+    restricted path gets its own explicit tests at the bottom of this file."""
+    monkeypatch.setattr(recall_mod, "lookup_surface", lambda _u, _s: verdict)
 
 
 class _Rows:
@@ -110,7 +121,8 @@ def test_recall_item_omits_session_when_absent():
 # ---------------------------------------------------------------------------
 
 
-def test_anchor_full_neighbors_heads():
+def test_anchor_full_neighbors_heads(monkeypatch):
+    _trust(monkeypatch)
     rows = [_turn(100 + s, s) for s in range(1, 8)]
     r, metrics = _bare(), []
     _wire(r, _PG(rows, anchor_seq=4), metrics)
@@ -127,14 +139,16 @@ def test_anchor_full_neighbors_heads():
     assert metrics and metrics[0]["kind"] == "fetch_session"
 
 
-def test_anchor_not_in_session_is_explicit_error():
+def test_anchor_not_in_session_is_explicit_error(monkeypatch):
+    _trust(monkeypatch)
     r, metrics = _bare(), []
     _wire(r, _PG([_turn(101, 1)], anchor_seq=None), metrics)
     out = r.fetch_session("sess-1", around="e:999")
     assert "not in session" in out["error"]
 
 
-def test_unparseable_anchor_is_explicit_error():
+def test_unparseable_anchor_is_explicit_error(monkeypatch):
+    _trust(monkeypatch)
     r, metrics = _bare(), []
     _wire(r, _PG([_turn(101, 1)]), metrics)
     assert "unparseable" in r.fetch_session("sess-1", around="banana")["error"]
@@ -145,7 +159,8 @@ def test_unparseable_anchor_is_explicit_error():
 # ---------------------------------------------------------------------------
 
 
-def test_paging_serves_heads_only():
+def test_paging_serves_heads_only(monkeypatch):
+    _trust(monkeypatch)
     rows = [_turn(100 + s, s) for s in range(1, 8)]
     r, metrics = _bare(), []
     _wire(r, _PG(rows), metrics)
@@ -155,7 +170,8 @@ def test_paging_serves_heads_only():
     assert {t["role"] for t in out["turns"]} == {"user", "mixed"}
 
 
-def test_radius_and_limit_clamped():
+def test_radius_and_limit_clamped(monkeypatch):
+    _trust(monkeypatch)
     rows = [_turn(100 + s, s) for s in range(1, 8)]
     r, metrics = _bare(), []
     _wire(r, _PG(rows, anchor_seq=4), metrics)
@@ -169,7 +185,8 @@ def test_radius_and_limit_clamped():
     assert paged[1] == 25  # page cap
 
 
-def test_unknown_session_is_explicit_error_not_empty():
+def test_unknown_session_is_explicit_error_not_empty(monkeypatch):
+    _trust(monkeypatch)
     r, metrics = _bare(), []
     _wire(r, _PG([]), metrics)
     out = r.fetch_session("nope")
@@ -220,7 +237,7 @@ def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_SELF_EXCLUDE", True)
     r._ensure_embedder = lambda: (_ for _ in ()).throw(RuntimeError("no embedder"))  # type: ignore[method-assign]
 
-    def _pool(q, e, p, session_id=None):
+    def _pool(q, e, p, session_id=None, allowed_projects=None):
         seen["session_id"] = session_id
         return []
 
@@ -242,3 +259,52 @@ def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
     seen.clear()
     r.recall_episodes("q", self_session="me")
     assert "excluded" in seen  # unscoped calls still self-exclude
+
+
+# ---------------------------------------------------------------------------
+# Audience scoping (schema 053): the drill-down can't outrun the overview
+# ---------------------------------------------------------------------------
+
+
+def test_restricted_surface_filters_every_session_query(monkeypatch):
+    """The project allowlist reaches the metadata probe AND both row reads.
+
+    Filtering only the row reads would leak the session's shape — turn count, first and
+    last date, project — for a session the caller may not read."""
+    rows = [_turn(100 + s, s) for s in range(1, 8)]
+    r, metrics = _bare(), []
+    _trust(
+        monkeypatch,
+        SurfaceTrust(
+            surface_id="work", trust="restricted", allowed_projects=("alpha",), known=True
+        ),
+    )
+    _wire(r, _PG(rows, anchor_seq=4), metrics)
+    r.fetch_session("sess-1", around="e:104", radius=2, surface="work")
+
+    for sql, params in _PG.calls:
+        assert "project = ANY(%s)" in sql, sql
+        assert ["alpha"] in [list(p) if isinstance(p, list) else p for p in params]
+
+
+def test_unknown_surface_gets_empty_allowlist_on_session_reads(monkeypatch):
+    """No surface at all still filters — with an allowlist that matches nothing."""
+    rows = [_turn(100 + s, s) for s in range(1, 8)]
+    r, metrics = _bare(), []
+    _trust(monkeypatch, SurfaceTrust())  # the fail-closed verdict
+    _wire(r, _PG(rows), metrics)
+    r.fetch_session("sess-1")
+
+    meta_sql, meta_params = _PG.calls[0]
+    assert "project = ANY(%s)" in meta_sql
+    assert [] in [list(p) if isinstance(p, list) else p for p in meta_params]
+
+
+def test_full_trust_adds_no_project_predicate(monkeypatch):
+    """The control: a trusted surface's SQL is byte-identical to the pre-053 shape."""
+    rows = [_turn(100 + s, s) for s in range(1, 8)]
+    r, metrics = _bare(), []
+    _trust(monkeypatch)
+    _wire(r, _PG(rows), metrics)
+    r.fetch_session("sess-1")
+    assert all("project = ANY(%s)" not in sql for sql, _ in _PG.calls)
