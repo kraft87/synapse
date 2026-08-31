@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-from common import _cfg, get_json
+from common import SURFACE, _cfg, get_json
 
 _MAX_PREF_LINES = 7
 _PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
@@ -43,6 +43,7 @@ def _board_text(project: str | None) -> str | None:
         return None
     try:
         params = {"project": project} if project else {}
+        params["surface"] = SURFACE  # host trust (schema 053) — the server does the filtering
         r = get_json("/context", params, timeout=10)
         return r.get("text") if r.get("status") == "ok" else None
     except Exception:

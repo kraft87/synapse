@@ -22,7 +22,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import _cfg, get_json
+from config import SURFACE, _cfg, get_json
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
@@ -50,6 +50,10 @@ def main() -> None:
     try:
         project = _project_label()
         params = {"project": project} if project else {}
+        # This host's id. The server decides what it may see (schema 053); the plugin
+        # never filters client-side, so an untrusted host is never SENT what it can't
+        # have. An unregistered surface gets the restricted board, not an error.
+        params["surface"] = SURFACE
         r = get_json("/context", params, timeout=10)
         text = r.get("text") if r.get("status") == "ok" else None
         if text:

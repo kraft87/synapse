@@ -110,9 +110,14 @@ def make_record(
     session_id: str | None = None,
     content: str | None = None,
     origin: str = "cli",
+    surface: str | None = None,
+    audience: str | None = None,
 ) -> dict:
     """One spool record. ``id`` is client-generated and is the server's idempotency key —
-    it is minted ONCE here and reused by every replay attempt, forever."""
+    it is minted ONCE here and reused by every replay attempt, forever.
+
+    ``surface``/``audience`` ride along so a replayed write is classified as if it had
+    landed live (schema 053) — the spool is a transport retry, not a different host."""
     return {
         "id": uuid.uuid4().hex,
         "ts": datetime.now(UTC).isoformat(),
@@ -123,6 +128,8 @@ def make_record(
         "session_id": session_id or None,
         "content": (content or "").strip() or None,
         "origin": origin,
+        "surface": surface or config.SURFACE,
+        "audience": audience or None,
     }
 
 
@@ -212,6 +219,10 @@ def post_intent(rec: dict) -> dict:
         "type": rec.get("type") or "project",
         "project": rec.get("project"),
         "session_id": rec.get("session_id"),
+        # Older spool lines predate 053 and carry no surface; fall back to this host's
+        # id, which is the host that wrote them.
+        "surface": rec.get("surface") or config.SURFACE,
+        "audience": rec.get("audience"),
     }
     return config.post_json(ROUTE, payload, timeout=TIMEOUT)
 
@@ -330,6 +341,8 @@ def _record_from_tool_input(ti: dict, payload: dict) -> dict:
         session_id=ti.get("session_id") or payload.get("session_id"),
         content=ti.get("content"),
         origin="posttooluse",
+        surface=ti.get("surface"),
+        audience=ti.get("audience"),
     )
 
 
