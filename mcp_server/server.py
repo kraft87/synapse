@@ -378,6 +378,14 @@ from mcp_server.private_session_routes import register as _register_private_rout
 
 _register_private_routes(mcp, DB_URL, _machine_authorized)
 
+# Surface registration — audience scoping's operator seam (schema 053). Which HOSTS get
+# the full corpus and which get only work-safe notes + an allowlisted set of projects.
+# An unregistered surface is restricted with an empty allowlist, so these routes only
+# ever GRANT; doing nothing is already the safe state. Same machine-token seam.
+from mcp_server.surface_routes import register as _register_surface_routes  # noqa: E402
+
+_register_surface_routes(mcp, DB_URL, _machine_authorized)
+
 # Board read route — GET /context?project=X serves the rendered explicit-memory board
 # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
 # Same machine-token seam. No-op w/o DB. get_recall is a lazy thunk: _get_recall is
@@ -466,6 +474,7 @@ def recall(
     session_focus: list[str] | None = None,
     group_id: str = "technical",
     self_session: str | None = None,
+    surface: str | None = None,
 ) -> dict:
     """Search the user's long-term memory: tens of thousands of reranked
     past-conversation turns, the knowledge-graph facts extracted from them, and a
@@ -508,6 +517,9 @@ def recall(
         self_session: NEVER set this yourself. The client's PreToolUse hook injects
             the calling session's id so serving can suppress self-session domination;
             calls without it simply skip that suppression.
+        surface: NEVER set this yourself. The client's PreToolUse hook injects the
+            calling HOST's id; the server resolves what that host is trusted to see.
+            A missing or unregistered surface serves the restricted view.
     """
     with logfire.span(
         "mcp.recall {query!r}",
@@ -522,6 +534,7 @@ def recall(
             group_id=group_id,
             source="mcp-tool",
             self_session=self_session,
+            surface=surface,
         )
 
 
@@ -532,6 +545,7 @@ def recall_full_turns(
     limit: int = 5,
     self_session: str | None = None,
     session_id: str | None = None,
+    surface: str | None = None,
 ) -> dict:
     """Search the complete, unabridged text of past conversation turns — the
     drill-down and retry sibling of recall().
@@ -569,6 +583,8 @@ def recall_full_turns(
             excluded; calls without it simply skip that exclusion.
         session_id: Scope to ONE conversation — the `session` field from a
             recall/fetch result, or "self" for the current session.
+        surface: NEVER set this yourself. The client's PreToolUse hook injects
+            the calling host's id; the server resolves what it may see.
     """
     with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
         if session_id == "self":
@@ -587,11 +603,12 @@ def recall_full_turns(
             source="mcp-tool",
             self_session=self_session,
             session_id=session_id,
+            surface=surface,
         )
 
 
 @mcp.tool()
-def fetch(ids: list[str]) -> dict:
+def fetch(ids: list[str], surface: str | None = None) -> dict:
     """Expand memory ids into full records: episode ids from recall results
     ("e:227168") and note ids from the board ("n:12"), mixed freely in one call.
 
@@ -606,9 +623,13 @@ def fetch(ids: list[str]) -> dict:
 
     Args:
         ids: Ids to expand — "e:N" episodes, "n:N" notes, bare N = episode.
+        surface: NEVER set this yourself. The client's PreToolUse hook injects
+            the calling host's id; the server resolves what it may see. Ids
+            outside that view come back under "skipped"-style absence, not an
+            error — drill-down can't reach past the overview's filter.
     """
     with logfire.span("mcp.fetch", n=len(ids)):
-        return _get_recall().fetch(ids, source="mcp-tool")
+        return _get_recall().fetch(ids, source="mcp-tool", surface=surface)
 
 
 @mcp.tool()
@@ -619,6 +640,7 @@ def fetch_session(
     offset: int = 0,
     limit: int = 10,
     self_session: str | None = None,
+    surface: str | None = None,
 ) -> dict:
     """Read one conversation sequentially — like opening the transcript file at
     a spot, instead of searching. Every recall/fetch episode carries a `session`
@@ -644,6 +666,9 @@ def fetch_session(
         limit: Anchorless paging — turns per page (1-25, default 10).
         self_session: NEVER set this yourself; the client hook injects it to
             resolve session_id="self".
+        surface: NEVER set this yourself. The client's PreToolUse hook injects
+            the calling host's id; a session outside that host's view reports
+            the same "not indexed" answer an unknown session id does.
     """
     with logfire.span("mcp.fetch_session {sid}", sid=session_id[:40], around=around):
         if session_id == "self":
@@ -659,6 +684,7 @@ def fetch_session(
             offset=offset,
             limit=limit,
             source="mcp-tool",
+            surface=surface,
         )
 
 
@@ -711,6 +737,8 @@ async def remember(
     type: str = "project",
     project: str | None = None,
     session_id: str | None = None,
+    surface: str | None = None,
+    audience: str | None = None,
 ) -> dict:
     """Write to the user's curated long-term memory: reconciles a NOTE into the
     explicit notes store (deduped against the live set, superseded on
@@ -759,6 +787,12 @@ async def remember(
         type: Note type — 'user' | 'feedback' | 'project' (default) | 'reference'.
         project: Optional project slug (scopes 'project' notes and the episode).
         session_id: Optional session ID to attach the episode to.
+        surface: NEVER set this yourself. The client's PreToolUse hook injects
+            the calling host's id; a note written from a work-trusted host is
+            tagged so it still appears on that host's board next session.
+        audience: 'personal' (default) or 'work-safe' — who may be SERVED this
+            note later. Leave unset unless the user says where it may appear;
+            the server derives it from the calling host and the project.
     """
     import time as _time
     import uuid as _uuid
@@ -768,6 +802,7 @@ async def remember(
     from ingestion.db import Database
     from ingestion.models import Episode, ExtractionItem
     from ingestion.notes import _VALID_TYPES, reconcile_note
+    from ingestion.surfaces import AUDIENCES, lookup_surface
 
     structured = hook is not None or body is not None
     if not structured and not (content or "").strip():
@@ -779,6 +814,11 @@ async def remember(
         return {
             "status": "error",
             "detail": f"invalid type {type!r} — expected one of {_VALID_TYPES}",
+        }
+    if audience is not None and audience not in AUDIENCES:
+        return {
+            "status": "error",
+            "detail": f"invalid audience {audience!r} — expected one of {AUDIENCES}",
         }
 
     if structured:
@@ -834,6 +874,13 @@ async def remember(
                 )
             )
 
+            # Audience precedence rule 2 fires only for a REGISTERED restricted surface
+            # (`known`). An unknown surface restricts what this host READS, but it must
+            # never widen a WRITE — defaulting an unrecognised hostname's notes to
+            # work-safe would turn a fail-closed read rule into a leak.
+            st = lookup_surface(DB_URL, surface)
+            caller_restricted = st.known and st.restricted
+
             embedder, llm = _notes_deps()
             res = reconcile_note(
                 db,
@@ -844,6 +891,8 @@ async def remember(
                 type=note_type,
                 project=project,
                 source_ref=f"ep:{episode_id}",
+                audience=audience,
+                caller_restricted=caller_restricted,
             )
         finally:
             db.close()
@@ -852,7 +901,12 @@ async def remember(
             "remember",
             source="mcp-tool",
             ms_total=(_time.perf_counter() - t0) * 1000.0,
-            served_ids={"note": res["note_id"], "outcome": res["outcome"], "type": note_type},
+            served_ids={
+                "note": res["note_id"],
+                "outcome": res["outcome"],
+                "type": note_type,
+                "audience": res.get("audience"),
+            },
         )
         return {
             "status": "ok",
@@ -860,6 +914,9 @@ async def remember(
             "outcome": res["outcome"],
             "episode_id": episode_id,
             "session_id": sid,
+            # None on a restatement that preserved the stored tier — the caller can tell
+            # "this write classified the note" from "this write left it alone".
+            "audience": res.get("audience"),
         }
 
     # reconcile_note does blocking DB I/O + possibly a sync LLM call that runs
@@ -1184,7 +1241,11 @@ async def recall_http(request: Request) -> JSONResponse:
     stays fast instead of cold-starting the pipeline each call.
 
     Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
-           "source"?: str, "debug"?: bool}.
+           "source"?: str, "debug"?: bool, "surface"?: str}.
+    ``surface`` gets the same enforcement the MCP tools do (schema 053): omitted or
+    unregistered means restricted. A plain-HTTP caller is not a trusted caller just
+    because it holds the machine token — the token says "a Synapse client", the surface
+    says "which host".
     write_feedback defaults FALSE here: automatic recalls must not bump the
     retrieval-count feedback signal (bench-grade discipline) — and the phase-2
     dashboard debug console relies on this default staying false so its diagnostic
@@ -1210,6 +1271,7 @@ async def recall_http(request: Request) -> JSONResponse:
     write_feedback = bool(body.get("write_feedback", False))
     source = body.get("source") or "http"
     debug = bool(body.get("debug", False))
+    surface = body.get("surface") or None
 
     def _work() -> dict:
         return _get_recall().recall(
@@ -1219,6 +1281,7 @@ async def recall_http(request: Request) -> JSONResponse:
             write_feedback=write_feedback,
             source=source,
             debug=debug,
+            surface=surface,
         )
 
     try:
