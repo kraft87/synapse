@@ -16,7 +16,7 @@ Covers:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -460,16 +460,22 @@ def test_fire_events_use_transcript_time_not_ingest_clock(lane, db_url, monkeypa
 
 
 def test_fire_events_fall_back_to_created_at(lane, db_url, monkeypatch):
+    """A metadata-less episode falls back to created_at for its fire timestamp.
+
+    The row is dated RELATIVE to now (30 days back, inside the 90-day window). It was
+    pinned at a literal 2026-06-01, which quietly aged out of that window on 2026-08-30
+    and turned a real assertion into a calendar failure — the fallback under test has
+    nothing to do with any particular date."""
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    fired_at = datetime.now(UTC).replace(microsecond=0) - timedelta(days=30)
     lane.execute(
         "INSERT INTO episodes (session_id, sequence, platform, content, metadata, created_at) "
-        "VALUES ('v2t-fire-sess2', 1, 'claude_code', %s, '{}'::jsonb, "
-        "'2026-06-01T12:00:00Z')",
-        ("[tool:Skill] {'skill': 'v2t-demo-skill'}",),
+        "VALUES ('v2t-fire-sess2', 1, 'claude_code', %s, '{}'::jsonb, %s)",
+        ("[tool:Skill] {'skill': 'v2t-demo-skill'}", fired_at),
     )
     events = [e for e in DBSRC.fire_events(days=90) if e["session_id"] == "v2t-fire-sess2"]
     assert len(events) == 1
-    assert events[0]["fired_at"] == datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    assert events[0]["fired_at"] == fired_at
 
 
 # ------------------------------------------------- migration 045 / data repair

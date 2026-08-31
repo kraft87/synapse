@@ -63,7 +63,7 @@ from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from filelock import lock_exclusive
+from synapse_filelock import lock_exclusive
 
 SPOOL_PATH = config.DATA_DIR / "remember_spool.jsonl"
 LOCK_PATH = str(SPOOL_PATH) + ".lock"

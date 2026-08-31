@@ -71,7 +71,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
-from filelock import lock_exclusive
+from synapse_filelock import lock_exclusive
 
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
