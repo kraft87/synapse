@@ -59,7 +59,6 @@ Env (all optional):
 
 from __future__ import annotations
 
-import fcntl
 import glob
 import json
 import os
@@ -72,6 +71,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+from filelock import lock_exclusive
 
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
@@ -250,7 +250,7 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
     """
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(str(CURSOR_PATH) + ".lock", "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        lock_exclusive(lf)
         state = _load_state()
         ent = state.get(path)
         if not force and isinstance(ent, dict) and int(ent.get("offset", -1)) > offset:
@@ -445,7 +445,7 @@ def _catchup(projects_root: str, skip_path: str) -> None:
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(config.DATA_DIR / "ingest_catchup.lock", "w") as lf:
         try:
-            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(lf, blocking=False)
         except OSError:
             _log("CATCHUP skipped: another sweep is running")
             return

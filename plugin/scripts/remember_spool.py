@@ -54,7 +54,6 @@ Env (all optional):
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import sys
@@ -64,6 +63,7 @@ from datetime import UTC, datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+from filelock import lock_exclusive
 
 SPOOL_PATH = config.DATA_DIR / "remember_spool.jsonl"
 LOCK_PATH = str(SPOOL_PATH) + ".lock"
@@ -97,7 +97,7 @@ def _locked(path: str = LOCK_PATH):
     """Exclusive flock around a spool mutation. Serializes concurrent hooks/CLIs."""
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as lf:
-        fcntl.flock(lf, fcntl.LOCK_EX)
+        lock_exclusive(lf)
         yield
 
 
@@ -231,7 +231,7 @@ def flush(*, max_items: int = MAX_PER_FLUSH, budget: float | None = None) -> dic
     config.DATA_DIR.mkdir(parents=True, exist_ok=True)
     with open(FLUSH_LOCK_PATH, "w") as lf:
         try:
-            fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(lf, blocking=False)
         except OSError:
             _log("FLUSH skipped: another flush is running")
             return {"flushed": [], "left": len(records), "error": None, "busy": True}
