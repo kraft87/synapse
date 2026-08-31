@@ -56,6 +56,11 @@ from ingestion.llm_client import (
     stage_model,
 )
 from ingestion.notes import _OWNER
+from ingestion.surfaces import (
+    DEFAULT_AUDIENCE,
+    RESTRICTED_AUDIENCE,
+    restricted_project_union,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +391,10 @@ def run_lane(
 
         # ---- stage C: global notes that are really about one project.
         projects: list[str] = db.known_project_slugs()
+        # Audience (schema 053) is derived from a note's PROJECT, so a retype changes the
+        # right answer. Read the restricted-surface allowlist union ONCE for the batch —
+        # it can't change mid-run, and re-deriving per note would be one query each.
+        restricted_projects = restricted_project_union(db)
         for note in db.find_retype_candidates(_OWNER, limit=cap_retype):
             if applied >= cap_apply:
                 break
@@ -405,7 +414,17 @@ def run_lane(
                 # recorded and skipped — writing it would file the note on a shelf
                 # nothing ever reads from, which is deletion with extra steps.
                 if db.project_slug_exists(slug):
-                    db.retype_note(int(note["id"]), type="project", project=slug)
+                    # Re-derive by the project rule: a note moving onto a work-readable
+                    # project becomes work-safe, one moving off it goes back to personal.
+                    # Nothing else in this lane touches audience — pair supersession keeps
+                    # each note's own tag, which IS the "preserve on update" requirement.
+                    new_audience = (
+                        RESTRICTED_AUDIENCE if slug in restricted_projects else DEFAULT_AUDIENCE
+                    )
+                    db.retype_note(
+                        int(note["id"]), type="project", project=slug, audience=new_audience
+                    )
+                    detail["audience"] = new_audience
                     act = True
                     applied += 1
                     counts["applied_retype"] += 1

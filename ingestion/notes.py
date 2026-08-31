@@ -36,6 +36,7 @@ from typing import Any, cast
 
 from ingestion.llm_client import MalformedResponseError, parse_with_retry, stage_model
 from ingestion.preferences_gate import _group_for
+from ingestion.surfaces import derive_audience
 
 logger = logging.getLogger(__name__)
 
@@ -122,18 +123,33 @@ def reconcile_note(
     type: str,
     project: str | None,
     source_ref: str | None,
+    audience: str | None = None,
+    caller_restricted: bool = False,
 ) -> dict[str, Any]:
     """Write one explicit note, reconciling against the live set.
 
     Returns ``{"outcome": "created"|"updated"|"superseded", "note_id": int,
-    "prev_id": int|None}`` — ``note_id`` is the live row after the write;
-    ``prev_id`` is the retired row on supersession, else None.
+    "prev_id": int|None, "audience": str|None}`` — ``note_id`` is the live row after
+    the write; ``prev_id`` is the retired row on supersession; ``audience`` is the tier
+    this write set, or None when an UPDATE preserved the stored one.
 
     ``embedder=None`` (or an embed failure) degrades to a straight insert with
     NULL embedding — dedup silently skipped, logged, never raised.
+
+    Audience (schema 053) is resolved here because this is the single write chokepoint.
+    ``audience`` is the explicit override (precedence 1); ``caller_restricted`` says the
+    write came from a REGISTERED restricted surface (precedence 2); everything else
+    falls to the project rule in :func:`ingestion.surfaces.derive_audience`. A
+    restatement (UPDATE) PRESERVES the note's stored tier unless ``audience`` overrides
+    it — reclassification is an explicit act, never a side effect of rephrasing.
     """
     if type not in _VALID_TYPES:
         raise ValueError(f"invalid note type {type!r} — expected one of {_VALID_TYPES}")
+    # Raises on an invalid explicit value BEFORE any write — a bad audience must not
+    # land a note under the wrong tier and report success.
+    new_audience = derive_audience(
+        db, explicit=audience, caller_restricted=caller_restricted, project=project
+    )
 
     vec: list[float] | None = None
     embed_model: str | None = None
@@ -167,12 +183,21 @@ def reconcile_note(
             embedding=vec,
             embed_model=embed_model,
             source_ref=source_ref,
+            audience=new_audience,
         )
-        logger.info("note created (#%s, %s): %s", new_id, type, hook[:80])
-        return {"outcome": "created", "note_id": new_id, "prev_id": None}
+        logger.info("note created (#%s, %s, %s): %s", new_id, type, new_audience, hook[:80])
+        return {
+            "outcome": "created",
+            "note_id": new_id,
+            "prev_id": None,
+            "audience": new_audience,
+        }
 
     relation = _confirm_relation(llm, top, hook, body)
     if relation == "contradicts":
+        # A contradiction is a NEW assertion, so it derives its own tier rather than
+        # inheriting the retired note's: inheriting would let a personal statement
+        # arrive work-safe just because it reversed a work-safe one.
         new_id = db.insert_note(
             owner_id=_OWNER,
             group_id=group_id,
@@ -183,11 +208,26 @@ def reconcile_note(
             embedding=vec,
             embed_model=embed_model,
             source_ref=source_ref,
+            audience=new_audience,
         )
         db.supersede_note(top["id"], new_id)
         logger.info("note superseded #%s -> #%s: %s", top["id"], new_id, hook[:80])
-        return {"outcome": "superseded", "note_id": new_id, "prev_id": top["id"]}
+        return {
+            "outcome": "superseded",
+            "note_id": new_id,
+            "prev_id": top["id"],
+            "audience": new_audience,
+        }
 
-    db.update_note(top["id"], hook=hook, body=body, embedding=vec, embed_model=embed_model)
+    # Restatement: pass the tier ONLY when it was explicitly given. `audience=None`
+    # reaches update_note as COALESCE(NULL, audience) — the stored tier survives.
+    db.update_note(
+        top["id"],
+        hook=hook,
+        body=body,
+        embedding=vec,
+        embed_model=embed_model,
+        audience=audience,
+    )
     logger.info("note updated (#%s): %s", top["id"], hook[:80])
-    return {"outcome": "updated", "note_id": top["id"], "prev_id": None}
+    return {"outcome": "updated", "note_id": top["id"], "prev_id": None, "audience": audience}
