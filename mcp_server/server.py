@@ -122,6 +122,16 @@ _mcp_host = "0.0.0.0" if _use_http else "127.0.0.1"
 _mcp_port = int(os.environ.get("MCP_PORT", "8765"))
 
 
+def _claims_identity(claims: dict, claim_keys: tuple[str, ...]) -> str:
+    """First non-empty identity claim, lowercased; "" when none is present.
+
+    Deliberately ONE definition: the allowlist gate below and the audience-scoping
+    surface derivation (:func:`_caller_surface`) must never disagree about who a caller
+    is, or a login could clear the gate as one identity and be served as another.
+    """
+    return next((str(claims[k]).lower() for k in claim_keys if claims.get(k)), "")
+
+
 class _UserAllowlist(Middleware):
     """Gate tool calls so the interactive OAuth leg can't expose memory to the world.
 
@@ -141,8 +151,7 @@ class _UserAllowlist(Middleware):
     async def on_call_tool(self, context, call_next):
         token = get_access_token()
         if token is not None and token.client_id != _MACHINE_CLIENT_ID:
-            claims = token.claims or {}
-            user = next((str(claims[k]).lower() for k in self._claim_keys if claims.get(k)), "")
+            user = _claims_identity(token.claims or {}, self._claim_keys)
             if user not in self._allowed:
                 raise AuthorizationError(f"{self._label} user {user!r} not in allowlist")
         return await call_next(context)
@@ -296,6 +305,57 @@ def _build_idp():
 
 _auth, _auth_mw = _build_auth()
 _idp = _build_idp()
+
+# Identity claims of whichever interactive leg _build_auth just selected, read off the
+# allowlist middleware it built rather than re-derived from env — one source, no drift.
+# Empty when there is no OAuth leg at all (open dev/stdio, bearer-only): those servers
+# have no OAuth callers to identify, so the derivation below stays inert.
+_IDENTITY_CLAIMS: tuple[str, ...] = _auth_mw[0]._claim_keys if _auth_mw else ()
+
+#: Namespace for a surface id derived from an OAuth/OIDC identity (schema 053). Keeping
+#: these in their own space means a `surfaces` row for a login can never be shadowed by
+#: (or shadow) a host whose SYNAPSE_SURFACE happens to be the same string.
+_OAUTH_SURFACE_PREFIX = "oauth:"
+
+
+def _oauth_identity() -> str:
+    """The caller's OAuth/OIDC login, lowercased — "" when this is not that lane.
+
+    Empty for the machine-token bearer leg (client_id ``synapse-machine``), for an open
+    dev/stdio server, and for any call with no token context at all. Empty means "no
+    identity evidence", which the caller below treats as "change nothing".
+    """
+    try:
+        token = get_access_token()
+    except Exception:  # pragma: no cover - defensive: no auth context at all
+        return ""
+    if token is None or token.client_id == _MACHINE_CLIENT_ID:
+        return ""
+    return _claims_identity(token.claims or {}, _IDENTITY_CLAIMS)
+
+
+def _caller_surface(surface: str | None) -> str | None:
+    """The surface id audience scoping should enforce for this call (schema 053).
+
+    Scoping resolves a ``surface`` param that the client's PreToolUse hook injects. MCP
+    callers on the OAuth/OIDC lane (the claude.ai connector) have no such hook, so they
+    send nothing and used to resolve to UNKNOWN — a fully authenticated owner identity
+    got the restricted, near-empty serve. They do carry better evidence than a hostname:
+    an identity this server verified. Resolve it to ``oauth:<login>`` and look THAT up
+    in `surfaces` like any other surface id.
+
+    Still fail-closed: no ``oauth:<login>`` row means restricted, exactly as before.
+    Nothing here creates a row or infers trust from a successful login — the operator
+    registers it (``PUT /surfaces/oauth:<login>``) to grant trust.
+
+    The derived id OVERRIDES a client-supplied ``surface``: a token identity the server
+    verified outranks a string the caller typed about itself. Machine-token callers are
+    untouched — that lane's token says only "a Synapse client", never which host, so its
+    hook-injected param remains the only evidence available.
+    """
+    identity = _oauth_identity()
+    return f"{_OAUTH_SURFACE_PREFIX}{identity}" if identity else surface
+
 
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
 # this string load at session start — it is the always-loaded orientation surface that
@@ -534,7 +594,7 @@ def recall(
             group_id=group_id,
             source="mcp-tool",
             self_session=self_session,
-            surface=surface,
+            surface=_caller_surface(surface),
         )
 
 
@@ -603,7 +663,7 @@ def recall_full_turns(
             source="mcp-tool",
             self_session=self_session,
             session_id=session_id,
-            surface=surface,
+            surface=_caller_surface(surface),
         )
 
 
@@ -629,7 +689,7 @@ def fetch(ids: list[str], surface: str | None = None) -> dict:
             error — drill-down can't reach past the overview's filter.
     """
     with logfire.span("mcp.fetch", n=len(ids)):
-        return _get_recall().fetch(ids, source="mcp-tool", surface=surface)
+        return _get_recall().fetch(ids, source="mcp-tool", surface=_caller_surface(surface))
 
 
 @mcp.tool()
@@ -684,7 +744,7 @@ def fetch_session(
             offset=offset,
             limit=limit,
             source="mcp-tool",
-            surface=surface,
+            surface=_caller_surface(surface),
         )
 
 
@@ -845,6 +905,11 @@ async def remember(
         note_type = "project"
 
     sid = session_id or str(_uuid.uuid4())
+    # Same resolution the serving tools do, so an OAuth identity registered as a
+    # RESTRICTED surface writes notes it can still read back. Resolved here, on the
+    # event loop, rather than inside _work(): the token context belongs to the request,
+    # and _work runs on a worker thread.
+    caller_surface = _caller_surface(surface)
 
     def _work() -> dict:
         t0 = _time.perf_counter()
@@ -878,7 +943,7 @@ async def remember(
             # (`known`). An unknown surface restricts what this host READS, but it must
             # never widen a WRITE — defaulting an unrecognised hostname's notes to
             # work-safe would turn a fail-closed read rule into a leak.
-            st = lookup_surface(DB_URL, surface)
+            st = lookup_surface(DB_URL, caller_surface)
             caller_restricted = st.known and st.restricted
 
             embedder, llm = _notes_deps()

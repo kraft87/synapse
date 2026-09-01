@@ -188,6 +188,30 @@ async def test_allowlist_middleware_claim_fallback(monkeypatch):
         assert "mallory" in str(e)
 
 
+def test_identity_claims_track_the_active_leg(monkeypatch):
+    """Audience scoping derives an OAuth caller's surface (`oauth:<login>`) from the SAME
+    claim keys the allowlist gate reads. If the two ever drift, a login clears the gate
+    as one identity and is served as another."""
+    _stub_oidc_discovery(monkeypatch)
+    s = _reload(
+        monkeypatch,
+        {
+            "SYNAPSE_MACHINE_TOKEN": "tok",
+            "OIDC_CONFIG_URL": "https://idp.example.net/.well-known/openid-configuration",
+            "OIDC_CLIENT_ID": "synapse",
+            "OIDC_CLIENT_SECRET": "sec",
+            "ALLOWED_OIDC_USERS": "kyle",
+        },
+    )
+    assert s._IDENTITY_CLAIMS == s._auth_mw[0]._claim_keys == ("preferred_username", "email")
+
+    # Bearer-only / open: no interactive leg means no OAuth callers to identify, so the
+    # derivation stays inert and a caller's own `surface` param is left alone.
+    s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
+    assert s._IDENTITY_CLAIMS == ()
+    assert s._caller_surface("work-host") == "work-host"
+
+
 def test_machine_authorized_constant_time_check(monkeypatch):
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
     assert s._machine_authorized(_Req({"authorization": "Bearer tok"})) is True

@@ -18,10 +18,15 @@ security allowlist is exactly how a stale grant survives a demotion. DELETE reve
 surface to the unregistered default (restricted, empty) — always a tightening, so it
 needs no confirmation dance.
 
-These routes deliberately do not authenticate the surface itself. Surface ids are
+These routes deliberately do not authenticate the surface itself. HOST surface ids are
 self-reported under the shared machine token; the threat model is an employer READING a
 transcript, not an employer attacking the API. Per-surface tokens through the existing
 device-flow lane are the answer for the day that changes.
+
+One family of ids is NOT self-reported: ``oauth:<login>``, which ``server._caller_surface``
+derives from an OAuth/OIDC caller's verified identity (MCP clients on that lane run no
+hook and send no id of their own). Register those exactly like a host — the id is just a
+string here — and note that they carry the trust of an identity rather than a machine.
 """
 
 from __future__ import annotations

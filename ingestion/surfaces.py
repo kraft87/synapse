@@ -6,6 +6,12 @@ surface through :func:`lookup_surface` and filters what it serves accordingly; t
 write path (remember → reconcile_note) resolves the audience tag through
 :func:`derive_audience`.
 
+A surface id is usually a HOST (the plugin's ``SYNAPSE_SURFACE`` / hostname constant),
+but not always: MCP callers on the OAuth/OIDC lane run no hook and send no id, so
+``mcp_server/server._caller_surface`` derives ``oauth:<login>`` from their verified
+identity instead. Both kinds resolve through the one lookup below and both are equally
+fail-closed — an unregistered ``oauth:<login>`` is as restricted as an unknown host.
+
 Fail-closed is the whole point, so it is concentrated in ONE place: every failure mode
 of :func:`lookup_surface` — no surface id, no row, missing table, unreachable database,
 a malformed row — returns :data:`UNKNOWN_SURFACE`, which is ``restricted`` with an empty
