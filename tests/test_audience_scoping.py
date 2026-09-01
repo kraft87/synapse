@@ -12,6 +12,8 @@ Three things are load-bearing and each gets its own section:
     fetch() must enforce exactly what recall() and the board do.
   * remember() classifies on write, in a fixed precedence, and a RESTATEMENT never
     silently reclassifies an existing note.
+  * An OAuth/OIDC-authenticated caller has no hook to inject a surface, so the server
+    derives one from its verified identity — and that derivation is itself fail-closed.
 
 Board filtering (notes tier + digest allowlist + banner) lives in test_board.py, and
 fetch_session's predicates in test_fetch_session.py — both next to the code they cover.
@@ -523,3 +525,175 @@ def test_contradiction_derives_rather_than_inheriting(monkeypatch):
     )
     assert res["outcome"] == "superseded" and res["audience"] == "personal"
     assert db.inserts[0]["audience"] == "personal"
+
+
+# ---------------------------------------------------------------------------
+# OAuth/OIDC callers: the surface comes from the identity, not a param
+# ---------------------------------------------------------------------------
+
+
+class _OAuthToken:
+    """The two fields server.py reads off a FastMCP access token: which lane, and who."""
+
+    def __init__(self, claims: dict, client_id: str = "claude-ai-connector") -> None:
+        self.client_id = client_id
+        self.claims = claims
+
+
+@pytest.fixture()
+def as_oauth_caller(monkeypatch):
+    """Put a verified OAuth/OIDC identity in the token context — the claude.ai
+    connector's shape: authenticated and allowlisted, but running no PreToolUse hook,
+    so it carries no `surface` param at all."""
+
+    def _login(login: str, *, client_id: str = "claude-ai-connector") -> None:
+        monkeypatch.setattr(server, "_IDENTITY_CLAIMS", ("preferred_username", "email"))
+        monkeypatch.setattr(
+            server,
+            "get_access_token",
+            lambda: _OAuthToken({"preferred_username": login}, client_id),
+        )
+
+    return _login
+
+
+def test_oauth_identity_becomes_its_own_surface_id(as_oauth_caller):
+    as_oauth_caller("Kyle")
+    assert server._caller_surface(None) == "oauth:kyle"  # lowercased, namespaced
+
+
+def test_the_derived_surface_overrides_a_client_supplied_one(as_oauth_caller):
+    """A token identity the server verified outranks a string the caller typed about
+    itself — otherwise an OAuth client could name a trusted host and widen its own view."""
+    as_oauth_caller("kyle")
+    assert server._caller_surface("test-full-surface") == "oauth:kyle"
+
+
+def test_machine_token_callers_keep_their_injected_surface(monkeypatch):
+    """The machine token says "a Synapse client", never which host, so the hook-injected
+    param stays the only evidence available on that lane."""
+    monkeypatch.setattr(
+        server,
+        "get_access_token",
+        lambda: _OAuthToken({"preferred_username": "kyle"}, server._MACHINE_CLIENT_ID),
+    )
+    assert server._caller_surface("work-host") == "work-host"
+    assert server._caller_surface(None) is None
+
+
+def test_no_token_context_changes_nothing(monkeypatch):
+    """Open dev/stdio servers and any call outside a request: no identity evidence, so
+    the param stands and the pre-existing fail-closed path applies unchanged."""
+    monkeypatch.setattr(server, "get_access_token", lambda: None)
+    assert server._caller_surface("work-host") == "work-host"
+    assert server._caller_surface(None) is None
+
+
+def test_an_oauth_token_with_no_identity_claim_derives_nothing(monkeypatch):
+    """Fail-closed on a malformed token: no claim means no derived id, never a guess."""
+    monkeypatch.setattr(server, "_IDENTITY_CLAIMS", ("preferred_username",))
+    monkeypatch.setattr(server, "get_access_token", lambda: _OAuthToken({}))
+    assert server._caller_surface(None) is None
+
+
+@pytest.fixture()
+def oauth_serving(clean, db_url, monkeypatch):
+    """The MCP tools wired at the test DB with the retrieval legs stubbed — these
+    assertions drive server.recall/server.fetch, not the engine, because the derivation
+    under test lives at the tool boundary."""
+    monkeypatch.setattr(server, "DB_URL", db_url)
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
+    return clean
+
+
+def test_registered_oauth_identity_gets_full_serving(oauth_serving, as_oauth_caller):
+    """The regression: before this, an owner identity on the OAuth lane sent no surface,
+    resolved to UNKNOWN, and got the near-empty restricted serve."""
+    _episode(oauth_serving, "alpha", "alpha discussion of the widget")
+    _episode(oauth_serving, "beta", "beta discussion of the widget")
+    _episode(oauth_serving, None, "unlabeled discussion of the widget")
+    register_full(oauth_serving, "oauth:kyle")
+    as_oauth_caller("kyle")
+
+    assert len(server.recall("widget")["episodes"]) == 3
+
+
+def test_unregistered_oauth_identity_is_still_restricted(oauth_serving, as_oauth_caller):
+    """The fail-closed half: authenticating is not the same as being trusted. The
+    operator registers `oauth:<login>` to grant trust — a login never creates its own row."""
+    _episode(oauth_serving, "alpha", "alpha discussion of the widget")
+    as_oauth_caller("mallory")
+    assert server.recall("widget").get("episodes") is None
+
+
+def test_oauth_identity_scopes_a_restricted_row(oauth_serving, as_oauth_caller):
+    """An identity can be registered restricted, same as a host: partial trust is a row,
+    not a special case."""
+    _episode(oauth_serving, "alpha", "alpha discussion of the widget")
+    _episode(oauth_serving, "beta", "beta discussion of the widget")
+    register_restricted(oauth_serving, ["alpha"], "oauth:kyle")
+    as_oauth_caller("kyle")
+
+    served = [it["text"] for it in server.recall("widget")["episodes"]]
+    assert served == ["alpha discussion of the widget"]
+
+
+def test_oauth_drill_down_enforces_the_same_verdict(oauth_serving, db_url, as_oauth_caller):
+    """fetch() resolves the identity too — otherwise the cheap way around a restricted
+    overview is to guess sequential ids and fetch them."""
+    eid = _episode(oauth_serving, "alpha", "a turn")
+    private = _note(db_url, "User keeps a personal journal", audience="personal")
+    as_oauth_caller("kyle")
+
+    out = server.fetch([f"e:{eid}", f"n:{private}"])
+    assert out["episodes"] == [] and out["notes"] == []
+
+    register_full(oauth_serving, "oauth:kyle")
+    out_full = server.fetch([f"e:{eid}", f"n:{private}"])
+    assert [e["id"] for e in out_full["episodes"]] == [f"e:{eid}"]
+    assert [n["id"] for n in out_full["notes"]] == [f"n:{private}"]
+
+
+def test_oauth_full_turns_resolve_the_identity(oauth_serving, as_oauth_caller):
+    _episode(oauth_serving, "alpha", "alpha raw turn about the widget")
+    _episode(oauth_serving, "beta", "beta raw turn about the widget")
+    register_restricted(oauth_serving, ["alpha"], "oauth:kyle")
+    as_oauth_caller("kyle")
+
+    out = server.recall_full_turns("widget")
+    assert [e["content"] for e in out["episodes"]] == ["alpha raw turn about the widget"]
+
+
+def test_machine_token_serving_is_unchanged(oauth_serving, monkeypatch):
+    """The plugin's lane, with a token in context: the hook-injected surface is still
+    the whole answer, and the identity claims on that token are ignored."""
+    _episode(oauth_serving, "alpha", "alpha discussion of the widget")
+    _episode(oauth_serving, "beta", "beta discussion of the widget")
+    sid = register_restricted(oauth_serving, ["alpha"])
+    monkeypatch.setattr(
+        server,
+        "get_access_token",
+        lambda: _OAuthToken({"preferred_username": "kyle"}, server._MACHINE_CLIENT_ID),
+    )
+
+    served = [it["text"] for it in server.recall("widget", surface=sid)["episodes"]]
+    assert served == ["alpha discussion of the widget"]
+
+
+def test_remember_from_a_restricted_oauth_identity_defaults_work_safe(
+    remember_env, as_oauth_caller
+):
+    """The write side derives the same id, so an identity registered restricted can read
+    back what it just wrote — the same symmetry a restricted HOST gets."""
+    register_restricted(remember_env, ["alpha"], "oauth:kyle")
+    as_oauth_caller("kyle")
+    out = _remember(hook="Beta uses a queue", body="B.", project="beta")
+    assert out["audience"] == "work-safe"
+
+
+def test_remember_from_an_unregistered_oauth_identity_stays_personal(remember_env, as_oauth_caller):
+    """Unknown restricts reads but must never widen a write — an unregistered identity
+    is exactly as unknown as an unregistered hostname."""
+    as_oauth_caller("mallory")
+    out = _remember(hook="User keeps a personal journal", body="B.", type="user")
+    assert out["audience"] == "personal"
