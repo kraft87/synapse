@@ -9,8 +9,11 @@ to the tool input as `self_session` via the PreToolUse `updatedInput` mechanism;
 the exclusion is keyed to exactly that id, so two concurrent sessions never
 suppress each other's genuinely relevant content.
 
-recall_feedback: the same id lands in the existing `session_id` param so
-feedback reports group by session (same-session noise analysis needs it).
+recall_feedback / remember: the same id lands in each tool's existing
+`session_id` param — feedback reports group by session (same-session noise
+analysis needs it) and remembered episodes attach to the writing session.
+Neither tool accepts `self_session`; sending it fails their pydantic
+validation and the whole call errors out.
 
 It used to inject a `surface` (this host's name) as well, which is how schema 053
 keyed per-host trust. Schema 054 removed that lane entirely: trust now rides on the
@@ -53,7 +56,7 @@ def main() -> None:
         # recall_feedback's existing session_id param groups reports so noise can be
         # classified by session later (all 96 historical rows were NULL — unmeasurable).
         if session_id:
-            field = "session_id" if base == "recall_feedback" else "self_session"
+            field = "session_id" if base in ("recall_feedback", "remember") else "self_session"
             if not tool_input.get(field):  # already set (retry/nested call) — don't overwrite
                 tool_input[field] = session_id
                 changed = True
