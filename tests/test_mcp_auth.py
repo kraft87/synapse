@@ -1,14 +1,18 @@
 """Auth-mode wiring for the MCP server.
 
 The server is env-gated: no machine token => OPEN (dev/pre-cutover); machine token =>
-StaticTokenVerifier bearer; + GitHub creds => MultiAuth with a login allowlist. These
-tests reload the module under different env so the security boundary can't silently
-regress (e.g. a refactor that drops the allowlist or stops gating the custom routes).
+SynapseTokenVerifier (root + per-device bearers, schema 054); + GitHub creds =>
+MultiAuth with a login allowlist. These tests reload the module under different env so
+the security boundary can't silently regress (e.g. a refactor that drops the allowlist,
+stops gating the custom routes, or lets the root token clear the admin gate).
 """
 
 from __future__ import annotations
 
 import importlib
+import os
+
+import pytest
 
 _AUTH_KEYS = (
     "SYNAPSE_MACHINE_TOKEN",
@@ -51,10 +55,10 @@ def test_open_mode_has_no_auth(monkeypatch):
 
 
 def test_bearer_only(monkeypatch):
-    from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
+    from mcp_server.auth_tokens import SynapseTokenVerifier
 
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
-    assert isinstance(s._auth, StaticTokenVerifier)
+    assert isinstance(s._auth, SynapseTokenVerifier)
     assert s._auth_mw == []  # no GitHub leg => no allowlist middleware
 
 
@@ -235,3 +239,137 @@ def test_oauth_storage_none_without_db_or_key(monkeypatch):
     monkeypatch.setenv("SYNAPSE_DB_URL", "")
     s = _reload(monkeypatch, {"SYNAPSE_OAUTH_SIGNING_KEY": "k" * 32})
     assert s._oauth_client_storage() is None
+
+
+# ---------------------------------------------------------------------------
+# Credential-bound trust (schema 054): two gates, and root cannot clear the second
+# ---------------------------------------------------------------------------
+
+_TEST_DB = os.environ.get(
+    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
+)
+
+
+def _db_reachable() -> bool:
+    try:
+        import psycopg
+
+        psycopg.connect(_TEST_DB, connect_timeout=2).close()
+        return True
+    except Exception:  # pragma: no cover - environment dependent
+        return False
+
+
+_needs_db = pytest.mark.skipif(not _db_reachable(), reason="no test DB reachable")
+
+
+@pytest.fixture()
+def credentialed(monkeypatch):
+    """A server reloaded against the test DB, with a root token and two device tokens:
+    one full-trust (the admin credential) and one restricted (a work laptop)."""
+    import psycopg
+
+    from tests.helpers.surfaces import clear_surfaces, register_device
+
+    conn = psycopg.connect(_TEST_DB, autocommit=True)
+    clear_surfaces(conn)
+    register_device(conn, "full-device", trust="full", surface_id="dev-full")
+    register_device(conn, "work-device", trust="restricted", projects=["w"], surface_id="dev-work")
+    register_device(conn, "pending-device", trust="full", surface_id="dev-pend", status="pending")
+    monkeypatch.setenv("SYNAPSE_DB_URL", _TEST_DB)
+    s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "root-tok"})
+    yield s
+    clear_surfaces(conn)
+    conn.close()
+
+
+@_needs_db
+@pytest.mark.parametrize(
+    "token,client_ok,admin_ok",
+    [
+        ("root-tok", True, False),  # THE asymmetry: enrollment credential, not an admin
+        ("full-device", True, True),
+        ("work-device", True, False),  # restricted is a read scope, not a lesser admin
+        ("pending-device", False, False),  # authenticates as nothing until approved
+        ("garbage", False, False),
+    ],
+)
+def test_the_two_gates_admit_exactly_the_right_credentials(
+    credentialed, token, client_ok, admin_ok
+):
+    req = _Req({"authorization": f"Bearer {token}"})
+    assert credentialed._machine_authorized(req) is client_ok
+    assert credentialed._admin_authorized(req) is admin_ok
+
+
+@_needs_db
+def test_the_admin_gate_is_the_no_self_approve_property(credentialed):
+    """Spelled out because it is the reason this change exists: every machine holds the
+    root token at install time, so if root cleared the admin gate a device could approve
+    itself and the pending state would mean nothing."""
+    assert credentialed._admin_authorized(_Req({"authorization": "Bearer root-tok"})) is False
+    assert credentialed._admin_authorized(_Req({})) is False
+
+
+@_needs_db
+def test_request_trust_prefers_the_credential_over_the_param(credentialed):
+    from ingestion.surfaces import UNKNOWN_SURFACE
+
+    work = _Req({"authorization": "Bearer work-device"})
+    st = credentialed._request_trust(work, "dev-full")  # asks for the trusted surface
+    assert st.surface_id == "dev-work" and st.restricted
+
+    # Root keeps the legacy param lane for the migration window.
+    root = _Req({"authorization": "Bearer root-tok"})
+    assert credentialed._request_trust(root, "dev-full").trust == "full"
+    assert credentialed._request_trust(root, None) == UNKNOWN_SURFACE
+
+
+@_needs_db
+async def test_the_verifier_admits_root_with_no_database_at_all(monkeypatch):
+    """Root is verified by constant-time compare and NOTHING else. The services on the
+    Docker host authenticate with it to reach /ingest, so a PG blip must not take out
+    the one lane that repairs things."""
+    from mcp_server.auth_tokens import SynapseTokenVerifier
+
+    v = SynapseTokenVerifier("root-tok", "postgresql://nobody@127.0.0.1:1/nope", ["user"])
+    tok = await v.verify_token("root-tok")
+    assert tok is not None and tok.claims == {"kind": "root"}
+    # Anything else on an unreachable DB fails CLOSED rather than erroring out.
+    assert await v.verify_token("some-device-token") is None
+
+
+@_needs_db
+async def test_the_verifier_stamps_a_device_with_its_resolved_row(credentialed):
+    from mcp_server.auth_tokens import SynapseTokenVerifier
+
+    v = SynapseTokenVerifier("root-tok", _TEST_DB, ["user"])
+    tok = await v.verify_token("work-device")
+    assert tok is not None
+    assert tok.claims == {
+        "kind": "device",
+        "surface_id": "dev-work",
+        "trust": "restricted",
+        "allowed_projects": ["w"],
+    }
+    assert await v.verify_token("pending-device") is None
+    assert await v.verify_token("never-issued") is None
+
+
+@_needs_db
+def test_a_device_token_cannot_fetch_the_root_credential(credentialed, monkeypatch):
+    """Device tokens are leaves. Handing one the shared, un-revocable enrollment
+    credential would collapse the two back into one and make revocation meaningless."""
+    import fastmcp.exceptions as fe
+
+    class _Tok:
+        def __init__(self) -> None:
+            self.client_id = credentialed._DEVICE_CLIENT_ID
+            self.claims = {"kind": "device", "surface_id": "dev-full", "trust": "full"}
+
+    monkeypatch.setattr(credentialed, "get_access_token", lambda: _Tok())
+    with pytest.raises(fe.AuthorizationError):
+        credentialed.issue_machine_token()
+
+    monkeypatch.setattr(credentialed, "get_access_token", lambda: None)
+    assert credentialed.issue_machine_token() == {"token": "root-tok"}

@@ -3,9 +3,15 @@
 The hook must (a) print the server-rendered board text verbatim (stdout lands in the
 session's context), (b) scope it to the project derived from the hook payload's cwd
 the same way the ingest path labels episodes (basename of cwd; process cwd fallback),
-(c) honor the SYNAPSE_BOARD=0 kill switch without touching the network, and (d) be
+(c) honor the SYNAPSE_BOARD=0 kill switch without touching the network, (d) be
 fail-open: server down, timeout, or a non-ok payload prints nothing and exits 0 — a
-broken board must never break a session start.
+broken board must never break a session start — and (e) since schema 054, drive device
+enrollment and print the PAIRING block while this device is still pending, because a
+pending device is served nothing and an unexplained empty session start is worse than
+a restricted one.
+
+It no longer sends a ``surface`` param: the bearer identifies the caller now, and a
+host name the client asserts is evidence of nothing.
 
 Stdlib-only script loaded by path (it lives outside the package). No live server:
 config.get_json is monkeypatched on the loaded module.
@@ -58,8 +64,8 @@ def _isolated_env(monkeypatch, tmp_path) -> None:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    # Pin the surface (schema 053) so the asserted params don't depend on the
-    # hostname of whatever machine runs the suite.
+    # Pin the display label so nothing depends on the hostname of whatever machine
+    # runs the suite. It is a label now, not an identity.
     monkeypatch.setenv("SYNAPSE_SURFACE", _SURFACE)
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
@@ -69,13 +75,17 @@ def _isolated_env(monkeypatch, tmp_path) -> None:
 def _load_hook() -> ModuleType:
     """Load the hook fresh. `config` is popped around the load so it re-resolves
     from the current env rather than a module cached by an earlier test."""
-    for name in ("config", "board_block"):
+    for name in ("config", "enroll", "board_block"):
         sys.modules.pop(name, None)
-    spec = importlib.util.spec_from_file_location("board_block", _SCRIPT)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    for name in ("config", "board_block"):
+    sys.path.insert(0, str(_SCRIPT.parent))
+    try:
+        spec = importlib.util.spec_from_file_location("board_block", _SCRIPT)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path.remove(str(_SCRIPT.parent))
+    for name in ("config", "enroll", "board_block"):
         sys.modules.pop(name, None)
     return mod
 
@@ -92,6 +102,10 @@ def _run(monkeypatch, mod: ModuleType, stdin: str, reply) -> list[tuple[str, dic
         return reply
 
     monkeypatch.setattr(mod, "get_json", fake_get_json)
+    # Enrollment is a separate concern with its own tests; pin it "already approved"
+    # so these assertions stay about the board fetch.
+    monkeypatch.setattr(mod.enroll, "ensure_enrolled", lambda *a, **k: {"status": "approved"})
+    monkeypatch.setattr(mod.enroll, "mark_approved", lambda: None)
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     mod.main()
     return calls
@@ -103,9 +117,9 @@ def test_board_text_printed_verbatim(monkeypatch, tmp_path, capsys):
     payload = {"status": "ok", "text": _BOARD_TEXT, "n_notes": 1, "overflow": 0}
     calls = _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/services/synapse"}), payload)
     assert capsys.readouterr().out == _BOARD_TEXT + "\n"
-    # The board request always names this host: the server, not the plugin, decides
-    # what a given surface may see (schema 053).
-    assert calls == [("/context", {"project": "synapse", "surface": _SURFACE})]
+    # No `surface`: the token names the caller (schema 054), and the server decides
+    # what that credential may see.
+    assert calls == [("/context", {"project": "synapse"})]
 
 
 def test_kill_switch_no_output_no_http(monkeypatch, tmp_path, capsys):
@@ -162,7 +176,7 @@ def test_project_derived_from_hook_cwd(monkeypatch, tmp_path, capsys, cwd, expec
     _isolated_env(monkeypatch, tmp_path)
     mod = _load_hook()
     calls = _run(monkeypatch, mod, json.dumps({"cwd": cwd}), {"status": "ok", "text": "b"})
-    assert calls == [("/context", {"project": expected, "surface": _SURFACE})]
+    assert calls == [("/context", {"project": expected})]
     assert capsys.readouterr().out == "b\n"
 
 
@@ -191,4 +205,4 @@ def test_project_falls_back_to_process_cwd(monkeypatch, tmp_path, stdin):
     _isolated_env(monkeypatch, tmp_path)  # chdirs to tmp_path
     mod = _load_hook()
     calls = _run(monkeypatch, mod, stdin, {"status": "ok", "text": "b"})
-    assert calls == [("/context", {"project": tmp_path.name, "surface": _SURFACE})]
+    assert calls == [("/context", {"project": tmp_path.name})]

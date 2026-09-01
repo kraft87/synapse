@@ -369,7 +369,7 @@ def remember_env(clean, db_url, monkeypatch):
     """remember() wired at the test DB with keyless notes deps: NULL embedding, dedup
     KNN skipped, no LLM call. Every write is therefore a clean 'created'."""
     monkeypatch.setattr(server, "DB_URL", db_url)
-    monkeypatch.setattr(server, "_recall_engine", Recall(db_url, ""))
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
     monkeypatch.setattr(server, "_notes_deps", lambda: (None, None))
     return clean
 
@@ -634,7 +634,7 @@ def test_oauth_identity_scopes_a_restricted_row(oauth_serving, as_oauth_caller):
     register_restricted(oauth_serving, ["alpha"], "oauth:kyle")
     as_oauth_caller("kyle")
 
-    served = [it["text"] for it in server.recall("widget")["episodes"]]
+    served = [it["text"] for it in server.recall("widget").get("episodes", [])]
     assert served == ["alpha discussion of the widget"]
 
 
@@ -697,3 +697,95 @@ def test_remember_from_an_unregistered_oauth_identity_stays_personal(remember_en
     as_oauth_caller("mallory")
     out = _remember(hook="User keeps a personal journal", body="B.", type="user")
     assert out["audience"] == "personal"
+
+
+# ---------------------------------------------------------------------------
+# Device tokens (schema 054): the credential decides, and pending decides nothing
+# ---------------------------------------------------------------------------
+
+
+class _DeviceToken:
+    """What SynapseTokenVerifier stamps onto an approved device's request."""
+
+    def __init__(self, surface_id: str, trust: str, projects: tuple[str, ...] = ()) -> None:
+        self.client_id = server._DEVICE_CLIENT_ID
+        self.claims = {
+            "kind": "device",
+            "surface_id": surface_id,
+            "trust": trust,
+            "allowed_projects": list(projects),
+        }
+
+
+def test_a_device_tokens_claims_decide_what_it_is_served(clean, db_url, monkeypatch):
+    """The verifier already resolved the row; serving reads THAT, not a param."""
+    monkeypatch.setattr(server, "DB_URL", db_url)
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
+    _episode(clean, "alpha", "alpha discussion of the widget")
+    _episode(clean, "beta", "beta discussion of the widget")
+    monkeypatch.setattr(
+        server, "get_access_token", lambda: _DeviceToken("dev-work", "restricted", ("alpha",))
+    )
+
+    served = [it["text"] for it in server.recall("widget").get("episodes", [])]
+    assert served == ["alpha discussion of the widget"]
+
+
+def test_a_device_token_ignores_a_surface_param_entirely(clean, db_url, monkeypatch):
+    """The whole point of 054. A restricted device that names the trusted host must get
+    its OWN scope, not the one it asked for."""
+    monkeypatch.setattr(server, "DB_URL", db_url)
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
+    _episode(clean, "alpha", "alpha discussion of the widget")
+    _episode(clean, "beta", "beta discussion of the widget")
+    trusted = register_full(clean, "trusted-host")
+    monkeypatch.setattr(
+        server, "get_access_token", lambda: _DeviceToken("dev-work", "restricted", ("alpha",))
+    )
+
+    served = [it["text"] for it in server.recall("widget", surface=trusted).get("episodes", [])]
+    assert served == ["alpha discussion of the widget"]  # NOT the full corpus
+
+
+def test_a_root_token_caller_still_resolves_the_legacy_surface_param(clean, db_url, monkeypatch):
+    """The migration window: a 0.16.x plugin on the shared token keeps working exactly
+    as it did until it updates and enrolls."""
+    monkeypatch.setattr(server, "DB_URL", db_url)
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
+    _episode(clean, "alpha", "alpha discussion of the widget")
+    _episode(clean, "beta", "beta discussion of the widget")
+    sid = register_restricted(clean, ["alpha"], "legacy-work-host")
+    monkeypatch.setattr(server, "get_access_token", lambda: None)
+
+    served = [it["text"] for it in server.recall("widget", surface=sid).get("episodes", [])]
+    assert served == ["alpha discussion of the widget"]
+
+
+def test_a_pending_device_is_served_nothing(clean, db_url, monkeypatch):
+    """Pending holds a real token that authenticates as nothing — including through the
+    trust resolution, so even a hand-built claims dict cannot rescue it."""
+    from tests.helpers.surfaces import register_device
+
+    monkeypatch.setattr(server, "DB_URL", db_url)
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
+    _episode(clean, "alpha", "alpha discussion of the widget")
+    register_device(clean, "pending-tok", trust="full", surface_id="dev-new", status="pending")
+    monkeypatch.setattr(server, "get_access_token", lambda: None)
+
+    assert server.recall("widget", surface="dev-new").get("episodes") is None
+    assert server._caller_trust("dev-new") == UNKNOWN_SURFACE
+
+
+def test_restricted_project_union_ignores_pending_devices(clean, db_url):
+    """A pending device reads nothing, so letting its allowlist widen the work-safe tier
+    would classify notes for an audience that does not exist — permanently, if the
+    device is never approved."""
+    from tests.helpers.surfaces import register_device
+
+    register_restricted(clean, ["alpha"], "approved-work-host")
+    register_device(clean, "pending-tok", trust="restricted", projects=["secret"], status="pending")
+    db = Database(db_url)
+    try:
+        assert restricted_project_union(db) == {"alpha"}
+    finally:
+        db.close()

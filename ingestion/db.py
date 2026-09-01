@@ -642,11 +642,16 @@ class Database:
         """Every project any REGISTERED restricted surface may read (schema 053).
 
         The provenance half of audience derivation: a note filed under a project some
-        work host already reads episodes from is work-safe by construction."""
+        work host already reads episodes from is work-safe by construction.
+
+        APPROVED rows only (schema 054). A pending enrollment reads nothing, so letting
+        its allowlist widen the work-safe tier would classify notes for an audience that
+        does not exist yet — and a device that never gets approved would leave a
+        permanent, invisible widening behind it."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT DISTINCT unnest(allowed_projects) AS project FROM surfaces "
-                "WHERE trust = 'restricted'"
+                "WHERE trust = 'restricted' AND status = 'approved'"
             ).fetchall()
         return [cast(str, r["project"]) for r in rows if r["project"]]
 

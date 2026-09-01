@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Point it at a local or central Synapse.",
   "author": {
     "name": "kraft87"
@@ -14,9 +14,14 @@
     },
     "SYNAPSE_INGEST_TOKEN": {
       "type": "string",
-      "title": "Machine token",
-      "description": "Bearer token if your Synapse is auth-gated. Leave blank for an open/local server, or run `! synapse-login` in the Claude prompt to fetch it.",
+      "title": "Synapse token",
+      "description": "Your Synapse server's enrollment token (or leave blank for an open/local server, or run `! synapse-login` in the Claude prompt to fetch it). On first session this machine trades it for its own device token, stored right back here \u2014 a device token can be revoked on its own, and what this machine is served depends on it.",
       "sensitive": true
+    },
+    "SYNAPSE_MACHINE_ROLE": {
+      "type": "string",
+      "title": "This machine's role",
+      "description": "\"personal\" (default) or \"work\". Sent once at enrollment as a REQUEST, not a grant: it becomes the default trust level offered when you approve this device from an already-trusted machine. \"work\" asks for restricted access \u2014 work-safe notes plus an allowlist of projects \u2014 so personal memory is never served here."
     },
     "SYNAPSE_SKILLS_SYNC": {
       "type": "string",

@@ -44,10 +44,23 @@ from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Json as PgJson
 
 from ingestion import embedding as _embedding
-from ingestion.surfaces import lookup_surface
+from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.kg_pg import _vec_literal, search_kg_postgres
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve(db_url: str, surface: str | None, trust: SurfaceTrust | None) -> SurfaceTrust:
+    """The serving verdict for one call: a pre-resolved one wins, else look up the id.
+
+    ``trust`` is what the MCP server passes now that a caller is identified by its
+    DEVICE TOKEN (schema 054) — the credential resolved at authentication time, so the
+    engine must not go re-derive a verdict from a self-reported string. ``surface``
+    remains for the id lanes that still exist: the ``oauth:<login>`` identity and, for
+    one release, a legacy hostname param. Both fail closed the same way.
+    """
+    return trust if trust is not None else lookup_surface(db_url, surface)
+
 
 _KG_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
@@ -1813,6 +1826,7 @@ class Recall:
         debug: bool = False,
         self_session: str | None = None,
         surface: str | None = None,
+        trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """Overview retrieval: reranked episodes + KG facts (+ entities, web).
 
@@ -1848,7 +1862,7 @@ class Recall:
         """
         t_start = time.perf_counter()
         ex = self._leg_executor
-        st = lookup_surface(self._db_url, surface)
+        st = _resolve(self._db_url, surface, trust)
         allowed = st.project_filter
 
         # BM25 is pure text search — it does NOT need the query embedding. Start it
@@ -2160,6 +2174,7 @@ class Recall:
         self_session: str | None = None,
         session_id: str | None = None,
         surface: str | None = None,
+        trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """Raw episode drill-down: individual conversation turns.
 
@@ -2180,7 +2195,7 @@ class Recall:
         restricted caller must not reach whole turns it cannot reach passages of.
         """
         t_start = time.perf_counter()
-        allowed = lookup_surface(self._db_url, surface).project_filter
+        allowed = _resolve(self._db_url, surface, trust).project_filter
         try:
             query_emb = self._ensure_embedder().embed([query], task="query")[0]
         except Exception as e:
@@ -2250,7 +2265,11 @@ class Recall:
         return out
 
     def fetch(
-        self, ids: list[Any], source: str | None = None, surface: str | None = None
+        self,
+        ids: list[Any],
+        source: str | None = None,
+        surface: str | None = None,
+        trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """Drill-down by id: expand recall()'s compact serves into full records.
 
@@ -2266,7 +2285,7 @@ class Recall:
         would let a restricted caller enumerate exactly what the board and recall were
         built to withhold."""
         t_start = time.perf_counter()
-        st = lookup_surface(self._db_url, surface)
+        st = _resolve(self._db_url, surface, trust)
         ep_ids, note_ids, skipped, normalized = _parse_fetch_ids(ids)
         out: dict[str, Any] = {"episodes": [], "notes": [], "skipped": skipped}
         if not normalized:
@@ -2307,6 +2326,7 @@ class Recall:
         limit: int = _SESSION_PAGE_DEFAULT,
         source: str | None = None,
         surface: str | None = None,
+        trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """Sequential read of one session's turns — the Read analog of the
         session drill-down (recall_episodes(session_id=...) is the Grep analog).
@@ -2332,7 +2352,7 @@ class Recall:
         offset = max(0, int(offset))
         limit = max(1, min(int(limit), _SESSION_PAGE_MAX))
         out: dict[str, Any] = {"session_id": session_id}
-        allowed = lookup_surface(self._db_url, surface).project_filter
+        allowed = _resolve(self._db_url, surface, trust).project_filter
         # Appended to every query in this method; empty string on a full-trust surface.
         proj_sql = " AND project = ANY(%s)" if allowed is not None else ""
         proj_args: tuple[Any, ...] = (allowed,) if allowed is not None else ()

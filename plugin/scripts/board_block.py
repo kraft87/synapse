@@ -11,6 +11,14 @@ this hook just fetches and prints, so caps and layout evolve without a plugin re
 Reads the machine-token-gated ``GET /context`` route (thin client, no DSN). The project
 scope comes from the hook payload's ``cwd``, labeled the same way the ingest path labels
 episodes (mirror of ``ingestion.jsonl_client._cwd_to_project`` — basename of cwd).
+
+This hook also owns device enrollment (schema 054), because it is the first thing that
+needs a credential: it calls ``enroll.ensure_enrolled()`` before fetching. A device
+still awaiting approval is served nothing, so it prints the PAIRING block instead of a
+board — an empty session start with no explanation is the one outcome worse than a
+restricted one. No ``surface`` param is sent any more: the token identifies the caller,
+and a hostname the client asserts is no longer evidence of anything.
+
 Disable with SYNAPSE_BOARD=0. Fail-open: any error prints nothing and exits 0 — a
 broken board must never break a session start.
 """
@@ -22,7 +30,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import SURFACE, _cfg, get_json
+import enroll
+from config import _cfg, get_json
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
@@ -49,16 +58,21 @@ def main() -> None:
         return
     try:
         project = _project_label()
+        state = enroll.ensure_enrolled()
+        if state.get("status") == "pending":
+            print(enroll.pairing_block(state))
+            return
         params = {"project": project} if project else {}
-        # This host's id. The server decides what it may see (schema 053); the plugin
-        # never filters client-side, so an untrusted host is never SENT what it can't
-        # have. An unregistered surface gets the restricted board, not an error.
-        params["surface"] = SURFACE
         r = get_json("/context", params, timeout=10)
         text = r.get("text") if r.get("status") == "ok" else None
         if text:
+            # A served board is the only proof of approval the client ever gets — the
+            # server does not notify, so "it worked" is the signal.
+            enroll.mark_approved()
             print(text)  # inside the guard: a print that raises must not break the session
     except Exception:
+        # 401 lands here too: a revoked or still-pending device. Print nothing rather
+        # than a scary traceback; the pairing block above covers the case we can name.
         return  # fail-open: no block, no noise
 
 

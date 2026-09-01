@@ -6,7 +6,14 @@ lives on the PUBLIC base URL), so the flow bounces:
   LAN /dash → GET /dash/oauth/start            (302 to the IdP's authorize endpoint;
                                                  signed state carries the return origin)
   → IdP approves → PUBLIC /auth/callback/dash  (code→token exchange, allowlist gate)
-  → 302 {origin}/dash#token=<machine token>    (the app's existing fragment bootstrap)
+  → 302 {origin}/dash#token=<dash device token> (the app's existing fragment bootstrap)
+
+What comes back in that fragment is a **full-trust device token** minted for the
+logged-in identity (schema 054), NOT the root machine token. Two reasons: /dash/api now
+sits behind the admin gate, which the root token deliberately cannot clear, and a token
+that lives in a browser's URL fragment and localStorage should be individually
+revocable. One row per identity (label ``dash:<login>``), reused across logins, so the
+operator's surface list does not grow a row per sign-in.
 
 GitHub accepts redirect URIs that are SUBPATHS of the registered callback, which is
 how /auth/callback/dash coexists with the MCP leg on one OAuth App; OIDC providers
@@ -29,6 +36,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import quote
 
@@ -76,8 +84,14 @@ def register(
     idp: Any,
     machine_token: str,
     public_url: str,
+    issue_dash_token: Callable[[str], str] | None = None,
 ) -> None:
-    """Wire the browser-login routes. Same enablement condition as the device flow."""
+    """Wire the browser-login routes. Same enablement condition as the device flow.
+
+    ``issue_dash_token(identity) -> token`` mints/reuses the full-trust device token the
+    browser receives. None (no DB configured) falls back to the root machine token —
+    the pre-054 behaviour, and the only thing a DB-less deployment can do.
+    """
     if not (idp and machine_token):
         logger.info("web-login routes disabled (need an identity provider + SYNAPSE_MACHINE_TOKEN)")
         return
@@ -150,7 +164,18 @@ def register(
             logger.warning("web-login: %s user %r not in allowlist", idp.label, identity)
             return fail(f"{idp.label} user {identity!r} not in allowlist")
 
+        token = machine_token
+        if issue_dash_token is not None:
+            try:
+                token = issue_dash_token(identity)
+            except Exception as e:
+                # Fail the LOGIN rather than falling back to the root token: silently
+                # handing a browser the enrollment credential is the exact exposure this
+                # mint exists to remove, and "log in again" is a recoverable outcome.
+                logger.warning("web-login: dashboard token mint failed for %r: %s", identity, e)
+                return fail("could not issue a dashboard token — see server logs")
+
         logger.info(
-            "web-login: issued machine token to %s user %r via %s", idp.label, identity, origin
+            "web-login: issued dashboard token to %s user %r via %s", idp.label, identity, origin
         )
-        return RedirectResponse(f"{origin}/dash#token={quote(machine_token)}", status_code=302)
+        return RedirectResponse(f"{origin}/dash#token={quote(token)}", status_code=302)

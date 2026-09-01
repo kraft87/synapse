@@ -1,10 +1,14 @@
-"""Surface-registration routes (schema 053) — the operator seam for host trust.
+"""Surface-registration routes (053) — the id lane: `oauth:<login>` and legacy hosts.
 
-These routes are the ONLY way a host becomes trusted, so the tests are about the
+PUT/DELETE/GET are the operator seam for the CREDENTIAL-LESS surfaces: an OAuth
+identity (the claude.ai connector authenticates by verified login, not a device token)
+and the hostname rows that survive the 054 migration window. The tests are about the
 grant, not the plumbing: that a PUT actually widens what that surface is served, that
-DELETE narrows it back, that an omitted `trust` field defaults to restricted rather
-than to full, and that the whole thing sits behind the machine token like its
-private-session / preferences siblings.
+DELETE narrows it back, and that an omitted `trust` defaults to restricted rather than
+to full.
+
+Enrollment, approval, minting and the no-self-approve property live in
+test_credential_trust.py, next to the schema-054 machinery they cover.
 
 Skips cleanly when no test DB is reachable, mirroring test_private_session_routes.py.
 """
@@ -36,13 +40,16 @@ _SID = "route-test-host"
 
 
 def _client(db_url):
+    """Both gates satisfied by the one test token. The gates' ASYMMETRY (root enrolls,
+    only a full-trust device approves) is what test_credential_trust.py exists for;
+    conflating them here would just make these registration tests noisier."""
     from fastmcp import FastMCP
 
     def authorized(request):
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-surfaces")
-    register(test_mcp, db_url, authorized)
+    register(test_mcp, db_url, authorized, authorized)
     return TestClient(test_mcp.http_app())
 
 
@@ -53,7 +60,7 @@ def clean(conn):
     conn.execute("DELETE FROM surfaces")
 
 
-def test_routes_require_the_machine_token(clean, db_url):
+def test_routes_require_a_credential(clean, db_url):
     with _client(db_url) as client:
         assert client.get("/surfaces").status_code == 401
         assert client.put(f"/surfaces/{_SID}", json={"trust": "full"}).status_code == 401
@@ -137,17 +144,22 @@ def test_list_returns_every_registration(clean, db_url):
         rows = client.get("/surfaces", headers=_H).json()["surfaces"]
     assert [r["surface_id"] for r in rows] == ["host-a", "host-b"]
     assert rows[0]["trust"] == "full" and rows[1]["allowed_projects"] == ["alpha"]
-    assert all({"created_at", "updated_at"} <= set(r) for r in rows)
+    assert all({"created_at", "updated_at", "status", "has_token"} <= set(r) for r in rows)
+    # Credential-less rows: registered by id, so nothing to bind a token to.
+    assert all(r["status"] == "approved" and r["has_token"] is False for r in rows)
 
 
-def test_delete_reverts_to_the_unregistered_default(clean, db_url):
+def test_delete_revokes_back_to_the_unregistered_default(clean, db_url):
+    """DELETE revokes rather than deleting (schema 054): the row survives as the audit
+    record of what was once trusted, but it resolves to exactly what an absent row
+    does — restricted, unknown, empty allowlist."""
     with _client(db_url) as client:
         client.put(f"/surfaces/{_SID}", json={"trust": "full"}, headers=_H)
         assert lookup_surface(db_url, _SID).trust == "full"
         r = client.delete(f"/surfaces/{_SID}", headers=_H)
-        assert r.status_code == 200 and r.json()["deleted"] == 1
-        # Idempotent: deleting an absent row is a no-op, not an error.
-        assert client.delete(f"/surfaces/{_SID}", headers=_H).json()["deleted"] == 0
+        assert r.status_code == 200 and r.json()["revoked"] == 1
+        # Idempotent: revoking an already-revoked (or absent) row is a no-op.
+        assert client.delete(f"/surfaces/{_SID}", headers=_H).json()["revoked"] == 0
 
     st = lookup_surface(db_url, _SID)
     assert st.restricted and not st.known and st.project_filter == []

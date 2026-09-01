@@ -116,7 +116,11 @@ def register(
     db_url: str,
     authorized: Callable[[Request], bool],
     remember_fn: Callable[..., Any],
+    caller_surface: Callable[[Request], str | None] | None = None,
 ) -> None:
+    """``caller_surface`` resolves the CALLING DEVICE from its credential (schema 054).
+    Supplied, it outranks the ``surface`` field in the body — a self-reported hostname
+    must not decide a note's audience when the bearer already says who is writing."""
     if not db_url:
         logger.info("remember spool route disabled (no DB_URL)")
         return
@@ -173,8 +177,11 @@ def register(
             "session_id": body.get("session_id") or None,
             # A spooled write must classify the same way the live tool would have: the
             # spool exists because the MCP transport was down, not because the note came
-            # from a different host. Omitted -> derived by project rule, still fail-closed.
-            "surface": body.get("surface") or None,
+            # from a different device. Prefer the CREDENTIAL's surface; the body field is
+            # the pre-054 fallback. Neither -> derived by project rule, still fail-closed.
+            "surface": (
+                (caller_surface(request) if caller_surface else None) or body.get("surface") or None
+            ),
             "audience": body.get("audience") or None,
         }
         if str(body.get("hook") or "").strip() and str(body.get("body") or "").strip():

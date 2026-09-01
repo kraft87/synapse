@@ -234,6 +234,7 @@ def _device_login() -> int:
             config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
             who = f" as {resp['login']}" if resp.get("login") else ""
             print(f"Logged in{who}. Token saved to plugin config.")
+            _enroll_after_login()
             print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
             return 0
 
@@ -376,8 +377,39 @@ def _browser_login() -> int:
 
     config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
     print("Logged in. Token saved to plugin config.")
+    _enroll_after_login()
     print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
     return 0
+
+
+def _enroll_after_login() -> None:
+    """Trade the freshly-fetched enrollment credential for THIS device's own token.
+
+    Login gets the shared root token; schema 054 wants every machine on a token of its
+    own, and the sooner that swap happens the shorter the window in which the root
+    credential sits in a plugin config. Doing it here also means the user learns their
+    pairing code at login time instead of at the next session start.
+
+    Fail-soft: a server that predates /surfaces/enroll, or one that is briefly down,
+    leaves the machine on the root token — which still works. Enrollment retries from
+    the SessionStart hook.
+    """
+    try:
+        import enroll
+    except Exception:
+        return
+    state = enroll.ensure_enrolled()
+    if not state:
+        return
+    if state.get("status") == "pending":
+        print(
+            f"\nThis device enrolled and is awaiting approval. Pairing code: {state['pair_code']}"
+        )
+        print("Approve it from a machine that already has full Synapse trust:")
+        print(f"    /synapse-devices approve {state['pair_code']}")
+        print("Until then, this machine is served no memory.")
+    else:
+        print("\nThis device is enrolled and approved (first device on this Synapse).")
 
 
 def main() -> int:
