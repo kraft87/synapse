@@ -33,7 +33,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.db import Database
-from ingestion.surfaces import SurfaceTrust, lookup_surface, pending_surfaces
+from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.timeline_routes import _recent_events
 
@@ -124,29 +124,6 @@ def _fits(text: str) -> bool:
     return text.count("\n") + 1 <= _MAX_LINES and len(text) // 4 <= _MAX_EST_TOKENS
 
 
-def _pending_line(pending: list[dict[str, str]]) -> str:
-    """The device-approval nudge, shown only on a FULL-trust board.
-
-    A pending enrollment is invisible by design — it is served nothing and it cannot
-    announce itself. Something has to tell the operator it is waiting, and the board is
-    the one block that reliably reaches a trusted session. The pair code appears here
-    AND on the enrolling machine's own block: an approval where only one side shows the
-    code is an approval nobody can verify.
-    """
-    shown = ", ".join(
-        # "requests:" and not "role:" — the word has to carry that approving is a
-        # decision, not a formality, even when it is a one-word confirmation.
-        f"{p['label']} ({p['pair_code']}"
-        + (f", requests: {p['requested_trust']}" if p.get("requested_trust") else "")
-        + ")"
-        for p in pending
-    )
-    return (
-        f"{len(pending)} device(s) pending approval: {shown} — "
-        "approve from this trusted machine with `/synapse-devices approve <CODE>`."
-    )
-
-
 def _render(
     project: str | None,
     n_episodes: int,
@@ -154,7 +131,6 @@ def _render(
     notes: list[dict[str, Any]],
     dropped: int,
     events: list[dict[str, Any]],
-    pending: list[dict[str, str]] | None = None,
 ) -> str:
     lines = [f"[Synapse board — project: {project or 'all'}]"]
     recent = f" (most recent: {', '.join(project_names)})" if project_names else ""
@@ -163,8 +139,6 @@ def _render(
         "Absence from this board means SEARCH (recall), not doesn't-exist. "
         "Note bodies: fetch by id."
     )
-    if pending:
-        lines.append(_pending_line(pending))
 
     by_type: dict[str, list[dict[str, Any]]] = {}
     for n in notes:
@@ -220,9 +194,6 @@ def build_board(
     st = trust if trust is not None else lookup_surface(db_url, surface)
     audience = st.audience_filter
     allowed = st.project_filter
-    # Only a full-trust board carries the approval nudge: a restricted surface must not
-    # learn that other machines exist, let alone hold a code that could approve one.
-    pending = [] if st.restricted else pending_surfaces(db_url)
 
     db = Database(db_url)
     try:
@@ -253,10 +224,10 @@ def build_board(
     # the board for zero benefit. With event facts clamped this is a residual guard.
     kept = list(notes)
     dropped = 0
-    floor = _render(project, n_episodes, project_names, [], len(notes), events, pending)
+    floor = _render(project, n_episodes, project_names, [], len(notes), events)
     can_reach_cap = _fits(floor)
     while True:
-        text = _render(project, n_episodes, project_names, kept, dropped, events, pending)
+        text = _render(project, n_episodes, project_names, kept, dropped, events)
         if not kept or not can_reach_cap or _fits(text):
             break
         victim = min(kept, key=lambda n: (_DROP_CLASS.get(n["type"], 0), n["updated_at"], n["id"]))

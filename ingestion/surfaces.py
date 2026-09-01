@@ -13,7 +13,10 @@ applied to it. A device token closes that: the token IS the surface identity, so
 is nothing left to claim. Three kinds of caller resolve here:
 
 1. **Device token** — ``sha256(token)`` matches ``surfaces.token_hash``. The row's
-   trust applies, and only when ``status='approved'``.
+   trust applies, and only when ``status='approved'``. Devices get their token by
+   ENROLLING, which requires an OAuth/OIDC identity this deployment's allowlist admits
+   (``mcp_server/surface_routes``): the owner standing at the new machine is the
+   authority for what that machine is, so the grant lands live with no second step.
 2. **``oauth:<login>``** — MCP callers on the OAuth/OIDC lane (the claude.ai connector)
    present a verified identity rather than a device token; ``mcp_server/server``
    derives the id and passes it as ``legacy_surface_id``. That lane is unchanged.
@@ -55,16 +58,12 @@ logger = logging.getLogger(__name__)
 
 AUDIENCES = ("personal", "work-safe")
 TRUST_LEVELS = ("full", "restricted")
-STATUSES = ("pending", "approved", "revoked")
+STATUSES = ("approved", "revoked")
 
-#: Only this status serves anything. A pending device holds a real token that
-#: authenticates as nothing; a revoked one holds a token that matches no row at all.
+#: Only this status serves anything. Revoking clears the token hash too, so a revoked
+#: credential matches no row at all.
 APPROVED = "approved"
-
-#: Pair-code alphabet: no 0/O/1/I/L — the code is read off one screen and typed on
-#: another, so the ambiguous glyphs are simply not in it.
-_PAIR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
-_PAIR_LEN = 6
+REVOKED = "revoked"
 
 #: The default audience for an unclassified note — never leaves a trusted host.
 DEFAULT_AUDIENCE = "personal"
@@ -129,15 +128,10 @@ def new_device_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def new_pair_code() -> str:
-    """A fresh 6-character pairing code from the unambiguous alphabet."""
-    return "".join(secrets.choice(_PAIR_ALPHABET) for _ in range(_PAIR_LEN))
-
-
 def _row_to_trust(surface_id: str, row: Any) -> SurfaceTrust:
-    """A surfaces row → verdict. A non-approved row is UNKNOWN, not "restricted-known":
-    a pending or revoked device must not even set the write-side ``caller_restricted``
-    flag, because that flag WIDENS what a note is later served to."""
+    """A surfaces row → verdict. A revoked row is UNKNOWN, not "restricted-known": it
+    must not even set the write-side ``caller_restricted`` flag, because that flag
+    WIDENS what a note is later served to."""
     if str(row.get("status") or "") != APPROVED:
         return UNKNOWN_SURFACE
     trust = str(row["trust"] or "restricted")
@@ -293,16 +287,19 @@ def derive_audience(
 
 
 # ---------------------------------------------------------------------------
-# Registration / enrollment CRUD (the routes in mcp_server/surface_routes.py)
+# Enrollment / registration CRUD (the routes in mcp_server/surface_routes.py)
+#
+# One creation path (mint_surface, aliased enroll_surface) and one destruction path
+# (revoke_surface). There is deliberately no "approve" and no pending state: a device
+# token is only ever created by a caller who has ALREADY proved they may create one —
+# an allowlisted OAuth identity, an approved full-trust device, or shell access to the
+# database. A second confirmation step after an owner-authenticated request confirms
+# nothing, and a state that serves nothing is a state that silently breaks a laptop.
 # ---------------------------------------------------------------------------
 
 
 class SchemaMissing(Exception):
     """schema/053+054 not applied on this deployment — reported as 503, never as success."""
-
-
-class NoSuchPairCode(Exception):
-    """approve() was handed a code that matches no PENDING row. Never a 200."""
 
 
 def _surface_row(r: Any) -> dict[str, Any]:
@@ -317,35 +314,23 @@ def _surface_row(r: Any) -> dict[str, Any]:
         "label": r.get("label"),
         "allowed_projects": list(r["allowed_projects"] or []),
         "has_token": bool(r.get("token_hash")),
-        # Live only while pending: approve() clears it, so a code is single-use.
-        "pair_code": r.get("pair_code"),
-        # What the machine SAYS it is. Display + approve-default only; nothing serves
-        # off it, and a device is served nothing until someone approves it regardless.
-        "requested_trust": r.get("requested_trust"),
-        "requested_projects": list(r.get("requested_projects") or []),
         "last_seen_at": last.isoformat() if last else None,
         "created_at": r["created_at"].isoformat(),
         "updated_at": r["updated_at"].isoformat(),
     }
 
 
-#: The operator view, pending rows first — an enrollment nobody sees is an enrollment
-#: nobody approves. Same reason as the constants above: spelled out, so no query in this
-#: module is built from anything at runtime.
+#: The operator view. Spelled out rather than interpolated, like every other query in
+#: this module: nothing here builds SQL from anything at runtime.
 _LIST_SQL = (
-    "SELECT surface_id, trust, status, label, allowed_projects, token_hash, pair_code,"
-    " requested_trust, requested_projects, last_seen_at, created_at, updated_at"
-    " FROM surfaces ORDER BY (status <> 'pending'), surface_id"  # pending first
+    "SELECT surface_id, trust, status, label, allowed_projects, token_hash,"
+    " last_seen_at, created_at, updated_at"
+    " FROM surfaces ORDER BY (status <> 'approved'), surface_id"
 )
 
 
 def list_surfaces(db_url: str) -> list[dict[str, Any]]:
-    """Every surface — including PENDING ones, which is the point.
-
-    An enrollment that never shows up in the operator's list is an enrollment that
-    never gets approved, so this deliberately lists all three statuses, pending first
-    (they are the rows that need a human), then by id.
-    """
+    """Every surface, live ones first. Operator read — "who can see what"."""
     conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
     try:
         rows = conn.execute(_LIST_SQL).fetchall()
@@ -356,43 +341,10 @@ def list_surfaces(db_url: str) -> list[dict[str, Any]]:
     return [_surface_row(r) for r in rows]
 
 
-def pending_surfaces(db_url: str) -> list[dict[str, str]]:
-    """``[{label, pair_code}]`` for every device awaiting approval — the board's nudge.
-
-    The pair code has to appear on BOTH ends of an approval: the enrolling device
-    prints it, and the trusted device that can approve has to see it too, or the
-    operator is comparing a code against nothing. Fail-soft (empty list): a board must
-    never fail over a nudge.
-    """
-    try:
-        conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-        try:
-            rows = conn.execute(
-                "SELECT label, pair_code, requested_trust FROM surfaces "
-                "WHERE status = 'pending' AND pair_code IS NOT NULL "
-                "ORDER BY created_at LIMIT 10"
-            ).fetchall()
-        finally:
-            conn.close()
-    except Exception as e:
-        logger.debug("pending-surface lookup failed: %s", e)
-        return []
-    return [
-        {
-            "label": str(r["label"] or "unnamed"),
-            "pair_code": str(r["pair_code"]),
-            # Shown beside the code so approving is a one-word confirmation of a role
-            # the operator can already read, not a second decision typed from memory.
-            "requested_trust": str(r["requested_trust"] or ""),
-        }
-        for r in rows
-    ]
-
-
 def _new_surface_id(kind: str = "dev") -> str:
-    """An OPAQUE surface id. Deliberately not the hostname: binding an enrollment to a
-    self-reported name is how hostname spoofing gets reintroduced through the back
-    door (enroll as 'trusted-laptop', inherit that row's grant). The label carries the
+    """An OPAQUE surface id. Deliberately not the hostname: keying a row on a
+    self-reported name is how hostname spoofing gets reintroduced through the back door
+    (enroll as 'trusted-laptop', inherit that row's grant). The label carries the
     hostname for humans; the id carries nothing."""
     return f"{kind}-{secrets.token_hex(6)}"
 
@@ -402,218 +354,28 @@ def _insert_surface(
     *,
     surface_id: str,
     trust: str,
-    status: str,
     label: str | None,
     allowed_projects: list[str],
     th: str | None,
-    pair_code: str | None,
-    requested_trust: str | None = None,
-    requested_projects: list[str] | None = None,
 ) -> dict[str, Any]:
     row = conn.execute(
-        "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, "
-        "                      label, pair_code, requested_trust, requested_projects) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+        "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, label) "
+        "VALUES (%s, %s, %s, %s, 'approved', %s) "
         "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
-        "          pair_code, requested_trust, requested_projects, last_seen_at, "
-        "          created_at, updated_at",
-        (
-            surface_id,
-            trust,
-            allowed_projects,
-            th,
-            status,
-            label,
-            pair_code,
-            requested_trust,
-            requested_projects,
-        ),
+        "          last_seen_at, created_at, updated_at",
+        (surface_id, trust, allowed_projects, th, label),
     ).fetchone()
     assert row is not None, "INSERT ... RETURNING returned nothing"
     return _surface_row(row)
 
 
-def _clean_request(
-    requested_trust: str | None, requested_projects: list[str] | None
-) -> tuple[str | None, list[str] | None]:
-    """Normalize a self-declared role. Anything unrecognised becomes "unstated".
-
-    Rejecting a bad value at enrollment would lock out a client with a typo in its
-    config for no security gain: the request grants nothing either way, and "unstated"
-    already falls back to the narrow default at approve time.
-    """
-    rt = (requested_trust or "").strip().lower() or None
-    if rt not in TRUST_LEVELS:
-        rt = None
-    rp = [str(p).strip() for p in (requested_projects or []) if str(p).strip()] or None
-    return rt, rp
-
-
-def enroll_surface(
-    db_url: str,
-    label: str | None,
-    requested_trust: str | None = None,
-    requested_projects: list[str] | None = None,
-) -> dict[str, Any]:
-    """Mint a device token for a machine that is asking to join. TOFU, fail-closed.
-
-    Returns ``{"surface": {...}, "token": "<plaintext, shown once>"}``.
-
-    ``requested_trust`` is the machine's self-declared role, from the plugin's install
-    prompt ("personal" ⇒ full, "work" ⇒ restricted). It is a REQUEST and it is recorded
-    as one: it becomes the default :func:`approve_surface` offers, and it changes
-    nothing else. A machine cannot talk itself into being served.
-
-    Two outcomes, decided by whether this Synapse already has ANY approved device:
-
-    * **First device** — nobody could possibly approve it, so it enrolls
-      ``approved``/``full``. That is the bootstrap, and it is safe precisely because it
-      is only reachable once: the SECOND enrollment can no longer take this branch.
-      A first device that declares itself RESTRICTED does not take this branch at all —
-      it lands pending. Bootstrapping a device that will not be able to approve anything
-      would leave the deployment with no admin credential and no way to mint one over
-      HTTP, so the odd case goes to ``scripts/surface_admin.py bootstrap`` rather than
-      producing a Synapse nobody can administer.
-    * **Every device after** — enrolls ``pending``/``restricted`` with a pair code, and
-      is served nothing at all until an already-trusted device approves it.
-
-    The count and the insert run under one advisory lock in one transaction: without it
-    two simultaneous first-enrollments both read zero and both bootstrap to full trust.
-    """
-    tok = new_device_token()
-    th = token_hash(tok)
-    clean_label = (label or "").strip()[:200] or None
-    req_trust, req_projects = _clean_request(requested_trust, requested_projects)
-    try:
-        conn = psycopg.connect(db_url, row_factory=dict_row)
-    except Exception as e:  # pragma: no cover - defensive
-        raise SchemaMissing from e
-    try:
-        with conn.transaction():
-            # Serialize enrollment against itself; nothing else takes this lock.
-            conn.execute("SELECT pg_advisory_xact_lock(hashtext('synapse.surfaces.enroll'))")
-            row = conn.execute(
-                "SELECT count(*) AS n FROM surfaces "
-                "WHERE status = 'approved' AND token_hash IS NOT NULL"
-            ).fetchone()
-            first_ever = int((row or {}).get("n") or 0) == 0
-            bootstrap = first_ever and req_trust != "restricted"
-            surface = _insert_surface(
-                conn,
-                surface_id=_new_surface_id(),
-                trust="full" if bootstrap else "restricted",
-                status=APPROVED if bootstrap else "pending",
-                label=clean_label,
-                allowed_projects=[],
-                th=th,
-                pair_code=None if bootstrap else new_pair_code(),
-                requested_trust=req_trust,
-                requested_projects=req_projects,
-            )
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
-    logger.info(
-        "surface enrolled: %s (%s) label=%r", surface["surface_id"], surface["status"], clean_label
-    )
-    return {"surface": surface, "token": tok}
-
-
-def approve_surface(
-    db_url: str,
-    pair_code: str,
-    trust: str | None = None,
-    allowed_projects: list[str] | None = None,
-) -> dict[str, Any]:
-    """Approve a PENDING enrollment by its pair code, granting it a trust level.
-
-    ``trust``/``allowed_projects`` are OPTIONAL. Omitted, they fall back to what the
-    device requested at enrollment — so approving is a one-word confirmation of a role
-    the operator can already read next to the pair code, instead of a second decision
-    retyped from memory. Supplied, they override the request outright: the request never
-    constrains what the approver may grant, in either direction.
-
-    Fallback order, per field:
-
-    * trust: explicit → ``requested_trust`` → ``restricted`` (the narrow default, for a
-      client too old to state a role).
-    * projects, restricted only: explicit → ``requested_projects`` → the union of every
-      approved restricted surface's allowlist. That last rule matters in practice: a
-      second work machine should see the same work projects as the first, and requiring
-      the operator to re-list them is how a scope silently drifts between devices. Empty
-      when there are no other restricted surfaces, which serves nothing — still the
-      fail-closed direction.
-
-    Both reads happen in ONE transaction with the update, so a concurrent approve cannot
-    change the union between the read and the grant.
-
-    The code is cleared on success, so approving twice with the same code is a
-    :class:`NoSuchPairCode`, not a silent re-grant. Only ``status='pending'`` rows are
-    reachable — approve can never resurrect a revoked device (mint a new one instead).
-    """
-    if trust is not None and trust not in TRUST_LEVELS:
-        raise ValueError(f"invalid trust {trust!r} — expected one of {TRUST_LEVELS}")
-    code = (pair_code or "").strip().upper()
-    if not code:
-        raise ValueError("pair_code required")
-    explicit_projects = (
-        [str(p).strip() for p in allowed_projects if str(p).strip()]
-        if allowed_projects is not None
-        else None
-    )
-    conn = psycopg.connect(db_url, row_factory=dict_row)
-    try:
-        with conn.transaction():
-            pending = conn.execute(
-                "SELECT requested_trust, requested_projects FROM surfaces "
-                "WHERE pair_code = %s AND status = 'pending' FOR UPDATE",
-                (code,),
-            ).fetchone()
-            if pending is None:
-                raise NoSuchPairCode(f"no pending device with pair code {code!r}")
-
-            granted = trust or str(pending["requested_trust"] or "") or "restricted"
-            if granted not in TRUST_LEVELS:  # pragma: no cover - CHECK constraint holds
-                granted = "restricted"
-
-            projects: list[str] = []
-            if granted == "restricted":
-                projects = (
-                    explicit_projects
-                    if explicit_projects is not None
-                    else [str(p) for p in (pending["requested_projects"] or [])]
-                    or _approved_restricted_projects(conn)
-                )
-
-            row = conn.execute(
-                "UPDATE surfaces SET status = 'approved', trust = %s, allowed_projects = %s, "
-                "  pair_code = NULL, updated_at = now() "
-                "WHERE pair_code = %s AND status = 'pending' "
-                "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
-                "          pair_code, requested_trust, requested_projects, last_seen_at, "
-                "          created_at, updated_at",
-                (granted, projects, code),
-            ).fetchone()
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
-    assert row is not None, "the FOR UPDATE above already proved the row exists"
-    out = _surface_row(row)
-    logger.info(
-        "surface approved: %s trust=%s (requested %s) label=%r",
-        out["surface_id"],
-        out["trust"],
-        out["requested_trust"] or "-",
-        out["label"],
-    )
-    return out
-
-
 def _approved_restricted_projects(conn: Any) -> list[str]:
-    """Every project an approved restricted surface may already read — the scope a new
-    work machine inherits when nobody says otherwise. Same set audience derivation uses."""
+    """Every project an approved restricted surface may already read.
+
+    A second work machine should see the same work projects as the first; making the
+    operator re-list them by hand is how a scope silently drifts between devices. Same
+    set audience derivation reads for precedence rule 3.
+    """
     rows = conn.execute(
         "SELECT DISTINCT unnest(allowed_projects) AS project FROM surfaces "
         "WHERE trust = 'restricted' AND status = 'approved'"
@@ -622,40 +384,75 @@ def _approved_restricted_projects(conn: Any) -> list[str]:
 
 
 def mint_surface(
-    db_url: str, label: str | None, trust: str, allowed_projects: list[str]
+    db_url: str,
+    label: str | None,
+    trust: str | None = None,
+    allowed_projects: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Pre-mint an APPROVED device token from a trusted machine — the untrusted-machine
-    path.
+    """Create an APPROVED device surface and return its brand-new token.
 
-    Enrollment requires the target machine to hold a credential that can call
-    ``/surfaces/enroll``. When you do not want to put one there (the whole point of
-    calling that machine untrusted), mint the token here instead and paste only the
-    minted token over. It arrives already scoped to the trust you chose.
+    Returns ``{"surface": {...}, "token": "<plaintext, shown ONCE>"}``. Only the hash is
+    stored, so nothing can hand the token back later — including this function.
 
-    Returns ``{"surface": {...}, "token": "<plaintext, shown once>"}``.
+    This is the one creation path, used by both callers that are allowed to create a
+    credential, and the row lands approved in both cases because the CALLER is already
+    the authority:
+
+    * ``POST /surfaces/enroll`` — the machine being enrolled proved an OAuth/OIDC
+      identity that this deployment's allowlist admits. That is the owner standing at
+      the new machine saying what it is; there is nothing further to confirm.
+    * ``POST /surfaces/mint`` — an already-trusted device (or the break-glass CLI)
+      pre-creating a token for a headless box that will never run a browser flow.
+
+    ``trust`` defaults to ``restricted`` when unstated. That default is for CLIENTS, not
+    for humans: the plugin's install prompt makes the person choose (and defaults to
+    personal, the single-user common case), so an enrollment that arrives with no stated
+    role came from a client that did not ask — and an unasked question must not resolve
+    to full access. A restricted surface with no stated projects inherits the union of
+    what other approved restricted surfaces already read; empty when there are none,
+    which serves nothing.
     """
-    if trust not in TRUST_LEVELS:
-        raise ValueError(f"invalid trust {trust!r} — expected one of {TRUST_LEVELS}")
-    projects = [str(p).strip() for p in allowed_projects if str(p).strip()]
+    granted = (trust or "").strip().lower() or "restricted"
+    if granted not in TRUST_LEVELS:
+        raise ValueError(f"invalid trust {granted!r} — expected one of {TRUST_LEVELS}")
+    explicit = (
+        [str(p).strip() for p in allowed_projects if str(p).strip()]
+        if allowed_projects is not None
+        else None
+    )
     tok = new_device_token()
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
+    conn = psycopg.connect(db_url, row_factory=dict_row)
     try:
-        surface = _insert_surface(
-            conn,
-            surface_id=_new_surface_id(),
-            trust=trust,
-            status=APPROVED,
-            label=(label or "").strip()[:200] or None,
-            allowed_projects=projects,
-            th=token_hash(tok),
-            pair_code=None,
-        )
+        with conn.transaction():
+            projects: list[str] = []
+            if granted == "restricted":
+                projects = explicit if explicit is not None else _approved_restricted_projects(conn)
+            surface = _insert_surface(
+                conn,
+                surface_id=_new_surface_id(),
+                trust=granted,
+                label=(label or "").strip()[:200] or None,
+                allowed_projects=projects,
+                th=token_hash(tok),
+            )
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
         raise SchemaMissing from e
     finally:
         conn.close()
-    logger.info("surface minted: %s trust=%s label=%r", surface["surface_id"], trust, label)
+    logger.info(
+        "surface created: %s trust=%s projects=%s label=%r",
+        surface["surface_id"],
+        surface["trust"],
+        surface["allowed_projects"],
+        surface["label"],
+    )
     return {"surface": surface, "token": tok}
+
+
+#: Enrollment and minting are the same database operation; they differ only in who is
+#: allowed to ask, which is a routing concern. Named separately so call sites read as
+#: what they mean.
+enroll_surface = mint_surface
 
 
 #: Surface-id namespace for a browser session issued by the dashboard login flow.
@@ -685,7 +482,7 @@ def issue_dash_token(db_url: str, identity: str) -> str:
             "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, label) "
             "VALUES (%s, 'full', '{}', %s, 'approved', %s) "
             "ON CONFLICT (surface_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, "
-            "  trust = 'full', status = 'approved', pair_code = NULL, updated_at = now()",
+            "  trust = 'full', status = 'approved', updated_at = now()",
             (f"{DASH_SURFACE_PREFIX}{ident}", token_hash(tok), f"dashboard ({ident})"),
         )
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
@@ -702,9 +499,9 @@ def upsert_surface(
     lane, and legacy hostname rows during the migration window.
 
     Device surfaces never come through here: their id is server-generated and their
-    trust is set by :func:`approve_surface` or :func:`mint_surface`, so a PUT that could
-    name an arbitrary id must not be able to promote one. It writes ``status='approved'``
-    because an operator PUT is itself the approval for an identity row.
+    trust is set by :func:`mint_surface` at creation, so a PUT that could name an
+    arbitrary id must not be able to promote one. It writes ``status='approved'``
+    because an operator PUT is itself the grant for an identity row.
 
     Deliberately not a PATCH: a partial update of a security allowlist is how a stale
     entry survives a demotion. The caller states the whole intended state every time.
@@ -720,12 +517,11 @@ def upsert_surface(
             "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
             "  allowed_projects = EXCLUDED.allowed_projects, status = 'approved', "
             "  updated_at = now() "
-            # A device row must not be reachable by id: that would let a PUT hand a
-            # known token full trust without ever going through approve().
+            # A device row must not be reachable by id: that would let a PUT hand an
+            # already-issued token full trust without an owner-authenticated enrollment.
             "  WHERE surfaces.token_hash IS NULL "
             "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
-            "          pair_code, requested_trust, requested_projects, last_seen_at, "
-            "          created_at, updated_at",
+            "          last_seen_at, created_at, updated_at",
             (surface_id, trust, projects),
         ).fetchone()
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
@@ -733,7 +529,7 @@ def upsert_surface(
     finally:
         conn.close()
     if row is None:
-        raise ValueError(f"{surface_id!r} is a device surface — use approve/mint/revoke")
+        raise ValueError(f"{surface_id!r} is a device surface — use enroll/mint/revoke")
     return _surface_row(row)
 
 
@@ -750,7 +546,7 @@ def revoke_surface(db_url: str, surface_id: str) -> int:
     conn = psycopg.connect(db_url, autocommit=True)
     try:
         cur = conn.execute(
-            "UPDATE surfaces SET status = 'revoked', token_hash = NULL, pair_code = NULL, "
+            "UPDATE surfaces SET status = 'revoked', token_hash = NULL, "
             "  trust = 'restricted', allowed_projects = '{}', updated_at = now() "
             "WHERE surface_id = %s AND status <> 'revoked'",
             (surface_id,),

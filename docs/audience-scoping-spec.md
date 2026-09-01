@@ -69,12 +69,13 @@ threat model, it is a hope.
 nothing left to claim.
 
 - `surfaces` extends with `token_hash` (sha256 hex, unique where non-null), `status IN
-  ('pending','approved','revoked')` default `pending`, `label` (self-reported hostname,
-  **display only**), `pair_code`, `last_seen_at`, and `requested_trust` /
-  `requested_projects`. `trust` and `allowed_projects` keep their meaning and their
-  fail-closed defaults.
-- **Only `status='approved'` serves anything.** A pending device holds a real token that
-  authenticates as nothing; a revoked one holds a token that matches no row.
+  ('approved','revoked')`, a display-only `label`, and `last_seen_at`. `trust` and
+  `allowed_projects` keep their meaning and their fail-closed defaults. `status`
+  defaults to `revoked` — it reads odd and is deliberate: every real creation path sets
+  it explicitly, so the default only ever catches a hand-written row, and "nobody
+  granted this" should behave exactly like "this grant was pulled".
+- **Only `status='approved'` serves anything.** Revoking also clears the hash, so a
+  revoked credential matches no row at all, and the row survives as the audit record.
 - Three caller kinds resolve through `ingestion/surfaces.resolve_caller`:
   1. **device token** — sha256 lookup; the row's trust applies and any `surface` param
      is ignored;
@@ -83,43 +84,65 @@ nothing left to claim.
   3. **legacy hostname `surface` param** — accepted from ROOT-token callers for one
      release, so 0.16.x plugins keep working during the migration.
 
-**Enrollment (TOFU).** `POST /surfaces/enroll` mints a device token. If this Synapse has
-no approved device yet, the first one in is approved at full trust — nobody exists who
-could approve it, and the branch is unreachable ever after. Every later enrollment lands
-`pending` with a 6-character pair code and is served nothing until approved.
+### Enrollment is anchored to the owner's identity
 
-**The machine role is a REQUEST.** The plugin's install prompt asks personal or work
-(`SYNAPSE_MACHINE_ROLE`, default personal) and sends it as `requested_trust`. It is
-recorded on the pending row, shown next to the pair code on **both** ends, and used as
-the DEFAULT that `approve` fills in — so approving is a one-word confirmation of a role
-the operator can already read. It grants nothing on its own: a machine declaring itself
-personal is served exactly as much as one declaring nothing, which is nothing. An
-explicit `trust`/`allowed_projects` on approve overrides the request in either
-direction; a restricted approve with no stated projects inherits the union of existing
-approved restricted surfaces' allowlists, so a second work machine sees the same work
-projects as the first. **Edge case, deliberate:** a *first-ever* device that requests
-`restricted` does NOT bootstrap — auto-approving a device that cannot reach the admin
-routes would leave the deployment unadministrable, so it lands pending and the operator
-uses `scripts/surface_admin.py bootstrap`.
+A new machine gets its device token by completing the IdP's device flow (RFC 8628 — the
+same lane `synapse login` already uses: a short code approved in a browser on any
+device, phone included) and passing the resulting `device_code` to
+`POST /surfaces/enroll {device_code, label, trust, allowed_projects}`. The server polls
+the IdP, reads the identity, enforces the same allowlist every other login clears, and
+only then mints. The row lands `approved` immediately.
+
+**TOFU was considered and rejected.** The first cut of this design used a pair code: a
+new machine enrolled `pending`, printed a 6-character code, and a second already-trusted
+machine approved it. That ceremony exists to compensate for an ANONYMOUS enrollment
+credential — if all a new machine can prove is "I hold the shared token", something else
+has to vouch for it. An OAuth-verified owner standing at the new machine has already
+answered the only question the ceremony was asking, so it bought a second round trip, a
+pending state in which a laptop silently has no memory, and a code to copy between
+screens, in exchange for nothing. **Accepted in the threat model:** theft of the owner's
+IdP credential, mitigated by the IdP's own 2FA (Authelia here) and in any case already
+sufficient to reach the dashboard and read everything directly.
+
+`trust` is the answer to the plugin's install-time "personal or work?" prompt
+(`SYNAPSE_MACHINE_ROLE`), and it is authoritative because the person who answered it is
+the person who just authenticated. The prompt defaults to `personal`, because the
+single-user common case is a machine that should see everything and a default that makes
+the normal path silently useless gets worked around rather than understood. The narrow
+default lives one layer down: the SERVER treats an *unstated* role as `restricted`, so a
+client that never asked the question cannot resolve it to full access. Human says
+nothing ⇒ personal; software says nothing ⇒ restricted. A restricted enrollment that
+names no projects inherits the union of what approved restricted surfaces already read
+(a second work machine should see the same work projects as the first); an explicit `[]`
+still means empty.
+
+**`POST /surfaces/mint`** is the same operation for a machine that will never run a
+browser flow — a headless box, a service, a container. It is `admin`-gated, so it needs
+a machine that is already trusted, and the token is carried over by hand.
+
+**The root machine token cannot enroll or mint.** It is the services' credential for
+`/ingest` and the internal write paths, and every machine that ever ran the plugin has
+held it. A credential that widespread must not be able to create a new credential.
 
 **Two gates, and their asymmetry is the design.**
 
 | Gate | Admits | Guards |
 | --- | --- | --- |
-| client (`_machine_authorized`) | root token, or any APPROVED device token | `/ingest`, `/recall`, `/context`, skills, config, timeline, preferences, private mode, remember-spool, `/surfaces/enroll` |
-| admin (`_admin_authorized`) | APPROVED **full-trust device** token only — **never root** | `/surfaces/{approve,mint,list,PUT,DELETE}`, all of `/dash/api/*` |
+| client (`_machine_authorized`) | root token, or any APPROVED device token | `/ingest`, `/recall`, `/context`, skills, config, timeline, preferences, private mode, remember-spool |
+| admin (`_admin_authorized`) | APPROVED **full-trust device** token only — **never root** | `/surfaces/{mint,list,PUT,DELETE}`, all of `/dash/api/*` |
 
-Every machine holds the root token long enough to enroll. If root could also approve, a
-machine could self-approve and TOFU would be decoration. The dashboard had to move for
-the same reason: `/dash/api` serves the whole corpus unfiltered, so leaving it on the
-root token would be a bypass around the entire filter. The dashboard login now mints a
-full-trust device token for the OAuth-allowlisted identity (`dash:<login>`) instead of
-handing the browser the root token. `issue_machine_token` refuses device tokens: leaves
-do not get to fetch the root.
+The dashboard had to move for the same reason: `/dash/api` serves the whole corpus
+unfiltered, so leaving it on the root token would be a bypass around the entire filter.
+The dashboard login now mints a full-trust device token for the OAuth-allowlisted
+identity (`dash:<login>`, one row per identity, rotated per login) instead of handing
+the browser the root token. `issue_machine_token` refuses device tokens: leaves do not
+get to fetch the root.
 
-**Break-glass** is deliberately not a token: `scripts/surface_admin.py` talks to Postgres
-directly, which requires shell access on the DB host — a strictly higher bar than holding
-a bearer, and the right shape for a recovery tool.
+**Break-glass** is deliberately not a token: `scripts/surface_admin.py` (list / mint /
+revoke / bootstrap) talks to Postgres directly, which requires shell access on the DB
+host — a strictly higher bar than holding a bearer. It is the answer for the three cases
+where nothing else works: no IdP configured at all, the IdP down or the account locked,
+or no full-trust device left.
 
 **Root token verification never touches the database.** The services on the Docker host
 authenticate with it to reach `/ingest` and the internal write paths; a verifier that had
@@ -127,16 +150,14 @@ to read PG to admit root would turn every PG blip into a total auth outage on th
 lane that repairs things.
 
 `resolve_caller` is the single resolution point and **never fails open**: no credential,
-no row, a non-approved row, missing table, unreachable database, malformed row — all
-return restricted with an empty allowlist. `project = ANY('{}')` is false for every row,
-NULL project included, so an unknown caller serves *nothing* rather than everything.
+no row, a revoked row, missing table, unreachable database, malformed row — all return
+restricted with an empty allowlist. `project = ANY('{}')` is false for every row, NULL
+project included, so an unknown caller serves *nothing* rather than everything.
 
 **Enforcement on a restricted surface** (unchanged from v1):
 
 - **Board**: notes filtered to `audience='work-safe'`; timeline digest and episodes
-  banner filtered by project allowlist. The pending-device nudge is full-trust-only — a
-  restricted surface must not learn other machines exist, let alone hold a code that
-  could approve one.
+  banner filtered by project allowlist.
 - **recall / recall_full_turns**: notes by `audience`; episodes (BM25 + vector legs) by
   `project = ANY(allowed_projects)`. **KG facts leg skipped entirely** —
   `kg_relationships` has no `project` column, so serving zero facts is fail-closed.
@@ -154,21 +175,17 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 2. **Deploy the server.** Root-token clients keep working through the legacy `surface`
    param; the dashboard's *existing* fragment token (the root token) now 401s on
    `/dash/api` — that is expected, see step 4.
-3. **Update the plugin to 0.17.0 on the machine you trust most, and open a session.**
-   It enrolls; since prod already has approved (credential-less) rows but none with a
-   token, that first enrollment takes the bootstrap branch and comes back approved at
-   full trust. If it comes back pending instead, use break-glass:
-   `scripts/surface_admin.py bootstrap "<label>"` on the DB host and set the printed
-   token as `SYNAPSE_INGEST_TOKEN` there.
+3. **Update the plugin to 0.17.0 and run `synapse-login` on each machine.** It signs in,
+   then enrolls: a second device-flow approval that mints that machine's own token,
+   scoped by its install-time personal/work answer, stored in the same
+   `SYNAPSE_INGEST_TOKEN` slot. Until a machine enrolls it keeps working on the root
+   token via the legacy lane, and its SessionStart block says it is not enrolled.
 4. **Log into the dashboard again.** The login flow mints its own full-trust device
    token; the old fragment token is dead.
-5. **Update the remaining machines.** Each enrolls pending and prints its pair code; the
-   trusted machine's board lists the same code plus the role it asked for. Approve from
-   there: `/synapse-devices approve <CODE>`.
-6. **For a machine you will not put the enrollment token on:**
-   `/synapse-devices mint "work-laptop" --projects work-thing` from the trusted machine,
-   and carry only the minted token over.
-7. **Next release:** drop the legacy `surface` param and the root token's serving lane
+5. **For a machine that cannot run a browser flow anywhere** (headless, a service):
+   `/synapse-devices mint "<label>" --projects work-thing` from an already-trusted
+   machine, or `scripts/surface_admin.py mint` on the DB host, and carry the token over.
+6. **Next release:** drop the legacy `surface` param and the root token's serving lane
    entirely, once every machine is enrolled (`/surfaces` shows `has_token` per row).
 
 ## What this does NOT do
@@ -181,9 +198,9 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 - No KG facts on restricted surfaces (see above).
 - No device-token expiry or rotation schedule. Revocation is manual and immediate; a
   TTL would add a renewal path (and a renewal credential) for no threat this model has.
-- Pending devices cannot ingest. Their transcripts are not lost — the ingest hook's
-  `--catchup` sweep re-posts them after approval — but a long-pending machine can
-  outrun that window.
+- No enrollment without an identity provider. A bearer-only deployment has no identity
+  to anchor an enrollment to, so `POST /surfaces/enroll` reports 503 and points at the
+  break-glass CLI. Adding a weaker fallback would recreate exactly the hole 054 closes.
 
 ## Decisions
 
@@ -197,9 +214,14 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 4. ~~Surface spoofing: hostname self-reported under the shared machine token is accepted
    for the current threat model.~~ **Superseded 2026-09-01**: the machine token has to
    live on the untrusted machine for ingest to work, so a self-reported hostname was
-   never a boundary. Per-device tokens + TOFU approval (schema 054).
-5. The self-declared machine role is a request, not a grant, and approve defaults to it.
-   Rejected alternative: let a work-declared machine auto-approve itself restricted. It
-   reads safe and is not — "restricted" is only narrow relative to an allowlist the
-   machine would then also be choosing, and it would make the pending state mean
-   "personal machines only", which is a rule nobody would remember. (2026-09-01)
+   never a boundary. Per-device tokens (schema 054).
+5. Enrollment is OAuth-anchored, not trust-on-first-use. Rejected alternative: pending
+   rows + a pair code approved from a second trusted machine. That ceremony compensates
+   for an anonymous enrollment credential; with an allowlisted identity at the new
+   machine there is nothing left for it to establish, and it costs a state in which a
+   laptop silently has no memory. IdP-credential theft is accepted as out of scope
+   (Authelia 2FA, and such an attacker could read the dashboard directly). (2026-09-01)
+6. The install prompt defaults to `personal` while the server defaults an *unstated*
+   role to `restricted`. A narrow prompt default would make the common single-user case
+   silently useless and get worked around; a wide server default would let a client that
+   never asked the question resolve it to full access. (2026-09-01)

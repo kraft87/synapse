@@ -30,9 +30,10 @@ def _upsert(
     status: str = "approved",
     token_hash: str | None = None,
 ) -> str:
-    """Write one surfaces row. ``status='approved'`` by default — schema 054 makes
-    'pending' the column default, so a helper that omitted it would silently produce
-    rows that serve nothing and every unrelated test would go mysteriously empty."""
+    """Write one surfaces row. ``status='approved'`` by default — schema 054's column
+    default is the fail-closed 'revoked', so a helper that omitted it would silently
+    produce rows that serve nothing and every unrelated test would go mysteriously
+    empty."""
     conn.execute(
         "INSERT INTO surfaces (surface_id, trust, allowed_projects, status, token_hash) "
         "VALUES (%s, %s, %s, %s, %s) "
@@ -53,8 +54,6 @@ def register_device(
     status: str = "approved",
     surface_id: str | None = None,
     label: str | None = None,
-    pair_code: str | None = None,
-    requested_trust: str | None = None,
 ) -> str:
     """Register a CREDENTIAL-bound surface (schema 054) and return its id.
 
@@ -65,14 +64,12 @@ def register_device(
 
     sid = surface_id or f"dev-test-{token[:8]}"
     conn.execute(
-        "INSERT INTO surfaces (surface_id, trust, allowed_projects, status, token_hash, "
-        "                      label, pair_code, requested_trust) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+        "INSERT INTO surfaces (surface_id, trust, allowed_projects, status, token_hash, label) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
         "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
         "  allowed_projects = EXCLUDED.allowed_projects, status = EXCLUDED.status, "
-        "  token_hash = EXCLUDED.token_hash, pair_code = EXCLUDED.pair_code, "
-        "  requested_trust = EXCLUDED.requested_trust, updated_at = now()",
-        (sid, trust, projects or [], status, _hash(token), label, pair_code, requested_trust),
+        "  token_hash = EXCLUDED.token_hash, label = EXCLUDED.label, updated_at = now()",
+        (sid, trust, projects or [], status, _hash(token), label),
     )
     return sid
 

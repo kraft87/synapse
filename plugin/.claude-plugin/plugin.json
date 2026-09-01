@@ -15,13 +15,13 @@
     "SYNAPSE_INGEST_TOKEN": {
       "type": "string",
       "title": "Synapse token",
-      "description": "Your Synapse server's enrollment token (or leave blank for an open/local server, or run `! synapse-login` in the Claude prompt to fetch it). On first session this machine trades it for its own device token, stored right back here \u2014 a device token can be revoked on its own, and what this machine is served depends on it.",
+      "description": "Optional. Leave blank and run `! synapse-login` in the Claude prompt: you sign in once and this machine enrolls, receiving its OWN device token, which is stored right back here. What this machine is served depends on that token, and it can be revoked on its own. Paste a token directly only for an open/local server or a machine minted one from elsewhere.",
       "sensitive": true
     },
     "SYNAPSE_MACHINE_ROLE": {
       "type": "string",
       "title": "This machine's role",
-      "description": "\"personal\" (default) or \"work\". Sent once at enrollment as a REQUEST, not a grant: it becomes the default trust level offered when you approve this device from an already-trusted machine. \"work\" asks for restricted access \u2014 work-safe notes plus an allowlist of projects \u2014 so personal memory is never served here."
+      "description": "\"personal\" (default) or \"work\". Declared once when this machine enrolls, right after you sign in \u2014 so it is authoritative, not a request. \"work\" enrolls at restricted access: work-safe notes plus an allowlist of projects, so personal memory is never served here. Change it later with `/synapse-devices`."
     },
     "SYNAPSE_SKILLS_SYNC": {
       "type": "string",

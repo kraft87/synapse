@@ -21,7 +21,7 @@ Env vars (all optional):
   SYNAPSE_MCP_URL       legacy override for /mcp     (else derived)
   SYNAPSE_SKILLS_SYNC   "1" enables the SessionStart skills sync (default OFF — opt-in)
   SYNAPSE_CONFIG_SYNC   "1" enables config-file mirroring (default OFF — opt-in)
-  SYNAPSE_MACHINE_ROLE  "personal" (default) or "work" — the trust this device REQUESTS
+  SYNAPSE_MACHINE_ROLE  "personal" (default) or "work" — the trust this device enrolls at
 """
 
 from __future__ import annotations
@@ -181,8 +181,9 @@ INGEST_TOKEN = _cfg("SYNAPSE_INGEST_TOKEN") or _cred("SYNAPSE_INGEST_TOKEN")
 
 # Enrollment state for this device (schema 054). Kept in DATA_DIR rather than
 # settings.json because it is local bookkeeping, not configuration: which surface row
-# this machine got, whether it is still pending, and the pair code to show the user
-# while it is. settings.json holds the credential; this holds the story around it.
+# this machine got and what it was granted. settings.json holds the credential; this
+# holds the story around it, and its presence is how the hooks know this machine has a
+# credential of its OWN rather than one someone pasted in.
 DEVICE_FILE = DATA_DIR / "device.json"
 
 
@@ -221,20 +222,26 @@ CONFIG_PATHS = [g for g in re.split(r"[,\s]+", _cfg("SYNAPSE_CONFIG_PATHS", ""))
 # device token; a hostname is no longer accepted as evidence of anything.
 SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 
-# What this machine SAYS it is, from the install prompt: "personal" (default) or "work".
-# It travels once, at enrollment, as a REQUEST — the server records it and offers it as
-# the default when a trusted machine approves this device. It grants nothing by itself,
-# which is the point: a work laptop declaring itself personal is still served nothing
-# until a human on an already-trusted machine says otherwise.
+# What this machine is, from the install prompt: "personal" (default) or "work". It
+# travels once, at enrollment, and it is authoritative there — the person answering it
+# has just authenticated to the IdP, so they are the authority for what their own
+# machine is.
+#
+# The prompt defaults to "personal" because the single-user common case is a machine
+# that should see everything, and a default that makes the normal path silently useless
+# gets worked around rather than understood. The narrow default lives one layer down
+# instead: the SERVER treats an unstated role as restricted, so a client that never
+# asked the question cannot resolve it to full access. Human says nothing -> personal;
+# software says nothing -> restricted.
 MACHINE_ROLE = (_cfg("SYNAPSE_MACHINE_ROLE", "personal") or "personal").strip().lower()
 
-#: role -> the trust level to ask for. Anything unrecognised asks for nothing, and the
-#: server's own narrow default (restricted, empty allowlist) applies.
+#: role -> trust level. Anything unrecognised states nothing, and the server's own
+#: narrow default (restricted, inherited work projects) applies.
 _ROLE_TRUST = {"personal": "full", "work": "restricted"}
 
 
 def requested_trust() -> str | None:
-    """The trust level this machine asks for at enrollment, or None if unstated."""
+    """The trust level this machine declares at enrollment, or None if unstated."""
     return _ROLE_TRUST.get(MACHINE_ROLE)
 
 

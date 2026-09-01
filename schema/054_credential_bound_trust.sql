@@ -17,60 +17,35 @@
 --                surface kinds that survive: legacy hostname rows (migration window)
 --                and `oauth:<login>` identity rows (the claude.ai connector lane,
 --                which authenticates by OIDC/GitHub identity, not by a device token).
---   status       'pending' | 'approved' | 'revoked'. ONLY 'approved' serves anything.
---                A freshly enrolled device is 'pending': it holds a real token that
---                authenticates as nothing until a trusted device approves it (TOFU).
+--   status       'approved' | 'revoked'. Only 'approved' serves anything; revoking
+--                clears the hash, so the credential itself stops matching any row and
+--                the row stays behind as the audit record of what was once trusted.
 --   label        the device's self-reported hostname. DISPLAY ONLY — never resolved,
 --                never matched, never used to pick a row. It exists so a human can
---                tell which pending row is the laptop they just installed on.
---   pair_code    short human-transferable code, shown on BOTH ends of an approval
---                (the enrolling device prints it, the trusted device's board lists
---                it). Cleared on approve so a code is single-use.
+--                tell which device a listing line refers to.
 --   last_seen_at best-effort liveness for the operator's `GET /surfaces` view.
---
---   requested_trust / requested_projects
---                what the enrolling machine SAYS it is ("personal" or "work"), captured
---                at install time. A REQUEST, never a grant: it is stored on the pending
---                row and read only as the DEFAULT that `approve` fills in, so the
---                operator confirms a role instead of retyping one. Nothing serves off
---                these columns. A machine that declares itself personal is still served
---                nothing until an approved full-trust device approves it — the whole
---                security property would evaporate if a self-declaration could
---                activate itself.
 --
 -- The unique partial index on token_hash is the security-relevant constraint: two rows
 -- can never share a credential, so "which surface is this" has exactly one answer.
 --
--- Fail-closed defaults are unchanged and now doubled: trust DEFAULT 'restricted'
--- (053) AND status DEFAULT 'pending' (here). An INSERT that forgets both columns
--- produces a row that can read nothing.
+-- DEFAULT 'revoked' reads odd and is deliberate. Enrollment is owner-authenticated, so
+-- every code path that creates a live device sets status explicitly; the default only
+-- ever applies to a row someone wrote by hand. "Nobody granted this" and "this grant was
+-- pulled" should behave identically, and the failure that matters is a hand-written row
+-- silently authenticating. Fail-closed defaults are now doubled: trust DEFAULT
+-- 'restricted' (053) AND status DEFAULT 'revoked' (here).
 
 ALTER TABLE surfaces
-    ADD COLUMN IF NOT EXISTS token_hash         TEXT,
-    ADD COLUMN IF NOT EXISTS status             TEXT NOT NULL DEFAULT 'pending',
-    ADD COLUMN IF NOT EXISTS label              TEXT,
-    ADD COLUMN IF NOT EXISTS pair_code          TEXT,
-    ADD COLUMN IF NOT EXISTS last_seen_at       TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS requested_trust    TEXT,
-    ADD COLUMN IF NOT EXISTS requested_projects TEXT[];
+    ADD COLUMN IF NOT EXISTS token_hash   TEXT,
+    ADD COLUMN IF NOT EXISTS status       TEXT NOT NULL DEFAULT 'revoked',
+    ADD COLUMN IF NOT EXISTS label        TEXT,
+    ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ;
 
--- ADD CONSTRAINT has no IF NOT EXISTS; the DO blocks make the file re-runnable.
+-- ADD CONSTRAINT has no IF NOT EXISTS; the DO block makes the file re-runnable.
 DO $$
 BEGIN
     ALTER TABLE surfaces ADD CONSTRAINT surfaces_status_chk
-        CHECK (status IN ('pending', 'approved', 'revoked'));
-EXCEPTION
-    WHEN duplicate_object THEN NULL;
-END
-$$;
-
--- Nullable: a client too old to send a role, or one that sends nonsense, must land as
--- "no request" rather than being rejected at enrollment. NULL reads as "unstated", and
--- approve then falls back to its own restricted default.
-DO $$
-BEGIN
-    ALTER TABLE surfaces ADD CONSTRAINT surfaces_requested_trust_chk
-        CHECK (requested_trust IS NULL OR requested_trust IN ('full', 'restricted'));
+        CHECK (status IN ('approved', 'revoked'));
 EXCEPTION
     WHEN duplicate_object THEN NULL;
 END
@@ -81,12 +56,7 @@ $$;
 CREATE UNIQUE INDEX IF NOT EXISTS surfaces_token_hash_idx
     ON surfaces (token_hash) WHERE token_hash IS NOT NULL;
 
--- A pending row is looked up by pair code exactly once, but the code has to be unique
--- while it is live or an approval could hit the wrong device.
-CREATE UNIQUE INDEX IF NOT EXISTS surfaces_pair_code_idx
-    ON surfaces (pair_code) WHERE pair_code IS NOT NULL;
-
 -- Every pre-054 row was created by the owner through the machine-token CRUD, so it is
 -- approved by construction. Without this the migration would silently revoke every
--- registered host (status defaults to 'pending') and every board would go empty.
-UPDATE surfaces SET status = 'approved' WHERE status = 'pending';
+-- registered host and every board would go empty.
+UPDATE surfaces SET status = 'approved' WHERE status = 'revoked' AND token_hash IS NULL;

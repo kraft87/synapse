@@ -12,12 +12,11 @@ Reads the machine-token-gated ``GET /context`` route (thin client, no DSN). The 
 scope comes from the hook payload's ``cwd``, labeled the same way the ingest path labels
 episodes (mirror of ``ingestion.jsonl_client._cwd_to_project`` — basename of cwd).
 
-This hook also owns device enrollment (schema 054), because it is the first thing that
-needs a credential: it calls ``enroll.ensure_enrolled()`` before fetching. A device
-still awaiting approval is served nothing, so it prints the PAIRING block instead of a
-board — an empty session start with no explanation is the one outcome worse than a
-restricted one. No ``surface`` param is sent any more: the token identifies the caller,
-and a hostname the client asserts is no longer evidence of anything.
+No ``surface`` param is sent any more (schema 054): the token identifies the caller, and
+a hostname the client asserts is no longer evidence of anything. Enrollment itself is
+interactive — it prints a sign-in code and waits for a human — so this hook never runs
+it; it only says so when this machine holds no device credential, because an empty
+session start with no explanation is the one outcome worse than a restricted one.
 
 Disable with SYNAPSE_BOARD=0. Fail-open: any error prints nothing and exits 0 — a
 broken board must never break a session start.
@@ -28,6 +27,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import enroll
@@ -58,21 +58,20 @@ def main() -> None:
         return
     try:
         project = _project_label()
-        state = enroll.ensure_enrolled()
-        if state.get("status") == "pending":
-            print(enroll.pairing_block(state))
-            return
         params = {"project": project} if project else {}
-        r = get_json("/context", params, timeout=10)
+        try:
+            r = get_json("/context", params, timeout=10)
+        except urllib.error.HTTPError as e:
+            # 401 with no device credential is the one error worth explaining: this
+            # machine has not enrolled (or its token was revoked), so it is served
+            # nothing and will go on being served nothing until someone signs in.
+            if e.code == 401 and not enroll.is_enrolled():
+                print(enroll.not_enrolled_block())
+            return
         text = r.get("text") if r.get("status") == "ok" else None
         if text:
-            # A served board is the only proof of approval the client ever gets — the
-            # server does not notify, so "it worked" is the signal.
-            enroll.mark_approved()
             print(text)  # inside the guard: a print that raises must not break the session
     except Exception:
-        # 401 lands here too: a revoked or still-pending device. Print nothing rather
-        # than a scary traceback; the pairing block above covers the case we can name.
         return  # fail-open: no block, no noise
 
 

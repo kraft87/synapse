@@ -761,29 +761,28 @@ def test_a_root_token_caller_still_resolves_the_legacy_surface_param(clean, db_u
     assert served == ["alpha discussion of the widget"]
 
 
-def test_a_pending_device_is_served_nothing(clean, db_url, monkeypatch):
-    """Pending holds a real token that authenticates as nothing — including through the
-    trust resolution, so even a hand-built claims dict cannot rescue it."""
+def test_a_revoked_device_is_served_nothing(clean, db_url, monkeypatch):
+    """Revoking clears the token hash, so the credential matches no row — and the id
+    lane refuses the row too, so nothing can resurrect it by name."""
     from tests.helpers.surfaces import register_device
 
     monkeypatch.setattr(server, "DB_URL", db_url)
     monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
     _episode(clean, "alpha", "alpha discussion of the widget")
-    register_device(clean, "pending-tok", trust="full", surface_id="dev-new", status="pending")
+    register_device(clean, "gone-tok", trust="full", surface_id="dev-gone", status="revoked")
     monkeypatch.setattr(server, "get_access_token", lambda: None)
 
-    assert server.recall("widget", surface="dev-new").get("episodes") is None
-    assert server._caller_trust("dev-new") == UNKNOWN_SURFACE
+    assert server.recall("widget", surface="dev-gone").get("episodes") is None
+    assert server._caller_trust("dev-gone") == UNKNOWN_SURFACE
 
 
-def test_restricted_project_union_ignores_pending_devices(clean, db_url):
-    """A pending device reads nothing, so letting its allowlist widen the work-safe tier
-    would classify notes for an audience that does not exist — permanently, if the
-    device is never approved."""
+def test_restricted_project_union_ignores_revoked_devices(clean, db_url):
+    """A revoked device reads nothing, so letting its allowlist widen the work-safe tier
+    would keep classifying notes for an audience that no longer exists."""
     from tests.helpers.surfaces import register_device
 
     register_restricted(clean, ["alpha"], "approved-work-host")
-    register_device(clean, "pending-tok", trust="restricted", projects=["secret"], status="pending")
+    register_device(clean, "gone-tok", trust="restricted", projects=["secret"], status="revoked")
     db = Database(db_url)
     try:
         assert restricted_project_union(db) == {"alpha"}

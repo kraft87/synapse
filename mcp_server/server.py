@@ -570,12 +570,13 @@ _register_private_routes(mcp, DB_URL, _machine_authorized)
 
 # Surface enrollment + registration — audience scoping's operator seam (schema 053/054).
 # Which DEVICES get the full corpus and which get only work-safe notes + an allowlisted
-# set of projects. Enrollment is open to any Synapse client (it can only ever create a
-# PENDING row); approving, minting and revoking demand the admin gate, which the root
-# token cannot clear. Doing nothing is already the safe state.
+# set of projects. Enrolling is anchored to an allowlisted OAuth/OIDC identity (the same
+# device flow `synapse login` uses), NOT to the shared machine token; minting, listing
+# and revoking demand the admin gate, which the root token also cannot clear. Registered
+# AFTER _idp is built, since enrollment needs it. Doing nothing is already the safe state.
 from mcp_server.surface_routes import register as _register_surface_routes  # noqa: E402
 
-_register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized)
+_register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized, idp=_idp)
 
 # Board read route — GET /context?project=X serves the rendered explicit-memory board
 # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).

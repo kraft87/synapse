@@ -5,13 +5,14 @@ session's context), (b) scope it to the project derived from the hook payload's 
 the same way the ingest path labels episodes (basename of cwd; process cwd fallback),
 (c) honor the SYNAPSE_BOARD=0 kill switch without touching the network, (d) be
 fail-open: server down, timeout, or a non-ok payload prints nothing and exits 0 — a
-broken board must never break a session start — and (e) since schema 054, drive device
-enrollment and print the PAIRING block while this device is still pending, because a
-pending device is served nothing and an unexplained empty session start is worse than
-a restricted one.
+broken board must never break a session start — and (e) since schema 054, explain a 401
+on an UNENROLLED machine instead of failing silently, because a machine with no
+credential of its own is served nothing and an unexplained empty session start is worse
+than a restricted one.
 
 It no longer sends a ``surface`` param: the bearer identifies the caller now, and a
-host name the client asserts is evidence of nothing.
+host name the client asserts is evidence of nothing. Enrollment itself is interactive
+(it prints a sign-in code and waits for a human), so the hook never runs it.
 
 Stdlib-only script loaded by path (it lives outside the package). No live server:
 config.get_json is monkeypatched on the loaded module.
@@ -102,10 +103,9 @@ def _run(monkeypatch, mod: ModuleType, stdin: str, reply) -> list[tuple[str, dic
         return reply
 
     monkeypatch.setattr(mod, "get_json", fake_get_json)
-    # Enrollment is a separate concern with its own tests; pin it "already approved"
-    # so these assertions stay about the board fetch.
-    monkeypatch.setattr(mod.enroll, "ensure_enrolled", lambda *a, **k: {"status": "approved"})
-    monkeypatch.setattr(mod.enroll, "mark_approved", lambda: None)
+    # Enrollment is a separate concern with its own tests; pin it "already enrolled" so
+    # these assertions stay about the board fetch.
+    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: True)
     monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
     mod.main()
     return calls
@@ -206,3 +206,38 @@ def test_project_falls_back_to_process_cwd(monkeypatch, tmp_path, stdin):
     mod = _load_hook()
     calls = _run(monkeypatch, mod, stdin, {"status": "ok", "text": "b"})
     assert calls == [("/context", {"project": tmp_path.name})]
+
+
+def test_a_401_on_an_unenrolled_machine_explains_itself(monkeypatch, tmp_path, capsys):
+    """The one error worth a block: this machine holds no credential of its own, so it
+    will go on being served nothing until someone signs in. Silence would read as
+    "memory is empty"."""
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
+
+    def fake_get_json(path, params=None, timeout=30.0):
+        raise urllib.error.HTTPError("http://x/context", 401, "unauthorized", None, None)
+
+    monkeypatch.setattr(mod, "get_json", fake_get_json)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    mod.main()
+    out = capsys.readouterr().out
+    assert "not enrolled" in out and "synapse-login" in out
+
+
+def test_a_401_on_an_enrolled_machine_stays_silent(monkeypatch, tmp_path, capsys):
+    """A revoked or briefly-broken credential on a machine that DID enroll is not the
+    user's cue to re-run login — it is an operator problem, and a session start is the
+    wrong place to guess at it."""
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: True)
+
+    def fake_get_json(path, params=None, timeout=30.0):
+        raise urllib.error.HTTPError("http://x/context", 401, "unauthorized", None, None)
+
+    monkeypatch.setattr(mod, "get_json", fake_get_json)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    mod.main()
+    assert capsys.readouterr().out == ""

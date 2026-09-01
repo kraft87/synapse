@@ -6,41 +6,48 @@ episodes and timeline events inside its ``allowed_projects``. A caller with no m
 row is restricted with an empty allowlist, which is why these routes only ever GRANT —
 the safe state is the one you get by doing nothing.
 
-**Two gates, and the difference between them is the whole design.**
+**Enrollment is anchored to the owner's identity, not to a shared secret.** A new
+machine gets its device token by completing the IdP's device flow (RFC 8628 — a short
+code approved in a browser on any device, the same lane ``synapse login`` already uses)
+and passing the resulting ``device_code`` here. The server polls the IdP, reads the
+identity, and enforces the same allowlist as every other login. Only then does it mint.
 
-``authorized`` (client) admits the root token or any approved device token. ``admin``
-admits ONLY an approved, FULL-TRUST device token — never the root token. Every machine
-that installs the plugin has to hold the root token long enough to enroll, so if the
-root token could also approve, a machine could self-approve and TOFU would be theatre.
-Enrollment can enroll; it cannot bless.
+That is why there is no pair code and no pending state. Trust-on-first-use exists to
+compensate for an ANONYMOUS enrollment credential — if all a new machine can prove is
+"I hold the shared token", something else has to vouch for it, so you get a pending row
+and a second device that approves it. But an OAuth-verified owner standing at the new
+machine has already answered the only question that ceremony was asking. A second
+confirmation after an authenticated request confirms nothing, and a pending state is a
+state in which a laptop silently has no memory. Accepted in the threat model: theft of
+the owner's IdP credential (mitigated by the IdP's own 2FA), which would in any case be
+enough to reach the dashboard and read everything directly.
+
+**The root machine token cannot enroll.** It is the services' credential for ``/ingest``
+and the internal write paths, and every machine that ever ran the plugin has held it. A
+credential that widespread must not be able to create a *new* credential.
 
 Routes:
-  POST   /surfaces/enroll         client  -> {"status", "surface", "token", "pair_code"?}
-  POST   /surfaces/approve        admin   -> {"status": "ok", "surface": {...}}
-  POST   /surfaces/mint           admin   -> {"status": "ok", "surface": {...}, "token"}
-  GET    /surfaces                admin   -> {"status": "ok", "surfaces": [...]}
-  PUT    /surfaces/{surface_id}   admin   -> {"status": "ok", "surface": {...}}
-  DELETE /surfaces/{surface_id}   admin   -> {"status": "ok", "revoked": N}
+  POST   /surfaces/enroll         OAuth device_code -> {"status":"ok","surface":{...},"token"}
+  POST   /surfaces/mint           admin             -> {"status":"ok","surface":{...},"token"}
+  GET    /surfaces                admin             -> {"status":"ok","surfaces":[...]}
+  PUT    /surfaces/{surface_id}   admin             -> {"status":"ok","surface":{...}}
+  DELETE /surfaces/{surface_id}   admin             -> {"status":"ok","revoked":N}
 
-**enroll** mints a device token and inserts a row. If this Synapse has no approved
-device yet, that first row is approved at full trust — nobody exists who could approve
-it, and the branch is unreachable ever after. Every later enrollment lands ``pending``
-with a 6-character pair code and is served nothing until approved. The body may carry
-the machine's self-declared role (``requested_trust``), which is stored as a REQUEST:
-it becomes approve's default and grants nothing on its own.
+**enroll** takes ``{device_code, label, trust, allowed_projects}``. ``label`` is the
+hostname and is DISPLAY ONLY — never matched against an existing row, because keying an
+enrollment on a self-reported name is exactly the hostname spoofing 054 removes ("enroll
+as `trusted-laptop`, inherit its grant"). ``trust`` is the answer to the plugin's
+install-time "personal or work?" prompt, and it is authoritative here because the person
+answering it just authenticated. Unstated ⇒ ``restricted``: a client that did not ask
+the question must not resolve it to full access.
 
-**approve** takes the pair code and grants a trust level, defaulting to what the device
-requested. The code is cleared on success, so it is single-use, and only ``pending``
-rows are reachable — a revoked device is never resurrected by replaying its old code.
+**mint** is the same operation for a machine that will never run a browser flow (a
+headless box, a service). ``admin`` gated, so it needs a machine that is already trusted.
 
-**mint** is the untrusted-machine path: pre-create an approved token from a machine you
-already trust, and carry only that token over. The target machine never holds the
-enrollment credential at all.
-
-**PUT** still exists for the CREDENTIAL-LESS ids: ``oauth:<login>`` (the claude.ai
-connector authenticates by verified identity, not by a device token) and legacy
-hostname rows during the migration window. It cannot touch a device row — promoting a
-known token to full trust without going through approve() would reopen the hole.
+**PUT** exists for the CREDENTIAL-LESS ids: ``oauth:<login>`` (the claude.ai connector
+authenticates by verified identity, not by a device token) and legacy hostname rows
+during the migration window. It cannot touch a device row — handing an already-issued
+token full trust by id would bypass enrollment entirely.
 
 **DELETE** revokes: status='revoked', token cleared, trust reset to the floor. The row
 survives as the audit record of what was once trusted.
@@ -57,9 +64,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.surfaces import (
-    NoSuchPairCode,
     SchemaMissing,
-    approve_surface,
     enroll_surface,
     list_surfaces,
     mint_surface,
@@ -74,18 +79,24 @@ _MAX_ID_LEN = 200
 _MAX_PROJECTS = 100
 _MAX_LABEL_LEN = 200
 
+#: IdP device-flow states that mean "keep polling", passed straight back to the client
+#: so it can distinguish "not yet" from "no".
+_PENDING_ERRORS = {"authorization_pending", "slow_down"}
+
 
 def register(
     mcp: Any,
     db_url: str,
     authorized: Callable[[Request], bool],
     admin: Callable[[Request], bool] | None = None,
+    idp: Any = None,
 ) -> None:
     """Mount the surface routes.
 
-    ``admin`` defaults to ``authorized`` only so a caller that has not been updated
-    still boots; every real deployment passes the stricter gate. Tests that exercise
-    the no-self-approve property MUST pass it explicitly.
+    ``admin`` defaults to ``authorized`` only so an un-updated caller still boots; every
+    real deployment passes the stricter gate. ``idp`` enables ``/surfaces/enroll``:
+    without an identity provider there is no identity to anchor an enrollment to, so
+    that route reports 503 and the operator uses ``scripts/surface_admin.py mint``.
     """
     if not db_url:
         logger.info("surface routes disabled (no DB_URL)")
@@ -96,20 +107,17 @@ def register(
         return (request.path_params.get("surface_id") or "").strip()
 
     async def _run(
-        request: Request, work: Callable[[], Any], gate: Callable[[Request], bool]
+        request: Request, work: Callable[[], Any], gate: Callable[[Request], bool] | None
     ) -> JSONResponse | Any:
         """Auth + threadpool, shared by every verb. Returns a JSONResponse on any
-        failure, or the raw work() result on success."""
-        if not gate(request):
+        failure, or the raw work() result on success. ``gate=None`` means the caller has
+        already authenticated by another means (the enroll route's identity check)."""
+        if gate is not None and not gate(request):
             return unauthorized()
         try:
             return await run_in_threadpool(work)
         except SchemaMissing:
             return err("surfaces table missing (apply schema/053+054)", 503)
-        except NoSuchPairCode as e:
-            # 404, not 401: the caller is authorized, the CODE is what is wrong. A 401
-            # here would send an operator hunting a credential problem that isn't one.
-            return err(str(e)[:200], 404)
         except ValueError as e:
             return err(str(e)[:200], 400)
         except Exception as e:  # pragma: no cover - defensive
@@ -125,106 +133,124 @@ def register(
             return err("body must be a JSON object", 400)
         return body
 
-    def _projects(body: dict[str, Any], key: str = "allowed_projects") -> list[str] | JSONResponse:
-        projects = body.get(key) or []
+    def _projects(body: dict[str, Any]) -> list[str] | None | JSONResponse:
+        """The allowlist the caller stated, or None for "unstated".
+
+        The distinction is load-bearing: unstated lets a restricted surface inherit the
+        scope other restricted surfaces already have, while an explicit ``[]`` narrows
+        it to nothing. An operator has to be able to say "no projects" and mean it.
+        """
+        if body.get("allowed_projects") is None:
+            return None
+        projects = body["allowed_projects"]
         if not isinstance(projects, list):
-            return err(f"{key} must be a list", 400)
+            return err("allowed_projects must be a list", 400)
         if len(projects) > _MAX_PROJECTS:
-            return err(f"{key} capped at {_MAX_PROJECTS}", 400)
+            return err(f"allowed_projects capped at {_MAX_PROJECTS}", 400)
         return [str(p) for p in projects]
+
+    def _grant(body: dict[str, Any]) -> tuple[str | None, list[str] | None] | JSONResponse:
+        projects = _projects(body)
+        if isinstance(projects, JSONResponse):
+            return projects
+        return (str(body.get("trust") or "") or None), projects
 
     # -- enrollment ---------------------------------------------------------
 
     @mcp.custom_route("/surfaces/enroll", methods=["POST"])  # type: ignore[misc]
     async def surfaces_enroll(request: Request) -> JSONResponse:
-        """Join this Synapse: mint a device token for the calling machine.
+        """Join this Synapse: prove an allowlisted identity, get this device's token.
 
-        Body ``{"label": "<hostname>", "requested_trust": "full"|"restricted",
-        "requested_projects": [...]}``.
+        Body ``{"device_code": "...", "label": "<hostname>", "trust": "full"|"restricted",
+        "allowed_projects": [...]}``.
 
-        The label is DISPLAY ONLY — it is never matched against an existing row, because
-        binding an enrollment to a self-reported name is exactly the hostname spoofing
-        054 removes ("enroll as `trusted-laptop`, inherit its grant"). The row's real id
-        is server-generated.
-
-        ``requested_trust`` is the machine's answer to "personal or work?" from the
-        plugin's install prompt. It is a REQUEST: stored on the pending row, offered as
-        the default when someone approves, and load-bearing for nothing else. A device
-        that declares itself personal is served exactly as much as one that declares
-        nothing — which is nothing — until an approved full-trust device approves it.
+        ``device_code`` comes from ``POST /device/code`` — the client prints the short
+        user code, the human approves it in a browser anywhere (phone included), and the
+        client polls here. Each poll re-polls the IdP, so ``authorization_pending`` and
+        ``slow_down`` come straight back and the client keeps waiting. Approval plus an
+        allowlisted identity is what authorizes the mint; the machine token is refused
+        outright, because the credential every machine already holds must not be able to
+        create new credentials.
         """
+        if idp is None:
+            return err(
+                "enrollment needs an identity provider (GitHub or OIDC); "
+                "use scripts/surface_admin.py mint on the database host instead",
+                503,
+            )
         body = await _body(request)
         if isinstance(body, JSONResponse):
             return body
-        req_projects = _projects(body, "requested_projects")
-        if isinstance(req_projects, JSONResponse):
-            return req_projects
+        device_code = str(body.get("device_code") or "")
+        if not device_code:
+            return err("device_code required — start with POST /device/code", 400)
+        grant = _grant(body)
+        if isinstance(grant, JSONResponse):
+            return grant
+        trust, projects = grant
         label = str(body.get("label") or "")[:_MAX_LABEL_LEN]
-        req_trust = str(body.get("requested_trust") or "") or None
-        out = await _run(
-            request,
-            lambda: enroll_surface(db_url, label, req_trust, req_projects),
-            authorized,
-        )
+
+        # Identity first, always. Nothing below this point runs for a caller the IdP
+        # and the allowlist have not both admitted.
+        try:
+            tok = await idp.device_poll(device_code)
+        except Exception as e:
+            logger.warning("enroll: %s device poll failed: %s", idp.label, e)
+            return err(f"{idp.label} device poll failed", 502)
+        access = tok.get("access_token")
+        if not access:
+            reason = tok.get("error", "authorization_pending")
+            # 202 for "still waiting" so a polling client can tell it apart from a
+            # refusal without parsing prose; 403 once the IdP has said no.
+            return JSONResponse(
+                {"status": "pending", "error": reason},
+                status_code=202 if reason in _PENDING_ERRORS else 403,
+            )
+        try:
+            identity = await idp.fetch_identity(access)
+        except Exception as e:
+            logger.warning("enroll: %s identity lookup failed: %s", idp.label, e)
+            return err(f"{idp.label} identity lookup failed", 502)
+        if not identity or identity not in idp.allowed:
+            logger.warning("enroll: %s user %r not in allowlist", idp.label, identity)
+            return err(f"{idp.label} user {identity!r} not in allowlist", 403)
+
+        out = await _run(request, lambda: enroll_surface(db_url, label, trust, projects), None)
         if isinstance(out, JSONResponse):
             return out
-        surface = out["surface"]
+        logger.info(
+            "device enrolled by %s user %r: %s trust=%s",
+            idp.label,
+            identity,
+            out["surface"]["surface_id"],
+            out["surface"]["trust"],
+        )
         return JSONResponse(
             {
-                "status": surface["status"],  # "approved" (bootstrap) or "pending"
-                "surface": surface,
+                "status": "ok",
+                "surface": out["surface"],
                 # Shown ONCE. Only the hash is stored, so nothing can hand it back later.
                 "token": out["token"],
-                "pair_code": surface.get("pair_code"),
+                "login": identity,
             }
         )
 
-    @mcp.custom_route("/surfaces/approve", methods=["POST"])  # type: ignore[misc]
-    async def surfaces_approve(request: Request) -> JSONResponse:
-        """Approve a pending device by pair code. ADMIN gate — the root token cannot.
-
-        Body ``{"pair_code": "ABC123", "trust": "full"|"restricted",
-        "allowed_projects": [...]}``. ``trust`` and ``allowed_projects`` are OPTIONAL:
-        omitted, they fall back to what the device asked for at enrollment (and, for a
-        restricted device that named no projects, to the scope other approved restricted
-        devices already have). Supplying them overrides the request entirely.
-
-        A device with no stated request lands on ``restricted`` with an empty allowlist,
-        which serves nothing — the schema default, the no-row default and this default
-        all agree, so an unstated role never becomes a grant by omission.
-        """
-        body = await _body(request)
-        if isinstance(body, JSONResponse):
-            return body
-        projects = None
-        if body.get("allowed_projects") is not None:
-            projects = _projects(body)
-            if isinstance(projects, JSONResponse):
-                return projects
-        code = str(body.get("pair_code") or "")
-        trust = str(body.get("trust") or "") or None
-        out = await _run(
-            request, lambda: approve_surface(db_url, code, trust, projects), admin_gate
-        )
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse({"status": "ok", "surface": out})
-
     @mcp.custom_route("/surfaces/mint", methods=["POST"])  # type: ignore[misc]
     async def surfaces_mint(request: Request) -> JSONResponse:
-        """Pre-mint an approved device token for a machine you do not want to trust
-        with the enrollment credential. ADMIN gate.
+        """Create a device token for a machine that will never run a browser flow —
+        a headless box, a service, a container. ADMIN gate: it needs a machine that is
+        already trusted, since there is no identity in the request to anchor on.
 
         Body ``{"label": "...", "trust": ..., "allowed_projects": [...]}``.
         """
         body = await _body(request)
         if isinstance(body, JSONResponse):
             return body
-        projects = _projects(body)
-        if isinstance(projects, JSONResponse):
-            return projects
+        grant = _grant(body)
+        if isinstance(grant, JSONResponse):
+            return grant
+        trust, projects = grant
         label = str(body.get("label") or "")[:_MAX_LABEL_LEN]
-        trust = str(body.get("trust") or "restricted")
         out = await _run(request, lambda: mint_surface(db_url, label, trust, projects), admin_gate)
         if isinstance(out, JSONResponse):
             return out
@@ -234,8 +260,8 @@ def register(
 
     @mcp.custom_route("/surfaces", methods=["GET"])  # type: ignore[misc]
     async def surfaces_list(request: Request) -> JSONResponse:
-        """Every surface — pending first — in one read: "who can see what, and who is
-        asking". ADMIN gate: the pair codes in here are approval capabilities."""
+        """Every surface — "who can see what", in one read. ADMIN gated: the listing is
+        the map of what each credential reaches."""
         out = await _run(request, lambda: list_surfaces(db_url), admin_gate)
         if isinstance(out, JSONResponse):
             return out
@@ -246,22 +272,24 @@ def register(
         """Register or re-register one credential-less surface (``oauth:<login>``, or a
         legacy hostname row). Idempotent; replaces trust + allowlist wholesale, because
         a partial update of a security allowlist is how a stale grant survives a
-        demotion. Rejects device rows — those go through approve/mint/revoke."""
+        demotion. Rejects device rows — those go through enroll/mint/revoke."""
         surface_id = _surface_id(request)
         if not surface_id or len(surface_id) > _MAX_ID_LEN:
             return err("surface_id required", 400)
         body = await _body(request)
         if isinstance(body, JSONResponse):
             return body
-        projects = _projects(body)
-        if isinstance(projects, JSONResponse):
-            return projects
+        grant = _grant(body)
+        if isinstance(grant, JSONResponse):
+            return grant
+        trust, projects = grant
         # Default to restricted when the caller omits `trust`: the schema default and
         # the no-row default both say restricted, so the route must not be the one
         # place where a missing field means "full".
-        trust = str(body.get("trust") or "restricted")
         out = await _run(
-            request, lambda: upsert_surface(db_url, surface_id, trust, projects), admin_gate
+            request,
+            lambda: upsert_surface(db_url, surface_id, trust or "restricted", projects or []),
+            admin_gate,
         )
         if isinstance(out, JSONResponse):
             return out

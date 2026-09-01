@@ -265,8 +265,9 @@ _needs_db = pytest.mark.skipif(not _db_reachable(), reason="no test DB reachable
 
 @pytest.fixture()
 def credentialed(monkeypatch):
-    """A server reloaded against the test DB, with a root token and two device tokens:
-    one full-trust (the admin credential) and one restricted (a work laptop)."""
+    """A server reloaded against the test DB, with a root token and three device tokens:
+    one full-trust (the admin credential), one restricted (a work laptop), and one
+    revoked."""
     import psycopg
 
     from tests.helpers.surfaces import clear_surfaces, register_device
@@ -275,7 +276,7 @@ def credentialed(monkeypatch):
     clear_surfaces(conn)
     register_device(conn, "full-device", trust="full", surface_id="dev-full")
     register_device(conn, "work-device", trust="restricted", projects=["w"], surface_id="dev-work")
-    register_device(conn, "pending-device", trust="full", surface_id="dev-pend", status="pending")
+    register_device(conn, "revoked-device", trust="full", surface_id="dev-gone", status="revoked")
     monkeypatch.setenv("SYNAPSE_DB_URL", _TEST_DB)
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "root-tok"})
     yield s
@@ -287,10 +288,10 @@ def credentialed(monkeypatch):
 @pytest.mark.parametrize(
     "token,client_ok,admin_ok",
     [
-        ("root-tok", True, False),  # THE asymmetry: enrollment credential, not an admin
+        ("root-tok", True, False),  # THE asymmetry: the services' credential, not an admin
         ("full-device", True, True),
         ("work-device", True, False),  # restricted is a read scope, not a lesser admin
-        ("pending-device", False, False),  # authenticates as nothing until approved
+        ("revoked-device", False, False),  # the hash is cleared: it matches no row
         ("garbage", False, False),
     ],
 )
@@ -303,10 +304,10 @@ def test_the_two_gates_admit_exactly_the_right_credentials(
 
 
 @_needs_db
-def test_the_admin_gate_is_the_no_self_approve_property(credentialed):
-    """Spelled out because it is the reason this change exists: every machine holds the
-    root token at install time, so if root cleared the admin gate a device could approve
-    itself and the pending state would mean nothing."""
+def test_the_admin_gate_excludes_the_root_token(credentialed):
+    """Spelled out because it is load-bearing: every machine that ever ran the plugin
+    has held the root token, so a credential that widespread must not be able to mint
+    new credentials, list who is trusted, or read the dashboard's unfiltered view."""
     assert credentialed._admin_authorized(_Req({"authorization": "Bearer root-tok"})) is False
     assert credentialed._admin_authorized(_Req({})) is False
 
@@ -352,14 +353,14 @@ async def test_the_verifier_stamps_a_device_with_its_resolved_row(credentialed):
         "trust": "restricted",
         "allowed_projects": ["w"],
     }
-    assert await v.verify_token("pending-device") is None
+    assert await v.verify_token("revoked-device") is None
     assert await v.verify_token("never-issued") is None
 
 
 @_needs_db
 def test_a_device_token_cannot_fetch_the_root_credential(credentialed, monkeypatch):
-    """Device tokens are leaves. Handing one the shared, un-revocable enrollment
-    credential would collapse the two back into one and make revocation meaningless."""
+    """Device tokens are leaves. Handing one the shared, un-revocable root credential
+    would collapse the two back into one and make revocation meaningless."""
     import fastmcp.exceptions as fe
 
     class _Tok:
