@@ -26,7 +26,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-from common import SURFACE, _cfg, get_json
+from common import _cfg, get_json
 
 _MAX_PREF_LINES = 7
 _PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
@@ -42,9 +42,12 @@ def _board_text(project: str | None) -> str | None:
     if _cfg("SYNAPSE_BOARD", "1") == "0":
         return None
     try:
-        params = {"project": project} if project else {}
-        params["surface"] = SURFACE  # host trust (schema 053) — the server does the filtering
-        r = get_json("/context", params, timeout=10)
+        # No `surface` param since schema 054: the bearer identifies the caller, and a
+        # host name the client asserts identifies nothing. This mirror reads whatever
+        # credential is configured — including the device token the Claude Code plugin's
+        # enroll.py writes into the shared settings.json, so a machine running both
+        # plugins is ONE surface rather than two.
+        r = get_json("/context", {"project": project} if project else {}, timeout=10)
         return r.get("text") if r.get("status") == "ok" else None
     except Exception:
         return None

@@ -21,14 +21,57 @@ FULL_SURFACE = "test-full-surface"
 RESTRICTED_SURFACE = "test-restricted-surface"
 
 
-def _upsert(conn: psycopg.Connection, surface_id: str, trust: str, projects: list[str]) -> str:
+def _upsert(
+    conn: psycopg.Connection,
+    surface_id: str,
+    trust: str,
+    projects: list[str],
+    *,
+    status: str = "approved",
+    token_hash: str | None = None,
+) -> str:
+    """Write one surfaces row. ``status='approved'`` by default — schema 054's column
+    default is the fail-closed 'revoked', so a helper that omitted it would silently
+    produce rows that serve nothing and every unrelated test would go mysteriously
+    empty."""
     conn.execute(
-        "INSERT INTO surfaces (surface_id, trust, allowed_projects) VALUES (%s, %s, %s) "
+        "INSERT INTO surfaces (surface_id, trust, allowed_projects, status, token_hash) "
+        "VALUES (%s, %s, %s, %s, %s) "
         "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
-        "  allowed_projects = EXCLUDED.allowed_projects, updated_at = now()",
-        (surface_id, trust, projects),
+        "  allowed_projects = EXCLUDED.allowed_projects, status = EXCLUDED.status, "
+        "  token_hash = EXCLUDED.token_hash, updated_at = now()",
+        (surface_id, trust, projects, status, token_hash),
     )
     return surface_id
+
+
+def register_device(
+    conn: psycopg.Connection,
+    token: str,
+    *,
+    trust: str = "full",
+    projects: list[str] | None = None,
+    status: str = "approved",
+    surface_id: str | None = None,
+    label: str | None = None,
+) -> str:
+    """Register a CREDENTIAL-bound surface (schema 054) and return its id.
+
+    The token is stored hashed, exactly as the routes store it, so tests authenticate
+    with the plaintext the same way a real client does.
+    """
+    from ingestion.surfaces import token_hash as _hash
+
+    sid = surface_id or f"dev-test-{token[:8]}"
+    conn.execute(
+        "INSERT INTO surfaces (surface_id, trust, allowed_projects, status, token_hash, label) "
+        "VALUES (%s, %s, %s, %s, %s, %s) "
+        "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
+        "  allowed_projects = EXCLUDED.allowed_projects, status = EXCLUDED.status, "
+        "  token_hash = EXCLUDED.token_hash, label = EXCLUDED.label, updated_at = now()",
+        (sid, trust, projects or [], status, _hash(token), label),
+    )
+    return sid
 
 
 def register_full(conn: psycopg.Connection, surface_id: str = FULL_SURFACE) -> str:

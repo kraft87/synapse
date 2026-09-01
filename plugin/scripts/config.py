@@ -21,6 +21,7 @@ Env vars (all optional):
   SYNAPSE_MCP_URL       legacy override for /mcp     (else derived)
   SYNAPSE_SKILLS_SYNC   "1" enables the SessionStart skills sync (default OFF — opt-in)
   SYNAPSE_CONFIG_SYNC   "1" enables config-file mirroring (default OFF — opt-in)
+  SYNAPSE_MACHINE_ROLE  "personal" (default) or "work" — the trust this device enrolls at
 """
 
 from __future__ import annotations
@@ -168,7 +169,41 @@ RECALL_URL = _cfg("SYNAPSE_RECALL_URL") or BASE_URL + "/recall"
 MCP_URL = _cfg("SYNAPSE_MCP_URL") or BASE_URL + "/mcp"
 SKILLS_URL = BASE_URL + "/skills"
 # env / userConfig wins; else a token fetched by `synapse login`.
+#
+# Schema 054 changed what this value MEANS over a machine's lifetime without changing
+# where it lives. At install it is the ENROLLMENT credential — the shared root token,
+# pasted or fetched by `synapse login`. On first session, enroll.py trades it for a
+# token minted for THIS device and overwrites it here, so plugin.json's
+# `Authorization: Bearer ${user_config.SYNAPSE_INGEST_TOKEN}` header keeps working with
+# no change on either side. One slot, two lifecycle stages: the client never has to
+# manage two credentials, and nothing downstream had to learn a new config key.
 INGEST_TOKEN = _cfg("SYNAPSE_INGEST_TOKEN") or _cred("SYNAPSE_INGEST_TOKEN")
+
+# Enrollment state for this device (schema 054). Kept in DATA_DIR rather than
+# settings.json because it is local bookkeeping, not configuration: which surface row
+# this machine got and what it was granted. settings.json holds the credential; this
+# holds the story around it, and its presence is how the hooks know this machine has a
+# credential of its OWN rather than one someone pasted in.
+DEVICE_FILE = DATA_DIR / "device.json"
+
+
+def read_device_state() -> dict:
+    """This device's enrollment record, or ``{}``. Never raises."""
+    try:
+        data = json.loads(DEVICE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_device_state(state: dict) -> None:
+    """Persist the enrollment record. Fail-soft: a hook must not die over bookkeeping."""
+    try:
+        DEVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DEVICE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
 
 # Skills sync: OFF by default — a hook that writes files into ~/.claude/skills on
 # every session start should be opt-in for a public plugin (issue #9). Set
@@ -181,7 +216,34 @@ SKILLS_SYNC = _cfg("SYNAPSE_SKILLS_SYNC", "0") not in ("", "0")
 # (relative to CONFIG_DIR) beyond the auto set. Surface = this machine.
 CONFIG_SYNC = _cfg("SYNAPSE_CONFIG_SYNC", "0") != "0"
 CONFIG_PATHS = [g for g in re.split(r"[,\s]+", _cfg("SYNAPSE_CONFIG_PATHS", "")) if g]
+# This machine's NAME. Since schema 054 it is a display label sent once at enrollment —
+# it identifies nothing and grants nothing. The config lane still keys mirrored files on
+# it (those are per-machine files, not a trust boundary). Serving trust comes from the
+# device token; a hostname is no longer accepted as evidence of anything.
 SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
+
+# What this machine is, from the install prompt: "personal" (default) or "work". It
+# travels once, at enrollment, and it is authoritative there — the person answering it
+# has just authenticated to the IdP, so they are the authority for what their own
+# machine is.
+#
+# The prompt defaults to "personal" because the single-user common case is a machine
+# that should see everything, and a default that makes the normal path silently useless
+# gets worked around rather than understood. The narrow default lives one layer down
+# instead: the SERVER treats an unstated role as restricted, so a client that never
+# asked the question cannot resolve it to full access. Human says nothing -> personal;
+# software says nothing -> restricted.
+MACHINE_ROLE = (_cfg("SYNAPSE_MACHINE_ROLE", "personal") or "personal").strip().lower()
+
+#: role -> trust level. Anything unrecognised states nothing, and the server's own
+#: narrow default (restricted, inherited work projects) applies.
+_ROLE_TRUST = {"personal": "full", "work": "restricted"}
+
+
+def requested_trust() -> str | None:
+    """The trust level this machine declares at enrollment, or None if unstated."""
+    return _ROLE_TRUST.get(MACHINE_ROLE)
+
 
 _UA = "synapse-plugin/0.9"
 

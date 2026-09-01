@@ -278,9 +278,16 @@ def register(
     db_url: str,
     authorized: Callable[[Request], bool],
     get_recall: Callable[[], Any] | None = None,
+    resolve_trust: Callable[[Request, str | None], SurfaceTrust] | None = None,
 ) -> None:
-    """Mount GET /context. ``get_recall`` lazily yields the process's Recall engine so
-    board serves share its telemetry writer; None (dev/stdio) skips telemetry."""
+    """Mount GET /context.
+
+    ``get_recall`` lazily yields the process's Recall engine so board serves share its
+    telemetry writer; None (dev/stdio) skips telemetry. ``resolve_trust`` is the
+    server's single caller-resolution point (device token → its surface; root token →
+    the legacy ``?surface=`` param). None falls back to resolving the query param
+    alone, which is the pre-054 behaviour and still fail-closed.
+    """
     if not db_url:
         logger.info("board routes disabled (no DB_URL)")
         return
@@ -293,9 +300,10 @@ def register(
             return unauthorized()
         project = request.query_params.get("project") or None
         surface = request.query_params.get("surface") or None
+        trust = resolve_trust(request, surface) if resolve_trust is not None else None
         t0 = time.perf_counter()
         try:
-            board = await run_in_threadpool(build_board, db_url, project, surface)
+            board = await run_in_threadpool(build_board, db_url, project, surface, trust)
         except Exception as e:
             logger.warning("board build failed: %s", e)
             return err(str(e)[:200], 500)

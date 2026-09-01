@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# synapse-devices — list / mint / revoke Synapse device credentials.
+#
+# Claude Code puts a plugin's bin/ on PATH, so this is just `synapse-devices list`
+# in any terminal (or `! synapse-devices list` inside a session). It locates the CLI relative
+# to itself and reads config from settings.json, so it needs NO environment variables and NO
+# $CLAUDE_PLUGIN_ROOT. Requires a FULL-TRUST device token: the shared machine token is
+# refused by these routes on purpose, so a widely-held credential can never mint new ones.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$DIR/../scripts/device_admin.py"
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "synapse-devices: need python3 or python on PATH" >&2
+  exit 1
+fi
+exec "$PY" "$SCRIPT" "$@"

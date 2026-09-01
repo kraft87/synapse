@@ -15,17 +15,40 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import Any
 
 import logfire
 from fastmcp import FastMCP
 from fastmcp.exceptions import AuthorizationError
 from fastmcp.server.auth import MultiAuth
 from fastmcp.server.auth.providers.github import GitHubProvider
-from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from ingestion.surfaces import SurfaceTrust, resolve_caller, token_hash
+
+# The credential verifier and the constants it stamps, from ONE module so what WRITES a
+# claim and what READS it cannot drift: the client_ids decide whether the human-login
+# allowlist applies, and `kind` decides which trust lane a call resolves through.
+from mcp_server.auth_tokens import (
+    DEVICE_CLIENT_ID as _DEVICE_CLIENT_ID,
+)
+from mcp_server.auth_tokens import (
+    KIND_DEVICE as _KIND_DEVICE,
+)
+from mcp_server.auth_tokens import (
+    ROOT_CLIENT_ID as _MACHINE_CLIENT_ID,
+)
+from mcp_server.auth_tokens import (
+    SynapseTokenVerifier,
+    claims_of,
+)
+
+#: Both machine lanes. The human-login allowlist skips these client_ids — the credential
+#: is their whole gate, and there is no identity on them to match against a list.
+_MACHINE_CLIENT_IDS = {_MACHINE_CLIENT_ID, _DEVICE_CLIENT_ID}
 
 # Logfire spans for the MCP server. Each tool invocation (recall, fetch,
 # remember, ...) gets a top-level span; auto-instrument
@@ -76,8 +99,13 @@ def _cfg(key: str, default: str = "") -> str:
 
 
 # --- Auth (env-gated; absent machine token => OPEN server, the pre-cutover / dev default) ---
-# One opaque bearer gates /mcp (StaticTokenVerifier) AND /ingest + /recall (manual check below).
-# Set GITHUB_CLIENT_ID to additionally stand up the claude.ai-web OAuth leg via MultiAuth.
+# The ROOT bearer. It gates /mcp (via SynapseTokenVerifier) AND the internal write lanes
+# (/ingest and friends, manual check below), and it is the ENROLLMENT credential every new
+# device pastes once to obtain its own token. It is deliberately NOT sufficient for the
+# privileged operations — approving a device, minting a token, the dashboard — because the
+# credential a machine has to hold in order to join must not also be the credential that
+# decides who may join. Set GITHUB_CLIENT_ID to additionally stand up the claude.ai-web
+# OAuth leg via MultiAuth.
 MACHINE_TOKEN = _cfg("SYNAPSE_MACHINE_TOKEN")
 GITHUB_CLIENT_ID = _cfg("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = _cfg("GITHUB_CLIENT_SECRET")
@@ -109,12 +137,9 @@ OIDC_SCOPES = [
 OIDC_USER_CLAIMS = tuple(
     c for c in re.split(r"[ ,]+", _cfg("OIDC_USER_CLAIMS", "preferred_username,email")) if c
 )
-_MACHINE_CLIENT_ID = "synapse-machine"  # marks the bearer leg so the GitHub allowlist skips it
-
 # ---------------------------------------------------------------------------
 # Server bootstrap
 # ---------------------------------------------------------------------------
-
 import sys as _sys  # noqa: E402
 
 _use_http = "--stdio" not in _sys.argv
@@ -136,11 +161,12 @@ class _UserAllowlist(Middleware):
     """Gate tool calls so the interactive OAuth leg can't expose memory to the world.
 
     The OAuth proxies admit ANY upstream account by default; without this, anyone who
-    completes the OAuth flow could read this instance's memory. The machine bearer
-    leg carries client_id ``synapse-machine`` and skips the identity check. The
-    identity claim differs by provider: GitHub tokens carry ``login``, OIDC id_tokens
-    carry ``preferred_username``/``email`` (the IdP's claims config must put them in
-    the id_token — e.g. an Authelia claims policy).
+    completes the OAuth flow could read this instance's memory. The machine bearer legs
+    (root ``synapse-machine`` and per-device ``synapse-device``) carry no human identity
+    and skip the identity check — their gate is the credential itself. The identity claim
+    differs by provider: GitHub tokens carry ``login``, OIDC id_tokens carry
+    ``preferred_username``/``email`` (the IdP's claims config must put them in the
+    id_token — e.g. an Authelia claims policy).
     """
 
     def __init__(self, allowed_users: set[str], claim_keys: tuple[str, ...], label: str) -> None:
@@ -150,7 +176,7 @@ class _UserAllowlist(Middleware):
 
     async def on_call_tool(self, context, call_next):
         token = get_access_token()
-        if token is not None and token.client_id != _MACHINE_CLIENT_ID:
+        if token is not None and token.client_id not in _MACHINE_CLIENT_IDS:
             user = _claims_identity(token.claims or {}, self._claim_keys)
             if user not in self._allowed:
                 raise AuthorizationError(f"{self._label} user {user!r} not in allowlist")
@@ -230,9 +256,7 @@ def _build_auth():
     # The bearer's scopes must clear whichever interactive leg is active (MultiAuth
     # applies the server's required scopes to /mcp): "user" for GitHub, the OIDC set
     # otherwise. Carrying both is harmless.
-    bearer = StaticTokenVerifier(
-        {MACHINE_TOKEN: {"client_id": _MACHINE_CLIENT_ID, "scopes": ["user", *OIDC_SCOPES]}}
-    )
+    bearer = SynapseTokenVerifier(MACHINE_TOKEN, DB_URL, ["user", *OIDC_SCOPES])
     if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
         from fastmcp.server.auth.oidc_proxy import OIDCProxy
 
@@ -318,43 +342,97 @@ _IDENTITY_CLAIMS: tuple[str, ...] = _auth_mw[0]._claim_keys if _auth_mw else ()
 _OAUTH_SURFACE_PREFIX = "oauth:"
 
 
+def _access_token() -> Any:
+    """The request's AccessToken, or None. Never raises (no auth context at all)."""
+    try:
+        return get_access_token()
+    except Exception:  # pragma: no cover - defensive
+        return None
+
+
 def _oauth_identity() -> str:
     """The caller's OAuth/OIDC login, lowercased — "" when this is not that lane.
 
-    Empty for the machine-token bearer leg (client_id ``synapse-machine``), for an open
-    dev/stdio server, and for any call with no token context at all. Empty means "no
-    identity evidence", which the caller below treats as "change nothing".
+    Empty for both machine-credential legs (root and per-device), for an open dev/stdio
+    server, and for any call with no token context at all. Empty means "no identity
+    evidence", which the callers below treat as "change nothing".
     """
-    try:
-        token = get_access_token()
-    except Exception:  # pragma: no cover - defensive: no auth context at all
-        return ""
-    if token is None or token.client_id == _MACHINE_CLIENT_ID:
+    token = _access_token()
+    if token is None or token.client_id in _MACHINE_CLIENT_IDS:
         return ""
     return _claims_identity(token.claims or {}, _IDENTITY_CLAIMS)
 
 
 def _caller_surface(surface: str | None) -> str | None:
-    """The surface id audience scoping should enforce for this call (schema 053).
+    """The surface ID for this call — display/telemetry, and the legacy id lane.
 
-    Scoping resolves a ``surface`` param that the client's PreToolUse hook injects. MCP
-    callers on the OAuth/OIDC lane (the claude.ai connector) have no such hook, so they
-    send nothing and used to resolve to UNKNOWN — a fully authenticated owner identity
-    got the restricted, near-empty serve. They do carry better evidence than a hostname:
-    an identity this server verified. Resolve it to ``oauth:<login>`` and look THAT up
-    in `surfaces` like any other surface id.
-
-    Still fail-closed: no ``oauth:<login>`` row means restricted, exactly as before.
-    Nothing here creates a row or infers trust from a successful login — the operator
-    registers it (``PUT /surfaces/oauth:<login>``) to grant trust.
-
-    The derived id OVERRIDES a client-supplied ``surface``: a token identity the server
-    verified outranks a string the caller typed about itself. Machine-token callers are
-    untouched — that lane's token says only "a Synapse client", never which host, so its
-    hook-injected param remains the only evidence available.
+    See :func:`_caller_trust` for the verdict itself; this is the id that goes with it.
     """
+    return _caller_trust(surface).surface_id
+
+
+def _trust_from_claims(claims: dict) -> SurfaceTrust:
+    """A device token's verified claims → the trust verdict, with no second lookup.
+
+    The verifier already resolved the row (that is how the token authenticated at all),
+    so re-reading it here would double every request's auth cost to learn nothing. The
+    claims are per-request — ``verify_token`` runs on each call — so there is no stale
+    window a revocation could slip through.
+    """
+    return SurfaceTrust(
+        surface_id=claims.get("surface_id"),
+        trust=str(claims.get("trust") or "restricted"),
+        allowed_projects=tuple(claims.get("allowed_projects") or ()),
+        known=True,
+    )
+
+
+def _caller_trust(surface: str | None) -> SurfaceTrust:
+    """THE resolution point for an MCP call: which surface is this, and what may it see?
+
+    Three lanes, in strict precedence — a caller never gets to pick which one applies:
+
+    1. **Device token** (schema 054). The credential itself names the surface, so a
+       ``surface`` param is ignored outright. This is the lane the plugin uses after
+       enrollment and the one the whole design exists for: nothing self-reported can
+       widen it.
+    2. **OAuth/OIDC identity**. MCP clients on the interactive lane (the claude.ai
+       connector) run no hook and hold no device token, but they do carry an identity
+       this server verified and allowlisted. Resolve it to ``oauth:<login>`` and look
+       that up like any other surface id. Unregistered still means restricted.
+    3. **Root token + a legacy ``surface`` param**. The migration window, byte for byte
+       what schema 053 did. Deprecated: the param is self-reported under a shared
+       credential, which is exactly the spoofable arrangement 054 replaces. Callers
+       that send nothing resolve to UNKNOWN, the pre-054 behaviour for an unidentified
+       machine-token call.
+
+    Fail-closed at every step: an unknown credential, an unregistered identity, an
+    unreadable database all yield restricted with an empty allowlist.
+    """
+    claims = claims_of(_access_token())
+    if claims.get("kind") == _KIND_DEVICE:
+        return _trust_from_claims(claims)
     identity = _oauth_identity()
-    return f"{_OAUTH_SURFACE_PREFIX}{identity}" if identity else surface
+    if identity:
+        return resolve_caller(DB_URL, legacy_surface_id=f"{_OAUTH_SURFACE_PREFIX}{identity}")
+    return resolve_caller(DB_URL, legacy_surface_id=surface)
+
+
+def _request_trust(request: Request, surface: str | None = None) -> SurfaceTrust:
+    """:func:`_caller_trust` for the plain-HTTP custom routes.
+
+    Custom routes bypass FastMCP's auth middleware by design (issue #3704), so there is
+    no token context to read — the bearer has to be re-resolved from the header. Same
+    precedence, minus the OAuth lane, which never reaches these routes: browsers and
+    hooks send a bearer, not an OIDC token.
+    """
+    token = _bearer(request)
+    # No MACHINE_TOKEN at all means an OPEN server: no verifier was built, so no device
+    # token can exist and any bearer present is noise. Fall straight to the id lane, or
+    # a dev box would resolve every call to UNKNOWN and serve an empty board.
+    if MACHINE_TOKEN and token and not hmac.compare_digest(token, MACHINE_TOKEN):
+        return resolve_caller(DB_URL, token_hash_hex=token_hash(token))
+    return resolve_caller(DB_URL, legacy_surface_id=surface)
 
 
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
@@ -391,15 +469,67 @@ if DB_URL:
     mcp.add_provider(PgSkillsProvider(DB_URL))
 
 
+def _bearer(request: Request) -> str:
+    """The raw bearer credential on this request, or "" when there isn't one."""
+    authz = request.headers.get("authorization", "")
+    return authz[len("Bearer ") :].strip() if authz.startswith("Bearer ") else ""
+
+
+def _is_root(request: Request) -> bool:
+    """Root token, constant-time, no DB touch (see mcp_server.auth_tokens)."""
+    tok = _bearer(request)
+    return bool(MACHINE_TOKEN and tok and hmac.compare_digest(tok, MACHINE_TOKEN))
+
+
 def _machine_authorized(request: Request) -> bool:
-    """Custom routes bypass FastMCP's auth middleware (by design, issue #3704), so gate
-    them here. Open when no machine token is set (dev / pre-cutover)."""
+    """ "Is this a Synapse client?" — the CLIENT gate on the custom routes.
+
+    Custom routes bypass FastMCP's auth middleware (by design, issue #3704), so gate
+    them here. Passes for the root token (the services on the Docker host, and any
+    client still in the migration window) and for an APPROVED device token. A pending
+    enrollment fails it: a device that has not been approved holds a real token that
+    authenticates as nothing, which is the whole point of pending. Its transcripts are
+    not lost — the ingest hook's ``--catchup`` sweep re-posts them after approval.
+
+    Open when no machine token is set (dev / pre-cutover).
+    """
     if not MACHINE_TOKEN:
         return True
-    authz = request.headers.get("authorization", "")
-    if not authz.startswith("Bearer "):
+    if _is_root(request):
+        return True
+    tok = _bearer(request)
+    return bool(tok) and resolve_caller(DB_URL, token_hash_hex=token_hash(tok)).known
+
+
+def _admin_authorized(request: Request) -> bool:
+    """ "May this caller change who is trusted?" — the ADMIN gate, and it excludes root.
+
+    Requires an APPROVED, FULL-TRUST device token. The root token is deliberately NOT
+    enough, and that asymmetry is the security property this whole change buys:
+
+      the credential a new machine must hold in order to ENROLL cannot APPROVE.
+
+    Every machine that runs the plugin ends up holding the enrollment credential at
+    install time. If that credential also approved devices, an attacker who read it off
+    any one machine could self-approve to full trust and the TOFU gate would be
+    decoration. So approval, minting, revocation, the surface list and the dashboard all
+    demand a credential that only an already-trusted machine has.
+
+    The dashboard reaches this gate through the login flow, which mints a full-trust
+    device token for an OAuth-allowlisted identity rather than handing out the root
+    token. Break-glass, when no full-trust device exists (first deploy, or every device
+    revoked): ``scripts/surface_admin.py`` talks to Postgres directly, which requires
+    shell access on the DB host — a strictly higher bar than holding a bearer token.
+
+    Open when no machine token is set (dev / pre-cutover), same as the client gate.
+    """
+    if not MACHINE_TOKEN:
+        return True
+    tok = _bearer(request)
+    if not tok or _is_root(request):
         return False
-    return hmac.compare_digest(authz[len("Bearer ") :].strip(), MACHINE_TOKEN)
+    st = resolve_caller(DB_URL, token_hash_hex=token_hash(tok))
+    return st.known and not st.restricted
 
 
 # Shared error-envelope helpers for the machine-token custom routes below (imports only
@@ -438,13 +568,15 @@ from mcp_server.private_session_routes import register as _register_private_rout
 
 _register_private_routes(mcp, DB_URL, _machine_authorized)
 
-# Surface registration — audience scoping's operator seam (schema 053). Which HOSTS get
-# the full corpus and which get only work-safe notes + an allowlisted set of projects.
-# An unregistered surface is restricted with an empty allowlist, so these routes only
-# ever GRANT; doing nothing is already the safe state. Same machine-token seam.
+# Surface enrollment + registration — audience scoping's operator seam (schema 053/054).
+# Which DEVICES get the full corpus and which get only work-safe notes + an allowlisted
+# set of projects. Enrolling is anchored to an allowlisted OAuth/OIDC identity (the same
+# device flow `synapse login` uses), NOT to the shared machine token; minting, listing
+# and revoking demand the admin gate, which the root token also cannot clear. Registered
+# AFTER _idp is built, since enrollment needs it. Doing nothing is already the safe state.
 from mcp_server.surface_routes import register as _register_surface_routes  # noqa: E402
 
-_register_surface_routes(mcp, DB_URL, _machine_authorized)
+_register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized, idp=_idp)
 
 # Board read route — GET /context?project=X serves the rendered explicit-memory board
 # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
@@ -452,14 +584,23 @@ _register_surface_routes(mcp, DB_URL, _machine_authorized)
 # defined below and only resolved at request time (telemetry shares its writer).
 from mcp_server.board import register as _register_board_routes  # noqa: E402
 
-_register_board_routes(mcp, DB_URL, _machine_authorized, get_recall=lambda: _get_recall())
+_register_board_routes(
+    mcp,
+    DB_URL,
+    _machine_authorized,
+    get_recall=lambda: _get_recall(),
+    resolve_trust=_request_trust,
+)
 
 # Operator dashboard — static React bundle at /dash + read/flag API at /dash/api/* (issue #12,
 # contract docs/dashboard-contract.md). Static routes are unauthenticated (public bundle, no
-# data); every api route rides the same machine-token seam. No-op w/o DB_URL, like the siblings.
+# data); every api route rides the ADMIN gate, not the client one. That move is required, not
+# cosmetic: /dash/api serves the whole corpus unfiltered and can flag/edit, so leaving it on the
+# root token would let anything holding the enrollment credential read everything the TOFU gate
+# was meant to withhold. No-op w/o DB_URL, like the siblings.
 from mcp_server.dashboard_routes import register as _register_dashboard_routes  # noqa: E402
 
-_register_dashboard_routes(mcp, DB_URL, _machine_authorized)
+_register_dashboard_routes(mcp, DB_URL, _admin_authorized)
 
 # Device-login lane — RFC 8628 device flow so `synapse login` works browser-free on servers /
 # headless boxes. Proxies the configured IdP's device flow (GitHub or OIDC) and gates the
@@ -473,7 +614,17 @@ _register_device_routes(mcp, _idp, MACHINE_TOKEN)
 # origins restricted via SYNAPSE_DASH_ORIGINS. Same enablement condition as the device flow.
 from mcp_server.web_login_routes import register as _register_web_login_routes  # noqa: E402
 
-_register_web_login_routes(mcp, _idp, MACHINE_TOKEN, PUBLIC_URL)
+
+def _issue_dash_token(identity: str) -> str:
+    """Mint the browser's full-trust device token (schema 054) after a dashboard login."""
+    from ingestion.surfaces import issue_dash_token
+
+    return issue_dash_token(DB_URL, identity)
+
+
+_register_web_login_routes(
+    mcp, _idp, MACHINE_TOKEN, PUBLIC_URL, _issue_dash_token if DB_URL else None
+)
 
 
 # Lazy-init recall engine (one per process)
@@ -577,9 +728,8 @@ def recall(
         self_session: NEVER set this yourself. The client's PreToolUse hook injects
             the calling session's id so serving can suppress self-session domination;
             calls without it simply skip that suppression.
-        surface: NEVER set this yourself. The client's PreToolUse hook injects the
-            calling HOST's id; the server resolves what that host is trusted to see.
-            A missing or unregistered surface serves the restricted view.
+        surface: DEPRECATED and ignored — the server identifies the calling
+            device from its own credential. Never set it.
     """
     with logfire.span(
         "mcp.recall {query!r}",
@@ -594,7 +744,7 @@ def recall(
             group_id=group_id,
             source="mcp-tool",
             self_session=self_session,
-            surface=_caller_surface(surface),
+            trust=_caller_trust(surface),
         )
 
 
@@ -643,8 +793,8 @@ def recall_full_turns(
             excluded; calls without it simply skip that exclusion.
         session_id: Scope to ONE conversation — the `session` field from a
             recall/fetch result, or "self" for the current session.
-        surface: NEVER set this yourself. The client's PreToolUse hook injects
-            the calling host's id; the server resolves what it may see.
+        surface: DEPRECATED and ignored — the server identifies the calling
+            device from its own credential. Never set it.
     """
     with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
         if session_id == "self":
@@ -663,7 +813,7 @@ def recall_full_turns(
             source="mcp-tool",
             self_session=self_session,
             session_id=session_id,
-            surface=_caller_surface(surface),
+            trust=_caller_trust(surface),
         )
 
 
@@ -683,13 +833,11 @@ def fetch(ids: list[str], surface: str | None = None) -> dict:
 
     Args:
         ids: Ids to expand — "e:N" episodes, "n:N" notes, bare N = episode.
-        surface: NEVER set this yourself. The client's PreToolUse hook injects
-            the calling host's id; the server resolves what it may see. Ids
-            outside that view come back under "skipped"-style absence, not an
-            error — drill-down can't reach past the overview's filter.
+        surface: DEPRECATED and ignored — the server identifies the calling
+            device from its own credential. Never set it.
     """
     with logfire.span("mcp.fetch", n=len(ids)):
-        return _get_recall().fetch(ids, source="mcp-tool", surface=_caller_surface(surface))
+        return _get_recall().fetch(ids, source="mcp-tool", trust=_caller_trust(surface))
 
 
 @mcp.tool()
@@ -726,9 +874,8 @@ def fetch_session(
         limit: Anchorless paging — turns per page (1-25, default 10).
         self_session: NEVER set this yourself; the client hook injects it to
             resolve session_id="self".
-        surface: NEVER set this yourself. The client's PreToolUse hook injects
-            the calling host's id; a session outside that host's view reports
-            the same "not indexed" answer an unknown session id does.
+        surface: DEPRECATED and ignored — the server identifies the calling
+            device from its own credential. Never set it.
     """
     with logfire.span("mcp.fetch_session {sid}", sid=session_id[:40], around=around):
         if session_id == "self":
@@ -744,7 +891,7 @@ def fetch_session(
             offset=offset,
             limit=limit,
             source="mcp-tool",
-            surface=_caller_surface(surface),
+            trust=_caller_trust(surface),
         )
 
 
@@ -847,9 +994,8 @@ async def remember(
         type: Note type — 'user' | 'feedback' | 'project' (default) | 'reference'.
         project: Optional project slug (scopes 'project' notes and the episode).
         session_id: Optional session ID to attach the episode to.
-        surface: NEVER set this yourself. The client's PreToolUse hook injects
-            the calling host's id; a note written from a work-trusted host is
-            tagged so it still appears on that host's board next session.
+        surface: DEPRECATED and ignored — the server identifies the calling
+            device from its own credential. Never set it.
         audience: 'personal' (default) or 'work-safe' — who may be SERVED this
             note later. Leave unset unless the user says where it may appear;
             the server derives it from the calling host and the project.
@@ -862,7 +1008,7 @@ async def remember(
     from ingestion.db import Database
     from ingestion.models import Episode, ExtractionItem
     from ingestion.notes import _VALID_TYPES, reconcile_note
-    from ingestion.surfaces import AUDIENCES, lookup_surface
+    from ingestion.surfaces import AUDIENCES
 
     structured = hook is not None or body is not None
     if not structured and not (content or "").strip():
@@ -905,11 +1051,11 @@ async def remember(
         note_type = "project"
 
     sid = session_id or str(_uuid.uuid4())
-    # Same resolution the serving tools do, so an OAuth identity registered as a
-    # RESTRICTED surface writes notes it can still read back. Resolved here, on the
+    # Same resolution the serving tools do, so a device (or OAuth identity) registered
+    # as a RESTRICTED surface writes notes it can still read back. Resolved here, on the
     # event loop, rather than inside _work(): the token context belongs to the request,
     # and _work runs on a worker thread.
-    caller_surface = _caller_surface(surface)
+    caller_trust = _caller_trust(surface)
 
     def _work() -> dict:
         t0 = _time.perf_counter()
@@ -940,11 +1086,10 @@ async def remember(
             )
 
             # Audience precedence rule 2 fires only for a REGISTERED restricted surface
-            # (`known`). An unknown surface restricts what this host READS, but it must
-            # never widen a WRITE — defaulting an unrecognised hostname's notes to
+            # (`known`). An unknown surface restricts what this caller READS, but it must
+            # never widen a WRITE — defaulting an unrecognised credential's notes to
             # work-safe would turn a fail-closed read rule into a leak.
-            st = lookup_surface(DB_URL, caller_surface)
-            caller_restricted = st.known and st.restricted
+            caller_restricted = caller_trust.known and caller_trust.restricted
 
             embedder, llm = _notes_deps()
             res = reconcile_note(
@@ -998,7 +1143,13 @@ async def remember(
 # Idempotent on the client's intent id (schema 052). No-op w/o DB_URL, like the siblings.
 from mcp_server.remember_routes import register as _register_remember_routes  # noqa: E402
 
-_register_remember_routes(mcp, DB_URL, _machine_authorized, remember)
+_register_remember_routes(
+    mcp,
+    DB_URL,
+    _machine_authorized,
+    remember,
+    caller_surface=lambda request: _request_trust(request).surface_id,
+)
 
 
 # recall_episodes was retired as a standalone tool (item 6 tool-surface audit:
@@ -1307,10 +1458,11 @@ async def recall_http(request: Request) -> JSONResponse:
 
     Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
            "source"?: str, "debug"?: bool, "surface"?: str}.
-    ``surface`` gets the same enforcement the MCP tools do (schema 053): omitted or
-    unregistered means restricted. A plain-HTTP caller is not a trusted caller just
-    because it holds the machine token — the token says "a Synapse client", the surface
-    says "which host".
+    The caller gets the same enforcement the MCP tools do: a DEVICE token names its own
+    surface and ``surface`` is ignored; a root-token caller may still pass the
+    deprecated ``surface`` param for the migration window. Holding a credential is not
+    the same as being trusted — the token says "a Synapse client", the surface row says
+    what that client may read.
     write_feedback defaults FALSE here: automatic recalls must not bump the
     retrieval-count feedback signal (bench-grade discipline) — and the phase-2
     dashboard debug console relies on this default staying false so its diagnostic
@@ -1336,7 +1488,7 @@ async def recall_http(request: Request) -> JSONResponse:
     write_feedback = bool(body.get("write_feedback", False))
     source = body.get("source") or "http"
     debug = bool(body.get("debug", False))
-    surface = body.get("surface") or None
+    trust = _request_trust(request, body.get("surface") or None)
 
     def _work() -> dict:
         return _get_recall().recall(
@@ -1346,7 +1498,7 @@ async def recall_http(request: Request) -> JSONResponse:
             write_feedback=write_feedback,
             source=source,
             debug=debug,
-            surface=surface,
+            trust=trust,
         )
 
     try:
@@ -1407,13 +1559,24 @@ async def feedback_http(request: Request) -> JSONResponse:
 # name via a raw tools/call, which the listing filter deliberately leaves intact.
 @mcp.tool()
 def issue_machine_token() -> dict:
-    """Return this Synapse's shared machine bearer token (auth-gated).
+    """Return this Synapse's ROOT bearer — the enrollment credential (auth-gated).
 
-    Lets ``synapse login`` fetch the token over OAuth instead of a manual copy-paste:
-    the caller authenticates to /mcp (GitHub OAuth or an existing bearer), the
-    on_call_tool allowlist gates it to permitted identities, and we hand back the
-    token the hooks send to /ingest, /recall, and /mcp. Empty if auth is disabled.
+    Lets ``synapse login`` fetch it over OAuth instead of a manual copy-paste: the
+    caller authenticates to /mcp, the on_call_tool allowlist gates it to permitted
+    identities, and we hand back the token a fresh machine uses to call
+    ``POST /surfaces/enroll`` and obtain its OWN device token. Empty if auth is disabled.
+
+    A DEVICE token is refused here (schema 054). Not because the root token grants more
+    reading — a full-trust device already reads everything — but because handing the
+    long-lived, un-revocable, shared enrollment credential to a per-device credential
+    would collapse the two back into one and make revocation meaningless. Device tokens
+    are the leaves; they do not get to fetch the root.
     """
+    if claims_of(_access_token()).get("kind") == _KIND_DEVICE:
+        raise AuthorizationError(
+            "device tokens cannot fetch the root enrollment credential — "
+            "log in with `synapse login` on the machine that needs to enroll"
+        )
     return {"token": MACHINE_TOKEN}
 
 

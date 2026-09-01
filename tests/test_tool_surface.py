@@ -33,6 +33,7 @@ except Exception:  # pragma: no cover - environment dependent
 from fastmcp import Client  # noqa: E402
 
 from ingestion.db import Database  # noqa: E402
+from ingestion.surfaces import UNKNOWN_SURFACE  # noqa: E402
 from mcp_server import server  # noqa: E402
 from mcp_server.board import _OWNER  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
@@ -296,7 +297,10 @@ def test_recall_full_turns_routes_to_episode_drilldown(monkeypatch):
                 "source": "mcp-tool",
                 "self_session": None,
                 "session_id": None,
-                "surface": None,
+                # The server resolves the caller ONCE and hands the engine a verdict,
+                # never a self-reported id. No credential in this test => UNKNOWN,
+                # which is restricted with an empty allowlist.
+                "trust": UNKNOWN_SURFACE,
             },
         )
     ]

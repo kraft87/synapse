@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # mypy: ignore-errors
-"""synapse login — fetch this machine's Synapse token, stdlib only.
+"""synapse login — sign in and give this machine its own Synapse credential. Stdlib only.
 
-No third-party dependencies. Two flows, both ending in the machine token stored in the
-plugin's credentials file (the zero-dependency ingest/recall hooks read it back as the bearer):
+No third-party dependencies. Two sign-in flows, both ending in a bearer stored in the
+plugin config (the zero-dependency ingest/recall hooks read it back):
 
   * DEVICE (default) — RFC 8628 device flow. Prints a short code; you approve at
     github.com/login/device on ANY device. No same-host browser, no loopback redirect.
@@ -19,7 +19,14 @@ Usage:
     python synapse_login.py --browser      # legacy same-host browser flow
     SYNAPSE_URL=https://synapse.example.net python synapse_login.py
 
-Truly headless with no second device either? Set SYNAPSE_INGEST_TOKEN directly instead.
+After the sign-in, this runs ENROLLMENT (schema 054): a second device-flow approval that
+mints a token belonging to THIS machine, scoped by the install prompt's personal/work
+answer, and stores it in the same config slot. What a session is served depends on that
+token, so a machine that never enrolls is served nothing.
+
+Truly headless with no browser on any device? Mint a token from an already-trusted
+machine (`/synapse-devices mint "<label>"`) or from the database host
+(`scripts/surface_admin.py mint`), and set it as SYNAPSE_INGEST_TOKEN here.
 """
 
 from __future__ import annotations
@@ -234,6 +241,7 @@ def _device_login() -> int:
             config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
             who = f" as {resp['login']}" if resp.get("login") else ""
             print(f"Logged in{who}. Token saved to plugin config.")
+            _enroll_device()
             print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
             return 0
 
@@ -376,8 +384,31 @@ def _browser_login() -> int:
 
     config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
     print("Logged in. Token saved to plugin config.")
+    _enroll_device()
     print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
     return 0
+
+
+def _enroll_device() -> bool:
+    """Enroll THIS machine — its own device flow, its own device token (schema 054).
+
+    Deliberately a SECOND sign-in rather than a reuse of the login above. A device code
+    is spent by the poll that redeems it, and the two flows want different things: login
+    fetches the shared root token (the services still need it), enrollment mints a
+    credential scoped to this machine. Keeping them separate also means `synapse-login`
+    on an already-enrolled machine re-fetches the root token without disturbing the
+    device credential.
+
+    Returns True when this machine now holds a device token.
+    """
+    try:
+        import enroll
+    except Exception:
+        return False
+    if enroll.is_enrolled():
+        print("\nThis machine is already enrolled; leaving its device token alone.")
+        return True
+    return bool(enroll.enroll())
 
 
 def main() -> int:

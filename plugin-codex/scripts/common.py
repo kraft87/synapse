@@ -52,9 +52,11 @@ BASE_URL = _base_url()
 INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
 TOKEN = _cfg("SYNAPSE_INGEST_TOKEN")
 PRIVATE_DIR = Path(os.path.expanduser(_cfg("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
-# This host's id for audience scoping (schema 053) — same env-override + hostname
-# fallback as plugin/scripts/config.py, so a machine running both plugins registers
-# ONE surface rather than two that drift apart.
+# This machine's display NAME. Since schema 054 it grants nothing and identifies
+# nothing — trust rides on the device token in SYNAPSE_INGEST_TOKEN. Same env-override +
+# hostname fallback as plugin/scripts/config.py so the label matches across both
+# plugins; enrollment itself happens in the Claude Code plugin, and this mirror reuses
+# the token it writes.
 SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 
 _UA = "synapse-codex-plugin/0.1"

@@ -34,7 +34,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
-            "timeout": 15
+            "timeout": 20
           },
           {
             "type": "command",
@@ -102,7 +102,7 @@
     ],
     "PreToolUse": [
       {
-        "matcher": "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch|fetch_session|remember)$",
+        "matcher": "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session|remember)$",
         "hooks": [
           {
             "type": "command",

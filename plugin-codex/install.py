@@ -61,7 +61,7 @@ _HOOK_BLOCKS: list[tuple[str, str]] = [
     (
         "pre_tool_use.py",
         "[[hooks.PreToolUse]]\n"
-        'matcher = "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch|fetch_session|remember)$"\n'
+        'matcher = "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session|remember)$"\n'
         "[[hooks.PreToolUse.hooks]]\n"
         'type = "command"\n'
         f'command = "python3 {HOOKS_DIR}/pre_tool_use.py"\n'
