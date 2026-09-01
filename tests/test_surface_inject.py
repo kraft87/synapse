@@ -66,18 +66,21 @@ def test_no_hook_injects_a_surface_any_more(hook, tool):
 
 
 @_HOOKS
-@pytest.mark.parametrize("tool", ["recall", "recall_full_turns", "fetch_session", "remember"])
+@pytest.mark.parametrize("tool", ["recall", "recall_full_turns", "fetch_session"])
 def test_self_session_is_injected_into_the_recall_family(hook, tool):
     ti = _run(hook, {"tool_name": _MCP + tool, "session_id": "s-1", "tool_input": {}})
     assert ti["self_session"] == "s-1"
 
 
 @_HOOKS
-def test_recall_feedback_gets_session_id_not_self_session(hook):
-    """Its own pre-existing field — feedback reports group by session."""
+@pytest.mark.parametrize("tool", ["recall_feedback", "remember"])
+def test_session_id_tools_never_get_self_session(hook, tool):
+    """recall_feedback and remember only accept `session_id`; injecting
+    `self_session` fails their pydantic validation and kills the whole call
+    (regression: remember was unusable under plugin 0.17.0)."""
     ti = _run(
         hook,
-        {"tool_name": _MCP + "recall_feedback", "session_id": "s-1", "tool_input": {"query": "q"}},
+        {"tool_name": _MCP + tool, "session_id": "s-1", "tool_input": {"query": "q"}},
     )
     assert ti["session_id"] == "s-1" and "self_session" not in ti
 

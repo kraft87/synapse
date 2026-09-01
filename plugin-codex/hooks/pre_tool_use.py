@@ -5,8 +5,10 @@
 Port of plugin/scripts/self_session_inject.py. recall / recall_full_turns
 serving excludes the calling session's own episodes (already in context); the
 model can't know its own session id, so this adds it as ``self_session`` via
-Codex's ``updatedInput``. recall_feedback gets it as ``session_id`` so reports
-group by session.
+Codex's ``updatedInput``. recall_feedback and remember get it as
+``session_id`` (their existing param — neither accepts ``self_session``, which
+would fail their pydantic validation) so reports group by session and
+remembered episodes attach to the writing session.
 
 The ``surface`` injection is GONE (schema 054): trust is bound to the per-device token
 the client authenticates with, so a host name asserted by the client identifies nothing
@@ -49,7 +51,7 @@ def main() -> None:
         changed = False
 
         if session_id:
-            field = "session_id" if base == "recall_feedback" else "self_session"
+            field = "session_id" if base in ("recall_feedback", "remember") else "self_session"
             if not tool_input.get(field):  # already set (retry or nested call)
                 tool_input[field] = session_id
                 changed = True
