@@ -79,12 +79,12 @@ nothing to publish:
 
 The install prompts for:
 
-- **Synapse URL** — base URL, no path. `http://localhost:8765` for the local quickstart.
-- **Synapse token** — the device token from step 3. On an OAuth-backed server you can leave
+- **Synapse URL**: base URL, no path. `http://localhost:8765` for the local quickstart.
+- **Synapse token**: the device token from step 3. On an OAuth-backed server you can leave
   it blank and run `! synapse-login` instead.
-- **This machine's role** — `personal` (default, sees everything) or `work` (restricted:
+- **This machine's role**: `personal` (default, sees everything) or `work` (restricted:
   work-safe notes plus an allowlist of projects, so personal memory is never served there).
-- **Opt-in syncs** — two-way skill sync and config mirroring, both off by default.
+- **Opt-in syncs**: two-way skill sync and config mirroring, both off by default.
 
 Then `/reload-plugins` (or restart Claude Code) to activate the hooks and the MCP server.
 Full plugin detail: [plugin/README.md](../plugin/README.md).
@@ -218,6 +218,6 @@ gets a release note saying so.
 
 ## Next
 
-- [docs/auth.md](auth.md) — device tokens, enrollment, exposing the server to claude.ai.
-- [docs/tools.md](tools.md) — what the MCP tools and hooks actually do.
-- [ARCHITECTURE.md §13](../ARCHITECTURE.md#13-configuration) — every configuration variable.
+- [docs/auth.md](auth.md): device tokens, enrollment, exposing the server to claude.ai.
+- [docs/tools.md](tools.md): what the MCP tools and hooks actually do.
+- [ARCHITECTURE.md §13](../ARCHITECTURE.md#13-configuration): every configuration variable.

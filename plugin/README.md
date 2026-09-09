@@ -119,8 +119,8 @@ Slash commands:
   accept.
 - **`/synapse:config-review`** — triage dream→config proposals. Only relevant with config
   mirroring on.
-- **`/synapse-devices`** — list, mint, or revoke the per-device credentials that decide what
-  each machine is served ([docs/auth.md](../docs/auth.md)).
+- **`/synapse-devices`** lists, mints, or revokes the per-device credentials that decide
+  what each machine is served ([docs/auth.md](../docs/auth.md)).
 
 Bundled commands (`!` prefix in a session; full path from an outside terminal):
 
@@ -188,7 +188,7 @@ an older server the flush fails loudly into the log and the spool simply keeps i
 
 ## More
 
-- [docs/tools.md](../docs/tools.md) — hooks, MCP tools, configuration variables, and what
+- [docs/tools.md](../docs/tools.md): hooks, MCP tools, configuration variables, and what
   gets sent to your server.
-- [docs/auth.md](../docs/auth.md) — tokens, enrollment, personal vs work.
-- [docs/install.md](../docs/install.md) — the server side, and troubleshooting.
+- [docs/auth.md](../docs/auth.md): tokens, enrollment, personal vs work.
+- [docs/install.md](../docs/install.md): the server side, and troubleshooting.

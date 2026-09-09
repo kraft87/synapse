@@ -12,26 +12,26 @@ The board is deliberately NOT a tool: the plugin's SessionStart hook injects it 
 `GET /context`, and a listed board tool would invite a double-inject of a block the model
 already has (the Hermes pattern — when injection covers the read, ship no read tool).
 
-- **`recall(query, project=None, session_focus=None, group_id="technical")`** — the primary
-  retrieval tool: reranked episode passages blended with knowledge-graph facts, timeline
-  events, captured web research, and fact history. Served passages carry a `role` label
+- **`recall(query, project=None, session_focus=None, group_id="technical")`**: the primary
+  retrieval tool. Reranked episode passages blended with knowledge-graph facts, captured
+  web research, and fact history. Served passages carry a `role` label
   (`user` / `assistant` / `mixed`) and a date, so a caller can weight a human-stated fact
   over the agent's own past output. Every served item carries an id (`e:N` episode, `n:N`
-  note, `f:<uuid>` fact, `t:N` timeline, `w:N` web); only `e:` and `n:` are fetchable, the
+  note, `f:<uuid>` fact, `w:N` web); only `e:` and `n:` are fetchable, the
   rest are feedback-only. `group_id` scopes the knowledge graph to `technical` (default) or
   `personal`.
-- **`recall_full_turns(query, project=None, limit=5, session_id=None)`** — the drill-down and
+- **`recall_full_turns(query, project=None, limit=5, session_id=None)`**: the drill-down and
   retry sibling. `recall()` serves compressed ~1400-char passage slices; this serves whole
   turns and nothing else, ranked by relevance plus recency. It is the right call for exact
   wording, for the retry when an overview recall comes back thin, and when a passage was cut
   off mid-thought. It replaced the former `recall(mode="turns")`, which in turn had absorbed
   the standalone `recall_episodes` tool.
-- **`fetch(ids)`** — expand ids into full records: `e:N` episode ids from recall results
+- **`fetch(ids)`** expands ids into full records: `e:N` episode ids from recall results
   (bare `N` also accepted) and `n:N` note ids, so the session-start board block's `n:ID`
   lines resolve to their full note bodies. Mixed lists are fine, unknown ids come back under
   `skipped`, and at most 20 ids expand per call. It only expands ids you already hold; it
   does not search.
-- **`fetch_session(session_id, around=None, radius=3, offset=0, limit=10)`** — read one
+- **`fetch_session(session_id, around=None, radius=3, offset=0, limit=10)`** reads one
   conversation sequentially, like opening the transcript file at a spot instead of searching
   it. Every recall/fetch episode carries a `session` field; pass it here to see what
   surrounded that turn. With `around` set to an `e:N` id, that anchor comes back full and
@@ -39,7 +39,7 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   `offset`/`limit`. `session_id="self"` reads the current conversation. An unindexed session
   returns an explicit error, which is the signal to read the on-disk transcript instead.
 - **`remember(content=None, hook=None, body=None, type="project", project=None, audience=None)`**
-  — write a curated memory. The preferred form passes `hook` (a one-line index entry, ~120
+  writes a curated memory. The preferred form passes `hook` (a one-line index entry, ~120
   chars) plus `body` (the full self-contained note) and a `type` (`user` / `feedback` /
   `project` / `reference`); the legacy `content`-only form still works and derives the hook
   from the first sentence. Both forms also archive the text as an episode and enqueue
@@ -48,8 +48,8 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   supersedes the old note while keeping the lineage — so the curated set stays small and
   current instead of accumulating duplicates.
 - **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, project=None)`**
-  — after a recall whose results you used, report which served ids were load-bearing, which
-  were noise, and what was missing. It writes one row of offline labeled data for eval
+  reports retrieval quality after a recall whose results you used: which served ids were
+  load-bearing, which were noise, and what was missing. It writes one row of offline labeled data for eval
   goldens and reranker tuning, and is deliberately not wired into live ranking.
 
 Two parameters exist on several of these that a caller should never set. `self_session` is

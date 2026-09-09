@@ -90,17 +90,17 @@ troubleshooting: **[docs/install.md](docs/install.md)**.
 
 ## Docs
 
-- **[docs/install.md](docs/install.md)** — the full install: required configuration, first
+- **[docs/install.md](docs/install.md)**: the full install. Required configuration, first
   device, verification, importing months of past sessions, ports, upgrading, troubleshooting.
-- **[docs/auth.md](docs/auth.md)** — machine token vs device tokens, enrollment, what a
+- **[docs/auth.md](docs/auth.md)**: machine token vs device tokens, enrollment, what a
   restricted machine is served, GitHub OAuth and OIDC for the claude.ai connector.
-- **[docs/tools.md](docs/tools.md)** — the MCP tool surface, the plugin's hooks, and every
+- **[docs/tools.md](docs/tools.md)**: the MCP tool surface, the plugin's hooks, and every
   plugin configuration variable.
-- **[docs/features.md](docs/features.md)** — what's in the box, and the stack it runs on.
-- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the design doc: pipelines, schema, decisions,
+- **[docs/features.md](docs/features.md)**: what's in the box, and the stack it runs on.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)**: the design doc. Pipelines, schema, decisions,
   measurements, full server configuration reference.
-- **[plugin/README.md](./plugin/README.md)** — the Claude Code plugin.
-  **[plugin-codex/README.md](./plugin-codex/README.md)** — the Codex CLI equivalent.
+- **[plugin/README.md](./plugin/README.md)**: the Claude Code plugin.
+  **[plugin-codex/README.md](./plugin-codex/README.md)**: the Codex CLI equivalent.
 - Design specs: [audience scoping](docs/audience-scoping-spec.md),
   [session drill-down](docs/session-drilldown-spec.md),
   [dashboard contract](docs/dashboard-contract.md).

@@ -7,13 +7,13 @@ themselves are in [docs/install.md](install.md); the design reasoning is
 
 ## Two kinds of bearer token
 
-- **Machine token** (`SYNAPSE_MACHINE_TOKEN`) — one shared root bearer per deployment. It is
+- **Machine token** (`SYNAPSE_MACHINE_TOKEN`): one shared root bearer per deployment. It is
   the services' credential for `/ingest` and the internal write lanes, and it is verified by
   constant-time compare with no database read, so a Postgres blip never becomes an auth
   outage on the lane that repairs things. It identifies a *deployment*, not a machine, so it
   resolves to no surface and is served restricted. It also cannot enroll a device, mint one,
   list surfaces, or reach the dashboard API.
-- **Device token** — one per machine, stored as a `sha256` hash in the `surfaces` table with
+- **Device token**: one per machine, stored as a `sha256` hash in the `surfaces` table with
   a trust level and a project allowlist. This is what decides what a session is served.
   Revoking one clears its hash, so it matches no row at all and the row survives as the
   audit record.
@@ -65,10 +65,10 @@ The plugin's install prompt asks for this machine's role (`SYNAPSE_MACHINE_ROLE`
 answer becomes the enrolled device's trust level. It is authoritative because the person who
 answered it is the person who just authenticated.
 
-- **personal** (default) — full trust. The single-user common case is a machine that should
+- **personal** (default): full trust. The single-user common case is a machine that should
   see everything, and a default that makes the normal path silently useless gets worked
   around rather than understood.
-- **work** — restricted. Work-safe notes plus an allowlist of projects, so personal memory is
+- **work**: restricted. Work-safe notes plus an allowlist of projects, so personal memory is
   never served on employer-owned hardware.
 
 The narrow default lives one layer down: the *server* treats an unstated role as restricted.

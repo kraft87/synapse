@@ -24,7 +24,7 @@ The parts of Synapse, and the stack they run on. How they fit together is
 - **Claude Code plugin** — ingest + recall wiring, plus a nightly dream→skills lane that
   mines your transcripts to maintain a self-improving skill library, with opt-in two-way
   skill sync (`SYNAPSE_SKILLS_SYNC=1`). See [plugin/README.md](../plugin/README.md).
-- **Codex CLI client** — the same per-session surface for OpenAI Codex CLI. See
+- **Codex CLI client** brings the same per-session surface to OpenAI Codex CLI. See
   [plugin-codex/README.md](../plugin-codex/README.md).
 
 ## Stack
