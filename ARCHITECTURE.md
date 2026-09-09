@@ -528,7 +528,7 @@ The **KG leg is skipped, not filtered**: `kg_relationships` has no `project` col
 
 **Write-side tagging** happens at the single note chokepoint (`ingestion/notes.reconcile_note`), in precedence order: (1) an explicit `audience` argument on `remember()`; (2) a write from a **live, approved** restricted surface defaults `work-safe`, symmetric with what it may read (else notes written at work vanish from the work board next session); (3) the note's `project` is in the union of **approved** restricted surfaces' allowlists ⇒ `work-safe`; (4) otherwise `personal`. Rule 2 requires an approved surface on purpose — unknown restricts reads, but must never widen a write. A **restatement preserves** the stored tier (`COALESCE(%s, audience)`), so rephrasing is never reclassification; a **contradiction derives** its own. The dream→notes lane re-derives by rule 3 when a retype changes a note's project.
 
-**Rollout is enforcement-first, no feature flag**, and ordered: apply 054 (existing rows are stamped `approved`, so nothing working stops working) → deploy → run `synapse-login` on each machine to sign in and enroll → log into the dashboard again to pick up its minted token → `mint` for anything headless → next release, drop the legacy `surface` param. A machine that has not enrolled yet keeps working on the root token via the legacy lane, and its SessionStart block says it is not enrolled rather than going silently empty. `docs/audience-scoping-spec.md` carries the step-by-step. Every pre-053 note is `personal`, so restricted boards run empty but safe until `scripts/audience_backfill.py --propose` writes a review table (to a path **outside the repo** — it lists every note hook, and this repository is public), a human edits the audience column, and `--apply` writes it back.
+**Rollout is enforcement-first, no feature flag**, and ordered: apply 054 (existing rows are stamped `approved`, so nothing working stops working) → deploy → run `synapse-login` on each machine to sign in and enroll → log into the dashboard again to pick up its minted token → `mint` for anything headless → next release, drop the legacy `surface` param. **A machine that has not enrolled is served nothing.** The legacy lane only fires on a root token that also sends a `surface` param, and the 0.17 client no longer sends one, so a root-token caller resolves to `UNKNOWN_SURFACE`: restricted, empty allowlist, a 200 with an empty board rather than a 401. Enrolling is the fix (`synapse login`); on a deployment with no IdP at all, mint the first device token on the server host with `docker compose exec mcp-server synapse-admin bootstrap "<label>"` and paste it into that machine's `SYNAPSE_INGEST_TOKEN`. `docs/audience-scoping-spec.md` carries the step-by-step, and [docs/install.md](docs/install.md) the fresh-install path. Every pre-053 note is `personal`, so restricted boards run empty but safe until `scripts/audience_backfill.py --propose` writes a review table (to a path **outside the repo** — it lists every note hook, and this repository is public), a human edits the audience column, and `--apply` writes it back.
 
 ### 7.6 Skills serving
 
@@ -696,7 +696,9 @@ A 2026 multi-source review of production agent-memory systems converged on exact
 
 ## 13. Configuration
 
-The poller reads config via `pydantic-settings`; the MCP server reads `os.environ` with `.env` fallback. Only the first two variables are required for a basic install — everything else has a sane default.
+This is the reference list. The install path that uses it is [docs/install.md](docs/install.md).
+
+The poller reads config via `pydantic-settings`; the MCP server reads `os.environ` with `.env` fallback. Five things are required for a working install: `SYNAPSE_DB_PASSWORD` + `SYNAPSE_DB_URL` (storage), an embedding/rerank backend (`VOYAGE_API_KEY`, or the `SYNAPSE_EMBED_*` / `SYNAPSE_RERANK_*` alternatives), an extraction-LLM credential (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, without which nothing reaches the knowledge graph), and `SYNAPSE_MACHINE_TOKEN`. Everything else has a sane default.
 
 ### Core
 
@@ -731,11 +733,18 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYNAPSE_MACHINE_TOKEN` | optional | ROOT bearer: the services' credential for `/ingest` + the internal write lanes. Deliberately NOT sufficient to enroll or mint a device, list surfaces, or reach `/dash/api` ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)). **Unset → server runs open** |
+| `SYNAPSE_MACHINE_TOKEN` | **required** | ROOT bearer: the services' credential for `/ingest` + the internal write lanes. Generate with `openssl rand -hex 32`. Deliberately NOT sufficient to enroll or mint a device, list surfaces, or reach `/dash/api`, and it resolves to no surface, so a caller presenting it is served restricted ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)). Blank → the server refuses to start unless `SYNAPSE_ALLOW_OPEN=1` |
+| `SYNAPSE_ALLOW_OPEN` | `0` | dev-only escape hatch: `1` starts the server with no machine token. Every caller then resolves to `UNKNOWN_SURFACE` and is served restricted, so the board and recall come back empty. Not a deployment mode |
 | `SYNAPSE_PUBLIC_URL` | `https://synapse.example.net` | public base URL advertised in OAuth discovery metadata |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | optional | GitHub OAuth app for the claude.ai web connector; unset → no OAuth leg |
 | `ALLOWED_GITHUB_USERS` | empty | comma-separated GitHub logins admitted by the OAuth leg |
 | `SYNAPSE_OAUTH_SIGNING_KEY` | optional | stable signing key so issued OAuth tokens survive server restarts |
+| `OIDC_CONFIG_URL` | unset | any OIDC IdP instead of GitHub: the provider's `/.well-known/openid-configuration`. Set → replaces the GitHub leg for this deployment (MCP discovery advertises one authorization server) |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | unset | OIDC client credentials; register `{base_url}/auth/callback` and `{base_url}/auth/callback/dash` as redirect URIs |
+| `ALLOWED_OIDC_USERS` | empty | comma-separated identities admitted by the OIDC leg, matched against `preferred_username` then `email` |
+| `OIDC_SCOPES` | `openid profile email offline_access` | trim `offline_access` for IdPs that reject it (Google), at the cost of short-lived connector sessions |
+| `OIDC_USER_CLAIMS` | `preferred_username,email` | ordered claims read for the user's identity |
+| `SYNAPSE_MACHINE_ROLE` | `personal` | **plugin side**, not the server: this machine's declared role at enrollment, `personal` (full trust) or `work` (restricted). An *unstated* role resolves to restricted server-side ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)) |
 
 ### Recall tuning (`mcp_server/recall.py`)
 

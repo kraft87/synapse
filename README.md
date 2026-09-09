@@ -50,63 +50,13 @@ session asks synapse:recall ──► MCP server fuses, in parallel:           �
 compact, ranked result
 ```
 
-1. A `Stop` hook pushes the tail of each session transcript to `/ingest` — detached, never
-   blocking the turn.
-2. `/ingest` dedups by a stable per-turn id — and skips byte-identical replays of turns
-   already stored in the project (retry/re-import guard) — then appends genuinely-new
-   turns as **episodes**.
-3. A background poller groups episodes into overlapping **chunks** and mines them for
-   entities and bitemporal facts — the **knowledge graph**, in Postgres.
-4. `recall()` runs its legs in parallel (reranked episodes, KG facts, timeline events,
-   web research, fact history) and returns a compact, ranked result.
+A `Stop` hook pushes the tail of each session transcript to `/ingest`, detached, never
+blocking the turn; genuinely-new turns are stored as episodes. A background poller groups
+episodes into overlapping chunks and mines them for entities and bitemporal facts. `recall()`
+runs its legs in parallel and returns one compact, ranked result.
 
 Architecture, design decisions, and the measurements behind them:
 [ARCHITECTURE.md](./ARCHITECTURE.md).
-
-## What's in the box
-
-- **Episodic memory** — one episode per human turn, served by a deep fetch (100 candidates
-  per leg) plus a Voyage cross-encoder rerank. The retrieval workhorse for broad and needle
-  queries alike.
-- **Knowledge graph** — entities and bitemporal `RELATES_TO` fact edges in Postgres; the
-  relational/multi-hop specialist. Facts are never deleted: contradictions invalidate the
-  old edge and write a new one, which powers a "what changed" history leg.
-- **Timeline** — an append-only log of dated point-events ("shipped X", "decided Y") mined
-  from turns by an LLM gate and fed by git commits, serving "when / in what order" questions.
-  A re-told happening confirm-merges into its existing row (an LLM reads both source turns,
-  both presentation orders must agree) instead of duplicating; each event carries a
-  `personal`/`technical` domain label so personal-scope queries exclude work noise; and
-  happenings narrated inside quoted third-party material (someone else's email, a pasted
-  transcript, an article) are never logged as the user's own.
-- **Web-research capture** — WebFetch/Exa/Firecrawl/search results are captured and embedded
-  so past research is recallable.
-- **MCP server** — FastMCP over streamable HTTP (tool list [below](#mcp-tools)).
-- **Claude Code plugin** — ingest + recall wiring, plus a nightly dream→skills lane that
-  mines your transcripts to maintain a self-improving skill library, with opt-in two-way
-  skill sync (`SYNAPSE_SKILLS_SYNC=1`). See [plugin/README.md](./plugin/README.md).
-
-## Stack
-
-- **Storage:** PostgreSQL (ParadeDB image) for everything — episodes, chunks, the queue, the
-  web store, and the knowledge graph.
-- **Vector search:** pgvector `halfvec` HNSW (2048 dims by default; width is fixed at
-  first-boot schema provisioning via `SYNAPSE_EMBED_DIMS`).
-- **Full-text search:** ParadeDB `pg_search` (BM25), fused with vector via reciprocal-rank
-  fusion.
-- **Embeddings + rerank:** Voyage AI by default (`voyage-4-large`, 2048 dims, and
-  `rerank-2.5-lite`). Pluggable: any OpenAI-compatible `/embeddings` endpoint plus any
-  TEI/Infinity/Cohere-shape `/rerank` server, or the bundled `local-inference` compose
-  profile (see `.env.example`). Published retrieval quality was measured on the Voyage
-  stack, and the rerank leg matters — `SYNAPSE_RERANK_PROVIDER=none` degrades recall to
-  fusion-only ordering.
-- **Extraction LLM:** Claude Haiku 4.5 by default, via `claude-agent-sdk` with a Claude
-  subscription token or an `ANTHROPIC_API_KEY`. Set `SYNAPSE_LLM_PROVIDER=openai` to point
-  at any OpenAI-compatible `/chat/completions` endpoint (OpenRouter, a local model, etc.).
-- **MCP:** FastMCP, streamable HTTP, port 8765.
-- **Language:** Python 3.12, managed with `uv`.
-
-> An earlier version stored the graph in FalkorDB. The graph now lives in Postgres
-> (`ingestion/kg_client.py`); FalkorDB has been decommissioned.
 
 ## Quick start
 
@@ -117,165 +67,43 @@ The whole install, end to end — clone, configure, `compose up`, wire up the pl
 Single box, everything local:
 
 ```bash
-git clone <this-repo> synapse && cd synapse
-cp .env.example .env             # then fill in the required values below
-docker compose up -d --build     # builds the image, starts Postgres + poller + MCP server
+git clone https://github.com/kraft87/synapse.git synapse && cd synapse
+cp .env.example .env                 # fill in DB password + DSN, machine token, API keys
+docker compose up -d --build         # builds the image, starts Postgres + poller + MCP server
+docker compose exec mcp-server synapse-admin bootstrap "this laptop"
 ```
 
-The images build locally from public bases (no registry auth), and the schema is applied
-automatically on Postgres's first boot.
-
-Required configuration (in `.env`):
-
-- `SYNAPSE_DB_PASSWORD` — password for the bundled Postgres (must match the one in the DSN).
-- `SYNAPSE_DB_URL` — Postgres DSN; the `.env.example` default just needs the password
-  filled in.
-- `VOYAGE_API_KEY` — Voyage AI key (embeddings + rerank). Not needed if you configure an
-  alternative backend (`SYNAPSE_EMBED_*` / `SYNAPSE_RERANK_*` in `.env.example`, e.g. the
-  `local-inference` profile).
-- `CLAUDE_CODE_OAUTH_TOKEN` **or** `ANTHROPIC_API_KEY` — auth for the extraction LLM (the
-  subscription token wins if both are set).
-
-Optional knobs (`SYNAPSE_INGEST_TAIL`, `POLL_INTERVAL_SECONDS`, recall-serving tuning such
-as the shadow-phase `SYNAPSE_RECALL_FLOOR` / `SYNAPSE_RECALL_FLOOR_ENFORCE` abstention
-floor, and more) are listed in
-[ARCHITECTURE.md §13](./ARCHITECTURE.md#13-configuration). If the default ports are taken,
-set `MCP_PORT` and/or `POSTGRES_HOST_PORT` in `.env`. Set `LOGFIRE_TOKEN` to stream traces
-to [Pydantic Logfire](https://logfire.pydantic.dev); leave it blank and telemetry is fully
-off.
-
-Then install the [plugin](./plugin/README.md) on each Claude Code machine so sessions feed
-and query the server automatically. The repo ships its own marketplace manifest, so there is
-nothing to publish:
+That last command prints a one-time device token. Every machine is served according to its
+own device token, so this step is not optional: paste the printed token as the "Synapse
+token" when you install the plugin.
 
 ```
 /plugin marketplace add kraft87/synapse
 /plugin install synapse@synapse
 ```
 
-Install prompts for your `SYNAPSE_URL` (`http://localhost:8765` for the local quickstart)
-and an optional token, then run `/reload-plugins`. Backfill months of past sessions in one
-shot with `! synapse-import` (see
-[Import your existing sessions](#import-your-existing-sessions)).
+The install prompts for your `SYNAPSE_URL` (`http://localhost:8765` for the local
+quickstart), the token above, and this machine's role. Then run `/reload-plugins`.
 
-### Verify your install
+Required values, verification steps, importing your existing history, upgrades, and
+troubleshooting: **[docs/install.md](docs/install.md)**.
 
-```bash
-# 1. Ship a test transcript (≥4 turns) to the server:
-curl -sX POST localhost:8765/ingest -H 'Content-Type: application/json' \
-  -d @docs/example-transcript.json
-# 2. Wait one poll cycle (up to ~5 minutes), then ask for it back:
-curl -sX POST localhost:8765/recall -H 'Content-Type: application/json' \
-  -d '{"query": "what caching layer did we pick for the demo app search service"}'
-```
+## Docs
 
-Two timing expectations that look like bugs but aren't: **episodes** appear within seconds
-of ingest, but **knowledge-graph facts** are extracted from 4-turn sliding windows — a
-session with fewer than 4 human turns produces episodes and an *empty graph*. And extraction
-runs on a poll cycle (`POLL_INTERVAL_SECONDS`, default 300), so first facts land a few
-minutes after ingest, not instantly.
-
-### Import your existing sessions
-
-A fresh install doesn't have to start cold. If you've been using Claude Code, months of
-transcripts already sit in `~/.claude/projects` — import them once and `recall()` knows your
-history on day one:
-
-```
-! synapse-import        # inside a Claude Code session (the plugin puts it on PATH)
-```
-
-It offers an optional date range (by each file's last-activity date), prints a summary
-(file count, size, estimated turns), and asks for confirmation before sending anything —
-importing runs KG extraction on your configured LLM for every new turn, which consumes
-subscription usage or API credits roughly in proportion to the turn count, so bounding a
-first import by date bounds the spend. The server dedups turns by `span_id`, so Ctrl-C
-and re-running are always safe: an interrupted import resumes where it left off.
-
-Cursor history can be imported too, but only as a server-side dev path for now
-(`python -m ingestion.cursor_sqlite_backfill`).
-
-### Upgrading
-
-First-boot init never re-runs on an existing data volume. To bring an existing database up
-to date, run [`scripts/apply_schema.sh`](./scripts/apply_schema.sh) (the single source of
-truth for migration order) against it — see the script's header for caveats.
-
-Every service verifies at boot that the database schema matches the code (the script
-stamps the applied version; a mismatch refuses to start with instructions rather than
-failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, restart.
-`SYNAPSE_SCHEMA_CHECK=0` skips the guard.
-
-Releases are tagged (`v0.8.1`, ...). `main` is kept releasable, but for a known-good
-build check out the latest tag; a change that needs a migration or renames an env var
-gets a release note saying so.
-
-## MCP tools
-
-Five tools, listed in the order the server registers them (deliberate — tool-list
-position biases which tool a model picks). The board is deliberately NOT a tool: the
-plugin's SessionStart hook injects it via `GET /context`, and a listed board tool would
-invite a double-inject of a block the model already has (the Hermes pattern — when
-injection covers the read, ship no read tool).
-
-- `recall(query, project=None, session_focus=None, group_id="technical", mode="overview")` —
-  the primary retrieval tool: reranked episodes + KG facts + timeline + web + history. Served
-  episode passages carry a `role` label (`user` / `assistant` / `mixed`) so the caller can
-  weight a human-stated fact over the agent's own past output. `mode="turns"` is the
-  raw-episode drill-down (full conversation turns, relevance + recency ranked) — it absorbed
-  the former standalone `recall_episodes` tool.
-- `fetch(ids)` — expand ids into full records: `e:N` episode ids from recall results
-  (bare `N` also accepted) and `n:N` note ids — the session-start board block's `n:ID`
-  lines resolve to their full note bodies through this tool. Mixed lists are fine; unknown ids come
-  back under `skipped`, and at most 20 ids expand per call.
-- `remember(content=None, hook=None, body=None, type="project", project=None)` — write a
-  curated memory. The preferred form passes `hook` (a one-line index entry, ~120 chars) plus
-  `body` (the full self-contained note) and a `type` (`user` / `feedback` / `project` /
-  `reference`); the legacy `content`-only form still works and derives the hook from the
-  first sentence. Both forms also archive the text as an episode and enqueue knowledge-graph
-  extraction. Notes land in a dedicated store that is reconciled on write: a new note that
-  restates an existing one updates it in place, and one that contradicts it supersedes the
-  old note while keeping the lineage — so the curated set stays small and current instead
-  of accumulating duplicates.
-- `recall_timeline(query=None, since=None, until=None, group_id=None)` — dated events for
-  "when / in what order" questions; `group_id="personal"` scopes to life events, excluding
-  technical/work noise.
-
-One more tool exists but is hidden from tool listings: `issue_machine_token`, the
-auth-gated plumbing `synapse login` calls to fetch the machine bearer token. It stays
-callable by name (`tools/call`) — it just never competes for a model's attention.
-
-## Auth
-
-The MCP server supports two auth modes at once, so machines and the claude.ai web connector
-can share one server:
-
-- **Machine bearer** — a static token the plugin's hooks send to `/ingest`, `/recall`, and
-  `/mcp`. Headless boxes set it directly.
-- **GitHub OAuth** — for the claude.ai web connector and the plugin's `synapse-login`. Login
-  defaults to the device flow (RFC 8628): approve a short code at `github.com/login/device`
-  from any device — no same-host browser — and the machine token is stored for you
-  (`--browser` keeps the legacy loopback flow). Access is gated to an allowlist of GitHub
-  users (`ALLOWED_GITHUB_USERS`); the GitHub OAuth App needs "Enable Device Flow" on.
-
-Instead of GitHub, any OIDC-compliant IdP (Authelia, Keycloak, Pocket ID, ...) can back the
-same three interactive flows — set `OIDC_CONFIG_URL` (the provider's
-`/.well-known/openid-configuration`), `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`, and
-`ALLOWED_OIDC_USERS` (matched against `preferred_username`, then `email`). MCP discovery can
-only advertise one authorization server, so this replaces GitHub for that deployment; leave
-the OIDC vars unset to keep the GitHub default. Register both `{base_url}/auth/callback` and
-`{base_url}/auth/callback/dash` as redirect URIs on the OIDC client, grant
-`openid profile email offline_access`, and (for the MCP leg's allowlist) configure the IdP to
-put `preferred_username`/`email` in the id_token — e.g. an Authelia claims policy. The device
-flow needs the IdP to support the device authorization grant. Two knobs adapt to IdP
-differences: `OIDC_SCOPES` (default `openid profile email offline_access`; trim
-`offline_access` for IdPs that reject the scope, like Google, at the cost of short-lived
-connector sessions) and `OIDC_USER_CLAIMS` (default `preferred_username,email`; the ordered
-claims read for the user's identity).
-
-With no token configured the server runs open, which is fine for a purely local instance. A
-central instance can be exposed to claude.ai over a Cloudflare tunnel; the MCP server
-handles auth itself, so no separate proxy is needed.
+- **[docs/install.md](docs/install.md)** — the full install: required configuration, first
+  device, verification, importing months of past sessions, ports, upgrading, troubleshooting.
+- **[docs/auth.md](docs/auth.md)** — machine token vs device tokens, enrollment, what a
+  restricted machine is served, GitHub OAuth and OIDC for the claude.ai connector.
+- **[docs/tools.md](docs/tools.md)** — the MCP tool surface, the plugin's hooks, and every
+  plugin configuration variable.
+- **[docs/features.md](docs/features.md)** — what's in the box, and the stack it runs on.
+- **[ARCHITECTURE.md](./ARCHITECTURE.md)** — the design doc: pipelines, schema, decisions,
+  measurements, full server configuration reference.
+- **[plugin/README.md](./plugin/README.md)** — the Claude Code plugin.
+  **[plugin-codex/README.md](./plugin-codex/README.md)** — the Codex CLI equivalent.
+- Design specs: [audience scoping](docs/audience-scoping-spec.md),
+  [session drill-down](docs/session-drilldown-spec.md),
+  [dashboard contract](docs/dashboard-contract.md).
 
 ## Status
 

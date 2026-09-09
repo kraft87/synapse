@@ -35,6 +35,15 @@ Auth: export `SYNAPSE_INGEST_TOKEN` in the environment Codex runs under
 fall back to the Claude plugin's saved options in `~/.claude/settings.json`,
 so a machine running both plugins configures once.
 
+That value must be this machine's own **device** token, not the shared
+`SYNAPSE_MACHINE_TOKEN`. Since schema 054 what a machine is served depends on
+its own credential, and the machine token resolves to no surface, so a Codex
+session using it gets an empty board and empty recalls with no error. Mint one
+on the server host with
+`docker compose exec mcp-server synapse-admin bootstrap "<label>"`, or from an
+already-trusted machine with `/synapse-devices mint "<label>"`. Background:
+[../docs/auth.md](../docs/auth.md).
+
 ## Why hooks in config.toml and not a plugin manifest?
 
 Codex v0.147 validates but does not enable plugin-bundled hooks (the
