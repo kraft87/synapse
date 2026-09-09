@@ -27,6 +27,7 @@ from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.scope import coerce_group, personal_scope_enabled
 from ingestion.surfaces import SurfaceTrust, resolve_caller, token_hash
 
 # The credential verifier and the constants it stamps, from ONE module so what WRITES a
@@ -682,7 +683,25 @@ async def health(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 
 
+# Personal scope off (SYNAPSE_PERSONAL_SCOPE=0): the tool description must not
+# advertise a graph this deployment does not keep. A model told about a scope
+# that no longer exists spends a call asking for it. The sentence is swapped at
+# import, before FastMCP reads the docstring into the tool description.
+_GROUP_ID_DOC_SPLIT = 'group_id: Knowledge graph scope — "technical" (default) or "personal".'
+_GROUP_ID_DOC_SINGLE = (
+    "group_id: Knowledge graph scope. This deployment keeps one graph;\n            leave it unset."
+)
+
+
+def _scope_doc(fn):  # type: ignore[no-untyped-def]
+    """Rewrite the personal-scope line out of a tool docstring when the scope is off."""
+    if not personal_scope_enabled() and fn.__doc__:
+        fn.__doc__ = fn.__doc__.replace(_GROUP_ID_DOC_SPLIT, _GROUP_ID_DOC_SINGLE)
+    return fn
+
+
 @mcp.tool()
+@_scope_doc
 def recall(
     query: str,
     project: str | None = None,
@@ -734,6 +753,9 @@ def recall(
         surface: DEPRECATED and ignored — the server identifies the calling
             device from its own credential. Never set it.
     """
+    # With the personal scope off, "personal" is an alias for the one graph that
+    # exists; coerced here too so the telemetry span records what was searched.
+    group_id = coerce_group(group_id) or "technical"
     with logfire.span(
         "mcp.recall {query!r}",
         query=query[:80],
@@ -1487,7 +1509,7 @@ async def recall_http(request: Request) -> JSONResponse:
     if not query:
         return err("missing 'query'", 400)
     project = body.get("project") or None
-    group_id = body.get("group_id") or "technical"
+    group_id = coerce_group(body.get("group_id")) or "technical"
     write_feedback = bool(body.get("write_feedback", False))
     source = body.get("source") or "http"
     debug = bool(body.get("debug", False))

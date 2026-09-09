@@ -44,6 +44,7 @@ from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Json as PgJson
 
 from ingestion import embedding as _embedding
+from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.kg_pg import _vec_literal, search_kg_postgres
 
@@ -1859,7 +1860,14 @@ class Recall:
         kg_relationships has no project column, so serving zero facts is the only
         fail-closed answer available). Bare calls with no surface therefore serve a
         narrow result on purpose; that is the design, not a regression.
+
+        ``group_id`` is coerced through ``coerce_group``: with the personal scope
+        off (SYNAPSE_PERSONAL_SCOPE=0) a request for the personal graph is served
+        from the technical one, because that is where every fact was written. A
+        model that asks for a scope this deployment does not run gets answers
+        instead of an empty graph.
         """
+        group_id = coerce_group(group_id) or "technical"
         t_start = time.perf_counter()
         ex = self._leg_executor
         st = _resolve(self._db_url, surface, trust)

@@ -171,6 +171,28 @@ minutes, up to 5 attempts, so fixing the configuration is enough: those turns pi
 facts on a later cycle rather than staying graph-less. Episodes are unaffected throughout,
 stored and recallable even when extraction fails.
 
+## Personal scope (optional)
+
+Synapse keeps two knowledge graphs: `technical` (the default, and what `recall()` searches
+unless told otherwise) and `personal` (family, health, job search, anything about the
+owner's life rather than their work). Extraction routes each entity and timeline event to
+one of them by name patterns and by the `SYNAPSE_PERSONAL_PROJECTS` list.
+
+If nobody will ever talk to this server about their life, turn the split off:
+
+```
+SYNAPSE_PERSONAL_SCOPE=0
+```
+
+Everything then lands in the single technical graph, and a recall that asks for the
+personal scope is answered from it. Work-only deployments should set this: with the split
+on, a technical entity that happens to match a personal word ("sleep" in a retry loop,
+"book" in a domain model) lands in the graph the default search never reads. The switch
+changes routing from now on; rows already written keep their group.
+
+This is a different "personal" from the machine role in step 4. The role says what a
+machine may be served. The scope says which graph a fact is written to.
+
 ## Local inference (no external accounts)
 
 The bundled `local-inference` compose profile runs embeddings and rerank locally, so

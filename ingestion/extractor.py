@@ -30,6 +30,7 @@ from ingestion.models import (
     ExtractedFact,
     ExtractionResult,
 )
+from ingestion.scope import active_groups, personal_scope_enabled
 
 if TYPE_CHECKING:
     from ingestion.embedding import EmbeddingModel
@@ -46,6 +47,11 @@ logger = logging.getLogger(__name__)
 # heuristics. Patterns mirror scripts/survey_cross_graph_leaks.py — same
 # regexes that identified the post-hoc leakers — so the writer-side classifier
 # matches the cleanup-side classifier.
+
+# The whole split is off when SYNAPSE_PERSONAL_SCOPE=0 (ingestion/scope.py): every
+# item and entity below routes to "technical" and the personal graph is never
+# written. Work-only deployments want that: a technical entity tripping the
+# personal regex lands in a graph the default search never reads.
 
 # Projects whose extraction items default to the personal graph. Deployment-
 # specific slugs (e.g. a project named after the owner) are config, not code:
@@ -91,7 +97,13 @@ _TECHNICAL_NAME_PATTERN = re.compile(
 
 
 def _default_group_for_project(project: str | None) -> str:
-    """Item-level default group derived from project tag."""
+    """Item-level default group derived from project tag.
+
+    With the personal scope off (SYNAPSE_PERSONAL_SCOPE=0) the project list is
+    never consulted: there is one graph, so every item defaults to technical.
+    """
+    if not personal_scope_enabled():
+        return "technical"
     if project and project.lower() in _PERSONAL_PROJECTS:
         return "personal"
     return "technical"
@@ -105,7 +117,13 @@ def _classify_entity_group(name: str, summary: str | None, default_group: str) -
     versa for clearly-technical names that surface in personal sessions.
     Borderline cases stay with the default. Matches the cleanup-pass regex
     in scripts/survey_cross_graph_leaks.py so writer and survey agree.
+
+    With the personal scope off (SYNAPSE_PERSONAL_SCOPE=0) neither pattern runs:
+    a technical entity that trips the personal regex would otherwise land in a
+    graph nothing reads.
     """
+    if not personal_scope_enabled():
+        return "technical"
     text = f"{name}\n{summary or ''}"
     if _PERSONAL_NAME_PATTERN.search(text):
         return "personal"
@@ -1841,7 +1859,7 @@ class ExtractionPipeline:
 
         Group routing: each entity is assigned to either the technical or personal
         graph via _classify_entity_group (project tag → item default, then per-entity
-        regex override). Entities are partitioned by group and resolved/written
+        regex override), or to technical alone when the personal scope is off. Entities are partitioned by group and resolved/written
         independently against their target graph. Edges are only written when both
         endpoints landed in the same group; cross-group facts are dropped (rare —
         a sign of borderline content the regex misclassified).
@@ -1984,7 +2002,7 @@ class ExtractionPipeline:
         uuid_map: dict[str, str] = {}
         grp_entities_map: dict[str, list[ExtractedEntity]] = {}
         dedupers: dict[str, NodeDeduper] = {}
-        for grp in ("technical", "personal"):
+        for grp in active_groups():
             grp_entities = [e for e in all_entities if entity_groups[e.name] == grp]
             if not grp_entities:
                 continue
@@ -2042,12 +2060,12 @@ class ExtractionPipeline:
 
         # Partition facts by the group of their (source, target) entity pair. Drop
         # cross-group facts — they imply the regex misclassified one endpoint.
-        facts_by_group: dict[str, list[ExtractedFact]] = {"technical": [], "personal": []}
+        facts_by_group: dict[str, list[ExtractedFact]] = {g: [] for g in active_groups()}
         cross_group_dropped = 0
         for fact in llm_result.facts:
             src_grp = entity_groups.get(fact.source)
             tgt_grp = entity_groups.get(fact.target)
-            if src_grp and tgt_grp and src_grp == tgt_grp:
+            if src_grp and tgt_grp and src_grp == tgt_grp and src_grp in facts_by_group:
                 facts_by_group[src_grp].append(fact)
             else:
                 cross_group_dropped += 1
@@ -2077,7 +2095,7 @@ class ExtractionPipeline:
         # Stage 6 + 7 run separately per group — same code path, different graph.
         # default_valid_at doubles as the relative-date reference_time (the segment
         # timestamp), so "last week" resolves against the conversation, not ingest.
-        for grp in ("technical", "personal"):
+        for grp in active_groups():
             grp_facts = facts_by_group[grp]
             if not grp_facts:
                 continue
