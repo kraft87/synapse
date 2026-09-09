@@ -27,6 +27,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
+from ingestion.scope import coerce_group
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,20 @@ def _embed_text(project: str | None, fact: str) -> str:
     # Metadata-enriched embed string — short naked facts under-fill a 2048-dim space,
     # so give the model the project for grip (2026-07-01 design review).
     return f"Project: {project or '-'} | {fact}"
+
+
+def _event_domain(e: dict[str, Any]) -> str | None:
+    """The stored ``domain`` for one pushed event (schema 038).
+
+    Git-sourced events are technical by construction; other pushers may label
+    explicitly; anything else stays NULL, which fails open at read. With the
+    personal scope off (SYNAPSE_PERSONAL_SCOPE=0) only one domain exists, so a
+    pushed "personal" label is stored as technical.
+    """
+    domain = e.get("domain")
+    if domain not in ("personal", "technical"):
+        domain = "technical" if str(e["source"]).startswith("git:") else None
+    return coerce_group(domain)
 
 
 def _ingest_events(
@@ -82,11 +97,7 @@ def _ingest_events(
 
         inserted = 0
         for e, vec in zip(fresh, vecs, strict=True):
-            # Domain scoping (schema 038): git-sourced events are technical by
-            # construction; other pushers may label explicitly. NULL fails open at read.
-            domain = e.get("domain")
-            if domain not in ("personal", "technical"):
-                domain = "technical" if str(e["source"]).startswith("git:") else None
+            domain = _event_domain(e)
             inserted += conn.execute(
                 "INSERT INTO timeline_events "
                 "(t_valid, fact, source, source_ref, project, salience, embedding, embed_model, "
