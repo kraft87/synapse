@@ -19,12 +19,13 @@ Fill in these values in `.env`. Everything else has a working default.
 |----------|-------------------|
 | `SYNAPSE_DB_PASSWORD` | Password for the bundled Postgres. Must match the password inside `SYNAPSE_DB_URL`. |
 | `SYNAPSE_DB_URL` | Postgres DSN. The `.env.example` default just needs the same password filled in. |
-| `SYNAPSE_MACHINE_TOKEN` | The shared root bearer. Generate one with `openssl rand -hex 32`. |
+| `SYNAPSE_MACHINE_TOKEN` | The shared root bearer. `.env.example` ships it as `CHANGEME`; generate a real one with `openssl rand -hex 32`. |
 | `VOYAGE_API_KEY` | Voyage AI key, used for embeddings and rerank. Skip it only if you configure an alternative backend (see [local inference](#local-inference-no-external-accounts)). |
 | `CLAUDE_CODE_OAUTH_TOKEN` **or** `ANTHROPIC_API_KEY` | Auth for the extraction LLM. The subscription token wins if both are set. |
 
-`SYNAPSE_MACHINE_TOKEN` is required: the server refuses to start with it blank. The one
-exception is `SYNAPSE_ALLOW_OPEN=1`, a dev-only mode that starts without a token and then
+`SYNAPSE_MACHINE_TOKEN` is required: the server refuses to boot while it is blank or still
+the `CHANGEME` placeholder, and prints what to do about it. The one exception is
+`SYNAPSE_ALLOW_OPEN=1`, a dev-and-stdio-only mode that starts without a token and then
 serves **every** caller restricted, which means an empty board and empty recalls. It is for
 poking at a throwaway stack, not for running one.
 
@@ -54,8 +55,15 @@ starting. See [Ports and a second instance](#ports-and-a-second-instance).
 docker compose exec mcp-server synapse-admin bootstrap "this laptop"
 ```
 
-It prints a full-trust device token once. Copy it: you paste it as the "Synapse token" in
-the plugin install prompt in the next step.
+```
+minted dev-<surface-id> trust=full label=this laptop
+token: <one-time token>
+Shown once — only the hash is stored.
+```
+
+Copy the token: you paste it as the "Synapse token" in the plugin install prompt in the
+next step. It is shown once because only its hash is stored, so if you lose it, run
+`bootstrap` again for a new one and revoke the old row.
 
 Why this step exists: since schema 054, what a machine is served depends on **its own**
 device token, not on the shared machine token and not on any name it reports. The shared
@@ -144,9 +152,10 @@ Cursor history can be imported too, but only as a server-side dev path for now
 as `anthropic/claude-haiku-4.5`, is the OpenRouter spelling and is only valid with
 `SYNAPSE_LLM_PROVIDER=openai`. The default `claude-code` provider passes the id straight to
 the Claude CLI, which rejects it, and every extraction stage then fails with empty output.
-The `claude-code` provider now refuses a prefixed id at startup rather than failing once per
-queue item. On the default provider, either leave `SYNAPSE_LLM_MODEL` unset or use a plain
-Claude model name.
+Two guards now catch that: `.env.example` ships the line commented out, and the
+`claude-code` provider refuses a prefixed id at startup, naming the spelling it wants
+(`claude-haiku-4-5`) instead of failing once per queue item. On the default provider, either
+leave `SYNAPSE_LLM_MODEL` unset or use a plain Claude model name.
 
 Failed extraction items are not retried automatically, so an install that ran for a while on
 a broken model id leaves those first turns permanently graph-less. The episodes are still

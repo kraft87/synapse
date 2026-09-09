@@ -45,7 +45,7 @@ Two ways to get one:
   token into the config slot for you.
 - Otherwise, on the server host:
   `docker compose exec mcp-server synapse-admin bootstrap "<label>"`. It prints a full-trust
-  device token once. Copy it for the next step.
+  device token once (only the hash is stored). Copy it for the next step.
 
 Details, roles, and revocation: [docs/auth.md](../docs/auth.md).
 

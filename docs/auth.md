@@ -42,8 +42,8 @@ belonging to this machine, written back into the same config slot.
 docker compose exec mcp-server synapse-admin bootstrap "<label>"
 ```
 
-Prints a full-trust device token once. This is the local quickstart's normal path, since a
-purely local stack usually has no IdP at all.
+Prints a full-trust device token once, because only its hash is stored. This is the local
+quickstart's normal path, since a purely local stack usually has no IdP at all.
 
 **Mint from an already-trusted machine.** For a box that will never run a browser flow (a
 service, a container):
@@ -111,8 +111,10 @@ These routes require a full-trust **device** token. The shared machine token is 
 design, so if the CLI reports 401 that is the reason.
 
 **Break-glass is not a token.** `synapse-admin` (`list` / `mint` / `revoke` / `bootstrap`)
-talks to Postgres over a direct DSN, so recovery needs shell access on the database host, a
-strictly higher bar than holding a bearer. It covers the three cases where nothing else
+talks to Postgres over a direct DSN, so recovery needs shell access on the host, a strictly
+higher bar than holding a bearer. It is a console script inside the image;
+`scripts/surface_admin.py` remains as a host-side shim for a database you reach without the
+container. It covers the three cases where nothing else
 works: no IdP configured at all, the IdP down or the account locked, and no full-trust device
 left.
 
