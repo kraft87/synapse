@@ -98,7 +98,7 @@ def _cfg(key: str, default: str = "") -> str:
     return os.environ.get(key) or _env.get(key, default)
 
 
-# --- Auth (env-gated; absent machine token => OPEN server, the pre-cutover / dev default) ---
+# --- Auth (machine token REQUIRED to start; SYNAPSE_ALLOW_OPEN=1 is the dev/stdio hatch) ---
 # The ROOT bearer. It gates /mcp (via SynapseTokenVerifier) AND the internal write lanes
 # (/ingest and friends, manual check below), and it is the ENROLLMENT credential every new
 # device pastes once to obtain its own token. It is deliberately NOT sufficient for the
@@ -107,6 +107,9 @@ def _cfg(key: str, default: str = "") -> str:
 # decides who may join. Set GITHUB_CLIENT_ID to additionally stand up the claude.ai-web
 # OAuth leg via MultiAuth.
 MACHINE_TOKEN = _cfg("SYNAPSE_MACHINE_TOKEN")
+# Placeholders .env.example ships. Treated as "not set", so a copied-but-unedited .env
+# fails the startup check instead of standing up a server with a guessable root bearer.
+_TOKEN_PLACEHOLDERS = {"changeme", "change-me", "changeme!", "todo", "xxx"}
 GITHUB_CLIENT_ID = _cfg("GITHUB_CLIENT_ID")
 GITHUB_CLIENT_SECRET = _cfg("GITHUB_CLIENT_SECRET")
 PUBLIC_URL = _cfg("SYNAPSE_PUBLIC_URL", "https://synapse.example.net")
@@ -1580,16 +1583,58 @@ def issue_machine_token() -> dict:
     return {"token": MACHINE_TOKEN}
 
 
+_MISSING_TOKEN_ERROR = """
+SYNAPSE_MACHINE_TOKEN is not set — refusing to start.
+
+Since schema 054 a caller is served according to the credential it presents. With
+no machine token there is no credential to check, so EVERY caller resolves to an
+unknown surface and is served nothing: an empty board, empty recall, no error.
+
+Fix it in one minute:
+
+  1. Generate a token:      openssl rand -hex 32
+  2. Put it in .env:        SYNAPSE_MACHINE_TOKEN=<that value>
+  3. Restart:               docker compose up -d
+  4. Mint this machine its own device token (printed once):
+         docker compose exec mcp-server synapse-admin bootstrap "<label>"
+     and paste that token into the plugin's Synapse token prompt.
+
+Really want an open server (dev / stdio only)? Set SYNAPSE_ALLOW_OPEN=1. It still
+serves every caller `restricted` — this flag suppresses the check, not the effect.
+"""
+
+_OPEN_BANNER = (
+    "OPEN server: every caller is served restricted; "
+    "set SYNAPSE_MACHINE_TOKEN and bootstrap a device"
+)
+
+
+def _startup_auth_mode() -> str:
+    """``"authenticated"`` or ``"open"``, refusing to start when the token is missing.
+
+    The open server is a legitimate dev/stdio shape, but it is NOT a working install:
+    it serves nothing to everyone, silently. So the token is required by default and
+    open mode has to be asked for by name (SYNAPSE_ALLOW_OPEN=1) — and says what it is
+    every time it boots.
+    """
+    if MACHINE_TOKEN and MACHINE_TOKEN.strip().lower() not in _TOKEN_PLACEHOLDERS:
+        return "authenticated"
+    if _cfg("SYNAPSE_ALLOW_OPEN", "0") not in ("", "0"):
+        logger.warning(_OPEN_BANNER)
+        return "open"
+    raise SystemExit(_MISSING_TOKEN_ERROR)
+
+
 if __name__ == "__main__":
     import sys
 
     from ingestion.schema_check import check_schema_version
 
     logging.basicConfig(level=logging.INFO)
+    _mode = _startup_auth_mode()
     check_schema_version(DB_URL)
 
     if "--stdio" not in sys.argv:
-        _mode = "authenticated" if MACHINE_TOKEN else "OPEN (no auth)"
         logger.info("Starting Synapse MCP server (http, %s) on %s:%d", _mode, _mcp_host, _mcp_port)
         mcp.run(transport="http", host=_mcp_host, port=_mcp_port, stateless_http=True, path="/mcp")
     else:
