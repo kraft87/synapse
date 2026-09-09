@@ -29,7 +29,12 @@ import re
 from datetime import datetime, timedelta
 from typing import Any
 
-from ingestion.llm_client import MalformedResponseError, parse_with_retry, structured_call
+from ingestion.llm_client import (
+    LLM_TRANSPORT_ERRORS,
+    MalformedResponseError,
+    parse_with_retry,
+    structured_call,
+)
 from ingestion.llm_schemas import TimelineGateEvents
 
 logger = logging.getLogger(__name__)
@@ -195,11 +200,21 @@ class TimelineGate:
         self.dedup_enabled = os.environ.get("SYNAPSE_TIMELINE_DEDUP", "1") != "0"
 
     def process(self, item: dict[str, Any]) -> None:
-        """Gate one turn. Fail-soft: errors are logged, never raised."""
+        """Gate one turn. Fail-soft for CONTENT failures; transport failures re-raise.
+
+        The distinction is what keeps a broken config from being recorded as a decision.
+        A gate that swallowed everything returned normally when the LLM never answered
+        at all, so the poller marked the queue row done (attempts=0, error NULL) and the
+        turn was permanently gate-less: fixing the token or the model id later re-ran
+        nothing. Anything in ``LLM_TRANSPORT_ERRORS`` therefore propagates, the row is
+        marked failed with the reason, and the queue retries it.
+        """
         if not self.enabled:
             return
         try:
             self._process(item)
+        except LLM_TRANSPORT_ERRORS:
+            raise
         except Exception as e:
             logger.warning("timeline gate failed for item %s: %s", item.get("id"), e)
 

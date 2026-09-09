@@ -175,17 +175,28 @@ def _mcp_call_token(access_token: str) -> str:
 
 def _device_login() -> int:
     """RFC 8628 device flow: print a code, approve on any device, poll for the machine token."""
+    import enroll
+
     try:
         start = _post_json(BASE + "/device/code", {})
     except urllib.error.HTTPError as e:
-        if e.code == 404:
+        body = {}
+        try:
+            body = json.loads(e.read() or b"{}")
+        except Exception:
+            pass
+        if body.get("error") in ("no_idp", "no_machine_token"):
+            # The server is telling us there is nobody to sign in to. Retrying, or
+            # switching to --browser, cannot help; minting on the server can.
+            print(enroll.bootstrap_hint(), file=sys.stderr)
+        elif e.code == 404:
             print(
                 "This Synapse has no device-login route (older server). Retry with --browser, "
                 "or set SYNAPSE_INGEST_TOKEN directly.",
                 file=sys.stderr,
             )
         else:
-            print(f"device/code failed: HTTP {e.code} {e.read().decode()[:200]}", file=sys.stderr)
+            print(f"device/code failed: HTTP {e.code} {str(body)[:200]}", file=sys.stderr)
         return 1
     except Exception as e:
         print(f"device/code failed: {e}", file=sys.stderr)
@@ -193,6 +204,9 @@ def _device_login() -> int:
 
     if "user_code" not in start:
         err = start.get("error", "unknown")
+        if err in ("no_idp", "no_machine_token"):
+            print(enroll.bootstrap_hint(), file=sys.stderr)
+            return 1
         print(f"device login unavailable: {err}", file=sys.stderr)
         if err == "device_flow_disabled":
             print(

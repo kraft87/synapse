@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.17.1",
+  "version": "0.18.0",
   "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Point it at a local or central Synapse.",
   "author": {
     "name": "kraft87"
@@ -15,7 +15,7 @@
     "SYNAPSE_INGEST_TOKEN": {
       "type": "string",
       "title": "Synapse token",
-      "description": "Optional. Leave blank and run `! synapse-login` in the Claude prompt: you sign in once and this machine enrolls, receiving its OWN device token, which is stored right back here. What this machine is served depends on that token, and it can be revoked on its own. Paste a token directly only for an open/local server or a machine minted one from elsewhere.",
+      "description": "Optional. Leave blank and run `! synapse-login` in the Claude prompt: you sign in once and this machine enrolls, receiving its OWN device token, which is stored right back here. What this machine is served depends on that token, and it can be revoked on its own. Paste a token directly when the server has no sign-in configured: run `docker compose exec mcp-server synapse-admin bootstrap \"<label>\"` there and paste what it prints.",
       "sensitive": true
     },
     "SYNAPSE_MACHINE_ROLE": {

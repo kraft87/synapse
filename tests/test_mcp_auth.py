@@ -374,3 +374,44 @@ def test_a_device_token_cannot_fetch_the_root_credential(credentialed, monkeypat
 
     monkeypatch.setattr(credentialed, "get_access_token", lambda: None)
     assert credentialed.issue_machine_token() == {"token": "root-tok"}
+
+
+# --- startup gate: a machine token is a required install value ----------------------
+#
+# An open server is not a working install — since 054 it serves every caller nothing,
+# with no error anywhere. So `python -m mcp_server.server` refuses to boot without a
+# token unless open mode is asked for by name.
+
+
+def test_startup_refuses_without_a_machine_token(monkeypatch):
+    s = _reload(monkeypatch, {})
+    monkeypatch.setenv("SYNAPSE_ALLOW_OPEN", "0")
+    with pytest.raises(SystemExit) as e:
+        s._startup_auth_mode()
+    msg = str(e.value)
+    assert "SYNAPSE_MACHINE_TOKEN" in msg
+    assert "openssl rand -hex 32" in msg
+    assert "synapse-admin bootstrap" in msg
+
+
+def test_startup_refuses_the_env_example_placeholder(monkeypatch):
+    """A copied-but-unedited .env must not stand up a server on a guessable bearer."""
+    s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "CHANGEME"})
+    monkeypatch.setenv("SYNAPSE_ALLOW_OPEN", "0")
+    with pytest.raises(SystemExit):
+        s._startup_auth_mode()
+
+
+def test_startup_allows_open_mode_when_asked_for_by_name(monkeypatch, caplog):
+    s = _reload(monkeypatch, {})
+    monkeypatch.setenv("SYNAPSE_ALLOW_OPEN", "1")
+    with caplog.at_level("WARNING"):
+        assert s._startup_auth_mode() == "open"
+    assert "OPEN server" in caplog.text
+    assert "restricted" in caplog.text
+
+
+def test_startup_passes_with_a_real_token(monkeypatch):
+    s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "0f1e2d3c"})
+    monkeypatch.setenv("SYNAPSE_ALLOW_OPEN", "0")
+    assert s._startup_auth_mode() == "authenticated"

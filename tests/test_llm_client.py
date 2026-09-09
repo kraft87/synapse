@@ -38,6 +38,7 @@ from tenacity import wait_exponential
 from ingestion.llm_client import (
     _MAX_THINKING_TOKENS,
     ClaudeCLIClient,
+    LLMUnavailableError,
     MalformedResponseError,
     _is_usage_limit,
     _MessagesProxy,
@@ -297,6 +298,38 @@ class TestParseWithRetry:
 
         assert client.messages.create.call_count == 3
 
+    def test_all_blank_responses_are_a_transport_failure(self):
+        """An EMPTY body on every attempt is not a parse failure — the model never
+        answered. Call sites are entitled to degrade on MalformedResponseError (the
+        model spoke, badly); degrading here would record a decision that was never
+        made and let the queue mark the item done. This is exactly what a wrong model
+        id looks like: `claude -p --model anthropic/claude-haiku-4.5` exits 0 with
+        [claude-code:unrecognized_model] and no output."""
+        client = MagicMock()
+        client.messages.create.return_value = mock_llm_message("")
+
+        with pytest.raises(LLMUnavailableError) as e:
+            parse_with_retry(
+                client, base_prompt="extract this", parser=self._parser, max_attempts=3
+            )
+        assert client.messages.create.call_count == 3
+        assert "no output" in str(e.value)
+
+    def test_one_non_blank_answer_stays_a_parse_failure(self):
+        """The model DID speak on some attempt, so the failure is about content and the
+        caller's conservative fallback is a fair reading of it."""
+        client = MagicMock()
+        client.messages.create.side_effect = [
+            mock_llm_message(""),
+            mock_llm_message("not json"),
+            mock_llm_message("   "),
+        ]
+
+        with pytest.raises(MalformedResponseError):
+            parse_with_retry(
+                client, base_prompt="extract this", parser=self._parser, max_attempts=3
+            )
+
     def test_no_retry_on_first_success(self):
         """Valid JSON first time → 1 call, no feedback appended."""
         client = MagicMock()
@@ -426,3 +459,41 @@ def test_agent_call_caps_thinking_budget():
     assert out == "hello"
     assert captured.get("max_thinking_tokens") == _MAX_THINKING_TOKENS
     assert _MAX_THINKING_TOKENS <= 4096  # guard the intent: a real reduction
+
+
+def test_agent_call_refuses_an_error_result():
+    """The CLI reports its own failures as a normal result with ``is_error=True`` and
+    error TEXT in the result field — "Not logged in · Please run /login" for a stack
+    with no token, an unrecognised-model notice for a bad id. Parsed as a model answer
+    that is exactly a content failure (unparseable text), which is how a whole queue of
+    turns got marked done and extracted nothing. It has to be its own signal."""
+    import ingestion.llm_client as mod
+
+    class _FakeResult:
+        def __init__(self) -> None:
+            self.result = "Not logged in · Please run /login"
+            self.structured_output = None
+            self.is_error = True
+
+    class _FakeClient:
+        def __init__(self, options: Any = None) -> None:
+            pass
+
+        async def __aenter__(self) -> _FakeClient:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        async def query(self, prompt: str) -> None:
+            return None
+
+        async def receive_response(self):  # type: ignore[no-untyped-def]
+            yield _FakeResult()
+
+    with (
+        patch.object(mod, "ClaudeSDKClient", _FakeClient),
+        patch.object(mod, "ResultMessage", _FakeResult),
+    ):
+        with pytest.raises(LLMUnavailableError, match="Not logged in"):
+            asyncio.run(agent_call("hi"))

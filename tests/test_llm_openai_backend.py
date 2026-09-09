@@ -120,12 +120,15 @@ class TestProviderSelection:
         assert "localhost:11434" in client.base_url
 
     def test_stage_env_beats_global_env(self, monkeypatch):
+        # Slashed ids are openai-provider ids; under claude-code they are refused.
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
         monkeypatch.setenv("SYNAPSE_EXTRACTOR_MODEL", "per-stage/model")
         monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
         assert stage_model("EXTRACTOR") == "per-stage/model"
         assert stage_model("extractor") == "per-stage/model"  # case-insensitive stage
 
     def test_global_env_beats_default(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
         monkeypatch.delenv("SYNAPSE_EXTRACTOR_MODEL", raising=False)
         monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
         assert stage_model("EXTRACTOR", "claude-haiku-4-5") == "global/model"
@@ -835,3 +838,63 @@ class TestThreadLocalConnectionState:
         t.start()
         t.join()
         assert seen["loop"] is not loop
+
+
+# ---------------------------------------------------------------------------
+# Model-id spelling guard
+# ---------------------------------------------------------------------------
+
+
+class TestModelIdGuard:
+    """A slashed model id under claude-code is a config error the CLI reports as silence.
+
+    `claude -p --model anthropic/claude-haiku-4.5` exits 0 with
+    [claude-code:unrecognized_model] and no output, so the real symptom appears four
+    layers away as "no JSON object in response" on every stage. .env.example shipped
+    that exact id, uncommented, under the default provider.
+    """
+
+    def test_slashed_id_is_refused_under_claude_code(self, monkeypatch):
+        from ingestion.llm_client import check_model_id
+
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "claude-code")
+        with pytest.raises(ValueError) as e:
+            check_model_id("anthropic/claude-haiku-4.5")
+        msg = str(e.value)
+        assert "SYNAPSE_LLM_MODEL" in msg  # the variable to edit
+        assert "claude-haiku-4-5" in msg  # the spelling that works
+        assert "SYNAPSE_LLM_PROVIDER=openai" in msg  # where the slashed id belongs
+
+    def test_the_stage_variable_is_named_when_it_is_the_culprit(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("SYNAPSE_TIMELINE_MODEL", "anthropic/claude-haiku-4.5")
+        with pytest.raises(ValueError, match="SYNAPSE_TIMELINE_MODEL"):
+            stage_model("TIMELINE")
+
+    def test_create_llm_client_refuses_it_at_construction(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_LLM_PROVIDER", raising=False)
+        with pytest.raises(ValueError, match="SYNAPSE_LLM_MODEL"):
+            create_llm_client(model="anthropic/claude-haiku-4.5")
+
+    def test_plain_claude_ids_pass(self, monkeypatch):
+        monkeypatch.delenv("SYNAPSE_LLM_PROVIDER", raising=False)
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "claude-haiku-4-5")
+        assert stage_model("EXTRACTOR") == "claude-haiku-4-5"
+
+    def test_openai_provider_still_takes_slashed_ids(self, monkeypatch):
+        monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "anthropic/claude-haiku-4.5")
+        assert stage_model("EXTRACTOR") == "anthropic/claude-haiku-4.5"
+
+    def test_env_example_does_not_ship_a_live_slashed_id(self):
+        """The regression that made this necessary: the file set it, uncommented, under
+        SYNAPSE_LLM_PROVIDER=claude-code."""
+        from pathlib import Path
+
+        env_example = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+        live = [
+            ln
+            for ln in env_example.splitlines()
+            if ln.startswith("SYNAPSE_") and "_MODEL=" in ln and ln.split("=", 1)[1].strip()
+        ]
+        assert live == [], f"uncommented model override(s) in .env.example: {live}"

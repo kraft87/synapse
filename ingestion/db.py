@@ -1251,14 +1251,32 @@ class Database:
             ).fetchall()
         return cast(list[dict[str, Any]], result)
 
+    #: A failed item is retried at most this many times before it stays failed. Bounded
+    #: so a genuinely poisonous item (content the model will never parse) stops costing
+    #: LLM calls, while an outage or a wrong model id — which is what failure normally
+    #: means here — gets picked up again on its own.
+    MAX_EXTRACTION_ATTEMPTS = 5
+    #: How long a failed item waits before it is eligible again. Long enough that a
+    #: broken config is a slow trickle rather than a hot loop, short enough that fixing
+    #: the config drains the backlog the same afternoon.
+    FAILED_RETRY_MINUTES = 30
+
     def claim_pending_extractions(self, limit: int = 30) -> list[dict[str, Any]]:
-        """Atomically claim up-to-N pending items for this worker.
+        """Atomically claim up-to-N claimable items for this worker.
 
         Uses ``FOR UPDATE SKIP LOCKED`` against the inner SELECT so multiple
         worker processes (e.g. scaled poller replicas) can call this
         concurrently without race or duplication: each call grabs a distinct
-        slice of the pending queue, marks them ``status='processing'`` in the
+        slice of the queue, marks them ``status='processing'`` in the
         same transaction via ``UPDATE ... RETURNING``, and returns the rows.
+
+        Claimable = ``pending``, plus ``failed`` rows that have not exhausted
+        ``MAX_EXTRACTION_ATTEMPTS`` and last ran more than
+        ``FAILED_RETRY_MINUTES`` ago. Without the second lane ``failed`` was
+        terminal forever: nothing ever re-claimed it, so an item that failed
+        during an outage (or against a wrong model id) stayed graph-less no
+        matter what was fixed afterwards. Pending always sorts first, so a
+        retry backlog can never starve new ingest.
 
         If a worker crashes after claiming but before marking done/failed,
         the rows are left ``processing`` indefinitely — see
@@ -1272,14 +1290,21 @@ class Database:
                 WHERE id IN (
                     SELECT id FROM extraction_queue
                     WHERE status = 'pending'
-                    -- priority lane: new ingest (0) before backfill (10), then oldest-first.
-                    ORDER BY priority ASC, enqueued_at ASC
+                       OR (
+                            status = 'failed'
+                            AND attempts < %s
+                            AND COALESCE(processed_at, enqueued_at)
+                                < now() - make_interval(mins => %s)
+                       )
+                    -- new work first, retries after; then the priority lane
+                    -- (new ingest 0 before backfill 10) and oldest-first.
+                    ORDER BY (status <> 'pending'), priority ASC, enqueued_at ASC
                     LIMIT %s
                     FOR UPDATE SKIP LOCKED
                 )
                 RETURNING *
                 """,
-                (limit,),
+                (self.MAX_EXTRACTION_ATTEMPTS, self.FAILED_RETRY_MINUTES, limit),
             ).fetchall()
         return cast(list[dict[str, Any]], result)
 

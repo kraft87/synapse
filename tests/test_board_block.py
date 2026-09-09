@@ -241,3 +241,58 @@ def test_a_401_on_an_enrolled_machine_stays_silent(monkeypatch, tmp_path, capsys
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     mod.main()
     assert capsys.readouterr().out == ""
+
+
+# --- the SILENT case: 200 + restricted + no device credential -----------------------
+
+
+def test_a_restricted_unenrolled_caller_explains_itself(monkeypatch, tmp_path, capsys):
+    """The failure a fresh install actually hits. An open server, or a caller holding
+    the shared root token, is served a perfectly successful empty board — same outcome
+    as the 401 above, none of the signal. Both remedies must appear, because which one
+    applies depends on whether the server has a sign-in at all."""
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+
+    def fake_get_json(path, params=None, timeout=30.0):
+        return {"status": "ok", "text": "", "trust": "restricted", "n_notes": 0}
+
+    monkeypatch.setattr(mod, "get_json", fake_get_json)
+    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    mod.main()
+    out = capsys.readouterr().out
+    assert "served nothing" in out
+    assert "synapse-login" in out  # remedy 1: server with an IdP
+    assert "synapse-admin bootstrap" in out  # remedy 2: local server, no IdP
+    assert "Synapse token" in out  # ...and where the minted token goes
+
+
+def test_restricted_but_enrolled_stays_silent(monkeypatch, tmp_path, capsys):
+    """A restricted WORK machine is a deliberate grant, not a misconfiguration. It got
+    the credential it was meant to get; nagging it every session would train the block
+    to be ignored on the machine that needs it."""
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+    calls = _run(
+        monkeypatch,
+        mod,
+        "{}",
+        {"status": "ok", "text": _BOARD_TEXT, "trust": "restricted"},
+    )
+    assert calls  # the fetch happened
+    assert capsys.readouterr().out == _BOARD_TEXT + "\n"  # board only, no explainer
+
+
+def test_full_trust_prints_no_explainer(monkeypatch, tmp_path, capsys):
+    _isolated_env(monkeypatch, tmp_path)
+    mod = _load_hook()
+    monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
+
+    def fake_get_json(path, params=None, timeout=30.0):
+        return {"status": "ok", "text": _BOARD_TEXT, "trust": "full"}
+
+    monkeypatch.setattr(mod, "get_json", fake_get_json)
+    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
+    mod.main()
+    assert capsys.readouterr().out == _BOARD_TEXT + "\n"

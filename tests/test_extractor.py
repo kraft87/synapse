@@ -831,24 +831,29 @@ class TestEntityResolver:
         assert mapping["Alpha"] == "cand0"
         assert mapping["Beta"].startswith("new:")
 
-    def test_batch_confirm_empty_response_defaults_distinct(self):
-        # The old bug: an empty SDK body -> json.loads raises -> code defaulted
-        # to SAME-entity (silent wrong-merge). Now the conservative default is
-        # DISTINCT: every pending entity becomes a new node.
+    def test_batch_confirm_empty_response_raises_for_retry(self):
+        # The original bug: an empty SDK body -> json.loads raises -> code defaulted to
+        # SAME-entity (silent wrong-merge). It then defaulted to DISTINCT, which is safe
+        # for the graph but still records a decision the model never made, on an item the
+        # queue then marks done. An EMPTY body on every attempt means the model never
+        # answered (unrecognised id, dead auth), so it now propagates: the queue marks the
+        # item failed with the reason and retries it once the config is fixed.
+        from ingestion.llm_client import LLMUnavailableError
+
         embedder = self._mock_embedder([self._make_embedding(0.1)])
         falkordb = _mock_falkordb(
             similar_nodes=[{"uuid": "cand0", "name": "Candidate", "score": 0.12}]
         )
         llm_client = MagicMock()
         mock_msg = MagicMock()
-        mock_msg.content = [MagicMock(text="")]  # empty body -> parse failure
+        mock_msg.content = [MagicMock(text="")]  # empty body -> nothing was decided
         llm_client.messages.create.return_value = mock_msg
 
         resolver = EntityResolver(
             embedder=embedder, llm_client=llm_client, similarity_threshold=0.85
         )
-        mapping = resolver.resolve([_entity("Gamma")], kg_client=falkordb, group_id="technical")
-        assert mapping["Gamma"].startswith("new:")  # NOT merged into cand0
+        with pytest.raises(LLMUnavailableError):
+            resolver.resolve([_entity("Gamma")], kg_client=falkordb, group_id="technical")
 
     def test_batch_confirm_no_llm_trusts_top_candidate(self):
         # With no LLM client, a confirm-band match trusts the top candidate
@@ -1303,24 +1308,27 @@ class TestPerStageModels:
         )
 
     def test_stage_envs_reach_their_stages(self, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_TIMELINE_MODEL", "stage/timeline")
-        monkeypatch.setenv("SYNAPSE_CONTRADICTION_MODEL", "stage/contradiction")
+        # Dashed placeholders, not slashed: a slashed id means "openai provider", and
+        # the claude-code backend refuses it (check_model_id) rather than sending an id
+        # the CLI answers with empty output.
+        monkeypatch.setenv("SYNAPSE_TIMELINE_MODEL", "stage-timeline")
+        monkeypatch.setenv("SYNAPSE_CONTRADICTION_MODEL", "stage-contradiction")
         pipe = self._pipeline()
-        assert pipe._timeline_gate._model == "stage/timeline"
-        assert pipe._contradiction_model == "stage/contradiction"
-        assert pipe._contradiction_detector._model == "stage/contradiction"
+        assert pipe._timeline_gate._model == "stage-timeline"
+        assert pipe._contradiction_model == "stage-contradiction"
+        assert pipe._contradiction_detector._model == "stage-contradiction"
         # Untouched stages keep the code default.
         assert pipe._llm._model == "claude-haiku-4-5"
         assert pipe._preferences_gate._model == "claude-haiku-4-5"
 
     def test_global_env_covers_every_stage(self, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global-model")
         pipe = self._pipeline()
-        assert pipe._llm._model == "global/model"
-        assert pipe._timeline_gate._model == "global/model"
-        assert pipe._preferences_gate._model == "global/model"
-        assert pipe._edge_date_extractor._model == "global/model"
-        assert pipe._contradiction_model == "global/model"
+        assert pipe._llm._model == "global-model"
+        assert pipe._timeline_gate._model == "global-model"
+        assert pipe._preferences_gate._model == "global-model"
+        assert pipe._edge_date_extractor._model == "global-model"
+        assert pipe._contradiction_model == "global-model"
 
 
 # ---------------------------------------------------------------------------

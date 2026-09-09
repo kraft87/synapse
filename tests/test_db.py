@@ -308,6 +308,57 @@ class TestExtractionQueue:
         still_pending = db.get_pending_extractions(limit=100)
         assert not any(p["id"] == queue_id for p in still_pending)
 
+    # --- failed items are retried, not buried ---------------------------------
+    #
+    # `failed` used to be terminal: claim_pending_extractions only ever looked at
+    # `pending`, so an item that failed during an outage (or against a wrong model id)
+    # stayed graph-less forever no matter what was fixed afterwards.
+
+    def _queued(self, db, tag: str) -> int:
+        ep_id = db.upsert_episode(Episode(session_id=tag, sequence=1, content=f"content {tag}"))
+        db.enqueue_extraction(
+            ExtractionItem(episode_id=ep_id, content=f"content {tag}", content_type="episode")
+        )
+        return next(
+            p["id"] for p in db.get_pending_extractions(limit=100) if p["episode_id"] == ep_id
+        )
+
+    def _age(self, db, queue_id: int, *, minutes: int, attempts: int = 1) -> None:
+        """Backdate a failed row so the retry window is expressible without sleeping."""
+        with db._conn() as conn:
+            conn.execute(
+                "UPDATE extraction_queue SET processed_at = now() - make_interval(mins => %s), "
+                "attempts = %s WHERE id = %s",
+                (minutes, attempts, queue_id),
+            )
+
+    def test_a_cooled_off_failure_is_reclaimed(self, db):
+        qid = self._queued(db, "eq-retry")
+        db.claim_pending_extractions(limit=10)
+        db.mark_extraction_failed(qid, error="model returned no output on any attempt")
+        assert qid not in [r["id"] for r in db.claim_pending_extractions(limit=10)]  # too fresh
+        self._age(db, qid, minutes=Database.FAILED_RETRY_MINUTES + 1)
+        assert qid in [r["id"] for r in db.claim_pending_extractions(limit=10)]
+
+    def test_an_exhausted_failure_is_left_alone(self, db):
+        """A genuinely poisonous item must stop costing LLM calls."""
+        qid = self._queued(db, "eq-exhausted")
+        db.claim_pending_extractions(limit=10)
+        db.mark_extraction_failed(qid, error="nope")
+        self._age(db, qid, minutes=600, attempts=Database.MAX_EXTRACTION_ATTEMPTS)
+        assert db.claim_pending_extractions(limit=10) == []
+
+    def test_pending_is_selected_before_retries(self, db):
+        """A retry backlog must never starve new ingest: with room for one item, the
+        pending row wins even though the failed one is older."""
+        old_fail = self._queued(db, "eq-order-failed")
+        db.claim_pending_extractions(limit=10)
+        db.mark_extraction_failed(old_fail, error="nope")
+        self._age(db, old_fail, minutes=600)
+        fresh = self._queued(db, "eq-order-pending")
+        assert [r["id"] for r in db.claim_pending_extractions(limit=1)] == [fresh]
+        assert [r["id"] for r in db.claim_pending_extractions(limit=1)] == [old_fail]
+
     def test_mark_failed_with_error(self, db):
         ep_id = db.upsert_episode(Episode(session_id="eq-fail", sequence=1, content="fail me"))
         item = ExtractionItem(episode_id=ep_id, content="fail me", content_type="episode")

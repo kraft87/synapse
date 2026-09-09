@@ -311,3 +311,45 @@ class _Body:
 
     def close(self) -> None:
         pass
+
+
+# ---------------------------------------------------------------------------
+# No identity provider: the other remedy
+# ---------------------------------------------------------------------------
+
+
+def _no_idp_reply(monkeypatch, mod, *, http_error: bool) -> None:
+    """/device/code answers "there is nobody to sign in to" — as a 503 body (current
+    servers) or as a bare 404 (a server predating the explicit error)."""
+
+    def fake_post(path, payload, timeout=30.0):
+        if http_error:
+            raise urllib.error.HTTPError("http://x/device/code", 404, "nf", None, None)
+        return {"error": "no_idp", "error_description": "run synapse-admin bootstrap"}
+
+    monkeypatch.setattr(mod.config, "post_json", fake_post)
+
+
+@pytest.mark.parametrize("http_error", [False, True], ids=["503-no_idp", "404-old-server"])
+def test_no_idp_prints_the_bootstrap_command(monkeypatch, hook, capsys, http_error):
+    """ "enrollment unavailable: unknown" is a dead end: the user cannot tell a broken
+    server from one that simply has no login, and the fix for the second is a command
+    nothing has ever mentioned to them."""
+    _no_idp_reply(monkeypatch, hook, http_error=http_error)
+    assert hook.enroll() == {}
+    err = capsys.readouterr().err
+    assert "synapse-admin bootstrap" in err
+    assert "SYNAPSE_INGEST_TOKEN" in err
+    assert "unavailable: unknown" not in err
+
+
+def test_a_real_enrollment_error_still_reports_itself(monkeypatch, hook, capsys):
+    """The bootstrap hint replaces the unknown-reason dead end, not every diagnosis."""
+
+    def fake_post(path, payload, timeout=30.0):
+        return {"error": "device_flow_disabled"}
+
+    monkeypatch.setattr(hook.config, "post_json", fake_post)
+    assert hook.enroll() == {}
+    err = capsys.readouterr().err
+    assert "device_flow_disabled" in err and "Enable Device Flow" in err

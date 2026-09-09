@@ -37,12 +37,37 @@ def register(
     idp: Any,
     machine_token: str,
 ) -> None:
-    """Wire the device-flow routes. No-op unless an identity provider AND a machine token are
-    set — without an IdP there's no identity to gate on, without a token nothing to hand back."""
+    """Wire the device-flow routes. Needs an identity provider AND a machine token —
+    without an IdP there's no identity to gate on, without a token nothing to hand back.
+
+    When either is missing the routes still EXIST and answer 503 with a machine-readable
+    ``error`` (``no_idp`` / ``no_machine_token``). They used to be absent, so the client
+    got a bare 404 and printed "enrollment unavailable: unknown" — which reads like a bug
+    on a deployment where it is simply the truth that there is nobody to sign in to. The
+    remedy in that case is ``synapse-admin bootstrap``, and the client can only say so if
+    the server tells it which case this is.
+    """
     if not (idp and machine_token):
+        reason = "no_idp" if machine_token else "no_machine_token"
         logger.info(
-            "device-login routes disabled (need an identity provider + SYNAPSE_MACHINE_TOKEN)"
+            "device-login routes disabled (%s) — /device/* will report it to clients", reason
         )
+        description = (
+            "no identity provider is configured on this server, so there is no sign-in to "
+            "approve; run 'docker compose exec mcp-server synapse-admin bootstrap \"<label>\"' "
+            "on the server and paste the token into SYNAPSE_INGEST_TOKEN"
+            if reason == "no_idp"
+            else "this server has no SYNAPSE_MACHINE_TOKEN set, so it has no credential to issue"
+        )
+
+        @mcp.custom_route("/device/code", methods=["POST"])  # type: ignore[misc]
+        async def device_code_unavailable(request: Request) -> JSONResponse:
+            return _err(reason, description, 503)
+
+        @mcp.custom_route("/device/token", methods=["POST"])  # type: ignore[misc]
+        async def device_token_unavailable(request: Request) -> JSONResponse:
+            return _err(reason, description, 503)
+
         return
 
     @mcp.custom_route("/device/code", methods=["POST"])  # type: ignore[misc]

@@ -227,6 +227,22 @@ class MalformedResponseError(Exception):
         self.raw_response = raw_response
 
 
+class LLMUnavailableError(Exception):
+    """The LLM produced no usable output at all — a transport/config failure, not content.
+
+    The distinction that matters to the queue: ``MalformedResponseError`` means the model
+    ANSWERED and the answer did not parse (a content decision — a conservative no-op is a
+    fair reading of it), while this means the call never really happened. Every attempt
+    came back blank: a model id the backend does not recognise (``claude -p --model
+    anthropic/claude-haiku-4.5`` exits 0 with an empty completion), a missing or expired
+    token, an endpoint that is not there.
+
+    Nothing about the item was decided, so a stage must not swallow this into "found
+    nothing" and let the row be marked done. It raises, the row is marked failed with the
+    reason, and the queue retries it once the config is fixed.
+    """
+
+
 class LLMHTTPError(Exception):
     """Non-transient HTTP failure from an OpenAI-compatible endpoint.
 
@@ -249,6 +265,19 @@ class TransientLLMHTTPError(LLMHTTPError):
     OpenRouter 402s swallowed as empty extraction output, silently
     producing zero facts. See project_openrouter_credits_exhausted.
     """
+
+
+#: "The model never really answered" — the failures a pipeline stage must NOT absorb
+#: into a no-op decision. A stage that catches broadly (the timeline / preferences gates,
+#: the dedup confirms) re-raises these so ``process_item`` fails, the queue row is marked
+#: failed with the reason, and the item is retried later. ``UsageLimitError`` rides along
+#: because its handling is stricter still, not looser: the poller releases the batch back
+#: to ``pending`` and backs off, which a swallow inside a gate silently prevented.
+LLM_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
+    LLMUnavailableError,
+    LLMHTTPError,
+    UsageLimitError,
+)
 
 
 def _is_usage_limit(text: str | None) -> bool:
@@ -386,16 +415,28 @@ async def agent_call(
                     await client.query(full_prompt)
                     result_text: str | None = None
                     structured: dict[str, Any] | None = None
+                    is_error = False
                     async for msg in client.receive_response():
                         if isinstance(msg, ResultMessage):
                             result_text = msg.result
                             structured = getattr(msg, "structured_output", None)
+                            is_error = bool(getattr(msg, "is_error", False))
                 if structured is not None:
                     return json.dumps(structured)
                 if result_text is None:
                     raise RuntimeError("agent_call: no ResultMessage")
                 if _is_usage_limit(result_text):
                     raise UsageLimitError(result_text.strip()[:300])
+                if is_error:
+                    # The CLI answered, but the "answer" is its own error text — no
+                    # login ("Not logged in · Please run /login"), an unrecognised
+                    # model id, a spawn failure. Callers must not parse that as a
+                    # model response: it looks exactly like a content failure
+                    # (unparseable text) while being a config failure that will
+                    # repeat identically until someone fixes the environment.
+                    raise LLMUnavailableError(
+                        f"claude CLI returned an error result: {result_text.strip()[:300]}"
+                    )
                 # When output_format is requested but the SDK delivered
                 # plain text, strip ```json fences so callers can json.loads
                 # the result directly.
@@ -404,6 +445,11 @@ async def agent_call(
                 return result_text
             except UsageLimitError:
                 raise  # do not retry usage limits — bubble up immediately
+            except LLMUnavailableError:
+                # Same shape: a missing login or a bad model id is identical on every
+                # attempt, and wrapping it in RuntimeError here would hide the one
+                # signal that tells the queue to retry the item later.
+                raise
             except Exception as e:
                 if attempt < _MAX_RETRIES:
                     logger.debug(
@@ -724,9 +770,17 @@ def _run_agent_sync(
                 raise _map_model_http_error(exc) from exc
             except UnexpectedModelBehavior as exc:
                 if structured and "output retries" in str(exc).lower():
-                    raise MalformedResponseError(
-                        str(exc), raw_response=_last_response_text(list(captured))
-                    ) from exc
+                    raw = _last_response_text(list(captured))
+                    if not raw.strip():
+                        # Every attempt came back EMPTY. That is not the model deciding
+                        # there was nothing to extract — it is the model never speaking
+                        # (unrecognised id, dead auth). Retryable, not a content result.
+                        raise LLMUnavailableError(
+                            f"model returned no output on any attempt: {exc}"
+                        ) from exc
+                    raise MalformedResponseError(str(exc), raw_response=raw) from exc
+                # Empty/malformed completion on the text path keeps its existing class;
+                # LLM_TRANSPORT_ERRORS covers both, so the queue treats them alike.
                 raise LLMHTTPError(f"empty or invalid completion: {exc}") from exc
 
     return _attempt()
@@ -930,6 +984,36 @@ class OpenAIChatClient:
 # ---------------------------------------------------------------------------
 
 
+def _provider() -> str:
+    return os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
+
+
+def check_model_id(model: str, var: str = "SYNAPSE_LLM_MODEL") -> str:
+    """Reject an OpenRouter-style model id on the claude-code backend. Returns *model*.
+
+    The two backends spell the same model differently, and only one of them says so when
+    it is handed the wrong spelling. ``claude -p --model anthropic/claude-haiku-4.5``
+    exits 0 with ``[claude-code:unrecognized_model]`` and an EMPTY completion, so the
+    failure surfaces four layers away as "no JSON object in response" on every extraction
+    stage — a wrong config that reads as a broken pipeline. (.env.example shipped exactly
+    that id, uncommented, under the default provider.)
+
+    Cheap and total: a Claude CLI model name never contains a slash, and a provider-
+    routed id always does.
+    """
+    if model and "/" in model and _provider() in ("", "claude-code"):
+        raise ValueError(
+            f"{var}={model!r} is an OpenRouter-style model id, which the Claude Code CLI "
+            "rejects: it returns [claude-code:unrecognized_model] with empty output, and "
+            "every extraction stage then fails with 'no JSON object in response'.\n"
+            "With SYNAPSE_LLM_PROVIDER=claude-code use the CLI's own spelling, e.g. "
+            f"{DEFAULT_MODEL!r} (dashes, no vendor prefix). Slashed ids like "
+            f"{DEFAULT_OPENAI_MODEL!r} belong to SYNAPSE_LLM_PROVIDER=openai.\n"
+            "Leaving the variable unset is also fine — each stage has a working default."
+        )
+    return model
+
+
 def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     """Resolve the LLM model for a named pipeline stage (issue #8).
 
@@ -942,14 +1026,14 @@ def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     DeepSeek-vs-Haiku) showed model choice matters per stage — a cheap model
     can be fine for binary confirms while extraction wants a stronger one.
     """
-    v = os.environ.get(f"SYNAPSE_{stage.upper()}_MODEL", "").strip()
+    stage_var = f"SYNAPSE_{stage.upper()}_MODEL"
+    v = os.environ.get(stage_var, "").strip()
     if v:
-        return v
+        return check_model_id(v, stage_var)
     v = os.environ.get("SYNAPSE_LLM_MODEL", "").strip()
     if v:
-        return v
-    provider = os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
-    if provider == "openai":
+        return check_model_id(v)
+    if _provider() == "openai":
         return DEFAULT_OPENAI_MODEL
     return default
 
@@ -970,9 +1054,11 @@ def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAICha
       (``SYNAPSE_<STAGE>_MODEL``) are honored; unresolved per-call Claude
       ids fall back to the configured model.
     """
-    provider = os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
+    provider = _provider()
     if provider in ("", "claude-code"):
-        return ClaudeCLIClient(model=model)
+        # Startup validation: every construction site routes here, so a mis-spelled
+        # model id fails loudly at client creation instead of as empty completions.
+        return ClaudeCLIClient(model=check_model_id(model, "SYNAPSE_LLM_MODEL"))
     if provider == "openai":
         return OpenAIChatClient(
             base_url=os.environ.get("SYNAPSE_LLM_BASE_URL", DEFAULT_OPENAI_BASE_URL)
@@ -1199,6 +1285,17 @@ def parse_with_retry[T](
     """
     feedback = ""
     last_error: Exception | None = None
+    #: Was there EVER text to parse? All-blank across every attempt means the backend
+    #: never answered (wrong model id, dead auth), which is a retryable transport
+    #: failure — not the parse failure the caller is entitled to degrade on.
+    saw_text = False
+
+    def _exhausted(exc: Exception) -> Exception:
+        if saw_text:
+            return exc
+        return LLMUnavailableError(
+            f"model returned no output on any of {max_attempts} attempt(s) (model={model!r}): {exc}"
+        )
 
     for attempt in range(1, max_attempts + 1):
         prompt = base_prompt + feedback
@@ -1210,6 +1307,7 @@ def parse_with_retry[T](
             response_format=response_format,
         )
         raw = str(response.content[0].text)
+        saw_text = saw_text or bool(raw.strip())
         try:
             return parser(raw)
         except MalformedResponseError as exc:
@@ -1226,7 +1324,7 @@ def parse_with_retry[T](
                     str(exc)[:120],
                 )
                 continue
-            raise
+            raise _exhausted(exc) from exc
         except (json.JSONDecodeError, ValueError) as exc:
             # Wrap raw parser exceptions in MalformedResponseError so the
             # caller catches a uniform type after retries exhaust.
@@ -1244,7 +1342,7 @@ def parse_with_retry[T](
                     str(exc)[:120],
                 )
                 continue
-            raise wrapped from exc
+            raise _exhausted(wrapped) from exc
 
     # Defensive — the for-loop returns or raises on each iteration.
     if last_error is not None:  # pragma: no cover - unreachable

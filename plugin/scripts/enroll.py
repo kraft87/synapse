@@ -46,6 +46,46 @@ def is_enrolled() -> bool:
     return bool(config.read_device_state().get("surface_id"))
 
 
+#: The command that mints a device token on a server with no identity provider — a
+#: local `docker compose` install, which is the common case for a fresh clone. Kept as
+#: one string so the wording can't drift between the hook, `synapse-login` and enroll.
+BOOTSTRAP_CMD = 'docker compose exec mcp-server synapse-admin bootstrap "<label>"'
+
+
+def bootstrap_hint(prefix: str = "") -> str:
+    """What to do when this server has no IdP: there is nothing to sign in to.
+
+    Printed instead of "enrollment unavailable: unknown", which reads like a broken
+    server when it is in fact a correctly-configured local one that never had a login.
+    """
+    return (
+        f"{prefix}No sign-in is configured on this Synapse, so there is nothing to approve.\n"
+        "Mint this machine a token on the server instead:\n"
+        f"    {BOOTSTRAP_CMD}\n"
+        "then paste it into /plugin > synapse > Synapse token (SYNAPSE_INGEST_TOKEN)."
+    )
+
+
+def restricted_block() -> str:
+    """What the SessionStart hook prints when the server answers but serves nothing.
+
+    The 401 case has an explainer (below); this is the QUIET one: an unenrolled caller
+    on an open server, or one holding the shared root token, gets a perfectly successful
+    200 with an empty board. Same outcome as a 401 — no memory — with none of the signal,
+    which is how a new install ends up looking like "Synapse just has nothing in it".
+    """
+    return (
+        "[Synapse — this machine is served nothing]\n"
+        "The server answered, but this caller is `restricted` with no projects: it holds no "
+        "device credential of its own (schema 054), so the board and recall come back empty.\n"
+        "Fix it either way:\n"
+        "  - Server with a sign-in configured: run `! synapse-login` in this session.\n"
+        "  - Local server, no sign-in: run\n"
+        f"        {BOOTSTRAP_CMD}\n"
+        "    on the server, then paste the token into /plugin > synapse > Synapse token."
+    )
+
+
 def not_enrolled_block() -> str:
     """What the SessionStart hook prints when this machine has no device credential.
 
@@ -73,9 +113,12 @@ def _post(path: str, payload: dict, timeout: float = 30.0) -> dict:
         return config.post_json(path, payload, timeout=timeout)
     except urllib.error.HTTPError as e:
         try:
-            return json.loads(e.read() or b"{}")
+            body = json.loads(e.read() or b"{}")
         except Exception:
-            return {"error": f"http_{e.code}"}
+            body = {}
+        # An empty body (a bare 404 from a server that never mounted the route) parses
+        # to {}, which would read downstream as "no reason given". Keep the status.
+        return body if isinstance(body, dict) and body else {"error": f"http_{e.code}"}
 
 
 def enroll(interactive: bool = True) -> dict:
@@ -95,6 +138,11 @@ def enroll(interactive: bool = True) -> dict:
         return {}
     if "user_code" not in start:
         reason = start.get("error", "unknown")
+        if reason in ("no_idp", "no_machine_token", "http_404"):
+            # Nothing to sign in to — not a failure of this machine's enrollment, and
+            # the user needs the OTHER remedy, not a retry.
+            print(bootstrap_hint(), file=sys.stderr)
+            return {}
         print(f"enrollment unavailable: {reason}", file=sys.stderr)
         if reason == "device_flow_disabled":
             print("Turn on 'Enable Device Flow' in the OAuth App settings.", file=sys.stderr)
