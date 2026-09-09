@@ -930,6 +930,36 @@ class OpenAIChatClient:
 # ---------------------------------------------------------------------------
 
 
+def _provider() -> str:
+    return os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
+
+
+def check_model_id(model: str, var: str = "SYNAPSE_LLM_MODEL") -> str:
+    """Reject an OpenRouter-style model id on the claude-code backend. Returns *model*.
+
+    The two backends spell the same model differently, and only one of them says so when
+    it is handed the wrong spelling. ``claude -p --model anthropic/claude-haiku-4.5``
+    exits 0 with ``[claude-code:unrecognized_model]`` and an EMPTY completion, so the
+    failure surfaces four layers away as "no JSON object in response" on every extraction
+    stage — a wrong config that reads as a broken pipeline. (.env.example shipped exactly
+    that id, uncommented, under the default provider.)
+
+    Cheap and total: a Claude CLI model name never contains a slash, and a provider-
+    routed id always does.
+    """
+    if model and "/" in model and _provider() in ("", "claude-code"):
+        raise ValueError(
+            f"{var}={model!r} is an OpenRouter-style model id, which the Claude Code CLI "
+            "rejects: it returns [claude-code:unrecognized_model] with empty output, and "
+            "every extraction stage then fails with 'no JSON object in response'.\n"
+            "With SYNAPSE_LLM_PROVIDER=claude-code use the CLI's own spelling, e.g. "
+            f"{DEFAULT_MODEL!r} (dashes, no vendor prefix). Slashed ids like "
+            f"{DEFAULT_OPENAI_MODEL!r} belong to SYNAPSE_LLM_PROVIDER=openai.\n"
+            "Leaving the variable unset is also fine — each stage has a working default."
+        )
+    return model
+
+
 def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     """Resolve the LLM model for a named pipeline stage (issue #8).
 
@@ -942,14 +972,14 @@ def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     DeepSeek-vs-Haiku) showed model choice matters per stage — a cheap model
     can be fine for binary confirms while extraction wants a stronger one.
     """
-    v = os.environ.get(f"SYNAPSE_{stage.upper()}_MODEL", "").strip()
+    stage_var = f"SYNAPSE_{stage.upper()}_MODEL"
+    v = os.environ.get(stage_var, "").strip()
     if v:
-        return v
+        return check_model_id(v, stage_var)
     v = os.environ.get("SYNAPSE_LLM_MODEL", "").strip()
     if v:
-        return v
-    provider = os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
-    if provider == "openai":
+        return check_model_id(v)
+    if _provider() == "openai":
         return DEFAULT_OPENAI_MODEL
     return default
 
@@ -970,9 +1000,11 @@ def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAICha
       (``SYNAPSE_<STAGE>_MODEL``) are honored; unresolved per-call Claude
       ids fall back to the configured model.
     """
-    provider = os.environ.get("SYNAPSE_LLM_PROVIDER", "claude-code").strip().lower()
+    provider = _provider()
     if provider in ("", "claude-code"):
-        return ClaudeCLIClient(model=model)
+        # Startup validation: every construction site routes here, so a mis-spelled
+        # model id fails loudly at client creation instead of as empty completions.
+        return ClaudeCLIClient(model=check_model_id(model, "SYNAPSE_LLM_MODEL"))
     if provider == "openai":
         return OpenAIChatClient(
             base_url=os.environ.get("SYNAPSE_LLM_BASE_URL", DEFAULT_OPENAI_BASE_URL)

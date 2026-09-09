@@ -1303,24 +1303,27 @@ class TestPerStageModels:
         )
 
     def test_stage_envs_reach_their_stages(self, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_TIMELINE_MODEL", "stage/timeline")
-        monkeypatch.setenv("SYNAPSE_CONTRADICTION_MODEL", "stage/contradiction")
+        # Dashed placeholders, not slashed: a slashed id means "openai provider", and
+        # the claude-code backend refuses it (check_model_id) rather than sending an id
+        # the CLI answers with empty output.
+        monkeypatch.setenv("SYNAPSE_TIMELINE_MODEL", "stage-timeline")
+        monkeypatch.setenv("SYNAPSE_CONTRADICTION_MODEL", "stage-contradiction")
         pipe = self._pipeline()
-        assert pipe._timeline_gate._model == "stage/timeline"
-        assert pipe._contradiction_model == "stage/contradiction"
-        assert pipe._contradiction_detector._model == "stage/contradiction"
+        assert pipe._timeline_gate._model == "stage-timeline"
+        assert pipe._contradiction_model == "stage-contradiction"
+        assert pipe._contradiction_detector._model == "stage-contradiction"
         # Untouched stages keep the code default.
         assert pipe._llm._model == "claude-haiku-4-5"
         assert pipe._preferences_gate._model == "claude-haiku-4-5"
 
     def test_global_env_covers_every_stage(self, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global/model")
+        monkeypatch.setenv("SYNAPSE_LLM_MODEL", "global-model")
         pipe = self._pipeline()
-        assert pipe._llm._model == "global/model"
-        assert pipe._timeline_gate._model == "global/model"
-        assert pipe._preferences_gate._model == "global/model"
-        assert pipe._edge_date_extractor._model == "global/model"
-        assert pipe._contradiction_model == "global/model"
+        assert pipe._llm._model == "global-model"
+        assert pipe._timeline_gate._model == "global-model"
+        assert pipe._preferences_gate._model == "global-model"
+        assert pipe._edge_date_extractor._model == "global-model"
+        assert pipe._contradiction_model == "global-model"
 
 
 # ---------------------------------------------------------------------------
