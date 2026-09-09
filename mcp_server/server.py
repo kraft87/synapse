@@ -692,8 +692,7 @@ def recall(
     surface: str | None = None,
 ) -> dict:
     """Search the user's long-term memory: tens of thousands of reranked
-    past-conversation turns, the knowledge-graph facts extracted from them, and a
-    dated event timeline.
+    past-conversation turns and the knowledge-graph facts extracted from them.
 
     BEFORE answering anything that references past work — a prior decision or
     discussion ("what did we decide", "last time", "have we tried"), any device,

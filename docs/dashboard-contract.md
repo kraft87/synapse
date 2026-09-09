@@ -158,9 +158,9 @@ The `debug` envelope surfaces the SAME numbers the engine already measures for t
 ```
 
 `legs_ms` carries only legs the engine timed. `embed / bm25 / vector / kg / web / rerank`
-are always present; `timeline` appears only when its leg is enabled
-(`SYNAPSE_RECALL_TIMELINE` ≠ 0) — an omitted leg renders as
-untimed/skipped in the waterfall. Absent `debug` key ⇒ `debug` was not requested. The waterfall
+are always present; `timeline` is no longer emitted (the inline timeline leg was
+removed from `recall()` on 2026-08-07) and the waterfall renders an omitted leg as
+untimed/skipped. Absent `debug` key ⇒ `debug` was not requested. The waterfall
 UI models the parallel band schematically (all parallel legs start at embed-end, rerank at the
 max parallel end) from these durations; the payload carries durations, not start offsets.
 
