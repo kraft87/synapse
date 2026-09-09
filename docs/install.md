@@ -157,11 +157,14 @@ Two guards now catch that: `.env.example` ships the line commented out, and the
 (`claude-haiku-4-5`) instead of failing once per queue item. On the default provider, either
 leave `SYNAPSE_LLM_MODEL` unset or use a plain Claude model name.
 
-A missing extraction credential is loud now too. With no `CLAUDE_CODE_OAUTH_TOKEN` the Claude
-CLI answers with its own error text (`Not logged in · Please run /login`) rather than empty
-output, which used to be parsed as a model response and swallowed. Those rows are now marked
-`failed` carrying that exact string, and retried, instead of being recorded as a silent
-`done`. Episodes are unaffected either way: they are stored and recallable even when fact
+Extraction failures are loud now, and recoverable. A bad credential or a rejected model id
+marks the queue row `failed` with the reason instead of recording a silent `done`: with no
+`CLAUDE_CODE_OAUTH_TOKEN` the Claude CLI answers with its own error text
+(`claude CLI returned an error result: Not logged in · Please run /login`), and a model id
+the CLI will not take leaves either that same shape or `model returned no output on any of N
+attempt(s)`. The queue re-claims a failed row after 30 minutes, up to 5 attempts, so fixing
+the configuration is enough: those turns pick up their facts on a later cycle rather than
+staying graph-less. Episodes are unaffected either way, stored and recallable even when
 extraction fails.
 
 ## Local inference (no external accounts)
@@ -212,8 +215,8 @@ gets a release note saying so.
 - **Episodes appear but the graph stays empty.** KG facts are extracted from 4-turn-or-longer
   windows on a poll cycle (default 5 min); a short session or a fresh import needs a few
   minutes. If it stays empty for longer, check the extraction LLM: a bad credential or model
-  id now leaves `failed` extraction rows carrying the reason. See
-  [Model ids](#model-ids-one-thing-that-bites).
+  id leaves `failed` extraction rows carrying the reason, and the queue retries them once the
+  configuration is fixed. See [Model ids](#model-ids-one-thing-that-bites).
 - **`401 Unauthorized`.** Token missing, stale, or revoked. Re-run `! synapse-login`, or
   paste a fresh device token into the `/plugin` config.
 - **Recall returns nothing and the hooks seem dead.** Hooks are fail-soft, so an unreachable
