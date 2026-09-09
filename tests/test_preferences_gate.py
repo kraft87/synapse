@@ -203,6 +203,38 @@ def test_errors_are_swallowed(monkeypatch):
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500})
 
 
+def test_transport_failures_are_not_swallowed(monkeypatch):
+    """The swallow is for CONTENT failures. When the LLM never answered at all, a quiet
+    return meant the poller marked the queue row done (attempts=0, error NULL) and the
+    turn was permanently gate-less — fixing the token or model id re-ran nothing."""
+    import ingestion.preferences_gate as pg
+    from ingestion.llm_client import LLMUnavailableError
+
+    def _boom(*a, **k):
+        raise LLMUnavailableError("model returned no output on any of 3 attempts")
+
+    monkeypatch.setattr(pg, "parse_with_retry", _boom)
+    g = pg.PreferencesGate(db=_Boom(), llm_client=object(), embedder=_Boom())
+    monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
+    with pytest.raises(LLMUnavailableError):
+        g.process({"id": 1, "episode_id": 5, "content": "x" * 500})
+
+
+def test_usage_limits_reach_the_poller(monkeypatch):
+    """A quota hit inside a gate must release the batch, not be absorbed into "done"."""
+    import ingestion.preferences_gate as pg
+    from ingestion.llm_client import UsageLimitError
+
+    def _boom(*a, **k):
+        raise UsageLimitError("5-hour limit reached")
+
+    monkeypatch.setattr(pg, "parse_with_retry", _boom)
+    g = pg.PreferencesGate(db=_Boom(), llm_client=object(), embedder=_Boom())
+    monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
+    with pytest.raises(UsageLimitError):
+        g.process({"id": 1, "episode_id": 5, "content": "x" * 500})
+
+
 # ---- full write flow (stubbed db + embedder + gate return) ----
 
 

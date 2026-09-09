@@ -146,3 +146,40 @@ def test_stop_request_releases_unstarted_concurrent_items(conn, db_url, monkeypa
     p.request_stop()  # stop before dispatch: every item releases, none run
     assert p.drain_extraction_queue(batch_limit=8) == 0
     assert set(_statuses(conn).values()) == {"pending"}
+
+
+def test_a_failed_item_is_retried_once_it_cools_off(conn, db_url, monkeypatch):
+    """The end of the silent-loss path: a transport failure marks the row failed WITH
+    the reason, and the next drain after the retry window picks it back up. Before this,
+    `failed` was terminal — claim only ever looked at `pending` — so an item that failed
+    against a wrong model id or a dead token stayed graph-less no matter what was fixed.
+    """
+    from ingestion.llm_client import LLMUnavailableError
+
+    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "1")
+    (qid,) = _seed(conn, 1)
+    attempts: list[int] = []
+
+    def behavior(item):
+        attempts.append(int(item["id"]))
+        if len(attempts) == 1:
+            raise LLMUnavailableError("model returned no output on any of 3 attempts")
+
+    p = _poller(db_url, behavior)
+    assert p.drain_extraction_queue(batch_limit=8) == 0
+    row = conn.execute(
+        "SELECT status, attempts, error FROM extraction_queue WHERE id = %s", (qid,)
+    ).fetchone()
+    assert row[0] == "failed" and row[1] == 1 and "no output" in row[2]
+
+    # Still inside the cool-off window: nothing to claim.
+    assert p.drain_extraction_queue(batch_limit=8) == 0
+    assert attempts == [qid]
+
+    conn.execute(
+        "UPDATE extraction_queue SET processed_at = now() - make_interval(mins => %s) WHERE id = %s",
+        (Database.FAILED_RETRY_MINUTES + 1, qid),
+    )
+    assert p.drain_extraction_queue(batch_limit=8) == 1
+    assert attempts == [qid, qid]
+    assert _statuses(conn)[qid] == "done"

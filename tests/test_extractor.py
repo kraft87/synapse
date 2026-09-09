@@ -831,24 +831,29 @@ class TestEntityResolver:
         assert mapping["Alpha"] == "cand0"
         assert mapping["Beta"].startswith("new:")
 
-    def test_batch_confirm_empty_response_defaults_distinct(self):
-        # The old bug: an empty SDK body -> json.loads raises -> code defaulted
-        # to SAME-entity (silent wrong-merge). Now the conservative default is
-        # DISTINCT: every pending entity becomes a new node.
+    def test_batch_confirm_empty_response_raises_for_retry(self):
+        # The original bug: an empty SDK body -> json.loads raises -> code defaulted to
+        # SAME-entity (silent wrong-merge). It then defaulted to DISTINCT, which is safe
+        # for the graph but still records a decision the model never made, on an item the
+        # queue then marks done. An EMPTY body on every attempt means the model never
+        # answered (unrecognised id, dead auth), so it now propagates: the queue marks the
+        # item failed with the reason and retries it once the config is fixed.
+        from ingestion.llm_client import LLMUnavailableError
+
         embedder = self._mock_embedder([self._make_embedding(0.1)])
         falkordb = _mock_falkordb(
             similar_nodes=[{"uuid": "cand0", "name": "Candidate", "score": 0.12}]
         )
         llm_client = MagicMock()
         mock_msg = MagicMock()
-        mock_msg.content = [MagicMock(text="")]  # empty body -> parse failure
+        mock_msg.content = [MagicMock(text="")]  # empty body -> nothing was decided
         llm_client.messages.create.return_value = mock_msg
 
         resolver = EntityResolver(
             embedder=embedder, llm_client=llm_client, similarity_threshold=0.85
         )
-        mapping = resolver.resolve([_entity("Gamma")], kg_client=falkordb, group_id="technical")
-        assert mapping["Gamma"].startswith("new:")  # NOT merged into cand0
+        with pytest.raises(LLMUnavailableError):
+            resolver.resolve([_entity("Gamma")], kg_client=falkordb, group_id="technical")
 
     def test_batch_confirm_no_llm_trusts_top_candidate(self):
         # With no LLM client, a confirm-band match trusts the top candidate

@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
 from ingestion.kg_client import rrf_merge
-from ingestion.llm_client import MalformedResponseError
+from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError
 from ingestion.models import (
     CombinedExtraction,
     ExtractedEntity,
@@ -877,6 +877,10 @@ class LLMExtractor:
                 max_attempts=self._MAX_ATTEMPTS,
             )
         except MalformedResponseError as exc:
+            # The model ANSWERED and the answer never validated — a content failure, so
+            # an empty result is a fair reading of it. The other case (no output at all:
+            # unrecognised model id, dead auth) arrives as LLMUnavailableError and is NOT
+            # caught here: nothing was decided, so the item must fail and be retried.
             logger.warning(
                 "LLM extraction failed after %d attempts (malformed JSON): %s",
                 self._MAX_ATTEMPTS,
@@ -1110,6 +1114,11 @@ class EntityResolver:
                 model=self._confirm_model,
                 max_tokens=max_tokens,
             )
+        except LLM_TRANSPORT_ERRORS:
+            # "Treat all as distinct" is a defensible reading of a model that answered
+            # badly. It is not a defensible reading of a model that never answered —
+            # that would write a fragmented graph and mark the item done.
+            raise
         except Exception as e:
             logger.warning(
                 "batch dedup confirm failed for %d entit%s (%s); treating all as distinct",
@@ -1449,6 +1458,8 @@ class ExtractionPipeline:
             )
             dup_idx = [i for i in resolution.duplicate_facts if i in idx_to_uuid]
             contradicted_idx = [i for i in resolution.contradicted_facts if i in idx_to_uuid]
+        except LLM_TRANSPORT_ERRORS:
+            raise  # never answered: fail the item, don't record a non-decision
         except Exception:
             return False, []
         dup_uuids = [idx_to_uuid[i] for i in dup_idx]
@@ -1509,6 +1520,8 @@ class ExtractionPipeline:
                 model=self._contradiction_model,
                 max_tokens=300 * max(1, len(items)),
             )
+        except LLM_TRANSPORT_ERRORS:
+            raise  # never answered: fail the item, don't record a non-decision
         except Exception:
             return set(), {}, {}, False
 
