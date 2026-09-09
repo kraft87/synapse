@@ -10,8 +10,8 @@ Runs from a machine that ALREADY has full Synapse trust, because that is the onl
 credential these routes accept (schema 054). The root machine token is deliberately
 refused: every machine that ever ran the plugin has held it, so a credential that
 widespread must not be able to create new credentials. A 401 here is the design
-working — use ``scripts/surface_admin.py`` on the database host if you have no trusted
-machine yet.
+working — run ``synapse-admin bootstrap "<label>"`` on the server if you have no
+trusted machine yet.
 
 There is no ``approve``. A machine gets its own token by ENROLLING, which needs an
 OAuth/OIDC sign-in the allowlist admits (``synapse-login`` on that machine), and an
@@ -120,7 +120,8 @@ def main(argv: list[str]) -> int:
             return _die(
                 "unauthorized — these routes need a FULL-TRUST device token. The shared "
                 "machine token cannot create credentials by design. Run this from an "
-                "already-trusted machine, or use scripts/surface_admin.py on the DB host."
+                'already-trusted machine, or run: docker compose exec mcp-server '
+                'synapse-admin bootstrap "<label>"'
             )
         return _die(f"{cmd} failed: {e}")
     print(_USAGE)

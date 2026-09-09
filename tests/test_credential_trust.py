@@ -178,7 +178,7 @@ def test_enrollment_is_unavailable_without_an_identity_provider(clean, db_url):
     pointer at the break-glass CLI beats silently falling back to a weaker check."""
     with _client(db_url, idp=None) as client:
         r = client.post("/surfaces/enroll", json=_enroll_body(trust="full"), headers=_h(_ROOT))
-    assert r.status_code == 503 and "surface_admin" in r.json()["detail"]
+    assert r.status_code == 503 and "synapse-admin bootstrap" in r.json()["detail"]
     assert _rows(clean) == 0
 
 

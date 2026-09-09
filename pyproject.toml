@@ -27,6 +27,11 @@ dependencies = [
     "py-key-value-aio[postgresql]>=0.4.5",
 ]
 
+[project.scripts]
+# On PATH inside the image (/app/.venv/bin), which is what makes the first-device
+# bootstrap one command: `docker compose exec mcp-server synapse-admin bootstrap "<label>"`.
+synapse-admin = "ingestion.surface_admin:main"
+
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",

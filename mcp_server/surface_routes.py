@@ -96,7 +96,7 @@ def register(
     ``admin`` defaults to ``authorized`` only so an un-updated caller still boots; every
     real deployment passes the stricter gate. ``idp`` enables ``/surfaces/enroll``:
     without an identity provider there is no identity to anchor an enrollment to, so
-    that route reports 503 and the operator uses ``scripts/surface_admin.py mint``.
+    that route reports 503 and the operator uses ``synapse-admin bootstrap``.
     """
     if not db_url:
         logger.info("surface routes disabled (no DB_URL)")
@@ -174,8 +174,9 @@ def register(
         """
         if idp is None:
             return err(
-                "enrollment needs an identity provider (GitHub or OIDC); "
-                "use scripts/surface_admin.py mint on the database host instead",
+                "enrollment needs an identity provider (GitHub or OIDC); run "
+                "'docker compose exec mcp-server synapse-admin bootstrap \"<label>\"' "
+                "on the server instead",
                 503,
             )
         body = await _body(request)

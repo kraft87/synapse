@@ -521,7 +521,8 @@ def _admin_authorized(request: Request) -> bool:
     The dashboard reaches this gate through the login flow, which mints a full-trust
     device token for an OAuth-allowlisted identity rather than handing out the root
     token. Break-glass, when no full-trust device exists (first deploy, or every device
-    revoked): ``scripts/surface_admin.py`` talks to Postgres directly, which requires
+    revoked): ``synapse-admin bootstrap "<label>"`` (in the container, or
+    ``scripts/surface_admin.py`` on the host) talks to Postgres directly, which requires
     shell access on the DB host — a strictly higher bar than holding a bearer token.
 
     Open when no machine token is set (dev / pre-cutover), same as the client gate.

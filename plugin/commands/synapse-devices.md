@@ -10,6 +10,6 @@ Steps:
 3. Mint only for a machine that can't run a browser sign-in anywhere (a headless box, a service): `… mint "<label>" [--full] [--projects a,b]`. Defaults to restricted, inheriting the project scope other restricted devices already have. The token prints once — tell the user to set it as `SYNAPSE_INGEST_TOKEN` there, and do not repeat it back later.
 4. Revoke: `… revoke <surface_id>`. Effective on that device's very next request.
 
-Never mint or widen a grant without the user's explicit say-so — this is the control that keeps personal memory off machines that shouldn't have it. If the CLI reports 401, say so plainly: these routes require a full-trust device token, and the shared machine token is refused by design; recovery without one is `scripts/surface_admin.py` on the database host.
+Never mint or widen a grant without the user's explicit say-so — this is the control that keeps personal memory off machines that shouldn't have it. If the CLI reports 401, say so plainly: these routes require a full-trust device token, and the shared machine token is refused by design; recovery without one is `docker compose exec mcp-server synapse-admin bootstrap "<label>"` on the server.
 
 Pass any argument the user gave straight through.
