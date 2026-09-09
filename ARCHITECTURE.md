@@ -426,14 +426,17 @@ Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage r
 
 Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it. The board is push-only — `GET /context` feeds the plugin's SessionStart hook; there is no MCP board tool (the hook already injects the block).
 
-- **`recall(query, project=None, session_focus=None, group_id="technical", mode="overview")`** — the primary retrieval tool ([§6](#6-recall-pipeline)). `mode="turns"` is the raw-episode drill-down (full turns, same deep-fetch + rerank machinery) — it absorbed the standalone `recall_episodes` tool (item 6 tool-surface audit; telemetry keeps `kind='episodes'`).
-- **`fetch(ids)`** — expand `e:N` episode ids (bare `N` accepted) and `n:N` note ids into full records; mixed lists fine, unknown ids reported under `skipped`, capped at 20 per call.
-- **`remember(content=None, hook=None, body=None, type="project", project=None, session_id=None)`** — reconciles a note into the notes store and archives the text as a manual `Episode` with KG extraction.
-- **`recall_timeline(query=None, since=None, until=None, project=None, min_salience=0, limit=20, group_id=None)`** — dated what-happened events, chronological.
-- **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, session_id=None, project=None)`** — after-the-fact retrieval-quality report: which served ids (`e:N`/`n:N`, validated) were load-bearing vs noise, what content was missing (`missing` + `found_via`), and `comment` as the free-text spot for everything else (serving volume, ordering, misleading results). Writes one `recall_feedback` row (schema 046; `comment` lands in the `note` column) — offline labeled data for eval goldens and reranker tuning, deliberately not wired into live ranking.
-- **`issue_machine_token()`** — returns the shared machine bearer token, auth-gated by MultiAuth + the allowlist; lets `synapse login` fetch it over OAuth instead of a manual copy-paste ([§7.4](#74-auth)). **Hidden from `tools/list`** by an `on_list_tools` middleware; still callable by name via `tools/call`.
+Six visible tools, in registration order, plus one hidden. Per-tool detail (what each parameter does, and when a model should reach for which) lives in [docs/tools.md](docs/tools.md).
 
-Removed from the surface (git history keeps the code): `list_projects` (the board banner carries per-project activity now), `query_graph` (experimental NL→SQL; `recall()` owns retrieval), and `recall_episodes` (~4% of recall-family calls — merged into `recall(mode="turns")`).
+- **`recall(query, project=None, session_focus=None, group_id="technical")`**: the primary retrieval tool ([§6](#6-recall-pipeline)). Reranked episode passages fused with KG facts, captured web research, and fact history.
+- **`recall_full_turns(query, project=None, limit=5, session_id=None)`**: the drill-down and retry sibling. Whole unabridged turns, relevance + recency ranked, same deep-fetch + rerank machinery. It absorbed the standalone `recall_episodes` tool (item 6 tool-surface audit; telemetry keeps `kind='episodes'`), first as `recall(mode="turns")`, then re-split into its own tool in 0.9.9.
+- **`fetch(ids)`**: expand `e:N` episode ids (bare `N` accepted) and `n:N` note ids into full records; mixed lists fine, unknown ids reported under `skipped`, capped at 20 per call.
+- **`fetch_session(session_id, around=None, radius=3, offset=0, limit=10)`**: read one session sequentially instead of searching it. `around` centers a window on an `e:N` anchor (anchor full, neighbours as 500-char heads); anchorless, it pages with `offset`/`limit`. `session_id="self"` is the calling conversation, and an unindexed session returns an explicit error rather than an empty read ([spec](docs/session-drilldown-spec.md)).
+- **`remember(content=None, hook=None, body=None, type="project", project=None, session_id=None, audience=None)`**: reconciles a note into the notes store and archives the text as a manual `Episode` with KG extraction.
+- **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, session_id=None, project=None)`**: after-the-fact retrieval-quality report. Which served ids (`e:N`/`n:N`, validated) were load-bearing vs noise, what content was missing (`missing` + `found_via`), and `comment` as the free-text spot for everything else (serving volume, ordering, misleading results). Writes one `recall_feedback` row (schema 046; `comment` lands in the `note` column): offline labeled data for eval goldens and reranker tuning, deliberately not wired into live ranking.
+- **`issue_machine_token()`**: returns the shared machine bearer token, auth-gated by MultiAuth + the allowlist; lets `synapse login` fetch it over OAuth instead of a manual copy-paste ([§7.4](#74-auth)). **Hidden from `tools/list`** by an `on_list_tools` middleware; still callable by name via `tools/call`.
+
+Removed from the surface (git history keeps the code): `list_projects` (the board banner carries per-project activity now), `query_graph` (experimental NL→SQL; `recall()` owns retrieval), `recall_episodes` (~4% of recall-family calls, now served by `recall_full_turns`), and `recall_timeline`, dropped on 2026-08-07 together with recall's inline timeline leg (39 helpful vs 92 noise citations lifetime; the `timeline_events` store, its ingestion gate, and the board's "Last 7 days" block are untouched, only retrieval went).
 
 ### 7.2 Custom HTTP routes (`/ingest`, `/recall`)
 
@@ -528,7 +531,7 @@ The **KG leg is skipped, not filtered**: `kg_relationships` has no `project` col
 
 **Write-side tagging** happens at the single note chokepoint (`ingestion/notes.reconcile_note`), in precedence order: (1) an explicit `audience` argument on `remember()`; (2) a write from a **live, approved** restricted surface defaults `work-safe`, symmetric with what it may read (else notes written at work vanish from the work board next session); (3) the note's `project` is in the union of **approved** restricted surfaces' allowlists ⇒ `work-safe`; (4) otherwise `personal`. Rule 2 requires an approved surface on purpose — unknown restricts reads, but must never widen a write. A **restatement preserves** the stored tier (`COALESCE(%s, audience)`), so rephrasing is never reclassification; a **contradiction derives** its own. The dream→notes lane re-derives by rule 3 when a retype changes a note's project.
 
-**Rollout is enforcement-first, no feature flag**, and ordered: apply 054 (existing rows are stamped `approved`, so nothing working stops working) → deploy → run `synapse-login` on each machine to sign in and enroll → log into the dashboard again to pick up its minted token → `mint` for anything headless → next release, drop the legacy `surface` param. A machine that has not enrolled yet keeps working on the root token via the legacy lane, and its SessionStart block says it is not enrolled rather than going silently empty. `docs/audience-scoping-spec.md` carries the step-by-step. Every pre-053 note is `personal`, so restricted boards run empty but safe until `scripts/audience_backfill.py --propose` writes a review table (to a path **outside the repo** — it lists every note hook, and this repository is public), a human edits the audience column, and `--apply` writes it back.
+**Rollout is enforcement-first, no feature flag**, and ordered: apply 054 (existing rows are stamped `approved`, so nothing working stops working) → deploy → run `synapse-login` on each machine to sign in and enroll → log into the dashboard again to pick up its minted token → `mint` for anything headless → next release, drop the legacy `surface` param. **A machine that has not enrolled is served nothing.** The legacy lane only fires on a root token that also sends a `surface` param, and the 0.17 client no longer sends one, so a root-token caller resolves to `UNKNOWN_SURFACE`: restricted, empty allowlist, a 200 with an empty board rather than a 401. Fail-closed is unchanged, but it is no longer silent: the SessionStart board hook prints an explainer whenever `/context` answers ok with `trust=restricted` and the machine holds no device credential. Enrolling is the fix (`synapse login`); on a deployment with no IdP at all, mint the first device token on the server host with `docker compose exec mcp-server synapse-admin bootstrap "<label>"` (a console script in the image; `scripts/surface_admin.py` stays as the host-side shim) and paste it into that machine's `SYNAPSE_INGEST_TOKEN`. `docs/audience-scoping-spec.md` carries the step-by-step, and [docs/install.md](docs/install.md) the fresh-install path. Every pre-053 note is `personal`, so restricted boards run empty but safe until `scripts/audience_backfill.py --propose` writes a review table (to a path **outside the repo** — it lists every note hook, and this repository is public), a human edits the audience column, and `--apply` writes it back.
 
 ### 7.6 Skills serving
 
@@ -696,7 +699,9 @@ A 2026 multi-source review of production agent-memory systems converged on exact
 
 ## 13. Configuration
 
-The poller reads config via `pydantic-settings`; the MCP server reads `os.environ` with `.env` fallback. Only the first two variables are required for a basic install — everything else has a sane default.
+This is the reference list. The install path that uses it is [docs/install.md](docs/install.md).
+
+The poller reads config via `pydantic-settings`; the MCP server reads `os.environ` with `.env` fallback. Five things are required for a working install: `SYNAPSE_DB_PASSWORD` + `SYNAPSE_DB_URL` (storage), an embedding/rerank backend (`VOYAGE_API_KEY`, or the `SYNAPSE_EMBED_*` / `SYNAPSE_RERANK_*` alternatives), an extraction-LLM credential (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`, without which nothing reaches the knowledge graph), and `SYNAPSE_MACHINE_TOKEN`. Everything else has a sane default.
 
 ### Core
 
@@ -731,11 +736,18 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYNAPSE_MACHINE_TOKEN` | optional | ROOT bearer: the services' credential for `/ingest` + the internal write lanes. Deliberately NOT sufficient to enroll or mint a device, list surfaces, or reach `/dash/api` ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)). **Unset → server runs open** |
+| `SYNAPSE_MACHINE_TOKEN` | **required** | ROOT bearer: the services' credential for `/ingest` + the internal write lanes. Generate with `openssl rand -hex 32`. Deliberately NOT sufficient to enroll or mint a device, list surfaces, or reach `/dash/api`, and it resolves to no surface, so a caller presenting it is served restricted ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)). Blank → the server refuses to start unless `SYNAPSE_ALLOW_OPEN=1` |
+| `SYNAPSE_ALLOW_OPEN` | `0` | dev-only escape hatch: `1` starts the server with no machine token. Every caller then resolves to `UNKNOWN_SURFACE` and is served restricted, so the board and recall come back empty. Not a deployment mode |
 | `SYNAPSE_PUBLIC_URL` | `https://synapse.example.net` | public base URL advertised in OAuth discovery metadata |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | optional | GitHub OAuth app for the claude.ai web connector; unset → no OAuth leg |
 | `ALLOWED_GITHUB_USERS` | empty | comma-separated GitHub logins admitted by the OAuth leg |
 | `SYNAPSE_OAUTH_SIGNING_KEY` | optional | stable signing key so issued OAuth tokens survive server restarts |
+| `OIDC_CONFIG_URL` | unset | any OIDC IdP instead of GitHub: the provider's `/.well-known/openid-configuration`. Set → replaces the GitHub leg for this deployment (MCP discovery advertises one authorization server) |
+| `OIDC_CLIENT_ID` / `OIDC_CLIENT_SECRET` | unset | OIDC client credentials; register `{base_url}/auth/callback` and `{base_url}/auth/callback/dash` as redirect URIs |
+| `ALLOWED_OIDC_USERS` | empty | comma-separated identities admitted by the OIDC leg, matched against `preferred_username` then `email` |
+| `OIDC_SCOPES` | `openid profile email offline_access` | trim `offline_access` for IdPs that reject it (Google), at the cost of short-lived connector sessions |
+| `OIDC_USER_CLAIMS` | `preferred_username,email` | ordered claims read for the user's identity |
+| `SYNAPSE_MACHINE_ROLE` | `personal` | **plugin side**, not the server: this machine's declared role at enrollment, `personal` (full trust) or `work` (restricted). An *unstated* role resolves to restricted server-side ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)) |
 
 ### Recall tuning (`mcp_server/recall.py`)
 

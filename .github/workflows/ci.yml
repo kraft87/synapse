@@ -5,9 +5,11 @@ on:
     branches: [main, "claude/**", "feat/**"]
     paths-ignore:
       - "**.md"
+  # No paths-ignore on pull_request: branch protection requires every job below,
+  # and a workflow that never runs never reports them, so a docs-only PR could
+  # only be force-merged. The push trigger keeps its filter (no image rebuild
+  # for a README change).
   pull_request:
-    paths-ignore:
-      - "**.md"
 
 jobs:
   ruff:
