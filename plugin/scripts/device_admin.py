@@ -120,7 +120,7 @@ def main(argv: list[str]) -> int:
             return _die(
                 "unauthorized — these routes need a FULL-TRUST device token. The shared "
                 "machine token cannot create credentials by design. Run this from an "
-                'already-trusted machine, or run: docker compose exec mcp-server '
+                "already-trusted machine, or run: docker compose exec mcp-server "
                 'synapse-admin bootstrap "<label>"'
             )
         return _die(f"{cmd} failed: {e}")
