@@ -740,6 +740,9 @@ def recall(
     recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
     rest are feedback-only.
 
+    A `warnings` list appears when a retrieval leg degraded; empty results with a
+    warning mean a config problem, not empty memory.
+
     Follow-ups: fetch(ids) expands a truncated passage or note body;
 
     Args:
@@ -808,6 +811,9 @@ def recall_full_turns(
     what was SAID, which may be stale; the box is ground truth for that.
 
     Served turns carry e:N ids — fetch()-able and rateable in recall_feedback.
+
+    A `warnings` list appears when a retrieval leg degraded; empty results with a
+    warning mean a config problem, not empty memory.
 
     Args:
         query: Plain-language query carrying the distinctive nouns/keywords.

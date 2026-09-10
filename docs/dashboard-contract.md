@@ -164,6 +164,26 @@ untimed/skipped. Absent `debug` key ⇒ `debug` was not requested. The waterfall
 UI models the parallel band schematically (all parallel legs start at embed-end, rerank at the
 max parallel end) from these durations; the payload carries durations, not start offsets.
 
+### POST /recall: the `warnings` field
+
+Every retrieval leg is fail-soft, so a dead embedding or rerank backend degrades that leg
+instead of raising. When that happens the response gains a `warnings` array of one-line
+human-readable strings, one per degraded leg:
+
+```json
+{"query": "...", "facts": [],
+ "warnings": ["embedding failed (voyage: Unauthorized): vector legs skipped, results are BM25-only. Check VOYAGE_API_KEY.",
+              "KG facts leg skipped: no query embedding, so the facts bucket is empty."]}
+```
+
+The key is **absent** when nothing degraded, so a healthy response is byte-identical to
+before. Consumers must treat it as optional and must not expect an empty array. Empty
+buckets alongside a `warnings` entry mean broken retrieval, not empty memory, and the
+console should surface them rather than render a normal empty result. The strings are
+diagnostics, not served memory: they are not counted in the `est_tokens` / `chars`
+telemetry. They never contain a credential or a traceback. The MCP `recall` and
+`recall_full_turns` tools return the same field on the same terms.
+
 ### GET /dash/api/recall/history?limit=50
 
 Recent `recall()` calls from the `recall_metrics` log (`kind = 'recall'`), newest first.

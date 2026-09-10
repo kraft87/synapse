@@ -213,6 +213,16 @@ export function Recall() {
           {tab === 'served' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '14px', marginTop: '14px' }}>
               {loading && !result && <div style={{ color: 'var(--txt3)', fontFamily: mono, fontSize: '12.5px' }}>running recall…</div>}
+              {/* Degradation banner: thin buckets next to a warning mean broken retrieval,
+                  not empty memory, so it renders above the buckets, not beside them. */}
+              {result?.warnings?.length ? (
+                <div style={{ background: 'var(--bg1)', border: '1px solid var(--warn)', borderRadius: '8px', padding: '9px 12px' }}>
+                  <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--warn)', marginBottom: '4px' }}>degraded</div>
+                  {result.warnings.map((w) => (
+                    <div key={w} style={{ fontFamily: mono, fontSize: '12px', lineHeight: 1.5, color: 'var(--txt2)' }}>{w}</div>
+                  ))}
+                </div>
+              ) : null}
               {result && [...BUCKETS, ...(result.superseded_facts?.length ? ['superseded_facts'] : [])].map((name) => {
                 const items = bucketItems(name, result);
                 return (
