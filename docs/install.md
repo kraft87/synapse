@@ -10,10 +10,25 @@ install per Claude Code machine).
 
 ```bash
 git clone https://github.com/kraft87/synapse.git synapse && cd synapse
-cp .env.example .env
 ```
 
-Fill in these values in `.env`. Everything else has a working default.
+**Pick a starting file.** `.env.example` is the annotated reference for every variable that
+exists. [`examples/env/`](../examples/env/) holds three complete `.env` files, one per
+deployment shape, so a non-default setup is one copy instead of seven hand-edited variables:
+
+- [`voyage.env`](../examples/env/voyage.env): today's default. Needs a Voyage AI key for
+  embeddings and rerank, plus a Claude subscription token or an Anthropic API key.
+- [`local.env`](../examples/env/local.env): no retrieval signups. The bundled
+  `local-inference` container serves embeddings and rerank; extraction still needs the
+  Claude token or an Anthropic key. See [Local inference](#local-inference-no-external-accounts).
+- [`openrouter.env`](../examples/env/openrouter.env): no Claude subscription. Voyage for
+  retrieval, OpenRouter for extraction, so one key each.
+
+```bash
+cp examples/env/voyage.env .env      # or local.env, or openrouter.env, or .env.example
+```
+
+Whichever you copied, fill in these values in `.env`. Everything else has a working default.
 
 | Variable | What to put there |
 |----------|-------------------|
@@ -195,14 +210,23 @@ machine may be served. The scope says which graph a fact is written to.
 
 ## Local inference (no external accounts)
 
-The bundled `local-inference` compose profile runs embeddings and rerank locally, so
-`VOYAGE_API_KEY` can stay blank. The recipe (provider, base URL, model ids, and the
-`SYNAPSE_EMBED_DIMS` value you must set **before** the database's first boot) is in
-`.env.example` under "Fully local, zero-signup recipe". Honest caveat: published retrieval
-quality was measured on the Voyage stack, and the local models are a convenience floor.
+Everything below is one file. Copy [`examples/env/local.env`](../examples/env/local.env)
+instead of editing variables by hand:
 
-Embedding width is fixed at first-boot schema provisioning and recorded in `synapse_meta`;
-the server fails loudly on a later mismatch rather than serving garbage.
+```bash
+cp examples/env/local.env .env
+```
+
+It ships the whole recipe already applied (provider, base URLs, model ids,
+`SYNAPSE_EMBED_DIMS=768`, and `COMPOSE_PROFILES=local-inference`, so a plain
+`docker compose up -d --build` starts the inference container), and `VOYAGE_API_KEY` stays
+blank. Honest caveat: retrieval quality was measured on the Voyage stack; the local models
+are a convenience floor and have not been benchmarked.
+
+One thing you cannot fix later: embedding width is fixed at first-boot schema provisioning
+and recorded in `synapse_meta`, so `SYNAPSE_EMBED_DIMS=768` has to be in place **before** the
+first `docker compose up`. The server fails loudly on a later mismatch rather than serving
+garbage, and switching stacks after the fact means an empty data volume.
 
 ## Ports and a second instance
 
