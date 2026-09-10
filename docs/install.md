@@ -235,9 +235,12 @@ gets a release note saying so.
   `! synapse-login`, then paste it into the plugin config. The SessionStart block says which
   case you are in.
 - **`POST /recall` returns `{"facts": []}` with no `episodes` key.** The embedding call
-  failed, almost always a bad or blank `VOYAGE_API_KEY`. The HTTP status is still 200, so
-  the only signal is the log: run `docker compose logs mcp-server` and look for
-  `Embedding query failed`.
+  failed, almost always a bad or blank `VOYAGE_API_KEY`. The HTTP status is still 200, but
+  the response now carries a `warnings` list naming the leg that degraded, for example
+  `embedding failed (voyage: Unauthorized): vector legs skipped, results are BM25-only.
+  Check VOYAGE_API_KEY.` The same list appears on the `recall` and `recall_full_turns` MCP
+  tools. A `warnings` key means broken retrieval, not empty memory. For the full error, run
+  `docker compose logs mcp-server` and look for `Embedding query failed`.
 - **Episodes appear but the graph stays empty.** KG facts are extracted from 4-turn-or-longer
   windows on a poll cycle (default 5 min); a short session or a fresh import needs a few
   minutes. If it stays empty for longer, check the extraction LLM: a bad credential or an

@@ -263,6 +263,9 @@ export interface RecallResult {
   preferences?: { pref: string; polarity?: string; since?: string; asserted?: number; score?: number }[];
   web?: { context?: string; excerpt?: string; url?: string; title?: string; date?: string; score?: number }[];
   superseded_facts?: { fact: string; superseded_by: string }[];
+  // Present only when a retrieval leg degraded (dead embed/rerank backend, failed KG or
+  // notes leg). Absent on a healthy recall, so treat it as optional and never expect [].
+  warnings?: string[];
   debug?: RecallDebug;
 }
 export interface RecallParams { query: string; project?: string; group_id?: string; }

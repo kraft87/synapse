@@ -36,7 +36,10 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from typing import Any
 
 import psycopg
@@ -143,6 +146,105 @@ _WS_RE = re.compile(r"\s+")
 def _norm_ws(s: str) -> str:
     """Whitespace-collapsed lowercase — the normal form for query-echo overlap matching."""
     return _WS_RE.sub(" ", s).strip().lower()
+
+
+# ----------------------------------------------------------------------------
+# Degradation warnings
+# ----------------------------------------------------------------------------
+# Every retrieval leg is fail-soft: a dead embedder or reranker degrades that leg
+# instead of raising. That is the right serving posture, but it used to be SILENT:
+# a blank VOYAGE_API_KEY produced HTTP 200 with a normal-looking `{"facts": []}` and
+# the only evidence was an ERROR line in the mcp-server log, so a new install read
+# "memory is empty" instead of "retrieval is broken".
+#
+# Each degradation now appends one human-readable line to a per-call sink, surfaced
+# as the response's `warnings` key. The key is present ONLY when the list is
+# non-empty, so a healthy response keeps its exact previous shape (the plugin, the
+# dashboard contract, and the tests all consume that shape).
+#
+# The sink is a ContextVar, not an argument threaded through every helper: the legs
+# run on _leg_executor workers, and a signature change would also break the
+# fixed-arity leg stubs the test suite monkeypatches in. ThreadPoolExecutor does not
+# propagate contextvars on its own, so leg submissions go through _submit_ctx, which
+# carries a copy of the submitting context into the worker.
+_WARN_SINK: ContextVar[list[str] | None] = ContextVar("synapse_recall_warnings", default=None)
+# Guards the dedupe read-then-append; legs append concurrently from worker threads.
+_WARN_LOCK = threading.Lock()
+
+# Substrings that mark a backend error as CONFIGURATION (bad credential, unreachable
+# endpoint) rather than transient load, the cases where naming the env var helps.
+_CONFIG_MARKERS = (
+    "unauthorized",
+    "forbidden",
+    "401",
+    "403",
+    "invalid api key",
+    "invalid_api_key",
+    "authentication",
+    "permission denied",
+    "connect",
+    "connection",
+    "timed out",
+    "timeout",
+    "refused",
+    "not known",
+    "name resolution",
+    "ssl",
+    "certificate",
+)
+
+# Credential-shaped fragments get redacted out of any error text we surface.
+_SECRET_RE = re.compile(r"(?i)\b(api[-_]?key|authorization|token|bearer)\b['\"]?\s*[:=]?\s*\S+")
+
+
+@contextmanager
+def _warn_sink(sink: list[str]) -> Iterator[None]:
+    """Bind ``sink`` as the active recall's warning list for the duration of the block."""
+    token = _WARN_SINK.set(sink)
+    try:
+        yield
+    finally:
+        _WARN_SINK.reset(token)
+
+
+def _warn(msg: str) -> None:
+    """Record one degradation notice on the active sink, deduped. No-op outside a recall."""
+    sink = _WARN_SINK.get()
+    if sink is None:
+        return
+    with _WARN_LOCK:
+        if msg not in sink:
+            sink.append(msg)
+
+
+def _submit_ctx(ex: ThreadPoolExecutor, fn: Any, *args: Any) -> Future[Any]:
+    """Submit a leg carrying the caller's context, so it writes to the same warning sink."""
+    return ex.submit(copy_context().run, fn, *args)
+
+
+def _err_brief(e: BaseException, cap: int = 120) -> str:
+    """One-line, secret-free rendering of a backend error: its message, or the exception
+    class name when it carries none. Never a traceback, never a credential."""
+    msg = _SECRET_RE.sub(r"\1=***", _norm_ws_preserve(str(e))).strip()
+    return msg[:cap] or type(e).__name__
+
+
+def _norm_ws_preserve(s: str) -> str:
+    """Collapse whitespace but KEEP case: error text reads wrong lowercased."""
+    return _WS_RE.sub(" ", s).strip()
+
+
+def _config_hint(detail: str, *, backend: str, env_prefix: str) -> str:
+    """Env-var pointer appended when a backend error reads like configuration.
+
+    Empty string for transient failures (rate limits, 5xx): naming VOYAGE_API_KEY on a
+    rate limit sends the reader to fix something that is not broken."""
+    low = detail.lower()
+    if not any(m in low for m in _CONFIG_MARKERS):
+        return ""
+    if backend == "voyage":
+        return " Check VOYAGE_API_KEY."
+    return f" Check {env_prefix}_PROVIDER / {env_prefix}_BASE_URL / {env_prefix}_API_KEY."
 
 
 def _echo_lcs_len(content: str, q: str) -> int:
@@ -870,6 +972,7 @@ class Recall:
             ]
         except Exception as e:
             logger.warning("BM25 %s search failed: %s", table, e)
+            _warn(f"BM25 {table} search failed ({_err_brief(e)}): lexical leg served nothing.")
             return []
 
     def _search_bm25_episodes(
@@ -937,6 +1040,7 @@ class Recall:
             ]
         except Exception as e:
             logger.warning("Vector %s search failed: %s", table, e)
+            _warn(f"vector {table} search failed ({_err_brief(e)}): semantic leg served nothing.")
             return []
 
     def _search_vector_episodes(
@@ -1007,6 +1111,13 @@ class Recall:
             scored = reranker.rerank_scored(query, docs)
         except Exception as e:
             logger.warning("Scored rerank failed, using RRF order: %s", e)
+            detail = _err_brief(e)
+            backend = _embedding.rerank_provider()
+            _warn(
+                f"rerank failed ({backend}: {detail}): serving RRF fusion order, "
+                f"result ranking is degraded."
+                + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
+            )
             return [(i, 0.0) for i in range(len(pool))]
         best: dict[int, float] = {}
         for di, s in scored:
@@ -1120,6 +1231,12 @@ class Recall:
             scored = reranker.rerank_scored(query, texts)
         except Exception as e:
             logger.warning("Relevance-floor rerank failed, keeping all items: %s", e)
+            detail = _err_brief(e)
+            backend = _embedding.rerank_provider()
+            _warn(
+                f"relevance-floor rerank failed ({backend}: {detail}): serving all items "
+                f"unfiltered." + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
+            )
             return items
         kept = [items[i] for i, s in scored if s >= floor]
         if not kept and keep_min > 0:
@@ -1214,6 +1331,13 @@ class Recall:
                 scored = reranker.rerank_scored(query, passages, top_k=None if _capped else n)
             except Exception as e:
                 logger.warning("Passage rerank failed, serving full episodes: %s", e)
+                detail = _err_brief(e)
+                backend = _embedding.rerank_provider()
+                _warn(
+                    f"passage rerank failed ({backend}: {detail}): episode passages dropped "
+                    f"from this result, retry with recall_full_turns for raw turns."
+                    + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
+                )
                 return []
             if _capped:
                 sess_fresh: dict[Any, bool] = {}
@@ -1462,6 +1586,7 @@ class Recall:
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
             logger.warning("BM25 web search failed: %s", e)
+            _warn(f"BM25 web search failed ({_err_brief(e)}): web bucket is degraded.")
             return []
 
     def _search_vector_web(self, query_emb: list[float], limit: int) -> list[dict[str, Any]]:
@@ -1484,6 +1609,7 @@ class Recall:
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
             logger.warning("Vector web search failed: %s", e)
+            _warn(f"vector web search failed ({_err_brief(e)}): web bucket is degraded.")
             return []
 
     @staticmethod
@@ -1557,6 +1683,7 @@ class Recall:
                 db.close()
         except Exception as e:
             logger.warning("notes leg fetch failed: %s", e)
+            _warn(f"notes leg failed ({_err_brief(e)}): no notes served.")
             return []
         if not rows:
             return []
@@ -1608,6 +1735,7 @@ class Recall:
                 )
         except Exception as e:
             logger.warning("KG search failed: %s", e)
+            _warn(f"KG facts leg failed ({_err_brief(e)}): no facts served.")
             return [], []
 
     def _fetch_superseded_pairs_pg(
@@ -1866,7 +1994,43 @@ class Recall:
         from the technical one, because that is where every fact was written. A
         model that asks for a scope this deployment does not run gets answers
         instead of an empty graph.
+
+        A ``warnings`` list is attached when a leg degraded (embedding or rerank
+        backend down, KG or notes leg errored). The key is ABSENT on a healthy call,
+        so the response shape is unchanged for every existing consumer. Empty buckets
+        WITH a warning mean broken retrieval, not empty memory.
         """
+        warnings: list[str] = []
+        with _warn_sink(warnings):
+            return self._recall_inner(
+                query=query,
+                warnings=warnings,
+                project=project,
+                session_focus=session_focus,
+                group_id=group_id,
+                write_feedback=write_feedback,
+                source=source,
+                debug=debug,
+                self_session=self_session,
+                surface=surface,
+                trust=trust,
+            )
+
+    def _recall_inner(
+        self,
+        query: str,
+        warnings: list[str],
+        project: str | None = None,
+        session_focus: list[str] | None = None,
+        group_id: str = "technical",
+        write_feedback: bool = True,
+        source: str | None = None,
+        debug: bool = False,
+        self_session: str | None = None,
+        surface: str | None = None,
+        trust: SurfaceTrust | None = None,
+    ) -> dict[str, Any]:
+        """recall()'s body, run with ``warnings`` bound as the active degradation sink."""
         group_id = coerce_group(group_id) or "technical"
         t_start = time.perf_counter()
         ex = self._leg_executor
@@ -1878,8 +2042,8 @@ class Recall:
         # below, instead of running after it (the embed gates the vector/KG/web legs,
         # but not BM25). Each leg owns a thread-local PG connection, so concurrent
         # psycopg use is safe. Legs run through _timed for per-leg latency telemetry.
-        f_bm25 = ex.submit(
-            _timed, self._search_bm25_episodes, query, project, _EPISODE_FETCH, None, allowed
+        f_bm25 = _submit_ctx(
+            ex, _timed, self._search_bm25_episodes, query, project, _EPISODE_FETCH, None, allowed
         )
 
         t_emb = time.perf_counter()
@@ -1887,6 +2051,13 @@ class Recall:
             query_emb = self._ensure_embedder().embed([query], task="query")[0]
         except Exception as e:
             logger.error("Embedding query failed: %s", e)
+            detail = _err_brief(e)
+            backend = _embedding.embed_provider()
+            _warn(
+                f"embedding failed ({backend}: {detail}): vector legs skipped, "
+                f"results are BM25-only."
+                + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_EMBED")
+            )
             query_emb = None
         ms_embed = (time.perf_counter() - t_emb) * 1000.0
 
@@ -1901,14 +2072,18 @@ class Recall:
             # project column, and joining back through source episodes to derive one
             # isn't worth the per-query cost yet — so there is no way to filter facts,
             # and serving none is the only fail-closed option.
-            if query_emb is None or st.restricted:
+            if query_emb is None:
+                _warn("KG facts leg skipped: no query embedding, so the facts bucket is empty.")
+                return [], []
+            if st.restricted:
                 return [], []
             return self._search_kg(
                 query, query_emb, group_id, session_focus or [], fact_limit=_FACT_LIMIT
             )
 
         f_vec = (
-            ex.submit(
+            _submit_ctx(
+                ex,
                 _timed,
                 self._search_vector_episodes,
                 query_emb,
@@ -1920,8 +2095,8 @@ class Recall:
             if query_emb is not None
             else None
         )
-        f_web = ex.submit(_timed, _web_leg)
-        f_kg = ex.submit(_timed, _kg_leg)
+        f_web = _submit_ctx(ex, _timed, _web_leg)
+        f_kg = _submit_ctx(ex, _timed, _kg_leg)
 
         # Notes leg: hook-KNN + rerank floor over the curated notes store (the board's
         # searchable other half). Reuses this call's query embedding; no-ops without it.
@@ -1930,7 +2105,7 @@ class Recall:
                 return []
             return self._search_notes(query, query_emb, project, audience=st.audience_filter)
 
-        f_notes = ex.submit(_timed, _notes_leg) if _NOTES_IN_RECALL else None
+        f_notes = _submit_ctx(ex, _timed, _notes_leg) if _NOTES_IN_RECALL else None
 
         # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
         # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
@@ -1951,9 +2126,9 @@ class Recall:
         # bi-temporal superseded-pairs fetch hit different backends. Use the SCORED rerank — same
         # ordering as _rerank_pool, but it also yields the top relevance score (a recall-
         # confidence signal, and the basis for an eventual inject-only-if-relevant gate).
-        f_rerank = ex.submit(_timed, self._rerank_pool_scored, query, ep_pool)
-        f_superseded = ex.submit(
-            self._fetch_superseded_pairs_pg, group_id, surfaced_edge_uuids, _SUPERSEDED_LIMIT
+        f_rerank = _submit_ctx(ex, _timed, self._rerank_pool_scored, query, ep_pool)
+        f_superseded = _submit_ctx(
+            ex, self._fetch_superseded_pairs_pg, group_id, surfaced_edge_uuids, _SUPERSEDED_LIMIT
         )
         scored, ms_rerank = f_rerank.result()
         superseded_facts = f_superseded.result()
@@ -2080,8 +2255,17 @@ class Recall:
                 note_items, ms_notes = f_notes.result()
             except Exception as e:
                 logger.warning("notes leg failed: %s", e)
+                _warn(f"notes leg failed ({_err_brief(e)}): no notes served.")
         if note_items:
             out["notes"] = note_items
+
+        # Degradation notices (see the _WARN_SINK block up top). Present ONLY when a leg
+        # actually degraded: a healthy recall carries no `warnings` key at all, so nothing
+        # downstream has to learn a new field to keep working. `_served_chars` deliberately
+        # does not count these: they are diagnostics, not served memory, and counting them
+        # would move est_tokens telemetry on exactly the calls that are already anomalous.
+        if warnings:
+            out["warnings"] = list(warnings)
 
         # Fire-and-forget telemetry to recall_metrics (NOT logfire) — same background-write
         # pattern as the retrieval_count bump, so zero read-path latency.
@@ -2201,13 +2385,52 @@ class Recall:
 
         ``surface`` applies the same project allowlist recall() does (schema 053): a
         restricted caller must not reach whole turns it cannot reach passages of.
+
+        Carries the same ``warnings`` list recall() does, and on the same terms: present
+        only when a leg degraded, absent otherwise.
         """
         t_start = time.perf_counter()
+        warnings: list[str] = []
+        with _warn_sink(warnings):
+            return self._recall_episodes_inner(
+                query=query,
+                warnings=warnings,
+                project=project,
+                limit=limit,
+                source=source,
+                self_session=self_session,
+                session_id=session_id,
+                surface=surface,
+                trust=trust,
+                t_start=t_start,
+            )
+
+    def _recall_episodes_inner(
+        self,
+        query: str,
+        warnings: list[str],
+        project: str | None,
+        limit: int,
+        source: str | None,
+        self_session: str | None,
+        session_id: str | None,
+        surface: str | None,
+        trust: SurfaceTrust | None,
+        t_start: float,
+    ) -> dict[str, Any]:
+        """recall_episodes()'s body, run with ``warnings`` bound as the degradation sink."""
         allowed = _resolve(self._db_url, surface, trust).project_filter
         try:
             query_emb = self._ensure_embedder().embed([query], task="query")[0]
         except Exception as e:
             logger.error("Embedding query failed: %s", e)
+            detail = _err_brief(e)
+            backend = _embedding.embed_provider()
+            _warn(
+                f"embedding failed ({backend}: {detail}): vector legs skipped, "
+                f"results are BM25-only."
+                + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_EMBED")
+            )
             query_emb = None
 
         # Deep-fetch both legs (golds rank up to ~88 in a single leg), fuse, then
@@ -2237,10 +2460,13 @@ class Recall:
         if ep_ids:
             self._increment_retrieval_counts(ep_ids)
 
-        out = {
+        out: dict[str, Any] = {
             "query": query,
             "episodes": [_to_recall_item(r) for r in episodes],
         }
+        # Same contract as recall(): key present only when a leg degraded.
+        if warnings:
+            out["warnings"] = list(warnings)
         served_ids: dict[str, Any] = {
             "episodes": [r["id"] for r in episodes if r.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
