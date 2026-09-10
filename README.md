@@ -68,7 +68,7 @@ Single box, everything local:
 
 ```bash
 git clone https://github.com/kraft87/synapse.git synapse && cd synapse
-cp .env.example .env                 # fill in DB password + DSN, machine token, API keys
+cp .env.example .env                 # or a preset from examples/env/
 docker compose up -d --build         # builds the image, starts Postgres + poller + MCP server
 docker compose exec mcp-server synapse-admin bootstrap "this laptop"
 ```
