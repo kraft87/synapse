@@ -758,8 +758,9 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall(mode="turns")`: serve turns scoring ≥ tau×top_score |
 | `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |
 | `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
-| `SYNAPSE_RECALL_FLOOR` | `0.58` | **shadow-phase** abstention floor: when the raw (pre-recency) rerank top score is strictly below it, the call's `recall_metrics.served_ids` envelope gains `would_abstain`/`floor` markers — telemetry only, serving is unchanged (`0` = off) |
-| `SYNAPSE_RECALL_FLOOR_ENFORCE` | `0` | read but **inert** this release: actually abstaining below the floor ships in a later release, once the shadow telemetry validates a threshold |
+| `SYNAPSE_RECALL_FLOOR` | `0` (off) | abstention floor on the raw (pre-recency) rerank top score: strictly below it, recall serves no episodes for that call instead of the least-bad ones, and `recall_metrics.served_ids` gains `would_abstain`/`floor` markers. The threshold belongs to the reranker (scores are not comparable across models), so each `examples/env` preset sets it: `0.58` for the default `rerank-2.5-lite`, `0` for the bundled local reranker |
+| `SYNAPSE_RECALL_FLOOR_ENFORCE` | `1` | `0` keeps the telemetry markers but never withholds episodes |
+| `SYNAPSE_RECALL_FLOOR_KEEP_MIN` | `0` | when the floor fires, serve this many top passages instead of none |
 | `SYNAPSE_SUPERSEDE_MAX_DIST` | `0.45` | cosine-distance gate for surfacing successor facts of superseded edges |
 | `SYNAPSE_TIMELINE_GROUP_SCOPE` | `1` | `group_id="personal"` filters timeline serving to personal-domain events (`0` = never filter) |
 | `SYNAPSE_SCHEMA_CHECK` | `1` | boot-time guard: refuse to start when the database schema is behind the code (`0` = skip) |

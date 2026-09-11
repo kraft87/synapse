@@ -45,8 +45,8 @@ serves **every** caller restricted, which means an empty board and empty recalls
 poking at a throwaway stack, not for running one.
 
 Optional knobs (`SYNAPSE_INGEST_TAIL`, `POLL_INTERVAL_SECONDS`, recall-serving tuning such
-as the shadow-phase `SYNAPSE_RECALL_FLOOR` / `SYNAPSE_RECALL_FLOOR_ENFORCE` abstention
-floor, and more) are listed in
+as the `SYNAPSE_RECALL_FLOOR` abstention floor, which every `examples/env` preset pins to
+the value calibrated for its reranker, and more) are listed in
 [ARCHITECTURE.md §13](../ARCHITECTURE.md#13-configuration). Set `LOGFIRE_TOKEN` to stream
 traces to [Pydantic Logfire](https://logfire.pydantic.dev); leave it blank and telemetry is
 fully off.
