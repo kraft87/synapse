@@ -328,8 +328,8 @@ def test_enforce_gates_episodes_below_floor(monkeypatch):
 def test_env_defaults_and_parsing(monkeypatch):
     import importlib
 
-    # Defaults: provisional p10 of the prod rerank_top_score distribution; enforce ON.
-    assert recall_mod._RECALL_FLOOR == 0.58
+    # Defaults: floor OFF (the threshold is reranker-specific and lives in .env); enforce ON.
+    assert recall_mod._RECALL_FLOOR == 0.0
     assert recall_mod._RECALL_FLOOR_ENFORCE is True
     monkeypatch.setenv("SYNAPSE_RECALL_FLOOR", "0.7")
     monkeypatch.setenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "0")

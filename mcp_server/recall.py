@@ -498,15 +498,20 @@ _RECALL_FACT_FLOOR = float(os.getenv("SYNAPSE_RECALL_FACT_FLOOR", "0") or "0")
 # pre-recency-reweight top score (the same value recall_metrics.rerank_top_score records)
 # is strictly below _RECALL_FLOOR, the served_ids telemetry envelope gains
 # {"would_abstain": true, "floor": <float>} — see _floor_shadow(). The marker is recorded
-# regardless of enforcement. Default 0.58 ~= p10 of the last 30 days' rerank_top_score
-# distribution (p05=0.5039 p10=0.5781 p25=0.6914 p50=0.7891, n=687). 0 disables the marker.
-_RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0.58") or "0.58")
+# regardless of enforcement. The threshold is a property of the RERANKER in use, not of
+# recall: rerank scores are not comparable across models, and a floor calibrated on one
+# backend replayed against another blanked 39-56% of episode buckets on the LME A/B set
+# (2026-09-10). So the code default is 0 (off) and each examples/env preset sets the value
+# calibrated for its reranker (0.58 for the default stack ~= p10 of 30 days of prod
+# rerank_top_score: p05=0.5039 p10=0.5781 p25=0.6914 p50=0.7891, n=687).
+_RECALL_FLOOR = float(os.getenv("SYNAPSE_RECALL_FLOOR", "0") or "0")
 # Enforcement gate — ON by default (2026-07-23): the shadow phase validated the floor fires
 # on ~9% of real recalls (the bottom ~p10 by episode-rerank strength). When enforced, recall()
 # drops the EPISODE bucket if the RAW top rerank score is in (0, floor) under working
 # retrieval — low relevance costs fewer tokens instead of serving the least-bad passages.
 # Facts/timeline are unaffected (own gates); recall_episodes() drill-down never enforces.
-# SYNAPSE_RECALL_FLOOR_ENFORCE=0 disables. SYNAPSE_RECALL_FLOOR=0 disables both marker + enforce.
+# SYNAPSE_RECALL_FLOOR_ENFORCE=0 disables. SYNAPSE_RECALL_FLOOR unset or 0 disables both
+# marker + enforce.
 _RECALL_FLOOR_ENFORCE = os.getenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "1") != "0"
 # Keep-min under enforcement (LME 2026-07-25: blanking the bucket cost multi-session -8pts at
 # the enforce commit — synthesis questions have flat score spreads, so a low TOP score doesn't
