@@ -25,15 +25,20 @@ commands.
 python3 plugin-codex/install.py --synapse-url http://your-synapse:8765
 ```
 
-Appends six hook blocks to `~/.codex/config.toml` (idempotent; re-run after
-upgrades to pick up new blocks) and registers the `synapse` MCP server. Then
+Installs six hook blocks in `~/.codex/config.toml` (idempotent; re-run after
+upgrades to migrate legacy matchers and MCP authentication) and registers the `synapse` MCP server. Then
 start `codex`, run `/hooks`, and trust the new hooks — Codex refuses
 unreviewed hooks.
 
-Auth: export `SYNAPSE_INGEST_TOKEN` in the environment Codex runs under
-(the MCP client hard-requires the env var). The hook scripts themselves also
-fall back to the Claude plugin's saved options in `~/.claude/settings.json`,
-so a machine running both plugins configures once.
+Auth: MCP and hooks share the same credential source: `SYNAPSE_INGEST_TOKEN`
+when explicitly set, otherwise the Claude plugin's saved options in
+`~/.claude/settings.json`. MCP uses `scripts/mcp_headers.py` through Codex's
+`http_headers_helper` setting (verified with Codex 0.155.0). A background Codex
+daemon no longer needs to inherit a shell export. No token is copied into
+`config.toml`, and the helper refuses to send it to a different server origin.
+Re-run the installer to replace legacy `bearer_token_env_var` configuration,
+then reload MCP or start a new session. Older Codex builds without header-helper
+support must be updated first.
 
 That value must be this machine's own **device** token, not the shared
 `SYNAPSE_MACHINE_TOKEN`. Since schema 054 what a machine is served depends on
@@ -62,7 +67,7 @@ and `updatedInput` is only honored alongside `permissionDecision: "allow"`.
 | var | default | |
 |---|---|---|
 | `SYNAPSE_URL` | `http://localhost:8765` | base URL |
-| `SYNAPSE_INGEST_TOKEN` | – | bearer token (required for MCP) |
+| `SYNAPSE_INGEST_TOKEN` | saved plugin option | per-device bearer token |
 | `SYNAPSE_PRIVATE_DIR` | `~/.synapse/private` | private-mode markers |
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
 | `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window |

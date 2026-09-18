@@ -6,10 +6,10 @@ shipped builds), so this installer wires the two halves directly:
 
   1. Appends a ``[[hooks.Stop]]`` block to ~/.codex/config.toml pointing at
      hooks/synapse_stop_hook.py (absolute path, resolved from this repo).
-  2. Registers the Synapse MCP server via ``codex mcp add synapse``.
+  2. Registers Synapse MCP with a saved-credential HTTP header helper.
 
-Idempotent: re-running skips anything already present. Nothing else in
-config.toml is touched — the hook block is appended, not merged.
+Idempotent: existing Synapse auth and legacy matchers are upgraded in place.
+Unrelated configuration and hook trust records are preserved.
 
 Usage:
     python3 plugin-codex/install.py [--synapse-url URL] [--dry-run]
@@ -21,10 +21,12 @@ Codex refuses to run unreviewed hooks.
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import shutil
-import subprocess
+import re
+import shlex
 import sys
+import tomllib
 from pathlib import Path
 
 CONFIG_PATH = Path(os.path.expanduser("~/.codex/config.toml"))
@@ -89,6 +91,27 @@ _HOOK_BLOCKS: list[tuple[str, str]] = [
 
 def install_hook(dry_run: bool) -> None:
     existing = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else ""
+    old_matcher = 'matcher = "mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session)$"'
+    new_matcher = old_matcher.replace("fetch_session)", "fetch_session|remember)")
+    hook_blocks = re.compile(
+        r"(?ms)^\[\[hooks\.PreToolUse\]\].*?(?=^\[(?!\[hooks\.PreToolUse\.hooks\]\])|\Z)"
+    )
+    upgraded = hook_blocks.sub(
+        lambda match: (
+            match[0].replace(old_matcher, new_matcher)
+            if "pre_tool_use.py" in match[0]
+            else match[0]
+        ),
+        existing,
+    )
+    if upgraded != existing:
+        tomllib.loads(upgraded)
+        if dry_run:
+            print("hooks: would upgrade the Synapse session-id matcher to include remember")
+        else:
+            CONFIG_PATH.write_text(upgraded, encoding="utf-8")
+            print("hooks: upgraded the Synapse session-id matcher to include remember")
+        existing = upgraded
     missing = [(m, b) for m, b in _HOOK_BLOCKS if m.split()[0] not in existing]
     if not missing:
         print(f"hooks: all {len(_HOOK_BLOCKS)} blocks already present in {CONFIG_PATH} — skipping")
@@ -106,40 +129,53 @@ def install_hook(dry_run: bool) -> None:
 
 
 def install_mcp(synapse_url: str, dry_run: bool) -> None:
-    codex = shutil.which("codex")
-    if not codex:
-        print("mcp: codex binary not on PATH — skipping MCP registration", file=sys.stderr)
-        return
-    have = subprocess.run([codex, "mcp", "get", "synapse"], capture_output=True, text=True)
-    if have.returncode == 0:
-        print("mcp: server 'synapse' already registered — skipping")
-        return
-    cmd = [
-        codex,
-        "mcp",
-        "add",
-        "synapse",
-        "--url",
-        synapse_url.rstrip("/") + "/mcp",
-        "--bearer-token-env-var",
-        "SYNAPSE_INGEST_TOKEN",
-    ]
-    if dry_run:
-        print(f"mcp: would run: {' '.join(cmd)}")
-        return
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print(f"mcp: codex mcp add failed: {r.stderr.strip()}", file=sys.stderr)
+    existing = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else ""
+    config = tomllib.loads(existing)
+    current = config.get("mcp_servers", {}).get("synapse", {})
+    if current.get("command"):
+        raise ValueError("Refusing to replace a custom Synapse stdio connection")
+    if current.get("http_headers", {}).get("Authorization") or current.get(
+        "env_http_headers", {}
+    ).get("Authorization"):
+        raise ValueError("Remove the custom Synapse Authorization override before migrating")
+    url = synapse_url.rstrip("/")
+    if not url.endswith("/mcp"):
+        url += "/mcp"
+    helper = shlex.join(["python3", str(SCRIPTS_DIR / "mcp_headers.py"), "--url", url])
+    fields = f"url = {json.dumps(url)}\nhttp_headers_helper = {json.dumps(helper)}\n"
+    table = re.search(r"(?m)^\[mcp_servers\.synapse\][ \t]*(?:#.*)?$", existing)
+    if table:
+        next_table = re.search(r"(?m)^\[", existing[table.end() :])
+        end = table.end() + next_table.start() if next_table else len(existing)
+        body = existing[table.end() : end]
+        body = re.sub(
+            r"(?m)^[ \t]*(?:url|bearer_token_env_var|http_headers_helper)[ \t]*=.*\n?",
+            "",
+            body,
+        )
+        updated = existing[: table.end()] + "\n" + fields + body.lstrip("\n") + existing[end:]
+    elif current:
+        raise ValueError("Synapse config uses an unsupported table layout; left unchanged")
     else:
-        print("mcp: registered 'synapse' MCP server")
+        updated = existing.rstrip() + "\n\n[mcp_servers.synapse]\n" + fields
+    tomllib.loads(updated)
+    if updated == existing:
+        print("mcp: saved-credential helper already configured")
+        return
+    if dry_run:
+        print("mcp: would configure the saved-credential helper (no token copied into config)")
+        return
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(updated, encoding="utf-8")
+    print("mcp: configured saved-credential helper")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Install Synapse into Codex CLI")
     parser.add_argument(
         "--synapse-url",
-        default=os.environ.get("SYNAPSE_URL", "http://localhost:8765"),
-        help="Synapse base URL (default: $SYNAPSE_URL or http://localhost:8765)",
+        default=None,
+        help="Synapse base URL (default: existing MCP URL, then hook configuration)",
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -148,12 +184,19 @@ def main() -> int:
         print(f"error: hook scripts not found under {HOOKS_DIR}", file=sys.stderr)
         return 2
 
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    from common import BASE_URL
+
+    config = tomllib.loads(CONFIG_PATH.read_text()) if CONFIG_PATH.exists() else {}
+    url = (
+        args.synapse_url or config.get("mcp_servers", {}).get("synapse", {}).get("url") or BASE_URL
+    )
+    install_mcp(url, args.dry_run)
     install_hook(args.dry_run)
-    install_mcp(args.synapse_url, args.dry_run)
     print(
         "\nDone. Next: start `codex`, run /hooks, and trust the Synapse Stop hook.\n"
-        "Set SYNAPSE_INGEST_TOKEN in the environment Codex runs under if your\n"
-        "server is auth-gated."
+        "MCP and hooks now share the saved Synapse device credential; no daemon\n"
+        "environment export is needed. Requires Codex with http_headers_helper support."
     )
     return 0
 
