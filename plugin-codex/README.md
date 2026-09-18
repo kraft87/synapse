@@ -13,11 +13,19 @@ the Claude Code plugin (`../plugin/`) for the per-session surface:
 | self-session injection | PreToolUse | `hooks/pre_tool_use.py` |
 | recall-feedback nudge | PostToolUse | `hooks/post_tool_use.py` |
 | private mode | marker + server row | `scripts/private_mode.py` (+ SessionEnd cleanup) |
+| skills sync (opt-in) | SessionStart `skills_sync.py` | `scripts/skills_sync.py`, run by `hooks/session_start.py` |
+
+Skills sync shares the Claude plugin's engine and its `SYNAPSE_SKILLS_SYNC=1`
+opt-in. It syncs Synapse's global skills two-way with Codex's user-skills
+folder (`~/.agents/skills`) only; Codex's bundled skills under
+`~/.codex/skills/.system` and plugin caches are never scanned or uploaded.
+Both plugins on one machine converge on the same server copy, so an edit in
+either folder reaches the other at its next session start.
 
 Not ported (machine-level curation lanes, run them from Claude Code; running
-them from both hosts would double-sync): skills_sync, config_sync,
-git_feeder (board git feeder), and the `/synapse:skill-review` / `/synapse:config-review`
-commands.
+them from both hosts would double-sync): config_sync, git_feeder (board git
+feeder), project-scoped skills, and the `/synapse:skill-review` /
+`/synapse:config-review` commands.
 
 ## Install
 
@@ -71,4 +79,7 @@ and `updatedInput` is only honored alongside `permissionDecision: "allow"`.
 | `SYNAPSE_PRIVATE_DIR` | `~/.synapse/private` | private-mode markers |
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
 | `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window |
+| `SYNAPSE_SKILLS_SYNC` | `0` (saved plugin option) | `1` enables skills sync |
+| `SYNAPSE_CODEX_SKILLS_DIR` | `~/.agents/skills` | folder the sync scans |
+| `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT` | `12` | seconds SessionStart waits for the sync |
 | `SYNAPSE_BOARD` / `SYNAPSE_PREFS_BLOCK` / `SYNAPSE_RECALL_NUDGE` / `SYNAPSE_RECALL_FEEDBACK_NUDGE` / `SYNAPSE_CODEX_CATCHUP` | `1` | kill switches |
