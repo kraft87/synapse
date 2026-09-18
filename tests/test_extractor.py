@@ -1455,7 +1455,7 @@ class TestStage6aCandidateLimit:
 
         fact = ExtractedFact(source="A", target="B", relationship="USES", fact="A uses B")
 
-        with patch("ingestion.extractor.rrf_merge", return_value=[]) as mock_rrf:
+        with patch("ingestion.extraction_edges.rrf_merge", return_value=[]) as mock_rrf:
             pipe._stage6a_embedding_filter([fact], {"A": "ua", "B": "ub"}, "technical")
 
         assert falkordb.find_similar_edges.call_args.kwargs["limit"] == _SEMANTIC_POOL_LIMIT * 2

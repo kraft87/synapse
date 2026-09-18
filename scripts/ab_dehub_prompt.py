@@ -68,11 +68,8 @@ from psycopg.rows import dict_row
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
-from ingestion.extractor import (  # noqa: E402
-    _EXTRACTION_PROMPT,
-    DeterministicExtractor,
-    LLMExtractor,
-)
+from ingestion.extraction_llm import _EXTRACTION_PROMPT  # noqa: E402
+from ingestion.extractor import DeterministicExtractor, LLMExtractor  # noqa: E402
 from ingestion.llm_client import OpenAIChatClient  # noqa: E402
 from ingestion.models import ExtractionResult, banned_name  # noqa: E402
 

@@ -23,6 +23,7 @@ from ingestion.db import Database
 from ingestion.jsonl_client import JSONLParser
 from ingestion.models import Episode, ExtractionItem
 from ingestion.private_sessions import PrivateSessions
+from ingestion.scratch_projects import is_scratch_project
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,9 @@ def _write_session_episodes(
         # transcribe_ai deposition payloads and Synapse's own harness calls must
         # not enter memory via the disk sweep either.
         if is_transcript_contamination(ep.content) or is_harness_call(ep.content):
+            continue
+        # Throwaway smoke-test workspaces (axon-test, tmp, ...) are not memory.
+        if is_scratch_project(ep.project):
             continue
 
         ep_to_write = ep.model_copy(
