@@ -10,11 +10,14 @@ hook entry as a separate process; one fetch pass is cheaper):
   * preferences_block — GET /preferences/top, max 8 lines
   * ingest catchup  — detached ``synapse_stop_hook.py --catchup`` sweep that
                       ships any rollout tails the live hook missed
+  * skills sync     — ``scripts/skills_sync.py`` (opt-in, SYNAPSE_SKILLS_SYNC=1),
+                      run inline under a wall-clock budget so the synced skills
+                      exist before Codex scans ~/.agents/skills
 
 Output is Codex's JSON envelope: {"hookSpecificOutput": {"hookEventName":
 "SessionStart", "additionalContext": ...}} — Codex does not read plain stdout.
 Disable pieces with SYNAPSE_BOARD=0 / SYNAPSE_PREFS_BLOCK=0 /
-SYNAPSE_CODEX_CATCHUP=0. Fail-open everywhere: a broken board must never
+SYNAPSE_CODEX_CATCHUP=0 / SYNAPSE_SKILLS_SYNC=0. Fail-open everywhere: a broken board must never
 break a session start.
 """
 
@@ -27,6 +30,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 from common import _cfg, get_json
+
+_SCRIPTS = sys.path[0]
 
 _MAX_PREF_LINES = 7
 _PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
@@ -84,12 +89,32 @@ def _spawn_catchup() -> None:
         pass
 
 
+def _sync_skills() -> None:
+    if _cfg("SYNAPSE_SKILLS_SYNC", "0") in ("", "0"):
+        return
+    # Bounded: the hook block's timeout is 20s and the board fetch still has to fit. A kill
+    # mid-pull is safe — the engine's next pass re-mirrors the skill and a push can never
+    # shrink the server's file set.
+    try:
+        budget = float(_cfg("SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT", "12"))
+        subprocess.run(
+            [sys.executable, os.path.join(_SCRIPTS, "skills_sync.py")],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=budget,
+        )
+    except Exception:
+        pass
+
+
 def main() -> None:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
         payload = {}
     _spawn_catchup()
+    _sync_skills()
     project = _cwd_to_project(payload.get("cwd")) or _cwd_to_project(os.getcwd())
     parts = [t for t in (_prefs_text(), _board_text(project)) if t]
     if not parts:

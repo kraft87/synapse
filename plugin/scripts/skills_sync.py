@@ -22,6 +22,10 @@ Without a reachable server it is a silent no-op. Fail-open: never blocks/fails s
 emits reloadSkills only when something actually synced. OPT-IN: enable with
 SYNAPSE_SKILLS_SYNC=1 (default off — a hook that writes into ~/.claude/skills should
 never be a surprise, issue #9).
+
+The HTTP client is injectable (``client=``, anything with ``post_json``) so plugin-codex
+reuses this engine against its own config instead of carrying a second copy of the
+merge rules.
 """
 
 from __future__ import annotations
@@ -96,9 +100,9 @@ def _disk_skill(d: Path):
     return body, files, newest
 
 
-def _push(scope: str, name: str, disk) -> None:
+def _push(scope: str, name: str, disk, client=config) -> None:
     body, files, mtime = disk
-    config.post_json(
+    client.post_json(
         "/skills/publish",
         {
             "name": name,
@@ -120,8 +124,8 @@ def _push(scope: str, name: str, disk) -> None:
     )
 
 
-def _pull(scope: str, target_dir: Path, name: str, cmod_iso: str | None) -> None:
-    remote = config.post_json("/skills/fetch", {"name": name})
+def _pull(scope: str, target_dir: Path, name: str, cmod_iso: str | None, client=config) -> None:
+    remote = client.post_json("/skills/fetch", {"name": name})
     if not remote.get("found"):
         return
     body = remote.get("body", "")
@@ -133,7 +137,7 @@ def _pull(scope: str, target_dir: Path, name: str, cmod_iso: str | None) -> None
     if md.is_file():
         old = md.read_text(encoding="utf-8", errors="ignore")
         if old != body:
-            config.post_json(
+            client.post_json(
                 "/skills/overwrite",
                 {
                     "name": name,
@@ -180,10 +184,10 @@ def _pull(scope: str, target_dir: Path, name: str, cmod_iso: str | None) -> None
             pass
 
 
-def _sync(scope: str, target_dir: Path) -> tuple[int, int]:
+def _sync(scope: str, target_dir: Path, client=config) -> tuple[int, int]:
     target_dir.mkdir(parents=True, exist_ok=True)
 
-    listing = config.post_json("/skills/list", {"scope": scope}).get("skills", [])
+    listing = client.post_json("/skills/list", {"scope": scope}).get("skills", [])
     server = {
         s["name"]: (
             s.get("body", ""),
@@ -203,11 +207,11 @@ def _sync(scope: str, target_dir: Path) -> tuple[int, int]:
     for name in sorted(set(server) | set(disk)):
         d, g = disk.get(name), server.get(name)
         if g and not d:  # only on server -> materialize
-            _pull(scope, target_dir, name, g[2])
+            _pull(scope, target_dir, name, g[2], client=client)
             pulled += 1
             continue
         if d and not g:  # only on disk -> publish
-            _push(scope, name, d)
+            _push(scope, name, d, client=client)
             pushed += 1
             continue
         body_d, files_d, mt_d = d
@@ -243,10 +247,10 @@ def _sync(scope: str, target_dir: Path) -> tuple[int, int]:
         if winner == "push" and not disk_files >= srv_files:
             winner = "pull"
         if winner == "push":
-            _push(scope, name, d)
+            _push(scope, name, d, client=client)
             pushed += 1
         else:
-            _pull(scope, target_dir, name, cmod_g)
+            _pull(scope, target_dir, name, cmod_g, client=client)
             pulled += 1
     return pulled, pushed
 
@@ -257,9 +261,13 @@ def main() -> None:
     try:
         n = _sync("global", config.SKILLS_DIR)
         proj = os.environ.get("CLAUDE_PROJECT_DIR")
-        if proj:
-            p = Path(proj)
-            m = _sync(f"project:{p.name}", p / ".claude" / "skills")
+        proj_dir = Path(proj) / ".claude" / "skills" if proj else None
+        # A session whose project dir IS the home dir (cwd=~) resolves the project skills
+        # folder to the global one. Syncing that folder twice under two scopes flips every
+        # skill's scope on each session start (the registry is unique on name), so the global
+        # list is empty between sessions and no other host or plugin ever sees the skills.
+        if proj_dir and proj_dir.resolve() != config.SKILLS_DIR.resolve():
+            m = _sync(f"project:{Path(proj).name}", proj_dir)
             n = (n[0] + m[0], n[1] + m[1])
     except Exception:
         return  # fail-open: server/token/permission issues never break session start
