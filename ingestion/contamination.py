@@ -57,9 +57,9 @@ def is_transcript_contamination(content: str | None) -> bool:
 # "[user] <prompt>". Dev conversations that merely QUOTE these prompts start
 # with prose or [context] blocks and keep flowing in.
 _HARNESS_PREFIXES = (
-    # ingestion/extractor.py::_EXTRACTION_PROMPT
+    # ingestion/extraction_llm.py::_EXTRACTION_PROMPT
     "Given the session summary and pre-identified entities below",
-    # ingestion/extractor.py::_WEB_EXTRACTION_PROMPT
+    # ingestion/extraction_llm.py::_WEB_EXTRACTION_PROMPT
     "The text below is an excerpt from ",
     # ingestion/extractor.py::_CONTRADICTION_PROMPT + _BATCH_CONTRADICTION_PROMPT
     "You are a knowledge graph deduplication assistant.",

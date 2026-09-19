@@ -10,7 +10,6 @@ Or via stdio for Claude Code:
 
 from __future__ import annotations
 
-import hmac
 import logging
 import os
 import re
@@ -20,19 +19,13 @@ from typing import Any
 import logfire
 from fastmcp import FastMCP
 from fastmcp.exceptions import AuthorizationError
-from fastmcp.server.auth import MultiAuth
-from fastmcp.server.auth.providers.github import GitHubProvider
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ingestion.scope import coerce_group, personal_scope_enabled
-from ingestion.surfaces import SurfaceTrust, resolve_caller, token_hash
-
-# The credential verifier and the constants it stamps, from ONE module so what WRITES a
-# claim and what READS it cannot drift: the client_ids decide whether the human-login
-# allowlist applies, and `kind` decides which trust lane a call resolves through.
+from ingestion.scope import personal_scope_enabled
+from ingestion.surfaces import SurfaceTrust
 from mcp_server.auth_tokens import (
     DEVICE_CLIENT_ID as _DEVICE_CLIENT_ID,
 )
@@ -43,9 +36,23 @@ from mcp_server.auth_tokens import (
     ROOT_CLIENT_ID as _MACHINE_CLIENT_ID,
 )
 from mcp_server.auth_tokens import (
-    SynapseTokenVerifier,
     claims_of,
 )
+
+# The credential verifier and the constants it stamps, from ONE module so what WRITES a
+# claim and what READS it cannot drift: the client_ids decide whether the human-login
+# allowlist applies, and `kind` decides which trust lane a call resolves through.
+from mcp_server.auxiliary_routes import register as _register_auxiliary_routes
+from mcp_server.caller_trust import caller_trust as _resolve_caller_trust
+from mcp_server.caller_trust import request_trust as _resolve_request_trust
+from mcp_server.feedback_tools import register as _register_feedback_tools
+from mcp_server.http_auth import admin_authorized, is_root, machine_authorized
+from mcp_server.http_auth import bearer as _bearer
+from mcp_server.ingest_route import register as _register_ingest_route
+from mcp_server.recall_route import register as _register_recall_route
+from mcp_server.remember_tool import register as _register_remember_tool
+from mcp_server.retrieval_tools import register as _register_retrieval_tools
+from mcp_server.server_auth import AuthSettings, build_auth, build_idp, oauth_client_storage
 
 #: Both machine lanes. The human-login allowlist skips these client_ids — the credential
 #: is their whole gate, and there is no identity on them to match against a list.
@@ -206,129 +213,33 @@ class _HiddenToolsList(Middleware):
 
 
 def _oauth_client_storage():
-    """Where the OAuth proxy keeps its state: DCR client registrations, upstream GitHub
-    tokens, and JTI mappings.
+    return oauth_client_storage(DB_URL, OAUTH_SIGNING_KEY)
 
-    FastMCP's default is a FileTree store under ~/.local/share/fastmcp/oauth-proxy. In a
-    container with no volume that path is on the ephemeral layer, so every recreate
-    (watchtower redeploy, reboot) wipes it — the claude.ai connector's registered client
-    then vanishes and its next token refresh fails, forcing a full re-auth. Persist in
-    Postgres instead (the DB already survives on its own volume).
 
-    FastMCP only Fernet-wraps the state in its disk-default branch; a bare backend stores
-    the upstream GitHub tokens as plaintext. Since this is the same DB recall() serves, we
-    wrap it ourselves with a key deterministically derived from the signing key — matching
-    the default's encryption-at-rest. Returns None (=> FastMCP's encrypted disk default)
-    when there's no DB or signing key, e.g. dev/stdio.
-    """
-    if not (DB_URL and OAUTH_SIGNING_KEY):
-        return None
-    import base64
-    import hashlib
-
-    from cryptography.fernet import Fernet
-    from key_value.aio.stores.postgresql import PostgreSQLStore
-    from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
-
-    # Deterministic 32-byte Fernet key from the (stable) signing key. Self-contained: it
-    # does not have to match FastMCP's internal derivation, only be stable across restarts
-    # so the same ciphertext decrypts after a redeploy.
-    fernet_key = base64.urlsafe_b64encode(
-        hashlib.sha256(f"synapse-oauth-store::{OAUTH_SIGNING_KEY}".encode()).digest()
+def _auth_settings() -> AuthSettings:
+    return AuthSettings(
+        DB_URL=DB_URL,
+        MACHINE_TOKEN=MACHINE_TOKEN,
+        OIDC_SCOPES=OIDC_SCOPES,
+        OIDC_CONFIG_URL=OIDC_CONFIG_URL,
+        OIDC_CLIENT_ID=OIDC_CLIENT_ID,
+        OIDC_CLIENT_SECRET=OIDC_CLIENT_SECRET,
+        PUBLIC_URL=PUBLIC_URL,
+        OAUTH_SIGNING_KEY=OAUTH_SIGNING_KEY,
+        ALLOWED_OIDC_USERS=ALLOWED_OIDC_USERS,
+        OIDC_USER_CLAIMS=OIDC_USER_CLAIMS,
+        GITHUB_CLIENT_ID=GITHUB_CLIENT_ID,
+        GITHUB_CLIENT_SECRET=GITHUB_CLIENT_SECRET,
+        ALLOWED_GITHUB_USERS=ALLOWED_GITHUB_USERS,
     )
-    store = PostgreSQLStore(url=DB_URL, table_name="oauth_proxy_kv")
-    return FernetEncryptionWrapper(
-        key_value=store, fernet=Fernet(fernet_key), raise_on_decryption_error=False
-    )
-
-
-_ALLOWED_CLIENT_REDIRECTS = [
-    "https://claude.ai/api/mcp/auth_callback",
-    "https://claude.com/api/mcp/auth_callback",
-    # `synapse login` (RFC 8252): an ephemeral loopback redirect on a random
-    # port. Without these patterns the OAuthProxy 400s the authorize step
-    # ("does not match allowed patterns") and the CLI login can never complete.
-    "http://localhost:*",
-    "http://127.0.0.1:*",
-]
 
 
 def _build_auth():
-    """(auth_provider, middleware). No machine token => open server (dev/stdio/pre-cutover)."""
-    if not MACHINE_TOKEN:
-        return None, []
-    # The bearer's scopes must clear whichever interactive leg is active (MultiAuth
-    # applies the server's required scopes to /mcp): "user" for GitHub, the OIDC set
-    # otherwise. Carrying both is harmless.
-    bearer = SynapseTokenVerifier(MACHINE_TOKEN, DB_URL, ["user", *OIDC_SCOPES])
-    if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
-        from fastmcp.server.auth.oidc_proxy import OIDCProxy
-
-        oidc = OIDCProxy(
-            config_url=OIDC_CONFIG_URL,
-            client_id=OIDC_CLIENT_ID,
-            client_secret=OIDC_CLIENT_SECRET,
-            base_url=PUBLIC_URL,
-            jwt_signing_key=OAUTH_SIGNING_KEY or None,
-            client_storage=_oauth_client_storage(),
-            # Self-hosted IdPs (Authelia et al.) issue opaque access tokens; the
-            # id_token is the JWT the discovery JWKS can verify.
-            verify_id_token=True,
-            required_scopes=list(OIDC_SCOPES),
-            allowed_client_redirect_uris=_ALLOWED_CLIENT_REDIRECTS,
-        )
-        if not ALLOWED_OIDC_USERS:
-            logger.warning(
-                "OIDC auth on but ALLOWED_OIDC_USERS empty -> all human logins DENIED (fail-closed)"
-            )
-        return (
-            MultiAuth(server=oidc, verifiers=[bearer]),
-            [_UserAllowlist(ALLOWED_OIDC_USERS, OIDC_USER_CLAIMS, "oidc")],
-        )
-    if not GITHUB_CLIENT_ID:
-        return bearer, []  # bearer-only: hooks + Claude Code --header; no claude.ai-web connector
-    github = GitHubProvider(
-        client_id=GITHUB_CLIENT_ID,
-        client_secret=GITHUB_CLIENT_SECRET,
-        base_url=PUBLIC_URL,
-        jwt_signing_key=OAUTH_SIGNING_KEY or None,
-        client_storage=_oauth_client_storage(),
-        allowed_client_redirect_uris=_ALLOWED_CLIENT_REDIRECTS,
-    )
-    if not ALLOWED_GITHUB_USERS:
-        logger.warning(
-            "GitHub OAuth on but ALLOWED_GITHUB_USERS empty -> all human logins DENIED (fail-closed)"
-        )
-    return (
-        MultiAuth(server=github, verifiers=[bearer]),
-        [_UserAllowlist(ALLOWED_GITHUB_USERS, ("login",), "github")],
-    )
+    return build_auth(_auth_settings(), _oauth_client_storage, _UserAllowlist)
 
 
 def _build_idp():
-    """IdP for the custom login flows (dashboard + device) — same selection as _build_auth."""
-    if OIDC_CONFIG_URL and OIDC_CLIENT_ID:
-        from mcp_server.idp import OIDCIdP
-
-        # The custom flows discard the upstream tokens after the identity check, so
-        # they never need offline_access/refresh — request the trimmed scope set.
-        return OIDCIdP(
-            config_url=OIDC_CONFIG_URL,
-            client_id=OIDC_CLIENT_ID,
-            client_secret=OIDC_CLIENT_SECRET,
-            allowed=ALLOWED_OIDC_USERS,
-            scope=" ".join(s for s in OIDC_SCOPES if s != "offline_access"),
-            identity_claims=OIDC_USER_CLAIMS,
-        )
-    if GITHUB_CLIENT_ID:
-        from mcp_server.idp import GitHubIdP
-
-        return GitHubIdP(
-            client_id=GITHUB_CLIENT_ID,
-            client_secret=GITHUB_CLIENT_SECRET,
-            allowed=ALLOWED_GITHUB_USERS,
-        )
-    return None
+    return build_idp(_auth_settings())
 
 
 _auth, _auth_mw = _build_auth()
@@ -340,11 +251,6 @@ _idp = _build_idp()
 # have no OAuth callers to identify, so the derivation below stays inert.
 _IDENTITY_CLAIMS: tuple[str, ...] = _auth_mw[0]._claim_keys if _auth_mw else ()
 
-#: Namespace for a surface id derived from an OAuth/OIDC identity (schema 053). Keeping
-#: these in their own space means a `surfaces` row for a login can never be shadowed by
-#: (or shadow) a host whose SYNAPSE_SURFACE happens to be the same string.
-_OAUTH_SURFACE_PREFIX = "oauth:"
-
 
 def _access_token() -> Any:
     """The request's AccessToken, or None. Never raises (no auth context at all)."""
@@ -352,19 +258,6 @@ def _access_token() -> Any:
         return get_access_token()
     except Exception:  # pragma: no cover - defensive
         return None
-
-
-def _oauth_identity() -> str:
-    """The caller's OAuth/OIDC login, lowercased — "" when this is not that lane.
-
-    Empty for both machine-credential legs (root and per-device), for an open dev/stdio
-    server, and for any call with no token context at all. Empty means "no identity
-    evidence", which the callers below treat as "change nothing".
-    """
-    token = _access_token()
-    if token is None or token.client_id in _MACHINE_CLIENT_IDS:
-        return ""
-    return _claims_identity(token.claims or {}, _IDENTITY_CLAIMS)
 
 
 def _caller_surface(surface: str | None) -> str | None:
@@ -375,51 +268,16 @@ def _caller_surface(surface: str | None) -> str | None:
     return _caller_trust(surface).surface_id
 
 
-def _trust_from_claims(claims: dict) -> SurfaceTrust:
-    """A device token's verified claims → the trust verdict, with no second lookup.
-
-    The verifier already resolved the row (that is how the token authenticated at all),
-    so re-reading it here would double every request's auth cost to learn nothing. The
-    claims are per-request — ``verify_token`` runs on each call — so there is no stale
-    window a revocation could slip through.
-    """
-    return SurfaceTrust(
-        surface_id=claims.get("surface_id"),
-        trust=str(claims.get("trust") or "restricted"),
-        allowed_projects=tuple(claims.get("allowed_projects") or ()),
-        known=True,
-    )
-
-
 def _caller_trust(surface: str | None) -> SurfaceTrust:
-    """THE resolution point for an MCP call: which surface is this, and what may it see?
-
-    Three lanes, in strict precedence — a caller never gets to pick which one applies:
-
-    1. **Device token** (schema 054). The credential itself names the surface, so a
-       ``surface`` param is ignored outright. This is the lane the plugin uses after
-       enrollment and the one the whole design exists for: nothing self-reported can
-       widen it.
-    2. **OAuth/OIDC identity**. MCP clients on the interactive lane (the claude.ai
-       connector) run no hook and hold no device token, but they do carry an identity
-       this server verified and allowlisted. Resolve it to ``oauth:<login>`` and look
-       that up like any other surface id. Unregistered still means restricted.
-    3. **Root token + a legacy ``surface`` param**. The migration window, byte for byte
-       what schema 053 did. Deprecated: the param is self-reported under a shared
-       credential, which is exactly the spoofable arrangement 054 replaces. Callers
-       that send nothing resolve to UNKNOWN, the pre-054 behaviour for an unidentified
-       machine-token call.
-
-    Fail-closed at every step: an unknown credential, an unregistered identity, an
-    unreadable database all yield restricted with an empty allowlist.
-    """
-    claims = claims_of(_access_token())
-    if claims.get("kind") == _KIND_DEVICE:
-        return _trust_from_claims(claims)
-    identity = _oauth_identity()
-    if identity:
-        return resolve_caller(DB_URL, legacy_surface_id=f"{_OAUTH_SURFACE_PREFIX}{identity}")
-    return resolve_caller(DB_URL, legacy_surface_id=surface)
+    """Resolve authenticated caller scope; see caller_trust for credential precedence."""
+    return _resolve_caller_trust(
+        db_url=DB_URL,
+        surface=surface,
+        access_token=_access_token(),
+        identity_claims=_IDENTITY_CLAIMS,
+        machine_client_ids=_MACHINE_CLIENT_IDS,
+        claims_identity=_claims_identity,
+    )
 
 
 def _request_trust(request: Request, surface: str | None = None) -> SurfaceTrust:
@@ -430,13 +288,12 @@ def _request_trust(request: Request, surface: str | None = None) -> SurfaceTrust
     precedence, minus the OAuth lane, which never reaches these routes: browsers and
     hooks send a bearer, not an OIDC token.
     """
-    token = _bearer(request)
-    # No MACHINE_TOKEN at all means an OPEN server: no verifier was built, so no device
-    # token can exist and any bearer present is noise. Fall straight to the id lane, or
-    # a dev box would resolve every call to UNKNOWN and serve an empty board.
-    if MACHINE_TOKEN and token and not hmac.compare_digest(token, MACHINE_TOKEN):
-        return resolve_caller(DB_URL, token_hash_hex=token_hash(token))
-    return resolve_caller(DB_URL, legacy_surface_id=surface)
+    return _resolve_request_trust(
+        db_url=DB_URL,
+        machine_token=MACHINE_TOKEN,
+        bearer=_bearer(request),
+        surface=surface,
+    )
 
 
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
@@ -473,151 +330,16 @@ if DB_URL:
     mcp.add_provider(PgSkillsProvider(DB_URL))
 
 
-def _bearer(request: Request) -> str:
-    """The raw bearer credential on this request, or "" when there isn't one."""
-    authz = request.headers.get("authorization", "")
-    return authz[len("Bearer ") :].strip() if authz.startswith("Bearer ") else ""
-
-
 def _is_root(request: Request) -> bool:
-    """Root token, constant-time, no DB touch (see mcp_server.auth_tokens)."""
-    tok = _bearer(request)
-    return bool(MACHINE_TOKEN and tok and hmac.compare_digest(tok, MACHINE_TOKEN))
+    return is_root(request, MACHINE_TOKEN)
 
 
 def _machine_authorized(request: Request) -> bool:
-    """ "Is this a Synapse client?" — the CLIENT gate on the custom routes.
-
-    Custom routes bypass FastMCP's auth middleware (by design, issue #3704), so gate
-    them here. Passes for the root token (the services on the Docker host, and any
-    client still in the migration window) and for an APPROVED device token. A pending
-    enrollment fails it: a device that has not been approved holds a real token that
-    authenticates as nothing, which is the whole point of pending. Its transcripts are
-    not lost — the ingest hook's ``--catchup`` sweep re-posts them after approval.
-
-    Open when no machine token is set (dev / pre-cutover).
-    """
-    if not MACHINE_TOKEN:
-        return True
-    if _is_root(request):
-        return True
-    tok = _bearer(request)
-    return bool(tok) and resolve_caller(DB_URL, token_hash_hex=token_hash(tok)).known
+    return machine_authorized(request, MACHINE_TOKEN, DB_URL)
 
 
 def _admin_authorized(request: Request) -> bool:
-    """ "May this caller change who is trusted?" — the ADMIN gate, and it excludes root.
-
-    Requires an APPROVED, FULL-TRUST device token. The root token is deliberately NOT
-    enough, and that asymmetry is the security property this whole change buys:
-
-      the credential a new machine must hold in order to ENROLL cannot APPROVE.
-
-    Every machine that runs the plugin ends up holding the enrollment credential at
-    install time. If that credential also approved devices, an attacker who read it off
-    any one machine could self-approve to full trust and the TOFU gate would be
-    decoration. So approval, minting, revocation, the surface list and the dashboard all
-    demand a credential that only an already-trusted machine has.
-
-    The dashboard reaches this gate through the login flow, which mints a full-trust
-    device token for an OAuth-allowlisted identity rather than handing out the root
-    token. Break-glass, when no full-trust device exists (first deploy, or every device
-    revoked): ``synapse-admin bootstrap "<label>"`` (in the container, or
-    ``scripts/surface_admin.py`` on the host) talks to Postgres directly, which requires
-    shell access on the DB host — a strictly higher bar than holding a bearer token.
-
-    Open when no machine token is set (dev / pre-cutover), same as the client gate.
-    """
-    if not MACHINE_TOKEN:
-        return True
-    tok = _bearer(request)
-    if not tok or _is_root(request):
-        return False
-    st = resolve_caller(DB_URL, token_hash_hex=token_hash(tok))
-    return st.known and not st.restricted
-
-
-# Shared error-envelope helpers for the machine-token custom routes below (imports only
-# starlette/stdlib, so no cycle with this module).
-from mcp_server.http_helpers import err, unauthorized  # noqa: E402
-
-# Skill sync + review over plain HTTP — lets the Claude Code plugin stay DSN-free (it talks to
-# these machine-token-gated routes instead of reaching Postgres directly). No-op without DB_URL.
-from mcp_server.skill_sync_routes import register as _register_skill_routes  # noqa: E402
-
-_register_skill_routes(mcp, DB_URL, _machine_authorized)
-
-# Config lane — the plugin mirrors each surface's opted-in config files here (machine-token gated)
-# so the dream pipeline can read them and propose edits. Same DSN-free seam as skills. No-op w/o DB.
-from mcp_server.config_sync_routes import register as _register_config_routes  # noqa: E402
-
-_register_config_routes(mcp, DB_URL, _machine_authorized)
-
-# Timeline event ingest — feeders (the plugin's git feeder, later calendar) POST plain event
-# rows here; the server embeds + upserts. Same DSN-free machine-token seam. No-op w/o DB.
-from mcp_server.timeline_routes import register as _register_timeline_routes  # noqa: E402
-
-_register_timeline_routes(mcp, DB_URL, _machine_authorized, VOYAGE_API_KEY)
-
-# Preferences read route — the plugin's SessionStart block GETs the top standing user
-# preferences here (schema 035). Same machine-token seam; server owns the DB. No-op w/o DB.
-from mcp_server.preferences_routes import register as _register_preferences_routes  # noqa: E402
-
-_register_preferences_routes(mcp, DB_URL, _machine_authorized)
-
-# Private mode — the plugin's toggle CLI flips a session's "off the record" flag here
-# (schema 050). The flag is what ingest_turns/backfill check, so a session marked private
-# can never be ingested by ANY path, including one that bypasses the plugin's hook.
-# Same machine-token seam. No-op w/o DB.
-from mcp_server.private_session_routes import register as _register_private_routes  # noqa: E402
-
-_register_private_routes(mcp, DB_URL, _machine_authorized)
-
-# Surface enrollment + registration — audience scoping's operator seam (schema 053/054).
-# Which DEVICES get the full corpus and which get only work-safe notes + an allowlisted
-# set of projects. Enrolling is anchored to an allowlisted OAuth/OIDC identity (the same
-# device flow `synapse login` uses), NOT to the shared machine token; minting, listing
-# and revoking demand the admin gate, which the root token also cannot clear. Registered
-# AFTER _idp is built, since enrollment needs it. Doing nothing is already the safe state.
-from mcp_server.surface_routes import register as _register_surface_routes  # noqa: E402
-
-_register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized, idp=_idp)
-
-# Board read route — GET /context?project=X serves the rendered explicit-memory board
-# for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
-# Same machine-token seam. No-op w/o DB. get_recall is a lazy thunk: _get_recall is
-# defined below and only resolved at request time (telemetry shares its writer).
-from mcp_server.board import register as _register_board_routes  # noqa: E402
-
-_register_board_routes(
-    mcp,
-    DB_URL,
-    _machine_authorized,
-    get_recall=lambda: _get_recall(),
-    resolve_trust=_request_trust,
-)
-
-# Operator dashboard — static React bundle at /dash + read/flag API at /dash/api/* (issue #12,
-# contract docs/dashboard-contract.md). Static routes are unauthenticated (public bundle, no
-# data); every api route rides the ADMIN gate, not the client one. That move is required, not
-# cosmetic: /dash/api serves the whole corpus unfiltered and can flag/edit, so leaving it on the
-# root token would let anything holding the enrollment credential read everything the TOFU gate
-# was meant to withhold. No-op w/o DB_URL, like the siblings.
-from mcp_server.dashboard_routes import register as _register_dashboard_routes  # noqa: E402
-
-_register_dashboard_routes(mcp, DB_URL, _admin_authorized)
-
-# Device-login lane — RFC 8628 device flow so `synapse login` works browser-free on servers /
-# headless boxes. Proxies the configured IdP's device flow (GitHub or OIDC) and gates the
-# machine token by the same allowlist as the web leg. No-op without an IdP + machine token.
-from mcp_server.device_routes import register as _register_device_routes  # noqa: E402
-
-_register_device_routes(mcp, _idp, MACHINE_TOKEN)
-
-# Browser-login lane — authorization-code flow for the dashboard login screen (redirect UX;
-# the device flow stays for `synapse login`). Same IdP identity + allowlist gate; return
-# origins restricted via SYNAPSE_DASH_ORIGINS. Same enablement condition as the device flow.
-from mcp_server.web_login_routes import register as _register_web_login_routes  # noqa: E402
+    return admin_authorized(request, MACHINE_TOKEN, DB_URL)
 
 
 def _issue_dash_token(identity: str) -> str:
@@ -627,8 +349,18 @@ def _issue_dash_token(identity: str) -> str:
     return issue_dash_token(DB_URL, identity)
 
 
-_register_web_login_routes(
-    mcp, _idp, MACHINE_TOKEN, PUBLIC_URL, _issue_dash_token if DB_URL else None
+_register_auxiliary_routes(
+    mcp,
+    DB_URL,
+    VOYAGE_API_KEY,
+    MACHINE_TOKEN,
+    PUBLIC_URL,
+    _idp,
+    _machine_authorized,
+    _admin_authorized,
+    lambda: _get_recall(),
+    _request_trust,
+    _issue_dash_token,
 )
 
 
@@ -662,25 +394,10 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse(app_health_check())
 
 
-# ---------------------------------------------------------------------------
-# Tools — REGISTRATION ORDER IS DELIBERATE. Tool-list position biases which tool
-# a model reaches for (first-listed wins most ties), so the surface reads in
-# intended-use order: recall (the workhorse), recall_full_turns (its drill-down /
-# retry sibling — re-split from mode="turns" on 2026-07-26 so its trigger
-# inventory gets a full 2KB description instead of a corner of recall's), fetch
-# (id expansion), remember (the write),
-# then recall_feedback (the after-the-fact quality report). Hidden plumbing
-# (issue_machine_token, see _HIDDEN_TOOLS) registers last.
-# test_tool_surface.py pins this order.
-#
-# There is deliberately NO board tool: the board is push-only (the plugin's
-# SessionStart hook injects it via GET /context). A listed get_context tool told the
-# model to "call this once at session start" when the hook had already injected the
-# block — a compliant model double-spends ~2K tokens. The Hermes pattern: when
-# injection covers the read, ship no read tool. Clients without the hook (claude.ai
-# connector) never spontaneously orient anyway; re-registering is a small revert if
-# that changes.
-# ---------------------------------------------------------------------------
+# Registration order is part of the public tool surface (test_tool_surface.py):
+# recall, recall_full_turns, fetch, fetch_session, remember, recall_feedback.
+# Hidden issue_machine_token registers last. The board stays push-only via /context;
+# exposing a read tool would duplicate the SessionStart hook's injected context.
 
 
 # Personal scope off (SYNAPSE_PERSONAL_SCOPE=0): the tool description must not
@@ -700,230 +417,9 @@ def _scope_doc(fn):  # type: ignore[no-untyped-def]
     return fn
 
 
-@mcp.tool()
-@_scope_doc
-def recall(
-    query: str,
-    project: str | None = None,
-    session_focus: list[str] | None = None,
-    group_id: str = "technical",
-    self_session: str | None = None,
-    surface: str | None = None,
-) -> dict:
-    """Search the user's long-term memory: tens of thousands of reranked
-    past-conversation turns and the knowledge-graph facts extracted from them.
-
-    BEFORE answering anything that references past work — a prior decision or
-    discussion ("what did we decide", "last time", "have we tried"), any device,
-    purchase, tool, project, or person the user names, their preferences, or
-    history this session alone can't supply — call this first. WHEN the topic
-    shifts to something plausibly discussed before, call it again. Assume memory
-    has the context; the failure mode is not checking, not over-checking.
-
-    Do NOT call for facts already visible in the current conversation or context
-    (read those directly), nor for generic-knowledge questions with no
-    user-history angle (definitions, math, general how-tos).
-
-    This is the overview — compressed passages blended with the buckets below,
-    the right first call. Its drill-down sibling recall_full_turns serves
-    complete raw turns: the follow-up when a passage is truncated mid-thought,
-    and the retry when this overview comes back thin.
-
-    Query in plain language carrying the message's distinctive nouns; leave
-    `project` unset unless results come back noisy from another domain. Served
-    passages carry `role` (user / assistant / mixed) and a `date`: for "current
-    state of X", weight newer user-stated content over older assistant-role text,
-    which may be speculation or a plan that never happened.
-
-    Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact — also
-    the superseded_facts pairs, t:N timeline, w:N web) — copy it into
-    recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
-    rest are feedback-only.
-
-    A `warnings` list appears when a retrieval leg degraded; empty results with a
-    warning mean a config problem, not empty memory.
-
-    Follow-ups: fetch(ids) expands a truncated passage or note body;
-
-    Args:
-        query: Natural language search query.
-        project: Optional project slug to filter results (e.g. "synapse").
-        session_focus: Entity names active in current conversation for KG bias.
-        group_id: Knowledge graph scope — "technical" (default) or "personal".
-        self_session: NEVER set this yourself. The client's PreToolUse hook injects
-            the calling session's id so serving can suppress self-session domination;
-            calls without it simply skip that suppression.
-        surface: DEPRECATED and ignored — the server identifies the calling
-            device from its own credential. Never set it.
-    """
-    # With the personal scope off, "personal" is an alias for the one graph that
-    # exists; coerced here too so the telemetry span records what was searched.
-    group_id = coerce_group(group_id) or "technical"
-    with logfire.span(
-        "mcp.recall {query!r}",
-        query=query[:80],
-        project=project,
-        group_id=group_id,
-    ):
-        return _get_recall().recall(
-            query=query,
-            project=project,
-            session_focus=session_focus or [],
-            group_id=group_id,
-            source="mcp-tool",
-            self_session=self_session,
-            trust=_caller_trust(surface),
-        )
-
-
-@mcp.tool()
-def recall_full_turns(
-    query: str,
-    project: str | None = None,
-    limit: int = 5,
-    self_session: str | None = None,
-    session_id: str | None = None,
-    surface: str | None = None,
-) -> dict:
-    """Search the complete, unabridged text of past conversation turns — the
-    drill-down and retry sibling of recall().
-
-    recall() serves compressed ~1400-char passage slices blended with facts and
-    timeline; this serves WHOLE turns and nothing else, ranked by relevance +
-    recency (keyword + semantic search + rerank over the full archive). `limit`
-    sizes the response: 1-2 turns for a pinpoint quote, the default 5 to
-    reconstruct a discussion (weak trailing matches drop automatically).
-
-    Three triggers —
-    - Exact wording: "what exactly did we say about X", quoting the actual
-      exchange, reconstructing how a specific conversation went.
-    - The retry: an overview recall came back thin or off-topic for something
-      plausibly discussed before. Re-query here with the message's distinctive
-      keywords BEFORE falling back to files, grep, or the live system — if it
-      was ever said in a session, this is the tool that finds the saying.
-    - Full context: an overview passage hit but the ~1400-char slice cut off
-      what you need and you want the surrounding discussion.
-
-    Do NOT open with this for general past-work questions — recall() is the
-    right first call (cheaper, blended, usually sufficient). Do NOT use it to
-    expand an id you already hold — fetch(ids) does that directly. Do NOT
-    query it for live system state (ports, configs, processes) — it returns
-    what was SAID, which may be stale; the box is ground truth for that.
-
-    Served turns carry e:N ids — fetch()-able and rateable in recall_feedback.
-
-    A `warnings` list appears when a retrieval leg degraded; empty results with a
-    warning mean a config problem, not empty memory.
-
-    Args:
-        query: Plain-language query carrying the distinctive nouns/keywords.
-        project: Optional project slug to filter results (e.g. "synapse").
-        limit: Max turns returned (1-10, default 5).
-        self_session: NEVER set this yourself. The client's PreToolUse hook
-            injects the calling session's id so your own session's turns are
-            excluded; calls without it simply skip that exclusion.
-        session_id: Scope to ONE conversation — the `session` field from a
-            recall/fetch result, or "self" for the current session.
-        surface: DEPRECATED and ignored — the server identifies the calling
-            device from its own credential. Never set it.
-    """
-    with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
-        if session_id == "self":
-            if not self_session:  # no hook injection — refuse loudly, don't search globally
-                return {
-                    "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
-                }
-            session_id = self_session
-        # Same engine path as the retired recall_episodes tool and the interim
-        # recall(mode="turns") — telemetry keeps kind='episodes' so historical
-        # per-tool metrics stay comparable.
-        return _get_recall().recall_episodes(
-            query=query,
-            project=project,
-            limit=max(1, min(int(limit), 10)),
-            source="mcp-tool",
-            self_session=self_session,
-            session_id=session_id,
-            trust=_caller_trust(surface),
-        )
-
-
-@mcp.tool()
-def fetch(ids: list[str], surface: str | None = None) -> dict:
-    """Expand memory ids into full records: episode ids from recall results
-    ("e:227168") and note ids from the board ("n:12"), mixed freely in one call.
-
-    WHEN a recall() passage is relevant but truncated and you need the whole
-    turn, or WHEN a hook on the session-start board block (its n:ID lines)
-    matters and you need the note body — pass the ids here. Bare numeric ids
-    are treated as episode ids.
-
-    Do NOT search with this — it only expands ids you already hold; recall()
-    finds things. Do NOT re-fetch ids already expanded this session. Unknown or
-    unparseable ids are returned under "skipped"; at most 20 ids per call.
-
-    Args:
-        ids: Ids to expand — "e:N" episodes, "n:N" notes, bare N = episode.
-        surface: DEPRECATED and ignored — the server identifies the calling
-            device from its own credential. Never set it.
-    """
-    with logfire.span("mcp.fetch", n=len(ids)):
-        return _get_recall().fetch(ids, source="mcp-tool", trust=_caller_trust(surface))
-
-
-@mcp.tool()
-def fetch_session(
-    session_id: str,
-    around: str | None = None,
-    radius: int = 3,
-    offset: int = 0,
-    limit: int = 10,
-    self_session: str | None = None,
-    surface: str | None = None,
-) -> dict:
-    """Read one conversation sequentially — like opening the transcript file at
-    a spot, instead of searching. Every recall/fetch episode carries a `session`
-    field; pass it here to see what surrounded that turn.
-
-    WHEN a recalled turn is the middle of a discussion and you need how it
-    started or what was decided after — pass its e:N id as `around`: that anchor
-    comes back FULL, ±`radius` neighbors as 500-char heads with `full_chars`
-    (expand interesting ones via fetch()). WHEN you want to skim a whole
-    session, page it with offset/limit (heads only). Use "self" as session_id
-    for the current conversation.
-
-    Do NOT search with this — recall_full_turns(query, session_id=...) greps
-    within a session; this reads it in order. An unindexed session returns an
-    explicit error — THAT is the signal to read the on-disk transcript instead.
-
-    Args:
-        session_id: Session to read — the `session` field from a recall/fetch
-            episode, or "self" for the current conversation.
-        around: Anchor episode id ("e:N") to center the window on.
-        radius: Neighbors per side around the anchor (0-10, default 3).
-        offset: Anchorless paging — turn index to start from (default 0).
-        limit: Anchorless paging — turns per page (1-25, default 10).
-        self_session: NEVER set this yourself; the client hook injects it to
-            resolve session_id="self".
-        surface: DEPRECATED and ignored — the server identifies the calling
-            device from its own credential. Never set it.
-    """
-    with logfire.span("mcp.fetch_session {sid}", sid=session_id[:40], around=around):
-        if session_id == "self":
-            if not self_session:  # no hook injection — refuse loudly
-                return {
-                    "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
-                }
-            session_id = self_session
-        return _get_recall().fetch_session(
-            session_id=session_id,
-            around=around,
-            radius=radius,
-            offset=offset,
-            limit=limit,
-            source="mcp-tool",
-            trust=_caller_trust(surface),
-        )
+recall, recall_full_turns, fetch, fetch_session = _register_retrieval_tools(
+    mcp, lambda: _get_recall(), lambda surface: _caller_trust(surface), _scope_doc
+)
 
 
 def _notes_deps() -> tuple:
@@ -967,203 +463,14 @@ def _derive_hook(content: str) -> str:
 # SECTION and everything from it on is silently dropped from the wire description
 # (that once cost this tool its entire type-semantics block). Em-dash headers
 # survive; test_tool_surface.py pins the tail phrases of every description.
-@mcp.tool()
-async def remember(
-    content: str | None = None,
-    hook: str | None = None,
-    body: str | None = None,
-    type: str = "project",
-    project: str | None = None,
-    session_id: str | None = None,
-    surface: str | None = None,
-    audience: str | None = None,
-) -> dict:
-    """Write to the user's curated long-term memory: reconciles a NOTE into the
-    explicit notes store (deduped against the live set, superseded on
-    contradiction) AND archives the text as an episode with knowledge-graph
-    extraction.
-
-    WHEN the user states a durable fact, preference, or decision, corrects
-    something you had wrong, or explicitly asks you to remember → call this.
-    If you are about to reply "noted" / "got it" / "I'll remember that," call
-    this FIRST, then reply. Also bank a 2-3 sentence summary of what was
-    decided before a session ends or is cleared.
-
-    Do NOT call for transient task state, to restate something already stored,
-    or to save your own speculation or an unconfirmed plan. Routine
-    conversation is ingested automatically.
-
-    Form — pass hook + body (+ type). `hook` is the one-line index entry
-    (target ~120 chars, hard cap 200, whitespace collapsed); `body` is the
-    full note, fetched on demand by id. Passing either selects this form and
-    both must then be non-empty — a lone hook never falls back to legacy.
-    The legacy content-only form stays for compatibility (hook derived from
-    the first sentence, type 'project'); content alongside a full hook + body
-    pair becomes the archived episode text.
-
-    Type semantics — user: durable facts about the user, and feedback:
-    corrections to agent behavior (both global — every session); project:
-    scoped to `project`, staleness-managed (the default);
-    reference: pointers to canonical sources.
-
-    The write contract — a good note:
-    - States decisions WITH reasons: "chose X because Y" survives; "merged
-      the fix" is noise.
-    - Is DECLARATIVE, not imperative: "User prefers concise responses",
-      never "Always respond concisely" — imperative memory re-reads as a
-      standing directive.
-    - Has no PR numbers, commit SHAs, "phase N done", file counts — anything
-      week-stale belongs in the episode archive (written automatically),
-      never in a note.
-    - Uses absolute dates ("2026-07-12"), never "yesterday" or "last week".
-    - Is self-contained: the body must stand alone months later.
-
-    Args:
-        content: Legacy form — full text to remember (hook and type derived).
-        hook: Preferred form — one-line note index entry (target ~120 chars).
-        body: Preferred form — the full, self-contained note text.
-        type: Note type — 'user' | 'feedback' | 'project' (default) | 'reference'.
-        project: Optional project slug (scopes 'project' notes and the episode).
-        session_id: Optional session ID to attach the episode to.
-        surface: DEPRECATED and ignored — the server identifies the calling
-            device from its own credential. Never set it.
-        audience: 'personal' (default) or 'work-safe' — who may be SERVED this
-            note later. Leave unset unless the user says where it may appear;
-            the server derives it from the calling host and the project.
-    """
-    import time as _time
-    import uuid as _uuid
-
-    import anyio.to_thread
-
-    from ingestion.db import Database
-    from ingestion.models import Episode, ExtractionItem
-    from ingestion.notes import _VALID_TYPES, reconcile_note
-    from ingestion.surfaces import AUDIENCES
-
-    structured = hook is not None or body is not None
-    if not structured and not (content or "").strip():
-        return {
-            "status": "error",
-            "detail": "provide hook + body (preferred) or content (legacy)",
-        }
-    if type not in _VALID_TYPES:
-        return {
-            "status": "error",
-            "detail": f"invalid type {type!r} — expected one of {_VALID_TYPES}",
-        }
-    if audience is not None and audience not in AUDIENCES:
-        return {
-            "status": "error",
-            "detail": f"invalid audience {audience!r} — expected one of {AUDIENCES}",
-        }
-
-    if structured:
-        # Passing either hook or body commits to the structured form — a lone
-        # hook (even with content also present) must NOT silently fall back to
-        # legacy, which would discard the caller's hook. Board lines are
-        # single-line by contract: collapse whitespace runs/newlines BEFORE the
-        # hard cap so a multi-line hook can't smuggle newlines under it.
-        note_hook = " ".join((hook or "").split())[:200]  # hard cap; targets ~120
-        note_body = (body or "").strip()
-        if not note_hook or not note_body:
-            missing = "hook" if not note_hook else "body"
-            return {
-                "status": "error",
-                "detail": f"structured form requires hook + body — {missing} is missing or blank",
-            }
-        note_type = type
-        # content alongside a full pair serves as the archived episode text.
-        ep_content = (content or "").strip() or f"{note_hook}\n\n{note_body}"
-    else:
-        ep_content = (content or "").strip()  # non-empty per the form check above
-        note_hook = _derive_hook(ep_content)
-        note_body = ep_content
-        note_type = "project"
-
-    sid = session_id or str(_uuid.uuid4())
-    # Same resolution the serving tools do, so a device (or OAuth identity) registered
-    # as a RESTRICTED surface writes notes it can still read back. Resolved here, on the
-    # event loop, rather than inside _work(): the token context belongs to the request,
-    # and _work runs on a worker thread.
-    caller_trust = _caller_trust(surface)
-
-    def _work() -> dict:
-        t0 = _time.perf_counter()
-        # Use a dedicated short-lived connection for writes — keeps the shared
-        # recall engine's read connection clean and avoids transaction leakage.
-        db = Database(DB_URL)
-        try:
-            existing = db.get_session_episodes(sid)
-            seq = (max(e["sequence"] for e in existing) + 1) if existing else 1
-
-            ep = Episode(
-                session_id=sid,
-                sequence=seq,
-                project=project,
-                content=ep_content,
-                source="manual",
-            )
-            episode_id = db.upsert_episode(ep)
-
-            db.enqueue_extraction(
-                ExtractionItem(
-                    episode_id=episode_id,
-                    session_id=sid,
-                    content=ep_content,
-                    content_type="manual",
-                    project=project,
-                )
-            )
-
-            # Audience precedence rule 2 fires only for a REGISTERED restricted surface
-            # (`known`). An unknown surface restricts what this caller READS, but it must
-            # never widen a WRITE — defaulting an unrecognised credential's notes to
-            # work-safe would turn a fail-closed read rule into a leak.
-            caller_restricted = caller_trust.known and caller_trust.restricted
-
-            embedder, llm = _notes_deps()
-            res = reconcile_note(
-                db,
-                embedder,
-                llm,
-                hook=note_hook,
-                body=note_body,
-                type=note_type,
-                project=project,
-                source_ref=f"ep:{episode_id}",
-                audience=audience,
-                caller_restricted=caller_restricted,
-            )
-        finally:
-            db.close()
-
-        _get_recall().record_event(
-            "remember",
-            source="mcp-tool",
-            ms_total=(_time.perf_counter() - t0) * 1000.0,
-            served_ids={
-                "note": res["note_id"],
-                "outcome": res["outcome"],
-                "type": note_type,
-                "audience": res.get("audience"),
-            },
-        )
-        return {
-            "status": "ok",
-            "note_id": res["note_id"],
-            "outcome": res["outcome"],
-            "episode_id": episode_id,
-            "session_id": sid,
-            # None on a restatement that preserved the stored tier — the caller can tell
-            # "this write classified the note" from "this write left it alone".
-            "audience": res.get("audience"),
-        }
-
-    # reconcile_note does blocking DB I/O + possibly a sync LLM call that runs
-    # asyncio.run() internally — asyncio.run() cannot be called from a running
-    # event loop, so it must live on a worker thread, never on FastMCP's loop.
-    return await anyio.to_thread.run_sync(_work)
+remember = _register_remember_tool(
+    mcp,
+    lambda: DB_URL,
+    lambda: _get_recall(),
+    lambda surface: _caller_trust(surface),
+    lambda: _notes_deps(),
+    _derive_hook,
+)
 
 
 # Spooled-remember replay — the plugin queues a memory write to local disk whenever the
@@ -1183,406 +490,23 @@ _register_remember_routes(
 )
 
 
-# recall_episodes was retired as a standalone tool (item 6 tool-surface audit:
-# 12 of ~325 recall-family mcp-tool calls over 5 weeks, under the pre-registered
-# 5% merge threshold), lived as recall(mode="turns") 07-13..07-26, then re-split
-# as recall_full_turns: usage stayed flat (~0.6 calls/day) across the merge, so
-# packaging wasn't the lever — the under-specified description was, and a mode
-# buried in recall's near-full 2KB docstring couldn't grow a real trigger
-# inventory. recall_full_turns routes to the same engine path (kind='episodes').
-
-# --- recall_feedback: offline labeled retrieval-quality capture (schema 046) ------
-# One row per rated recall. Deliberately NOT wired into live scoring — no ranking
-# boost, no retrieval_count bump, nothing feeds _merge_rrf. The rows are goldens
-# for offline eval + reranker tuning, so the id validation is strict: downstream
-# tooling must be able to trust the served id forms without re-parsing. Every recall
-# bucket carries an id, so all are ratable:
-#   e:N episode  n:N note  f:<uuid> fact  t:N timeline  w:N web
-# The numeric kinds share one shape; facts (and superseded_facts) carry the KG edge uuid.
-# "p:N" preference was dropped on 2026-07-27 with the preferences recall leg — recall no
-# longer serves that bucket, so no p:N id can be legitimately cited and it is now rejected.
-
-_FEEDBACK_ID_RE = re.compile(r"^(?:[entw]:\d+|f:[0-9a-fA-F-]{8,})$")
+# Offline retrieval-quality capture, shared by MCP and HTTP.
+_feedback_ids_error, _file_recall_feedback, recall_feedback, feedback_http = (
+    _register_feedback_tools(mcp, lambda: DB_URL, lambda request: _machine_authorized(request))
+)
 
 
-def _feedback_ids_error(field: str, ids: list[str] | None) -> str | None:
-    """Validation error for recall_feedback's helpful/noise lists, or None if valid.
-
-    Accepts None or a list of served-id strings — "e:N" episode, "n:N" note,
-    "f:<uuid>" fact, "t:N" timeline, "w:N" web — exactly as recall() serves them.
-    Anything else is rejected."""
-    if ids is None:
-        return None
-    if not isinstance(ids, list):
-        return f"{field} must be a list of served ids like ['e:123', 'f:<uuid>']"
-    bad = [i for i in ids if not (isinstance(i, str) and _FEEDBACK_ID_RE.fullmatch(i))]
-    if bad:
-        return (
-            f"{field} contains invalid ids {bad!r} — expected recall-served ids: "
-            '"e:N" episode, "n:N" note, "f:<uuid>" fact, "t:N" timeline, "w:N" web'
-        )
-    return None
+ingest_turns = _register_ingest_route(
+    mcp, lambda: DB_URL, lambda request: _machine_authorized(request)
+)
 
 
-def _file_recall_feedback(
-    query: str,
-    helpful: list[str] | None,
-    noise: list[str] | None,
-    missing: str | None,
-    found_via: str | None,
-    comment: str | None,
-    session_id: str | None,
-    project: str | None,
-) -> dict:
-    """Validate + INSERT one recall_feedback row — shared by the MCP tool and
-    POST /feedback. Returns the tool-shaped result dict (never raises for bad
-    input; DB errors propagate to the caller's boundary)."""
-    from ingestion.db import Database
-
-    q = (query or "").strip()
-    if not q:
-        return {"status": "error", "detail": "missing 'query' — pass the recall query being rated"}
-    for field, ids in (("helpful", helpful), ("noise", noise)):
-        err = _feedback_ids_error(field, ids)
-        if err:
-            return {"status": "error", "detail": err}
-
-    db = Database(DB_URL)
-    try:
-        feedback_id = db.insert_recall_feedback(
-            query=q,
-            helpful=helpful or [],
-            noise=noise or [],
-            missing=missing,
-            # One short token ("full_turns", "filesystem", ...) — whitespace-collapsed
-            # and capped, free text by design (see schema 048).
-            found_via=" ".join((found_via or "").split())[:60] or None,
-            # The model-facing name is `comment` (general free-text spot); the
-            # column stays `note` from schema 046 — no migration for a rename.
-            note=comment,
-            session_id=session_id,
-            project=project,
-        )
-    finally:
-        db.close()
-    return {"status": "ok", "feedback_id": feedback_id}
-
-
-@mcp.tool()
-def recall_feedback(
-    query: str,
-    helpful: list[str] | None = None,
-    noise: list[str] | None = None,
-    missing: str | None = None,
-    found_via: str | None = None,
-    comment: str | None = None,
-    session_id: str | None = None,
-    project: str | None = None,
-) -> dict:
-    """Report retrieval quality after a recall() whose results you used: which
-    served ids helped, which were noise, plus free-text comment on the serving.
-
-    AFTER acting on a recall's results, call this ONCE with that recall's
-    query string. `helpful` = served ids that were load-bearing; `noise` =
-    served ids that were irrelevant or distracting. Everything else goes in
-    `comment`, free text: too much dumped at once, load-bearing hit buried,
-    wrong granularity or ordering, a misleading passage, an improvement idea.
-
-    `missing` is the exception, not a per-report field — most recalls lack
-    nothing; then OMIT it (never file "nothing missing"). Set it only when
-    you can name the specific content you needed AND have concrete reason to
-    believe memory holds it (a past session covered it, or the user said it
-    was stored). Never-discussed content is not a miss; weak results belong
-    in `comment`. A `missing` without `found_via` is unusable, so always pair
-    them: "full_turns" / "fetch" / "another_recall" (memory HAD it — a
-    serving miss, the highest-value signal) vs "filesystem" / "live_system" /
-    "web" / "user" (memory never had it) vs "nowhere" (still unresolved).
-
-    Rate any served id verbatim — "e:N" episodes, "f:<uuid>" facts (and
-    superseded_facts), "t:N" timeline, "w:N" web — plus
-    "n:N" note ids from the session-start board or fetch(): WHEN a board
-    note shaped your answer (or misled it), rate it too. A comment-only
-    report is still valuable when the serving itself was the problem.
-
-    This is offline labeled data (eval goldens, reranker tuning); it never
-    changes live ranking, so honest negatives are safe and wanted. Do NOT
-    file more than one report per recall query, do NOT rate results you
-    never used, and do NOT invent ids — report only ids actually served to
-    you by recall, the board, or fetch.
-
-    Args:
-        query: The recall query being rated, verbatim.
-        helpful: Served ids that were load-bearing ("e:123", "f:<uuid>", "w:7").
-        noise: Served ids that were irrelevant or distracting.
-        missing: The specific content you needed but were not served — omit
-            entirely unless you can name it AND believe memory holds it.
-            Always pair with `found_via`.
-        found_via: Where the missing info turned up ("full_turns"/"fetch"/
-            "another_recall" = memory had it; "filesystem"/"live_system"/
-            "web"/"user" = it never did; "nowhere" = unresolved). Set it
-            whenever `missing` is set.
-        comment: Free text for anything the other fields can't say — serving
-            volume, ordering, presentation, misleading results, improvement ideas.
-        session_id: Optional session id for grouping reports.
-        project: Optional project slug the recall was scoped to.
-    """
-    with logfire.span("mcp.recall_feedback {query!r}", query=query[:80], project=project):
-        return _file_recall_feedback(
-            query, helpful, noise, missing, found_via, comment, session_id, project
-        )
-
-
-@mcp.custom_route("/ingest", methods=["POST"])
-async def ingest_turns(request: Request) -> JSONResponse:
-    """Direct-push ingest endpoint — replaces the Logfire poll for Claude Code.
-
-    A Claude Code ``Stop`` hook POSTs a bounded TAIL of the session transcript
-    (raw JSONL records) here on every turn. We parse with the SAME ``JSONLParser``
-    the disk sweep uses, then dedup by span_id (a turn's stable last-record uuid):
-    already-stored turns are skipped, new turns append at ``max(sequence)+1``. The
-    parser's positional sequence is NOT used as the key — a tail would renumber it
-    from 1 and collide — so identity rides on span_id and the sweep/push still
-    converge idempotently. A full-transcript POST stays correct too (all old turns
-    skip), so this is backward compatible with the pre-tail hook.
-
-    Any client that runs the real ``claude`` CLI fires this same hook.
-    Body: {"records": [...], "project": optional, "source": optional,
-    "format": optional ("claude_code" default | "codex"), "session_id": optional}.
-
-    ``format: "codex"`` parses the records as Codex CLI rollout lines via
-    ``CodexRolloutParser`` instead. A pushed tail usually lacks the rollout's
-    session_meta line, so the Codex hook passes ``session_id`` (from the
-    rollout filename) as a fallback identity hint. Everything downstream —
-    span_id dedup, private sessions, contamination guards — is shared.
-    """
-    if not _machine_authorized(request):
-        return unauthorized()
-
-    from starlette.concurrency import run_in_threadpool
-
-    try:
-        body = await request.json()
-    except Exception:
-        return err("invalid JSON body", 400)
-
-    records = body.get("records")
-    if not isinstance(records, list):
-        return err("body must contain a 'records' list", 400)
-    source_label = body.get("source") or "hook"
-    project_override = body.get("project")
-    record_format = body.get("format") or "claude_code"
-    session_id_hint = body.get("session_id")
-    if record_format not in ("claude_code", "codex"):
-        return err(f"unknown format {record_format!r}", 400)
-
-    def _work() -> int:
-        from ingestion.contamination import is_harness_call, is_transcript_contamination
-        from ingestion.db import Database
-        from ingestion.jsonl_client import JSONLParser
-        from ingestion.models import ExtractionItem
-        from ingestion.private_sessions import PrivateSessions
-
-        if record_format == "codex":
-            from ingestion.codex_client import CodexRolloutParser
-
-            episodes = CodexRolloutParser().parse_records(
-                records, source_label, project_override, session_id_hint=session_id_hint
-            )
-        else:
-            episodes = JSONLParser().parse_records(records, source_label, project_override)
-        if not episodes:
-            return 0
-        db = Database(DB_URL)
-        private = PrivateSessions(db)  # per-batch memo; schema/050
-        try:
-            # The hook ships a bounded TAIL of the transcript, so the parser's
-            # positional sequence is meaningless here — turn 50 arrives numbered 1
-            # and would collide with the real turn 1. Identity is the span_id (a
-            # turn's last record uuid), stable across full and tail parses. Per
-            # session, load the stored span_ids + max sequence ONCE, then:
-            #   * span_id already stored -> skip wholesale. Idempotent no-op; also
-            #     stops a tail's truncated leading fragment (same span_id as the
-            #     full turn it tails) from overwriting that turn.
-            #   * new span_id            -> append at max_seq+1 and enqueue for KG.
-            # Backward compatible with a full-transcript POST (old hook): every old
-            # turn skips, only genuinely-new tail turns append at the same numbers
-            # they had positionally — same final state, minus the O(turns^2)
-            # re-upsert/re-enqueue churn the full re-ship used to cause.
-            index: dict[str, tuple[set[str], int]] = {}
-            written = 0
-            dropped = 0
-            private_dropped = 0
-            content_dups = 0
-            for ep in episodes:
-                # Reject transcribe_ai deposition payloads before they ever land — third-party
-                # PII must not enter memory. Dev conversations about the domain still flow in.
-                # Likewise reject Synapse's own extraction/judge calls (the eval must not
-                # eat itself — see contamination.is_harness_call).
-                if is_transcript_contamination(ep.content) or is_harness_call(ep.content):
-                    dropped += 1
-                    continue
-                # Private mode (schema/050): the user took this session off the record.
-                # The plugin's hook already stops posting while its local marker exists;
-                # this is the durable half, so a catch-up sweep or a backfill months
-                # later can't ingest what the hook skipped.
-                if private.is_private(ep.session_id):
-                    private_dropped += 1
-                    continue
-                if ep.session_id not in index:
-                    index[ep.session_id] = db.get_session_span_index(ep.session_id)
-                seen, max_seq = index[ep.session_id]
-                if not ep.span_id or ep.span_id in seen:
-                    continue  # no identity key, or already stored — skip
-                # Cross-session replay guard (schema 036): a retried session ships the
-                # same turns under a new session id + new span ids, so the span index
-                # above can't see them. SYNAPSE_CONTENT_DEDUP=0 is the kill switch.
-                if os.environ.get("SYNAPSE_CONTENT_DEDUP", "1") != "0" and db.content_dup_exists(
-                    ep.project, ep.content
-                ):
-                    content_dups += 1
-                    continue
-                max_seq += 1
-                ep.sequence = max_seq
-                seen.add(ep.span_id)
-                index[ep.session_id] = (seen, max_seq)
-                eid = db.upsert_episode(ep)
-                if ep.content and ep.content.strip():
-                    db.enqueue_extraction(
-                        ExtractionItem(
-                            episode_id=eid,
-                            session_id=ep.session_id,
-                            content=ep.content,
-                            content_type="episode",
-                            project=ep.project,
-                        )
-                    )
-                written += 1
-            if dropped:
-                logger.info("ingest dropped %d transcribe_ai transcript-payload turn(s)", dropped)
-            if private_dropped:
-                logger.info("ingest dropped %d private-session turn(s)", private_dropped)
-            if content_dups:
-                logger.info(
-                    "ingest skipped %d cross-session content-duplicate turn(s)", content_dups
-                )
-            return written
-        finally:
-            db.close()
-
-    try:
-        n = await run_in_threadpool(_work)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("ingest failed")
-        return err(str(exc)[:200], 500)
-    return JSONResponse({"status": "ok", "ingested": n})
-
-
-@mcp.custom_route("/recall", methods=["POST"])
-async def recall_http(request: Request) -> JSONResponse:
-    """Plain-HTTP recall for non-MCP callers — the auto-recall memory hook.
-
-    A shell/Python hook (UserPromptSubmit) has no MCP client: command hooks talk
-    stdout/exit-code only and can't invoke an MCP tool. This route gives them the
-    same recall() over plain HTTP, reusing the warm process-singleton engine
-    (loaded embedder + pooled PG connections + warm HNSW cache) so a per-turn hook
-    stays fast instead of cold-starting the pipeline each call.
-
-    Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
-           "source"?: str, "debug"?: bool, "surface"?: str}.
-    The caller gets the same enforcement the MCP tools do: a DEVICE token names its own
-    surface and ``surface`` is ignored; a root-token caller may still pass the
-    deprecated ``surface`` param for the migration window. Holding a credential is not
-    the same as being trusted — the token says "a Synapse client", the surface row says
-    what that client may read.
-    write_feedback defaults FALSE here: automatic recalls must not bump the
-    retrieval-count feedback signal (bench-grade discipline) — and the phase-2
-    dashboard debug console relies on this default staying false so its diagnostic
-    recalls never pollute the feedback signal. ``debug`` attaches the per-leg timing /
-    pool-size / rerank envelope the engine already measures (see recall(debug=...)).
-    Fail-soft like /ingest — never raises past the JSONResponse boundary.
-    """
-    if not _machine_authorized(request):
-        return unauthorized()
-
-    from starlette.concurrency import run_in_threadpool
-
-    try:
-        body = await request.json()
-    except Exception:
-        return err("invalid JSON body", 400)
-
-    query = (body.get("query") or "").strip()
-    if not query:
-        return err("missing 'query'", 400)
-    project = body.get("project") or None
-    group_id = coerce_group(body.get("group_id")) or "technical"
-    write_feedback = bool(body.get("write_feedback", False))
-    source = body.get("source") or "http"
-    debug = bool(body.get("debug", False))
-    trust = _request_trust(request, body.get("surface") or None)
-
-    def _work() -> dict:
-        return _get_recall().recall(
-            query=query,
-            project=project,
-            group_id=group_id,
-            write_feedback=write_feedback,
-            source=source,
-            debug=debug,
-            trust=trust,
-        )
-
-    try:
-        with logfire.span("http.recall {query!r}", query=query[:80], group_id=group_id):
-            out = await run_in_threadpool(_work)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("http recall failed")
-        return err(str(exc)[:200], 500)
-    return JSONResponse(out)
-
-
-@mcp.custom_route("/feedback", methods=["POST"])
-async def feedback_http(request: Request) -> JSONResponse:
-    """Plain-HTTP recall_feedback for non-MCP callers — the /recall sibling.
-
-    Hooks and the dashboard talk to /recall over plain HTTP (no MCP client), so
-    the labeled-feedback write needs the same seam or those callers could never
-    file a report. Same validation + insert as the recall_feedback tool
-    (_file_recall_feedback); same machine-token gate; fail-soft like /ingest.
-
-    Body: {"query": str, "helpful"?: [..], "noise"?: [..], "missing"?: str,
-           "found_via"?: str, "comment"?: str, "session_id"?: str, "project"?: str}.
-    "note" is accepted as a legacy alias for "comment" (pre-1.0.1 callers).
-    """
-    if not _machine_authorized(request):
-        return unauthorized()
-
-    from starlette.concurrency import run_in_threadpool
-
-    try:
-        body = await request.json()
-    except Exception:
-        return err("invalid JSON body", 400)
-
-    def _work() -> dict:
-        return _file_recall_feedback(
-            query=body.get("query") or "",
-            helpful=body.get("helpful"),
-            noise=body.get("noise"),
-            missing=body.get("missing"),
-            found_via=body.get("found_via"),
-            comment=body.get("comment") or body.get("note"),
-            session_id=body.get("session_id"),
-            project=body.get("project"),
-        )
-
-    try:
-        with logfire.span("http.feedback"):
-            out = await run_in_threadpool(_work)
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.exception("http feedback failed")
-        return err(str(exc)[:200], 500)
-    return JSONResponse(out, status_code=200 if out.get("status") == "ok" else 400)
+recall_http = _register_recall_route(
+    mcp,
+    lambda: _get_recall(),
+    lambda request: _machine_authorized(request),
+    lambda request, surface: _request_trust(request, surface),
+)
 
 
 # Registered LAST and hidden from tools/list (_HiddenToolsList): infra plumbing,

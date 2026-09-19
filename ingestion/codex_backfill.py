@@ -28,6 +28,7 @@ from ingestion.config import get_settings
 from ingestion.contamination import is_harness_call, is_transcript_contamination
 from ingestion.db import Database
 from ingestion.models import Episode
+from ingestion.scratch_projects import is_scratch_project
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,11 @@ def backfill_codex_sessions(
         eps = [
             ep
             for ep in eps
-            if not (is_transcript_contamination(ep.content) or is_harness_call(ep.content))
+            if not (
+                is_transcript_contamination(ep.content)
+                or is_harness_call(ep.content)
+                or is_scratch_project(ep.project)
+            )
         ]
         if eps:
             parsed_episodes += len(eps)
