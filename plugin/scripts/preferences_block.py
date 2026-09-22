@@ -14,6 +14,7 @@ start never breaks.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 
@@ -41,7 +42,16 @@ def main() -> None:
             tag = _MARK.get(it.get("polarity"), it.get("polarity") or "")
             lines.append(f"  - ({tag}) {pref}")
         if len(lines) > 1:
-            print("\n".join(lines))  # inside the guard: rendering must not break the session
+            print(
+                json.dumps(
+                    {
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": "\n".join(lines),
+                        }
+                    }
+                )
+            )  # inside the guard: rendering must not break the session
     except Exception:
         return  # fail-open: no block, no noise
 

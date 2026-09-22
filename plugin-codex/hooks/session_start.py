@@ -40,7 +40,7 @@ _PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
 def _cwd_to_project(cwd: str | None) -> str | None:
     if not cwd:
         return None
-    return cwd.rstrip("/").rsplit("/", 1)[-1] or None
+    return cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or None
 
 
 def _board_text(project: str | None) -> str | None:
@@ -122,7 +122,6 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "suppressOutput": True,
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
                     "additionalContext": "\n\n".join(parts),

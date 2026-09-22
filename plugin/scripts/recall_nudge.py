@@ -27,6 +27,7 @@ Kill switches: SYNAPSE_RECALL_NUDGE=0, SYNAPSE_PROMPT_TIMESTAMP=0
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -48,7 +49,16 @@ def main() -> None:
             "remember'? Call synapse:remember FIRST, then reply."
         )
     if lines:
-        print("\n".join(lines))
+        print(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "UserPromptSubmit",
+                        "additionalContext": "\n".join(lines),
+                    }
+                }
+            )
+        )
 
 
 if __name__ == "__main__":

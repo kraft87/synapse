@@ -7,6 +7,7 @@ its own kill switch; both off means no output at all (not a blank line).
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -35,7 +36,11 @@ def _run(tmp_path, env: dict | None = None) -> str:
         cwd=tmp_path,
         check=True,
     )
-    return out.stdout
+    if not out.stdout:
+        return ""
+    payload = json.loads(out.stdout)
+    assert payload["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    return payload["hookSpecificOutput"]["additionalContext"]
 
 
 def test_default_emits_timestamp_then_nudge(tmp_path):

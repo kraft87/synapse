@@ -111,12 +111,21 @@ def _run(monkeypatch, mod: ModuleType, stdin: str, reply) -> list[tuple[str, dic
     return calls
 
 
+def _context(capsys) -> str:
+    output = capsys.readouterr().out
+    if not output:
+        return ""
+    payload = json.loads(output)
+    assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+    return payload["hookSpecificOutput"]["additionalContext"]
+
+
 def test_board_text_printed_verbatim(monkeypatch, tmp_path, capsys):
     _isolated_env(monkeypatch, tmp_path)
     mod = _load_hook()
     payload = {"status": "ok", "text": _BOARD_TEXT, "n_notes": 1, "overflow": 0}
     calls = _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/services/synapse"}), payload)
-    assert capsys.readouterr().out == _BOARD_TEXT + "\n"
+    assert _context(capsys) == _BOARD_TEXT
     # No `surface`: the token names the caller (schema 054), and the server decides
     # what that credential may see.
     assert calls == [("/context", {"project": "synapse"})]
@@ -128,7 +137,7 @@ def test_kill_switch_no_output_no_http(monkeypatch, tmp_path, capsys):
     mod = _load_hook()
     payload = {"status": "ok", "text": _BOARD_TEXT}
     calls = _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/services/synapse"}), payload)
-    assert capsys.readouterr().out == ""
+    assert _context(capsys) == ""
     assert calls == []
 
 
@@ -145,7 +154,7 @@ def test_server_errors_are_silent(monkeypatch, tmp_path, capsys, reply):
     _isolated_env(monkeypatch, tmp_path)
     mod = _load_hook()
     _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/services/synapse"}), reply)
-    assert capsys.readouterr().out == ""  # fail-open: no block, no noise, exit 0
+    assert _context(capsys) == ""  # fail-open: no block, no noise, exit 0
 
 
 @pytest.mark.parametrize(
@@ -162,7 +171,7 @@ def test_non_ok_payload_is_silent(monkeypatch, tmp_path, capsys, reply):
     _isolated_env(monkeypatch, tmp_path)
     mod = _load_hook()
     _run(monkeypatch, mod, json.dumps({"cwd": "/home/user/services/synapse"}), reply)
-    assert capsys.readouterr().out == ""
+    assert _context(capsys) == ""
 
 
 @pytest.mark.parametrize(
@@ -177,7 +186,7 @@ def test_project_derived_from_hook_cwd(monkeypatch, tmp_path, capsys, cwd, expec
     mod = _load_hook()
     calls = _run(monkeypatch, mod, json.dumps({"cwd": cwd}), {"status": "ok", "text": "b"})
     assert calls == [("/context", {"project": expected})]
-    assert capsys.readouterr().out == "b\n"
+    assert _context(capsys) == "b"
 
 
 def test_unprintable_board_is_silent(monkeypatch, tmp_path):
@@ -222,7 +231,7 @@ def test_a_401_on_an_unenrolled_machine_explains_itself(monkeypatch, tmp_path, c
     monkeypatch.setattr(mod, "get_json", fake_get_json)
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     mod.main()
-    out = capsys.readouterr().out
+    out = _context(capsys)
     assert "not enrolled" in out and "synapse-login" in out
 
 
@@ -240,7 +249,7 @@ def test_a_401_on_an_enrolled_machine_stays_silent(monkeypatch, tmp_path, capsys
     monkeypatch.setattr(mod, "get_json", fake_get_json)
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     mod.main()
-    assert capsys.readouterr().out == ""
+    assert _context(capsys) == ""
 
 
 # --- the SILENT case: 200 + restricted + no device credential -----------------------
@@ -261,7 +270,7 @@ def test_a_restricted_unenrolled_caller_explains_itself(monkeypatch, tmp_path, c
     monkeypatch.setattr(mod.enroll, "is_enrolled", lambda: False)
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     mod.main()
-    out = capsys.readouterr().out
+    out = _context(capsys)
     assert "served nothing" in out
     assert "synapse-login" in out  # remedy 1: server with an IdP
     assert "synapse-admin bootstrap" in out  # remedy 2: local server, no IdP
@@ -281,7 +290,7 @@ def test_restricted_but_enrolled_stays_silent(monkeypatch, tmp_path, capsys):
         {"status": "ok", "text": _BOARD_TEXT, "trust": "restricted"},
     )
     assert calls  # the fetch happened
-    assert capsys.readouterr().out == _BOARD_TEXT + "\n"  # board only, no explainer
+    assert _context(capsys) == _BOARD_TEXT  # board only, no explainer
 
 
 def test_full_trust_prints_no_explainer(monkeypatch, tmp_path, capsys):
@@ -295,4 +304,4 @@ def test_full_trust_prints_no_explainer(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(mod, "get_json", fake_get_json)
     monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
     mod.main()
-    assert capsys.readouterr().out == _BOARD_TEXT + "\n"
+    assert _context(capsys) == _BOARD_TEXT

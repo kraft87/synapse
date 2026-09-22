@@ -34,6 +34,21 @@ import enroll
 from config import _cfg, get_json
 
 
+def _emit_context(parts: list[str]) -> None:
+    if not parts:
+        return
+    print(
+        json.dumps(
+            {
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": "\n\n".join(parts),
+                }
+            }
+        )
+    )
+
+
 def _cwd_to_project(cwd: str | None) -> str | None:
     """Mirror of ``ingestion.jsonl_client._cwd_to_project`` — kept inline so the hook
     stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -41,7 +56,7 @@ def _cwd_to_project(cwd: str | None) -> str | None:
     labeled, or the project section goes empty."""
     if not cwd:
         return None
-    return cwd.rstrip("/").rsplit("/", 1)[-1] or None
+    return cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or None
 
 
 def _project_label() -> str | None:
@@ -57,6 +72,7 @@ def main() -> None:
     if _cfg("SYNAPSE_BOARD", "1") == "0":
         return
     try:
+        parts = []
         project = _project_label()
         params = {"project": project} if project else {}
         try:
@@ -66,7 +82,8 @@ def main() -> None:
             # machine has not enrolled (or its token was revoked), so it is served
             # nothing and will go on being served nothing until someone signs in.
             if e.code == 401 and not enroll.is_enrolled():
-                print(enroll.not_enrolled_block())
+                parts.append(enroll.not_enrolled_block())
+                _emit_context(parts)
             return
         ok = r.get("status") == "ok"
         # 200 + restricted + no device credential is the SILENT version of the 401 above:
@@ -74,10 +91,11 @@ def main() -> None:
         # board and no reason for it. Say why here, or a fresh install reads as "Synapse
         # is just empty" and the user never learns there is a credential to get.
         if ok and r.get("trust") == "restricted" and not enroll.is_enrolled():
-            print(enroll.restricted_block())
+            parts.append(enroll.restricted_block())
         text = r.get("text") if ok else None
         if text:
-            print(text)  # inside the guard: a print that raises must not break the session
+            parts.append(text)
+        _emit_context(parts)  # inside the guard: a print that raises must not break the session
     except Exception:
         return  # fail-open: no block, no noise
 

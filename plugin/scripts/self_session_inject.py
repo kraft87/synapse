@@ -68,6 +68,7 @@ def main() -> None:
                 {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
                         "updatedInput": tool_input,
                     }
                 }

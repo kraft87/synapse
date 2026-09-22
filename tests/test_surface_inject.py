@@ -151,6 +151,21 @@ def test_codex_hook_declares_the_permission_decision():
     assert block["permissionDecision"] == "allow"
 
 
+def test_bundled_hook_declares_the_permission_decision():
+    proc = subprocess.run(
+        [sys.executable, str(_CC_HOOK)],
+        input=json.dumps(
+            {"tool_name": _MCP + "recall", "session_id": "s-1", "tool_input": {"query": "q"}}
+        ),
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"},
+        timeout=30,
+    )
+    block = json.loads(proc.stdout)["hookSpecificOutput"]
+    assert block["permissionDecision"] == "allow"
+
+
 def test_hook_matchers_cover_exactly_the_injected_tools():
     """The Claude Code matcher, the Codex matcher and the in-script guards must agree,
     or a tool silently stops receiving its session id."""

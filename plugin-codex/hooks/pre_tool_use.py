@@ -61,7 +61,6 @@ def main() -> None:
         print(
             json.dumps(
                 {
-                    "suppressOutput": True,
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "allow",
