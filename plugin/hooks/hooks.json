@@ -7,6 +7,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\"",
             "timeout": 15
           }
         ]
@@ -19,36 +20,43 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/skills_sync.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/skills_sync.py\"",
             "timeout": 30
           },
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/config_sync.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/config_sync.py\"",
             "timeout": 30
           },
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
             "timeout": 30
           },
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",
             "timeout": 20
           },
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/preferences_block.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/preferences_block.py\"",
             "timeout": 15
           },
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/ingest_hook.py\" --catchup",
             "timeout": 10
           },
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" session-start",
             "timeout": 20
           }
         ]
@@ -61,7 +69,8 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/private_mode.py\" --session-end",
-            "timeout": 5
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/private_mode.py\" --session-end",
+            "timeout": 3
           }
         ]
       }
@@ -73,6 +82,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/recall_nudge.py\"",
             "timeout": 5
           }
         ]
@@ -85,6 +95,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/recall_feedback_nudge.py\"",
             "timeout": 5
           }
         ]
@@ -95,6 +106,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/remember_spool.py\" post-tool-use",
             "timeout": 5
           }
         ]
@@ -107,6 +119,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"",
+            "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/self_session_inject.py\"",
             "timeout": 5
           }
         ]
