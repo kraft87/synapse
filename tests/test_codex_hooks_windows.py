@@ -3,7 +3,6 @@
 import json
 from pathlib import Path
 
-
 _HOOKS_PATH = Path(__file__).resolve().parents[1] / "plugin" / "hooks" / "hooks.json"
 
 
