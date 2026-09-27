@@ -8,7 +8,9 @@
 bootstrap commands write/remove one pointer skill (``synapse-gateway-research``) whose
 only job is to make the client fetch the gateway-served workflow at
 ``skill://gateway-research/SKILL.md`` — so both clients follow the same, single copy.
-``remove-bootstrap`` deletes only a folder this tool created (marker line + SKILL.md only).
+Ownership is by exact content: a folder counts as ours only if it holds nothing but a
+SKILL.md byte-identical to a version this tool generated. Any user edit — even one that
+keeps the marker line — makes install and remove leave the folder alone.
 
 With Synapse's opt-in two-way skills sync on (``SYNAPSE_SKILLS_SYNC=1``) an installed
 pointer is published like any local skill and reaches the user's other machines. It is
@@ -18,6 +20,7 @@ inert where the gateway is not connected (it says so and stops).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -48,6 +51,15 @@ device, say so and stop; do not improvise a substitute workflow.
 """
 
 
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+#: Every SKILL.md this tool has ever generated. When STUB changes, add the old digest here
+#: so an untouched older install still upgrades/removes, while any edited copy is kept.
+_GENERATED = frozenset({_sha(STUB)})
+
+
 def _default_dir(client: str) -> Path:
     if client == "claude":
         return Path(os.path.expanduser("~/.claude/skills"))
@@ -58,13 +70,15 @@ def _default_dir(client: str) -> Path:
 def install_bootstrap(skills_dir: Path, dry_run: bool) -> int:
     target = skills_dir / STUB_NAME / "SKILL.md"
     if target.parent.exists():
-        if _is_ours(target.parent):
-            if target.read_text(encoding="utf-8") == STUB:
-                print(f"bootstrap: already installed at {target}")
-                return 0
-        else:
-            print(f"bootstrap: {target.parent} exists and was not created here; left unchanged")
+        if not _is_ours(target.parent):
+            print(
+                f"bootstrap: {target.parent} exists and is not an unmodified copy from this "
+                "tool; left unchanged"
+            )
             return 1
+        if target.read_text(encoding="utf-8") == STUB:
+            print(f"bootstrap: already installed at {target}")
+            return 0
     if dry_run:
         print(f"bootstrap: would write {target}")
         return 0
@@ -80,7 +94,7 @@ def remove_bootstrap(skills_dir: Path, dry_run: bool) -> int:
         print(f"bootstrap: nothing at {folder}")
         return 0
     if not _is_ours(folder):
-        print(f"bootstrap: {folder} was not created by this tool (or was edited); left unchanged")
+        print(f"bootstrap: {folder} is not an unmodified copy from this tool; left unchanged")
         return 1
     if dry_run:
         print(f"bootstrap: would remove {folder}")
@@ -95,7 +109,7 @@ def _is_ours(folder: Path) -> bool:
     md = folder / "SKILL.md"
     try:
         entries = {p.name for p in folder.iterdir()}
-        return entries == {"SKILL.md"} and MARKER in md.read_text(encoding="utf-8")
+        return entries == {"SKILL.md"} and _sha(md.read_text(encoding="utf-8")) in _GENERATED
     except OSError:
         return False
 

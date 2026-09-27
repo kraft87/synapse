@@ -90,7 +90,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_synapse_synapse__(recall|recall_full_turns)$",
+        "matcher": "mcp__.*__(recall|recall_full_turns)$",
         "hooks": [
           {
             "type": "command",

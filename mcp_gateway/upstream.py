@@ -144,8 +144,10 @@ class UpstreamProvider(Provider):
         client_factory: Returns a NEW, unconnected Client for the current request.
         identity: Cache partition for the current request (raise PermissionError when
             there is no caller; the provider then serves nothing).
-        allow: Whether the current caller may see this upstream at all. Checked before
-            any upstream I/O on every list and lookup.
+        allow: ``allow(kind)`` — may the current caller see this upstream's ``kind``
+            ("tools", "resources", "templates", "prompts")? Checked before any upstream
+            I/O on every list and lookup, so the gateway can withhold a component class
+            (e.g. skill resources) even when the upstream itself would serve it.
     """
 
     def __init__(
@@ -154,7 +156,7 @@ class UpstreamProvider(Provider):
         client_factory: ClientFactory,
         *,
         identity: Callable[[], str],
-        allow: Callable[[], bool],
+        allow: Callable[[str], bool],
         cache_ttl: float,
         discovery_timeout: float,
         failure_backoff: float,
@@ -208,7 +210,7 @@ class UpstreamProvider(Provider):
         return out
 
     async def _components(self, kind: str) -> Sequence[Any]:
-        if not self._allow():
+        if not self._allow(kind):
             return []
         try:
             ident = self._identity()

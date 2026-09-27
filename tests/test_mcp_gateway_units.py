@@ -35,6 +35,7 @@ def test_defaults_enable_no_research_upstream():
     assert s.synapse_mcp_url == "http://127.0.0.1:8765/mcp"
     assert s.whoami_url == "http://127.0.0.1:8765/auth/whoami"
     assert s.research_trust == "full"
+    assert s.skills_trust == "full"  # Synapse skills withheld from restricted devices by default
     assert (s.host, s.port) == ("127.0.0.1", 8766)
 
 
@@ -43,6 +44,12 @@ def test_synapse_url_may_be_given_with_mcp_suffix():
         load_settings({P + "SYNAPSE_URL": "https://syn.example/mcp"}).synapse_url
         == "https://syn.example"
     )
+
+
+def test_keyless_upstream_needs_only_a_url():
+    (exa,) = load_settings({P + "EXA_URL": "https://exa.example/mcp"}).research
+    assert exa.url() == "https://exa.example/mcp" and exa.headers() == {}
+    assert load_settings({P + "EXA_URL": "https://exa.example/mcp"}).secrets() == []
 
 
 def test_url_keyed_upstream_substitutes_quoted_key():
@@ -104,6 +111,7 @@ def test_secret_file(tmp_path):
             "only one",
         ),
         ({P + "RESEARCH_TRUST": "everyone"}, "RESEARCH_TRUST"),
+        ({P + "SKILLS_TRUST": "anyone"}, "SKILLS_TRUST"),
         ({P + "DISCOVERY_TIMEOUT": "-1"}, ">= 0"),
     ],
 )
@@ -289,7 +297,7 @@ def _provider(ident: list[str], allowed: list[bool] | None = None, **kw):
         "stub",
         lambda: None,  # type: ignore[arg-type,return-value]
         identity=lambda: ident[0],
-        allow=lambda: (allowed or [True])[0],
+        allow=lambda kind: (allowed or [True])[0] and kind not in kw.get("denied_kinds", ()),
         cache_ttl=kw.get("ttl", 10.0),
         discovery_timeout=1.0,
         failure_backoff=kw.get("backoff", 0.0),
@@ -346,3 +354,43 @@ async def test_provider_checks_access_before_any_upstream_io(monkeypatch):
     p._identity = no_caller
     allowed[0] = True
     assert await p._list_resources() == []
+
+
+async def test_provider_withholds_a_denied_kind_without_upstream_io(monkeypatch):
+    p = _provider(["bob"], denied_kinds=("resources", "templates"))
+    fetched: list[str] = []
+
+    async def fetch(kind):
+        fetched.append(kind)
+        return [f"bob-{kind}"]
+
+    monkeypatch.setattr(p, "_fetch", fetch)
+    assert await p._components("tools") == ["bob-tools"]
+    assert await p._list_resources() == []
+    assert await p._get_resource("skill://x/SKILL.md") is None
+    assert await p._get_resource_template("skill://x/a.py") is None
+    assert fetched == ["tools"]
+
+
+def test_probe_search_fills_required_args_and_falls_back_between_providers():
+    from types import SimpleNamespace
+
+    from mcp_gateway.probe import _search_call
+
+    def tool(props, required):
+        return SimpleNamespace(inputSchema={"properties": props, "required": required})
+
+    exa = tool(
+        {"query": {"type": "string"}, "objective": {"type": "string"}}, ["query", "objective"]
+    )
+    fc = tool({"query": {"type": "string"}, "limit": {"type": "integer"}}, ["query"])
+    odd = tool({"query": {"type": "string"}, "n": {"type": "integer"}}, ["query", "n"])
+    assert _search_call({"exa_web_search_exa": exa, "firecrawl_firecrawl_search": fc}, "q") == (
+        "exa_web_search_exa",
+        {"query": "q", "objective": "q"},
+    )
+    assert _search_call({"firecrawl_firecrawl_search": fc, "recall": fc}, "q") == (
+        "firecrawl_firecrawl_search",
+        {"query": "q"},
+    )
+    assert _search_call({"exa_search_odd": odd}, "q") is None

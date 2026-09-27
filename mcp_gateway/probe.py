@@ -22,17 +22,34 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from mcp_gateway.app import RESEARCH_SKILL
 
+RESEARCH_PREFIXES = ("exa_", "firecrawl_")
+
+
+def _search_call(listed: dict[str, Any], text: str) -> tuple[str, dict[str, Any]] | None:
+    """First research search tool whose required arguments are all strings, with every
+    required argument filled from ``text`` (e.g. Exa wants ``query`` AND ``objective``)."""
+    for name in sorted(listed, key=lambda n: (not n.startswith("exa_"), n)):
+        if not name.startswith(RESEARCH_PREFIXES) or "search" not in name:
+            continue
+        schema = listed[name].inputSchema or {}
+        props = schema.get("properties") or {}
+        required = schema.get("required") or []
+        if "query" not in props or any(props.get(r, {}).get("type") != "string" for r in required):
+            continue
+        return name, {"query": text, **{r: text for r in required}}
+    return None
+
 
 async def _probe(url: str, token: str, search: str | None) -> int:
     uri = f"skill://{RESEARCH_SKILL}/SKILL.md"
     async with Client(StreamableHttpTransport(url, auth=token), timeout=60) as c:
         listed = {t.name: t for t in await c.list_tools()}
-        tools = sorted(listed)
         groups: dict[str, list[str]] = {}
-        for name in tools:
-            groups.setdefault(name.split("_", 1)[0], []).append(name)
-        for prefix, names in sorted(groups.items()):
-            print(f"tools[{prefix}]: {', '.join(names)}")
+        for name in sorted(listed):
+            group = next((p[:-1] for p in RESEARCH_PREFIXES if name.startswith(p)), "memory+bridge")
+            groups.setdefault(group, []).append(name)
+        for group, names in sorted(groups.items()):
+            print(f"tools[{group}]: {', '.join(names)}")
         skills = sorted(
             str(r.uri) for r in await c.list_resources() if str(r.uri).endswith("/SKILL.md")
         )
@@ -45,21 +62,17 @@ async def _probe(url: str, token: str, search: str | None) -> int:
             same = getattr(direct, "text", None) == bridged.content[0].text
             print(f"{uri}: readable; resources/read == read_resource tool: {same}")
         if search:
-            candidates = [
-                t
-                for t in tools
-                if t.startswith("exa_")
-                and "search" in t
-                and "query" in (listed[t].inputSchema.get("properties") or {})
-            ]
-            if not candidates:
-                print("search: no exa_ search tool taking `query` is listed for this device")
+            call = _search_call(listed, search)
+            if call is None:
+                print("search: no research search tool with string-only required args is listed")
                 return 1
-            args: dict[str, Any] = {"query": search}
-            result = await c.call_tool(candidates[0], args, raise_on_error=False)
+            name, args = call
+            result = await c.call_tool(name, args, raise_on_error=False)
             text = result.content[0].text if result.content else ""
             status = "error" if result.is_error else "ok"
-            print(f"search via {candidates[0]}: {status}, {len(text)} chars")
+            print(
+                f"search via {name} (args: {', '.join(sorted(args))}): {status}, {len(text)} chars"
+            )
     return 0
 
 

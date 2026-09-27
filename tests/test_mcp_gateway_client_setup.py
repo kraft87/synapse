@@ -72,3 +72,29 @@ def test_snippets_are_valid_client_config(capsys):
     assert server["url"] == "https://gw.example:8766/mcp"
     assert shlex.split(server["http_headers_helper"])[-3:] == ["--url", server["url"], "--gateway"]
     assert "Bearer ${SYNAPSE_INGEST_TOKEN}" in out  # a reference, never a token value
+
+
+def test_user_edits_that_keep_the_marker_are_preserved(tmp_path):
+    """The marker line is a hint for humans, not proof of ownership: an edited copy is the
+    user's now, and neither install (overwrite) nor remove (delete) may touch it."""
+    args = ["--client", "claude", "--skills-dir", str(tmp_path)]
+    assert cs.main(["install-bootstrap", *args]) == 0
+    md = tmp_path / cs.STUB_NAME / "SKILL.md"
+    edited = cs.STUB.replace("say so and stop", "say so, then try the direct connection")
+    assert cs.MARKER in edited and edited != cs.STUB
+    md.write_text(edited)
+
+    assert cs.main(["install-bootstrap", *args]) == 1
+    assert md.read_text() == edited
+    assert cs.main(["remove-bootstrap", *args]) == 1
+    assert md.read_text() == edited
+    assert cs.main(["remove-bootstrap", *args, "--dry-run"]) == 1
+
+
+def test_whitespace_only_edit_is_still_an_edit(tmp_path):
+    args = ["--client", "codex", "--skills-dir", str(tmp_path)]
+    assert cs.main(["install-bootstrap", *args]) == 0
+    md = tmp_path / cs.STUB_NAME / "SKILL.md"
+    md.write_text(cs.STUB + "\n")
+    assert cs.main(["remove-bootstrap", *args]) == 1
+    assert md.exists()

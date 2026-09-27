@@ -1,15 +1,17 @@
 """Assemble the gateway server: Synapse + optional research upstreams behind one /mcp.
 
-Public surface (stable; clients and the research skill depend on it):
+Public surface (stable; clients, hooks and the research skill depend on it):
 
-* ``synapse_<tool>`` — Synapse's own tools, called with the CALLER's device bearer.
+* Synapse's own tools under their OWN names (``recall``, ``fetch``, ``remember``, …),
+  called with the CALLER's device bearer. Unprefixed on purpose: the Synapse plugins' hooks
+  match ``mcp__<any server>__recall`` etc., so the gateway must not rename them.
 * ``exa_<tool>`` / ``firecrawl_<tool>`` — research tools, called with the gateway's
-  research keys, listed only to callers whose trust meets ``RESEARCH_TRUST``.
+  research configuration, listed only to callers whose trust meets ``RESEARCH_TRUST``.
 * ``list_resources`` / ``read_resource`` — FastMCP's ResourcesAsTools bridge for clients
   that cannot read MCP resources. It routes through this server's normal resource path,
   so a bridged read is authorized exactly like ``resources/read``.
-* ``skill://…`` resources — Synapse's canonical PG skills, URIs unchanged, plus the
-  gateway's bundled ``skill://gateway-research/…`` pilot skill.
+* ``skill://…`` resources — Synapse's canonical PG skills (URIs unchanged; callers meeting
+  ``SKILLS_TRUST`` only), plus the bundled ``skill://gateway-research/…`` pilot skill.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
-from fastmcp.server.transforms import Namespace, ResourcesAsTools, Transform
+from fastmcp.server.transforms import Namespace, ResourcesAsTools
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -32,7 +34,6 @@ from mcp_gateway.caller import (
     trust_allows,
 )
 from mcp_gateway.config import (
-    SYNAPSE_NAMESPACE,
     GatewaySettings,
     install_log_redaction,
     load_settings,
@@ -46,19 +47,6 @@ SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 RESEARCH_SKILL = "gateway-research"
 
 
-class ToolNamespace(Namespace):
-    """Namespace tools and prompts only; resource URIs pass through untouched.
-
-    ``skill://{name}/SKILL.md`` is the wire contract stock ``sync_skills`` and the Synapse
-    plugins rely on. Prefixing it (``skill://synapse/...``) would fork that contract.
-    """
-
-    list_resources = Transform.list_resources
-    get_resource = Transform.get_resource
-    list_resource_templates = Transform.list_resource_templates
-    get_resource_template = Transform.get_resource_template
-
-
 def _authenticated() -> bool:
     tok = current_token()
     return tok is not None and tok.client_id == CLIENT_ID
@@ -68,16 +56,15 @@ def _instructions(settings: GatewaySettings) -> str:
     research = ", ".join(f"{u.name}_*" for u in settings.research) or "none configured"
     return (
         "Gateway to the user's Synapse memory plus web-research tools, over one connection. "
-        "Memory tools are prefixed synapse_ (synapse_recall, synapse_fetch, synapse_remember, "
-        "...): BEFORE answering anything about past work, decisions, devices, projects, people "
-        "or preferences, call synapse_recall first; when the user states a durable fact, call "
-        "synapse_remember. Research tools: " + research + " (only listed where this "
-        "device may use them; names are whatever tools/list returns — never assume). "
-        "Skills are MCP resources at skill://<name>/SKILL.md with a skill://<name>/_manifest "
-        "file list. Read them with your client's MCP resource reader or the read_resource / "
-        "list_resources tools. For web research, read skill://" + RESEARCH_SKILL + "/SKILL.md "
-        "and follow it. Reading a skill's bundled script does not run it; scripts only run "
-        "after the skill is materialized locally."
+        "Memory: BEFORE answering anything that references past work — a prior decision, "
+        "device, project, person or preference — call recall first; fetch expands ids from "
+        "its results; when the user states a durable fact or correction, call remember. "
+        "Research tools: " + research + " (listed only where this device may use them; use "
+        "the names and input schemas tools/list returns). Skills are MCP resources at "
+        "skill://<name>/SKILL.md (file list: skill://<name>/_manifest); read them with your "
+        "client's MCP resource reader or the read_resource / list_resources tools. For web "
+        "research read skill://" + RESEARCH_SKILL + "/SKILL.md. Reading a bundled script "
+        "does not run it; scripts run only from a skill materialized locally."
     )
 
 
@@ -93,6 +80,17 @@ def build_gateway(settings: GatewaySettings) -> FastMCP:
     )
     mcp = FastMCP("synapse-gateway", instructions=_instructions(settings), auth=auth)
 
+    def research_allowed() -> bool:
+        return trust_allows(settings.research_trust)
+
+    def synapse_allowed(kind: str) -> bool:
+        # Memory tools: every approved device (Synapse scopes the data per bearer).
+        # Skill resources: Synapse's provider serves every active skill to any bearer, so
+        # withhold the class unless the caller meets SKILLS_TRUST (fail closed).
+        if kind in ("resources", "templates"):
+            return trust_allows(settings.skills_trust)
+        return _authenticated()
+
     synapse = UpstreamProvider(
         "synapse",
         http_client_factory(
@@ -103,17 +101,13 @@ def build_gateway(settings: GatewaySettings) -> FastMCP:
             init_timeout=settings.synapse_discovery_timeout,
         ),
         identity=lambda: identity_key(current_bearer()),
-        allow=_authenticated,
+        allow=synapse_allowed,
         cache_ttl=settings.synapse_cache_ttl,
         discovery_timeout=settings.synapse_discovery_timeout,
         # Memory is the core service: retry on the next request rather than sit out.
         failure_backoff=0.0,
     )
-    synapse.add_transform(ToolNamespace(SYNAPSE_NAMESPACE))
     mcp.add_provider(synapse)
-
-    def research_allowed() -> bool:
-        return trust_allows(settings.research_trust)
 
     for up in settings.research:
         provider = UpstreamProvider(
@@ -127,7 +121,7 @@ def build_gateway(settings: GatewaySettings) -> FastMCP:
             # Research credentials are the gateway's, identical for every caller, so the
             # component listing is shared. Access is still decided per caller by `allow`.
             identity=lambda: "shared",
-            allow=research_allowed,
+            allow=lambda kind: research_allowed(),
             cache_ttl=settings.research_cache_ttl,
             discovery_timeout=up.discovery_timeout,
             failure_backoff=settings.failure_backoff,
@@ -156,12 +150,14 @@ def main() -> None:
     settings = load_settings()
     mcp = build_gateway(settings)
     logger.info(
-        "synapse-gateway on %s:%d -> synapse %s (research: %s; research trust: %s)",
+        "synapse-gateway on %s:%d -> synapse %s (research: %s; research trust: %s; "
+        "skills trust: %s)",
         settings.host,
         settings.port,
         redact_url(settings.synapse_url),
         ", ".join(u.name for u in settings.research) or "none",
         settings.research_trust,
+        settings.skills_trust,
     )
     mcp.run(
         transport="http",

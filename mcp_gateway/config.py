@@ -32,10 +32,6 @@ ENV_PREFIX = "SYNAPSE_GATEWAY_"
 #: also the tool namespace (``exa_<tool>``), so it is part of the public tool surface.
 RESEARCH_UPSTREAMS = ("exa", "firecrawl")
 
-#: Namespace for the Synapse upstream's tools (``synapse_recall``, ...). Resources are NOT
-#: namespaced: ``skill://`` URIs stay canonical so stock ``sync_skills`` keeps working.
-SYNAPSE_NAMESPACE = "synapse"
-
 TRUST_LEVELS = ("full", "restricted")
 
 
@@ -78,6 +74,10 @@ class GatewaySettings:
     public_url: str = ""
     #: Minimum Synapse trust a caller needs to see research tools and the research skill.
     research_trust: str = "full"
+    #: Minimum Synapse trust a caller needs to see Synapse's skill:// resources. Synapse's
+    #: skills provider is not caller-scoped (every active skill, personal ones included),
+    #: so the gateway withholds the whole class from restricted devices by default.
+    skills_trust: str = "full"
     #: How long a verified caller identity is reused before asking Synapse again.
     auth_cache_ttl: float = 30.0
     #: Per-identity lifetime of the Synapse component listing (tools/resources/templates).
@@ -133,6 +133,13 @@ def _float(env: Mapping[str, str], key: str, default: float) -> float:
     return value
 
 
+def _trust(env: Mapping[str, str], key: str) -> str:
+    value = _get(env, key, "full").lower()
+    if value not in TRUST_LEVELS:
+        raise ConfigError(f"{ENV_PREFIX}{key} must be one of {TRUST_LEVELS}")
+    return value
+
+
 def _secret(env: Mapping[str, str], key: str) -> str:
     """``<key>`` or the contents of ``<key>_FILE``; setting both is ambiguous and refused."""
     inline = _get(env, key)
@@ -182,9 +189,8 @@ def _research(
 
 def load_settings(env: Mapping[str, str] | None = None) -> GatewaySettings:
     env = os.environ if env is None else env
-    research_trust = _get(env, "RESEARCH_TRUST", "full").lower()
-    if research_trust not in TRUST_LEVELS:
-        raise ConfigError(f"{ENV_PREFIX}RESEARCH_TRUST must be one of {TRUST_LEVELS}")
+    research_trust = _trust(env, "RESEARCH_TRUST")
+    skills_trust = _trust(env, "SKILLS_TRUST")
     synapse_url = _get(env, "SYNAPSE_URL", "http://127.0.0.1:8765").rstrip("/")
     if synapse_url.endswith("/mcp"):
         synapse_url = synapse_url[: -len("/mcp")]
@@ -204,6 +210,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> GatewaySettings:
         port=port,
         public_url=_get(env, "PUBLIC_URL"),
         research_trust=research_trust,
+        skills_trust=skills_trust,
         auth_cache_ttl=_float(env, "AUTH_CACHE_TTL", 30.0),
         synapse_cache_ttl=_float(env, "SYNAPSE_CACHE_TTL", 30.0),
         research_cache_ttl=_float(env, "RESEARCH_CACHE_TTL", 300.0),
