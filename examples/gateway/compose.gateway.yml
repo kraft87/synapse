@@ -1,0 +1,35 @@
+# Example compose override adding the MCP gateway beside the stack (docs/gateway.md):
+#   docker compose -f compose.yml -f examples/gateway/compose.gateway.yml up -d mcp-gateway
+# Needs an image built from a revision that includes mcp_gateway/ and GET /auth/whoami.
+services:
+  mcp-gateway:
+    image: ghcr.io/kraft87/synapse:latest
+    build: .
+    container_name: ${COMPOSE_PROJECT_NAME:-synapse}-gateway
+    restart: unless-stopped
+    command: python -m mcp_gateway
+    # No env_file: .env on purpose — the gateway must not hold the machine token or DSN.
+    environment:
+      SYNAPSE_GATEWAY_HOST: 0.0.0.0
+      SYNAPSE_GATEWAY_PORT: "8766"
+      SYNAPSE_GATEWAY_SYNAPSE_URL: http://mcp-server:${MCP_PORT:-8765}
+      SYNAPSE_GATEWAY_SKILLS_TRUST: full
+      # Optional registry of this deployment's own MCP services (see gateway.example.json).
+      # Unset = Synapse memory + skills only.
+      # SYNAPSE_GATEWAY_CONFIG_FILE: /config/gateway.json
+    # volumes:
+    #   - ./gateway-config:/config:ro          # gateway.json (+ any secret_file it names)
+    # secrets: [tracker_mcp_token]           # then use "secret_file": "/run/secrets/tracker_mcp_token"
+    depends_on: [mcp-server]
+    ports:
+      # Loopback by default; publish wider only behind TLS.
+      - "127.0.0.1:8766:8766"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8766/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+# secrets:
+#   tracker_mcp_token:
+#     file: ${SYNAPSE_GATEWAY_SECRETS_DIR:-./secrets}/tracker_mcp_token

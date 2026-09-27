@@ -2,6 +2,7 @@ import os
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
+import logfire
 import psycopg
 import pytest
 
@@ -33,6 +34,19 @@ _refuse_production(DB_URL)
 # would otherwise pick up the production DSN that .env just loaded into this process.
 # Pin it to the test database so a missing monkeypatch cannot reach prod.
 os.environ["SYNAPSE_DB_URL"] = DB_URL
+
+
+def pytest_configure(config):
+    # Auth tests reload mcp_server.server repeatedly. Logfire's MCP instrumentation wraps
+    # process-global SDK methods on every call; stacked wrappers slow later HTTP tests and
+    # its console exporter bypasses their output isolation. Keep unit-test telemetry local
+    # and silent, and prevent server imports from installing production instrumentation.
+    logfire.configure(send_to_logfire=False, console=False)
+    telemetry = pytest.MonkeyPatch()
+    for name in ("configure", "instrument_mcp", "instrument_httpx"):
+        telemetry.setattr(logfire, name, lambda *args, **kwargs: None)
+    config.add_cleanup(telemetry.undo)
+
 
 # Files whose tests touch the shared Postgres test DB. The collection hook below
 # auto-tags every test in these files with `xdist_group="db"`, which pins them

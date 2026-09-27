@@ -99,6 +99,15 @@ Note-writing follows the same line: a write from a live, approved restricted sur
 to `work-safe`, symmetric with what it may read, so notes written at work do not vanish from
 the work board next session.
 
+## Asking what a token is
+
+`GET /auth/whoami` with a bearer answers for that bearer only:
+`{"kind": "device", "trust": "full"|"restricted", "surface_id": …}` for an approved device,
+`{"kind": "root", "trust": "restricted", "surface_id": null}` for the machine token, and 401
+for anything else. It never returns token material or the project allowlist. The
+[MCP gateway](gateway.md) uses it to admit callers without holding a Synapse credential of its
+own.
+
 ## Managing devices
 
 ```

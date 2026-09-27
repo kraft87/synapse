@@ -97,6 +97,9 @@ troubleshooting: **[docs/install.md](docs/install.md)**.
 - **[docs/tools.md](docs/tools.md)**: the MCP tool surface, the plugin's hooks, and every
   plugin configuration variable.
 - **[docs/features.md](docs/features.md)**: what's in the box, and the stack it runs on.
+- **[docs/gateway.md](docs/gateway.md)** (pilot): one MCP connection for Synapse memory,
+  skills and whichever MCP services a deployment configures, shared by Claude Code and Codex,
+  each caller keeping its own device identity.
 - **[ARCHITECTURE.md](./ARCHITECTURE.md)**: the design doc. Pipelines, schema, decisions,
   measurements, full server configuration reference.
 - **[plugin/README.md](./plugin/README.md)**: the Claude Code plugin.
