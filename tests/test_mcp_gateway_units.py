@@ -394,3 +394,20 @@ def test_probe_search_fills_required_args_and_falls_back_between_providers():
         {"query": "q"},
     )
     assert _search_call({"exa_search_odd": odd}, "q") is None
+
+
+def test_probe_explains_a_refused_credential(monkeypatch, capsys):
+    import mcp_gateway.probe as probe
+
+    async def refused(*a, **k):
+        raise httpx.HTTPStatusError(
+            "Client error '401 Unauthorized'",
+            request=httpx.Request("POST", "http://gw/mcp"),
+            response=httpx.Response(401),
+        )
+
+    monkeypatch.setattr(probe, "_probe", refused)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", "root-like-token")
+    assert probe.main([]) == 3
+    err = capsys.readouterr().err
+    assert "only approved Synapse DEVICE tokens" in err and "root-like-token" not in err

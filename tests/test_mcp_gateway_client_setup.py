@@ -98,3 +98,29 @@ def test_whitespace_only_edit_is_still_an_edit(tmp_path):
     md.write_text(cs.STUB + "\n")
     assert cs.main(["remove-bootstrap", *args]) == 1
     assert md.exists()
+
+
+def test_saved_credential_snippets_drop_env_token_overrides(capsys):
+    """Live pilot finding: a shell exporting the root token silently overrode the saved
+    device credential. --saved-credential wraps the helper so the overrides are removed."""
+    assert (
+        cs.main(["snippets", "--gateway-url", "http://gw.example:8766", "--saved-credential"]) == 0
+    )
+    out = capsys.readouterr().out
+    add_json = next(line for line in out.splitlines() if line.startswith("claude mcp add-json"))
+    claude_helper = shlex.split(json.loads(shlex.split(add_json)[-1])["headersHelper"])
+    toml_block = out.split("## Codex — add to ~/.codex/config.toml\n", 1)[1].split("## Optional")[0]
+    codex_helper = shlex.split(
+        tomllib.loads(toml_block)["mcp_servers"]["synapse-gateway"]["http_headers_helper"]
+    )
+    for argv in (claude_helper, codex_helper):
+        assert argv[:5] == [
+            "env",
+            "-u",
+            "SYNAPSE_INGEST_TOKEN",
+            "-u",
+            "CLAUDE_PLUGIN_OPTION_SYNAPSE_INGEST_TOKEN",
+        ]
+        assert argv[-1] == "--gateway"
+    assert cs.main(["snippets"]) == 0
+    assert "env -u" not in capsys.readouterr().out.split("## Claude Code — add")[1]

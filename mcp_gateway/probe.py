@@ -86,7 +86,18 @@ def main(argv: list[str] | None = None) -> int:
     if not token:
         print(f"set {args.token_env} to this device's Synapse token", file=sys.stderr)
         return 2
-    return asyncio.run(_probe(args.url, token, args.search))
+    try:
+        return asyncio.run(_probe(args.url, token, args.search))
+    except Exception as e:
+        if "401" in str(e):
+            print(
+                f"gateway refused the credential in {args.token_env} (401): only approved "
+                "Synapse DEVICE tokens are admitted; the root/enrollment token and pending or "
+                "revoked devices are refused by design",
+                file=sys.stderr,
+            )
+            return 3
+        raise
 
 
 if __name__ == "__main__":

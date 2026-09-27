@@ -114,17 +114,33 @@ def _is_ours(folder: Path) -> bool:
         return False
 
 
-def snippets(gateway_url: str) -> str:
+#: Env vars that override the saved plugin credential in mcp_headers.py's resolution order.
+TOKEN_OVERRIDES = ("SYNAPSE_INGEST_TOKEN", "CLAUDE_PLUGIN_OPTION_SYNAPSE_INGEST_TOKEN")
+
+
+def snippets(gateway_url: str, saved_credential: bool = False) -> str:
     base = gateway_url.rstrip("/").removesuffix("/mcp")
     url = base + "/mcp"
-    helper = shlex.join(
-        ["python3", str(_REPO / "plugin-codex/scripts/mcp_headers.py"), "--url", url, "--gateway"]
-    )
+    argv = [
+        "python3",
+        str(_REPO / "plugin-codex/scripts/mcp_headers.py"),
+        "--url",
+        url,
+        "--gateway",
+    ]
+    if saved_credential:
+        # A shell that exports some OTHER token (e.g. the root enrollment token for admin
+        # tooling) would otherwise win over the saved device credential, and the gateway
+        # rightly refuses root. Drop the overrides for the helper only.
+        argv = ["env", *[a for v in TOKEN_OVERRIDES for a in ("-u", v)], *argv]
+    helper = shlex.join(argv)
     claude_json = json.dumps({"type": "http", "url": url, "headersHelper": helper})
     return f"""\
 # Credential: both clients reuse this machine's Synapse DEVICE token through
 # plugin-codex/scripts/mcp_headers.py (env SYNAPSE_INGEST_TOKEN, else the Synapse Claude
 # plugin's saved options). --gateway admits only a gateway on the Synapse host or loopback.
+# If your shell exports a token that is NOT this device's (e.g. the root token), rerun with
+# --saved-credential so the helper ignores env overrides and uses the saved device token.
 
 ## Claude Code — add (user scope)
 claude mcp add-json --scope user synapse-gateway {shlex.quote(claude_json)}
@@ -140,6 +156,9 @@ claude mcp remove --scope user synapse-gateway
 [mcp_servers.synapse-gateway]
 url = "{url}"
 http_headers_helper = {_toml_str(helper)}
+## Optional: codex exec cannot prompt; pre-approve memory tools like a direct synapse entry:
+## [mcp_servers.synapse-gateway.tools.recall]
+## approval_mode = "approve"
 ## Codex — remove: delete the [mcp_servers.synapse-gateway] table above.
 
 ## Bootstrap pointer skill (both clients; reversible)
@@ -158,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     sn = sub.add_parser("snippets", help="print client configuration (no changes made)")
     sn.add_argument("--gateway-url", default="http://127.0.0.1:8766")
+    sn.add_argument(
+        "--saved-credential",
+        action="store_true",
+        help="helper ignores SYNAPSE_INGEST_TOKEN env overrides (use the saved device token)",
+    )
     for name in ("install-bootstrap", "remove-bootstrap"):
         p = sub.add_parser(name)
         p.add_argument("--client", choices=("claude", "codex"), required=True)
@@ -165,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     if args.cmd == "snippets":
-        sys.stdout.write(snippets(args.gateway_url))
+        sys.stdout.write(snippets(args.gateway_url, args.saved_credential))
         return 0
     skills_dir = args.skills_dir or _default_dir(args.client)
     if args.cmd == "install-bootstrap":

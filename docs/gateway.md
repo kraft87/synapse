@@ -184,7 +184,28 @@ on loopback. No token is written into client config.
 - **Claude Code**: `claude mcp add-json --scope user synapse-gateway '{"type":"http",…,"headersHelper":…}'`.
   Undo with `claude mcp remove --scope user synapse-gateway`.
 - **Codex**: add a `[mcp_servers.synapse-gateway]` table with `url` and `http_headers_helper`.
-  Undo by deleting the table.
+  Undo by deleting the table. `codex exec` can't prompt for approval, so tools that aren't
+  marked read-only (for example `recall` or a Firecrawl scrape) fail there unless
+  pre-approved with `[mcp_servers.synapse-gateway.tools.<tool>] approval_mode = "approve"`,
+  the same per-tool mechanism a direct `synapse` entry uses.
+
+If a shell exports `SYNAPSE_INGEST_TOKEN` with some other credential, such as the root
+enrollment token kept for admin tooling, that value overrides the saved device token. The
+gateway then refuses it, correctly. Generate the snippets with `--saved-credential`: the
+helper then runs under `env -u SYNAPSE_INGEST_TOKEN -u CLAUDE_PLUGIN_OPTION_SYNAPSE_INGEST_TOKEN`,
+so the saved device token wins for the gateway only, and other env consumers keep theirs.
+The probe explains a refusal like this with a clear message instead of a bare 401.
+
+Personal hooks keyed on the plugin's server name, such as a Stop hook that counts
+`mcp__plugin_synapse_synapse__recall`, need the `mcp__synapse-gateway__` form added. So does
+the plugin's feedback-nudge matcher until an installed plugin carries the any-server version.
+A narrow user-level PostToolUse hook on `mcp__synapse-gateway__(recall|recall_full_turns)$`
+that runs the plugin's `recall_feedback_nudge.py` covers the gap. Remove it after the plugin
+update, or gateway recalls get the nudge twice.
+
+When scripting a client check from inside another Claude Code session, start the child
+without the parent's inherited `CLAUDE_*` session variables. A nested session marker such as
+`CLAUDE_CODE_SAFE_MODE` stops the child from loading any MCP server.
 
 ## Verify
 
