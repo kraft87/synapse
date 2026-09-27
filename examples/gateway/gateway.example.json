@@ -1,0 +1,21 @@
+{
+  "upstreams": [
+    {
+      "namespace": "tracker",
+      "description": "Project tracker: issues and milestones",
+      "url": "https://tracker.example.com/mcp",
+      "auth": {"type": "bearer", "secret_env": "TRACKER_MCP_TOKEN"},
+      "min_trust": "full"
+    },
+    {
+      "namespace": "wiki",
+      "description": "Team wiki pages",
+      "url": "https://wiki.example.com/mcp",
+      "auth": {"type": "header", "header": "X-Api-Key", "secret_file": "/run/secrets/wiki_api_key"},
+      "min_trust": "restricted",
+      "discovery_timeout": 5,
+      "call_timeout": 60
+    }
+  ],
+  "skills_dirs": []
+}

@@ -1,10 +1,11 @@
 """End-to-end gateway behaviour against local stub upstreams (no network, no database).
 
-Three real HTTP MCP servers run in-process: a stub Synapse (the REAL ``/auth/whoami`` route
-and the REAL ``PgSkillsProvider`` over in-memory storage), a stub Exa (header-keyed) and a
-stub Firecrawl (URL-keyed). The gateway is built from ``build_gateway`` exactly as
-``python -m mcp_gateway`` builds it. Nothing here proves anything about the live Exa or
-Firecrawl services — only about what the gateway does with whatever answers.
+Real HTTP MCP servers run in-process: a stub Synapse (the REAL ``/auth/whoami`` route and
+the REAL ``PgSkillsProvider`` over in-memory storage) and two fictional deployment services
+named only in a registry file — a project ``tracker`` (bearer secret from an env var, full
+trust) and a team ``wiki`` (secret in its URL path from a secret file, restricted trust).
+The gateway is built from ``load_settings`` + ``build_gateway`` exactly as
+``python -m mcp_gateway`` builds it. Nothing here is specific to any real third-party service.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ import mcp_server.skills_provider as skills_mod
 import mcp_server.whoami_route as whoami_mod
 from ingestion.surfaces import SurfaceTrust, token_hash
 from mcp_gateway.app import build_gateway
-from mcp_gateway.config import GatewaySettings, ResearchUpstream
+from mcp_gateway.config import load_settings
 
 ROOT = "root-enrollment-token"
 DEVICES = {
@@ -41,9 +42,9 @@ DEVICES = {
     "tok-bob-work": SurfaceTrust("dev-bob", "restricted", ("proj-a",), True),
     "tok-carol-full": SurfaceTrust("dev-carol", "full", (), True),
 }
-EXA_KEY = "exa-test-key-111"
-FIRECRAWL_KEY = "fc-test-key-222"
-ALL_SECRETS = (EXA_KEY, FIRECRAWL_KEY, ROOT, *DEVICES)
+TRACKER_SECRET = "tracker-secret-111"
+WIKI_SECRET = "wiki-secret-222"
+ALL_SECRETS = (TRACKER_SECRET, WIKI_SECRET, ROOT, *DEVICES)
 
 SKILLS = {"demo-skill": ("Demo skill", "---\nname: demo-skill\ndescription: d\n---\n# Demo\n")}
 SKILL_FILES = {("demo-skill", "scripts/run.py"): b"print('hi')\n"}
@@ -122,6 +123,11 @@ def _stub_synapse(seen: list[dict[str, str]]) -> FastMCP:
         return RecallHit(caller=(tok.claims or {}).get("surface_id") or "root", query=query)
 
     @mcp.tool()
+    def fetch(ids: list[str]) -> str:
+        """Expand ids."""
+        return ",".join(ids)
+
+    @mcp.tool()
     def remember(content: str) -> str:
         """Store a memory."""
         return "stored"
@@ -148,30 +154,51 @@ def _stub_synapse(seen: list[dict[str, str]]) -> FastMCP:
     return mcp
 
 
-def _stub_research(name: str, seen: list[dict[str, str]], slow_list: float = 0.0) -> FastMCP:
+def _slow_listing(seconds: float) -> list[Middleware]:
     class _Slow(Middleware):
         async def on_list_tools(self, context, call_next):
-            await asyncio.sleep(slow_list)
+            await asyncio.sleep(seconds)
             return await call_next(context)
 
-    mw: list[Middleware] = [_Recorder(seen)] + ([_Slow()] if slow_list else [])
-    mcp = FastMCP(f"stub-{name}", middleware=mw)
+    return [_Slow()] if seconds else []
 
-    if name == "exa":
 
-        @mcp.tool()
-        def web_search_exa(query: str, objective: str, numResults: int = 3) -> str:
-            """Search the web."""
-            if get_http_headers(include={"x-api-key"}).get("x-api-key") != EXA_KEY:
-                raise ToolError("exa: bad key")
-            return f"results for {query}"
+def _stub_tracker(seen: list[dict[str, str]], slow_list: float = 0.0) -> FastMCP:
+    """A fictional project tracker that demands its own bearer secret."""
+    mcp = FastMCP("stub-tracker", middleware=[_Recorder(seen), *_slow_listing(slow_list)])
 
-    else:
+    def _authorized() -> None:
+        auth = get_http_headers(include={"authorization"}).get("authorization")
+        if auth != f"Bearer {TRACKER_SECRET}":
+            raise ToolError("tracker: bad credential")
 
-        @mcp.tool()
-        def firecrawl_scrape(url: str) -> str:
-            """Scrape a page."""
-            return f"# page {url}"
+    @mcp.tool()
+    def list_issues(project: str, state: str = "open") -> list[str]:
+        """List issues in a project."""
+        _authorized()
+        return [f"{project}-1", f"{project}-2"]
+
+    @mcp.tool()
+    def create_issue(project: str, title: str) -> str:
+        """Create an issue."""
+        _authorized()
+        return f"{project}-3"
+
+    return mcp
+
+
+def _stub_wiki(seen: list[dict[str, str]]) -> FastMCP:
+    """A fictional team wiki; its secret is part of its URL path (see _start)."""
+    mcp = FastMCP("stub-wiki", middleware=[_Recorder(seen)])
+
+    @mcp.tool()
+    def get_page(slug: str) -> str:
+        """Fetch a wiki page."""
+        return f"# {slug}"
+
+    @mcp.resource("docs://home")
+    def home() -> str:
+        return "wiki home"
 
     return mcp
 
@@ -204,8 +231,8 @@ def _in_memory_skills(monkeypatch):
 class Stack:
     def __init__(self) -> None:
         self.synapse_seen: list[dict[str, str]] = []
-        self.exa_seen: list[dict[str, str]] = []
-        self.firecrawl_seen: list[dict[str, str]] = []
+        self.tracker_seen: list[dict[str, str]] = []
+        self.wiki_seen: list[dict[str, str]] = []
         self.gateway_url = ""
         self.gateway: FastMCP | None = None
 
@@ -215,40 +242,58 @@ class Stack:
 
 async def _start(
     stack: AsyncExitStack,
+    tmp_path: Path,
     *,
-    exa_slow: float = 0.0,
-    firecrawl_down: bool = False,
-    research_trust: str = "full",
+    upstreams: bool = True,
+    tracker_slow: float = 0.0,
+    wiki_down: bool = False,
     skills_trust: str = "full",
-    **overrides: Any,
+    skills_dirs: list[dict[str, Any]] | None = None,
 ) -> Stack:
+    """Start stub Synapse (+ tracker and wiki), write a registry file, build the gateway."""
     s = Stack()
     syn_url = await stack.enter_async_context(run_server_async(_stub_synapse(s.synapse_seen)))
-    exa_url = await stack.enter_async_context(
-        run_server_async(_stub_research("exa", s.exa_seen, exa_slow))
-    )
-    if firecrawl_down:
-        fc_template = "http://127.0.0.1:9/{api_key}/mcp"  # discard port: connection refused
-    else:
-        fc_url = await stack.enter_async_context(
-            run_server_async(
-                _stub_research("firecrawl", s.firecrawl_seen), path=f"/{FIRECRAWL_KEY}/mcp"
-            )
+    registry: dict[str, Any] = {"upstreams": [], "skills_dirs": skills_dirs or []}
+    if upstreams:
+        tracker_url = await stack.enter_async_context(
+            run_server_async(_stub_tracker(s.tracker_seen, tracker_slow))
         )
-        fc_template = fc_url.replace(FIRECRAWL_KEY, "{api_key}")
-    settings = GatewaySettings(
-        synapse_url=syn_url.removesuffix("/mcp"),
-        research_trust=research_trust,
-        skills_trust=skills_trust,
-        research=(
-            ResearchUpstream(
-                "exa", exa_url, EXA_KEY, "x-api-key", discovery_timeout=1.0, call_timeout=10
-            ),
-            ResearchUpstream(
-                "firecrawl", fc_template, FIRECRAWL_KEY, "", discovery_timeout=1.0, call_timeout=10
-            ),
-        ),
-        **overrides,
+        if wiki_down:
+            wiki_template = "http://127.0.0.1:9/{secret}/mcp"  # discard port: refused
+        else:
+            wiki_url = await stack.enter_async_context(
+                run_server_async(_stub_wiki(s.wiki_seen), path=f"/{WIKI_SECRET}/mcp")
+            )
+            wiki_template = wiki_url.replace(WIKI_SECRET, "{secret}")
+        (tmp_path / "wiki.secret").write_text(WIKI_SECRET + "\n")
+        registry["upstreams"] = [
+            {
+                "namespace": "tracker",
+                "description": "Project tracker: issues",
+                "url": tracker_url,
+                "auth": {"type": "bearer", "secret_env": "TRACKER_MCP_TOKEN"},
+                "min_trust": "full",
+                "discovery_timeout": 1.0,
+                "call_timeout": 10,
+            },
+            {
+                "namespace": "wiki",
+                "url": wiki_template,
+                "auth": {"type": "url", "secret_file": "wiki.secret"},
+                "min_trust": "restricted",
+                "discovery_timeout": 1.0,
+                "call_timeout": 10,
+            },
+        ]
+    config = tmp_path / "gateway.json"
+    config.write_text(json.dumps(registry))
+    settings = load_settings(
+        {
+            "SYNAPSE_GATEWAY_SYNAPSE_URL": syn_url,
+            "SYNAPSE_GATEWAY_CONFIG_FILE": str(config),
+            "SYNAPSE_GATEWAY_SKILLS_TRUST": skills_trust,
+            "TRACKER_MCP_TOKEN": TRACKER_SECRET,
+        }
     )
     s.gateway = build_gateway(settings)
     s.gateway_url = await stack.enter_async_context(run_server_async(s.gateway))
@@ -261,20 +306,34 @@ def _text(result) -> str:
 
 # --------------------------------------------------------------------------- authentication
 
+CORE = {
+    "recall",
+    "fetch",
+    "remember",
+    "full_only_note",
+    "broken",
+    "list_resources",
+    "read_resource",
+}
+TRACKER_TOOLS = {"tracker_list_issues", "tracker_create_issue"}
+WIKI_TOOLS = {"wiki_get_page"}
+
 
 @pytest.mark.parametrize("token", [None, "not-a-token", ROOT])
-async def test_unauthenticated_root_and_unknown_callers_are_rejected(token):
+async def test_unauthenticated_root_and_unknown_callers_are_rejected(tmp_path, token):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         with pytest.raises(Exception, match=r"401|Unauthorized"):
             async with s.client(token) as c:
                 await c.list_tools()
+        # Nothing reached a configured upstream on behalf of a refused caller.
+        assert not s.tracker_seen and not s.wiki_seen
 
 
-async def test_revoked_device_loses_memory_on_its_next_call():
+async def test_revoked_device_loses_memory_on_its_next_call(tmp_path):
     """The identity cache never outlives Synapse for memory: every call re-authenticates."""
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-carol-full") as c:
             assert (await c.call_tool("recall", {"query": "q"})).structured_content[
                 "caller"
@@ -290,9 +349,9 @@ async def test_revoked_device_loses_memory_on_its_next_call():
 # --------------------------------------------------------------------------- identity
 
 
-async def test_each_request_reaches_synapse_as_its_own_caller():
+async def test_each_request_reaches_synapse_as_its_own_caller(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         tokens = ["tok-alice-full", "tok-bob-work", "tok-carol-full"] * 6
 
         async def one(tok: str, i: int) -> tuple[str, str]:
@@ -308,51 +367,56 @@ async def test_each_request_reaches_synapse_as_its_own_caller():
         assert seen_bearers == {f"Bearer {t}" for t in DEVICES}
 
 
-async def test_credentials_stay_with_their_own_upstream():
+async def test_credentials_stay_with_their_own_upstream(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
             await c.call_tool("recall", {"query": "x"})
-            await c.call_tool("exa_web_search_exa", {"query": "x", "objective": "x"})
-            await c.call_tool("firecrawl_firecrawl_scrape", {"url": "https://example.org"})
-        assert s.exa_seen and s.firecrawl_seen and s.synapse_seen
+            listed = await c.call_tool("tracker_list_issues", {"project": "web"})
+            assert listed.structured_content == {"result": ["web-1", "web-2"]}
+            assert _text(await c.call_tool("wiki_get_page", {"slug": "home"})) == "# home"
+        assert s.tracker_seen and s.wiki_seen and s.synapse_seen
 
         def blob(seen: list[dict[str, str]]) -> str:
             return json.dumps(seen)
 
-        # Research upstreams never see a Synapse bearer (or any Authorization at all) ...
-        for seen in (s.exa_seen, s.firecrawl_seen):
-            assert not any("authorization" in h for h in seen)
+        # The tracker sees exactly its own configured bearer, never a caller's ...
+        assert {h.get("authorization") for h in s.tracker_seen} == {f"Bearer {TRACKER_SECRET}"}
+        # ... the wiki sees no Authorization at all (its secret rides only in its URL path) ...
+        assert not any("authorization" in h for h in s.wiki_seen)
+        for seen in (s.tracker_seen, s.wiki_seen):
             assert not any(tok in blob(seen) for tok in (*DEVICES, ROOT))
-        # ... Exa sees only its own key, Firecrawl's key rides only in its own URL path ...
-        assert all(h.get("x-api-key") == EXA_KEY for h in s.exa_seen)
-        assert FIRECRAWL_KEY not in blob(s.exa_seen) and EXA_KEY not in blob(s.firecrawl_seen)
-        # ... and Synapse never sees a research key.
-        assert EXA_KEY not in blob(s.synapse_seen) and FIRECRAWL_KEY not in blob(s.synapse_seen)
+        assert WIKI_SECRET not in blob(s.tracker_seen) and TRACKER_SECRET not in blob(s.wiki_seen)
+        # ... and Synapse never sees an upstream secret.
+        assert TRACKER_SECRET not in blob(s.synapse_seen) and WIKI_SECRET not in blob(
+            s.synapse_seen
+        )
 
 
 # --------------------------------------------------------------------------- restricted callers
 
 
-async def test_restricted_caller_gets_no_research_tools_or_research_skill():
+async def test_min_trust_is_enforced_per_upstream(tmp_path):
+    """tracker requires full trust, wiki admits restricted devices: each device sees exactly
+    the namespaces it qualifies for, and cannot call the others by name."""
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as full:
-            names = {t.name for t in await full.list_tools()}
-            assert {"exa_web_search_exa", "firecrawl_firecrawl_scrape"} <= names
-            uris = {str(r.uri) for r in await full.list_resources()}
-            assert "skill://gateway-research/SKILL.md" in uris
+            assert {t.name for t in await full.list_tools()} == CORE | TRACKER_TOOLS | WIKI_TOOLS
+            assert "docs://wiki/home" in {str(r.uri) for r in await full.list_resources()}
 
+        tracker_calls_before = len(s.tracker_seen)
         async with s.client("tok-bob-work") as work:
-            names = {t.name for t in await work.list_tools()}
-            assert not any(n.startswith(("exa_", "firecrawl_")) for n in names)
-            assert "recall" in names
+            assert {t.name for t in await work.list_tools()} == (
+                CORE - {"full_only_note"}
+            ) | WIKI_TOOLS
             with pytest.raises(ToolError, match="Unknown tool"):
-                await work.call_tool("exa_web_search_exa", {"query": "x", "objective": "x"})
-            with pytest.raises(McpError, match="Unknown resource"):
-                await work.read_resource("skill://gateway-research/SKILL.md")
-            with pytest.raises(ToolError):
-                await work.call_tool("read_resource", {"uri": "skill://gateway-research/SKILL.md"})
+                await work.call_tool("tracker_create_issue", {"project": "web", "title": "x"})
+            assert _text(await work.call_tool("wiki_get_page", {"slug": "a"})) == "# a"
+            # Namespaced upstream resources follow the same per-upstream trust.
+            assert (await work.read_resource("docs://wiki/home"))[0].text == "wiki home"
+        # The refused tracker call never reached the tracker.
+        assert len(s.tracker_seen) == tracker_calls_before
 
 
 PERSONAL_SKILL_URIS = (
@@ -362,12 +426,12 @@ PERSONAL_SKILL_URIS = (
 )
 
 
-async def test_restricted_device_cannot_reach_synapse_skills_by_any_path():
+async def test_restricted_device_cannot_reach_synapse_skills_by_any_path(tmp_path):
     """The upstream skills provider is permissive (see _stub_synapse); the gateway is the
     gate. Listing, templates, direct reads and the tools bridge must all come up empty —
     while the restricted device keeps its (Synapse-scoped) memory tools."""
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-bob-work") as work:
             assert not [r for r in await work.list_resources() if str(r.uri).startswith("skill://")]
             assert not await work.list_resource_templates()
@@ -391,27 +455,39 @@ async def test_restricted_device_cannot_reach_synapse_skills_by_any_path():
                 await work.read_resource(PERSONAL_SKILL_URIS[0])
 
 
-async def test_skills_trust_can_be_widened_explicitly():
+async def test_skills_trust_can_be_widened_explicitly(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack, skills_trust="restricted")
+        s = await _start(stack, tmp_path, skills_trust="restricted")
         async with s.client("tok-bob-work") as work:
             body = (await work.read_resource("skill://demo-skill/SKILL.md"))[0].text
             assert body == SKILLS["demo-skill"][1]
-            # Widening skills does not widen research.
-            uris = {str(r.uri) for r in await work.list_resources()}
-            assert "skill://gateway-research/SKILL.md" not in uris
+            # Widening skills does not widen a full-trust upstream.
+            assert not TRACKER_TOOLS & {t.name for t in await work.list_tools()}
 
 
-async def test_research_trust_can_be_widened_explicitly():
+async def test_configured_skills_dir_uses_native_provider_and_trust_guard(tmp_path):
+    team = tmp_path / "team-skills" / "release-checklist"
+    team.mkdir(parents=True)
+    (team / "SKILL.md").write_text(
+        "---\nname: release-checklist\ndescription: Steps before tagging a release\n---\n# Go\n"
+    )
+    uri = "skill://release-checklist/SKILL.md"
     async with AsyncExitStack() as stack:
-        s = await _start(stack, research_trust="restricted")
+        s = await _start(
+            stack, tmp_path, skills_dirs=[{"path": "team-skills", "min_trust": "full"}]
+        )
+        async with s.client("tok-alice-full") as full:
+            assert uri in {str(r.uri) for r in await full.list_resources()}
+            assert "# Go" in _text(await full.call_tool("read_resource", {"uri": uri}))
         async with s.client("tok-bob-work") as work:
-            assert "exa_web_search_exa" in {t.name for t in await work.list_tools()}
+            assert uri not in {str(r.uri) for r in await work.list_resources()}
+            with pytest.raises(McpError, match="Unknown resource"):
+                await work.read_resource(uri)
 
 
-async def test_synapse_side_filtering_is_not_leaked_through_the_cache():
+async def test_synapse_side_filtering_is_not_leaked_through_the_cache(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as full:
             assert "full_only_note" in {t.name for t in await full.list_tools()}
             assert _text(await full.call_tool("full_only_note", {})) == "personal"
@@ -421,33 +497,57 @@ async def test_synapse_side_filtering_is_not_leaked_through_the_cache():
                 await work.call_tool("full_only_note", {})
 
 
+# --------------------------------------------------------------------------- core only
+
+
+async def test_core_only_config_is_synapse_memory_and_skills(tmp_path):
+    """No configured upstreams: the gateway is exactly Synapse memory + skills + bridge."""
+    async with AsyncExitStack() as stack:
+        s = await _start(stack, tmp_path, upstreams=False)
+        async with s.client("tok-alice-full") as c:
+            assert {t.name for t in await c.list_tools()} == CORE
+            assert "skill://demo-skill/SKILL.md" in {str(r.uri) for r in await c.list_resources()}
+            text = c.initialize_result.instructions or ""
+        assert "recall" in text and "skill://<name>/SKILL.md" in text
+        assert "namespace" not in text  # no services advertised when none are configured
+
+
+async def test_core_only_without_any_config_file(tmp_path, monkeypatch):
+    async with AsyncExitStack() as stack:
+        syn_url = await stack.enter_async_context(run_server_async(_stub_synapse([])))
+        settings = load_settings({"SYNAPSE_GATEWAY_SYNAPSE_URL": syn_url})
+        assert settings.registry.upstreams == () and settings.registry.skills_dirs == ()
+        url = await stack.enter_async_context(run_server_async(build_gateway(settings)))
+        async with Client(StreamableHttpTransport(url, auth="tok-alice-full")) as c:
+            assert {t.name for t in await c.list_tools()} == CORE
+
+
 # --------------------------------------------------------------------------- degradation
 
 
-async def test_research_outage_does_not_take_memory_or_skills_down(caplog):
+async def test_upstream_outage_does_not_take_memory_or_skills_down(tmp_path, caplog):
     # FastMCP's loggers do not propagate to root; attach caplog's handler directly so the
     # aggregate provider's "Error during list_tools" warnings are captured too.
     fastmcp_log = logging.getLogger("fastmcp")
     fastmcp_log.addHandler(caplog.handler)
     caplog.set_level(logging.DEBUG)
     try:
-        await _outage_scenario()
+        await _outage_scenario(tmp_path)
     finally:
         fastmcp_log.removeHandler(caplog.handler)
     assert "upstream" in caplog.text  # the outage was logged ...
-    for secret in ALL_SECRETS:  # ... without the keyed Firecrawl URL or any bearer
+    for secret in ALL_SECRETS:  # ... without the keyed wiki URL or any bearer
         assert secret not in caplog.text
 
 
-async def _outage_scenario() -> None:
+async def _outage_scenario(tmp_path: Path) -> None:
     async with AsyncExitStack() as stack:
-        s = await _start(stack, exa_slow=5.0, firecrawl_down=True)
+        s = await _start(stack, tmp_path, tracker_slow=5.0, wiki_down=True)
         async with s.client("tok-alice-full") as c:
             start = time.monotonic()
             names = {t.name for t in await c.list_tools()}
             elapsed = time.monotonic() - start
-            assert "recall" in names and "read_resource" in names
-            assert not any(n.startswith(("exa_", "firecrawl_")) for n in names)
+            assert names == CORE
             assert elapsed < 3.0, f"discovery not bounded: {elapsed:.1f}s"
             r = await c.call_tool("recall", {"query": "still here"})
             assert r.structured_content["caller"] == "dev-alice"
@@ -462,32 +562,31 @@ async def _outage_scenario() -> None:
 # --------------------------------------------------------------------------- surface
 
 
-async def test_tool_names_and_schemas_are_stable_and_preserved():
+async def test_tool_names_and_schemas_are_stable_and_preserved(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with Client(StreamableHttpTransport(s.gateway_url, auth="tok-alice-full")) as c:
             gw = {t.name: t for t in await c.list_tools()}
         # Memory tools keep their Synapse names (hooks match mcp__<server>__recall etc.);
-        # research tools are namespaced; the hidden plumbing tool stays hidden.
-        assert set(gw) == {
-            "recall",
-            "remember",
-            "full_only_note",
-            "broken",
-            "exa_web_search_exa",
-            "firecrawl_firecrawl_scrape",
-            "list_resources",
-            "read_resource",
-        }
-        upstream = {t.name: t for t in await _stub_synapse([]).list_tools()}
-        assert gw["recall"].inputSchema == upstream["recall"].to_mcp_tool().inputSchema
-        assert gw["recall"].outputSchema == upstream["recall"].to_mcp_tool().outputSchema
+        # configured upstreams are namespaced; the hidden plumbing tool stays hidden.
+        assert set(gw) == CORE | TRACKER_TOOLS | WIKI_TOOLS
+        upstream = {t.name: t.to_mcp_tool() for t in await _stub_synapse([]).list_tools()}
+        assert gw["recall"].inputSchema == upstream["recall"].inputSchema
+        assert gw["recall"].outputSchema == upstream["recall"].outputSchema
         assert gw["recall"].description == "Search memory."
+        tracker = {t.name: t.to_mcp_tool() for t in await _stub_tracker([]).list_tools()}
+        for name, tool in tracker.items():
+            mine = gw[f"tracker_{name}"]
+            assert (mine.inputSchema, mine.outputSchema, mine.description) == (
+                tool.inputSchema,
+                tool.outputSchema,
+                tool.description,
+            )
 
 
-async def test_upstream_tool_errors_pass_through():
+async def test_upstream_tool_errors_pass_through(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
             r = await c.call_tool("broken", {}, raise_on_error=False)
             assert r.is_error and "recall index offline" in _text(r)
@@ -495,14 +594,16 @@ async def test_upstream_tool_errors_pass_through():
                 "recall", {"limit": "not-a-number", "query": "q"}, raise_on_error=False
             )
             assert r.is_error
+            r = await c.call_tool("tracker_list_issues", {}, raise_on_error=False)
+            assert r.is_error  # upstream schema validation error, passed through
 
 
 # --------------------------------------------------------------------------- skills
 
 
-async def test_skill_resources_and_tools_bridge_end_to_end():
+async def test_skill_resources_and_tools_bridge_end_to_end(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
             uris = {str(r.uri) for r in await c.list_resources()}
             assert {"skill://demo-skill/SKILL.md", "skill://demo-skill/_manifest"} <= uris
@@ -527,52 +628,56 @@ async def test_skill_resources_and_tools_bridge_end_to_end():
                 == "print('hi')\n"
             )
 
+
+async def test_no_bundled_skill_or_workflow(tmp_path):
+    """The gateway ships no skill of its own: only Synapse's (and configured dirs')."""
+    async with AsyncExitStack() as stack:
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
-            research = _text(
-                await c.call_tool("read_resource", {"uri": "skill://gateway-research/SKILL.md"})
-            )
-            assert "name: gateway-research" in research
-            # The skill names only tool prefixes / memory names the gateway really serves.
-            names = {t.name for t in await c.list_tools()}
-            for prefix in ("exa_", "firecrawl_"):
-                assert f"`{prefix}*`" in research and any(n.startswith(prefix) for n in names)
-            assert "`recall`" in research and "recall" in names
+            skills = {
+                str(r.uri) for r in await c.list_resources() if str(r.uri).startswith("skill://")
+            }
+    assert skills == {"skill://demo-skill/SKILL.md", "skill://demo-skill/_manifest"}
 
 
-async def test_hidden_synapse_tools_are_not_reachable_by_name():
+async def test_hidden_synapse_tools_are_not_reachable_by_name(tmp_path):
     """A tool Synapse leaves out of tools/list (issue_machine_token) is not forwarded."""
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
             with pytest.raises(ToolError, match="Unknown tool"):
                 await c.call_tool("issue_machine_token", {})
 
 
-async def test_instructions_fit_claude_code_cap():
+async def test_instructions_describe_memory_services_and_skill_discovery(tmp_path):
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
             text = c.initialize_result.instructions or ""
-        assert "skill://gateway-research/SKILL.md" in text
-        assert len(text.encode()) <= 2048
+    assert "call recall" in text and "skill://<name>/SKILL.md" in text
+    assert "tracker_* (Project tracker: issues)" in text and "wiki_*" in text
+    assert "http" not in text  # namespaces and descriptions only, never URLs
+    assert len(text.encode()) <= 2048
 
 
-async def test_probe_reports_surface_without_printing_the_token(capsys):
+async def test_probe_reports_structure_without_printing_the_token(tmp_path, capsys):
     from mcp_gateway.probe import _probe
 
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
-        assert await _probe(s.gateway_url, "tok-alice-full", "gateway pilot") == 0
+        s = await _start(stack, tmp_path)
+        call = ("tracker_list_issues", {"project": "web"})
+        assert await _probe(s.gateway_url, "tok-alice-full", ["tracker", "wiki"], call) == 0
         full = capsys.readouterr().out
-        assert await _probe(s.gateway_url, "tok-bob-work", None) == 0
+        # A restricted device does not see the tracker; expecting it fails the probe.
+        assert await _probe(s.gateway_url, "tok-bob-work", ["tracker"], None) == 1
         work = capsys.readouterr().out
-    assert "tools[exa]: exa_web_search_exa" in full
-    assert "resources/read == read_resource tool: True" in full
-    assert "search via exa_web_search_exa (args: objective, query): ok" in full
-    assert "tools[exa]" not in work and "not served to this device" in work
-    assert "tools[memory+bridge]: broken, list_resources, read_resource, recall, remember" in work
-    assert "skill resources: 0" in work
-    assert not any(tok in full + work for tok in DEVICES)
+    assert "core tools: ok" in full and "namespace tracker: ok" in full
+    assert "tools[tracker]: 2" in full and "tools[wiki]: 1" in full
+    assert "skill read (native == read_resource tool): True" in full
+    assert "call tracker_list_issues: ok" in full
+    assert "namespace tracker: NOT LISTED" in work and "skill resources: 0" in work
+    assert "web-1" not in full  # results are sized, never printed
+    assert not any(tok in full + work for tok in (*DEVICES, TRACKER_SECRET, WIKI_SECRET))
 
 
 # --------------------------------------------------------------------------- hook compatibility
@@ -593,14 +698,14 @@ def _hook_patterns() -> list[str]:
     return pats
 
 
-async def test_existing_hooks_see_gateway_memory_tools_like_direct_ones():
+async def test_existing_hooks_see_gateway_memory_tools_like_direct_ones(tmp_path):
     """Session injection, the remember spool and the feedback nudge key on tool names.
     Through a gateway named anything, each hook must fire for exactly the memory tools it
     fires for on the plugin's own direct connection."""
     patterns = _hook_patterns()
     assert len(patterns) >= 7
     async with AsyncExitStack() as stack:
-        s = await _start(stack)
+        s = await _start(stack, tmp_path)
         async with s.client("tok-alice-full") as c:
             gateway = {t.name for t in await c.list_tools()}
     direct = {t.name for t in await _stub_synapse([]).list_tools()} - {"issue_machine_token"}

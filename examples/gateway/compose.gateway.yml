@@ -13,17 +13,13 @@ services:
       SYNAPSE_GATEWAY_HOST: 0.0.0.0
       SYNAPSE_GATEWAY_PORT: "8766"
       SYNAPSE_GATEWAY_SYNAPSE_URL: http://mcp-server:${MCP_PORT:-8765}
-      SYNAPSE_GATEWAY_RESEARCH_TRUST: full
       SYNAPSE_GATEWAY_SKILLS_TRUST: full
-      # Keyless research endpoints need only the URL.
-      SYNAPSE_GATEWAY_EXA_URL: ${SYNAPSE_GATEWAY_EXA_URL:-}
-      SYNAPSE_GATEWAY_FIRECRAWL_URL: ${SYNAPSE_GATEWAY_FIRECRAWL_URL:-}
-      # Keyed endpoints: uncomment the matching lines below and the `secrets` blocks.
-      # SYNAPSE_GATEWAY_EXA_AUTH_HEADER: ${SYNAPSE_GATEWAY_EXA_AUTH_HEADER:-}
-      # SYNAPSE_GATEWAY_EXA_API_KEY_FILE: /run/secrets/exa_api_key
-      # SYNAPSE_GATEWAY_FIRECRAWL_AUTH_HEADER: ${SYNAPSE_GATEWAY_FIRECRAWL_AUTH_HEADER:-}
-      # SYNAPSE_GATEWAY_FIRECRAWL_API_KEY_FILE: /run/secrets/firecrawl_api_key
-    # secrets: [exa_api_key, firecrawl_api_key]
+      # Optional registry of this deployment's own MCP services (see gateway.example.json).
+      # Unset = Synapse memory + skills only.
+      # SYNAPSE_GATEWAY_CONFIG_FILE: /config/gateway.json
+    # volumes:
+    #   - ./gateway-config:/config:ro          # gateway.json (+ any secret_file it names)
+    # secrets: [tracker_mcp_token]           # then use "secret_file": "/run/secrets/tracker_mcp_token"
     depends_on: [mcp-server]
     ports:
       # Loopback by default; publish wider only behind TLS.
@@ -35,7 +31,5 @@ services:
       retries: 3
 
 # secrets:
-#   exa_api_key:
-#     file: ${SYNAPSE_GATEWAY_SECRETS_DIR:-./secrets}/exa_api_key
-#   firecrawl_api_key:
-#     file: ${SYNAPSE_GATEWAY_SECRETS_DIR:-./secrets}/firecrawl_api_key
+#   tracker_mcp_token:
+#     file: ${SYNAPSE_GATEWAY_SECRETS_DIR:-./secrets}/tracker_mcp_token

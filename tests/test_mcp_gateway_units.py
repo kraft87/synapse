@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import httpx
@@ -26,17 +27,17 @@ from mcp_gateway.upstream import _guard
 
 P = "SYNAPSE_GATEWAY_"
 
-# --------------------------------------------------------------------------- config
+# --------------------------------------------------------------------------- core settings
 
 
-def test_defaults_enable_no_research_upstream():
+def test_defaults_are_synapse_only():
     s = load_settings({})
-    assert s.research == ()
+    assert s.registry.upstreams == () and s.registry.skills_dirs == ()
     assert s.synapse_mcp_url == "http://127.0.0.1:8765/mcp"
     assert s.whoami_url == "http://127.0.0.1:8765/auth/whoami"
-    assert s.research_trust == "full"
     assert s.skills_trust == "full"  # Synapse skills withheld from restricted devices by default
     assert (s.host, s.port) == ("127.0.0.1", 8766)
+    assert s.secrets() == []
 
 
 def test_synapse_url_may_be_given_with_mcp_suffix():
@@ -46,84 +47,166 @@ def test_synapse_url_may_be_given_with_mcp_suffix():
     )
 
 
-def test_keyless_upstream_needs_only_a_url():
-    (exa,) = load_settings({P + "EXA_URL": "https://exa.example/mcp"}).research
-    assert exa.url() == "https://exa.example/mcp" and exa.headers() == {}
-    assert load_settings({P + "EXA_URL": "https://exa.example/mcp"}).secrets() == []
-
-
-def test_url_keyed_upstream_substitutes_quoted_key():
-    s = load_settings(
-        {P + "FIRECRAWL_URL": "https://fc.example/{api_key}/mcp", P + "FIRECRAWL_API_KEY": "a/b c"}
-    )
-    (fc,) = s.research
-    assert fc.url() == "https://fc.example/a%2Fb%20c/mcp"
-    assert fc.headers() == {}
-    assert "a/b" not in repr(fc) and fc.display_url == "https://fc.example/…"
-
-
-def test_header_keyed_upstream_and_authorization_bearer():
-    s = load_settings(
-        {
-            P + "EXA_URL": "https://exa.example/mcp",
-            P + "EXA_API_KEY": "k1",
-            P + "EXA_AUTH_HEADER": "x-api-key",
-            P + "FIRECRAWL_URL": "https://fc.example/mcp",
-            P + "FIRECRAWL_API_KEY": "k2",
-            P + "FIRECRAWL_AUTH_HEADER": "Authorization",
-        }
-    )
-    exa, fc = s.research
-    assert exa.headers() == {"x-api-key": "k1"} and exa.url() == "https://exa.example/mcp"
-    assert fc.headers() == {"Authorization": "Bearer k2"}
-    assert s.secrets() == ["k1", "k2"]
-
-
-def test_secret_file(tmp_path):
-    f = tmp_path / "exa.key"
-    f.write_text("from-file\n")
-    s = load_settings(
-        {P + "EXA_URL": "https://e.example/mcp?k={api_key}", P + "EXA_API_KEY_FILE": str(f)}
-    )
-    assert s.research[0].url() == "https://e.example/mcp?k=from-file"
-
-
 @pytest.mark.parametrize(
     "env, match",
     [
-        ({P + "EXA_URL": "https://e/mcp", P + "EXA_API_KEY": "k"}, "never be sent"),
-        ({P + "EXA_URL": "https://e/{api_key}"}, "required"),
-        (
-            {
-                P + "EXA_URL": "https://e/{api_key}",
-                P + "EXA_API_KEY": "k",
-                P + "EXA_AUTH_HEADER": "x",
-            },
-            "not both",
-        ),
-        ({P + "EXA_URL": "ftp://e"}, "http"),
-        (
-            {
-                P + "EXA_URL": "https://e/{api_key}",
-                P + "EXA_API_KEY": "k",
-                P + "EXA_API_KEY_FILE": "/x",
-            },
-            "only one",
-        ),
-        ({P + "RESEARCH_TRUST": "everyone"}, "RESEARCH_TRUST"),
         ({P + "SKILLS_TRUST": "anyone"}, "SKILLS_TRUST"),
-        ({P + "DISCOVERY_TIMEOUT": "-1"}, ">= 0"),
+        ({P + "AUTH_CACHE_TTL": "-1"}, ">= 0"),
+        ({P + "SYNAPSE_URL": "ftp://syn"}, "http"),
+        ({P + "PORT": "eighty"}, "PORT"),
     ],
 )
-def test_invalid_config_is_refused_at_startup(env, match):
+def test_invalid_core_settings_are_refused(env, match):
     with pytest.raises(ConfigError, match=match):
         load_settings(env)
 
 
-def test_config_errors_never_echo_the_key():
+# --------------------------------------------------------------------------- registry
+
+SECRET = "s3cr3t-value-that-must-never-appear"
+
+
+def _load(tmp_path, registry, env=None):
+    cfg = tmp_path / "gateway.json"
+    cfg.write_text(registry if isinstance(registry, str) else json.dumps(registry))
+    return load_settings({P + "CONFIG_FILE": str(cfg), **(env or {})})
+
+
+def _up(**over):
+    return {"namespace": "tracker", "url": "https://tracker.example/mcp", **over}
+
+
+def test_registry_auth_shapes(tmp_path):
+    (tmp_path / "docs.key").write_text("from-file\n")
+    s = _load(
+        tmp_path,
+        {
+            "upstreams": [
+                _up(auth={"type": "bearer", "secret_env": "TRACKER_TOKEN"}, min_trust="full"),
+                {
+                    "namespace": "docs-search",
+                    "url": "https://docs.example/mcp",
+                    "auth": {"type": "header", "header": "X-Api-Key", "secret_file": "docs.key"},
+                    "min_trust": "restricted",
+                    "discovery_timeout": 2,
+                    "description": "Team docs",
+                },
+                {
+                    "namespace": "files",
+                    "url": "https://files.example/{secret}/mcp",
+                    "auth": {"type": "url", "secret_env": "FILES_KEY"},
+                },
+                {"namespace": "status", "url": "http://status.internal:9000/mcp"},
+            ]
+        },
+        {"TRACKER_TOKEN": "t1", "FILES_KEY": "a/b c"},
+    )
+    tracker, docs, files, status = s.registry.upstreams
+    assert tracker.headers() == {"Authorization": "Bearer t1"} and tracker.min_trust == "full"
+    assert docs.headers() == {"X-Api-Key": "from-file"} and docs.min_trust == "restricted"
+    assert docs.discovery_timeout == 2.0 and docs.description == "Team docs"
+    assert files.url() == "https://files.example/a%2Fb%20c/mcp" and files.headers() == {}
+    assert files.display_url == "https://files.example/…" and "a/b" not in repr(files)
+    assert status.auth_type == "none" and status.headers() == {} and status.min_trust == "full"
+    assert sorted(s.secrets()) == ["a/b c", "from-file", "t1"]
+
+
+def test_registry_skills_dirs_resolve_relative_to_the_file(tmp_path):
+    (tmp_path / "team").mkdir()
+    s = _load(tmp_path, {"skills_dirs": [{"path": "team", "min_trust": "restricted"}]})
+    (d,) = s.registry.skills_dirs
+    assert d.path == (tmp_path / "team").resolve() and d.min_trust == "restricted"
+
+
+@pytest.mark.parametrize(
+    "registry, match",
+    [
+        ({"upstreams": [_up(), _up()]}, "duplicate namespace"),
+        ({"upstreams": [_up(namespace="recall")]}, "reserved"),
+        ({"upstreams": [_up(namespace="synapse")]}, "reserved"),
+        ({"upstreams": [_up(namespace="list")]}, "reserved"),
+        ({"upstreams": [_up(namespace="Tracker")]}, "namespace must be"),
+        ({"upstreams": [_up(namespace="my_tracker")]}, "namespace must be"),
+        ({"upstreams": [_up(namespace="../x")]}, "namespace must be"),
+        ({"upstreams": [_up(namespace="")]}, "namespace must be"),
+        ({"upstreams": [_up(namespace="a" * 33)]}, "namespace must be"),
+        ({"upstreams": [_up(namespace="-x")]}, "namespace must be"),
+        ({"upstreams": [_up(url="ftp://tracker.example/mcp")]}, "http"),
+        ({"upstreams": [_up(url="stdio:tracker")]}, "http"),
+        ({"upstreams": [_up(url="https://u:p@tracker.example/mcp")]}, "must not embed"),
+        ({"upstreams": [_up(url="https://t.example/{secret}")]}, "placeholder"),
+        ({"upstreams": [_up(auth={"type": "url", "secret_env": "K"})]}, "placeholder"),
+        ({"upstreams": [_up(auth={"type": "oauth"})]}, "auth.type"),
+        ({"upstreams": [_up(auth={"type": "bearer"})]}, "exactly one"),
+        (
+            {"upstreams": [_up(auth={"type": "bearer", "secret_env": "K", "secret_file": "f"})]},
+            "exactly one",
+        ),
+        ({"upstreams": [_up(auth={"type": "bearer", "secret_env": "UNSET_VAR_X"})]}, "unset"),
+        (
+            {"upstreams": [_up(auth={"type": "bearer", "secret_file": "missing.key"})]},
+            "cannot read",
+        ),
+        ({"upstreams": [_up(auth={"type": "header", "secret_env": "K"})]}, "header name"),
+        (
+            {"upstreams": [_up(auth={"type": "header", "header": "Host", "secret_env": "K"})]},
+            "not allowed",
+        ),
+        (
+            {"upstreams": [_up(auth={"type": "bearer", "header": "X", "secret_env": "K"})]},
+            "only applies",
+        ),
+        ({"upstreams": [_up(min_trust="everyone")]}, "min_trust"),
+        # An inline credential next to a valid reference must not ride along silently.
+        (
+            {"upstreams": [_up(auth={"type": "bearer", "secret_env": "K", "token": "inline"})]},
+            "unknown key",
+        ),
+        ({"upstreams": [_up(call_timeout=-1)]}, "non-negative"),
+        ({"upstreams": [_up(call_timeout=True)]}, "non-negative"),
+        ({"upstreams": [_up(cache="big")]}, "unknown key"),
+        ({"upstreams": "tracker"}, "must be lists"),
+        ({"skills_dirs": [{"path": "nope"}]}, "not a directory"),
+        ({"extra": 1}, "unknown key"),
+        ([], "JSON object"),
+    ],
+)
+def test_malformed_registry_is_refused_at_startup(tmp_path, registry, match):
+    with pytest.raises(ConfigError, match=match):
+        _load(tmp_path, registry, {"K": "v"})
+
+
+@pytest.mark.parametrize(
+    "registry",
+    [
+        # An inline credential — in an unknown field or where a reference belongs — is refused
+        # and never echoed back.
+        {"upstreams": [_up(auth={"type": "bearer", "token": SECRET})]},
+        {"upstreams": [_up(auth={"type": "bearer", "secret_env": SECRET})]},
+        {"upstreams": [_up(api_key=SECRET)]},
+        {"upstreams": [_up(url=f"https://user:{SECRET}@t.example/mcp")]},
+        {"upstreams": [_up(namespace=SECRET)]},
+        {"upstreams": [_up(description=SECRET * 10)]},
+        f'{{"upstreams": [{{"namespace": "{SECRET}", }}]}}',  # malformed JSON quoting it
+    ],
+)
+def test_registry_errors_never_echo_values(tmp_path, registry):
     with pytest.raises(ConfigError) as e:
-        load_settings({P + "EXA_URL": "https://e/mcp", P + "EXA_API_KEY": "super-secret-value"})
-    assert "super-secret-value" not in str(e.value)
+        _load(tmp_path, registry)
+    assert SECRET not in str(e.value)
+
+
+def test_registry_secret_values_never_in_errors(tmp_path):
+    (tmp_path / "k").write_text(SECRET)
+    bad = {"upstreams": [_up(auth={"type": "header", "header": "Cookie", "secret_file": "k"})]}
+    with pytest.raises(ConfigError) as e:
+        _load(tmp_path, bad, {"TRACKER_TOKEN": SECRET})
+    assert SECRET not in str(e.value)
+
+
+def test_missing_or_unreadable_registry_file_is_refused(tmp_path):
+    with pytest.raises(ConfigError, match="cannot read registry"):
+        load_settings({P + "CONFIG_FILE": str(tmp_path / "absent.json")})
 
 
 def test_redact_url_keeps_only_origin():
@@ -163,7 +246,7 @@ def test_log_redaction_covers_messages_and_tracebacks(monkeypatch):
     try:
         install_log_redaction(["topsecret"])
         try:
-            raise RuntimeError("GET https://fc.example/topsecret/mcp failed")
+            raise RuntimeError("GET https://files.example/topsecret/mcp failed")
         except RuntimeError:
             log.exception("upstream said %s", "topsecret")
         log.warning("clean %s", "args")
@@ -182,25 +265,25 @@ async def _fail(exc: BaseException):
 
 
 async def test_guard_hides_transport_errors_that_quote_keyed_urls():
-    req = httpx.Request("POST", "https://fc.example/fc-KEY/mcp")
+    req = httpx.Request("POST", "https://files.example/fc-KEY/mcp")
     err = httpx.HTTPStatusError(
-        "Server error for url 'https://fc.example/fc-KEY/mcp'",
+        "Server error for url 'https://files.example/fc-KEY/mcp'",
         request=req,
         response=httpx.Response(500, request=req),
     )
     with pytest.raises(ToolError) as e:
-        await _guard("firecrawl", _fail(err), ToolError)
+        await _guard("wiki", _fail(err), ToolError)
     assert "fc-KEY" not in str(e.value) and "HTTP 500" in str(e.value)
     assert e.value.__suppress_context__
 
-    with pytest.raises(ToolError, match="firecrawl upstream request failed \\(ConnectError\\)"):
-        await _guard("firecrawl", _fail(httpx.ConnectError("https://fc.example/fc-KEY")), ToolError)
+    with pytest.raises(ToolError, match="wiki upstream request failed \\(ConnectError\\)"):
+        await _guard("wiki", _fail(httpx.ConnectError("https://files.example/fc-KEY")), ToolError)
 
 
 async def test_guard_passes_upstream_protocol_errors_verbatim():
     with pytest.raises(ToolError, match=r"^Invalid params: query$"):
         await _guard(
-            "exa",
+            "tracker",
             _fail(McpError(ErrorData(code=-32602, message="Invalid params: query"))),
             ToolError,
         )
@@ -268,13 +351,13 @@ def test_whoami_without_machine_token_is_unavailable_not_open(whoami):
 async def test_guard_describes_wrapped_and_timeout_failures():
     try:
         try:
-            raise httpx.ConnectError("https://fc.example/fc-KEY")
+            raise httpx.ConnectError("https://files.example/fc-KEY")
         except httpx.ConnectError as inner:
             raise RuntimeError("Client failed to connect") from inner
     except RuntimeError as wrapped:
         err = wrapped
     with pytest.raises(ToolError, match=r"request failed \(ConnectError\)$"):
-        await _guard("firecrawl", _fail(err), ToolError)
+        await _guard("wiki", _fail(err), ToolError)
     try:
         try:
             raise asyncio.CancelledError()
@@ -283,8 +366,8 @@ async def test_guard_describes_wrapped_and_timeout_failures():
     except TimeoutError as t:
         timeout_err = t
     timeout_err.__context__ = asyncio.CancelledError()
-    with pytest.raises(ToolError, match="exa upstream timed out"):
-        await _guard("exa", _fail(timeout_err), ToolError)
+    with pytest.raises(ToolError, match="tracker upstream timed out"):
+        await _guard("tracker", _fail(timeout_err), ToolError)
 
 
 # --------------------------------------------------------------------------- provider cache
@@ -372,28 +455,23 @@ async def test_provider_withholds_a_denied_kind_without_upstream_io(monkeypatch)
     assert fetched == ["tools"]
 
 
-def test_probe_search_fills_required_args_and_falls_back_between_providers():
-    from types import SimpleNamespace
+def test_probe_call_arguments_must_be_an_explicit_json_object(monkeypatch, capsys):
+    import mcp_gateway.probe as probe
 
-    from mcp_gateway.probe import _search_call
+    called = []
 
-    def tool(props, required):
-        return SimpleNamespace(inputSchema={"properties": props, "required": required})
+    async def fake(*a, **k):
+        called.append(a)
+        return 0
 
-    exa = tool(
-        {"query": {"type": "string"}, "objective": {"type": "string"}}, ["query", "objective"]
-    )
-    fc = tool({"query": {"type": "string"}, "limit": {"type": "integer"}}, ["query"])
-    odd = tool({"query": {"type": "string"}, "n": {"type": "integer"}}, ["query", "n"])
-    assert _search_call({"exa_web_search_exa": exa, "firecrawl_firecrawl_search": fc}, "q") == (
-        "exa_web_search_exa",
-        {"query": "q", "objective": "q"},
-    )
-    assert _search_call({"firecrawl_firecrawl_search": fc, "recall": fc}, "q") == (
-        "firecrawl_firecrawl_search",
-        {"query": "q"},
-    )
-    assert _search_call({"exa_search_odd": odd}, "q") is None
+    monkeypatch.setattr(probe, "_probe", fake)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", "device-token")
+    assert probe.main(["--call", "tracker_list_issues", "--args", "[1]"]) == 2
+    assert probe.main(["--call", "tracker_list_issues", "--args", "not json"]) == 2
+    assert not called
+    assert probe.main(["--call", "tracker_list_issues", "--args", '{"project": "web"}']) == 0
+    assert called[0][3] == ("tracker_list_issues", {"project": "web"})
+    assert "device-token" not in capsys.readouterr().err
 
 
 def test_probe_explains_a_refused_credential(monkeypatch, capsys):
@@ -411,3 +489,18 @@ def test_probe_explains_a_refused_credential(monkeypatch, capsys):
     assert probe.main([]) == 3
     err = capsys.readouterr().err
     assert "only approved Synapse DEVICE tokens" in err and "root-like-token" not in err
+
+
+def test_shipped_example_registry_is_valid(tmp_path):
+    """examples/gateway/gateway.example.json must stay loadable: only its secret references
+    are swapped for test ones (a secret file here, the env var it names)."""
+    from pathlib import Path
+
+    example = Path(__file__).resolve().parents[1] / "examples/gateway/gateway.example.json"
+    data = json.loads(example.read_text())
+    (tmp_path / "wiki.key").write_text("k")
+    for up in data["upstreams"]:
+        if "secret_file" in up.get("auth", {}):
+            up["auth"]["secret_file"] = "wiki.key"
+    s = _load(tmp_path, data, {"TRACKER_MCP_TOKEN": "t"})
+    assert [u.namespace for u in s.registry.upstreams] == ["tracker", "wiki"]

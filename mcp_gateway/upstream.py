@@ -5,20 +5,21 @@ pass upstream results — schemas, structured content, ``isError`` — through u
 deliberately does NOT use ``ProxyProvider``/``ProxyClient``/``create_proxy`` as shipped:
 
 * ``ProxyClient`` turns on ``forward_incoming_headers``, relaying the caller's
-  ``Authorization`` (and most other inbound headers) to the upstream. For a third-party
-  research server that would hand it the caller's Synapse device token.
+  ``Authorization`` (and most other inbound headers) to the upstream, handing a
+  third-party server the caller's Synapse device token.
 * ``ProxyProvider`` keeps one component cache for every session and identity, and its
   ``_get_*`` read that shared cache right after a refresh another identity may have won.
 
 So each upstream here gets an explicit client factory (auth chosen per upstream, header
 forwarding off) and a cache keyed by an identity function: the caller's token hash for
-Synapse, a constant for research servers that only ever see the gateway's own key.
+Synapse, a constant for configured upstreams, which only ever see the deployment's own
+credential.
 
 Discovery is bounded: every listing runs under ``discovery_timeout``; a failed listing
 falls back to the last good snapshot (at most an hour old), and otherwise the upstream
-sits out for ``failure_backoff`` seconds so a dead research server cannot slow every request. Failures
-surface as :class:`UpstreamUnavailable`, which FastMCP's aggregate provider logs and skips —
-memory and skills keep working while Exa or Firecrawl are down.
+sits out for ``failure_backoff`` seconds so a dead upstream cannot slow every request.
+Failures surface as :class:`UpstreamUnavailable`, which FastMCP's aggregate provider logs and skips —
+memory and skills keep working while a configured upstream is down.
 """
 
 from __future__ import annotations

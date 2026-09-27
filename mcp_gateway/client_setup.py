@@ -1,20 +1,23 @@
-"""Reversible client bootstrap for the gateway pilot (Claude Code and Codex).
+"""Reversible client bootstrap for the gateway (Claude Code and Codex).
 
     python -m mcp_gateway.client_setup snippets --gateway-url http://127.0.0.1:8766
     python -m mcp_gateway.client_setup install-bootstrap --client claude|codex [--dry-run]
     python -m mcp_gateway.client_setup remove-bootstrap  --client claude|codex [--dry-run]
 
 ``snippets`` only PRINTS client configuration; it never edits a client config. The
-bootstrap commands write/remove one pointer skill (``synapse-gateway-research``) whose
-only job is to make the client fetch the gateway-served workflow at
-``skill://gateway-research/SKILL.md`` — so both clients follow the same, single copy.
+bootstrap commands write/remove one small local skill, ``synapse-gateway``, whose only job
+is to make the client discover the user's published skills on the gateway
+(``skill://<name>/SKILL.md``) and load the one that fits a task. It names no workflow,
+tool or service of its own.
+
 Ownership is by exact content: a folder counts as ours only if it holds nothing but a
 SKILL.md byte-identical to a version this tool generated. Any user edit — even one that
-keeps the marker line — makes install and remove leave the folder alone.
+keeps the marker line — makes install and remove leave the folder alone. Installing also
+retires this tool's earlier pointer (``synapse-gateway-research``) under the same rule.
 
 With Synapse's opt-in two-way skills sync on (``SYNAPSE_SKILLS_SYNC=1``) an installed
 pointer is published like any local skill and reaches the user's other machines. It is
-inert where the gateway is not connected (it says so and stops).
+inert where the gateway is not connected (it says so and carries on).
 """
 
 from __future__ import annotations
@@ -27,27 +30,30 @@ import shlex
 import sys
 from pathlib import Path
 
-STUB_NAME = "synapse-gateway-research"
+STUB_NAME = "synapse-gateway"
 MARKER = "<!-- installed-by: mcp_gateway.client_setup -->"
 _REPO = Path(__file__).resolve().parents[1]
 
 STUB = f"""---
 name: {STUB_NAME}
-description: Web research through the Synapse MCP gateway. Use when the user asks to research, look up, compare, or verify something on the web and the synapse-gateway MCP server is connected.
+description: Find and use the user's own published workflows through the Synapse MCP gateway. Use when a task may match a procedure, checklist or workflow the user keeps as a skill, or when the user refers to their skills, and the synapse-gateway MCP server is connected.
 ---
 {MARKER}
-# Research via the Synapse gateway
+# Skills via the Synapse gateway
 
-This skill is a pointer; the workflow itself is served by the gateway so every client
-follows the same copy.
+The user's published skills are MCP resources on the `synapse-gateway` server.
 
-1. Read the MCP resource `skill://gateway-research/SKILL.md` from the `synapse-gateway`
-   server — with your client's MCP resource reader, or by calling that server's
-   `read_resource` tool with the URI.
-2. Follow it.
+1. List that server's resources (your client's MCP resource list, or its `list_resources`
+   tool) and scan the `skill://<name>/SKILL.md` entries and their descriptions.
+2. If one fits the task, read its SKILL.md (resource reader, or `read_resource` with the
+   URI) and follow it. Its other files are listed at `skill://<name>/_manifest`.
+3. Tools a skill mentions come from the same server: Synapse memory tools under their own
+   names, other services this deployment configured as `<namespace>_<tool>`. Use the names
+   and input schemas the server's tool list shows.
 
-If the synapse-gateway server is not connected, or the resource is not available to this
-device, say so and stop; do not improvise a substitute workflow.
+Reading a skill's script does not run it; only a skill materialized into a local skills
+folder can run scripts. If nothing fits, or the server is not connected or serves no skills
+to this device, say so if relevant and carry on without it.
 """
 
 
@@ -55,9 +61,17 @@ def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-#: Every SKILL.md this tool has ever generated. When STUB changes, add the old digest here
-#: so an untouched older install still upgrades/removes, while any edited copy is kept.
+#: Every SKILL.md this tool has ever generated for the CURRENT name. When STUB changes, add
+#: the old digest here so an untouched older install still upgrades/removes.
 _GENERATED = frozenset({_sha(STUB)})
+
+#: Earlier pointer names this tool generated, with the exact digests it wrote. Only a
+#: byte-identical copy is ever removed; an edited one is the user's.
+_LEGACY: dict[str, frozenset[str]] = {
+    "synapse-gateway-research": frozenset(
+        {"7ccbd41ad6f62013839d0057fe91ca47a58909964dfdbf916556ad7c96e6873e"}
+    ),
+}
 
 
 def _default_dir(client: str) -> Path:
@@ -69,31 +83,43 @@ def _default_dir(client: str) -> Path:
 
 def install_bootstrap(skills_dir: Path, dry_run: bool) -> int:
     target = skills_dir / STUB_NAME / "SKILL.md"
-    if target.parent.exists():
-        if not _is_ours(target.parent):
-            print(
-                f"bootstrap: {target.parent} exists and is not an unmodified copy from this "
-                "tool; left unchanged"
-            )
-            return 1
-        if target.read_text(encoding="utf-8") == STUB:
-            print(f"bootstrap: already installed at {target}")
-            return 0
-    if dry_run:
+    if target.parent.exists() and not _is_ours(target.parent, _GENERATED):
+        print(
+            f"bootstrap: {target.parent} exists and is not an unmodified copy from this "
+            "tool; left unchanged"
+        )
+        return 1
+    if target.exists() and target.read_text(encoding="utf-8") == STUB:
+        print(f"bootstrap: already installed at {target}")
+    elif dry_run:
         print(f"bootstrap: would write {target}")
-        return 0
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(STUB, encoding="utf-8")
-    print(f"bootstrap: wrote {target}")
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(STUB, encoding="utf-8")
+        print(f"bootstrap: wrote {target}")
+    _retire_legacy(skills_dir, dry_run)
     return 0
 
 
 def remove_bootstrap(skills_dir: Path, dry_run: bool) -> int:
-    folder = skills_dir / STUB_NAME
+    rc = _remove(skills_dir / STUB_NAME, _GENERATED, dry_run)
+    return max(rc, _retire_legacy(skills_dir, dry_run))
+
+
+def _retire_legacy(skills_dir: Path, dry_run: bool) -> int:
+    rc = 0
+    for name, digests in _LEGACY.items():
+        folder = skills_dir / name
+        if folder.exists():
+            rc = max(rc, _remove(folder, digests, dry_run))
+    return rc
+
+
+def _remove(folder: Path, digests: frozenset[str], dry_run: bool) -> int:
     if not folder.exists():
         print(f"bootstrap: nothing at {folder}")
         return 0
-    if not _is_ours(folder):
+    if not _is_ours(folder, digests):
         print(f"bootstrap: {folder} is not an unmodified copy from this tool; left unchanged")
         return 1
     if dry_run:
@@ -105,11 +131,11 @@ def remove_bootstrap(skills_dir: Path, dry_run: bool) -> int:
     return 0
 
 
-def _is_ours(folder: Path) -> bool:
+def _is_ours(folder: Path, digests: frozenset[str]) -> bool:
     md = folder / "SKILL.md"
     try:
         entries = {p.name for p in folder.iterdir()}
-        return entries == {"SKILL.md"} and _sha(md.read_text(encoding="utf-8")) in _GENERATED
+        return entries == {"SKILL.md"} and _sha(md.read_text(encoding="utf-8")) in digests
     except OSError:
         return False
 

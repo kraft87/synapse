@@ -8,7 +8,8 @@ presenting the caller's OWN bearer to Synapse's ``GET /auth/whoami``; Synapse's 
   disagree with Synapse about who a caller is;
 * every Synapse MCP call is still re-authenticated upstream with that same bearer, so a
   revoked device loses memory access on its very next call regardless of the short
-  identity cache below (which only bounds how long research access can outlive it);
+  identity cache below (which only bounds how long access to configured upstreams can
+  outlive it);
 * only APPROVED DEVICE tokens are admitted. The root/enrollment token identifies a
   deployment rather than a device, and the gateway has no business relaying it.
 

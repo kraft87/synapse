@@ -1,23 +1,24 @@
-"""Assemble the gateway server: Synapse + optional research upstreams behind one /mcp.
+"""Assemble the gateway: Synapse memory + skills, plus the deployment's own MCP upstreams.
 
-Public surface (stable; clients, hooks and the research skill depend on it):
+Public surface (stable; clients and the Synapse plugins' hooks depend on it):
 
 * Synapse's own tools under their OWN names (``recall``, ``fetch``, ``remember``, …),
-  called with the CALLER's device bearer. Unprefixed on purpose: the Synapse plugins' hooks
-  match ``mcp__<any server>__recall`` etc., so the gateway must not rename them.
-* ``exa_<tool>`` / ``firecrawl_<tool>`` — research tools, called with the gateway's
-  research configuration, listed only to callers whose trust meets ``RESEARCH_TRUST``.
+  called with the CALLER's device bearer. Unprefixed on purpose: the plugins' hooks match
+  ``mcp__<any server>__recall`` etc., so the gateway must not rename them.
+* ``<namespace>_<tool>`` for each upstream in the deployment's registry
+  (:mod:`mcp_gateway.registry`), called with that upstream's own configured credential and
+  listed only to callers meeting its ``min_trust``. None by default.
 * ``list_resources`` / ``read_resource`` — FastMCP's ResourcesAsTools bridge for clients
   that cannot read MCP resources. It routes through this server's normal resource path,
   so a bridged read is authorized exactly like ``resources/read``.
-* ``skill://…`` resources — Synapse's canonical PG skills (URIs unchanged; callers meeting
-  ``SKILLS_TRUST`` only), plus the bundled ``skill://gateway-research/…`` pilot skill.
+* ``skill://…`` resources — Synapse's canonical skills (URIs unchanged; callers meeting
+  ``SKILLS_TRUST`` only), plus any skill directories the registry adds.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
+from functools import partial
 
 from fastmcp import FastMCP
 from fastmcp.server.providers.skills import SkillsDirectoryProvider
@@ -33,18 +34,14 @@ from mcp_gateway.caller import (
     identity_key,
     trust_allows,
 )
-from mcp_gateway.config import (
-    GatewaySettings,
-    install_log_redaction,
-    load_settings,
-    redact_url,
-)
+from mcp_gateway.config import GatewaySettings, install_log_redaction, load_settings, redact_url
+from mcp_gateway.registry import Upstream
 from mcp_gateway.upstream import GatedProvider, UpstreamProvider, http_client_factory
 
 logger = logging.getLogger(__name__)
 
-SKILLS_DIR = Path(__file__).resolve().parent / "skills"
-RESEARCH_SKILL = "gateway-research"
+#: Claude Code keeps at most this much of a server's instructions.
+INSTRUCTIONS_CAP = 2048
 
 
 def _authenticated() -> bool:
@@ -53,19 +50,62 @@ def _authenticated() -> bool:
 
 
 def _instructions(settings: GatewaySettings) -> str:
-    research = ", ".join(f"{u.name}_*" for u in settings.research) or "none configured"
-    return (
-        "Gateway to the user's Synapse memory plus web-research tools, over one connection. "
-        "Memory: BEFORE answering anything that references past work — a prior decision, "
-        "device, project, person or preference — call recall first; fetch expands ids from "
-        "its results; when the user states a durable fact or correction, call remember. "
-        "Research tools: " + research + " (listed only where this device may use them; use "
-        "the names and input schemas tools/list returns). Skills are MCP resources at "
-        "skill://<name>/SKILL.md (file list: skill://<name>/_manifest); read them with your "
-        "client's MCP resource reader or the read_resource / list_resources tools. For web "
-        "research read skill://" + RESEARCH_SKILL + "/SKILL.md. Reading a bundled script "
-        "does not run it; scripts run only from a skill materialized locally."
+    memory = (
+        "One connection to the user's Synapse memory, their published skills, and any MCP "
+        "services this deployment adds. Memory: BEFORE answering anything that references "
+        "past work — a prior decision, device, project, person or preference — call recall "
+        "first; fetch expands ids from its results; when the user states a durable fact or "
+        "correction, call remember. "
     )
+    skills = (
+        "Skills: the user's published workflows are MCP resources at skill://<name>/SKILL.md "
+        "(file list: skill://<name>/_manifest). When a task may match one, list resources "
+        "(your client's resource list, or the list_resources tool), read the SKILL.md whose "
+        "description fits, and follow it; read_resource reads any listed URI. Reading a "
+        "bundled script does not run it; scripts run only from a skill materialized locally."
+    )
+    ups = settings.registry.upstreams
+    if not ups:
+        return memory + skills
+
+    def services(with_descriptions: bool) -> str:
+        parts = [
+            f"{u.namespace}_*"
+            + (f" ({u.description})" if with_descriptions and u.description else "")
+            for u in ups
+        ]
+        return (
+            "Other tools come from services this deployment configured, prefixed by namespace: "
+            + "; ".join(parts)
+            + ". Each is listed only where this device may use it; use the names and input "
+            "schemas tools/list returns. "
+        )
+
+    text = memory + services(True) + skills
+    if len(text.encode()) > INSTRUCTIONS_CAP:
+        text = memory + services(False) + skills
+    return text
+
+
+def _upstream_provider(up: Upstream) -> UpstreamProvider:
+    provider = UpstreamProvider(
+        up.namespace,
+        http_client_factory(
+            up.url(),
+            headers=up.headers,
+            timeout=up.call_timeout,
+            init_timeout=up.discovery_timeout,
+        ),
+        # The upstream's credential is the deployment's, identical for every caller, so its
+        # component listing is shared. Access is still decided per caller by `allow`.
+        identity=lambda: "shared",
+        allow=lambda kind: trust_allows(up.min_trust),
+        cache_ttl=up.cache_ttl,
+        discovery_timeout=up.discovery_timeout,
+        failure_backoff=up.failure_backoff,
+    )
+    provider.add_transform(Namespace(up.namespace))
+    return provider
 
 
 def build_gateway(settings: GatewaySettings) -> FastMCP:
@@ -79,9 +119,6 @@ def build_gateway(settings: GatewaySettings) -> FastMCP:
         base_url=settings.public_url or None,
     )
     mcp = FastMCP("synapse-gateway", instructions=_instructions(settings), auth=auth)
-
-    def research_allowed() -> bool:
-        return trust_allows(settings.research_trust)
 
     def synapse_allowed(kind: str) -> bool:
         # Memory tools: every approved device (Synapse scopes the data per bearer).
@@ -109,30 +146,23 @@ def build_gateway(settings: GatewaySettings) -> FastMCP:
     )
     mcp.add_provider(synapse)
 
-    for up in settings.research:
-        provider = UpstreamProvider(
-            up.name,
-            http_client_factory(
-                up.url(),
-                headers=up.headers,
-                timeout=up.call_timeout,
-                init_timeout=up.discovery_timeout,
-            ),
-            # Research credentials are the gateway's, identical for every caller, so the
-            # component listing is shared. Access is still decided per caller by `allow`.
-            identity=lambda: "shared",
-            allow=lambda kind: research_allowed(),
-            cache_ttl=settings.research_cache_ttl,
-            discovery_timeout=up.discovery_timeout,
-            failure_backoff=settings.failure_backoff,
+    for up in settings.registry.upstreams:
+        mcp.add_provider(_upstream_provider(up))
+        logger.info(
+            "upstream %s -> %s (auth %s, min trust %s)",
+            up.namespace,
+            up.display_url,
+            up.auth_type,
+            up.min_trust,
         )
-        provider.add_transform(Namespace(up.name))
-        mcp.add_provider(provider)
-        logger.info("research upstream %s -> %s", up.name, up.display_url)
 
-    if settings.local_skills:
+    for i, skills_dir in enumerate(settings.registry.skills_dirs):
         mcp.add_provider(
-            GatedProvider(SkillsDirectoryProvider(SKILLS_DIR), research_allowed, "local-skills")
+            GatedProvider(
+                SkillsDirectoryProvider(skills_dir.path),
+                partial(trust_allows, skills_dir.min_trust),
+                f"skills-dir-{i}",
+            )
         )
 
     mcp.add_transform(ResourcesAsTools(mcp))
@@ -150,13 +180,12 @@ def main() -> None:
     settings = load_settings()
     mcp = build_gateway(settings)
     logger.info(
-        "synapse-gateway on %s:%d -> synapse %s (research: %s; research trust: %s; "
-        "skills trust: %s)",
+        "synapse-gateway on %s:%d -> synapse %s (upstreams: %s; skills dirs: %d; skills trust: %s)",
         settings.host,
         settings.port,
         redact_url(settings.synapse_url),
-        ", ".join(u.name for u in settings.research) or "none",
-        settings.research_trust,
+        ", ".join(u.namespace for u in settings.registry.upstreams) or "none",
+        len(settings.registry.skills_dirs),
         settings.skills_trust,
     )
     mcp.run(

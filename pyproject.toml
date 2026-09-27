@@ -31,7 +31,7 @@ dependencies = [
 # On PATH inside the image (/app/.venv/bin), which is what makes the first-device
 # bootstrap one command: `docker compose exec mcp-server synapse-admin bootstrap "<label>"`.
 synapse-admin = "ingestion.surface_admin:main"
-# The MCP gateway pilot (docs/gateway.md): Synapse + research upstreams behind one /mcp.
+# The MCP gateway pilot (docs/gateway.md): Synapse + configured MCP services behind one /mcp.
 synapse-gateway = "mcp_gateway.app:main"
 
 [project.optional-dependencies]

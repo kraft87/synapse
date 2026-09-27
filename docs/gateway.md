@@ -1,34 +1,96 @@
 # MCP gateway (pilot)
 
-One MCP connection that gives Claude Code and Codex the same Synapse memory, the same
-`skill://` skills, and the same Exa/Firecrawl web research. The gateway (`mcp_gateway/`) is a
-separate FastMCP 3.4.2 service that runs beside Synapse; Synapse itself is unchanged except for
-one small route, `GET /auth/whoami`.
+One MCP connection that gives an agent client (Claude Code, Codex, …) the user's Synapse
+memory, their published `skill://` skills, and any other MCP services **the deployment chooses
+to put behind it**. The gateway (`mcp_gateway/`) is a separate FastMCP 3.4.2 service that runs
+beside Synapse. The only change to Synapse itself is one small route, `GET /auth/whoami`.
 
 ```
-Claude Code ─┐                    ┌─ Synapse /mcp      (caller's OWN device bearer)
-             ├─ gateway /mcp ─────┼─ Exa MCP           (gateway's Exa config, key optional)
-Codex ───────┘   (device bearer)  └─ Firecrawl MCP     (gateway's Firecrawl config, key optional)
+Claude Code ─┐                    ┌─ Synapse /mcp              (the caller's OWN device bearer)
+             ├─ gateway /mcp ─────┤
+Codex ───────┘   (device bearer)  └─ 0..n configured MCP services  (each with its own credential)
 ```
+
+Synapse memory and skills are built in. Everything else is deployment configuration: the
+gateway bundles no third-party services, research workflow, or tool assumptions. With no
+registry file, it serves Synapse memory and skills, and nothing else.
 
 ## What a client sees
 
 | Name | From | Who sees it |
 | --- | --- | --- |
 | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback` | Synapse, **names unchanged** | every approved device; Synapse filters the data per device as always |
-| `exa_<tool>`, `firecrawl_<tool>` | research upstreams, upstream name behind a fixed prefix | full-trust devices (see `RESEARCH_TRUST`) |
+| `<namespace>_<tool>` | each configured upstream, its tool name behind the namespace you chose | devices meeting that upstream's `min_trust` |
 | `list_resources`, `read_resource` | FastMCP `ResourcesAsTools` | every approved device (reads are gated like `resources/read`) |
-| `skill://<name>/SKILL.md`, `/_manifest`, `/<file>` | Synapse's PG skills, URIs unchanged | full-trust devices (see `SKILLS_TRUST`) |
-| `skill://gateway-research/SKILL.md` | bundled with the gateway | same devices as the research tools |
+| `skill://<name>/SKILL.md`, `/_manifest`, `/<file>` | Synapse's skills, URIs unchanged | devices meeting `SKILLS_TRUST` (default: full trust) |
+| `skill://<name>/…` from configured `skills_dirs` | FastMCP's native `SkillsDirectoryProvider` | devices meeting that directory's `min_trust` |
+| `<scheme>://<namespace>/…` resources | configured upstreams, URIs prefixed with the namespace | devices meeting that upstream's `min_trust` |
 
-Memory tools keep their Synapse names so that every existing plugin hook keeps working
-through the gateway (see [Hooks](#hooks)). Research tools keep their upstream name behind
-the prefix, which can double it: `firecrawl_firecrawl_scrape`, `exa_web_search_exa`. Tool
-descriptions, input schemas and output schemas pass through unchanged. Upstream tool errors (`isError`) and
-JSON-RPC errors pass through verbatim. Transport failures become a generic
-`"<upstream> upstream request failed (ConnectError)"` because the raw text could quote a
-keyed URL. Resource URIs are not prefixed, so stock `sync_skills` and the plugins' skill
-contract are unaffected.
+Memory tools keep their Synapse names so every existing plugin hook keeps working through
+the gateway (see [Hooks](#hooks)). Upstream tools keep their own names behind the prefix, so
+an upstream tool called `tracker_search` under namespace `tracker` becomes
+`tracker_tracker_search`. Descriptions, input schemas and output schemas pass through
+unchanged, as do upstream tool errors (`isError`) and JSON-RPC errors. A transport failure
+becomes a generic `"<namespace> upstream request failed (ConnectError)"`, because the raw text
+could quote a keyed URL.
+
+## Configure upstreams
+
+Name a JSON file with `SYNAPSE_GATEWAY_CONFIG_FILE`. Relative paths inside it resolve against
+the file's own directory.
+
+```json
+{
+  "upstreams": [
+    {
+      "namespace": "tracker",
+      "description": "Project tracker: issues and milestones",
+      "url": "https://tracker.example.com/mcp",
+      "auth": {"type": "bearer", "secret_env": "TRACKER_MCP_TOKEN"},
+      "min_trust": "full",
+      "discovery_timeout": 5,
+      "call_timeout": 120,
+      "cache_ttl": 300,
+      "failure_backoff": 30
+    },
+    {
+      "namespace": "wiki",
+      "url": "https://wiki.example.com/mcp",
+      "auth": {"type": "header", "header": "X-Api-Key", "secret_file": "secrets/wiki.key"},
+      "min_trust": "restricted"
+    }
+  ],
+  "skills_dirs": [{"path": "team-skills", "min_trust": "full"}]
+}
+```
+
+| Key | Meaning |
+| --- | --- |
+| `namespace` | required. 1–32 chars: lowercase letters, digits, single hyphens, starting with a letter. It becomes the `<namespace>_` tool prefix. It must be unique, and can't be one of the reserved names (`synapse`, `gateway`, `skill(s)`, `mcp`, `recall`, `fetch`, `remember`, `list`, `read`, `issue`), which would be confusable with the gateway's own tools. |
+| `url` | required. A streamable-HTTP MCP endpoint (`http`/`https`), with no `user:pass@` in it. |
+| `auth.type` | `none` (default), `bearer` (`Authorization: Bearer <secret>`), `header` (`auth.header: <secret>`; `Host`, `Cookie`, `Content-*`, MCP session headers and the like are refused), or `url` (the secret replaces `{secret}` in `url`, URL-quoted). |
+| `auth.secret_env` / `auth.secret_file` | exactly one for any type except `none`: the NAME of an environment variable, or a path to a file holding the secret (a docker/systemd secret, for example). Inline secrets aren't accepted. |
+| `min_trust` | `full` (default) or `restricted`, the lowest Synapse device trust that sees this upstream at all |
+| `discovery_timeout` / `call_timeout` | seconds; defaults 5 / 120 |
+| `cache_ttl` / `failure_backoff` | seconds; defaults 300 / 30 (see [Degradation](#degradation)) |
+| `description` | optional, up to 120 chars. Shown to the model in the server instructions next to the namespace. |
+| `skills_dirs[].path` / `.min_trust` | extra skill folders served through FastMCP's native provider, behind the same trust gate. Pick names that don't clash with your Synapse skills. |
+
+The file is validated strictly at startup, and the gateway refuses to start on any problem:
+an unknown key (so a typo can't silently drop a setting, and a pasted credential can't hide in
+a stray field), a duplicate, reserved or unsafe namespace, a non-HTTP URL, credentials in the
+URL, a `{secret}` placeholder without `type: url` (or the reverse), a forbidden header, an
+unset or empty secret reference, a missing directory, or malformed JSON. Error messages name
+keys, variables and paths, never values.
+
+**Supported:** streamable-HTTP MCP servers, with no auth or a static secret. **Not
+supported:** stdio servers, OAuth-enrolled servers (no interactive consent flow runs on the
+gateway), and per-caller upstream credentials. Every caller who passes an upstream's
+`min_trust` uses the deployment's one credential for it.
+
+Integrations belong to each deployment. The repository ships generic examples only
+(`examples/gateway/`). Your own services and their credentials live in your private
+deployment config.
 
 ## Identity and security model
 
@@ -42,35 +104,33 @@ contract are unaffected.
   its normal device rules to it: restricted scoping, project allowlists, the KG leg skipped,
   hidden tools. The gateway never widens that. A tool Synapse leaves out of a device's
   `tools/list` is not callable through the gateway either.
-- **Credentials only go to the upstream they belong to.** The upstream clients are built with
+- **Credentials only go to the upstream they belong to.** Upstream clients are built with
   FastMCP's inbound-header forwarding turned off. That matters because the stock
-  `ProxyClient`/`create_proxy` forwards the caller's `Authorization` header to every upstream,
-  Exa and Firecrawl included. Exa and Firecrawl see only their own configured key. Synapse
-  sees only the caller's bearer.
+  `ProxyClient`/`create_proxy` forwards the caller's `Authorization` header to every upstream.
+  Each configured upstream sees only its own configured credential, and Synapse sees only the
+  caller's bearer.
 - **No shared state across identities.** The stock `ProxyProvider` keeps one component cache
   for all sessions, so the gateway doesn't use it. Synapse listings are cached per identity,
-  keyed by `sha256(token)`, and research listings are shared because the credential behind
-  them is the gateway's own. Every upstream operation opens a fresh client, so no HTTP pool,
-  cookie jar or MCP session is reused between callers, and the gateway runs stateless HTTP.
+  keyed by `sha256(token)`. Upstream listings are shared, because the credential behind them
+  is the deployment's own, and access is still decided per caller before any upstream I/O.
+  Every upstream operation opens a fresh client, so no HTTP pool, cookie jar or MCP session
+  is reused between callers, and the gateway runs stateless HTTP.
 - **Revocation.** Memory access ends on a revoked device's next call, because Synapse checks
-  the bearer again on every request. Research access can outlive revocation by at most
-  `AUTH_CACHE_TTL` (default 30s).
-- **Restricted devices get no Synapse skills.** Synapse's skills provider isn't scoped to
-  the caller: it serves every active skill, personal ones included, to any valid bearer, and
-  skills carry no audience label to filter on. So the gateway withholds Synapse's whole
-  `skill://` class (listing, templates, reads, and the `read_resource` bridge) from any
-  device below `SKILLS_TRUST` (default `full`), however permissive the upstream is.
-  Restricted devices keep their memory tools. Direct connections to Synapse's own `/mcp`
-  are outside the gateway and unchanged; they still list skills to restricted devices.
-- **Research policy.** By default only full-trust devices see research tools and the research
-  skill. A restricted, work-profile device therefore can't send queries through the owner's
-  research configuration or pick up tools it wasn't granted. Set `RESEARCH_TRUST=restricted` to allow any
-  approved device.
-- **No credentials in logs.** Keys come from env or secret files and never from the repo.
-  Logs show upstreams as `scheme://host/…`. A log-record scrubber removes configured keys from
-  every logger, tracebacks included, and httpx request logging is capped at WARNING. Don't
-  run with DEBUG logging in production: the `mcp` library then logs full request and response
-  payloads, which include memory content.
+  the bearer again on every request. Access to configured upstreams can outlive revocation by
+  at most `AUTH_CACHE_TTL` (default 30s).
+- **Restricted devices get no Synapse skills by default.** Synapse's skills provider isn't
+  scoped to the caller: it serves every active skill, personal ones included, to any valid
+  bearer, and skills carry no audience label to filter on. So the gateway withholds Synapse's
+  whole `skill://` class (listing, templates, reads, and the `read_resource` bridge) from any
+  device below `SKILLS_TRUST`, however permissive the upstream is. Restricted devices keep
+  their memory tools. Direct connections to Synapse's own `/mcp` are outside the gateway and
+  unchanged; they still list skills to restricted devices.
+- **Per-upstream trust.** `min_trust` defaults to `full`, so a restricted work device can't
+  reach a service, or spend its credential, unless the deployment explicitly allows it.
+- **No credentials in logs.** Upstreams are logged as `scheme://host/…`. A log-record scrubber
+  removes every configured secret from every logger, tracebacks included, and httpx request
+  logging is capped at WARNING. Don't run with DEBUG logging in production: the `mcp` library
+  then logs full request and response payloads, which include memory content.
 - The gateway adds no raw HTTP forwarding routes. Its only custom route is an unauthenticated
   `/health` that reports liveness and makes no upstream call.
 
@@ -90,50 +150,48 @@ only after a plugin version bump and release.
 
 SessionStart board/preferences, ingest, and skills sync use Synapse's HTTP routes directly,
 so the gateway doesn't affect them. If a client connects to both Synapse and the gateway,
-it sees two sets of memory tools. Pilot one connection per client.
+it sees two sets of memory tools.
 
 ## Degradation
 
-Each upstream listing runs under a discovery timeout (research defaults to 5s, Synapse to 10s).
-If a listing fails, the gateway serves the last good snapshot. If there isn't one, it logs a
-redacted warning and leaves that upstream out. A failed research upstream then sits out for
-`FAILURE_BACKOFF` seconds, so a dead Exa or Firecrawl can't slow down every request. Memory
-tools and skills keep working. Synapse is never backed off, because memory is the core service.
+Every upstream listing runs under its `discovery_timeout` (Synapse: 10s). If a listing
+fails, the gateway serves the last good snapshot, up to an hour old. If there isn't one, it
+logs a redacted warning and leaves that upstream out, and the upstream then sits out for its
+`failure_backoff`, so a dead service can't slow every request. Memory tools and skills keep
+working. Synapse is never backed off, because memory is the core service.
 
 ## Skills: publishing is not activating
 
 MCP resources are just readable documents. A client doesn't turn `skill://` resources into
-skills by itself. The pilot bridges that gap in three small layers:
+skills by itself. The gateway bridges that gap without shipping any workflow of its own:
 
-1. **Server instructions** (under 2 KB, the size Claude Code keeps) name the memory tools and
-   research prefixes, and point research at `skill://gateway-research/SKILL.md`.
+1. **Server instructions** (under 2 KB, the size Claude Code keeps) describe the memory tools,
+   the configured namespaces with their descriptions (never URLs), and how to discover skills:
+   list resources, read the `SKILL.md` whose description fits the task, and follow it.
 2. **Resource access for every client.** Claude Code reads MCP resources natively. Any client
    can also use the `read_resource`/`list_resources` tools. These go through the server's
-   normal resource path, so a bridged read is authorized exactly like `resources/read`: a
-   restricted device can't read the research skill or any Synapse skill either way.
-3. **An optional local pointer skill**, `synapse-gateway-research`, installed per client by
-   `python -m mcp_gateway.client_setup install-bootstrap --client claude|codex`. Its only job
-   is to fetch and follow the gateway-served skill, so both clients run the single copy. It
-   uses a different name from the served skill, so the two can never collide. If opt-in
-   two-way skills sync is on, the pointer gets published like any other local skill. It does
-   nothing on machines that aren't connected to the gateway.
+   normal resource path, so a bridged read is authorized exactly like `resources/read`.
+3. **An optional local pointer skill**, `synapse-gateway`, installed per client by
+   `python -m mcp_gateway.client_setup install-bootstrap --client claude|codex`. It names no
+   workflow or service. It tells the client to look for a matching skill among the user's
+   published ones on the gateway and load it. Installing it also retires this tool's earlier
+   pilot pointer (`synapse-gateway-research`), but only if that copy is byte-identical to
+   what the tool generated; edited copies are left alone. If opt-in two-way skills sync is on,
+   the pointer gets published like any other local skill.
 
-Canonical skills stay in Postgres and reach clients through the existing sync. The gateway
-doesn't fork them. It only adds the one pilot skill that is tied to its own tool names.
-Disable that skill with `SYNAPSE_GATEWAY_LOCAL_SKILLS=0`. Don't publish a PG skill named
-`gateway-research`.
+Canonical skills stay in Synapse and reach clients through the existing sync. The gateway
+serves them as they are.
 
 **Scripts:** reading `skill://x/scripts/foo.py` returns text and runs nothing. A skill's
 scripts only work after the skill is materialized into a local skills folder (plugin skills
-sync, or FastMCP's `sync_skills`). `gateway-research` has no scripts by design.
+sync, or FastMCP's `sync_skills`).
 
-The pilot skill itself is short and gateway-specific. It picks tools from the live list and
-fills every required argument from the input schema. It uses `recall` first only when the
-question touches the user's own history, and reads as many sources as the question needs. If
-one research provider is down, it says so and falls back to the other. It passes the
-skill-creator `quick_validate.py` check.
+**Portability boundary.** The gateway makes the same memory, skills and services reachable
+from every client. It does not translate one client's personal instructions (CLAUDE.md,
+AGENTS.md, client-specific tool names in a skill's text) for another. A skill that names
+another client's built-in tools still needs editing to be portable.
 
-## Configuration
+## Core settings
 
 All variables are prefixed `SYNAPSE_GATEWAY_`.
 
@@ -142,25 +200,12 @@ All variables are prefixed `SYNAPSE_GATEWAY_`.
 | `SYNAPSE_URL` | `http://127.0.0.1:8765` | Synapse base URL (`/mcp`, `/auth/whoami` are appended) |
 | `HOST` / `PORT` | `127.0.0.1` / `8766` | listener; MCP at `/mcp` |
 | `PUBLIC_URL` | unset | public base URL, only for auth metadata |
-| `RESEARCH_TRUST` | `full` | `full` or `restricted` (= any approved device) |
-| `SKILLS_TRUST` | `full` | who gets Synapse's `skill://` resources; `restricted` = any approved device (they are not caller-scoped upstream) |
-| `EXA_URL`, `FIRECRAWL_URL` | unset | setting one enables that upstream |
-| `<UP>_API_KEY` or `<UP>_API_KEY_FILE` | unset | optional key (prefer `_FILE`: a docker/systemd secret); omit for keyless endpoints |
-| `<UP>_AUTH_HEADER` | unset | send the key in this header (`Authorization` becomes `Bearer <key>`)… |
-| `{api_key}` in `<UP>_URL` | — | …or put it in the URL (URL-quoted). Exactly one of the two. |
-| `DISCOVERY_TIMEOUT`, `<UP>_DISCOVERY_TIMEOUT` | `5` | research listing bound (s) |
-| `<UP>_CALL_TIMEOUT` | `120` | research tool-call bound (s) |
-| `SYNAPSE_DISCOVERY_TIMEOUT` / `SYNAPSE_CALL_TIMEOUT` | `10` / `120` | Synapse bounds (s) |
+| `CONFIG_FILE` | unset | the upstream/skills registry above; unset = Synapse memory + skills only |
+| `SKILLS_TRUST` | `full` | who gets Synapse's `skill://` resources; `restricted` = any approved device |
 | `AUTH_CACHE_TTL` | `30` | how long a verified caller is reused (s); `0` disables |
-| `SYNAPSE_CACHE_TTL` / `RESEARCH_CACHE_TTL` | `30` / `300` | listing caches (s) |
-| `FAILURE_BACKOFF` | `30` | research upstream sit-out after a failed listing (s) |
-| `LOCAL_SKILLS` | `1` | serve the bundled `gateway-research` skill |
-
-Invalid combinations are refused at startup: a key with nowhere to go, both placements, a
-placeholder without a key, or a non-http URL. If a provider's hosted MCP endpoint works
-without a key, set only its URL. Otherwise check the provider's documentation for where the
-endpoint expects the key. The gateway doesn't assume either placement.
-`examples/gateway/` has an env template and a compose override.
+| `SYNAPSE_CACHE_TTL` | `30` | per-caller Synapse listing cache (s) |
+| `SYNAPSE_DISCOVERY_TIMEOUT` / `SYNAPSE_CALL_TIMEOUT` | `10` / `120` | Synapse bounds (s) |
+| `WHOAMI_TIMEOUT` | `5` | caller verification bound (s) |
 
 ## Run locally
 
@@ -168,9 +213,8 @@ Synapse must include `GET /auth/whoami` (this branch). Then:
 
 ```bash
 export SYNAPSE_GATEWAY_SYNAPSE_URL=http://127.0.0.1:8765
-export SYNAPSE_GATEWAY_EXA_URL=...            # see examples/gateway/gateway.env.example
-export SYNAPSE_GATEWAY_EXA_API_KEY_FILE=...   # only if the endpoint needs one; never commit keys
-uv run python -m mcp_gateway                  # or: uv run synapse-gateway
+export SYNAPSE_GATEWAY_CONFIG_FILE=/path/to/gateway.json   # optional; see examples/gateway/
+uv run python -m mcp_gateway                               # or: uv run synapse-gateway
 ```
 
 ## Connect clients
@@ -185,16 +229,15 @@ on loopback. No token is written into client config.
   Undo with `claude mcp remove --scope user synapse-gateway`.
 - **Codex**: add a `[mcp_servers.synapse-gateway]` table with `url` and `http_headers_helper`.
   Undo by deleting the table. `codex exec` can't prompt for approval, so tools that aren't
-  marked read-only (for example `recall` or a Firecrawl scrape) fail there unless
-  pre-approved with `[mcp_servers.synapse-gateway.tools.<tool>] approval_mode = "approve"`,
-  the same per-tool mechanism a direct `synapse` entry uses.
+  marked read-only fail there unless pre-approved with
+  `[mcp_servers.synapse-gateway.tools.<tool>] approval_mode = "approve"`, the same per-tool
+  mechanism a direct `synapse` entry uses.
 
 If a shell exports `SYNAPSE_INGEST_TOKEN` with some other credential, such as the root
 enrollment token kept for admin tooling, that value overrides the saved device token. The
 gateway then refuses it, correctly. Generate the snippets with `--saved-credential`: the
 helper then runs under `env -u SYNAPSE_INGEST_TOKEN -u CLAUDE_PLUGIN_OPTION_SYNAPSE_INGEST_TOKEN`,
 so the saved device token wins for the gateway only, and other env consumers keep theirs.
-The probe explains a refusal like this with a clear message instead of a bare 401.
 
 Personal hooks keyed on the plugin's server name, such as a Stop hook that counts
 `mcp__plugin_synapse_synapse__recall`, need the `mcp__synapse-gateway__` form added. So does
@@ -212,28 +255,26 @@ without the parent's inherited `CLAUDE_*` session variables. A nested session ma
 ```bash
 # 1. Synapse knows the device (prints kind/trust/surface_id, never the token)
 curl -s -H "Authorization: Bearer $SYNAPSE_INGEST_TOKEN" http://127.0.0.1:8765/auth/whoami
-# 2. The gateway, as this device sees it (read-only; no research call)
-SYNAPSE_INGEST_TOKEN=... uv run python -m mcp_gateway.probe --url http://127.0.0.1:8766/mcp
-# 3. Optional: one real research call. The query goes to the provider and may spend credits.
-#    Every required string argument (e.g. Exa's `objective`) is filled from the text.
-uv run python -m mcp_gateway.probe --url http://127.0.0.1:8766/mcp --search "fastmcp release notes"
+# 2. The gateway's structure, as this device sees it (read-only: listings and one skill read)
+SYNAPSE_INGEST_TOKEN=... uv run python -m mcp_gateway.probe --url http://127.0.0.1:8766/mcp \
+    --expect-namespace tracker
+# 3. Optional: exactly one call you specify. The probe prints only ok/error and the size.
+uv run python -m mcp_gateway.probe --url http://127.0.0.1:8766/mcp \
+    --call tracker_list_issues --args '{"project": "web"}'
 ```
 
-Then, in each client, ask for web research. The client should read
-`skill://gateway-research/SKILL.md` and use the `exa_*` and `firecrawl_*` tools. It should
-call `recall` first only when the question involves the user's own history. On a restricted
-device, expect the memory tools only: no research tools and no `skill://` resources.
+The probe exits non-zero if the core memory tools are missing, an expected namespace isn't
+listed for this device, a native skill read disagrees with the bridged one, or the explicit
+call errors. On a restricted device, expect the memory tools plus whichever namespaces allow
+`restricted`, and no Synapse `skill://` resources unless `SKILLS_TRUST=restricted`.
 
 ## Limitations (pilot)
 
 - Only device-bearer callers are supported. The claude.ai OAuth connector keeps talking to
   Synapse directly.
+- Upstreams are HTTP MCP with static credentials only (see [Configure upstreams](#configure-upstreams)).
 - Per-call overhead: each upstream operation opens a fresh MCP client (initialize plus the
   request). This is the price of zero shared state, and it's acceptable at pilot scale.
-- Automated tests use local Exa and Firecrawl stubs. The pilot also passed live search,
-  scraping, skill reads, and memory recall through both Claude Code and Codex. Hosted
-  keyless endpoints have provider quotas; existing Claude connector subscriptions do not
-  configure or fund the gateway.
 - Skills for restricted devices are all or nothing. Allowing some skills would need an
   audience or scope field that Synapse's skills don't have yet.
 - Upstream sampling and elicitation requests are not relayed to the caller, because the plain
