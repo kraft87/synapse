@@ -230,9 +230,10 @@ device, expect the memory tools only: no research tools and no `skill://` resour
   Synapse directly.
 - Per-call overhead: each upstream operation opens a fresh MCP client (initialize plus the
   request). This is the price of zero shared state, and it's acceptable at pilot scale.
-- Exa and Firecrawl are exercised in tests only through local stubs, shaped like the live
-  schemas recorded during the pilot. Live behaviour still has to be verified against the real
-  services.
+- Automated tests use local Exa and Firecrawl stubs. The pilot also passed live search,
+  scraping, skill reads, and memory recall through both Claude Code and Codex. Hosted
+  keyless endpoints have provider quotas; existing Claude connector subscriptions do not
+  configure or fund the gateway.
 - Skills for restricted devices are all or nothing. Allowing some skills would need an
   audience or scope field that Synapse's skills don't have yet.
 - Upstream sampling and elicitation requests are not relayed to the caller, because the plain
