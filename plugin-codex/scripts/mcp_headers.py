@@ -13,13 +13,33 @@ from urllib.parse import urlsplit
 
 from common import BASE_URL, TOKEN
 
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+
+
+def _allowed(url: str, gateway: bool) -> bool:
+    """The saved credential goes only to its own Synapse — or, with ``--gateway``, to an
+    MCP gateway on that same host (any port) or on loopback. The gateway relays the
+    credential to that Synapse and nowhere else (docs/gateway.md)."""
+    target, configured = urlsplit(url), urlsplit(BASE_URL)
+    if (target.scheme, target.netloc) == (configured.scheme, configured.netloc):
+        return True
+    if not gateway or target.scheme not in ("http", "https"):
+        return False
+    return target.hostname in _LOOPBACK or (
+        (target.scheme, target.hostname) == (configured.scheme, configured.hostname)
+    )
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Synapse MCP credential helper")
     parser.add_argument("--url", required=True)
+    parser.add_argument(
+        "--gateway",
+        action="store_true",
+        help="URL is a Synapse MCP gateway on the Synapse host or loopback",
+    )
     args = parser.parse_args()
-    target, configured = urlsplit(args.url), urlsplit(BASE_URL)
-    if (target.scheme, target.netloc) != (configured.scheme, configured.netloc):
+    if not _allowed(args.url, args.gateway):
         print("Synapse MCP URL differs from the saved credential's server", file=sys.stderr)
         return 1
     if not TOKEN:

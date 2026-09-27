@@ -64,6 +64,12 @@ def register(
 
     _register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized, idp=_idp)
 
+    # Caller self-description — the MCP gateway presents each caller's OWN bearer here to
+    # learn its kind/trust, so the gateway holds no Synapse credential and no DSN.
+    from mcp_server.whoami_route import register as _register_whoami_route
+
+    _register_whoami_route(mcp, DB_URL, MACHINE_TOKEN)
+
     # Board read route — GET /context?project=X serves the rendered explicit-memory board
     # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
     # Same machine-token seam. No-op w/o DB. The engine callback is resolved lazily

@@ -88,6 +88,8 @@ LABEL org.opencontainers.image.title="synapse" \
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/ingestion /app/ingestion
 COPY --from=builder /app/mcp_server /app/mcp_server
+# Optional MCP gateway (docs/gateway.md); only runs when a service's command asks for it.
+COPY --from=builder /app/mcp_gateway /app/mcp_gateway
 COPY --from=builder /app/dream /app/dream
 COPY --from=builder /app/schema /app/schema
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml

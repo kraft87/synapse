@@ -140,3 +140,28 @@ def test_saved_credentials_work_without_env_token(monkeypatch, tmp_path):
     common = _load("synapse_common_test", _PLUGIN / "scripts/common.py")
     assert common.TOKEN == "saved-device-token"
     assert common.BASE_URL == "https://memory.example"
+
+
+@pytest.mark.parametrize(
+    ("url", "gateway", "expected"),
+    [
+        ("https://memory.example:8766/mcp", True, 0),  # gateway beside Synapse
+        ("http://127.0.0.1:8766/mcp", True, 0),  # local gateway
+        ("https://memory.example:8766/mcp", False, 1),  # still needs the explicit opt-in
+        ("http://memory.example:8766/mcp", True, 1),  # no scheme downgrade
+        ("https://elsewhere.example/mcp", True, 1),  # never an unrelated host
+    ],
+)
+def test_header_helper_gateway_mode_is_narrow(monkeypatch, capsys, url, gateway, expected):
+    common = ModuleType("common")
+    common.BASE_URL = "https://memory.example"
+    common.TOKEN = "test-device-token"
+    monkeypatch.setitem(sys.modules, "common", common)
+    helper = _load("synapse_headers_gateway_test", _PLUGIN / "scripts/mcp_headers.py")
+    argv = ["mcp_headers.py", "--url", url] + (["--gateway"] if gateway else [])
+    monkeypatch.setattr(sys, "argv", argv)
+    assert helper.main() == expected
+    out = capsys.readouterr().out
+    assert (json.loads(out) if expected == 0 else out) == (
+        {"Authorization": "Bearer test-device-token"} if expected == 0 else ""
+    )
