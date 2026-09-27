@@ -15,6 +15,7 @@ messages and tracebacks.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import traceback
 from collections.abc import Callable, Iterable, Mapping
@@ -83,8 +84,8 @@ def _float(env: Mapping[str, str], key: str, default: float) -> float:
         value = float(raw)
     except ValueError as e:
         raise ConfigError(f"{ENV_PREFIX}{key} must be a number") from e
-    if value < 0:
-        raise ConfigError(f"{ENV_PREFIX}{key} must be >= 0")
+    if not math.isfinite(value) or value < 0:
+        raise ConfigError(f"{ENV_PREFIX}{key} must be finite and >= 0")
     return value
 
 

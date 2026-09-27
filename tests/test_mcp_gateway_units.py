@@ -52,6 +52,8 @@ def test_synapse_url_may_be_given_with_mcp_suffix():
     [
         ({P + "SKILLS_TRUST": "anyone"}, "SKILLS_TRUST"),
         ({P + "AUTH_CACHE_TTL": "-1"}, ">= 0"),
+        ({P + "AUTH_CACHE_TTL": "nan"}, "finite"),
+        ({P + "AUTH_CACHE_TTL": "inf"}, "finite"),
         ({P + "SYNAPSE_URL": "ftp://syn"}, "http"),
         ({P + "PORT": "eighty"}, "PORT"),
     ],
@@ -133,6 +135,8 @@ def test_registry_skills_dirs_resolve_relative_to_the_file(tmp_path):
         ({"upstreams": [_up(namespace="-x")]}, "namespace must be"),
         ({"upstreams": [_up(url="ftp://tracker.example/mcp")]}, "http"),
         ({"upstreams": [_up(url="stdio:tracker")]}, "http"),
+        ({"upstreams": [_up(url="https://tracker.example:bad/mcp")]}, "valid URL"),
+        ({"upstreams": [_up(url="https://tracker.example:65536/mcp")]}, "valid URL"),
         ({"upstreams": [_up(url="https://u:p@tracker.example/mcp")]}, "must not embed"),
         ({"upstreams": [_up(url="https://t.example/{secret}")]}, "placeholder"),
         ({"upstreams": [_up(auth={"type": "url", "secret_env": "K"})]}, "placeholder"),
@@ -164,6 +168,8 @@ def test_registry_skills_dirs_resolve_relative_to_the_file(tmp_path):
         ),
         ({"upstreams": [_up(call_timeout=-1)]}, "non-negative"),
         ({"upstreams": [_up(call_timeout=True)]}, "non-negative"),
+        ({"upstreams": [_up(call_timeout=float("nan"))]}, "finite"),
+        ({"upstreams": [_up(cache_ttl=float("inf"))]}, "finite"),
         ({"upstreams": [_up(cache="big")]}, "unknown key"),
         ({"upstreams": "tracker"}, "must be lists"),
         ({"skills_dirs": [{"path": "nope"}]}, "not a directory"),
@@ -174,6 +180,23 @@ def test_registry_skills_dirs_resolve_relative_to_the_file(tmp_path):
 def test_malformed_registry_is_refused_at_startup(tmp_path, registry, match):
     with pytest.raises(ConfigError, match=match):
         _load(tmp_path, registry, {"K": "v"})
+
+
+def test_large_registry_keeps_initialization_bounded_and_private(tmp_path):
+    from mcp_gateway.app import INSTRUCTIONS_CAP, _instructions
+
+    settings = _load(
+        tmp_path,
+        {
+            "upstreams": [
+                _up(namespace=f"private{i}", description=f"Private service {i}") for i in range(200)
+            ]
+        },
+    )
+    instructions = _instructions(settings)
+    assert len(instructions.encode()) <= INSTRUCTIONS_CAP
+    assert "private" not in instructions.lower()
+    assert "tools/list" in instructions
 
 
 @pytest.mark.parametrize(

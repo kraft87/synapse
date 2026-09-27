@@ -73,7 +73,7 @@ the file's own directory.
 | `min_trust` | `full` (default) or `restricted`, the lowest Synapse device trust that sees this upstream at all |
 | `discovery_timeout` / `call_timeout` | seconds; defaults 5 / 120 |
 | `cache_ttl` / `failure_backoff` | seconds; defaults 300 / 30 (see [Degradation](#degradation)) |
-| `description` | optional, up to 120 chars. Shown to the model in the server instructions next to the namespace. |
+| `description` | optional operator label, up to 120 chars. Kept in configuration; not exposed in shared server instructions. |
 | `skills_dirs[].path` / `.min_trust` | extra skill folders served through FastMCP's native provider, behind the same trust gate. Pick names that don't clash with your Synapse skills. |
 
 The file is validated strictly at startup, and the gateway refuses to start on any problem:
@@ -166,7 +166,7 @@ MCP resources are just readable documents. A client doesn't turn `skill://` reso
 skills by itself. The gateway bridges that gap without shipping any workflow of its own:
 
 1. **Server instructions** (under 2 KB, the size Claude Code keeps) describe the memory tools,
-   the configured namespaces with their descriptions (never URLs), and how to discover skills:
+   how to discover authorized tools without exposing restricted service names, and skills:
    list resources, read the `SKILL.md` whose description fits the task, and follow it.
 2. **Resource access for every client.** Claude Code reads MCP resources natively. Any client
    can also use the `read_resource`/`list_resources` tools. These go through the server's

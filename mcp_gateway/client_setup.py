@@ -44,12 +44,13 @@ description: Find and use the user's own published workflows through the Synapse
 The user's published skills are MCP resources on the `synapse-gateway` server.
 
 1. List that server's resources (your client's MCP resource list, or its `list_resources`
-   tool) and scan the `skill://<name>/SKILL.md` entries and their descriptions.
+   tool) and scan the `skill://<name>/SKILL.md` entries and their descriptions. Skip this
+   discovery skill itself if it appears in the list.
 2. If one fits the task, read its SKILL.md (resource reader, or `read_resource` with the
    URI) and follow it. Its other files are listed at `skill://<name>/_manifest`.
-3. Tools a skill mentions come from the same server: Synapse memory tools under their own
-   names, other services this deployment configured as `<namespace>_<tool>`. Use the names
-   and input schemas the server's tool list shows.
+3. For tools supplied by the gateway, use its listed names and input schemas: Synapse memory
+   tools keep their own names; other configured services use `<namespace>_<tool>`. A skill
+   may also use local scripts, CLI tools, or connections outside this gateway.
 
 Reading a skill's script does not run it; only a skill materialized into a local skills
 folder can run scripts. If nothing fits, or the server is not connected or serves no skills
@@ -63,7 +64,9 @@ def _sha(text: str) -> str:
 
 #: Every SKILL.md this tool has ever generated for the CURRENT name. When STUB changes, add
 #: the old digest here so an untouched older install still upgrades/removes.
-_GENERATED = frozenset({_sha(STUB)})
+_GENERATED = frozenset(
+    {_sha(STUB), "6a5f1313251c4e3c726f22d455a2414ad0ada0e2b89b5b9325cd32c1542cd81c"}
+)
 
 #: Earlier pointer names this tool generated, with the exact digests it wrote. Only a
 #: byte-identical copy is ever removed; an edited one is the user's.

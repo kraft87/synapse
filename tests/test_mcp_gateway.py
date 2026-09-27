@@ -649,14 +649,16 @@ async def test_hidden_synapse_tools_are_not_reachable_by_name(tmp_path):
                 await c.call_tool("issue_machine_token", {})
 
 
-async def test_instructions_describe_memory_services_and_skill_discovery(tmp_path):
+@pytest.mark.parametrize("token", ["tok-alice-full", "tok-bob-work"])
+async def test_instructions_describe_discovery_without_private_service_metadata(tmp_path, token):
     async with AsyncExitStack() as stack:
         s = await _start(stack, tmp_path)
-        async with s.client("tok-alice-full") as c:
+        async with s.client(token) as c:
             text = c.initialize_result.instructions or ""
     assert "call recall" in text and "skill://<name>/SKILL.md" in text
-    assert "tracker_* (Project tracker: issues)" in text and "wiki_*" in text
-    assert "http" not in text  # namespaces and descriptions only, never URLs
+    assert "tools/list" in text and "<namespace>_<tool>" in text
+    assert "tracker" not in text and "wiki" not in text
+    assert "Project tracker: issues" not in text and "http" not in text
     assert len(text.encode()) <= 2048
 
 

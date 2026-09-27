@@ -29,6 +29,7 @@ values.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from collections.abc import Mapping
@@ -167,8 +168,13 @@ def _unknown(where: str, obj: Mapping[str, Any], allowed: set[str]) -> None:
 
 def _number(where: str, obj: Mapping[str, Any], key: str, default: float) -> float:
     value = obj.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int | float) or value < 0:
-        raise RegistryError(f"{where}: {key} must be a non-negative number")
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int | float)
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise RegistryError(f"{where}: {key} must be a finite non-negative number")
     return float(value)
 
 
@@ -207,6 +213,7 @@ def _url(where: str, raw: Any, auth_type: str) -> str:
         raise RegistryError(f"{where}: url must be a string")
     try:
         parts = urlsplit(raw.replace(_PLACEHOLDER, "x"))
+        _ = parts.port  # urlsplit validates the port only when this property is read.
     except ValueError:
         raise RegistryError(f"{where}: url is not a valid URL") from None
     if parts.scheme not in ("http", "https") or not parts.hostname:

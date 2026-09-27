@@ -68,23 +68,13 @@ def _instructions(settings: GatewaySettings) -> str:
     if not ups:
         return memory + skills
 
-    def services(with_descriptions: bool) -> str:
-        parts = [
-            f"{u.namespace}_*"
-            + (f" ({u.description})" if with_descriptions and u.description else "")
-            for u in ups
-        ]
-        return (
-            "Other tools come from services this deployment configured, prefixed by namespace: "
-            + "; ".join(parts)
-            + ". Each is listed only where this device may use it; use the names and input "
-            "schemas tools/list returns. "
-        )
-
-    text = memory + services(True) + skills
-    if len(text.encode()) > INSTRUCTIONS_CAP:
-        text = memory + services(False) + skills
-    return text
+    # Initialization instructions are shared by all callers. Service names and operator
+    # descriptions can be private, so discover them only through the authorized listing.
+    services = (
+        "Additional MCP tools use <namespace>_<tool> names. Discover the tools this device "
+        "may access through tools/list, and use their listed input schemas. "
+    )
+    return memory + services + skills
 
 
 def _upstream_provider(up: Upstream) -> UpstreamProvider:
