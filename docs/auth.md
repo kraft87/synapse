@@ -78,8 +78,8 @@ Human says nothing means personal; software says nothing means restricted.
 
 | Path | Notes | Episodes / timeline | KG facts |
 | --- | --- | --- | --- |
-| `GET /context` (board) | `audience='work-safe'` only | filtered to the project allowlist, NULL project excluded | n/a |
-| `recall` / `POST /recall` | `audience='work-safe'` only | both legs filtered to the allowlist | **leg skipped entirely** |
+| `GET /context` (board) | `audience='work-safe'` only | filtered to the project allowlist plus the machine's own uploads, NULL project excluded | n/a |
+| `recall` / `POST /recall` | `audience='work-safe'` only | both legs filtered to the allowlist plus own uploads | **leg skipped entirely** |
 | `recall_full_turns` | n/a | same allowlist | n/a |
 | `fetch(ids)` | `audience='work-safe'` only | same allowlist | n/a |
 | `fetch_session` | n/a | allowlist on the probe and both row reads | n/a |
@@ -90,6 +90,11 @@ column, so serving zero facts is the only fail-closed answer available. `fetch` 
 would let a restricted caller enumerate exactly what the board withholds. A session outside
 the allowlist reports the same "not indexed" answer an unknown id does, deliberately
 indistinguishable.
+
+An enrolled restricted machine always reads back the conversations it ingested itself,
+even with an empty project allowlist: each ingested turn is stamped with the surface of the
+device token that uploaded it (schema 055). Turns uploaded under the root token, and every
+turn ingested before 055, carry no stamp and stay reachable only through the allowlist.
 
 Resolution never fails open. No credential, no row, a non-approved row, a missing table, an
 unreachable database, a malformed row: all resolve to restricted with an empty allowlist. An

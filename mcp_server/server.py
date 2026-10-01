@@ -487,6 +487,7 @@ _register_remember_routes(
     _machine_authorized,
     remember,
     caller_surface=lambda request: _request_trust(request).surface_id,
+    caller_trust=lambda request: _request_trust(request),
 )
 
 
@@ -497,7 +498,10 @@ _feedback_ids_error, _file_recall_feedback, recall_feedback, feedback_http = (
 
 
 ingest_turns = _register_ingest_route(
-    mcp, lambda: DB_URL, lambda request: _machine_authorized(request)
+    mcp,
+    lambda: DB_URL,
+    lambda request: _machine_authorized(request),
+    lambda request: _request_trust(request),
 )
 
 

@@ -83,7 +83,8 @@ class RecallEpisodesMixin:
     ) -> dict[str, Any]:
         """recall_episodes()'s body, run with ``warnings`` bound as the degradation sink."""
         settings = self._settings()
-        allowed = self._resolve_trust(surface, trust).project_filter
+        st = self._resolve_trust(surface, trust)
+        allowed = st.project_filter
         try:
             query_emb = self._ensure_embedder().embed([query], task="query")[0]
         except Exception as e:
@@ -102,7 +103,12 @@ class RecallEpisodesMixin:
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
         pool = self._episode_pool(
-            query, query_emb, project, session_id=session_id, allowed_projects=allowed
+            query,
+            query_emb,
+            project,
+            session_id=session_id,
+            allowed_projects=allowed,
+            own_surface=st.own_surface,
         )
         # Same self-exclusion as recall(): the caller's own turns are already in
         # its context window. Pool-level so excluded slots backfill before rerank.

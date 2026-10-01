@@ -159,7 +159,8 @@ project included, so an unknown caller serves *nothing* rather than everything.
 - **Board**: notes filtered to `audience='work-safe'`; timeline digest and episodes
   banner filtered by project allowlist.
 - **recall / recall_full_turns**: notes by `audience`; episodes (BM25 + vector legs) by
-  `project = ANY(allowed_projects)`. **KG facts leg skipped entirely** —
+  `project = ANY(allowed_projects)`, widened by schema 055 to `OR surface_id = <caller>`
+  for a credential-bound caller, so a restricted device reads its own uploads. **KG facts leg skipped entirely** —
   `kg_relationships` has no `project` column, so serving zero facts is fail-closed.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.

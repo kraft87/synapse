@@ -84,6 +84,11 @@ class SurfaceTrust:
     trust: str = "restricted"
     allowed_projects: tuple[str, ...] = ()
     known: bool = False
+    #: True only when the SERVER established which surface this is: a device token
+    #: (schema 054) or a verified OAuth identity. False for the legacy self-reported
+    #: hostname lane, whose id is whatever the caller chose to send. Provenance
+    #: (schema 055) rides on this flag, never on ``known`` alone.
+    credential_bound: bool = False
 
     @property
     def restricted(self) -> bool:
@@ -96,14 +101,59 @@ class SurfaceTrust:
 
         A restricted surface always gets a LIST — empty for an unknown surface, which
         makes ``project = ANY('{}')`` false for every row (NULL project included). That
-        is the intended fail-closed serve: nothing, rather than everything.
+        is the intended fail-closed serve: nothing, rather than everything. A KNOWN,
+        credential-bound restricted surface additionally reads the rows it ingested
+        itself: :attr:`own_surface` always travels with this filter (schema 055).
         """
         return None if not self.restricted else list(self.allowed_projects)
+
+    @property
+    def stamp_surface_id(self) -> str | None:
+        """The provenance stamp for a row this caller WRITES (schema 055), or None.
+
+        Only a server-established identity stamps. A self-reported hostname must not:
+        stamping from it would let any root-token holder file rows under a work host's
+        id, and :attr:`own_surface` would then serve them there.
+        """
+        if self.known and self.credential_bound and self.surface_id:
+            return self.surface_id
+        return None
+
+    @property
+    def own_surface(self) -> str | None:
+        """The surface id whose OWN rows a restricted read may also serve, or None.
+
+        Anything a restricted host uploaded is that host's work by definition, so it may
+        read it back without an allowlist entry. None for full trust (no filter to widen)
+        and for every unknown or self-reported caller: those keep the allowlist-only,
+        fail-closed serve. Rows stamped NULL (pre-055, root token) never match.
+        """
+        return self.stamp_surface_id if self.restricted else None
 
     @property
     def audience_filter(self) -> str | None:
         """Notes audience to filter on, or None for no filter (full trust)."""
         return None if not self.restricted else RESTRICTED_AUDIENCE
+
+
+def episode_scope_sql(
+    allowed_projects: list[str] | None, own_surface: str | None = None
+) -> tuple[str, list[Any]] | None:
+    """The restricted-surface row predicate for episode/timeline reads, or None.
+
+    ``None`` means full trust: apply no predicate. Otherwise the predicate is
+    ``project = ANY(allowed)``, widened to ``(project = ANY(allowed) OR surface_id =
+    own)`` when the caller is a credential-bound restricted surface (schema 055). This
+    is the one place the SQL is spelled, so no read path can drift into its own variant.
+
+    ``ANY('{}')`` matches nothing (NULL project included) and ``surface_id = %s`` never
+    matches a NULL stamp, so an unknown surface still serves nothing at all.
+    """
+    if allowed_projects is None:
+        return None
+    if own_surface:
+        return "(project = ANY(%s) OR surface_id = %s)", [allowed_projects, own_surface]
+    return "project = ANY(%s)", [allowed_projects]
 
 
 #: The verdict for "no surface id", "no such surface", or any lookup failure.
@@ -128,7 +178,7 @@ def new_device_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def _row_to_trust(surface_id: str, row: Any) -> SurfaceTrust:
+def _row_to_trust(surface_id: str, row: Any, credential_bound: bool = False) -> SurfaceTrust:
     """A surfaces row → verdict. A revoked row is UNKNOWN, not "restricted-known": it
     must not even set the write-side ``caller_restricted`` flag, because that flag
     WIDENS what a note is later served to."""
@@ -139,7 +189,13 @@ def _row_to_trust(surface_id: str, row: Any) -> SurfaceTrust:
         logger.warning("surface %r has unknown trust %r; treating as restricted", surface_id, trust)
         trust = "restricted"
     projects = tuple(str(p) for p in (row["allowed_projects"] or ()))
-    return SurfaceTrust(surface_id=surface_id, trust=trust, allowed_projects=projects, known=True)
+    return SurfaceTrust(
+        surface_id=surface_id,
+        trust=trust,
+        allowed_projects=projects,
+        known=True,
+        credential_bound=credential_bound,
+    )
 
 
 #: Written out in full rather than interpolated: every SQL string in this module is a
@@ -223,7 +279,10 @@ def resolve_caller(
         # and it makes an empty board diagnosable). A token that matched nothing keeps
         # NOTHING — echoing a credential-derived id back would be an oracle.
         return SurfaceTrust(surface_id=sid or None)
-    return _row_to_trust(str(row["surface_id"]), row)
+    # Only the token lane is credential-bound here. The id lane is either a deprecated
+    # self-reported hostname or an ``oauth:<login>`` id that mcp_server.caller_trust
+    # derived from a verified identity and marks bound itself.
+    return _row_to_trust(str(row["surface_id"]), row, credential_bound=bool(th))
 
 
 def lookup_surface(db_url: str, surface_id: str | None) -> SurfaceTrust:
@@ -410,7 +469,7 @@ def mint_surface(
     role came from a client that did not ask — and an unasked question must not resolve
     to full access. A restricted surface with no stated projects inherits the union of
     what other approved restricted surfaces already read; empty when there are none,
-    which serves nothing.
+    which serves only what that device uploads itself (schema 055).
     """
     granted = (trust or "").strip().lower() or "restricted"
     if granted not in TRUST_LEVELS:

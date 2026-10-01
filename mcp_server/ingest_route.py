@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.surfaces import SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,12 @@ def register(
     mcp: FastMCP,
     db_url: Callable[[], str],
     _machine_authorized: Callable[[Request], bool],
+    _request_trust: Callable[[Request], SurfaceTrust] | None = None,
 ) -> Any:
+    """``_request_trust`` resolves the caller from its BEARER (schema 054); its
+    credential-bound surface id is stamped on every episode written (schema 055). Omitted,
+    or for the root token / an unknown credential, episodes are stamped NULL."""
+
     @mcp.custom_route("/ingest", methods=["POST"])
     async def ingest_turns(request: Request) -> JSONResponse:
         """Direct-push ingest endpoint — replaces the Logfire poll for Claude Code.
@@ -43,6 +49,10 @@ def register(
         session_meta line, so the Codex hook passes ``session_id`` (from the
         rollout filename) as a fallback identity hint. Everything downstream —
         span_id dedup, private sessions, contamination guards — is shared.
+
+        Provenance (schema 055): each stored turn is stamped with the surface the BEARER
+        resolves to, which is what lets a restricted device read its own uploads back.
+        Nothing in the body can set or influence that stamp.
         """
         if not _machine_authorized(request):
             return unauthorized()
@@ -82,6 +92,11 @@ def register(
                 episodes = JSONLParser().parse_records(records, source_label, project_override)
             if not episodes:
                 return 0
+            # Resolved from the credential only. Assigned unconditionally so nothing a
+            # parser might ever lift out of the records can survive as a stamp.
+            stamp = _request_trust(request).stamp_surface_id if _request_trust else None
+            for ep in episodes:
+                ep.surface_id = stamp
             db = Database(db_url())
             private = PrivateSessions(db)  # per-batch memo; schema/050
             try:

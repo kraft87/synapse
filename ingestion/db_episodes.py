@@ -59,16 +59,21 @@ class EpisodeStore(DatabaseConnection):
         # episode to import day — which then poisoned served dates, recency
         # ranking, and the KG's fact t_valid via get_episodes_valid_at. NULL
         # (no transcript ts) falls back to now(), right for live ingestion.
+        #
+        # surface_id (schema 055) is written on INSERT only and deliberately absent from
+        # the DO UPDATE list: provenance belongs to whoever first stored the row. A later
+        # write of the same (session_id, sequence) must not be able to claim a legacy
+        # NULL row for a surface (that would serve it there), nor clear a stamp.
         sql = """
             INSERT INTO episodes
                 (session_id, sequence, project, platform, model,
                  human_turn, assistant_turn, content, span_id, metadata, source,
-                 created_at)
+                 created_at, surface_id)
             VALUES
                 (%(session_id)s, %(sequence)s, %(project)s, %(platform)s, %(model)s,
                  %(human_turn)s, %(assistant_turn)s, %(content)s,
                  %(span_id)s, %(metadata)s::jsonb, %(source)s,
-                 COALESCE(%(created_at)s, now()))
+                 COALESCE(%(created_at)s, now()), %(surface_id)s)
             ON CONFLICT (session_id, sequence) DO UPDATE SET
                 content        = EXCLUDED.content,
                 human_turn     = EXCLUDED.human_turn,
@@ -98,6 +103,7 @@ class EpisodeStore(DatabaseConnection):
             "metadata": orjson.dumps(strip_nul(ep.metadata)).decode(),
             "source": ep.source,
             "created_at": ep.created_at,
+            "surface_id": ep.surface_id,
         }
         with self._conn() as conn:
             row = conn.execute(sql, params).fetchone()

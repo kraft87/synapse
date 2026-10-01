@@ -2,7 +2,8 @@
 
 A surface is one CREDENTIAL that talks to Synapse. Trust is per-credential: ``full``
 sees the whole corpus, ``restricted`` sees only ``audience='work-safe'`` notes plus
-episodes and timeline events inside its ``allowed_projects``. A caller with no matching
+episodes and timeline events inside its ``allowed_projects`` or uploaded by that same
+credential (schema 055). A caller with no matching
 row is restricted with an empty allowlist, which is why these routes only ever GRANT —
 the safe state is the one you get by doing nothing.
 

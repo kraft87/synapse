@@ -28,6 +28,7 @@ from starlette.responses import JSONResponse
 
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.scope import coerce_group
+from ingestion.surfaces import episode_scope_sql
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,7 @@ def _recent_events(
     limit: int,
     project: str | None,
     allowed_projects: list[str] | None = None,
+    own_surface: str | None = None,
 ) -> list[dict[str, Any]]:
     """Pure time-window read (no embeddings): the session-start milestones feed.
 
@@ -146,6 +148,9 @@ def _recent_events(
     semantics would drift. The project allowlist is the filter instead, and
     ``project = ANY(...)`` excludes NULL-project events by construction: an unlabeled
     event has no provenance to clear it, so it stays off restricted boards.
+
+    ``own_surface`` (schema 055) also admits events whose source turn the calling
+    surface ingested itself; the gate copies that stamp onto the event at write time.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
@@ -162,9 +167,10 @@ def _recent_events(
         if project:
             q += "AND project = %s "
             params.append(project)
-        if allowed_projects is not None:
-            q += "AND project = ANY(%s) "
-            params.append(allowed_projects)
+        scope = episode_scope_sql(allowed_projects, own_surface)
+        if scope is not None:
+            q += f"AND {scope[0]} "
+            params.extend(scope[1])
         q += ") ranked WHERE day_rank <= %s ORDER BY t_valid DESC LIMIT %s"
         params.extend([_PER_PROJECT_DAY, limit])
         rows = conn.execute(q, params).fetchall()

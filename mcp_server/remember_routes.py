@@ -40,6 +40,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.surfaces import SurfaceTrust
+from mcp_server.caller_trust import route_trust
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -117,10 +119,16 @@ def register(
     authorized: Callable[[Request], bool],
     remember_fn: Callable[..., Any],
     caller_surface: Callable[[Request], str | None] | None = None,
+    caller_trust: Callable[[Request], SurfaceTrust] | None = None,
 ) -> None:
     """``caller_surface`` resolves the CALLING DEVICE from its credential (schema 054).
     Supplied, it outranks the ``surface`` field in the body — a self-reported hostname
-    must not decide a note's audience when the bearer already says who is writing."""
+    must not decide a note's audience when the bearer already says who is writing.
+
+    ``caller_trust`` is the full verdict for that credential. When supplied it is bound
+    for the duration of the replayed write (``route_trust``), so the remember tool sees
+    the device as credential-bound and stamps the archived episode with it (schema 055)
+    instead of re-resolving a bare id through the self-reported lane."""
     if not db_url:
         logger.info("remember spool route disabled (no DB_URL)")
         return
@@ -171,6 +179,12 @@ def register(
                 }
             )
 
+        verdict = caller_trust(request) if caller_trust else None
+        cred_surface = (
+            verdict.surface_id
+            if verdict is not None
+            else (caller_surface(request) if caller_surface else None)
+        )
         kwargs: dict[str, Any] = {
             "type": body.get("type") or "project",
             "project": body.get("project") or None,
@@ -179,9 +193,7 @@ def register(
             # spool exists because the MCP transport was down, not because the note came
             # from a different device. Prefer the CREDENTIAL's surface; the body field is
             # the pre-054 fallback. Neither -> derived by project rule, still fail-closed.
-            "surface": (
-                (caller_surface(request) if caller_surface else None) or body.get("surface") or None
-            ),
+            "surface": cred_surface or body.get("surface") or None,
             "audience": body.get("audience") or None,
         }
         if str(body.get("hook") or "").strip() and str(body.get("body") or "").strip():
@@ -191,7 +203,8 @@ def register(
             kwargs["content"] = body["content"]
 
         try:
-            result = await remember_fn(**kwargs)
+            with route_trust(verdict):
+                result = await remember_fn(**kwargs)
         except Exception as e:
             logger.warning("remember spool write failed: %s", e)
             return err(str(e)[:200], 500)

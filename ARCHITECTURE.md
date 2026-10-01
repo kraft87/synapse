@@ -519,13 +519,15 @@ What a `restricted` surface gets:
 
 | Path | Notes | Episodes / timeline | KG facts |
 | --- | --- | --- | --- |
-| `GET /context` (board) | `audience='work-safe'` | digest + banner filtered to `allowed_projects`, NULL project excluded | n/a |
-| `recall` / `POST /recall` | `audience='work-safe'` | BM25 + vector legs `project = ANY(allowed)` | **leg skipped entirely** |
+| `GET /context` (board) | `audience='work-safe'` | digest + banner filtered to `allowed_projects` + own uploads, NULL project excluded | n/a |
+| `recall` / `POST /recall` | `audience='work-safe'` | BM25 + vector legs `project = ANY(allowed) OR surface_id = <caller>` | **leg skipped entirely** |
 | `recall_full_turns` | n/a | same allowlist on the pool | n/a |
 | `fetch(ids)` | `audience='work-safe'` | same allowlist | n/a |
 | `fetch_session` | n/a | allowlist on the metadata probe *and* both row reads | n/a |
 
 The **KG leg is skipped, not filtered**: `kg_relationships` has no `project` column and joining back through source episodes isn't worth the per-query cost yet, so serving zero facts is the only fail-closed answer available. **`fetch` and `fetch_session` enforcement is not belt-and-braces** — `e:N`/`n:N` ids are sequential integers, so an unfiltered drill-down would let a restricted caller enumerate exactly what the board withholds. A session outside the allowlist reports the same "not indexed" answer an unknown id does, deliberately indistinguishable: a distinct "exists but forbidden" reply would itself disclose the project map.
+
+**A restricted surface also reads what it ingested itself (schema 055).** Every episode written by `/ingest`, `remember()` or the remember-spool replay is stamped with `episodes.surface_id`, taken from the *credential-resolved* caller (device token or verified `oauth:<login>`), never from the request body, and never from the legacy self-reported `surface` param. Restricted reads widen from `project = ANY(allowed)` to `project = ANY(allowed) OR surface_id = <caller>` (one helper, `ingestion/surfaces.episode_scope_sql`, used by every path in the table above). Anything a work laptop uploaded is work by definition, so it can recall its own conversations with an empty allowlist and nobody maintains a project list for it. Root-token writes, unknown callers and every pre-055 row are stamped NULL, and NULL never matches, so legacy rows stay exactly as reachable as before. The stamp is INSERT-only (a later upsert of the same turn can neither claim a NULL row nor clear a stamp). `timeline_events.surface_id` is copied from the source episode by the timeline gate, so the board digest follows the same rule.
 
 **Timeline gets no `audience` column.** `timeline_events` already carries `domain IN ('personal','technical')` (schema 038) which fails *open* (NULL); a second overlapping label with the opposite fail semantics invites drift. The project allowlist is the filter instead.
 

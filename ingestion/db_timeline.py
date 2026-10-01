@@ -19,17 +19,23 @@ class TimelineStore(DatabaseConnection):
         embed_model: str | None,
         event_type: str | None = None,
         domain: str | None = None,
+        source_episode_id: int | None = None,
     ) -> int:
         """Append one event to the episodic timeline (schema 033). Idempotent on
         UNIQUE(source, source_ref) — re-processing a turn never duplicates. Returns
-        rows inserted (0 = already present)."""
+        rows inserted (0 = already present).
+
+        ``source_episode_id`` copies that turn's provenance stamp (schema 055) onto the
+        event in the same statement, so an event is served to a restricted surface
+        exactly when its source turn is. None (or an unstamped turn) stamps NULL."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
             return conn.execute(
                 "INSERT INTO timeline_events "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "(t_valid, fact, source, source_ref, project, salience, embedding, embed_model, "
-                " event_type, domain) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s) "
+                " event_type, domain, surface_id) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,"
+                " (SELECT surface_id FROM episodes WHERE id = %s)) "
                 "ON CONFLICT (source, source_ref) DO NOTHING",
                 (
                     t_valid,
@@ -42,6 +48,7 @@ class TimelineStore(DatabaseConnection):
                     embed_model if embedding is not None else None,
                     event_type,
                     domain,
+                    source_episode_id,
                 ),
             ).rowcount
 

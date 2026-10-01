@@ -74,6 +74,7 @@ _DB_FILES = {
     "test_audience_scoping.py",
     "test_surface_routes.py",
     "test_credential_trust.py",
+    "test_own_surface_episodes.py",
 }
 
 

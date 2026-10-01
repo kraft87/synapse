@@ -64,7 +64,8 @@ class RecallOverviewMixin:
 
         ``surface`` is the calling host's id (schema 053). Anything but a surface
         registered ``trust='full'`` — including a missing one — is RESTRICTED: episodes
-        are filtered to the surface's project allowlist, notes to
+        are filtered to the surface's project allowlist (plus, for a credential-bound
+        surface, the episodes it ingested itself — schema 055), notes to
         ``audience='work-safe'``, and the KG facts leg is skipped entirely (v1:
         kg_relationships has no project column, so serving zero facts is the only
         fail-closed answer available). Bare calls with no surface therefore serve a
@@ -133,6 +134,7 @@ class RecallOverviewMixin:
             settings._EPISODE_FETCH,
             None,
             allowed,
+            st.own_surface,
         )
 
         t_emb = time.perf_counter()
@@ -180,6 +182,7 @@ class RecallOverviewMixin:
                 settings._EPISODE_FETCH,
                 None,
                 allowed,
+                st.own_surface,
             )
             if query_emb is not None
             else None

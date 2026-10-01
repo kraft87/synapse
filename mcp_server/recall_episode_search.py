@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ingestion.surfaces import episode_scope_sql
 from mcp_server.kg_pg import _vec_literal
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_settings import _EPISODE_FETCH, _EPISODE_RERANK_POOL
@@ -44,6 +45,7 @@ class RecallEpisodeSearchMixin:
         doc_type: str,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         # A query with no alphanumeric content tokenizes to nothing — skip the
         # round-trip instead of burning it on a guaranteed-empty (or erroring)
@@ -62,12 +64,14 @@ class RecallEpisodeSearchMixin:
         if session_id:  # episodes only — the session-scoped drill-down filter
             where.append("session_id = %s")
             params.append(session_id)
-        if allowed_projects is not None:  # restricted surface (schema 053)
+        scope = episode_scope_sql(allowed_projects, own_surface)
+        if scope is not None:  # restricted surface (schema 053/055)
             # ANY('{}') is false for every row, NULL project included — an unknown
             # surface serves nothing rather than everything. That is the fail-closed
-            # serve, not a bug to "fix" with an emptiness special case.
-            where.append("project = ANY(%s)")
-            params.append(allowed_projects)
+            # serve, not a bug to "fix" with an emptiness special case. A known
+            # restricted surface also matches the rows it ingested (own_surface).
+            where.append(scope[0])
+            params.extend(scope[1])
         try:
             rows = pg.execute(
                 f"""
@@ -95,9 +99,10 @@ class RecallEpisodeSearchMixin:
         limit: int,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         return self._bm25_table(
-            "episodes", query, project, limit, "episode", session_id, allowed_projects
+            "episodes", query, project, limit, "episode", session_id, allowed_projects, own_surface
         )
 
     def _vector_table(
@@ -109,6 +114,7 @@ class RecallEpisodeSearchMixin:
         doc_type: str,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         settings = self._settings()
         pg = self._ensure_pg()
@@ -130,9 +136,10 @@ class RecallEpisodeSearchMixin:
         if session_id:  # episodes only — the session-scoped drill-down filter
             where.append("session_id = %s")
             params.append(session_id)
-        if allowed_projects is not None:  # restricted surface (schema 053) — see _bm25_table
-            where.append("project = ANY(%s)")
-            params.append(allowed_projects)
+        scope = episode_scope_sql(allowed_projects, own_surface)
+        if scope is not None:  # restricted surface (schema 053/055) — see _bm25_table
+            where.append(scope[0])
+            params.extend(scope[1])
         try:
             rows = pg.execute(
                 f"""
@@ -160,10 +167,18 @@ class RecallEpisodeSearchMixin:
         limit: int,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         emb_literal = _vec_literal(query_emb)
         return self._vector_table(
-            "episodes", emb_literal, project, limit, "episode", session_id, allowed_projects
+            "episodes",
+            emb_literal,
+            project,
+            limit,
+            "episode",
+            session_id,
+            allowed_projects,
+            own_surface,
         )
 
     def _episode_pool(
@@ -175,6 +190,7 @@ class RecallEpisodeSearchMixin:
         pool_size: int = _EPISODE_RERANK_POOL,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fused BM25+vector episode candidate pool, PRE-rerank (WIN1 deep-fetch).
 
@@ -186,11 +202,14 @@ class RecallEpisodeSearchMixin:
         both legs to one conversation (the fetch_session/Grep drill-down).
         ``allowed_projects`` applies a restricted surface's project allowlist to BOTH
         legs — filtering the pool, not the served slice, so the allowlisted content
-        still gets the full deep-fetch width."""
-        bm25_eps = self._search_bm25_episodes(query, project, fetch, session_id, allowed_projects)
+        still gets the full deep-fetch width. ``own_surface`` widens that filter to the
+        rows the calling surface ingested itself (schema 055)."""
+        bm25_eps = self._search_bm25_episodes(
+            query, project, fetch, session_id, allowed_projects, own_surface
+        )
         vec_eps: list[dict[str, Any]] = []
         if query_emb is not None:
             vec_eps = self._search_vector_episodes(
-                query_emb, project, fetch, session_id, allowed_projects
+                query_emb, project, fetch, session_id, allowed_projects, own_surface
             )
         return _merge_rrf(bm25_eps, vec_eps, id_key="id")[:pool_size]

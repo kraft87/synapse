@@ -72,8 +72,8 @@ def _wired(*, embed_fail: bool = False, rerank_fail: bool = False, pool: list[di
     p = _pool() if pool is None else pool
     r._ensure_embedder = lambda: _FakeEmbedder(fail=embed_fail)
     r._reranker = _FakeReranker(fail=rerank_fail)
-    r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None: list(p)
-    r._search_vector_episodes = lambda emb, proj, limit, sid=None, allowed=None: []
+    r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None, own=None: list(p)
+    r._search_vector_episodes = lambda emb, proj, limit, sid=None, allowed=None, own=None: []
     r._search_vector_web = lambda emb, n: []
     r._search_bm25_web = lambda q, n: []
     r._search_kg = lambda *a, **k: ([], [])
@@ -86,7 +86,9 @@ def _wired(*, embed_fail: bool = False, rerank_fail: bool = False, pool: list[di
     ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
     r._increment_retrieval_counts = lambda ids: None
-    r._episode_pool = lambda q, emb, proj, session_id=None, allowed_projects=None: list(p)
+    r._episode_pool = (
+        lambda q, emb, proj, session_id=None, allowed_projects=None, own_surface=None: list(p)
+    )
     r._select_episodes = lambda q, pl, limit: (pl[:limit], 0, 0.9)
     r._record_metrics = lambda m: None
     return r
