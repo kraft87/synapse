@@ -461,3 +461,126 @@ def test_spool_replay_stamps_the_device_from_its_bearer(remember_env, db_url):
         assert _archived_stamp(remember_env, r.json()["episode_id"]) == sid
     finally:
         remember_env.execute("DELETE FROM remember_intents")
+
+
+# ---------------------------------------------------------------------------
+# Session-start read routes: /timeline/recent and /preferences/top are scoped too
+# ---------------------------------------------------------------------------
+
+
+def _route_trust(db_url):
+    from mcp_server.http_auth import bearer
+
+    return lambda r: ct.request_trust(
+        db_url=db_url, machine_token=_ROOT, bearer=bearer(r), surface=None
+    )
+
+
+@pytest.fixture()
+def route_corpus(clean, db_url):
+    """Three devices (own restricted, other restricted, full) and one row of each
+    provenance class in both timeline_events and preferences."""
+    from ingestion.db import Database
+    from tests.helpers.surfaces import register_device
+
+    toks = {k: f"{k}-token-{uuid.uuid4().hex}" for k in ("own", "other", "full")}
+    sids = {
+        "own": register_device(clean, toks["own"], trust="restricted", projects=["work-x"]),
+        "other": register_device(clean, toks["other"], trust="restricted", projects=[]),
+        "full": register_device(clean, toks["full"], trust="full"),
+    }
+    eps = {
+        "own": _episode(clean, "scratch-own", "own turn", sids["own"]),
+        "other": _episode(clean, "scratch-other", "other turn", sids["other"]),
+    }
+    rows = {  # key -> (project, source episode)
+        "allowlisted": ("work-x", None),
+        "personal": ("family", None),
+        "own": ("scratch-own", eps["own"]),
+        "other": ("scratch-other", eps["other"]),
+    }
+    db = Database(db_url)
+    try:
+        for key, (project, ep) in rows.items():
+            db.insert_timeline_event(
+                t_valid="2099-01-01T00:00:00+00:00",
+                fact=f"{key} event",
+                source="chat",
+                source_ref=f"ep:{ep}" if ep else f"git:{key}",
+                project=project,
+                salience=2,
+                embedding=None,
+                embed_model=None,
+                source_episode_id=ep,
+            )
+            db.insert_preference(
+                owner_id="default",
+                group_id="technical",
+                project=project,
+                pref=f"{key} pref",
+                polarity="like",
+                embedding=None,
+                embed_model=None,
+                source_ref=f"ep:{ep}" if ep else None,
+            )
+    finally:
+        db.close()
+    yield {k: {"Authorization": f"Bearer {t}"} for k, t in toks.items()}
+    clean.execute("DELETE FROM preferences")
+
+
+def _route_client(db_url):
+    from fastmcp import FastMCP
+    from starlette.testclient import TestClient
+
+    from mcp_server.preferences_routes import register as reg_prefs
+    from mcp_server.timeline_routes import register as reg_timeline
+
+    m = FastMCP("test-route-scope")
+    reg_timeline(m, db_url, lambda r: True, "", _route_trust(db_url))
+    reg_prefs(m, db_url, lambda r: True, _route_trust(db_url))
+    return TestClient(m.http_app())
+
+
+def _served(client, headers):
+    tl = client.post("/timeline/recent", json={"days": 90, "limit": 20}, headers=headers)
+    pr = client.get("/preferences/top?limit=50", headers=headers)
+    assert tl.status_code == 200 and pr.status_code == 200
+    return (
+        sorted(i["fact"].removesuffix(" event") for i in tl.json()["items"]),
+        sorted(i["pref"].removesuffix(" pref") for i in pr.json()["items"]),
+    )
+
+
+@needs_db
+def test_session_start_routes_scope_a_restricted_device(route_corpus, db_url):
+    c = _route_client(db_url)
+    assert _served(c, route_corpus["own"]) == (["allowlisted", "own"], ["allowlisted", "own"])
+    assert _served(c, route_corpus["other"]) == (["other"], ["other"])
+
+
+@needs_db
+def test_session_start_routes_full_trust_unchanged(route_corpus, db_url):
+    everything = ["allowlisted", "other", "own", "personal"]
+    assert _served(_route_client(db_url), route_corpus["full"]) == (everything, everything)
+
+
+@needs_db
+def test_session_start_routes_unknown_caller_gets_nothing(route_corpus, db_url):
+    c = _route_client(db_url)
+    assert _served(c, {"Authorization": f"Bearer {_ROOT}"}) == ([], [])
+    assert _served(c, {}) == ([], [])
+
+
+@needs_db
+def test_session_start_routes_fail_closed_without_a_resolver(route_corpus, db_url):
+    from fastmcp import FastMCP
+    from starlette.testclient import TestClient
+
+    from mcp_server.preferences_routes import register as reg_prefs
+    from mcp_server.timeline_routes import register as reg_timeline
+
+    m = FastMCP("test-route-unwired")
+    reg_timeline(m, db_url, lambda r: True, "")
+    reg_prefs(m, db_url, lambda r: True)
+    assert _served(TestClient(m.http_app()), route_corpus["full"]) == ([], [])

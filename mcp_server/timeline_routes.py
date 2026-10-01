@@ -28,7 +28,7 @@ from starlette.responses import JSONResponse
 
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.scope import coerce_group
-from ingestion.surfaces import episode_scope_sql
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, episode_scope_sql
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -190,8 +190,15 @@ def _recent_events(
 
 
 def register(
-    mcp: Any, db_url: str, authorized: Callable[[Request], bool], voyage_api_key: str
+    mcp: Any,
+    db_url: str,
+    authorized: Callable[[Request], bool],
+    voyage_api_key: str,
+    resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
 ) -> None:
+    """``resolve_trust`` maps a request to its bearer-resolved verdict (schema 054). The
+    read route filters by it; when it is not supplied the route treats every caller as
+    an unknown surface and serves nothing, so a wiring slip fails closed, never open."""
     if not db_url:
         logger.info("timeline routes disabled (no DB_URL)")
         return
@@ -200,7 +207,11 @@ def register(
     async def timeline_recent(request: Request) -> JSONResponse:
         """Recent high-salience events for the plugin's session-start milestones block.
         Body: {days?=7, min_salience?=2, limit?=5, project?}. Time-scoped and tiny by
-        design — this is a bounded factual block, not query-blind recall injection."""
+        design — this is a bounded factual block, not query-blind recall injection.
+
+        Scoped like the board digest (schema 053/055): a restricted caller sees only
+        events in its project allowlist or derived from turns it ingested itself; an
+        unknown caller sees nothing. The scope comes from the bearer, never the body."""
         if not authorized(request):
             return unauthorized()
         try:
@@ -211,8 +222,20 @@ def register(
         min_sal = int(body.get("min_salience") or 2)
         limit = min(int(body.get("limit") or 5), 20)
         try:
+            st = (
+                await run_in_threadpool(resolve_trust, request)
+                if resolve_trust
+                else UNKNOWN_SURFACE
+            )
             items = await run_in_threadpool(
-                _recent_events, db_url, days, min_sal, limit, body.get("project")
+                _recent_events,
+                db_url,
+                days,
+                min_sal,
+                limit,
+                body.get("project"),
+                st.project_filter,
+                st.own_surface,
             )
         except Exception as e:
             logger.warning("timeline recent failed: %s", e)
