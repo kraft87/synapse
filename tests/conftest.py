@@ -75,6 +75,7 @@ _DB_FILES = {
     "test_surface_routes.py",
     "test_credential_trust.py",
     "test_own_surface_episodes.py",
+    "test_config_scope.py",
 }
 
 

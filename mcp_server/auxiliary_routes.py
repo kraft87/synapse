@@ -32,7 +32,7 @@ def register(
     # so the dream pipeline can read them and propose edits. Same DSN-free seam as skills. No-op w/o DB.
     from mcp_server.config_sync_routes import register as _register_config_routes
 
-    _register_config_routes(mcp, DB_URL, _machine_authorized)
+    _register_config_routes(mcp, DB_URL, _machine_authorized, lambda r: _request_trust(r))
 
     # Timeline event ingest — feeders (the plugin's git feeder, later calendar) POST plain event
     # rows here; the server embeds + upserts. Same DSN-free machine-token seam. No-op w/o DB.
