@@ -270,7 +270,7 @@ export function mockRecall<T>(query: string): Promise<T> {
       total_ms: 341,
       legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, timeline: 33, prefs: 9 },
       pool_sizes: { bm25: 100, vector: 100, fused: 100, kg_candidates: 12 },
-      rerank: { model: 'rerank-2.5-lite', top_score: 0.91 },
+      rerank: { model: 'rerank-3-lite', top_score: 0.91 },
       est_tokens: 1874,
     },
   } as T);

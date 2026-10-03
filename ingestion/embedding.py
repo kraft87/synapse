@@ -70,11 +70,15 @@ def _is_voyage_retryable(exc: BaseException) -> bool:
     return type(exc).__name__ in _VOYAGE_RETRYABLE_NAMES
 
 
-# Reranker model. rerank-2.5-lite is the default after a 2-sample A/B (2026-06-20):
-# equal-or-better quality vs rerank-2.5 on Synapse's golden sets (EXACT 0.929->0.976
-# deterministic; BROAD/REL tied within judge noise) at ~5-9% lower rerank latency and
-# lower per-call cost. Override (rollback) with SYNAPSE_RERANK_MODEL=rerank-2.5.
-_RERANK_MODEL = os.environ.get("SYNAPSE_RERANK_MODEL", "rerank-2.5-lite")
+# Reranker model. rerank-3-lite is the default after a 3-arm A/B (2026-10-02) against
+# rerank-2.5-lite (the previous default) and rerank-3, through the real recall path on
+# Synapse's golden sets: needle hit@5 33/42 vs 32/42, answer-recall funnel served@20
+# 0.906 vs 0.812, BROAD/REL/LongMemEval answerability within judge noise, same latency,
+# same price per token. rerank-3 (2.5x the price) did not clearly beat it. Its raw scores
+# run slightly higher than 2.5-lite's (episode top score +0.02, KG facts +0.02-0.04 at the
+# median), so score floors tuned on 2.5-lite need a small retune: see SYNAPSE_RECALL_FLOOR
+# in .env.example. Override (rollback) with SYNAPSE_RERANK_MODEL=rerank-2.5-lite.
+_RERANK_MODEL = os.environ.get("SYNAPSE_RERANK_MODEL", "rerank-3-lite")
 
 
 # Retry policy differs by failure type. A 429 (TPM rate-limit) is GUARANTEED transient —
@@ -193,7 +197,7 @@ class VoyageEmbeddingModel:
         return out
 
     def rerank(self, query: str, documents: list[str], top_k: int | None = None) -> list[int]:
-        """Voyage rerank-2.5 cross-encoder: return document indices ordered
+        """Voyage cross-encoder (``_RERANK_MODEL``): return document indices ordered
         most→least relevant to the query. Used by recall() to pick which pooled
         summary/chunk candidates to surface. Transient failures are retried with
         backoff (_voyage_retry); a permanent failure still raises so the caller
@@ -206,7 +210,7 @@ class VoyageEmbeddingModel:
     def rerank_scored(
         self, query: str, documents: list[str], top_k: int | None = None
     ) -> list[tuple[int, float]]:
-        """Same Voyage rerank-2.5 call as ``rerank()`` but returns
+        """Same Voyage rerank call as ``rerank()`` but returns
         ``(doc_index, relevance_score)`` pairs in most→least relevant order.
 
         ``rerank()`` discards the scores; callers that want a RELATIVE score
@@ -662,7 +666,7 @@ def create_reranker(
     ``SYNAPSE_RERANK_PROVIDER``:
 
     * ``voyage`` (default, also blank) — the existing Voyage cross-encoder
-      (model via ``SYNAPSE_RERANK_MODEL``, default rerank-2.5-lite; unchanged).
+      (model via ``SYNAPSE_RERANK_MODEL``, default rerank-3-lite).
     * ``http`` — a TEI/Infinity/Cohere-compatible POST /rerank server
       (``SYNAPSE_RERANK_BASE_URL``, optional ``SYNAPSE_RERANK_API_KEY``,
       ``SYNAPSE_RERANK_MODEL`` = the served model id).
