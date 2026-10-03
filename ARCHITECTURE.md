@@ -79,7 +79,7 @@ graph TD
 | Full-text search | ParadeDB `pg_search` (BM25) | `id @@@ paradedb.match('content', …)` |
 | Graph store | PostgreSQL (`kg_entities`, `kg_relationships`) | FalkorDB **decommissioned** (#67) — the KG is Postgres-only (`ingestion.kg_client`, recall via `mcp_server.kg_pg`); bitemporal edges via `t_valid` / `t_invalid` |
 | Embeddings | Voyage AI `voyage-4-large`, 2048 dims | separate `input_type` for query vs document |
-| Reranker | Voyage `rerank-2.5-lite` cross-encoder (default; WIN1 measured on `rerank-2.5`) | the active ingredient in episode recall (WIN1) |
+| Reranker | Voyage `rerank-3-lite` cross-encoder (default since 2026-10-02; WIN1 measured on `rerank-2.5`) | the active ingredient in episode recall (WIN1) |
 | LLM calls | `claude-agent-sdk` via `ClaudeCLIClient` / `agent_call` | `claude-haiku-4-5`; subscription OAuth token or `ANTHROPIC_API_KEY` (or an OpenAI-compatible endpoint via `SYNAPSE_LLM_PROVIDER=openai`) |
 | MCP server | **standalone `fastmcp` 3.4.2**, HTTP (stateless), port 8765 | `/mcp` (tools + `skill://` resources), `/ingest` + `/recall` custom routes; **MultiAuth** (machine bearer + GitHub OAuth) |
 | Ingestion trigger | Claude Code `Stop` hook → HTTP push | **replaced Logfire polling** (now removed) |
@@ -365,7 +365,7 @@ flowchart TD
     W1 --> WEB[web: vector over web_chunks]
     W1 --> KG[KG: vector + BM25 + 1-hop\nRRF, _FACT_LIMIT=12]
     EP --> W2{Wave 2 — parallel}
-    W2 --> RR[Voyage rerank-2.5-lite\npool 100 → top 5]
+    W2 --> RR[Voyage rerank-3-lite\npool 100 → top 5]
     W2 --> HIST[bitemporal history pairs]
     RR --> OUT[structured result]
     KG --> OUT
@@ -396,7 +396,7 @@ Two sub-legs deep-fetch 100 candidates each, fuse, then a cross-encoder reranks:
 - **BM25** (ParadeDB): `WHERE id @@@ paradedb.match('content', %s) ORDER BY paradedb.score(id) DESC`.
 - **Vector** (halfvec HNSW, #104): `ORDER BY embedding::halfvec(2048) <=> %s::halfvec(2048)` — the cast must match the index expression *verbatim* to be served by HNSW. `SET hnsw.ef_search = 200` per connection (default 40 under-recalls a 100-deep fetch). This took episode vector search from ~878ms to ~15–23ms (38x) at recall@10 = 1.000 vs exact scan.
 - **Fusion** (`_merge_rrf`): RRF `k=60` × recency decay (half-life 30 days) × feedback boost (`min(2.0, 1 + log1p(retrieval_count)·0.3)`).
-- **Rerank (WIN1)**: the fused 100-pool goes to Voyage `rerank-2.5-lite` by default (WIN1 measured on `rerank-2.5`); top `_RECALL_EPISODE_LIMIT = 5` served in pure rerank order. The reranker is the active ingredient — deeper RRF alone can't lift a rank-40 gold; the cross-encoder can. Degrades gracefully to RRF order on reranker error (recall never hard-fails). Lifted answerability 90.5%→95.2%, exact-gold hit +7pts, served tokens −20%.
+- **Rerank (WIN1)**: the fused 100-pool goes to Voyage `rerank-3-lite` by default (WIN1 measured on `rerank-2.5`); top `_RECALL_EPISODE_LIMIT = 5` served in pure rerank order. The reranker is the active ingredient — deeper RRF alone can't lift a rank-40 gold; the cross-encoder can. Degrades gracefully to RRF order on reranker error (recall never hard-fails). Lifted answerability 90.5%→95.2%, exact-gold hit +7pts, served tokens −20%.
 
 ### 6.3 KG fact leg (`_search_kg`)
 
@@ -674,7 +674,7 @@ Facts are never deleted; contradictions set `t_invalid` and a new edge is writte
 
 ### 12.6 Deep-fetch + cross-encoder rerank (WIN1)
 
-Fetch 100 candidates per leg, fuse, rerank with Voyage `rerank-2.5-lite` by default (WIN1 measured on `rerank-2.5`), serve top 5. Exact-fact misses were pure truncation (golds ranked 16–88 but prod fetched 15); the reranker — not deeper RRF — recovers them. Tokens dropped 20% because fewer, better episodes are served.
+Fetch 100 candidates per leg, fuse, rerank with Voyage `rerank-3-lite` by default (WIN1 measured on `rerank-2.5`), serve top 5. Exact-fact misses were pure truncation (golds ranked 16–88 but prod fetched 15); the reranker — not deeper RRF — recovers them. Tokens dropped 20% because fewer, better episodes are served.
 
 ### 12.7 Why a thin graph, not graph-maximalist
 
@@ -758,7 +758,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall(mode="turns")`: serve turns scoring ≥ tau×top_score |
 | `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |
 | `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
-| `SYNAPSE_RECALL_FLOOR` | `0` (off) | abstention floor on the raw (pre-recency) rerank top score: strictly below it, recall serves no episodes for that call instead of the least-bad ones, and `recall_metrics.served_ids` gains `would_abstain`/`floor` markers. The threshold belongs to the reranker (scores are not comparable across models), so each `examples/env` preset sets it: `0.58` for the default `rerank-2.5-lite`, `0` for the bundled local reranker |
+| `SYNAPSE_RECALL_FLOOR` | `0` (off) | abstention floor on the raw (pre-recency) rerank top score: strictly below it, recall serves no episodes for that call instead of the least-bad ones, and `recall_metrics.served_ids` gains `would_abstain`/`floor` markers. The threshold belongs to the reranker (scores are not comparable across models), so each `examples/env` preset sets it: `0.60` for the default `rerank-3-lite` (`0.58` if you roll back to `rerank-2.5-lite`), `0` for the bundled local reranker |
 | `SYNAPSE_RECALL_FLOOR_ENFORCE` | `1` | `0` keeps the telemetry markers but never withholds episodes |
 | `SYNAPSE_RECALL_FLOOR_KEEP_MIN` | `0` | when the floor fires, serve this many top passages instead of none |
 | `SYNAPSE_SUPERSEDE_MAX_DIST` | `0.45` | cosine-distance gate for surfacing successor facts of superseded edges |
@@ -774,7 +774,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 |----------|---------|-------------|
 | `SYNAPSE_INGEST_TAIL` | `400` | Stop-hook tail size (raw records) |
 | `SYNAPSE_DRAIN_ONLY` | unset | `1` → replica is a pure extraction worker (no chunk/embed cycle) |
-| `SYNAPSE_RERANK_MODEL` | `rerank-2.5-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5` to roll back); for `http` the served model id |
+| `SYNAPSE_RERANK_MODEL` | `rerank-3-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5-lite` to roll back); for `http` the served model id |
 | `SYNAPSE_DEDUP_TYPE_GATE` | `1` | entity-type compatibility gate in fact dedup (`0` = off) |
 | `SYNAPSE_TIMELINE_GATE` | `1` | LLM gate that promotes ingested turns to timeline events (`0` = off) |
 | `SYNAPSE_TIMELINE_DEDUP` | `1` | write-time confirm-merge of re-told timeline events ([§3.5](#35-timeline-events--the-episodic-date-log); `0` = off) |
@@ -818,7 +818,7 @@ synapse/
 │   ├── poller.py              # maintenance loop: chunk rebuild, embed, drain
 │   ├── chunks.py              # sliding-window chunk construction (window=4 step=3)
 │   ├── db.py                  # PG CRUD: episodes, chunks, queue, claim, span index
-│   ├── embedding.py           # VoyageEmbeddingModel (embed + rerank-2.5-lite)
+│   ├── embedding.py           # VoyageEmbeddingModel (embed + rerank-3-lite)
 │   ├── extractor.py           # ExtractionPipeline + stages 2-7
 │   ├── edge_dates.py          # EdgeDateExtractor + temporal prefilter
 │   ├── kg_client.py           # Postgres KG client (KGClient): nodes/edges/indexes, bitemporal writes, candidate-find

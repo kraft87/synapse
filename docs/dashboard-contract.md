@@ -153,7 +153,7 @@ The `debug` envelope surfaces the SAME numbers the engine already measures for t
    "legs_ms": {"embed": 12.0, "bm25": 48.0, "vector": 96.0, "kg": 141.0,
                "web": 4.0, "rerank": 168.0, "timeline": 33.0},
    "pool_sizes": {"bm25": 100, "vector": 100, "fused": 100, "kg_candidates": 12},
-   "rerank": {"model": "rerank-2.5-lite", "top_score": 0.91},
+   "rerank": {"model": "rerank-3-lite", "top_score": 0.91},
    "est_tokens": 1874}}
 ```
 

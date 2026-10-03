@@ -36,7 +36,7 @@ The parts of Synapse, and the stack they run on. How they fit together is
 - **Full-text search:** ParadeDB `pg_search` (BM25), fused with vector via reciprocal-rank
   fusion.
 - **Embeddings + rerank:** Voyage AI by default (`voyage-4-large`, 2048 dims, and
-  `rerank-2.5-lite`). Pluggable: any OpenAI-compatible `/embeddings` endpoint plus any
+  `rerank-3-lite`). Pluggable: any OpenAI-compatible `/embeddings` endpoint plus any
   TEI/Infinity/Cohere-shape `/rerank` server, or the bundled `local-inference` compose
   profile (see `.env.example`). Published retrieval quality was measured on the Voyage
   stack, and the rerank leg matters — `SYNAPSE_RERANK_PROVIDER=none` degrades recall to
