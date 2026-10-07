@@ -126,7 +126,8 @@ Slash commands:
 
 Bundled commands (`!` prefix in a session; full path from an outside terminal):
 
-- **`! synapse-login`** — sign in and enroll this machine (or `--browser`).
+- **`! synapse-login`** — sign in and enroll this machine (or `--browser`). On an enrolled
+  machine it keeps the existing device token; `--reenroll` replaces it.
 - **`! synapse-import`** — backfill your existing history (step 4).
 - **`! synapse-private on|off|status <session-id>`** — private mode (below).
 
