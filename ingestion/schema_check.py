@@ -16,6 +16,12 @@ Fail-open cases — the guard never blocks on its own infrastructure:
     additive, so an older build runs fine on a newer schema; exiting here
     turned "migration applied before the new image landed" (or an older image
     redeployed by watchtower after the stamp) into a full outage.
+  * database behind this build ONLY by migrations marked optional -> warn and
+    continue. A migration carries the :data:`OPTIONAL_MARKER` header line when
+    the code that ships with it probes for what it adds and keeps its
+    pre-migration behaviour until it is applied. That lets the image land
+    before the migration is applied by hand, without a crash loop. Any
+    unmarked migration in the gap still exits.
 """
 
 from __future__ import annotations
@@ -40,20 +46,49 @@ _SCHEMA_DIR_CANDIDATES = (
 )
 
 
+#: A migration header line declaring that this build runs correctly without it.
+OPTIONAL_MARKER = "-- schema-check: optional"
+
+
+def _migrations(schema_dir: Path | None) -> list[tuple[str, Path]]:
+    """``(NNN, path)`` for every migration in the first schema dir that has any,
+    sorted by number. Empty when no schema directory can be found."""
+    candidates = (schema_dir,) if schema_dir is not None else _SCHEMA_DIR_CANDIDATES
+    for d in candidates:
+        if not d.is_dir():
+            continue
+        found = sorted(
+            (m.group(1), f) for f in d.glob("*.sql") if (m := _SCHEMA_FILE_RE.match(f.name))
+        )
+        if found:
+            return found
+    return []
+
+
+def is_optional_migration(path: Path) -> bool:
+    """True when the migration's text carries :data:`OPTIONAL_MARKER` on a line of its own."""
+    try:
+        return any(line.strip() == OPTIONAL_MARKER for line in path.read_text().splitlines())
+    except OSError:
+        return False
+
+
 def expected_schema_version(schema_dir: Path | None = None) -> str | None:
     """Highest ``NNN`` prefix among the schema files shipped with this build.
 
     Returns None when no schema directory can be found — callers treat
     that as "cannot verify, don't block".
     """
-    candidates = (schema_dir,) if schema_dir is not None else _SCHEMA_DIR_CANDIDATES
-    for d in candidates:
-        if not d.is_dir():
-            continue
-        nums = sorted(m.group(1) for f in d.glob("*.sql") if (m := _SCHEMA_FILE_RE.match(f.name)))
-        if nums:
-            return nums[-1]
-    return None
+    found = _migrations(schema_dir)
+    return found[-1][0] if found else None
+
+
+def required_schema_version(schema_dir: Path | None = None) -> str | None:
+    """Highest ``NNN`` this build cannot run without: the newest migration NOT marked
+    optional. An optional migration only relaxes the check when it sits in the tail;
+    one followed by a required migration is covered by that migration's number."""
+    required = [num for num, path in _migrations(schema_dir) if not is_optional_migration(path)]
+    return required[-1] if required else None
 
 
 def applied_schema_version(db_url: str) -> str | None:
@@ -74,7 +109,8 @@ def applied_schema_version(db_url: str) -> str | None:
 
 
 def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
-    """Exit the process when the database schema is unstamped or behind this build."""
+    """Exit the process when the database schema is unstamped or behind a migration this
+    build requires (an unmarked one; see :func:`required_schema_version`)."""
     if os.environ.get("SYNAPSE_SCHEMA_CHECK", "1") == "0":
         return
     expected = expected_schema_version(schema_dir)
@@ -92,6 +128,21 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
         logger.warning(
             "Database is at schema %s, ahead of this build's schema %s; continuing "
             "(migrations are additive). Deploy the newer image to clear this.",
+            applied,
+            expected,
+        )
+        return
+    required = required_schema_version(schema_dir)
+    if (
+        applied is not None
+        and applied.isdigit()
+        and required is not None
+        and int(applied) >= int(required)
+    ):
+        logger.warning(
+            "Database is at schema %s, behind this build's schema %s, but every newer "
+            "migration is marked optional (this build keeps its pre-migration behaviour "
+            "without them); continuing. Run scripts/apply_schema.sh to apply them.",
             applied,
             expected,
         )

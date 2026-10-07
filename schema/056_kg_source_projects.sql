@@ -37,6 +37,9 @@
 --
 -- Deploy order: the application ships BEFORE this file is applied. Until it is, the
 -- column does not exist and the restricted KG paths serve nothing, exactly as before 056.
+-- The marker below tells the boot-time schema guard (ingestion/schema_check.py) that a
+-- database behind only by this file is fine, so the new image boots instead of exiting:
+-- schema-check: optional
 -- Every statement is guarded (IF NOT EXISTS / OR REPLACE / DROP ... IF EXISTS) and the
 -- backfill only rewrites rows whose value differs, so a re-run is safe and cheap.
 

@@ -244,7 +244,9 @@ truth for migration order) against it — see the script's header for caveats.
 Every service verifies at boot that the database schema matches the code (the script
 stamps the applied version; a mismatch refuses to start with instructions rather than
 failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, restart.
-`SYNAPSE_SCHEMA_CHECK=0` skips the guard.
+`SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
+`-- schema-check: optional` boots with a warning: the code shipped with them runs without
+them and keeps its old behaviour until they are applied.
 
 Releases are tagged (`v0.8.1`, ...). `main` is kept releasable, but for a known-good
 build check out the latest tag; a change that needs a migration or renames an env var

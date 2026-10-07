@@ -30,6 +30,7 @@ import psycopg
 import pytest
 from psycopg.rows import dict_row
 
+from ingestion import schema_check
 from ingestion.kg_pg_write import KGPostgresWriter
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
@@ -672,3 +673,9 @@ def test_schema_056_is_registered_for_apply_schema():
     script = (Path(__file__).resolve().parent.parent / "scripts" / "apply_schema.sh").read_text()
     assert "056_kg_source_projects.sql" in script
     assert os.path.exists(_SCHEMA_056)
+
+
+def test_schema_056_does_not_block_boot_before_it_is_applied():
+    """The image lands (watchtower) before 056 is applied by hand. The boot guard must
+    let a database stamped 055 start, or the deploy-order fallback above never runs."""
+    assert schema_check.is_optional_migration(_SCHEMA_056)
