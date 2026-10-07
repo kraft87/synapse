@@ -27,7 +27,7 @@ Design constraints, inherited from the Claude Code hook:
 Env:
   SYNAPSE_URL              base URL           (default http://localhost:8765)
   SYNAPSE_INGEST_URL       override /ingest   (else derived from SYNAPSE_URL)
-  SYNAPSE_INGEST_TOKEN     bearer token
+  SYNAPSE_INGEST_TOKEN     bearer token (an enrolled machine's saved device token wins)
   SYNAPSE_CODEX_CURSORS    cursor state file  (default ~/.synapse/codex_cursors.json)
   SYNAPSE_PRIVATE_DIR      private markers    (default ~/.synapse/private)
   SYNAPSE_CODEX_HOOK_LOG   log file           (default /tmp/synapse-codex-hook.log)
@@ -44,13 +44,19 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+# The bearer comes from the shared resolver so this hook, the board and the MCP header
+# helper always agree: on an enrolled machine the saved device token beats a stale env
+# SYNAPSE_INGEST_TOKEN (common._resolve_token). Stdlib-only, like this hook.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from common import TOKEN
+
 
 def _claude_plugin_options() -> dict[str, str]:
     """Fallback config source: the Synapse *Claude Code* plugin persists
     SYNAPSE_URL / SYNAPSE_INGEST_TOKEN in ~/.claude/settings.json at install
     time. Codex hooks only inherit plain env, so on a machine running both
     plugins this reuses that config instead of requiring duplicate env vars.
-    Env always wins."""
+    Env always wins here; the token is resolved in common (see above)."""
     try:
         data = json.loads(
             Path(os.path.expanduser("~/.claude/settings.json")).read_text(encoding="utf-8")
@@ -74,7 +80,6 @@ def _cfg(key: str, default: str = "") -> str:
 
 BASE_URL = _cfg("SYNAPSE_URL", "http://localhost:8765").rstrip("/")
 INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
-TOKEN = _cfg("SYNAPSE_INGEST_TOKEN")
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
 LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
 CURSORS_PATH = Path(

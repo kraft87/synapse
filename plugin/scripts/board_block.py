@@ -18,8 +18,14 @@ interactive — it prints a sign-in code and waits for a human — so this hook 
 it; it only says so when this machine holds no device credential, because an empty
 session start with no explanation is the one outcome worse than a restricted one.
 
-Disable with SYNAPSE_BOARD=0. Fail-open: any error prints nothing and exits 0 — a
-broken board must never break a session start.
+It also carries the one-line credential notice (config.token_override_notice): when an
+enrolled machine's device token overrode a SYNAPSE_INGEST_TOKEN from the environment,
+say so and where to remove it, to the user (systemMessage) and the model. That line is
+local, needs no server, and is printed even with the board disabled or the server down,
+since a silent override is the bug it exists to prevent.
+
+Disable the board with SYNAPSE_BOARD=0. Fail-open: any error prints nothing beyond that
+notice and exits 0 — a broken board must never break a session start.
 """
 
 from __future__ import annotations
@@ -31,22 +37,23 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import enroll
-from config import _cfg, get_json
+from config import _cfg, get_json, token_override_notice
 
 
-def _emit_context(parts: list[str]) -> None:
+def _emit_context(parts: list[str], user_notice: str = "") -> None:
+    """``user_notice`` also goes out as ``systemMessage``, which Claude Code shows to the
+    user directly rather than only to the model."""
     if not parts:
         return
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "SessionStart",
-                    "additionalContext": "\n\n".join(parts),
-                }
-            }
-        )
-    )
+    out: dict = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "\n\n".join(parts),
+        }
+    }
+    if user_notice:
+        out["systemMessage"] = user_notice
+    print(json.dumps(out))
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
@@ -68,36 +75,51 @@ def _project_label() -> str | None:
     return _cwd_to_project(cwd) or _cwd_to_project(os.getcwd())
 
 
-def main() -> None:
-    if _cfg("SYNAPSE_BOARD", "1") == "0":
-        return
+def _board_parts() -> list[str]:
+    """The server-rendered board, plus the enrollment explainer when one applies."""
+    parts = []
+    project = _project_label()
+    params = {"project": project} if project else {}
     try:
-        parts = []
-        project = _project_label()
-        params = {"project": project} if project else {}
-        try:
-            r = get_json("/context", params, timeout=10)
-        except urllib.error.HTTPError as e:
-            # 401 with no device credential is the one error worth explaining: this
-            # machine has not enrolled (or its token was revoked), so it is served
-            # nothing and will go on being served nothing until someone signs in.
-            if e.code == 401 and not enroll.is_enrolled():
-                parts.append(enroll.not_enrolled_block())
-                _emit_context(parts)
-            return
-        ok = r.get("status") == "ok"
-        # 200 + restricted + no device credential is the SILENT version of the 401 above:
-        # an open server, or a caller holding the shared root token, is served an empty
-        # board and no reason for it. Say why here, or a fresh install reads as "Synapse
-        # is just empty" and the user never learns there is a credential to get.
-        if ok and r.get("trust") == "restricted" and not enroll.is_enrolled():
-            parts.append(enroll.restricted_block())
-        text = r.get("text") if ok else None
-        if text:
-            parts.append(text)
-        _emit_context(parts)  # inside the guard: a print that raises must not break the session
+        r = get_json("/context", params, timeout=10)
+    except urllib.error.HTTPError as e:
+        # 401 with no device credential is the one error worth explaining: this
+        # machine has not enrolled (or its token was revoked), so it is served
+        # nothing and will go on being served nothing until someone signs in.
+        if e.code == 401 and not enroll.is_enrolled():
+            parts.append(enroll.not_enrolled_block())
+        return parts
+    ok = r.get("status") == "ok"
+    # 200 + restricted + no device credential is the SILENT version of the 401 above:
+    # an open server, or a caller holding the shared root token, is served an empty
+    # board and no reason for it. Say why here, or a fresh install reads as "Synapse
+    # is just empty" and the user never learns there is a credential to get.
+    if ok and r.get("trust") == "restricted" and not enroll.is_enrolled():
+        parts.append(enroll.restricted_block())
+    text = r.get("text") if ok else None
+    if text:
+        parts.append(text)
+    return parts
+
+
+def main() -> None:
+    parts = []
+    try:
+        notice = token_override_notice()
     except Exception:
-        return  # fail-open: no block, no noise
+        notice = ""
+    if notice:
+        parts.append(notice)
+    if _cfg("SYNAPSE_BOARD", "1") != "0":
+        try:
+            parts += _board_parts()
+        except Exception:
+            pass  # fail-open: no board, no noise
+    try:
+        # guarded: a print that raises must not break the session
+        _emit_context(parts, user_notice=notice)
+    except Exception:
+        return
 
 
 if __name__ == "__main__":

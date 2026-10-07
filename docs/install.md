@@ -283,6 +283,10 @@ gets a release note saying so.
   lost: every session start retries the failed transcripts, at any age, until they upload.
   The line goes away after the first successful upload. The hook log
   (`/tmp/synapse-ingest-hook.log`, `SYNAPSE_INGEST_LOG`) has each failure.
+- **"SYNAPSE_INGEST_TOKEN from your environment is ignored" at session start.** An old token
+  is still exported from your shell profile or from the `env` block of `settings.json`. This
+  machine is enrolled, so the hooks already use its device token. Delete the export from the
+  place the line names; nothing else needs to change.
 - **Recall returns nothing and the hooks seem dead.** Hooks are fail-soft, so an unreachable
   server is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health`, then that `SYNAPSE_URL`
   and the token are set (`/plugin` shows the stored values).

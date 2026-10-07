@@ -40,9 +40,14 @@ unreviewed hooks.
 
 Auth: MCP and hooks share the same credential source: `SYNAPSE_INGEST_TOKEN`
 when explicitly set, otherwise the Claude plugin's saved options in
-`~/.claude/settings.json`. MCP uses `scripts/mcp_headers.py` through Codex's
-`http_headers_helper` setting (verified with Codex 0.155.0). A background Codex
-daemon no longer needs to inherit a shell export. No token is copied into
+`~/.claude/settings.json`. Once the Claude plugin has enrolled this machine
+(`synapse-login`), its saved device token wins over the environment value, so a
+stale export cannot split ingest and recall across two credentials. Session
+start prints one line naming the overridden variable, and an
+`env -u SYNAPSE_INGEST_TOKEN` wrapper around Codex is no longer needed. MCP
+uses `scripts/mcp_headers.py` through Codex's `http_headers_helper` setting
+(verified with Codex 0.155.0). A background Codex daemon no longer needs to
+inherit a shell export. No token is copied into
 `config.toml`, and the helper refuses to send it to a different server origin.
 Re-run the installer to replace legacy `bearer_token_env_var` configuration,
 then reload MCP or start a new session. Older Codex builds without header-helper
@@ -75,7 +80,7 @@ and `updatedInput` is only honored alongside `permissionDecision: "allow"`.
 | var | default | |
 |---|---|---|
 | `SYNAPSE_URL` | `http://localhost:8765` | base URL |
-| `SYNAPSE_INGEST_TOKEN` | saved plugin option | per-device bearer token |
+| `SYNAPSE_INGEST_TOKEN` | saved plugin option | per-device bearer token; ignored once the machine is enrolled |
 | `SYNAPSE_PRIVATE_DIR` | `~/.synapse/private` | private-mode markers |
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
 | `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window |

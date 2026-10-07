@@ -18,6 +18,7 @@ Stdlib-only script loaded by path. No live server: config.post_json is monkeypat
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -173,7 +174,12 @@ def test_the_local_record_captures_what_was_granted(monkeypatch, hook):
         "allowed_projects": ["work-a"],
         "label": "test-laptop",
         "login": "owner",
+        # The token's fingerprint and its server, so the hooks can prefer it over a
+        # stale env value. Never the token itself.
+        "token_sha256": hashlib.sha256(b"device-token-xyz").hexdigest(),
+        "server": "http://localhost:8765",
     }
+    assert "device-token-xyz" not in json.dumps(state)
     assert hook.config.read_device_state() == state
     assert hook.is_enrolled()
 

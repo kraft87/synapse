@@ -75,6 +75,11 @@ Default is the device flow (RFC 8628): it prints a short code, you approve at
 no same-host browser, so it works on servers and headless boxes. `--browser` falls back to
 the legacy loopback flow. Either way the token is stored for the hooks and MCP server.
 
+Keep the token in the plugin config. Don't also export `SYNAPSE_INGEST_TOKEN` from your shell
+profile or the `env` block of `settings.json`: the MCP server never reads it there. On an
+enrolled machine the hooks ignore it too, and session start prints one line saying where to
+remove it ([docs/auth.md](../docs/auth.md)).
+
 > `synapse-login` and `synapse-import` ship in the plugin's `bin/`, which Claude Code puts
 > on PATH **inside sessions only** — hence the `!` prefix. From an outside terminal, run the
 > script by full path, e.g.

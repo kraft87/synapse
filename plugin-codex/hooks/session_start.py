@@ -29,7 +29,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-from common import _cfg, get_json
+from common import _cfg, get_json, token_override_notice
 
 _SCRIPTS = sys.path[0]
 
@@ -116,7 +116,9 @@ def main() -> None:
     _spawn_catchup()
     _sync_skills()
     project = _cwd_to_project(payload.get("cwd")) or _cwd_to_project(os.getcwd())
-    parts = [t for t in (_prefs_text(), _board_text(project)) if t]
+    # The credential notice is local and leads: an env token silently overridden by the
+    # device token is exactly the split this line exists to surface.
+    parts = [t for t in (token_override_notice(), _prefs_text(), _board_text(project)) if t]
     if not parts:
         return
     print(

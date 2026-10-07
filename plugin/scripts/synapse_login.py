@@ -31,7 +31,8 @@ a new device token; it drops the enrollment record only once the sign-in has suc
 
 Truly headless with no browser on any device? Mint a token from an already-trusted
 machine (`/synapse-devices mint "<label>"`) or from the database host
-(`scripts/surface_admin.py mint`), and set it as SYNAPSE_INGEST_TOKEN here.
+(`scripts/surface_admin.py mint`), and paste it into /plugin > synapse > Synapse token
+(SYNAPSE_INGEST_TOKEN in the plugin config) here, not into an environment variable.
 """
 
 from __future__ import annotations
@@ -197,7 +198,7 @@ def _device_login() -> int:
         elif e.code == 404:
             print(
                 "This Synapse has no device-login route (older server). Retry with --browser, "
-                "or set SYNAPSE_INGEST_TOKEN directly.",
+                "or paste a token into /plugin > synapse > Synapse token.",
                 file=sys.stderr,
             )
         else:
@@ -293,7 +294,8 @@ def _browser_login() -> int:
     except urllib.error.HTTPError as e:
         if e.code == 404:
             print(
-                "This Synapse has no OAuth enabled. Set SYNAPSE_INGEST_TOKEN directly.",
+                "This Synapse has no OAuth enabled. Paste a token into "
+                "/plugin > synapse > Synapse token instead.",
                 file=sys.stderr,
             )
         else:

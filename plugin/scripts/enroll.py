@@ -18,7 +18,9 @@ Enrollment is the IdP's device flow (RFC 8628), the same lane `synapse login` us
      to confirm from somewhere else.
   4. The minted token is written to SYNAPSE_INGEST_TOKEN via the same
      ``write_user_config`` path `synapse login` uses, so the MCP server's Authorization
-     header picks it up with no other change anywhere.
+     header picks it up with no other change anywhere. The local record keeps only its
+     sha256, which is how the hooks prefer it over a stale SYNAPSE_INGEST_TOKEN left in
+     the environment (config._resolve_ingest_token).
 
 Interactive by nature — it prints a code and waits for a human — so the SessionStart
 hook never runs it. The hook only reports that this machine is not enrolled; `synapse
@@ -200,6 +202,11 @@ def _persist(r: dict) -> dict:
         "allowed_projects": surface.get("allowed_projects") or [],
         "label": config.SURFACE,
         "login": r.get("login", ""),
+        # The token's fingerprint and the server that minted it, never the token: they
+        # let config.py recognise this credential over a stale env value without the
+        # record becoming a second copy of it. `--reenroll` rewrites both.
+        "token_sha256": config.token_sha256(r["token"]),
+        "server": config.BASE_URL,
     }
     config.write_device_state(state)
     scope = ", ".join(state["allowed_projects"]) or "no projects"

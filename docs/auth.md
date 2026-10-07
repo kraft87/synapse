@@ -21,6 +21,22 @@ themselves are in [docs/install.md](install.md); the design reasoning is
 The plugin puts whichever token you give it in `SYNAPSE_INGEST_TOKEN`, and one token covers
 ingest, recall, skill sync, and MCP. In practice that value should be a device token.
 
+That slot is the plugin config (`/plugin` > synapse > Synapse token), not an environment
+variable. The MCP server reads only the plugin config. A `SYNAPSE_INGEST_TOKEN` exported
+from a shell profile, or from the `env` block of `settings.json`, reaches only the hooks,
+which then upload as one credential while recall is served as another. To prevent that,
+an enrolled machine's hooks resolve to its device token whatever the environment says. The
+enrollment record (`device.json` in the plugin's data dir) keeps the token's sha256 and the
+server that minted it, never the token. Session start prints one line when an env value was
+overridden, naming where to remove it. Two limits:
+
+- The override only applies toward the server that minted the token, or the one the plugin
+  config points at. If `SYNAPSE_URL` or `SYNAPSE_INGEST_URL` in the environment points
+  somewhere else, the env token is used for that server, as before.
+- A machine enrolled before the record carried a hash has none. Its plugin-config token is
+  taken as the device token, because enrollment wrote it there and only a hand edit
+  replaces it. `synapse-login --reenroll` records the hash.
+
 ## Getting a device token
 
 **Self-enrollment (needs an IdP configured).** On the new machine:
@@ -53,7 +69,9 @@ service, a container):
 ```
 
 Defaults to restricted, inheriting the project scope other restricted devices already have.
-The token prints once; set it as `SYNAPSE_INGEST_TOKEN` on the target machine.
+The token prints once. On the target machine, paste it into `/plugin` > synapse > Synapse
+token. Use a `SYNAPSE_INGEST_TOKEN` environment variable only where there is no plugin
+config to hold it, such as a service or container.
 
 The `label` is display only and is deliberately never matched against an existing row:
 keying an enrollment on a self-reported name would reintroduce hostname spoofing through the

@@ -16,6 +16,7 @@ Stdlib-only script loaded by path. No live server: the HTTP helpers are monkeypa
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import sys
@@ -228,7 +229,11 @@ def test_reenroll_replaces_the_device_credential(monkeypatch, login, tmp_path):
 
     assert enroll_calls == ["/device/code", "/surfaces/enroll"]
     assert _slot(tmp_path) == "device-token-new"
-    assert login.config.read_device_state()["surface_id"] == "dev-new456"
+    record = login.config.read_device_state()
+    assert record["surface_id"] == "dev-new456"
+    # The record now pins the NEW token (a legacy record gains its hash here).
+    assert record["token_sha256"] == hashlib.sha256(b"device-token-new").hexdigest()
+    assert "device-token-new" not in json.dumps(record)
 
 
 def test_reenroll_whose_sign_in_fails_leaves_the_old_credential(monkeypatch, login, tmp_path):
