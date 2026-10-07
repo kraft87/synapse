@@ -12,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.scope import coerce_group
-from ingestion.surfaces import SurfaceTrust
+from ingestion.surfaces import SurfaceTrust, own_surface_served
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.recall_warnings import serving_notice, with_notice
@@ -73,10 +73,11 @@ def register(
         debug = bool(body.get("debug", False))
         note_ignored_surface(body.get("surface"), "http.recall")
         trust = _request_trust(request)
-        notice = serving_notice(trust) if _authenticated(request) else None
+        told = _authenticated(request)
 
-        def _work() -> dict:
-            return _get_recall().recall(
+        def _work() -> tuple[dict, str | None]:
+            engine = _get_recall()
+            result = engine.recall(
                 query=query,
                 project=project,
                 group_id=group_id,
@@ -85,10 +86,14 @@ def register(
                 debug=debug,
                 trust=trust,
             )
+            if not told:
+                return result, None
+            own = own_surface_served(getattr(engine, "_db_url", ""), trust)
+            return result, serving_notice(trust, own)
 
         try:
             with logfire.span("http.recall {query!r}", query=query[:80], group_id=group_id):
-                out = await run_in_threadpool(_work)
+                out, notice = await run_in_threadpool(_work)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("http recall failed")
             return err(str(exc)[:200], 500)

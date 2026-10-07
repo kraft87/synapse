@@ -195,6 +195,9 @@ def register(
                     project=project,
                     content=ep_content,
                     source="manual",
+                    # Provenance (schema 057): the credential-resolved caller, never an
+                    # argument. A self-reported `surface` or an unknown caller stamps NULL.
+                    surface_id=trust.stamp_surface_id,
                 )
                 episode_id = db.upsert_episode(ep)
 

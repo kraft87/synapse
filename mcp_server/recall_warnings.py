@@ -114,7 +114,7 @@ SIGN_IN_NOTICE = (
 )
 
 
-def serving_notice(trust: SurfaceTrust | None) -> str | None:
+def serving_notice(trust: SurfaceTrust | None, own_served: bool = False) -> str | None:
     """The notice explaining an empty serve for this verdict, or None when there is none.
 
     Fires for exactly two verdicts: UNKNOWN (no credential identity, no row, or a
@@ -122,6 +122,13 @@ def serving_notice(trust: SurfaceTrust | None) -> str | None:
     Full trust, and restricted with any project at all, get nothing: narrower serving
     there is the design, not a fault. The caller decides whether the request was
     authenticated; this only maps a verdict to text.
+
+    ``own_served`` (``ingestion.surfaces.own_surface_served``) says the caller is served
+    what it ingested itself (schema 057). A restricted DEVICE with no projects is then
+    the designed work-laptop setup, not a fault, so it gets no notice (and the notice's
+    remedy, a new credential, would cost it its own uploads, which stay stamped with the
+    old one). Before 057 is applied it is served nothing and keeps the notice. A sign-in
+    keeps its notice either way: a connector's own rows are only its remember() writes.
     """
     if trust is None or not trust.restricted:
         return None
@@ -129,7 +136,9 @@ def serving_notice(trust: SurfaceTrust | None) -> str | None:
         return None
     if (trust.surface_id or "").startswith(_OAUTH_PREFIX):
         return SIGN_IN_NOTICE
-    return RESTRICTED_EMPTY_NOTICE if trust.known else NO_CREDENTIAL_NOTICE
+    if not trust.known:
+        return NO_CREDENTIAL_NOTICE
+    return None if own_served and trust.own_surface else RESTRICTED_EMPTY_NOTICE
 
 
 def with_notice(out: Any, notice: str | None) -> Any:

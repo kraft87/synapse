@@ -151,6 +151,9 @@ class Episode(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     source: str | None = None
     created_at: datetime | None = None
+    # Provenance (schema 057): the credential-resolved surface that wrote this turn.
+    # Set only by the server from the authenticated caller, never parsed from a payload.
+    surface_id: str | None = None
 
 
 class SessionSummary(BaseModel):

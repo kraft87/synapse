@@ -321,6 +321,8 @@ class TimelineGate:
                 # Personal scope off: one domain exists, so the stored label is
                 # deterministic rather than whatever the model happened to emit.
                 domain=gate.get("domain") if personal_scope_enabled() else "technical",
+                # Inherit the turn's provenance (schema 057) for restricted-board serving.
+                source_episode_id=int(episode_id),
             )
             logger.info(
                 "timeline event (s%d) from ep:%s: %s",

@@ -96,18 +96,31 @@ Human says nothing means personal; software says nothing means restricted.
 
 | Path | Notes | Episodes / timeline | KG facts |
 | --- | --- | --- | --- |
-| `GET /context` (board) | `audience='work-safe'` only | filtered to the project allowlist, NULL project excluded | n/a |
-| `recall` / `POST /recall` | `audience='work-safe'` only | both legs filtered to the allowlist | **leg skipped entirely** |
-| `recall_full_turns` | n/a | same allowlist | n/a |
-| `fetch(ids)` | `audience='work-safe'` only | same allowlist | n/a |
-| `fetch_session` | n/a | allowlist on the probe and both row reads | n/a |
+| `GET /context` (board) | `audience='work-safe'` only | filtered to the project allowlist plus the machine's own uploads, NULL project excluded | n/a |
+| `recall` / `POST /recall` | `audience='work-safe'` only | both legs filtered to the allowlist plus own uploads | only facts whose source episodes all sit in allowlisted projects (schema 056) |
+| `recall_full_turns` | n/a | same as recall | n/a |
+| `fetch(ids)` | `audience='work-safe'` only | same as recall | n/a |
+| `fetch_session` | n/a | same as recall, on the probe and both row reads | n/a |
+| `POST /timeline/recent` | n/a | same as the board | n/a |
+| `GET /preferences/top` | n/a | preferences from allowlisted projects only | n/a |
+| `/config/*` | n/a | its own mirrored config only; proposals mined only from its own sessions | n/a |
 
-The KG leg is skipped rather than filtered because `kg_relationships` has no `project`
-column, so serving zero facts is the only fail-closed answer available. `fetch` and
-`fetch_session` are filtered because ids are sequential integers: an unfiltered drill-down
-would let a restricted caller enumerate exactly what the board withholds. A session outside
-the allowlist reports the same "not indexed" answer an unknown id does, deliberately
+`fetch` and `fetch_session` are filtered because ids are sequential integers: an unfiltered
+drill-down would let a restricted caller enumerate exactly what the board withholds. A session
+outside the allowlist reports the same "not indexed" answer an unknown id does, deliberately
 indistinguishable.
+
+An enrolled restricted machine always reads back the conversations it ingested itself,
+even with an empty project allowlist: each ingested turn is stamped with the surface of the
+device token that uploaded it (schema 057). Turns uploaded under the root token, and every
+turn ingested before 057, carry no stamp and stay reachable only through the allowlist. A
+turn rewritten by a different credential loses its stamp. Until 057 is applied the server
+behaves exactly as before it: nothing is stamped, and the allowlist alone applies.
+
+The session-start routes (`/timeline/recent`, `/preferences/top`) and the config lane
+(`/config/*`) resolve the machine from its token as well, never from a `surface` field in
+the request. The root token is not a machine: it gets nothing from them, and a 403 on
+config writes.
 
 Resolution never fails open. No credential, no row, a non-approved row, a missing table, an
 unreachable database, a malformed row: all resolve to restricted with an empty allowlist. An
@@ -120,8 +133,11 @@ says so: a `WARNING:` line right under the board header, and the same text first
 `POST /recall`. The text names the cause and the fix (enroll with `synapse-login`; mint a
 device a new credential with projects; grant an `oauth:<login>` identity with `PUT`), and
 no ids. Full trust and restricted-with-projects get no notice, and neither does an open
-server, where no credential would change the answer. Old clients show it too, since it is
-part of the server's response rather than the plugin.
+server, where no credential would change the answer. Once schema 057 is applied, neither
+does a restricted device with no projects: it reads back its own uploads, which is the
+intended work-laptop setup, and minting it a new credential would leave those uploads
+behind under the old one. Old clients show the notice too, since it is part of the
+server's response rather than the plugin.
 
 Note-writing follows the same line: a write from a live, approved restricted surface defaults
 to `work-safe`, symmetric with what it may read, so notes written at work do not vanish from

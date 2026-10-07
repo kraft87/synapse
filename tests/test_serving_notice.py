@@ -64,6 +64,32 @@ def test_serving_notice_fires_only_for_the_serve_nothing_verdicts(trust, expecte
     assert serving_notice(trust) == expected
 
 
+_BOUND_EMPTY = SurfaceTrust("dev-0a1b2c", "restricted", (), known=True, credential_bound=True)
+
+
+@pytest.mark.parametrize(
+    "trust,own_served,expected",
+    [
+        # A device served its own uploads (schema 057 applied) is the designed work-laptop
+        # setup, not a fault: no notice, and no advice to re-mint (that would strand them).
+        (_BOUND_EMPTY, True, None),
+        # Before 057 it is served nothing, exactly as before: the notice stays.
+        (_BOUND_EMPTY, False, RESTRICTED_EMPTY_NOTICE),
+        # Only a credential-bound verdict has own uploads; a self-reported id never does.
+        (SurfaceTrust("dev-0a1b2c", "restricted", (), known=True), True, RESTRICTED_EMPTY_NOTICE),
+        # A sign-in keeps its remedy, and unknown callers have nothing of their own.
+        (
+            SurfaceTrust("oauth:someone", "restricted", (), known=True, credential_bound=True),
+            True,
+            SIGN_IN_NOTICE,
+        ),
+        (UNKNOWN_SURFACE, True, NO_CREDENTIAL_NOTICE),
+    ],
+)
+def test_a_device_served_its_own_uploads_gets_no_notice(trust, own_served, expected):
+    assert serving_notice(trust, own_served) == expected
+
+
 def test_with_notice_goes_first_and_keeps_leg_warnings():
     leg = "embedding failed (voyage: Unauthorized): vector legs skipped."
     out = with_notice({"query": "q", "facts": [], "warnings": [leg]}, NO_CREDENTIAL_NOTICE)
@@ -308,17 +334,7 @@ def test_http_recall_explains_a_serve_nothing_verdict(server, token, expected):
         assert body["warnings"] == [expected]
 
 
-@_needs_db
-@pytest.mark.parametrize(
-    "token,expected",
-    [
-        (_ROOT, NO_CREDENTIAL_NOTICE),
-        ("empty-dev-tok", RESTRICTED_EMPTY_NOTICE),
-        ("scoped-dev-tok", None),
-        ("full-dev-tok", None),
-    ],
-)
-def test_board_puts_the_notice_at_the_top(server, token, expected):
+def _assert_board(server, token, expected):
     with _client(server) as c:
         r = c.get("/context", headers=_h(token))
     assert r.status_code == 200
@@ -333,6 +349,35 @@ def test_board_puts_the_notice_at_the_top(server, token, expected):
         assert body["warnings"] == [expected]
         assert lines[1] == f"WARNING: {expected}"  # one line, right under the header
         assert "episodes across" in lines[2]
+
+
+@_needs_db
+@pytest.mark.parametrize(
+    "token,expected",
+    [
+        (_ROOT, NO_CREDENTIAL_NOTICE),
+        # The test database has schema 057, so this device reads back its own uploads:
+        # the designed work-laptop setup, not a serve-nothing fault.
+        ("empty-dev-tok", None),
+        ("scoped-dev-tok", None),
+        ("full-dev-tok", None),
+    ],
+)
+def test_board_puts_the_notice_at_the_top(server, token, expected):
+    _assert_board(server, token, expected)
+
+
+@_needs_db
+def test_board_keeps_the_restricted_notice_before_057(server):
+    """Without schema 057 an empty-allowlist device is served nothing, so it keeps the
+    notice, exactly as before 057."""
+    from ingestion.surfaces import OWN_SURFACE_PROBE
+
+    OWN_SURFACE_PROBE.missing(_TEST_DB)  # as if the probe had just found no column
+    try:
+        _assert_board(server, "empty-dev-tok", RESTRICTED_EMPTY_NOTICE)
+    finally:
+        OWN_SURFACE_PROBE.reset()
 
 
 @_needs_db

@@ -78,6 +78,8 @@ _DB_FILES = {
     "test_credential_trust.py",
     "test_serving_notice.py",
     "test_root_surface_lane.py",
+    "test_own_surface_episodes.py",
+    "test_config_scope.py",
 }
 
 

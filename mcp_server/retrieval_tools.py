@@ -10,7 +10,7 @@ import logfire
 from fastmcp import FastMCP
 
 from ingestion.scope import coerce_group
-from ingestion.surfaces import SurfaceTrust
+from ingestion.surfaces import SurfaceTrust, own_surface_served
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.recall_warnings import serving_notice, with_notice
 
@@ -37,8 +37,10 @@ def register(
     """
 
     def _served(out: Any, trust: SurfaceTrust) -> Any:
-        authenticated = _access_token() is not None
-        return with_notice(out, serving_notice(trust) if authenticated else None)
+        if _access_token() is None:
+            return out
+        own = own_surface_served(getattr(_get_recall(), "_db_url", ""), trust)
+        return with_notice(out, serving_notice(trust, own))
 
     @mcp.tool()
     @_scope_doc

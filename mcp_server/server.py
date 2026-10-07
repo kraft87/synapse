@@ -495,7 +495,7 @@ _feedback_ids_error, _file_recall_feedback, recall_feedback, feedback_http = (
 
 
 ingest_turns = _register_ingest_route(
-    mcp, lambda: DB_URL, lambda request: _machine_authorized(request)
+    mcp, lambda: DB_URL, lambda request: _machine_authorized(request), _request_trust
 )
 
 

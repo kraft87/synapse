@@ -237,7 +237,7 @@ def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_SELF_EXCLUDE", True)
     r._ensure_embedder = lambda: (_ for _ in ()).throw(RuntimeError("no embedder"))  # type: ignore[method-assign]
 
-    def _pool(q, e, p, session_id=None, allowed_projects=None):
+    def _pool(q, e, p, session_id=None, allowed_projects=None, own_surface=None):
         seen["session_id"] = session_id
         return []
 

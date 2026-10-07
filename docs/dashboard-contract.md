@@ -185,7 +185,8 @@ telemetry. They never contain a credential or a traceback. The MCP `recall` and
 `recall_full_turns` tools return the same field on the same terms.
 
 The list also carries a serve-nothing notice, always first, when an authenticated caller
-resolves to an unknown surface or to a restricted surface with no projects. It explains an
+resolves to an unknown surface or to a restricted surface with no projects (except a device
+that reads back its own uploads, schema 057). It explains an
 empty result that is a credential problem rather than a backend one (for example
 `This connection has no device credential, so it is served little or no memory. Run
 synapse-login on this machine to enroll it ...`). The dashboard's own full-trust token
