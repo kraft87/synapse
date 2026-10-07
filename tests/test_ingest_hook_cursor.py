@@ -222,9 +222,12 @@ def test_ship_resumes_after_failed_post(hook, tmp_path, monkeypatch):
 
     monkeypatch.setattr(hook, "_post_records", flaky)
     assert hook._ship(str(path), mode="catchup") == (0, 0)
-    assert str(path) not in hook._load_state()  # nothing advanced
+    ent = hook._load_state()[str(path)]
+    assert ent["offset"] == 0 and ent["size"] == -1  # nothing advanced...
+    assert ent["pending"]  # ...but the failure is on record, so catch-up retries it
     posts, shipped = hook._ship(str(path), mode="catchup")  # the retry ships it all
     assert (posts, shipped) == (1, 6)
+    assert "pending" not in hook._load_state()[str(path)]
 
 
 def test_ship_crash_mid_backlog_does_not_fake_completion(hook, tmp_path, monkeypatch):

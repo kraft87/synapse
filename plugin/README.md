@@ -110,6 +110,20 @@ recently active projects, so yours should appear with a rising count. Knowledge-
 land a few minutes later, on the poll cycle. Seeing nothing? Hooks fail silently by design —
 work through [the troubleshooting list](../docs/install.md#troubleshooting).
 
+A failed upload is not lost. The hook records it, and every session start's catch-up sweep
+retries it, however long the outage lasted: a down server, a revoked token, a proxy answering
+`403`. The sweep picks up any lagging transcript modified in the last
+`SYNAPSE_INGEST_CATCHUP_DAYS` (default 3) plus every transcript whose upload failed, at any
+age, `SYNAPSE_INGEST_CATCHUP_MAX` (default 20) files per session start. When uploads keep
+failing, session start shows one line saying so:
+
+```
+Synapse uploads have been failing since 2026-01-31 09:12 (HTTP 403 Forbidden); transcripts will be retried automatically.
+```
+
+The sweep never picks up a transcript the hook didn't try to upload, so history from before
+you installed the plugin still needs `synapse-import` (step 4).
+
 ## Commands
 
 Slash commands:
