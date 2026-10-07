@@ -105,8 +105,9 @@ _STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the s
 # Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
 # statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals
 # an operator reviews, so the unified list excludes them (the nav badge still only counts
-# 'proposed'). skills terminal = 'promoted' (fs mv), config terminal = 'applied' (disk write) —
-# both reached OUTSIDE the dashboard; the dashboard only moves proposed→accepted / →rejected.
+# 'proposed'). skills terminal = 'promoted' (reached by approve: the lane's accept applies
+# the proposal to the skill registry), config terminal = 'applied' (disk write, reached outside
+# the dashboard).
 _PROPOSALS_LANE_CAP = 200
 _SKILL_REVIEW_STATUSES = ("proposed", "accepted", "promoted", "rejected")
 _CONFIG_REVIEW_STATUSES = ("proposed", "accepted", "applied", "rejected")
@@ -1725,17 +1726,17 @@ def _retire_flag(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: s
 # lane's own _proposal_act (the state transition + side effects) and _proposal_detail
 # (the row read), and adds three things on top: a lane-merged list, a normalized detail
 # envelope, and a dashboard_audit trail keyed by the namespaced id ("skill:<n>" /
-# "config:<n>"). It never materializes an accepted change — promote (skills) and apply
-# (config) stay with the lanes. See docs/dashboard-contract.md §"Phase 2b".
+# "config:<n>"). Approve does whatever the lane's accept does: for skills that APPLIES the
+# proposal (registry write, status 'promoted'); config apply stays with the config CLI.
+# See docs/dashboard-contract.md §"Phase 2b".
 
 
 def _skill_routing_eval_stub(_conn: Any, _cid: int, _name: str) -> str:
     """The skills lane's accept path takes an advisory ``llm`` callable that runs a
     routing-eval on RETUNE candidates — an Anthropic API call that only annotates the
-    accept result. The dashboard decision path is contracted to write ONLY state + notes,
-    so it passes THIS stub in place of the real ``_routing_eval``: accept still flips
-    status→accepted and records the grounded 'accept' signal, but no LLM call is made from
-    the request path. Running the eval stays with the skills review CLI."""
+    accept result. The dashboard passes THIS stub in place of the real ``_routing_eval``:
+    accept still applies the proposal and records the grounded 'accept' signal, but no LLM
+    call is made from the request path. Running the eval stays with the skills review CLI."""
     return "routing-eval: skipped (dashboard decision path — advisory eval runs in the skills CLI)"
 
 
@@ -1917,7 +1918,9 @@ def _proposal_decision(
     db_url: str, lane: str, n: int, action: str, note: str | None
 ) -> dict[str, Any] | None:
     """Delegate to the lane's _proposal_act (approve→accept, reject→reject-with-reason),
-    then append a dashboard_audit row. Returns the lane result, or None if the row is gone."""
+    then append a dashboard_audit row. Returns the lane result, or None if the row is gone.
+    A lane refusal (skills accept: no draft yet, stale draft, name taken) changed nothing,
+    so it is returned as-is and leaves no audit row."""
     lane_action = "accept" if action == "approve" else "reject"
     if lane == "skill":
         result = _skill_proposal_act(db_url, n, lane_action, note, _skill_routing_eval_stub)
@@ -1927,6 +1930,8 @@ def _proposal_decision(
         result = _config_proposal_act(db_url, n, lane_action, note, None)
     if isinstance(result, dict) and result.get("found") is False:
         return None
+    if isinstance(result, dict) and result.get("status") == "refused":
+        return result
 
     audit_action = "proposal_approve" if action == "approve" else "proposal_reject"
     conn = psycopg.connect(db_url, autocommit=True)

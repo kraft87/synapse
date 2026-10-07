@@ -179,13 +179,20 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [copied, setCopied] = useState(false);
+  // A skills approve APPLIES the proposal; the lane refuses (200, status 'refused') when it
+  // can't — no draft yet, a stale draft, a taken name — and nothing changed, so say why.
+  const [refusal, setRefusal] = useState<string | null>(null);
 
-  useEffect(() => { setRejecting(false); setReason(''); }, [id]);
+  useEffect(() => { setRejecting(false); setReason(''); setRefusal(null); }, [id]);
 
   const decide = (action: 'approve' | 'reject', note?: string) => {
     setBusy(true);
+    setRefusal(null);
     postProposalDecision(id, action, note)
-      .then(() => { setRejecting(false); setReason(''); reload(); onDecided(); })
+      .then((r) => {
+        if (r.status === 'refused') { setRefusal(String(r.detail ?? 'refused by the lane')); return; }
+        setRejecting(false); setReason(''); reload(); onDecided();
+      })
       .catch(() => {})
       .finally(() => setBusy(false));
   };
@@ -239,6 +246,7 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
       {/* decision bar (proposed only) */}
       {!decided && (
         <div style={{ borderTop: '1px solid var(--line)', paddingTop: '14px', marginTop: '16px' }}>
+          {refusal && <div style={{ fontSize: '12.5px', color: 'var(--err)', lineHeight: 1.5, marginBottom: '10px' }}>not applied: {refusal}</div>}
           {!rejecting ? (
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
               <button disabled={busy} onClick={() => decide('approve')}
