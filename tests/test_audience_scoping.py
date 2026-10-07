@@ -161,7 +161,8 @@ def _engine(db_url, monkeypatch, notes_rows=None):
         {"id": e["id"], "text": e.get("content", "")} for e in eps
     ]
     r._search_web_reranked = lambda q, emb: []
-    r._fetch_superseded_pairs_pg = lambda gid, uuids, cap: []
+    r._search_kg = lambda *a, **k: ([], [])
+    r._fetch_superseded_pairs_pg = lambda gid, uuids, cap, allowed_projects=None: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
     r._increment_retrieval_counts = lambda ids: None
@@ -209,22 +210,45 @@ def test_restricted_recall_passes_the_work_safe_tier_to_the_notes_leg(clean, db_
     assert r2.recall("tabs", surface=full)["notes"][0]["audience"] is None
 
 
-def test_restricted_recall_skips_the_kg_leg_entirely(clean, db_url, monkeypatch):
-    """v1 posture: kg_relationships has no project column, so facts cannot be filtered
-    and the only fail-closed answer is to serve none. Skipping is also cheaper than
-    filtering — the leg never runs."""
+def test_restricted_recall_scopes_the_kg_leg_to_the_allowlist(clean, db_url, monkeypatch):
+    """Schema 056: a registered restricted surface runs the KG leg WITH its allowlist
+    (the provenance filter itself is covered in test_kg_source_projects.py). Full trust
+    calls it exactly as before, with no scope argument at all."""
     sid = register_restricted(clean, ["alpha"])
-    calls: list[tuple] = []
+    calls: list[dict] = []
 
     r = _engine(db_url, monkeypatch)
-    r._search_kg = lambda *a, **k: calls.append(a) or ([{"fact": "leaked", "_uuid": "u1"}], [])
-    assert r.recall("anything", surface=sid)["facts"] == []
-    assert calls == [], "the KG leg must not run at all on a restricted surface"
+    r._search_kg = lambda *a, **k: calls.append(k) or ([{"fact": "scoped", "_uuid": "u1"}], [])
+    assert [f["fact"] for f in r.recall("anything", surface=sid)["facts"]] == ["scoped"]
+    assert calls[0]["allowed_projects"] == ["alpha"]
 
     full = register_full(clean)
+    full_calls: list[dict] = []
     r2 = _engine(db_url, monkeypatch)
-    r2._search_kg = lambda *a, **k: ([{"fact": "served", "_uuid": "u1"}], [])
+    r2._search_kg = lambda *a, **k: (
+        full_calls.append(k) or ([{"fact": "served", "_uuid": "u1"}], [])
+    )
     assert [f["fact"] for f in r2.recall("anything", surface=full)["facts"]] == ["served"]
+    assert "allowed_projects" not in full_calls[0]
+
+
+def test_unknown_surface_skips_every_kg_read(clean, db_url, monkeypatch):
+    """An unknown caller's allowlist is empty, and no fact can be a non-empty subset of
+    nothing, so the facts leg and every KG-derived extra are skipped without a query."""
+    calls: list[str] = []
+
+    def _spy(name, result):
+        return lambda *a, **k: calls.append(name) or result
+
+    r = _engine(db_url, monkeypatch)
+    r._search_kg = _spy("facts", ([{"fact": "leaked", "_uuid": "u1"}], []))
+    r._fetch_superseded_pairs_pg = _spy("pairs", [{"fact": "leaked", "superseded_by": "x"}])
+    r._surface_supersessions = _spy("surface", [{"fact": "leaked", "_uuid": "u2"}])
+    r._episode_supersessions = _spy("overlay", {})
+    out = r.recall("anything", surface="never-registered")
+    assert out["facts"] == []
+    assert "superseded_facts" not in out
+    assert calls == []
 
 
 def test_recall_records_the_trust_regime_in_telemetry(clean, db_url, monkeypatch):

@@ -66,6 +66,59 @@ def test_check_continues_when_database_is_ahead(tmp_path, monkeypatch, caplog):
     assert "ahead of this build" in caplog.text
 
 
+def _make_schema_dir_with(tmp_path: Path, files: dict[str, bool]) -> Path:
+    """{filename: optional?} -> a schema dir whose optional files carry the marker."""
+    d = tmp_path / "schema"
+    d.mkdir()
+    for name, optional in files.items():
+        marker = f"{schema_check.OPTIONAL_MARKER}\n" if optional else ""
+        (d / name).write_text(f"-- header\n{marker}SELECT 1;\n")
+    return d
+
+
+def test_required_version_skips_an_optional_tail(tmp_path):
+    d = _make_schema_dir_with(tmp_path, {"039_a.sql": False, "040_b.sql": True, "041_c.sql": True})
+    assert expected_schema_version(d) == "041"
+    assert schema_check.required_schema_version(d) == "039"
+
+
+def test_an_optional_migration_followed_by_a_required_one_relaxes_nothing(tmp_path):
+    d = _make_schema_dir_with(tmp_path, {"039_a.sql": False, "040_b.sql": True, "041_c.sql": False})
+    assert schema_check.required_schema_version(d) == "041"
+
+
+def test_the_marker_must_be_a_line_of_its_own(tmp_path):
+    d = tmp_path / "schema"
+    d.mkdir()
+    (d / "040_b.sql").write_text(f"-- mentions {schema_check.OPTIONAL_MARKER} in prose\n")
+    assert not schema_check.is_optional_migration(d / "040_b.sql")
+
+
+def test_check_continues_when_behind_only_by_optional_migrations(tmp_path, monkeypatch, caplog):
+    # The image lands before an optional migration is applied by hand: boot, warn.
+    d = _make_schema_dir_with(tmp_path, {"039_a.sql": False, "040_b.sql": True})
+    monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "039")
+    with caplog.at_level("WARNING"):
+        check_schema_version("postgresql://x", schema_dir=d)  # no exit
+    assert "marked optional" in caplog.text
+
+
+def test_check_exits_when_behind_a_required_migration_despite_an_optional_tail(
+    tmp_path, monkeypatch
+):
+    d = _make_schema_dir_with(tmp_path, {"038_a.sql": False, "039_b.sql": False, "040_c.sql": True})
+    monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "038")
+    with pytest.raises(SystemExit):
+        check_schema_version("postgresql://x", schema_dir=d)
+
+
+def test_an_optional_tail_does_not_excuse_a_missing_stamp(tmp_path, monkeypatch):
+    d = _make_schema_dir_with(tmp_path, {"039_a.sql": False, "040_b.sql": True})
+    monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: None)
+    with pytest.raises(SystemExit):
+        check_schema_version("postgresql://x", schema_dir=d)
+
+
 def test_check_exits_on_unparseable_stamp(tmp_path, monkeypatch):
     d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
     monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "garbage")

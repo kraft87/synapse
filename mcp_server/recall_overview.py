@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import time
 from typing import Any
@@ -65,10 +66,13 @@ class RecallOverviewMixin:
         ``surface`` is the calling host's id (schema 053). Anything but a surface
         registered ``trust='full'`` — including a missing one — is RESTRICTED: episodes
         are filtered to the surface's project allowlist, notes to
-        ``audience='work-safe'``, and the KG facts leg is skipped entirely (v1:
-        kg_relationships has no project column, so serving zero facts is the only
-        fail-closed answer available). Bare calls with no surface therefore serve a
-        narrow result on purpose; that is the design, not a regression.
+        ``audience='work-safe'``, and KG facts to those whose provenance is known and
+        lies wholly inside the allowlist (schema 056 ``source_projects``: every source
+        episode exists, has a project, and that project is allowed). The same rule
+        covers every KG-derived extra (superseded pairs, the supersession surface, the
+        episode-validity overlay). An empty allowlist, or a database without schema 056,
+        serves no facts at all. Bare calls with no surface therefore serve a narrow
+        result on purpose; that is the design, not a regression.
 
         ``group_id`` is coerced through ``coerce_group``: with the personal scope
         off (SYNAPSE_PERSONAL_SCOPE=0) a request for the personal graph is served
@@ -118,6 +122,12 @@ class RecallOverviewMixin:
         ex = self._leg_executor
         st = self._resolve_trust(surface, trust)
         allowed = st.project_filter
+        # KG provenance scope (schema 056). Full trust: no kwargs, so every KG call below
+        # is exactly the call it always was. Restricted: each KG read gets the allowlist,
+        # and an EMPTY allowlist skips them outright, because no fact can be a non-empty
+        # subset of nothing.
+        kg_scope: dict[str, Any] = {"allowed_projects": allowed} if st.restricted else {}
+        kg_off = st.restricted and not allowed
 
         # BM25 is pure text search — it does NOT need the query embedding. Start it
         # FIRST so its ~165ms fetch overlaps the ~170ms Voyage query-embedding call
@@ -157,17 +167,23 @@ class RecallOverviewMixin:
             return self._search_web_reranked(query, query_emb) if query_emb is not None else []
 
         def _kg_leg() -> tuple[list[Any], list[Any]]:
-            # v1 KG posture on a restricted surface: SKIP. kg_relationships carries no
-            # project column, and joining back through source episodes to derive one
-            # isn't worth the per-query cost yet — so there is no way to filter facts,
-            # and serving none is the only fail-closed option.
+            # Restricted surface: serve only facts whose cached provenance set
+            # (kg_relationships.source_projects, schema 056) is known, non-empty and a
+            # subset of the allowlist. Mixed or unknown provenance is never served. With
+            # an empty allowlist, or before 056 is applied, the leg serves nothing,
+            # exactly the pre-056 skip (see _search_kg / _kg_scope_ready).
             if query_emb is None:
                 _warn("KG facts leg skipped: no query embedding, so the facts bucket is empty.")
                 return [], []
-            if st.restricted:
+            if kg_off:
                 return [], []
             return self._search_kg(
-                query, query_emb, group_id, session_focus or [], fact_limit=settings._FACT_LIMIT
+                query,
+                query_emb,
+                group_id,
+                session_focus or [],
+                fact_limit=settings._FACT_LIMIT,
+                **kg_scope,
             )
 
         f_vec = (
@@ -218,15 +234,19 @@ class RecallOverviewMixin:
         # ordering as _rerank_pool, but it also yields the top relevance score (a recall-
         # confidence signal, and the basis for an eventual inject-only-if-relevant gate).
         f_rerank = _submit_ctx(ex, _timed, self._rerank_pool_scored, query, ep_pool)
-        f_superseded = _submit_ctx(
-            ex,
-            self._fetch_superseded_pairs_pg,
-            group_id,
-            surfaced_edge_uuids,
-            settings._SUPERSEDED_LIMIT,
+        f_superseded = (
+            None
+            if kg_off
+            else _submit_ctx(
+                ex,
+                functools.partial(self._fetch_superseded_pairs_pg, **kg_scope),
+                group_id,
+                surfaced_edge_uuids,
+                settings._SUPERSEDED_LIMIT,
+            )
         )
         scored, ms_rerank = f_rerank.result()
-        superseded_facts = f_superseded.result()
+        superseded_facts = f_superseded.result() if f_superseded is not None else []
         rerank_top = scored[0][1] if scored else 0.0  # RAW top score (telemetry) — pre-recency
         # Post-rerank recency re-injection: the cross-encoder is recency-blind, so an old
         # *definitive* claim out-ranks a newer *correction* when both make the pool. Re-weight
@@ -302,8 +322,15 @@ class RecallOverviewMixin:
             served_facts = self._floor_facts(query, served_facts)
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
-        sup_extras = self._surface_supersessions(
-            query_emb, group_id, {f.get("_uuid") for f in served_facts if f.get("_uuid")}
+        sup_extras = (
+            []
+            if kg_off
+            else self._surface_supersessions(
+                query_emb,
+                group_id,
+                {f.get("_uuid") for f in served_facts if f.get("_uuid")},
+                **kg_scope,
+            )
         )
         if sup_extras:
             served_facts = list(served_facts) + sup_extras
@@ -322,10 +349,11 @@ class RecallOverviewMixin:
         # superseded, attach the CURRENT fact (via the invalidated_by link). Augments, never replaces
         # — the turn is immutable history and usually carries more than the stale claim. Deduped
         # against the facts bucket above. Cheap (partial GIN, fail-open); usually a no-op.
-        if ep_items:
+        if ep_items and not kg_off:
             sup = self._episode_supersessions(
                 _parse_episode_ids([it.get("id") for it in ep_items if it.get("id")]),
                 group_id,
+                **kg_scope,
             )
             if sup:
                 _apply_supersessions(ep_items, sup, {f["fact"] for f in facts})

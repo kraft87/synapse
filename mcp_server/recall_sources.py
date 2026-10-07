@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
+import psycopg
 from psycopg.rows import tuple_row
 
-from mcp_server.kg_pg import _vec_literal, search_kg_postgres
+from mcp_server.kg_pg import _vec_literal, scope_predicate, search_kg_postgres
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
@@ -16,8 +18,80 @@ from mcp_server.recall_warnings import warn as _warn
 
 logger = logging.getLogger(__name__)
 
+# Restricted KG serving needs kg_relationships.source_projects (schema 056), and the code
+# ships before that migration is applied by hand. A positive probe is cached for the
+# process lifetime; a negative one is re-probed at most this often, so applying 056 under
+# a running server takes effect without a restart. Until then every restricted KG path
+# serves nothing, which is exactly the pre-056 posture.
+_KG_SCOPE_REPROBE_S = 60.0
+_KG_SCOPE_PROBE_SQL = (
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('kg_relationships') "
+    "  AND attname = 'source_projects' AND NOT attisdropped"
+)
+
 
 class RecallSourcesMixin:
+    # Schema-056 probe state (per engine). Plain attributes: the leg threads race only to
+    # write the same answer, and the worst case is one extra probe.
+    _kg_scope_ok: bool = False
+    _kg_scope_probed_at: float | None = None
+    _kg_scope_warned: bool = False
+
+    def _kg_scope_ready(self) -> bool:
+        """True when restricted KG serving can run, i.e. schema 056 is applied.
+
+        Fail-closed: a probe error or a missing column answers False, and the restricted
+        caller is served no facts. Full-trust paths never call this. They do not read
+        the column, so its absence cannot break them."""
+        if self._kg_scope_ok:
+            return True
+        last = self._kg_scope_probed_at
+        if last is not None and time.monotonic() - last < _KG_SCOPE_REPROBE_S:
+            return False
+        self._kg_scope_probed_at = time.monotonic()
+        try:
+            row = self._ensure_pg().execute(_KG_SCOPE_PROBE_SQL).fetchone()
+        except Exception as e:
+            logger.warning("KG provenance probe failed (%s): restricted KG serving stays off", e)
+            return False
+        if row is None:
+            self._kg_scope_missing()
+            return False
+        self._kg_scope_ok = True
+        return True
+
+    def _kg_scope_missing(self, err: BaseException | None = None) -> None:
+        """Note that source_projects is absent: restricted KG serving stays off until a
+        later probe finds it. One log warning per engine and never a response warning, so
+        a restricted serve before the migration looks exactly as it did before 056."""
+        self._kg_scope_ok = False
+        self._kg_scope_probed_at = time.monotonic()
+        if not self._kg_scope_warned:
+            self._kg_scope_warned = True
+            logger.warning(
+                "kg_relationships.source_projects is missing (schema 056 not applied%s): "
+                "restricted surfaces are served no KG facts until it is",
+                f": {err}" if err is not None else "",
+            )
+
+    def _kg_scope_blocked(self, allowed_projects: list[str] | None) -> bool:
+        """True when a restricted KG read must return nothing without querying.
+
+        ``None`` is full trust (never blocked). An empty allowlist cannot contain a
+        non-empty provenance set, and a database without schema 056 cannot prove one."""
+        if allowed_projects is None:
+            return False
+        return not allowed_projects or not self._kg_scope_ready()
+
+    def _kg_scope_error(self, allowed_projects: list[str] | None, e: Exception) -> bool:
+        """True when ``e`` is the restricted predicate hitting a missing column (056 rolled
+        back, or dropped after the probe cached it). The caller then returns empty."""
+        if allowed_projects is not None and isinstance(e, psycopg.errors.UndefinedColumn):
+            self._kg_scope_missing(e)
+            return True
+        return False
+
     def _search_bm25_web(self, query: str, limit: int) -> list[dict[str, Any]]:
         # Same no-alphanumeric-tokens short-circuit as _bm25_table.
         if not any(c.isalnum() for c in query):
@@ -171,8 +245,14 @@ class RecallSourcesMixin:
         group_id: str,
         session_focus: list[str],
         fact_limit: int,
+        allowed_projects: list[str] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """KG facts leg over kg_entities / kg_relationships (task #67).
+
+        ``allowed_projects`` is a restricted surface's allowlist: only facts whose whole
+        provenance lies inside it are served (schema 056, ``kg_pg.scope_predicate``).
+        Without schema 056 the restricted leg returns nothing and logs one warning. It
+        never adds a response warning, matching the pre-056 skip. ``None`` = full trust.
 
         Runs inside one transaction so the planner GUCs are SET LOCAL — scoped
         to this query, not the thread-local connection that other legs may
@@ -182,6 +262,8 @@ class RecallSourcesMixin:
         bucket rather than failing the whole recall.
         """
         settings = self._settings()
+        if self._kg_scope_blocked(allowed_projects):
+            return [], []
         try:
             conn = self._ensure_pg()
             with conn.transaction():
@@ -191,9 +273,18 @@ class RecallSourcesMixin:
                 cur.execute("SET LOCAL enable_seqscan = off")
                 cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
                 return search_kg_postgres(
-                    cur, query, query_emb, settings._KG_OWNER, group_id, session_focus, fact_limit
+                    cur,
+                    query,
+                    query_emb,
+                    settings._KG_OWNER,
+                    group_id,
+                    session_focus,
+                    fact_limit,
+                    allowed_projects=allowed_projects,
                 )
         except Exception as e:
+            if self._kg_scope_error(allowed_projects, e):
+                return [], []
             logger.warning("KG search failed: %s", e)
             _warn(f"KG facts leg failed ({_err_brief(e)}): no facts served.")
             return [], []
@@ -203,20 +294,34 @@ class RecallSourcesMixin:
         group_id: str,
         active_edge_uuids: list[str],
         cap: int,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Superseded-fact pairs for served edges (Postgres port of the old
         FalkorDB _fetch_history_pairs).
 
         DISTINCT ON picks the most recently invalidated predecessor per active
         edge in SQL (the FalkorDB path does this dedup in Python).
+
+        ``allowed_projects`` (restricted surface) requires BOTH sides of a pair, the
+        served edge and the displaced one, to pass the schema-056 provenance rule, so a
+        pair is dropped when either side is out of scope. The filter runs before
+        DISTINCT ON: when an edge's newest predecessor is out of scope, an older
+        in-scope one can still be shown.
         """
         settings = self._settings()
         if not active_edge_uuids or cap <= 0:
             return []
+        if self._kg_scope_blocked(allowed_projects):
+            return []
+        scope_sql = ""
+        scope_args: tuple[Any, ...] = ()
+        if allowed_projects is not None:
+            scope_sql = f" AND {scope_predicate('a')} AND {scope_predicate('o')}"
+            scope_args = (allowed_projects, allowed_projects)
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
                        o.uuid AS old_uid, o.fact AS old_fact
                 FROM kg_relationships a
@@ -226,12 +331,14 @@ class RecallSourcesMixin:
                 WHERE a.owner_id = %s AND a.group_id = %s
                   AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                   AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
-                  AND o.fact IS NOT NULL AND a.fact IS NOT NULL
+                  AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
                 ORDER BY a.uuid, o.t_invalid DESC
                 """,
-                (settings._KG_OWNER, group_id, active_edge_uuids),
+                (settings._KG_OWNER, group_id, active_edge_uuids, *scope_args),
             ).fetchall()
         except Exception as e:
+            if self._kg_scope_error(allowed_projects, e):
+                return []
             logger.debug("PG superseded-pairs query failed: %s", e)
             return []
         by_uid = {r["uid"]: r for r in rows}
@@ -256,21 +363,38 @@ class RecallSourcesMixin:
         return out
 
     def _episode_supersessions(
-        self, episode_ids: list[int], group_id: str, cap: int = 6
+        self,
+        episode_ids: list[int],
+        group_id: str,
+        cap: int = 6,
+        allowed_projects: list[str] | None = None,
     ) -> dict[int, list[str]]:
         """Map served episode ids -> the CURRENT facts that superseded a claim each made.
 
         A retired edge P citing the episode (episodes @> [id]) links to its superseding live edge N
         via P.invalidated_by (schema 028 + backfill); N.fact is the "now" value. Hits the partial GIN
         (schema 029, WHERE invalidated_by IS NOT NULL) so the per-recall lookup is cheap. Fail-open —
-        a lookup error just yields no annotations, never breaks recall."""
+        a lookup error just yields no annotations, never breaks recall.
+
+        ``allowed_projects`` (restricted surface) requires both the retired edge P and the
+        superseding edge N to pass the schema-056 provenance rule: N's text is what gets
+        served, and P is what ties it to the episode."""
         settings = self._settings()
         if not episode_ids:
             return {}
+        if self._kg_scope_blocked(allowed_projects):
+            return {}
+        scope_sql = ""
+        scope_args: list[Any] = []
+        if allowed_projects is not None:
+            scope_sql = f"AND {scope_predicate('p')} AND {scope_predicate('n')} "
+            scope_args = [allowed_projects, allowed_projects]
         ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
-        params: list[Any] = [json.dumps([i]) for i in episode_ids] + [
+        params: list[Any] = [
+            *(json.dumps([i]) for i in episode_ids),
             settings._KG_OWNER,
             group_id,
+            *scope_args,
             cap,
         ]
         try:
@@ -279,10 +403,14 @@ class RecallSourcesMixin:
                 "SELECT p.episodes, n.fact FROM kg_relationships p "
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                 f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
-                "  AND p.owner_id = %s AND p.group_id = %s LIMIT %s",
+                "  AND p.owner_id = %s AND p.group_id = %s "
+                f"{scope_sql}"
+                "LIMIT %s",
                 params,
             ).fetchall()
         except Exception as e:
+            if self._kg_scope_error(allowed_projects, e):
+                return {}
             logger.warning("episode supersession lookup failed: %s", e)
             return {}
         idset = set(episode_ids)
@@ -302,6 +430,7 @@ class RecallSourcesMixin:
         group_id: str,
         served_uuids: set[str],
         cap: int = _SUP_LIMIT,
+        allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """A query that matches a now-INVALID fact should still return the CURRENT answer.
 
@@ -310,10 +439,20 @@ class RecallSourcesMixin:
         uuid and distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
         correction in. Go-forward coverage only (no link => skipped); never returns the stale fact
         itself. Shape matches the KG fact leg ({fact, _uuid, _date}) so it flows through fact serving.
-        Fail-open — a lookup error just yields no extras."""
+        Fail-open — a lookup error just yields no extras.
+
+        ``allowed_projects`` (restricted surface) requires both the matched superseded edge
+        and its served successor to pass the schema-056 provenance rule."""
         settings = self._settings()
         if query_emb is None:
             return []
+        if self._kg_scope_blocked(allowed_projects):
+            return []
+        scope_sql = ""
+        scope_args: tuple[Any, ...] = ()
+        if allowed_projects is not None:
+            scope_sql = f"  AND {scope_predicate('p')} AND {scope_predicate('n')} "
+            scope_args = (allowed_projects, allowed_projects)
         vec = _vec_literal(query_emb)
         try:
             conn = self._ensure_pg()
@@ -324,10 +463,13 @@ class RecallSourcesMixin:
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
                 "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
                 "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
+                f"{scope_sql}"
                 f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
-                (vec, settings._KG_OWNER, group_id, vec, settings._SUP_CANDIDATES),
+                (vec, settings._KG_OWNER, group_id, *scope_args, vec, settings._SUP_CANDIDATES),
             ).fetchall()
         except Exception as e:
+            if self._kg_scope_error(allowed_projects, e):
+                return []
             logger.warning("supersession surface failed: %s", e)
             return []
         out: list[dict[str, Any]] = []

@@ -24,6 +24,11 @@ on HNSW), then filtering the tenant scope on that small candidate set. The two
 GUCs force the planner onto the index. (The long-term multi-tenant-at-scale answer
 is LIST partitioning by owner_id so partition pruning removes the filter entirely;
 not needed while there is one real owner + throwaway DBs for isolated runs.)
+
+Restricted surfaces (schema 053/054) pass ``allowed_projects``; every leg then serves
+only facts whose cached provenance set (schema 056, ``source_projects``) is known,
+non-empty and inside the allowlist — see :func:`scope_predicate`. ``None`` is full trust
+and runs the original SQL unchanged.
 """
 
 from __future__ import annotations
@@ -42,6 +47,19 @@ _RRF_K = 60
 # applying the owner/group filter. Headroom for multi-tenant filtering; for a single
 # owner every candidate matches and the outer LIMIT (limit*3) is what bites.
 _OVERFETCH = 200
+
+
+def scope_predicate(alias: str = "") -> str:
+    """The restricted-surface serving rule over ``kg_relationships`` (schema 056).
+
+    A fact is servable to a restricted caller iff its source-project set is KNOWN
+    (``source_projects`` is NULL whenever any source episode is missing, has no project,
+    or the fact has no episode provenance at all), NON-EMPTY, and a SUBSET of the
+    caller's allowlist — so a fact with even one source outside the allowlist (mixed
+    provenance) is never served. One ``%s`` placeholder: the allowlist as a list.
+    """
+    col = f"{alias}.source_projects" if alias else "source_projects"
+    return f"{col} IS NOT NULL AND cardinality({col}) > 0 AND {col} <@ %s::text[]"
 
 
 def _rrf_fuse(lists: list[list[str]], k: int = _RRF_K) -> dict[str, float]:
@@ -64,13 +82,26 @@ def search_kg_postgres(
     group_id: str,
     session_focus: list[str],
     limit: int,
+    allowed_projects: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Mirror of recall._search_kg over the Postgres KG mirror.
 
     Returns ``(facts, seed_entities)``: facts carry internal ``_uuid`` (for
     retrieval-count bumps + history lookup), seed_entities is the ranked list of
     connected seeds used by the entity bucket downstream.
+
+    ``allowed_projects`` (a restricted surface's allowlist) applies
+    :func:`scope_predicate` to every fact-returning leg and to the seed degree gate,
+    and returns no seed entities: an entity's name and summary are distilled from ALL
+    its facts, so nothing proves them confined to the allowlist. ``None`` (full trust)
+    executes exactly the statements it always did. Requires schema 056; the caller owns
+    the column-missing fallback (recall_sources._search_kg).
     """
+    restricted = allowed_projects is not None
+    # Spliced into the full-trust statements as "" so their text is unchanged; a
+    # restricted call appends the predicate and its one bound allowlist parameter.
+    scope_sql = f"  AND {scope_predicate()} " if restricted else ""
+    scope_args: tuple[Any, ...] = (allowed_projects,) if restricted else ()
     emb_s = _vec_literal(query_emb)
     # uuid -> (fact text, t_valid). t_valid = when the fact became true (bitemporal valid-from),
     # surfaced as the fact's "as-of" date so the reader can weight currency. 100% populated on
@@ -81,14 +112,32 @@ def search_kg_postgres(
     # partial-index predicate (no owner/group -> the planner keeps the kg_rel_hnsw
     # index instead of falling back to a 47K-row bitmap+sort), then filter the tenant
     # scope on the small candidate set. See module docstring for the required GUCs.
-    cur.execute(
-        "SELECT uuid, fact, t_valid FROM ("
-        "  SELECT uuid, fact, t_valid, owner_id, group_id FROM kg_relationships "
-        "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
-        f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
-        ") sub WHERE owner_id = %s AND group_id = %s LIMIT %s",
-        (emb_s, _OVERFETCH, owner_id, group_id, limit * 3),
-    )
+    if not restricted:
+        cur.execute(
+            "SELECT uuid, fact, t_valid FROM ("
+            "  SELECT uuid, fact, t_valid, owner_id, group_id FROM kg_relationships "
+            "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
+            f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
+            ") sub WHERE owner_id = %s AND group_id = %s LIMIT %s",
+            (emb_s, _OVERFETCH, owner_id, group_id, limit * 3),
+        )
+    else:
+        # Restricted: EXACT KNN over the allowlisted set. The global-HNSW over-fetch
+        # above would under-return here — a selective filter applied to the 200 nearest
+        # facts corpus-wide can leave few or none. The MATERIALIZED fence keeps the
+        # planner off the HNSW ordering; the provenance filter rides the partial GIN
+        # (kg_rel_source_projects_gin). Cost scales with the allowlisted fact count.
+        cur.execute(
+            "WITH cand AS MATERIALIZED ("
+            "  SELECT uuid, fact, t_valid, "
+            f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
+            "  FROM kg_relationships "
+            "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
+            "    AND owner_id = %s AND group_id = %s "
+            f"   AND {scope_predicate()}"
+            ") SELECT uuid, fact, t_valid FROM cand ORDER BY dist LIMIT %s",
+            (emb_s, owner_id, group_id, allowed_projects, limit * 3),
+        )
     vec_uuids: list[str] = []
     for u, f, tv in cur.fetchall():
         if not f:
@@ -106,8 +155,9 @@ def search_kg_postgres(
             "SELECT uuid, fact, t_valid, paradedb.score(id) AS sc FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s) "
             "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+            f"{scope_sql}"
             "ORDER BY sc DESC LIMIT %s",
-            (safe, owner_id, group_id, limit * 3),
+            (safe, owner_id, group_id, *scope_args, limit * 3),
         )
         for u, f, tv, _sc in cur.fetchall():
             if not f:
@@ -142,16 +192,30 @@ def search_kg_postgres(
         "  SELECT u, count(*) AS d FROM ("
         "    SELECT src_uuid AS u FROM kg_relationships "
         "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        f"{scope_sql}"
         "        AND src_uuid IN (SELECT uuid FROM seeds) "
         "    UNION ALL "
         "    SELECT tgt_uuid AS u FROM kg_relationships "
         "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        f"{scope_sql}"
         "        AND tgt_uuid IN (SELECT uuid FROM seeds) "
         "  ) z GROUP BY u"
         ") "
         "SELECT s.uuid, s.name, s.summary, s.dist, COALESCE(d.d, 0) AS deg "
         "FROM seeds s LEFT JOIN deg d ON d.u = s.uuid ORDER BY s.dist",
-        (emb_s, emb_s, _OVERFETCH, owner_id, group_id, owner_id, group_id, owner_id, group_id),
+        (
+            emb_s,
+            emb_s,
+            _OVERFETCH,
+            owner_id,
+            group_id,
+            owner_id,
+            group_id,
+            *scope_args,
+            owner_id,
+            group_id,
+            *scope_args,
+        ),
     )
     focus_set = set(session_focus)
     connected: list[tuple[float, str, str | None, str | None]] = []
@@ -164,7 +228,9 @@ def search_kg_postgres(
             break
     connected.sort(key=lambda x: x[0])
     seed_uuids = [c[1] for c in connected]
-    seed_entities = [{"uuid": u, "name": n, "summary": s} for _, u, n, s in connected]
+    seed_entities = (
+        [] if restricted else [{"uuid": u, "name": n, "summary": s} for _, u, n, s in connected]
+    )
 
     # 4 — 1-hop traversal facts from the seeds (per-seed LIMIT 8, undirected).
     hop_uuids: list[str] = []
@@ -176,8 +242,10 @@ def search_kg_postgres(
             # Recency is the least-wrong single ordering for a "what about X" hop sample.
             "SELECT uuid, fact, t_valid FROM kg_relationships "
             "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-            "  AND (src_uuid = %s OR tgt_uuid = %s) ORDER BY t_valid DESC LIMIT 8",
-            (owner_id, group_id, sd, sd),
+            "  AND (src_uuid = %s OR tgt_uuid = %s) "
+            f"{scope_sql}"
+            "ORDER BY t_valid DESC LIMIT 8",
+            (owner_id, group_id, sd, sd, *scope_args),
         )
         for u, f, tv in cur.fetchall():
             if u and f:
