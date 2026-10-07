@@ -8,6 +8,8 @@ from typing import Any
 from fastmcp import FastMCP
 from starlette.requests import Request
 
+from mcp_server.http_auth import authenticated
+
 
 def register(
     mcp: FastMCP,
@@ -76,6 +78,7 @@ def register(
         _machine_authorized,
         get_recall=lambda: _get_recall(),
         resolve_trust=_request_trust,
+        authenticated=lambda request: authenticated(request, MACHINE_TOKEN),
     )
 
     # Operator dashboard — static React bundle at /dash + read/flag API at /dash/api/* (issue #12,

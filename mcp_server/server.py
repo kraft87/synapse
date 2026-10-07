@@ -46,7 +46,7 @@ from mcp_server.auxiliary_routes import register as _register_auxiliary_routes
 from mcp_server.caller_trust import caller_trust as _resolve_caller_trust
 from mcp_server.caller_trust import request_trust as _resolve_request_trust
 from mcp_server.feedback_tools import register as _register_feedback_tools
-from mcp_server.http_auth import admin_authorized, is_root, machine_authorized
+from mcp_server.http_auth import admin_authorized, authenticated, is_root, machine_authorized
 from mcp_server.http_auth import bearer as _bearer
 from mcp_server.ingest_route import register as _register_ingest_route
 from mcp_server.recall_route import register as _register_recall_route
@@ -418,7 +418,7 @@ def _scope_doc(fn):  # type: ignore[no-untyped-def]
 
 
 recall, recall_full_turns, fetch, fetch_session = _register_retrieval_tools(
-    mcp, lambda: _get_recall(), lambda surface: _caller_trust(surface), _scope_doc
+    mcp, lambda: _get_recall(), lambda surface: _caller_trust(surface), _scope_doc, _access_token
 )
 
 
@@ -506,6 +506,7 @@ recall_http = _register_recall_route(
     lambda: _get_recall(),
     lambda request: _machine_authorized(request),
     lambda request, surface: _request_trust(request, surface),
+    lambda request: authenticated(request, MACHINE_TOKEN),
 )
 
 

@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
+from mcp_server.recall_warnings import serving_notice, with_notice
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ def register(
     _get_recall: Callable[[], Any],
     _machine_authorized: Callable[[Request], bool],
     _request_trust: Callable[[Request, str | None], SurfaceTrust],
+    _authenticated: Callable[[Request], bool],
 ) -> Any:
     @mcp.custom_route("/recall", methods=["POST"])
     async def recall_http(request: Request) -> JSONResponse:
@@ -47,6 +49,8 @@ def register(
         recalls never pollute the feedback signal. ``debug`` attaches the per-leg timing /
         pool-size / rerank envelope the engine already measures (see recall(debug=...)).
         Fail-soft like /ingest — never raises past the JSONResponse boundary.
+        An authenticated caller whose verdict serves (almost) nothing gets the reason
+        first in ``warnings`` (recall_warnings.serving_notice), same as the MCP tools.
         """
         if not _machine_authorized(request):
             return unauthorized()
@@ -67,6 +71,7 @@ def register(
         source = body.get("source") or "http"
         debug = bool(body.get("debug", False))
         trust = _request_trust(request, body.get("surface") or None)
+        notice = serving_notice(trust) if _authenticated(request) else None
 
         def _work() -> dict:
             return _get_recall().recall(
@@ -85,6 +90,6 @@ def register(
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("http recall failed")
             return err(str(exc)[:200], 500)
-        return JSONResponse(out)
+        return JSONResponse(with_notice(out, notice))
 
     return recall_http

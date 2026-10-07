@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.recall_warnings import serving_notice, with_notice
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +21,20 @@ def register(
     _get_recall: Callable[[], Any],
     _caller_trust: Callable[[str | None], SurfaceTrust],
     _scope_doc: Callable[[Any], Any],
+    _access_token: Callable[[], Any],
 ) -> tuple[Any, ...]:
+    """Register the four read tools.
+
+    ``_access_token`` yields the current call's verified credential (root token, device
+    token, or OAuth sign-in), or None when there is none. Only an authenticated call gets
+    a serve-nothing notice in ``warnings`` (recall_warnings.serving_notice): an open
+    dev/stdio server has no credential to fix, so it keeps today's silent shape.
+    """
+
+    def _served(out: Any, trust: SurfaceTrust) -> Any:
+        authenticated = _access_token() is not None
+        return with_notice(out, serving_notice(trust) if authenticated else None)
+
     @mcp.tool()
     @_scope_doc
     def recall(
@@ -61,8 +75,9 @@ def register(
         recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
         rest are feedback-only.
 
-        A `warnings` list appears when a retrieval leg degraded; empty results with a
-        warning mean a config problem, not empty memory.
+        A `warnings` list appears when a retrieval leg degraded or this connection is
+        served (almost) nothing; empty results with a warning mean a config problem,
+        not empty memory.
 
         Follow-ups: fetch(ids) expands a truncated passage or note body;
 
@@ -86,15 +101,17 @@ def register(
             project=project,
             group_id=group_id,
         ):
-            return _get_recall().recall(
+            trust = _caller_trust(surface)
+            out = _get_recall().recall(
                 query=query,
                 project=project,
                 session_focus=session_focus or [],
                 group_id=group_id,
                 source="mcp-tool",
                 self_session=self_session,
-                trust=_caller_trust(surface),
+                trust=trust,
             )
+            return _served(out, trust)
 
     @mcp.tool()
     def recall_full_turns(
@@ -157,15 +174,17 @@ def register(
             # Same engine path as the retired recall_episodes tool and the interim
             # recall(mode="turns") — telemetry keeps kind='episodes' so historical
             # per-tool metrics stay comparable.
-            return _get_recall().recall_episodes(
+            trust = _caller_trust(surface)
+            out = _get_recall().recall_episodes(
                 query=query,
                 project=project,
                 limit=max(1, min(int(limit), 10)),
                 source="mcp-tool",
                 self_session=self_session,
                 session_id=session_id,
-                trust=_caller_trust(surface),
+                trust=trust,
             )
+            return _served(out, trust)
 
     @mcp.tool()
     def fetch(ids: list[str], surface: str | None = None) -> dict:
@@ -187,7 +206,8 @@ def register(
                 device from its own credential. Never set it.
         """
         with logfire.span("mcp.fetch", n=len(ids)):
-            return _get_recall().fetch(ids, source="mcp-tool", trust=_caller_trust(surface))
+            trust = _caller_trust(surface)
+            return _served(_get_recall().fetch(ids, source="mcp-tool", trust=trust), trust)
 
     @mcp.tool()
     def fetch_session(
@@ -233,14 +253,16 @@ def register(
                         "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
                     }
                 session_id = self_session
-            return _get_recall().fetch_session(
+            trust = _caller_trust(surface)
+            out = _get_recall().fetch_session(
                 session_id=session_id,
                 around=around,
                 radius=radius,
                 offset=offset,
                 limit=limit,
                 source="mcp-tool",
-                trust=_caller_trust(surface),
+                trust=trust,
             )
+            return _served(out, trust)
 
     return recall, recall_full_turns, fetch, fetch_session
