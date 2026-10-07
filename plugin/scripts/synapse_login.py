@@ -17,12 +17,17 @@ plugin config (the zero-dependency ingest/recall hooks read it back):
 Usage:
     python synapse_login.py               # device flow (recommended)
     python synapse_login.py --browser      # legacy same-host browser flow
+    python synapse_login.py --reenroll     # replace this machine's device token
     SYNAPSE_URL=https://synapse.example.net python synapse_login.py
 
 After the sign-in, this runs ENROLLMENT (schema 054): a second device-flow approval that
 mints a token belonging to THIS machine, scoped by the install prompt's personal/work
 answer, and stores it in the same config slot. What a session is served depends on that
 token, so a machine that never enrolls is served nothing.
+
+On a machine that is already enrolled this does nothing: the sign-in would put the root
+token back in that slot over the device token. `--reenroll` is the deliberate way to get
+a new device token; it drops the enrollment record only once the sign-in has succeeded.
 
 Truly headless with no browser on any device? Mint a token from an already-trusted
 machine (`/synapse-devices mint "<label>"`) or from the database host
@@ -252,7 +257,8 @@ def _device_login() -> int:
 
         token = resp.get("token")
         if token:
-            config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
+            if not _store_root_token(token):
+                return 1
             who = f" as {resp['login']}" if resp.get("login") else ""
             print(f"Logged in{who}. Token saved to plugin config.")
             _enroll_device()
@@ -396,11 +402,30 @@ def _browser_login() -> int:
         print("login failed: no token returned (is auth enabled on the server?)", file=sys.stderr)
         return 1
 
-    config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
+    if not _store_root_token(token):
+        return 1
     print("Logged in. Token saved to plugin config.")
     _enroll_device()
     print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
     return 0
+
+
+def _store_root_token(token: str) -> bool:
+    """Put the root token a sign-in just fetched into the one credential slot.
+
+    Only reached on a machine that is not enrolled, or on `--reenroll` (main() stops an
+    enrolled machine before any sign-in). The enrollment record is dropped FIRST: a crash
+    between the two steps then leaves the old device token with no record, which simply
+    re-enrolls, rather than the root token under a record claiming this machine is
+    enrolled, which is served nothing and never re-enrolls.
+    """
+    try:
+        config.DEVICE_FILE.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"login failed: could not clear {config.DEVICE_FILE}: {e}", file=sys.stderr)
+        return False
+    config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
+    return True
 
 
 def _enroll_device() -> bool:
@@ -408,10 +433,10 @@ def _enroll_device() -> bool:
 
     Deliberately a SECOND sign-in rather than a reuse of the login above. A device code
     is spent by the poll that redeems it, and the two flows want different things: login
-    fetches the shared root token (the services still need it), enrollment mints a
-    credential scoped to this machine. Keeping them separate also means `synapse-login`
-    on an already-enrolled machine re-fetches the root token without disturbing the
-    device credential.
+    fetches the shared root token, enrollment mints a credential scoped to this machine
+    and writes it over the root token in the same slot. That shared slot is why login
+    never runs on an enrolled machine (see main()): a re-login would put the root token
+    back over the device token.
 
     Returns True when this machine now holds a device token.
     """
@@ -426,6 +451,26 @@ def _enroll_device() -> bool:
 
 
 def main() -> int:
+    import enroll
+
+    # An enrolled machine's slot holds its device token, and a sign-in would overwrite it
+    # with the root token (no surface: served nothing). Stop before asking anyone to
+    # approve a code whose result could only do harm.
+    if enroll.is_enrolled():
+        state = config.read_device_state()
+        surface = f"{state['surface_id']} ({state.get('trust') or 'unknown trust'})"
+        if "--reenroll" not in sys.argv:
+            print(
+                f"This machine is already enrolled as {surface}; keeping its device token.\n"
+                "To replace it with a new one, run `synapse-login --reenroll`."
+            )
+            return 0
+        print(
+            f"Re-enrolling: this replaces the device token for {surface}. "
+            "Revoke the old device afterwards with /synapse-devices.",
+            file=sys.stderr,
+        )
+
     # Device flow is the default — browser-free, works on servers/headless. --browser opts
     # into the legacy same-host loopback flow for setups that prefer it.
     if "--browser" in sys.argv:

@@ -176,7 +176,9 @@ SKILLS_URL = BASE_URL + "/skills"
 # token minted for THIS device and overwrites it here, so plugin.json's
 # `Authorization: Bearer ${user_config.SYNAPSE_INGEST_TOKEN}` header keeps working with
 # no change on either side. One slot, two lifecycle stages: the client never has to
-# manage two credentials, and nothing downstream had to learn a new config key.
+# manage two credentials, and nothing downstream had to learn a new config key. The
+# stages only move forward: `synapse login` refuses to run on an enrolled machine, since
+# its root token would overwrite the device token (`--reenroll` replaces it on purpose).
 INGEST_TOKEN = _cfg("SYNAPSE_INGEST_TOKEN") or _cred("SYNAPSE_INGEST_TOKEN")
 
 # Enrollment state for this device (schema 054). Kept in DATA_DIR rather than
