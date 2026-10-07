@@ -260,19 +260,18 @@ def _access_token() -> Any:
         return None
 
 
-def _caller_surface(surface: str | None) -> str | None:
-    """The surface ID for this call — display/telemetry, and the legacy id lane.
+def _caller_surface() -> str | None:
+    """The surface ID for this call, for display and telemetry.
 
     See :func:`_caller_trust` for the verdict itself; this is the id that goes with it.
     """
-    return _caller_trust(surface).surface_id
+    return _caller_trust().surface_id
 
 
-def _caller_trust(surface: str | None) -> SurfaceTrust:
-    """Resolve authenticated caller scope; see caller_trust for credential precedence."""
+def _caller_trust() -> SurfaceTrust:
+    """Caller scope from the credential alone (no ``surface``); see caller_trust."""
     return _resolve_caller_trust(
         db_url=DB_URL,
-        surface=surface,
         access_token=_access_token(),
         identity_claims=_IDENTITY_CLAIMS,
         machine_client_ids=_MACHINE_CLIENT_IDS,
@@ -280,7 +279,7 @@ def _caller_trust(surface: str | None) -> SurfaceTrust:
     )
 
 
-def _request_trust(request: Request, surface: str | None = None) -> SurfaceTrust:
+def _request_trust(request: Request) -> SurfaceTrust:
     """:func:`_caller_trust` for the plain-HTTP custom routes.
 
     Custom routes bypass FastMCP's auth middleware by design (issue #3704), so there is
@@ -292,7 +291,6 @@ def _request_trust(request: Request, surface: str | None = None) -> SurfaceTrust
         db_url=DB_URL,
         machine_token=MACHINE_TOKEN,
         bearer=_bearer(request),
-        surface=surface,
     )
 
 
@@ -418,7 +416,7 @@ def _scope_doc(fn):  # type: ignore[no-untyped-def]
 
 
 recall, recall_full_turns, fetch, fetch_session = _register_retrieval_tools(
-    mcp, lambda: _get_recall(), lambda surface: _caller_trust(surface), _scope_doc, _access_token
+    mcp, lambda: _get_recall(), lambda: _caller_trust(), _scope_doc, _access_token
 )
 
 
@@ -463,11 +461,11 @@ def _derive_hook(content: str) -> str:
 # SECTION and everything from it on is silently dropped from the wire description
 # (that once cost this tool its entire type-semantics block). Em-dash headers
 # survive; test_tool_surface.py pins the tail phrases of every description.
-remember = _register_remember_tool(
+remember, _remember_as = _register_remember_tool(
     mcp,
     lambda: DB_URL,
     lambda: _get_recall(),
-    lambda surface: _caller_trust(surface),
+    lambda: _caller_trust(),
     lambda: _notes_deps(),
     _derive_hook,
 )
@@ -476,8 +474,8 @@ remember = _register_remember_tool(
 # Spooled-remember replay — the plugin queues a memory write to local disk whenever the
 # remember() MCP tool is unavailable (OAuth down, server never connected) and replays it
 # here over the machine-token lane, which is a different transport and stayed up through
-# the 2026-08-25 outage. Registered HERE, not with the sibling routes above, because it
-# takes `remember` itself as its writer — same code path as the tool, no drift possible.
+# the 2026-08-25 outage. Registered HERE because it takes the tool's own writer
+# (`_remember_as`, trust passed in from the bearer) — same code path, no drift possible.
 # Idempotent on the client's intent id (schema 052). No-op w/o DB_URL, like the siblings.
 from mcp_server.remember_routes import register as _register_remember_routes  # noqa: E402
 
@@ -485,8 +483,8 @@ _register_remember_routes(
     mcp,
     DB_URL,
     _machine_authorized,
-    remember,
-    caller_surface=lambda request: _request_trust(request).surface_id,
+    _remember_as,
+    resolve_trust=lambda request: _request_trust(request),
 )
 
 
@@ -505,7 +503,7 @@ recall_http = _register_recall_route(
     mcp,
     lambda: _get_recall(),
     lambda request: _machine_authorized(request),
-    lambda request, surface: _request_trust(request, surface),
+    lambda request: _request_trust(request),
     lambda request: authenticated(request, MACHINE_TOKEN),
 )
 

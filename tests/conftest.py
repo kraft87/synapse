@@ -77,6 +77,7 @@ _DB_FILES = {
     "test_surface_routes.py",
     "test_credential_trust.py",
     "test_serving_notice.py",
+    "test_root_surface_lane.py",
 }
 
 

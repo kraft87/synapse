@@ -349,11 +349,10 @@ logger = logging.getLogger(__name__)
 def _resolve(db_url: str, surface: str | None, trust: SurfaceTrust | None) -> SurfaceTrust:
     """The serving verdict for one call: a pre-resolved one wins, else look up the id.
 
-    ``trust`` is what the MCP server passes now that a caller is identified by its
-    DEVICE TOKEN (schema 054) — the credential resolved at authentication time, so the
-    engine must not go re-derive a verdict from a self-reported string. ``surface``
-    remains for the id lanes that still exist: the ``oauth:<login>`` identity and, for
-    one release, a legacy hostname param. Both fail closed the same way.
+    ``trust`` is what the MCP server and the HTTP routes pass: the caller's verdict,
+    resolved from its credential, so the engine must not go re-derive one from a
+    self-reported string. ``surface`` is for in-process callers and tests: a
+    server-derived id, never a value a caller supplied. It fails closed the same way.
     """
     return trust if trust is not None else lookup_surface(db_url, surface)
 

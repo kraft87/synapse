@@ -210,10 +210,10 @@ def test_identity_claims_track_the_active_leg(monkeypatch):
     assert s._IDENTITY_CLAIMS == s._auth_mw[0]._claim_keys == ("preferred_username", "email")
 
     # Bearer-only / open: no interactive leg means no OAuth callers to identify, so the
-    # derivation stays inert and a caller's own `surface` param is left alone.
+    # derivation stays inert and a call with no device credential resolves to no surface.
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
     assert s._IDENTITY_CLAIMS == ()
-    assert s._caller_surface("work-host") == "work-host"
+    assert s._caller_surface() is None
 
 
 def test_machine_authorized_constant_time_check(monkeypatch):
@@ -313,17 +313,26 @@ def test_the_admin_gate_excludes_the_root_token(credentialed):
 
 
 @_needs_db
-def test_request_trust_prefers_the_credential_over_the_param(credentialed):
+def test_request_trust_reads_the_credential_and_nothing_else(credentialed):
+    """The plain-HTTP lane takes no `surface` at all. A device bearer is its own surface;
+    the root token, a missing bearer and an unknown bearer are all UNKNOWN."""
+    import inspect
+
     from ingestion.surfaces import UNKNOWN_SURFACE
 
-    work = _Req({"authorization": "Bearer work-device"})
-    st = credentialed._request_trust(work, "dev-full")  # asks for the trusted surface
-    assert st.surface_id == "dev-work" and st.restricted
+    assert list(inspect.signature(credentialed._request_trust).parameters) == ["request"]
 
-    # Root keeps the legacy param lane for the migration window.
-    root = _Req({"authorization": "Bearer root-tok"})
-    assert credentialed._request_trust(root, "dev-full").trust == "full"
-    assert credentialed._request_trust(root, None) == UNKNOWN_SURFACE
+    work = credentialed._request_trust(_Req({"authorization": "Bearer work-device"}))
+    assert work.surface_id == "dev-work" and work.restricted and work.known
+    full = credentialed._request_trust(_Req({"authorization": "Bearer full-device"}))
+    assert full.surface_id == "dev-full" and not full.restricted
+
+    for headers in ({"authorization": "Bearer root-tok"}, {}, {"authorization": "Bearer x"}):
+        st = credentialed._request_trust(_Req(headers))
+        assert st.restricted and not st.known and st.project_filter == [], headers
+    assert credentialed._request_trust(_Req({"authorization": "Bearer root-tok"})) == (
+        UNKNOWN_SURFACE
+    )
 
 
 @_needs_db

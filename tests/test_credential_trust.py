@@ -364,7 +364,21 @@ def test_a_revoked_row_resolves_to_unknown_not_to_restricted_known(clean):
     must not get that — it would WIDEN a note's later audience."""
     register_device(clean, "tok", trust="full", surface_id="dev-x", status="revoked")
     assert resolve_caller(_DB_URL, token_hash_hex=token_hash("tok")) == UNKNOWN_SURFACE
-    assert resolve_caller(_DB_URL, legacy_surface_id="dev-x") == UNKNOWN_SURFACE
+    by_id = resolve_caller(_DB_URL, legacy_surface_id="dev-x")
+    assert not by_id.known and by_id.restricted and by_id.project_filter == []
+
+
+def test_the_id_lane_never_matches_a_device_row(clean):
+    """A device row (the dashboard's full-trust ``dash:<login>`` rows included) is
+    reachable by its token and nothing else: an id that leaked from a log or a listing
+    must not turn into that device's scope, whoever passes it."""
+    register_device(clean, "dash-tok", trust="full", surface_id="dash:owner")
+    register_device(clean, "work-tok", trust="restricted", projects=["w"], surface_id="dev-w")
+    for sid in ("dash:owner", "dev-w"):
+        st = resolve_caller(_DB_URL, legacy_surface_id=sid)
+        assert not st.known and st.restricted and st.project_filter == [], sid
+    # The token itself still resolves, so this is the id lane only.
+    assert not resolve_caller(_DB_URL, token_hash_hex=token_hash("dash-tok")).restricted
 
 
 def test_an_unmatched_token_reveals_nothing(clean):

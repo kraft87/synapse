@@ -1,26 +1,39 @@
-"""remember tool registration with explicit runtime dependencies."""
+"""remember tool registration with explicit runtime dependencies.
+
+:func:`register` returns two callables over ONE write path:
+
+* ``remember`` — the MCP tool. It resolves the caller's trust from the MCP credential.
+* ``remember_as`` — the same write with the trust passed in, for the plain-HTTP spool
+  replay (``mcp_server/remember_routes``), which resolves trust from the request bearer.
+
+Neither takes a self-reported surface into account. The tool keeps a ``surface``
+parameter only so an older client that sends it is not rejected.
+"""
 
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastmcp import FastMCP
 
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.caller_trust import note_ignored_surface
 
 logger = logging.getLogger(__name__)
+
+RememberAs = Callable[..., Awaitable[dict]]
 
 
 def register(
     mcp: FastMCP,
     db_url: Callable[[], str],
     _get_recall: Callable[[], Any],
-    _caller_trust: Callable[[str | None], SurfaceTrust],
+    _caller_trust: Callable[[], SurfaceTrust],
     _notes_deps: Callable[[], tuple],
     _derive_hook: Callable[[str], str],
-) -> Any:
+) -> tuple[Any, RememberAs]:
     @mcp.tool()
     async def remember(
         content: str | None = None,
@@ -85,6 +98,36 @@ def register(
                 note later. Leave unset unless the user says where it may appear;
                 the server derives it from the calling host and the project.
         """
+        note_ignored_surface(surface, "mcp.remember")
+        # Resolved here, on the event loop: the token context belongs to the request.
+        return await remember_as(
+            trust=_caller_trust(),
+            content=content,
+            hook=hook,
+            body=body,
+            type=type,
+            project=project,
+            session_id=session_id,
+            audience=audience,
+        )
+
+    async def remember_as(
+        *,
+        trust: SurfaceTrust,
+        content: str | None = None,
+        hook: str | None = None,
+        body: str | None = None,
+        type: str = "project",
+        project: str | None = None,
+        session_id: str | None = None,
+        audience: str | None = None,
+    ) -> dict:
+        """The remember() write, attributed to an already-resolved ``trust``.
+
+        ``trust`` must come from the caller's CREDENTIAL (MCP token context or HTTP
+        bearer). It decides precedence rule 2 of audience derivation: a registered
+        restricted caller defaults its notes to ``work-safe``.
+        """
         import time as _time
         import uuid as _uuid
 
@@ -136,11 +179,6 @@ def register(
             note_type = "project"
 
         sid = session_id or str(_uuid.uuid4())
-        # Same resolution the serving tools do, so a device (or OAuth identity) registered
-        # as a RESTRICTED surface writes notes it can still read back. Resolved here, on the
-        # event loop, rather than inside _work(): the token context belongs to the request,
-        # and _work runs on a worker thread.
-        caller_trust = _caller_trust(surface)
 
         def _work() -> dict:
             t0 = _time.perf_counter()
@@ -174,7 +212,7 @@ def register(
                 # (`known`). An unknown surface restricts what this caller READS, but it must
                 # never widen a WRITE — defaulting an unrecognised credential's notes to
                 # work-safe would turn a fail-closed read rule into a leak.
-                caller_restricted = caller_trust.known and caller_trust.restricted
+                caller_restricted = trust.known and trust.restricted
 
                 embedder, llm = _notes_deps()
                 res = reconcile_note(
@@ -219,4 +257,4 @@ def register(
         # event loop, so it must live on a worker thread, never on FastMCP's loop.
         return await anyio.to_thread.run_sync(_work)
 
-    return remember
+    return remember, remember_as

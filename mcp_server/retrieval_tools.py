@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.recall_warnings import serving_notice, with_notice
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 def register(
     mcp: FastMCP,
     _get_recall: Callable[[], Any],
-    _caller_trust: Callable[[str | None], SurfaceTrust],
+    _caller_trust: Callable[[], SurfaceTrust],
     _scope_doc: Callable[[Any], Any],
     _access_token: Callable[[], Any],
 ) -> tuple[Any, ...]:
@@ -29,6 +30,10 @@ def register(
     token, or OAuth sign-in), or None when there is none. Only an authenticated call gets
     a serve-nothing notice in ``warnings`` (recall_warnings.serving_notice): an open
     dev/stdio server has no credential to fix, so it keeps today's silent shape.
+
+    Every tool keeps its ``surface`` parameter so an older client that still sends it
+    is not rejected, but the value never reaches trust resolution: ``_caller_trust``
+    takes no argument. A caller's scope is its device token or OAuth identity.
     """
 
     def _served(out: Any, trust: SurfaceTrust) -> Any:
@@ -92,6 +97,7 @@ def register(
             surface: DEPRECATED and ignored — the server identifies the calling
                 device from its own credential. Never set it.
         """
+        note_ignored_surface(surface, "mcp.recall")
         # With the personal scope off, "personal" is an alias for the one graph that
         # exists; coerced here too so the telemetry span records what was searched.
         group_id = coerce_group(group_id) or "technical"
@@ -101,7 +107,7 @@ def register(
             project=project,
             group_id=group_id,
         ):
-            trust = _caller_trust(surface)
+            trust = _caller_trust()
             out = _get_recall().recall(
                 query=query,
                 project=project,
@@ -164,6 +170,7 @@ def register(
             surface: DEPRECATED and ignored — the server identifies the calling
                 device from its own credential. Never set it.
         """
+        note_ignored_surface(surface, "mcp.recall_full_turns")
         with logfire.span("mcp.recall_full_turns {query!r}", query=query[:80], project=project):
             if session_id == "self":
                 if not self_session:  # no hook injection — refuse loudly, don't search globally
@@ -174,7 +181,7 @@ def register(
             # Same engine path as the retired recall_episodes tool and the interim
             # recall(mode="turns") — telemetry keeps kind='episodes' so historical
             # per-tool metrics stay comparable.
-            trust = _caller_trust(surface)
+            trust = _caller_trust()
             out = _get_recall().recall_episodes(
                 query=query,
                 project=project,
@@ -205,8 +212,9 @@ def register(
             surface: DEPRECATED and ignored — the server identifies the calling
                 device from its own credential. Never set it.
         """
+        note_ignored_surface(surface, "mcp.fetch")
         with logfire.span("mcp.fetch", n=len(ids)):
-            trust = _caller_trust(surface)
+            trust = _caller_trust()
             return _served(_get_recall().fetch(ids, source="mcp-tool", trust=trust), trust)
 
     @mcp.tool()
@@ -246,6 +254,7 @@ def register(
             surface: DEPRECATED and ignored — the server identifies the calling
                 device from its own credential. Never set it.
         """
+        note_ignored_surface(surface, "mcp.fetch_session")
         with logfire.span("mcp.fetch_session {sid}", sid=session_id[:40], around=around):
             if session_id == "self":
                 if not self_session:  # no hook injection — refuse loudly
@@ -253,7 +262,7 @@ def register(
                         "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
                     }
                 session_id = self_session
-            trust = _caller_trust(surface)
+            trust = _caller_trust()
             out = _get_recall().fetch_session(
                 session_id=session_id,
                 around=around,

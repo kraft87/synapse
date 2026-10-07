@@ -277,7 +277,7 @@ def _recall_tool(monkeypatch):
             return {"results": []}
 
     monkeypatch.setattr(srv, "_get_recall", lambda: _Stub())
-    monkeypatch.setattr(srv, "_caller_trust", lambda surface: None)
+    monkeypatch.setattr(srv, "_caller_trust", lambda: None)
     srv.recall(query="what did we decide", group_id="personal")
     return captured["group_id"]
 
