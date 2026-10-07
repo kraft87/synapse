@@ -73,6 +73,7 @@ _DB_FILES = {
     "test_recall_feedback.py",
     "test_private_session_routes.py",
     "test_audience_scoping.py",
+    "test_kg_source_projects.py",
     "test_surface_routes.py",
     "test_credential_trust.py",
 }

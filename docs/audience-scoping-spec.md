@@ -154,13 +154,16 @@ no row, a revoked row, missing table, unreachable database, malformed row — al
 restricted with an empty allowlist. `project = ANY('{}')` is false for every row, NULL
 project included, so an unknown caller serves *nothing* rather than everything.
 
-**Enforcement on a restricted surface** (unchanged from v1):
+**Enforcement on a restricted surface** (v1, plus KG provenance from schema 056):
 
 - **Board**: notes filtered to `audience='work-safe'`; timeline digest and episodes
   banner filtered by project allowlist.
 - **recall / recall_full_turns**: notes by `audience`; episodes (BM25 + vector legs) by
-  `project = ANY(allowed_projects)`. **KG facts leg skipped entirely** —
-  `kg_relationships` has no `project` column, so serving zero facts is fail-closed.
+  `project = ANY(allowed_projects)`. **KG facts by provenance** (schema 056): a fact
+  is served only when `kg_relationships.source_projects` (the distinct projects of its
+  source episodes, trigger-maintained) is known, non-empty, and a subset of
+  `allowed_projects`. Unknown (a missing or project-less source episode, or no episode
+  provenance) and mixed provenance are never served. Before 056 is applied, no facts.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
@@ -195,7 +198,8 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 - No retroactive classification of 40k+ episodes. Project allowlist is the episode
   boundary; accept the coarseness.
 - No client-side filtering. The plugin never sees what it isn't served.
-- No KG facts on restricted surfaces (see above).
+- No KG fact whose provenance is unknown or mixed on restricted surfaces (see above),
+  and no entity summaries there at all.
 - No device-token expiry or rotation schedule. Revocation is manual and immediate; a
   TTL would add a renewal path (and a renewal credential) for no threat this model has.
 - No enrollment without an identity provider. A bearer-only deployment has no identity
