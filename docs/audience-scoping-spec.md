@@ -76,13 +76,23 @@ nothing left to claim.
   granted this" should behave exactly like "this grant was pulled".
 - **Only `status='approved'` serves anything.** Revoking also clears the hash, so a
   revoked credential matches no row at all, and the row survives as the audit record.
-- Three caller kinds resolve through `ingestion/surfaces.resolve_caller`:
+- Two caller kinds resolve through `ingestion/surfaces.resolve_caller`:
   1. **device token** — sha256 lookup; the row's trust applies and any `surface` param
      is ignored;
   2. **`oauth:<login>`** — the claude.ai connector lane, unchanged from PR #174: an
-     identity the server verified, resolved by id;
-  3. **legacy hostname `surface` param** — accepted from ROOT-token callers for one
-     release, so 0.16.x plugins keep working during the migration.
+     identity the server verified, resolved by id. The id lane matches credential-less
+     rows only, so a device row (including a full-trust `dash:<login>` row) is
+     reachable by its token and never by its id.
+
+  Every other caller resolves to unknown: restricted, empty allowlist. That includes
+  the ROOT token, which for one release after 054 could still name a legacy hostname
+  row through a `surface` param. **That lane is closed.** It let anyone holding the
+  shared root token (every machine that ever ran the plugin) borrow any row's trust,
+  `full` included. A `surface` param, query arg or body field is now ignored on every
+  path, read and write: `GET /context?surface=`, `POST /recall` and
+  `POST /remember/spool` bodies, and the `surface` argument of every MCP tool.
+  (`mcp_server/caller_trust.py` takes no `surface` argument at all; the server logs once
+  per call site when a client still sends one.) There is no switch to re-open it.
 
 ### Enrollment is anchored to the owner's identity
 
@@ -175,21 +185,26 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 
 1. **Apply `schema/054_credential_bound_trust.sql` on prod.** Existing rows are stamped
    `approved` (they were owner-registered), so nothing that works today stops working.
-2. **Deploy the server.** Root-token clients keep working through the legacy `surface`
-   param; the dashboard's *existing* fragment token (the root token) now 401s on
-   `/dash/api` — that is expected, see step 4.
-3. **Update the plugin to 0.17.0 and run `synapse-login` on each machine.** It signs in,
-   then enrolls: a second device-flow approval that mints that machine's own token,
-   scoped by its install-time personal/work answer, stored in the same
-   `SYNAPSE_INGEST_TOKEN` slot. Until a machine enrolls it keeps working on the root
-   token via the legacy lane, and its SessionStart block says it is not enrolled.
+2. **Deploy the server.** The dashboard's *existing* fragment token (the root token)
+   now 401s on `/dash/api` — that is expected, see step 4. Root-token clients are
+   served nothing (see step 6).
+3. **Update the plugin to 0.17.0 or later and run `synapse-login` on each machine.** It
+   signs in, then enrolls: a second device-flow approval that mints that machine's own
+   token, scoped by its install-time personal/work answer, stored in the same
+   `SYNAPSE_INGEST_TOKEN` slot. Until a machine enrolls it is served nothing (it can
+   still ingest), and its SessionStart block says it is not enrolled.
 4. **Log into the dashboard again.** The login flow mints its own full-trust device
    token; the old fragment token is dead.
 5. **For a machine that cannot run a browser flow anywhere** (headless, a service):
    `/synapse-devices mint "<label>" --projects work-thing` from an already-trusted
    machine, or `scripts/surface_admin.py mint` on the DB host, and carry the token over.
-6. **Next release:** drop the legacy `surface` param and the root token's serving lane
-   entirely, once every machine is enrolled (`/surfaces` shows `has_token` per row).
+6. **Done:** the legacy `surface` param and the root token's serving lane are gone. A
+   root-token caller resolves to unknown whatever it sends, so an un-enrolled machine
+   (a pre-0.17 plugin, or one that never ran `synapse-login`) is served an empty
+   board and empty recall until it enrolls. Legacy hostname rows are now unreachable:
+   a `full` one is inert, and a `restricted` one only keeps widening audience
+   derivation's project rule. Revoke the ones you no longer want with
+   `synapse-admin revoke <id>`; `/surfaces` shows `has_token` per row.
 
 ## What this does NOT do
 

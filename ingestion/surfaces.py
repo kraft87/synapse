@@ -10,7 +10,7 @@ write path (remember → reconcile_note) resolves the audience tag through
 scoping keyed trust on the plugin's self-reported ``SYNAPSE_SURFACE``, accepted under
 the one shared machine token — which meant the untrusted machine chose which trust row
 applied to it. A device token closes that: the token IS the surface identity, so there
-is nothing left to claim. Three kinds of caller resolve here:
+is nothing left to claim. Two kinds of caller resolve here:
 
 1. **Device token** — ``sha256(token)`` matches ``surfaces.token_hash``. The row's
    trust applies, and only when ``status='approved'``. Devices get their token by
@@ -18,11 +18,15 @@ is nothing left to claim. Three kinds of caller resolve here:
    (``mcp_server/surface_routes``): the owner standing at the new machine is the
    authority for what that machine is, so the grant lands live with no second step.
 2. **``oauth:<login>``** — MCP callers on the OAuth/OIDC lane (the claude.ai connector)
-   present a verified identity rather than a device token; ``mcp_server/server``
-   derives the id and passes it as ``legacy_surface_id``. That lane is unchanged.
-3. **Legacy hostname** — a machine-token caller that still sends a ``surface`` param.
-   Accepted for ONE release so the migration window works; spoofable exactly as it
-   always was, which is why it is time-boxed and why the client stopped sending it.
+   present a verified identity rather than a device token; ``mcp_server/caller_trust``
+   derives the id and passes it as ``legacy_surface_id``.
+
+The third kind, a root-token caller naming its own ``surface`` id, is gone. It was kept
+for one release after 054 as a migration window and it let anyone holding the shared
+root token borrow any row's trust, ``full`` included. A root-token caller now resolves
+to :data:`UNKNOWN_SURFACE` whatever it sends (``mcp_server/caller_trust``). Legacy
+hostname rows still exist but no caller can select them; restricted ones keep feeding
+:func:`restricted_project_union`, and full ones are inert (revoke them at leisure).
 
 Fail-closed is the whole point, so it is concentrated in ONE place: every failure mode
 of :func:`resolve_caller` — no credential, no row, a non-approved row, missing table,
@@ -148,8 +152,13 @@ def _row_to_trust(surface_id: str, row: Any) -> SurfaceTrust:
 _SELECT_BY_TOKEN = (
     "SELECT surface_id, trust, allowed_projects, status FROM surfaces WHERE token_hash = %s"
 )
+#: The id lane only ever matches a CREDENTIAL-LESS row (``oauth:<login>``, a legacy
+#: hostname). A device row, the dashboard's full-trust ``dash:<login>`` rows included,
+#: is reachable by its token and nothing else, so even an id that leaked out of a log or
+#: a listing cannot be turned into that device's scope.
 _SELECT_BY_ID = (
-    "SELECT surface_id, trust, allowed_projects, status FROM surfaces WHERE surface_id = %s"
+    "SELECT surface_id, trust, allowed_projects, status FROM surfaces "
+    "WHERE surface_id = %s AND token_hash IS NULL"
 )
 
 #: Don't rewrite the row on every single request — one bump per device per window is
@@ -185,13 +194,13 @@ def resolve_caller(
 
     * ``token_hash_hex`` — the sha256 of a device token (schema 054). The row it names
       is the caller's surface; nothing the caller *says* can change which row that is.
-    * ``legacy_surface_id`` — a self-reported id. Two live users: ``oauth:<login>``
-      (derived by the server from a VERIFIED identity, not self-reported at all) and
-      the deprecated hostname ``surface`` param, kept for the migration window.
+    * ``legacy_surface_id`` — a SERVER-DERIVED id, never a value a caller supplied. The
+      one live user is ``oauth:<login>``, derived from a VERIFIED identity. It matches
+      credential-less rows only (see ``_SELECT_BY_ID``). The name predates the removal
+      of the self-reported ``surface`` lane and is kept so call sites stay stable.
 
-    A root-token caller that sends no ``surface`` param resolves to
-    :data:`UNKNOWN_SURFACE` — the pre-054 behaviour for an unidentified machine-token
-    call, deliberately unchanged.
+    A root-token caller never reaches this function with an id: it resolves to
+    :data:`UNKNOWN_SURFACE` in ``mcp_server/caller_trust``.
 
     Missing credential, missing row, non-approved row, missing table (a deployment
     behind schema/054), or an unreachable database all yield :data:`UNKNOWN_SURFACE` —
@@ -227,10 +236,11 @@ def resolve_caller(
 
 
 def lookup_surface(db_url: str, surface_id: str | None) -> SurfaceTrust:
-    """Deprecated alias for the id lane of :func:`resolve_caller`.
+    """Alias for the id lane of :func:`resolve_caller`, for in-process callers.
 
-    Kept because the ``oauth:<login>`` lane and the legacy ``surface`` param both
-    resolve by id, and several call sites read better spelled this way.
+    The engine's ``surface=`` arguments (``Recall.recall``, ``build_board``) resolve
+    through here. They take server-derived ids only; no route or tool forwards a
+    caller-supplied value into them.
     """
     return resolve_caller(db_url, legacy_surface_id=surface_id)
 
@@ -496,7 +506,8 @@ def upsert_surface(
     db_url: str, surface_id: str, trust: str, allowed_projects: list[str]
 ) -> dict[str, Any]:
     """Register or re-register one CREDENTIAL-LESS surface by id — the ``oauth:<login>``
-    lane, and legacy hostname rows during the migration window.
+    lane. (A legacy hostname row can still be written, but no caller resolves to one any
+    more; a restricted one only widens the project-union rule of audience derivation.)
 
     Device surfaces never come through here: their id is server-generated and their
     trust is set by :func:`mint_surface` at creation, so a PUT that could name an

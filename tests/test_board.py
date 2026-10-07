@@ -288,33 +288,36 @@ def test_timeline_section_present_and_absent(conn, db_url):
 _TOKEN = "test-board-token"
 
 
-def _client(db_url, get_recall=None):
+def _client(db_url, get_recall=None, resolve_trust=None):
+    """``resolve_trust`` stands in for the server's bearer resolution. Omitted, every
+    request is UNKNOWN, which is what the route does when it is given no resolver."""
     from fastmcp import FastMCP
 
     def authorized(request):
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-board")
-    register(test_mcp, db_url, authorized, get_recall=get_recall)
+    register(test_mcp, db_url, authorized, get_recall=get_recall, resolve_trust=resolve_trust)
     return TestClient(test_mcp.http_app())
+
+
+def _full_trust(_request):
+    return FULL_TRUST
 
 
 def test_route_auth_and_project_param(conn, db_url):
     _wipe(conn)
-    sid = register_full(conn)
     db = Database(db_url)
     _note(db, type="project", hook="Alpha project state", project="alpha")
     db.close()
-    with _client(db_url) as client:
+    with _client(db_url, resolve_trust=_full_trust) as client:
         assert client.get("/context").status_code == 401  # no token
-        r = client.get(f"/context?surface={sid}", headers={"Authorization": f"Bearer {_TOKEN}"})
+        r = client.get("/context", headers={"Authorization": f"Bearer {_TOKEN}"})
         assert r.status_code == 200
         body = r.json()
         assert body["status"] == "ok" and "note_ids" not in body
         assert "Alpha project state" not in body["text"]  # unscoped -> global set only
-        r2 = client.get(
-            f"/context?project=alpha&surface={sid}", headers={"Authorization": f"Bearer {_TOKEN}"}
-        )
+        r2 = client.get("/context?project=alpha", headers={"Authorization": f"Bearer {_TOKEN}"})
         assert "Alpha project state" in r2.json()["text"]
 
 
@@ -322,13 +325,12 @@ def test_route_records_board_telemetry(conn, db_url):
     from mcp_server.recall import Recall
 
     _wipe(conn)
-    sid = register_full(conn)
     db = Database(db_url)
     kept = _note(db, type="user", hook="Telemetry fixture note")
     db.close()
     engine = Recall(db_url=db_url, voyage_api_key="")
-    with _client(db_url, get_recall=lambda: engine) as client:
-        r = client.get(f"/context?surface={sid}", headers={"Authorization": f"Bearer {_TOKEN}"})
+    with _client(db_url, get_recall=lambda: engine, resolve_trust=_full_trust) as client:
+        r = client.get("/context", headers={"Authorization": f"Bearer {_TOKEN}"})
         assert r.status_code == 200
     # The metrics write is fire-and-forget on a single-worker FIFO pool: a barrier
     # task completing proves the row insert before ours has finished.
@@ -463,22 +465,34 @@ def test_surface_lookup_error_degrades_to_restricted_not_unfiltered(conn, db_url
     assert "0 episodes across 0 projects" in out["text"]
 
 
-def test_restricted_route_passes_surface_through(conn, db_url):
-    """The /context route reads ?surface= and enforces on it — the plugin's only seam."""
+def test_route_enforces_the_resolved_verdict_not_the_surface_param(conn, db_url):
+    """The /context route serves what the CREDENTIAL resolves to. ``?surface=`` used to
+    select the row for a root-token caller; naming a full-trust row must change nothing."""
+    from ingestion.surfaces import SurfaceTrust
+
     _audience_fixture(conn, db_url)
-    sid = register_restricted(conn, ["alpha"])
-    with _client(db_url) as client:
-        r = client.get(
-            f"/context?project=alpha&surface={sid}", headers={"Authorization": f"Bearer {_TOKEN}"}
-        )
-        assert r.status_code == 200
-        body = r.json()
+    full = register_full(conn, "legacy-full-host")
+    work = SurfaceTrust(surface_id="dev-w", trust="restricted", allowed_projects=("alpha",))
+    h = {"Authorization": f"Bearer {_TOKEN}"}
+    with _client(db_url, resolve_trust=lambda _r: work) as client:
+        body = client.get(f"/context?project=alpha&surface={full}", headers=h).json()
         assert body["trust"] == "restricted"
         assert "User keeps a personal journal" not in body["text"]
         assert "User prefers tabs over spaces" in body["text"]
-        # A request with no surface at all gets the same treatment, not a bypass:
-        # restricted, and with an empty allowlist it loses the project material too.
-        bare = client.get("/context?project=alpha", headers={"Authorization": f"Bearer {_TOKEN}"})
-        assert bare.json()["trust"] == "restricted"
-        assert "User keeps a personal journal" not in bare.json()["text"]
-        assert "Alpha shipped a release" not in bare.json()["text"]
+        assert "Alpha shipped a release" in body["text"]  # its OWN allowlist still serves
+
+
+def test_route_without_a_resolver_serves_unknown_whatever_surface_is_named(conn, db_url):
+    """No resolver means no credential evidence: UNKNOWN, restricted with an empty
+    allowlist. A ``?surface=`` naming a full-trust row is not a fallback."""
+    _audience_fixture(conn, db_url)
+    full = register_full(conn, "legacy-full-host")
+    h = {"Authorization": f"Bearer {_TOKEN}"}
+    with _client(db_url) as client:
+        named = client.get(f"/context?project=alpha&surface={full}", headers=h).json()
+        bare = client.get("/context?project=alpha", headers=h).json()
+    for body in (named, bare):
+        assert body["trust"] == "restricted"
+        assert "User keeps a personal journal" not in body["text"]
+        assert "Alpha shipped a release" not in body["text"]
+    assert named["text"] == bare["text"]

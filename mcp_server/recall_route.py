@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse
 
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.recall_warnings import serving_notice, with_notice
 
@@ -23,7 +24,7 @@ def register(
     mcp: FastMCP,
     _get_recall: Callable[[], Any],
     _machine_authorized: Callable[[Request], bool],
-    _request_trust: Callable[[Request, str | None], SurfaceTrust],
+    _request_trust: Callable[[Request], SurfaceTrust],
     _authenticated: Callable[[Request], bool],
 ) -> Any:
     @mcp.custom_route("/recall", methods=["POST"])
@@ -37,12 +38,12 @@ def register(
         stays fast instead of cold-starting the pipeline each call.
 
         Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
-               "source"?: str, "debug"?: bool, "surface"?: str}.
-        The caller gets the same enforcement the MCP tools do: a DEVICE token names its own
-        surface and ``surface`` is ignored; a root-token caller may still pass the
-        deprecated ``surface`` param for the migration window. Holding a credential is not
-        the same as being trusted — the token says "a Synapse client", the surface row says
-        what that client may read.
+               "source"?: str, "debug"?: bool}.
+        The caller gets the same enforcement the MCP tools do, resolved from the bearer: a
+        DEVICE token names its own surface, and the root token resolves to unknown
+        (restricted, empty allowlist). A ``surface`` body field is ignored. Holding a
+        credential is not the same as being trusted — the token says "a Synapse client",
+        the surface row says what that client may read.
         write_feedback defaults FALSE here: automatic recalls must not bump the
         retrieval-count feedback signal (bench-grade discipline) — and the phase-2
         dashboard debug console relies on this default staying false so its diagnostic
@@ -70,7 +71,8 @@ def register(
         write_feedback = bool(body.get("write_feedback", False))
         source = body.get("source") or "http"
         debug = bool(body.get("debug", False))
-        trust = _request_trust(request, body.get("surface") or None)
+        note_ignored_surface(body.get("surface"), "http.recall")
+        trust = _request_trust(request)
         notice = serving_notice(trust) if _authenticated(request) else None
 
         def _work() -> dict:

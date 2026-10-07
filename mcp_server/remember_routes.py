@@ -12,9 +12,16 @@ Route (POST, machine-token gated):
   /remember/spool  {intent_id, hook, body, type?, project?, session_id?, content?}
                                                             -> {"status":"ok", note_id, ...}
 
-``remember_fn`` is ``mcp_server.server.remember`` itself — injected rather than imported so
-this module has no cycle with server.py, and so the spooled write CANNOT drift from the tool
-it replays (episode archive + extraction enqueue + note reconcile, one code path).
+``remember_fn`` is the remember tool's own writer (``remember_as`` from
+``mcp_server.remember_tool``) — injected rather than imported so this module has no cycle
+with server.py, and so the spooled write CANNOT drift from the tool it replays (episode
+archive + extraction enqueue + note reconcile, one code path).
+
+Attribution comes from the request's BEARER, never the body. Spool lines carry a
+``surface`` field (older plugins always set it); it is ignored. A device token writes as
+its own surface; the root token writes as an unknown caller, so the note's audience falls
+to the project rule and then ``personal``. A body field naming a restricted surface must
+not be able to mark a note ``work-safe`` on that surface's behalf.
 
 Idempotency (schema 052). The client generates ``intent_id`` once, when the intent is
 spooled, and keeps re-posting it until the server confirms; the flush only drops the local
@@ -40,6 +47,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
+from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -116,11 +125,11 @@ def register(
     db_url: str,
     authorized: Callable[[Request], bool],
     remember_fn: Callable[..., Any],
-    caller_surface: Callable[[Request], str | None] | None = None,
+    resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
 ) -> None:
-    """``caller_surface`` resolves the CALLING DEVICE from its credential (schema 054).
-    Supplied, it outranks the ``surface`` field in the body — a self-reported hostname
-    must not decide a note's audience when the bearer already says who is writing."""
+    """``resolve_trust`` resolves the CALLING DEVICE from its bearer (schema 054) and is
+    passed to ``remember_fn`` as ``trust``. None (tests, dev) means unknown: the write
+    is attributed to no surface, which can only make its audience narrower."""
     if not db_url:
         logger.info("remember spool route disabled (no DB_URL)")
         return
@@ -171,17 +180,16 @@ def register(
                 }
             )
 
+        note_ignored_surface(body.get("surface"), "http.remember_spool")
         kwargs: dict[str, Any] = {
+            # A spooled write must classify the same way the live tool would have: the
+            # spool exists because the MCP transport was down, not because the note came
+            # from a different device. So the CREDENTIAL decides; the body's `surface`
+            # field is ignored (see the module docstring).
+            "trust": resolve_trust(request) if resolve_trust is not None else UNKNOWN_SURFACE,
             "type": body.get("type") or "project",
             "project": body.get("project") or None,
             "session_id": body.get("session_id") or None,
-            # A spooled write must classify the same way the live tool would have: the
-            # spool exists because the MCP transport was down, not because the note came
-            # from a different device. Prefer the CREDENTIAL's surface; the body field is
-            # the pre-054 fallback. Neither -> derived by project rule, still fail-closed.
-            "surface": (
-                (caller_surface(request) if caller_surface else None) or body.get("surface") or None
-            ),
             "audience": body.get("audience") or None,
         }
         if str(body.get("hook") or "").strip() and str(body.get("body") or "").strip():

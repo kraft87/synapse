@@ -33,7 +33,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.db import Database
-from ingestion.surfaces import SurfaceTrust, lookup_surface
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, lookup_surface
+from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
@@ -192,12 +193,13 @@ def build_board(
     under the header and comes back as ``warnings: [notice]``; the key exists only when
     there is one, the same contract as recall's ``warnings``.
 
-    ``surface`` is the calling host's id (schema 053). It is resolved to a trust verdict
-    that is FAIL-CLOSED at every step: absent, unregistered, or unreadable all mean
-    restricted with an empty allowlist. On a restricted surface the notes section is
-    filtered to ``audience='work-safe'``, and the digest + banner are filtered to the
-    surface's project allowlist. ``trust`` is a pre-resolved verdict (tests, and callers
-    that already looked it up); passing it skips the lookup.
+    ``trust`` is the caller's verdict, resolved from its credential by the route. On a
+    restricted verdict the notes section is filtered to ``audience='work-safe'``, and
+    the digest + banner are filtered to the surface's project allowlist. ``surface`` is
+    the in-process alternative for server-side callers and tests: a surface id resolved
+    here, FAIL-CLOSED at every step (absent, unregistered, or unreadable all mean
+    restricted with an empty allowlist). It must never carry a caller-supplied value;
+    the /context route does not pass one.
 
     Missing tables (a deployment behind migration 033/041) degrade that section to
     empty rather than failing the whole board — same posture as preferences_routes.
@@ -295,16 +297,17 @@ def register(
     db_url: str,
     authorized: Callable[[Request], bool],
     get_recall: Callable[[], Any] | None = None,
-    resolve_trust: Callable[[Request, str | None], SurfaceTrust] | None = None,
+    resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
     authenticated: Callable[[Request], bool] | None = None,
 ) -> None:
     """Mount GET /context.
 
     ``get_recall`` lazily yields the process's Recall engine so board serves share its
     telemetry writer; None (dev/stdio) skips telemetry. ``resolve_trust`` is the
-    server's single caller-resolution point (device token → its surface; root token →
-    the legacy ``?surface=`` param). None falls back to resolving the query param
-    alone, which is the pre-054 behaviour and still fail-closed.
+    server's single caller-resolution point: a device token resolves to its surface,
+    anything else (the root token included) to unknown. None means unknown for every
+    request. A ``?surface=`` query param is ignored: it used to select the trust row for
+    a root-token caller, which let any holder of the shared token borrow any row's trust.
 
     ``authenticated`` says whether the request presented a credential the server
     checked (http_auth.authenticated). Only then, and only with a resolved verdict, does
@@ -322,13 +325,14 @@ def register(
         if not authorized(request):
             return unauthorized()
         project = request.query_params.get("project") or None
-        surface = request.query_params.get("surface") or None
-        trust = resolve_trust(request, surface) if resolve_trust is not None else None
-        told = trust is not None and authenticated is not None and authenticated(request)
+        note_ignored_surface(request.query_params.get("surface"), "http.context")
+        trust = resolve_trust(request) if resolve_trust is not None else UNKNOWN_SURFACE
+        # Explain only a verdict that was actually resolved for an authenticated caller.
+        told = resolve_trust is not None and authenticated is not None and authenticated(request)
         notice = serving_notice(trust) if told else None
         t0 = time.perf_counter()
         try:
-            board = await run_in_threadpool(build_board, db_url, project, surface, trust, notice)
+            board = await run_in_threadpool(build_board, db_url, project, None, trust, notice)
         except Exception as e:
             logger.warning("board build failed: %s", e)
             return err(str(e)[:200], 500)

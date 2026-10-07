@@ -14,6 +14,8 @@ Three things are load-bearing and each gets its own section:
     silently reclassifies an existing note.
   * An OAuth/OIDC-authenticated caller has no hook to inject a surface, so the server
     derives one from its verified identity — and that derivation is itself fail-closed.
+  * Only a credential picks the row. A root-token caller that names a surface (even a
+    full-trust one) is served exactly what it is served when it names none: nothing.
 
 Board filtering (notes tier + digest allowlist + banner) lives in test_board.py, and
 fetch_session's predicates in test_fetch_session.py — both next to the code they cover.
@@ -408,12 +410,27 @@ def test_remember_explicit_audience_wins(remember_env):
     assert _audience_of(remember_env, out["note_id"]) == "work-safe"
 
 
-def test_remember_from_a_registered_restricted_surface_defaults_work_safe(remember_env):
+def test_remember_from_a_registered_restricted_surface_defaults_work_safe(
+    remember_env, monkeypatch
+):
     """Symmetric with what that host can READ: otherwise notes written at work vanish
-    from the work board on the next session."""
-    sid = register_restricted(remember_env, ["alpha"], "work-host")
-    out = _remember(hook="Beta uses a queue", body="B.", project="beta", surface=sid)
+    from the work board on the next session. The host is named by its device token."""
+    monkeypatch.setattr(
+        server, "get_access_token", lambda: _DeviceToken("dev-work", "restricted", ("alpha",))
+    )
+    out = _remember(hook="Beta uses a queue", body="B.", project="beta")
     assert out["audience"] == "work-safe"
+
+
+def test_a_root_token_remember_cannot_claim_a_restricted_surface(remember_env, monkeypatch):
+    """The write-side half of closing the root lane. Naming a registered restricted
+    surface used to default the note to work-safe on that surface's behalf; the root
+    token now writes as an unknown caller, so the project rule and then `personal`
+    decide, exactly as if no surface had been sent."""
+    sid = register_restricted(remember_env, ["alpha"], "legacy-work-host")
+    monkeypatch.setattr(server, "get_access_token", lambda: _RootToken())
+    out = _remember(hook="User keeps a personal journal", body="B.", type="user", surface=sid)
+    assert out["audience"] == "personal"
 
 
 def test_remember_from_an_unknown_surface_does_not_default_work_safe(remember_env):
@@ -583,41 +600,34 @@ def as_oauth_caller(monkeypatch):
 
 def test_oauth_identity_becomes_its_own_surface_id(as_oauth_caller):
     as_oauth_caller("Kyle")
-    assert server._caller_surface(None) == "oauth:kyle"  # lowercased, namespaced
+    assert server._caller_surface() == "oauth:kyle"  # lowercased, namespaced
 
 
-def test_the_derived_surface_overrides_a_client_supplied_one(as_oauth_caller):
-    """A token identity the server verified outranks a string the caller typed about
-    itself — otherwise an OAuth client could name a trusted host and widen its own view."""
-    as_oauth_caller("kyle")
-    assert server._caller_surface("test-full-surface") == "oauth:kyle"
-
-
-def test_machine_token_callers_keep_their_injected_surface(monkeypatch):
-    """The machine token says "a Synapse client", never which host, so the hook-injected
-    param stays the only evidence available on that lane."""
+def test_machine_token_callers_resolve_to_no_surface(monkeypatch):
+    """The machine token says "a Synapse client", never which host — and identity
+    claims riding on it are not an identity either."""
     monkeypatch.setattr(
         server,
         "get_access_token",
         lambda: _OAuthToken({"preferred_username": "kyle"}, server._MACHINE_CLIENT_ID),
     )
-    assert server._caller_surface("work-host") == "work-host"
-    assert server._caller_surface(None) is None
+    assert server._caller_surface() is None
+    assert server._caller_trust() == UNKNOWN_SURFACE
 
 
-def test_no_token_context_changes_nothing(monkeypatch):
-    """Open dev/stdio servers and any call outside a request: no identity evidence, so
-    the param stands and the pre-existing fail-closed path applies unchanged."""
+def test_no_token_context_resolves_to_no_surface(monkeypatch):
+    """Open dev/stdio servers and any call outside a request: no credential evidence,
+    so the fail-closed verdict applies."""
     monkeypatch.setattr(server, "get_access_token", lambda: None)
-    assert server._caller_surface("work-host") == "work-host"
-    assert server._caller_surface(None) is None
+    assert server._caller_surface() is None
+    assert server._caller_trust() == UNKNOWN_SURFACE
 
 
 def test_an_oauth_token_with_no_identity_claim_derives_nothing(monkeypatch):
     """Fail-closed on a malformed token: no claim means no derived id, never a guess."""
     monkeypatch.setattr(server, "_IDENTITY_CLAIMS", ("preferred_username",))
     monkeypatch.setattr(server, "get_access_token", lambda: _OAuthToken({}))
-    assert server._caller_surface(None) is None
+    assert server._caller_surface() is None
 
 
 @pytest.fixture()
@@ -678,6 +688,15 @@ def test_oauth_drill_down_enforces_the_same_verdict(oauth_serving, db_url, as_oa
     assert [n["id"] for n in out_full["notes"]] == [f"n:{private}"]
 
 
+def test_an_oauth_caller_cannot_name_a_trusted_surface(oauth_serving, as_oauth_caller):
+    """A token identity the server verified outranks a string the caller typed about
+    itself — otherwise an OAuth client could name a trusted host and widen its own view."""
+    _episode(oauth_serving, "alpha", "alpha discussion of the widget")
+    trusted = register_full(oauth_serving, "trusted-host")
+    as_oauth_caller("mallory")  # authenticated, but no row of its own
+    assert server.recall("widget", surface=trusted).get("episodes") is None
+
+
 def test_oauth_full_turns_resolve_the_identity(oauth_serving, as_oauth_caller):
     _episode(oauth_serving, "alpha", "alpha raw turn about the widget")
     _episode(oauth_serving, "beta", "beta raw turn about the widget")
@@ -686,22 +705,6 @@ def test_oauth_full_turns_resolve_the_identity(oauth_serving, as_oauth_caller):
 
     out = server.recall_full_turns("widget")
     assert [e["content"] for e in out["episodes"]] == ["alpha raw turn about the widget"]
-
-
-def test_machine_token_serving_is_unchanged(oauth_serving, monkeypatch):
-    """The plugin's lane, with a token in context: the hook-injected surface is still
-    the whole answer, and the identity claims on that token are ignored."""
-    _episode(oauth_serving, "alpha", "alpha discussion of the widget")
-    _episode(oauth_serving, "beta", "beta discussion of the widget")
-    sid = register_restricted(oauth_serving, ["alpha"])
-    monkeypatch.setattr(
-        server,
-        "get_access_token",
-        lambda: _OAuthToken({"preferred_username": "kyle"}, server._MACHINE_CLIENT_ID),
-    )
-
-    served = [it["text"] for it in server.recall("widget", surface=sid)["episodes"]]
-    assert served == ["alpha discussion of the widget"]
 
 
 def test_remember_from_a_restricted_oauth_identity_defaults_work_safe(
@@ -726,6 +729,14 @@ def test_remember_from_an_unregistered_oauth_identity_stays_personal(remember_en
 # ---------------------------------------------------------------------------
 # Device tokens (schema 054): the credential decides, and pending decides nothing
 # ---------------------------------------------------------------------------
+
+
+class _RootToken:
+    """What SynapseTokenVerifier stamps onto a root-token request: no surface at all."""
+
+    def __init__(self) -> None:
+        self.client_id = server._MACHINE_CLIENT_ID
+        self.claims = {"kind": "root"}
 
 
 class _DeviceToken:
@@ -771,18 +782,43 @@ def test_a_device_token_ignores_a_surface_param_entirely(clean, db_url, monkeypa
     assert served == ["alpha discussion of the widget"]  # NOT the full corpus
 
 
-def test_a_root_token_caller_still_resolves_the_legacy_surface_param(clean, db_url, monkeypatch):
-    """The migration window: a 0.16.x plugin on the shared token keeps working exactly
-    as it did until it updates and enrolls."""
+@pytest.mark.parametrize("token", [_RootToken, lambda: None], ids=["root-token", "no-token"])
+def test_a_root_token_caller_cannot_borrow_a_full_trust_row(clean, db_url, monkeypatch, token):
+    """The lane that is now closed. Every machine that ever ran the plugin has held the
+    shared root token, and naming a full-trust legacy row's id used to serve that row's
+    whole corpus, personal notes included. Every MCP read path now serves a root caller
+    that names a surface exactly what it serves one that names none: nothing."""
     monkeypatch.setattr(server, "DB_URL", db_url)
     monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
-    _episode(clean, "alpha", "alpha discussion of the widget")
-    _episode(clean, "beta", "beta discussion of the widget")
-    sid = register_restricted(clean, ["alpha"], "legacy-work-host")
-    monkeypatch.setattr(server, "get_access_token", lambda: None)
+    eid = _episode(clean, "alpha", "alpha discussion of the widget")
+    session = clean.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,)).fetchone()[0]
+    private = _note(db_url, "User keeps a personal journal", audience="personal")
+    full = register_full(clean, "legacy-full-host")
+    monkeypatch.setattr(server, "get_access_token", token)
 
-    served = [it["text"] for it in server.recall("widget", surface=sid).get("episodes", [])]
-    assert served == ["alpha discussion of the widget"]
+    assert server._caller_trust() == UNKNOWN_SURFACE
+    assert server.recall("widget", surface=full).get("episodes") is None
+    assert server.recall_full_turns("widget", surface=full).get("episodes", []) == []
+    fetched = server.fetch([f"e:{eid}", f"n:{private}"], surface=full)
+    assert fetched["episodes"] == [] and fetched["notes"] == []
+    assert "error" in server.fetch_session(session, surface=full)
+
+
+def test_a_device_token_is_unaffected_by_closing_the_root_lane(clean, db_url, monkeypatch):
+    """The control for the test above: a full-trust DEVICE reads the same corpus."""
+    monkeypatch.setattr(server, "DB_URL", db_url)
+    monkeypatch.setattr(server, "_recall_engine", _engine(db_url, monkeypatch))
+    eid = _episode(clean, "alpha", "alpha discussion of the widget")
+    session = clean.execute("SELECT session_id FROM episodes WHERE id = %s", (eid,)).fetchone()[0]
+    private = _note(db_url, "User keeps a personal journal", audience="personal")
+    monkeypatch.setattr(server, "get_access_token", lambda: _DeviceToken("dev-home", "full"))
+
+    assert [e["text"] for e in server.recall("widget")["episodes"]] == [
+        "alpha discussion of the widget"
+    ]
+    fetched = server.fetch([f"e:{eid}", f"n:{private}"])
+    assert [n["id"] for n in fetched["notes"]] == [f"n:{private}"]
+    assert "error" not in server.fetch_session(session)
 
 
 def test_a_revoked_device_is_served_nothing(clean, db_url, monkeypatch):
@@ -797,7 +833,7 @@ def test_a_revoked_device_is_served_nothing(clean, db_url, monkeypatch):
     monkeypatch.setattr(server, "get_access_token", lambda: None)
 
     assert server.recall("widget", surface="dev-gone").get("episodes") is None
-    assert server._caller_trust("dev-gone") == UNKNOWN_SURFACE
+    assert server._caller_trust() == UNKNOWN_SURFACE
 
 
 def test_restricted_project_union_ignores_revoked_devices(clean, db_url):

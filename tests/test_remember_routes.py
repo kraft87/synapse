@@ -64,14 +64,16 @@ class _SlotEmb:
         return out
 
 
-def _client(db_url):
+def _client(db_url, resolve_trust=None):
+    """``resolve_trust`` stands in for the server's bearer resolution; omitted, every
+    write is attributed to an unknown caller (the route's own default)."""
     from fastmcp import FastMCP
 
     def authorized(request):
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-remember-spool")
-    register(test_mcp, db_url, authorized, server.remember)
+    register(test_mcp, db_url, authorized, server._remember_as, resolve_trust=resolve_trust)
     return TestClient(test_mcp.http_app())
 
 
@@ -272,6 +274,41 @@ def test_route_is_a_no_op_without_a_db_url(env):
     from fastmcp import FastMCP
 
     m = FastMCP("no-db")
-    register(m, "", lambda r: True, server.remember)
+    register(m, "", lambda r: True, server._remember_as)
     with TestClient(m.http_app()) as client:
         assert client.post(_ROUTE, json={"probe": True}, headers=_H).status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Attribution — the bearer decides who wrote the note, never the body
+# ---------------------------------------------------------------------------
+
+
+def test_a_body_surface_cannot_attribute_the_write(env, db_url):
+    """Spool lines carry a `surface` field. Naming a registered restricted surface used
+    to default the note to work-safe on that surface's behalf (precedence rule 2) for a
+    root-token caller. The field is ignored now: an unknown caller writes `personal`."""
+    from tests.helpers.surfaces import clear_surfaces, register_restricted
+
+    clear_surfaces(env)
+    try:
+        sid = register_restricted(env, ["alpha"], "legacy-work-host")
+        with _client(db_url) as client:
+            r = client.post(_ROUTE, json=_payload(surface=sid), headers=_H)
+        assert r.status_code == 200 and r.json()["audience"] == "personal"
+    finally:
+        clear_surfaces(env)
+
+
+def test_the_bearers_trust_attributes_the_write(env, db_url):
+    """The device half: a restricted device's spooled write defaults work-safe, exactly
+    as its live remember() call would, and a body surface naming a full-trust row
+    changes nothing."""
+    from ingestion.surfaces import SurfaceTrust
+
+    work = SurfaceTrust(
+        surface_id="dev-w", trust="restricted", allowed_projects=("alpha",), known=True
+    )
+    with _client(db_url, resolve_trust=lambda _r: work) as client:
+        r = client.post(_ROUTE, json=_payload(surface="legacy-full-host"), headers=_H)
+    assert r.status_code == 200 and r.json()["audience"] == "work-safe"
