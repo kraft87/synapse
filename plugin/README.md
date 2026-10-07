@@ -115,8 +115,10 @@ work through [the troubleshooting list](../docs/install.md#troubleshooting).
 Slash commands:
 
 - **`/synapse:skill-review`** — triage dream→skills proposals (new skills, trigger retunes,
-  merges): accept / reject / promote. Nothing touches your live skills without an explicit
-  accept.
+  merges): list → show (a diff against the current skill) → accept or reject. Accept applies
+  the change: the server writes it into its skill registry and the two-way skills sync
+  delivers it to the machine that owns the skill at its next session start. Nothing touches
+  your live skills without an explicit accept.
 - **`/synapse:config-review`** — triage dream→config proposals. Only relevant with config
   mirroring on.
 - **`/synapse-devices`** lists, mints, or revokes the per-device credentials that decide
