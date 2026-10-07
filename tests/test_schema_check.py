@@ -56,6 +56,23 @@ def test_check_exits_when_database_is_behind(tmp_path, monkeypatch):
         check_schema_version("postgresql://x", schema_dir=d)
 
 
+def test_check_continues_when_database_is_ahead(tmp_path, monkeypatch, caplog):
+    # A migration stamped before the new image lands, or an older image redeployed
+    # after the stamp, must not take the service down.
+    d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
+    monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "041")
+    with caplog.at_level("WARNING"):
+        check_schema_version("postgresql://x", schema_dir=d)  # no exit
+    assert "ahead of this build" in caplog.text
+
+
+def test_check_exits_on_unparseable_stamp(tmp_path, monkeypatch):
+    d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
+    monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "garbage")
+    with pytest.raises(SystemExit):
+        check_schema_version("postgresql://x", schema_dir=d)
+
+
 def test_check_exits_when_stamp_is_missing(tmp_path, monkeypatch):
     d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
     monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: None)

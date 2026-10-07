@@ -12,6 +12,10 @@ Fail-open cases — the guard never blocks on its own infrastructure:
   * schema/ directory not found (unusual dev layout) -> skip.
   * database unreachable (compose start-up race) -> warn and continue; the
     service's own connection handling owns that failure mode.
+  * database AHEAD of this build -> warn and continue. Migrations are
+    additive, so an older build runs fine on a newer schema; exiting here
+    turned "migration applied before the new image landed" (or an older image
+    redeployed by watchtower after the stamp) into a full outage.
 """
 
 from __future__ import annotations
@@ -70,7 +74,7 @@ def applied_schema_version(db_url: str) -> str | None:
 
 
 def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
-    """Exit the process when the database schema doesn't match this build."""
+    """Exit the process when the database schema is unstamped or behind this build."""
     if os.environ.get("SYNAPSE_SCHEMA_CHECK", "1") == "0":
         return
     expected = expected_schema_version(schema_dir)
@@ -83,6 +87,14 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
         logger.warning("schema check skipped (database not reachable yet): %s", e)
         return
     if applied == expected:
+        return
+    if applied is not None and applied.isdigit() and int(applied) > int(expected):
+        logger.warning(
+            "Database is at schema %s, ahead of this build's schema %s; continuing "
+            "(migrations are additive). Deploy the newer image to clear this.",
+            applied,
+            expected,
+        )
         return
     state = (
         "has no schema_version stamp (it predates the stamp, or init was interrupted)"
