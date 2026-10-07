@@ -773,6 +773,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SYNAPSE_INGEST_TAIL` | `400` | Stop-hook tail size (raw records) |
+| `SYNAPSE_INGEST_CATCHUP_DAYS` | `3` | client-side: the SessionStart catch-up sweep ships lagging transcripts modified this recently, plus any transcript whose upload failed, however old. Never-attempted older files (pre-install history) are `synapse-import`'s job |
 | `SYNAPSE_DRAIN_ONLY` | unset | `1` → replica is a pure extraction worker (no chunk/embed cycle) |
 | `SYNAPSE_RERANK_MODEL` | `rerank-3-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5-lite` to roll back); for `http` the served model id |
 | `SYNAPSE_DEDUP_TYPE_GATE` | `1` | entity-type compatibility gate in fact dedup (`0` = off) |

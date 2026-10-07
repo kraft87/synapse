@@ -28,6 +28,30 @@ SessionStart runs `--catchup`: a detached sweep over the projects dir that ships
 any recently-modified transcript whose cursor lags its size — sessions that died
 without a Stop hook, or turns dropped while the server was unreachable.
 
+Failed uploads are retried however old they are. A POST that fails (server
+down, 401/403 from a revoked token or a proxy/WAF, timeout) marks the file's
+cursor entry `pending`, with the time and a short reason; the next successful
+POST for that file clears it. The sweep takes every lagging file modified
+within SYNAPSE_INGEST_CATCHUP_DAYS, plus every pending or half-shipped file
+regardless of age, and pending entries are exempt from the cursor TTL. An
+outage longer than the window therefore no longer loses the history it
+covered. A file the hook never attempted that is older than the window
+(history from before the plugin was installed) is still left alone: importing
+that is `synapse-import`'s job.
+
+The sweep visits the least recently touched file first (its last failed
+attempt, else its mtime), so repeated capped sweeps make oldest-first progress
+and a file that keeps failing goes to the back of the queue instead of holding
+a slot.
+
+The cursor file also keeps one `_health` record of the upload streak. After
+_WARN_AFTER_FAILS failed POSTs in a row, or _WARN_AFTER_HOURS of failure, with
+no success since, the SessionStart parent prints one line, shown to the user
+and to the model: "Synapse uploads have been failing since <date> (<reason>);
+transcripts will be retried automatically." Reasons come from a short fixed
+vocabulary (HTTP status, timeout, connection refused, ...) and never carry the
+token.
+
 Design constraints:
   * NEVER block or fail the turn. Claude waits for Stop hooks to exit, so the
     actual HTTP work is done in a DETACHED child (start_new_session) and the
@@ -50,7 +74,9 @@ Env (all optional):
   SYNAPSE_INGEST_TIMEOUT       default 30 (seconds per POST)
   SYNAPSE_INGEST_TAIL          default 400 (records per POST chunk; also the
                                first-run seed window on the Stop path)
-  SYNAPSE_INGEST_CATCHUP_DAYS  default 3 (sweep looks this far back by mtime)
+  SYNAPSE_INGEST_CATCHUP_DAYS  default 3 (the sweep picks up any lagging file
+                               modified this recently; a file whose upload
+                               failed is retried regardless of age)
   SYNAPSE_INGEST_ACTIVE_GRACE  default 300 (skip files modified this recently —
                                a live session's own Stop hooks handle them)
   SYNAPSE_INGEST_CATCHUP_MAX   default 20 (files per sweep; the rest defer to
@@ -60,12 +86,17 @@ Env (all optional):
 from __future__ import annotations
 
 import glob
+import http.client
 import json
 import os
+import socket
+import ssl
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
@@ -82,7 +113,12 @@ CATCHUP_DAYS = float(os.environ.get("SYNAPSE_INGEST_CATCHUP_DAYS", "3"))
 ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
 CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
-_CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted)
+_CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
+# The upload-streak record in the cursor file. Transcript keys are absolute paths,
+# so this key can't collide with one.
+_HEALTH_KEY = "_health"
+_WARN_AFTER_FAILS = 3  # failed POSTs in a row with no success since → warn at session start
+_WARN_AFTER_HOURS = 24.0  # ...or a failure this old with no success since
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
 _PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
@@ -239,6 +275,41 @@ def _load_state() -> dict[str, Any]:
         return {}
 
 
+def _needs_retry(ent: Any) -> bool:
+    """True if this file's upload was attempted and did not complete: a failed
+    POST left a `pending` marker, or a chunked backlog stopped partway (`size`
+    -1). Such a file is swept regardless of age and is never TTL-pruned."""
+    return isinstance(ent, dict) and (bool(ent.get("pending")) or ent.get("size") == -1)
+
+
+def _update_state(path: str, apply: Callable[[dict[str, Any], float], None]) -> None:
+    """Load, mutate (`apply(state, now)`), prune and atomically rewrite the cursor
+    file under its exclusive flock. Pruning drops entries for deleted transcripts
+    and for ones idle past _CURSOR_TTL_DAYS, except a file still owed a retry,
+    which stays until it ships or disappears."""
+    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(str(CURSOR_PATH) + ".lock", "w") as lf:
+        lock_exclusive(lf)
+        state = _load_state()
+        now = time.time()
+        apply(state, now)
+        cutoff = now - _CURSOR_TTL_DAYS * 86400
+        state = {
+            p: e
+            for p, e in state.items()
+            if p in (path, _HEALTH_KEY)
+            or (
+                isinstance(e, dict)
+                and (e.get("ts", 0) >= cutoff or _needs_retry(e))
+                and os.path.exists(p)
+            )
+        }
+        tmp = str(CURSOR_PATH) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, CURSOR_PATH)
+
+
 def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -> None:
     """Persist a cursor under an exclusive flock, monotonic per file unless
     `force` (truncation reset). Concurrent shippers (a Stop child racing the
@@ -247,26 +318,136 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
 
     `size` is the EOF of a FULLY shipped file; pass -1 for intermediate chunks
     so a crash mid-backlog can't fake the everything-shipped skip condition.
+
+    Only ever called after a successful POST, so it also ends the upload-failure
+    streak, and rewriting the entry clears the file's `pending` marker.
     """
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(str(CURSOR_PATH) + ".lock", "w") as lf:
-        lock_exclusive(lf)
-        state = _load_state()
+
+    def apply(state: dict[str, Any], now: float) -> None:
+        state[_HEALTH_KEY] = {"last_ok": now}
         ent = state.get(path)
         if not force and isinstance(ent, dict) and int(ent.get("offset", -1)) > offset:
-            return
-        now = time.time()
-        cutoff = now - _CURSOR_TTL_DAYS * 86400
+            return  # a racer already got further (and cleared any marker)
         state[path] = {"offset": offset, "size": size, "ts": now}
-        state = {
-            p: e
-            for p, e in state.items()
-            if p == path or (isinstance(e, dict) and e.get("ts", 0) >= cutoff and os.path.exists(p))
-        }
-        tmp = str(CURSOR_PATH) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp, CURSOR_PATH)
+
+    _update_state(path, apply)
+
+
+def _record_failure(path: str, reason: str, offset: int) -> None:
+    """Mark `path` pending after a failed POST and extend the upload-failure
+    streak. The cursor never moves here: an existing entry keeps its offset, and
+    a file with no entry yet gets one at `offset` (where this run started) with
+    size -1. `pending` holds the time of the first failure since the file last
+    shipped; `tried` is bumped on every failure, which moves a file that keeps
+    failing to the back of the sweep queue."""
+    reason = _scrub(reason)
+
+    def apply(state: dict[str, Any], now: float) -> None:
+        old = state.get(path)
+        ent = dict(old) if isinstance(old, dict) else {"offset": offset, "size": -1}
+        ent.update(
+            pending=ent.get("pending") or now,
+            tried=now,
+            fails=int(ent.get("fails", 0)) + 1,
+            last_error=reason,
+            ts=now,
+        )
+        state[path] = ent
+        h = state.get(_HEALTH_KEY)
+        h = dict(h) if isinstance(h, dict) else {}
+        h.update(
+            fail_since=h.get("fail_since") or now,
+            fails=int(h.get("fails", 0)) + 1,
+            last_error=reason,
+            last_fail=now,
+        )
+        state[_HEALTH_KEY] = h
+
+    _update_state(path, apply)
+
+
+# ---------------------------------------------------------------------------
+# Upload-failure reasons + the session-start warning
+# ---------------------------------------------------------------------------
+
+
+def _scrub(text: str) -> str:
+    """Last line of defence for anything stored or printed: never the token, never long."""
+    if INGEST_TOKEN:
+        text = text.replace(INGEST_TOKEN, "***")
+    return text[:80]
+
+
+def _short_reason(e: BaseException) -> str:
+    """A short, token-free reason for a failed POST, from a fixed vocabulary.
+
+    Built from the exception type and the HTTP status code only. Message text
+    from the server or the library is never used, since it can echo URLs,
+    headers or response bodies."""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            return f"HTTP {e.code} {http.HTTPStatus(e.code).phrase}"
+        except ValueError:
+            return f"HTTP {e.code}"
+    cause = e.reason if isinstance(e, urllib.error.URLError) else e
+    if isinstance(cause, TimeoutError):  # socket.timeout is an alias
+        return "timed out"
+    if isinstance(cause, ConnectionRefusedError):
+        return "connection refused"
+    if isinstance(cause, socket.gaierror):
+        return "DNS lookup failed"
+    if isinstance(cause, (ssl.SSLError, ssl.CertificateError)):
+        return "TLS error"
+    if isinstance(cause, ConnectionError):
+        return "connection dropped"
+    if isinstance(cause, http.client.HTTPException):
+        return "bad HTTP response"
+    if isinstance(cause, OSError):
+        return "network error"
+    if cause is not e:
+        return "server unreachable"  # URLError with a non-exception reason
+    return type(e).__name__
+
+
+def _failure_warning(state: dict[str, Any], now: float) -> str | None:
+    """The session-start line for a sustained upload failure, or None.
+
+    Sustained means _WARN_AFTER_FAILS failed POSTs in a row, or a first failure
+    _WARN_AFTER_HOURS old, with no successful POST since. Any success resets it."""
+    h = state.get(_HEALTH_KEY)
+    if not isinstance(h, dict) or not h.get("fail_since"):
+        return None
+    since = float(h["fail_since"])
+    if int(h.get("fails", 0)) < _WARN_AFTER_FAILS and now - since < _WARN_AFTER_HOURS * 3600:
+        return None
+    when = datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M")
+    reason = _scrub(str(h.get("last_error") or "unknown error"))
+    return (
+        f"Synapse uploads have been failing since {when} ({reason}); "
+        "transcripts will be retried automatically."
+    )
+
+
+def _emit_failure_warning() -> None:
+    """Print the sustained-failure line at SessionStart: `systemMessage` shows it
+    to the user, `additionalContext` to the model. Reads local state only (no
+    network), prints nothing while uploads are healthy, and never raises."""
+    try:
+        line = _failure_warning(_load_state(), time.time())
+        if line:
+            print(
+                json.dumps(
+                    {
+                        "systemMessage": line,
+                        "hookSpecificOutput": {
+                            "hookEventName": "SessionStart",
+                            "additionalContext": line,
+                        },
+                    }
+                )
+            )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -384,19 +565,31 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
         return (0, 0)
 
     posts = shipped = 0
+    chunk_start = cursor
     for n, (records, cursor_after) in enumerate(plans):
         if not records:
             continue
         try:
             payload = _post_records(records, source="hook" if mode == "stop" else "sweep")
-            final = n == len(plans) - 1
-            _advance_cursor(transcript_path, cursor_after, eof if final else -1, force=force)
         except Exception as e:
             # Cursor stays at the failure point — the next Stop or the
             # SessionStart sweep resumes exactly there. Earlier chunks stand.
+            # The pending marker is what lets the sweep retry this file after
+            # it ages out of the catch-up window.
+            _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
+            try:
+                _record_failure(transcript_path, _short_reason(e), chunk_start)
+            except Exception as e2:
+                _log(f"ERR {mode} record-failure: {type(e2).__name__}: {str(e2)[:160]}")
+            break
+        try:
+            final = n == len(plans) - 1
+            _advance_cursor(transcript_path, cursor_after, eof if final else -1, force=force)
+        except Exception as e:
             _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
             break
         force = False
+        chunk_start = cursor_after
         posts += 1
         shipped += len(records)
         _log(
@@ -417,10 +610,19 @@ def _catchup_candidates(
     state: dict[str, Any],
     now: float,
 ) -> list[str]:
-    """Transcripts worth sweeping: recently modified, not the live session, not
-    mid-write (ACTIVE_GRACE — an active session's own Stop hooks own it), and
-    with bytes past their cursor. Oldest-mtime first so repeated capped sweeps
-    make forward progress. Pure given os.stat results — patchable in tests."""
+    """Transcripts worth sweeping: not the live session, not mid-write
+    (ACTIVE_GRACE — an active session's own Stop hooks own it), with bytes past
+    their cursor, and either modified within CATCHUP_DAYS or owed a retry (a
+    failed or half-finished upload, _needs_retry) however old.
+
+    A file older than the window that the hook never attempted is NOT a
+    candidate: that is history from before the plugin was installed (or from
+    before failures were recorded), and `synapse-import` is the tool for it.
+
+    Least recently touched first — the last failed attempt, else the mtime — so
+    repeated capped sweeps make oldest-first progress and a file that keeps
+    failing rotates to the back instead of starving the rest. Pure given
+    os.stat results — patchable in tests."""
     out: list[tuple[float, str]] = []
     skip_real = os.path.realpath(skip_path) if skip_path else ""
     for path in glob.glob(os.path.join(projects_root, "*", "*.jsonl")):
@@ -430,14 +632,15 @@ def _catchup_candidates(
             st = os.stat(path)
         except OSError:
             continue
-        if st.st_mtime < now - CATCHUP_DAYS * 86400:
+        ent = state.get(path)
+        if st.st_mtime < now - CATCHUP_DAYS * 86400 and not _needs_retry(ent):
             continue
         if st.st_mtime > now - ACTIVE_GRACE:
             continue
-        ent = state.get(path)
         if isinstance(ent, dict) and int(ent.get("size", -1)) == st.st_size:
             continue  # fully shipped and unchanged
-        out.append((st.st_mtime, path))
+        tried = float(ent.get("tried") or 0) if isinstance(ent, dict) else 0.0
+        out.append((max(st.st_mtime, tried), path))
     out.sort()
     return [p for _, p in out]
 
@@ -505,6 +708,9 @@ def main() -> None:
     transcript_path = payload.get("transcript_path") or ""
 
     if len(sys.argv) >= 2 and sys.argv[1] == "--catchup":
+        # Say so when uploads keep failing. Before the sweep runs, so the line
+        # reflects the streak as it stood; a sweep that succeeds ends the streak.
+        _emit_failure_warning()
         root = (
             _projects_root_from(transcript_path)
             if transcript_path

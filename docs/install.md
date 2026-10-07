@@ -275,6 +275,13 @@ gets a release note saying so.
   a poller that never starts. See [Model ids](#model-ids-one-thing-that-bites).
 - **`401 Unauthorized`.** Token missing, stale, or revoked. Re-run `! synapse-login`, or
   paste a fresh device token into the `/plugin` config.
+- **Session start says "Synapse uploads have been failing since …".** The last several
+  transcript uploads failed, with no success since; the reason is in brackets. `HTTP 401` or
+  `HTTP 403` usually means a revoked or stale token, or a proxy or WAF in front of the server.
+  `connection refused` or `timed out` means the server is down or unreachable. Nothing is
+  lost: every session start retries the failed transcripts, at any age, until they upload.
+  The line goes away after the first successful upload. The hook log
+  (`/tmp/synapse-ingest-hook.log`, `SYNAPSE_INGEST_LOG`) has each failure.
 - **Recall returns nothing and the hooks seem dead.** Hooks are fail-soft, so an unreachable
   server is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health`, then that `SYNAPSE_URL`
   and the token are set (`/plugin` shows the stored values).
