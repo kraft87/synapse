@@ -287,9 +287,13 @@ _JUDGE_PROMPT = """You audit AI-agent skill routing. Below is one coding-session
 Skills auto-fire when the user's phrasing matches a skill's description. Judge two things STRICTLY:
 
 1. would_have_helped: skills that did NOT fire this session but CLEARLY should have (the work squarely matches the skill's purpose). Be conservative — empty list if none obviously apply. Do NOT list a skill that did fire.
+   For EACH would_have_helped skill, compare the user's wording against that skill's CURRENT catalog description (the text after its name below — its trigger surface):
+   - description_covers: true when the description ALREADY names what the user asked for (the same words, tool, command, product, file or concept). The skill was a match and simply was not invoked; adding trigger words would change nothing.
+   - description_covers: false ONLY when there is a real vocabulary gap: the user used wording, a file, a tool, a setting name or a concept that the description does not mention.
+   - missing_phrasing: when description_covers is false, the specific user wording or concept the description lacks (a few words, quoted from the user where possible). Use "" when description_covers is true.
 2. dismissed: skills that DID fire but look like a MISMATCH (the work diverged from the skill's purpose / it shouldn't have fired).
 
-SKILL CATALOG:
+SKILL CATALOG (name: current description):
 {catalog}
 
 SESSION:
@@ -300,7 +304,76 @@ SESSION:
 {user_msgs}
 
 Output ONLY a JSON object, no prose:
-{{"would_have_helped": [{{"skill": "name", "why": "one sentence"}}], "dismissed": [{{"skill": "name", "why": "one sentence"}}]}}"""
+{{"would_have_helped": [{{"skill": "name", "why": "one sentence", "description_covers": true or false, "missing_phrasing": "the user wording the description lacks; empty string when covered"}}], "dismissed": [{{"skill": "name", "why": "one sentence"}}]}}"""
+
+
+# --- under-trigger gate: does a would_have_helped item show a real description gap? ---
+# Whole words dropped before the deterministic coverage match, so filler ("run THIS sql")
+# can't break an otherwise literal match. Only standalone words: the parts of a compound
+# identifier (pipeline_a.yml -> pipeline, a, yml) are always kept.
+_COVER_STOP = frozenset(
+    "a an the this that these those it its to of in on at by for from with into and or "
+    "is are be me my i we our you your please can could would should some any".split()
+)
+
+
+def _cover_tokens(text: str) -> list[str]:
+    """Lowercase alphanumeric tokens in order. Punctuation, quotes and identifier
+    separators (_ . - /) all split, so `SYNAPSE_RECALL_FLOOR` -> synapse recall floor and
+    `pipeline_c.yml` -> pipeline c yml. Standalone stopwords are dropped."""
+    out: list[str] = []
+    for word in (text or "").lower().split():
+        parts = re.findall(r"[a-z0-9]+", word)
+        if len(parts) == 1 and parts[0] in _COVER_STOP:
+            continue
+        out.extend(parts)
+    return out
+
+
+def description_covers_phrasing(phrasing: str, description: str) -> bool:
+    """Deterministic backstop for the under-trigger judge: True when `phrasing` is already
+    literally present in the skill `description` — its normalized token sequence appears
+    contiguously in the description's (the `Triggers on:` list is part of the description
+    text, so a trigger phrase counts). Conservative by design: a phrasing with any word the
+    description lacks (`pipeline_c.yml` against a description naming only pipeline_a.yml /
+    pipeline_b.yml) is NOT covered, and an empty or all-stopword phrasing is never covered."""
+    p = _cover_tokens(phrasing)
+    if not p:
+        return False
+    return f" {' '.join(p)} " in f" {' '.join(_cover_tokens(description))} "
+
+
+def _judge_bool(v) -> bool | None:
+    """A judge-emitted boolean: real bools, or the strings "true"/"false" (LLMs drift).
+    None when absent or unparseable."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str) and v.strip().lower() in ("true", "false"):
+        return v.strip().lower() == "true"
+    return None
+
+
+def under_trigger_verdict(item: dict, description: str, phrasing: str = "") -> str:
+    """Classify one would_have_helped item against the skill's CURRENT description:
+      "gap"      — judge says description_covers=false AND names a non-empty
+                   missing_phrasing that the description really lacks -> widen fuel;
+      "covered"  — judge says description_covers=true: the skill matched but wasn't invoked;
+      "backstop" — judge claims a gap, but its missing_phrasing (or the session `phrasing`)
+                   is already literally in the description -> treated as covered;
+      "no_gap"   — no stated gap: legacy output without the fields, description_covers
+                   missing/unparseable, or false with an empty missing_phrasing.
+    Safe default: only "gap" may widen a skill; everything else never does."""
+    covers = _judge_bool(item.get("description_covers"))
+    if covers is True:
+        return "covered"
+    missing = str(item.get("missing_phrasing") or "").strip()
+    if covers is None or not missing:
+        return "no_gap"
+    if description_covers_phrasing(missing, description) or description_covers_phrasing(
+        phrasing, description
+    ):
+        return "backstop"
+    return "gap"
 
 
 def run_judge(prompt: str, model: str | None = None, timeout: int = 240) -> str:
