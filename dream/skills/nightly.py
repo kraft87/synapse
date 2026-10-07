@@ -149,23 +149,47 @@ def run_derive(conn, substantive, catalog, seen_ids):
     return {"gaps": len(gaps), "clusters": len(clusters), "proposed": n_proposed}
 
 
-def run_retune(conn, substantive, catalog, seen_ids):
-    n = 0
+def run_retune(conn, substantive, catalog, seen_ids, descriptions):
+    """Under-trigger judge -> retune/widen candidates, gated on a REAL description gap.
+
+    A would_have_helped skill whose current description already covers the request was a
+    match the model simply didn't invoke; more trigger words change nothing, so it must not
+    become a widen proposal. Only SM.under_trigger_verdict() == "gap" merges evidence. The
+    rest is counted, never merged: covered / backstop-covered items are tallied per skill
+    (matched-but-not-invoked telemetry), and items with no stated gap (incl. legacy judge
+    output without description_covers / missing_phrasing) are dropped as `no_gap_stated`.
+    `descriptions` is name -> current description (the catalog the judge saw)."""
+    stats = {"under_trigger": 0, "covered_not_fired": 0, "backstop_covered": 0, "no_gap_stated": 0}
+    covered_by_skill: dict[str, int] = {}
     for s in substantive:
         v = SM.judge_session(s, catalog)
         if not v:
             continue
         for m in v.get("would_have_helped", []):
             sk = m.get("skill")
-            if not sk or sk in s["fired"]:
+            # a skill missing from the catalog has no description to widen
+            if not sk or sk in s["fired"] or sk not in descriptions:
                 continue
+            phrasing = s.get("first_user", "")[:160]
+            verdict = SM.under_trigger_verdict(m, descriptions[sk], phrasing)
+            if verdict in ("covered", "backstop"):
+                stats["covered_not_fired"] += 1
+                if verdict == "backstop":  # judge claimed a gap the description already has
+                    stats["backstop_covered"] += 1
+                covered_by_skill[sk] = covered_by_skill.get(sk, 0) + 1
+                continue
+            if verdict != "gap":
+                stats["no_gap_stated"] += 1
+                continue
+            missing = str(m["missing_phrasing"]).strip()[:160]
             ev = [
                 {
                     "session_id": s["session"],
                     "class": "judge",
                     "signal": "under_trigger",
                     "skill": sk,
-                    "phrasing": s.get("first_user", "")[:160],
+                    "phrasing": phrasing,
+                    "missing_phrasing": missing,
                     "why": m.get("why", ""),
                 }
             ]
@@ -176,12 +200,14 @@ def run_retune(conn, substantive, catalog, seen_ids):
                 ev,
                 direction="widen",
                 target_skills=[sk],
-                summary=f"under-fires: {m.get('why', '')[:120]}",
+                summary=f"under-fires; description lacks {missing[:60]!r}: {m.get('why', '')[:120]}",
                 do_embed=False,
             )
             seen_ids.add(res["id"])
-            n += 1
-    return {"under_trigger": n}
+            stats["under_trigger"] += 1
+    if covered_by_skill:
+        stats["covered_by_skill"] = dict(sorted(covered_by_skill.items()))
+    return stats
 
 
 def capture_grounded(conn, last_scan_at, seen_ids):
@@ -322,7 +348,8 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     cur_state = L.get_cursor(conn)
     last = None if backfill else cur_state.get("last_scan_at")
 
-    catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(SM.load_skills().items()))
+    skills = SM.load_skills()
+    catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(skills.items()))
     seen: set[int] = set()
 
     print(
@@ -336,7 +363,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     print(f"substantive sessions to judge: {len(substantive)}")
 
     print("derive:", run_derive(conn, substantive, catalog, seen))
-    print("retune:", run_retune(conn, substantive, catalog, seen))
+    print("retune:", run_retune(conn, substantive, catalog, seen, skills))
     print("grounded:", capture_grounded(conn, last, seen))
 
     # v2 detectors — on by default; SYNAPSE_SKILLS_DETECTORS is the kill switch
