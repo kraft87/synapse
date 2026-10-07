@@ -35,6 +35,7 @@ from starlette.responses import JSONResponse
 from ingestion.db import Database
 from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.http_helpers import err, unauthorized
+from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
 
 logger = logging.getLogger(__name__)
@@ -131,8 +132,12 @@ def _render(
     notes: list[dict[str, Any]],
     dropped: int,
     events: list[dict[str, Any]],
+    notice: str | None = None,
 ) -> str:
     lines = [f"[Synapse board — project: {project or 'all'}]"]
+    if notice:
+        # Directly under the header, ahead of the "0 episodes" banner it explains.
+        lines.append(f"WARNING: {notice}")
     recent = f" (most recent: {', '.join(project_names)})" if project_names else ""
     lines.append(f"{n_episodes} episodes across {len(project_names)} projects{recent}.")
     lines.append(
@@ -170,13 +175,22 @@ def _render(
 
 
 def build_board(
-    db_url: str, project: str | None, surface: str | None = None, trust: SurfaceTrust | None = None
+    db_url: str,
+    project: str | None,
+    surface: str | None = None,
+    trust: SurfaceTrust | None = None,
+    notice: str | None = None,
 ) -> dict[str, Any]:
     """Build the rendered board block. Pure SQL, no embedding calls.
 
     Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids", "trust"}`` —
     ``note_ids`` is the telemetry envelope's serve list; serve paths pop it before
     returning the block to callers (the ids the caller needs are inline as ``n:ID``).
+
+    ``notice`` is a serve-nothing explanation (recall_warnings.serving_notice) that the
+    route computed for an authenticated caller. It renders as a ``WARNING:`` line right
+    under the header and comes back as ``warnings: [notice]``; the key exists only when
+    there is one, the same contract as recall's ``warnings``.
 
     ``surface`` is the calling host's id (schema 053). It is resolved to a trust verdict
     that is FAIL-CLOSED at every step: absent, unregistered, or unreadable all mean
@@ -224,17 +238,17 @@ def build_board(
     # the board for zero benefit. With event facts clamped this is a residual guard.
     kept = list(notes)
     dropped = 0
-    floor = _render(project, n_episodes, project_names, [], len(notes), events)
+    floor = _render(project, n_episodes, project_names, [], len(notes), events, notice)
     can_reach_cap = _fits(floor)
     while True:
-        text = _render(project, n_episodes, project_names, kept, dropped, events)
+        text = _render(project, n_episodes, project_names, kept, dropped, events, notice)
         if not kept or not can_reach_cap or _fits(text):
             break
         victim = min(kept, key=lambda n: (_DROP_CLASS.get(n["type"], 0), n["updated_at"], n["id"]))
         kept.remove(victim)
         dropped += 1
 
-    return {
+    out: dict[str, Any] = {
         "status": "ok",
         "text": text,
         "n_notes": len(kept),
@@ -244,6 +258,9 @@ def build_board(
         # isn't registered" instead of "memory is empty". It reveals nothing filtered.
         "trust": st.trust,
     }
+    if notice:
+        out["warnings"] = [notice]
+    return out
 
 
 def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[str, Any]) -> None:
@@ -279,6 +296,7 @@ def register(
     authorized: Callable[[Request], bool],
     get_recall: Callable[[], Any] | None = None,
     resolve_trust: Callable[[Request, str | None], SurfaceTrust] | None = None,
+    authenticated: Callable[[Request], bool] | None = None,
 ) -> None:
     """Mount GET /context.
 
@@ -287,6 +305,11 @@ def register(
     server's single caller-resolution point (device token → its surface; root token →
     the legacy ``?surface=`` param). None falls back to resolving the query param
     alone, which is the pre-054 behaviour and still fail-closed.
+
+    ``authenticated`` says whether the request presented a credential the server
+    checked (http_auth.authenticated). Only then, and only with a resolved verdict, does
+    a serve-nothing verdict put its explanation at the top of the board. None (an open
+    server, or a caller that does not wire it) keeps the board silent, as before.
     """
     if not db_url:
         logger.info("board routes disabled (no DB_URL)")
@@ -301,9 +324,11 @@ def register(
         project = request.query_params.get("project") or None
         surface = request.query_params.get("surface") or None
         trust = resolve_trust(request, surface) if resolve_trust is not None else None
+        told = trust is not None and authenticated is not None and authenticated(request)
+        notice = serving_notice(trust) if told else None
         t0 = time.perf_counter()
         try:
-            board = await run_in_threadpool(build_board, db_url, project, surface, trust)
+            board = await run_in_threadpool(build_board, db_url, project, surface, trust, notice)
         except Exception as e:
             logger.warning("board build failed: %s", e)
             return err(str(e)[:200], 500)

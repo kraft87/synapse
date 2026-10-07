@@ -259,7 +259,8 @@ gets a release note saying so.
   token instead of a device token. Mint one with
   `docker compose exec mcp-server synapse-admin bootstrap "<label>"`, or run
   `! synapse-login`, then paste it into the plugin config. The SessionStart block says which
-  case you are in.
+  case you are in, and so does the server itself: a `WARNING:` line under the board header
+  and the first entry of recall's `warnings` list, which reach even an old plugin.
 - **`POST /recall` returns `{"facts": []}` with no `episodes` key.** The embedding call
   failed, almost always a bad or blank `VOYAGE_API_KEY`. The HTTP status is still 200, but
   the response now carries a `warnings` list naming the leg that degraded, for example

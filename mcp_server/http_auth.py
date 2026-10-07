@@ -19,6 +19,18 @@ def is_root(request: Request, machine_token: str) -> bool:
     return bool(machine_token and tok and hmac.compare_digest(tok, machine_token))
 
 
+def authenticated(request: Request, machine_token: str) -> bool:
+    """Did this request present a credential, on a server that checks credentials?
+
+    Read it AFTER :func:`machine_authorized` admitted the request: past that gate a
+    bearer is the root token or an approved device token, so this needs no second
+    database read. On an open server (no machine token) nothing authenticates, and this
+    is False for every caller. Decides who may be told WHY they are served nothing
+    (recall_warnings.serving_notice): a caller with no credential has nothing to fix.
+    """
+    return bool(machine_token) and bool(bearer(request))
+
+
 def machine_authorized(request: Request, machine_token: str, db_url: str) -> bool:
     """ "Is this a Synapse client?" — the CLIENT gate on the custom routes.
 

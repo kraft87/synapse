@@ -95,6 +95,16 @@ Resolution never fails open. No credential, no row, a non-approved row, a missin
 unreachable database, a malformed row: all resolve to restricted with an empty allowlist. An
 unknown caller serves nothing rather than everything.
 
+Serving nothing is not silent. When an authenticated caller (root token, device token, or
+OAuth sign-in) resolves to unknown, or to a restricted surface with no projects, the server
+says so: a `WARNING:` line right under the board header, and the same text first in the
+`warnings` list of `recall`, `recall_full_turns`, `fetch`, `fetch_session` and
+`POST /recall`. The text names the cause and the fix (enroll with `synapse-login`; mint a
+device a new credential with projects; grant an `oauth:<login>` identity with `PUT`), and
+no ids. Full trust and restricted-with-projects get no notice, and neither does an open
+server, where no credential would change the answer. Old clients show it too, since it is
+part of the server's response rather than the plugin.
+
 Note-writing follows the same line: a write from a live, approved restricted surface defaults
 to `work-safe`, symmetric with what it may read, so notes written at work do not vanish from
 the work board next session.

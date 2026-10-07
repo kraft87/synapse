@@ -76,6 +76,7 @@ _DB_FILES = {
     "test_kg_source_projects.py",
     "test_surface_routes.py",
     "test_credential_trust.py",
+    "test_serving_notice.py",
 }
 
 
