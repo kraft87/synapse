@@ -34,19 +34,21 @@ def register(
     # so the dream pipeline can read them and propose edits. Same DSN-free seam as skills. No-op w/o DB.
     from mcp_server.config_sync_routes import register as _register_config_routes
 
-    _register_config_routes(mcp, DB_URL, _machine_authorized)
+    _register_config_routes(mcp, DB_URL, _machine_authorized, lambda r: _request_trust(r))
 
     # Timeline event ingest — feeders (the plugin's git feeder, later calendar) POST plain event
     # rows here; the server embeds + upserts. Same DSN-free machine-token seam. No-op w/o DB.
     from mcp_server.timeline_routes import register as _register_timeline_routes
 
-    _register_timeline_routes(mcp, DB_URL, _machine_authorized, VOYAGE_API_KEY)
+    _register_timeline_routes(
+        mcp, DB_URL, _machine_authorized, VOYAGE_API_KEY, lambda r: _request_trust(r)
+    )
 
     # Preferences read route — the plugin's SessionStart block GETs the top standing user
     # preferences here (schema 035). Same machine-token seam; server owns the DB. No-op w/o DB.
     from mcp_server.preferences_routes import register as _register_preferences_routes
 
-    _register_preferences_routes(mcp, DB_URL, _machine_authorized)
+    _register_preferences_routes(mcp, DB_URL, _machine_authorized, lambda r: _request_trust(r))
 
     # Private mode — the plugin's toggle CLI flips a session's "off the record" flag here
     # (schema 050). The flag is what ingest_turns/backfill check, so a session marked private

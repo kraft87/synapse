@@ -33,7 +33,13 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.db import Database
-from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, lookup_surface
+from ingestion.surfaces import (
+    UNKNOWN_SURFACE,
+    SurfaceTrust,
+    episode_scope_sql,
+    lookup_surface,
+    own_surface_if_ready,
+)
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
 from mcp_server.recall_warnings import serving_notice
@@ -67,7 +73,9 @@ _SECTION_TITLES = {
 }
 
 
-def _banner_stats(db_url: str, allowed_projects: list[str] | None = None) -> tuple[int, list[str]]:
+def _banner_stats(
+    db_url: str, allowed_projects: list[str] | None = None, own_surface: str | None = None
+) -> tuple[int, list[str]]:
     """(total episodes, project names newest-activity first, capped at 12).
 
     The episode total comes from pg_class.reltuples (approximate but O(1)) rather
@@ -83,19 +91,25 @@ def _banner_stats(db_url: str, allowed_projects: list[str] | None = None) -> tup
     corpus-wide episode count next to an allowlisted project list would misdescribe what
     the caller can actually reach. The reltuples shortcut is skipped in that branch —
     it cannot answer a filtered question — but the filtered count is over a small slice.
+    ``own_surface`` (schema 057) widens both numbers to the episodes the calling surface
+    ingested itself, matching what recall will actually serve it.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
-        if allowed_projects is not None:
+        own = own_surface_if_ready(conn, db_url, own_surface)  # None before schema 057
+        scope = episode_scope_sql(allowed_projects, own)
+        if scope is not None:
+            pred, args = scope
             row = conn.execute(
-                "SELECT count(*) FROM episodes WHERE project = ANY(%s)", (allowed_projects,)
+                f"SELECT count(*) FROM episodes WHERE {pred}",  # nosec B608 — pred is a literal from episode_scope_sql; values are bound
+                args,
             ).fetchone()
             n_episodes = int(row[0]) if row else 0
             rows = conn.execute(
-                "SELECT project, max(created_at)::date FROM episodes "
-                "WHERE project = ANY(%s) AND project IS NOT NULL AND project <> '' "
+                "SELECT project, max(created_at)::date FROM episodes "  # nosec B608 — as above
+                f"WHERE {pred} AND project IS NOT NULL AND project <> '' "
                 "GROUP BY project ORDER BY 2 DESC LIMIT 12",
-                (allowed_projects,),
+                args,
             ).fetchall()
             return n_episodes, [r[0] for r in rows]
         row = conn.execute(
@@ -195,11 +209,12 @@ def build_board(
 
     ``trust`` is the caller's verdict, resolved from its credential by the route. On a
     restricted verdict the notes section is filtered to ``audience='work-safe'``, and
-    the digest + banner are filtered to the surface's project allowlist. ``surface`` is
-    the in-process alternative for server-side callers and tests: a surface id resolved
-    here, FAIL-CLOSED at every step (absent, unregistered, or unreadable all mean
-    restricted with an empty allowlist). It must never carry a caller-supplied value;
-    the /context route does not pass one.
+    the digest + banner are filtered to the surface's project allowlist plus, for a
+    credential-bound surface, what that surface ingested itself (schema 057).
+    ``surface`` is the in-process alternative for server-side callers and tests: a
+    surface id resolved here, FAIL-CLOSED at every step (absent, unregistered, or
+    unreadable all mean restricted with an empty allowlist). It must never carry a
+    caller-supplied value; the /context route does not pass one.
 
     Missing tables (a deployment behind migration 033/041) degrade that section to
     empty rather than failing the whole board — same posture as preferences_routes.
@@ -210,6 +225,7 @@ def build_board(
     st = trust if trust is not None else lookup_surface(db_url, surface)
     audience = st.audience_filter
     allowed = st.project_filter
+    own = st.own_surface
 
     db = Database(db_url)
     try:
@@ -227,11 +243,12 @@ def build_board(
             limit=10,
             project=None,
             allowed_projects=allowed,
+            own_surface=own,
         )
     except psycopg.errors.UndefinedTable:
         events = []
 
-    n_episodes, project_names = _banner_stats(db_url, allowed_projects=allowed)
+    n_episodes, project_names = _banner_stats(db_url, allowed_projects=allowed, own_surface=own)
 
     # Cap loop: drop one note at a time (drop class, then oldest updated_at) and
     # re-render until under both caps. Dozens of notes at most — O(n^2) is fine.

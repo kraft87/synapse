@@ -6,7 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
-from ingestion.surfaces import SurfaceTrust
+from ingestion.surfaces import SurfaceTrust, episode_scope_sql
 from mcp_server.recall_presentation import parse_fetch_ids as _parse_fetch_ids
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
@@ -33,6 +33,7 @@ class RecallFetchMixin:
         ) -> SurfaceTrust: ...
         def _record_metrics(self, metrics: dict[str, Any]) -> None: ...
         def _increment_retrieval_counts(self, episode_ids: list[int]) -> None: ...
+        def _own_surface(self, st: SurfaceTrust) -> str | None: ...
 
     def fetch(
         self,
@@ -60,7 +61,11 @@ class RecallFetchMixin:
         out: dict[str, Any] = {"episodes": [], "notes": [], "skipped": skipped}
         if not normalized:
             return out
-        out["episodes"] = self._fetch_episode_records(ep_ids, st.project_filter) if ep_ids else []
+        out["episodes"] = (
+            self._fetch_episode_records(ep_ids, st.project_filter, self._own_surface(st))
+            if ep_ids
+            else []
+        )
         out["notes"] = (
             self._fetch_note_records(note_ids, audience=st.audience_filter) if note_ids else []
         )
@@ -112,8 +117,9 @@ class RecallFetchMixin:
         explicit ``error`` — never a silent empty — so the caller knows to fall
         back to the on-disk transcript rather than concluding "nothing there".
 
-        ``surface`` applies the restricted project allowlist (schema 053) to every read
-        below, including the metadata probe — so a session outside the allowlist reports
+        ``surface`` applies the restricted project allowlist (schema 053, widened to the
+        surface's own ingested turns by 057) to every read below, including the metadata
+        probe — so a session outside the allowlist reports
         the same "not indexed" answer an unknown id does. Deliberately indistinguishable:
         a distinct "exists but forbidden" reply would itself disclose the project map.
         """
@@ -122,10 +128,12 @@ class RecallFetchMixin:
         offset = max(0, int(offset))
         limit = max(1, min(int(limit), _SESSION_PAGE_MAX))
         out: dict[str, Any] = {"session_id": session_id}
-        allowed = self._resolve_trust(surface, trust).project_filter
+        st = self._resolve_trust(surface, trust)
         # Appended to every query in this method; empty string on a full-trust surface.
-        proj_sql = " AND project = ANY(%s)" if allowed is not None else ""
-        proj_args: tuple[Any, ...] = (allowed,) if allowed is not None else ()
+        # The predicate is a literal from episode_scope_sql; only its values are bound.
+        scope = episode_scope_sql(st.project_filter, self._own_surface(st))
+        proj_sql = f" AND {scope[0]}" if scope is not None else ""
+        proj_args: tuple[Any, ...] = tuple(scope[1]) if scope is not None else ()
 
         try:
             pg = self._ensure_pg()
@@ -231,12 +239,16 @@ class RecallFetchMixin:
             )
 
     def _fetch_episode_records(
-        self, parsed: list[int], allowed_projects: list[str] | None = None
+        self,
+        parsed: list[int],
+        allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         """The episodes leg of fetch(): full untruncated turns by int id. Fail-soft —
         a read error serves an empty leg, never breaks the call.
 
-        ``allowed_projects`` carries the restricted surface's allowlist. Ids are small
+        ``allowed_projects`` carries the restricted surface's allowlist and
+        ``own_surface`` its own-ingest widening (schema 057). Ids are small
         integers and therefore guessable, so drill-down enforces the SAME predicate the
         overview does — otherwise fetch() would be a trivial bypass of every filter
         recall() applies."""
@@ -247,9 +259,10 @@ class RecallFetchMixin:
                 " FROM episodes WHERE id = ANY(%s)"
             )
             params: list[Any] = [parsed]
-            if allowed_projects is not None:
-                sql += " AND project = ANY(%s)"
-                params.append(allowed_projects)
+            scope = episode_scope_sql(allowed_projects, own_surface)
+            if scope is not None:
+                sql += f" AND {scope[0]}"
+                params.extend(scope[1])
             rows = conn.execute(sql, params).fetchall()
         except Exception as e:
             logger.warning("fetch episodes leg failed: %s", e)

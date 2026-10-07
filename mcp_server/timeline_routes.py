@@ -28,6 +28,12 @@ from starlette.responses import JSONResponse
 
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.scope import coerce_group
+from ingestion.surfaces import (
+    UNKNOWN_SURFACE,
+    SurfaceTrust,
+    episode_scope_sql,
+    own_surface_if_ready,
+)
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -137,6 +143,7 @@ def _recent_events(
     limit: int,
     project: str | None,
     allowed_projects: list[str] | None = None,
+    own_surface: str | None = None,
 ) -> list[dict[str, Any]]:
     """Pure time-window read (no embeddings): the session-start milestones feed.
 
@@ -146,6 +153,9 @@ def _recent_events(
     semantics would drift. The project allowlist is the filter instead, and
     ``project = ANY(...)`` excludes NULL-project events by construction: an unlabeled
     event has no provenance to clear it, so it stays off restricted boards.
+
+    ``own_surface`` (schema 057) also admits events whose source turn the calling
+    surface ingested itself; the gate copies that stamp onto the event at write time.
     """
     conn = psycopg.connect(db_url, autocommit=True)
     try:
@@ -162,9 +172,11 @@ def _recent_events(
         if project:
             q += "AND project = %s "
             params.append(project)
-        if allowed_projects is not None:
-            q += "AND project = ANY(%s) "
-            params.append(allowed_projects)
+        own = own_surface_if_ready(conn, db_url, own_surface)  # None before schema 057
+        scope = episode_scope_sql(allowed_projects, own)
+        if scope is not None:
+            q += f"AND {scope[0]} "
+            params.extend(scope[1])
         q += ") ranked WHERE day_rank <= %s ORDER BY t_valid DESC LIMIT %s"
         params.extend([_PER_PROJECT_DAY, limit])
         rows = conn.execute(q, params).fetchall()
@@ -184,8 +196,15 @@ def _recent_events(
 
 
 def register(
-    mcp: Any, db_url: str, authorized: Callable[[Request], bool], voyage_api_key: str
+    mcp: Any,
+    db_url: str,
+    authorized: Callable[[Request], bool],
+    voyage_api_key: str,
+    resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
 ) -> None:
+    """``resolve_trust`` maps a request to its bearer-resolved verdict (schema 054). The
+    read route filters by it; when it is not supplied the route treats every caller as
+    an unknown surface and serves nothing, so a wiring slip fails closed, never open."""
     if not db_url:
         logger.info("timeline routes disabled (no DB_URL)")
         return
@@ -194,7 +213,11 @@ def register(
     async def timeline_recent(request: Request) -> JSONResponse:
         """Recent high-salience events for the plugin's session-start milestones block.
         Body: {days?=7, min_salience?=2, limit?=5, project?}. Time-scoped and tiny by
-        design — this is a bounded factual block, not query-blind recall injection."""
+        design — this is a bounded factual block, not query-blind recall injection.
+
+        Scoped like the board digest (schema 053/057): a restricted caller sees only
+        events in its project allowlist or derived from turns it ingested itself; an
+        unknown caller sees nothing. The scope comes from the bearer, never the body."""
         if not authorized(request):
             return unauthorized()
         try:
@@ -205,8 +228,20 @@ def register(
         min_sal = int(body.get("min_salience") or 2)
         limit = min(int(body.get("limit") or 5), 20)
         try:
+            st = (
+                await run_in_threadpool(resolve_trust, request)
+                if resolve_trust
+                else UNKNOWN_SURFACE
+            )
             items = await run_in_threadpool(
-                _recent_events, db_url, days, min_sal, limit, body.get("project")
+                _recent_events,
+                db_url,
+                days,
+                min_sal,
+                limit,
+                body.get("project"),
+                st.project_filter,
+                st.own_surface,
             )
         except Exception as e:
             logger.warning("timeline recent failed: %s", e)

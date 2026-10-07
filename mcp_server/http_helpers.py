@@ -51,7 +51,8 @@ async def guarded_json(
 
     Gate on ``authorized(request)`` (401), parse the JSON body (400 on failure), run
     ``work(body)`` in a threadpool (500 + logged on exception), else return ``JSONResponse(out)``.
-    ``label`` names the route in the 500 log line (e.g. 'skill route' / 'config route')."""
+    ``label`` names the route in the 500 log line (e.g. 'skill route' / 'config route').
+    ``work`` may return a ready ``JSONResponse`` (e.g. a 403) and it is passed through."""
     if not authorized(request):
         return unauthorized()
     try:
@@ -63,4 +64,6 @@ async def guarded_json(
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("%s failed", label)
         return err(str(exc)[:200], 500)
+    if isinstance(out, JSONResponse):
+        return out
     return JSONResponse(out)

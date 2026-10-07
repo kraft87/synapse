@@ -11,6 +11,10 @@ Route (GET):
 Ranked by (assert_count DESC, last_asserted DESC): the strongest, most-recently-reasserted
 preferences first. Across ALL groups for the owner — a standing preference ("never use
 tables") shapes every session, not just its originating project's.
+
+Scoped by the caller's BEARER, like the board digest (schema 053/054): full trust is
+unchanged, a restricted device gets only preferences from its project allowlist, and an
+unknown caller (the root token included) gets none.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -34,17 +39,32 @@ _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 _MAX_LIMIT = 50
 
 
-def _top_preferences(db_url: str, limit: int) -> list[dict[str, Any]]:
+def _top_preferences(
+    db_url: str, limit: int, allowed_projects: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Live preferences for the session-start block, strongest first. Degrades to []
-    if migration 035 hasn't been applied on this deployment yet."""
+    if migration 035 hasn't been applied on this deployment yet.
+
+    ``allowed_projects`` is the restricted caller's allowlist (None = full trust, no
+    filter); ``project = ANY('{}')`` matches nothing, NULL project included, so an
+    unknown caller is served nothing. There is deliberately no own-surface widening
+    here (schema 057): a preference carries only its FIRST turn's ``source_ref``, and
+    ``merge_preference_text`` folds detail from later turns into the stored text without
+    recording where it came from, so that ref cannot prove which device the text is
+    from."""
+    sql = (
+        "SELECT pref, polarity, assert_count, left(first_seen::text, 10) AS since "
+        "FROM preferences WHERE owner_id = %s AND t_invalid IS NULL"
+    )
+    params: list[Any] = [_OWNER]
+    if allowed_projects is not None:
+        sql += " AND project = ANY(%s)"
+        params.append(allowed_projects)
+    sql += " ORDER BY assert_count DESC, last_asserted DESC LIMIT %s"
+    params.append(limit)
     conn = psycopg.connect(db_url, autocommit=True)
     try:
-        rows = conn.execute(
-            "SELECT pref, polarity, assert_count, left(first_seen::text, 10) AS since "
-            "FROM preferences WHERE owner_id = %s AND t_invalid IS NULL "
-            "ORDER BY assert_count DESC, last_asserted DESC LIMIT %s",
-            (_OWNER, limit),
-        ).fetchall()
+        rows = conn.execute(sql, params).fetchall()
         return [{"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows]
     except psycopg.errors.UndefinedTable:
         return []
@@ -52,7 +72,14 @@ def _top_preferences(db_url: str, limit: int) -> list[dict[str, Any]]:
         conn.close()
 
 
-def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
+def register(
+    mcp: Any,
+    db_url: str,
+    authorized: Callable[[Request], bool],
+    resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
+) -> None:
+    """``resolve_trust`` maps a request to its bearer-resolved verdict. Not supplied, every
+    caller is treated as an unknown surface and served nothing (fail closed)."""
     if not db_url:
         logger.info("preferences routes disabled (no DB_URL)")
         return
@@ -69,7 +96,12 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             limit = 8
         limit = max(limit, 1)
         try:
-            items = await run_in_threadpool(_top_preferences, db_url, limit)
+            st = (
+                await run_in_threadpool(resolve_trust, request)
+                if resolve_trust
+                else UNKNOWN_SURFACE
+            )
+            items = await run_in_threadpool(_top_preferences, db_url, limit, st.project_filter)
         except Exception as e:
             logger.warning("preferences top failed: %s", e)
             return err(str(e)[:200], 500)

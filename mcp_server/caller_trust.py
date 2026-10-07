@@ -23,6 +23,7 @@ from __future__ import annotations
 import hmac
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, resolve_caller, token_hash
@@ -43,6 +44,7 @@ def trust_from_claims(claims: dict[str, Any]) -> SurfaceTrust:
         trust=str(claims.get("trust") or "restricted"),
         allowed_projects=tuple(claims.get("allowed_projects") or ()),
         known=True,
+        credential_bound=True,
     )
 
 
@@ -67,7 +69,11 @@ def caller_trust(
     if access_token is not None and access_token.client_id not in machine_client_ids:
         identity = claims_identity(access_token.claims or {}, identity_claims)
         if identity:
-            return resolve_caller(db_url, legacy_surface_id=f"{OAUTH_SURFACE_PREFIX}{identity}")
+            st = resolve_caller(db_url, legacy_surface_id=f"{OAUTH_SURFACE_PREFIX}{identity}")
+            # The id was derived by the server from a VERIFIED identity, so it is as
+            # credential-bound as a device token (schema 057 provenance rides on it).
+            # Only a matched, approved row counts.
+            return replace(st, credential_bound=True) if st.known else st
     return UNKNOWN_SURFACE
 
 

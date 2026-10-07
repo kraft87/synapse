@@ -167,16 +167,23 @@ project included, so an unknown caller serves *nothing* rather than everything.
 **Enforcement on a restricted surface** (v1, plus KG provenance from schema 056):
 
 - **Board**: notes filtered to `audience='work-safe'`; timeline digest and episodes
-  banner filtered by project allowlist.
+  banner filtered by project allowlist, plus (schema 057) the caller's own uploads.
 - **recall / recall_full_turns**: notes by `audience`; episodes (BM25 + vector legs) by
-  `project = ANY(allowed_projects)`. **KG facts by provenance** (schema 056): a fact
-  is served only when `kg_relationships.source_projects` (the distinct projects of its
-  source episodes, trigger-maintained) is known, non-empty, and a subset of
-  `allowed_projects`. Unknown (a missing or project-less source episode, or no episode
-  provenance) and mixed provenance are never served. Before 056 is applied, no facts.
+  `project = ANY(allowed_projects)`, widened by schema 057 to `OR surface_id = <caller>`
+  for a credential-bound caller, so a restricted device reads its own uploads. **KG facts
+  by provenance** (schema 056): a fact is served only when
+  `kg_relationships.source_projects` (the distinct projects of its source episodes,
+  trigger-maintained) is known, non-empty, and a subset of `allowed_projects`. Unknown (a
+  missing or project-less source episode, or no episode provenance) and mixed provenance
+  are never served. Before 056 is applied, no facts.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
+- **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**: project
+  allowlist only (a merged preference's text has no per-turn provenance). **`/config/*`**:
+  a restricted device reads and writes only its own mirror, and sees only proposals whose
+  every evidence session consists solely of its own turns. All resolved from the bearer;
+  the root token and unknown callers get nothing.
 
 ## Rollout order (schema 054)
 

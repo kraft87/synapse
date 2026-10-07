@@ -30,7 +30,9 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 import psycopg
 
@@ -161,3 +163,75 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
         expected,
     )
     sys.exit(1)
+
+
+class ColumnProbe:
+    """Cached runtime answer to "has this optional migration been applied here yet?".
+
+    Code that ships with an optional migration (:data:`OPTIONAL_MARKER`) keeps its
+    pre-migration behaviour until what the migration adds exists. ``sql`` must return
+    a row exactly when it does, and no row otherwise (one form works for dict and tuple
+    rows alike). Answers are cached per ``key`` (normally the database URL): a positive
+    one for the life of the process, a negative one for ``reprobe_s`` only, so applying
+    the migration under a running service takes effect without a restart.
+
+    The probe runs on the CALLER's connection, inside a transaction block (a savepoint
+    when one is already open), so a probe failure never poisons the caller's
+    transaction. A failure answers False without caching. State is plain dicts: threads
+    race only to write the same answer, and the worst case is one extra probe.
+    """
+
+    def __init__(self, sql: str, what: str, reprobe_s: float = 60.0) -> None:
+        self._sql = sql
+        self._what = what
+        self.reprobe_s = reprobe_s
+        self._ok: dict[str, bool] = {}
+        self._probed_at: dict[str, float] = {}
+        self._warned: set[str] = set()
+
+    def ready(self, conn: Any, key: str = "") -> bool:
+        """True when the migration's columns exist on ``conn``'s database."""
+        if self._ok.get(key):
+            return True
+        last = self._probed_at.get(key)
+        if last is not None and time.monotonic() - last < self.reprobe_s:
+            return False
+        self._probed_at[key] = time.monotonic()
+        try:
+            with conn.transaction():
+                row = conn.execute(self._sql).fetchone()
+        except Exception as e:
+            logger.warning("%s probe failed (%s); treating it as not applied", self._what, e)
+            return False
+        if row is None:
+            self.missing(key)
+            return False
+        self._ok[key] = True
+        return True
+
+    def missing(self, key: str = "", err: BaseException | None = None) -> None:
+        """Record that the columns are absent (a negative probe, or a query that hit
+        ``UndefinedColumn`` after a positive one). One log line per key, not per call."""
+        self._ok[key] = False
+        self._probed_at[key] = time.monotonic()
+        if key not in self._warned:
+            self._warned.add(key)
+            logger.warning(
+                "%s is not applied%s: keeping the pre-migration behaviour until it is",
+                self._what,
+                f" ({err})" if err is not None else "",
+            )
+
+    def note_error(self, err: BaseException, key: str = "") -> bool:
+        """True (and the cache flipped to "missing") when ``err`` is an UndefinedColumn,
+        i.e. the migration was rolled back under a running service."""
+        if isinstance(err, psycopg.errors.UndefinedColumn):
+            self.missing(key, err)
+            return True
+        return False
+
+    def reset(self) -> None:
+        """Forget every cached answer (tests)."""
+        self._ok.clear()
+        self._probed_at.clear()
+        self._warned.clear()

@@ -96,6 +96,7 @@ FILES=(
   054_credential_bound_trust.sql
   055_skill_proposal_base_hash.sql
   056_kg_source_projects.sql
+  057_own_surface_episodes.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

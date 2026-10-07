@@ -7,7 +7,49 @@ import psycopg
 
 from ingestion.db_connection import DatabaseConnection
 from ingestion.models import Episode
+from ingestion.surfaces import OWN_SURFACE_PROBE, own_surface_columns_ready
 from ingestion.textsafe import strip_nul
+
+_UPSERT_COLUMNS = """
+    (session_id, sequence, project, platform, model,
+     human_turn, assistant_turn, content, span_id, metadata, source,
+     created_at{extra_col})
+VALUES
+    (%(session_id)s, %(sequence)s, %(project)s, %(platform)s, %(model)s,
+     %(human_turn)s, %(assistant_turn)s, %(content)s,
+     %(span_id)s, %(metadata)s::jsonb, %(source)s,
+     COALESCE(%(created_at)s, now()){extra_val})
+ON CONFLICT (session_id, sequence) DO UPDATE SET
+    content        = EXCLUDED.content,
+    human_turn     = EXCLUDED.human_turn,
+    assistant_turn = EXCLUDED.assistant_turn,
+    model          = EXCLUDED.model,
+    span_id        = COALESCE(EXCLUDED.span_id, episodes.span_id),
+    metadata       = EXCLUDED.metadata,
+    project        = COALESCE(EXCLUDED.project, episodes.project),
+    created_at     = CASE WHEN %(created_at)s IS NOT NULL
+                          THEN %(created_at)s::timestamptz
+                          ELSE episodes.created_at END{extra_set}
+RETURNING id
+"""
+
+#: The pre-057 statement: what runs until the provenance column exists.
+_UPSERT = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(extra_col="", extra_val="", extra_set="")
+
+#: Schema 057: also writes the provenance stamp (``episodes.surface_id``). A stamp means
+#: "every byte of this row came from that surface", so on a rewrite it survives only when
+#: the SAME surface wrote it again. A rewrite by anyone else (another device, the root
+#: token, an unknown caller) clears it, because the content is no longer that surface's
+#: alone, and a NULL row can never be claimed: NULL vs a stamp is DISTINCT, so the CASE
+#: (no ELSE) yields NULL. Either way a rewrite can only make a row serve LESS, never more.
+_UPSERT_STAMPED = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(
+    extra_col=", surface_id",
+    extra_val=", %(surface_id)s",
+    extra_set=(
+        ",\n    surface_id     = CASE WHEN episodes.surface_id IS NOT DISTINCT FROM"
+        " EXCLUDED.surface_id\n                          THEN episodes.surface_id END"
+    ),
+)
 
 
 class EpisodeStore(DatabaseConnection):
@@ -59,29 +101,7 @@ class EpisodeStore(DatabaseConnection):
         # episode to import day — which then poisoned served dates, recency
         # ranking, and the KG's fact t_valid via get_episodes_valid_at. NULL
         # (no transcript ts) falls back to now(), right for live ingestion.
-        sql = """
-            INSERT INTO episodes
-                (session_id, sequence, project, platform, model,
-                 human_turn, assistant_turn, content, span_id, metadata, source,
-                 created_at)
-            VALUES
-                (%(session_id)s, %(sequence)s, %(project)s, %(platform)s, %(model)s,
-                 %(human_turn)s, %(assistant_turn)s, %(content)s,
-                 %(span_id)s, %(metadata)s::jsonb, %(source)s,
-                 COALESCE(%(created_at)s, now()))
-            ON CONFLICT (session_id, sequence) DO UPDATE SET
-                content        = EXCLUDED.content,
-                human_turn     = EXCLUDED.human_turn,
-                assistant_turn = EXCLUDED.assistant_turn,
-                model          = EXCLUDED.model,
-                span_id        = COALESCE(EXCLUDED.span_id, episodes.span_id),
-                metadata       = EXCLUDED.metadata,
-                project        = COALESCE(EXCLUDED.project, episodes.project),
-                created_at     = CASE WHEN %(created_at)s IS NOT NULL
-                                      THEN %(created_at)s::timestamptz
-                                      ELSE episodes.created_at END
-            RETURNING id
-        """
+        #
         # strip_nul on the text/metadata fields: TEXT columns reject NUL bytes
         # and jsonb rejects the u0000 escape, so one stray byte in a transcript
         # would fail the whole INSERT.
@@ -98,9 +118,19 @@ class EpisodeStore(DatabaseConnection):
             "metadata": orjson.dumps(strip_nul(ep.metadata)).decode(),
             "source": ep.source,
             "created_at": ep.created_at,
+            "surface_id": ep.surface_id,
         }
-        with self._conn() as conn:
-            row = conn.execute(sql, params).fetchone()
+        try:
+            with self._conn() as conn:
+                # Schema 057 names the provenance column; before it is applied the
+                # statement is exactly the pre-057 one and the stamp is dropped.
+                sql = _UPSERT_STAMPED if own_surface_columns_ready(conn, self._url) else _UPSERT
+                row = conn.execute(sql, params).fetchone()
+        except psycopg.errors.UndefinedColumn as e:
+            # 057 rolled back under a running process: note it, write the pre-057 row.
+            OWN_SURFACE_PROBE.missing(self._url, e)
+            with self._conn() as conn:
+                row = conn.execute(_UPSERT, params).fetchone()
 
         assert row is not None, "INSERT RETURNING id returned nothing"
         return cast(int, row["id"])

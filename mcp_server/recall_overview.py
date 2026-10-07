@@ -65,7 +65,8 @@ class RecallOverviewMixin:
 
         ``surface`` is the calling host's id (schema 053). Anything but a surface
         registered ``trust='full'`` — including a missing one — is RESTRICTED: episodes
-        are filtered to the surface's project allowlist, notes to
+        are filtered to the surface's project allowlist (plus, for a credential-bound
+        surface, the episodes it ingested itself: schema 057 ``surface_id``), notes to
         ``audience='work-safe'``, and KG facts to those whose provenance is known and
         lies wholly inside the allowlist (schema 056 ``source_projects``: every source
         episode exists, has a project, and that project is allowed). The same rule
@@ -122,6 +123,9 @@ class RecallOverviewMixin:
         ex = self._leg_executor
         st = self._resolve_trust(surface, trust)
         allowed = st.project_filter
+        # Own-surface widening of the episode legs (schema 057): None unless the caller is
+        # a credential-bound restricted surface AND the provenance column exists.
+        own = self._own_surface(st)
         # KG provenance scope (schema 056). Full trust: no kwargs, so every KG call below
         # is exactly the call it always was. Restricted: each KG read gets the allowlist,
         # and an EMPTY allowlist skips them outright, because no fact can be a non-empty
@@ -143,6 +147,7 @@ class RecallOverviewMixin:
             settings._EPISODE_FETCH,
             None,
             allowed,
+            own,
         )
 
         t_emb = time.perf_counter()
@@ -196,6 +201,7 @@ class RecallOverviewMixin:
                 settings._EPISODE_FETCH,
                 None,
                 allowed,
+                own,
             )
             if query_emb is not None
             else None
