@@ -15,18 +15,19 @@ files. Keep plugin-script module names prefixed for that reason.
 
 from __future__ import annotations
 
-from typing import IO
+from typing import IO, Any
 
 try:
     import fcntl
 
-    def lock_exclusive(f: IO, *, blocking: bool = True) -> None:
+    def lock_exclusive(f: IO[Any], *, blocking: bool = True) -> None:
         fcntl.flock(f, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 except ImportError:  # Windows
     import msvcrt
 
-    def lock_exclusive(f: IO, *, blocking: bool = True) -> None:
+    def lock_exclusive(f: IO[Any], *, blocking: bool = True) -> None:
         # LK_LOCK retries for ~10s then raises OSError; that beats blocking a
         # 15s-budget hook forever, so it stands in for a true blocking lock.
-        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+        # (typeshed only declares msvcrt's members when type-checking for win32)
+        msvcrt.locking(f.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined,unused-ignore]
