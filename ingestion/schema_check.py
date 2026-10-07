@@ -209,6 +209,16 @@ class ColumnProbe:
         self._ok[key] = True
         return True
 
+    def cached(self, key: str = "") -> bool | None:
+        """The cached answer for ``key`` without touching the database: True (applied),
+        False (absent, and not yet due a re-probe), or None (never probed, or due)."""
+        if self._ok.get(key):
+            return True
+        last = self._probed_at.get(key)
+        if last is not None and time.monotonic() - last < self.reprobe_s:
+            return False
+        return None
+
     def missing(self, key: str = "", err: BaseException | None = None) -> None:
         """Record that the columns are absent (a negative probe, or a query that hit
         ``UndefinedColumn`` after a positive one). One log line per key, not per call."""

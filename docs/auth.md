@@ -133,8 +133,11 @@ says so: a `WARNING:` line right under the board header, and the same text first
 `POST /recall`. The text names the cause and the fix (enroll with `synapse-login`; mint a
 device a new credential with projects; grant an `oauth:<login>` identity with `PUT`), and
 no ids. Full trust and restricted-with-projects get no notice, and neither does an open
-server, where no credential would change the answer. Old clients show it too, since it is
-part of the server's response rather than the plugin.
+server, where no credential would change the answer. Once schema 057 is applied, neither
+does a restricted device with no projects: it reads back its own uploads, which is the
+intended work-laptop setup, and minting it a new credential would leave those uploads
+behind under the old one. Old clients show the notice too, since it is part of the
+server's response rather than the plugin.
 
 Note-writing follows the same line: a write from a live, approved restricted surface defaults
 to `work-safe`, symmetric with what it may read, so notes written at work do not vanish from

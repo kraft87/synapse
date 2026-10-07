@@ -192,6 +192,25 @@ def own_surface_if_ready(conn: Any, key: str, own_surface: str | None) -> str | 
     return own_surface if OWN_SURFACE_PROBE.ready(conn, key) else None
 
 
+def own_surface_served(db_url: str, trust: SurfaceTrust | None) -> bool:
+    """True when ``trust`` is served the rows it ingested itself on ``db_url``'s database:
+    a credential-bound restricted caller, on a database with schema 057 applied.
+
+    Answers from the probe's cache when it can, so after the first call it costs nothing;
+    otherwise it opens one short connection to probe. Any failure answers False."""
+    if trust is None or not trust.own_surface or not db_url:
+        return False
+    cached = OWN_SURFACE_PROBE.cached(db_url)
+    if cached is not None:
+        return cached
+    try:
+        with psycopg.connect(db_url, autocommit=True, connect_timeout=5) as conn:
+            return OWN_SURFACE_PROBE.ready(conn, db_url)
+    except Exception as e:
+        logger.warning("own-surface probe failed (%s); treating schema 057 as not applied", e)
+        return False
+
+
 #: The verdict for "no surface id", "no such surface", or any lookup failure.
 UNKNOWN_SURFACE = SurfaceTrust()
 

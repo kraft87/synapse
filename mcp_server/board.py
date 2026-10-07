@@ -39,6 +39,7 @@ from ingestion.surfaces import (
     episode_scope_sql,
     lookup_surface,
     own_surface_if_ready,
+    own_surface_served,
 )
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
@@ -346,7 +347,10 @@ def register(
         trust = resolve_trust(request) if resolve_trust is not None else UNKNOWN_SURFACE
         # Explain only a verdict that was actually resolved for an authenticated caller.
         told = resolve_trust is not None and authenticated is not None and authenticated(request)
-        notice = serving_notice(trust) if told else None
+        notice = None
+        if told:
+            own = await run_in_threadpool(own_surface_served, db_url, trust)
+            notice = serving_notice(trust, own)
         t0 = time.perf_counter()
         try:
             board = await run_in_threadpool(build_board, db_url, project, None, trust, notice)
