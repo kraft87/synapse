@@ -71,7 +71,11 @@ def _print_token(out: dict[str, Any], *, bootstrap: bool = False) -> None:
         print("  /plugin > synapse > Synapse token   (SYNAPSE_INGEST_TOKEN)")
         print("Then start a new session — the board should stop coming back empty.")
     else:
-        print("Set it as SYNAPSE_INGEST_TOKEN there.")
+        print(
+            "On that machine, paste it into /plugin > synapse > Synapse token; use the\n"
+            "SYNAPSE_INGEST_TOKEN env var only where there is no plugin config (a service\n"
+            "or container)."
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

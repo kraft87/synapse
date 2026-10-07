@@ -90,7 +90,11 @@ def cmd_mint(args: list[str]) -> int:
     print(f"minted {s['surface_id']} trust={s['trust']} {scope}")
     # Only chance to see it — the server keeps the hash, not the token.
     print(f"token: {r['token']}")
-    print("Set it as SYNAPSE_INGEST_TOKEN on the target machine. It is shown only once.")
+    print(
+        "On the target machine, paste it into /plugin > synapse > Synapse token; use the\n"
+        "SYNAPSE_INGEST_TOKEN env var only where there is no plugin config (a service or\n"
+        "container). It is shown only once."
+    )
     return 0
 
 

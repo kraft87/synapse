@@ -3,11 +3,14 @@
 Mirror of plugin/scripts/config.py, adapted for Codex: hooks inherit plain
 env only, so resolution is env var first, then the Synapse *Claude Code*
 plugin's saved options in ~/.claude/settings.json (a machine running both
-plugins configures once), then the default. Dependency-free (urllib).
+plugins configures once), then the default. One exception: on a machine the Claude
+plugin has enrolled, its saved device token beats an env SYNAPSE_INGEST_TOKEN (see
+_resolve_token). Dependency-free (urllib).
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import socket
@@ -50,7 +53,79 @@ def _base_url() -> str:
 
 BASE_URL = _base_url()
 INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
-TOKEN = _cfg("SYNAPSE_INGEST_TOKEN")
+
+# The Claude Code plugin's enrollment record (plugin/scripts/config.py DEVICE_FILE). It
+# holds the device token's sha256 and the server that minted it, never the token.
+_DEVICE_FILE = (
+    Path(os.path.expanduser(os.environ.get("SYNAPSE_DATA_DIR") or "~/.local/share/synapse-skills"))
+    / "device.json"
+)
+
+
+def _device_state() -> dict[str, Any]:
+    try:
+        data = json.loads(_DEVICE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _origin(url: str) -> tuple[str, str]:
+    parts = urllib.parse.urlsplit(url)
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+def _resolve_token() -> tuple[str, str]:
+    """Mirror of plugin/scripts/config.py ``_resolve_ingest_token`` (read that for the
+    reasoning), minus the CLAUDE_PLUGIN_OPTION_* source Codex never sets.
+
+    Plain precedence is env first, which let a stale SYNAPSE_INGEST_TOKEN in the shell
+    shadow the device token the Claude plugin enrolled and saved: Codex client configs
+    needed an ``env -u SYNAPSE_INGEST_TOKEN`` wrapper to make the saved token win. Once
+    this machine is enrolled, the device token wins on its own, but only toward a server
+    that already gets it. Returns (token, enrolled surface_id when an env value was
+    overridden, else "").
+    """
+    env = os.environ.get("SYNAPSE_INGEST_TOKEN") or ""
+    saved = _FALLBACK.get("SYNAPSE_INGEST_TOKEN") or ""
+    plain = env or saved
+    state = _device_state()
+    surface = str(state.get("surface_id") or "")
+    if not surface:
+        return plain, ""
+    pinned = state.get("token_sha256")
+    if pinned:
+        matches = [
+            v for v in (env, saved) if v and hashlib.sha256(v.encode()).hexdigest() == pinned
+        ]
+        device = matches[0] if matches else ""
+    else:
+        device = saved  # legacy record: the plugin config is where enrollment wrote it
+    if not device:
+        return plain, ""
+    allowed = {_origin(v) for k in ("SYNAPSE_URL", "SYNAPSE_INGEST_URL") if (v := _FALLBACK.get(k))}
+    if state.get("server"):
+        allowed.add(_origin(str(state["server"])))
+    if any(_origin(url) not in allowed for url in (BASE_URL, INGEST_URL)):
+        return plain, ""
+    return device, (surface if env and env != device else "")
+
+
+TOKEN, _OVERRIDDEN_FOR = _resolve_token()
+
+
+def token_override_notice() -> str:
+    """One line when an env token was overridden by the device token, else "".
+    Names the surface, never a token value or any part of one."""
+    if not _OVERRIDDEN_FOR:
+        return ""
+    return (
+        f"[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "
+        f"enrolled as {_OVERRIDDEN_FOR}. Remove it from your shell profile or wherever "
+        "Codex inherits it."
+    )
+
+
 PRIVATE_DIR = Path(os.path.expanduser(_cfg("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
 # This machine's display NAME. Since schema 054 it grants nothing and identifies
 # nothing — trust rides on the device token in SYNAPSE_INGEST_TOKEN. Same env-override +

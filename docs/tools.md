@@ -101,6 +101,13 @@ Settings resolve in order: env var → `CLAUDE_PLUGIN_OPTION_*` → your `/plugi
 answers (stored in `settings.json`) → built-in default. A fresh install just answers the
 install prompt; env vars are optional overrides (e.g. CI).
 
+The token is the exception. Don't set `SYNAPSE_INGEST_TOKEN` in your shell profile or in
+the `env` block of `settings.json`: run `! synapse-login`, or paste a token into
+`/plugin` > synapse > Synapse token. The MCP server only ever reads that plugin config, so a
+token set anywhere else reaches the hooks but not recall. Once this machine is enrolled, its
+device token wins over an env value. Session start then prints one line naming the variable
+and where to remove it.
+
 Prompted at install:
 
 | Variable | Meaning |

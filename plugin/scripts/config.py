@@ -15,7 +15,9 @@ Env vars (all optional):
   CLAUDE_PROJECTS_DIR   transcript root              (default ~/.claude/projects)
   SYNAPSE_DATA_DIR      local state / proposal drafts (default ~/.local/share/synapse-skills)
   SYNAPSE_URL           base URL of the server       (default http://localhost:8765)
-  SYNAPSE_INGEST_TOKEN  bearer token (auth-gated server; else `synapse-login` fetches it)
+  SYNAPSE_INGEST_TOKEN  bearer token. Prefer the plugin config (`synapse-login` writes it
+                        there); once this machine is enrolled its device token wins over
+                        an env value — see _resolve_ingest_token
   SYNAPSE_INGEST_URL    legacy override for /ingest  (else derived from SYNAPSE_URL)
   SYNAPSE_RECALL_URL    legacy override for /recall  (else derived)
   SYNAPSE_MCP_URL       legacy override for /mcp     (else derived)
@@ -26,6 +28,7 @@ Env vars (all optional):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -168,24 +171,15 @@ INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
 RECALL_URL = _cfg("SYNAPSE_RECALL_URL") or BASE_URL + "/recall"
 MCP_URL = _cfg("SYNAPSE_MCP_URL") or BASE_URL + "/mcp"
 SKILLS_URL = BASE_URL + "/skills"
-# env / userConfig wins; else a token fetched by `synapse login`.
-#
-# Schema 054 changed what this value MEANS over a machine's lifetime without changing
-# where it lives. At install it is the ENROLLMENT credential — the shared root token,
-# pasted or fetched by `synapse login`. On first session, enroll.py trades it for a
-# token minted for THIS device and overwrites it here, so plugin.json's
-# `Authorization: Bearer ${user_config.SYNAPSE_INGEST_TOKEN}` header keeps working with
-# no change on either side. One slot, two lifecycle stages: the client never has to
-# manage two credentials, and nothing downstream had to learn a new config key. The
-# stages only move forward: `synapse login` refuses to run on an enrolled machine, since
-# its root token would overwrite the device token (`--reenroll` replaces it on purpose).
-INGEST_TOKEN = _cfg("SYNAPSE_INGEST_TOKEN") or _cred("SYNAPSE_INGEST_TOKEN")
-
 # Enrollment state for this device (schema 054). Kept in DATA_DIR rather than
 # settings.json because it is local bookkeeping, not configuration: which surface row
 # this machine got and what it was granted. settings.json holds the credential; this
 # holds the story around it, and its presence is how the hooks know this machine has a
 # credential of its OWN rather than one someone pasted in.
+#
+# It never holds the token. Records written now also hold `token_sha256`, the fingerprint
+# of the token enrollment wrote into the config slot, and `server`, the origin that
+# minted it, so the resolution below can recognise the device token wherever it sits.
 DEVICE_FILE = DATA_DIR / "device.json"
 
 
@@ -205,6 +199,163 @@ def write_device_state(state: dict) -> None:
         DEVICE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
     except Exception:
         pass
+
+
+def token_sha256(token: str) -> str:
+    """Fingerprint a credential for the enrollment record. The record has to recognise
+    the device token without becoming a second copy of it: data dirs get copied by
+    backups and sync tools, and the hash of a random bearer gives nothing back."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _origin(url: str) -> tuple[str, str]:
+    parts = urllib.parse.urlsplit(url or "")
+    return parts.scheme.lower(), parts.netloc.lower()
+
+
+_TOKEN_KEY = "SYNAPSE_INGEST_TOKEN"
+
+
+def _token_candidates() -> list[tuple[str, str]]:
+    """Every place the token can come from, in plain precedence order, as (source, value).
+    Only the source names ever leave this module; the values stay in the bearer header."""
+    return [
+        ("env", os.environ.get(_TOKEN_KEY) or ""),
+        ("plugin_option", os.environ.get(f"CLAUDE_PLUGIN_OPTION_{_TOKEN_KEY}") or ""),
+        ("plugin_config", str(_FILE_OPTIONS.get(_TOKEN_KEY) or "")),
+    ]
+
+
+def _plugin_config_origins() -> set:
+    """Origins the plugin config itself points at: where the MCP server already sends
+    whatever token that config holds."""
+    out = set()
+    for key in ("SYNAPSE_URL", "SYNAPSE_INGEST_URL"):
+        for val in (os.environ.get(f"CLAUDE_PLUGIN_OPTION_{key}"), _FILE_OPTIONS.get(key)):
+            if val:
+                out.add(_origin(str(val)))
+    return out
+
+
+def _resolve_ingest_token() -> tuple[str, dict]:
+    """The bearer every hook and script sends, plus a note of what it overrode.
+
+    Unenrolled machines keep plain precedence (env var, CLAUDE_PLUGIN_OPTION_*, the
+    settings.json plugin config, then the legacy credentials file): before enrollment
+    the slot carries the root token, wherever the user put it, and enrolling needs it.
+
+    An ENROLLED machine resolves to its device token even when the environment says
+    otherwise. Under plain precedence a token left in a shell profile, or in
+    settings.json's "env" block (which Claude Code exports to every hook), shadowed the
+    device token for ingest, the board, private mode and the sync lanes, while the MCP
+    server, which reads only the plugin config, used the device token. Uploads were
+    attributed to one credential and recall served by another, with no signal.
+
+    How the device token is recognised:
+
+    * The record has ``token_sha256``: it is whichever configured value hashes to it.
+      If none does, the configured token was replaced by hand after enrolling, the
+      record no longer describes it, and nothing is overridden.
+    * A record written before the hash existed: the plugin-config value is taken
+      as the device token. Enrollment wrote it there, and nothing in the plugin replaces
+      it while the record exists (login's root-token write deletes the record first), so
+      only a hand edit changes it, and that value is what the MCP header sends anyway.
+      Following it can only bring the hooks in line with recall. The record gains its
+      hash at the next ``synapse-login --reenroll``; hooks never rewrite it.
+
+    Either way, only toward a server that already gets that token: the one that minted
+    it, or the one the plugin config points the MCP server at. If SYNAPSE_URL or
+    SYNAPSE_INGEST_URL send the hooks somewhere else, the env token is presumably that
+    server's, and a device token must not go to an origin that never had it.
+
+    The second value is ``{}`` unless a configured value was overridden; then it names
+    the surface and the overridden SOURCES, never values, for the session-start notice.
+    """
+    candidates = _token_candidates()
+    plain = next((v for _, v in candidates if v), "") or _cred(_TOKEN_KEY)
+    state = read_device_state()
+    surface = state.get("surface_id")
+    if not surface:
+        return plain, {}
+    pinned = state.get("token_sha256")
+    if pinned:
+        idx = next(
+            (i for i, (_, v) in enumerate(candidates) if v and token_sha256(v) == pinned), -1
+        )
+    else:
+        idx = 2 if candidates[2][1] else -1
+    if idx < 0:
+        return plain, {}
+    allowed = _plugin_config_origins()
+    if state.get("server"):
+        allowed.add(_origin(str(state["server"])))
+    if any(_origin(url) not in allowed for url in (BASE_URL, INGEST_URL)):
+        return plain, {}
+    device = candidates[idx][1]
+    overridden = [name for name, v in candidates[:idx] if v and v != device]
+    return device, ({"surface_id": surface, "sources": overridden} if overridden else {})
+
+
+# Schema 054 changed what this value MEANS over a machine's lifetime without changing
+# where it lives. At install it is the ENROLLMENT credential — the shared root token,
+# pasted or fetched by `synapse login`. On first session, enroll.py trades it for a
+# token minted for THIS device and overwrites it here, so plugin.json's
+# `Authorization: Bearer ${user_config.SYNAPSE_INGEST_TOKEN}` header keeps working with
+# no change on either side. One slot, two lifecycle stages: the client never has to
+# manage two credentials, and nothing downstream had to learn a new config key. The
+# stages only move forward: `synapse login` refuses to run on an enrolled machine, since
+# its root token would overwrite the device token (`--reenroll` replaces it on purpose).
+# Once enrolled, the device token also wins over an env value (_resolve_ingest_token).
+INGEST_TOKEN, TOKEN_OVERRIDE = _resolve_ingest_token()
+
+
+def _env_block_files() -> list[Path]:
+    """settings.json files whose "env" block sets the token. Claude Code exports those
+    values to every hook, so that is where a stale token usually lives."""
+    found = []
+    for path in _settings_files():
+        try:
+            env = json.loads(path.read_text(encoding="utf-8")).get("env")
+        except Exception:
+            continue
+        if isinstance(env, dict) and env.get(_TOKEN_KEY):
+            found.append(path)
+    return found
+
+
+def _display_path(path: Path) -> str:
+    home, text = os.path.expanduser("~"), str(path)
+    return "~" + text[len(home) :] if home and text.startswith(home + os.sep) else text
+
+
+def token_override_notice() -> str:
+    """One line per token source this process overrode, or "" when none was.
+
+    Printed at session start so the override is never silent. Names the source and the
+    enrolled surface; never a token value or any part of one.
+    """
+    if not TOKEN_OVERRIDE:
+        return ""
+    surface = TOKEN_OVERRIDE["surface_id"]
+    lines = []
+    for source in TOKEN_OVERRIDE["sources"]:
+        if source == "env":
+            files = _env_block_files()
+            where = (
+                " and ".join(f'the "env" block of {_display_path(p)}' for p in files)
+                or "your shell profile"
+            )
+            lines.append(
+                f"[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this "
+                f"machine is enrolled as {surface}. Remove it from {where}."
+            )
+        elif source == "plugin_option":
+            lines.append(
+                f"[Synapse] The Synapse token Claude Code loaded for this session is ignored: "
+                f"this machine is enrolled as {surface}, and hooks use its device token. "
+                "Run /reload-plugins (or restart) so recall uses it too."
+            )
+    return "\n".join(lines)
 
 
 # Skills sync: OFF by default — a hook that writes files into ~/.claude/skills on
