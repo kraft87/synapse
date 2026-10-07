@@ -50,7 +50,9 @@ no success since, the SessionStart parent prints one line, shown to the user
 and to the model: "Synapse uploads have been failing since <date> (<reason>);
 transcripts will be retried automatically." Reasons come from a short fixed
 vocabulary (HTTP status, timeout, connection refused, ...) and never carry the
-token.
+token. That failure bookkeeping lives in synapse_ingest_retry.py, which the
+Codex Stop hook (plugin-codex/hooks/synapse_stop_hook.py) shares, so both
+hosts retry and warn the same way.
 
 Design constraints:
   * NEVER block or fail the turn. Claude waits for Stop hooks to exit, so the
@@ -86,15 +88,11 @@ Env (all optional):
 from __future__ import annotations
 
 import glob
-import http.client
 import json
 import os
-import socket
-import ssl
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.request
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -102,6 +100,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+import synapse_ingest_retry as retry
 from synapse_filelock import lock_exclusive
 
 INGEST_URL = config.INGEST_URL
@@ -114,11 +113,9 @@ ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
 CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
-# The upload-streak record in the cursor file. Transcript keys are absolute paths,
-# so this key can't collide with one.
-_HEALTH_KEY = "_health"
-_WARN_AFTER_FAILS = 3  # failed POSTs in a row with no success since → warn at session start
-_WARN_AFTER_HOURS = 24.0  # ...or a failure this old with no success since
+_HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
+_WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
+_WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
 _PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
@@ -267,47 +264,17 @@ def _plan_from_cursor(
 
 
 def _load_state() -> dict[str, Any]:
-    try:
-        with open(CURSOR_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    return retry.load_state(CURSOR_PATH)
 
 
-def _needs_retry(ent: Any) -> bool:
-    """True if this file's upload was attempted and did not complete: a failed
-    POST left a `pending` marker, or a chunked backlog stopped partway (`size`
-    -1). Such a file is swept regardless of age and is never TTL-pruned."""
-    return isinstance(ent, dict) and (bool(ent.get("pending")) or ent.get("size") == -1)
+_needs_retry = retry.needs_retry  # attempted and not completed: swept at any age, never pruned
 
 
 def _update_state(path: str, apply: Callable[[dict[str, Any], float], None]) -> None:
-    """Load, mutate (`apply(state, now)`), prune and atomically rewrite the cursor
-    file under its exclusive flock. Pruning drops entries for deleted transcripts
-    and for ones idle past _CURSOR_TTL_DAYS, except a file still owed a retry,
-    which stays until it ships or disappears."""
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(str(CURSOR_PATH) + ".lock", "w") as lf:
-        lock_exclusive(lf)
-        state = _load_state()
-        now = time.time()
-        apply(state, now)
-        cutoff = now - _CURSOR_TTL_DAYS * 86400
-        state = {
-            p: e
-            for p, e in state.items()
-            if p in (path, _HEALTH_KEY)
-            or (
-                isinstance(e, dict)
-                and (e.get("ts", 0) >= cutoff or _needs_retry(e))
-                and os.path.exists(p)
-            )
-        }
-        tmp = str(CURSOR_PATH) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-        os.replace(tmp, CURSOR_PATH)
+    """Locked load → `apply(state, now)` → prune → atomic rewrite of the cursor
+    file. Pruning drops deleted transcripts and ones idle past _CURSOR_TTL_DAYS,
+    except a file still owed a retry (synapse_ingest_retry.update_state)."""
+    retry.update_state(CURSOR_PATH, path, apply, ttl_days=_CURSOR_TTL_DAYS)
 
 
 def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -> None:
@@ -324,7 +291,7 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
     """
 
     def apply(state: dict[str, Any], now: float) -> None:
-        state[_HEALTH_KEY] = {"last_ok": now}
+        retry.mark_ok(state, now)
         ent = state.get(path)
         if not force and isinstance(ent, dict) and int(ent.get("offset", -1)) > offset:
             return  # a racer already got further (and cleared any marker)
@@ -335,97 +302,27 @@ def _advance_cursor(path: str, offset: int, size: int, *, force: bool = False) -
 
 def _record_failure(path: str, reason: str, offset: int) -> None:
     """Mark `path` pending after a failed POST and extend the upload-failure
-    streak. The cursor never moves here: an existing entry keeps its offset, and
-    a file with no entry yet gets one at `offset` (where this run started) with
-    size -1. `pending` holds the time of the first failure since the file last
-    shipped; `tried` is bumped on every failure, which moves a file that keeps
-    failing to the back of the sweep queue."""
-    reason = _scrub(reason)
-
-    def apply(state: dict[str, Any], now: float) -> None:
-        old = state.get(path)
-        ent = dict(old) if isinstance(old, dict) else {"offset": offset, "size": -1}
-        ent.update(
-            pending=ent.get("pending") or now,
-            tried=now,
-            fails=int(ent.get("fails", 0)) + 1,
-            last_error=reason,
-            ts=now,
-        )
-        state[path] = ent
-        h = state.get(_HEALTH_KEY)
-        h = dict(h) if isinstance(h, dict) else {}
-        h.update(
-            fail_since=h.get("fail_since") or now,
-            fails=int(h.get("fails", 0)) + 1,
-            last_error=reason,
-            last_fail=now,
-        )
-        state[_HEALTH_KEY] = h
-
-    _update_state(path, apply)
+    streak. The cursor never moves here; a file with no entry yet gets one at
+    `offset` (where this run started). See synapse_ingest_retry.mark_failed."""
+    retry.record_failure(
+        CURSOR_PATH, path, reason, offset, token=INGEST_TOKEN, ttl_days=_CURSOR_TTL_DAYS
+    )
 
 
 # ---------------------------------------------------------------------------
-# Upload-failure reasons + the session-start warning
+# Upload-failure reasons + the session-start warning (synapse_ingest_retry)
 # ---------------------------------------------------------------------------
 
 
 def _scrub(text: str) -> str:
-    """Last line of defence for anything stored or printed: never the token, never long."""
-    if INGEST_TOKEN:
-        text = text.replace(INGEST_TOKEN, "***")
-    return text[:80]
+    return retry.scrub(text, INGEST_TOKEN)
 
 
-def _short_reason(e: BaseException) -> str:
-    """A short, token-free reason for a failed POST, from a fixed vocabulary.
-
-    Built from the exception type and the HTTP status code only. Message text
-    from the server or the library is never used, since it can echo URLs,
-    headers or response bodies."""
-    if isinstance(e, urllib.error.HTTPError):
-        try:
-            return f"HTTP {e.code} {http.HTTPStatus(e.code).phrase}"
-        except ValueError:
-            return f"HTTP {e.code}"
-    cause = e.reason if isinstance(e, urllib.error.URLError) else e
-    if isinstance(cause, TimeoutError):  # socket.timeout is an alias
-        return "timed out"
-    if isinstance(cause, ConnectionRefusedError):
-        return "connection refused"
-    if isinstance(cause, socket.gaierror):
-        return "DNS lookup failed"
-    if isinstance(cause, (ssl.SSLError, ssl.CertificateError)):
-        return "TLS error"
-    if isinstance(cause, ConnectionError):
-        return "connection dropped"
-    if isinstance(cause, http.client.HTTPException):
-        return "bad HTTP response"
-    if isinstance(cause, OSError):
-        return "network error"
-    if cause is not e:
-        return "server unreachable"  # URLError with a non-exception reason
-    return type(e).__name__
+_short_reason = retry.short_reason  # fixed vocabulary, never message text
 
 
 def _failure_warning(state: dict[str, Any], now: float) -> str | None:
-    """The session-start line for a sustained upload failure, or None.
-
-    Sustained means _WARN_AFTER_FAILS failed POSTs in a row, or a first failure
-    _WARN_AFTER_HOURS old, with no successful POST since. Any success resets it."""
-    h = state.get(_HEALTH_KEY)
-    if not isinstance(h, dict) or not h.get("fail_since"):
-        return None
-    since = float(h["fail_since"])
-    if int(h.get("fails", 0)) < _WARN_AFTER_FAILS and now - since < _WARN_AFTER_HOURS * 3600:
-        return None
-    when = datetime.fromtimestamp(since).strftime("%Y-%m-%d %H:%M")
-    reason = _scrub(str(h.get("last_error") or "unknown error"))
-    return (
-        f"Synapse uploads have been failing since {when} ({reason}); "
-        "transcripts will be retried automatically."
-    )
+    return retry.failure_warning(state, now, INGEST_TOKEN)
 
 
 def _emit_failure_warning() -> None:
@@ -622,27 +519,18 @@ def _catchup_candidates(
     Least recently touched first — the last failed attempt, else the mtime — so
     repeated capped sweeps make oldest-first progress and a file that keeps
     failing rotates to the back instead of starving the rest. Pure given
-    os.stat results — patchable in tests."""
-    out: list[tuple[float, str]] = []
-    skip_real = os.path.realpath(skip_path) if skip_path else ""
-    for path in glob.glob(os.path.join(projects_root, "*", "*.jsonl")):
-        if skip_real and os.path.realpath(path) == skip_real:
-            continue
-        try:
-            st = os.stat(path)
-        except OSError:
-            continue
-        ent = state.get(path)
-        if st.st_mtime < now - CATCHUP_DAYS * 86400 and not _needs_retry(ent):
-            continue
-        if st.st_mtime > now - ACTIVE_GRACE:
-            continue
-        if isinstance(ent, dict) and int(ent.get("size", -1)) == st.st_size:
-            continue  # fully shipped and unchanged
-        tried = float(ent.get("tried") or 0) if isinstance(ent, dict) else 0.0
-        out.append((max(st.st_mtime, tried), path))
-    out.sort()
-    return [p for _, p in out]
+    os.stat results — patchable in tests. The rules are
+    synapse_ingest_retry.sweep_candidates, shared with the Codex hook."""
+    return retry.sweep_candidates(
+        glob.glob(os.path.join(projects_root, "*", "*.jsonl")),
+        state,
+        now,
+        window_days=CATCHUP_DAYS,
+        active_grace=ACTIVE_GRACE,
+        # fully shipped and unchanged: `size` is the EOF of the last complete run
+        shipped=lambda ent, st: int(ent.get("size", -1)) == st.st_size,
+        skip_path=skip_path,
+    )
 
 
 def _catchup(projects_root: str, skip_path: str) -> None:

@@ -6,7 +6,8 @@ the Claude Code plugin (`../plugin/`) for the per-session surface:
 | feature | Claude plugin | here |
 |---|---|---|
 | live turn ingest | `Stop` hook | `hooks/synapse_stop_hook.py` |
-| catchup sweep | SessionStart `--catchup` | spawned by `hooks/session_start.py` |
+| catchup sweep + failed-upload retry | SessionStart `--catchup` | spawned by `hooks/session_start.py` |
+| upload-failure warning | SessionStart `--catchup` | `hooks/session_start.py` |
 | board + preferences into context | SessionStart hooks | `hooks/session_start.py` |
 | recall/remember MCP | plugin manifest | `codex mcp add` (installer) |
 | per-prompt recall nudge | UserPromptSubmit | `hooks/user_prompt_submit.py` |
@@ -21,6 +22,25 @@ folder (`~/.agents/skills`) only; Codex's bundled skills under
 `~/.codex/skills/.system` and plugin caches are never scanned or uploaded.
 Both plugins on one machine converge on the same server copy, so an edit in
 either folder reaches the other at its next session start.
+
+A failed upload is not lost. When a POST fails (server down, a revoked token, a
+proxy answering `403`), the Stop hook marks that rollout in its cursor file, and
+every session start's catch-up sweep retries it, however long the outage
+lasted. The sweep takes any lagging rollout modified in the last
+`SYNAPSE_CODEX_CATCHUP_DAYS` (default 3) plus every rollout whose upload failed,
+at any age, oldest first, `SYNAPSE_CODEX_CATCHUP_MAX` (default 20) per session
+start. When uploads keep failing (3 in a row, or a day with no success), session
+start shows one line, as a Codex warning and in the model's context:
+
+```
+Synapse uploads have been failing since 2026-01-31 09:12 (HTTP 403 Forbidden); transcripts will be retried automatically.
+```
+
+The rules and the wording are the Claude plugin's: the Stop hook imports
+`../plugin/scripts/synapse_ingest_retry.py` from this checkout instead of keeping
+a copy, the same way the skills sync shares its engine. The sweep never picks up
+a rollout the hook didn't try to upload, so history from before install still
+needs `python -m ingestion.codex_backfill`.
 
 Not ported (machine-level curation lanes, run them from Claude Code; running
 them from both hosts would double-sync): config_sync, git_feeder (board git
@@ -83,7 +103,9 @@ and `updatedInput` is only honored alongside `permissionDecision: "allow"`.
 | `SYNAPSE_INGEST_TOKEN` | saved plugin option | per-device bearer token; ignored once the machine is enrolled |
 | `SYNAPSE_PRIVATE_DIR` | `~/.synapse/private` | private-mode markers |
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
-| `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window |
+| `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window for lagging rollouts; failed uploads are retried at any age |
+| `SYNAPSE_CODEX_CATCHUP_MAX` | `20` | rollouts per sweep; the rest wait for the next session start |
+| `SYNAPSE_CODEX_HOOK_LOG` | `/tmp/synapse-codex-hook.log` | Stop-hook log, one line per upload or failure |
 | `SYNAPSE_SKILLS_SYNC` | `0` (saved plugin option) | `1` enables skills sync |
 | `SYNAPSE_CODEX_SKILLS_DIR` | `~/.agents/skills` | folder the sync scans |
 | `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT` | `12` | seconds SessionStart waits for the sync |

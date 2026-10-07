@@ -282,7 +282,9 @@ gets a release note saying so.
   `connection refused` or `timed out` means the server is down or unreachable. Nothing is
   lost: every session start retries the failed transcripts, at any age, until they upload.
   The line goes away after the first successful upload. The hook log
-  (`/tmp/synapse-ingest-hook.log`, `SYNAPSE_INGEST_LOG`) has each failure.
+  (`/tmp/synapse-ingest-hook.log`, `SYNAPSE_INGEST_LOG`) has each failure. Codex CLI
+  sessions show the same line from the Codex hooks, which log to
+  `/tmp/synapse-codex-hook.log` (`SYNAPSE_CODEX_HOOK_LOG`).
 - **"SYNAPSE_INGEST_TOKEN from your environment is ignored" at session start.** An old token
   is still exported from your shell profile or from the `env` block of `settings.json`. This
   machine is enrolled, so the hooks already use its device token. Delete the export from the
