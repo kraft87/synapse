@@ -318,7 +318,10 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     through config.py. Raises on transport/HTTP errors — callers decide how to
     fail-soft."""
     body = json.dumps({"records": records, "source": source}).encode()
-    headers = {"Content-Type": "application/json"}
+    # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
+    # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
+    # soft, so without it every ingest is silently dropped.
+    headers = {"Content-Type": "application/json", "User-Agent": config._UA}
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
