@@ -317,3 +317,29 @@ def test_catchup_orders_oldest_first(hook, tmp_path):
         os.utime(p, (now - age, now - age))
     got = hook._catchup_candidates(str(root), "", {}, now)
     assert got == [str(older), str(newer)]
+
+
+def test_post_records_sends_a_real_user_agent(hook, monkeypatch):
+    """Cloudflare 403s urllib's default ``Python-urllib/x`` UA ("error code: 1010"), and
+    the hook fails soft, so a missing UA silently drops every ingest. It must send the
+    same UA the rest of the plugin does."""
+    seen: dict[str, str] = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"status":"ok"}'
+
+    def fake_urlopen(req, timeout=None):
+        seen.update({k.lower(): v for k, v in req.header_items()})
+        return _Resp()
+
+    monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
+    hook._post_records([_u("u1")])
+    assert seen.get("user-agent") == hook.config._UA
+    assert not seen["user-agent"].startswith("Python-urllib")
