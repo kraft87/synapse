@@ -203,8 +203,9 @@ A THIN review console over the two independent proposal lanes
 (`skills_lane.skill_gap_candidates`, schema 022/027; `config_lane.config_proposals`,
 schema 030). The dashboard REUSES each lane's own `_proposal_act` (state transition +
 side effects) and `_proposal_detail` (row read) from `mcp_server/skill_sync_routes.py`
-and `mcp_server/config_sync_routes.py`; it never reimplements them and never materializes
-an accepted change (promote / apply stay with the lanes). Proposal ids are namespaced
+and `mcp_server/config_sync_routes.py`; it never reimplements them. Approving a skill
+proposal applies it, because the skills lane's accept does; config apply stays with the
+config CLI. Proposal ids are namespaced
 `"skill:<n>" | "config:<n>"`; kinds normalize to `"skill" | "config-edit"`.
 
 ### GET /dash/api/proposals?status&kind
@@ -252,18 +253,23 @@ Normalized detail over the lane's `_proposal_detail`.
 body: {"action": "approve" | "reject", "note": "…"}
 ```
 - `approve` → the lane's `_proposal_act(..., "accept", ...)`, delegating the lane's own accept:
-  - **skills**: appends a grounded `accept` signal, recomputes the evidence roll-ups, sets
-    `status='accepted'`. Materializing (`promoted` = the `mv` into `~/.claude/skills`) stays
-    with the skills CLI. The lane's accept takes an advisory `llm` callable (a routing-eval
-    on RETUNE candidates — an Anthropic call that only annotates the result). The dashboard
-    passes a **stub** returning a skip note, so a decision is a pure state transition + note;
-    the real eval runs in the skills CLI.
+  - **skills**: applies the proposal. The drafted `proposal_body` is written to
+    `skills_lane.skill_registry` through the same upsert `/skills/publish` uses (the two-way
+    sync then delivers it to the owning machine), a grounded `accept` signal is appended, the
+    roll-ups recomputed, and `status='promoted'`. A merge proposal (consolidate) is only
+    recorded (`status='accepted'`). When the lane refuses (no draft yet, the registry body
+    changed since drafting, a new skill's name is taken) it returns
+    `{"status": "refused", "detail": …}`, nothing changes and no audit row is written; the
+    Review page shows the detail. Overrides (`--force`, `--body-file`, `--scope`) are CLI-only.
+    The lane's accept takes an advisory `llm` callable (a routing-eval on RETUNE candidates —
+    an Anthropic call that only annotates the result). The dashboard passes a **stub**
+    returning a skip note; the real eval runs in the skills CLI.
   - **config**: sets `status='accepted'`, keeps the stored blast-radius `scope` (the
     dashboard never re-scopes → `scope=None`). Materializing (`applied` = the disk write)
     stays with the config CLI.
 - `reject` → the lane's `_proposal_act(..., "reject", note)`. **`note` is REQUIRED**
   (non-empty; 400 otherwise) and becomes the lane's `reject_reason`.
-- Every decision appends a `dashboard_audit` row: `action` `proposal_approve|proposal_reject`,
+- Every decision that changed something appends a `dashboard_audit` row: `action` `proposal_approve|proposal_reject`,
   `kind` (`skill|config-edit`), `item_id` (the namespaced id), `detail` `{note, lane_result}`.
 - Returns the lane's own result dict. 404 when the row is absent.
 

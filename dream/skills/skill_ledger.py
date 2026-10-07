@@ -13,7 +13,7 @@ observe->proposed classification (v2 gates: retune proposes on one quote-carryin
 instance; derive on recurrence across scan nights, high salience, or the legacy
 score), and decay of unseen 'observe' candidates ('proposed' rows wait for human
 review). Grounded signals advance; the LLM judge only nominates. promoted is NEVER
-set here (filesystem-accept path only).
+set here (only the review accept, which applies the proposal to skill_registry).
 
 Evidence entry shape (all fields beyond class/signal optional, backward compatible):
     {"class": "judge"|"grounded", "signal": str, "session_id": str|None,

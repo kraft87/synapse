@@ -791,6 +791,9 @@ def clean_proposals(conn):
         _wipe(conn)  # episodes, kg, timeline, notes, prefs, dashboard_flags/audit
         conn.execute("TRUNCATE skills_lane.skill_gap_candidates RESTART IDENTITY CASCADE")
         conn.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY CASCADE")
+        # a skills approve applies the proposal to the registry (the lane's accept)
+        conn.execute("DELETE FROM skills_lane.skill_registry WHERE name = 'latency-triage'")
+        conn.execute("DELETE FROM skills_lane.skill_history WHERE name = 'latency-triage'")
 
     _w()
     yield
@@ -928,15 +931,19 @@ def test_proposal_decision_approve_writes_state_and_audit(clean_proposals, conn,
             headers=_H,
         )
         assert r.status_code == 200
-        # dashboard approve maps to the skills lane's 'accept' (NOT promote — materializing
-        # stays with the lane); the lane returns status 'accepted'.
-        assert r.json()["status"] == "accepted"
+        # dashboard approve maps to the skills lane's 'accept', which APPLIES the proposal:
+        # the drafted body lands in the skill registry and the row goes to 'promoted'.
+        assert r.json()["status"] == "promoted"
 
     # Lane row transitioned; dashboard_audit carries the namespaced id + note.
     row = conn.execute(
         "SELECT status FROM skills_lane.skill_gap_candidates WHERE id=%s", (sk,)
     ).fetchone()
-    assert row[0] == "accepted"
+    assert row[0] == "promoted"
+    reg = conn.execute(
+        "SELECT body, status FROM skills_lane.skill_registry WHERE name='latency-triage'"
+    ).fetchone()
+    assert reg[0].startswith("# latency-triage") and reg[1] == "active"
     audit = conn.execute(
         "SELECT action, kind, item_id, detail FROM dashboard_audit WHERE item_id=%s",
         (f"skill:{sk}",),
@@ -949,6 +956,31 @@ def test_proposal_decision_approve_writes_state_and_audit(clean_proposals, conn,
         detail = client.get(f"/dash/api/proposals/skill:{sk}", headers=_H).json()
     assert [a["action"] for a in detail["audit_log"]] == ["proposal_approve"]
     assert detail["audit_log"][0]["note"] == "clear win"
+
+
+def test_proposal_approve_without_draft_is_refused_and_not_audited(clean_proposals, conn, db_url):
+    sk = _skill_proposal(conn, name="latency-triage", status="proposed", proposal_body=None)
+    with _client(db_url) as client:
+        r = client.post(
+            f"/dash/api/proposals/skill:{sk}/decision",
+            json={"action": "approve", "note": "looks right"},
+            headers=_H,
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "refused" and "no draft yet" in r.json()["detail"]
+
+    assert (
+        conn.execute(
+            "SELECT status FROM skills_lane.skill_gap_candidates WHERE id=%s", (sk,)
+        ).fetchone()[0]
+        == "proposed"
+    )
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (f"skill:{sk}",)
+        ).fetchone()[0]
+        == 0
+    )
 
 
 def test_proposal_reject_requires_note_and_records_reason(clean_proposals, conn, db_url):

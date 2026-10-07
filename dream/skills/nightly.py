@@ -10,12 +10,15 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
   3. DERIVE         — gap scan -> cluster -> ledger (judge evidence); draft SKILL.md for proposed
   4. RETUNE         — under-trigger judge -> ledger retune/widen (judge evidence)
   5. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
-  6. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
+  6. draft          — every proposed derive/retune without a body (or with a stale retune
+                      draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
+  7. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
                       throttled Discord digest (top 5, pings only on NEW proposals)
 Incremental via skill_scan_cursor (whole-session scan since last_scan_at). --backfill ignores the watermark.
 
 The LLM finders honor SKILL_MEASURE_MODEL (deepseek for cheap backfill); drafting uses Opus.
-Propose-only: nothing here ever writes ~/.claude/skills or sets status='promoted'.
+Propose-only: nothing here writes skill_registry or sets status='promoted' — the review
+accept does both (mcp_server/skill_sync_routes.py).
 """
 
 from __future__ import annotations
@@ -26,9 +29,10 @@ import os
 import re
 import urllib.request
 
-from . import config, post_fire, procedure_miner, struggle_arc
+from . import config, post_fire, procedure_miner, skill_draft, struggle_arc
 from . import skill_db_source as DB
 from . import skill_derive as SD
+from . import skill_doc as D
 from . import skill_ledger as L
 
 SM = SD.skill_measure
@@ -262,11 +266,13 @@ def _tools_from_bash(bash_heads):
 
 def _draft_if_needed(conn, cid, cluster):
     cur = conn.cursor()
-    cur.execute("SELECT proposal_path FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,))
+    cur.execute("SELECT proposal_body FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,))
     if (cur.fetchone() or [None])[0]:
         return
     name = re.sub(r"[^a-z0-9-]", "", cluster.get("procedure", "unnamed").lower()) or "unnamed"
     body = SD.draft_skill(cluster)
+    if D.new_skill_problem(body):
+        return  # unusable draft (no frontmatter name/description): the draft pass retries
     d = PROPOSALS_DIR / f"cand{cid}-{name}"
     d.mkdir(parents=True, exist_ok=True)
     (d / "SKILL.md").write_text(body)
@@ -310,7 +316,7 @@ def discord_digest(conn, no_discord):
         lines.append(f"- `{kind}` **{name}** (score {score:.1f}, {js} judge{g}{s}{v})")
     if len(rows) > DIGEST_CAP:
         lines.append(f"+{len(rows) - DIGEST_CAP} more pending (skill_review list)")
-    lines.append("\nReview: `/skill-review` (or skill_review.py list) · accept/reject/promote <id>")
+    lines.append("\nReview: `/skill-review` (or skill_review.py list) · accept/reject <id>")
     msg = "\n".join(lines)
 
     cur.execute(
@@ -382,6 +388,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     if "procedure_miner" in detectors and procedure_miner.due(conn):
         print("procedure_miner:", procedure_miner.run(conn))
 
+    print("drafts:", skill_draft.draft_pending(conn))
     print("decay:", L.decay_stale(conn))
     print("digest:", discord_digest(conn, no_discord))
 

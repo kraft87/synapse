@@ -7,7 +7,8 @@ other half: spot recurring, generalizable multi-step PROCEDURES the
 agent carried out by hand that NO existing skill covers, cluster the candidates ACROSS
 sessions (frequency floor — don't overfit one utterance), then DRAFT a SKILL.md for
 each survivor. Propose-only: writes to ~/data/skill-measure/proposals/, never touches
-~/.claude/skills/. A human reviews and `mv`s it in.
+~/.claude/skills/. (The nightly lane stores its drafts on the candidate row instead; the
+review accept applies them to the skill registry.)
 
 Pipeline:
   1. parse raw transcripts (reuses skill-measure: same session view)
