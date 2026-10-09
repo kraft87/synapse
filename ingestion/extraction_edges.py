@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ingestion.extraction_llm import LLMExtractor
 
 from ingestion.extraction_policy import (
+    _FULLTEXT_MIN_SIM,
     _SATURATION_MAX_ROUNDS,
     _SATURATION_MIN,
     _SEMANTIC_POOL_LIMIT,
@@ -25,6 +26,17 @@ from ingestion.extraction_policy import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _on_topic(fulltext_hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """BM25 hits close enough to the new fact to be judged against it (_FULLTEXT_MIN_SIM).
+
+    A hit with no stored embedding cannot be checked and is dropped."""
+    return [
+        h
+        for h in fulltext_hits
+        if h.get("dist") is not None and 1.0 - h["dist"] >= _FULLTEXT_MIN_SIM
+    ]
 
 
 class ExtractionEdgesMixin:
@@ -87,7 +99,11 @@ class ExtractionEdgesMixin:
             # None -> always gray/LLM-confirmed; their score isn't comparable).
             for cand in vector_hits:
                 cand["_sim"] = 1.0 - float(cand.get("score") or 0.0)
-            fulltext_hits = self._kg.find_edges_by_fulltext(fact.fact, group_id, limit=_src_limit)
+            fulltext_hits = _on_topic(
+                self._kg.find_edges_by_fulltext(
+                    fact.fact, group_id, limit=_src_limit, fact_embedding=fact_emb
+                )
+            )
             semantic_pool = rrf_merge(vector_hits, fulltext_hits, limit=_SEMANTIC_POOL_LIMIT, k=1)
 
             # Drop any pair-pool uuid from the semantic pool so the LLM doesn't
@@ -279,8 +295,13 @@ class ExtractionEdgesMixin:
                     vector_hits = self._kg.find_similar_edges(
                         fact_embeddings[idx], group_id, limit=src_limit
                     )
-                    fulltext_hits = self._kg.find_edges_by_fulltext(
-                        facts[idx].fact, group_id, limit=src_limit
+                    fulltext_hits = _on_topic(
+                        self._kg.find_edges_by_fulltext(
+                            facts[idx].fact,
+                            group_id,
+                            limit=src_limit,
+                            fact_embedding=fact_embeddings[idx],
+                        )
                     )
                     pool = [
                         c

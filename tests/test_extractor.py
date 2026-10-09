@@ -1465,6 +1465,62 @@ class TestStage6aCandidateLimit:
         assert _SEMANTIC_POOL_LIMIT < 20
 
 
+class TestBM25CandidateFloor:
+    """2026-10-09: a BM25-only hit reaches the contradiction judge only when its stored
+    embedding is close to the new fact (_FULLTEXT_MIN_SIM). Sharing an identifier is
+    not enough; that is how unrelated facts were being retired."""
+
+    def _pipe(self, fulltext_hits):
+        pipe = ExtractionPipeline.__new__(ExtractionPipeline)
+        pipe._embedder = MagicMock()
+        pipe._embedder.embed.return_value = [[1.0, 0.0, 0.0, 0.0]]
+        kg = MagicMock()
+        kg.find_similar_edges.return_value = []
+        kg.find_edges_by_pair.return_value = []
+        kg.find_edges_by_fulltext.return_value = fulltext_hits
+        pipe._kg = kg
+        return pipe
+
+    def test_far_and_unembedded_bm25_hits_never_reach_the_judge(self):
+        hits = [
+            {"uuid": "close", "fact": "PR 12 is open", "score": 3.0, "dist": 0.2},
+            {"uuid": "far", "fact": "PR 12 touches recall.py", "score": 5.0, "dist": 0.5},
+            {"uuid": "noemb", "fact": "PR 12 reviewed", "score": 4.0, "dist": None},
+        ]
+        pipe = self._pipe(hits)
+        fact = ExtractedFact(source="A", target="B", relationship="R", fact="PR 12 is merged")
+        pools = pipe._stage6a_embedding_filter([fact], {"A": "ua", "B": "ub"}, "technical")
+        _, semantic = pools[0]
+        assert [c["uuid"] for c in semantic] == ["close"]
+        kwargs = pipe._kg.find_edges_by_fulltext.call_args.kwargs
+        assert kwargs["fact_embedding"] == [1.0, 0.0, 0.0, 0.0]
+
+    def test_floor_boundary(self):
+        from ingestion.extraction_edges import _on_topic
+        from ingestion.extraction_policy import _FULLTEXT_MIN_SIM
+
+        edge = 1.0 - _FULLTEXT_MIN_SIM
+        kept = _on_topic([{"uuid": "a", "dist": edge}, {"uuid": "b", "dist": edge + 0.01}])
+        assert [h["uuid"] for h in kept] == ["a"]
+
+    def test_saturation_rounds_apply_the_floor_too(self):
+        pipe = self._pipe(
+            [
+                {"uuid": f"far-{i}", "fact": f"related fact {i}", "score": 1.0, "dist": 0.6}
+                for i in range(10)
+            ]
+        )
+        pipe._stage6b_batch_confirm = MagicMock()
+        fact = ExtractedFact(source="A", target="B", relationship="R", fact="sweeping update")
+        invalidate = {0: ["u1", "u2", "u3", "u4"]}
+        candidates = {0: ([], [{"uuid": u, "fact": "x"} for u in invalidate[0]])}
+        extra = pipe._stage6b_saturation_rounds(
+            [fact], candidates, invalidate, [[1.0, 0.0, 0.0, 0.0]], "technical"
+        )
+        assert extra == 0
+        pipe._stage6b_batch_confirm.assert_not_called()  # nothing on-topic left to judge
+
+
 class TestCanonicalAliases:
     """Task #49: identity aliases rewrite to the canonical hub pre-resolution.
 

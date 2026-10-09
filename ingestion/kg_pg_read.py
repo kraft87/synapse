@@ -233,21 +233,42 @@ class KGPostgresReader:
         ]
 
     def find_edges_by_fulltext(
-        self, query: str, group_id: str, limit: int = 20
+        self,
+        query: str,
+        group_id: str,
+        limit: int = 20,
+        fact_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        """BM25 candidates over live fact text (ParadeDB, OR semantics)."""
+        """BM25 candidates over live fact text (ParadeDB, OR semantics).
+
+        With ``fact_embedding``, each hit also carries ``dist``: the cosine distance from
+        its stored embedding to that vector (None when the edge has no embedding), so a
+        caller can tell a lexical hit on a shared identifier from one on the same topic."""
         safe = "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
         if not safe:
             return []
         conn = self._connection()
+        args: tuple[Any, ...]
+        if fact_embedding is None:
+            dist_sql, args = "NULL", (safe, OWNER, group_id, limit)
+        else:
+            dist_sql = f"fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})"
+            args = (_vec_literal(fact_embedding), safe, OWNER, group_id, limit)
         cur = conn.execute(
-            "SELECT uuid, fact, valid_at, paradedb.score(id) AS sc FROM kg_relationships "
+            f"SELECT uuid, fact, valid_at, paradedb.score(id) AS sc, {dist_sql} AS dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+            "FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s) "
             "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
             "ORDER BY sc DESC LIMIT %s",
-            (safe, OWNER, group_id, limit),
+            args,
         )
         return [
-            {"uuid": u, "fact": f, "valid_at": _iso(v), "score": float(sc)}
-            for u, f, v, sc in cur.fetchall()
+            {
+                "uuid": u,
+                "fact": f,
+                "valid_at": _iso(v),
+                "score": float(sc),
+                "dist": None if d is None else float(d),
+            }
+            for u, f, v, sc, d in cur.fetchall()
         ]
