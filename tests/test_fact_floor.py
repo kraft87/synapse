@@ -78,28 +78,3 @@ def test_floor_by_rerank_keep_min_backstops_empty():
     # keep_min=0 -> [] ; keep_min=2 -> top 2 survive the blanket
     assert r._floor_by_rerank("q", items, 0.5, keep_min=0) == []
     assert [i["fact"] for i in r._floor_by_rerank("q", items, 0.5, keep_min=2)] == ["f0", "f1"]
-
-
-def test_floor_facts_keep_min_zero_may_abstain(monkeypatch):
-    # SYNAPSE_RECALL_FACT_FLOOR_KEEP_MIN=0: everything sub-floor -> serve NO fact rather than
-    # the least-bad one (the "confidently wrong on a lone off-topic fact" case).
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.99)
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR_KEEP_MIN", 0)
-    r = _bare()
-    r._reranker = _Emb([(0, 0.6), (1, 0.5)])
-    assert r._floor_facts("q", _facts(2)) == []
-
-
-def test_floor_facts_gates_a_singleton(monkeypatch):
-    # A single served fact is scored too (it used to skip the gate entirely).
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.40)
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR_KEEP_MIN", 0)
-    r = _bare()
-    r._reranker = _Emb([(0, 0.2)])
-    assert r._floor_facts("q", _facts(1)) == []
-    r._reranker = _Emb([(0, 0.8)])
-    assert [f["fact"] for f in r._floor_facts("q", _facts(1))] == ["fact0"]
-
-
-def test_fact_floor_keep_min_default_is_one():
-    assert recall_mod._RECALL_FACT_FLOOR_KEEP_MIN == 1

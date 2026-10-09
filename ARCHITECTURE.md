@@ -409,7 +409,7 @@ Three candidate lists over Postgres (`kg_relationships`), all filtering `t_inval
 2. **BM25 fulltext** (ParadeDB) over fact text.
 3. **1-hop join** from seed entities via `src_uuid`/`tgt_uuid`.
 
-Seed entities come from a pgvector KNN over `kg_entities.embedding` (halfvec HNSW, fetch 25), degree-gated (drop orphans), capped at 8, with a `session_focus` bonus (0.3 subtracted from distance when a seed's name/uuid is in the caller-supplied focus set). `_FACT_LIMIT = 12` (#100 — doubled exact-fact keyword recall 0.119→0.214 at zero graph bloat). Returns `(facts, seed_entities)`; seeds feed the `entities` bucket. The optional fact relevance gate (`SYNAPSE_RECALL_FACT_FLOOR`, off by default) scores every served fact — singleton buckets included since 2026-10 — and `SYNAPSE_RECALL_FACT_FLOOR_KEEP_MIN` (default 1) says how many top facts survive when all are sub-floor; `0` lets the bucket abstain.
+Seed entities come from a pgvector KNN over `kg_entities.embedding` (halfvec HNSW, fetch 25), degree-gated (drop orphans), capped at 8, with a `session_focus` bonus (0.3 subtracted from distance when a seed's name/uuid is in the caller-supplied focus set). `_FACT_LIMIT = 12` (#100 — doubled exact-fact keyword recall 0.119→0.214 at zero graph bloat). Returns `(facts, seed_entities)`; seeds feed the `entities` bucket.
 
 ### 6.4 Web & history legs
 

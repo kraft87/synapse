@@ -17,7 +17,6 @@ class RecallSettings:
     _RERANK_WINDOW: bool
     _ECHO_MIN_QUERY_LEN: int
     _RECALL_FACT_FLOOR: float
-    _RECALL_FACT_FLOOR_KEEP_MIN: int
     _RECALL_PASSAGE_CAND: int
     _EPISODE_CUTOFF_TAU: float
     _EPISODE_CUTOFF_MIN_K: int

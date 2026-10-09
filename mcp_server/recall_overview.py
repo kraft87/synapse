@@ -323,11 +323,8 @@ class RecallOverviewMixin:
         # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
         # default (adds one rerank of the served facts), so this is a no-op until enabled.
-        # Singleton buckets are gated too (2026-10-09): a lone off-topic fact is the
-        # worst case for a reader, not a reason to skip the check. Whether the gate may
-        # empty the bucket is _RECALL_FACT_FLOOR_KEEP_MIN's call (default keeps 1).
         served_facts = facts_internal
-        if settings._RECALL_FACT_FLOOR > 0 and served_facts:
+        if settings._RECALL_FACT_FLOOR > 0 and len(served_facts) > 1:
             served_facts = self._floor_facts(query, served_facts)
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
