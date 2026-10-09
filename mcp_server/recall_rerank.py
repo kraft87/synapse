@@ -210,10 +210,12 @@ class RecallRerankMixin:
         return kept
 
     def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Fact relevance gate (_RECALL_FACT_FLOOR): drop off-topic facts, keep >=1 so the bucket
-        is never blanked. Thin wrapper over _floor_by_rerank; caller gates on the floor > 0."""
+        """Fact relevance gate (_RECALL_FACT_FLOOR): drop off-topic facts. Keeps the top
+        _RECALL_FACT_FLOOR_KEEP_MIN when everything is sub-floor (1 = never blank the bucket;
+        0 = allowed to abstain). Thin wrapper over _floor_by_rerank; caller gates on floor > 0."""
         settings = self._settings()
-        return self._floor_by_rerank(query, facts, settings._RECALL_FACT_FLOOR, keep_min=1)
+        keep_min = max(0, int(getattr(settings, "_RECALL_FACT_FLOOR_KEEP_MIN", 1)))
+        return self._floor_by_rerank(query, facts, settings._RECALL_FACT_FLOOR, keep_min=keep_min)
 
     def _select_episodes(
         self, query: str, pool: list[dict[str, Any]], limit: int

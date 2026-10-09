@@ -103,10 +103,13 @@ def search_kg_postgres(
     scope_sql = f"  AND {scope_predicate()} " if restricted else ""
     scope_args: tuple[Any, ...] = (allowed_projects,) if restricted else ()
     emb_s = _vec_literal(query_emb)
-    # uuid -> (fact text, t_valid). t_valid = when the fact became true (bitemporal valid-from),
-    # surfaced as the fact's "as-of" date so the reader can weight currency. 100% populated on
-    # live edges. Served facts are already live (t_invalid IS NULL filtered everywhere below).
-    fact_by_uuid: dict[str, tuple[str, Any]] = {}
+    # uuid -> (fact text, t_valid, ongoing, last_supported_at). t_valid = when the fact became
+    # true (bitemporal valid-from), surfaced as the fact's "as-of" date; ongoing +
+    # last_supported_at (schema 058) say whether the claim can lapse silently and when the
+    # user last restated it, so the reader can tell "valid-from 2025, never confirmed since"
+    # from "restated last week". Served facts are already live (t_invalid IS NULL filtered
+    # everywhere below).
+    fact_by_uuid: dict[str, tuple[str, Any, Any, Any]] = {}
 
     # 1 — fact-embedding vector KNN. Over-fetch the GLOBAL live-fact HNSW on the bare
     # partial-index predicate (no owner/group -> the planner keeps the kg_rel_hnsw
@@ -114,8 +117,9 @@ def search_kg_postgres(
     # scope on the small candidate set. See module docstring for the required GUCs.
     if not restricted:
         cur.execute(
-            "SELECT uuid, fact, t_valid FROM ("
-            "  SELECT uuid, fact, t_valid, owner_id, group_id FROM kg_relationships "
+            "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM ("
+            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id "
+            "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
             f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
             ") sub WHERE owner_id = %s AND group_id = %s LIMIT %s",
@@ -129,20 +133,21 @@ def search_kg_postgres(
         # (kg_rel_source_projects_gin). Cost scales with the allowlisted fact count.
         cur.execute(
             "WITH cand AS MATERIALIZED ("
-            "  SELECT uuid, fact, t_valid, "
+            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, "
             f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
             "    AND owner_id = %s AND group_id = %s "
             f"   AND {scope_predicate()}"
-            ") SELECT uuid, fact, t_valid FROM cand ORDER BY dist LIMIT %s",
+            ") SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM cand "
+            "ORDER BY dist LIMIT %s",
             (emb_s, owner_id, group_id, allowed_projects, limit * 3),
         )
     vec_uuids: list[str] = []
-    for u, f, tv in cur.fetchall():
+    for u, f, tv, og, sup in cur.fetchall():
         if not f:
             continue
-        fact_by_uuid.setdefault(u, (f, tv))
+        fact_by_uuid.setdefault(u, (f, tv, og, sup))
         vec_uuids.append(u)
 
     # 2 — BM25 full-text over fact text (ParadeDB). Same alnum/space sanitize as
@@ -152,17 +157,18 @@ def search_kg_postgres(
     bm25_uuids: list[str] = []
     if safe:
         cur.execute(
-            "SELECT uuid, fact, t_valid, paradedb.score(id) AS sc FROM kg_relationships "
+            "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
+            "FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s) "
             "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
             f"{scope_sql}"
             "ORDER BY sc DESC LIMIT %s",
             (safe, owner_id, group_id, *scope_args, limit * 3),
         )
-        for u, f, tv, _sc in cur.fetchall():
+        for u, f, tv, og, sup, _sc in cur.fetchall():
             if not f:
                 continue
-            fact_by_uuid.setdefault(u, (f, tv))
+            fact_by_uuid.setdefault(u, (f, tv, og, sup))
             bm25_uuids.append(u)
 
     # 3 — entity seed vector KNN (top 25) + live-degree gate + focus bonus -> top 8.
@@ -240,23 +246,29 @@ def search_kg_postgres(
             # entity had a handful of edges, but a supernode seed (the User node, live
             # degree ~3.4k and growing with event facts) turned it into 8 arbitrary edges.
             # Recency is the least-wrong single ordering for a "what about X" hop sample.
-            "SELECT uuid, fact, t_valid FROM kg_relationships "
+            "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM kg_relationships "
             "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
             "  AND (src_uuid = %s OR tgt_uuid = %s) "
             f"{scope_sql}"
             "ORDER BY t_valid DESC LIMIT 8",
             (owner_id, group_id, sd, sd, *scope_args),
         )
-        for u, f, tv in cur.fetchall():
+        for u, f, tv, og, sup in cur.fetchall():
             if u and f:
-                fact_by_uuid.setdefault(u, (f, tv))
+                fact_by_uuid.setdefault(u, (f, tv, og, sup))
                 hop_uuids.append(u)
 
     # 5 — RRF fuse the three ranked lists; take the top `limit`.
     fused = _rrf_fuse([vec_uuids, bm25_uuids, hop_uuids])
     top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
     results = [
-        {"fact": fact_by_uuid[u][0], "_uuid": u, "_date": fact_by_uuid[u][1]}
+        {
+            "fact": fact_by_uuid[u][0],
+            "_uuid": u,
+            "_date": fact_by_uuid[u][1],
+            "_ongoing": fact_by_uuid[u][2],
+            "_supported": fact_by_uuid[u][3],
+        }
         for u, _ in top
         if u in fact_by_uuid
     ][:limit]

@@ -56,20 +56,18 @@ def register(
         past-conversation turns and the knowledge-graph facts extracted from them.
 
         BEFORE answering anything that references past work — a prior decision or
-        discussion ("what did we decide", "last time", "have we tried"), any device,
-        purchase, tool, project, or person the user names, their preferences, or
-        history this session alone can't supply — call this first. WHEN the topic
-        shifts to something plausibly discussed before, call it again. Assume memory
-        has the context; the failure mode is not checking, not over-checking.
+        discussion, any device, purchase, tool, project, or person the user names,
+        their preferences, or history this session alone can't supply — call this
+        first. WHEN the topic shifts to something plausibly discussed before, call it
+        again. Assume memory has the context; the failure mode is not checking.
 
-        Do NOT call for facts already visible in the current conversation or context
-        (read those directly), nor for generic-knowledge questions with no
-        user-history angle (definitions, math, general how-tos).
+        Do NOT call for facts already visible in this conversation, nor for
+        generic-knowledge questions with no user-history angle.
 
-        This is the overview — compressed passages blended with the buckets below,
-        the right first call. Its drill-down sibling recall_full_turns serves
-        complete raw turns: the follow-up when a passage is truncated mid-thought,
-        and the retry when this overview comes back thin.
+        This is the overview: compressed passages plus the buckets below, the right
+        first call. Its drill-down sibling recall_full_turns serves complete raw
+        turns: the follow-up when a passage is truncated, the retry when this comes
+        back thin.
 
         Query in plain language carrying the message's distinctive nouns; leave
         `project` unset unless results come back noisy from another domain. Served
@@ -77,14 +75,19 @@ def register(
         state of X", weight newer user-stated content over older assistant-role text,
         which may be speculation or a plan that never happened.
 
-        Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact — also
-        the superseded_facts pairs, t:N timeline, w:N web) — copy it into
-        recall_feedback to rate that result. Only e:/n: ids are fetch()-able; the
-        rest are feedback-only.
+        Facts: `date` is when the fact became true as stored, not when it was last
+        confirmed. `ongoing: true` marks a habit, usage, or state that can lapse
+        unannounced; `supported` is when the user last asserted it (absent = never).
+        An ongoing fact without recent `supported` is a lead to ask about, not
+        current truth. A fact supports only what it states; one about a profile or
+        document describes that document.
 
-        A `warnings` list appears when a retrieval leg degraded or this connection is
-        served (almost) nothing; empty results with a warning mean a config problem,
-        not empty memory.
+        Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact incl.
+        superseded_facts pairs, t:N timeline, w:N web); copy it into recall_feedback
+        to rate it. Only e:/n: ids are fetch()-able.
+
+        A `warnings` list means a leg degraded or this connection is served (almost)
+        nothing: a config problem, not empty memory.
 
         Follow-ups: fetch(ids) expands a truncated passage or note body;
 

@@ -323,8 +323,11 @@ class RecallOverviewMixin:
         # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
         # default (adds one rerank of the served facts), so this is a no-op until enabled.
+        # Singleton buckets are gated too (2026-10-09): a lone off-topic fact is the
+        # worst case for a reader, not a reason to skip the check. Whether the gate may
+        # empty the bucket is _RECALL_FACT_FLOOR_KEEP_MIN's call (default keeps 1).
         served_facts = facts_internal
-        if settings._RECALL_FACT_FLOOR > 0 and len(served_facts) > 1:
+        if settings._RECALL_FACT_FLOOR > 0 and served_facts:
             served_facts = self._floor_facts(query, served_facts)
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
@@ -340,8 +343,13 @@ class RecallOverviewMixin:
         )
         if sup_extras:
             served_facts = list(served_facts) + sup_extras
-        # Slim facts to {fact, date} — date = t_valid (when the fact became true), so the reader
-        # can weight currency. Served facts are already live (invalidated edges filtered upstream).
+        # Slim facts to {fact, date, ongoing?, supported?}. date = t_valid: when the fact became
+        # true AS STORED (an in-text date, else the conversation it came from) — it is NOT the
+        # last time anyone confirmed it. Schema 058 adds the currency signals: `ongoing` marks
+        # a claim that can lapse without being contradicted (a habit, a tool in use), and
+        # `supported` is the date the user themself last asserted it; absent = never
+        # user-confirmed or pre-058. Served facts are already live (invalidated edges
+        # filtered upstream).
         facts: list[dict[str, Any]] = []
         for f in served_facts:
             item: dict[str, Any] = {"fact": f["fact"]}
@@ -349,6 +357,10 @@ class RecallOverviewMixin:
                 item["id"] = f"f:{uid}"  # KG edge uuid — cite in recall_feedback (not fetch())
             if (d := f.get("_date")) is not None:
                 item["date"] = str(d)[:10]
+            if f.get("_ongoing"):
+                item["ongoing"] = True
+            if (sup := f.get("_supported")) is not None:
+                item["supported"] = str(sup)[:10]
             facts.append(item)
 
         # Episode-validity overlay: if a served episode/passage asserted a claim the KG has since

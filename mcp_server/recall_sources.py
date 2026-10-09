@@ -438,7 +438,8 @@ class RecallSourcesMixin:
         schema 028), resolves the live successor, and returns those not already served — deduped by
         uuid and distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
         correction in. Go-forward coverage only (no link => skipped); never returns the stale fact
-        itself. Shape matches the KG fact leg ({fact, _uuid, _date}) so it flows through fact serving.
+        itself. Shape matches the KG fact leg ({fact, _uuid, _date, _ongoing, _supported}) so it
+        flows through fact serving.
         Fail-open — a lookup error just yields no extras.
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
@@ -457,7 +458,7 @@ class RecallSourcesMixin:
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
-                "SELECT n.uuid, n.fact, n.t_valid, "
+                "SELECT n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
                 f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
                 "FROM kg_relationships p "
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
@@ -479,7 +480,15 @@ class RecallSourcesMixin:
                 continue
             u, fact = r.get("uuid"), r.get("fact")
             if u and fact and u not in served_uuids:
-                out.append({"fact": fact, "_uuid": u, "_date": r.get("t_valid")})
+                out.append(
+                    {
+                        "fact": fact,
+                        "_uuid": u,
+                        "_date": r.get("t_valid"),
+                        "_ongoing": r.get("ongoing"),
+                        "_supported": r.get("last_supported_at"),
+                    }
+                )
                 served_uuids.add(u)
                 if len(out) >= cap:
                     break

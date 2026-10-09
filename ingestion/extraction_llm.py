@@ -38,10 +38,25 @@ Session summary:
 Output ONLY valid JSON (no explanation, no markdown fence):
 {{
   "entities": [{{"name": "...", "type": "...", "summary": "..."}}],
-  "facts": [{{"source": "...", "target": "...", "relationship": "...", "fact": "..."}}]
+  "facts": [{{"source": "...", "target": "...", "relationship": "...", "fact": "...",
+             "ongoing": true|false, "attribution": "user"|"assistant"|"third_party"}}]
 }}
 
 Rules:
+- EVIDENCE FIELDS (every fact carries both):
+  `ongoing` is true ONLY when the fact asserts something that is true now and can
+  stop being true without anyone saying so — a habit or routine ("User swims laps
+  before work"), a tool or service in use, a current job, an active subscription, a
+  living arrangement. It is false for a dated happening, a one-time event, a permanent or
+  slow-moving trait ("User has ADHD", "User was born in Halifax"), a decision, a
+  config value, and for any DESCRIPTION OF AN ARTIFACT — "User's gym profile lists
+  rock climbing" describes the profile, not what the user does; keep such facts
+  about the artifact and never promote the listed item into an activity.
+  `attribution` is who asserted the fact in the summary: "user" when the user said
+  it in their own turn ([user] / [attachments] parts), "assistant" when only the
+  assistant stated, inferred, or repeated it, "third_party" when it comes from a
+  quoted document, web page, or another person. An assistant restating a user claim
+  is still "user" only if the user's own words carry it in THIS summary.
 - Entity types are open-ended — use whatever fits (Tool, Project, Decision, Issue, Config, etc.)
 - fact text must be phrased as a self-contained searchable statement ("X uses Y for Z")
 - Include rationale for decisions ("chose X because Y")
@@ -405,6 +420,8 @@ class LLMExtractor:
                     target=f.target,
                     relationship=f.relationship,
                     fact=f.fact,
+                    ongoing=f.ongoing if f.ongoing is not None else False,  # type: ignore[arg-type]  # coerced by the model validator
+                    attribution=f.attribution or "unknown",
                 )
                 for f in output.facts
             ],

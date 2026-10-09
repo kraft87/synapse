@@ -328,12 +328,20 @@ class ExtractionEntityRow(BaseModel):
 
 
 class ExtractionFactRow(BaseModel):
-    """One extracted fact row — all four keys required, as in the prompt."""
+    """One extracted fact row — the four text keys required, as in the prompt.
+
+    ``ongoing`` / ``attribution`` are the schema-058 evidence fields. Both are
+    optional on the wire so a model that drops them still yields a usable row;
+    the defaults are the conservative reading (not ongoing, attribution unknown
+    = never counts as user confirmation). Value coercion lives on
+    ``ingestion.models.ExtractedFact``."""
 
     source: str
     target: str
     relationship: str
     fact: str
+    ongoing: bool | str | None = None
+    attribution: str | None = None
 
 
 class ExtractionOutput(BaseModel):

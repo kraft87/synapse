@@ -282,3 +282,94 @@ class TestReinforceEdges:
 
     def test_empty_items_is_noop(self, kg_writer):
         kg_writer.reinforce_edges([], GROUP)  # must not raise or connect
+
+
+class TestEvidenceCurrency:
+    """Schema 058: ongoing / last_supported_at / last_supported_by, and the clamped
+    invalidation time."""
+
+    def _row(self, uuid: str, **over):
+        return make_edge_row(uuid, drop=("emb",), **over)
+
+    def test_create_writes_evidence_fields(self, kg_writer, conn):
+        kg_writer.create_edges(
+            [
+                self._row(
+                    "r-1",
+                    ongoing=True,
+                    last_supported_at="2026-06-01T00:00:00+00:00",
+                    last_supported_by=2,
+                ),
+                self._row("r-2"),  # legacy caller: nothing supplied -> NULLs (unknown)
+            ],
+            GROUP,
+        )
+        rows = conn.execute(
+            "SELECT uuid, ongoing, last_supported_at, last_supported_by "
+            "FROM kg_relationships ORDER BY uuid"
+        ).fetchall()
+        assert rows[0][1] is True
+        assert str(rows[0][2]).startswith("2026-06-01")
+        assert rows[0][3] == 2
+        assert rows[1][1] is None and rows[1][2] is None and rows[1][3] is None
+
+    def test_reinforce_refreshes_support_forward_only_on_new_provenance(self, kg_writer, conn):
+        kg_writer.create_edges(
+            [self._row("r-1", last_supported_at="2026-06-01T00:00:00+00:00", last_supported_by=2)],
+            GROUP,
+        )  # episodes [1,2]
+        # (a) assistant restatement (no support) with new provenance: count bumps, support stays
+        kg_writer.reinforce_edges([("r-1", [3], None, None)], GROUP)
+        cnt, sup, by = conn.execute(
+            "SELECT mention_count, last_supported_at, last_supported_by FROM kg_relationships "
+            "WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert cnt == 2 and str(sup).startswith("2026-06-01") and by == 2
+        # (b) user restatement, newer, new provenance: support moves forward
+        kg_writer.reinforce_edges([("r-1", [4], "2026-08-01T00:00:00+00:00", 4)], GROUP)
+        cnt, sup, by = conn.execute(
+            "SELECT mention_count, last_supported_at, last_supported_by FROM kg_relationships "
+            "WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert cnt == 3 and str(sup).startswith("2026-08-01") and by == 4
+        # (c) a replayed chunk (provenance already present) refreshes nothing, even as user
+        kg_writer.reinforce_edges([("r-1", [4], "2026-09-01T00:00:00+00:00", 4)], GROUP)
+        # (d) an OLDER user statement (backfilled transcript) never moves support backward
+        kg_writer.reinforce_edges([("r-1", [5], "2026-01-01T00:00:00+00:00", 5)], GROUP)
+        cnt, sup, by = conn.execute(
+            "SELECT mention_count, last_supported_at, last_supported_by FROM kg_relationships "
+            "WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert cnt == 4 and str(sup).startswith("2026-08-01") and by == 4
+
+    def test_reinforce_sets_support_when_never_confirmed(self, kg_writer, conn):
+        kg_writer.create_edges([self._row("r-1")], GROUP)  # last_supported_at NULL
+        kg_writer.reinforce_edges([("r-1", [9], "2026-07-01T00:00:00+00:00", 9)], GROUP)
+        sup, by = conn.execute(
+            "SELECT last_supported_at, last_supported_by FROM kg_relationships WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert str(sup).startswith("2026-07-01") and by == 9
+
+    def test_invalidate_clamps_to_the_edge_own_valid_from(self, kg_writer, conn):
+        # Stale edge became live 2026-06-01; the correction is dated 2026-03-01 (the user said
+        # "stopped in March") -> retired as of 2026-06-01, never a negative lifetime.
+        kg_writer.create_edges([self._row("r-1")], GROUP)  # t_valid 2026-06-01
+        kg_writer.invalidate_edges(
+            [("r-1", "2026-03-01T00:00:00+00:00")], GROUP, invalidated_by="n"
+        )
+        t_inv, inv, by = conn.execute(
+            "SELECT t_invalid, invalid_at, invalidated_by FROM kg_relationships WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert str(t_inv).startswith("2026-06-01") and t_inv == inv and by == "n"
+
+    def test_invalidate_keeps_the_earlier_retirement(self, kg_writer, conn):
+        kg_writer.create_edges([self._row("r-1")], GROUP)
+        kg_writer.invalidate_edges([("r-1", "2026-07-01T00:00:00+00:00")], GROUP)
+        kg_writer.invalidate_edges(
+            [("r-1", "2026-09-01T00:00:00+00:00")], GROUP, invalidated_by="n"
+        )
+        t_inv, by = conn.execute(
+            "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert str(t_inv).startswith("2026-07-01")  # first retirement stands
+        assert by == "n"  # but the later call may still add the missing link
