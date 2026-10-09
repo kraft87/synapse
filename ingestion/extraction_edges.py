@@ -19,7 +19,6 @@ from ingestion.extraction_policy import (
     _SATURATION_MAX_ROUNDS,
     _SATURATION_MIN,
     _SEMANTIC_POOL_LIMIT,
-    _cosine_similarity,
     build_batch_resolution_prompt,
     build_resolution_prompt,
     dedupe_pools,
@@ -82,23 +81,12 @@ class ExtractionEdgesMixin:
             pair_pool: list[dict[str, Any]] = []
             if src_uuid and tgt_uuid:
                 pair_pool = list(self._kg.find_edges_by_pair(src_uuid, tgt_uuid, group_id))
-            # Gray-zone gate signal (issue #14): tag every candidate that has an
-            # embedding with its cosine similarity to the new fact. Pair-pool rows
-            # return their stored embedding; computed here, in-process, no extra I/O.
-            for cand in pair_pool:
-                emb = cand.get("fact_embedding")
-                cand["_sim"] = _cosine_similarity(fact_emb, emb) if emb else None
 
             # Semantic pool — RRF over vector + BM25 hits. Pull 2x the eventual
             # cap from each modality so the long tail of moderate-rank entries
             # in both lists has a chance to win the merge.
             _src_limit = _SEMANTIC_POOL_LIMIT * 2
             vector_hits = self._kg.find_similar_edges(fact_emb, group_id, limit=_src_limit)
-            # Vector hits carry cosine DISTANCE as "score" (kg_pg_read) — convert once
-            # here so the gate sees one signal. BM25-only hits stay untagged (_sim
-            # None -> always gray/LLM-confirmed; their score isn't comparable).
-            for cand in vector_hits:
-                cand["_sim"] = 1.0 - float(cand.get("score") or 0.0)
             fulltext_hits = _on_topic(
                 self._kg.find_edges_by_fulltext(
                     fact.fact, group_id, limit=_src_limit, fact_embedding=fact_emb
@@ -185,9 +173,8 @@ class ExtractionEdgesMixin:
         edge uuids]}, reinforce = {new_idx: [matched existing edge uuids]} for
         the skipped duplicates — the dedup-hit signal Stage 7 uses to bump
         mention_count + union episodes instead of dropping the re-assertion.
-        ok=False means the LLM call/parse failed (fail-closed empties) — the
-        gray-zone gate's shadow log uses it to keep failed batches out of the
-        threshold-analysis data (issue #14).
+        ok=False means the LLM call/parse failed (fail-closed empties), so no
+        saturation round runs on the result.
         """
         if not candidates_map:
             return set(), {}, {}, True

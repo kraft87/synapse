@@ -1146,7 +1146,7 @@ class TestStage6bBatchConfirm:
             self._facts(1),
             {0: ([{"uuid": "x", "fact": "y"}], [])},
         )
-        assert ok is False  # the gate's shadow log must not treat this as a verdict
+        assert ok is False  # a failed call is not a verdict
         assert skip_indices == set()
         assert invalidate == {}
         assert reinforce == {}
