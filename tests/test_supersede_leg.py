@@ -65,3 +65,46 @@ def test_off_topic_superseded_fact_is_gated_out(conn, db_url):
     # query aligns with the SUCCESSOR (axis 0); the superseded P (axis 1) is cosine-distance 1.0
     # away -> beyond _SUP_MAX_DIST -> nothing surfaced (the live leg already owns this case).
     assert r._surface_supersessions(_axis_list(0), GROUP, served_uuids=set()) == []
+
+
+def _seed_pairs(conn) -> None:
+    """One served live edge A on (a,b) plus three retired edges on the same endpoints:
+    linked to A with another predicate, unlinked with A's predicate, unlinked with a
+    different predicate. Only the first two are genuine predecessors."""
+    conn.execute("TRUNCATE kg_relationships RESTART IDENTITY CASCADE")
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "  t_valid, t_invalid, invalidated_by) VALUES "
+        "('a', 'default', %(g)s, 'a', 'b', 'CORRECTED', 'User corrected the assistant on 10-08', "
+        "  '2026-10-08T00:00:00+00:00', NULL, NULL), "
+        "('linked', 'default', %(g)s, 'a', 'b', 'TOLD', 'User told the assistant X (linked)', "
+        "  '2026-09-01T00:00:00+00:00', '2026-10-08T00:00:00+00:00', 'a'), "
+        "('same-name', 'default', %(g)s, 'a', 'b', 'CORRECTED', 'User corrected the assistant on 09-08', "
+        "  '2026-09-08T00:00:00+00:00', '2026-09-09T00:00:00+00:00', NULL), "
+        "('unrelated', 'default', %(g)s, 'a', 'b', 'TOLD_TO_STOP', 'User told the assistant on 08-29 to stop X', "
+        "  '2026-08-29T00:00:00+00:00', '2026-08-29T00:00:00+00:00', NULL)",
+        {"g": GROUP},
+    )
+
+
+def test_superseded_pair_needs_a_link_or_the_same_predicate(conn, db_url):
+    _seed_pairs(conn)
+    r = Recall(db_url, "")
+    out = r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)
+    # DISTINCT ON keeps the most recently retired genuine predecessor: the linked one.
+    assert [x["id"] for x in out] == ["f:linked"]
+    assert out[0]["superseded_by"] == "User corrected the assistant on 10-08"
+
+
+def test_unrelated_retired_edge_on_the_same_endpoints_is_never_paired(conn, db_url):
+    _seed_pairs(conn)
+    conn.execute("DELETE FROM kg_relationships WHERE uuid IN ('linked', 'same-name')")
+    r = Recall(db_url, "")
+    assert r._fetch_superseded_pairs_pg(GROUP, ["a"], 10) == []
+
+
+def test_same_predicate_without_a_link_still_pairs(conn, db_url):
+    _seed_pairs(conn)
+    conn.execute("DELETE FROM kg_relationships WHERE uuid = 'linked'")
+    r = Recall(db_url, "")
+    assert [x["id"] for x in r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)] == ["f:same-name"]

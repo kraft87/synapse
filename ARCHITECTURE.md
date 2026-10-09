@@ -344,7 +344,7 @@ Batched stages (one call across the item's facts): Stage-4 confirm, 6b, EdgeDate
 
 - `t_created` (== `created_at`) — write time, never updated.
 - `t_valid` (== `valid_at`) — when the fact began being true; from `EdgeDateExtractor` or `now()`.
-- `t_invalid` (== `invalid_at`) — when the fact stopped being true; **absent/NULL on create**, set on contradiction.
+- `t_invalid` (== `invalid_at`) — when the fact was superseded by a later fact; **always NULL on create**, set only by Stage-6b / writer-side contradiction. The `EdgeDateExtractor`'s `invalid_at` is no longer applied at birth (2026-10-09): a fact recording a dated happening or a bounded past state ("the outage ran Aug–Sep", "User told the assistant on 08-29 to stop X") is a true statement for good, and writing it already-retired dropped it out of the live index with no successor link (616 such edges in prod). Currency for the reader rides `t_valid` and the 058 fields.
 - `t_expired` — reserved for future selective forgetting; nothing writes it yet.
 
 Contradictions **invalidate the old edge** (an `UPDATE` setting `invalid_at`/`t_invalid`) and always write the new one — they never block it. All live-edge read filters use `t_invalid IS NULL`. This gives a queryable history of fact evolution (surfaced by recall's `history` leg).
@@ -383,7 +383,7 @@ if episodes_served: out["episodes"]    = [...]   # reranked passages, cap 5 (see
 if entities_bucket: out["entities"]    = [...]   # {name, summary}, cap 3
 if web_chunks:      out["web"]         = [...]   # {context|excerpt, url?, title?, date?}, cap 3
 if timeline:        out["timeline"]    = [...]   # dated events (§3.5), cap 8
-if superseded:      out["superseded_facts"] = [...]  # {fact: old, superseded_by: current}, cap 2
+if superseded:      out["superseded_facts"] = [...]  # {fact: old, superseded_by: current}, cap 2 — old carries the 028 link to current, or no link and the same predicate
 return out
 ```
 

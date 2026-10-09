@@ -302,6 +302,14 @@ class RecallSourcesMixin:
         DISTINCT ON picks the most recently invalidated predecessor per active
         edge in SQL (the FalkorDB path does this dedup in Python).
 
+        A predecessor must actually be one: either it carries the schema-028
+        ``invalidated_by`` link to the served edge, or it has no link at all and
+        shares the served edge's predicate ``name``. Endpoints alone are not enough
+        (2026-10-09): every retired edge between the same two entities was being
+        paired with whatever live edge between them got served, so "User told the
+        assistant on 08-29 to stop X" showed up as superseded by an unrelated
+        correction weeks later.
+
         ``allowed_projects`` (restricted surface) requires BOTH sides of a pair, the
         served edge and the displaced one, to pass the schema-056 provenance rule, so a
         pair is dropped when either side is out of scope. The filter runs before
@@ -331,6 +339,8 @@ class RecallSourcesMixin:
                 WHERE a.owner_id = %s AND a.group_id = %s
                   AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                   AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
+                  AND (o.invalidated_by = a.uuid
+                       OR (o.invalidated_by IS NULL AND o.name = a.name))
                   AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
                 ORDER BY a.uuid, o.t_invalid DESC
                 """,

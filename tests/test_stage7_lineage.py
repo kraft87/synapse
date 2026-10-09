@@ -197,3 +197,26 @@ class TestEvidenceMetadata:
         pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {})
         (row,) = _created(pipe)
         assert row["last_supported_at"] == row["t_created"]
+
+
+class TestNeverBornInvalid:
+    def test_extracted_end_date_does_not_retire_the_new_edge(self):
+        # "User told the assistant on 2026-08-29 to stop X": the date extractor reads an
+        # end into it (valid 08-29, invalid 08-29). The fact is a dated happening and stays
+        # true; it must be written LIVE, not already-retired with no successor link.
+        facts = [_fact(0, attribution="user")]
+        pipe = _pipe(1, dates=[("2026-08-29T00:00:00Z", "2026-08-29T00:00:00Z")])
+        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {}, default_valid_at=SEG)
+        (row,) = _created(pipe)
+        assert row["t_valid"] == "2026-08-29T00:00:00Z"
+        assert row["t_invalid"] is None
+        pipe._kg.invalidate_edges_batch.assert_not_called()
+
+    def test_bounded_past_state_is_written_live(self):
+        # "the outage ran from 2026-08-01 to 2026-09-01": a true statement about a past
+        # interval, not a fact that stopped being true.
+        facts = [_fact(0)]
+        pipe = _pipe(1, dates=[("2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z")])
+        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {})
+        (row,) = _created(pipe)
+        assert row["t_invalid"] is None
