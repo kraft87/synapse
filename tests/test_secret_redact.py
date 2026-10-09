@@ -32,6 +32,12 @@ ALNUM = "aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"  # 32 mixed chars
         ("M" + "TIz" + "NDU2Nzg5MDEyMzQ1Njc4OTAx" + ".Gh1Jk2." + ALNUM[:30], "discord"),
         ("ey" + "JhbGciOiJIUzI1NiJ9" + ".ey" + "JzdWIiOiIxMjM0In0" + ".abcDEF123ghiJKL456", "jwt"),
         ("hf" + "_" + ALNUM, "huggingface"),
+        ("pylf" + "_v1_us_" + ALNUM + "Ab12", "logfire"),
+        ("syt" + "_bmV1cm9u_" + ALNUM[:20] + "_1aB2cD", "matrix"),
+        ("pa" + "-" + ALNUM + "Ab3dE5fG7hJ9k", "voyage"),
+        ("fc" + "-" + "0a1b2c3d" * 4, "firecrawl"),
+        ("sk" + "_" + "0a1b2c3d4e" * 5, "elevenlabs"),
+        ("123456789" + ":AA" + ALNUM + "a", "telegram"),
     ],
 )
 def test_provider_tokens_are_replaced(token: str, kind: str) -> None:
@@ -53,12 +59,15 @@ def test_private_key_block_including_json_escaped_newlines() -> None:
         ("MCP_SECRET_PASSWORD=Zq9xLm2Pw8", "MCP_SECRET_PASSWORD=[REDACTED:secret]"),
         (
             "export LOGFIRE_TOKEN='pylf_v1_us_" + ALNUM + "'",
-            "export LOGFIRE_TOKEN='[REDACTED:secret]'",
+            "export LOGFIRE_TOKEN='[REDACTED:logfire]'",
         ),
         ('{"api_key": "a1b2c3d4e5f6a7b8"}', '{"api_key": "[REDACTED:secret]"}'),
         ("X-Api-Key: 0a1b2c3d4e5f60718293a4b5c6d7e8f9", "X-Api-Key: [REDACTED:secret]"),
         ("password: hunter2hunter2", "password: [REDACTED:secret]"),
         ("Authorization: Bearer " + ALNUM, "Authorization: Bearer [REDACTED:bearer]"),
+        # JSON-escaped quotes, as inside a serialized tool result
+        ('MATRIX_TOKEN=\\"a1b2c3d4e5f6g7h8\\"', 'MATRIX_TOKEN=\\"[REDACTED:secret]\\"'),
+        ('{\\"token\\": \\"AnYx12345678abcd\\"}', '{\\"token\\": \\"[REDACTED:secret]\\"}'),
         (
             "postgresql://synapse:s3cretPass@192.168.0.20:5432/synapse",
             "postgresql://synapse:[REDACTED:password]@192.168.0.20:5432/synapse",
