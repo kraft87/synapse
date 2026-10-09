@@ -27,7 +27,6 @@ class RecallSettings:
     _EPISODE_FETCH: int
     _NOTES_IN_RECALL: bool
     _SUPERSEDED_LIMIT: int
-    _RECALL_SELF_EXCLUDE: int
     _RECALL_BM25_FUSE: bool
     _RECALL_FLOOR_ENFORCE: bool
     _RERANK_RECENCY: bool

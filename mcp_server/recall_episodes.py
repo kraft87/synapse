@@ -82,7 +82,6 @@ class RecallEpisodesMixin:
         t_start: float,
     ) -> dict[str, Any]:
         """recall_episodes()'s body, run with ``warnings`` bound as the degradation sink."""
-        settings = self._settings()
         st = self._resolve_trust(surface, trust)
         allowed = st.project_filter
         try:
@@ -115,7 +114,7 @@ class RecallEpisodesMixin:
         # Skipped under a session filter — the caller explicitly asked for that
         # session's turns, including when it is its own.
         n_self_excluded = 0
-        if settings._RECALL_SELF_EXCLUDE and self_session and not session_id:
+        if self_session and not session_id:
             pre_excl = len(pool)
             pool = self._exclude_self(pool, self_session)
             n_self_excluded = pre_excl - len(pool)

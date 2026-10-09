@@ -229,12 +229,9 @@ def test_vector_leg_scopes_to_session():
 def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
     """An explicit session ask must never be suppressed — even for the caller's
     own session (the whole point is reading yourself back)."""
-    import mcp_server.recall as recall_mod
-
     r = _bare()
     seen: dict[str, Any] = {}
 
-    monkeypatch.setattr(recall_mod, "_RECALL_SELF_EXCLUDE", True)
     r._ensure_embedder = lambda: (_ for _ in ()).throw(RuntimeError("no embedder"))  # type: ignore[method-assign]
 
     def _pool(q, e, p, session_id=None, allowed_projects=None, own_surface=None):

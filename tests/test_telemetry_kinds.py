@@ -155,6 +155,29 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
     assert served["n_bm25_lifted"] == 0  # stub pool has no bm25_score -> fusion is a no-op
 
 
+def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, full_surface):
+    """No flag: a hook-injected self_session always drops the caller's own episodes from
+    the overview, and the envelope records how many were dropped."""
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+    q = f"telemetry self exclusion recall {uuid.uuid4().hex[:8]}"
+    p = _pool()
+    for i, ep in enumerate(p):
+        ep["session_id"] = "MY-SESSION" if i < 2 else f"other-{i}"
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    engine._search_bm25_episodes = lambda q_, proj, limit, sid=None, allowed=None, own=None: [
+        dict(e) for e in p
+    ]
+    mark = _watermark(conn)
+    out = engine.recall(q, source="mcp-tool", surface=full_surface, self_session="MY-SESSION")
+    assert [it["id"] for it in out["episodes"]] == ["e:2", "e:3"]
+
+    row = _newest(conn, engine, "recall", "served_ids", mark)
+    assert row is not None
+    (served,) = row
+    assert served["self_session"] == "MY-SESSION"
+    assert served["n_self_excluded"] == 2
+
+
 # ---------------------------------------------------------------------------
 # kind='episodes' — recall_full_turns, the raw-episode drill-down (+ the
 # abstention-shadow keys). Driven through the MCP tool so the pin also proves
@@ -202,7 +225,6 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
     """With a hook-injected self_session, the envelope gains self_session +
     n_self_excluded and the caller's own turns never serve; hookless calls
     (the test above) keep the lean key set."""
-    monkeypatch.setattr(recall_mod, "_RECALL_SELF_EXCLUDE", 1)
     q = f"telemetry self exclusion {uuid.uuid4().hex[:8]}"
     p = _pool()
     for i, ep in enumerate(p):

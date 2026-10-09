@@ -265,7 +265,7 @@ class RecallOverviewMixin:
         # already RRF(bm25, vector) there, so re-fusing BM25 would double-count it.
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
         n_self_excluded = 0
-        if settings._RECALL_SELF_EXCLUDE and self_session:
+        if self_session:
             pre_excl = len(ranked_eps)
             ranked_eps = self._exclude_self(ranked_eps, self_session)
             n_self_excluded = pre_excl - len(ranked_eps)

@@ -226,14 +226,6 @@ _RECALL_BM25_LIFT_CAP = int(os.getenv("SYNAPSE_RECALL_BM25_LIFT_CAP", "0") or "0
 # guaranteed to the best BM25 hits not already inside. Replaces RRF reordering when set.
 _RECALL_BM25_RESERVE = int(os.getenv("SYNAPSE_RECALL_BM25_RESERVE", "0") or "0")
 
-# Self-exclusion: when the recall call carries the calling session's id (injected by
-# the client's PreToolUse hook as self_session), drop that session's episodes from the
-# served pool entirely. The caller's own turns are already in its context window, and
-# they were the top measured recall_feedback noise driver (2026-07-23). Full exclusion
-# replaces the per-session serving cap for this purpose; drill-down (mode="turns",
-# fetch) is unaffected. OFF by default.
-_RECALL_SELF_EXCLUDE = int(os.getenv("SYNAPSE_RECALL_SELF_EXCLUDE", "0") or "0")
-
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
 _WEB_LIMIT = 3  # web_chunks (deduped by parent page) returned by recall()
@@ -402,7 +394,6 @@ class Recall(
             _EPISODE_FETCH=_EPISODE_FETCH,
             _NOTES_IN_RECALL=_NOTES_IN_RECALL,
             _SUPERSEDED_LIMIT=_SUPERSEDED_LIMIT,
-            _RECALL_SELF_EXCLUDE=_RECALL_SELF_EXCLUDE,
             _RECALL_BM25_FUSE=_RECALL_BM25_FUSE,
             _RECALL_FLOOR_ENFORCE=_RECALL_FLOOR_ENFORCE,
             _RERANK_RECENCY=_RERANK_RECENCY,
@@ -502,8 +493,11 @@ class Recall(
     def _exclude_self(ranked_eps: list[dict[str, Any]], self_session: str) -> list[dict[str, Any]]:
         """Drop the calling session's own episodes from the serving pool.
 
-        The caller already holds its own turns in context; serving them back both
-        wastes tokens and crowds out older real history (see _RECALL_SELF_EXCLUDE).
+        Runs whenever the call carries ``self_session`` (injected by the client's
+        PreToolUse hook). The caller already holds its own turns in context; serving
+        them back wastes tokens, crowds out older real history, and was the top
+        measured recall_feedback noise driver. A session-scoped drill-down
+        (``session_id`` set, or fetch) is never excluded.
         """
         return [e for e in ranked_eps if e.get("session_id") != self_session]
 
