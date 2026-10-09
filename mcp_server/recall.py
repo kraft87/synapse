@@ -195,36 +195,19 @@ _RECALL_EPISODE_LIMIT = 5  # direct episode turns served by recall()
 # rerank here because the chunk count is bounded (~20-80 from 20 episodes, capped at
 # _RECALL_PASSAGE_CAND) and a direct rerank IS that cascade's quality ceiling — and rerank-only
 # (no live passage embedding) keeps the second pass ~0.2s, not the ~2.2s a cosine leg would add.
-_RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "3") or "3")  # passages served
+# 6 passages: the benches ran at 6 and prod ran SYNAPSE_RECALL_PASSAGE_N=6 from 2026-06-30
+# (default 3 until 2026-10-09). Still overridable: it is the episode bucket's token budget.
+_RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "6") or "6")  # passages served
 # 10→20 (2026-07-23): a funnel decomposition on the _seglen golden found the answer episode is
 # in the RRF pool 92% of the time but the reranker ranks ~11% of answers at position 11-20 — just
 # outside the mining window. Mining the top 20 recovers them: served answer-recall 0.583→0.667,
 # no full-episode/token cost (still serves _RECALL_PASSAGE_N passages, capped at _RECALL_PASSAGE_CAND).
 _RECALL_PASSAGE_SRC_K = 20  # top reranked episodes to mine passages from
 _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds the extra call)
-# Lexical-fusion of the FINAL episode order. The web-search-trained cross-encoder systematically
-# under-ranks answer episodes that are exact lexical matches (query keyword/entity verbatim in the
-# turn) — measured 2026-07-23 as ~31% of pooled answers stuck at rank 21-50. BM25 nails those, so
-# RRF-fusing the rerank order with the pool's BM25 order for the SERVING order recovers them:
-# answer-episode hit@10 0.636->0.909 (exact-fact golden) / 0.762->0.905 (natural), no regression,
-# and it is BM25 specifically (rerank+vector was WORSE — vector shares the reranker's semantic bias).
-# Reorders ranked_eps only; the rerank call, rerank_top telemetry, and the abstention floor are all
-# untouched. Off with SYNAPSE_RECALL_BM25_FUSE=0.
-_RECALL_BM25_FUSE = os.getenv("SYNAPSE_RECALL_BM25_FUSE", "1") != "0"
-# Fusion shaping (LME 2026-07-25: unweighted full-order fusion cost multi-session -4.6pts —
-# lexical hits colonize the served window on queries whose terms recur across many sessions).
-# _W scales the BM25 term's RRF contribution (1.0 = original equal-weight fusion).
-# _LIFT_CAP bounds how MANY episodes get a lexical lift (0 = uncapped): displacement of the
-# cross-session semantic spread is a count problem, not a magnitude one.
-_RECALL_BM25_FUSE_W = float(os.getenv("SYNAPSE_RECALL_BM25_FUSE_W", "1.0") or "1.0")
-_RECALL_BM25_LIFT_CAP = int(os.getenv("SYNAPSE_RECALL_BM25_LIFT_CAP", "0") or "0")
-# Reserved-slot fusion (LME sweep 2026-07-25): weight/cap shaping failed — RRF's flat
-# 1/(k+pos) curve lifts a strong lexical hit past the head even at w=0.25, and the top 1-2
-# lifts displace the most load-bearing passages. Fusion's validated win was getting the
-# lexical hit INTO the mining window at all (hit@10 0.64->0.91), not ranking it first: with
-# _RESERVE=N>0, the window head stays pure rerank order and the last N window slots are
-# guaranteed to the best BM25 hits not already inside. Replaces RRF reordering when set.
-_RECALL_BM25_RESERVE = int(os.getenv("SYNAPSE_RECALL_BM25_RESERVE", "0") or "0")
+# BM25 fusion of the final episode order (SYNAPSE_RECALL_BM25_FUSE and its _W / _LIFT_CAP /
+# _RESERVE shapes, 2026-07-23..25) is gone: it won the exact-fact goldens but lost
+# LongMemEval-S 75.9 vs 84.8, prod ran it off from 2026-08-03, and its exact-string-miss
+# tripwire never fired. Deleted 2026-10-09.
 
 _ENTITY_LIMIT = 3  # seed entities (with summaries) returned by recall()
 _SUPERSEDED_LIMIT = 2  # superseded-fact pairs returned by recall()
@@ -394,7 +377,6 @@ class Recall(
             _EPISODE_FETCH=_EPISODE_FETCH,
             _NOTES_IN_RECALL=_NOTES_IN_RECALL,
             _SUPERSEDED_LIMIT=_SUPERSEDED_LIMIT,
-            _RECALL_BM25_FUSE=_RECALL_BM25_FUSE,
             _RECALL_FLOOR_ENFORCE=_RECALL_FLOOR_ENFORCE,
             _RERANK_RECENCY=_RERANK_RECENCY,
             _SUPPRESS_QUERY_ECHO=_SUPPRESS_QUERY_ECHO,
@@ -500,40 +482,6 @@ class Recall(
         (``session_id`` set, or fetch) is never excluded.
         """
         return [e for e in ranked_eps if e.get("session_id") != self_session]
-
-    @staticmethod
-    def _fuse_bm25_order(ranked_eps: list[dict[str, Any]], k: int = 60) -> list[dict[str, Any]]:
-        """RRF-fuse the rerank order of ``ranked_eps`` with the pool's BM25 order.
-
-        The web-trained cross-encoder under-ranks exact lexical matches; BM25 (already scored on
-        the pool items as ``bm25_score``) ranks them high. Reciprocal-rank-fuse the two orders
-        (k=60) so a strong lexical hit the reranker buried is lifted back into the served window.
-        Only episodes that were BM25 hits (carry a ``bm25_score``) contribute a lexical term —
-        vector-only episodes keep their rerank position. Validated 2026-07-23; see _RECALL_BM25_FUSE."""
-        if len(ranked_eps) < 2:
-            return ranked_eps
-        bm = sorted(
-            (i for i, e in enumerate(ranked_eps) if e.get("bm25_score") is not None),
-            key=lambda i: ranked_eps[i]["bm25_score"],
-            reverse=True,
-        )
-        if _RECALL_BM25_RESERVE > 0:
-            # Reserved-slot mode: keep the mining-window head in pure rerank order and
-            # guarantee the last _RESERVE window slots to the best BM25 hits not already
-            # inside the window. Lexical recovery without displacing the semantic head.
-            window = _RECALL_PASSAGE_SRC_K
-            head = min(max(window - _RECALL_BM25_RESERVE, 0), len(ranked_eps))
-            in_head = set(range(head))
-            lifted = [i for i in bm if i not in in_head][:_RECALL_BM25_RESERVE]
-            rest = [i for i in range(len(ranked_eps)) if i >= head and i not in lifted]
-            order = list(range(head)) + lifted + rest
-            return [ranked_eps[i] for i in order]
-        fused: dict[int, float] = {i: 1.0 / (k + i + 1) for i in range(len(ranked_eps))}
-        if _RECALL_BM25_LIFT_CAP > 0:
-            bm = bm[:_RECALL_BM25_LIFT_CAP]
-        for pos, i in enumerate(bm):
-            fused[i] += _RECALL_BM25_FUSE_W / (k + pos + 1)
-        return [ranked_eps[i] for i in sorted(fused, key=lambda i: fused[i], reverse=True)]
 
 
 __all__ = [

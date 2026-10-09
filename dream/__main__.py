@@ -55,9 +55,10 @@ def run_once() -> None:
     errors: list[str] = []
     overall_ok = True
 
-    # dream→skills lane. Lazy import + try/except so a lane error can't crash the dream loop,
-    # and gated on SKILLS_LANE_ENABLED so the image can ship inert until the cutover flips it on
-    # (deploy → verify a manual pass → set the flag → retire the client cron).
+    # dream→skills lane: an optional feature, opt-in per deployment (SKILLS_LANE_ENABLED=1).
+    # It mines past sessions for new-skill / retune / merge proposals and pings Discord; nothing
+    # changes until a proposal is accepted in review. Lazy import + try/except so a lane error
+    # can't crash the dream loop.
     if os.environ.get("SKILLS_LANE_ENABLED") == "1":
         try:
             from dream.skills.nightly import run_lane

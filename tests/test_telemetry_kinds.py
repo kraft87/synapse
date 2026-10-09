@@ -142,7 +142,6 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
         "web",
         "notes",
         "n_echo_suppressed",
-        "n_bm25_lifted",
         "trust",  # schema 053 — which trust regime produced these numbers
     }
     assert served["trust"] == "full"
@@ -152,7 +151,7 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
     assert "prefs" not in served and "preferences" not in out
     assert served["web"] == []
     assert served["n_echo_suppressed"] == 0
-    assert served["n_bm25_lifted"] == 0  # stub pool has no bm25_score -> fusion is a no-op
+    assert "n_bm25_lifted" not in served  # BM25 fusion deleted 2026-10-09
 
 
 def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, full_surface):
