@@ -178,7 +178,9 @@ def enroll(interactive: bool = True) -> dict:
         if r.get("status") == "ok" and r.get("token"):
             return _persist(r)
         reason = r.get("error") or r.get("detail") or ""
-        if reason == "slow_down":
+        if reason in ("slow_down", "temporarily_unavailable"):
+            # The IdP is rate-limiting the poll (a 429), not refusing the human. Back off
+            # and keep asking: the approval may already be sitting there.
             interval += 5
             continue
         if reason == "authorization_pending":

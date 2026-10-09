@@ -218,6 +218,20 @@ def test_the_loop_keeps_waiting_while_the_human_has_not_approved(monkeypatch, ho
     assert sum(1 for path, _ in calls if path == "/surfaces/enroll") == 3
 
 
+def test_an_idp_rate_limit_backs_off_instead_of_giving_up(monkeypatch, hook):
+    """``temporarily_unavailable`` is the IdP's 429 (two device flows polling at once).
+    Treated like slow_down: the interval grows and the loop keeps asking, so an approval
+    that is probably already there gets picked up instead of "enrollment failed"."""
+    throttled = {"status": "pending", "error": "temporarily_unavailable"}
+    calls = _replies(monkeypatch, hook, [throttled, throttled, _MINTED])
+    sleeps: list[float] = []
+    monkeypatch.setattr(hook.time, "sleep", sleeps.append)
+    state = hook.enroll(interactive=False)
+    assert state["surface_id"] == "dev-abc123"
+    assert sum(1 for path, _ in calls if path == "/surfaces/enroll") == 3
+    assert sleeps == sorted(sleeps) and sleeps[-1] > sleeps[0]  # backed off, not hammered
+
+
 def test_a_refusal_stops_the_loop_instead_of_spinning(monkeypatch, hook, capsys):
     denied = urllib.error.HTTPError(
         "http://x/surfaces/enroll",

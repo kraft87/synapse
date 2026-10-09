@@ -269,7 +269,8 @@ def _device_login() -> int:
         err = resp.get("error", "authorization_pending")
         if err == "authorization_pending":
             continue
-        if err == "slow_down":
+        if err in ("slow_down", "temporarily_unavailable"):
+            # Rate-limited at the IdP (429), not refused: back off and keep polling.
             interval += 5
             continue
         if err == "access_denied":

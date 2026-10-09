@@ -82,7 +82,10 @@ _MAX_LABEL_LEN = 200
 
 #: IdP device-flow states that mean "keep polling", passed straight back to the client
 #: so it can distinguish "not yet" from "no".
-_PENDING_ERRORS = {"authorization_pending", "slow_down"}
+# "Not yet" answers from the IdP. ``temporarily_unavailable`` is what an OIDC provider
+# sends with a 429 when two device flows (sign-in + enrollment) poll it at once; the
+# human may already have approved, so the client must back off and ask again, not stop.
+_PENDING_ERRORS = {"authorization_pending", "slow_down", "temporarily_unavailable"}
 
 
 def register(

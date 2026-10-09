@@ -215,6 +215,34 @@ def test_first_login_stores_the_root_token_then_enrolls(monkeypatch, login, tmp_
     assert login.config.read_device_state()["surface_id"] == "dev-new456"
 
 
+def test_login_backs_off_on_an_idp_rate_limit_instead_of_failing(monkeypatch, login, tmp_path):
+    """``temporarily_unavailable`` is the IdP's 429 — what it sends when the sign-in and
+    enrollment flows poll it at once. Like slow_down: the interval grows and the loop
+    keeps asking, rather than printing "login failed" over an approval already given."""
+    throttled = {"error": "temporarily_unavailable"}
+    replies = [throttled, throttled, {"token": _ROOT, "login": "owner"}]
+    polls: list[str] = []
+
+    def fake_post_json(url, payload):
+        if url.endswith("/device/code"):
+            # Room for the backoff: the loop's budget is the code's lifetime, and the
+            # scripted one is deliberately short for every other test.
+            return {**_LOGIN_START, "expires_in": 600}
+        polls.append(url)
+        return dict(replies.pop(0))
+
+    monkeypatch.setattr(login, "_post_json", fake_post_json)
+    _script_enroll(monkeypatch, login)
+    sleeps: list[float] = []
+    monkeypatch.setattr(login.time, "sleep", sleeps.append)
+
+    assert _run(monkeypatch, login) == 0
+    assert len(polls) == 3
+    waits = sleeps[: len(polls)]  # the sign-in loop's; enrollment's own poll follows
+    assert waits == sorted(waits) and waits[-1] > waits[0]  # backed off, not hammered
+    assert _slot(tmp_path) == "device-token-new"  # and enrollment still followed
+
+
 # ---------------------------------------------------------------------------
 # --reenroll: replacing the device credential on purpose
 # ---------------------------------------------------------------------------
