@@ -156,6 +156,18 @@ def test_enrollment_reports_pending_while_the_human_has_not_approved(clean, db_u
     assert _rows(clean) == 0
 
 
+def test_enrollment_keeps_the_client_polling_when_the_idp_is_rate_limited(clean, db_url):
+    """A 429 at the IdP comes back as ``temporarily_unavailable``. That is "ask again",
+    not "no": the human may already have approved. 202, so the client backs off and polls
+    on instead of reporting a failed enrollment. Seen live 2026-10-09: the sign-in and
+    enrollment flows polled the IdP at once and the second was throttled, then refused."""
+    idp = _FakeIdP(poll={"error": "temporarily_unavailable"})
+    with _client(db_url, idp=idp) as client:
+        r = client.post("/surfaces/enroll", json=_enroll_body())
+    assert r.status_code == 202 and r.json()["error"] == "temporarily_unavailable"
+    assert _rows(clean) == 0
+
+
 def test_enrollment_reports_a_refusal_distinctly(clean, db_url):
     idp = _FakeIdP(poll={"error": "access_denied"})
     with _client(db_url, idp=idp) as client:
