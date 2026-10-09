@@ -229,6 +229,16 @@ class RecallOverviewMixin:
         facts_internal = kg_results[
             : settings._FACT_LIMIT
         ]  # carry _uuid for bump + superseded pairs
+        # Self-exclusion, facts half: drop facts sourced only from the calling session.
+        # Runs before the retrieval_count bump so an unserved fact is not reinforced.
+        n_self_facts_excluded = 0
+        if self_session and facts_internal:
+            own_facts = self._self_session_facts(
+                [f["_uuid"] for f in facts_internal if f.get("_uuid")], self_session
+            )
+            if own_facts:
+                facts_internal = [f for f in facts_internal if f.get("_uuid") not in own_facts]
+                n_self_facts_excluded = len(own_facts)
         # Feedback loop: bump retrieval_count on every surfaced edge so frequent hits
         # float higher next time. Already fire-and-forget — never blocks the response.
         surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
@@ -338,6 +348,12 @@ class RecallOverviewMixin:
                 **kg_scope,
             )
         )
+        if sup_extras and self_session:
+            own_facts = self._self_session_facts(
+                [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
+            )
+            sup_extras = [f for f in sup_extras if f.get("_uuid") not in own_facts]
+            n_self_facts_excluded += len(own_facts)
         if sup_extras:
             served_facts = list(served_facts) + sup_extras
         # Slim facts to {fact, date, ongoing?, supported?}. date = t_valid: when the fact became
@@ -431,6 +447,7 @@ class RecallOverviewMixin:
         if self_session:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
+            served_ids["n_self_facts_excluded"] = n_self_facts_excluded
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.

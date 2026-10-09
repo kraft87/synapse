@@ -176,6 +176,53 @@ def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, fu
     (served,) = row
     assert served["self_session"] == "MY-SESSION"
     assert served["n_self_excluded"] == 2
+    assert served["n_self_facts_excluded"] == 0
+
+
+def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypatch, full_surface):
+    """Facts sourced only from the calling session drop out of the facts bucket and the
+    supersession extras, are not retrieval-bumped, and are counted in the envelope."""
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+    q = f"telemetry self exclusion facts {uuid.uuid4().hex[:8]}"
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    kg = [{"fact": f"fact {k}", "_uuid": k, "_date": None} for k in ("own-1", "old-1", "own-2")]
+    engine._search_kg = lambda *a, **k: ([dict(f) for f in kg], [])
+    engine._surface_supersessions = lambda *a, **k: [
+        {"fact": "successor own-3", "_uuid": "own-3", "_date": None},
+        {"fact": "successor old-2", "_uuid": "old-2", "_date": None},
+    ]
+    asked: list[tuple[list[str], str]] = []
+
+    def _own(uuids, session):
+        asked.append((list(uuids), session))
+        return {u for u in uuids if u.startswith("own-")}
+
+    engine._self_session_facts = _own
+    bumped: list[list[str]] = []
+    engine._increment_fact_retrieval_counts = lambda uuids, gid: bumped.append(list(uuids))
+    mark = _watermark(conn)
+    out = engine.recall(q, source="mcp-tool", surface=full_surface, self_session="MY-SESSION")
+    assert [f["id"] for f in out["facts"]] == ["f:old-1", "f:old-2"]
+    assert bumped == [["old-1"]]
+    assert all(session == "MY-SESSION" for _, session in asked)
+
+    row = _newest(conn, engine, "recall", "served_ids", mark)
+    assert row is not None
+    (served,) = row
+    assert served["facts"] == ["old-1", "old-2"]
+    assert served["n_self_facts_excluded"] == 3
+
+
+def test_recall_without_self_session_never_looks_up_fact_provenance(db_url, full_surface):
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    engine._search_kg = lambda *a, **k: ([{"fact": "f", "_uuid": "own-1", "_date": None}], [])
+
+    def _never(*a, **k):
+        raise AssertionError("no self_session, no lookup")
+
+    engine._self_session_facts = _never
+    out = engine.recall("no hook here", source="mcp-tool", surface=full_surface)
+    assert [f["id"] for f in out["facts"]] == ["f:own-1"]
 
 
 # ---------------------------------------------------------------------------
