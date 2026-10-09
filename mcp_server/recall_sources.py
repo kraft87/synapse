@@ -31,6 +31,20 @@ _KG_SCOPE_PROBE_SQL = (
 )
 
 
+def _self_only_sql(alias: str) -> str:
+    """SQL predicate: every source episode of fact ``alias`` belongs to the session bound at %s.
+
+    False for a fact with no recorded source (web artifacts, a malformed ``episodes`` value),
+    so self-exclusion never drops what it cannot attribute."""
+    return (
+        f"(jsonb_typeof({alias}.episodes) = 'array' AND jsonb_array_length({alias}.episodes) > 0 "
+        f"AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text({alias}.episodes) AS src(eid) "
+        "WHERE NOT EXISTS (SELECT 1 FROM episodes e "
+        "WHERE e.id = CASE WHEN src.eid ~ '^[0-9]+$' THEN src.eid::bigint END "
+        "AND e.session_id = %s)))"
+    )
+
+
 class RecallSourcesMixin:
     # Schema-056 probe state (per engine). Plain attributes: the leg threads race only to
     # write the same answer, and the worst case is one extra probe.
@@ -304,18 +318,8 @@ class RecallSourcesMixin:
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
-                """
-                SELECT r.uuid FROM kg_relationships r
-                WHERE r.uuid = ANY(%s)
-                  AND jsonb_typeof(r.episodes) = 'array'
-                  AND jsonb_array_length(r.episodes) > 0
-                  AND NOT EXISTS (
-                      SELECT 1 FROM jsonb_array_elements_text(r.episodes) AS src(eid)
-                      WHERE NOT EXISTS (
-                          SELECT 1 FROM episodes e
-                          WHERE e.id = CASE WHEN src.eid ~ '^[0-9]+$' THEN src.eid::bigint END
-                            AND e.session_id = %s))
-                """,
+                "SELECT r.uuid FROM kg_relationships r "
+                f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r')}",
                 (uuids, self_session),
             ).fetchall()
         except Exception as e:
@@ -412,6 +416,7 @@ class RecallSourcesMixin:
         group_id: str,
         cap: int = 6,
         allowed_projects: list[str] | None = None,
+        self_session: str | None = None,
     ) -> dict[int, list[str]]:
         """Map served episode ids -> the CURRENT facts that superseded a claim each made.
 
@@ -422,7 +427,10 @@ class RecallSourcesMixin:
 
         ``allowed_projects`` (restricted surface) requires both the retired edge P and the
         superseding edge N to pass the schema-056 provenance rule: N's text is what gets
-        served, and P is what ties it to the episode."""
+        served, and P is what ties it to the episode.
+
+        ``self_session`` drops a successor N sourced only from the calling session, the
+        overlay half of self-exclusion (see ``_self_session_facts``)."""
         settings = self._settings()
         if not episode_ids:
             return {}
@@ -433,6 +441,9 @@ class RecallSourcesMixin:
         if allowed_projects is not None:
             scope_sql = f"AND {scope_predicate('p')} AND {scope_predicate('n')} "
             scope_args = [allowed_projects, allowed_projects]
+        if self_session:
+            scope_sql += f"AND NOT {_self_only_sql('n')} "
+            scope_args.append(self_session)
         ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
         params: list[Any] = [
             *(json.dumps([i]) for i in episode_ids),
