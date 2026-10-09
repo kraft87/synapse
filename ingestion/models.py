@@ -6,7 +6,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
 
@@ -188,11 +188,38 @@ class ExtractedEntity(BaseModel):
     summary: str = ""
 
 
+#: Who asserted a fact, as judged by the extractor from the chunk's role markers.
+#: Only ``"user"`` counts as support for the proposition's currency (schema 058).
+FACT_ATTRIBUTIONS = ("user", "assistant", "third_party", "unknown")
+
+
 class ExtractedFact(BaseModel):
     source: str  # entity name
     target: str  # entity name
     relationship: str  # e.g. USES, DECIDED, HAS_ISSUE
     fact: str  # full searchable statement: "X uses Y for Z"
+    # Evidence metadata (schema 058). ``ongoing``: the fact asserts an activity,
+    # usage, or state that can lapse silently (a habit, a tool in use, a job) —
+    # as opposed to a dated happening, a permanent trait, or a description of an
+    # artifact. ``attribution``: who stated it; defaults to "unknown" so a model
+    # or caller that omits it never passes for user confirmation.
+    ongoing: bool = False
+    attribution: str = "unknown"
+
+    @field_validator("attribution", mode="before")
+    @classmethod
+    def _coerce_attribution(cls, v: Any) -> str:
+        v = str(v or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if v in ("third_party", "thirdparty", "other", "document", "quoted"):
+            return "third_party"
+        return v if v in FACT_ATTRIBUTIONS else "unknown"
+
+    @field_validator("ongoing", mode="before")
+    @classmethod
+    def _coerce_ongoing(cls, v: Any) -> bool:
+        if isinstance(v, str):
+            return v.strip().lower() in ("true", "1", "yes")
+        return bool(v)
 
 
 class ExtractionResult(BaseModel):

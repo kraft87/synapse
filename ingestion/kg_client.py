@@ -311,10 +311,13 @@ class KGClient:
 
         return [r["edge_uuid"] for r in rows]
 
-    def reinforce_edges(self, items: list[tuple[str, list[int]]], group_id: str) -> None:
+    def reinforce_edges(self, items: list[tuple[Any, ...]], group_id: str) -> None:
         """Capture dedup hits: bump ``mention_count`` + union source episodes on
         each existing edge a newly-extracted duplicate fact matched. ``items`` is
-        a list of ``(edge_uuid, source_episode_ids)``. Empty list is a no-op."""
+        a list of ``(edge_uuid, source_episode_ids)`` or, with schema-058 support
+        evidence, ``(edge_uuid, source_episode_ids, support_at, support_episode)``
+        where a non-None ``support_at`` (a USER-attributed re-assertion) refreshes
+        the edge's ``last_supported_at``. Empty list is a no-op."""
         if not items:
             return
         self._writer.reinforce_edges(items, group_id)

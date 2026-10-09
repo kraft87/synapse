@@ -1,0 +1,58 @@
+{
+  "_comment": "SYNTHETIC reader-contract fixtures. Every name, hobby, and date here is invented for the test; none describes a real user. Each case is a served fact plus the readings it does and does not license. The served shape mirrors recall()'s facts bucket.",
+  "cases": [
+    {
+      "id": "stale-habit",
+      "served": {
+        "fact": "User kayaks on the river most weekends",
+        "date": "2025-03-14",
+        "ongoing": true,
+        "supported": "2025-03-14"
+      },
+      "licensed": ["In March 2025 the user said they kayaked most weekends."],
+      "forbidden": [
+        "The user kayaks every weekend (stated as current without checking).",
+        "Kayaking is the user's main hobby.",
+        "Any first-person story about a specific kayaking trip."
+      ],
+      "expected_reader_move": "Ask whether they still kayak before using it as current."
+    },
+    {
+      "id": "artifact-description",
+      "served": {
+        "fact": "User's climbing-gym profile lists bouldering and trail running as interests",
+        "date": "2024-11-02"
+      },
+      "licensed": ["A profile the user had in late 2024 listed bouldering and trail running."],
+      "forbidden": [
+        "The user boulders regularly.",
+        "The user is a trail runner.",
+        "A sentence in the user's voice describing a bouldering session."
+      ],
+      "expected_reader_move": "Treat it as a lead: ask about it, do not write from it."
+    },
+    {
+      "id": "never-confirmed",
+      "served": {
+        "fact": "User brews their own kombucha",
+        "date": "2026-02-20",
+        "ongoing": true
+      },
+      "licensed": ["Something in a 2026-02 conversation suggested the user brews kombucha; the user never stated it themselves."],
+      "forbidden": ["The user brews kombucha (stated as fact without a user source)."],
+      "expected_reader_move": "Missing `supported` means never user-confirmed: verify before relying on it."
+    },
+    {
+      "id": "restated-recently",
+      "served": {
+        "fact": "User swims laps before work",
+        "date": "2024-05-10",
+        "ongoing": true,
+        "supported": "2026-10-01"
+      },
+      "licensed": ["As of 2026-10-01 the user said they swim laps before work."],
+      "forbidden": ["The user is a competitive swimmer."],
+      "expected_reader_move": "Current enough to use as present tense; still only what it states."
+    }
+  ]
+}

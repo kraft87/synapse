@@ -166,7 +166,9 @@ class KGPostgresWriter:
 
         Each row carries: src, tgt, edge_uuid, name, fact, episodes,
         created_at, t_created, valid_at, t_valid, optional emb (fact embedding),
-        and optional web_artifact_id (web-lane provenance, task #68).
+        optional web_artifact_id (web-lane provenance, task #68), and the optional
+        schema-058 evidence fields ongoing / last_supported_at / last_supported_by
+        (absent or None -> NULL: unknown, never-confirmed).
         """
         if not rows:
             return
@@ -194,6 +196,9 @@ class KGPostgresWriter:
                     valid,
                     t_valid,
                     r.get("web_artifact_id"),
+                    r.get("ongoing"),
+                    _ts(r.get("last_supported_at")),
+                    r.get("last_supported_by"),
                 )
             )
 
@@ -204,8 +209,10 @@ class KGPostgresWriter:
                 "INSERT INTO kg_relationships "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "(uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
                 "fact_embedding, episodes, retrieval_count, created_at, t_created, "
-                "valid_at, t_valid, web_artifact_id) VALUES "
-                f"(%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s::jsonb,%s,%s,%s,%s,%s,%s) "
+                "valid_at, t_valid, web_artifact_id, ongoing, last_supported_at, "
+                "last_supported_by) VALUES "
+                f"(%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s::jsonb,%s,%s,%s,%s,%s,%s,"
+                "%s,%s,%s) "
                 "ON CONFLICT (uuid) DO NOTHING",
                 params,
             )
@@ -223,7 +230,12 @@ class KGPostgresWriter:
         resolved to a concrete timestamp by the caller, None falls back to
         now() per-row. ``invalidated_by`` (the superseding edge's uuid) applies
         to every item in the call and is set only when provided (contradiction
-        path); COALESCE preserves any existing value when None (schema 028)."""
+        path); COALESCE preserves any existing value when None (schema 028).
+
+        The effective time is clamped to no earlier than the edge's own
+        ``t_valid``: a correction dated before a stale edge was ever written
+        retires it as of the moment it became live, never with a negative
+        lifetime. An already-retired edge keeps its earlier ``t_invalid``."""
         if not items:
             return
 
@@ -232,8 +244,8 @@ class KGPostgresWriter:
                 ts = _ts(inv)
                 cur.execute(
                     "UPDATE kg_relationships "
-                    "SET t_invalid = COALESCE(%s, now()), "
-                    "    invalid_at = COALESCE(%s, now()), "
+                    "SET t_invalid = COALESCE(t_invalid, GREATEST(t_valid, COALESCE(%s, now()))), "
+                    "    invalid_at = COALESCE(t_invalid, GREATEST(t_valid, COALESCE(%s, now()))), "
                     "    invalidated_by = COALESCE(%s, invalidated_by) "
                     "WHERE uuid = %s",
                     (ts, ts, invalidated_by, edge_uuid),
@@ -241,22 +253,30 @@ class KGPostgresWriter:
 
         self._run(_do)
 
-    def reinforce_edges(self, items: list[tuple[str, list[int]]], group_id: str) -> None:
+    def reinforce_edges(self, items: list[tuple[Any, ...]], group_id: str) -> None:
         """Capture dedup hits: a newly-extracted fact restated an existing edge.
 
-        For each ``(edge_uuid, source_episode_ids)``: UNION the new source
-        episodes into the edge's ``episodes`` (provenance) and bump
-        ``mention_count`` (the clean re-assertion frequency signal). Idempotent on
-        re-processing — mention_count only increments when the episodes carry
+        For each ``(edge_uuid, source_episode_ids[, support_at, support_episode])``:
+        UNION the new source episodes into the edge's ``episodes`` (provenance) and
+        bump ``mention_count`` (the clean re-assertion frequency signal). Idempotent
+        on re-processing — mention_count only increments when the episodes carry
         genuinely NEW provenance (``episodes`` doesn't already contain them), so
         re-extracting the same chunk can't double-count. Empty episode list is a
         per-item no-op; the DEFAULT-1 on create already counts the first assertion.
+
+        Schema 058: a non-None ``support_at`` (the caller passes it only for a
+        USER-attributed re-assertion) moves ``last_supported_at`` forward to it —
+        never backward, and only under the same new-provenance condition, so a
+        replayed chunk cannot refresh currency. ``last_supported_by`` follows it.
         """
         if not items:
             return
 
         def _do(cur: Any) -> None:
-            for edge_uuid, eps in items:
+            for item in items:
+                edge_uuid, eps = item[0], item[1]
+                support_at = _ts(item[2]) if len(item) > 2 else None
+                support_by = item[3] if len(item) > 3 else None
                 if not eps:
                     continue
                 eps_json = json.dumps(eps)
@@ -265,9 +285,30 @@ class KGPostgresWriter:
                     "  episodes = (SELECT jsonb_agg(DISTINCT e) FROM "
                     "      jsonb_array_elements(COALESCE(episodes, '[]'::jsonb) || %s::jsonb) e), "
                     "  mention_count = mention_count + CASE "
-                    "      WHEN COALESCE(episodes, '[]'::jsonb) @> %s::jsonb THEN 0 ELSE 1 END "
+                    "      WHEN COALESCE(episodes, '[]'::jsonb) @> %s::jsonb THEN 0 ELSE 1 END, "
+                    "  last_supported_by = CASE "
+                    "      WHEN %s::timestamptz IS NULL "
+                    "        OR COALESCE(episodes, '[]'::jsonb) @> %s::jsonb "
+                    "        OR (last_supported_at IS NOT NULL AND last_supported_at >= %s::timestamptz) "
+                    "      THEN last_supported_by ELSE %s END, "
+                    "  last_supported_at = CASE "
+                    "      WHEN %s::timestamptz IS NULL "
+                    "        OR COALESCE(episodes, '[]'::jsonb) @> %s::jsonb "
+                    "      THEN last_supported_at "
+                    "      ELSE GREATEST(last_supported_at, %s::timestamptz) END "
                     "WHERE uuid = %s",
-                    (eps_json, eps_json, edge_uuid),
+                    (
+                        eps_json,
+                        eps_json,
+                        support_at,
+                        eps_json,
+                        support_at,
+                        support_by,
+                        support_at,
+                        eps_json,
+                        support_at,
+                        edge_uuid,
+                    ),
                 )
 
         self._run(_do)

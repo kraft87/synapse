@@ -326,7 +326,7 @@ else:  # summary or manual
 - **Stage 5 — write nodes**: upsert kept (non-orphan) entities into `kg_entities` with pgvector embeddings.
 - **Stage 6a — embedding filter**: no-LLM candidate find. A `pair_pool` (edges sharing the new fact's exact source+target) + a `semantic_pool` (RRF of vector + BM25 over fact text). `_SEMANTIC_POOL_LIMIT = 8` (#121, down from 20 — the rank 9–20 tail was noise and pushed the dedup prompt to ~30K tokens).
 - **Stage 6b — batched LLM confirm**: ONE Haiku call classifies every fact-with-candidates as `duplicate` / `contradict` / `none`.
-- **Stage 7 — write edges**: three batched helpers — `EdgeDateExtractor.extract_batch` (one call for all `(valid_at, invalid_at)`), `ContradictionDetector.detect_contradictions_batch` (one call for same-pair live-edge contradictions), then `invalidate_edges_batch` + `create_edges_batch` (one batched SQL statement each).
+- **Stage 7 — write edges**: three batched helpers — `EdgeDateExtractor.extract_batch` (one call for all `(valid_at, invalid_at)`), `ContradictionDetector.detect_contradictions_batch` (one call for same-pair live-edge contradictions), then `invalidate_edges_batch` + `create_edges_batch` (one batched SQL statement each). Every edge a new fact retires — from the Stage-6b verdict or the writer-side detector — is linked to its successor (`invalidated_by`, schema 028): the new edge, or the confirmed existing duplicate when the write is skipped (a drop-in replacement). Until 2026-10 Stage-6b verdicts were written with no link, so a correction found at extraction was invisible to recall's successor legs. Retirement is dated by the correcting fact's evidenced valid-from (in-text date, else the conversation timestamp), clamped by the writer to no earlier than the old edge's own `t_valid`; never the write clock.
 
 Batched stages (one call across the item's facts): Stage-4 confirm, 6b, EdgeDateExtractor, ContradictionDetector, Stage-7 writes/invalidations (#38, #40, #42, PR #83/#94). Per-item single passes: 2, 3, 5, 6a.
 
@@ -348,6 +348,8 @@ Batched stages (one call across the item's facts): Stage-4 confirm, 6b, EdgeDate
 - `t_expired` — reserved for future selective forgetting; nothing writes it yet.
 
 Contradictions **invalidate the old edge** (an `UPDATE` setting `invalid_at`/`t_invalid`) and always write the new one — they never block it. All live-edge read filters use `t_invalid IS NULL`. This gives a queryable history of fact evolution (surfaced by recall's `history` leg).
+
+**Evidence currency (schema 058).** `t_valid` says when a fact *became* true; nothing said when it was last *confirmed*, so a habit extracted once stayed a live present-tense fact until someone contradicted it. Three columns fix the bookkeeping without rewriting any fact text (the pipeline never invents end dates — `extract_edge_dates` forbids it): `ongoing` (the extractor's call: the fact asserts an activity, usage, or state that can lapse silently — a habit, a tool in use, a job — as opposed to a dated happening, a permanent trait, or a *description of an artifact*: "the profile lists rock climbing" is about the profile), `last_supported_at` (the conversation time of the most recent USER-attributed statement asserting the proposition; set on create and moved forward on reinforcement only when the extractor attributes the restating fact to the user and the chunk is new provenance — assistant repeats and replayed chunks never refresh it) and `last_supported_by` (that statement's episode). The extractor emits `ongoing` and `attribution` (`user` / `assistant` / `third_party`) per fact; a missing or unrecognised attribution is `unknown` and never counts as support. NULL on every pre-058 edge: unknown, not false. Recall serves `ongoing` and `supported` beside `date` ([§6.1](#61-return-shape)).
 
 `EdgeDateExtractor` (#46) skips the LLM for any fact with no date signal via a `_TEMPORAL_RE` regex prefilter (years, ISO/slash dates, month/weekday names, "yesterday/since/until", durations, "started/stopped/no longer/used to", …) — a non-temporal fact resolves to the `now()` fallback identically, so the call is wasted.
 
@@ -376,7 +378,7 @@ flowchart TD
 ### 6.1 Return shape
 
 ```python
-out = {"query": query, "facts": facts}   # always present (facts may be [])
+out = {"query": query, "facts": facts}   # always present (facts may be []); each {fact, id, date, ongoing?, supported?}
 if episodes_served: out["episodes"]    = [...]   # reranked passages, cap 5 (see role note)
 if entities_bucket: out["entities"]    = [...]   # {name, summary}, cap 3
 if web_chunks:      out["web"]         = [...]   # {context|excerpt, url?, title?, date?}, cap 3
@@ -386,6 +388,8 @@ return out
 ```
 
 Served episode passages carry a **`role` provenance label** (`"user"` / `"assistant"` / `"mixed"`): episode content is assembled from role-marked parts, but passage compaction slices it into chunks and a mid-block chunk loses its marker — without the label, a reader cannot tell a human-stated fact from the agent's own past output (which may be speculation). The label is recovered deterministically from chunk char-offsets against the parent turn's marker layout; unattributable slices omit the key (fail-open, advisory only). Rank-side provenance *weighting* was deliberately rejected: serve-time rerank score surgery is the historically dead lever here, and most technical needle answers live in assistant halves — a blanket penalty would trade one failure class for a worse one.
+
+Served facts carry `date` = `t_valid` (when the fact became true *as stored*: an in-text date, else the conversation it came from — not the last time anyone confirmed it), `ongoing: true` when the edge is flagged as a claim that can lapse silently, and `supported` = the date the user themself last asserted it (absent = never user-confirmed, or pre-058). The reader contract that rides the server instructions and the `recall` description: a fact supports exactly what it states — one mention is not frequency, identity, or current activity; a fact about a profile or document describes the document; an ongoing fact with no recent `supported` is a lead to ask about, not current truth; anything written in the user's voice uses only what they said. `tests/fixtures/reader_contract.json` holds synthetic cases (licensed vs forbidden readings) that double as an eval set.
 
 `chunks`, `summaries`, and the `communities` bucket are **not** returned (chunks/summaries retired in #63; communities retired with the #67 KG cutover, never measured as contributing). Keys are present only when their bucket is non-empty (`query` and `facts` always present).
 
@@ -588,6 +592,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **036 content-md5 index** — `episodes (md5(content))`, the cross-session replay guard ([§4.1](#4-ingestion-pipeline)).
 - **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **038 `timeline_events.domain`** — `personal`/`technical` scoping label ([§3.5](#35-timeline-events--the-episodic-date-log)).
+- **058 `kg_relationships` evidence currency** — `ongoing`, `last_supported_at`, `last_supported_by` ([§5.4](#54-bitemporal-edges)). No backfill: attribution is not recoverable from stored edges.
 
 Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` exists but is dormant (`memory_proposals` was dropped by 047).
 
@@ -620,6 +625,9 @@ kg_relationships (
     fact_embedding vector(2048),   -- Voyage embedding of the FACT text
     episodes JSONB,                -- provenance: source episode ids
     mention_count,                 -- re-assertion count, bumped at the dedup-skip (#019)
+    ongoing,                       -- claim can lapse silently (habit/usage/state); NULL pre-058 (#058)
+    last_supported_at,             -- conversation time of the last USER-attributed assertion (#058)
+    last_supported_by,             -- that assertion's episode id (#058)
     retrieval_count,
     t_created, t_valid, t_invalid, t_expired   -- bitemporal quad (+ legacy mirrors); t_invalid NULL = live
 )

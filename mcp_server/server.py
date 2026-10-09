@@ -313,7 +313,11 @@ _INSTRUCTIONS = (
     "durable fact or correction, or you are about to say 'noted', call remember "
     "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "
     "reports which served ids helped, which were noise, and what was missing. "
-    "Absence from results means unknown, not false."
+    "Absence from results means unknown, not false. A served fact supports exactly "
+    "what it states: one mention of an activity is not evidence of frequency, "
+    "currency, or identity, and a fact about a document describes the document. "
+    "Anything written in the user's voice uses only what they said; a gap is a "
+    "question, never an invented detail."
 )
 
 mcp = FastMCP(
