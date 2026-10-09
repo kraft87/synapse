@@ -317,6 +317,12 @@ _RECALL_FLOOR_KEEP_MIN = int(os.getenv("SYNAPSE_RECALL_FLOOR_KEEP_MIN", "0") or 
 _SUP_CANDIDATES = 10  # nearest invalid-with-link edges to consider per recall
 _SUP_LIMIT = 3  # max successor facts added per recall (additive, beyond _FACT_LIMIT)
 _SUP_MAX_DIST = float(os.getenv("SYNAPSE_SUPERSEDE_MAX_DIST", "0.45") or "0.45")  # cosine-dist gate
+# A successor link is believed only when the successor is about the same thing as the fact it
+# retired (2026-10-09). Once Stage-6b contradiction verdicts started writing invalidated_by, the
+# judge's false positives (BM25-only candidates sharing an identifier) linked unrelated facts:
+# before that change 6% of links had a successor farther than 0.35, after it 58%, and every
+# pair past 0.35 read as junk. Calibrated on voyage-4-large; recalibrate with the embedder.
+_SUP_LINK_MAX_DIST = float(os.getenv("SYNAPSE_SUPERSEDE_LINK_MAX_DIST", "0.35") or "0.35")
 
 logger = logging.getLogger(__name__)
 
@@ -395,6 +401,7 @@ class Recall(
             _RECALL_PASSAGE_N=_RECALL_PASSAGE_N,
             _RECALL_FLOOR_KEEP_MIN=_RECALL_FLOOR_KEEP_MIN,
             _SUP_MAX_DIST=_SUP_MAX_DIST,
+            _SUP_LINK_MAX_DIST=_SUP_LINK_MAX_DIST,
             _NOTES_FETCH=_NOTES_FETCH,
             _RERANK_RECENCY_HALF_LIFE_DAYS=_RERANK_RECENCY_HALF_LIFE_DAYS,
             _SUP_CANDIDATES=_SUP_CANDIDATES,

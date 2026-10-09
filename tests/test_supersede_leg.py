@@ -26,18 +26,25 @@ def _axis_list(i: int) -> list[float]:
     return v
 
 
+def _mix(i: int, j: int, wi: float) -> str:
+    """Unit vector mostly along axis ``i`` (weight ``wi``), the rest along ``j``."""
+    v = [0.0] * DIM
+    v[i], v[j] = wi, (1.0 - wi * wi) ** 0.5
+    return "[" + ",".join(map(str, v)) + "]"
+
+
 def _seed(conn) -> None:
     conn.execute("TRUNCATE kg_relationships RESTART IDENTITY CASCADE")
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
         "  fact_embedding, t_valid, t_invalid, invalidated_by) VALUES "
-        # live successor N — query for axis(1) should NOT match it directly (it's on axis 0)
-        "('n-1', 'default', %(g)s, 'a', 'b', 'USES', 'Synapse uses Postgres now', %(v0)s, "
+        # live successor N: about the same thing as P (cosine 0.9) but not on the query's axis
+        "('n-1', 'default', %(g)s, 'a', 'b', 'USES', 'Synapse uses Postgres now', %(vn)s, "
         "  '2026-06-10T00:00:00+00:00', NULL, NULL), "
         # superseded predecessor P — on axis(1); links to n-1 via invalidated_by
         "('p-1', 'default', %(g)s, 'a', 'b', 'USES', 'Synapse uses FalkorDB', %(v1)s, "
         "  '2026-05-01T00:00:00+00:00', '2026-06-10T00:00:00+00:00', 'n-1')",
-        {"g": GROUP, "v0": _axis(0), "v1": _axis(1)},
+        {"g": GROUP, "vn": _mix(1, 0, 0.9), "v1": _axis(1)},
     )
 
 
@@ -108,3 +115,58 @@ def test_same_predicate_without_a_link_still_pairs(conn, db_url):
     conn.execute("DELETE FROM kg_relationships WHERE uuid = 'linked'")
     r = Recall(db_url, "")
     assert [x["id"] for x in r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)] == ["f:same-name"]
+
+
+def _seed_far_link(conn) -> dict[str, int]:
+    """P (axis 1) retired by an UNRELATED successor (axis 5): a false contradiction verdict."""
+    _seed(conn)
+    eid = conn.execute(
+        "INSERT INTO episodes (session_id, sequence, content) VALUES ('far-link', 1, 'x') RETURNING id"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "  fact_embedding, episodes, t_valid, t_invalid, invalidated_by) VALUES "
+        "('n-far', 'default', %(g)s, 'c', 'd', 'R', 'An unrelated later fact', %(v5)s, NULL, "
+        "  '2026-10-09T00:00:00+00:00', NULL, NULL), "
+        "('p-far', 'default', %(g)s, 'c', 'd', 'R', 'A fact wrongly judged contradicted', %(v1)s, "
+        "  %(eps)s::jsonb, '2026-09-01T00:00:00+00:00', '2026-10-09T00:00:00+00:00', 'n-far')",
+        {"g": GROUP, "v1": _axis(1), "v5": _axis(5), "eps": f"[{eid}]"},
+    )
+    return {"episode": eid}
+
+
+def test_far_successor_link_is_not_believed_by_any_leg(conn, db_url):
+    ids = _seed_far_link(conn)
+    r = Recall(db_url, "")
+    surfaced = {
+        x["_uuid"] for x in r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
+    }
+    assert "n-far" not in surfaced and "n-1" in surfaced  # the close link still surfaces
+    assert r._episode_supersessions([ids["episode"]], GROUP) == {}
+    assert r._fetch_superseded_pairs_pg(GROUP, ["n-far"], 10) == []
+
+
+def test_close_successor_link_still_overlays_its_episode(conn, db_url):
+    _seed(conn)
+    eid = conn.execute(
+        "INSERT INTO episodes (session_id, sequence, content) VALUES ('close-link', 1, 'x') RETURNING id"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)
+    )
+    r = Recall(db_url, "")
+    assert r._episode_supersessions([eid], GROUP) == {eid: ["Synapse uses Postgres now"]}
+    pairs = r._fetch_superseded_pairs_pg(GROUP, ["n-1"], 10)
+    assert [x["id"] for x in pairs] == ["f:p-1"]
+
+
+def test_overlay_never_serves_a_retired_successor(conn, db_url):
+    _seed(conn)
+    eid = conn.execute(
+        "INSERT INTO episodes (session_id, sequence, content) VALUES ('stale-succ', 1, 'x') RETURNING id"
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)
+    )
+    conn.execute("UPDATE kg_relationships SET t_invalid = now() WHERE uuid = 'n-1'")
+    assert Recall(db_url, "")._episode_supersessions([eid], GROUP) == {}

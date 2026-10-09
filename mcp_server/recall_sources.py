@@ -45,6 +45,16 @@ def _self_only_sql(alias: str) -> str:
     )
 
 
+def _link_close_sql(old: str, new: str, dims: int) -> str:
+    """SQL predicate: successor ``new`` is about the same thing as the retired ``old``.
+
+    Distance bound at %s (_SUP_LINK_MAX_DIST). A missing embedding trusts the link."""
+    return (
+        f"COALESCE({old}.fact_embedding::halfvec({dims}) <=> "
+        f"{new}.fact_embedding::halfvec({dims}), 0) < %s"
+    )
+
+
 class RecallSourcesMixin:
     # Schema-056 probe state (per engine). Plain attributes: the leg threads race only to
     # write the same answer, and the worst case is one extra probe.
@@ -377,12 +387,19 @@ class RecallSourcesMixin:
                 WHERE a.owner_id = %s AND a.group_id = %s
                   AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                   AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
-                  AND (o.invalidated_by = a.uuid
+                  AND ((o.invalidated_by = a.uuid
+                        AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
                        OR (o.invalidated_by IS NULL AND o.name = a.name))
                   AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
                 ORDER BY a.uuid, o.t_invalid DESC
                 """,
-                (settings._KG_OWNER, group_id, active_edge_uuids, *scope_args),
+                (
+                    settings._KG_OWNER,
+                    group_id,
+                    active_edge_uuids,
+                    settings._SUP_LINK_MAX_DIST,
+                    *scope_args,
+                ),
             ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
@@ -449,6 +466,7 @@ class RecallSourcesMixin:
             *(json.dumps([i]) for i in episode_ids),
             settings._KG_OWNER,
             group_id,
+            settings._SUP_LINK_MAX_DIST,
             *scope_args,
             cap,
         ]
@@ -458,7 +476,8 @@ class RecallSourcesMixin:
                 "SELECT p.episodes, n.fact FROM kg_relationships p "
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                 f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
-                "  AND p.owner_id = %s AND p.group_id = %s "
+                "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
+                f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                 f"{scope_sql}"
                 "LIMIT %s",
                 params,
@@ -519,9 +538,18 @@ class RecallSourcesMixin:
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
                 "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
                 "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
+                f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                 f"{scope_sql}"
                 f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
-                (vec, settings._KG_OWNER, group_id, *scope_args, vec, settings._SUP_CANDIDATES),
+                (
+                    vec,
+                    settings._KG_OWNER,
+                    group_id,
+                    settings._SUP_LINK_MAX_DIST,
+                    *scope_args,
+                    vec,
+                    settings._SUP_CANDIDATES,
+                ),
             ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
