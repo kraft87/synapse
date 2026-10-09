@@ -49,6 +49,12 @@ _TOKEN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})")),
     ("gitlab", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}")),
     ("huggingface", re.compile(r"\bhf_[A-Za-z0-9]{30,}")),
+    ("logfire", re.compile(r"\bpylf_v\d+_[a-z]+_[A-Za-z0-9]{20,}")),
+    ("matrix", re.compile(r"\bsyt_[A-Za-z0-9_-]{20,}")),
+    ("voyage", re.compile(r"\bpa-[A-Za-z0-9_-]{40,}")),
+    ("firecrawl", re.compile(r"\bfc-[a-f0-9]{32}\b")),
+    ("elevenlabs", re.compile(r"\bsk_[a-f0-9]{40,}\b")),
+    ("telegram", re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b")),
     ("slack", re.compile(r"\bxox[abposre]-[A-Za-z0-9-]{10,}")),
     ("aws-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
     ("google-api", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
@@ -64,7 +70,8 @@ _VALUE = r"[^\s\"'`$<>{}()\[\],;\\]"
 _ASSIGNMENT = re.compile(
     r"(?P<name>(?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key"
     r"|secret[_-]?key|private[_-]?key|client[_-]?secret|credentials?))"
-    r"(?P<sep>[\"']?\s*[:=]\s*[\"']?)"
+    # Quotes may arrive JSON-escaped (\" in a serialized tool result), up to two levels deep.
+    r"(?P<sep>\\{0,3}[\"']?\s*[:=]\s*\\{0,3}[\"']?)"
     rf"(?P<value>{_VALUE}{{8,}})",
     re.IGNORECASE,
 )

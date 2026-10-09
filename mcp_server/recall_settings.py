@@ -45,6 +45,7 @@ class RecallSettings:
     _RECALL_PASSAGE_N: int
     _RECALL_FLOOR_KEEP_MIN: int
     _SUP_MAX_DIST: float
+    _SUP_LINK_MAX_DIST: float
     _NOTES_FETCH: int
     _RERANK_RECENCY_HALF_LIFE_DAYS: int
     _SUP_CANDIDATES: int

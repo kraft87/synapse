@@ -59,3 +59,39 @@ def test_lookup_failure_fails_open(db_url):
 
     r._ensure_pg = _boom
     assert r._self_session_facts(["f-1"], "me") == set()
+
+
+def _superseded(conn, old_uuid: str, new_uuid: str, old_eps: str, new_eps: str) -> None:
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact,"
+        " episodes, t_invalid, invalidated_by) VALUES"
+        " (%s, 'default', %s, 'a', 'b', 'R', %s, %s::jsonb, now(), %s),"
+        " (%s, 'default', %s, 'a', 'b', 'R', %s, %s::jsonb, NULL, NULL)",
+        (
+            old_uuid,
+            GROUP,
+            f"old {old_uuid}",
+            old_eps,
+            new_uuid,
+            new_uuid,
+            GROUP,
+            f"now {new_uuid}",
+            new_eps,
+        ),
+    )
+
+
+def test_episode_overlay_skips_successors_from_the_calling_session(conn, db_url):
+    me, other = f"me-{uuid.uuid4().hex[:8]}", f"other-{uuid.uuid4().hex[:8]}"
+    old_ep = _episode(conn, other, 1)  # the served (older) episode
+    mine, theirs = _episode(conn, me, 1), _episode(conn, other, 2)
+    tag = uuid.uuid4().hex[:8]
+    _superseded(conn, f"{tag}-p1", f"{tag}-n-mine", f"[{old_ep}]", f"[{mine}]")
+    _superseded(conn, f"{tag}-p2", f"{tag}-n-theirs", f"[{old_ep}]", f"[{theirs}]")
+
+    r = Recall(db_url, "")
+    everyone = r._episode_supersessions([old_ep], GROUP)
+    assert sorted(everyone[old_ep]) == [f"now {tag}-n-mine", f"now {tag}-n-theirs"]
+    assert r._episode_supersessions([old_ep], GROUP, self_session=me) == {
+        old_ep: [f"now {tag}-n-theirs"]
+    }

@@ -31,6 +31,30 @@ _KG_SCOPE_PROBE_SQL = (
 )
 
 
+def _self_only_sql(alias: str) -> str:
+    """SQL predicate: every source episode of fact ``alias`` belongs to the session bound at %s.
+
+    False for a fact with no recorded source (web artifacts, a malformed ``episodes`` value),
+    so self-exclusion never drops what it cannot attribute."""
+    return (
+        f"(jsonb_typeof({alias}.episodes) = 'array' AND jsonb_array_length({alias}.episodes) > 0 "
+        f"AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text({alias}.episodes) AS src(eid) "
+        "WHERE NOT EXISTS (SELECT 1 FROM episodes e "
+        "WHERE e.id = CASE WHEN src.eid ~ '^[0-9]+$' THEN src.eid::bigint END "
+        "AND e.session_id = %s)))"
+    )
+
+
+def _link_close_sql(old: str, new: str, dims: int) -> str:
+    """SQL predicate: successor ``new`` is about the same thing as the retired ``old``.
+
+    Distance bound at %s (_SUP_LINK_MAX_DIST). A missing embedding trusts the link."""
+    return (
+        f"COALESCE({old}.fact_embedding::halfvec({dims}) <=> "
+        f"{new}.fact_embedding::halfvec({dims}), 0) < %s"
+    )
+
+
 class RecallSourcesMixin:
     # Schema-056 probe state (per engine). Plain attributes: the leg threads race only to
     # write the same answer, and the worst case is one extra probe.
@@ -304,18 +328,8 @@ class RecallSourcesMixin:
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
-                """
-                SELECT r.uuid FROM kg_relationships r
-                WHERE r.uuid = ANY(%s)
-                  AND jsonb_typeof(r.episodes) = 'array'
-                  AND jsonb_array_length(r.episodes) > 0
-                  AND NOT EXISTS (
-                      SELECT 1 FROM jsonb_array_elements_text(r.episodes) AS src(eid)
-                      WHERE NOT EXISTS (
-                          SELECT 1 FROM episodes e
-                          WHERE e.id = CASE WHEN src.eid ~ '^[0-9]+$' THEN src.eid::bigint END
-                            AND e.session_id = %s))
-                """,
+                "SELECT r.uuid FROM kg_relationships r "
+                f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r')}",
                 (uuids, self_session),
             ).fetchall()
         except Exception as e:
@@ -373,12 +387,19 @@ class RecallSourcesMixin:
                 WHERE a.owner_id = %s AND a.group_id = %s
                   AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                   AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
-                  AND (o.invalidated_by = a.uuid
+                  AND ((o.invalidated_by = a.uuid
+                        AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
                        OR (o.invalidated_by IS NULL AND o.name = a.name))
                   AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
                 ORDER BY a.uuid, o.t_invalid DESC
                 """,
-                (settings._KG_OWNER, group_id, active_edge_uuids, *scope_args),
+                (
+                    settings._KG_OWNER,
+                    group_id,
+                    active_edge_uuids,
+                    settings._SUP_LINK_MAX_DIST,
+                    *scope_args,
+                ),
             ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
@@ -412,6 +433,7 @@ class RecallSourcesMixin:
         group_id: str,
         cap: int = 6,
         allowed_projects: list[str] | None = None,
+        self_session: str | None = None,
     ) -> dict[int, list[str]]:
         """Map served episode ids -> the CURRENT facts that superseded a claim each made.
 
@@ -422,7 +444,10 @@ class RecallSourcesMixin:
 
         ``allowed_projects`` (restricted surface) requires both the retired edge P and the
         superseding edge N to pass the schema-056 provenance rule: N's text is what gets
-        served, and P is what ties it to the episode."""
+        served, and P is what ties it to the episode.
+
+        ``self_session`` drops a successor N sourced only from the calling session, the
+        overlay half of self-exclusion (see ``_self_session_facts``)."""
         settings = self._settings()
         if not episode_ids:
             return {}
@@ -433,11 +458,15 @@ class RecallSourcesMixin:
         if allowed_projects is not None:
             scope_sql = f"AND {scope_predicate('p')} AND {scope_predicate('n')} "
             scope_args = [allowed_projects, allowed_projects]
+        if self_session:
+            scope_sql += f"AND NOT {_self_only_sql('n')} "
+            scope_args.append(self_session)
         ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
         params: list[Any] = [
             *(json.dumps([i]) for i in episode_ids),
             settings._KG_OWNER,
             group_id,
+            settings._SUP_LINK_MAX_DIST,
             *scope_args,
             cap,
         ]
@@ -447,7 +476,8 @@ class RecallSourcesMixin:
                 "SELECT p.episodes, n.fact FROM kg_relationships p "
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                 f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
-                "  AND p.owner_id = %s AND p.group_id = %s "
+                "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
+                f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                 f"{scope_sql}"
                 "LIMIT %s",
                 params,
@@ -508,9 +538,18 @@ class RecallSourcesMixin:
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
                 "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
                 "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
+                f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                 f"{scope_sql}"
                 f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
-                (vec, settings._KG_OWNER, group_id, *scope_args, vec, settings._SUP_CANDIDATES),
+                (
+                    vec,
+                    settings._KG_OWNER,
+                    group_id,
+                    settings._SUP_LINK_MAX_DIST,
+                    *scope_args,
+                    vec,
+                    settings._SUP_CANDIDATES,
+                ),
             ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):

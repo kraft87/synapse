@@ -375,6 +375,7 @@ class RecallOverviewMixin:
             sup = self._episode_supersessions(
                 _parse_episode_ids([it.get("id") for it in ep_items if it.get("id")]),
                 group_id,
+                self_session=self_session,
                 **kg_scope,
             )
             if sup:
