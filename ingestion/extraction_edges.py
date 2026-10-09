@@ -385,11 +385,16 @@ class ExtractionEdgesMixin:
         #   2. ``batched_contradictions[idx]`` — old live edges the new fact
         #      supersedes. Applied BEFORE the new CREATE (preserves the
         #      semantic ordering from the per-fact create_edge detector path).
-        #   3. ``t_invalid_pre`` from the batched edge-date extractor — the
-        #      new edge was already-contradicted at extraction time (e.g. the
-        #      fact text said "the user worked at X from 2020 to 2022"). Applied
-        #      AFTER the create_edges_batch via create_edges_batch's own
-        #      follow-up invalidate_edges_batch call.
+        # The edge-date extractor's ``invalid_at`` is deliberately NOT a third
+        # source (2026-10-09). It used to be applied at birth, so a fact whose text
+        # expressed an end ("User told the assistant on 2026-08-29 to stop X", "the
+        # outage ran Aug-Sep") was written already-retired and dropped out of the
+        # live index on the spot: 616 such edges in prod, with no successor link,
+        # invisible to every recall leg. A fact that records a dated happening or a
+        # bounded past state is a TRUE statement for as long as the graph exists;
+        # ``t_invalid`` means "superseded by a later fact", and only supersession
+        # (Stage 6b, the writer-side detector) sets it. Currency for the reader
+        # rides ``t_valid`` + the schema-058 fields instead.
         # Pre-generate the new edge uuid for each fact that WILL be created (same guards as the
         # create_rows loop below), so a contradiction can record WHICH new edge supersedes the old
         # one (schema 028, invalidated_by). Facts that won't be created (no resolved src/tgt) can
@@ -483,7 +488,6 @@ class ExtractionEdgesMixin:
             src_clean = src_uuid.removeprefix("new:")
             tgt_clean = tgt_uuid.removeprefix("new:")
             emb = fact_embeddings[idx] if fact_embeddings and idx < len(fact_embeddings) else None
-            _, t_invalid_pre = batched_dates[idx]
             valid_at_ts = valid_at_by_idx[idx]
             user_stated = getattr(fact, "attribution", "unknown") == "user"
             create_rows.append(
@@ -499,11 +503,10 @@ class ExtractionEdgesMixin:
                     "t_created": now,
                     "t_valid": valid_at_ts,
                     "emb": emb,
-                    # Non-None => create_edges_batch fires a follow-up
-                    # invalidate_edges_batch with these uuids so the new edge
-                    # is born already-invalidated (preserves bi-temporal
-                    # lifecycle bookend from the per-fact create_edge path).
-                    "t_invalid": t_invalid_pre,
+                    # Never born-invalidated (see the note above the invalidation
+                    # block); create_edges_batch still honours a t_invalid for
+                    # callers that genuinely know one, this lane does not pass it.
+                    "t_invalid": None,
                     # Web provenance (task #68). None on the episode lane.
                     "web_artifact_id": web_artifact_id,
                     # Evidence metadata (schema 058).
