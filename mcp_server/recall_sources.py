@@ -289,6 +289,40 @@ class RecallSourcesMixin:
             _warn(f"KG facts leg failed ({_err_brief(e)}): no facts served.")
             return [], []
 
+    def _self_session_facts(self, uuids: list[str], self_session: str) -> set[str]:
+        """The facts among ``uuids`` whose every source episode belongs to ``self_session``.
+
+        The KG half of ``_exclude_self``: the drain extracts facts while a session is
+        still running, so the session's own claims came back to it as memory (2.6% of
+        served facts, in 10% of hook-injected recalls, over the 14 days to 2026-10-09).
+        A fact the session only reinforced keeps an older source and still serves, and
+        a fact with no recorded source (web artifacts, a malformed ``episodes`` value)
+        is never excluded. Fails open: a lookup error serves the facts as before.
+        """
+        if not uuids:
+            return set()
+        try:
+            conn = self._ensure_pg()
+            rows = conn.execute(
+                """
+                SELECT r.uuid FROM kg_relationships r
+                WHERE r.uuid = ANY(%s)
+                  AND jsonb_typeof(r.episodes) = 'array'
+                  AND jsonb_array_length(r.episodes) > 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM jsonb_array_elements_text(r.episodes) AS src(eid)
+                      WHERE NOT EXISTS (
+                          SELECT 1 FROM episodes e
+                          WHERE e.id = CASE WHEN src.eid ~ '^[0-9]+$' THEN src.eid::bigint END
+                            AND e.session_id = %s))
+                """,
+                (uuids, self_session),
+            ).fetchall()
+        except Exception as e:
+            logger.warning("self-session fact lookup failed: %s", e)
+            return set()
+        return {r["uuid"] for r in rows}
+
     def _fetch_superseded_pairs_pg(
         self,
         group_id: str,
