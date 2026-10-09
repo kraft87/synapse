@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from ingestion.secret_redact import redact_secrets
+
 logger = logging.getLogger(__name__)
 
 
@@ -154,6 +156,13 @@ class Episode(BaseModel):
     # Provenance (schema 057): the credential-resolved surface that wrote this turn.
     # Set only by the server from the authenticated caller, never parsed from a payload.
     surface_id: str | None = None
+
+    # Every ingest path builds an Episode, so this is the one place a credential in a
+    # transcript is stopped before it is stored, chunked, extracted or served.
+    @field_validator("human_turn", "assistant_turn", "content")
+    @classmethod
+    def _redact(cls, v: str | None) -> str | None:
+        return redact_secrets(v)
 
 
 class SessionSummary(BaseModel):

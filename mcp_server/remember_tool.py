@@ -18,6 +18,7 @@ from typing import Any
 
 from fastmcp import FastMCP
 
+from ingestion.secret_redact import redact_secrets
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.caller_trust import note_ignored_surface
 
@@ -155,6 +156,9 @@ def register(
                 "detail": f"invalid audience {audience!r} — expected one of {AUDIENCES}",
             }
 
+        # The note, the archived episode and its extraction item all carry this text, so
+        # redact once here; the Episode's own redaction only covers the episode.
+        hook, body, content = redact_secrets(hook), redact_secrets(body), redact_secrets(content)
         if structured:
             # Passing either hook or body commits to the structured form — a lone
             # hook (even with content also present) must NOT silently fall back to

@@ -165,6 +165,21 @@ def test_structured_create(env):
     assert env.llm_calls == []  # empty live set -> no confirm call
 
 
+def test_credentials_are_redacted_in_note_episode_and_extraction(env):
+    key = "sk-" + "proj-" + "aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"
+    out = _remember(
+        hook=f"OpenRouter key is {key}", body=f"Set OPENROUTER_API_KEY={key} in .env.", type="user"
+    )
+    assert out["status"] == "ok"
+    hook, body, *_ = _note_row(env, out["note_id"])
+    (ep_content,) = env.conn.execute(
+        "SELECT content FROM episodes WHERE id = %s", (out["episode_id"],)
+    ).fetchone()
+    (queued,) = env.conn.execute("SELECT content FROM extraction_queue").fetchone()
+    for text in (hook, body, ep_content, queued):
+        assert key not in text and "[REDACTED:openai]" in text
+
+
 def test_high_sim_same_type_confirm_same_updates(env):
     old = _seed_note(env, slot=1)
     env.emb.mapping["User prefers light mode"] = 1  # sim 1.0 to the seeded note
