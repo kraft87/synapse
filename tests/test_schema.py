@@ -3,6 +3,8 @@ Schema smoke tests. Run against a live synapse_test database.
 All tests should pass once scripts/apply_schema.sh has been applied.
 """
 
+from pathlib import Path
+
 import psycopg
 import pytest
 
@@ -121,6 +123,27 @@ def test_session_summaries_dropped(conn):
         "SELECT tablename FROM pg_tables WHERE schemaname='public' AND tablename='session_summaries'"
     ).fetchone()
     assert row is None, "session_summaries should be dropped by schema/007"
+
+
+# ---------------------------------------------------------------------------
+# dedup_gate_shadow — retired (040 creates it, 059 drops it; gate deleted 2026-10)
+# ---------------------------------------------------------------------------
+
+
+def test_dedup_gate_shadow_dropped(conn):
+    """A fresh database runs 040 then 059 and must end without the table,
+    the same state an upgraded database converges to."""
+    row = conn.execute("SELECT to_regclass('public.dedup_gate_shadow')").fetchone()
+    assert row[0] is None, "dedup_gate_shadow should be dropped by schema/059"
+
+
+def test_schema_059_does_not_block_boot():
+    """Nothing reads the dropped table, so the boot guard must start this build on
+    a database still at 058 (the image lands before the migration is applied)."""
+    from ingestion.schema_check import is_optional_migration
+
+    path = Path(__file__).resolve().parent.parent / "schema" / "059_drop_dedup_gate_shadow.sql"
+    assert is_optional_migration(path)
 
 
 # ---------------------------------------------------------------------------

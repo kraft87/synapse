@@ -36,26 +36,11 @@ from ingestion.extraction_policy import (
     _apply_canonical_aliases as _apply_canonical_aliases,
 )
 from ingestion.extraction_policy import (
-    _apply_gate_enforce as _apply_gate_enforce,
-)
-from ingestion.extraction_policy import (
     _classify_entity_group as _classify_entity_group,
 )
 from ingestion.extraction_policy import _cosine_similarity as _cosine_similarity
 from ingestion.extraction_policy import (
-    _dedup_gate_mode as _dedup_gate_mode,
-)
-from ingestion.extraction_policy import (
-    _dedup_gate_thresholds as _dedup_gate_thresholds,
-)
-from ingestion.extraction_policy import (
     _default_group_for_project as _default_group_for_project,
-)
-from ingestion.extraction_policy import (
-    _gate_decisions as _gate_decisions,
-)
-from ingestion.extraction_policy import (
-    _gate_shadow_rows as _gate_shadow_rows,
 )
 from ingestion.extraction_policy import (
     build_batch_resolution_prompt as build_batch_resolution_prompt,
@@ -418,23 +403,6 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             with logfire.span("stage6a_embedding_filter"):
                 candidates_map = self._stage6a_embedding_filter(facts, uuid_map, group_id)
 
-            # Gray-zone gate (issue #14): triage candidates on the similarity 6a
-            # already computed. shadow = log would-be decisions, change nothing;
-            # enforce = only the gray zone reaches the LLM confirm below.
-            gate_mode = _dedup_gate_mode()
-            gate_info: dict[int, list[tuple[dict[str, Any], str, float | None, str]]] = {}
-            pre_skip: set[int] = set()
-            pre_reinforce: dict[int, list[str]] = {}
-            llm_map = candidates_map
-            if gate_mode != "off" and candidates_map:
-                high, low = _dedup_gate_thresholds()
-                gate_info = {
-                    idx: _gate_decisions(pair_pool, semantic_pool, high, low)
-                    for idx, (pair_pool, semantic_pool) in candidates_map.items()
-                }
-                if gate_mode == "enforce":
-                    llm_map, pre_skip, pre_reinforce = _apply_gate_enforce(gate_info)
-
             # Pre-embed fact texts for Stage 7
             with logfire.span("voyage_embed_facts {n}", n=len(facts)):
                 fact_embeddings_list = self._embedder.embed(
@@ -447,43 +415,24 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # for callers that need single-fact confirmation (e.g. dream writes).
             with logfire.span(
                 "stage6b_batch_confirm cands={cands}",
-                cands=len(llm_map),
+                cands=len(candidates_map),
             ) as span:
                 skip_indices, invalidate, reinforce, llm_ok = self._stage6b_batch_confirm(
-                    facts, llm_map
+                    facts, candidates_map
                 )
-                skip_indices |= pre_skip
-                for idx, uuids in pre_reinforce.items():
-                    reinforce[idx] = uuids
                 span.set_attribute("skipped", len(skip_indices))
                 span.set_attribute("invalidated", sum(len(v) for v in invalidate.values()))
-                span.set_attribute("gate_mode", gate_mode)
-                span.set_attribute("gate_pre_skipped", len(pre_skip))
 
             # Saturation continuation: facts that contradicted most of their
             # pool get fresh retrieval rounds so a sweeping supersession can
-            # invalidate beyond the _SEMANTIC_POOL_LIMIT cap. Uses the FULL
-            # round-1 pools (candidates_map, not the gate-shrunk llm_map) for
-            # its seen-set so enforcement-dropped candidates aren't re-judged.
+            # invalidate beyond the _SEMANTIC_POOL_LIMIT cap. The round-1 pools
+            # (candidates_map) seed its seen-set so nothing is judged twice.
             if llm_ok and invalidate:
                 with logfire.span("stage6b_saturation_rounds") as sat_span:
                     extra = self._stage6b_saturation_rounds(
                         facts, candidates_map, invalidate, fact_embeddings_list, group_id
                     )
                     sat_span.set_attribute("extra_invalidated", extra)
-
-            # Shadow log: one row per (fact, candidate) with the gate's would-be
-            # decision next to the LLM's actual verdict — the threshold-picking
-            # data for enforcement. Best-effort; never blocks the pipeline.
-            if gate_info:
-                try:
-                    self._db.log_dedup_gate_shadow(
-                        _gate_shadow_rows(
-                            facts, gate_info, llm_map, group_id, invalidate, reinforce, llm_ok
-                        )
-                    )
-                except Exception as e:
-                    logger.debug("dedup gate shadow log failed: %s", e)
 
             # Stage 7: write edges
             with logfire.span("stage7_write_edges {n}", n=len(facts)):

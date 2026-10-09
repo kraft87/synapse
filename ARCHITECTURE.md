@@ -592,7 +592,9 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **036 content-md5 index** — `episodes (md5(content))`, the cross-session replay guard ([§4.1](#4-ingestion-pipeline)).
 - **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **038 `timeline_events.domain`** — `personal`/`technical` scoping label ([§3.5](#35-timeline-events--the-episodic-date-log)).
+- **040 `dedup_gate_shadow`** — was the shadow log for a Stage-6 embedding-similarity gate meant to skip the 6b LLM confirm on clear-cut pairs. Measured over its shadow run (2026-07 to 2026-10), a 0.95 merge threshold would have swallowed ~1.6% of genuine corrections (similarity barely registers digits: a changed dose, version or PR number reads as a duplicate), and it could never skip the batched call (BM25-only candidates carry no score, so they are always gray). The gate was deleted 2026-10-09 and 059 drops the table.
 - **058 `kg_relationships` evidence currency** — `ongoing`, `last_supported_at`, `last_supported_by` ([§5.4](#54-bitemporal-edges)). No backfill: attribution is not recoverable from stored edges.
+- **059 drop `dedup_gate_shadow`** — see 040. Marked `-- schema-check: optional`: nothing reads the table, so the image can land before the drop is applied.
 
 Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` exists but is dormant (`memory_proposals` was dropped by 047).
 

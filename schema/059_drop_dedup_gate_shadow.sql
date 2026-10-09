@@ -1,0 +1,24 @@
+-- 059_drop_dedup_gate_shadow.sql
+-- Drop the dedup_gate_shadow telemetry table (created by 040).
+--
+-- 040 logged the Stage-6 similarity gate's would-be decision beside the LLM confirm's
+-- verdict, to pick thresholds for enforcing the gate. Three months of shadow data
+-- settled it against enforcement, and the gate is deleted in the same change:
+--   * at the 0.95 merge threshold it would have swallowed ~1.6% of genuine
+--     corrections. Embedding similarity barely registers digits, so a changed dose,
+--     version or PR number reads as a duplicate of the fact it corrects.
+--   * it would never have saved an LLM call. Stage 6b is one batched call, and a
+--     BM25-only candidate has no similarity score, so it is always gray and keeps
+--     that call alive. Enforcing would only have trimmed the prompt.
+--   * the duplicates worth removing are chunk/episode duplicates and same-batch
+--     twins, which never reach this stage as candidate pairs.
+-- 040 stays in the apply list, so a fresh database creates the table and this file
+-- drops it again; an existing database converges to the same state.
+--
+-- Deploy order does not matter. Nothing in this build reads or writes the table, and
+-- the previous build's shadow write was best-effort (a missing table is logged at
+-- debug and skipped). The marker below lets the boot-time schema guard
+-- (ingestion/schema_check.py) start this build on a database not yet at 059:
+-- schema-check: optional
+
+DROP TABLE IF EXISTS dedup_gate_shadow;
