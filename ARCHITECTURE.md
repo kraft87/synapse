@@ -766,7 +766,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYNAPSE_RECALL_PASSAGE_N` | `3` | passages served per `recall()` from the second-pass passage rerank |
+| `SYNAPSE_RECALL_PASSAGE_N` | `6` | passages served per `recall()` from the second-pass passage rerank |
 | `SYNAPSE_RERANK_WINDOW` | `1` | relevance-windowed truncation of long episodes before rerank (`0` = full episodes) |
 | `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall(mode="turns")`: serve turns scoring ≥ tau×top_score |
 | `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |

@@ -270,22 +270,13 @@ class RecallOverviewMixin:
         scored = self._apply_rerank_recency(scored, ep_pool)
         ranked = [ep_pool[i] for i, _ in scored]
 
-        # Episodes: rerank order, then RRF-fused with the pool's BM25 order for lexical recovery
-        # (see _RECALL_BM25_FUSE). Skipped on the degraded path (rerank_top <= 0): the pool is
-        # already RRF(bm25, vector) there, so re-fusing BM25 would double-count it.
+        # Episodes: rerank order (recency-adjusted above).
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
         n_self_excluded = 0
         if self_session:
             pre_excl = len(ranked_eps)
             ranked_eps = self._exclude_self(ranked_eps, self_session)
             n_self_excluded = pre_excl - len(ranked_eps)
-        n_bm25_lifted = 0  # telemetry: episodes fusion pulled INTO the src_k serving window
-        if settings._RECALL_BM25_FUSE and rerank_top > 0.0:
-            pre_fuse = {e.get("id") for e in ranked_eps[: settings._RECALL_PASSAGE_SRC_K]}
-            ranked_eps = self._fuse_bm25_order(ranked_eps)
-            n_bm25_lifted = len(
-                {e.get("id") for e in ranked_eps[: settings._RECALL_PASSAGE_SRC_K]} - pre_fuse
-            )
         # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
         # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
         # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
@@ -435,7 +426,6 @@ class RecallOverviewMixin:
             "web": [c["id"] for c in web_chunks if c.get("id")],
             "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
-            "n_bm25_lifted": n_bm25_lifted,  # BM25 fusion recovered these into the served window
             # Trust verdict (schema 053): a restricted serve is narrower by design, so
             # the metrics have to say which regime produced these numbers.
             "trust": st.trust,
