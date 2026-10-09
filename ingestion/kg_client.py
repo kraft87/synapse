@@ -395,13 +395,15 @@ class KGClient:
         query: str,
         group_id: str,
         limit: int = 20,
+        fact_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
         """BM25 candidates over live fact text (ParadeDB, OR semantics).
 
         No score floor: rank-only RRF (k=1) plus the stage-6b LLM confirm gate
-        the pool instead (see ``kg_pg_read.find_edges_by_fulltext``).
+        the pool instead (see ``kg_pg_read.find_edges_by_fulltext``). Pass
+        ``fact_embedding`` to get each hit's cosine ``dist`` to it.
         """
         hits: list[dict[str, Any]] = self._reader.find_edges_by_fulltext(
-            query, group_id, limit=limit
+            query, group_id, limit=limit, fact_embedding=fact_embedding
         )
         return hits

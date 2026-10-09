@@ -138,6 +138,19 @@ class TestEdgeReads:
         assert "r-other" not in uuids
         assert all(isinstance(h["score"], float) for h in hits)
 
+    def test_fulltext_reports_distance_to_a_supplied_embedding(self, kg_tables):
+        # "Synapse ... FalkorDB" lexically matches r-live (axis 0), r-far (axis 1) and
+        # r-noemb (no embedding); the distance is what tells the topical hit apart.
+        hits = kg_tables.find_edges_by_fulltext(
+            "Synapse FalkorDB Postgres", GROUP, fact_embedding=_axis_list(0)
+        )
+        dist = {h["uuid"]: h["dist"] for h in hits}
+        assert dist["r-live"] == pytest.approx(0.0, abs=1e-3)
+        assert dist["r-far"] == pytest.approx(1.0, abs=1e-3)
+        assert dist["r-noemb"] is None
+        plain = kg_tables.find_edges_by_fulltext("Synapse FalkorDB Postgres", GROUP)
+        assert all(h["dist"] is None for h in plain)
+
     def test_fulltext_empty_query_short_circuits(self, kg_tables):
         assert kg_tables.find_edges_by_fulltext("", GROUP) == []
         assert kg_tables.find_edges_by_fulltext("!!! ---", GROUP) == []

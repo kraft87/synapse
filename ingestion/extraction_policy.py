@@ -183,6 +183,13 @@ _SEMANTIC_POOL_LIMIT = 8
 # with the fact still saturating. 8 covers the worst observed sweep with
 # ~2x margin; _SATURATION_MIN remains the real stop condition.
 _SATURATION_MIN = 4
+#: A BM25-only hit reaches the contradiction judge only when its stored embedding is at
+#: least this similar to the new fact (2026-10-09). Vector hits already need >= 0.80
+#: (find_similar_edges' distance_threshold); BM25 hits had no floor, and the judge
+#: retired facts that merely shared an identifier (a ticket key, a PR number) with the
+#: new one: 79% of October's contradiction verdicts came from BM25-only candidates. A
+#: shared entity is not enough on its own, since hub entities sit on most facts.
+_FULLTEXT_MIN_SIM = 0.70
 _SATURATION_MAX_ROUNDS = 8
 
 _CONTRADICTION_PROMPT = """\
@@ -201,6 +208,7 @@ Indices are continuous across both sections. Refer to facts by their `idx`, not 
 Rules:
 - duplicate_facts: idx values whose information is restated by the NEW FACT (same relationship, same meaning, may differ only by phrasing).
 - contradicted_facts: idx values whose claim is incompatible with or superseded by the NEW FACT. This INCLUDES drop-in replacements ("X uses A" → "X uses B") even when the target entity differs.
+- A status change of the SAME thing IS a contradiction ("PR 12 is open" → "PR 12 is merged"). NOT a contradiction: a different fact about a related thing (another ticket, PR, file, step or person in the same project or thread), or added detail or later progress that leaves the old claim still true. Sharing an identifier or a topic is not enough.
 - An idx MAY appear in BOTH lists when the new fact restates the old predicate while correcting/superseding the value.
 - Both lists may be empty if the NEW FACT is genuinely novel.
 """
@@ -260,6 +268,7 @@ For each new fact:
 Rules (apply per-fact):
 - duplicate_facts: idx of facts the NEW FACT restates (same relationship, same meaning, may differ only by phrasing).
 - contradicted_facts: idx of facts the NEW FACT supersedes or is incompatible with. This INCLUDES drop-in replacements ("X uses A" -> "X uses B") even when the target differs.
+- A status change of the SAME thing IS a contradiction ("PR 12 is open" -> "PR 12 is merged"). NOT a contradiction: a different fact about a related thing (another ticket, PR, file, step or person in the same project or thread), or added detail or later progress that leaves the old claim still true. Sharing an identifier or a topic is not enough.
 - An idx MAY appear in both lists when the new fact restates a predicate while correcting/superseding the value.
 - Both lists may be empty if the NEW FACT is genuinely novel.
 
