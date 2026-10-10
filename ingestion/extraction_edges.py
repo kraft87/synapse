@@ -51,6 +51,7 @@ class ExtractionEdgesMixin:
         facts: list[ExtractedFact],
         uuid_map: dict[str, str],
         group_id: str,
+        fact_embeddings: list[list[float]] | None = None,
     ) -> dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
         """Find duplicate/contradiction candidates for each fact.
 
@@ -63,13 +64,14 @@ class ExtractionEdgesMixin:
 
         Pools are deduped so any uuid in pair_pool is removed from semantic_pool.
         Facts with both pools empty are omitted from the returned dict.
+        ``fact_embeddings`` reuses the caller's embeddings of the same texts; without
+        them the facts are embedded here.
         """
         if not facts:
             return {}
 
-        # Embed all fact texts in one batch
-        fact_texts = [f.fact for f in facts]
-        fact_embeddings = self._embedder.embed(fact_texts, task="document")
+        if fact_embeddings is None:
+            fact_embeddings = self._embedder.embed([f.fact for f in facts], task="document")
 
         per_fact_pools: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
 

@@ -47,6 +47,7 @@ from ingestion.extraction_policy import (
 )
 from ingestion.extraction_policy import build_resolution_prompt as build_resolution_prompt
 from ingestion.extraction_policy import dedupe_pools as dedupe_pools
+from ingestion.extraction_twins import collapse_batch_twins
 
 logger = logging.getLogger(__name__)
 
@@ -399,14 +400,28 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             group_id=group_id,
             facts_n=len(facts),
         ):
-            # Stage 6a: find contradiction candidates (no LLM)
-            with logfire.span("stage6a_embedding_filter"):
-                candidates_map = self._stage6a_embedding_filter(facts, uuid_map, group_id)
-
-            # Pre-embed fact texts for Stage 7
+            # Embed the fact texts once: the twin pass, Stage 6a retrieval and the
+            # Stage 7 write all use these (6a used to embed the same texts again).
             with logfire.span("voyage_embed_facts {n}", n=len(facts)):
                 fact_embeddings_list = self._embedder.embed(
                     [f.fact for f in facts], task="document"
+                )
+
+            # Same-batch twins: Stage 6 compares a fact only with edges already in the
+            # graph, so a fact this batch states twice (usually one sentence fanned out
+            # over every entity it names) would land twice. See ingestion.extraction_twins.
+            with logfire.span("collapse_batch_twins") as twin_span:
+                facts, fact_embeddings_list, twins = collapse_batch_twins(
+                    facts, fact_embeddings_list
+                )
+                twin_span.set_attribute("collapsed", twins)
+            if twins:
+                logger.info("Collapsed %d same-batch twin fact(s) in group %s", twins, group_id)
+
+            # Stage 6a: find contradiction candidates (no LLM)
+            with logfire.span("stage6a_embedding_filter"):
+                candidates_map = self._stage6a_embedding_filter(
+                    facts, uuid_map, group_id, fact_embeddings_list
                 )
 
             # Stage 6b: ONE batched LLM call for every fact with candidates,

@@ -47,6 +47,7 @@ _DB_FILES = {
     "test_web_enqueue.py",
     "test_contradiction.py",
     "test_extractor.py",
+    "test_extraction_twins_db.py",
     "test_kg_pg_write.py",
     "test_kg_pg_read.py",
     "test_skills_provider.py",
