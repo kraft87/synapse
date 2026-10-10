@@ -322,6 +322,10 @@ class KGClient:
             return
         self._writer.reinforce_edges(items, group_id)
 
+    def delete_orphan_entities(self, min_age_hours: int = 24) -> int:
+        """Delete edge-less entities older than ``min_age_hours``; returns the count."""
+        return self._writer.delete_orphan_entities(min_age_hours)
+
     # ------------------------------------------------------------------
     # Reads (entity resolution, dedup, contradiction + dedup pools)
     # ------------------------------------------------------------------
