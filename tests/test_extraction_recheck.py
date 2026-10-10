@@ -215,6 +215,37 @@ class TestStage7Wiring:
             [("e-old-san", SEG)], "g", invalidated_by="e-live"
         )
 
+    def test_writer_side_verdict_of_a_restated_fact_still_retires_linked(self):
+        facts = [_fact("The build cache lives on the NAS", "Cache", "NAS")]
+        uuid_map = {"Cache": "u-c", "NAS": "u-n"}
+        pipe = _pipe(nearest=[[_edge("e-live", "The build cache lives on the NAS")]])
+        pipe._contradiction_detector.detect_contradictions_batch.side_effect = lambda fs, *a, **k: [
+            ["e-old-san"]
+        ]
+
+        pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
+
+        assert _created(pipe) == []
+        pipe._kg.invalidate_edges_batch.assert_called_once_with(
+            [("e-old-san", SEG)], "g", invalidated_by="e-live"
+        )
+
+    def test_writer_side_verdict_against_the_near_copy_writes_a_replacement(self):
+        facts = [_fact("The build cache lives on the NAS", "Cache", "NAS")]
+        uuid_map = {"Cache": "u-c", "NAS": "u-n"}
+        pipe = _pipe(nearest=[[_edge("e-live", "The build cache lives on the NAS")]])
+        pipe._contradiction_detector.detect_contradictions_batch.side_effect = lambda fs, *a, **k: [
+            ["e-live"]
+        ]
+
+        pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
+
+        created = _created(pipe)
+        assert [r["fact"] for r in created] == ["The build cache lives on the NAS"]
+        pipe._kg.invalidate_edges_batch.assert_called_once_with(
+            [("e-live", SEG)], "g", invalidated_by=created[0]["edge_uuid"]
+        )
+
 
 def _entity(name: str) -> ExtractedEntity:
     return ExtractedEntity(name=name, type="Concept", summary=f"{name} summary")

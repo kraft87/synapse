@@ -28,6 +28,7 @@ restatement only adds provenance.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from ingestion.extraction_twins import _TWIN_MIN_SIM, fact_tokens, lexical_twins
@@ -67,11 +68,13 @@ def recheck_restated(
     skip_indices: set[int],
     invalidate: dict[int, list[str]],
     reinforce: dict[int, list[str]],
+    also_retiring: Iterable[str] = (),
 ) -> int:
     """Stage 6c. Moves restated facts into ``skip_indices`` / ``reinforce`` in place.
 
     Only facts Stage 7 would create are looked up (not skipped, both endpoints resolved),
-    in one query for the group. An edge any fact of this batch retires is never a match,
+    in one query for the group. An edge any fact of this batch retires (a Stage 6 verdict in
+    ``invalidate``, or a writer-side one in ``also_retiring``) is never a match,
     since absorbing a fact into it would leave the claim with no live edge; a fact judged
     to contradict its own near-copy is a drop-in replacement and is written as one.
     Returns the number of facts moved."""
@@ -82,7 +85,7 @@ def recheck_restated(
     ]
     if not todo:
         return 0
-    retiring = {u for uuids in invalidate.values() for u in uuids}
+    retiring = {u for uuids in invalidate.values() for u in uuids} | set(also_retiring)
     hits = kg.nearest_live_edges(
         [fact_embeddings[i] for i in todo],
         group_id,

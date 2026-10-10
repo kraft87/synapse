@@ -477,7 +477,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # LLM calls. 6c rechecks the facts about to be created against the live graph
             # as it is NOW (an edge written since 6a pooled, or one the judge missed); then
             # only the new entities a fact still being created links are written.
-            def recheck_then_write_new_nodes() -> None:
+            def recheck_then_write_new_nodes(writer_retires: list[list[str]]) -> None:
                 with logfire.span("stage6c_recheck") as recheck_span:
                     restated = recheck_restated(
                         facts,
@@ -488,6 +488,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                         skip_indices,
                         invalidate,
                         reinforce,
+                        also_retiring=[u for uuids in writer_retires for u in uuids],
                     )
                     recheck_span.set_attribute("restated", restated)
                 if restated:
