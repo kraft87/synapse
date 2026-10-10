@@ -46,16 +46,86 @@ class _Boom:
 
 def test_returns_n_passages_with_parent_meta():
     r = Recall("", "")
-    r._reranker = _FakeEmb([2, 0, 5])
-    eps = [_ep(_LONG, project="synapse", date="2026-06-02")]
+    r._reranker = _FakeEmb([2, 5, 0])
+    eps = [
+        _ep(_LONG, project="synapse", date="2026-06-02"),
+        _ep(_LONG.replace("lorem", "other"), project="neuron", date="2026-06-03"),
+    ]
     out = r._compact_to_passages("q", eps, n=2)
-    assert len(out) == 2
-    for item in out:
+    assert [it["project"] for it in out] == ["synapse", "neuron"]  # chunk 5 = 2nd doc's 1st
+    assert [it["date"] for it in out] == ["2026-06-02", "2026-06-03"]
+    for item, parent in zip(out, eps, strict=True):
         assert item["content"].strip()
-        assert item["content"] in _LONG  # a real slice of the parent, not the whole turn
-        assert len(item["content"]) < len(_LONG)  # genuinely compacted
-        assert item["project"] == "synapse"
-        assert item["date"] == "2026-06-02"
+        assert item["content"] in parent["content"]  # a real slice of the parent
+        assert len(item["content"]) < len(parent["content"])  # genuinely compacted
+
+
+def test_chunks_of_one_episode_serve_as_one_item():
+    # Chunks 0, 1 and 3 of one turn win: ONE item, adjacent chunks joined without repeating
+    # their overlap, the gap before chunk 3 marked, and n still counts chunks.
+    from ingestion.web_chunker import chunk_markdown
+
+    chunks = chunk_markdown(_LONG)
+    r = Recall("", "")
+    r._reranker = _FakeEmb([3, 0, 1])
+    stats: dict = {}
+    out = r._compact_to_passages("q", [{**_ep(_LONG), "id": "e:9"}], n=3, stats=stats)
+    assert len(out) == 1 and out[0]["id"] == "e:9"
+    run = _LONG[chunks[0].char_start : chunks[1].char_end]
+    assert out[0]["content"] == run + "\n[…]\n" + chunks[3].content
+    assert stats == {"n_dup_passages": 0}
+
+
+def test_repeat_of_another_episode_is_skipped_and_backfilled():
+    # Same turn stored twice (two capture sources): the copy's chunk is skipped and the slot
+    # goes to the next-ranked passage, not to a repeat.
+    short = (
+        "[user] which port does the dashboard use\n\n[assistant] it listens on 8081 behind caddy"
+    )
+    other = "[user] what about backups\n\n[assistant] restic runs nightly to the nas"
+    eps = [
+        {**_ep(short), "id": "e:1"},
+        {**_ep(short), "id": "e:2"},
+        {**_ep(other), "id": "e:3"},
+    ]
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 1, 2])
+    stats: dict = {}
+    out = r._compact_to_passages("q", eps, n=2, stats=stats)
+    assert [it["id"] for it in out] == ["e:1", "e:3"]
+    assert stats == {"n_dup_passages": 1}
+
+
+def test_repeat_skipped_when_pool_fits_without_rerank():
+    eps = [{**_ep("the same short turn text here"), "id": f"e:{i}"} for i in (1, 2)]
+    r = Recall("", "")
+    r._reranker = _Boom()  # few chunks: never called
+    assert [it["id"] for it in r._compact_to_passages("q", eps, n=3)] == ["e:1"]
+
+
+def test_near_copy_with_a_different_number_is_kept():
+    # A changed dose/version/PR number is a correction, not a repeat: both serve.
+    a = "the nightly backup job keeps 30 daily snapshots and 12 monthly ones on the nas share"
+    b = a.replace("30 daily", "14 daily")
+    eps = [{**_ep(a), "id": "e:1"}, {**_ep(b), "id": "e:2"}]
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 1])
+    stats: dict = {}
+    out = r._compact_to_passages("q", eps, n=2, stats=stats)
+    assert [it["id"] for it in out] == ["e:1", "e:2"]
+    assert stats == {"n_dup_passages": 0}
+
+
+def test_join_overlap_rebuilds_the_parent_text():
+    from ingestion.web_chunker import chunk_markdown
+    from mcp_server.recall_passages import _join_overlap
+
+    chunks = chunk_markdown(_LONG)
+    text = chunks[0].content
+    for c in chunks[1:]:
+        text = _join_overlap(text, c.content)
+    assert text == _LONG
+    assert _join_overlap("abc", "xyz") == "abc\nxyz"  # no overlap: plain line join
 
 
 def test_few_chunks_skip_rerank():
@@ -151,18 +221,35 @@ def test_no_markers_omits_role():
     assert "role" not in out[0]
 
 
+_USER_HALF = "[user] " + "".join(f"\n## U{i}\nuser fact text " * 6 for i in range(12))
+_ASST_HALF = "\n\n[assistant] " + "".join(
+    f"\n## A{i}\nspeculative plan text " * 6 for i in range(12)
+)
+
+
 def test_multichunk_passages_carry_side_specific_roles():
     # User half and assistant half each long enough to yield whole chunks on one side.
-    user_half = "[user] " + "".join(f"\n## U{i}\nuser fact text " * 6 for i in range(12))
-    asst_half = "\n\n[assistant] " + "".join(
-        f"\n## A{i}\nspeculative plan text " * 6 for i in range(12)
-    )
     r = Recall("", "")
-    r._reranker = _FakeEmb(list(range(40)))
-    out = r._compact_to_passages("q", [_ep(user_half + asst_half)], n=6)
-    roles = {item.get("role") for item in out}
-    assert roles <= {"user", "assistant", "mixed"}
-    assert "user" in roles and "assistant" in roles  # both sides labeled, not all mixed
+    r._reranker = _FakeEmb([2])
+    out = r._compact_to_passages("q", [_ep(_USER_HALF + _ASST_HALF)], n=1)
+    assert out[0]["role"] == "assistant"
+    r._reranker = _FakeEmb([0])
+    out = r._compact_to_passages("q", [_ep(_USER_HALF + _ASST_HALF)], n=1)
+    assert out[0]["role"] == "user"
+
+
+def test_merged_runs_keep_their_speaker_markers():
+    # A user-side chunk and a non-adjacent assistant-side chunk merge into one "mixed" item;
+    # the run that starts mid-turn gets its speaker's marker back.
+    from ingestion.web_chunker import chunk_markdown
+
+    chunks = chunk_markdown(_USER_HALF + _ASST_HALF)
+    r = Recall("", "")
+    r._reranker = _FakeEmb([0, 2])
+    out = r._compact_to_passages("q", [_ep(_USER_HALF + _ASST_HALF)], n=2)
+    assert len(out) == 1 and out[0]["role"] == "mixed"
+    assert chunks[0].content.startswith("[user]")  # already marked: left as is
+    assert out[0]["content"] == chunks[0].content + "\n[…]\n[assistant] " + chunks[2].content
 
 
 def test_apply_supersessions_attaches_and_dedups():

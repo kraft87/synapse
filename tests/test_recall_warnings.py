@@ -81,7 +81,7 @@ def _wired(*, embed_fail: bool = False, rerank_fail: bool = False, pool: list[di
     r._fetch_superseded_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
-    r._compact_to_passages = lambda q, eps, n: [
+    r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "content": f"passage {e['id']}"} for e in eps[:n]
     ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
@@ -144,7 +144,7 @@ def test_empty_recall_with_a_warning_is_still_a_200_shaped_body():
     # The regression this whole field exists for: the body still looks normal, so the
     # warning is the ONLY thing distinguishing broken retrieval from empty memory.
     r = _wired(embed_fail=True)
-    r._compact_to_passages = lambda q, eps, n: []
+    r._compact_to_passages = lambda q, eps, n, **_k: []
     out = r.recall("anything")
     assert out["facts"] == []
     assert "episodes" not in out

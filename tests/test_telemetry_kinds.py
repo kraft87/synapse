@@ -82,7 +82,7 @@ def _wired(db_url: str, scores: list[float]) -> Recall:
     r._episode_supersessions = lambda *a, **k: {}
     # Compaction serves compact passages of the top reranked eps; stub returns them
     # directly (no more full-episode fallback — an empty return omits the bucket).
-    r._compact_to_passages = lambda q, eps, n: [
+    r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "content": f"passage {e['id']}"} for e in eps[:n]
     ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
@@ -142,6 +142,7 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
         "web",
         "notes",
         "n_echo_suppressed",
+        "n_dup_passages",
         "trust",  # schema 053 — which trust regime produced these numbers
     }
     assert served["trust"] == "full"
@@ -151,6 +152,7 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
     assert "prefs" not in served and "preferences" not in out
     assert served["web"] == []
     assert served["n_echo_suppressed"] == 0
+    assert served["n_dup_passages"] == 0
     assert "n_bm25_lifted" not in served  # BM25 fusion deleted 2026-10-09
 
 
@@ -397,3 +399,16 @@ def test_board_kind_row_shape(conn, db_url, full_surface):
     assert est_tokens == chars // 4
     # Note ids in served ("n:N") form — joinable against recall_feedback's id lists.
     assert served == {"notes": [f"n:{nid}"], "n_notes": 1, "overflow": 0, "trust": "full"}
+
+
+def test_overlay_gets_the_served_passage_text(conn, db_url, monkeypatch, full_surface):
+    """The episode-validity overlay is judged against what was served for each episode,
+    so a chunk-cited successor only lands on a passage that states the retired claim."""
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    seen: list[dict] = []
+    engine._episode_supersessions = lambda ids, g, **k: seen.append({"ids": ids, **k}) or {}
+    out = engine.recall("overlay text", source="mcp-tool", surface=full_surface)
+    served = {int(it["id"][2:]): it["content"] for it in out["episodes"]}
+    assert seen and seen[0]["ids"] == list(served)
+    assert seen[0]["served_text"] == served

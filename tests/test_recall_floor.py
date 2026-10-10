@@ -81,7 +81,7 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
     # them from chunks). Stub returns them directly so the payload-invariance tests run
     # against a non-empty episode bucket; the empty-return case is exercised explicitly
     # by test_recall_no_passages_yields_empty_episode_bucket.
-    r._compact_to_passages = lambda q, eps, n: [
+    r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "content": f"passage {e['id']}"} for e in eps[:n]
     ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
@@ -152,7 +152,7 @@ def test_recall_no_passages_yields_empty_episode_bucket(monkeypatch):
     # the bucket is omitted (empty container). Drill-down still returns full turns.
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     r, captured = _wired([0.91, 0.80, 0.60, 0.59])  # above floor -> floor does not fire
-    r._compact_to_passages = lambda q, eps, n: []  # but no passage is produced
+    r._compact_to_passages = lambda q, eps, n, **_k: []  # but no passage is produced
     out = r.recall("q")
     assert "episodes" not in out  # empty container from the compaction gate, no fallback
     assert captured[0]["served_ids"]["episodes"] == []  # telemetry agrees: nothing served

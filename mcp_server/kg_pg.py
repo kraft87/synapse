@@ -258,18 +258,30 @@ def search_kg_postgres(
                 fact_by_uuid.setdefault(u, (f, tv, og, sup))
                 hop_uuids.append(u)
 
-    # 5 — RRF fuse the three ranked lists; take the top `limit`.
+    # 5 — RRF fuse the three ranked lists; take the top `limit`. The same fact text stored
+    # as separate edges (same-batch twins: ~200 such groups were live on 2026-10-09) serves
+    # once, and the next fact takes the freed slot.
     fused = _rrf_fuse([vec_uuids, bm25_uuids, hop_uuids])
     top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
-    results = [
-        {
-            "fact": fact_by_uuid[u][0],
-            "_uuid": u,
-            "_date": fact_by_uuid[u][1],
-            "_ongoing": fact_by_uuid[u][2],
-            "_supported": fact_by_uuid[u][3],
-        }
-        for u, _ in top
-        if u in fact_by_uuid
-    ][:limit]
+    results: list[dict[str, Any]] = []
+    seen_text: set[str] = set()
+    for u, _ in top:
+        if u not in fact_by_uuid:
+            continue
+        fact, t_valid, ongoing, supported = fact_by_uuid[u]
+        text_key = " ".join(fact.lower().split())
+        if text_key in seen_text:
+            continue
+        seen_text.add(text_key)
+        results.append(
+            {
+                "fact": fact,
+                "_uuid": u,
+                "_date": t_valid,
+                "_ongoing": ongoing,
+                "_supported": supported,
+            }
+        )
+        if len(results) >= limit:
+            break
     return results, seed_entities

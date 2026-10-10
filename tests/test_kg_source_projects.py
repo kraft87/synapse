@@ -356,6 +356,18 @@ def test_full_trust_kg_leg_still_serves_everything(kg, db_url):
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
 
 
+def test_identical_fact_text_serves_once(kg, db_url):
+    """Twins (same text, separate edges) take one slot; the next fact gets the other."""
+    w = _ep(kg, WORK)
+    _fact(kg, "twin-a", "Widget runs on port 8081", f"[{w}]", emb=0)
+    _fact(kg, "twin-b", "widget  runs on port 8081", f"[{w}]", emb=0, src="ent-z")
+    _fact(kg, "other", "Widget runs on port 9090", f"[{w}]", emb=None)  # BM25 only: ranks 3rd
+    facts, _ = Recall(db_url, "")._search_kg("widget port", onehot(0), GROUP, [], 2)
+    assert len(facts) == 2
+    assert len(_uuids(facts) & {"twin-a", "twin-b"}) == 1
+    assert "other" in _uuids(facts)
+
+
 def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
     """A seed whose only live edges are out of scope must not consume a seed slot."""
     p = _ep(kg, PERSONAL)
@@ -470,7 +482,7 @@ def _recall_engine(db_url: str) -> Recall:
     r = Recall(db_url, "")
     r._ensure_embedder = lambda: _Emb()
     r._rerank_pool_scored = lambda q, pool: [(i, 0.9) for i in range(len(pool))]
-    r._compact_to_passages = lambda q, eps, n: [{"id": e["id"], "text": "t"} for e in eps]
+    r._compact_to_passages = lambda q, eps, n, **_k: [{"id": e["id"], "text": "t"} for e in eps]
     r._search_web_reranked = lambda q, emb: []
     r._search_notes = lambda *a, **k: []
     r._increment_retrieval_counts = lambda ids: None

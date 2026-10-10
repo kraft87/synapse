@@ -159,7 +159,7 @@ def _engine(db_url, monkeypatch, notes_rows=None):
     r = Recall(db_url, "")
     r._ensure_embedder = lambda: _Emb()
     r._rerank_pool_scored = lambda q, pool: [(i, 0.9) for i in range(len(pool))]
-    r._compact_to_passages = lambda q, eps, n: [
+    r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "text": e.get("content", "")} for e in eps
     ]
     r._search_web_reranked = lambda q, emb: []

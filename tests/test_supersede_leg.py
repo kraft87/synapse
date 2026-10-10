@@ -8,6 +8,8 @@ fact itself.
 
 from __future__ import annotations
 
+import uuid
+
 from mcp_server.recall import Recall
 from tests.helpers.embed import GROUP
 
@@ -170,3 +172,40 @@ def test_overlay_never_serves_a_retired_successor(conn, db_url):
     )
     conn.execute("UPDATE kg_relationships SET t_invalid = now() WHERE uuid = 'n-1'")
     assert Recall(db_url, "")._episode_supersessions([eid], GROUP) == {}
+
+
+def test_overlay_needs_the_served_text_to_state_the_retired_claim(conn, db_url):
+    """A chunk-sourced fact cites every episode of its chunk: the successor attaches only
+    to a passage that actually states the retired claim, not to every cited episode."""
+    _seed(conn)
+    on, off = (
+        conn.execute(
+            "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, 'x') RETURNING id",
+            (f"ovl-{uuid.uuid4().hex[:10]}",),
+        ).fetchone()[0]
+        for _ in range(2)
+    )
+    conn.execute(
+        "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{on}, {off}]",)
+    )
+    served = {
+        on: "[assistant] For now Synapse stores the graph in FalkorDB.",
+        off: "[user] set up restic backups to the nas please",
+    }
+    r = Recall(db_url, "")
+    assert r._episode_supersessions([on, off], GROUP, served_text=served) == {
+        on: ["Synapse uses Postgres now"]
+    }
+    # Without served text (drill-down callers) the citation alone still links.
+    assert set(r._episode_supersessions([on, off], GROUP)) == {on, off}
+
+
+def test_claim_support_scoring():
+    from mcp_server.recall_presentation import claim_support
+
+    claim = "Kyle restarted vitamin D at 10,000 IU daily (meaning 2026-01-05)"
+    assert claim_support(claim, "I restarted my vitamin d, 10000 iu daily now") == 1.0
+    assert claim_support(claim, "restic backup schedule for the nas") == 0.0
+    # A path in the claim matches when its parts appear in the text.
+    assert claim_support("rreading-glasses in compose.yml", "/opt/docker/plex/compose.yml") == 0.5
+    assert claim_support("the and of", "anything") == 1.0  # nothing to check against

@@ -293,10 +293,14 @@ class RecallOverviewMixin:
         # When compaction is empty the bucket is simply omitted (empty container); the
         # drill-down paths (recall_episodes / fetch) still return full turns on demand.
         ep_items: list[dict[str, Any]] | None = None
+        passage_stats: dict[str, int] = {}
         if ranked_eps:
             ep_items = (
                 self._compact_to_passages(
-                    query, ranked_eps[: settings._RECALL_PASSAGE_SRC_K], settings._RECALL_PASSAGE_N
+                    query,
+                    ranked_eps[: settings._RECALL_PASSAGE_SRC_K],
+                    settings._RECALL_PASSAGE_N,
+                    stats=passage_stats,
                 )
                 or None
             )
@@ -372,10 +376,15 @@ class RecallOverviewMixin:
         # — the turn is immutable history and usually carries more than the stale claim. Deduped
         # against the facts bucket above. Cheap (partial GIN, fail-open); usually a no-op.
         if ep_items and not kg_off:
+            served_text: dict[int, str] = {}
+            for it in ep_items:
+                for eid in _parse_episode_ids([it.get("id")]):
+                    served_text[eid] = served_text.get(eid, "") + (it.get("content") or "")
             sup = self._episode_supersessions(
-                _parse_episode_ids([it.get("id") for it in ep_items if it.get("id")]),
+                list(served_text),
                 group_id,
                 self_session=self_session,
+                served_text=served_text,
                 **kg_scope,
             )
             if sup:
@@ -427,6 +436,8 @@ class RecallOverviewMixin:
             "web": [c["id"] for c in web_chunks if c.get("id")],
             "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
+            # Passages skipped as repeats of another episode's chosen passage.
+            "n_dup_passages": passage_stats.get("n_dup_passages", 0),
             # Trust verdict (schema 053): a restricted serve is narrower by design, so
             # the metrics have to say which regime produced these numbers.
             "trust": st.trust,
