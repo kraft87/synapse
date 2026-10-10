@@ -123,7 +123,8 @@ def _seed_far_link(conn) -> dict[str, int]:
     """P (axis 1) retired by an UNRELATED successor (axis 5): a false contradiction verdict."""
     _seed(conn)
     eid = conn.execute(
-        "INSERT INTO episodes (session_id, sequence, content) VALUES ('far-link', 1, 'x') RETURNING id"
+        "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, 'x') RETURNING id",
+        (f"far-link-{uuid.uuid4().hex[:10]}",),
     ).fetchone()[0]
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
@@ -151,7 +152,8 @@ def test_far_successor_link_is_not_believed_by_any_leg(conn, db_url):
 def test_close_successor_link_still_overlays_its_episode(conn, db_url):
     _seed(conn)
     eid = conn.execute(
-        "INSERT INTO episodes (session_id, sequence, content) VALUES ('close-link', 1, 'x') RETURNING id"
+        "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, 'x') RETURNING id",
+        (f"close-link-{uuid.uuid4().hex[:10]}",),
     ).fetchone()[0]
     conn.execute(
         "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)
@@ -165,7 +167,8 @@ def test_close_successor_link_still_overlays_its_episode(conn, db_url):
 def test_overlay_never_serves_a_retired_successor(conn, db_url):
     _seed(conn)
     eid = conn.execute(
-        "INSERT INTO episodes (session_id, sequence, content) VALUES ('stale-succ', 1, 'x') RETURNING id"
+        "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, 'x') RETURNING id",
+        (f"stale-succ-{uuid.uuid4().hex[:10]}",),
     ).fetchone()[0]
     conn.execute(
         "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)

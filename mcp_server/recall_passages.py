@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from typing import Any
 
@@ -65,36 +64,6 @@ class RecallPassagesMixin:
             passages = passages[: settings._RECALL_PASSAGE_CAND]
             owner = owner[: settings._RECALL_PASSAGE_CAND]
             bounds = bounds[: settings._RECALL_PASSAGE_CAND]
-        # EXPERIMENT (env-gated): structural compaction v2.
-        # SYNAPSE_PASSAGE_QUOTA=k caps served chunks per parent episode (slot allocation —
-        # one loud session can't eat every slot). SYNAPSE_PASSAGE_WINDOW=w merges each
-        # winning chunk with up to w adjacent chunks of the same episode (restores the
-        # connective context that makes fragments summable). Both 0/off by default.
-        _quota = int(os.environ.get("SYNAPSE_PASSAGE_QUOTA", "0") or "0")
-        _window = int(os.environ.get("SYNAPSE_PASSAGE_WINDOW", "0") or "0")
-        # Session-diversity cap on the SERVED passages: at most _sess_cap of the n served may
-        # share a session_id. Fixes self/recency domination — the live session's freshly ingested
-        # turns are topically dense AND the recency leg boosts them, so uncapped all n served come
-        # from the current session, crowding out older real history (the top recall_feedback noise
-        # driver, measured 2026-07-23). Backfills from lower-ranked passages so a genuinely
-        # single-session result still serves n — the cap trims domination, never costs recall.
-        # ON by default (=2); disable with SYNAPSE_RECALL_SESSION_CAP=0.
-        _sess_cap = int(os.environ.get("SYNAPSE_RECALL_SESSION_CAP", "2") or "2")
-        # Slack gate on the cap: a capped session's passage still serves when every
-        # alternative from an under-served session scores more than _sess_slack below it —
-        # diversity acts as a near-tie tiebreak instead of a hard constraint. The hard cap
-        # (slack=0) measurably starves multi-hop questions whose evidence lives in 1-2
-        # sessions: LME multi-session served-precision drops 0.88->0.72 (2026-07-25).
-        # Rerank scores are 0-1 relevance; 0 (default) keeps the hard-cap behavior.
-        _sess_slack = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_SLACK", "0") or "0")
-        # Freshness scope on the cap: >0 restricts the cap to sessions whose newest pooled
-        # episode is within this many hours of now. The measured noise pattern the cap fixes
-        # is specifically the LIVE session's turns crowding the bucket (prod replay 2026-07-25:
-        # 11 of 27 dominations were <6h-old sessions at query time); an OLD session serving
-        # multiple slots usually means the evidence genuinely lives there (LME multi-session:
-        # capping those drops served-precision 0.88->0.72). Unparseable timestamps count as
-        # fresh (cap applies — the conservative, shipped-behavior side). 0 = cap all sessions.
-        _sess_fresh_h = float(os.environ.get("SYNAPSE_RECALL_SESSION_CAP_FRESH_H", "0") or "0")
         # Every path walks the full ranking: a passage redundant with one already chosen is
         # skipped and its slot backfills from the next-ranked passage.
         redundant = _Redundancy(passages, owner)
@@ -128,67 +97,20 @@ class RecallPassagesMixin:
                     + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
                 )
                 return []
-            sess_fresh: dict[Any, bool] = {}
-            if _sess_cap and _sess_fresh_h > 0:
-                from datetime import UTC, datetime
-
-                _now = datetime.now(UTC)
-                for f_ep in episodes:
-                    e_sid = f_ep.get("session_id")
-                    if e_sid is None:
-                        continue
-                    try:
-                        ts = f_ep.get("created_at")
-                        dt = ts if isinstance(ts, datetime) else datetime.fromisoformat(str(ts))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=UTC)
-                        fresh = (_now - dt).total_seconds() <= _sess_fresh_h * 3600
-                    except Exception:
-                        fresh = True  # unknown age -> treat as fresh, cap applies
-                    sess_fresh[e_sid] = sess_fresh.get(e_sid, False) or fresh
-            per_ep: dict[int, int] = {}
             per_sess: dict[Any, int] = {}
-            for pos, (i, _s) in enumerate(scored):
+            for i, _s in scored:
                 if not _fresh(i):
                     continue
-                ep = owner[i]
-                if _quota and per_ep.get(id(ep), 0) >= _quota:
+                sid = owner[i].get("session_id")
+                if sid is not None and per_sess.get(sid, 0) >= _SESSION_CAP:
                     continue
-                sid = ep.get("session_id")
-                if (
-                    _sess_cap
-                    and sid is not None
-                    and per_sess.get(sid, 0) >= _sess_cap
-                    and (_sess_fresh_h <= 0 or sess_fresh.get(sid, True))
-                ):
-                    if _sess_slack <= 0:
-                        continue
-                    alt = next(
-                        (
-                            s2
-                            for i2, s2 in scored[pos + 1 :]
-                            if owner[i2].get("session_id") != sid
-                            and not (_quota and per_ep.get(id(owner[i2]), 0) >= _quota)
-                            and not (
-                                owner[i2].get("session_id") is not None
-                                and per_sess.get(owner[i2].get("session_id"), 0) >= _sess_cap
-                            )
-                            and not redundant.covers(i2)
-                        ),
-                        None,
-                    )
-                    if alt is not None and (_s - alt) <= _sess_slack:
-                        continue  # near-tie: diversity wins the slot
-                    # No alternative within slack — serving diversity here would cost
-                    # real relevance, so the capped session keeps the slot.
-                per_ep[id(ep)] = per_ep.get(id(ep), 0) + 1
                 if sid is not None:
                     per_sess[sid] = per_sess.get(sid, 0) + 1
                 chosen.append(i)
                 redundant.keep(i)
                 if len(chosen) >= n:
                     break
-            # Backfill: caps starved us below n (pool is genuinely one session / one episode) —
+            # Backfill: the cap starved us below n (the pool is genuinely one session) —
             # relax and take the next-best passages in score order so diversity-trimming never
             # reduces the served count when nothing more diverse exists to serve. Redundant
             # passages stay out: a repeat adds tokens, not information.
@@ -209,12 +131,7 @@ class RecallPassagesMixin:
         groups: dict[int, tuple[dict[str, Any], set[int]]] = {}
         for i in chosen:
             ep = owner[i]
-            members = groups.setdefault(id(ep), (ep, set()))[1]
-            members.add(i)
-            for d in range(1, _window + 1):
-                for j in (i - d, i + d):
-                    if 0 <= j < len(passages) and owner[j] is ep:
-                        members.add(j)
+            groups.setdefault(id(ep), (ep, set()))[1].add(i)
         out: list[dict[str, Any]] = []
         for ep, members in groups.values():
             runs: list[list[int]] = []
@@ -255,6 +172,15 @@ class RecallPassagesMixin:
             out.append(item)
         return out
 
+
+#: Session-diversity cap on the served passages: at most this many of the n served chunks may
+#: share a session_id, backfilled from lower-ranked chunks when nothing more diverse exists.
+#: The live session's freshly ingested turns are topically dense and recency-boosted, so
+#: uncapped they took every slot (the top recall_feedback noise driver, 2026-07-23). The
+#: 2026-07-25 alternatives (a score-slack tiebreak, a freshness-scoped cap) and the
+#: per-episode quota/window experiments were never enabled and were removed 2026-10-10;
+#: chunks of one episode now merge into one item instead.
+_SESSION_CAP = 2
 
 #: Separator between non-adjacent chunks of one episode inside a merged passage item.
 _RUN_GAP = "\n[…]\n"
