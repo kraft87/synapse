@@ -376,10 +376,15 @@ class RecallOverviewMixin:
         # — the turn is immutable history and usually carries more than the stale claim. Deduped
         # against the facts bucket above. Cheap (partial GIN, fail-open); usually a no-op.
         if ep_items and not kg_off:
+            served_text: dict[int, str] = {}
+            for it in ep_items:
+                for eid in _parse_episode_ids([it.get("id")]):
+                    served_text[eid] = served_text.get(eid, "") + (it.get("content") or "")
             sup = self._episode_supersessions(
-                _parse_episode_ids([it.get("id") for it in ep_items if it.get("id")]),
+                list(served_text),
                 group_id,
                 self_session=self_session,
+                served_text=served_text,
                 **kg_scope,
             )
             if sup:

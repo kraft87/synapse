@@ -399,3 +399,16 @@ def test_board_kind_row_shape(conn, db_url, full_surface):
     assert est_tokens == chars // 4
     # Note ids in served ("n:N") form — joinable against recall_feedback's id lists.
     assert served == {"notes": [f"n:{nid}"], "n_notes": 1, "overflow": 0, "trust": "full"}
+
+
+def test_overlay_gets_the_served_passage_text(conn, db_url, monkeypatch, full_surface):
+    """The episode-validity overlay is judged against what was served for each episode,
+    so a chunk-cited successor only lands on a passage that states the retired claim."""
+    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    seen: list[dict] = []
+    engine._episode_supersessions = lambda ids, g, **k: seen.append({"ids": ids, **k}) or {}
+    out = engine.recall("overlay text", source="mcp-tool", surface=full_surface)
+    served = {int(it["id"][2:]): it["content"] for it in out["episodes"]}
+    assert seen and seen[0]["ids"] == list(served)
+    assert seen[0]["served_text"] == served

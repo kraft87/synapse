@@ -11,6 +11,7 @@ import psycopg
 from psycopg.rows import tuple_row
 
 from mcp_server.kg_pg import _vec_literal, scope_predicate, search_kg_postgres
+from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
@@ -434,6 +435,7 @@ class RecallSourcesMixin:
         cap: int = 6,
         allowed_projects: list[str] | None = None,
         self_session: str | None = None,
+        served_text: dict[int, str] | None = None,
     ) -> dict[int, list[str]]:
         """Map served episode ids -> the CURRENT facts that superseded a claim each made.
 
@@ -447,7 +449,10 @@ class RecallSourcesMixin:
         served, and P is what ties it to the episode.
 
         ``self_session`` drops a successor N sourced only from the calling session, the
-        overlay half of self-exclusion (see ``_self_session_facts``)."""
+        overlay half of self-exclusion (see ``_self_session_facts``).
+
+        ``served_text`` (episode id -> the text actually served for it) keeps a successor
+        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``)."""
         settings = self._settings()
         if not episode_ids:
             return {}
@@ -468,12 +473,12 @@ class RecallSourcesMixin:
             group_id,
             settings._SUP_LINK_MAX_DIST,
             *scope_args,
-            cap,
+            cap if served_text is None else cap * 4,  # headroom for the support filter
         ]
         try:
             conn = self._ensure_pg()
             rows = conn.execute(
-                "SELECT p.episodes, n.fact FROM kg_relationships p "
+                "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
                 "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                 f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
                 "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
@@ -489,13 +494,26 @@ class RecallSourcesMixin:
             return {}
         idset = set(episode_ids)
         out: dict[int, list[str]] = {}
+        n_links = 0
         for r in rows:
             fact = r.get("fact")
             if not fact:
                 continue
+            attached = False
             for eid in r.get("episodes") or []:
-                if eid in idset:
-                    out.setdefault(int(eid), []).append(fact)
+                if eid not in idset:
+                    continue
+                if (
+                    served_text is not None
+                    and claim_support(r.get("old_fact") or "", served_text.get(int(eid), ""))
+                    < OVERLAY_MIN_SUPPORT
+                ):
+                    continue
+                out.setdefault(int(eid), []).append(fact)
+                attached = True
+            n_links += attached
+            if n_links >= cap:
+                break
         return out
 
     def _surface_supersessions(

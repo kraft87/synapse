@@ -72,6 +72,54 @@ def passage_role(spans: list[tuple[int, str]], start: int, end: int) -> str | No
     return seen.pop() if len(seen) == 1 else "mixed"
 
 
+# Episode-validity overlay: a successor attaches to a served passage only when the passage
+# states the retired claim, i.e. contains at least this share of the claim's content words.
+# A fact extracted from a multi-turn chunk cites every episode in the chunk (4-31 of them),
+# so the citation alone put unrelated successors on unrelated passages: a piano fact on a
+# restic setup turn. Measured on prod 2026-10-09: the passage best matching a single-source
+# claim scored 0.25-1.0 (most >= 0.4); a third of chunk-citation attachments scored < 0.3.
+OVERLAY_MIN_SUPPORT = 0.3
+
+_CLAIM_STOP = frozenset(
+    "a an the and or of to in on for with by at from as is are was were be been being it its "
+    "this that these those has have had not no but via into over under than then so if when "
+    "while also only just about after before during kyle user kyle's user's meaning".split()
+)
+_CLAIM_TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_.\-/@:]*[a-z0-9]|[a-z0-9]")
+_CLAIM_PART_RE = re.compile(r"[/._\-:@]+")
+_CLAIM_MEANING_RE = re.compile(r"\(meaning [^)]*\)")
+_CLAIM_THOUSANDS_RE = re.compile(r"(?<=\d),(?=\d{3}\b)")
+
+
+def _claim_norm(text: str) -> str:
+    return _CLAIM_THOUSANDS_RE.sub("", _CLAIM_MEANING_RE.sub(" ", text.lower()))
+
+
+def claim_support(claim: str, text: str) -> float:
+    """Share of ``claim``'s content words (3+ chars, not stopwords) that ``text`` contains.
+
+    A dotted/slashed token (a path, host or file name) also counts when all of its parts
+    appear. Extractor annotations like "(meaning 2026-10-09)" and thousands separators are
+    ignored. A claim with no content words returns 1.0: nothing to check against."""
+    want = {
+        t
+        for t in _CLAIM_TOKEN_RE.findall(_claim_norm(claim))
+        if len(t) >= 3 and t not in _CLAIM_STOP
+    }
+    if not want:
+        return 1.0
+    have: set[str] = set()
+    for t in _CLAIM_TOKEN_RE.findall(_claim_norm(text)):
+        have.add(t)
+        have.update(part for part in _CLAIM_PART_RE.split(t) if part)
+    hits = sum(
+        1
+        for t in want
+        if t in have or all(part in have for part in _CLAIM_PART_RE.split(t) if part)
+    )
+    return hits / len(want)
+
+
 def parse_episode_ids(ids: list[Any]) -> list[int]:
     """Parse and cap the episode identifiers accepted by fetch()."""
     parsed: list[int] = []
