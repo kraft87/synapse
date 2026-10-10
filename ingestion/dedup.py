@@ -345,6 +345,7 @@ class NodeDeduper:
 
     Public surface:
         - ``find_or_none(name, summary)`` → existing UUID or None
+        - ``exact_match(name)`` → existing UUID or None, exact-name only (pre-INSERT guard)
         - ``register(name, uuid)`` — call after INSERT so the index stays warm
         - ``merge_summary(existing_summary, new_summary)`` → str (longer wins)
         - ``summary_of(uuid)`` / ``type_map`` — read-through index accessors
@@ -507,6 +508,14 @@ class NodeDeduper:
                 return cand_uuid
             # "no" or "uncertain" → keep trying the next LSH candidate.
         return None
+
+    def exact_match(self, name: str) -> str | None:
+        """Strategy 1 alone: the uuid of an entity with ``name``'s normalized name, or None.
+
+        Checks the shared index (nodes any worker thread registered) and then the live
+        DB, so a caller about to INSERT can see a node written since it resolved."""
+        normalized = _normalize_name(name)
+        return self._exact_name_lookup(normalized) if normalized else None
 
     def register(self, name: str, node_uuid: str, summary: str = "") -> None:
         """Add a freshly-inserted node to the shared in-memory index.

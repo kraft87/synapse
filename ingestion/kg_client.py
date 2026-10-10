@@ -377,6 +377,20 @@ class KGClient:
         )
         return hits
 
+    def nearest_live_edges(
+        self,
+        fact_embeddings: list[list[float]],
+        group_id: str,
+        max_distance: float,
+        limit: int,
+    ) -> list[list[dict[str, Any]]]:
+        """Per embedding, its nearest live edges within ``max_distance`` (cosine
+        distance), nearest first, in one round-trip (Stage 6c restatement recheck)."""
+        hits: list[list[dict[str, Any]]] = self._reader.nearest_live_edges(
+            fact_embeddings, group_id, max_distance=max_distance, limit=limit
+        )
+        return hits
+
     def find_edges_by_pair(
         self,
         source_uuid: str,

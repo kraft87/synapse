@@ -154,3 +154,66 @@ class TestEdgeReads:
     def test_fulltext_empty_query_short_circuits(self, kg_tables):
         assert kg_tables.find_edges_by_fulltext("", GROUP) == []
         assert kg_tables.find_edges_by_fulltext("!!! ---", GROUP) == []
+
+
+def _tilted(cos: float) -> list[float]:
+    """Unit vector at cosine ``cos`` to axis 0 (cosine distance 1 - cos)."""
+    v = [0.0] * DIM
+    v[0], v[1] = cos, (1.0 - cos * cos) ** 0.5
+    return v
+
+
+class TestNearestLiveEdges:
+    """Stage 6c's batched lookup: per embedding, the nearest live in-scope edges inside
+    the distance bound, nearest first, in one statement."""
+
+    @pytest.fixture()
+    def reader(self, conn, monkeypatch, db_url):
+        monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+        conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
+        rows = [
+            # uuid, owner, group, vector, retired
+            ("n-same", "default", GROUP, _tilted(1.0), False),
+            ("n-close", "default", GROUP, _tilted(0.95), False),
+            ("n-edge", "default", GROUP, _tilted(0.91), False),
+            ("n-far", "default", GROUP, _tilted(0.80), False),
+            ("n-retired", "default", GROUP, _tilted(1.0), True),
+            ("n-other-group", "default", "personal", _tilted(1.0), False),
+            ("n-other-owner", "tenant2", GROUP, _tilted(1.0), False),
+            ("n-noemb", "default", GROUP, None, False),
+        ]
+        for uuid, owner, group, vec, retired in rows:
+            conn.execute(
+                "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, "
+                "name, fact, fact_embedding, t_invalid) VALUES "
+                "(%s, %s, %s, 'e-s', 'e-t', 'R', %s, %s::vector, %s)",
+                (
+                    uuid,
+                    owner,
+                    group,
+                    f"fact {uuid}",
+                    None if vec is None else "[" + ",".join(map(str, vec)) + "]",
+                    "2026-06-01T00:00:00+00:00" if retired else None,
+                ),
+            )
+        return KGPostgresReader()
+
+    def test_in_scope_live_neighbours_inside_the_bound_nearest_first(self, reader):
+        (hits,) = reader.nearest_live_edges([_tilted(1.0)], GROUP, max_distance=0.10, limit=5)
+        assert [h["uuid"] for h in hits] == ["n-same", "n-close", "n-edge"]
+        assert hits[0]["fact"] == "fact n-same"
+        assert hits[0]["score"] == pytest.approx(0.0, abs=1e-3)
+        assert hits[1]["score"] == pytest.approx(0.05, abs=1e-3)
+
+    def test_one_result_list_per_embedding_in_input_order(self, reader):
+        out = reader.nearest_live_edges(
+            [_axis_list(7), _tilted(0.95), _tilted(1.0)], GROUP, max_distance=0.10, limit=1
+        )
+        assert [[h["uuid"] for h in hits] for hits in out] == [[], ["n-close"], ["n-same"]]
+
+    def test_other_group_sees_only_its_own(self, reader):
+        (hits,) = reader.nearest_live_edges([_tilted(1.0)], "personal", 0.10, 5)
+        assert [h["uuid"] for h in hits] == ["n-other-group"]
+
+    def test_empty_input_issues_no_query(self, reader):
+        assert reader.nearest_live_edges([], GROUP, 0.10, 5) == []

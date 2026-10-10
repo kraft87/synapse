@@ -2,12 +2,29 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from ingestion.extraction_entities import DeterministicExtractor, EntityResolver
 from ingestion.extraction_llm import LLMExtractor
-from ingestion.models import ExtractedEntity, ExtractionResult
+from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PendingNodes:
+    """One group's NEW entities, held back until Stage 7's write decision is known.
+
+    ``entities`` are the ones Stage 4 resolved to a "new:" uuid; the rest is what
+    ``_stage5_write_nodes`` needs to write them."""
+
+    entities: list[ExtractedEntity]
+    project: str | None
+    embeddings: dict[str, list[float]]
+    deduper: Any | None
 
 
 class ExtractionNodesMixin:
@@ -77,6 +94,17 @@ class ExtractionNodesMixin:
             clean_uuid = raw_uuid.removeprefix("new:")
             emb = (embeddings or {}).get(entity.name)
 
+            # Same-name guard: Stage 4 resolved this name as new, but another worker (or
+            # an earlier entity of this batch with the same normalized name) may have
+            # written it since. Handle it as the exact-name hit Stage 4 would find now:
+            # route the batch's edges to that entity and update it instead of inserting
+            # a second one.
+            if is_new and deduper is not None:
+                existing = deduper.exact_match(entity.name)
+                if existing is not None:
+                    uuid_map[entity.name] = existing
+                    is_new, clean_uuid = False, existing
+
             # When dedup matched an EXISTING entity, prefer the longer
             # summary so the more-detailed text survives. Without this
             # the freshly-extracted (often shorter) summary would
@@ -112,6 +140,44 @@ class ExtractionNodesMixin:
             # the deduper's exact-name index from its initial hydration.
             if is_new and deduper is not None:
                 deduper.register(entity.name, clean_uuid, entity.summary)
+
+    def _stage5_write_new_nodes(
+        self,
+        facts: list[ExtractedFact],
+        uuid_map: dict[str, str],
+        skip_indices: set[int],
+        group_id: str,
+        pending: PendingNodes,
+    ) -> None:
+        """Write the group's NEW entities that a fact Stage 7 will create links, no others.
+
+        Runs right after Stage 6c, inside Stage 7 before its edge writes, with the same
+        create guard Stage 7 applies (not skipped, both endpoints resolved). A new entity whose facts were all
+        dropped (cross-group, same-batch twin, 6b or 6c duplicate, unresolved endpoint) is
+        never written, so it cannot be left without an edge. ``uuid_map`` is updated in
+        place when the same-name guard routes a name to an entity written meanwhile."""
+        linked: set[str] = set()
+        for idx, fact in enumerate(facts):
+            if idx in skip_indices or not (uuid_map.get(fact.source) and uuid_map.get(fact.target)):
+                continue
+            linked.update((fact.source, fact.target))
+        to_write = [
+            e
+            for e in pending.entities
+            if e.name in linked and uuid_map.get(e.name, "").startswith("new:")
+        ]
+        held = len(pending.entities) - len(to_write)
+        if held:
+            logger.debug("Held back %d new entities no written fact links", held)
+        if to_write:
+            self._stage5_write_nodes(
+                to_write,
+                uuid_map,
+                pending.project,
+                group_id,
+                pending.embeddings,
+                deduper=pending.deduper,
+            )
 
     def _deduper_for(self, group_id: str) -> Any:
         """Cached per-group NodeDeduper (thin shell; see ingestion.dedup).

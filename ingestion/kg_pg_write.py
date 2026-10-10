@@ -257,9 +257,10 @@ class KGPostgresWriter:
         """Delete entities that no edge, live or retired, references, once they are
         ``min_age_hours`` old. Returns the number deleted.
 
-        Stage 5 writes an extraction's entities before Stage 6/7 decide its edges, so an
-        entity can end up with none: its only fact was skipped as a duplicate or collapsed
-        as a same-batch twin, or its edges were deleted with their episode. Orphans cost
+        Extraction writes a new entity only for a fact Stage 7 creates, but an entity can
+        still end up with no edge: its edges were deleted with their episode, the item
+        failed between the entity and edge writes, or it predates that rule (until
+        2026-10 Stage 5 wrote entities before Stage 6/7 decided their facts). Orphans cost
         serving: the facts leg's seed KNN takes 25 entities and keeps those with live
         degree, so every orphan near the query burns a seed slot (19% of entities on prod
         by 2026-10-10). The age gate keeps a sweep from racing an in-flight extraction.

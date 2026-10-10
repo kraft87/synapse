@@ -7,6 +7,7 @@ The extraction pipeline reads the graph in six places while writing it:
   - stage 6a/6b contradiction      -> ``find_edges_by_pair``
   - stage 7 dedup candidate pool   -> ``find_edges_by_pair`` + ``find_similar_edges``
                                       + ``find_edges_by_fulltext``
+  - stage 6c restatement recheck   -> ``nearest_live_edges``
 
 This module serves all of them from the ``kg_entities`` / ``kg_relationships``
 tables (schema/017), scoped by ``owner_id`` + ``group_id``, via
@@ -56,6 +57,10 @@ OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
 # Over-fetch pool for global-HNSW-then-filter (see module docstring / kg_pg.py).
 _OVERFETCH = 200
+# The same over-fetch for the Stage 6c restatement lookup, one HNSW scan per fact. A
+# restatement sits within cosine distance 0.10, among the very nearest live edges of any
+# scope, so a short pool is enough and keeps the per-fact heap fetches cheap.
+_RESTATED_OVERFETCH = 32
 
 
 def _vec_literal(emb: list[float]) -> str:
@@ -215,6 +220,54 @@ class KGPostgresReader:
                 {"uuid": u, "fact": f, "valid_at": _iso(v), "score": float(d)}
                 for u, f, v, d in cur.fetchall()
             ]
+
+    def nearest_live_edges(
+        self,
+        fact_embeddings: list[list[float]],
+        group_id: str,
+        max_distance: float,
+        limit: int,
+    ) -> list[list[dict[str, Any]]]:
+        """Per embedding, up to ``limit`` live edges of the group within ``max_distance``
+        (cosine), nearest first. Parallel to ``fact_embeddings``.
+
+        One statement for the whole batch: ``unnest`` feeds each embedding into a LATERAL
+        HNSW scan over the bare partial-index predicate, and the tenant scope and distance
+        bound filter that scan's short over-fetch (same discipline as
+        ``find_similar_edges``)."""
+        if not fact_embeddings:
+            return []
+        conn = self._connection()
+        with conn.transaction():
+            cur = conn.cursor()
+            cur.execute("SET LOCAL hnsw.ef_search = 200")
+            cur.execute("SET LOCAL enable_seqscan = off")
+            cur.execute(
+                "SELECT q.i, n.uuid, n.fact, n.dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                "FROM unnest(%s::text[]) WITH ORDINALITY AS q(emb, i) "
+                "CROSS JOIN LATERAL ("
+                "  SELECT uuid, fact, dist FROM ("
+                "    SELECT uuid, fact, owner_id, group_id, "
+                f"           fact_embedding::halfvec({_EMBED_DIMS}) <=> q.emb::halfvec({_EMBED_DIMS}) AS dist "
+                "    FROM kg_relationships "
+                "    WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
+                "    ORDER BY dist LIMIT %s"
+                "  ) c WHERE owner_id = %s AND group_id = %s AND dist <= %s "
+                "  ORDER BY dist LIMIT %s"
+                ") n ORDER BY q.i, n.dist",
+                (
+                    [_vec_literal(e) for e in fact_embeddings],
+                    _RESTATED_OVERFETCH,
+                    OWNER,
+                    group_id,
+                    max_distance,
+                    limit,
+                ),
+            )
+            out: list[list[dict[str, Any]]] = [[] for _ in fact_embeddings]
+            for i, u, f, d in cur.fetchall():
+                out[i - 1].append({"uuid": u, "fact": f, "score": float(d)})
+            return out
 
     def find_edges_by_pair(
         self, source_uuid: str, target_uuid: str, group_id: str
