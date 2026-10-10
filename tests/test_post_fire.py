@@ -120,8 +120,13 @@ def _stub_merge(calls):
     return fake
 
 
-def _wire(monkeypatch, *, fires, episodes, verdict_json, calls, doc=("desc", "body")):
+def _wire(
+    monkeypatch, *, fires, episodes, verdict_json, calls, doc=("desc", "body"), registered=None
+):
     seen = {}
+    if registered is None:
+        registered = {f["skill"] for f in fires}
+    monkeypatch.setattr(PF, "_registered_skills", lambda conn: set(registered))
 
     def fetch_fires(conn, since):
         seen["since"] = since
@@ -187,6 +192,7 @@ def test_deviation_emits_retune_call_shape(monkeypatch):
         "unlocated": 0,
         "candidates": 1,
         "judge_failures": 0,
+        "unregistered": 0,
     }
     c = calls[0]
     assert c["kind"] == "retune" and c["name"] == "widget-deploy"
@@ -349,3 +355,37 @@ def test_window_caps_at_ten_episodes(monkeypatch):
 def test_run_signature_is_keyword_only():
     with pytest.raises(TypeError):
         PF.run(None, None)  # since must be keyword-only
+
+
+def test_unregistered_skill_fire_is_skipped_unjudged(monkeypatch):
+    # A built-in or third-party skill has no registry row: no judge call, no proposal.
+    calls = []
+    prompts, _ = _wire(
+        monkeypatch,
+        fires=[_fire()],
+        episodes=_SESSION,
+        verdict_json=json.dumps(_DEVIATION_VERDICT),
+        calls=calls,
+        registered=set(),
+    )
+    stats = PF.run(None, since=None)
+    assert stats["unregistered"] == 1
+    assert stats["candidates"] == 0
+    assert prompts == [] and calls == []
+
+
+def test_registered_skill_still_judged_alongside_unregistered(monkeypatch):
+    calls = []
+    prompts, _ = _wire(
+        monkeypatch,
+        fires=[_fire(skill="built-in-thing"), _fire()],
+        episodes=_SESSION,
+        verdict_json=json.dumps(_DEVIATION_VERDICT),
+        calls=calls,
+        registered={"widget-deploy"},
+    )
+    stats = PF.run(None, since=None)
+    assert stats["unregistered"] == 1
+    assert stats["candidates"] == 1
+    assert [c["name"] for c in calls] == ["widget-deploy"]
+    assert len(prompts) == 1  # only the registered fire reached the judge

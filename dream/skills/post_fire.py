@@ -158,6 +158,15 @@ def _fetch_fires(conn, since) -> list[dict]:
     ]
 
 
+def _registered_skills(conn) -> set[str]:
+    """Names of the skills in the registry (not retired). A fire of anything else, such
+    as a skill built into the agent or shipped by a third-party plugin, has no registry
+    row to retune, so judging it can only produce a proposal nobody can apply."""
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM skills_lane.skill_registry WHERE status <> 'retired'")
+    return {name for (name,) in cur.fetchall()}
+
+
 def _fetch_session_episodes(conn, session_id: str) -> list[dict]:
     cur = conn.cursor()
     cur.execute(
@@ -242,6 +251,7 @@ def run(conn, *, since, model: str | None = None) -> dict:
         "unlocated": 0,
         "candidates": 0,
         "judge_failures": 0,
+        "unregistered": 0,
     }
     fires = _fetch_fires(conn, since)
     stats["fires"] = len(fires)
@@ -249,8 +259,16 @@ def run(conn, *, since, model: str | None = None) -> dict:
         return stats
 
     scan_night = SM.scan_night()
+    registered = _registered_skills(conn)
     sessions: dict[str, list[dict]] = {}
     for fire in fires:
+        # Only skills the lane owns can be retuned. The other detectors already gate on
+        # the registry (struggle_arc: name in skill_names; procedure_miner: extends in
+        # registry); without this, a fire of a built-in skill became an unappliable
+        # retune proposal.
+        if fire["skill"] not in registered:
+            stats["unregistered"] += 1
+            continue
         sid = fire["session_id"]
         if not sid:
             stats["unassessable"] += 1
