@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 from ingestion.extraction_edges import ExtractionEdgesMixin
 from ingestion.extraction_entities import DeterministicExtractor, EntityResolver
 from ingestion.extraction_llm import LLMExtractor
-from ingestion.extraction_nodes import ExtractionNodesMixin
+from ingestion.extraction_nodes import ExtractionNodesMixin, PendingNodes
 from ingestion.extraction_policy import _BATCH_CONTRADICTION_PROMPT as _BATCH_CONTRADICTION_PROMPT
 from ingestion.extraction_policy import _CONTRADICTION_PROMPT as _CONTRADICTION_PROMPT
 from ingestion.extraction_policy import _ERROR_RE as _ERROR_RE
@@ -47,6 +47,7 @@ from ingestion.extraction_policy import (
 )
 from ingestion.extraction_policy import build_resolution_prompt as build_resolution_prompt
 from ingestion.extraction_policy import dedupe_pools as dedupe_pools
+from ingestion.extraction_recheck import recheck_restated
 from ingestion.extraction_twins import collapse_batch_twins
 
 logger = logging.getLogger(__name__)
@@ -228,8 +229,10 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
 
         # --- Pre-resolve orphan filter --------------------------------------
         # Only entities that appear as the source or target of an extracted
-        # fact can survive Stage 5 (the orphan-drop below enforces that). But
-        # the deterministic extractor emits hundreds-to-thousands of entity
+        # fact can be written at all: an existing one is updated in Stage 5
+        # below, a new one only when Stage 7 will create a fact linking it
+        # (_stage5_write_new_nodes, per group, right before Stage 7 writes). But the
+        # deterministic extractor emits hundreds-to-thousands of entity
         # mentions per summary (file paths, URLs, identifiers): on a real
         # corpus summary that's ~1300 entities backing only ~6-12 facts.
         # Resolving every one of them in Stage 4 (per-entity vector search +
@@ -269,7 +272,9 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # build — is constructed once per worker and reused across items.
         # ``register`` keeps the in-memory index in sync after Stage 5
         # writes each new node, so repeat names dedupe against
-        # freshly-inserted nodes both within an item and across items.
+        # freshly-inserted nodes both within an item and across items, and
+        # the same-name guard in ``_stage5_write_nodes`` re-checks the name
+        # right before each insert.
         from ingestion.dedup import NodeDeduper
 
         uuid_map: dict[str, str] = {}
@@ -289,8 +294,12 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # graph write per entity, check that the LLM extractor actually
         # produced a fact referencing it. Without this filter the
         # deterministic extractor + LLM extractor produce ~92% zero-edge
-        # orphan nodes. Entities orphaned later (a skipped duplicate fact, a collapsed
-        # twin, deleted edges) are swept daily by Poller.sweep_orphan_entities.
+        # orphan nodes. A referenced fact can still be dropped later (cross-group,
+        # same-batch twin, 6b/6c duplicate, unresolved endpoint), which used to
+        # leave a third of the fresh entities edge-less: so NEW entities are held
+        # back here and written per group right before Stage 7 writes edges, only
+        # for the facts it creates. Poller.sweep_orphan_entities stays as the daily safety net
+        # (edges deleted with their episode, a crash between the two writes).
         referenced_uuids: set[str] = set()
         for fact in llm_result.facts:
             src_uuid = uuid_map.get(fact.source)
@@ -300,9 +309,12 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             if tgt_uuid:
                 referenced_uuids.add(tgt_uuid.removeprefix("new:"))
 
-        # Stage 5 — write only the entities whose resolved UUID shows up as
-        # the source or target of some fact in the same response.
+        # Stage 5 — only entities whose resolved UUID shows up as the source or
+        # target of some fact in the same response. EXISTING ones get their
+        # summary-merge update now; NEW ones wait in ``new_nodes`` for their group's
+        # Stage 7 write decision.
         orphan_count = 0
+        new_nodes: dict[str, PendingNodes] = {}
         for grp, grp_entities in grp_entities_map.items():
             grp_uuid_map = {e.name: uuid_map[e.name] for e in grp_entities if e.name in uuid_map}
             kept_entities = [
@@ -311,10 +323,13 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                 if grp_uuid_map.get(e.name, "").removeprefix("new:") in referenced_uuids
             ]
             orphan_count += len(grp_entities) - len(kept_entities)
-            if not kept_entities:
+            fresh = [e for e in kept_entities if grp_uuid_map[e.name].startswith("new:")]
+            new_nodes[grp] = PendingNodes(fresh, project, entity_embeddings, dedupers.get(grp))
+            existing = [e for e in kept_entities if e not in fresh]
+            if not existing:
                 continue
             self._stage5_write_nodes(
-                kept_entities,
+                existing,
                 grp_uuid_map,
                 project,
                 grp,
@@ -369,6 +384,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # Stage 6 + 7 run separately per group — same code path, different graph.
         # default_valid_at doubles as the relative-date reference_time (the segment
         # timestamp), so "last week" resolves against the conversation, not ingest.
+        # A group with no facts left (all cross-group) writes none of its new entities.
         for grp in active_groups():
             grp_facts = facts_by_group[grp]
             if not grp_facts:
@@ -381,6 +397,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                 web_artifact_id=web_artifact_id,
                 default_valid_at=default_valid_at,
                 reference_time=default_valid_at,
+                new_nodes=new_nodes.get(grp),
             )
 
     def _process_facts_for_group(
@@ -392,8 +409,12 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         web_artifact_id: int | None = None,
         default_valid_at: str | None = None,
         reference_time: str | None = None,
+        new_nodes: PendingNodes | None = None,
     ) -> None:
-        """Stage 6 + 7 for one group's facts (extracted from process_item to keep it readable)."""
+        """Stage 6 + 7 for one group's facts (extracted from process_item to keep it readable).
+
+        ``new_nodes`` are the group's entities Stage 4 resolved as new; only those a fact
+        Stage 7 creates links are written, right before its edges."""
         import logfire
 
         with logfire.span(
@@ -450,6 +471,36 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     )
                     sat_span.set_attribute("extra_invalidated", extra)
 
+            # Stage 6c + the deferred Stage 5 for new entities run INSIDE Stage 7, after its
+            # LLM pre-pass and right before its first write, so the window in which an
+            # overlapping window's freshly written edge goes unseen is DB round-trips, not
+            # LLM calls. 6c rechecks the facts about to be created against the live graph
+            # as it is NOW (an edge written since 6a pooled, or one the judge missed); then
+            # only the new entities a fact still being created links are written.
+            def recheck_then_write_new_nodes(writer_retires: list[list[str]]) -> None:
+                with logfire.span("stage6c_recheck") as recheck_span:
+                    restated = recheck_restated(
+                        facts,
+                        fact_embeddings_list,
+                        uuid_map,
+                        group_id,
+                        self._kg,
+                        skip_indices,
+                        invalidate,
+                        reinforce,
+                        also_retiring=[u for uuids in writer_retires for u in uuids],
+                    )
+                    recheck_span.set_attribute("restated", restated)
+                if restated:
+                    logger.info(
+                        "Stage 6c: %d fact(s) restate a live edge in %s", restated, group_id
+                    )
+                if new_nodes is not None and new_nodes.entities:
+                    with logfire.span("stage5_write_new_nodes"):
+                        self._stage5_write_new_nodes(
+                            facts, uuid_map, skip_indices, group_id, new_nodes
+                        )
+
             # Stage 7: write edges
             with logfire.span("stage7_write_edges {n}", n=len(facts)):
                 self._stage7_write_edges(
@@ -464,4 +515,5 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     default_valid_at=default_valid_at,
                     reference_time=reference_time,
                     reinforce=reinforce,
+                    before_write=recheck_then_write_new_nodes,
                 )

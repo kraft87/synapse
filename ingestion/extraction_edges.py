@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -336,6 +337,7 @@ class ExtractionEdgesMixin:
         default_valid_at: str | None = None,
         reference_time: str | None = None,
         reinforce: dict[int, list[str]] | None = None,
+        before_write: Callable[[list[list[str]]], None] | None = None,
     ) -> None:
         """Write fact edges, skipping duplicates and invalidating contradictions.
 
@@ -343,6 +345,12 @@ class ExtractionEdgesMixin:
         duplicate of one existing edge but also contradicts another (drop-in
         replacement case), we skip the redundant write but still mark the
         superseded edge as invalid.
+
+        ``before_write`` runs after the LLM pre-pass (edge dates, writer-side
+        contradictions, which it receives) and before the first write. It may add to
+        ``skip_indices`` and ``reinforce`` and remap ``uuid_map``; everything below reads
+        them after it. The extractor runs Stage 6c and the new-entity writes there, so an
+        edge another worker writes while this batch waits on those LLM calls is still seen.
         """
         # Pre-extract (valid_at, invalid_at) for ALL facts in ONE LLM call
         # (PR #89). Previously create_edge fired EdgeDateExtractor.extract
@@ -385,6 +393,8 @@ class ExtractionEdgesMixin:
         batched_contradictions = self._contradiction_detector.detect_contradictions_batch(
             facts, eligible_srcs, eligible_tgts, group_id, fact_embeddings=eligible_embs
         )
+        if before_write is not None:
+            before_write(batched_contradictions)
 
         # Assemble the FULL invalidation list before writing edges so we
         # dispatch ONE UNWIND-batched MATCH+SET round-trip instead of N.
@@ -453,9 +463,9 @@ class ExtractionEdgesMixin:
         orphan_invalidations: list[tuple[str, str | None]] = []
         seen_old: set[tuple[str, str | None]] = set()
         for idx in range(len(facts)):
-            olds: list[str] = list(invalidate.get(idx, []))
-            if idx not in skip_indices:
-                olds.extend(batched_contradictions[idx])
+            # A fact skipped by 6b reached the detector with blank endpoints, so its
+            # list is empty; one 6c absorbed keeps its verdicts, linked to the absorbing edge.
+            olds: list[str] = list(invalidate.get(idx, [])) + batched_contradictions[idx]
             if not olds:
                 continue
             sup = _superseder(idx)
