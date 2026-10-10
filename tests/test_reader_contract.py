@@ -58,7 +58,7 @@ def _wired(kg_facts: list[dict]) -> Recall:
     r._fetch_history_pairs_pg = lambda gid, uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
-    r._compact_to_passages = lambda q, eps, n: []
+    r._compact_to_passages = lambda q, eps, n, **_k: []
     r._increment_fact_retrieval_counts = lambda *a, **k: None
     r._increment_retrieval_counts = lambda ids: None
     r._rerank_pool_scored = lambda q, pl: []

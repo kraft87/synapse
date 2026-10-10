@@ -293,10 +293,14 @@ class RecallOverviewMixin:
         # When compaction is empty the bucket is simply omitted (empty container); the
         # drill-down paths (recall_episodes / fetch) still return full turns on demand.
         ep_items: list[dict[str, Any]] | None = None
+        passage_stats: dict[str, int] = {}
         if ranked_eps:
             ep_items = (
                 self._compact_to_passages(
-                    query, ranked_eps[: settings._RECALL_PASSAGE_SRC_K], settings._RECALL_PASSAGE_N
+                    query,
+                    ranked_eps[: settings._RECALL_PASSAGE_SRC_K],
+                    settings._RECALL_PASSAGE_N,
+                    stats=passage_stats,
                 )
                 or None
             )
@@ -427,6 +431,8 @@ class RecallOverviewMixin:
             "web": [c["id"] for c in web_chunks if c.get("id")],
             "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,
+            # Passages skipped as repeats of another episode's chosen passage.
+            "n_dup_passages": passage_stats.get("n_dup_passages", 0),
             # Trust verdict (schema 053): a restricted serve is narrower by design, so
             # the metrics have to say which regime produced these numbers.
             "trust": st.trust,

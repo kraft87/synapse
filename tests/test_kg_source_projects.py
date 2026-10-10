@@ -470,7 +470,7 @@ def _recall_engine(db_url: str) -> Recall:
     r = Recall(db_url, "")
     r._ensure_embedder = lambda: _Emb()
     r._rerank_pool_scored = lambda q, pool: [(i, 0.9) for i in range(len(pool))]
-    r._compact_to_passages = lambda q, eps, n: [{"id": e["id"], "text": "t"} for e in eps]
+    r._compact_to_passages = lambda q, eps, n, **_k: [{"id": e["id"], "text": "t"} for e in eps]
     r._search_web_reranked = lambda q, emb: []
     r._search_notes = lambda *a, **k: []
     r._increment_retrieval_counts = lambda ids: None
