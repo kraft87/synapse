@@ -356,6 +356,18 @@ def test_full_trust_kg_leg_still_serves_everything(kg, db_url):
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
 
 
+def test_identical_fact_text_serves_once(kg, db_url):
+    """Twins (same text, separate edges) take one slot; the next fact gets the other."""
+    w = _ep(kg, WORK)
+    _fact(kg, "twin-a", "Widget runs on port 8081", f"[{w}]", emb=0)
+    _fact(kg, "twin-b", "widget  runs on port 8081", f"[{w}]", emb=0, src="ent-z")
+    _fact(kg, "other", "Widget runs on port 9090", f"[{w}]", emb=None)  # BM25 only: ranks 3rd
+    facts, _ = Recall(db_url, "")._search_kg("widget port", onehot(0), GROUP, [], 2)
+    assert len(facts) == 2
+    assert len(_uuids(facts) & {"twin-a", "twin-b"}) == 1
+    assert "other" in _uuids(facts)
+
+
 def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
     """A seed whose only live edges are out of scope must not consume a seed slot."""
     p = _ep(kg, PERSONAL)
