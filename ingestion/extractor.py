@@ -289,7 +289,8 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # graph write per entity, check that the LLM extractor actually
         # produced a fact referencing it. Without this filter the
         # deterministic extractor + LLM extractor produce ~92% zero-edge
-        # orphan nodes that the nightly cleanup later has to delete.
+        # orphan nodes. Entities orphaned later (a skipped duplicate fact, a collapsed
+        # twin, deleted edges) are swept daily by Poller.sweep_orphan_entities.
         referenced_uuids: set[str] = set()
         for fact in llm_result.facts:
             src_uuid = uuid_map.get(fact.source)

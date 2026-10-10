@@ -35,6 +35,12 @@ def _drain_concurrency() -> int:
         return 1
 
 
+# Daily, on the master replica's full cycle: entities with no edges are deleted once a day
+# old (KGPostgresWriter.delete_orphan_entities). Drain-only replicas never sweep.
+_ORPHAN_SWEEP_INTERVAL_S = 24 * 3600
+_ORPHAN_MIN_AGE_H = 24
+
+
 class Poller:
     def __init__(
         self,
@@ -60,6 +66,12 @@ class Poller:
     def request_stop(self) -> None:
         """Ask the loop to exit at the next item boundary."""
         self._stop_requested.set()
+
+    def sweep_orphan_entities(self) -> int:
+        """Delete KG entities no edge references (see KGPostgresWriter.delete_orphan_entities)."""
+        if self._extraction is None:
+            return 0
+        return int(self._extraction._kg.delete_orphan_entities(_ORPHAN_MIN_AGE_H))
 
     def embed_pending(self, batch_size: int = 96) -> int:
         """Embed unembedded episodes and chunks.
@@ -362,6 +374,7 @@ class Poller:
             logger.info("Released %d stale 'processing' claims back to pending", released)
         last_full_cycle = 0.0
         last_stale_sweep = time.monotonic()  # just swept above; next sweep one interval out
+        last_orphan_sweep = 0.0  # first full cycle sweeps, then daily
         # Small batches on purpose: a worker holds claimed rows in 'processing' for the
         # whole batch (~per-item time each, serial), so a LARGE batch (a) makes the priority
         # lane laggy — a worker won't re-check for new high-priority ingest until its batch
@@ -402,6 +415,14 @@ class Poller:
                         self.embed_pending()
                     except Exception as e:
                         logger.error("Embed pending failed: %s", e, exc_info=True)
+                    if now_mono - last_orphan_sweep >= _ORPHAN_SWEEP_INTERVAL_S:
+                        try:
+                            n_orphans = self.sweep_orphan_entities()
+                            if n_orphans:
+                                logger.info("Deleted %d orphan KG entities", n_orphans)
+                        except Exception as e:
+                            logger.error("Orphan entity sweep failed: %s", e, exc_info=True)
+                        last_orphan_sweep = now_mono
                     last_full_cycle = now_mono
             try:
                 drained = self.drain_extraction_queue(batch_limit=drain_batch_limit)

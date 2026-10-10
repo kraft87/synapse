@@ -373,3 +373,34 @@ class TestEvidenceCurrency:
         ).fetchone()
         assert str(t_inv).startswith("2026-07-01")  # first retirement stands
         assert by == "n"  # but the later call may still add the missing link
+
+
+class TestDeleteOrphanEntities:
+    def _entity(self, conn, uuid: str, age_hours: int, group: str = GROUP) -> None:
+        conn.execute(
+            "INSERT INTO kg_entities (uuid, group_id, name, created_at) "
+            "VALUES (%s, %s, %s, now() - make_interval(hours => %s))",
+            (uuid, group, uuid, age_hours),
+        )
+
+    def _edge(self, conn, uuid: str, src: str, tgt: str, *, retired: bool = False, group=GROUP):
+        conn.execute(
+            "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, t_invalid) "
+            "VALUES (%s, %s, %s, %s, 'f', CASE WHEN %s THEN now() END)",
+            (uuid, group, src, tgt, retired),
+        )
+
+    def test_only_old_entities_without_any_edge_go(self, kg_writer, conn):
+        for name in ("src", "tgt", "retired-only", "cross-group", "orphan-old"):
+            self._entity(conn, name, age_hours=48)
+        self._entity(conn, "orphan-new", age_hours=1)
+        self._entity(conn, "other", age_hours=48, group="personal")
+        self._edge(conn, "r1", "src", "other", group="personal")
+        self._edge(conn, "r2", "other", "tgt", group="personal")
+        self._edge(conn, "r3", "retired-only", "other", retired=True, group="personal")
+        # an edge in another group still counts (a few edges cross groups on prod)
+        self._edge(conn, "r4", "other", "cross-group", group="personal")
+        assert kg_writer.delete_orphan_entities(24) == 1
+        left = {r[0] for r in conn.execute("SELECT uuid FROM kg_entities").fetchall()}
+        assert left == {"src", "tgt", "retired-only", "cross-group", "orphan-new", "other"}
+        assert kg_writer.delete_orphan_entities(24) == 0  # idempotent

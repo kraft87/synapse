@@ -183,3 +183,19 @@ def test_a_failed_item_is_retried_once_it_cools_off(conn, db_url, monkeypatch):
     assert p.drain_extraction_queue(batch_limit=8) == 1
     assert attempts == [qid, qid]
     assert _statuses(conn)[qid] == "done"
+
+
+def test_orphan_sweep_goes_through_the_pipeline_kg_client():
+    calls: list[int] = []
+
+    class _KG:
+        def delete_orphan_entities(self, min_age_hours):
+            calls.append(min_age_hours)
+            return 3
+
+    class _Pipe:
+        _kg = _KG()
+
+    assert Poller(db=None, extraction_pipeline=_Pipe()).sweep_orphan_entities() == 3  # type: ignore[arg-type]
+    assert calls == [24]
+    assert Poller(db=None).sweep_orphan_entities() == 0  # type: ignore[arg-type]

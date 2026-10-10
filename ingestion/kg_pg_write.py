@@ -253,6 +253,41 @@ class KGPostgresWriter:
 
         self._run(_do)
 
+    def delete_orphan_entities(self, min_age_hours: int = 24) -> int:
+        """Delete entities that no edge, live or retired, references, once they are
+        ``min_age_hours`` old. Returns the number deleted.
+
+        Stage 5 writes an extraction's entities before Stage 6/7 decide its edges, so an
+        entity can end up with none: its only fact was skipped as a duplicate or collapsed
+        as a same-batch twin, or its edges were deleted with their episode. Orphans cost
+        serving: the facts leg's seed KNN takes 25 entities and keeps those with live
+        degree, so every orphan near the query burns a seed slot (19% of entities on prod
+        by 2026-10-10). The age gate keeps a sweep from racing an in-flight extraction.
+        The anti-join covers edges in any group (a few cross groups); the re-check at
+        delete time is the indexed same-group probe, for an edge written mid-statement."""
+        deleted = 0
+
+        def _do(cur: Any) -> None:
+            nonlocal deleted
+            cur.execute(
+                "DELETE FROM kg_entities e USING ("
+                "  SELECT e2.id FROM kg_entities e2 "
+                "  LEFT JOIN (SELECT src_uuid AS u FROM kg_relationships "
+                "             UNION SELECT tgt_uuid FROM kg_relationships) r ON r.u = e2.uuid "
+                "  WHERE r.u IS NULL AND e2.created_at < now() - make_interval(hours => %s)"
+                ") o "
+                "WHERE e.id = o.id "
+                "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+                "                  AND r.group_id = e.group_id AND r.src_uuid = e.uuid) "
+                "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+                "                  AND r.group_id = e.group_id AND r.tgt_uuid = e.uuid)",
+                (min_age_hours,),
+            )
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+        self._run(_do)
+        return deleted
+
     def reinforce_edges(self, items: list[tuple[Any, ...]], group_id: str) -> None:
         """Capture dedup hits: a newly-extracted fact restated an existing edge.
 
