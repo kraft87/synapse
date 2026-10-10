@@ -40,6 +40,14 @@ _MACHINERY_PREFIXES = (
 )
 
 
+# Hook output that Claude Code feeds back as a user record ("Stop hook feedback:\n..."), e.g.
+# the Synapse Stop-hook gate asking for recall_feedback. It still opens its own turn, so the
+# (session_id, sequence) numbering of already-ingested sessions does not move, but its text
+# is not human input: stored as the turn's human side it matched every query about feedback
+# (255 such turns by 2026-10-09). The assistant's reply after the bounce is kept.
+_HOOK_FEEDBACK_PREFIX = "Stop hook feedback:"
+
+
 def _is_machinery_text(text: str) -> bool:
     return text.lstrip().startswith(_MACHINERY_PREFIXES)
 
@@ -287,6 +295,8 @@ class JSONLParser:
                 model = model or mdl
 
                 if rtype == "user":
+                    if text and text.startswith(_HOOK_FEEDBACK_PREFIX):
+                        text = None
                     if text and human_turn is None and len(text) > 0:
                         human_turn = text[:3000]
                         content_parts.append(f"[user] {human_turn}")
@@ -299,7 +309,8 @@ class JSONLParser:
                         assistant_turn = text
                         content_parts.append(f"[assistant] {text[:3000]}")
 
-            if not session_id or not content_parts:
+            # A hook bounce with no reply leaves only the [context] prefix: nothing to store.
+            if not session_id or not content_parts[1 if prev_assistant else 0 :]:
                 continue
 
             span_id = f"jsonl:{last_uuid}" if last_uuid else None

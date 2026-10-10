@@ -274,3 +274,45 @@ class TestParseFile:
         eps = JSONLParser().parse_file(p)
         assert len(eps) == 1
         assert eps[0].human_turn == "hello there"
+
+
+class TestHookFeedback:
+    def _rec(self, rtype: str, content, uuid: str) -> dict:
+        return {
+            "type": rtype,
+            "message": {"content": content},
+            "uuid": uuid,
+            "sessionId": "sess-hook",
+            "cwd": "/home/user/proj",
+            "timestamp": "2026-10-09T10:00:00.000Z",
+        }
+
+    def test_hook_feedback_text_is_not_stored_as_the_human_side(self, tmp_path: Path):
+        gate = "Stop hook feedback:\n[Synapse gate] This turn made 1 recall() call(s) ..."
+        records = [
+            self._rec("user", "what port does the dashboard use?", "u1"),
+            self._rec("assistant", [{"type": "text", "text": "It listens on 8081."}], "a1"),
+            self._rec("user", gate, "u2"),
+            self._rec("assistant", [{"type": "text", "text": "Filed the feedback; 8081."}], "a2"),
+            self._rec("user", "thanks", "u3"),
+            self._rec("assistant", [{"type": "text", "text": "Anytime."}], "a3"),
+        ]
+        eps = JSONLParser().parse_file(_write_jsonl(tmp_path, records))
+        # Numbering is unchanged: the bounce still opens turn 2.
+        assert [e.sequence for e in eps] == [1, 2, 3]
+        assert eps[1].human_turn is None
+        assert "Synapse gate" not in eps[1].content
+        assert "Filed the feedback; 8081." in eps[1].content
+        assert eps[2].human_turn == "thanks"
+
+    def test_bounce_without_a_reply_stores_nothing(self, tmp_path: Path):
+        records = [
+            self._rec("user", "hello", "u1"),
+            self._rec("assistant", [{"type": "text", "text": "hi"}], "a1"),
+            self._rec("user", "Stop hook feedback:\nblocked", "u2"),
+            self._rec("user", "next question", "u3"),
+            self._rec("assistant", [{"type": "text", "text": "answer"}], "a3"),
+        ]
+        eps = JSONLParser().parse_file(_write_jsonl(tmp_path, records))
+        assert [e.sequence for e in eps] == [1, 3]
+        assert all("blocked" not in e.content for e in eps)
