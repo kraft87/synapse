@@ -6,6 +6,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Any
 
+from ingestion.localtime import local_date
 from ingestion.surfaces import SurfaceTrust, episode_scope_sql
 from mcp_server.recall_presentation import parse_fetch_ids as _parse_fetch_ids
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
@@ -151,8 +152,8 @@ class RecallFetchMixin:
                 return out
             out["project"] = meta["project"]
             out["total_turns"] = meta["n"]
-            out["first_date"] = str(meta["first"])[:10]
-            out["last_date"] = str(meta["last"])[:10]
+            out["first_date"] = local_date(meta["first"])
+            out["last_date"] = local_date(meta["last"])
 
             anchor_id: int | None = None
             if around:
@@ -196,7 +197,7 @@ class RecallFetchMixin:
                 item: dict[str, Any] = {
                     "id": f"e:{r['id']}",
                     "seq": r["sequence"],
-                    "date": str(r["created_at"])[:10],
+                    "date": local_date(r["created_at"]),
                     "role": (
                         "mixed"
                         if r["has_h"] and r["has_a"]

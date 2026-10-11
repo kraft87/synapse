@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from ingestion import embedding as _embedding
+from ingestion.localtime import local_date
 from ingestion.web_chunker import CHUNK_OVERLAP, chunk_markdown
 from mcp_server.recall_presentation import passage_role as _passage_role
 from mcp_server.recall_presentation import role_spans as _role_spans
@@ -162,7 +163,7 @@ class RecallPassagesMixin:
             if (project := ep.get("project")) is not None:
                 item["project"] = project
             if (ts := ep.get("created_at")) is not None:
-                item["date"] = str(ts)[:10]
+                item["date"] = local_date(ts)
             if (sid := ep.get("session_id")) is not None:
                 item["session"] = sid  # pivot key for fetch_session drill-down
             # Provenance label (issue #17): who produced this slice of the turn —

@@ -6,6 +6,8 @@ import math
 import re
 from typing import Any
 
+from ingestion.localtime import local_date
+
 _ROLE_MARKER_RE = re.compile(
     r"(?m)^\[(user|attachments|assistant|context|result|title|tool:[^\]\n]{0,80})\]"
 )
@@ -42,7 +44,7 @@ def to_recall_item(row: dict[str, Any]) -> dict[str, Any]:
     if (project := row.get("project")) is not None:
         out["project"] = project
     if (created_at := row.get("created_at")) is not None:
-        out["date"] = str(created_at)[:10]
+        out["date"] = local_date(created_at)  # the user's day, not the UTC one
     if (session_id := row.get("session_id")) is not None:
         out["session"] = session_id
     return out

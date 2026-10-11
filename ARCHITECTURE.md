@@ -793,6 +793,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_DRAIN_ONLY` | unset | `1` → replica is a pure extraction worker (no chunk/embed cycle) |
 | `SYNAPSE_RERANK_MODEL` | `rerank-3-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5-lite` to roll back); for `http` the served model id |
 | `SYNAPSE_DEDUP_TYPE_GATE` | `1` | entity-type compatibility gate in fact dedup (`0` = off) |
+| `SYNAPSE_TIMEZONE` | `America/Toronto` | the user's IANA zone. Turns the stored UTC instants into the user's calendar day wherever a conversation date is derived: the extraction prompt's session date, the edge-date reference time, the timeline gate's turn date, and the date recall serves on episodes. Unset, a turn after 20:00 EDT would be dated the next day. An unknown name logs a warning and uses UTC. Existing rows are not rewritten |
 | `SYNAPSE_TIMELINE_GATE` | `1` | LLM gate that promotes ingested turns to timeline events (`0` = off) |
 | `SYNAPSE_TIMELINE_DEDUP` | `1` | write-time confirm-merge of re-told timeline events ([§3.5](#35-timeline-events--the-episodic-date-log); `0` = off) |
 | `SYNAPSE_CONTENT_DEDUP` | `1` | cross-session byte-identical replay guard at `/ingest` (`0` = off) |

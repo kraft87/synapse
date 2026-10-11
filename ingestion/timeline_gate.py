@@ -36,6 +36,7 @@ from ingestion.llm_client import (
     structured_call,
 )
 from ingestion.llm_schemas import TimelineGateEvents
+from ingestion.localtime import local_date
 from ingestion.scope import personal_scope_enabled
 
 logger = logging.getLogger(__name__)
@@ -257,7 +258,7 @@ class TimelineGate:
         turn_ts = self._db.get_episodes_valid_at([int(episode_id)])
         if not turn_ts:
             return
-        turn_date = turn_ts[:10]  # YYYY-MM-DD
+        turn_date = local_date(turn_ts)  # YYYY-MM-DD, the user's day (not UTC's)
 
         gated = structured_call(
             self._llm_client,
