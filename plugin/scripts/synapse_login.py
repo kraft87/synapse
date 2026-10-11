@@ -2,17 +2,22 @@
 # mypy: ignore-errors
 """synapse login — sign in and give this machine its own Synapse credential. Stdlib only.
 
-No third-party dependencies. Two sign-in flows, both ending in a bearer stored in the
-plugin config (the zero-dependency ingest/recall hooks read it back):
+No third-party dependencies. Two sign-in flows, both ending in a device token stored in
+the plugin config (the zero-dependency ingest/recall hooks read it back):
 
-  * DEVICE (default) — RFC 8628 device flow. Prints a short code; you approve at
-    github.com/login/device on ANY device. No same-host browser, no loopback redirect.
-    The right flow for servers / headless / remote boxes. Needs a server new enough to expose
-    /device/code (and the GitHub OAuth App's "Enable Device Flow" turned on).
+  * DEVICE (default) — RFC 8628 device flow, ONE approval. Prints a short code; you
+    approve it on ANY device (github.com/login/device or your OIDC provider). No
+    same-host browser, no loopback redirect, so it is the right flow for servers,
+    headless and remote boxes. That single approval is both the sign-in and the
+    ENROLLMENT (schema 054): the server reads who approved, checks the allowlist, and
+    mints a token belonging to THIS machine, scoped by the install prompt's
+    personal/work answer. The shared root token is never fetched.
 
-  * BROWSER (--browser) — the legacy loopback authorization-code flow: discovery -> dynamic
-    client registration -> PKCE -> opens a browser on THIS host -> token exchange ->
-    issue_machine_token. Only works where a browser can open on the same machine.
+  * BROWSER (--browser) — the legacy loopback authorization-code flow: discovery ->
+    dynamic client registration -> PKCE -> opens a browser on THIS host -> token
+    exchange -> issue_machine_token. The OAuth token it gets cannot enroll a machine, so
+    this flow is followed by the device-flow enrollment above: two approvals. Only
+    works where a browser can open on the same machine.
 
 Usage:
     python synapse_login.py               # device flow (recommended)
@@ -20,14 +25,13 @@ Usage:
     python synapse_login.py --reenroll     # replace this machine's device token
     SYNAPSE_URL=https://synapse.example.net python synapse_login.py
 
-After the sign-in, this runs ENROLLMENT (schema 054): a second device-flow approval that
-mints a token belonging to THIS machine, scoped by the install prompt's personal/work
-answer, and stores it in the same config slot. What a session is served depends on that
-token, so a machine that never enrolls is served nothing.
+What a session is served depends on the device token, so a machine that never enrolls is
+served nothing.
 
-On a machine that is already enrolled this does nothing: the sign-in would put the root
-token back in that slot over the device token. `--reenroll` is the deliberate way to get
-a new device token; it drops the enrollment record only once the sign-in has succeeded.
+On a machine that is already enrolled this does nothing: there is nothing to gain from
+a new token, and a sign-in that fails part-way must not cost the one it has.
+`--reenroll` is the deliberate way to get a new device token; the old enrollment record
+is dropped only once the new token has been minted.
 
 Truly headless with no browser on any device? Mint a token from an already-trusted
 machine (`/synapse-devices mint "<label>"`) or from the database host
@@ -179,74 +183,42 @@ def _mcp_call_token(access_token: str) -> str:
     return ""
 
 
-def _device_login() -> int:
-    """RFC 8628 device flow: print a code, approve on any device, poll for the machine token."""
+def _device_login(replace: bool = False) -> int:
+    """One device flow: the approval signs you in AND enrolls this machine.
+
+    The enrollment route reads the approving identity itself, so there is no separate
+    sign-in to run first and no root token to fetch: the device token it mints is the
+    only thing ever written to the slot. A refused, expired or abandoned approval writes
+    nothing, so the machine stays exactly as it was.
+    """
     import enroll
 
-    try:
-        start = _post_json(BASE + "/device/code", {})
-    except urllib.error.HTTPError as e:
-        body = {}
+    state = enroll.enroll(replace=replace, open_browser=True, on_missing_route=_legacy_sign_in)
+    if not state:
+        return 1
+    print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
+    return 0
+
+
+def _legacy_sign_in(start: dict) -> dict:
+    """A server with no /surfaces/enroll: redeem the SAME device code at /device/token.
+
+    Such a server predates per-device tokens, so the shared root token is all it has to
+    give, and it is what that server serves by. The code was never polled at the IdP
+    (the 404 came from the route table), so the human's one approval still counts.
+    Returns a truthy marker on success, ``{}`` on failure.
+    """
+    interval = max(1, int(start.get("interval") or 5))
+    deadline = time.time() + int(start.get("expires_in") or 900)
+    first = True
+    while time.time() < deadline:
+        if not first:
+            time.sleep(interval)
+        first = False
         try:
-            body = json.loads(e.read() or b"{}")
-        except Exception:
-            pass
-        if body.get("error") in ("no_idp", "no_machine_token"):
-            # The server is telling us there is nobody to sign in to. Retrying, or
-            # switching to --browser, cannot help; minting on the server can.
-            print(enroll.bootstrap_hint(), file=sys.stderr)
-        elif e.code == 404:
-            print(
-                "This Synapse has no device-login route (older server). Retry with --browser, "
-                "or paste a token into /plugin > synapse > Synapse token.",
-                file=sys.stderr,
-            )
-        else:
-            print(f"device/code failed: HTTP {e.code} {str(body)[:200]}", file=sys.stderr)
-        return 1
-    except Exception as e:
-        print(f"device/code failed: {e}", file=sys.stderr)
-        return 1
-
-    if "user_code" not in start:
-        err = start.get("error", "unknown")
-        if err in ("no_idp", "no_machine_token"):
-            print(enroll.bootstrap_hint(), file=sys.stderr)
-            return 1
-        print(f"device login unavailable: {err}", file=sys.stderr)
-        if err == "device_flow_disabled":
-            print(
-                "Turn on 'Enable Device Flow' in the GitHub OAuth App settings, then retry.",
-                file=sys.stderr,
-            )
-        return 1
-
-    device_code = start["device_code"]
-    user_code = start["user_code"]
-    verify = start.get("verification_uri") or "https://github.com/login/device"
-    verify_complete = start.get("verification_uri_complete")
-    interval = int(start.get("interval") or 5)
-    expires_in = int(start.get("expires_in") or 900)
-
-    print("\nTo sign in, open this on ANY device and enter the code:\n", file=sys.stderr)
-    print(f"    {verify}", file=sys.stderr)
-    print(f"    code:  {user_code}\n", file=sys.stderr)
-    if verify_complete:
-        print(f"(or open the direct link: {verify_complete})\n", file=sys.stderr)
-    try:  # convenience only — the flow works fine without a local browser
-        webbrowser.open(verify_complete or verify)
-    except Exception:
-        pass
-
-    print("Waiting for approval...", file=sys.stderr)
-    waited = 0
-    while waited < expires_in:
-        time.sleep(interval)
-        waited += interval
-        try:
-            resp = _post_json(BASE + "/device/token", {"device_code": device_code})
+            resp = _post_json(BASE + "/device/token", {"device_code": start["device_code"]})
         except urllib.error.HTTPError as e:
-            if e.code >= 500:  # transient upstream hiccup — keep polling
+            if e.code >= 500:  # transient upstream hiccup: keep polling
                 continue
             try:
                 resp = json.loads(e.read())
@@ -259,12 +231,13 @@ def _device_login() -> int:
         token = resp.get("token")
         if token:
             if not _store_root_token(token):
-                return 1
+                return {}
             who = f" as {resp['login']}" if resp.get("login") else ""
-            print(f"Logged in{who}. Token saved to plugin config.")
-            _enroll_device()
-            print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
-            return 0
+            print(
+                f"Logged in{who}. This server has no device enrollment, so the shared "
+                "token was saved to plugin config."
+            )
+            return {"legacy_login": resp.get("login") or True}
 
         err = resp.get("error", "authorization_pending")
         if err == "authorization_pending":
@@ -273,20 +246,14 @@ def _device_login() -> int:
             # Rate-limited at the IdP (429), not refused: back off and keep polling.
             interval += 5
             continue
-        if err == "access_denied":
-            print(
-                f"login failed: {resp.get('error_description', 'not authorized for this Synapse')}",
-                file=sys.stderr,
-            )
-            return 1
         if err == "expired_token":
             print("login failed: code expired before approval. Run login again.", file=sys.stderr)
-            return 1
+            return {}
         print(f"login failed: {err} {resp.get('error_description', '')}".rstrip(), file=sys.stderr)
-        return 1
+        return {}
 
     print("login failed: timed out waiting for approval.", file=sys.stderr)
-    return 1
+    return {}
 
 
 def _browser_login() -> int:
@@ -416,8 +383,9 @@ def _browser_login() -> int:
 def _store_root_token(token: str) -> bool:
     """Put the root token a sign-in just fetched into the one credential slot.
 
-    Only reached on a machine that is not enrolled, or on `--reenroll` (main() stops an
-    enrolled machine before any sign-in). The enrollment record is dropped FIRST: a crash
+    Only the browser flow and the legacy-server fallback get here; the default device
+    flow never fetches the root token. Only reached on a machine that is not enrolled,
+    or on `--reenroll` (main() stops an enrolled machine before any sign-in). The enrollment record is dropped FIRST: a crash
     between the two steps then leaves the old device token with no record, which simply
     re-enrolls, rather than the root token under a record claiming this machine is
     enrolled, which is served nothing and never re-enrolls.
@@ -432,14 +400,11 @@ def _store_root_token(token: str) -> bool:
 
 
 def _enroll_device() -> bool:
-    """Enroll THIS machine — its own device flow, its own device token (schema 054).
+    """Enroll THIS machine after a browser sign-in: its own device flow, its own token.
 
-    Deliberately a SECOND sign-in rather than a reuse of the login above. A device code
-    is spent by the poll that redeems it, and the two flows want different things: login
-    fetches the shared root token, enrollment mints a credential scoped to this machine
-    and writes it over the root token in the same slot. That shared slot is why login
-    never runs on an enrolled machine (see main()): a re-login would put the root token
-    back over the device token.
+    The browser flow's OAuth token proves who you are to /mcp, but /surfaces/enroll
+    anchors on a device-flow approval, so this is a second approval. The default device
+    login does not come through here: its one approval already enrolls.
 
     Returns True when this machine now holds a device token.
     """
@@ -456,9 +421,10 @@ def _enroll_device() -> bool:
 def main() -> int:
     import enroll
 
-    # An enrolled machine's slot holds its device token, and a sign-in would overwrite it
-    # with the root token (no surface: served nothing). Stop before asking anyone to
-    # approve a code whose result could only do harm.
+    # An enrolled machine already holds what a login would produce. Stop before asking
+    # anyone to approve a code: the browser flow would put the root token (no surface:
+    # served nothing) over the device token, and a fresh enrollment is what --reenroll
+    # is for.
     if enroll.is_enrolled():
         state = config.read_device_state()
         surface = f"{state['surface_id']} ({state.get('trust') or 'unknown trust'})"
@@ -478,7 +444,7 @@ def main() -> int:
     # into the legacy same-host loopback flow for setups that prefer it.
     if "--browser" in sys.argv:
         return _browser_login()
-    return _device_login()
+    return _device_login(replace="--reenroll" in sys.argv)
 
 
 if __name__ == "__main__":

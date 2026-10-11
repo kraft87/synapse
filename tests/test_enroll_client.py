@@ -203,6 +203,47 @@ def test_an_already_enrolled_machine_does_not_re_enroll(monkeypatch, hook):
     assert len(calls) == n  # no second device flow
 
 
+def test_replace_runs_the_flow_on_an_enrolled_machine(monkeypatch, hook):
+    """`--reenroll`: one more device flow, and the new record replaces the old."""
+    calls = _replies(monkeypatch, hook, [_MINTED])
+    hook.enroll(interactive=False)
+    newer = {**_MINTED, "token": "device-token-2", "surface": {"surface_id": "dev-def456"}}
+    _replies(monkeypatch, hook, [newer])
+    state = hook.enroll(interactive=False, replace=True)
+    assert state["surface_id"] == "dev-def456"
+    assert hook.config.read_device_state()["surface_id"] == "dev-def456"
+    assert len(calls) == 2  # the first fake saw only the first flow
+
+
+def test_a_failed_replace_keeps_the_old_record(monkeypatch, hook):
+    _replies(monkeypatch, hook, [_MINTED])
+    before = hook.enroll(interactive=False)
+    _replies(monkeypatch, hook, [{"status": "pending", "error": "expired_token"}])
+    assert hook.enroll(interactive=False, replace=True) == {}
+    assert hook.config.read_device_state() == before
+
+
+def test_a_server_without_the_enroll_route_hands_back_the_unspent_code(monkeypatch, hook):
+    """A bare 404 on /surfaces/enroll comes from the route table, before any IdP poll,
+    so the device code is still good: the caller redeems it instead of a second flow."""
+    missing = urllib.error.HTTPError("http://x/surfaces/enroll", 404, "nf", None, None)
+    calls = _replies(monkeypatch, hook, [missing])
+    seen: list[dict] = []
+    out = hook.enroll(
+        interactive=False, on_missing_route=lambda start: seen.append(start) or {"ok": 1}
+    )
+    assert out == {"ok": 1}
+    assert seen and seen[0]["device_code"] == "dc-1"
+    assert [p for p, _ in calls] == ["/device/code", "/surfaces/enroll"]
+    assert hook.config.read_device_state() == {}
+
+
+def test_a_network_error_mid_poll_keeps_polling(monkeypatch, hook):
+    calls = _replies(monkeypatch, hook, [urllib.error.URLError("reset"), _MINTED])
+    assert hook.enroll(interactive=False)["surface_id"] == "dev-abc123"
+    assert sum(1 for path, _ in calls if path == "/surfaces/enroll") == 2
+
+
 # ---------------------------------------------------------------------------
 # The poll loop: waiting vs refused
 # ---------------------------------------------------------------------------

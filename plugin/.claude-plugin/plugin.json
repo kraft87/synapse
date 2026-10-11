@@ -1,6 +1,6 @@
 {
   "name": "synapse",
-  "version": "0.19.5",
+  "version": "0.19.6",
   "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Point it at a local or central Synapse.",
   "author": {
     "name": "kraft87"
@@ -15,13 +15,13 @@
     "SYNAPSE_INGEST_TOKEN": {
       "type": "string",
       "title": "Synapse token",
-      "description": "Optional. Leave blank and run `! synapse-login` in the Claude prompt: you sign in once and this machine enrolls, receiving its OWN device token, which is stored right back here. What this machine is served depends on that token, and it can be revoked on its own. Paste a token directly when the server has no sign-in configured: run `docker compose exec mcp-server synapse-admin bootstrap \"<label>\"` there and paste what it prints.",
+      "description": "Optional. Leave blank and run `! synapse-login` in the Claude prompt: you approve one code and this machine enrolls, receiving its OWN device token, which is stored right back here. What this machine is served depends on that token, and it can be revoked on its own. Paste a token directly when the server has no sign-in configured: run `docker compose exec mcp-server synapse-admin bootstrap \"<label>\"` there and paste what it prints.",
       "sensitive": true
     },
     "SYNAPSE_MACHINE_ROLE": {
       "type": "string",
       "title": "This machine's role",
-      "description": "\"personal\" (default) or \"work\". Declared once when this machine enrolls, right after you sign in \u2014 so it is authoritative, not a request. \"work\" enrolls at restricted access: work-safe notes plus an allowlist of projects, so personal memory is never served here. Change it later with `/synapse-devices`."
+      "description": "\"personal\" (default) or \"work\". Declared once when this machine enrolls, by the same approval that signs you in \u2014 so it is authoritative, not a request. \"work\" enrolls at restricted access: work-safe notes plus an allowlist of projects, so personal memory is never served here. Change it later with `/synapse-devices`."
     },
     "SYNAPSE_SKILLS_SYNC": {
       "type": "string",
