@@ -82,6 +82,7 @@ _DB_FILES = {
     "test_root_surface_lane.py",
     "test_own_surface_episodes.py",
     "test_config_scope.py",
+    "test_local_tz_dates.py",
 }
 
 

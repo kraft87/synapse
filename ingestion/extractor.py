@@ -49,6 +49,7 @@ from ingestion.extraction_policy import build_resolution_prompt as build_resolut
 from ingestion.extraction_policy import dedupe_pools as dedupe_pools
 from ingestion.extraction_recheck import recheck_restated
 from ingestion.extraction_twins import collapse_batch_twins
+from ingestion.localtime import local_date, local_iso
 
 logger = logging.getLogger(__name__)
 
@@ -173,7 +174,9 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             if (episode_ids and content_type != "episode")
             else None
         )
-        session_date = segment_valid_at[:10] if segment_valid_at else None
+        # The user's calendar day, not the UTC one: a turn at 20:30 EDT is stored as
+        # 00:30 UTC the next day.
+        session_date = local_date(segment_valid_at) if segment_valid_at else None
 
         # Stage 2: deterministic extraction
         if content_type == "episode":
@@ -367,11 +370,13 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # claims age with their source, not with ingestion time.
         web_artifact_id: int | None = None
         default_valid_at: str | None = None
+        reference_time: str | None = None
         if web_provenance:
             web_artifact_id = web_provenance.get("web_artifact_id")
             dt = web_provenance.get("published_at") or web_provenance.get("fetched_at")
             if dt is not None:
                 default_valid_at = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+            reference_time = default_valid_at
         else:
             # Conversation facts: default valid-time = the SEGMENT's own timestamp
             # (max created_at of its source episodes), NOT ingest wall-clock. Without
@@ -380,10 +385,13 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # backfilled/retro transcript. Mirrors how web provenance dates its facts.
             # Computed once up-front (segment_valid_at) and reused here.
             default_valid_at = segment_valid_at
+            # Same instant on the user's wall clock, so "yesterday" resolves against
+            # the local day the session date names, not the UTC one.
+            reference_time = local_iso(segment_valid_at) if segment_valid_at else None
 
         # Stage 6 + 7 run separately per group — same code path, different graph.
-        # default_valid_at doubles as the relative-date reference_time (the segment
-        # timestamp), so "last week" resolves against the conversation, not ingest.
+        # reference_time is the relative-date anchor (the segment timestamp), so
+        # "last week" resolves against the conversation, not ingest.
         # A group with no facts left (all cross-group) writes none of its new entities.
         for grp in active_groups():
             grp_facts = facts_by_group[grp]
@@ -396,7 +404,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                 grp,
                 web_artifact_id=web_artifact_id,
                 default_valid_at=default_valid_at,
-                reference_time=default_valid_at,
+                reference_time=reference_time,
                 new_nodes=new_nodes.get(grp),
             )
 
