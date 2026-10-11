@@ -45,12 +45,15 @@ overridden, naming where to remove it. Two limits:
 ! synapse-login        # in the Claude prompt, runs in-session, no LLM, streams live
 ```
 
-It signs you in with the device flow (RFC 8628): it prints a short code, you approve at
-`github.com/login/device` from any device, and it polls until done. No same-host browser, so
-it works on servers and headless boxes (`--browser` keeps the legacy loopback flow). It then
-runs a second device-flow approval that **enrolls** this machine: the server polls the IdP,
-reads the identity, checks the same allowlist every other login clears, and mints a token
-belonging to this machine, written back into the same config slot.
+It runs one device flow (RFC 8628): it prints a short code, you approve at
+`github.com/login/device` (or your OIDC provider) from any device, and it polls until done. No
+same-host browser, so it works on servers and headless boxes. That one approval both signs
+you in and **enrolls** this machine: the server polls the IdP, reads the identity, checks the
+same allowlist every other login clears, and mints a token belonging to this machine,
+written into the plugin's config slot. The shared root token is never fetched.
+
+`--browser` keeps the legacy loopback flow. Its OAuth token cannot enroll a machine, so it
+is followed by the device-flow enrollment: two approvals. Prefer the default.
 
 **Bootstrap (no IdP, or nothing trusted left).** On the server host:
 

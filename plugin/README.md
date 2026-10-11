@@ -41,8 +41,8 @@ not enough: presented on its own it is served restricted, which looks like an em
 Two ways to get one:
 
 - On a server with GitHub OAuth or OIDC configured, skip ahead and run `! synapse-login`
-  after installing (below). It signs you in and enrolls this machine, writing the minted
-  token into the config slot for you.
+  after installing (below). One approval signs you in and enrolls this machine, writing
+  the minted token into the config slot for you.
 - Otherwise, on the server host:
   `docker compose exec mcp-server synapse-admin bootstrap "<label>"`. It prints a full-trust
   device token once (only the hash is stored). Copy it for the next step.
@@ -70,10 +70,12 @@ To enroll instead of pasting, leave the token blank and run:
 ! synapse-login        # in the Claude prompt — runs in-session, no LLM, streams live
 ```
 
-Default is the device flow (RFC 8628): it prints a short code, you approve at
-`github.com/login/device` from any device (phone, another laptop), and it polls until done —
-no same-host browser, so it works on servers and headless boxes. `--browser` falls back to
-the legacy loopback flow. Either way the token is stored for the hooks and MCP server.
+Default is the device flow (RFC 8628): it prints ONE short code, you approve it at
+`github.com/login/device` (or your OIDC provider) from any device (phone, another laptop),
+and it polls until done. That single approval signs you in and enrolls this machine at the
+role you chose. No same-host browser, so it works on servers and headless boxes.
+`--browser` falls back to the legacy loopback flow, which needs a second (device-code)
+approval to enroll. Either way the device token is stored for the hooks and MCP server.
 
 Keep the token in the plugin config. Don't also export `SYNAPSE_INGEST_TOKEN` from your shell
 profile or the `env` block of `settings.json`: the MCP server never reads it there. On an
@@ -145,7 +147,7 @@ Slash commands:
 
 Bundled commands (`!` prefix in a session; full path from an outside terminal):
 
-- **`! synapse-login`** — sign in and enroll this machine (or `--browser`). On an enrolled
+- **`! synapse-login`** — sign in and enroll this machine with one approval (or `--browser`). On an enrolled
   machine it keeps the existing device token; `--reenroll` replaces it.
 - **`! synapse-import`** — backfill your existing history (step 4).
 - **`! synapse-private on|off|status <session-id>`** — private mode (below).

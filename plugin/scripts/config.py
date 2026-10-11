@@ -242,7 +242,7 @@ def _resolve_ingest_token() -> tuple[str, dict]:
 
     Unenrolled machines keep plain precedence (env var, CLAUDE_PLUGIN_OPTION_*, the
     settings.json plugin config, then the legacy credentials file): before enrollment
-    the slot carries the root token, wherever the user put it, and enrolling needs it.
+    the slot carries whatever token the user put there, wherever they put it.
 
     An ENROLLED machine resolves to its device token even when the environment says
     otherwise. Under plain precedence a token left in a shell profile, or in

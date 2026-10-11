@@ -6,21 +6,22 @@ Schema 054 made trust credential-bound: what a session is served depends on WHIC
 it presents, not on a hostname it claims. So every machine needs its own token, and the
 only way to get one is to prove you are the owner.
 
-Enrollment is the IdP's device flow (RFC 8628), the same lane `synapse login` uses:
+Enrollment is the IdP's device flow (RFC 8628), and it IS the sign-in: one approval.
 
-  1. `POST /device/code` — the server asks the IdP for a short user code.
+  1. `POST /device/code`: the server asks the IdP for a short user code.
   2. We print the verification URL and the code. The human approves in a browser on ANY
      device, phone included; no browser is needed on this machine.
-  3. `POST /surfaces/enroll {device_code, label, trust}` — the server polls the IdP,
+  3. `POST /surfaces/enroll {device_code, label, trust}`: the server polls the IdP,
      reads the identity, checks it against the allowlist, and mints a device token
      scoped to the role this install declared. Approved immediately: the person who just
      authenticated IS the authority for what this machine is, so there is nothing left
-     to confirm from somewhere else.
-  4. The minted token is written to SYNAPSE_INGEST_TOKEN via the same
-     ``write_user_config`` path `synapse login` uses, so the MCP server's Authorization
-     header picks it up with no other change anywhere. The local record keeps only its
-     sha256, which is how the hooks prefer it over a stale SYNAPSE_INGEST_TOKEN left in
-     the environment (config._resolve_ingest_token).
+     to confirm from somewhere else. Neither route takes a bearer, so a machine with no
+     token at all can do this; there is no separate sign-in to run first.
+  4. The minted token is written to SYNAPSE_INGEST_TOKEN via ``write_user_config``,
+     so the MCP server's Authorization header picks it up with no other change
+     anywhere. The local record keeps only its sha256, which is how the hooks prefer it
+     over a stale SYNAPSE_INGEST_TOKEN left in the environment
+     (config._resolve_ingest_token).
 
 Interactive by nature — it prints a code and waits for a human — so the SessionStart
 hook never runs it. The hook only reports that this machine is not enrolled; `synapse
@@ -34,6 +35,8 @@ import os
 import sys
 import time
 import urllib.error
+import webbrowser
+from collections.abc import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -123,14 +126,28 @@ def _post(path: str, payload: dict, timeout: float = 30.0) -> dict:
         return body if isinstance(body, dict) and body else {"error": f"http_{e.code}"}
 
 
-def enroll(interactive: bool = True) -> dict:
+def enroll(
+    interactive: bool = True,
+    replace: bool = False,
+    open_browser: bool = False,
+    on_missing_route: Callable[[dict], dict] | None = None,
+) -> dict:
     """Run the device flow and enroll this machine. Returns the local record, or ``{}``.
+
+    ``replace`` is `--reenroll`: run the flow even though this machine is enrolled. The
+    old record is dropped only once the new token has been minted, so a refused or
+    abandoned approval leaves the machine exactly as it was.
+
+    ``on_missing_route`` handles a server that predates enrollment: it answers
+    /surfaces/enroll with a bare 404 without touching the IdP, so the device code is
+    still unspent and the caller can redeem it some other way (``synapse-login`` signs
+    in with it) instead of asking the human for a second approval.
 
     Never raises: it is called from `synapse login`, where a failure should print a
     reason and leave the machine exactly as it was, not traceback.
     """
     state = config.read_device_state()
-    if state.get("surface_id"):
+    if state.get("surface_id") and not replace:
         return state
 
     try:
@@ -156,13 +173,21 @@ def enroll(interactive: bool = True) -> dict:
     deadline = time.time() + min(int(start.get("expires_in") or _MAX_WAIT_S), _MAX_WAIT_S)
 
     if interactive:
-        print("\nEnrolling this machine. Approve on ANY device:\n", file=sys.stderr)
+        print(
+            "\nTo sign in and enroll this machine, open this on ANY device and enter the code:\n",
+            file=sys.stderr,
+        )
         print(f"    {verify}", file=sys.stderr)
         print(f"    code:  {start['user_code']}\n", file=sys.stderr)
         if complete:
             print(f"(or open the direct link: {complete})\n", file=sys.stderr)
         print(f"This machine will enroll as: {config.MACHINE_ROLE}", file=sys.stderr)
         print("Waiting for approval...", file=sys.stderr)
+    if open_browser:
+        try:  # convenience only: the flow works fine without a local browser
+            webbrowser.open(complete or verify)
+        except Exception:
+            pass
 
     body = {
         "device_code": start["device_code"],
@@ -174,10 +199,20 @@ def enroll(interactive: bool = True) -> dict:
     }
     while time.time() < deadline:
         time.sleep(interval)
-        r = _post("/surfaces/enroll", body)
+        try:
+            r = _post("/surfaces/enroll", body)
+        except Exception as e:
+            # A network blip, not an answer: the approval may land while it lasts, and
+            # giving up here would throw away the code the human is about to approve.
+            print(f"poll error (continuing): {e}", file=sys.stderr)
+            continue
         if r.get("status") == "ok" and r.get("token"):
+            if replace and not _drop_record():
+                return {}
             return _persist(r)
         reason = r.get("error") or r.get("detail") or ""
+        if reason == "http_404" and on_missing_route is not None:
+            return on_missing_route(start)
         if reason in ("slow_down", "temporarily_unavailable"):
             # The IdP is rate-limiting the poll (a 429), not refusing the human. Back off
             # and keep asking: the approval may already be sitting there.
@@ -190,6 +225,18 @@ def enroll(interactive: bool = True) -> dict:
 
     print("enrollment failed: timed out waiting for approval.", file=sys.stderr)
     return {}
+
+
+def _drop_record() -> bool:
+    """`--reenroll`: forget the old enrollment before the new token is written. A crash
+    between the two then leaves a token with no record, which re-enrolls harmlessly,
+    never the new token under a record that describes the old one."""
+    try:
+        config.DEVICE_FILE.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"enrollment failed: could not clear {config.DEVICE_FILE}: {e}", file=sys.stderr)
+        return False
+    return True
 
 
 def _persist(r: dict) -> dict:
@@ -213,7 +260,10 @@ def _persist(r: dict) -> dict:
     config.write_device_state(state)
     scope = ", ".join(state["allowed_projects"]) or "no projects"
     detail = "the full corpus" if state["trust"] == "full" else f"work-safe notes + {scope}"
-    print(f"\nEnrolled as {state['surface_id']} ({state['trust']}) — this machine sees {detail}.")
+    who = f"Signed in as {state['login']}. " if state["login"] else ""
+    print(
+        f"\n{who}Enrolled as {state['surface_id']} ({state['trust']}) — this machine sees {detail}."
+    )
     return state
 
 
