@@ -57,7 +57,7 @@ def test_lookup_failure_fails_open(db_url):
     def _boom():
         raise RuntimeError("db down")
 
-    r._ensure_pg = _boom
+    r._pg = _boom
     assert r._self_session_facts(["f-1"], "me") == set()
 
 

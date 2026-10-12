@@ -449,13 +449,11 @@ _LIST_SQL = (
 
 def list_surfaces(db_url: str) -> list[dict[str, Any]]:
     """Every surface, live ones first. Operator read — "who can see what"."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
-        rows = conn.execute(_LIST_SQL).fetchall()
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        try:
+            rows = conn.execute(_LIST_SQL).fetchall()
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
+            raise SchemaMissing from e
     return [_surface_row(r) for r in rows]
 
 
@@ -539,24 +537,24 @@ def mint_surface(
         else None
     )
     tok = new_device_token()
-    conn = psycopg.connect(db_url, row_factory=dict_row)
-    try:
-        with conn.transaction():
-            projects: list[str] = []
-            if granted == "restricted":
-                projects = explicit if explicit is not None else _approved_restricted_projects(conn)
-            surface = _insert_surface(
-                conn,
-                surface_id=_new_surface_id(),
-                trust=granted,
-                label=(label or "").strip()[:200] or None,
-                allowed_projects=projects,
-                th=token_hash(tok),
-            )
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
+        try:
+            with conn.transaction():
+                projects: list[str] = []
+                if granted == "restricted":
+                    projects = (
+                        explicit if explicit is not None else _approved_restricted_projects(conn)
+                    )
+                surface = _insert_surface(
+                    conn,
+                    surface_id=_new_surface_id(),
+                    trust=granted,
+                    label=(label or "").strip()[:200] or None,
+                    allowed_projects=projects,
+                    th=token_hash(tok),
+                )
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
+            raise SchemaMissing from e
     logger.info(
         "surface created: %s trust=%s projects=%s label=%r",
         surface["surface_id"],
@@ -594,19 +592,17 @@ def issue_dash_token(db_url: str, identity: str) -> str:
     if not ident:
         raise ValueError("identity required")
     tok = new_device_token()
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
-        conn.execute(
-            "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, label) "
-            "VALUES (%s, 'full', '{}', %s, 'approved', %s) "
-            "ON CONFLICT (surface_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, "
-            "  trust = 'full', status = 'approved', updated_at = now()",
-            (f"{DASH_SURFACE_PREFIX}{ident}", token_hash(tok), f"dashboard ({ident})"),
-        )
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url) as conn:
+        try:
+            conn.execute(
+                "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, label) "
+                "VALUES (%s, 'full', '{}', %s, 'approved', %s) "
+                "ON CONFLICT (surface_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, "
+                "  trust = 'full', status = 'approved', updated_at = now()",
+                (f"{DASH_SURFACE_PREFIX}{ident}", token_hash(tok), f"dashboard ({ident})"),
+            )
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
+            raise SchemaMissing from e
     return tok
 
 
@@ -628,25 +624,23 @@ def upsert_surface(
     if trust not in TRUST_LEVELS:
         raise ValueError(f"invalid trust {trust!r} — expected one of {TRUST_LEVELS}")
     projects = [str(p).strip() for p in allowed_projects if str(p).strip()]
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
-        row = conn.execute(
-            "INSERT INTO surfaces (surface_id, trust, allowed_projects, status) "
-            "VALUES (%s, %s, %s, 'approved') "
-            "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
-            "  allowed_projects = EXCLUDED.allowed_projects, status = 'approved', "
-            "  updated_at = now() "
-            # A device row must not be reachable by id: that would let a PUT hand an
-            # already-issued token full trust without an owner-authenticated enrollment.
-            "  WHERE surfaces.token_hash IS NULL "
-            "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
-            "          last_seen_at, created_at, updated_at",
-            (surface_id, trust, projects),
-        ).fetchone()
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        try:
+            row = conn.execute(
+                "INSERT INTO surfaces (surface_id, trust, allowed_projects, status) "
+                "VALUES (%s, %s, %s, 'approved') "
+                "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
+                "  allowed_projects = EXCLUDED.allowed_projects, status = 'approved', "
+                "  updated_at = now() "
+                # A device row must not be reachable by id: that would let a PUT hand an
+                # already-issued token full trust without an owner-authenticated enrollment.
+                "  WHERE surfaces.token_hash IS NULL "
+                "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
+                "          last_seen_at, created_at, updated_at",
+                (surface_id, trust, projects),
+            ).fetchone()
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
+            raise SchemaMissing from e
     if row is None:
         raise ValueError(f"{surface_id!r} is a device surface — use enroll/mint/revoke")
     return _surface_row(row)
@@ -662,19 +656,17 @@ def revoke_surface(db_url: str, surface_id: str) -> int:
 
     Returns the number of rows changed (0 for an unknown id — idempotent, not an error).
     """
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
-        cur = conn.execute(
-            "UPDATE surfaces SET status = 'revoked', token_hash = NULL, "
-            "  trust = 'restricted', allowed_projects = '{}', updated_at = now() "
-            "WHERE surface_id = %s AND status <> 'revoked'",
-            (surface_id,),
-        )
-        return cur.rowcount
-    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-        raise SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url) as conn:
+        try:
+            cur = conn.execute(
+                "UPDATE surfaces SET status = 'revoked', token_hash = NULL, "
+                "  trust = 'restricted', allowed_projects = '{}', updated_at = now() "
+                "WHERE surface_id = %s AND status <> 'revoked'",
+                (surface_id,),
+            )
+            return cur.rowcount
+        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
+            raise SchemaMissing from e
 
 
 #: Pre-054 name. Revocation replaced deletion (the row is the audit trail), but the

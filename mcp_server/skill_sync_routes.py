@@ -30,7 +30,6 @@ import re
 from collections.abc import Callable
 from datetime import datetime
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from starlette.requests import Request
@@ -38,6 +37,7 @@ from starlette.responses import JSONResponse
 
 from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
 from dream.skills.skill_measure import skill_description
+from ingestion import pg_pool
 from mcp_server.http_helpers import _iso, guarded_json
 
 logger = logging.getLogger(__name__)
@@ -56,7 +56,7 @@ def _dt(iso: str | None) -> datetime | None:
 
 
 def _list_skills(db_url: str, scope: str) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         skills = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
             "content_modified_at FROM skills_lane.skill_registry "
@@ -83,7 +83,7 @@ def _list_skills(db_url: str, scope: str) -> dict:
 
 
 def _fetch_skill(db_url: str, name: str) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         row = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
             "content_modified_at FROM skills_lane.skill_registry WHERE name=%s AND status='active'",
@@ -140,7 +140,7 @@ def _upsert_registry(
 
 def _publish_skill(db_url: str, p: dict) -> dict:
     name = p["name"]
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         cur = c.cursor()
         _upsert_registry(
             cur,
@@ -171,7 +171,7 @@ def _publish_skill(db_url: str, p: dict) -> dict:
 
 
 def _record_overwrite(db_url: str, p: dict) -> dict:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         c.execute(
             "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
             "VALUES (%s,%s,%s,%s,'disk_overwrite')",
@@ -205,7 +205,7 @@ _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-fil
 
 
 def _proposals_list(db_url: str) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         rows = c.execute(
             """SELECT id, kind, name, direction, target_skills, status, score,
                       grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings,
@@ -329,7 +329,7 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
 
 
 def _proposal_detail(db_url: str, cid: int) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         r = c.execute(
             f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s",
             (cid,),
@@ -427,7 +427,7 @@ def _proposal_act(
 ) -> dict:
     from dream.skills.skill_ledger import _rollup
 
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         cur = c.cursor()
         row = c.execute(
             "SELECT kind, status, name, proposal_path, proposal_body, evidence "

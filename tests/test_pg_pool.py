@@ -172,6 +172,27 @@ def test_a_connection_left_mid_transaction_is_not_handed_on(pool):
         assert c.execute("SELECT 1").fetchone() == (1,)
 
 
+def test_nothing_issues_a_session_level_set():
+    """The pool does not scrub session settings on return (a RESET ALL per borrow cost
+    0.5 ms; run in the pool's worker it made back-to-back borrows 3x slower), so a
+    session-level SET from one borrower would reach the next. Use SET LOCAL or
+    set_config(..., true) inside a transaction instead."""
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    session_set = re.compile(r"""execute\(\s*f?["']SET\s+(?!LOCAL\b)""", re.I)
+    session_config = re.compile(r"set_config\([^)]*,\s*false\s*\)", re.I)
+    offenders = [
+        f"{path.relative_to(root)}:{n}"
+        for folder in ("mcp_server", "ingestion")
+        for path in sorted((root / folder).rglob("*.py"))
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if session_set.search(line) or session_config.search(line)
+    ]
+    assert offenders == []
+
+
 def test_more_borrowers_than_connections_wait_their_turn(pool):
     """A burst wider than the pool (a recall's legs plus HTTP requests) queues for a
     connection instead of failing with PoolTimeout."""

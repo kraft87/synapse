@@ -568,8 +568,10 @@ def _validate_embedding_meta(db_url: str, dims: int, model: str) -> None:
         return
     import psycopg
 
+    from ingestion import pg_pool
+
     try:
-        with psycopg.connect(db_url, connect_timeout=10) as conn:
+        with pg_pool.connection(db_url, autocommit=False, connect_timeout=10) as conn:
             rows = conn.execute(
                 "SELECT key, value FROM synapse_meta WHERE key IN ('embed_dims', 'embed_model')"
             ).fetchall()

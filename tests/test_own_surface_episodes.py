@@ -653,7 +653,7 @@ def test_full_trust_and_unknown_callers_never_probe(monkeypatch, db_url):
     def boom():
         raise AssertionError("probed")
 
-    monkeypatch.setattr(r, "_ensure_pg", boom)
+    monkeypatch.setattr(r, "_pg", boom)
     for st in (_FULL_BOUND, UNKNOWN_SURFACE, _LEGACY_A):
         assert r._own_surface(st) is None
 

@@ -47,6 +47,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
@@ -63,46 +64,42 @@ class _SchemaMissing(Exception):
 def _claim(db_url: str, intent_id: str, hook: str | None) -> dict[str, Any] | None:
     """Reserve ``intent_id``. Returns None when this caller won the claim (proceed with the
     write), or the existing row when someone already claimed it (see the module docstring)."""
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
-        row = conn.execute(
-            "INSERT INTO remember_intents (intent_id, hook) VALUES (%s, %s) "
-            "ON CONFLICT (intent_id) DO NOTHING RETURNING intent_id",
-            (intent_id, (hook or "")[:200] or None),
-        ).fetchone()
-        if row is not None:
-            return None
-        prior = conn.execute(
-            "SELECT status, note_id, episode_id, outcome FROM remember_intents WHERE intent_id = %s",
-            (intent_id,),
-        ).fetchone()
-        if prior is None:  # raced with a delete — treat as ours
-            return None
-        return {
-            "status": prior[0],
-            "note_id": prior[1],
-            "episode_id": prior[2],
-            "outcome": prior[3],
-        }
-    except psycopg.errors.UndefinedTable as e:
-        raise _SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url) as conn:
+        try:
+            row = conn.execute(
+                "INSERT INTO remember_intents (intent_id, hook) VALUES (%s, %s) "
+                "ON CONFLICT (intent_id) DO NOTHING RETURNING intent_id",
+                (intent_id, (hook or "")[:200] or None),
+            ).fetchone()
+            if row is not None:
+                return None
+            prior = conn.execute(
+                "SELECT status, note_id, episode_id, outcome FROM remember_intents WHERE intent_id = %s",
+                (intent_id,),
+            ).fetchone()
+            if prior is None:  # raced with a delete — treat as ours
+                return None
+            return {
+                "status": prior[0],
+                "note_id": prior[1],
+                "episode_id": prior[2],
+                "outcome": prior[3],
+            }
+        except psycopg.errors.UndefinedTable as e:
+            raise _SchemaMissing from e
 
 
 def _complete(db_url: str, intent_id: str, result: dict[str, Any]) -> None:
     """Record the write's ids against the claim. Only a 'done' row short-circuits a replay."""
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
-        conn.execute(
-            "UPDATE remember_intents SET status = 'done', note_id = %s, episode_id = %s, "
-            "outcome = %s, completed_at = now() WHERE intent_id = %s",
-            (result.get("note_id"), result.get("episode_id"), result.get("outcome"), intent_id),
-        )
-    except psycopg.errors.UndefinedTable as e:  # pragma: no cover - claim would have raised
-        raise _SchemaMissing from e
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url) as conn:
+        try:
+            conn.execute(
+                "UPDATE remember_intents SET status = 'done', note_id = %s, episode_id = %s, "
+                "outcome = %s, completed_at = now() WHERE intent_id = %s",
+                (result.get("note_id"), result.get("episode_id"), result.get("outcome"), intent_id),
+            )
+        except psycopg.errors.UndefinedTable as e:  # pragma: no cover - claim would have raised
+            raise _SchemaMissing from e
 
 
 def _validate(body: dict[str, Any]) -> str | None:

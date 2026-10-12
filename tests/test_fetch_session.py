@@ -14,6 +14,7 @@ instance, no live DB.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import Any, ClassVar
 
 import mcp_server.recall as recall_mod
@@ -89,7 +90,7 @@ def _turn(eid: int, seq: int, content: str = "") -> dict:
 
 def _wire(r: Recall, pg: _PG, metrics: list) -> None:
     _PG.calls = []
-    r._ensure_pg = lambda: pg  # type: ignore[method-assign]
+    r._pg = lambda: nullcontext(pg)  # type: ignore[method-assign]
     r._record_metrics = metrics.append  # type: ignore[method-assign]
     r._increment_retrieval_counts = lambda ids: None  # type: ignore[method-assign]
 
@@ -211,7 +212,7 @@ class _CapturePG:
 def test_bm25_leg_scopes_to_session():
     r = _bare()
     pg = _CapturePG()
-    r._ensure_pg = lambda: pg  # type: ignore[method-assign]
+    r._pg = lambda: nullcontext(pg)  # type: ignore[method-assign]
     r._search_bm25_episodes("q", None, 10, session_id="sess-1")
     sql, params = pg.calls[0]
     assert "session_id = %s" in sql and "sess-1" in params
@@ -220,7 +221,7 @@ def test_bm25_leg_scopes_to_session():
 def test_vector_leg_scopes_to_session():
     r = _bare()
     pg = _CapturePG()
-    r._ensure_pg = lambda: pg  # type: ignore[method-assign]
+    r._pg = lambda: nullcontext(pg)  # type: ignore[method-assign]
     r._search_vector_episodes([0.1, 0.2], "proj", 10, session_id="sess-1")
     sql, params = pg.calls[0]
     assert "session_id = %s" in sql and "sess-1" in params and "proj" in params
