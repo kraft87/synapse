@@ -93,7 +93,7 @@ def test_pull_materializes_only_into_user_skills_dir(sync, tmp_path):
     system.mkdir(parents=True)
     (system / "SKILL.md").write_text("bundled\n")
 
-    assert sync.run(server, target, tmp_path / ".synapse" / "lock") == (1, 0)
+    assert sync.run(server, target, tmp_path / ".synapse" / "lock") == (1, 0, 0)
 
     assert (target / "alpha" / "SKILL.md").read_text() == "---\ndescription: a\n---\nalpha body\n"
     assert (target / "alpha" / "ref.md").read_bytes() == b"ref"
@@ -108,11 +108,11 @@ def test_push_local_only_skill_to_global_scope(sync, tmp_path):
     (target / "local").mkdir(parents=True)
     (target / "local" / "SKILL.md").write_text("---\ndescription: mine\n---\nlocal\n")
 
-    assert sync.run(server, target, tmp_path / ".synapse" / "lock") == (0, 1)
+    assert sync.run(server, target, tmp_path / ".synapse" / "lock") == (0, 1, 0)
 
     published = server.skills[("global", "local")]
     assert published["body"].endswith("local\n")
-    assert sync.run(server, target, tmp_path / ".synapse" / "lock") == (0, 0)
+    assert sync.run(server, target, tmp_path / ".synapse" / "lock") == (0, 0, 0)
 
 
 def test_lock_held_skips_without_touching_server(sync, tmp_path):
@@ -142,9 +142,9 @@ def test_main_is_noop_unless_opted_in(sync, monkeypatch, capsys):
 def test_main_reports_counts_and_fails_open(sync, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(sync, "SKILLS_SYNC", True)
     monkeypatch.setattr(sync, "SKILLS_DIR", tmp_path / "skills")
-    monkeypatch.setattr(sync, "run", lambda *a: (2, 1))
+    monkeypatch.setattr(sync, "run", lambda *a: (2, 1, 0))
     assert sync.main() == 0
-    assert "pulled 2, pushed 1" in capsys.readouterr().out
+    assert "pulled 2, pushed 1, removed 0" in capsys.readouterr().out
 
     def boom(*a):
         raise ConnectionError("server down")

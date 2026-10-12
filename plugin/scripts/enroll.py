@@ -17,10 +17,10 @@ Enrollment is the IdP's device flow (RFC 8628), and it IS the sign-in: one appro
      authenticated IS the authority for what this machine is, so there is nothing left
      to confirm from somewhere else. Neither route takes a bearer, so a machine with no
      token at all can do this; there is no separate sign-in to run first.
-  4. The minted token is written to SYNAPSE_INGEST_TOKEN via ``write_user_config``,
-     so the MCP server's Authorization header picks it up with no other change
-     anywhere. The local record keeps only its sha256, which is how the hooks prefer it
-     over a stale SYNAPSE_INGEST_TOKEN left in the environment
+  4. The minted token and its record go to ~/.synapse/config.json in one write
+     (``config.store_token``), where the hooks and both harnesses' MCP headers helper
+     read it. The record keeps only the token's sha256, which is how the hooks prefer
+     it over a stale SYNAPSE_INGEST_TOKEN left in the environment
      (config._resolve_ingest_token).
 
 Interactive by nature — it prints a code and waits for a human — so the SessionStart
@@ -55,6 +55,8 @@ def is_enrolled() -> bool:
 #: local `docker compose` install, which is the common case for a fresh clone. Kept as
 #: one string so the wording can't drift between the hook, `synapse-login` and enroll.
 BOOTSTRAP_CMD = 'docker compose exec mcp-server synapse-admin bootstrap "<label>"'
+#: Where a token minted that way goes on this machine (it asks for the token, hidden).
+PASTE_CMD = "synapse login --token"
 
 
 def bootstrap_hint(prefix: str = "") -> str:
@@ -67,7 +69,8 @@ def bootstrap_hint(prefix: str = "") -> str:
         f"{prefix}No sign-in is configured on this Synapse, so there is nothing to approve.\n"
         "Mint this machine a token on the server instead:\n"
         f"    {BOOTSTRAP_CMD}\n"
-        "then paste it into /plugin > synapse > Synapse token (SYNAPSE_INGEST_TOKEN)."
+        f"then store it here with `{PASTE_CMD}` (it becomes this machine's "
+        "SYNAPSE_INGEST_TOKEN; the legacy /plugin > synapse > Synapse token slot works too)."
     )
 
 
@@ -87,7 +90,8 @@ def restricted_block() -> str:
         "  - Server with a sign-in configured: run `! synapse-login` in this session.\n"
         "  - Local server, no sign-in: run\n"
         f"        {BOOTSTRAP_CMD}\n"
-        "    on the server, then paste the token into /plugin > synapse > Synapse token."
+        f"    on the server, then run `{PASTE_CMD}` here (or paste it into\n"
+        "    /plugin > synapse > Synapse token)."
     )
 
 
@@ -113,7 +117,11 @@ def _post(path: str, payload: dict, timeout: float = 30.0) -> dict:
     The enroll route answers 202 while the human has not approved yet and 403 once the
     IdP says no; both carry the reason in the body, so an exception on non-2xx would
     throw away exactly the information the poll loop needs.
+
+    Sent without a bearer: neither route takes one, and enrolling is how a machine moves
+    to another server, which must never receive the credential the old one minted.
     """
+    saved, config.INGEST_TOKEN = config.INGEST_TOKEN, ""
     try:
         return config.post_json(path, payload, timeout=timeout)
     except urllib.error.HTTPError as e:
@@ -124,6 +132,8 @@ def _post(path: str, payload: dict, timeout: float = 30.0) -> dict:
         # An empty body (a bare 404 from a server that never mounted the route) parses
         # to {}, which would read downstream as "no reason given". Keep the status.
         return body if isinstance(body, dict) and body else {"error": f"http_{e.code}"}
+    finally:
+        config.INGEST_TOKEN = saved
 
 
 def enroll(
@@ -181,7 +191,7 @@ def enroll(
         print(f"    code:  {start['user_code']}\n", file=sys.stderr)
         if complete:
             print(f"(or open the direct link: {complete})\n", file=sys.stderr)
-        print(f"This machine will enroll as: {config.MACHINE_ROLE}", file=sys.stderr)
+        print(f"This machine will enroll as: {config.machine_role()}", file=sys.stderr)
         print("Waiting for approval...", file=sys.stderr)
     if open_browser:
         try:  # convenience only: the flow works fine without a local browser
@@ -193,7 +203,7 @@ def enroll(
         "device_code": start["device_code"],
         # DISPLAY ONLY server-side — it names nothing and grants nothing.
         "label": config.SURFACE,
-        # The install prompt's answer. Authoritative because the person about to
+        # The role `synapse login` asked for. Authoritative because the person about to
         # authenticate is the one who gave it.
         "trust": config.requested_trust() or "restricted",
     }
@@ -232,19 +242,18 @@ def _drop_record() -> bool:
     between the two then leaves a token with no record, which re-enrolls harmlessly,
     never the new token under a record that describes the old one."""
     try:
-        config.DEVICE_FILE.unlink(missing_ok=True)
+        config.clear_device_state()
     except OSError as e:
-        print(f"enrollment failed: could not clear {config.DEVICE_FILE}: {e}", file=sys.stderr)
+        print(f"enrollment failed: could not clear the old enrollment: {e}", file=sys.stderr)
         return False
     return True
 
 
 def _persist(r: dict) -> dict:
-    """Store the minted credential, then the local record. Order matters on a crash: a
-    machine with a token and no record re-enrolls harmlessly, while a machine with a
-    record and no token is locked out of a credential it can never obtain again."""
+    """Store the minted credential and its record in one write to config.json, so a crash
+    can't leave one without the other (a record with no token would lock this machine
+    out of a credential it can never obtain again)."""
     surface = r.get("surface") or {}
-    config.write_user_config("SYNAPSE_INGEST_TOKEN", r["token"])
     state = {
         "surface_id": surface.get("surface_id", ""),
         "trust": surface.get("trust", ""),
@@ -257,7 +266,11 @@ def _persist(r: dict) -> dict:
         "token_sha256": config.token_sha256(r["token"]),
         "server": config.BASE_URL,
     }
-    config.write_device_state(state)
+    try:
+        config.store_token(r["token"], state)
+    except OSError as e:
+        print(f"enrollment failed: could not save the device token: {e}", file=sys.stderr)
+        return {}
     scope = ", ".join(state["allowed_projects"]) or "no projects"
     detail = "the full corpus" if state["trust"] == "full" else f"work-safe notes + {scope}"
     who = f"Signed in as {state['login']}. " if state["login"] else ""

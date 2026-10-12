@@ -54,6 +54,7 @@ _DB_FILES = {
     "test_skills_provider.py",
     "test_skills_lane_v2.py",
     "test_skill_accept_applies.py",
+    "test_skill_retire.py",
     "test_supersede_leg.py",
     "test_self_session_facts.py",
     "test_config_lane.py",
@@ -153,3 +154,14 @@ def _reset_dedup_index_cache():
     dedup._index_cache_reset()
     yield
     dedup._index_cache_reset()
+
+
+@pytest.fixture(autouse=True)
+def _scratch_synapse_home(tmp_path_factory, monkeypatch):
+    """Point SYNAPSE_HOME (~/.synapse: the client's config.json, lib/ and bin/) at an
+    empty scratch dir for every test. Many client tests isolate CLAUDE_CONFIG_DIR and
+    SYNAPSE_DATA_DIR but not HOME, so without this a developer's real config.json would
+    leak into their resolution, and a login or enroll test would write to it.
+    Subprocesses inherit it through the environment. A test that needs its own home
+    sets SYNAPSE_HOME again."""
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path_factory.mktemp("synapse-home")))

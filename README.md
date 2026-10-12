@@ -74,16 +74,20 @@ docker compose exec mcp-server synapse-admin bootstrap "this laptop"
 ```
 
 That last command prints a one-time device token. Every machine is served according to its
-own device token, so this step is not optional: paste the printed token as the "Synapse
-token" when you install the plugin.
+own device token, so this step is not optional; on a server with GitHub OAuth or OIDC
+configured, `synapse login` enrolls the machine with one approval instead.
 
-```
-/plugin marketplace add kraft87/synapse
-/plugin install synapse@synapse
+Then, on each machine you code on, install the client from your server and log in:
+
+```bash
+curl -sSL http://localhost:8765/install | python3 -    # PowerShell: irm http://localhost:8765/install | python -
+synapse login --token     # paste the token above when asked; plain `synapse login` on a server with sign-in
 ```
 
-The install prompts for your `SYNAPSE_URL` (`http://localhost:8765` for the local
-quickstart), the token above, and this machine's role. Then run `/reload-plugins`.
+`synapse login` asks this machine's questions once (personal or work; sync skills here?),
+keeps the answers and the credential in `~/.synapse/config.json`, and wires up every coding
+harness it finds: the Claude Code plugin and Codex's hooks and MCP entry. Restart Claude
+Code (or run `/reload-plugins`); in Codex, trust the new hooks with `/hooks`.
 
 Required values, verification steps, importing your existing history, upgrades, and
 troubleshooting: **[docs/install.md](docs/install.md)**.

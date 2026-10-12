@@ -340,16 +340,16 @@ def test_accepted_change_is_pulled_by_the_owning_machine(acc, db_url, tmp_path, 
     engine._sync(scope, folder, client=client)  # the owner's copy, in sync with the registry
     md = folder / "acc-backup" / "SKILL.md"
     assert md.read_text() == V1
-    assert engine._sync(scope, folder, client=client) == (0, 0)  # steady state
+    assert engine._sync(scope, folder, client=client) == (0, 0, 0)  # steady state
 
     cid = _candidate(acc, body=V2, base=body_hash(V1))
     assert _accept(db_url, cid)["status"] == "promoted"
 
-    assert engine._sync(scope, folder, client=client) == (1, 0)  # next session start: a pull
+    assert engine._sync(scope, folder, client=client) == (1, 0, 0)  # next session start: a pull
     assert md.read_text() == V2
     cmod = _registry(acc, "acc-backup")[3]
     assert abs(md.stat().st_mtime - cmod.timestamp()) < 1  # disk clock aligned to the edit
-    assert engine._sync(scope, folder, client=client) == (0, 0)  # converged, no push-back
+    assert engine._sync(scope, folder, client=client) == (0, 0, 0)  # converged, no push-back
 
 
 def test_accepted_new_skill_is_materialized_in_its_project(acc, db_url, tmp_path, monkeypatch):
@@ -361,7 +361,7 @@ def test_accepted_new_skill_is_materialized_in_its_project(acc, db_url, tmp_path
     )  # fmt: skip
     assert _accept(db_url, cid)["scope"] == "project:acc-proj"
     folder = tmp_path / "acc-proj" / ".claude" / "skills"
-    pulled, pushed = engine._sync("project:acc-proj", folder, client=client)
+    pulled, pushed, _removed = engine._sync("project:acc-proj", folder, client=client)
     assert pulled >= 1 and pushed == 0
     assert (folder / "acc-new-skill" / "SKILL.md").read_text() == _NEW
 

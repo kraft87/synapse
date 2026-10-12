@@ -13,7 +13,7 @@ hook entry as a separate process; one fetch pass is cheaper):
                       failed uploads however old
   * upload warning  — when uploads keep failing, one line saying since when and
                       why (local cursor state only, no network)
-  * skills sync     — ``scripts/skills_sync.py`` (opt-in, SYNAPSE_SKILLS_SYNC=1),
+  * skills sync     — ``scripts/skills_sync.py`` (opt-in: ``synapse login`` asks),
                       run inline under a wall-clock budget so the synced skills
                       exist before Codex scans ~/.agents/skills
 

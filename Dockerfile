@@ -91,6 +91,10 @@ COPY --from=builder /app/mcp_server /app/mcp_server
 COPY --from=builder /app/dream /app/dream
 COPY --from=builder /app/schema /app/schema
 COPY --from=builder /app/pyproject.toml /app/pyproject.toml
+# The client, served by GET /install (mcp_server/install_routes.py): the installer unpacks
+# these two trees side by side, as in the repository.
+COPY --from=builder /app/plugin /app/plugin
+COPY --from=builder /app/plugin-codex /app/plugin-codex
 # The prebuilt dashboard bundle — the /dash routes serve it from here.
 COPY --from=webbuild /app/web/dist /app/web/dist
 

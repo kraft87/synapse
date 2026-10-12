@@ -1,0 +1,19 @@
+#!/usr/bin/env sh
+# synapse — the Synapse client CLI (login, config, install, update, skill retire).
+#
+# Claude Code puts a plugin's bin/ on PATH inside sessions, so `! synapse login` works in
+# the Claude prompt. Outside sessions the managed client's own shim (~/.synapse/bin/synapse,
+# from `curl <server>/install | python3 -`) is the one on PATH. It locates the CLI relative
+# to itself and needs NO environment variables.
+set -eu
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+SCRIPT="$DIR/../scripts/synapse_cli.py"
+if command -v python3 >/dev/null 2>&1; then
+  PY=python3
+elif command -v python >/dev/null 2>&1; then
+  PY=python
+else
+  echo "synapse: need python3 or python on PATH" >&2
+  exit 1
+fi
+exec "$PY" "$SCRIPT" "$@"

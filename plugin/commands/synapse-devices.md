@@ -6,8 +6,8 @@ Manage Synapse device trust (schema 054). Every machine authenticates with its O
 
 Steps:
 1. With no argument, or "list": `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/device_admin.py" list`. Report each surface's id, trust, label, project scope and last-seen.
-2. To give a NEW machine access, the answer is usually not this command: that machine runs `! synapse-login`, signs in, and enrolls itself. Say that rather than minting on its behalf.
-3. Mint only for a machine that can't run a browser sign-in anywhere (a headless box, a service): `… mint "<label>" [--full] [--projects a,b]`. Defaults to restricted, inheriting the project scope other restricted devices already have. The token prints once — tell the user to set it as `SYNAPSE_INGEST_TOKEN` there, and do not repeat it back later.
+2. To give a NEW machine access, the answer is usually not this command: that machine installs the client (`curl -sSL <server>/install | python3 -`) and runs `synapse login` (or `! synapse-login` in a Claude session), signs in, and enrolls itself. Say that rather than minting on its behalf.
+3. Mint only for a machine that can't run a browser sign-in anywhere (a headless box, a service): `… mint "<label>" [--full] [--projects a,b]`. Defaults to restricted, inheriting the project scope other restricted devices already have. The token prints once — tell the user to store it there with `synapse login --token`, and do not repeat it back later.
 4. Revoke: `… revoke <surface_id>`. Effective on that device's very next request.
 
 Never mint or widen a grant without the user's explicit say-so — this is the control that keeps personal memory off machines that shouldn't have it. If the CLI reports 401, say so plainly: these routes require a full-trust device token, and the shared machine token is refused by design; recovery without one is `docker compose exec mcp-server synapse-admin bootstrap "<label>"` on the server.

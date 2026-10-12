@@ -13,8 +13,11 @@ PG work in a threadpool, fail-soft JSON.
 
 Routes (all POST):
   /skills/list        {scope}                       -> active skills (name, desc, mtime, file shas)
+                                                        + retired ones (name, hash, retired_at)
   /skills/fetch       {name}                         -> body + file contents (base64) for a pull
-  /skills/publish     {name, scope, body, ...files}  -> upsert registry + replace files
+  /skills/publish     {name, scope, body, ...files}  -> upsert registry + replace files; refused
+                                                        when the skill was retired after the edit
+  /skills/retire      {name}                         -> status='retired', stamped with retired_at
   /skills/overwrite   {name, scope, body, mtime}     -> record a clobbered local edit in history
   /skills/proposals   {id?}                          -> list proposed candidates, or one's detail
                                                         (detail: + where accept would apply it)
@@ -25,10 +28,11 @@ Routes (all POST):
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
 import re
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 
 import psycopg
 from psycopg.rows import dict_row
@@ -38,6 +42,7 @@ from starlette.responses import JSONResponse
 
 from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
 from dream.skills.skill_measure import skill_description
+from ingestion.schema_check import ColumnProbe
 from mcp_server.http_helpers import _iso, guarded_json
 
 logger = logging.getLogger(__name__)
@@ -52,10 +57,54 @@ def _dt(iso: str | None) -> datetime | None:
         return None
 
 
+def _utc(dt: datetime) -> datetime:
+    """`dt`, with a naive one read as UTC so it compares against a timestamptz."""
+    return dt if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+#: Schema 060 adds skill_registry.retired_at. The image ships before it is applied, so every
+#: statement that names the column asks this probe first; until the column exists, retire
+#: reports the missing schema and list and publish behave exactly as before 060.
+RETIRED_AT_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('skills_lane.skill_registry') "
+    "  AND attname = 'retired_at' AND NOT attisdropped",
+    "schema 060 (skill_registry.retired_at)",
+)
+_NO_RETIRED_AT = "schema 060 (skill_registry.retired_at) not applied"
+
+
+def _retired_at_ready(c) -> bool:
+    return RETIRED_AT_PROBE.ready(c, c.info.dsn)
+
+
 # --------------------------------------------------------------------------- sync
 
 
+def whole_skill_hash(body: str, files) -> str:
+    """The client sync's whole-skill hash (plugin/scripts/skills_sync.py ``_whole_hash``),
+    byte for byte: the body, then each sorted (path, sha256) pair, NUL-separated. A retired
+    entry carries it so a client can tell the copy Synapse delivered from a local edit."""
+    h = hashlib.sha256()
+    h.update(body.encode("utf-8"))
+    for path, sha in sorted(files):
+        h.update(b"\0")
+        h.update(path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(sha.encode())
+    return h.hexdigest()
+
+
+def _file_shas(c, name: str) -> list[dict]:
+    return c.execute(
+        "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
+        (name,),
+    ).fetchall()
+
+
 def _list_skills(db_url: str, scope: str) -> dict:
+    """The skills in `scope`: active ones under "skills" (all an older client reads), and,
+    once schema 060 is applied, retired ones under "retired"."""
     with psycopg.connect(db_url, row_factory=dict_row) as c:
         skills = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
@@ -63,23 +112,48 @@ def _list_skills(db_url: str, scope: str) -> dict:
             "WHERE status='active' AND scope=%s ORDER BY name",
             (scope,),
         ).fetchall()
-        out = []
-        for s in skills:
-            files = c.execute(
-                "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
-                (s["name"],),
-            ).fetchall()
-            out.append(
+        listing = {
+            "skills": [
                 {
                     "name": s["name"],
                     "scope": s["scope"],
                     "body": s["body"],
                     "description": s["description"],
                     "content_modified_at": _iso(s["content_modified_at"]),
-                    "files": [{"path": f["path"], "sha256": f["sha256"]} for f in files],
+                    "files": _file_shas(c, s["name"]),
                 }
-            )
-    return {"skills": out}
+                for s in skills
+            ]
+        }
+        if _retired_at_ready(c):
+            listing["retired"] = _retired_skills(c)
+    return listing
+
+
+def _retired_skills(c) -> list[dict]:
+    """Every retired skill, whatever scope is asked for, each with the whole-skill hash of
+    the content it was retired with. A name is one registry row, and its scope is
+    whichever folder published it last: a copy of the same skill in another scope's
+    folder is just as retired. A client removes its copy only when that copy is still
+    exactly what Synapse delivered, whatever its timestamp (in another scope's folder:
+    only the exact retired content). A row with no retired_at (status set by hand) is
+    left out: publish does not enforce it either."""
+    rows = c.execute(
+        "SELECT name, scope, COALESCE(body,'') AS body, retired_at "
+        "FROM skills_lane.skill_registry "
+        "WHERE status='retired' AND retired_at IS NOT NULL ORDER BY name",
+    ).fetchall()
+    return [
+        {
+            "name": r["name"],
+            "scope": r["scope"],
+            "content_hash": whole_skill_hash(
+                r["body"], [(f["path"], f["sha256"]) for f in _file_shas(c, r["name"])]
+            ),
+            "retired_at": _iso(r["retired_at"]),
+        }
+        for r in rows
+    ]
 
 
 def _fetch_skill(db_url: str, name: str) -> dict:
@@ -122,7 +196,8 @@ def _upsert_registry(
 
     Nulls the description embedding when the description changed so the server lane
     re-embeds it (overlap detection). The skill_history trigger fires automatically on a body
-    change, so a superseded body stays recoverable."""
+    change, so a superseded body stays recoverable. A write is the skill's newest edit, so
+    it ends any retirement (callers refuse the writes that must not)."""
     cur.execute(
         """INSERT INTO skills_lane.skill_registry
                (name, scope, body, description, status, content_modified_at)
@@ -136,11 +211,50 @@ def _upsert_registry(
              updated_at=now()""",
         (name, scope, body, description, content_modified_at),
     )
+    if _retired_at_ready(cur.connection):
+        cur.execute(
+            "UPDATE skills_lane.skill_registry SET retired_at=NULL "
+            "WHERE name=%s AND retired_at IS NOT NULL",
+            (name,),
+        )
+
+
+def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
+    """The retired_at that refuses the publish `p` (edited at `edited`), or None.
+
+    Newest edit wins: only an edit made after the retirement brings the skill back, and an
+    edit with no time is not newer. Nor is the very content that was retired, whatever its
+    timestamp: a clone, a restore, a copy or a fast clock renews an mtime, not the skill.
+    Without this a machine that still holds a retired skill republishes it at its next
+    session start. Locks the row, so a retire can't land between this check and the
+    publish's write."""
+    if not _retired_at_ready(c):
+        return None
+    name = p["name"]
+    row = c.execute(
+        "SELECT status, retired_at, COALESCE(body,'') FROM skills_lane.skill_registry "
+        "WHERE name=%s FOR UPDATE",
+        (name,),
+    ).fetchone()
+    if row is None or row[0] != "retired" or row[1] is None:
+        return None
+    if edited is None or _utc(edited) <= row[1]:
+        return row[1]
+    retired = whole_skill_hash(row[2], [(f[0], f[1]) for f in _file_shas(c, name)])
+    pushed = whole_skill_hash(
+        p.get("body", ""), [(f["path"], f["sha256"]) for f in p.get("files", [])]
+    )
+    return row[1] if pushed == retired else None
 
 
 def _publish_skill(db_url: str, p: dict) -> dict:
     name = p["name"]
+    edited = _dt(p.get("content_modified_at"))
     with psycopg.connect(db_url) as c:
+        retired_at = _retirement_holds(c, p, edited)
+        if retired_at is not None:
+            c.rollback()
+            return {"status": "retired", "name": name, "retired_at": _iso(retired_at)}
         cur = c.cursor()
         _upsert_registry(
             cur,
@@ -148,7 +262,7 @@ def _publish_skill(db_url: str, p: dict) -> dict:
             p.get("scope", "global"),
             p.get("body", ""),
             p.get("description") or None,
-            _dt(p.get("content_modified_at")),
+            edited,
         )
         cur.execute("DELETE FROM skills_lane.skill_files WHERE skill_name=%s", (name,))
         for f in p.get("files", []):
@@ -179,6 +293,47 @@ def _record_overwrite(db_url: str, p: dict) -> dict:
         )
         c.commit()
     return {"status": "ok"}
+
+
+def _retire_skill(db_url: str, name) -> dict:
+    """Retire `name`: status='retired' stamped with retired_at, plus a skill_history row so
+    the retirement shows in the change trail. A row retired by hand (no retired_at) gets
+    stamped too, so its retirement starts to hold."""
+    if not isinstance(name, str) or not name.strip():
+        return {"status": "error", "detail": "'name' must be a non-empty string"}
+    with psycopg.connect(db_url, row_factory=dict_row) as c:
+        if not _retired_at_ready(c):
+            return {"status": "error", "detail": _NO_RETIRED_AT}
+        row = c.execute(
+            "UPDATE skills_lane.skill_registry "
+            "SET status='retired', retired_at=now(), updated_at=now() "
+            "WHERE name=%s AND (status<>'retired' OR retired_at IS NULL) "
+            "RETURNING name, scope, body, content_modified_at, retired_at",
+            (name,),
+        ).fetchone()
+        if row is None:
+            prior = c.execute(
+                "SELECT retired_at FROM skills_lane.skill_registry WHERE name=%s", (name,)
+            ).fetchone()
+            if prior is None:
+                return {"status": "not_found", "name": name}
+            return {
+                "status": "already_retired",
+                "name": name,
+                "retired_at": _iso(prior["retired_at"]),
+            }
+        c.execute(
+            "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
+            "VALUES (%s,%s,%s,%s,'retired')",
+            (row["name"], row["scope"], row["body"], row["content_modified_at"]),
+        )
+        c.commit()
+    return {
+        "status": "retired",
+        "name": row["name"],
+        "scope": row["scope"],
+        "retired_at": _iso(row["retired_at"]),
+    }
 
 
 # ----------------------------------------------------------------------- review
@@ -254,8 +409,8 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
         fm = frontmatter_name(body)
         skill = fm if valid_skill_name(fm) else re.sub(r"[^a-z0-9-]", "", row["name"].lower())
     reg = c.execute(
-        "SELECT scope, COALESCE(body, '') AS body FROM skills_lane.skill_registry WHERE name=%s"
-        + (" FOR UPDATE" if lock else ""),
+        "SELECT scope, status, COALESCE(body, '') AS body FROM skills_lane.skill_registry "
+        "WHERE name=%s" + (" FOR UPDATE" if lock else ""),
         (skill,),
     ).fetchone()
     exists = reg is not None
@@ -309,6 +464,12 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
                     "to apply this draft anyway",
                     force=True,
                 )
+    if exists and reg["status"] == "retired":
+        issue(
+            "retired",
+            f"'{skill}' is retired; accepting would reactivate it — pass --force to do that",
+            force=True,
+        )
 
     if scope_override is not None:
         scope = scope_override
@@ -590,6 +751,13 @@ def register(mcp, db_url: str, machine_authorized: Callable[[Request], bool]) ->
     @mcp.custom_route("/skills/publish", methods=["POST"])
     async def _publish(request: Request) -> JSONResponse:
         return await _guarded(request, lambda b: _publish_skill(db_url, b))
+
+    @mcp.custom_route("/skills/retire", methods=["POST"])
+    async def _retire(request: Request) -> JSONResponse:
+        def work(b):
+            return _retire_skill(db_url, b.get("name") if isinstance(b, dict) else None)
+
+        return await _guarded(request, work)
 
     @mcp.custom_route("/skills/overwrite", methods=["POST"])
     async def _overwrite(request: Request) -> JSONResponse:

@@ -152,17 +152,52 @@ def test_enrollment_sends_the_device_code_hostname_and_role(monkeypatch, hook):
     )
 
 
-def test_the_minted_token_lands_in_the_config_slot_the_mcp_header_reads(
-    monkeypatch, hook, tmp_path
-):
-    """settings.json's SYNAPSE_INGEST_TOKEN — so plugin.json's
-    `Bearer ${user_config.SYNAPSE_INGEST_TOKEN}` picks the device token up with no
-    change on either side. The client never manages two credentials."""
+def test_the_minted_token_lands_in_config_json(monkeypatch, hook, tmp_path):
+    """~/.synapse/config.json, the file the hooks and both harnesses' MCP headers helper
+    read. A machine whose settings.json never held a token doesn't get one there: the
+    client never manages two credentials."""
     _replies(monkeypatch, hook, [_MINTED])
     hook.enroll(interactive=False)
+    saved = json.loads(hook.config.synapse_home.config_file().read_text())
+    assert saved["token"] == "device-token-xyz"
+    assert not (tmp_path / "claude" / "settings.json").exists()
+
+
+def test_a_legacy_plaintext_slot_is_kept_in_step(monkeypatch, tmp_path):
+    """An install from before config.json has its token in settings.json, where the
+    Claude plugin's static Authorization header (the fallback when the headers helper
+    can't run) reads it. Enrollment updates that copy rather than leave a stale one."""
+    _isolate(monkeypatch, tmp_path)
+    options = {"SYNAPSE_URL": "http://localhost:8765", "SYNAPSE_INGEST_TOKEN": "old"}
+    (tmp_path / "claude" / "settings.json").write_text(
+        json.dumps({"pluginConfigs": {"synapse@synapse": {"options": options}}})
+    )
+    mod = _load()
+    _replies(monkeypatch, mod, [_MINTED])
+    mod.enroll(interactive=False)
     settings = json.loads((tmp_path / "claude" / "settings.json").read_text())
-    opts = next(iter(settings["pluginConfigs"].values()))["options"]
-    assert opts["SYNAPSE_INGEST_TOKEN"] == "device-token-xyz"
+    assert settings["pluginConfigs"]["synapse@synapse"]["options"]["SYNAPSE_INGEST_TOKEN"] == (
+        "device-token-xyz"
+    )
+
+
+def test_a_legacy_slot_for_another_server_never_gets_the_new_token(monkeypatch, tmp_path):
+    """The plugin still points elsewhere (a move made with --no-install): its static
+    header would carry this server's token there, so the slot goes instead."""
+    _isolate(monkeypatch, tmp_path)
+    options = {"SYNAPSE_URL": "https://old.example", "SYNAPSE_INGEST_TOKEN": "old"}
+    (tmp_path / "claude" / "settings.json").write_text(
+        json.dumps({"pluginConfigs": {"synapse@synapse": {"options": options}}})
+    )
+    # `synapse login --url <new> --reenroll` signs in with the new URL in the environment.
+    monkeypatch.setenv("SYNAPSE_URL", "http://localhost:8765")
+    mod = _load()
+    _replies(monkeypatch, mod, [_MINTED])
+    mod.enroll(interactive=False)
+    settings = json.loads((tmp_path / "claude" / "settings.json").read_text())
+    assert settings["pluginConfigs"]["synapse@synapse"]["options"] == {
+        "SYNAPSE_URL": "https://old.example"
+    }
 
 
 def test_the_local_record_captures_what_was_granted(monkeypatch, hook):
@@ -184,15 +219,34 @@ def test_the_local_record_captures_what_was_granted(monkeypatch, hook):
     assert hook.is_enrolled()
 
 
-def test_the_credential_is_persisted_before_the_local_record(monkeypatch, hook):
-    """Ordering matters on a crash: a machine with a token and no record re-enrolls;
-    a machine with a record and no token is locked out."""
-    order: list[str] = []
-    monkeypatch.setattr(hook.config, "write_user_config", lambda k, v: order.append(f"config:{k}"))
-    monkeypatch.setattr(hook.config, "write_device_state", lambda s: order.append("state"))
+def test_the_credential_and_its_record_are_written_together(monkeypatch, hook):
+    """One write to config.json: a crash can't separate them. A record with no token
+    would lock this machine out of a credential it can never obtain again."""
+    writes: list[dict] = []
+    real_save = hook.config.synapse_home.save
+
+    def spy(data, path=None):
+        writes.append(json.loads(json.dumps(data)))
+        real_save(data, path)
+
+    monkeypatch.setattr(hook.config.synapse_home, "save", spy)
     _replies(monkeypatch, hook, [_MINTED])
     hook.enroll(interactive=False)
-    assert order == ["config:SYNAPSE_INGEST_TOKEN", "state"]
+    assert len(writes) == 1
+    assert writes[0]["token"] == "device-token-xyz"
+    assert writes[0]["device"]["surface_id"] == "dev-abc123"
+    assert "device-token-xyz" not in json.dumps(writes[0]["device"])
+
+
+def test_a_failed_write_reports_and_leaves_the_machine_unenrolled(monkeypatch, hook, capsys):
+    def boom(data, path=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(hook.config.synapse_home, "save", boom)
+    _replies(monkeypatch, hook, [_MINTED])
+    assert hook.enroll(interactive=False) == {}
+    assert "could not save the device token" in capsys.readouterr().err
+    assert not hook.is_enrolled()
 
 
 def test_an_already_enrolled_machine_does_not_re_enroll(monkeypatch, hook):

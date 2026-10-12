@@ -67,7 +67,8 @@ def server(monkeypatch):
 def fake_sync(monkeypatch):
     calls: list[tuple[str, Path]] = []
     mod = types.ModuleType("skills_sync")
-    mod._sync = lambda scope, target: calls.append((scope, target)) or (1, 0)
+    # (pulled, pushed, removed), as the real _sync returns
+    mod._sync = lambda scope, target: calls.append((scope, target)) or (1, 0, 0)
     monkeypatch.setitem(sys.modules, "skills_sync", mod)
     return calls
 

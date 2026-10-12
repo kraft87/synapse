@@ -91,8 +91,8 @@ def cmd_mint(args: list[str]) -> int:
     # Only chance to see it — the server keeps the hash, not the token.
     print(f"token: {r['token']}")
     print(
-        "On the target machine, paste it into /plugin > synapse > Synapse token; use the\n"
-        "SYNAPSE_INGEST_TOKEN env var only where there is no plugin config (a service or\n"
+        "On the target machine, run `synapse login --token`; use the\n"
+        "SYNAPSE_INGEST_TOKEN env var only where there is no config file (a service or\n"
         "container). It is shown only once."
     )
     return 0

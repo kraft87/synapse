@@ -1,7 +1,7 @@
 {
   "name": "synapse",
-  "version": "0.19.6",
-  "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Point it at a local or central Synapse.",
+  "version": "0.20.0",
+  "description": "Claude Code integration for Synapse memory: pushes session transcripts to your Synapse (ingest), wires up the recall/remember MCP tools, and optionally two-way-syncs your skills library and mirrors opted-in config files for the dream lane. Set up with `synapse login`, which keeps this machine's settings in ~/.synapse/config.json.",
   "author": {
     "name": "kraft87"
   },
@@ -9,34 +9,14 @@
     "SYNAPSE_URL": {
       "type": "string",
       "title": "Synapse URL",
-      "description": "Base URL of your Synapse server (no path), e.g. https://synapse.example.net or http://localhost:8765",
+      "description": "Base URL of your Synapse server (no path), e.g. https://synapse.example.net or http://localhost:8765. `synapse login` fills this in; keep it the same as `synapse config url`.",
       "required": true
     },
     "SYNAPSE_INGEST_TOKEN": {
       "type": "string",
       "title": "Synapse token",
-      "description": "Optional. Leave blank and run `! synapse-login` in the Claude prompt: you approve one code and this machine enrolls, receiving its OWN device token, which is stored right back here. What this machine is served depends on that token, and it can be revoked on its own. Paste a token directly when the server has no sign-in configured: run `docker compose exec mcp-server synapse-admin bootstrap \"<label>\"` there and paste what it prints.",
+      "description": "Optional, and best left blank. `synapse login` enrolls this machine and keeps its OWN device token in ~/.synapse/config.json, where the hooks and this plugin's MCP headers helper read it. A value here is only the fallback the MCP connection sends when that helper can't run. On a server with no sign-in configured, mint a token there with `docker compose exec mcp-server synapse-admin bootstrap \"<label>\"` and store it with `synapse login --token`.",
       "sensitive": true
-    },
-    "SYNAPSE_MACHINE_ROLE": {
-      "type": "string",
-      "title": "This machine's role",
-      "description": "\"personal\" (default) or \"work\". Declared once when this machine enrolls, by the same approval that signs you in \u2014 so it is authoritative, not a request. \"work\" enrolls at restricted access: work-safe notes plus an allowlist of projects, so personal memory is never served here. Change it later with `/synapse-devices`."
-    },
-    "SYNAPSE_SKILLS_SYNC": {
-      "type": "string",
-      "title": "Two-way skill sync",
-      "description": "Opt-in: set to 1 to sync your ~/.claude/skills library with Synapse at session start (dream\u2192skills lane). OFF by default \u2014 nothing writes into your skills directory unless you enable it."
-    },
-    "SYNAPSE_CONFIG_SYNC": {
-      "type": "string",
-      "title": "Mirror config files",
-      "description": "Opt-in: mirror your config into Synapse for the dream lane. OFF by default \u2014 your CLAUDE.md + rules/*.md stay on this machine unless you set this to 1, which auto-grabs them from ~/.claude and the current project's .claude."
-    },
-    "SYNAPSE_CONFIG_PATHS": {
-      "type": "string",
-      "title": "Extra config globs",
-      "description": "Optional EXTRA globs (relative to ~/.claude) to mirror beyond the auto-discovered CLAUDE.md + rules/*.md, e.g. \"output-styles/*.md\"."
     }
   },
   "mcpServers": {
@@ -45,7 +25,8 @@
       "url": "${user_config.SYNAPSE_URL}/mcp",
       "headers": {
         "Authorization": "Bearer ${user_config.SYNAPSE_INGEST_TOKEN}"
-      }
+      },
+      "headersHelper": "python3 scripts/mcp_headers.py || python scripts/mcp_headers.py || py -3 scripts/mcp_headers.py"
     }
   }
 }

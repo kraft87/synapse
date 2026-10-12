@@ -108,3 +108,11 @@ def register(
     _register_web_login_routes(
         mcp, _idp, MACHINE_TOKEN, PUBLIC_URL, _issue_dash_token if DB_URL else None
     )
+
+    # Client installer — GET /install serves a stdlib script carrying this server's own
+    # client (`curl <server>/install | python3 -`, then `synapse login`). Unauthenticated
+    # like /health: the bundle is the repository's public code and holds no credential.
+    # Needs no DB.
+    from mcp_server.install_routes import register as _register_install_routes
+
+    _register_install_routes(mcp)

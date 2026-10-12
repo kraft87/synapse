@@ -67,13 +67,14 @@ def _print_token(out: dict[str, Any], *, bootstrap: bool = False) -> None:
         # The whole point of the command: a token nobody knows where to put is the same
         # as no token. Name the exact prompt, because that is where a new user is stuck.
         print()
-        print("Paste it into the plugin's Synapse token prompt:")
-        print("  /plugin > synapse > Synapse token   (SYNAPSE_INGEST_TOKEN)")
+        print("Store it on the machine that will use it:")
+        print("  synapse login --token   (its SYNAPSE_INGEST_TOKEN, in ~/.synapse/config.json)")
+        print("No client there yet? First: curl -sSL <this server>/install | python3 -")
         print("Then start a new session — the board should stop coming back empty.")
     else:
         print(
-            "On that machine, paste it into /plugin > synapse > Synapse token; use the\n"
-            "SYNAPSE_INGEST_TOKEN env var only where there is no plugin config (a service\n"
+            "On that machine, run `synapse login --token`; use the\n"
+            "SYNAPSE_INGEST_TOKEN env var only where there is no config file (a service\n"
             "or container)."
         )
 

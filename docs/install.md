@@ -76,9 +76,10 @@ token: <one-time token>
 Shown once — only the hash is stored.
 ```
 
-Copy the token: you paste it as the "Synapse token" in the plugin install prompt in the
-next step. It is shown once because only its hash is stored, so if you lose it, run
-`bootstrap` again for a new one and revoke the old row.
+Copy the token: `synapse login --token` asks for it and stores it on this machine in the next
+step.
+It is shown once because only its hash is stored, so if you lose it, run `bootstrap` again
+for a new one and revoke the old row.
 
 Why this step exists: since schema 054, what a machine is served depends on **its own**
 device token, not on the shared machine token and not on any name it reports. The shared
@@ -87,30 +88,49 @@ served restricted, which looks like an empty board and empty recalls. There is n
 path here: an unrecognised caller is served nothing rather than everything.
 
 On a server that has GitHub OAuth or OIDC configured, a machine can enroll itself instead
-with `! synapse-login`, and the bootstrap command is the break-glass path. See
+with plain `synapse login`, and the bootstrap command is the break-glass path. See
 [docs/auth.md](auth.md).
 
-## 4. Install the plugin
+## 4. Install the client and log in
 
-On each Claude Code machine. The repo ships its own marketplace manifest, so there is
-nothing to publish:
+On each machine you code on. The server serves its own client, so the version always
+matches:
 
+```bash
+curl -sSL http://localhost:8765/install | python3 -
+# Windows PowerShell:
+irm http://localhost:8765/install | python -
 ```
-/plugin marketplace add kraft87/synapse
-/plugin install synapse@synapse
+
+That unpacks the client into `~/.synapse/lib/<version>/`, puts a `synapse` command in
+`~/.synapse/bin` (it prints the line to add to your shell profile if that isn't on `PATH`;
+on Windows it adds it to your user `PATH`), and records the server URL. Python 3.11+ is
+the only requirement. Then:
+
+```bash
+synapse login --token     # server without sign-in: paste the step 3 token when asked
+synapse login                               # server with GitHub OAuth / OIDC: one approval
 ```
 
-The install prompts for:
+`synapse login` is the one setup step. It asks this machine's questions once and saves the
+answers in `~/.synapse/config.json`:
 
-- **Synapse URL**: base URL, no path. `http://localhost:8765` for the local quickstart.
-- **Synapse token**: the device token from step 3. On an OAuth-backed server you can leave
-  it blank and run `! synapse-login` instead.
-- **This machine's role**: `personal` (default, sees everything) or `work` (restricted:
+- **personal or work**: `personal` (default, sees everything) or `work` (restricted:
   work-safe notes plus an allowlist of projects, so personal memory is never served there).
-- **Opt-in syncs**: two-way skill sync and config mirroring, both off by default.
+  It is declared when the machine enrolls.
+- **Sync skills to this machine?**: two-way sync of your skills library at session start.
 
-Then `/reload-plugins` (or restart Claude Code) to activate the hooks and the MCP server.
-Full plugin detail: [plugin/README.md](../plugin/README.md).
+Then it wires every harness it finds. **Claude Code**: it installs the plugin
+(`claude plugin marketplace add kraft87/synapse`, `claude plugin install synapse@synapse`)
+with the server URL; restart Claude Code or run `/reload-plugins`. **Codex**: it writes the
+hooks and the `synapse` MCP server into `~/.codex/config.toml`; start `codex`, run `/hooks`
+and trust them. Re-running `synapse login` wires a harness you install later and never asks
+for a new sign-in on an enrolled machine (`--reenroll` does that on purpose).
+
+Settings live in `~/.synapse/config.json`, owned by no harness: `synapse config` lists
+them, `synapse config <key> <value>` changes one (`url`, `role`, `skills_sync`,
+`config_sync`, `config_paths`). Full client detail: [plugin/README.md](../plugin/README.md)
+and [plugin-codex/README.md](../plugin-codex/README.md).
 
 ## 5. Verify
 
@@ -148,7 +168,7 @@ transcripts already sit in `~/.claude/projects` — import them once and `recall
 history on day one:
 
 ```
-! synapse-import        # inside a Claude Code session (the plugin puts it on PATH)
+synapse import         # or `! synapse-import` inside a Claude Code session
 ```
 
 It offers an optional date range (by each file's last-activity date), prints a summary
@@ -248,6 +268,12 @@ failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, rest
 `-- schema-check: optional` boots with a warning: the code shipped with them runs without
 them and keeps its old behaviour until they are applied.
 
+Clients follow the server: `synapse update` on each machine fetches the client version the
+server now serves (the same `/install`), updates the Claude Code plugin, and keeps Codex's
+hook commands as they were, so their trust survives. An install from before 0.20 keeps
+working with no action, reading its old Claude plugin settings; the first `synapse login`
+copies those answers into `~/.synapse/config.json`.
+
 Releases are tagged (`v0.8.1`, ...). `main` is kept releasable, but for a known-good
 build check out the latest tag; a change that needs a migration or renames an env var
 gets a release note saying so.
@@ -257,8 +283,9 @@ gets a release note saying so.
 - **The board is empty but the URL is right, and recall returns nothing.** The machine is
   being served restricted: either it never enrolled, or it is presenting the shared machine
   token instead of a device token. Mint one with
-  `docker compose exec mcp-server synapse-admin bootstrap "<label>"`, or run
-  `! synapse-login`, then paste it into the plugin config. The SessionStart block says which
+  `docker compose exec mcp-server synapse-admin bootstrap "<label>"` and store it with
+  `synapse login --token`, or run `synapse login` on a server with sign-in. The
+  SessionStart block says which
   case you are in, and so does the server itself: a `WARNING:` line under the board header
   and the first entry of recall's `warnings` list, which reach even an old plugin.
 - **`POST /recall` returns `{"facts": []}` with no `episodes` key.** The embedding call
@@ -274,8 +301,8 @@ gets a release note saying so.
   unrecognised model name leaves `failed` extraction rows carrying the reason, and the queue
   retries them once the configuration is fixed. A slashed model id is a different symptom,
   a poller that never starts. See [Model ids](#model-ids-one-thing-that-bites).
-- **`401 Unauthorized`.** Token missing, stale, or revoked. Re-run `! synapse-login`, or
-  paste a fresh device token into the `/plugin` config.
+- **`401 Unauthorized`.** Token missing, stale, or revoked. Run `synapse login --reenroll`,
+  or store a fresh device token with `synapse login --token`.
 - **Session start says "Synapse uploads have been failing since …".** The last several
   transcript uploads failed, with no success since; the reason is in brackets. `HTTP 401` or
   `HTTP 403` usually means a revoked or stale token, or a proxy or WAF in front of the server.
@@ -290,14 +317,22 @@ gets a release note saying so.
   machine is enrolled, so the hooks already use its device token. Delete the export from the
   place the line names; nothing else needs to change.
 - **Recall returns nothing and the hooks seem dead.** Hooks are fail-soft, so an unreachable
-  server is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health`, then that `SYNAPSE_URL`
-  and the token are set (`/plugin` shows the stored values).
-- **`synapse-login` / `synapse-import` not found.** The plugin's `bin/` is only on PATH
-  inside Claude Code sessions, hence the `!` prefix. From a plain terminal, run the script
-  by full path.
+  server is a silent no-op. Check `curl -fsS $SYNAPSE_URL/health`, then `synapse config`:
+  the URL should be right and the token set.
+- **Recall answers 401 but the hooks work.** The MCP connection authenticates through a
+  headers helper that reads `~/.synapse/config.json`; when it can't run it falls back to the
+  plugin's static token. The helper's failures (wrong server, no token) are logged to
+  `~/.synapse/logs/mcp_headers.log`. `synapse install` puts the harnesses' own copy of the
+  URL back in step with `config.json`.
+- **`synapse` not found.** Install the client (step 4) and add `~/.synapse/bin` to `PATH` as
+  the installer printed. Inside Claude Code sessions the plugin's own `bin/` provides
+  `synapse` and `synapse-login` too.
+- **Codex hooks don't run.** Codex skips hooks nobody trusted: run `/hooks` in `codex` and
+  trust the Synapse ones. `synapse update` never changes their commands, so trust survives
+  updates.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device
-  Flow" on the GitHub OAuth App; fall back to `! synapse-login --browser`.
+  Flow" on the GitHub OAuth App; fall back to `synapse login --browser`.
 - **A service refuses to start, complaining about the schema version.** Run
   `scripts/apply_schema.sh` against the database, then restart. See
   [Upgrading](#upgrading).

@@ -25,14 +25,14 @@ just review what it proposes with `/synapse:skill-review`.
 
 ## Setup
 
-Prerequisites: a running Synapse server, Claude Code, and Python 3 on PATH — everything is
-stdlib, no `pip install`.
+Prerequisites: a running Synapse server, Claude Code (and/or Codex), and Python 3.11+ on
+PATH — everything is stdlib, no `pip install`.
 
 ### 1. Stand up the server
 
 Not covered here: [docs/install.md](../docs/install.md) walks the whole server side, from
 `git clone` to a verified `/health`. For a central deployment, expose the one server URL
-behind auth and point every machine's plugin at it.
+behind auth and point every machine at it.
 
 ### 2. Get this machine a device token
 
@@ -40,52 +40,67 @@ What a machine is served depends on its **own** device token, so the shared mach
 not enough: presented on its own it is served restricted, which looks like an empty board.
 Two ways to get one:
 
-- On a server with GitHub OAuth or OIDC configured, skip ahead and run `! synapse-login`
-  after installing (below). One approval signs you in and enrolls this machine, writing
-  the minted token into the config slot for you.
+- On a server with GitHub OAuth or OIDC configured, `synapse login` (next step) does it:
+  one approval signs you in and enrolls this machine.
 - Otherwise, on the server host:
   `docker compose exec mcp-server synapse-admin bootstrap "<label>"`. It prints a full-trust
   device token once (only the hash is stored). Copy it for the next step.
 
 Details, roles, and revocation: [docs/auth.md](../docs/auth.md).
 
-### 3. Install the plugin on each Claude Code machine
+### 3. Install the client and run `synapse login`
 
-The repo is its own marketplace (it ships `.claude-plugin/marketplace.json`), so there's
-nothing to publish:
-
-```
-/plugin marketplace add kraft87/synapse
-/plugin install synapse@synapse
-```
-
-Claude Code prompts for the configuration and stores secrets in the OS keychain — no
-hand-editing `settings.json` or `.mcp.json`. Paste the device token from step 2 as the
-**Synapse token**, and answer **personal** or **work** for this machine's role. Then
-`/reload-plugins` (or restart) to activate the hooks + MCP server.
-
-To enroll instead of pasting, leave the token blank and run:
+On each machine. The server serves the client matching its own version:
 
 ```
-! synapse-login        # in the Claude prompt — runs in-session, no LLM, streams live
+curl -sSL https://<your-synapse>/install | python3 -     # PowerShell: irm .../install | python -
+synapse login                                            # or: synapse login --token  (asks for the step 2 token)
 ```
 
-Default is the device flow (RFC 8628): it prints ONE short code, you approve it at
-`github.com/login/device` (or your OIDC provider) from any device (phone, another laptop),
-and it polls until done. That single approval signs you in and enrolls this machine at the
-role you chose. No same-host browser, so it works on servers and headless boxes.
-`--browser` falls back to the legacy loopback flow, which needs a second (device-code)
-approval to enroll. Either way the device token is stored for the hooks and MCP server.
+`synapse login` is the one setup step. It signs in and enrolls (the device flow, RFC 8628:
+ONE short code you approve at `github.com/login/device` or your OIDC provider, from any
+device, so it works on servers and headless boxes; `--browser` is the legacy loopback flow),
+asks this machine's questions once (**personal** or **work**; sync skills here?), saves the
+answers and the device token in `~/.synapse/config.json`, then wires every harness it finds.
+For Claude Code that is this plugin, installed with your server's URL through Claude Code's
+own CLI:
 
-Keep the token in the plugin config. Don't also export `SYNAPSE_INGEST_TOKEN` from your shell
-profile or the `env` block of `settings.json`: the MCP server never reads it there. On an
-enrolled machine the hooks ignore it too, and session start prints one line saying where to
-remove it ([docs/auth.md](../docs/auth.md)).
+```
+claude plugin marketplace add kraft87/synapse
+claude plugin install synapse@synapse --config SYNAPSE_URL=<your-synapse>
+```
 
-> `synapse-login` and `synapse-import` ship in the plugin's `bin/`, which Claude Code puts
-> on PATH **inside sessions only** — hence the `!` prefix. From an outside terminal, run the
-> script by full path, e.g.
-> `python ~/.claude/plugins/cache/synapse/synapse/<version>/scripts/synapse_login.py`.
+Then `/reload-plugins` (or restart) to activate the hooks + MCP server. Re-running
+`synapse login` on an enrolled machine keeps its device token and only re-wires;
+`--reenroll` replaces the token.
+
+Already in a session with the plugin installed the old way (`/plugin install`)? `! synapse-login`
+runs the same command from the plugin's own `bin/`, and copies the answers the old install
+prompt stored in `settings.json` into `~/.synapse/config.json`.
+
+**How the plugin authenticates.** Hooks and scripts read the token from
+`~/.synapse/config.json` (then, for installs from before 0.20, the plugin's saved options).
+The recall/remember MCP server gets it from a headers helper, `scripts/mcp_headers.py`,
+which Claude Code runs before each connection and which reads the same file; the only value
+the plugin config itself must hold is the server URL, because Claude Code opens that
+connection. The plugin's static `Authorization` header (`Synapse token` in `/plugin`) is the
+fallback for when the helper can't run, and is best left blank. Don't export
+`SYNAPSE_INGEST_TOKEN` from your shell profile or the `env` block of `settings.json`: Claude
+Code never passes it to the helper, and on an enrolled machine the hooks ignore it too,
+printing one line at session start saying where to remove it
+([docs/auth.md](../docs/auth.md)).
+
+Settings live in `~/.synapse/config.json`, owned by no harness:
+
+```
+synapse config                         # list
+synapse config skills_sync on          # two-way skill sync at session start
+synapse config config_sync on          # mirror CLAUDE.md + rules/*.md for the dream lane
+synapse config url https://...         # same server, new address; also rewires the harnesses
+```
+
+> Inside a Claude Code session the plugin's `bin/` puts `synapse` and `synapse-login` on
+> PATH (hence the `!` prefix). Everywhere else the client's shim in `~/.synapse/bin` does.
 
 ### 4. Import your existing history (recommended)
 
@@ -93,7 +108,7 @@ The `Stop` hook only sees sessions from install onward, but months of transcript
 already sit under `~/.claude/projects`. Import them once and recall works on day one:
 
 ```
-! synapse-import        # in the Claude prompt — or by full path from any terminal
+synapse import          # or `! synapse-import` in the Claude prompt
 ```
 
 It discovers every transcript (oldest-first; `--projects-dir` to override), offers an
@@ -145,12 +160,26 @@ Slash commands:
 - **`/synapse-devices`** lists, mints, or revokes the per-device credentials that decide
   what each machine is served ([docs/auth.md](../docs/auth.md)).
 
-Bundled commands (`!` prefix in a session; full path from an outside terminal):
+CLI (`synapse …` from any terminal once the client is installed; `!` prefix in a session):
 
-- **`! synapse-login`** — sign in and enroll this machine with one approval (or `--browser`). On an enrolled
-  machine it keeps the existing device token; `--reenroll` replaces it.
-- **`! synapse-import`** — backfill your existing history (step 4).
-- **`! synapse-private on|off|status <session-id>`** — private mode (below).
+- **`synapse login`** (alias `synapse-login`) — sign in, enroll this machine with one
+  approval, and wire Claude Code / Codex. On an enrolled machine it keeps the existing
+  device token; `--reenroll` replaces it, `--token` stores a minted one (it asks for it, hidden).
+- **`synapse config [key [value]]`** — read or change this machine's settings.
+- **`synapse install claude|codex`** — the wiring step alone.
+- **`synapse update`** — install the client version the server now serves, and update
+  this plugin.
+- **`synapse skill retire <name>`** — retire a skill everywhere (below).
+- **`synapse import`** / **`! synapse-import`** — backfill your existing history (step 4).
+- **`synapse private on|off|status <session-id>`** — private mode (below).
+
+## Retiring a skill
+
+`synapse skill retire <name>` marks the skill retired on the server. At their next session
+start, machines with skills sync on delete their copy if it is still exactly a version
+Synapse delivered to them; a copy edited after the retirement is pushed back instead and
+the skill is active again (newest edit wins, as everywhere in the sync). A folder Synapse
+doesn't recognise is never touched, and deleting a skill locally never retires it.
 
 Scripts (run by full path; see [Memory-write spool](#memory-write-spool)):
 

@@ -74,7 +74,7 @@ are fail-soft: an unreachable server is a silent no-op.
 | Event | Script | What it does |
 |-------|--------|--------------|
 | `Stop` | `ingest_hook.py` | Pushes a bounded tail of the session transcript to `/ingest` after every turn. This is how sessions become memory, and it works over the network, so a work laptop can feed a central Synapse. |
-| `SessionStart` | `skills_sync.py` | Two-way sync between the server and `~/.claude/skills` (plus the project's `.claude/skills`). Newest edit wins per skill, with an append-only server-side history; deletes never auto-propagate. Off by default. |
+| `SessionStart` | `skills_sync.py` | Two-way sync between the server and `~/.claude/skills` (plus the project's `.claude/skills`). Newest edit wins per skill, with an append-only server-side history. A local delete never retires anything; a skill retired on the server is removed from machines whose copy is still exactly what Synapse delivered (whatever its timestamp); a copy edited after the retirement is pushed back instead. Off by default. |
 | `SessionStart` | `config_sync.py` | Mirrors your `CLAUDE.md` and `rules/*.md` to the server so the dream lane can propose config edits. Off by default. |
 | `SessionStart` | `git_feeder.py` | Pushes commit subjects from repos listed in `SYNAPSE_TIMELINE_REPOS` to the server's timeline. Off until configured. |
 | `SessionStart` | `board_block.py` | Prints the board (`GET /context`) into the session's context: curated note hooks, the last week's milestones, and what memory exists at all. Server-rendered, hard-capped (~80 lines / ~2K tokens), scoped to the session's project. On a 401 from an unenrolled machine it prints why instead. |
@@ -97,27 +97,34 @@ review what it proposes with `/synapse:skill-review`.
 
 ## Plugin configuration
 
-Settings resolve in order: env var → `CLAUDE_PLUGIN_OPTION_*` → your `/plugin install`
-answers (stored in `settings.json`) → built-in default. A fresh install just answers the
-install prompt; env vars are optional overrides (e.g. CI).
+The client's settings live in `~/.synapse/config.json`, which belongs to no harness: both
+the Claude plugin and the Codex hooks read it, and `synapse login` / `synapse config` write
+it. Each setting resolves in order: env var → `~/.synapse/config.json` → the Claude plugin's
+legacy saved options (`CLAUDE_PLUGIN_OPTION_*`, then `pluginConfigs."synapse@<marketplace>".options`
+in `settings.json`, for installs from before 0.20) → built-in default. Env vars are optional
+overrides (e.g. CI).
 
 The token is the exception. Don't set `SYNAPSE_INGEST_TOKEN` in your shell profile or in
-the `env` block of `settings.json`: run `! synapse-login`, or paste a token into
-`/plugin` > synapse > Synapse token. The MCP server only ever reads that plugin config, so a
-token set anywhere else reaches the hooks but not recall. Once this machine is enrolled, its
-device token wins over an env value. Session start then prints one line naming the variable
-and where to remove it.
+the `env` block of `settings.json`: run `synapse login` (or `synapse login --token` for a
+minted one). The MCP connection authenticates through a headers helper that both harnesses
+run with your environment stripped of credentials, so a token set anywhere but
+`config.json` reaches the hooks but not recall. Once this machine is enrolled, its device
+token wins over an env value. Session start then prints one line naming the variable and
+where to remove it.
 
-Prompted at install:
+Set by `synapse login`, changed with `synapse config <key> <value>`:
 
-| Variable | Meaning |
-|----------|---------|
-| `SYNAPSE_URL` (required) | Base URL of your server, no path (`http://localhost:8765` or `https://synapse.example.net`). The plugin derives `/ingest`, `/recall`, `/skills`, `/timeline`, and `/mcp`. |
-| `SYNAPSE_INGEST_TOKEN` | This machine's bearer token. It should be a **device** token, not the shared machine token ([docs/auth.md](auth.md)). One token covers ingest, recall, skill sync, and MCP. Leave blank and run `! synapse-login` to enroll instead. |
-| `SYNAPSE_MACHINE_ROLE` | `personal` (default) or `work`. Declared once when this machine enrolls; `work` enrolls at restricted access. Change it later with `/synapse-devices`. |
-| `SYNAPSE_SKILLS_SYNC` | `1` enables two-way skill sync. Off by default. |
-| `SYNAPSE_CONFIG_SYNC` | `1` mirrors config for the dream lane. Off by default. |
-| `SYNAPSE_CONFIG_PATHS` | Optional extra globs (relative to `~/.claude`) to mirror. |
+| Key (env var) | Meaning |
+|---------------|---------|
+| `url` (`SYNAPSE_URL`) | Base URL of your server, no path (`http://localhost:8765` or `https://synapse.example.net`). The client derives `/ingest`, `/recall`, `/skills`, `/timeline`, and `/mcp`. The one value each harness also keeps in its own config, because it opens the MCP connection; `synapse config url` updates those copies too. Moving to another server is `synapse login --url <url> --reenroll`: `config url` refuses to carry this machine's credential to another origin unless `--same-server` says it is the same server under a new address. |
+| `token` (`SYNAPSE_INGEST_TOKEN`) | This machine's bearer token. It should be a **device** token, not the shared machine token ([docs/auth.md](auth.md)). One token covers ingest, recall, skill sync, and MCP. Written by `synapse login`. |
+| `role` (`SYNAPSE_MACHINE_ROLE`) | `personal` (default) or `work`. `synapse login` asks; declared once when this machine enrolls, and `work` enrolls at restricted access. Change it later with `/synapse-devices`. |
+| `skills_sync` (`SYNAPSE_SKILLS_SYNC`) | Two-way skill sync. `synapse login` asks ("Sync skills to this machine?"); off when unanswered. |
+| `config_sync` (`SYNAPSE_CONFIG_SYNC`) | Mirrors config for the dream lane. Off by default. |
+| `config_paths` (`SYNAPSE_CONFIG_PATHS`) | Optional extra globs (relative to `~/.claude`) to mirror. |
+
+The Claude plugin's install prompt asks only for `SYNAPSE_URL` and an optional fallback
+token; `synapse login` fills in the URL.
 
 Env or `settings.json` only:
 
