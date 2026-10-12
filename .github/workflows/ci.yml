@@ -136,6 +136,10 @@ jobs:
           # DB tests run serially to avoid TRUNCATE/INSERT races on the shared schema
           uv run pytest tests/ -p no:xdist --maxfail=5 \
             -m "db and not integration $EXTRA"
+          # ...and again through one session-wide connection pool, the way the server
+          # runs (ingestion/pg_pool); the run above covers the no-pool path.
+          SYNAPSE_TEST_POOL=1 uv run pytest tests/ -p no:xdist --maxfail=5 \
+            -m "db and not integration $EXTRA"
       - name: Drop ephemeral test DB
         if: always()
         run: psql -h "$PGHOST" -U "$PGUSER" -d postgres -c "DROP DATABASE IF EXISTS \"$CI_DB\" WITH (FORCE)" || true
