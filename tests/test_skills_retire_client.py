@@ -720,7 +720,7 @@ def test_the_claude_hook_reloads_skills_when_only_a_removal_happened(
     engine, monkeypatch, capsys, result, reload
 ):
     monkeypatch.setattr(engine.config, "SKILLS_SYNC", True)
-    monkeypatch.setattr(engine, "_sync", lambda scope, folder: result)
+    monkeypatch.setattr(engine, "_sync", lambda scope, folder, **_kw: result)
 
     engine.main()
 
@@ -738,7 +738,7 @@ def test_a_removal_in_the_project_folder_alone_also_reloads(engine, monkeypatch,
     monkeypatch.setattr(engine.config, "SKILLS_SYNC", True)
     seen = []
 
-    def fake_sync(scope, folder):
+    def fake_sync(scope, folder, **_kw):
         seen.append(scope)
         return (0, 0, 1) if scope.startswith("project:") else (0, 0, 0)
 

@@ -17,6 +17,11 @@ PG is the single source of truth (the dream->skills lane writes here).
 
 Note: ``sync_skills`` writes file contents but not the executable bit, so ``is_executable``
 is metadata only — it does not survive the client-side materialization.
+
+Every listing and read is filtered by the CALLER's trust, the rule the /skills/* routes
+apply (``skill_sync_routes.SkillAccess``): full trust sees every active skill, a restricted
+device only the ``project:<p>`` skills in its allowlist, anyone else none. A skill the
+caller may not read does not exist for it (no resource, no template, no manifest).
 """
 
 from __future__ import annotations
@@ -24,7 +29,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from fastmcp.resources.base import Resource, ResourceResult
@@ -34,6 +39,8 @@ from fastmcp.utilities.versions import VersionSpec
 from pydantic import AnyUrl
 
 from ingestion import pg_pool
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
+from mcp_server.skill_sync_routes import SkillAccess
 
 _SCHEME = "skill://"
 _MAIN = "SKILL.md"
@@ -45,22 +52,22 @@ _MANIFEST = "_manifest"
 # --------------------------------------------------------------------------- #
 
 
-def _fetch_active(db_url: str) -> list[tuple[str, str]]:
+def _fetch_active(db_url: str, access: SkillAccess) -> list[tuple[str, str]]:
     with pg_pool.connection(db_url, autocommit=False) as c:
         rows = c.execute(
-            "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
+            "SELECT name, COALESCE(description, ''), scope FROM skills_lane.skill_registry "
             "WHERE status = 'active' ORDER BY name"
         ).fetchall()
-    return [(r[0], r[1]) for r in rows]
+    return [(r[0], r[1]) for r in rows if access.serves(r[2])]
 
 
-def _skill_active(db_url: str, name: str) -> bool:
+def _skill_active(db_url: str, name: str, access: SkillAccess) -> bool:
     with pg_pool.connection(db_url, autocommit=False) as c:
         row = c.execute(
-            "SELECT 1 FROM skills_lane.skill_registry WHERE name = %s AND status = 'active'",
+            "SELECT scope FROM skills_lane.skill_registry WHERE name = %s AND status = 'active'",
             (name,),
         ).fetchone()
-    return row is not None
+    return row is not None and access.serves(row[0])
 
 
 def _fetch_body(db_url: str, name: str) -> str | None:
@@ -193,11 +200,23 @@ class _PgSkillFileTemplate(ResourceTemplate):
 
 
 class PgSkillsProvider(Provider):
-    """Expose all active ``skills_lane`` skills as ``skill://`` MCP resources from PG."""
+    """Expose the active ``skills_lane`` skills the caller may read as ``skill://`` MCP
+    resources from PG. ``trust`` returns the current caller's verdict (the server's
+    ``_caller_trust``); without it every caller is unknown and served nothing."""
 
-    def __init__(self, db_url: str) -> None:
+    def __init__(self, db_url: str, trust: Callable[[], SurfaceTrust] | None = None) -> None:
         super().__init__()
         self._db_url = db_url
+        self._trust = trust
+
+    def _access(self) -> SkillAccess:
+        return SkillAccess.of(self._trust() if self._trust else UNKNOWN_SURFACE)
+
+    def _active(self) -> list[tuple[str, str]]:
+        return _fetch_active(self._db_url, self._access())
+
+    def _served(self, name: str) -> bool:
+        return _skill_active(self._db_url, name, self._access())
 
     def _template(self, name: str) -> _PgSkillFileTemplate:
         return _PgSkillFileTemplate(
@@ -215,7 +234,7 @@ class PgSkillsProvider(Provider):
         )
 
     async def _list_resources(self) -> Sequence[Resource]:
-        skills = await asyncio.to_thread(_fetch_active, self._db_url)
+        skills = await asyncio.to_thread(self._active)
         out: list[Resource] = []
         for name, desc in skills:
             out.append(
@@ -249,7 +268,7 @@ class PgSkillsProvider(Provider):
         name, fp = parsed
         if fp not in (_MAIN, _MANIFEST):
             return None  # bundled files resolve via the template
-        if not await asyncio.to_thread(_skill_active, self._db_url, name):
+        if not await asyncio.to_thread(self._served, name):
             return None
         return _PgSkillResource(
             uri=AnyUrl(uri),
@@ -262,7 +281,7 @@ class PgSkillsProvider(Provider):
         )
 
     async def _list_resource_templates(self) -> Sequence[ResourceTemplate]:
-        skills = await asyncio.to_thread(_fetch_active, self._db_url)
+        skills = await asyncio.to_thread(self._active)
         return [self._template(name) for name, _ in skills]
 
     async def _get_resource_template(
@@ -274,7 +293,7 @@ class PgSkillsProvider(Provider):
         name, fp = parsed
         if fp in (_MAIN, _MANIFEST):
             return None
-        if not await asyncio.to_thread(_skill_active, self._db_url, name):
+        if not await asyncio.to_thread(self._served, name):
             return None
         return self._template(name)
 

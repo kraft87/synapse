@@ -17,8 +17,12 @@ the Claude Code plugin (`../plugin/`) for the per-session surface:
 | skills sync (opt-in) | SessionStart `skills_sync.py` | `scripts/skills_sync.py`, run by `hooks/session_start.py` |
 
 Skills sync shares the Claude plugin's engine and its opt-in (`skills_sync` in
-`~/.synapse/config.json`; `synapse login` asks). It syncs Synapse's global skills two-way with Codex's user-skills
-folder (`~/.agents/skills`) only; Codex's bundled skills under
+`~/.synapse/config.json`; `synapse login` asks). It syncs Synapse's global skills two-way
+with Codex's user-skills folder (`~/.agents/skills`), and the session's project skills
+(`project:<label>`, labelled like every hook) with `<project root>/.agents/skills`, which
+Codex reads from any subfolder of the repository; each skill folder pulled there is listed
+in the repository's `.git/info/exclude` (a skill folder the repository tracks is never
+overwritten). Codex's bundled skills under
 `~/.codex/skills/.system` and plugin caches are never scanned or uploaded.
 Both plugins on one machine converge on the same server copy, so an edit in
 either folder reaches the other at its next session start.
@@ -44,8 +48,7 @@ needs `python -m ingestion.codex_backfill`.
 
 Not ported (machine-level curation lanes, run them from Claude Code; running
 them from both hosts would double-sync): config_sync, git_feeder (board git
-feeder), project-scoped skills, and the `/synapse:skill-review` /
-`/synapse:config-review` commands.
+feeder), and the `/synapse:skill-review` / `/synapse:config-review` commands.
 
 ## Install
 

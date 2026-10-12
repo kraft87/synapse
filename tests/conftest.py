@@ -87,6 +87,7 @@ _DB_FILES = {
     "test_pg_pool.py",
     "test_project_identity_db.py",
     "test_relabel_projects_db.py",
+    "test_skill_trust_scoping.py",
 }
 
 

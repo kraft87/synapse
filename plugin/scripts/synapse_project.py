@@ -145,6 +145,55 @@ def _toplevel(start: Path, *, projects_only: bool = True) -> Path | None:
     return None
 
 
+def _common_gitdir(top: Path) -> Path | None:
+    """The git directory holding ``info/exclude`` for the working tree at ``top``: a
+    linked worktree shares its main checkout's; a submodule has its own."""
+    gitdir = _gitdir_of(top)
+    if gitdir is None:
+        return None
+    try:
+        common = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        return gitdir
+    return Path(common) if Path(common).is_absolute() else gitdir / common
+
+
+_GITIGNORE_SPECIAL = re.compile(r"([\\*?\[\]])")
+_EXCLUDE_HEADER = "# Skills synced by Synapse (synapse_project.git_exclude): not part of this repo"
+
+
+def git_exclude(folder) -> bool:
+    """Keep ``folder``, a directory inside a git working tree, out of that repository by
+    listing it in the repository's ``.git/info/exclude`` (local to this clone, unlike
+    ``.gitignore``, which would be a change to the repository itself). True when it is
+    listed afterwards. Never raises; a folder in no repository is left alone."""
+    try:
+        here = Path(folder).resolve()
+        top = _toplevel(here, projects_only=False)  # a dotfiles repo at ~ counts here
+        if top is None or top == here:
+            return False
+        common = _common_gitdir(top)
+        if common is None or not common.is_dir():
+            return False  # a worktree whose repository moved or is gone: git sees none
+        rel = here.relative_to(top).as_posix()
+        line = "/" + _GITIGNORE_SPECIAL.sub(r"\\\1", rel) + "/"
+        exclude = common / "info" / "exclude"
+        try:
+            text = exclude.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            text = ""
+        lines = text.splitlines()
+        if line in lines:
+            return True
+        add = ([] if _EXCLUDE_HEADER in lines else [_EXCLUDE_HEADER]) + [line]
+        exclude.parent.mkdir(exist_ok=True)  # info/ only; the git dir itself must exist
+        with open(exclude, "a", encoding="utf-8", newline="\n") as f:
+            f.write(("\n" if text and not text.endswith("\n") else "") + "\n".join(add) + "\n")
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def resolve(cwd=None) -> tuple[str | None, Path | None]:
     """``(label, root)`` for ``cwd`` (default: the process cwd).
 

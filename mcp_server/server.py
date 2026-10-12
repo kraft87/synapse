@@ -318,7 +318,7 @@ mcp = FastMCP(
 if DB_URL:
     from mcp_server.skills_provider import PgSkillsProvider
 
-    mcp.add_provider(PgSkillsProvider(DB_URL))
+    mcp.add_provider(PgSkillsProvider(DB_URL, lambda: _caller_trust()))
 
 
 def _is_root(request: Request) -> bool:

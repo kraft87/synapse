@@ -461,7 +461,7 @@ def session_start(env, monkeypatch) -> ModuleType:
     sys.modules.pop("common", None)
     monkeypatch.setattr(mod, "_prefs_text", lambda: None)
     monkeypatch.setattr(mod, "_board_text", lambda project: None)
-    monkeypatch.setattr(mod, "_sync_skills", lambda: None)
+    monkeypatch.setattr(mod, "_sync_skills", lambda cwd=None: None)
     return mod
 
 

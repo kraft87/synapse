@@ -12,17 +12,37 @@ auth via the shared machine token (custom routes bypass FastMCP's auth middlewar
 PG work in a threadpool, fail-soft JSON.
 
 Routes (all POST):
-  /skills/list        {scope}                       -> active skills (name, desc, mtime, file shas)
-                                                        + retired ones (name, hash, retired_at)
+  /skills/list        {scope, held?}                 -> active skills (name, desc, mtime, file shas)
+                                                        + retired ones (name, hashes, retired_at)
+                                                        + withdrawn ones among `held` (below)
+                                                        + publish: may this caller push here
   /skills/fetch       {name}                         -> body + file contents (base64) for a pull
   /skills/publish     {name, scope, body, ...files}  -> upsert registry + replace files; refused
-                                                        when the skill was retired after the edit
+                                                        when the skill was retired after the edit,
+                                                        lives in another scope, or the caller may
+                                                        not write that scope
   /skills/retire      {name}                         -> status='retired', stamped with retired_at
+  /skills/rescope     {name, scope}                  -> move an active skill to another scope
   /skills/overwrite   {name, scope, body, mtime}     -> record a clobbered local edit in history
   /skills/proposals   {id?}                          -> list proposed candidates, or one's detail
                                                         (detail: + where accept would apply it)
   /skills/proposals/act {id, action, reason?, body?, scope?, force?}
                                                      -> accept (applies) | reject | promote (no-op)
+
+Who is served what (schema 053/054 trust, the board's rule applied to skills): a full-trust
+device reads and writes every scope. A restricted device is served only ``project:<p>``
+skills whose project is in its allowlist (case-insensitively) and may write only there: no
+global skill, no other project's skill, no retire/rescope/review. A caller with no device
+credential (the root token included) is served nothing. Before this, any approved device
+was served every global skill, which is the leak schema 053 closed for notes.
+
+``withdrawn``: a client sends the names it holds in the folder it is syncing (``held``),
+and gets back each one that is still an active skill but is no longer served to it in this
+scope, because it was moved to another scope or this device may not read it. It then deletes
+its copy exactly when it is one Synapse delivered (the same removal path as a retirement,
+``plugin/scripts/skills_sync.py::_settle_unserved``), instead of pushing it back. Only names
+the client says it holds are answered, with content hashes and never content; a restricted
+device sees another scope's name only as "" and an unknown caller gets no answer at all.
 """
 
 from __future__ import annotations
@@ -32,6 +52,7 @@ import hashlib
 import logging
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from psycopg.rows import dict_row
@@ -44,7 +65,8 @@ from dream.skills.skill_measure import skill_description
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
-from mcp_server.http_helpers import _iso, guarded_json
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
+from mcp_server.http_helpers import _iso, err, guarded_json
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +101,76 @@ def _retired_at_ready(c) -> bool:
     return RETIRED_AT_PROBE.ready(c, c.info.dsn)
 
 
+@dataclass(frozen=True)
+class SkillAccess:
+    """Which skill scopes one caller is served and may write.
+
+    Full trust: every scope. A restricted surface: the ``project:<p>`` scopes whose project
+    is in its allowlist, compared case-insensitively (a label keeps its folder's case), and
+    nothing else: not ``global``. Anyone else, an unknown surface, the root token, a wiring
+    slip: nothing at all."""
+
+    full: bool = False
+    projects: frozenset[str] = frozenset()
+    #: A surfaces row vouches for the caller. An unknown one is answered nothing about
+    #: held names either, so the shared root token can't probe which skills exist.
+    known: bool = False
+
+    @classmethod
+    def of(cls, st: SurfaceTrust) -> SkillAccess:
+        if st.known and not st.restricted:
+            return cls(full=True, known=True)
+        return cls(projects=frozenset(p.lower() for p in st.allowed_projects), known=st.known)
+
+    def serves(self, scope) -> bool:
+        if not isinstance(scope, str):
+            return False
+        if self.full:
+            return True
+        return scope.lower().startswith("project:") and scope[8:].lower() in self.projects
+
+
+FULL_ACCESS = SkillAccess(full=True, known=True)
+
+_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_skill_name(name) -> bool:
+    """A skill name every machine can use as ONE folder name: no separator, no drive or
+    stream colon, no control character, not "." or "..", no outer whitespace. A name is a
+    folder on every machine the skill reaches, so a publish of anything else is refused."""
+    return (
+        isinstance(name, str)
+        and 0 < len(name) <= 128
+        and name == name.strip()
+        and name not in (".", "..")
+        and not any(ch in name for ch in "/\\:")
+        and not _CONTROL.search(name)
+    )
+
+
+def safe_file_path(path) -> bool:
+    """A bundled file path that stays inside its skill's folder on every OS: relative,
+    "/"-separated, no empty, "." or ".." segment, no backslash, colon or control char."""
+    if not isinstance(path, str) or not 0 < len(path) <= 512 or path.startswith("/"):
+        return False
+    if any(ch in path for ch in "\\:") or _CONTROL.search(path):
+        return False
+    return all(seg and seg not in (".", "..") and seg == seg.strip() for seg in path.split("/"))
+
+
+def _lock_name(c, name: str) -> None:
+    """Serialise writers of one skill name for the rest of the transaction: a row that does
+    not exist yet has nothing for FOR UPDATE to lock, so two first publishes could race."""
+    c.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("skills_lane.skill:" + name,))
+
+
+#: How many held names one listing answers, and how many past versions a withdrawn or
+#: retired entry vouches for.
+_MAX_HELD = 1000
+_MAX_PAST_VERSIONS = 20
+
+
 # --------------------------------------------------------------------------- sync
 
 
@@ -103,20 +195,35 @@ def _file_shas(c, name: str) -> list[dict]:
     ).fetchall()
 
 
-def _list_skills(db_url: str, scope: str) -> dict:
-    """The skills in `scope`: active ones under "skills" (all an older client reads), and,
-    once schema 060 is applied, retired ones under "retired".
+def _held_names(held) -> list[str] | None:
+    if not isinstance(held, list):
+        return None
+    return sorted({h for h in held if isinstance(h, str) and h})[:_MAX_HELD]
+
+
+def _list_skills(db_url: str, scope: str, access: SkillAccess = FULL_ACCESS, held=None) -> dict:
+    """The skills in `scope` this caller is served: active ones under "skills" (all an
+    older client reads); once schema 060 is applied, retired ones under "retired"; and,
+    when the client says which names it holds, the held ones it is no longer served here
+    under "withdrawn". "publish" says whether it may push to this scope at all.
 
     A project scope matches in any case: a project's label keeps its folder's case, and
     the same project can reach the server as ``project:Repo`` from one machine and
     ``project:repo`` from another."""
+    served = access.serves(scope)
+    held_names = _held_names(held) if access.known else None
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
-        skills = c.execute(
-            "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
-            "content_modified_at FROM skills_lane.skill_registry "
-            "WHERE status='active' AND lower(scope)=lower(%s) ORDER BY name",
-            (scope,),
-        ).fetchall()
+        skills = (
+            c.execute(
+                "SELECT name, scope, COALESCE(body,'') AS body, "
+                "COALESCE(description,'') AS description, content_modified_at "
+                "FROM skills_lane.skill_registry "
+                "WHERE status='active' AND lower(scope)=lower(%s) ORDER BY name",
+                (scope,),
+            ).fetchall()
+            if served
+            else []
+        )
         listing = {
             "skills": [
                 {
@@ -128,47 +235,118 @@ def _list_skills(db_url: str, scope: str) -> dict:
                     "files": _file_shas(c, s["name"]),
                 }
                 for s in skills
-            ]
+            ],
+            "publish": served,
         }
         if _retired_at_ready(c):
-            listing["retired"] = _retired_skills(c)
+            listing["retired"] = _retired_skills(c, scope, access, held_names)
+        if held_names is not None:
+            listed = {s["name"] for s in skills}
+            listing["withdrawn"] = _withdrawn_skills(
+                c, scope, access, [n for n in held_names if n not in listed]
+            )
     return listing
 
 
-def _retired_skills(c) -> list[dict]:
-    """Every retired skill, whatever scope is asked for, each with the whole-skill hash of
-    the content it was retired with. A name is one registry row, and its scope is
-    whichever folder published it last: a copy of the same skill in another scope's
-    folder is just as retired. A client removes its copy only when that copy is still
-    exactly what Synapse delivered, whatever its timestamp (in another scope's folder:
-    only the exact retired content). A row with no retired_at (status set by hand) is
-    left out: publish does not enforce it either."""
+def _shown_scope(scope: str, asked: str, access: SkillAccess) -> str:
+    """The scope a retired/withdrawn entry reports: the real one when this caller is
+    served that scope, else "". "" reads to a client as "another scope's skill", so only
+    the versions the entry vouches for (Synapse's own) are removed, never one a local
+    ledger remembers: in a scope a device may not write, an older client recorded pushes
+    the server refused as delivered. "" also keeps a restricted device from learning where
+    a skill it may not read lives."""
+    return scope if access.serves(scope) else ""
+
+
+def _past_hashes(c, name: str, files) -> list[str]:
+    """Whole-skill hashes of the skill's recent past registry bodies, with today's files:
+    a copy pulled before the latest edit is still a copy Synapse delivered. Only bodies
+    the registry itself held ('superseded' by the history trigger); a 'disk_overwrite'
+    row is a local edit a pull replaced, which Synapse never delivered."""
+    rows = c.execute(
+        "SELECT COALESCE(body,'') AS body FROM skills_lane.skill_history "
+        "WHERE name=%s AND op='superseded' ORDER BY recorded_at DESC LIMIT %s",
+        (name, _MAX_PAST_VERSIONS),
+    ).fetchall()
+    return list(dict.fromkeys(whole_skill_hash(r["body"], files) for r in rows))
+
+
+def _entry_hashes(c, name: str, body: str) -> tuple[str, list[str]]:
+    files = [(f["path"], f["sha256"]) for f in _file_shas(c, name)]
+    current = whole_skill_hash(body, files)
+    past = [h for h in _past_hashes(c, name, files) if h != current]
+    return current, [current, *past]
+
+
+def _retired_skills(c, asked: str, access: SkillAccess, held: list[str] | None) -> list[dict]:
+    """Retired skills, each with the whole-skill hash of the content it was retired with
+    ("content_hash") and of its recent past versions ("content_hashes"). A name is one
+    registry row, and its scope is whichever folder published it last: a copy of the same
+    skill in another scope's folder is just as retired. A client removes its copy only
+    when that copy is still exactly a version Synapse delivered, whatever its timestamp
+    (in another scope's folder: only those exact contents). A row with no retired_at
+    (status set by hand) is left out: publish does not enforce it either.
+
+    Full trust is told every retirement, whatever scope it asks about. A restricted caller
+    only of the skills it could have been served, and of the names it says it holds."""
     rows = c.execute(
         "SELECT name, scope, COALESCE(body,'') AS body, retired_at "
         "FROM skills_lane.skill_registry "
         "WHERE status='retired' AND retired_at IS NOT NULL ORDER BY name",
     ).fetchall()
-    return [
-        {
-            "name": r["name"],
-            "scope": r["scope"],
-            "content_hash": whole_skill_hash(
-                r["body"], [(f["path"], f["sha256"]) for f in _file_shas(c, r["name"])]
-            ),
-            "retired_at": _iso(r["retired_at"]),
-        }
-        for r in rows
-    ]
+    out = []
+    for r in rows:
+        if not (access.serves(r["scope"]) or (held is not None and r["name"] in held)):
+            continue
+        current, hashes = _entry_hashes(c, r["name"], r["body"])
+        out.append(
+            {
+                "name": r["name"],
+                "scope": _shown_scope(r["scope"], asked, access),
+                "content_hash": current,
+                "content_hashes": hashes,
+                "retired_at": _iso(r["retired_at"]),
+            }
+        )
+    return out
 
 
-def _fetch_skill(db_url: str, name: str) -> dict:
+def _withdrawn_skills(c, asked: str, access: SkillAccess, names: list[str]) -> list[dict]:
+    """Of the held names the listing did not serve, the ones that are active skills: moved
+    to another scope, or not this caller's to read. Each carries the hashes of the versions
+    Synapse delivered (see _retired_skills), and no retired_at: a withdrawn copy is removed
+    when it is exactly one of them and otherwise left alone, never pushed back."""
+    if not names:
+        return []
+    rows = c.execute(
+        "SELECT name, scope, COALESCE(body,'') AS body FROM skills_lane.skill_registry "
+        "WHERE status='active' AND name = ANY(%s) ORDER BY name",
+        (names,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        current, hashes = _entry_hashes(c, r["name"], r["body"])
+        out.append(
+            {
+                "name": r["name"],
+                "scope": _shown_scope(r["scope"], asked, access),
+                "content_hash": current,
+                "content_hashes": hashes,
+            }
+        )
+    return out
+
+
+def _fetch_skill(db_url: str, name: str, access: SkillAccess = FULL_ACCESS) -> dict:
+    """One active skill's body and files, for a pull. A skill this caller is not served is
+    "not found", exactly as one that does not exist."""
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         row = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
             "content_modified_at FROM skills_lane.skill_registry WHERE name=%s AND status='active'",
             (name,),
         ).fetchone()
-        if not row:
+        if not row or not access.serves(row["scope"]):
             return {"found": False}
         files = c.execute(
             "SELECT path, content, is_executable FROM skills_lane.skill_files "
@@ -252,19 +430,62 @@ def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
     return row[1] if pushed == retired else None
 
 
-def _publish_skill(db_url: str, p: dict) -> dict:
+def _scope_holds(c, name: str, scope: str, access: SkillAccess) -> dict | str:
+    """The scope a publish of ``name`` to ``scope`` writes, or the refusal (a dict).
+
+    An active skill keeps its scope: a push from another scope's folder is refused
+    ("scoped") instead of moving it, because a machine still holding a copy in the folder
+    a skill was moved OUT of would otherwise move it back at its next session start (and a
+    skill re-scoped for trust would leak again). Moving a skill is /skills/rescope. The
+    same scope in another case keeps the registry's spelling. A restricted caller may not
+    take over a retired skill of a scope it is not served."""
+    row = c.execute(
+        "SELECT scope, status FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
+        (name,),
+    ).fetchone()
+    if row is None:
+        return scope
+    if row[1] == "active":
+        if row[0].lower() != scope.lower():
+            return {
+                "status": "scoped",
+                "name": name,
+                "scope": row[0] if access.serves(row[0]) else None,
+            }
+        return row[0]
+    if not access.serves(row[0]):
+        return {"status": "forbidden", "name": name}
+    return scope
+
+
+def _publish_skill(db_url: str, p: dict, access: SkillAccess = FULL_ACCESS) -> dict:
     name = p["name"]
+    scope = p.get("scope", "global")
+    if not safe_skill_name(name):
+        return {"status": "error", "detail": "skill name must be usable as one folder name"}
+    if not all(isinstance(f, dict) and safe_file_path(f.get("path")) for f in p.get("files", [])):
+        return {"status": "error", "detail": "file paths must stay inside the skill's folder"}
+    if not isinstance(scope, str) or not _SCOPE_RE.match(scope):
+        return {"status": "error", "detail": "scope must be 'global' or 'project:<name>'"}
+    if not access.serves(scope):
+        # 200, not 403: an older client treats an HTTP error as the end of its whole sync.
+        return {"status": "forbidden", "name": name}
     edited = _dt(p.get("content_modified_at"))
     with pg_pool.connection(db_url, autocommit=False) as c:
+        _lock_name(c, name)
         retired_at = _retirement_holds(c, p, edited)
         if retired_at is not None:
             c.rollback()
             return {"status": "retired", "name": name, "retired_at": _iso(retired_at)}
+        held = _scope_holds(c, name, scope, access)
+        if isinstance(held, dict):
+            c.rollback()
+            return held
         cur = c.cursor()
         _upsert_registry(
             cur,
             name,
-            p.get("scope", "global"),
+            held,
             p.get("body", ""),
             p.get("description") or None,
             edited,
@@ -289,8 +510,15 @@ def _publish_skill(db_url: str, p: dict) -> dict:
     return {"status": "ok", "name": name}
 
 
-def _record_overwrite(db_url: str, p: dict) -> dict:
+def _record_overwrite(db_url: str, p: dict, access: SkillAccess = FULL_ACCESS) -> dict:
+    """Record a local body a pull is about to overwrite. A caller may record one only for a
+    skill it is served: checked against the skill's stored scope, not the one it sends."""
     with pg_pool.connection(db_url, autocommit=False) as c:
+        row = c.execute(
+            "SELECT scope FROM skills_lane.skill_registry WHERE name=%s", (p["name"],)
+        ).fetchone()
+        if not access.serves(row[0] if row else p.get("scope") or "global"):
+            return {"status": "forbidden"}
         c.execute(
             "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
             "VALUES (%s,%s,%s,%s,'disk_overwrite')",
@@ -339,6 +567,40 @@ def _retire_skill(db_url: str, name) -> dict:
         "scope": row["scope"],
         "retired_at": _iso(row["retired_at"]),
     }
+
+
+def _rescope_skill(db_url: str, name, scope) -> dict:
+    """Move an active skill to ``scope`` ('global' or 'project:<label>'), with a
+    skill_history row so the move shows in the change trail. Machines holding the skill in
+    the folder it left drop their copy at their next session start when it is one Synapse
+    delivered (it comes back as "withdrawn"); the new scope's folders pull it."""
+    if not isinstance(name, str) or not name.strip():
+        return {"status": "error", "detail": "'name' must be a non-empty string"}
+    if not isinstance(scope, str) or not _SCOPE_RE.match(scope):
+        return {"status": "error", "detail": "scope must be 'global' or 'project:<name>'"}
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
+        row = c.execute(
+            "SELECT scope, status, body, content_modified_at FROM skills_lane.skill_registry "
+            "WHERE name=%s FOR UPDATE",
+            (name,),
+        ).fetchone()
+        if row is None:
+            return {"status": "not_found", "name": name}
+        if row["status"] != "active":
+            return {"status": "error", "detail": f"{name} is {row['status']}, not active"}
+        if row["scope"] == scope:
+            return {"status": "unchanged", "name": name, "scope": scope}
+        c.execute(
+            "UPDATE skills_lane.skill_registry SET scope=%s, updated_at=now() WHERE name=%s",
+            (scope, name),
+        )
+        c.execute(
+            "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
+            "VALUES (%s,%s,%s,%s,'rescoped')",
+            (name, row["scope"], row["body"], row["content_modified_at"]),
+        )
+        c.commit()
+    return {"status": "rescoped", "name": name, "scope": scope, "from": row["scope"]}
 
 
 # ----------------------------------------------------------------------- review
@@ -533,6 +795,9 @@ def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool)
     if not row:
         c.rollback()
         return {"found": False}
+    for target in row["target_skills"] or [row["name"]]:
+        if isinstance(target, str):
+            _lock_name(c, target)  # the same lock a publish takes
     if row["status"] == "promoted":
         c.rollback()
         return {
@@ -742,36 +1007,71 @@ def _routing_eval(c, cid: int, name: str) -> str:
 # -------------------------------------------------------------------- register
 
 
-def register(mcp, db_url: str, machine_authorized: Callable[[Request], bool]) -> None:
-    """Wire the /skills/* routes onto the FastMCP app. No-op when db_url is empty (dev/stdio)."""
+def register(
+    mcp,
+    db_url: str,
+    machine_authorized: Callable[[Request], bool],
+    resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
+) -> None:
+    """Wire the /skills/* routes onto the FastMCP app. No-op when db_url is empty (dev/stdio).
+
+    ``resolve_trust`` maps a request to its bearer-resolved verdict (the board's and the
+    config lane's). Without it every caller is unknown and served nothing, so a wiring slip
+    fails closed."""
     if not db_url:
         return
+
+    def _access(request: Request) -> SkillAccess:
+        # Called inside the threadpool work: resolution may read Postgres.
+        return SkillAccess.of(resolve_trust(request) if resolve_trust else UNKNOWN_SURFACE)
+
+    def _forbidden():
+        return err("forbidden for this surface", 403)
 
     async def _guarded(request: Request, work):
         return await guarded_json(request, machine_authorized, work, label="skill route")
 
+    async def _full_only(request: Request, work):
+        """Retire, rescope and the review lane change what every machine is served."""
+
+        def gated(b):
+            return work(b) if _access(request).full else _forbidden()
+
+        return await _guarded(request, gated)
+
     @mcp.custom_route("/skills/list", methods=["POST"])
     async def _list(request: Request) -> JSONResponse:
-        return await _guarded(request, lambda b: _list_skills(db_url, b.get("scope", "global")))
+        def work(b):
+            return _list_skills(db_url, b.get("scope", "global"), _access(request), b.get("held"))
+
+        return await _guarded(request, work)
 
     @mcp.custom_route("/skills/fetch", methods=["POST"])
     async def _fetch(request: Request) -> JSONResponse:
-        return await _guarded(request, lambda b: _fetch_skill(db_url, b["name"]))
+        return await _guarded(request, lambda b: _fetch_skill(db_url, b["name"], _access(request)))
 
     @mcp.custom_route("/skills/publish", methods=["POST"])
     async def _publish(request: Request) -> JSONResponse:
-        return await _guarded(request, lambda b: _publish_skill(db_url, b))
+        return await _guarded(request, lambda b: _publish_skill(db_url, b, _access(request)))
 
     @mcp.custom_route("/skills/retire", methods=["POST"])
     async def _retire(request: Request) -> JSONResponse:
         def work(b):
             return _retire_skill(db_url, b.get("name") if isinstance(b, dict) else None)
 
-        return await _guarded(request, work)
+        return await _full_only(request, work)
+
+    @mcp.custom_route("/skills/rescope", methods=["POST"])
+    async def _rescope(request: Request) -> JSONResponse:
+        def work(b):
+            b = b if isinstance(b, dict) else {}
+            return _rescope_skill(db_url, b.get("name"), b.get("scope"))
+
+        return await _full_only(request, work)
 
     @mcp.custom_route("/skills/overwrite", methods=["POST"])
     async def _overwrite(request: Request) -> JSONResponse:
-        return await _guarded(request, lambda b: _record_overwrite(db_url, b))
+        return await _guarded(request, lambda b: _record_overwrite(db_url, b, _access(request)))
 
     @mcp.custom_route("/skills/proposals", methods=["POST"])
     async def _proposals(request: Request) -> JSONResponse:
@@ -779,7 +1079,7 @@ def register(mcp, db_url: str, machine_authorized: Callable[[Request], bool]) ->
             cid = b.get("id")
             return _proposal_detail(db_url, int(cid)) if cid else _proposals_list(db_url)
 
-        return await _guarded(request, work)
+        return await _full_only(request, work)
 
     @mcp.custom_route("/skills/proposals/act", methods=["POST"])
     async def _act(request: Request) -> JSONResponse:
@@ -800,4 +1100,4 @@ def register(mcp, db_url: str, machine_authorized: Callable[[Request], bool]) ->
                 force=bool(b.get("force")),
             )
 
-        return await _guarded(request, work)
+        return await _full_only(request, work)

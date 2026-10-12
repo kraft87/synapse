@@ -14,9 +14,10 @@ hook entry as a separate process; one fetch pass is cheaper):
                       failed uploads however old
   * upload warning  — when uploads keep failing, one line saying since when and
                       why (local cursor state only, no network)
-  * skills sync     — ``scripts/skills_sync.py`` (opt-in: ``synapse login`` asks),
-                      run inline under a wall-clock budget so the synced skills
-                      exist before Codex scans ~/.agents/skills
+  * skills sync     — ``scripts/skills_sync.py --cwd <cwd>`` (opt-in: ``synapse
+                      login`` asks), run inline under a wall-clock budget so the
+                      synced skills exist before Codex scans ~/.agents/skills and
+                      the project's <root>/.agents/skills
 
 Output is Codex's JSON envelope: {"hookSpecificOutput": {"hookEventName":
 "SessionStart", "additionalContext": ...}} — Codex does not read plain stdout.
@@ -112,7 +113,7 @@ def _spawn_catchup(skip_path: str = "") -> None:
         pass
 
 
-def _sync_skills() -> None:
+def _sync_skills(cwd: str | None = None) -> None:
     if _cfg("SYNAPSE_SKILLS_SYNC", "0") in ("", "0"):
         return
     # Bounded: the hook block's timeout is 20s and the board fetch still has to fit. A kill
@@ -121,7 +122,8 @@ def _sync_skills() -> None:
     try:
         budget = float(_cfg("SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT", "12"))
         subprocess.run(
-            [sys.executable, os.path.join(_SCRIPTS, "skills_sync.py")],
+            [sys.executable, os.path.join(_SCRIPTS, "skills_sync.py")]
+            + (["--cwd", cwd] if cwd else []),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -140,7 +142,7 @@ def main() -> None:
     # a sweep that succeeds ends the streak.
     warning = _upload_warning()
     _spawn_catchup(str(payload.get("transcript_path") or ""))
-    _sync_skills()
+    _sync_skills(str(payload.get("cwd") or os.getcwd()))
     project = synapse_project.project_label(payload.get("cwd")) or synapse_project.project_label(
         os.getcwd()
     )

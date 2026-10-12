@@ -170,6 +170,8 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
 - **`synapse update`** — install the client version the server now serves, and update
   this plugin.
 - **`synapse skill retire <name>`** — retire a skill everywhere (below).
+- **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
+  (below).
 - **`synapse import`** / **`! synapse-import`** — backfill your existing history (step 4).
 - **`synapse private on|off|status <session-id>`** — private mode (below).
 
@@ -180,6 +182,22 @@ start, machines with skills sync on delete their copy if it is still exactly a v
 Synapse delivered to them; a copy edited after the retirement is pushed back instead and
 the skill is active again (newest edit wins, as everywhere in the sync). A folder Synapse
 doesn't recognise is never touched, and deleting a skill locally never retires it.
+
+## Moving a skill, and who gets which skills
+
+A skill lives in one scope: `global` (every machine's `~/.claude/skills`) or
+`project:<label>` (`.claude/skills` at that project's root, on machines that work in it;
+the label is the one every hook uses: a `.synapse-project` marker, else the git toplevel's
+name). `synapse skill scope <name> project:<label>` moves it, from a full-trust machine. A
+push from a folder of another scope never moves it.
+
+A work-role (restricted) machine is served only the project skills of the projects in its
+allowlist, never global ones. Whenever a machine is no longer served a skill it holds
+(moved away, or not its to read), it deletes its copy at the next session start if the copy
+is still exactly a version Synapse delivered, the same rule as a retirement; an edited copy
+stays and is not pushed back. A skill folder git tracks is never deleted or overwritten
+(git distributes it), and a project skill Synapse pulls into a repository is listed in its
+`.git/info/exclude`, not committed.
 
 Scripts (run by full path; see [Memory-write spool](#memory-write-spool)):
 
