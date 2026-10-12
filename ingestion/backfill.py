@@ -23,7 +23,7 @@ from ingestion.db import Database
 from ingestion.jsonl_client import JSONLParser
 from ingestion.models import Episode, ExtractionItem
 from ingestion.private_sessions import PrivateSessions
-from ingestion.scratch_projects import is_scratch_project
+from ingestion.scratch_projects import is_scratch_turn
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,7 @@ def _write_session_episodes(
         if is_transcript_contamination(ep.content) or is_harness_call(ep.content):
             continue
         # Throwaway smoke-test workspaces (axon-test, tmp, ...) are not memory.
-        if is_scratch_project(ep.project):
+        if is_scratch_turn(ep.project, ep.metadata):
             continue
 
         ep_to_write = ep.model_copy(

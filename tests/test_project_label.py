@@ -862,6 +862,10 @@ def test_a_home_directory_repository_is_not_the_project_of_folders_under_it(ws, 
     nested = _init_repo(home / "code" / "acme")
     (nested / "src").mkdir()
     assert client.project_label(nested / "src") == "acme"  # a real repo under ~ still is one
+    # A folder that is gone keeps its own name too, at any depth under ~.
+    assert client.project_label(home / "scratch") == "scratch"
+    assert client.project_label(home / "code" / "gone-repo") == "gone-repo"
+    assert client.project_label(nested / "gone-subfolder") == "acme"
 
 
 def test_the_bare_plus_worktrees_layout_is_named_for_its_folder(ws):

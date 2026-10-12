@@ -712,6 +712,16 @@ def test_ingest_stores_a_label_never_a_path(ident, conn, db_url, project, cwd, e
     assert _stored_projects(conn, sid) == [expected]
 
 
+@pytest.mark.parametrize("folder", ["axon-test", "scratch", "tmp"])
+def test_a_scratch_folder_inside_a_repository_is_still_dropped(ident, conn, db_url, folder):
+    """The client sends the repository's label for a session run in its scratch folder;
+    the folder still marks the turn as a smoke test (ingestion.scratch_projects)."""
+    sid, records = _cc_records(ident, f"/work/{ident.alpha}/{folder}")
+    out = _post(db_url, {"records": records, "project": ident.alpha}).json()
+    assert out["ingested"] == 0, out
+    assert _stored_projects(conn, sid) == []
+
+
 def test_a_replay_across_the_label_change_is_not_stored_twice(ident, conn, db_url):
     """A session stored by an older plugin under its subfolder's label, replayed under a
     new session id by a client that now sends the repo's label: the cross-session replay

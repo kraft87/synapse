@@ -189,7 +189,10 @@ def _gone_label(raw) -> str | None:
         if path.is_absolute():
             for parent in path.parents:
                 if parent.is_dir():
-                    if _toplevel(parent.resolve()) is not None:
+                    top = _toplevel(parent.resolve())
+                    # A dotfiles repository at ~ is not the project of a folder under it,
+                    # gone or not (see _toplevel).
+                    if top is not None and top != _home():
                         return resolve(parent)[0]
                     break
     except (OSError, RuntimeError, ValueError):

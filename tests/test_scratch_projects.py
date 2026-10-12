@@ -5,7 +5,12 @@ from __future__ import annotations
 
 import pytest
 
-from ingestion.scratch_projects import _ENV_VAR, is_scratch_project, scratch_projects
+from ingestion.scratch_projects import (
+    _ENV_VAR,
+    is_scratch_project,
+    is_scratch_turn,
+    scratch_projects,
+)
 
 
 def test_flags_known_scratch_workspaces():
@@ -51,3 +56,22 @@ def test_empty_env_var_disables_the_filter(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(_ENV_VAR, "  ")
     assert scratch_projects() == frozenset()
     assert not is_scratch_project("axon-test")
+
+
+@pytest.mark.parametrize(
+    "cwd",
+    ["/home/pat/code/axon/axon-test", "C:\\Users\\pat\\axon\\scratch\\", "/srv/repo/tmp/"],
+)
+def test_a_scratch_folder_inside_a_repository_is_still_scratch(cwd):
+    """Clients label a session with its repository's name, so the folder it ran in is
+    what still names a scratch workspace inside a repository."""
+    assert is_scratch_turn("axon", {"cwd": cwd})
+
+
+def test_a_turn_is_scratch_by_label_or_folder_and_nothing_else():
+    assert is_scratch_turn("tmp", {})
+    assert is_scratch_turn("tmp", None)
+    assert not is_scratch_turn("axon", {"cwd": "/home/pat/code/axon/src"})
+    assert not is_scratch_turn("axon", {"cwd": None})
+    assert not is_scratch_turn("axon", {"cwd": 42})
+    assert not is_scratch_turn("axon", {"cwd": "/home/pat/scratchpad"})

@@ -91,7 +91,7 @@ def register(
             from ingestion.jsonl_client import JSONLParser
             from ingestion.models import ExtractionItem
             from ingestion.private_sessions import PrivateSessions
-            from ingestion.scratch_projects import is_scratch_project
+            from ingestion.scratch_projects import is_scratch_turn
 
             if record_format == "codex":
                 from ingestion.codex_client import CodexRolloutParser
@@ -142,7 +142,7 @@ def register(
                     # Throwaway smoke-test workspaces are not a memory source. The KG
                     # extractor cannot tell a story prompt from biography — see
                     # scratch_projects for the fiction that reached the personal graph.
-                    if is_scratch_project(ep.project):
+                    if is_scratch_turn(ep.project, ep.metadata):
                         dropped += 1
                         continue
                     # Private mode (schema/050): the user took this session off the record.
