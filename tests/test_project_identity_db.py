@@ -7,11 +7,12 @@ each gets a section below:
 
   * ``ingestion.surfaces.expand_allowlist``: a restricted allowlist matches every stored
     casing of its entries, so the reads keep their exact ``project = ANY(...)``
-    predicate. Any failure, or a database without schema 061's index, matches exactly.
+    predicate. Any failure, or a database with no index leading with ``project``,
+    matches exactly.
   * ``resolve_caller`` applies it to restricted verdicts only, and the serving paths
     (fetch, recall, the board) then serve every casing and nothing else.
   * ``derive_audience`` and ``/skills/list`` compare project names case-insensitively;
-    ``_evidence_scope`` folds case and never emits a path-shaped scope.
+    ``_evidence_scope`` folds case and counts a path-shaped label as its folder.
   * ``/ingest`` stores a label, never a path: the body's ``project`` is cleaned, and
     without a usable one the parser labels from a Windows or POSIX cwd alike.
 
@@ -53,7 +54,7 @@ _P = "pidtest-"
 
 @pytest.fixture(autouse=True)
 def _fresh_index_probe():
-    """The schema-061 probe caches per key for the life of the process; start each test
+    """The project-index probe caches per key for the life of the process; start each test
     from "never probed" so a fake connection's answer cannot leak into a real one."""
     PROJECT_INDEX_PROBE.reset()
     yield
@@ -77,7 +78,7 @@ class _Result:
 
 
 class _FakeConn:
-    """Answers the schema-061 index probe and the variant walk, recording each call."""
+    """Answers the project-index probe and the variant walk, recording each call."""
 
     def __init__(self, *, index=True, rows=(), fail=None, probe_fail=None) -> None:
         self.index = index
@@ -376,8 +377,9 @@ def test_the_id_lane_expands_too(ident, conn, db_url):
 
 
 def test_without_the_project_index_the_allowlist_matches_exactly(ident, conn, db_url, monkeypatch):
-    """A database behind schema 061: the skip scan would read the whole table per step,
-    so the allowlist is served exactly as written (the pre-change behaviour)."""
+    """A database with no index leading with ``project``: the skip scan would read the
+    whole table per step, so the allowlist is served exactly as written (the pre-change
+    behaviour)."""
     _seed_all(conn, ident)
     tok = _device(conn, ident, projects=[ident.alpha])
     monkeypatch.setattr(PROJECT_INDEX_PROBE, "ready", lambda c, key="": False)
@@ -552,15 +554,22 @@ def test_evidence_scope_folds_case_and_names_the_most_common_spelling(ident, con
     "labels",
     [
         ["D:\\src\\{a}"],
-        ["D:\\src\\{a}", "d:\\SRC\\{a}"],  # one project in case-folded terms, still a path
+        ["D:\\src\\{a}", "d:\\SRC\\{a}"],  # two casings of one path
+        ["D:\\src\\{a}", "{a}"],  # the path and the label a 0.21 client sends
         ["/srv/work/{a}"],
     ],
-    ids=["windows-path", "windows-path-two-casings", "posix-path"],
+    ids=["windows-path", "windows-path-two-casings", "path-and-bare-name", "posix-path"],
 )
-def test_evidence_scope_never_emits_a_path_shaped_scope(ident, conn, db_url, labels):
-    """Legacy rows labelled with their whole path (the pre-fix parsers) would otherwise
-    produce a ``project:D:\\src\\...`` scope that no client can ever match."""
+def test_evidence_scope_names_the_folder_of_a_path_label(ident, conn, db_url, labels):
+    """Legacy rows labelled with their whole path (the pre-fix parsers) count as the
+    folder's name: never a ``project:D:\\src\\...`` scope no client can match, and never
+    'global', which relabel_projects cannot move back into the project."""
     sessions = _sessions(conn, ident, [label.format(a=ident.alpha) for label in labels])
+    assert _evidence_scope_of(db_url, sessions) == f"project:{ident.alpha}"
+
+
+def test_evidence_scope_keeps_a_home_directory_session_global(ident, conn, db_url):
+    sessions = _sessions(conn, ident, ["C:\\Users\\someone"])
     assert _evidence_scope_of(db_url, sessions) == "global"
 
 
@@ -701,6 +710,22 @@ def test_ingest_stores_a_label_never_a_path(ident, conn, db_url, project, cwd, e
     assert r.status_code == 200, r.text
     assert r.json()["ingested"] == 1
     assert _stored_projects(conn, sid) == [expected]
+
+
+def test_a_replay_across_the_label_change_is_not_stored_twice(ident, conn, db_url):
+    """A session stored by an older plugin under its subfolder's label, replayed under a
+    new session id by a client that now sends the repo's label: the cross-session replay
+    guard (schema 036) still recognises it by its folder."""
+    cwd = f"/work/{ident.alpha}/tickets"
+    sid, records = _cc_records(ident, cwd)
+    assert _post(db_url, {"records": records}).json()["ingested"] == 1
+    assert _stored_projects(conn, sid) == ["tickets"]
+
+    replay_sid = ident.sid()
+    replay = [{**r, "sessionId": replay_sid, "uuid": f"replay-{r['uuid']}"} for r in records]
+    out = _post(db_url, {"records": replay, "project": ident.alpha}).json()
+    assert out["ingested"] == 0, out
+    assert _stored_projects(conn, replay_sid) == []
 
 
 @pytest.mark.parametrize(

@@ -42,6 +42,7 @@ from starlette.responses import JSONResponse
 from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
 from dream.skills.skill_measure import skill_description
 from ingestion import pg_pool
+from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
 from mcp_server.http_helpers import _iso, guarded_json
 
@@ -379,8 +380,10 @@ def _proposals_list(db_url: str) -> dict:
 def _evidence_scope(c, evidence) -> str:
     """'project:<name>' when every evidence session ran in that one project, else 'global'.
     Unprovable (no sessions, a session with no episodes, an untagged or home-dir session)
-    stays global. Labels that differ only in case are one project (the most common
-    spelling names it); a label that could not be a scope (a stored path) stays global."""
+    stays global. A label stored as a whole path (the parsers before the backslash fix)
+    counts as its folder's name, the label a client sends today, so relabel_projects can
+    still move the scope; labels that differ only in case are one project (the most
+    common spelling names it); a label that still could not be a scope stays global."""
     sids = sorted(
         {e["session_id"] for e in evidence or [] if isinstance(e, dict) and e.get("session_id")}
     )
@@ -393,7 +396,7 @@ def _evidence_scope(c, evidence) -> str:
     ).fetchall()
     if {r["session_id"] for r in rows} != set(sids):
         return "global"
-    projects = [r["project"] for r in rows]
+    projects = [label_from_path(r["project"]) for r in rows]
     if None in projects or len({p.lower() for p in projects}) != 1:
         return "global"
     if any(r["cwd"] and _HOME_DIR_RE.match(r["cwd"]) for r in rows):

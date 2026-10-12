@@ -397,6 +397,16 @@ def widening_entries(plan: Plan, entries: Iterable[str]) -> list[tuple[str, str]
     ]
 
 
+def case_matches(entries: Iterable[str], labels: Iterable[str]) -> list[str]:
+    """The stored labels an allowlist matches only because the server matches it
+    case-insensitively (``ingestion.surfaces.expand_allowlist``): the lower-case form of
+    an entry, spelled differently from every entry. For a generic folder name ('dev',
+    'src') another casing can be another project, which the device would then be served."""
+    entries = set(entries)
+    folded = {e.lower() for e in entries}
+    return sorted({lb for lb in labels if lb.lower() in folded and lb not in entries})
+
+
 def map_scope(plan: Plan, scope: str) -> str:
     if scope.startswith("project:"):
         return "project:" + (plan.map_label(scope[len("project:") :]) or scope[len("project:") :])
@@ -429,6 +439,9 @@ class Inventory:
     config_scopes: dict[str, int] = field(default_factory=dict)  # 'project:<label>' -> rows
     #: Tables --apply skips: a unique index includes their project column.
     unique_tables: set[str] = field(default_factory=set)
+    #: Full-trust surfaces (no allowlist applies). An inventory without it treats every
+    #: surface as restricted, which only lists more in the case-matching section.
+    full_surfaces: set[str] = field(default_factory=set)
 
     def other_labels(self) -> set[str]:
         """Every label outside episodes, allowlists and scopes included: a re-run after an
@@ -458,13 +471,13 @@ def read_inventory(conn: Any) -> Inventory:
         ).fetchall()
         tables[q] = {p: n for p, n in rows}
     surfaces = []
+    full: set[str] = set()
     if conn.execute("SELECT to_regclass('surfaces')").fetchone()[0]:
-        surfaces = [
-            {"surface_id": s, "allowed_projects": list(a or [])}
-            for s, a in conn.execute(
-                "SELECT surface_id, allowed_projects FROM surfaces ORDER BY surface_id"
-            ).fetchall()
-        ]
+        rows = conn.execute(
+            "SELECT surface_id, allowed_projects, trust FROM surfaces ORDER BY surface_id"
+        ).fetchall()
+        surfaces = [{"surface_id": s, "allowed_projects": list(a or [])} for s, a, _t in rows]
+        full = {s for s, _a, t in rows if t == "full"}
     skills = []
     if conn.execute("SELECT to_regclass('skills_lane.skill_registry')").fetchone()[0]:
         skills = [
@@ -484,7 +497,7 @@ def read_inventory(conn: Any) -> Inventory:
             ).fetchall()
         }
     unique = {q for q in tables if _unique_project_indexes(conn, q)}
-    return Inventory(groups, tables, surfaces, skills, config_scopes, unique)
+    return Inventory(groups, tables, surfaces, skills, config_scopes, unique, full)
 
 
 #: The read-only inventory as one JSON cell (for ``--inventory``): what read_inventory
@@ -522,6 +535,8 @@ SELECT json_build_object(
   'surfaces', (SELECT coalesce(json_agg(json_build_object(
                    'surface_id', surface_id, 'allowed_projects', allowed_projects)
                  ORDER BY surface_id), '[]') FROM surfaces),
+  'full_surfaces', (SELECT coalesce(json_agg(surface_id ORDER BY surface_id), '[]')
+                      FROM surfaces WHERE trust = 'full'),
   'skills', (SELECT coalesce(json_agg(json_build_object('name', name, 'scope', scope)
                ORDER BY name), '[]')
                FROM skills_lane.skill_registry WHERE scope LIKE 'project:%'),
@@ -555,7 +570,8 @@ def inventory_from_json(text: str) -> Inventory:
     skills = [{"name": s["name"], "scope": s["scope"]} for s in data.get("skills") or []]
     config = {s: int(n) for s, n in (data.get("config_scopes") or {}).items()}
     unique = set(data.get("unique_tables") or [])
-    return Inventory(groups, tables, surfaces, skills, config, unique)
+    full = set(data.get("full_surfaces") or [])
+    return Inventory(groups, tables, surfaces, skills, config, unique, full)
 
 
 def _unique_project_indexes(conn: Any, qualified: str) -> list[str]:
@@ -626,6 +642,7 @@ def report(inv: Inventory, plan: Plan) -> str:
                 f"    ! {entry!r} is part of {project!r}, which this device is not allowed: "
                 "kept as is (it will match nothing). Add the project yourself to grant it."
             )
+    out.extend(_case_matching_section(inv, plan))
     out.append("\nconfig_lane.config_registry.scope:")
     for scope, n in sorted(inv.config_scopes.items()):
         new = map_scope(plan, scope)
@@ -637,6 +654,40 @@ def report(inv: Inventory, plan: Plan) -> str:
             f"  {s['name']}: {s['scope']} -> {new}" + ("" if new != s["scope"] else "  (unchanged)")
         )
     return "\n".join(out) + "\n"
+
+
+def _case_matching_section(inv: Inventory, plan: Plan) -> list[str]:
+    """What each restricted allowlist matches beyond its own spellings, before and after
+    --apply. The server matches case-insensitively from its deploy on, so a label listed
+    under "now" is served to that device until the relabel runs."""
+    now: dict[str, int] = defaultdict(int)
+    after: dict[str, int] = defaultdict(int)
+    for key, n in inv.episode_groups.items():
+        now[key[0]] += n
+        after[plan.groups[key]] += n
+    for counts in inv.tables.values():
+        for lb, n in counts.items():
+            now[lb] += n
+            after[plan.map_label(lb) or lb] += n
+
+    def listed(found: list[str], rows: dict[str, int]) -> str:
+        return ", ".join(f"{lb!r} ({rows[lb]} rows)" for lb in found) or "none"
+
+    out = [
+        "\ncase-insensitive matching (restricted surfaces): stored labels an allowlist "
+        "matches beyond its own spellings. The server serves them from its deploy on; if "
+        "one is a different project, run --apply first or drop that entry."
+    ]
+    for s in inv.surfaces:
+        if s["surface_id"] in inv.full_surfaces:
+            continue
+        before = case_matches(s["allowed_projects"], now)
+        later = case_matches(map_allowlist(plan, s["allowed_projects"]), after)
+        out.append(
+            f"  {s['surface_id']}: until --apply: {listed(before, now)}; "
+            f"after: {listed(later, after)}"
+        )
+    return out
 
 
 def apply(conn: Any, inv: Inventory, plan: Plan, log=print) -> None:

@@ -561,6 +561,8 @@ def test_the_offline_inventory_is_the_live_one(conn, db_url, world, aliases, tmp
     assert offline.surfaces == live.surfaces
     assert offline.skills == live.skills
     assert offline.config_scopes == live.config_scopes
+    assert offline.full_surfaces == live.full_surfaces
+    assert w.full in live.full_surfaces and w.restricted not in live.full_surfaces
     assert offline.tables[f'"{w.schema}"."jobs"'] == {w.win: 1, w.alpha: 1}
     assert offline.episode_groups[(w.big.lower(), None)] == 1
 

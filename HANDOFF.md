@@ -24,7 +24,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   label (both parsers used to split on "/" only, so a Windows cwd became the whole path);
   `/ingest` cuts a client-sent label to a bare name (a non-string `project` used to 500).
   A restricted allowlist matches case-insensitively (`resolve_caller` widens it to every
-  stored casing via a skip scan on the 061 index, cached 60 s); skill scopes match
+  stored casing via a skip scan on the `project` index, cached 60 s); skill scopes match
   case-insensitively. `ingestion/project_id.py` (dead) and `MEMORY_PROJECT` are gone.
 - **`scripts/relabel_projects.py`**: maps stored labels to canonical names and rewrites
   `episodes.project` (the 056 trigger keeps KG `source_projects` in step), every other
@@ -35,14 +35,18 @@ changed, what to do on each machine, what was proven, and what is still open.
 **On each machine**: `synapse update` (or the plugin update) to 0.21.0. Optional: put a
 `.synapse-project` file in a repository whose folder name differs between machines.
 
-**Server**: merge → image. Then, only after Kyle approves the dry-run table:
-`scripts/relabel_projects.py --apply --aliases <file>` from a checkout. Until the relabel
-runs, old labels stay as they are (new sessions arrive under canonical names).
+**Server**: before deploying, read the dry run's "case-insensitive matching" section: the
+server matches a restricted allowlist case-insensitively from its deploy on, and an old
+subfolder entry (`dev`, `src`) can match another project's `Dev`. If it lists one, run the
+relabel first or drop that entry. Then merge → image, and only after Kyle approves the
+dry-run table: `scripts/relabel_projects.py --apply --aliases <file>` from a checkout.
+Until the relabel runs, old labels stay as they are (new sessions arrive under canonical
+names; a replay of an old session is still recognised by its folder).
 
 **Proven**
 
 - Real failures reproduced first, then fixed: the server parsers labelled
-  `C:\Users\…\CompromisedAccount` (and a lowercase-drive variant) with the whole path, from
+  a work project's `C:\Users\…\<repo>` (and a lowercase-drive variant) with the whole path, from
   both harnesses; main's real hooks, run as subprocesses against a local server in a real
   repo, labelled a session in `MyRepo/tickets/lab` as `lab`, a worktree as `agent-x`, sent no
   `project` from either ingest hook, and synced `project:lab`. After: all five hooks send

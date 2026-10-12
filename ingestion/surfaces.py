@@ -217,13 +217,18 @@ def own_surface_served(db_url: str, trust: SurfaceTrust | None) -> bool:
 # Case-insensitive allowlists
 # ---------------------------------------------------------------------------
 
-#: Schema 061's (project, created_at) index on episodes. The variant walk below is a skip
-#: scan over it; without the index it would read the whole table per step, so until a
-#: valid index exists an allowlist matches exactly as written (the pre-0.21 behaviour).
+#: A valid, whole-table btree index on episodes that leads with ``project`` (schema 001's
+#: ``episodes_project_idx``, or 061's ``(project, created_at)``). The variant walk below is
+#: a skip scan over it; without one it would read the whole table per step, so until one
+#: exists an allowlist matches exactly as written (the pre-0.21 behaviour).
 PROJECT_INDEX_PROBE = ColumnProbe(
-    "SELECT 1 FROM pg_index "
-    "WHERE indexrelid = to_regclass('episodes_project_created_idx') AND indisvalid",
-    "schema 061 (episodes (project, created_at) index)",
+    "SELECT 1 FROM pg_index i "
+    "JOIN pg_class ic ON ic.oid = i.indexrelid "
+    "JOIN pg_am am ON am.oid = ic.relam AND am.amname = 'btree' "
+    "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0] "
+    "WHERE i.indrelid = to_regclass('episodes') AND i.indisvalid "
+    "AND i.indpred IS NULL AND a.attname = 'project' LIMIT 1",
+    "an episodes index leading with project",
 )
 
 #: Every stored label whose lower-case form is in the list: a skip scan over the distinct

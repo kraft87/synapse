@@ -162,7 +162,9 @@ def register(
                     # above can't see them. SYNAPSE_CONTENT_DEDUP=0 is the kill switch.
                     if os.environ.get(
                         "SYNAPSE_CONTENT_DEDUP", "1"
-                    ) != "0" and db.content_dup_exists(ep.project, ep.content):
+                    ) != "0" and db.content_dup_exists(
+                        ep.project, ep.content, (ep.metadata or {}).get("cwd")
+                    ):
                         content_dups += 1
                         continue
                     max_seq += 1

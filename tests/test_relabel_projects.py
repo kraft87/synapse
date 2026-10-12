@@ -853,3 +853,47 @@ def test_the_report_marks_a_table_apply_will_skip():
     inv = rp.Inventory(groups, {'"x"."uniq"': {WIN: 2}}, [], [], {}, {'"x"."uniq"'})
     text = rp.report(inv, _plan(groups, aliases=""))
     assert '"x"."uniq": 2 rows WOULD change, but --apply SKIPS this table' in text
+
+
+# ---------------------------------------------------------------------------
+# Case-insensitive allowlists: what a restricted device newly matches
+# ---------------------------------------------------------------------------
+
+
+def test_case_matches_lists_only_other_spellings_of_an_entry():
+    labels = ["dev", "Dev", "DEV", "src", "Acme", "acme", "other"]
+    assert rp.case_matches(["dev", "Acme"], labels) == ["DEV", "Dev", "acme"]
+    assert rp.case_matches([], labels) == []
+    assert rp.case_matches(["nothing"], labels) == []
+
+
+def test_the_report_lists_what_case_matching_serves_a_restricted_device():
+    """A subfolder entry ('dev', from before the relabel) matches another project's 'Dev'
+    once the server matches case-insensitively. The dry run names it per restricted
+    surface, until and after --apply, and skips full-trust surfaces."""
+    groups = {
+        ("acme", "/home/u/code/acme"): 3,
+        ("dev", "/home/u/code/acme/dev"): 2,
+        ("Dev", "/home/u/Dev"): 4,
+    }
+    inv = rp.Inventory(
+        groups,
+        {'"public"."notes"': {"Dev": 1}},
+        [
+            {"surface_id": "dev-work", "allowed_projects": ["acme", "dev"]},
+            {"surface_id": "dev-home", "allowed_projects": ["dev"]},
+        ],
+        [],
+        full_surfaces={"dev-home"},
+    )
+    text = rp.report(inv, _plan(groups, aliases=""))
+    line = next(ln for ln in text.splitlines() if ln.startswith("  dev-work:") and "until" in ln)
+    assert "until --apply: 'Dev' (5 rows)" in line
+    assert line.endswith("after: none")  # 'dev' folds into acme; the entry goes with it
+    assert not any(ln.startswith("  dev-home:") and "until" in ln for ln in text.splitlines())
+
+
+def test_inventory_json_carries_full_trust_surfaces():
+    inv = rp.inventory_from_json('{"surfaces": [], "full_surfaces": ["dev-a"]}')
+    assert inv.full_surfaces == {"dev-a"}
+    assert rp.inventory_from_json('{"surfaces": []}').full_surfaces == set()
