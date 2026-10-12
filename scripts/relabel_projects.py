@@ -368,9 +368,12 @@ class Inventory:
     tables: dict[str, dict[str, int]]  # qualified table -> label -> rows (non-episodes)
     surfaces: list[dict[str, Any]]
     skills: list[dict[str, Any]]
+    config_scopes: dict[str, int] = field(default_factory=dict)  # 'project:<label>' -> rows
 
     def other_labels(self) -> set[str]:
-        return {lb for counts in self.tables.values() for lb in counts}
+        labels = {lb for counts in self.tables.values() for lb in counts}
+        labels |= {s[len("project:") :] for s in self.config_scopes}
+        return labels
 
 
 def read_inventory(conn: Any) -> Inventory:
@@ -407,7 +410,16 @@ def read_inventory(conn: Any) -> Inventory:
                 "WHERE scope LIKE 'project:%' ORDER BY name"
             ).fetchall()
         ]
-    return Inventory(groups, tables, surfaces, skills)
+    config_scopes: dict[str, int] = {}
+    if conn.execute("SELECT to_regclass('config_lane.config_registry')").fetchone()[0]:
+        config_scopes = {
+            s: n
+            for s, n in conn.execute(
+                "SELECT scope, count(*) FROM config_lane.config_registry "
+                "WHERE scope LIKE 'project:%' GROUP BY 1"
+            ).fetchall()
+        }
+    return Inventory(groups, tables, surfaces, skills, config_scopes)
 
 
 def _unique_project_indexes(conn: Any, qualified: str) -> list[str]:
@@ -455,6 +467,10 @@ def report(inv: Inventory, plan: Plan) -> str:
         new = map_allowlist(plan, s["allowed_projects"])
         mark = "" if new != s["allowed_projects"] else "  (unchanged)"
         out.append(f"  {s['surface_id']}: {s['allowed_projects']} -> {new}{mark}")
+    out.append("\nconfig_lane.config_registry.scope:")
+    for scope, n in sorted(inv.config_scopes.items()):
+        new = map_scope(plan, scope)
+        out.append(f"  {n:>7}  {scope} -> {new}" + ("" if new != scope else "  (unchanged)"))
     out.append("\nskills_lane.skill_registry.scope:")
     for s in inv.skills:
         new = map_scope(plan, s["scope"])
@@ -504,6 +520,21 @@ def apply(conn: Any, inv: Inventory, plan: Plan, log=print) -> None:
                     (new, lb),
                 )
         log(f"{q}: {sum(labels[lb] for lb in ch)} rows")
+    for scope in sorted(inv.config_scopes):
+        new = map_scope(plan, scope)
+        if new == scope:
+            continue
+        # (surface_id, scope, file_key) is the key: a file already mirrored under the new
+        # scope keeps that row, and the old-scope one stays for its owner to drop.
+        with conn.transaction():
+            moved = conn.execute(
+                "UPDATE config_lane.config_registry r SET scope = %s WHERE r.scope = %s "
+                "AND NOT EXISTS (SELECT 1 FROM config_lane.config_registry x WHERE "
+                "x.surface_id = r.surface_id AND x.scope = %s AND x.file_key = r.file_key)",
+                (new, scope, new),
+            ).rowcount
+        left = inv.config_scopes[scope] - moved
+        log(f"config_registry: {scope} -> {new}: {moved} rows" + (f", {left} kept" if left else ""))
     with conn.transaction():
         for s in inv.surfaces:
             new = map_allowlist(plan, s["allowed_projects"])
