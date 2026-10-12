@@ -9,7 +9,7 @@ a lowercase drive letter, several casings of the folder name, one label per subf
 session was started in, one per git worktree, and a hyphen/underscore twin when two
 machines named the checkout differently. Clients now resolve one label (a
 ``.synapse-project`` marker, else the git toplevel's name, else the folder's name; see
-``plugin/scripts/project_label.py``); this script brings the stored history in line.
+``plugin/scripts/synapse_project.py``); this script brings the stored history in line.
 
 How a label is mapped (the dry run prints the reason for every change):
 
@@ -231,6 +231,9 @@ class Plan:
     #: Bare labels whose sessions map to different names: left as they are outside
     #: episodes (rows there carry no cwd to tell them apart).
     ambiguous: dict[str, list[str]] = field(default_factory=dict)
+    #: Labels a restricted device can be served outside episodes (``served_labels``) that
+    #: no episode carries -> the project root (path key) a path label lies in, or None.
+    table_roots: dict[str, str | None] = field(default_factory=dict)
 
     def map_label(self, label: str | None) -> str | None:
         if label is None:
@@ -271,6 +274,7 @@ class Planner:
         self,
         episode_groups: dict[tuple[str, str | None], int],
         other_labels: Iterable[str] = (),
+        served_labels: Iterable[str] = (),
     ) -> Plan:
         # 1. Candidate roots: every directory a label was derived from. A Windows folder
         #    seen in several casings is one candidate, spelled the way most rows spell it.
@@ -401,6 +405,8 @@ class Planner:
             for (label, root, canonical, why), rows in agg.items()
         ]
         changes.sort(key=lambda c: (c.canonical.casefold(), c.label, c.cwd_root or ""))
+        on_episodes = {lb for lb, _ in episode_groups}
+        table_roots = {lb: root_key(lb, None) for lb in served_labels if lb not in on_episodes}
         return Plan(
             groups=groups,
             changes=changes,
@@ -409,6 +415,7 @@ class Planner:
             folded=frozenset(folded),
             group_roots=group_roots,
             ambiguous=ambiguous,
+            table_roots=table_roots,
         )
 
 
@@ -417,19 +424,42 @@ def _reads(entries: Iterable[str]) -> set[str]:
     return {e.lower() for e in entries}
 
 
+def _seen_roots(plan: Plan, now: set[str]) -> set[str]:
+    """The project folders (root keys) the labels an allowlist reads now lie in."""
+    seen = {r for k, r in plan.group_roots.items() if k[0].lower() in now and r}
+    return seen | {r for lb, r in plan.table_roots.items() if lb.lower() in now and r}
+
+
+def _label_root(plan: Plan, label: str) -> str | None:
+    """The one project folder a label's rows come from, or None when it has none or
+    several (a row outside episodes carries no cwd to tell which)."""
+    if label in plan.table_roots:
+        return plan.table_roots[label]
+    found = {r for (lb, _cwd), r in plan.group_roots.items() if lb == label}
+    return found.pop() if len(found) == 1 else None
+
+
 def exposure(
     plan: Plan, entries: Iterable[str], mapped: Iterable[str]
 ) -> list[tuple[tuple[str, str | None], bool]]:
-    """The episode groups the ``mapped`` allowlist reads after --apply that ``entries``
-    can't read now, each with whether it lies in a project folder (root) none of the
-    groups read now lies in: ``[((label, cwd), foreign)]``."""
+    """What the ``mapped`` allowlist reads after --apply that ``entries`` can't read now,
+    each with whether it lies in a project folder (root) nothing read now lies in:
+    ``[((label, cwd), foreign)]``. The episode groups, then (with cwd None) the labels
+    that only rows outside episodes carry (``Plan.table_roots``): a timeline event or a
+    preference whose session is gone is served by its label all the same."""
     now, after = _reads(entries), _reads(mapped)
-    seen = {r for k, r in plan.group_roots.items() if k[0].lower() in now and r}
-    return [
+    seen = _seen_roots(plan, now)
+    out = [
         (k, plan.group_roots.get(k) not in seen)
         for k, c in plan.groups.items()
         if c.lower() in after and k[0].lower() not in now
     ]
+    out.extend(
+        ((lb, None), root not in seen)
+        for lb, root in sorted(plan.table_roots.items())
+        if (plan.map_label(lb) or lb).lower() in after and lb.lower() not in now
+    )
+    return out
 
 
 def _allowlist_decisions(plan: Plan, entries: list[str]) -> list[tuple[str, str, str | None]]:
@@ -510,6 +540,12 @@ def _qual(schema: str, table: str) -> str:
     return f'"{schema}"."{table}"'
 
 
+#: The tables besides episodes the server filters by project label for a restricted
+#: device: timeline events (``episode_scope_sql``) and preferences. KG facts follow the
+#: episodes they cite (``source_projects``, schema 056); notes go by audience.
+SERVED_TABLES = (_qual("public", "timeline_events"), _qual("public", "preferences"))
+
+
 @dataclass
 class Inventory:
     episode_groups: dict[tuple[str, str | None], int]
@@ -531,6 +567,12 @@ class Inventory:
         labels |= {s["scope"][len("project:") :] for s in self.skills}
         labels |= {p for s in self.surfaces for p in s["allowed_projects"]}
         return labels
+
+    def served_labels(self) -> set[str]:
+        """The labels of rows a restricted device is served by label outside episodes:
+        the SERVED_TABLES and project skill scopes."""
+        labels = {lb for q in SERVED_TABLES for lb in self.tables.get(q, {})}
+        return labels | {s["scope"][len("project:") :] for s in self.skills}
 
 
 def read_inventory(conn: Any) -> Inventory:
@@ -785,27 +827,49 @@ def _case_matching_section(inv: Inventory, plan: Plan) -> list[str]:
 
 
 def _exposure_section(inv: Inventory, plan: Plan) -> list[str]:
-    """Per restricted surface, the sessions it reads after --apply that it can't read now
-    (its mapped allowlist against the relabelled episodes). '!' marks sessions from a
-    project folder it reads nothing from now: a different project that shares a name."""
+    """Per restricted surface, what it reads after --apply that it can't read now (its
+    mapped allowlist against the relabelled labels): sessions, then the rows of the other
+    tables it is served by label and project skills. '!' marks rows from a project folder
+    it reads nothing from now: a different project that shares a name."""
     out = [
-        "\nrestricted surfaces: sessions readable after --apply, not now "
+        "\nrestricted surfaces: rows readable after --apply, not now: sessions, then "
+        "[timeline_events], [preferences] and [skill] rows; KG facts follow their sessions "
         "('!' = from a folder the device reads nothing from now):"
     ]
     for s in inv.surfaces:
         if s["surface_id"] in inv.full_surfaces:
             continue
-        mapped = map_allowlist(plan, s["allowed_projects"])
-        rows: dict[tuple[str, str, bool], int] = defaultdict(int)
-        for key, foreign in exposure(plan, s["allowed_projects"], mapped):
-            where = plan.roots.get(plan.group_roots.get(key) or "", key[1] or "")
-            rows[(key[0], where, foreign)] += inv.episode_groups.get(key, 0)
+        entries = s["allowed_projects"]
+        mapped = map_allowlist(plan, entries)
+        now, after = _reads(entries), _reads(mapped)
+        seen = _seen_roots(plan, now)
+        rows: dict[tuple[str, str, str, bool], int] = defaultdict(int)
+        for key, foreign in exposure(plan, entries, mapped):
+            if key in inv.episode_groups:
+                where = plan.roots.get(plan.group_roots.get(key) or "", key[1] or "")
+                rows[("", key[0], where, foreign)] += inv.episode_groups[key]
+        served = [(q.split(".")[-1].strip('"'), inv.tables.get(q, {})) for q in SERVED_TABLES]
+        skills: dict[str, int] = defaultdict(int)
+        for sk in inv.skills:
+            skills[sk["scope"][len("project:") :]] += 1
+        for kind, counts in [*served, ("skill", skills)]:
+            for label, n in counts.items():
+                if (plan.map_label(label) or label).lower() in after and label.lower() not in now:
+                    root = _label_root(plan, label)
+                    where = plan.roots.get(root or "", "")
+                    rows[(kind, label, where, root not in seen)] += n
         if not rows:
             out.append(f"  {s['surface_id']}: none")
             continue
         out.append(f"  {s['surface_id']}:")
-        for (label, where, foreign), n in sorted(rows.items()):
-            out.append(f"    {'!' if foreign else ' '} {n:>7}  {label}  ({where or 'no folder'})")
+        order = {"": 0, "timeline_events": 1, "preferences": 2, "skill": 3}
+        for (kind, label, where, foreign), n in sorted(
+            rows.items(), key=lambda kv: (order.get(kv[0][0], 4), kv[0])
+        ):
+            out.append(
+                f"    {'!' if foreign else ' '} {n:>7}  {label}  ({where or 'no folder'})"
+                + (f"  [{kind}]" if kind else "")
+            )
     return out
 
 
@@ -861,11 +925,15 @@ def _plan_entries(doc: Any) -> dict[str, Any]:
     return doc
 
 
-def apply_plan(conn: Any, doc: dict[str, Any], log=print) -> None:
+def apply_plan(conn: Any, doc: dict[str, Any], log=print) -> list[str]:
     """Write exactly the approved plan (``plan_document``): one committed transaction per
     label, then one for the allowlists and skill scopes. A table the plan does not name
     is never touched, and an allowlist or scope that changed since the dry run is left
-    alone, so a re-run of the same plan after an interruption only finishes it."""
+    alone, so a re-run of the same plan after an interruption only finishes it.
+
+    Returns the allowlists and skill scopes left alone because they changed since the
+    dry run (one already at its planned value is not one): the labels moved anyway, so
+    such an allowlist's old entries may now match nothing."""
     doc = _plan_entries(doc)
     by_label: dict[str, list[tuple[str | None, str]]] = defaultdict(list)
     for label, cwd, canonical in doc.get("episodes") or []:
@@ -922,6 +990,7 @@ def apply_plan(conn: Any, doc: dict[str, Any], log=print) -> None:
                 "SELECT count(*) FROM config_lane.config_registry WHERE scope = %s", (old,)
             ).fetchone()[0]
         log(f"config_registry: {old} -> {new}: {moved} rows" + (f", {left} kept" if left else ""))
+    drifted: list[str] = []
     with conn.transaction():
         for sf in doc.get("surfaces") or []:
             n = conn.execute(
@@ -929,7 +998,13 @@ def apply_plan(conn: Any, doc: dict[str, Any], log=print) -> None:
                 "WHERE surface_id = %s AND allowed_projects = %s::text[]",
                 (sf["to"], sf["surface_id"], sf["from"]),
             ).rowcount
-            log(f"surfaces: {sf['surface_id']} -> {sf['to']}" if n else _left(conn, sf))
+            if n:
+                log(f"surfaces: {sf['surface_id']} -> {sf['to']}")
+                continue
+            line = _left(conn, sf)
+            log(line)
+            if line.endswith("left alone"):
+                drifted.append(f"surface {sf['surface_id']}")
         for sk in doc.get("skills") or []:
             n = conn.execute(
                 "UPDATE skills_lane.skill_registry SET scope = %s, updated_at = now() "
@@ -938,8 +1013,16 @@ def apply_plan(conn: Any, doc: dict[str, Any], log=print) -> None:
             ).rowcount
             if n:
                 log(f"skill_registry: {sk['name']} -> {sk['to']}")
+                continue
+            row = conn.execute(
+                "SELECT scope FROM skills_lane.skill_registry WHERE name = %s", (sk["name"],)
+            ).fetchone()
+            if row is not None and row[0] == sk["to"]:
+                log(f"skill_registry: {sk['name']}: already {sk['to']}")
             else:
                 log(f"skill_registry: {sk['name']}: not {sk['from']} any more, left alone")
+                drifted.append(f"skill {sk['name']}")
+    return drifted
 
 
 def _left(conn: Any, sf: dict[str, Any]) -> str:
@@ -993,7 +1076,11 @@ def main(argv: list[str] | None = None) -> int:
             return 2
     if args.inventory is not None:
         inv = inventory_from_json(args.inventory.expanduser().read_text(encoding="utf-8"))
-        _dry_run(inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels()), args)
+        _dry_run(
+            inv,
+            Planner(cfg).plan(inv.episode_groups, inv.other_labels(), inv.served_labels()),
+            args,
+        )
         return 0
     if not args.db_url:
         print("no database URL — pass --db-url or set SYNAPSE_DB_URL", file=sys.stderr)
@@ -1003,12 +1090,21 @@ def main(argv: list[str] | None = None) -> int:
 
     with psycopg.connect(args.db_url, autocommit=True) as conn:
         if args.apply:
-            apply_plan(conn, doc)
+            drifted = apply_plan(conn, doc)
+            if drifted:
+                print(
+                    f"changed since the dry run, left alone: {', '.join(drifted)}. The labels "
+                    "moved anyway: run the dry run again and fix these by hand.",
+                    file=sys.stderr,
+                )
+                return 1
             return 0
         with conn.transaction():
             conn.execute("SET TRANSACTION READ ONLY")
             inv = read_inventory(conn)
-    _dry_run(inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels()), args)
+    _dry_run(
+        inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels(), inv.served_labels()), args
+    )
     return 0
 
 
