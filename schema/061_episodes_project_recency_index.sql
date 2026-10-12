@@ -1,0 +1,23 @@
+-- 061_episodes_project_recency_index.sql
+-- (project, created_at) on episodes, for the board banner's project list.
+--
+-- The banner names the most recently active projects. It found them with a GROUP BY
+-- over every episode, a seq scan of the whole heap: 61 ms on prod at 52K episodes and
+-- 157 projects, which was nearly all of a /context build once the cap loop and the
+-- per-request connections were fixed. With this index the banner walks the distinct
+-- projects through it and reads each one's latest created_at from it
+-- (mcp_server/board.py): about 3 ms on a copy of prod's rows, against 19 ms for the
+-- GROUP BY on the same copy. The existing (project) index can't serve the per-project
+-- max(created_at); without this one that lookup is far slower than the seq scan.
+--
+-- On a POPULATED table, build it CONCURRENTLY by hand instead of running this file, so
+-- the build doesn't block ingestion writes:
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS episodes_project_created_idx
+--     ON episodes (project, created_at);
+-- A failed CONCURRENTLY build leaves an INVALID index: drop it and build it again.
+--
+-- The board checks for a valid index and keeps its GROUP BY query until there is one,
+-- so the image can land before this is applied:
+-- schema-check: optional
+
+CREATE INDEX IF NOT EXISTS episodes_project_created_idx ON episodes (project, created_at);

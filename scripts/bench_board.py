@@ -74,7 +74,7 @@ def main() -> int:
     if args.project:
         projects: list[str | None] = list(args.project)
     else:
-        _, names = work_tree_board._banner_stats(args.db_url)
+        _, _, names = work_tree_board._banner_stats(args.db_url)
         projects = [None, *names]
 
     mismatches = 0

@@ -23,14 +23,17 @@ _TYPES = ("feedback", "user", "project", "reference")
 _T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 
 
-def _old_cap_loop(project, n_episodes, project_names, notes, events, notice):
-    """The cap loop as it was before ``_fit_notes``, verbatim apart from the return."""
+def _old_cap_loop(project, n_episodes, project_names, notes, events, notice, n_projects=None):
+    """The cap loop as it was before ``_fit_notes``, verbatim apart from the return and
+    the banner's project count passed through to ``_render``."""
     kept = list(notes)
     dropped = 0
-    floor = _render(project, n_episodes, project_names, [], len(notes), events, notice)
+    floor = _render(project, n_episodes, project_names, [], len(notes), events, notice, n_projects)
     can_reach_cap = _fits(floor)
     while True:
-        text = _render(project, n_episodes, project_names, kept, dropped, events, notice)
+        text = _render(
+            project, n_episodes, project_names, kept, dropped, events, notice, n_projects
+        )
         if not kept or not can_reach_cap or _fits(text):
             break
         victim = min(kept, key=lambda n: (_DROP_CLASS.get(n["type"], 0), n["updated_at"], n["id"]))
