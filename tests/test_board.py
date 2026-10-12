@@ -251,6 +251,55 @@ def test_cap_loop_keeps_notes_when_floor_over_cap(conn, db_url):
     assert "Keep me" in out["text"]
 
 
+def test_large_board_matches_old_cap_loop_in_few_renders(conn, db_url, monkeypatch):
+    """240 live notes through the real DB path (prod had ~230 when the one-render-per-drop
+    loop cost ~300 ms a request): same text, kept ids and overflow as the old loop on the
+    same rows, from a handful of renders instead of one per dropped note."""
+    import math
+
+    from mcp_server import board
+    from tests.test_board_cap import _old_cap_loop
+
+    _wipe(conn)
+    db = Database(db_url)
+    types = ("feedback", "user", "project", "reference")
+    ids = [
+        _note(db, type=types[i % 4], hook=f"Note {i:03d} " + "w" * (i % 70), project="alpha")
+        for i in range(240)
+    ]
+    db.close()
+    for age, nid in enumerate(ids):
+        conn.execute(
+            "UPDATE notes SET updated_at = now() - make_interval(hours => %s) WHERE id = %s",
+            (age, nid),
+        )
+    _event(conn, "Shipped the board", salience=2, days_ago=1, ref="tb:big")
+
+    seen: dict[str, object] = {}
+    real_fit, real_render = board._fit_notes, board._render
+    renders = 0
+
+    def capture(*args):
+        seen["args"] = args
+        return real_fit(*args)
+
+    def counting_render(*args, **kwargs):
+        nonlocal renders
+        renders += 1
+        return real_render(*args, **kwargs)
+
+    monkeypatch.setattr(board, "_fit_notes", capture)
+    monkeypatch.setattr(board, "_render", counting_render)
+    out = _board(db_url, "alpha")
+    monkeypatch.setattr(board, "_render", real_render)
+
+    text, kept, dropped = _old_cap_loop(*seen["args"])
+    assert out["text"] == text
+    assert out["note_ids"] == [n["id"] for n in kept]
+    assert out["overflow"] == dropped and dropped > 150
+    assert renders <= 2 + math.ceil(math.log2(240))
+
+
 def test_overflow_line_separated_when_all_notes_dropped(conn, db_url):
     """A board whose every note was evicted still renders the overflow line with a
     blank line after the banner, not jammed directly under it."""

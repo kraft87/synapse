@@ -190,6 +190,74 @@ def _render(
     return "\n".join(lines)
 
 
+def _fit_notes(
+    project: str | None,
+    n_episodes: int,
+    project_names: list[str],
+    notes: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    notice: str | None,
+) -> tuple[str, list[dict[str, Any]], int]:
+    """Drop the fewest notes that brings the board under both caps: ``(text, kept,
+    dropped)``. Notes leave in drop order (drop class, then oldest updated_at, then id);
+    the survivors keep their list order.
+
+    Guard first: if the fixed portion (banner + clamped events) alone busts the caps, no
+    amount of note-dropping can reach them, so every note is kept rather than draining
+    the board for zero benefit. With event facts clamped this is a residual guard.
+
+    The fewest drops is found by binary search over the drop count k, which renders
+    O(log n) boards instead of one per dropped note (a few hundred live notes made that
+    a ~300 ms CPU tax on every /context). Binary search is exact because ``_fits`` only
+    ever flips once from k=1 upward: each further drop removes one note line, at least
+    19 chars ("- " + hook + " (n:N, upd MM-DD)") and one line, and, if it was the last
+    of its type, the section header too, while the overflow line gains at most one digit.
+    Every note renders a line because notes_type_chk limits ``type`` to the four rendered
+    sections. k=0 is checked on its own: the first drop adds the 27-char overflow line,
+    so a short note line can make k=1 longer than k=0. A ``_render`` change that breaks
+    this argument fails tests/test_board_cap.py, which pins the result to the old
+    one-drop-at-a-time loop.
+    """
+
+    def render(kept: list[dict[str, Any]], dropped: int) -> str:
+        return _render(project, n_episodes, project_names, kept, dropped, events, notice)
+
+    text = render(notes, 0)
+    if not notes or _fits(text):
+        return text, list(notes), 0
+    n = len(notes)
+    floor = render([], n)
+    if not _fits(floor):
+        return text, list(notes), 0
+
+    # A stable sort reproduces the old loop's tie-break: min() took the first of equals.
+    order = sorted(
+        range(n),
+        key=lambda i: (
+            _DROP_CLASS.get(notes[i]["type"], 0),
+            notes[i]["updated_at"],
+            notes[i]["id"],
+        ),
+    )
+    drop_rank = [0] * n
+    for rank, i in enumerate(order):
+        drop_rank[i] = rank
+
+    def kept_after(k: int) -> list[dict[str, Any]]:
+        return [note for i, note in enumerate(notes) if drop_rank[i] >= k]
+
+    # Smallest k in [1, n] that fits; k=n (the floor) is known to.
+    lo, hi, hi_text = 1, n, floor
+    while lo < hi:
+        mid = (lo + hi) // 2
+        mid_text = render(kept_after(mid), mid)
+        if _fits(mid_text):
+            hi, hi_text = mid, mid_text
+        else:
+            lo = mid + 1
+    return hi_text, kept_after(hi), hi
+
+
 def build_board(
     db_url: str,
     project: str | None,
@@ -251,22 +319,7 @@ def build_board(
 
     n_episodes, project_names = _banner_stats(db_url, allowed_projects=allowed, own_surface=own)
 
-    # Cap loop: drop one note at a time (drop class, then oldest updated_at) and
-    # re-render until under both caps. Dozens of notes at most — O(n^2) is fine.
-    # Guard first: if the fixed portion (banner + clamped events) alone busts the caps,
-    # no amount of note-dropping can reach them — keep every note rather than draining
-    # the board for zero benefit. With event facts clamped this is a residual guard.
-    kept = list(notes)
-    dropped = 0
-    floor = _render(project, n_episodes, project_names, [], len(notes), events, notice)
-    can_reach_cap = _fits(floor)
-    while True:
-        text = _render(project, n_episodes, project_names, kept, dropped, events, notice)
-        if not kept or not can_reach_cap or _fits(text):
-            break
-        victim = min(kept, key=lambda n: (_DROP_CLASS.get(n["type"], 0), n["updated_at"], n["id"]))
-        kept.remove(victim)
-        dropped += 1
+    text, kept, dropped = _fit_notes(project, n_episodes, project_names, notes, events, notice)
 
     out: dict[str, Any] = {
         "status": "ok",
