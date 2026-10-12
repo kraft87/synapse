@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Any, cast
 
 import orjson
+import psycopg
+from psycopg.rows import dict_row
 
 from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_literal
 
@@ -165,31 +167,9 @@ class NoteStore(DatabaseConnection):
     def list_board_notes(
         self, owner_id: str, project: str | None, audience: str | None = None
     ) -> list[dict[str, Any]]:
-        """Live notes for the board: every global-scope type (user/feedback/reference)
-        plus the current project's project-notes. Ordered feedback -> user -> project ->
-        reference, newest-updated first within each type. ``project=None`` serves the
-        global set only (``project = NULL`` matches nothing).
-
-        ``audience`` (schema 053) narrows to one tier — the board passes 'work-safe' for
-        a restricted surface, None for a full-trust one."""
-        clauses = [
-            "owner_id = %s",
-            "superseded_by IS NULL",
-            "(type IN ('user','feedback','reference') OR project = %s)",
-        ]
-        params: list[Any] = [owner_id, project]
-        if audience is not None:
-            clauses.append("audience = %s")
-            params.append(audience)
+        """:func:`select_board_notes` on this store's connection."""
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT id, hook, type, project, audience, updated_at FROM notes "  # nosec B608 — clause list is literal, values are bound
-                f"WHERE {' AND '.join(clauses)} "
-                "ORDER BY CASE type WHEN 'feedback' THEN 0 WHEN 'user' THEN 1 "
-                "WHEN 'project' THEN 2 ELSE 3 END, updated_at DESC",
-                params,
-            ).fetchall()
-        return [dict(r) for r in rows]
+            return select_board_notes(conn, owner_id, project, audience)
 
     def get_notes_by_ids(self, ids: list[int], audience: str | None = None) -> list[dict[str, Any]]:
         """Fetch note bodies by id — the on-demand half of the board (hook on the board,
@@ -392,3 +372,36 @@ class NoteStore(DatabaseConnection):
             ).fetchone()
         assert row is not None, "INSERT ... RETURNING id returned nothing"
         return cast(int, row["id"])
+
+
+def select_board_notes(
+    conn: psycopg.Connection[Any], owner_id: str, project: str | None, audience: str | None = None
+) -> list[dict[str, Any]]:
+    """Live notes for the board: every global-scope type (user/feedback/reference)
+    plus the current project's project-notes. Ordered feedback -> user -> project ->
+    reference, newest-updated first within each type. ``project=None`` serves the
+    global set only (``project = NULL`` matches nothing).
+
+    ``audience`` (schema 053) narrows to one tier — the board passes 'work-safe' for
+    a restricted surface, None for a full-trust one.
+
+    Takes the connection rather than owning one so the board can run it on a pooled
+    connection (ingestion/pg_pool); dict rows come from the cursor, not the connection."""
+    clauses = [
+        "owner_id = %s",
+        "superseded_by IS NULL",
+        "(type IN ('user','feedback','reference') OR project = %s)",
+    ]
+    params: list[Any] = [owner_id, project]
+    if audience is not None:
+        clauses.append("audience = %s")
+        params.append(audience)
+    with conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            "SELECT id, hook, type, project, audience, updated_at FROM notes "  # nosec B608 — clause list is literal, values are bound
+            f"WHERE {' AND '.join(clauses)} "
+            "ORDER BY CASE type WHEN 'feedback' THEN 0 WHEN 'user' THEN 1 "
+            "WHEN 'project' THEN 2 ELSE 3 END, updated_at DESC",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]

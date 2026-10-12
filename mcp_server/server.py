@@ -24,6 +24,7 @@ from fastmcp.server.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from ingestion.scope import personal_scope_enabled
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.auth_tokens import (
@@ -46,6 +47,7 @@ from mcp_server.auxiliary_routes import register as _register_auxiliary_routes
 from mcp_server.caller_trust import caller_trust as _resolve_caller_trust
 from mcp_server.caller_trust import request_trust as _resolve_request_trust
 from mcp_server.feedback_tools import register as _register_feedback_tools
+from mcp_server.hidden_tools import HiddenToolsList as _HiddenToolsList
 from mcp_server.http_auth import admin_authorized, authenticated, is_root, machine_authorized
 from mcp_server.http_auth import bearer as _bearer
 from mcp_server.ingest_route import register as _register_ingest_route
@@ -194,24 +196,6 @@ class _UserAllowlist(Middleware):
         return await call_next(context)
 
 
-# Tools that stay fully callable via tools/call but never appear in tools/list:
-# plumbing that a specific client invokes by name (synapse_login's raw tools/call
-# on issue_machine_token) and that a model browsing the tool list must not see.
-_HIDDEN_TOOLS = {"issue_machine_token"}
-
-
-class _HiddenToolsList(Middleware):
-    """Filter hidden tools out of tools/list responses.
-
-    Listing and calling are separate request paths in FastMCP, so dropping a tool
-    here leaves tools/call untouched — `synapse login` keeps working while the
-    model-facing surface stays the deliberate tools registered below."""
-
-    async def on_list_tools(self, context, call_next):
-        tools = await call_next(context)
-        return [t for t in tools if t.name not in _HIDDEN_TOOLS]
-
-
 def _oauth_client_storage():
     return oauth_client_storage(DB_URL, OAUTH_SIGNING_KEY)
 
@@ -321,7 +305,12 @@ _INSTRUCTIONS = (
 )
 
 mcp = FastMCP(
-    "synapse", instructions=_INSTRUCTIONS, auth=_auth, middleware=[*_auth_mw, _HiddenToolsList()]
+    "synapse",
+    instructions=_INSTRUCTIONS,
+    auth=_auth,
+    middleware=[*_auth_mw, _HiddenToolsList()],
+    # The Postgres pool the HTTP lanes borrow from: opened at startup, closed on shutdown.
+    lifespan=lambda _server: pg_pool.held_open(DB_URL),
 )
 
 # Serve skills_lane skills as skill:// MCP resources (PG-backed). Clients materialize
@@ -590,7 +579,18 @@ if __name__ == "__main__":
     check_schema_version(DB_URL)
 
     if "--stdio" not in sys.argv:
+        import contextlib
+        import signal
+
+        # uvicorn re-raises SIGTERM after draining. Unless this is PID 1 (whose default
+        # action the kernel ignores), Python's default handler then kills the process
+        # before the lifespan closes the Postgres pool. As a KeyboardInterrupt it unwinds
+        # through that teardown and stops here, however the server was launched.
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
         logger.info("Starting Synapse MCP server (http, %s) on %s:%d", _mode, _mcp_host, _mcp_port)
-        mcp.run(transport="http", host=_mcp_host, port=_mcp_port, stateless_http=True, path="/mcp")
+        with contextlib.suppress(KeyboardInterrupt):
+            mcp.run(
+                transport="http", host=_mcp_host, port=_mcp_port, stateless_http=True, path="/mcp"
+            )
     else:
         mcp.run(transport="stdio")

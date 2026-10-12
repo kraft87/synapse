@@ -7,6 +7,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from ingestion import pg_pool
 from ingestion.embedding import embed_dims
 
 # Embedding width for the vector casts below — matches the provisioned schema.
@@ -31,9 +32,23 @@ class DatabaseConnection:
         # transactions; the poller's concurrent drain gives each worker thread its own
         # Database (see Poller._thread_worker) rather than sharing this one.
         self._connection: psycopg.Connection[Any] | None = None
+        # In a process with a pool open (the MCP server), the connection is borrowed for
+        # the outermost _conn() block only and goes back when it exits; nested blocks
+        # reuse it and commit on exit exactly as below. Without a pool the instance keeps
+        # one connection until close(), which the poller and the backfills rely on.
+        self._borrowed = False
 
     @contextmanager
     def _conn(self) -> Generator[psycopg.Connection[Any], None, None]:
+        if self._connection is None and pg_pool.pooled(self._url):
+            with pg_pool.connection(self._url, autocommit=False, row_factory=dict_row) as conn:
+                self._connection, self._borrowed = conn, True
+                try:
+                    with self._conn() as same:
+                        yield same
+                finally:
+                    self._connection, self._borrowed = None, False
+            return
         if self._connection is None or self._connection.closed:
             self._connection = psycopg.connect(self._url, row_factory=dict_row, autocommit=False)
         try:
@@ -45,5 +60,5 @@ class DatabaseConnection:
             self._connection.commit()
 
     def close(self) -> None:
-        if self._connection and not self._connection.closed:
+        if self._connection and not self._connection.closed and not self._borrowed:
             self._connection.close()

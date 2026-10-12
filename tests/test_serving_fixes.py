@@ -212,7 +212,7 @@ def test_serving_fix_defaults_on():
 def test_bm25_table_short_circuits_no_alnum_query():
     # A query with no alphanumeric content tokenizes to nothing — the leg must
     # return "no candidates" without touching Postgres. _bare() has no pg, so
-    # reaching _ensure_pg would blow up the test.
+    # reaching _pg would blow up the test.
     r = _bare()
     assert r._bm25_table("episodes", "?!... ---", None, 10, "episode") == []
     assert r._bm25_table("episodes", "", None, 10, "episode") == []

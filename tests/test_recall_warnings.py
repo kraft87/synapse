@@ -14,6 +14,8 @@ them, and the embedder/reranker are replaced by objects that raise.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import ingestion.db as db_mod
 import mcp_server.recall as recall_mod
 from ingestion.surfaces import SurfaceTrust
@@ -220,7 +222,7 @@ class _DeadPG:
 def test_kg_leg_failure_warns():
     r = _wired()
     del r._search_kg  # use the real method
-    r._ensure_pg = lambda: _DeadPG()
+    r._pg = lambda: nullcontext(_DeadPG())
     # Full trust, or the KG leg is skipped by the schema-053 posture before it can fail.
     msg = _joined(r.recall("anything", trust=SurfaceTrust(trust="full", known=True)))
     assert "KG facts leg failed" in msg
@@ -245,7 +247,7 @@ def test_bm25_and_vector_episode_leg_failures_warn():
     r = _wired()
     del r._search_bm25_episodes  # real legs
     del r._search_vector_episodes
-    r._ensure_pg = lambda: _DeadPG()
+    r._pg = lambda: nullcontext(_DeadPG())
     msg = _joined(r.recall("anything"))
     assert "BM25 episodes search failed" in msg
     assert "vector episodes search failed" in msg
@@ -255,7 +257,7 @@ def test_web_leg_failures_warn():
     r = _wired()
     del r._search_bm25_web
     del r._search_vector_web
-    r._ensure_pg = lambda: _DeadPG()
+    r._pg = lambda: nullcontext(_DeadPG())
     msg = _joined(r.recall("anything"))
     assert "BM25 web search failed" in msg
     assert "vector web search failed" in msg

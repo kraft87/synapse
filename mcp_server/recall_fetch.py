@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 from ingestion.localtime import local_date
@@ -28,7 +29,7 @@ class RecallFetchMixin:
 
     if TYPE_CHECKING:
 
-        def _ensure_pg(self) -> Any: ...
+        def _pg(self) -> AbstractContextManager[Any]: ...
         def _resolve_trust(
             self, surface: str | None, trust: SurfaceTrust | None
         ) -> SurfaceTrust: ...
@@ -137,59 +138,59 @@ class RecallFetchMixin:
         proj_args: tuple[Any, ...] = tuple(scope[1]) if scope is not None else ()
 
         try:
-            pg = self._ensure_pg()
-            meta = pg.execute(
-                "SELECT count(*) AS n, min(created_at) AS first, max(created_at) AS last,"  # nosec B608 — proj_sql is a literal, its value is bound
-                f" min(project) AS project FROM episodes WHERE session_id = %s{proj_sql}",
-                (session_id, *proj_args),
-            ).fetchone()
-            if not meta or not meta["n"]:
-                out["error"] = (
-                    "session not indexed — no ingested turns under this id. If the session is"
-                    " recent or ran headless, its transcript may still be on disk"
-                    " (~/.claude/projects/*/<session_id>.jsonl); read it there."
-                )
-                return out
-            out["project"] = meta["project"]
-            out["total_turns"] = meta["n"]
-            out["first_date"] = local_date(meta["first"])
-            out["last_date"] = local_date(meta["last"])
-
-            anchor_id: int | None = None
-            if around:
-                try:
-                    anchor_id = int(str(around).split(":")[-1])
-                except ValueError:
-                    out["error"] = f"unparseable anchor id {around!r} — expected 'e:N'"
-                    return out
-                anchor = pg.execute(
-                    "SELECT sequence FROM episodes "  # nosec B608 — proj_sql is a literal, its value is bound
-                    f"WHERE id = %s AND session_id = %s{proj_sql}",
-                    (anchor_id, session_id, *proj_args),
+            with self._pg() as pg:
+                meta = pg.execute(
+                    "SELECT count(*) AS n, min(created_at) AS first, max(created_at) AS last,"  # nosec B608 — proj_sql is a literal, its value is bound
+                    f" min(project) AS project FROM episodes WHERE session_id = %s{proj_sql}",
+                    (session_id, *proj_args),
                 ).fetchone()
-                if anchor is None:
-                    out["error"] = f"episode {around} is not in session {session_id}"
+                if not meta or not meta["n"]:
+                    out["error"] = (
+                        "session not indexed — no ingested turns under this id. If the session is"
+                        " recent or ran headless, its transcript may still be on disk"
+                        " (~/.claude/projects/*/<session_id>.jsonl); read it there."
+                    )
                     return out
-                rows = pg.execute(
-                    "SELECT id, sequence, content, created_at,"  # nosec B608 — proj_sql is a literal, its value is bound
-                    " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
-                    f" FROM episodes WHERE session_id = %s AND sequence BETWEEN %s AND %s{proj_sql}"
-                    " ORDER BY sequence",
-                    (
-                        session_id,
-                        anchor["sequence"] - radius,
-                        anchor["sequence"] + radius,
-                        *proj_args,
-                    ),
-                ).fetchall()
-            else:
-                rows = pg.execute(
-                    "SELECT id, sequence, content, created_at,"  # nosec B608 — proj_sql is a literal, its value is bound
-                    " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
-                    f" FROM episodes WHERE session_id = %s{proj_sql}"
-                    " ORDER BY sequence LIMIT %s OFFSET %s",
-                    (session_id, *proj_args, limit, offset),
-                ).fetchall()
+                out["project"] = meta["project"]
+                out["total_turns"] = meta["n"]
+                out["first_date"] = local_date(meta["first"])
+                out["last_date"] = local_date(meta["last"])
+
+                anchor_id: int | None = None
+                if around:
+                    try:
+                        anchor_id = int(str(around).split(":")[-1])
+                    except ValueError:
+                        out["error"] = f"unparseable anchor id {around!r} — expected 'e:N'"
+                        return out
+                    anchor = pg.execute(
+                        "SELECT sequence FROM episodes "  # nosec B608 — proj_sql is a literal, its value is bound
+                        f"WHERE id = %s AND session_id = %s{proj_sql}",
+                        (anchor_id, session_id, *proj_args),
+                    ).fetchone()
+                    if anchor is None:
+                        out["error"] = f"episode {around} is not in session {session_id}"
+                        return out
+                    rows = pg.execute(
+                        "SELECT id, sequence, content, created_at,"  # nosec B608 — proj_sql is a literal, its value is bound
+                        " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
+                        f" FROM episodes WHERE session_id = %s AND sequence BETWEEN %s AND %s{proj_sql}"
+                        " ORDER BY sequence",
+                        (
+                            session_id,
+                            anchor["sequence"] - radius,
+                            anchor["sequence"] + radius,
+                            *proj_args,
+                        ),
+                    ).fetchall()
+                else:
+                    rows = pg.execute(
+                        "SELECT id, sequence, content, created_at,"  # nosec B608 — proj_sql is a literal, its value is bound
+                        " (human_turn IS NOT NULL) AS has_h, (assistant_turn IS NOT NULL) AS has_a"
+                        f" FROM episodes WHERE session_id = %s{proj_sql}"
+                        " ORDER BY sequence LIMIT %s OFFSET %s",
+                        (session_id, *proj_args, limit, offset),
+                    ).fetchall()
 
             turns: list[dict[str, Any]] = []
             for r in rows:
@@ -254,7 +255,6 @@ class RecallFetchMixin:
         overview does — otherwise fetch() would be a trivial bypass of every filter
         recall() applies."""
         try:
-            conn = self._ensure_pg()
             sql = (
                 "SELECT id, content, project, created_at, session_id"
                 " FROM episodes WHERE id = ANY(%s)"
@@ -264,7 +264,8 @@ class RecallFetchMixin:
             if scope is not None:
                 sql += f" AND {scope[0]}"
                 params.extend(scope[1])
-            rows = conn.execute(sql, params).fetchall()
+            with self._pg() as conn:
+                rows = conn.execute(sql, params).fetchall()
         except Exception as e:
             logger.warning("fetch episodes leg failed: %s", e)
             return []

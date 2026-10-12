@@ -1,7 +1,7 @@
 """Tests for MCP server code changes needed for Docker/SSE migration.
 
 Tests cover:
-  - Recall._ensure_pg() reconnects on dead connections (not just closed check)
+  - Recall._pg() borrows through ingestion/pg_pool (a one-off connection without a pool)
   - /health endpoint returns 200 with status
   - remember() uses shared connection, not fresh Database() per call
 """
@@ -11,70 +11,26 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 
-class TestEnsurePg:
-    """_ensure_pg() must reconnect on half-open TCP connections, not just closed ones."""
+class TestRecallConnections:
+    """Recall borrows a dict-row connection per use through ingestion/pg_pool. With no
+    pool open that is a one-off connection, closed when the block exits. (Dead pooled
+    connections are the pool's borrow check, covered in test_pg_pool.)"""
 
-    def test_connects_when_none(self):
-        from mcp_server.recall import Recall
-
-        r = Recall(db_url="postgresql://test", voyage_api_key="test")
-        mock_conn = MagicMock()
-        mock_conn.closed = False
-        with patch("mcp_server.recall.psycopg.connect", return_value=mock_conn) as mock_connect:
-            conn = r._ensure_pg()
-            mock_connect.assert_called_once()
-            assert conn is mock_conn
-
-    def test_reconnects_when_closed(self):
-        from mcp_server.recall import Recall
-
-        r = Recall(db_url="postgresql://test", voyage_api_key="test")
-        dead_conn = MagicMock()
-        dead_conn.closed = True
-        r._pg_local.conn = dead_conn
-
-        fresh_conn = MagicMock()
-        fresh_conn.closed = False
-        with patch("mcp_server.recall.psycopg.connect", return_value=fresh_conn) as mock_connect:
-            conn = r._ensure_pg()
-            mock_connect.assert_called_once()
-            assert conn is fresh_conn
-
-    def test_reconnects_on_execute_error(self):
-        """Half-open TCP: conn.closed is False but execute raises OperationalError."""
-        import psycopg
+    def test_without_a_pool_each_use_opens_and_closes_its_own_connection(self):
+        from psycopg.rows import dict_row
 
         from mcp_server.recall import Recall
 
         r = Recall(db_url="postgresql://test", voyage_api_key="test")
-
-        dead_conn = MagicMock()
-        dead_conn.closed = False
-        dead_conn.execute.side_effect = psycopg.OperationalError("server closed connection")
-        r._pg_local.conn = dead_conn
-
-        fresh_conn = MagicMock()
-        fresh_conn.closed = False
-        fresh_conn.execute.return_value = MagicMock(fetchall=lambda: [])
-
-        with patch("mcp_server.recall.psycopg.connect", return_value=fresh_conn):
-            # _ensure_pg with reconnect probe should return a working connection
-            conn = r._ensure_pg()
-            # After getting the fresh conn, execute should work
-            assert conn is fresh_conn
-
-    def test_reuses_healthy_connection(self):
-        from mcp_server.recall import Recall
-
-        r = Recall(db_url="postgresql://test", voyage_api_key="test")
-        healthy_conn = MagicMock()
-        healthy_conn.closed = False
-        r._pg_local.conn = healthy_conn
-
-        with patch("mcp_server.recall.psycopg.connect") as mock_connect:
-            conn = r._ensure_pg()
-            mock_connect.assert_not_called()
-            assert conn is healthy_conn
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        with patch("ingestion.pg_pool.psycopg.connect", return_value=conn) as connect:
+            with r._pg() as got:
+                assert got is conn
+        kwargs = connect.call_args.kwargs
+        assert kwargs["row_factory"] is dict_row and kwargs["autocommit"] is True
+        assert "hnsw.ef_search=200" in kwargs["options"]
+        conn.__exit__.assert_called_once()
 
 
 class TestHealthEndpoint:
