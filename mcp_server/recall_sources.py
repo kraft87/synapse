@@ -76,7 +76,8 @@ class RecallSourcesMixin:
             return False
         self._kg_scope_probed_at = time.monotonic()
         try:
-            row = self._ensure_pg().execute(_KG_SCOPE_PROBE_SQL).fetchone()
+            with self._pg() as pg:
+                row = pg.execute(_KG_SCOPE_PROBE_SQL).fetchone()
         except Exception as e:
             logger.warning("KG provenance probe failed (%s): restricted KG serving stays off", e)
             return False
@@ -121,21 +122,21 @@ class RecallSourcesMixin:
         # Same no-alphanumeric-tokens short-circuit as _bm25_table.
         if not any(c.isalnum() for c in query):
             return []
-        pg = self._ensure_pg()
         try:
-            rows = pg.execute(
-                """
-                SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
-                       c.content_ts AS created_at,
-                       a.url, a.title, a.tool_name,
-                       paradedb.score(c.id) AS bm25_score
-                FROM web_chunks c
-                JOIN web_artifacts a ON a.id = c.web_artifact_id
-                WHERE c.id @@@ paradedb.match('content', %s)
-                ORDER BY bm25_score DESC LIMIT %s
-                """,
-                (query, limit),
-            ).fetchall()
+            with self._pg() as pg:
+                rows = pg.execute(
+                    """
+                    SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
+                           c.content_ts AS created_at,
+                           a.url, a.title, a.tool_name,
+                           paradedb.score(c.id) AS bm25_score
+                    FROM web_chunks c
+                    JOIN web_artifacts a ON a.id = c.web_artifact_id
+                    WHERE c.id @@@ paradedb.match('content', %s)
+                    ORDER BY bm25_score DESC LIMIT %s
+                    """,
+                    (query, limit),
+                ).fetchall()
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
             logger.warning("BM25 web search failed: %s", e)
@@ -143,22 +144,22 @@ class RecallSourcesMixin:
             return []
 
     def _search_vector_web(self, query_emb: list[float], limit: int) -> list[dict[str, Any]]:
-        pg = self._ensure_pg()
         emb_literal = _vec_literal(query_emb)
         try:
-            rows = pg.execute(
-                """
-                SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
-                       c.content_ts AS created_at,
-                       a.url, a.title, a.tool_name,
-                       (c.embedding <=> %s::vector) AS vec_distance
-                FROM web_chunks c
-                JOIN web_artifacts a ON a.id = c.web_artifact_id
-                WHERE c.is_embedded = TRUE
-                ORDER BY vec_distance ASC LIMIT %s
-                """,
-                (emb_literal, limit),
-            ).fetchall()
+            with self._pg() as pg:
+                rows = pg.execute(
+                    """
+                    SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
+                           c.content_ts AS created_at,
+                           a.url, a.title, a.tool_name,
+                           (c.embedding <=> %s::vector) AS vec_distance
+                    FROM web_chunks c
+                    JOIN web_artifacts a ON a.id = c.web_artifact_id
+                    WHERE c.is_embedded = TRUE
+                    ORDER BY vec_distance ASC LIMIT %s
+                    """,
+                    (emb_literal, limit),
+                ).fetchall()
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
             logger.warning("Vector web search failed: %s", e)
@@ -283,30 +284,30 @@ class RecallSourcesMixin:
         to this query, not the thread-local connection that other legs may
         reuse later (enable_seqscan=off session-wide would be a foot-gun for
         any future unindexed query). hnsw.ef_search is already set
-        session-wide by _ensure_pg. A failure degrades to an empty facts
+        on every connection by ingestion/pg_pool. A failure degrades to an empty facts
         bucket rather than failing the whole recall.
         """
         settings = self._settings()
         if self._kg_scope_blocked(allowed_projects):
             return [], []
         try:
-            conn = self._ensure_pg()
-            with conn.transaction():
-                # kg_pg indexes rows positionally; recall's thread-local conns
-                # default to dict_row, so override at the cursor.
-                cur = conn.cursor(row_factory=tuple_row)
-                cur.execute("SET LOCAL enable_seqscan = off")
-                cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
-                return search_kg_postgres(
-                    cur,
-                    query,
-                    query_emb,
-                    settings._KG_OWNER,
-                    group_id,
-                    session_focus,
-                    fact_limit,
-                    allowed_projects=allowed_projects,
-                )
+            with self._pg() as conn:
+                with conn.transaction():
+                    # kg_pg indexes rows positionally; recall borrows dict-row
+                    # connections, so override at the cursor.
+                    cur = conn.cursor(row_factory=tuple_row)
+                    cur.execute("SET LOCAL enable_seqscan = off")
+                    cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    return search_kg_postgres(
+                        cur,
+                        query,
+                        query_emb,
+                        settings._KG_OWNER,
+                        group_id,
+                        session_focus,
+                        fact_limit,
+                        allowed_projects=allowed_projects,
+                    )
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
                 return [], []
@@ -327,12 +328,12 @@ class RecallSourcesMixin:
         if not uuids:
             return set()
         try:
-            conn = self._ensure_pg()
-            rows = conn.execute(
-                "SELECT r.uuid FROM kg_relationships r "
-                f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r')}",
-                (uuids, self_session),
-            ).fetchall()
+            with self._pg() as conn:
+                rows = conn.execute(
+                    "SELECT r.uuid FROM kg_relationships r "
+                    f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r')}",
+                    (uuids, self_session),
+                ).fetchall()
         except Exception as e:
             logger.warning("self-session fact lookup failed: %s", e)
             return set()
@@ -376,32 +377,32 @@ class RecallSourcesMixin:
             scope_sql = f" AND {scope_predicate('a')} AND {scope_predicate('o')}"
             scope_args = (allowed_projects, allowed_projects)
         try:
-            conn = self._ensure_pg()
-            rows = conn.execute(
-                f"""
-                SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
-                       o.uuid AS old_uid, o.fact AS old_fact
-                FROM kg_relationships a
-                JOIN kg_relationships o
-                  ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
-                 AND o.owner_id = a.owner_id AND o.group_id = a.group_id
-                WHERE a.owner_id = %s AND a.group_id = %s
-                  AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
-                  AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
-                  AND ((o.invalidated_by = a.uuid
-                        AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
-                       OR (o.invalidated_by IS NULL AND o.name = a.name))
-                  AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
-                ORDER BY a.uuid, o.t_invalid DESC
-                """,
-                (
-                    settings._KG_OWNER,
-                    group_id,
-                    active_edge_uuids,
-                    settings._SUP_LINK_MAX_DIST,
-                    *scope_args,
-                ),
-            ).fetchall()
+            with self._pg() as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
+                           o.uuid AS old_uid, o.fact AS old_fact
+                    FROM kg_relationships a
+                    JOIN kg_relationships o
+                      ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
+                     AND o.owner_id = a.owner_id AND o.group_id = a.group_id
+                    WHERE a.owner_id = %s AND a.group_id = %s
+                      AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
+                      AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
+                      AND ((o.invalidated_by = a.uuid
+                            AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
+                           OR (o.invalidated_by IS NULL AND o.name = a.name))
+                      AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
+                    ORDER BY a.uuid, o.t_invalid DESC
+                    """,
+                    (
+                        settings._KG_OWNER,
+                        group_id,
+                        active_edge_uuids,
+                        settings._SUP_LINK_MAX_DIST,
+                        *scope_args,
+                    ),
+                ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
                 return []
@@ -476,17 +477,17 @@ class RecallSourcesMixin:
             cap if served_text is None else cap * 4,  # headroom for the support filter
         ]
         try:
-            conn = self._ensure_pg()
-            rows = conn.execute(
-                "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
-                "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
-                f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
-                "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
-                f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
-                f"{scope_sql}"
-                "LIMIT %s",
-                params,
-            ).fetchall()
+            with self._pg() as conn:
+                rows = conn.execute(
+                    "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
+                    "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
+                    f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
+                    "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
+                    f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
+                    f"{scope_sql}"
+                    "LIMIT %s",
+                    params,
+                ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
                 return {}
@@ -548,27 +549,27 @@ class RecallSourcesMixin:
             scope_args = (allowed_projects, allowed_projects)
         vec = _vec_literal(query_emb)
         try:
-            conn = self._ensure_pg()
-            rows = conn.execute(
-                "SELECT n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
-                f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
-                "FROM kg_relationships p "
-                "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
-                "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
-                "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
-                f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
-                f"{scope_sql}"
-                f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
-                (
-                    vec,
-                    settings._KG_OWNER,
-                    group_id,
-                    settings._SUP_LINK_MAX_DIST,
-                    *scope_args,
-                    vec,
-                    settings._SUP_CANDIDATES,
-                ),
-            ).fetchall()
+            with self._pg() as conn:
+                rows = conn.execute(
+                    "SELECT n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
+                    f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
+                    "FROM kg_relationships p "
+                    "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
+                    "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
+                    "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
+                    f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
+                    f"{scope_sql}"
+                    f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
+                    (
+                        vec,
+                        settings._KG_OWNER,
+                        group_id,
+                        settings._SUP_LINK_MAX_DIST,
+                        *scope_args,
+                        vec,
+                        settings._SUP_CANDIDATES,
+                    ),
+                ).fetchall()
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
                 return []

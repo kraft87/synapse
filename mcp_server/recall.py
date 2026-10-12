@@ -30,14 +30,14 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from typing import Any
 
-import psycopg
 from psycopg.rows import dict_row
 
 from ingestion import embedding as _embedding
+from ingestion import pg_pool
 from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.recall_episode_search import RecallEpisodeSearchMixin
 from mcp_server.recall_episodes import RecallEpisodesMixin
@@ -429,10 +429,6 @@ class Recall(
         self._kg_owner = _KG_OWNER
         self._embedder: Any = None
         self._reranker: Any = _RERANKER_UNSET
-        # Postgres connections are THREAD-LOCAL: recall() fans its independent search
-        # legs out across the leg executor, and a single psycopg connection can't be
-        # used by two threads at once. Each worker lazily opens its own connection.
-        self._pg_local = threading.local()
         # Background executor for fire-and-forget feedback writes (retrieval
         # count bumps). One worker is enough for single-user scale; queueing
         # on a hot recall burst is cheaper than blocking the response.
@@ -440,29 +436,17 @@ class Recall(
             max_workers=1, thread_name_prefix="recall-feedback"
         )
         # Leg executor: runs recall()'s independent search legs (summaries, episodes,
-        # web, KG) concurrently. Persistent so each worker's thread-local PG connection
-        # is reused across calls. Legs never submit here, so concurrent recalls queue
-        # rather than deadlock.
+        # web, KG) concurrently, each borrowing its own connection (_pg). Legs never
+        # submit here, so concurrent recalls queue rather than deadlock.
         self._leg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="recall-leg")
 
-    def _ensure_pg(self) -> Any:
-        # Thread-local: each thread (the caller + every leg-executor worker) owns its
-        # own connection, so parallel search legs never share one psycopg handle.
-        conn = getattr(self._pg_local, "conn", None)
-        if conn is not None and not conn.closed:
-            # Probe for half-open TCP connections (closed=False but server dropped us)
-            try:
-                conn.execute("SELECT 1")
-                return conn
-            except Exception:
-                conn = None
-        conn = psycopg.connect(self._db_url, row_factory=dict_row, autocommit=True)
-        # HNSW search breadth for the halfvec vector indexes. Default 40 under-recalls a
-        # 100-deep fetch; 200 gives recall@100 0.981 / recall@10 1.000 vs exact (validated).
-        # Harmless on tables/queries that don't use an HNSW index.
-        conn.execute("SET hnsw.ef_search = 200")
-        self._pg_local.conn = conn
-        return conn
+    def _pg(self) -> AbstractContextManager[Any]:
+        """A dict-row autocommit connection for one query or a short run of them: borrowed
+        from the server's pool, or opened for the block where there is none (see
+        ingestion/pg_pool, which also sets hnsw.ef_search = 200 on every connection).
+        Each search leg borrows its own, so parallel legs never share a psycopg handle.
+        Hold it only around the statements: nothing inside the block may borrow again."""
+        return pg_pool.connection(self._db_url, row_factory=dict_row)
 
     def _ensure_embedder(self) -> Any:
         if self._embedder is None:

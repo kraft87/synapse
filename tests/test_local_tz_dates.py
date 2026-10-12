@@ -13,6 +13,7 @@ pre-fix code, where every reproduction fails on its assertion.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -277,7 +278,7 @@ def test_fetch_session_dates_are_the_local_day(monkeypatch):
 
     r = object.__new__(Recall)
     r._db_url = "postgresql://stub"
-    r._ensure_pg = lambda: _PG()
+    r._pg = lambda: nullcontext(_PG())
     r._record_metrics = lambda *a, **k: None
     r._increment_retrieval_counts = lambda ids: None
     out = r.fetch_session("98d71966-312e-4c84-a93d-b2aca1474b30")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
 from ingestion.surfaces import (
@@ -25,7 +26,7 @@ class RecallEpisodeSearchMixin:
 
     if TYPE_CHECKING:
 
-        def _ensure_pg(self) -> Any: ...
+        def _pg(self) -> AbstractContextManager[Any]: ...
 
     def _own_surface(self, st: SurfaceTrust) -> str | None:
         """The caller's own-surface widening (schema 057), or None.
@@ -36,7 +37,8 @@ class RecallEpisodeSearchMixin:
         if not st.own_surface:
             return None
         try:
-            return own_surface_if_ready(self._ensure_pg(), self._db_url, st.own_surface)
+            with self._pg() as pg:
+                return own_surface_if_ready(pg, self._db_url, st.own_surface)
         except Exception as e:  # no connection: the legs will report it themselves
             logger.warning("own-surface probe skipped (%s)", e)
             return None
@@ -78,7 +80,6 @@ class RecallEpisodeSearchMixin:
         # legs' sanitize-then-empty check.
         if not any(c.isalnum() for c in query):
             return []
-        pg = self._ensure_pg()
         ts = self._ts_col(table)
         extra = self._extra_cols(table)
         where = ["id @@@ paradedb.match('content', %s)"]
@@ -98,17 +99,18 @@ class RecallEpisodeSearchMixin:
             where.append(scope[0])
             params.extend(scope[1])
         try:
-            rows = pg.execute(
-                f"""
-                SELECT id, content, project,
-                       {ts} AS created_at{extra},
-                       paradedb.score(id) AS bm25_score
-                FROM {table}
-                WHERE {" AND ".join(where)}
-                ORDER BY bm25_score DESC LIMIT %s
-                """,
-                (*params, limit),
-            ).fetchall()
+            with self._pg() as pg:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project,
+                           {ts} AS created_at{extra},
+                           paradedb.score(id) AS bm25_score
+                    FROM {table}
+                    WHERE {" AND ".join(where)}
+                    ORDER BY bm25_score DESC LIMIT %s
+                    """,
+                    (*params, limit),
+                ).fetchall()
             return [
                 {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
             ]
@@ -147,7 +149,6 @@ class RecallEpisodeSearchMixin:
         own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         settings = self._settings()
-        pg = self._ensure_pg()
         ts = self._ts_col(table)
         extra = self._extra_cols(table)
         # Distance is computed over halfvec(N), NOT vector(N). The default embeddings are
@@ -171,17 +172,18 @@ class RecallEpisodeSearchMixin:
             where.append(scope[0])
             params.extend(scope[1])
         try:
-            rows = pg.execute(
-                f"""
-                SELECT id, content, project,
-                       {ts} AS created_at{extra},
-                       (embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS vec_distance
-                FROM {table}
-                WHERE {" AND ".join(where)}
-                ORDER BY embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) ASC LIMIT %s
-                """,
-                (*params, emb_literal, limit),
-            ).fetchall()
+            with self._pg() as pg:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project,
+                           {ts} AS created_at{extra},
+                           (embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS vec_distance
+                    FROM {table}
+                    WHERE {" AND ".join(where)}
+                    ORDER BY embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) ASC LIMIT %s
+                    """,
+                    (*params, emb_literal, limit),
+                ).fetchall()
             return [
                 {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
             ]

@@ -34,7 +34,6 @@ import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from starlette.requests import Request
@@ -42,6 +41,7 @@ from starlette.responses import JSONResponse
 
 from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
 from dream.skills.skill_measure import skill_description
+from ingestion import pg_pool
 from ingestion.schema_check import ColumnProbe
 from mcp_server.http_helpers import _iso, guarded_json
 
@@ -105,7 +105,7 @@ def _file_shas(c, name: str) -> list[dict]:
 def _list_skills(db_url: str, scope: str) -> dict:
     """The skills in `scope`: active ones under "skills" (all an older client reads), and,
     once schema 060 is applied, retired ones under "retired"."""
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         skills = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
             "content_modified_at FROM skills_lane.skill_registry "
@@ -157,7 +157,7 @@ def _retired_skills(c) -> list[dict]:
 
 
 def _fetch_skill(db_url: str, name: str) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         row = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
             "content_modified_at FROM skills_lane.skill_registry WHERE name=%s AND status='active'",
@@ -250,7 +250,7 @@ def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
 def _publish_skill(db_url: str, p: dict) -> dict:
     name = p["name"]
     edited = _dt(p.get("content_modified_at"))
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         retired_at = _retirement_holds(c, p, edited)
         if retired_at is not None:
             c.rollback()
@@ -285,7 +285,7 @@ def _publish_skill(db_url: str, p: dict) -> dict:
 
 
 def _record_overwrite(db_url: str, p: dict) -> dict:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         c.execute(
             "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
             "VALUES (%s,%s,%s,%s,'disk_overwrite')",
@@ -301,7 +301,7 @@ def _retire_skill(db_url: str, name) -> dict:
     stamped too, so its retirement starts to hold."""
     if not isinstance(name, str) or not name.strip():
         return {"status": "error", "detail": "'name' must be a non-empty string"}
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         if not _retired_at_ready(c):
             return {"status": "error", "detail": _NO_RETIRED_AT}
         row = c.execute(
@@ -360,7 +360,7 @@ _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-fil
 
 
 def _proposals_list(db_url: str) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         rows = c.execute(
             """SELECT id, kind, name, direction, target_skills, status, score,
                       grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings,
@@ -490,7 +490,7 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
 
 
 def _proposal_detail(db_url: str, cid: int) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         r = c.execute(
             f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s",
             (cid,),
@@ -588,7 +588,7 @@ def _proposal_act(
 ) -> dict:
     from dream.skills.skill_ledger import _rollup
 
-    with psycopg.connect(db_url, row_factory=dict_row) as c:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         cur = c.cursor()
         row = c.execute(
             "SELECT kind, status, name, proposal_path, proposal_body, evidence "

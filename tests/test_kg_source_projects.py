@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -560,7 +561,7 @@ def test_full_trust_sql_never_mentions_the_provenance_column():
     kg_pg.search_kg_postgres(cur, "widget q", onehot(0), "default", GROUP, ["x"], 5)
     r = Recall("postgresql://unused/none", "")
     conn = _RecordingConn()
-    r._ensure_pg = lambda: conn
+    r._pg = lambda: nullcontext(conn)
     r._fetch_superseded_pairs_pg(GROUP, ["u1"], 2)
     r._surface_supersessions(onehot(0), GROUP, set())
     r._episode_supersessions([1, 2], GROUP)
@@ -603,7 +604,7 @@ def _engine_on(tx) -> Recall:
     """recall() on ONE connection: a single leg worker keeps every statement serial on
     the transaction that hides the column."""
     r = _recall_engine("postgresql://unused/none")
-    r._ensure_pg = lambda: tx
+    r._pg = lambda: nullcontext(tx)
     r._leg_executor = ThreadPoolExecutor(max_workers=1)
     return r
 

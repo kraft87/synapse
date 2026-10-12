@@ -27,12 +27,13 @@ import json
 from collections.abc import Sequence
 from typing import Any
 
-import psycopg
 from fastmcp.resources.base import Resource, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.providers.base import Provider
 from fastmcp.utilities.versions import VersionSpec
 from pydantic import AnyUrl
+
+from ingestion import pg_pool
 
 _SCHEME = "skill://"
 _MAIN = "SKILL.md"
@@ -45,7 +46,7 @@ _MANIFEST = "_manifest"
 
 
 def _fetch_active(db_url: str) -> list[tuple[str, str]]:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         rows = c.execute(
             "SELECT name, COALESCE(description, '') FROM skills_lane.skill_registry "
             "WHERE status = 'active' ORDER BY name"
@@ -54,7 +55,7 @@ def _fetch_active(db_url: str) -> list[tuple[str, str]]:
 
 
 def _skill_active(db_url: str, name: str) -> bool:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         row = c.execute(
             "SELECT 1 FROM skills_lane.skill_registry WHERE name = %s AND status = 'active'",
             (name,),
@@ -63,7 +64,7 @@ def _skill_active(db_url: str, name: str) -> bool:
 
 
 def _fetch_body(db_url: str, name: str) -> str | None:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         row = c.execute(
             "SELECT body FROM skills_lane.skill_registry WHERE name = %s AND status = 'active'",
             (name,),
@@ -72,7 +73,7 @@ def _fetch_body(db_url: str, name: str) -> str | None:
 
 
 def _fetch_files_meta(db_url: str, name: str) -> list[tuple[str, int, str]]:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         rows = c.execute(
             "SELECT path, size, sha256 FROM skills_lane.skill_files "
             "WHERE skill_name = %s ORDER BY path",
@@ -82,7 +83,7 @@ def _fetch_files_meta(db_url: str, name: str) -> list[tuple[str, int, str]]:
 
 
 def _fetch_file(db_url: str, name: str, path: str) -> bytes | None:
-    with psycopg.connect(db_url) as c:
+    with pg_pool.connection(db_url, autocommit=False) as c:
         row = c.execute(
             "SELECT content FROM skills_lane.skill_files WHERE skill_name = %s AND path = %s",
             (name, path),

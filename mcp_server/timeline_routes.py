@@ -26,6 +26,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.scope import coerce_group
 from ingestion.surfaces import (
@@ -74,8 +75,7 @@ def _ingest_events(
     re-pushes cost nothing. Without a Voyage key, rows land with NULL embedding
     (keyless dev/test; a later re-embed pass can fill them) rather than failing.
     """
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
+    with pg_pool.connection(db_url) as conn:
         # Composite-tuple ANY isn't supported by psycopg; two plain ANYs over-fetch
         # (cross-product) but the result is only a membership set, so that's harmless.
         rows = conn.execute(
@@ -83,25 +83,28 @@ def _ingest_events(
             "WHERE source = ANY(%s) AND source_ref = ANY(%s)",
             ([e["source"] for e in cleaned], [e["source_ref"] for e in cleaned]),
         ).fetchall()
-        existing = {(r[0], r[1]) for r in rows}
-        fresh = [e for e in cleaned if (e["source"], e["source_ref"]) not in existing]
-        if not fresh:
-            return 0, len(cleaned)
+    existing = {(r[0], r[1]) for r in rows}
+    fresh = [e for e in cleaned if (e["source"], e["source_ref"]) not in existing]
+    if not fresh:
+        return 0, len(cleaned)
 
-        vecs: list[list[float] | None]
-        embed_model: str | None = None
-        if embed_provider() == "voyage" and not voyage_api_key:
-            # Keyless dev/test on the default (Voyage) backend: rows land with
-            # NULL embedding; a later re-embed pass can fill them.
-            vecs = [None] * len(fresh)
-        else:
-            emb = create_embedder(voyage_api_key=voyage_api_key, db_url=db_url)
-            embed_model = emb.model_name
-            vecs = list(
-                emb.embed([_embed_text(e["project"], e["fact"]) for e in fresh], task="document")
-            )
+    # Embedding is a network call and may itself read the database (the embedder's
+    # meta check), so no connection is held across it.
+    vecs: list[list[float] | None]
+    embed_model: str | None = None
+    if embed_provider() == "voyage" and not voyage_api_key:
+        # Keyless dev/test on the default (Voyage) backend: rows land with
+        # NULL embedding; a later re-embed pass can fill them.
+        vecs = [None] * len(fresh)
+    else:
+        emb = create_embedder(voyage_api_key=voyage_api_key, db_url=db_url)
+        embed_model = emb.model_name
+        vecs = list(
+            emb.embed([_embed_text(e["project"], e["fact"]) for e in fresh], task="document")
+        )
 
-        inserted = 0
+    inserted = 0
+    with pg_pool.connection(db_url) as conn:
         for e, vec in zip(fresh, vecs, strict=True):
             domain = _event_domain(e)
             inserted += conn.execute(
@@ -123,9 +126,7 @@ def _ingest_events(
                     domain,
                 ),
             ).rowcount
-        return inserted, len(cleaned) - inserted
-    finally:
-        conn.close()
+    return inserted, len(cleaned) - inserted
 
 
 # Diversity cap on the digest: max N events per (project, day). Recency-only
@@ -157,8 +158,7 @@ def _recent_events(
     ``own_surface`` (schema 057) also admits events whose source turn the calling
     surface ingested itself; the gate copies that stamp onto the event at write time.
     """
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
+    with pg_pool.connection(db_url) as conn:
         q = (
             "SELECT id, date, fact, project, salience, event_type FROM ("
             "  SELECT id, left(t_valid::text, 10) AS date, fact, project, salience, "
@@ -191,8 +191,6 @@ def _recent_events(
             }
             for r in rows
         ]
-    finally:
-        conn.close()
 
 
 def register(

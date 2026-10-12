@@ -37,11 +37,11 @@ import logging
 from collections.abc import Callable
 from datetime import datetime
 
-import psycopg
 from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, own_surface_columns_ready
 from mcp_server.http_helpers import _iso, err, guarded_json
 
@@ -65,7 +65,7 @@ def _publish_config(db_url: str, p: dict) -> dict:
     file_key = p["file_key"]
     content = p.get("content", "") or ""
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         row = conn.execute(
             "INSERT INTO config_lane.config_registry "
             "  (surface_id, scope, file_key, abs_path, content, content_hash, modified_at, updated_at) "
@@ -91,7 +91,7 @@ def _publish_config(db_url: str, p: dict) -> dict:
 
 
 def _list_configs(db_url: str, surface: str) -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT scope, file_key, content_hash, modified_at FROM config_lane.config_registry "
             "WHERE surface_id = %s ORDER BY scope, file_key",
@@ -111,7 +111,7 @@ def _list_configs(db_url: str, surface: str) -> dict:
 
 
 def _fetch_config(db_url: str, surface: str, file_key: str, scope: str = "global") -> dict:
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         row = conn.execute(
             "SELECT content, abs_path, content_hash, modified_at FROM config_lane.config_registry "
             "WHERE surface_id = %s AND scope = %s AND file_key = %s",
@@ -167,7 +167,7 @@ def _proposals_list(db_url: str, own_surface: str | None = None) -> dict:
     if own_surface:
         sql += _OWN_PROPOSAL
     sql += " ORDER BY updated_at DESC"
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         if not _own_ready(conn, db_url, own_surface):
             return {"proposals": []}
         rows = conn.execute(sql, {"own": own_surface}).fetchall()
@@ -190,7 +190,7 @@ def _proposals_list(db_url: str, own_surface: str | None = None) -> dict:
 
 def _proposal_owned(db_url: str, cid: int, own_surface: str) -> bool:
     """True when proposal ``cid`` is ``own_surface``'s own (see _OWN_PROPOSAL)."""
-    with psycopg.connect(db_url) as conn:
+    with pg_pool.connection(db_url, autocommit=False) as conn:
         if not _own_ready(conn, db_url, own_surface):
             return False
         row = conn.execute(
@@ -209,7 +209,7 @@ def _proposal_detail(db_url: str, cid: int, own_surface: str | None = None) -> d
     )
     if own_surface:
         sql += _OWN_PROPOSAL
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         if not _own_ready(conn, db_url, own_surface):
             return {"found": False}
         r = conn.execute(sql, {"id": cid, "own": own_surface}).fetchone()
@@ -227,7 +227,7 @@ def _proposal_act(
     radius via scope); apply marks it written-to-disk (the client did the actual write); reject drops
     it. The two-step accept->apply mirrors skills' accept->promote: 'accepted' = approved, 'applied' =
     on disk, so a failed disk write leaves it recoverable at 'accepted'."""
-    with psycopg.connect(db_url, row_factory=dict_row) as conn:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         cur = conn.cursor()
         row = conn.execute(
             "SELECT status, kind, file_key, scope, diff, summary "

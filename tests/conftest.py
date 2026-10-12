@@ -84,6 +84,7 @@ _DB_FILES = {
     "test_own_surface_episodes.py",
     "test_config_scope.py",
     "test_local_tz_dates.py",
+    "test_pg_pool.py",
 }
 
 
@@ -103,6 +104,21 @@ def no_retry_sleep():
     files that want it applied to every test."""
     with patch("tenacity.nap.time.sleep"):
         yield
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _session_pool():
+    """SYNAPSE_TEST_POOL=1 runs the suite the way the server runs: one pool open on the
+    test DB for the whole session, so every call that goes through ingestion/pg_pool
+    borrows from it. CI runs the DB suite both ways. Unset, nothing is opened."""
+    if os.environ.get("SYNAPSE_TEST_POOL") != "1":
+        yield
+        return
+    from ingestion import pg_pool
+
+    pg_pool.open_pool(DB_URL)
+    yield
+    pg_pool.close_pool(DB_URL)
 
 
 @pytest.fixture(scope="session")

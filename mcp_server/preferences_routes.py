@@ -29,6 +29,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
@@ -62,14 +63,14 @@ def _top_preferences(
         params.append(allowed_projects)
     sql += " ORDER BY assert_count DESC, last_asserted DESC LIMIT %s"
     params.append(limit)
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
-        rows = conn.execute(sql, params).fetchall()
-        return [{"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows]
-    except psycopg.errors.UndefinedTable:
-        return []
-    finally:
-        conn.close()
+    with pg_pool.connection(db_url) as conn:
+        try:
+            rows = conn.execute(sql, params).fetchall()
+            return [
+                {"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows
+            ]
+        except psycopg.errors.UndefinedTable:
+            return []
 
 
 def register(

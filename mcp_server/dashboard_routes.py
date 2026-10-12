@@ -52,6 +52,8 @@ from starlette.responses import (
     StreamingResponse,
 )
 
+from ingestion import pg_pool
+
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
 # them (see docs/dashboard-contract.md §"Phase 2b").
@@ -266,8 +268,7 @@ def _offset(raw: str | None) -> int:
 
 
 def _catalog(db_url: str) -> dict[str, Any]:
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         # NULL / '' project collapses to the single bucket name "untagged" (contract);
         # sources get the same defensive treatment so a NULL never lands as a null name.
         projects = conn.execute(
@@ -292,8 +293,6 @@ def _catalog(db_url: str) -> dict[str, Any]:
             "sources": [{"name": r["name"], "count": r["count"]} for r in sources],
             "group_ids": [r["g"] for r in gids],
         }
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -393,8 +392,7 @@ def _feed(
     cur = _decode_cursor(cursor) if cursor else None
     cts, cid = cur if cur else (None, None)
 
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         candidates: list[dict[str, Any]] = []
 
         # --- episodes (ts = created_at). Filters: project, source. No group_id column. ---
@@ -492,8 +490,6 @@ def _feed(
             item.pop("_ts", None)
             item.pop("_idstr", None)
         return {"items": emitted, "next_cursor": next_cursor}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -502,8 +498,7 @@ def _feed(
 
 
 def _episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         row = conn.execute(
             "SELECT id, session_id, sequence, project, source, platform, model, created_at, "
             "       human_turn, assistant_turn, content "
@@ -531,13 +526,10 @@ def _episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
             "assistant_turn": row["assistant_turn"],
             "content": row["content"],
         }
-    finally:
-        conn.close()
 
 
 def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         # Facts whose `episodes` jsonb array contains this id — as a number OR (defensively)
         # a numeric string, since the extractor's array element type isn't guaranteed.
         facts = conn.execute(
@@ -572,8 +564,6 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
                 for r in events
             ],
         }
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -582,8 +572,7 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
 
 
 def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT id, sequence, created_at, project, source, human_turn, assistant_turn, content "
             "FROM episodes WHERE session_id = %s ORDER BY sequence LIMIT %s",
@@ -607,8 +596,6 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
                 for r in rows
             ],
         }
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -617,8 +604,7 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
 
 
 def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | None:
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         ent = conn.execute(
             "SELECT uuid, name, entity_type, summary, degree, created_at "
             "FROM kg_entities WHERE uuid = %s",
@@ -721,8 +707,6 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 "total": int(total_row.get("total") or 0),
             },
         }
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -752,8 +736,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
     (name ILIKE, degree DESC). Global (no group scope): the graph is seeded explicitly."""
     if not q:
         return []
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT uuid, name, entity_type, entity_supertype, degree FROM kg_entities "
             "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
@@ -769,8 +752,6 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
             }
             for r in rows
         ]
-    finally:
-        conn.close()
 
 
 def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
@@ -815,11 +796,11 @@ def _graph_neighborhood(
     """
     node_budget = max(1, min(limit, _GRAPH_NODE_CAP))
     depth = 2 if depth >= 2 else 1
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
-        # Bound every query on this short-lived connection (SET can't bind a param).
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
+        # Bound every query of this read (SET can't bind a param). One transaction, with a
+        # transaction-local timeout: a session-level one would outlive the borrow.
         conn.execute(
-            "SELECT set_config('statement_timeout', %s, false)", (str(_GRAPH_STMT_TIMEOUT_MS),)
+            "SELECT set_config('statement_timeout', %s, true)", (str(_GRAPH_STMT_TIMEOUT_MS),)
         )
 
         seed = _resolve_seed(conn, entity)
@@ -924,8 +905,6 @@ def _graph_neighborhood(
             "truncated": truncated,
             "seed": seed_uuid,
         }
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -960,8 +939,7 @@ def _search(
     safe = _bm25_sanitize(q)
     like = f"%{q}%"
 
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         # --- per-type filter fragments (applied to both count and hit queries) ---
         ep_filt, ep_p = [], []
         if project is not None:
@@ -1104,8 +1082,6 @@ def _search(
                 )
 
         return {"hits": hits, "total_by_type": total, "offset": offset, "limit": limit}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1122,8 +1098,7 @@ def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
     still supersede it later. Turns-mode (kind='episodes') / fetch / remember rows are
     excluded by the kind filter so the console shows only overview recall() calls.
     """
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT id, created_at, query, source, ms_total, est_tokens, rerank_top_score "
             "FROM recall_metrics WHERE kind = 'recall' "
@@ -1144,8 +1119,6 @@ def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
                 for r in rows
             ]
         }
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1222,8 +1195,7 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
         f"percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_{leg}::double precision) AS leg_{leg}"
         for leg in _RECALL_LEGS
     )
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         series_rows = conn.execute(
             "SELECT date_trunc('hour', created_at) AS t, count(*) AS calls, "
             "  percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_total::double precision) AS p50, "
@@ -1283,8 +1255,6 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
             for i, n in enumerate(counts_by_bin)
         ]
         return {"series": series, "slowest": slowest, "score_hist": score_hist}
-    finally:
-        conn.close()
 
 
 def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
@@ -1293,8 +1263,7 @@ def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
     (processed_at) — the ONLY honest series the columns support. There is no historical
     depth series because a row's status is overwritten in place (contract §Phase 4)."""
     interval = f"{window_s} seconds"
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         depth = conn.execute(
             "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, "
             "  count(*) FILTER (WHERE status = 'processing') AS processing, "
@@ -1350,8 +1319,6 @@ def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
             ],
             "last_dream": _dream_run_json(last) if last else None,
         }
-    finally:
-        conn.close()
 
 
 def _dream_run_json(r: dict[str, Any]) -> dict[str, Any]:
@@ -1386,8 +1353,7 @@ def _metrics_corpus(db_url: str) -> dict[str, Any]:
     """Per-table row counts (+ 30-day sparkline + 30d delta) and the episodes-by-project /
     by-source proportions. Whole response is cached 1h in the route (row counts are the cost).
     Headline counts are pg_class estimates for big tables, exact for small ones."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         tables = []
         for name, tcol in _CORPUS_TABLES:
             present = conn.execute("SELECT to_regclass(%s) AS r", (f"public.{name}",)).fetchone()
@@ -1431,8 +1397,6 @@ def _metrics_corpus(db_url: str) -> dict[str, Any]:
             ).fetchall()
         ]
         return {"tables": tables, "by_project": by_project, "by_source": by_source}
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1471,8 +1435,7 @@ def _resolve_flag_gist(conn: psycopg.Connection[dict[str, Any]], kind: str, item
 
 
 def _flags_list(db_url: str) -> dict[str, Any]:
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT id, kind, item_id, note, created_at FROM dashboard_flags "
             "WHERE removed_at IS NULL ORDER BY created_at DESC, id DESC"
@@ -1490,15 +1453,12 @@ def _flags_list(db_url: str) -> dict[str, Any]:
                 for r in rows
             ]
         }
-    finally:
-        conn.close()
 
 
 def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool:
     """Insert a flag if none is active, else retire the active one. Returns the new
     flagged state and appends a dashboard_audit row either way."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         active = conn.execute(
             "SELECT id FROM dashboard_flags "
             "WHERE kind = %s AND item_id = %s AND removed_at IS NULL",
@@ -1524,8 +1484,6 @@ def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool
             (kind, item_id, Json({"note": note}) if note else None),
         )
         return True
-    finally:
-        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1592,8 +1550,7 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
 
     Returns the cascade summary the contract pins, or None when the episode doesn't
     exist (the route turns that into the 404)."""
-    conn = psycopg.connect(db_url, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         with conn.transaction():
             row = conn.execute(
                 "SELECT id FROM episodes WHERE id = %s FOR UPDATE", (episode_id,)
@@ -1674,15 +1631,12 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
                 (str(episode_id), Json(summary)),
             )
             return summary
-    finally:
-        conn.close()
 
 
 def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
     """Hard-delete ONE KG edge by uuid. No cascade — a fact is a leaf; the only cleanup is
     the dangling supersession pointer. None when the uuid doesn't exist (→ 404)."""
-    conn = psycopg.connect(db_url, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         with conn.transaction():
             row = conn.execute(
                 "SELECT uuid FROM kg_relationships WHERE uuid = %s FOR UPDATE", (uuid,)
@@ -1703,8 +1657,6 @@ def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
                 (uuid, Json(result)),
             )
             return result
-    finally:
-        conn.close()
 
 
 def _retire_flag(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str) -> None:
@@ -1801,8 +1753,7 @@ def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dic
     want_skill = kind in (None, "skill")
     want_config = kind in (None, "config-edit")
 
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         out: list[dict[str, Any]] = []
         if want_skill:
             for r in conn.execute(
@@ -1852,8 +1803,6 @@ def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dic
             None,
         )
         return {"proposals": out, "pending_count": pending}
-    finally:
-        conn.close()
 
 
 def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
@@ -1878,8 +1827,7 @@ def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
         rr_sql = "SELECT reject_reason FROM config_lane.config_proposals WHERE id=%s"
 
     full_id = f"{lane}:{n}"
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         provenance = _provenance_episodes(conn, evidence)
         audit_rows = conn.execute(
             "SELECT ts, action, detail FROM dashboard_audit WHERE item_id = %s ORDER BY ts, id",
@@ -1899,8 +1847,6 @@ def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
         # row already carries it, so a dashboard reject isn't shown twice.
         if reject_reason and not any(a["action"] == "proposal_reject" for a in audit_log):
             audit_log.append({"ts": None, "action": "reject_reason", "note": reject_reason})
-    finally:
-        conn.close()
 
     return {
         "id": full_id,
@@ -1934,8 +1880,7 @@ def _proposal_decision(
         return result
 
     audit_action = "proposal_approve" if action == "approve" else "proposal_reject"
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
+    with pg_pool.connection(db_url) as conn:
         conn.execute(
             "INSERT INTO dashboard_audit (action, kind, item_id, detail) VALUES (%s,%s,%s,%s)",
             (
@@ -1945,8 +1890,6 @@ def _proposal_decision(
                 Json({"note": note, "lane_result": result}),
             ),
         )
-    finally:
-        conn.close()
     return result
 
 
@@ -1987,8 +1930,7 @@ def _timeline(
     carries the coarse `salience` plus the 0.3/0.6/0.9 `sal` readout the type ramp reads,
     the resolved `ep:N` episode id, and its flag state."""
     cur = _parse_before(before)
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         where = ["1=1"]
         params: list[Any] = []
         if type_ is not None:
@@ -2034,8 +1976,6 @@ def _timeline(
             last = rows[-1]
             next_before = f"{_iso(last['t_valid'])}|{last['id']}"
         return {"events": events, "next_before": next_before}
-    finally:
-        conn.close()
 
 
 def _preferences(db_url: str, sort: str) -> dict[str, Any]:
@@ -2043,8 +1983,7 @@ def _preferences(db_url: str, sort: str) -> dict[str, Any]:
     ordered by the chosen sort. `superseded_by_text` is the replacing row's pref, joined in
     so the UI can name what won without a second fetch."""
     order = _PREF_SORTS.get(sort, _PREF_SORTS["recency"])
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT p.id, p.pref, p.polarity, p.first_seen, p.last_asserted, p.assert_count, "
             "  p.superseded_by, p.t_invalid, sp.pref AS superseded_by_text "
@@ -2070,16 +2009,13 @@ def _preferences(db_url: str, sort: str) -> dict[str, Any]:
                 for r in rows
             ]
         }
-    finally:
-        conn.close()
 
 
 def _dream_report(db_url: str, limit: int) -> dict[str, Any]:
     """Recent dream_runs (044), newest first — the full per-run drill-in the Dream-report
     page renders. Reuses the same row shaper the Metrics ingestion endpoint's last_dream
     uses. Empty table → {"runs": []}."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT id, started_at, finished_at, stages, counts, samples, errors, ok, "
             "  EXTRACT(EPOCH FROM (finished_at - started_at)) AS duration_s "
@@ -2087,8 +2023,6 @@ def _dream_report(db_url: str, limit: int) -> dict[str, Any]:
             (limit,),
         ).fetchall()
         return {"runs": [_dream_run_json(r) for r in rows]}
-    finally:
-        conn.close()
 
 
 def _wikilinks(content: str | None) -> list[str]:
@@ -2125,14 +2059,11 @@ def _behavior_files(db_url: str) -> dict[str, Any]:
     """The config-lane file mirror, grouped for the left list. One entry per registry row
     (surface_id + scope + file_key is the PK), so the same file_key on two surfaces lists
     twice — the client disambiguates the detail fetch with scope + surface."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT surface_id, scope, file_key, updated_at, octet_length(content) AS size "
             "FROM config_lane.config_registry ORDER BY file_key, scope, surface_id"
         ).fetchall()
-    finally:
-        conn.close()
     grouped: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
         grouped.setdefault(_behavior_group(r["file_key"]), []).append(
@@ -2153,8 +2084,7 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
     _fetch_config; when `surface` is omitted, the most-recently-updated surface for that
     (scope, file_key) is served. No history — the registry keeps only the current version
     (contract §Phase 5)."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         cols = (
             "surface_id, scope, file_key, abs_path, content, content_hash, modified_at, updated_at"
         )
@@ -2170,8 +2100,6 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
                 "WHERE file_key = %s AND scope = %s ORDER BY updated_at DESC LIMIT 1",
                 (key, scope),
             ).fetchone()
-    finally:
-        conn.close()
     if not row:
         return None
     content = row["content"]
@@ -2196,13 +2124,10 @@ def _behavior_linkgraph(db_url: str) -> dict[str, Any]:
     file_key (deduped across surfaces); edges are file_key → wikilink target. A target need
     not be a node (many point at memory notes, which are not mirrored files) — the client
     resolves what it can and renders the rest as inert leaves."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
             "SELECT scope, file_key, content FROM config_lane.config_registry"
         ).fetchall()
-    finally:
-        conn.close()
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, str]] = []
     for r in rows:
@@ -2230,8 +2155,7 @@ def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | No
     """Re-SELECT one feed row by id and map it to the SAME FeedItem shape /feed emits
     (including `flagged`). Returns None for an unknown type or a row that vanished between
     the NOTIFY and this read. Reuses _EP_SELECT/_FACT_SELECT/_TL_SELECT + the mappers."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         if type_ == "episode":
             if not str(id_).isdigit():
                 return None
@@ -2251,16 +2175,13 @@ def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | No
             return None
         item["flagged"] = (item["type"], item["id"]) in _flag_set(conn)
         return item
-    finally:
-        conn.close()
 
 
 def _processing_status(db_url: str) -> dict[str, Any]:
     """Extraction-queue health for the header live badge: {queue_depth, active}. ONE cheap
     indexed count (extraction_queue_status_idx) — the status refresher runs it once/second,
     shared across all connected SSE clients, never per-connection."""
-    conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-    try:
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         row = (
             conn.execute(
                 "SELECT count(*) FILTER (WHERE status = 'pending') AS queue_depth, "
@@ -2273,8 +2194,6 @@ def _processing_status(db_url: str) -> dict[str, Any]:
             "queue_depth": int(row.get("queue_depth") or 0),
             "active": int(row.get("processing") or 0) > 0,
         }
-    finally:
-        conn.close()
 
 
 class _FeedEventBuffer:
