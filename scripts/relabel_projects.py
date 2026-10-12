@@ -46,15 +46,27 @@ private projects and paths, and this repository is public. Format, one per line:
 Usage:
     scripts/relabel_projects.py --dry-run [--aliases FILE] [--db-url DSN] [--out FILE]
     scripts/relabel_projects.py --apply   [--aliases FILE] [--db-url DSN]
+    scripts/relabel_projects.py --inventory-sql
+    scripts/relabel_projects.py --dry-run --inventory FILE [--aliases FILE] [--out FILE]
 
 The DSN comes from --db-url, else $SYNAPSE_DB_URL. --dry-run runs in a READ ONLY
 transaction and writes nothing. --apply re-plans from the live data and commits one
 label at a time, so it can be re-run after an interruption.
+
+Without a DSN on hand (the database only reachable through ``docker exec ... psql``), dry
+run in two steps: ``--inventory-sql`` prints ONE read-only statement whose JSON cell is
+everything the plan reads; run it with ``psql -tA`` and pass the output to ``--dry-run
+--inventory FILE``, which plans without connecting anywhere:
+
+    scripts/relabel_projects.py --inventory-sql > inv.sql
+    docker exec -i <postgres> psql -U synapse -d synapse -tA < inv.sql > inv.json
+    scripts/relabel_projects.py --dry-run --inventory inv.json --aliases FILE
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -422,6 +434,70 @@ def read_inventory(conn: Any) -> Inventory:
     return Inventory(groups, tables, surfaces, skills, config_scopes)
 
 
+#: The read-only inventory as one JSON cell (for ``--inventory``): what read_inventory
+#: reads, in one statement psql can run. Tables with a ``project`` column are found in the
+#: catalog and counted through query_to_xml, so no dynamic SQL needs a function.
+INVENTORY_SQL = r"""
+BEGIN READ ONLY;
+WITH tabs AS (
+  SELECT c.table_schema AS s, c.table_name AS t
+    FROM information_schema.columns c
+    JOIN information_schema.tables tt
+      ON tt.table_schema = c.table_schema AND tt.table_name = c.table_name
+   WHERE c.column_name = 'project' AND c.data_type = 'text' AND tt.table_type = 'BASE TABLE'
+     AND c.table_schema NOT IN ('pg_catalog', 'information_schema')
+     AND NOT (c.table_schema = 'public' AND c.table_name = 'episodes')
+), counts AS (
+  SELECT s, t, x.project, x.n
+    FROM tabs,
+         XMLTABLE('/table/row' PASSING query_to_xml(
+           format('SELECT project, count(*) AS n FROM %I.%I '
+                  'WHERE project IS NOT NULL AND project <> %L GROUP BY 1', s, t, ''),
+           true, false, '')  -- nulls, NOT a forest: an empty table is <table/>
+         COLUMNS project text PATH 'project', n bigint PATH 'n') AS x
+)
+SELECT json_build_object(
+  'episodes', (SELECT coalesce(json_agg(json_build_array(project, cwd, n)), '[]')
+                 FROM (SELECT project, metadata->>'cwd' AS cwd, count(*) AS n FROM episodes
+                        WHERE project IS NOT NULL AND project <> '' GROUP BY 1, 2) e),
+  'tables', (SELECT coalesce(json_object_agg(q, m), '{}')
+               FROM (SELECT format('"%s"."%s"', tabs.s, tabs.t) AS q,
+                            coalesce(json_object_agg(c.project, c.n)
+                                       FILTER (WHERE c.project IS NOT NULL), '{}') AS m
+                       FROM tabs LEFT JOIN counts c ON c.s = tabs.s AND c.t = tabs.t
+                      GROUP BY tabs.s, tabs.t) z),
+  'surfaces', (SELECT coalesce(json_agg(json_build_object(
+                   'surface_id', surface_id, 'allowed_projects', allowed_projects)
+                 ORDER BY surface_id), '[]') FROM surfaces),
+  'skills', (SELECT coalesce(json_agg(json_build_object('name', name, 'scope', scope)
+               ORDER BY name), '[]')
+               FROM skills_lane.skill_registry WHERE scope LIKE 'project:%'),
+  'config_scopes', (SELECT coalesce(json_object_agg(scope, n), '{}')
+                      FROM (SELECT scope, count(*) AS n FROM config_lane.config_registry
+                             WHERE scope LIKE 'project:%' GROUP BY 1) c));
+ROLLBACK;
+"""
+
+
+def inventory_from_json(text: str) -> Inventory:
+    """An Inventory from INVENTORY_SQL's JSON (psql -tA output; the BEGIN/ROLLBACK lines
+    around it are ignored)."""
+    line = next(ln for ln in text.splitlines() if ln.strip().startswith("{"))
+    data = json.loads(line)
+    groups = {(p, c): int(n) for p, c, n in data.get("episodes") or []}
+    tables = {
+        q: {lb: int(n) for lb, n in (m or {}).items()}
+        for q, m in (data.get("tables") or {}).items()
+    }
+    surfaces = [
+        {"surface_id": s["surface_id"], "allowed_projects": list(s.get("allowed_projects") or [])}
+        for s in data.get("surfaces") or []
+    ]
+    skills = [{"name": s["name"], "scope": s["scope"]} for s in data.get("skills") or []]
+    config = {s: int(n) for s, n in (data.get("config_scopes") or {}).items()}
+    return Inventory(groups, tables, surfaces, skills, config)
+
+
 def _unique_project_indexes(conn: Any, qualified: str) -> list[str]:
     """Unique indexes that include ``project``: a relabel there could collide."""
     return [
@@ -563,16 +639,31 @@ def main(argv: list[str] | None = None) -> int:
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="print the mapping, write nothing")
     mode.add_argument("--apply", action="store_true", help="rewrite the stored labels")
+    mode.add_argument("--inventory-sql", action="store_true", help="print the inventory SQL")
     p.add_argument("--aliases", type=Path, help="alias file (keep it outside the repo)")
     p.add_argument("--out", type=Path, help="--dry-run: also write the report here")
+    p.add_argument("--inventory", type=Path, help="--dry-run: plan from --inventory-sql output")
     p.add_argument("--db-url", default=os.environ.get("SYNAPSE_DB_URL", ""))
     args = p.parse_args(argv)
-    if not args.db_url:
-        print("no database URL — pass --db-url or set SYNAPSE_DB_URL", file=sys.stderr)
-        return 2
+    if args.inventory_sql:
+        print(INVENTORY_SQL.strip())
+        return 0
     cfg = AliasConfig()
     if args.aliases:
         cfg = AliasConfig.parse(args.aliases.expanduser().read_text(encoding="utf-8"))
+    if args.inventory is not None:
+        if not args.dry_run:
+            print("--inventory plans offline, so it only goes with --dry-run", file=sys.stderr)
+            return 2
+        inv = inventory_from_json(args.inventory.expanduser().read_text(encoding="utf-8"))
+        text = report(inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels()))
+        print(text, end="")
+        if args.out:
+            args.out.expanduser().write_text(text, encoding="utf-8")
+        return 0
+    if not args.db_url:
+        print("no database URL — pass --db-url or set SYNAPSE_DB_URL", file=sys.stderr)
+        return 2
 
     import psycopg
 
