@@ -34,6 +34,7 @@ deployment that reuses one of these names for real work can opt out entirely.
 from __future__ import annotations
 
 import os
+from typing import Any
 
 # Workspaces that exist to exercise a client, never to do work. Exact match, lowercased.
 _DEFAULT_SCRATCH = frozenset({"axon-test", "axon_test", "test", "tmp", "scratch"})
@@ -60,7 +61,7 @@ def is_scratch_project(project: str | None) -> bool:
     return project.strip().lower() in scratch_projects()
 
 
-def is_scratch_turn(project: str | None, metadata: dict | None) -> bool:
+def is_scratch_turn(project: str | None, metadata: dict[str, Any] | None) -> bool:
     """True if the turn's project, or the folder it ran in, is a scratch workspace.
 
     Clients label a session with its repository's name (``.synapse-project``, else the
