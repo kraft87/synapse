@@ -101,6 +101,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import synapse_ingest_retry as retry
+import synapse_project
 from synapse_filelock import lock_exclusive
 
 INGEST_URL = config.INGEST_URL
@@ -389,13 +390,30 @@ def _is_private(session_id: str) -> bool:
     return True
 
 
+def _records_project(records: list[dict[str, Any]]) -> str | None:
+    """The project label for a batch, resolved from the records' own ``cwd`` the way
+    every client labels a project (synapse_project: marker file, git toplevel, folder).
+
+    The records, not the hook payload, because the catch-up sweep and the history import
+    have no payload, and a swept transcript's session ran somewhere other than this one.
+    None when no record carries a cwd, or when the cwds resolve to different projects:
+    the server then labels each turn from its own cwd, as it does for an old plugin."""
+    cwds = {c for r in records if isinstance(r, dict) and isinstance(c := r.get("cwd"), str) and c}
+    labels = {synapse_project.project_label(c) for c in cwds} - {None}
+    return labels.pop() if len(labels) == 1 else None
+
+
 def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     """POST a batch of raw transcript records to /ingest; returns the (truncated)
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
     bulk history import (import_history.py), so all resolve URL/token identically
-    through config.py. Raises on transport/HTTP errors — callers decide how to
-    fail-soft."""
-    body = json.dumps({"records": records, "source": source}).encode()
+    through config.py, and all send the batch's project label (_records_project).
+    Raises on transport/HTTP errors — callers decide how to fail-soft."""
+    payload: dict[str, Any] = {"records": records, "source": source}
+    project = _records_project(records)
+    if project:
+        payload["project"] = project
+    body = json.dumps(payload).encode()
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
     # soft, so without it every ingest is silently dropped.

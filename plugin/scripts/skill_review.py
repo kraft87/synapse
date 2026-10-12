@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+import synapse_project
 
 _KIND_BADGE = {"retune": "RETUNE", "consolidate": "MERGE", "derive": "DERIVE"}
 _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-file to accept"
@@ -131,13 +132,15 @@ def cmd_show(cid: int) -> None:
 
 def _local_dir(scope: str) -> Path | None:
     """The folder THIS machine syncs for `scope`, or None when it doesn't sync that scope.
-    Mirrors skills_sync.main(): global <-> SKILLS_DIR; project:<name> <-> the session's
-    project dir when its basename is <name> (and it isn't the global folder)."""
+    Mirrors skills_sync.main(): global <-> SKILLS_DIR; project:<label> <-> the session's
+    project root when its project label is <label>, in any case (and it isn't the global
+    folder)."""
     if scope == "global":
         return config.SKILLS_DIR
     proj = os.environ.get("CLAUDE_PROJECT_DIR")
-    if scope.startswith("project:") and proj and Path(proj).name == scope.split(":", 1)[1]:
-        d = Path(proj) / ".claude" / "skills"
+    label, root = synapse_project.resolve(proj) if proj else (None, None)
+    if scope.startswith("project:") and label and label.lower() == scope[8:].lower():
+        d = (root or Path(proj)) / ".claude" / "skills"
         if d.resolve() != config.SKILLS_DIR.resolve():
             return d
     return None

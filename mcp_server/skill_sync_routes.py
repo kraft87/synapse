@@ -104,12 +104,16 @@ def _file_shas(c, name: str) -> list[dict]:
 
 def _list_skills(db_url: str, scope: str) -> dict:
     """The skills in `scope`: active ones under "skills" (all an older client reads), and,
-    once schema 060 is applied, retired ones under "retired"."""
+    once schema 060 is applied, retired ones under "retired".
+
+    A project scope matches in any case: a project's label keeps its folder's case, and
+    the same project can reach the server as ``project:Repo`` from one machine and
+    ``project:repo`` from another."""
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         skills = c.execute(
             "SELECT name, scope, COALESCE(body,'') AS body, COALESCE(description,'') AS description, "
             "content_modified_at FROM skills_lane.skill_registry "
-            "WHERE status='active' AND scope=%s ORDER BY name",
+            "WHERE status='active' AND lower(scope)=lower(%s) ORDER BY name",
             (scope,),
         ).fetchall()
         listing = {
@@ -375,7 +379,8 @@ def _proposals_list(db_url: str) -> dict:
 def _evidence_scope(c, evidence) -> str:
     """'project:<name>' when every evidence session ran in that one project, else 'global'.
     Unprovable (no sessions, a session with no episodes, an untagged or home-dir session)
-    stays global."""
+    stays global. Labels that differ only in case are one project (the most common
+    spelling names it); a label that could not be a scope (a stored path) stays global."""
     sids = sorted(
         {e["session_id"] for e in evidence or [] if isinstance(e, dict) and e.get("session_id")}
     )
@@ -388,12 +393,14 @@ def _evidence_scope(c, evidence) -> str:
     ).fetchall()
     if {r["session_id"] for r in rows} != set(sids):
         return "global"
-    projects = {r["project"] for r in rows}
-    if len(projects) != 1 or None in projects:
+    projects = [r["project"] for r in rows]
+    if None in projects or len({p.lower() for p in projects}) != 1:
         return "global"
     if any(r["cwd"] and _HOME_DIR_RE.match(r["cwd"]) for r in rows):
         return "global"
-    return f"project:{projects.pop()}"
+    name = max(sorted(set(projects)), key=projects.count)
+    scope = f"project:{name}"
+    return scope if _SCOPE_RE.match(scope) else "global"
 
 
 def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = False) -> dict:

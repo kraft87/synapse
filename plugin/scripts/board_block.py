@@ -9,8 +9,8 @@ the board now, so one block covers both. Server-rendered and hard-capped server-
 this hook just fetches and prints, so caps and layout evolve without a plugin release.
 
 Reads the machine-token-gated ``GET /context`` route (thin client, no DSN). The project
-scope comes from the hook payload's ``cwd``, labeled the same way the ingest path labels
-episodes (mirror of ``ingestion.jsonl_client._cwd_to_project`` — basename of cwd).
+scope comes from the hook payload's ``cwd``, labeled exactly as the ingest hook labels
+the episodes it sends (``synapse_project``: marker file, git toplevel, folder name).
 
 No ``surface`` param is sent any more (schema 054): the token identifies the caller, and
 a hostname the client asserts is no longer evidence of anything. Enrollment itself is
@@ -37,6 +37,7 @@ import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import enroll
+import synapse_project
 from config import _cfg, get_json, token_override_notice
 
 
@@ -56,23 +57,15 @@ def _emit_context(parts: list[str], user_notice: str = "") -> None:
     print(json.dumps(out))
 
 
-def _cwd_to_project(cwd: str | None) -> str | None:
-    """Mirror of ``ingestion.jsonl_client._cwd_to_project`` — kept inline so the hook
-    stays dependency-free (it runs under the CLI's bare Python, off the repo path).
-    Must stay in lockstep: the board's project scope has to match how episodes are
-    labeled, or the project section goes empty."""
-    if not cwd:
-        return None
-    return cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or None
-
-
 def _project_label() -> str | None:
-    """Project label from the hook payload's cwd; falls back to the process cwd."""
+    """Project label for the hook payload's cwd; falls back to the process cwd. The same
+    resolver labels the episodes the ingest hook sends, so the board's project section
+    reads exactly the project its sessions are filed under."""
     try:
         cwd = json.loads(sys.stdin.read() or "{}").get("cwd")
     except Exception:
         cwd = None
-    return _cwd_to_project(cwd) or _cwd_to_project(os.getcwd())
+    return synapse_project.project_label(cwd) or synapse_project.project_label(os.getcwd())
 
 
 def _board_parts() -> list[str]:

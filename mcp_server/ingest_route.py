@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.project_label import clean_label
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
@@ -68,7 +69,9 @@ def register(
         if not isinstance(records, list):
             return err("body must contain a 'records' list", 400)
         source_label = body.get("source") or "hook"
-        project_override = body.get("project")
+        # The client resolves the label (marker file, git toplevel, folder name); without
+        # one the parser labels from the transcript's cwd. Either way, never a path.
+        project_override = clean_label(body.get("project"))
         record_format = body.get("format") or "claude_code"
         session_id_hint = body.get("session_id")
         if record_format not in ("claude_code", "codex"):

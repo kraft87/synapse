@@ -52,7 +52,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from typing import Any
 
 import psycopg
@@ -212,6 +213,76 @@ def own_surface_served(db_url: str, trust: SurfaceTrust | None) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Case-insensitive allowlists
+# ---------------------------------------------------------------------------
+
+#: Schema 061's (project, created_at) index on episodes. The variant walk below is a skip
+#: scan over it; without the index it would read the whole table per step, so until a
+#: valid index exists an allowlist matches exactly as written (the pre-0.21 behaviour).
+PROJECT_INDEX_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_index "
+    "WHERE indexrelid = to_regclass('episodes_project_created_idx') AND indisvalid",
+    "schema 061 (episodes (project, created_at) index)",
+)
+
+#: Every stored label whose lower-case form is in the list: a skip scan over the distinct
+#: projects (one index probe each), filtered as it goes.
+_CASE_VARIANTS_SQL = """
+WITH RECURSIVE labeled(project) AS (
+  (SELECT project FROM episodes WHERE project > '' ORDER BY project LIMIT 1)
+  UNION ALL
+  SELECT (SELECT e.project FROM episodes e WHERE e.project > labeled.project
+          ORDER BY e.project LIMIT 1)
+  FROM labeled WHERE labeled.project IS NOT NULL
+)
+SELECT project FROM labeled WHERE lower(project) = ANY(%s)
+"""
+
+#: Variants found per allowlist, briefly. Staleness can only under-serve: a casing that
+#: first appears inside the window is matched once it expires.
+_VARIANT_TTL_SECONDS = 60.0
+_variant_cache: dict[tuple[str, tuple[str, ...]], tuple[float, tuple[str, ...]]] = {}
+
+
+def expand_allowlist(conn: Any, key: str, allowed: tuple[str, ...]) -> tuple[str, ...]:
+    """``allowed`` plus every stored casing of each entry, so an allowlist matches its
+    projects case-insensitively while each read keeps its exact ``project = ANY(...)`` /
+    ``source_projects <@ ...`` predicate (and the indexes behind them).
+
+    A project's label keeps its folder's case, and the same folder can reach the server
+    in several casings (a Windows path typed in lower case, a clone made under another
+    name). Returns ``allowed`` unchanged on any failure: an allowlist is never widened
+    beyond its own spellings by an error."""
+    if not allowed:
+        return allowed
+    folded = tuple(sorted({p.lower() for p in allowed}))
+    now = time.monotonic()
+    hit = _variant_cache.get((key, folded))
+    if hit is not None and now - hit[0] < _VARIANT_TTL_SECONDS:
+        found = hit[1]
+    else:
+        try:
+            if not PROJECT_INDEX_PROBE.ready(conn, key):
+                return allowed
+            found = tuple(
+                str(r[0] if not isinstance(r, dict) else r["project"])
+                for r in conn.execute(_CASE_VARIANTS_SQL, (list(folded),)).fetchall()
+            )
+        except Exception as e:
+            logger.warning("allowlist case expansion failed (%s); matching exactly", e)
+            return allowed
+        _variant_cache[(key, folded)] = (now, found)
+    return allowed + tuple(p for p in found if p not in allowed)
+
+
+def _with_case_variants(conn: Any, key: str, st: SurfaceTrust) -> SurfaceTrust:
+    if not st.restricted or not st.allowed_projects:
+        return st
+    expanded = expand_allowlist(conn, key, st.allowed_projects)
+    return st if expanded == st.allowed_projects else replace(st, allowed_projects=expanded)
+
+
 #: The verdict for "no surface id", "no such surface", or any lookup failure.
 UNKNOWN_SURFACE = SurfaceTrust()
 
@@ -328,19 +399,22 @@ def resolve_caller(
                     _touch_last_seen(conn, th)
             else:
                 row = cur.execute(_SELECT_BY_ID, (sid,)).fetchone()
+            if row is None:
+                # A hostname/oauth id with no row keeps its id on the verdict (it is not
+                # secret and it makes an empty board diagnosable). A token that matched
+                # nothing keeps NOTHING — echoing a credential-derived id back would be
+                # an oracle.
+                return SurfaceTrust(surface_id=sid or None)
+            # Only the token lane is credential-bound here. The id lane is either a
+            # deprecated self-reported hostname or an ``oauth:<login>`` id that
+            # mcp_server.caller_trust derived from a verified identity and marks bound
+            # itself.
+            st = _row_to_trust(str(row["surface_id"]), row, credential_bound=bool(th))
+            return _with_case_variants(conn, db_url, st)
     except Exception as e:
         # Fail CLOSED and say so: an operator staring at an empty board needs the reason.
         logger.warning("surface resolve failed (%s); treating as restricted", e)
         return UNKNOWN_SURFACE
-    if row is None:
-        # A hostname/oauth id with no row keeps its id on the verdict (it is not secret
-        # and it makes an empty board diagnosable). A token that matched nothing keeps
-        # NOTHING — echoing a credential-derived id back would be an oracle.
-        return SurfaceTrust(surface_id=sid or None)
-    # Only the token lane is credential-bound here. The id lane is either a deprecated
-    # self-reported hostname or an ``oauth:<login>`` id that mcp_server.caller_trust
-    # derived from a verified identity and marks bound itself.
-    return _row_to_trust(str(row["surface_id"]), row, credential_bound=bool(th))
 
 
 def lookup_surface(db_url: str, surface_id: str | None) -> SurfaceTrust:
@@ -399,7 +473,7 @@ def derive_audience(
         return explicit
     if caller_restricted:
         return RESTRICTED_AUDIENCE
-    if project and project in restricted_project_union(db):
+    if project and project.lower() in {p.lower() for p in restricted_project_union(db)}:
         return RESTRICTED_AUDIENCE
     return DEFAULT_AUDIENCE
 

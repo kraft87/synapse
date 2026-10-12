@@ -23,6 +23,7 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.project_label import label_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +138,8 @@ def _extract_blocks(
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    return cwd.rstrip("/").rsplit("/", 1)[-1] or None
+    """Fallback label for a body sent without ``project`` (see ingestion.project_label)."""
+    return label_from_path(cwd)
 
 
 class JSONLParser:
