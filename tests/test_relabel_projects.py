@@ -814,3 +814,42 @@ def test_a_bad_alias_file_stops_before_touching_the_database(tmp_path, monkeypat
     monkeypatch.setattr("psycopg.connect", _no_connect)
     with pytest.raises(ValueError, match="line 1"):
         rp.main(["--apply", "--aliases", str(bad), "--db-url", "postgresql://unused/x_test"])
+
+
+# ---------------------------------------------------------------------------
+# Allowlists never widen; the report shows roots and skipped tables
+# ---------------------------------------------------------------------------
+
+
+def test_an_allowlisted_subfolder_is_never_widened_to_its_whole_project():
+    """A device allowed only `<repo>\\tickets` must not end up allowed the whole repo: the
+    entry is kept as it is (after the relabel it matches nothing: fail-closed) and the
+    dry run says so. Allowed through another entry, the subfolder entry just merges."""
+    plan = _plan({(WIN, WIN): 10, (WIN + r"\tickets", WIN + r"\tickets"): 3}, aliases="")
+    only_sub = [WIN + r"\tickets", "other-proj"]
+    assert rp.map_allowlist(plan, only_sub) == only_sub
+    assert rp.widening_entries(plan, only_sub) == [(WIN + r"\tickets", "BigProj")]
+    both = [WIN + r"\tickets", WIN, "bigproj"]
+    assert rp.map_allowlist(plan, both) == ["BigProj"]
+    assert rp.widening_entries(plan, both) == []
+    # a path, a case variant or an alias of the project itself is the same project (an
+    # allowlist's entries are planned too: Inventory.other_labels includes them)
+    plan = _plan({(WIN, WIN): 10}, aliases="", other=[WIN_LC, "BIGPROJ"])
+    assert rp.map_allowlist(plan, [WIN_LC, "BIGPROJ"]) == ["BigProj"]
+
+
+def test_the_report_flags_a_widening_allowlist_entry_and_lists_absorbing_roots():
+    groups = {(WIN, WIN): 10, (WIN + r"\tickets", WIN + r"\tickets"): 3}
+    plan = _plan(groups, aliases="")
+    surfaces = [{"surface_id": "dev-sub-only", "allowed_projects": [WIN + r"\tickets"]}]
+    text = rp.report(rp.Inventory(groups, {}, surfaces, []), plan)
+    assert "dev-sub-only" in text and "is part of 'BigProj'" in text
+    assert "project roots that absorb other labels" in text
+    assert f"{WIN_ROOT}  <-  1 label(s): {WIN}\\tickets" in text
+
+
+def test_the_report_marks_a_table_apply_will_skip():
+    groups = {(WIN, WIN): 1}
+    inv = rp.Inventory(groups, {'"x"."uniq"': {WIN: 2}}, [], [], {}, {'"x"."uniq"'})
+    text = rp.report(inv, _plan(groups, aliases=""))
+    assert '"x"."uniq": 2 rows WOULD change, but --apply SKIPS this table' in text

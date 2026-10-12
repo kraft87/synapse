@@ -33,8 +33,10 @@ What is rewritten: ``episodes.project`` (per label and cwd; the
 ``episodes_kg_source_projects_relabel`` trigger recomputes the facts that cite each
 episode), the ``project`` column of every other table that has one (found in the
 catalog, so prod-only tables are included), each surface's ``allowed_projects``
-(mapped, de-duplicated case-insensitively), and ``project:<label>`` skill scopes in
-``skills_lane.skill_registry``.
+(mapped, de-duplicated case-insensitively, and never widened: an entry naming a
+subfolder of a project the device is not otherwise allowed is kept as it is and flagged),
+and ``project:<label>`` scopes in ``skills_lane.skill_registry`` and
+``config_lane.config_registry``.
 
 The alias file stays OUTSIDE the repository, like the dry run's output: both name
 private projects and paths, and this repository is public. Format, one per line:
@@ -214,6 +216,9 @@ class Plan:
     #: label -> canonical for tables without a cwd (and allowlists, skill scopes).
     labels: dict[str, str]
     roots: dict[str, str]  # root key -> display path
+    #: Labels whose canonical name is a PARENT project (a subfolder or worktree folded
+    #: into its root). Mapping such an allowlist entry would widen what a device reads.
+    folded: frozenset[str] = frozenset()
 
     def map_label(self, label: str | None) -> str | None:
         if label is None:
@@ -310,8 +315,11 @@ class Planner:
             pre[(label, cwd)] = (name2, root, why)
             totals[name2] += n
         label_pre: dict[str, tuple[str, str]] = {}
+        folded: set[str] = set()
         for label in {lb for lb, _ in episode_groups} | set(other_labels):
             name, _root, why = base_of(label, None)
+            if why.startswith("subfolder"):
+                folded.add(label)
             name2, aliased = alias(name)
             if aliased and name2 != name:
                 why = "alias" if why == "kept" else f"{why}, alias"
@@ -351,19 +359,42 @@ class Planner:
             for (label, root, canonical, why), rows in agg.items()
         ]
         changes.sort(key=lambda c: (c.canonical.casefold(), c.label, c.cwd_root or ""))
-        return Plan(groups=groups, changes=changes, labels=labels, roots=roots)
+        return Plan(
+            groups=groups, changes=changes, labels=labels, roots=roots, folded=frozenset(folded)
+        )
 
 
 def map_allowlist(plan: Plan, entries: Iterable[str]) -> list[str]:
-    """Each entry mapped, first spelling of each name kept, case-insensitively unique."""
+    """Each entry mapped, first spelling of each name kept, case-insensitively unique.
+
+    Never wider than before: an entry that names a subfolder or worktree of a project
+    (it only reaches its canonical name by folding into the parent) is mapped only when
+    that project is already allowed through another entry. Otherwise it is kept as it is,
+    which after the relabel matches nothing (fail-closed); the dry run says so
+    (``widening_entries``) and the owner decides whether the device gets the project."""
+    entries = list(entries)
+    allowed = {(plan.map_label(e) or e).casefold() for e in entries if e not in plan.folded}
     out: list[str] = []
     seen: set[str] = set()
     for e in entries:
         m = plan.map_label(e) or e
+        if e in plan.folded and m.casefold() not in allowed:
+            m = e
         if m.casefold() not in seen:
             seen.add(m.casefold())
             out.append(m)
     return out
+
+
+def widening_entries(plan: Plan, entries: Iterable[str]) -> list[tuple[str, str]]:
+    """``(entry, project)`` for each entry map_allowlist leaves as it is rather than widen."""
+    entries = list(entries)
+    allowed = {(plan.map_label(e) or e).casefold() for e in entries if e not in plan.folded}
+    return [
+        (e, plan.map_label(e) or e)
+        for e in entries
+        if e in plan.folded and (plan.map_label(e) or e).casefold() not in allowed
+    ]
 
 
 def map_scope(plan: Plan, scope: str) -> str:
@@ -396,6 +427,8 @@ class Inventory:
     surfaces: list[dict[str, Any]]
     skills: list[dict[str, Any]]
     config_scopes: dict[str, int] = field(default_factory=dict)  # 'project:<label>' -> rows
+    #: Tables --apply skips: a unique index includes their project column.
+    unique_tables: set[str] = field(default_factory=set)
 
     def other_labels(self) -> set[str]:
         """Every label outside episodes, allowlists and scopes included: a re-run after an
@@ -450,7 +483,8 @@ def read_inventory(conn: Any) -> Inventory:
                 "WHERE scope LIKE 'project:%' GROUP BY 1"
             ).fetchall()
         }
-    return Inventory(groups, tables, surfaces, skills, config_scopes)
+    unique = {q for q in tables if _unique_project_indexes(conn, q)}
+    return Inventory(groups, tables, surfaces, skills, config_scopes, unique)
 
 
 #: The read-only inventory as one JSON cell (for ``--inventory``): what read_inventory
@@ -493,7 +527,13 @@ SELECT json_build_object(
                FROM skills_lane.skill_registry WHERE scope LIKE 'project:%'),
   'config_scopes', (SELECT coalesce(json_object_agg(scope, n), '{}')
                       FROM (SELECT scope, count(*) AS n FROM config_lane.config_registry
-                             WHERE scope LIKE 'project:%' GROUP BY 1) c));
+                             WHERE scope LIKE 'project:%' GROUP BY 1) c),
+  'unique_tables', (SELECT coalesce(json_agg(DISTINCT format('"%s"."%s"', tabs.s, tabs.t)), '[]')
+                      FROM tabs
+                      JOIN pg_index i ON i.indisunique
+                       AND i.indrelid = format('%I.%I', tabs.s, tabs.t)::regclass
+                      JOIN pg_attribute a ON a.attrelid = i.indrelid
+                       AND a.attnum = ANY(i.indkey) AND a.attname = 'project'));
 ROLLBACK;
 """
 
@@ -514,7 +554,8 @@ def inventory_from_json(text: str) -> Inventory:
     ]
     skills = [{"name": s["name"], "scope": s["scope"]} for s in data.get("skills") or []]
     config = {s: int(n) for s, n in (data.get("config_scopes") or {}).items()}
-    return Inventory(groups, tables, surfaces, skills, config)
+    unique = set(data.get("unique_tables") or [])
+    return Inventory(groups, tables, surfaces, skills, config, unique)
 
 
 def _unique_project_indexes(conn: Any, qualified: str) -> list[str]:
@@ -543,6 +584,17 @@ def report(inv: Inventory, plan: Plan) -> str:
     out.append("| --- | --- | --- | ---: | --- |")
     for c in plan.changes:
         out.append(f"| {c.label} | {c.cwd_root or ''} | {c.canonical} | {c.rows} | {c.reason} |")
+    absorbed: dict[str, set[str]] = defaultdict(set)
+    for c in plan.changes:
+        if c.cwd_root and c.reason.startswith("subfolder"):
+            absorbed[c.cwd_root].add(c.label)
+    if absorbed:
+        out.append(
+            "\nproject roots that absorb other labels (a wrong one is a folder that holds "
+            "projects: add `container: <path>` to the alias file and run the dry run again):"
+        )
+        for root, labels in sorted(absorbed.items()):
+            out.append(f"  {root}  <-  {len(labels)} label(s): {', '.join(sorted(labels))}")
     out.append("\ncanonical labels after (episodes):")
     counts: dict[str, int] = defaultdict(int)
     for key, n in inv.episode_groups.items():
@@ -551,7 +603,14 @@ def report(inv: Inventory, plan: Plan) -> str:
         out.append(f"  {n:>7}  {name}")
     for q, labels in inv.tables.items():
         ch = {lb: plan.map_label(lb) for lb in labels if plan.map_label(lb) != lb}
-        if ch:
+        if ch and q in inv.unique_tables:
+            out.append(
+                f"\n{q}: {sum(labels[lb] for lb in ch)} rows WOULD change, but --apply SKIPS "
+                "this table (a unique index includes project): relabel it by hand"
+            )
+            for lb, new in sorted(ch.items()):
+                out.append(f"  {labels[lb]:>7}  {lb} -> {new}")
+        elif ch:
             out.append(f"\n{q}: {sum(labels[lb] for lb in ch)} rows change")
             for lb, new in sorted(ch.items()):
                 out.append(f"  {labels[lb]:>7}  {lb} -> {new}")
@@ -562,6 +621,11 @@ def report(inv: Inventory, plan: Plan) -> str:
         new = map_allowlist(plan, s["allowed_projects"])
         mark = "" if new != s["allowed_projects"] else "  (unchanged)"
         out.append(f"  {s['surface_id']}: {s['allowed_projects']} -> {new}{mark}")
+        for entry, project in widening_entries(plan, s["allowed_projects"]):
+            out.append(
+                f"    ! {entry!r} is part of {project!r}, which this device is not allowed: "
+                "kept as is (it will match nothing). Add the project yourself to grant it."
+            )
     out.append("\nconfig_lane.config_registry.scope:")
     for scope, n in sorted(inv.config_scopes.items()):
         new = map_scope(plan, scope)
