@@ -358,8 +358,9 @@ def _settle_unserved(
     pulled: dict | None = None,
 ):
     """Settle a local copy of a skill this folder is no longer served. The one removal
-    path, for a retirement (``retired``) and for a skill withdrawn from this folder: moved
-    to another scope, or one this device may not read. Returns:
+    path (issue #222 part 6's retire flow, generalised), for a retirement (``retired``)
+    and for a skill withdrawn from this folder: moved to another scope, or one this device
+    may not read. Returns:
 
     * "removed" — still exactly a version Synapse delivered (whatever its timestamp: a
       clone, a restore or a copy renews that). The entry vouches for the versions
