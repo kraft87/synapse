@@ -116,7 +116,15 @@ DEFAULT_CONTAINERS = frozenset(
         "worktrees",
     }
 )
-_HOME = re.compile(r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+)$", re.IGNORECASE)
+_HOME = re.compile(
+    r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:/Users/[^/]+|/mnt/[a-z]/Users/[^/]+)$",
+    re.IGNORECASE,
+)
+#: Folders that hold home directories, drives or mounts: never a project, whatever ran there.
+_ABOVE_HOME = re.compile(
+    r"^(?:/home|/Users|/mnt|/media|/Volumes|[A-Za-z]:/Users|/mnt/[a-z]|/mnt/[a-z]/Users)$",
+    re.IGNORECASE,
+)
 _TEMP_ROOT = re.compile(r"^(?:/tmp|/var/tmp|/private/tmp|[A-Za-z]:/Windows/Temp)(?:/|$)", re.I)
 _ONEDRIVE = re.compile(r"^onedrive(?: - .*)?$", re.IGNORECASE)
 _DRIVE_PATH = re.compile(r"^/?([A-Za-z]):(?=/|$)")
@@ -224,6 +232,7 @@ class Planner:
             p == "/"
             or bool(re.fullmatch(r"[A-Z]:/", p))
             or bool(_HOME.match(p))
+            or bool(_ABOVE_HOME.match(p))
             or bool(_TEMP_ROOT.match(p) and p.count("/") <= 2)
             or base in DEFAULT_CONTAINERS
             or bool(_ONEDRIVE.match(base))
@@ -246,16 +255,21 @@ class Planner:
         episode_groups: dict[tuple[str, str | None], int],
         other_labels: Iterable[str] = (),
     ) -> Plan:
-        # 1. Candidate roots: every directory a label was derived from.
-        candidates: dict[str, str] = {}
-        for label, cwd in episode_groups:
+        # 1. Candidate roots: every directory a label was derived from. A Windows folder
+        #    seen in several casings is one candidate, spelled the way most rows spell it.
+        spellings: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for (label, cwd), n in episode_groups.items():
             p = self._derived_path(label, cwd)
             if p and not self._excluded(p):
-                candidates.setdefault(path_key(p), p)
+                spellings[path_key(p)][p] += n
         for label in other_labels:
             p = self._derived_path(label, None)
             if p and not self._excluded(p):
-                candidates.setdefault(path_key(p), p)
+                spellings[path_key(p)][p] += 0
+        candidates = {
+            k: sorted(seen, key=lambda sp, seen=seen: (-seen[sp], sp))[0]
+            for k, seen in spellings.items()
+        }
         # 2. Roots: candidates with no candidate above them.
         roots = {
             k: p
@@ -383,8 +397,12 @@ class Inventory:
     config_scopes: dict[str, int] = field(default_factory=dict)  # 'project:<label>' -> rows
 
     def other_labels(self) -> set[str]:
+        """Every label outside episodes, allowlists and scopes included: a re-run after an
+        interruption must still map the ones no table holds any more."""
         labels = {lb for counts in self.tables.values() for lb in counts}
         labels |= {s[len("project:") :] for s in self.config_scopes}
+        labels |= {s["scope"][len("project:") :] for s in self.skills}
+        labels |= {p for s in self.surfaces for p in s["allowed_projects"]}
         return labels
 
 
