@@ -23,9 +23,12 @@ The parts of Synapse, and the stack they run on. How they fit together is
 - **MCP server** — FastMCP over streamable HTTP. Tool list: [docs/tools.md](tools.md).
 - **Claude Code plugin** — ingest + recall wiring, plus a nightly dream→skills lane that
   mines your transcripts to maintain a self-improving skill library, with opt-in two-way
-  skill sync (`SYNAPSE_SKILLS_SYNC=1`). See [plugin/README.md](../plugin/README.md).
+  skill sync (`synapse login` asks). See [plugin/README.md](../plugin/README.md).
 - **Codex CLI client** brings the same per-session surface to OpenAI Codex CLI. See
   [plugin-codex/README.md](../plugin-codex/README.md).
+- **One setup command per machine** — the server serves its own client
+  (`curl <server>/install | python3 -`), and `synapse login` enrolls the machine, keeps its
+  settings in `~/.synapse/config.json`, and wires Claude Code and Codex.
 
 ## Stack
 

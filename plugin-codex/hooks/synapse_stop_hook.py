@@ -78,8 +78,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-# The bearer comes from the shared resolver so this hook, the board and the MCP header
-# helper always agree: on an enrolled machine the saved device token beats a stale env
+# The URL and bearer come from the shared resolver so this hook, the board and the MCP
+# header helper always agree (env, then ~/.synapse/config.json, then the Claude plugin's
+# saved options): on an enrolled machine the saved device token beats a stale env
 # SYNAPSE_INGEST_TOKEN (common._resolve_token). Stdlib-only, like this hook.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 # The failure bookkeeping is the Claude plugin's (synapse_ingest_retry), from this
@@ -87,39 +88,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 # imports.
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
 import synapse_ingest_retry as retry
-from common import TOKEN
+from common import INGEST_URL, TOKEN
 from synapse_filelock import lock_exclusive
 
-
-def _claude_plugin_options() -> dict[str, str]:
-    """Fallback config source: the Synapse *Claude Code* plugin persists
-    SYNAPSE_URL / SYNAPSE_INGEST_TOKEN in ~/.claude/settings.json at install
-    time. Codex hooks only inherit plain env, so on a machine running both
-    plugins this reuses that config instead of requiring duplicate env vars.
-    Env always wins here; the token is resolved in common (see above)."""
-    try:
-        data = json.loads(
-            Path(os.path.expanduser("~/.claude/settings.json")).read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError):
-        return {}
-    merged: dict[str, str] = {}
-    for cfg_key, cfg in (data.get("pluginConfigs") or {}).items():
-        if str(cfg_key).split("@", 1)[0] == "synapse":
-            opts = cfg.get("options") or {}
-            merged.update({k: str(v) for k, v in opts.items() if v not in (None, "")})
-    return merged
-
-
-_FALLBACK = _claude_plugin_options()
-
-
-def _cfg(key: str, default: str = "") -> str:
-    return os.environ.get(key) or _FALLBACK.get(key) or default
-
-
-BASE_URL = _cfg("SYNAPSE_URL", "http://localhost:8765").rstrip("/")
-INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
 LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
 CURSORS_PATH = Path(

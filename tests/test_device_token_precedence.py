@@ -23,6 +23,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -109,6 +110,11 @@ def _setup(
         monkeypatch.delenv(var, raising=False)
     for k, v in (env or {}).items():
         monkeypatch.setenv(k, v)
+
+
+def _home_config() -> dict:
+    """~/.synapse/config.json as enrollment left it (SYNAPSE_HOME is the conftest scratch)."""
+    return json.loads((Path(os.environ["SYNAPSE_HOME"]) / "config.json").read_text())
 
 
 def _load(name: str) -> ModuleType:
@@ -353,6 +359,79 @@ def test_the_device_token_never_goes_to_another_server(monkeypatch, tmp_path, va
     assert cfg.INGEST_TOKEN == _STALE and cfg.TOKEN_OVERRIDE == {}
 
 
+@pytest.mark.parametrize("env_token", [None, _STALE])
+def test_a_moved_saved_url_never_gets_the_device_token(monkeypatch, tmp_path, env_token):
+    """`config.json` pointed at another server (by hand, or an old `synapse config url`):
+    the device token stays with the server that minted it, even with nothing else to send."""
+    env = {"SYNAPSE_INGEST_TOKEN": env_token} if env_token else {}
+    _setup(monkeypatch, tmp_path, record=_record(), env=env)
+    home = Path(os.environ["SYNAPSE_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({"url": "https://other.example.org"}))
+    cfg = _load("config")
+    assert cfg.BASE_URL == "https://other.example.org"
+    assert cfg.INGEST_TOKEN == (env_token or "")
+    if env_token:  # that server's own token: sent, and nothing to say
+        assert cfg.TOKEN_OVERRIDE == {}
+    else:  # nothing sent: never in silence
+        notice = cfg.token_override_notice()
+        assert "https://other.example.org is not the server this machine enrolled with" in notice
+        assert "synapse config url https://other.example.org --same-server" in notice
+        assert "synapse login --url https://other.example.org --reenroll" in notice
+        _no_token_material(notice)
+
+
+def test_codex_never_sends_the_device_token_to_a_moved_url(monkeypatch, tmp_path):
+    home = Path(os.environ["SYNAPSE_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({"url": "https://other.example.org"}))
+    common = _codex_common(monkeypatch, tmp_path, record=_record(), env_token=None)
+    assert common.BASE_URL == "https://other.example.org" and common.TOKEN == ""
+    assert "--same-server" in common.token_override_notice()
+
+
+def test_a_plugin_url_holding_the_device_token_keeps_getting_it(monkeypatch, tmp_path, capsys):
+    """0.19: the plugin's URL changed to the same server's new address in Claude's own
+    dialog. That plugin config holds the device token, and its MCP header sends it there
+    anyway: the hooks keep sending it too, as 0.19 did."""
+    _setup(monkeypatch, tmp_path, record=_record(server="http://localhost:8765"))
+    cfg = _load("config")
+    assert cfg.BASE_URL == _URL
+    assert cfg.INGEST_TOKEN == _DEVICE and cfg.TOKEN_OVERRIDE == {}
+    common = _codex_common(
+        monkeypatch, tmp_path, record=_record(server="http://localhost:8765"), env_token=None
+    )
+    assert common.TOKEN == _DEVICE and common.token_override_notice() == ""
+
+
+def test_a_plugin_url_not_holding_the_device_token_does_not_widen(monkeypatch, tmp_path):
+    """A fresh 0.20 machine keeps its token in config.json only: a plugin URL changed in
+    Claude's dialog gets no device token from the hooks."""
+    _setup(monkeypatch, tmp_path, saved=None, record=_record(server="http://localhost:8765"))
+    home = Path(os.environ["SYNAPSE_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.json").write_text(json.dumps({"token": _DEVICE}))
+    cfg = _load("config")
+    assert cfg.BASE_URL == _URL and cfg.INGEST_TOKEN == ""
+
+
+def test_a_record_too_old_to_name_its_server_goes_by_config_json_without_a_plugin_config(
+    monkeypatch, tmp_path
+):
+    """Enrolled before 0.19.3, migrated by `synapse login`, and no Claude plugin config
+    this reader can see (another CLAUDE_CONFIG_DIR, or the options removed)."""
+    _setup(monkeypatch, tmp_path, saved=None, record=None)
+    home = Path(os.environ["SYNAPSE_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    record = {**_record(server=None)}
+    (home / "config.json").write_text(json.dumps({"url": _URL, "token": _DEVICE, "device": record}))
+    (Path(os.environ["CLAUDE_CONFIG_DIR"]) / "settings.json").write_text("{}")
+    cfg = _load("config")
+    assert cfg.INGEST_TOKEN == _DEVICE
+    common = _codex_common(monkeypatch, tmp_path, record=None, env_token=None, plugin=False)
+    assert common.TOKEN == _DEVICE
+
+
 def test_the_same_server_spelled_differently_still_overrides(monkeypatch, tmp_path):
     _setup(
         monkeypatch,
@@ -381,8 +460,10 @@ def test_enrollment_records_the_hash_and_server_but_not_the_token(monkeypatch, t
     state = enroll._persist(dict(_MINTED))
     assert state["token_sha256"] == _sha(_DEVICE)
     assert state["server"] == _URL
-    raw = (tmp_path / "data" / "device.json").read_text()
-    _no_token_material(raw)
+    saved = _home_config()
+    assert saved["token"] == _DEVICE  # the credential file holds the token...
+    _no_token_material(json.dumps(saved["device"]))  # ...its record never does
+    assert not (tmp_path / "data" / "device.json").exists()
     _no_token_material(capsys.readouterr().out)
 
     # The next hook process prefers the minted token over the stale env value.
@@ -421,7 +502,7 @@ def test_reenroll_replaces_the_hash(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["synapse_login.py", "--reenroll"])
     assert login.main() == 0
 
-    record = json.loads((tmp_path / "data" / "device.json").read_text())
+    record = _home_config()["device"]
     assert record["token_sha256"] == _sha(new) != _sha(_DEVICE)
     _no_token_material(json.dumps(record))
     assert new not in json.dumps(record)
@@ -433,21 +514,15 @@ def test_reenroll_replaces_the_hash(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _codex_common(monkeypatch, tmp_path, *, record, env_token):
+def _codex_common(monkeypatch, tmp_path, *, record, env_token, plugin: bool = True):
     """plugin-codex/scripts/common.py reads ~/.claude/settings.json and the Claude
-    plugin's device.json; HOME points both at the scratch dir."""
+    plugin's device.json; HOME points both at the scratch dir. ``plugin`` False: no
+    Claude plugin config there."""
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True, exist_ok=True)
+    options = {"SYNAPSE_URL": _URL, "SYNAPSE_INGEST_TOKEN": _DEVICE}
     (home / ".claude" / "settings.json").write_text(
-        json.dumps(
-            {
-                "pluginConfigs": {
-                    "synapse@synapse": {
-                        "options": {"SYNAPSE_URL": _URL, "SYNAPSE_INGEST_TOKEN": _DEVICE}
-                    }
-                }
-            }
-        ),
+        json.dumps({"pluginConfigs": {"synapse@synapse": {"options": options}}} if plugin else {}),
         encoding="utf-8",
     )
     data = tmp_path / "data"
@@ -476,17 +551,17 @@ def test_codex_enrolled_prefers_the_saved_device_token(monkeypatch, tmp_path, ca
     assert _SURFACE_ID in notice
     _no_token_material(notice)
 
-    # The MCP header helper, the Stop hook and the board all read common.TOKEN, so
+    # The MCP headers helper (shared with the Claude plugin) resolves the same way, so
     # Codex no longer needs `env -u SYNAPSE_INGEST_TOKEN` for the saved token to win.
-    monkeypatch.setitem(sys.modules, "common", common)
+    for name in ("config", "mcp_headers_t"):
+        sys.modules.pop(name, None)
     spec = importlib.util.spec_from_file_location(
-        "mcp_headers_t", _CODEX / "scripts/mcp_headers.py"
+        "mcp_headers_t", _REPO / "plugin" / "scripts" / "mcp_headers.py"
     )
     assert spec and spec.loader
     helper = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(helper)
-    monkeypatch.setattr(sys, "argv", ["mcp_headers.py", "--url", f"{_URL}/mcp"])
-    assert helper.main() == 0
+    assert helper.main(["--url", f"{_URL}/mcp"]) == 0
     assert json.loads(capsys.readouterr().out) == {"Authorization": f"Bearer {_DEVICE}"}
 
 

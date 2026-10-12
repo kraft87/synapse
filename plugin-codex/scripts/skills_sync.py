@@ -4,16 +4,18 @@
 
 Reuses the Claude plugin's sync engine (``plugin/scripts/skills_sync.py``) with this
 plugin's HTTP client, so the merge rules are identical on both hosts: newest edit wins,
-deletes never propagate, a push never shrinks the server's file set.
+a local delete never propagates, a skill retired on the server leaves this folder when
+the copy here is one Synapse delivered, and a push never shrinks the server's file set.
 
 Only ``SYNAPSE_CODEX_SKILLS_DIR`` (default ``~/.agents/skills``, Codex's user-skills
 directory) is scanned. Codex's bundled skills under ``~/.codex/skills/.system`` and any
 plugin caches live outside that folder and never enter the sync. Global scope only:
 project skills stay Claude-side because ``<repo>/.claude/skills`` is committed to git.
 
-Opt-in through ``SYNAPSE_SKILLS_SYNC=1``, the same option the Claude plugin reads, so a
-machine running both plugins configures once. A non-blocking lock serialises overlapping
-session starts; a second caller skips instead of double-syncing. Fail-open: any error
+Opt-in through ``skills_sync`` in ~/.synapse/config.json (``synapse login`` asks;
+``SYNAPSE_SKILLS_SYNC=1`` in the environment works too), the same setting the Claude
+plugin reads, so a machine running both plugins configures once. A non-blocking lock
+serialises overlapping session starts; a second caller skips instead of double-syncing. Fail-open: any error
 exits 0 with nothing printed, and session start is never blocked.
 """
 
@@ -50,7 +52,7 @@ def _engine():
     return _load("synapse_claude_skills_sync", _CLAUDE_SCRIPTS / "skills_sync.py")
 
 
-def run(client, target_dir: Path, lock_path: Path) -> tuple[int, int] | None:
+def run(client, target_dir: Path, lock_path: Path) -> tuple[int, int, int] | None:
     """Sync ``target_dir`` against the global scope. None when another sync holds the lock."""
     lock = _load("synapse_filelock", _CLAUDE_SCRIPTS / "synapse_filelock.py")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,8 +73,9 @@ def main() -> int:
         result = run(common, SKILLS_DIR, LOCK_PATH)
     except Exception:
         return 0
-    if result and result != (0, 0):
-        print(f"skills: pulled {result[0]}, pushed {result[1]} -> {SKILLS_DIR}")
+    if result and any(result):
+        pulled, pushed, removed = result
+        print(f"skills: pulled {pulled}, pushed {pushed}, removed {removed} -> {SKILLS_DIR}")
     return 0
 
 

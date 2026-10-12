@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import sys
 import urllib.error
 from pathlib import Path
@@ -118,18 +119,16 @@ def login(monkeypatch, tmp_path) -> ModuleType:
 
 
 def _slot(tmp_path) -> str | None:
-    """What settings.json holds in SYNAPSE_INGEST_TOKEN — what the MCP header sends."""
-    settings = tmp_path / "claude" / "settings.json"
-    if not settings.exists():
+    """The token ~/.synapse/config.json holds: what the hooks and the MCP headers helper
+    send. (``tmp_path`` is unused; SYNAPSE_HOME is the conftest scratch dir.)"""
+    path = Path(os.environ["SYNAPSE_HOME"]) / "config.json"
+    if not path.exists():
         return None
-    data = json.loads(settings.read_text())
-    opts = next(iter(data.get("pluginConfigs", {}).values()), {}).get("options", {})
-    return opts.get("SYNAPSE_INGEST_TOKEN")
+    return json.loads(path.read_text()).get("token")
 
 
 def _enrolled(mod) -> None:
-    mod.config.write_user_config("SYNAPSE_INGEST_TOKEN", _DEVICE)
-    mod.config.write_device_state(dict(_RECORD))
+    mod.config.store_token(_DEVICE, dict(_RECORD))
     assert mod.enroll_mod.is_enrolled()
 
 
@@ -241,13 +240,13 @@ def test_first_login_needs_exactly_one_approval(monkeypatch, login, tmp_path):
     login_calls = _script_login(monkeypatch, login)
     enroll_calls = _script_enroll(monkeypatch, login)
     written: list[str] = []
-    real_write = login.config.write_user_config
+    real_store = login.config.store_token
 
-    def spy(key, value):
-        written.append(value)
-        real_write(key, value)
+    def spy(token, record=None):
+        written.append(token)
+        real_store(token, record)
 
-    monkeypatch.setattr(login.config, "write_user_config", spy)
+    monkeypatch.setattr(login.config, "store_token", spy)
 
     assert _run(monkeypatch, login) == 0
 
@@ -468,13 +467,13 @@ def test_reenroll_drops_the_old_record_before_writing_the_new_token(monkeypatch,
     _script_login(monkeypatch, login)
     _script_enroll(monkeypatch, login)
     order: list[str] = []
-    real_write = login.config.write_user_config
+    real_store = login.config.store_token
 
-    def spy(key, value):
-        order.append("record" if login.config.DEVICE_FILE.exists() else "no-record")
-        real_write(key, value)
+    def spy(token, record=None):
+        order.append("record" if login.config.read_device_state() else "no-record")
+        real_store(token, record)
 
-    monkeypatch.setattr(login.config, "write_user_config", spy)
+    monkeypatch.setattr(login.config, "store_token", spy)
 
     assert _run(monkeypatch, login, "--reenroll") == 0
     assert order == ["no-record"]

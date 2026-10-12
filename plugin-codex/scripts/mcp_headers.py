@@ -1,35 +1,21 @@
 #!/usr/bin/env python3
-"""Supply MCP auth from the same credential source as the Synapse hooks.
+"""Kept for Codex configs written before 0.20, whose http_headers_helper names this file.
+
+The helper now lives in plugin/scripts/mcp_headers.py, shared with the Claude plugin;
+this runs it with the same arguments. `synapse install codex` points config.toml at the
+shared one.
 
 Stdout is a credential channel consumed by Codex, not a diagnostic log.
 """
 
 from __future__ import annotations
 
-import argparse
-import json
+import runpy
 import sys
-from urllib.parse import urlsplit
+from pathlib import Path
 
-from common import BASE_URL, TOKEN
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Synapse MCP credential helper")
-    parser.add_argument("--url", required=True)
-    args = parser.parse_args()
-    target, configured = urlsplit(args.url), urlsplit(BASE_URL)
-    if (target.scheme, target.netloc) != (configured.scheme, configured.netloc):
-        print("Synapse MCP URL differs from the saved credential's server", file=sys.stderr)
-        return 1
-    if not TOKEN:
-        print(
-            "Synapse device credential missing: configure the Synapse plugin first", file=sys.stderr
-        )
-        return 1
-    print(json.dumps({"Authorization": f"Bearer {TOKEN}"}))
-    return 0
-
+_SHARED = Path(__file__).resolve().parents[2] / "plugin" / "scripts" / "mcp_headers.py"
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.argv[0] = str(_SHARED)
+    runpy.run_path(str(_SHARED), run_name="__main__")

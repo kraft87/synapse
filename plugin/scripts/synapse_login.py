@@ -3,15 +3,15 @@
 """synapse login — sign in and give this machine its own Synapse credential. Stdlib only.
 
 No third-party dependencies. Two sign-in flows, both ending in a device token stored in
-the plugin config (the zero-dependency ingest/recall hooks read it back):
+~/.synapse/config.json (the zero-dependency hooks and the MCP headers helper read it back):
 
   * DEVICE (default) — RFC 8628 device flow, ONE approval. Prints a short code; you
     approve it on ANY device (github.com/login/device or your OIDC provider). No
     same-host browser, no loopback redirect, so it is the right flow for servers,
     headless and remote boxes. That single approval is both the sign-in and the
     ENROLLMENT (schema 054): the server reads who approved, checks the allowlist, and
-    mints a token belonging to THIS machine, scoped by the install prompt's
-    personal/work answer. The shared root token is never fetched.
+    mints a token belonging to THIS machine, scoped by the personal/work answer
+    `synapse login` asked for. The shared root token is never fetched.
 
   * BROWSER (--browser) — the legacy loopback authorization-code flow: discovery ->
     dynamic client registration -> PKCE -> opens a browser on THIS host -> token
@@ -35,8 +35,8 @@ is dropped only once the new token has been minted.
 
 Truly headless with no browser on any device? Mint a token from an already-trusted
 machine (`/synapse-devices mint "<label>"`) or from the database host
-(`scripts/surface_admin.py mint`), and paste it into /plugin > synapse > Synapse token
-(SYNAPSE_INGEST_TOKEN in the plugin config) here, not into an environment variable.
+(`scripts/surface_admin.py mint`), and store it here with `synapse login --token`,
+not in an environment variable.
 """
 
 from __future__ import annotations
@@ -235,7 +235,7 @@ def _legacy_sign_in(start: dict) -> dict:
             who = f" as {resp['login']}" if resp.get("login") else ""
             print(
                 f"Logged in{who}. This server has no device enrollment, so the shared "
-                "token was saved to plugin config."
+                "token was saved to ~/.synapse/config.json."
             )
             return {"legacy_login": resp.get("login") or True}
 
@@ -262,8 +262,8 @@ def _browser_login() -> int:
     except urllib.error.HTTPError as e:
         if e.code == 404:
             print(
-                "This Synapse has no OAuth enabled. Paste a token into "
-                "/plugin > synapse > Synapse token instead.",
+                "This Synapse has no OAuth enabled. Store a device token with "
+                "`synapse login --token` instead.",
                 file=sys.stderr,
             )
         else:
@@ -374,7 +374,7 @@ def _browser_login() -> int:
 
     if not _store_root_token(token):
         return 1
-    print("Logged in. Token saved to plugin config.")
+    print("Logged in. Token saved to ~/.synapse/config.json.")
     _enroll_device()
     print("Run /reload-plugins (or restart) to connect the recall/remember MCP server.")
     return 0
@@ -391,11 +391,11 @@ def _store_root_token(token: str) -> bool:
     enrolled, which is served nothing and never re-enrolls.
     """
     try:
-        config.DEVICE_FILE.unlink(missing_ok=True)
+        config.clear_device_state()
+        config.store_token(token)
     except OSError as e:
-        print(f"login failed: could not clear {config.DEVICE_FILE}: {e}", file=sys.stderr)
+        print(f"login failed: could not save the token: {e}", file=sys.stderr)
         return False
-    config.write_user_config("SYNAPSE_INGEST_TOKEN", token)
     return True
 
 
@@ -418,8 +418,10 @@ def _enroll_device() -> bool:
     return bool(enroll.enroll())
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     import enroll
+
+    argv = sys.argv[1:] if argv is None else argv
 
     # An enrolled machine already holds what a login would produce. Stop before asking
     # anyone to approve a code: the browser flow would put the root token (no surface:
@@ -428,7 +430,7 @@ def main() -> int:
     if enroll.is_enrolled():
         state = config.read_device_state()
         surface = f"{state['surface_id']} ({state.get('trust') or 'unknown trust'})"
-        if "--reenroll" not in sys.argv:
+        if "--reenroll" not in argv:
             print(
                 f"This machine is already enrolled as {surface}; keeping its device token.\n"
                 "To replace it with a new one, run `synapse-login --reenroll`."
@@ -442,9 +444,9 @@ def main() -> int:
 
     # Device flow is the default — browser-free, works on servers/headless. --browser opts
     # into the legacy same-host loopback flow for setups that prefer it.
-    if "--browser" in sys.argv:
+    if "--browser" in argv:
         return _browser_login()
-    return _device_login(replace="--reenroll" in sys.argv)
+    return _device_login(replace="--reenroll" in argv)
 
 
 if __name__ == "__main__":

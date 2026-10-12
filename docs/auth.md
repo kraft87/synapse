@@ -18,31 +18,59 @@ themselves are in [docs/install.md](install.md); the design reasoning is
   Revoking one clears its hash, so it matches no row at all and the row survives as the
   audit record.
 
-The plugin puts whichever token you give it in `SYNAPSE_INGEST_TOKEN`, and one token covers
-ingest, recall, skill sync, and MCP. In practice that value should be a device token.
+The client keeps whichever token you give it in one slot, `token` in
+`~/.synapse/config.json` (env name `SYNAPSE_INGEST_TOKEN`), and one token covers ingest,
+recall, skill sync, and MCP. In practice that value should be a device token.
 
-That slot is the plugin config (`/plugin` > synapse > Synapse token), not an environment
-variable. The MCP server reads only the plugin config. A `SYNAPSE_INGEST_TOKEN` exported
-from a shell profile, or from the `env` block of `settings.json`, reaches only the hooks,
-which then upload as one credential while recall is served as another. To prevent that,
-an enrolled machine's hooks resolve to its device token whatever the environment says. The
-enrollment record (`device.json` in the plugin's data dir) keeps the token's sha256 and the
-server that minted it, never the token. Session start prints one line when an env value was
-overridden, naming where to remove it. Two limits:
+That slot is the config file, not an environment variable. The MCP connection reads it
+through a headers helper (`plugin/scripts/mcp_headers.py`) that Claude Code and Codex both
+run with credential-named variables stripped from its environment, so a
+`SYNAPSE_INGEST_TOKEN` exported from a shell profile, or from the `env` block of
+`settings.json`, reaches only the hooks, which would then upload as one credential while
+recall is served as another. To prevent that, an enrolled machine's hooks resolve to its
+device token whatever the environment says. The enrollment record (`device` in
+`config.json`; `device.json` in the Claude plugin's data dir before 0.20) keeps the token's
+sha256 and the server that minted it, never the token. Session start prints one line when
+an env value was overridden, naming where to remove it. Two limits:
 
-- The override only applies toward the server that minted the token, or the one the plugin
-  config points at. If `SYNAPSE_URL` or `SYNAPSE_INGEST_URL` in the environment points
-  somewhere else, the env token is used for that server, as before.
+- The device token only goes to the server that minted it (the record's `server`), and to
+  wherever a Claude plugin config that holds that very token points, since that config's
+  own MCP header sends it there anyway (a pre-0.20 plugin URL changed to the same server's
+  new address keeps working). A record too old to name its server, with no such plugin
+  config, goes by `config.json`'s URL. If the URL points anywhere else
+  (`SYNAPSE_URL`/`SYNAPSE_INGEST_URL` in the environment, or a hand-edited `config.json`),
+  an env token is used for that server, as before; with nothing else to send, no token is
+  sent and session start says so in one line, as does the headers helper's log.
+- Nothing in the CLI points a harness at another origin while the machine holds a
+  credential (an enrollment, a pasted token, or a token Claude Code keeps for the plugin,
+  including one in the macOS keychain): `synapse config url`, `synapse install` and
+  `synapse update` refuse, naming the two ways out. `--same-server` says the new address
+  is the same server (the enrollment record, even one too old to have named its server,
+  moves with it); `synapse login --url <url> --reenroll` moves the machine, and saves the
+  new URL only once that server has enrolled it.
+- A token copy left in the Claude plugin's `settings.json` options by a pre-0.20 install
+  feeds the plugin's static header, which goes to the plugin's URL. It is kept in step
+  with a new token only while that URL is the new token's server: a move takes it out
+  until `synapse login` has re-pointed the plugin, and a move made with `--no-install`
+  leaves it out.
 - A machine enrolled before the record carried a hash has none. Its plugin-config token is
   taken as the device token, because enrollment wrote it there and only a hand edit
-  replaces it. `synapse-login --reenroll` records the hash.
+  replaces it. `synapse login --reenroll` records the hash.
+
+Installs from before 0.20 kept the token in the Claude plugin's config (`/plugin` > synapse >
+Synapse token). That still works as a fallback, and the first `synapse login` copies it into
+`config.json`: from `settings.json`, or from `~/.claude/.credentials.json` where Claude Code
+kept a token typed into its install dialog. On macOS Claude Code keeps such a token in the
+keychain, which nothing else can read; `synapse login` then says so, and
+`synapse login --token` (or `--reenroll`) gives `config.json` its own copy.
 
 ## Getting a device token
 
-**Self-enrollment (needs an IdP configured).** On the new machine:
+**Self-enrollment (needs an IdP configured).** On the new machine, after installing the
+client (`curl -sSL https://<your-synapse>/install | python3 -`):
 
 ```
-! synapse-login        # in the Claude prompt, runs in-session, no LLM, streams live
+synapse login          # or `! synapse-login` in the Claude prompt
 ```
 
 It runs one device flow (RFC 8628): it prints a short code, you approve at
@@ -50,7 +78,7 @@ It runs one device flow (RFC 8628): it prints a short code, you approve at
 same-host browser, so it works on servers and headless boxes. That one approval both signs
 you in and **enrolls** this machine: the server polls the IdP, reads the identity, checks the
 same allowlist every other login clears, and mints a token belonging to this machine,
-written into the plugin's config slot. The shared root token is never fetched.
+written into `~/.synapse/config.json`. The shared root token is never fetched.
 
 `--browser` keeps the legacy loopback flow. Its OAuth token cannot enroll a machine, so it
 is followed by the device-flow enrollment: two approvals. Prefer the default.
@@ -62,7 +90,8 @@ docker compose exec mcp-server synapse-admin bootstrap "<label>"
 ```
 
 Prints a full-trust device token once, because only its hash is stored. This is the local
-quickstart's normal path, since a purely local stack usually has no IdP at all.
+quickstart's normal path, since a purely local stack usually has no IdP at all. Store it on
+the machine with `synapse login --token`.
 
 **Mint from an already-trusted machine.** For a box that will never run a browser flow (a
 service, a container):
@@ -72,9 +101,9 @@ service, a container):
 ```
 
 Defaults to restricted, inheriting the project scope other restricted devices already have.
-The token prints once. On the target machine, paste it into `/plugin` > synapse > Synapse
-token. Use a `SYNAPSE_INGEST_TOKEN` environment variable only where there is no plugin
-config to hold it, such as a service or container.
+The token prints once. On the target machine, run `synapse login --token`. Use a
+`SYNAPSE_INGEST_TOKEN` environment variable only where there is no config file to hold it,
+such as a service or container.
 
 The `label` is display only and is deliberately never matched against an existing row:
 keying an enrollment on a self-reported name would reintroduce hostname spoofing through the
@@ -82,8 +111,9 @@ back door.
 
 ## Personal or work
 
-The plugin's install prompt asks for this machine's role (`SYNAPSE_MACHINE_ROLE`), and the
-answer becomes the enrolled device's trust level. It is authoritative because the person who
+`synapse login` asks for this machine's role (`role` in `~/.synapse/config.json`,
+`SYNAPSE_MACHINE_ROLE`; before 0.20 the plugin's install prompt asked), and the answer
+becomes the enrolled device's trust level. It is authoritative because the person who
 answered it is the person who just authenticated.
 
 - **personal** (default): full trust. The single-user common case is a machine that should

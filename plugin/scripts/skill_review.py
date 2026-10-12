@@ -159,7 +159,7 @@ def _deliver(scope: str) -> None:
     try:
         import skills_sync
 
-        pulled, pushed = skills_sync._sync(scope, d)
+        pulled, pushed, _removed = skills_sync._sync(scope, d)
         print(f"Synced here now: pulled {pulled}, pushed {pushed} -> {d}")
     except Exception as e:
         print(f"Local sync failed ({e}); it syncs here at the next session start.")
