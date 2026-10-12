@@ -5,8 +5,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-import psycopg
 from psycopg.types.json import Json as PgJson
+
+from ingestion import pg_pool
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ class RecallMetricsMixin:
 
     def _do_increment(self, edge_uuids: list[str], group_id: str) -> None:
         try:
-            with psycopg.connect(self._db_url, autocommit=True) as connection:
+            with pg_pool.connection(self._db_url) as connection:
                 connection.execute(
                     "UPDATE kg_relationships "
                     "SET retrieval_count = COALESCE(retrieval_count, 0) + 1 "
@@ -99,7 +100,7 @@ class RecallMetricsMixin:
             served_ids_index = _METRIC_COLS.index("served_ids")
             if values[served_ids_index] is not None:
                 values[served_ids_index] = PgJson(values[served_ids_index])
-            with psycopg.connect(self._db_url, autocommit=True) as connection:
+            with pg_pool.connection(self._db_url) as connection:
                 connection.execute(
                     f"INSERT INTO recall_metrics ({','.join(_METRIC_COLS)}) VALUES ({placeholders})",
                     values,

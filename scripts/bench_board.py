@@ -10,7 +10,10 @@ note ids or overflow differ between the two. Read-only: the board is pure SELECT
 
 With no ``--project``, it benchmarks the all-projects board plus every project on the
 banner's most-recent list. The two versions alternate build by build, so drift in
-database load lands on both.
+database load lands on both. ``--pool`` adds a third column: the working tree's build
+again with the server's connection pool (ingestion/pg_pool) open, so it borrows
+connections instead of opening one per read. The before and after columns always run
+with no pool open.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from ingestion import pg_pool  # noqa: E402
 from ingestion.surfaces import FULL_TRUST  # noqa: E402
 from mcp_server import board as work_tree_board  # noqa: E402
 
@@ -63,6 +67,7 @@ def main() -> int:
     ap.add_argument("--ref", default="origin/main", help="git ref for the 'before' board")
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--project", action="append", help="repeatable; default: all + banner")
+    ap.add_argument("--pool", action="store_true", help="also time the build with a pool open")
     args = ap.parse_args()
 
     before = board_at_ref(args.ref)
@@ -73,25 +78,42 @@ def main() -> int:
         projects = [None, *names]
 
     mismatches = 0
+    labels = ["before", "after", *(["after+pool"] if args.pool else [])]
     print(f"before = {args.ref}, after = working tree, {args.reps} builds each, median ms")
     print(
-        f"{'project':<24} {'notes':>5} {'drop':>5}  {'before wall/cpu':>16}  {'after wall/cpu':>15}"
+        f"{'project':<24} {'notes':>5} {'drop':>5}"
+        + "".join(f"  {lb + ' wall/cpu':>20}" for lb in labels)
     )
     for project in projects:
-        stats: dict[str, list[tuple[float, float]]] = {"before": [], "after": []}
+        stats: dict[str, list[tuple[float, float]]] = {lb: [] for lb in labels}
         outs: dict[str, dict[str, Any]] = {}
         for _ in range(args.reps):
             for label, mod in (("before", before), ("after", work_tree_board)):
-                out, wall, cpu = timed_build(mod, args.db_url, project)
-                outs[label] = out
+                outs[label], wall, cpu = timed_build(mod, args.db_url, project)
                 stats[label].append((wall, cpu))
-        same = all(outs["before"][k] == outs["after"][k] for k in ("text", "note_ids", "overflow"))
+        if args.pool:
+            pg_pool.open_pool(args.db_url)
+            try:
+                pg_pool._POOLS[args.db_url].wait(timeout=10)
+                for _ in range(args.reps):
+                    outs["after+pool"], wall, cpu = timed_build(
+                        work_tree_board, args.db_url, project
+                    )
+                    stats["after+pool"].append((wall, cpu))
+            finally:
+                pg_pool.close_pool(args.db_url)
+        same = all(
+            outs[lb][k] == outs["before"][k]
+            for lb in labels
+            for k in ("text", "note_ids", "overflow")
+        )
         mismatches += not same
 
         after = outs["after"]
         print(
             f"{(project or '(all)')[:24]:<24} {after['n_notes'] + after['overflow']:>5} "
-            f"{after['overflow']:>5}  {median_ms(stats['before']):>16}  {median_ms(stats['after']):>15}"
+            f"{after['overflow']:>5}"
+            + "".join(f"  {median_ms(stats[lb]):>20}" for lb in labels)
             + ("" if same else "  OUTPUT DIFFERS")
         )
     print("identical output on every board" if not mismatches else f"{mismatches} boards differ")

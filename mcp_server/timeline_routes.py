@@ -26,6 +26,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.scope import coerce_group
 from ingestion.surfaces import (
@@ -157,8 +158,7 @@ def _recent_events(
     ``own_surface`` (schema 057) also admits events whose source turn the calling
     surface ingested itself; the gate copies that stamp onto the event at write time.
     """
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
+    with pg_pool.connection(db_url) as conn:
         q = (
             "SELECT id, date, fact, project, salience, event_type FROM ("
             "  SELECT id, left(t_valid::text, 10) AS date, fact, project, salience, "
@@ -191,8 +191,6 @@ def _recent_events(
             }
             for r in rows
         ]
-    finally:
-        conn.close()
 
 
 def register(

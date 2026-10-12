@@ -13,10 +13,10 @@ mirrors preferences_routes). There is deliberately no MCP board tool: the hook
 already injects the block, and a listed tool invites a double-inject (Hermes
 pattern — when injection covers the read, ship no read tool).
 
-Pure SQL, no embedding calls, target <100ms: the note list (ingestion/db.py's
-list_board_notes), the timeline milestones (timeline_routes._recent_events — reused,
-not duplicated), and two cheap banner aggregates. Each helper owns its own short-lived
-connection; the board adds exactly one more for the banner.
+Pure SQL, no embedding calls, target <100ms: the note list (ingestion/db_notes.py's
+select_board_notes), the timeline milestones (timeline_routes._recent_events — reused,
+not duplicated), and two cheap banner aggregates. Each read borrows its own connection
+through ingestion/pg_pool, one after another, never two at once.
 """
 
 from __future__ import annotations
@@ -32,7 +32,8 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ingestion.db import Database
+from ingestion import pg_pool
+from ingestion.db_notes import select_board_notes
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     SurfaceTrust,
@@ -95,8 +96,7 @@ def _banner_stats(
     ``own_surface`` (schema 057) widens both numbers to the episodes the calling surface
     ingested itself, matching what recall will actually serve it.
     """
-    conn = psycopg.connect(db_url, autocommit=True)
-    try:
+    with pg_pool.connection(db_url) as conn:
         own = own_surface_if_ready(conn, db_url, own_surface)  # None before schema 057
         scope = episode_scope_sql(allowed_projects, own)
         if scope is not None:
@@ -128,8 +128,6 @@ def _banner_stats(
             "GROUP BY project ORDER BY 2 DESC LIMIT 12"
         ).fetchall()
         return n_episodes, [r[0] for r in rows]
-    finally:
-        conn.close()
 
 
 def _note_line(note: dict[str, Any]) -> str:
@@ -296,13 +294,11 @@ def build_board(
     allowed = st.project_filter
     own = st.own_surface
 
-    db = Database(db_url)
     try:
-        notes = db.list_board_notes(_OWNER, project, audience=audience)
+        with pg_pool.connection(db_url) as conn:
+            notes = select_board_notes(conn, _OWNER, project, audience=audience)
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
         notes = []
-    finally:
-        db.close()
 
     try:
         events = _recent_events(

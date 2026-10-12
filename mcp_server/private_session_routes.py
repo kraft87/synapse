@@ -32,6 +32,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion import pg_pool
 from mcp_server.http_helpers import err, unauthorized
 
 logger = logging.getLogger(__name__)
@@ -44,40 +45,34 @@ class _SchemaMissing(Exception):
 
 
 def _mark_private(db_url: str, session_id: str) -> None:
-    conn = psycopg.connect(db_url, autocommit=True)
     try:
-        conn.execute(
-            "INSERT INTO private_sessions (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
-            (session_id,),
-        )
+        with pg_pool.connection(db_url) as conn:
+            conn.execute(
+                "INSERT INTO private_sessions (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (session_id,),
+            )
     except psycopg.errors.UndefinedTable as e:
         raise _SchemaMissing from e
-    finally:
-        conn.close()
 
 
 def _unmark_private(db_url: str, session_id: str) -> int:
-    conn = psycopg.connect(db_url, autocommit=True)
     try:
-        cur = conn.execute("DELETE FROM private_sessions WHERE session_id = %s", (session_id,))
-        return cur.rowcount
+        with pg_pool.connection(db_url) as conn:
+            cur = conn.execute("DELETE FROM private_sessions WHERE session_id = %s", (session_id,))
+            return cur.rowcount
     except psycopg.errors.UndefinedTable as e:
         raise _SchemaMissing from e
-    finally:
-        conn.close()
 
 
 def _is_private(db_url: str, session_id: str) -> bool:
-    conn = psycopg.connect(db_url, autocommit=True)
     try:
-        row = conn.execute(
-            "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
-        ).fetchone()
-        return row is not None
+        with pg_pool.connection(db_url) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
+            ).fetchone()
+            return row is not None
     except psycopg.errors.UndefinedTable as e:
         raise _SchemaMissing from e
-    finally:
-        conn.close()
 
 
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:

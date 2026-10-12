@@ -58,6 +58,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import dict_row
 
+from ingestion import pg_pool
 from ingestion.schema_check import ColumnProbe
 
 logger = logging.getLogger(__name__)
@@ -197,14 +198,14 @@ def own_surface_served(db_url: str, trust: SurfaceTrust | None) -> bool:
     a credential-bound restricted caller, on a database with schema 057 applied.
 
     Answers from the probe's cache when it can, so after the first call it costs nothing;
-    otherwise it opens one short connection to probe. Any failure answers False."""
+    otherwise it borrows one connection to probe. Any failure answers False."""
     if trust is None or not trust.own_surface or not db_url:
         return False
     cached = OWN_SURFACE_PROBE.cached(db_url)
     if cached is not None:
         return cached
     try:
-        with psycopg.connect(db_url, autocommit=True, connect_timeout=5) as conn:
+        with pg_pool.connection(db_url, connect_timeout=5) as conn:
             return OWN_SURFACE_PROBE.ready(conn, db_url)
     except Exception as e:
         logger.warning("own-surface probe failed (%s); treating schema 057 as not applied", e)
@@ -320,16 +321,13 @@ def resolve_caller(
     if not th and not sid:
         return UNKNOWN_SURFACE
     try:
-        conn = psycopg.connect(db_url, autocommit=True, row_factory=dict_row)
-        try:
+        with pg_pool.connection(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
             if th:
-                row = conn.execute(_SELECT_BY_TOKEN, (th,)).fetchone()
+                row = cur.execute(_SELECT_BY_TOKEN, (th,)).fetchone()
                 if row is not None:
                     _touch_last_seen(conn, th)
             else:
-                row = conn.execute(_SELECT_BY_ID, (sid,)).fetchone()
-        finally:
-            conn.close()
+                row = cur.execute(_SELECT_BY_ID, (sid,)).fetchone()
     except Exception as e:
         # Fail CLOSED and say so: an operator staring at an empty board needs the reason.
         logger.warning("surface resolve failed (%s); treating as restricted", e)

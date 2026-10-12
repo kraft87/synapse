@@ -83,6 +83,7 @@ _DB_FILES = {
     "test_own_surface_episodes.py",
     "test_config_scope.py",
     "test_local_tz_dates.py",
+    "test_pg_pool.py",
 }
 
 
