@@ -22,6 +22,8 @@ the assertions only ever look at this test's rows.
 from __future__ import annotations
 
 import importlib.util
+import shutil
+import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -155,6 +157,28 @@ class World:
     def alias_text(self) -> str:
         return f"# generic test aliases\n{self.twin} = {self.big}\n"
 
+    def config_before(self) -> list[tuple[str, str]]:
+        """config_lane rows (scope, file_key) mirrored from the restricted device. The
+        first one collides: CLAUDE.md is already mirrored under the canonical scope."""
+        return [
+            (f"project:{self.win}", "CLAUDE.md"),
+            (f"project:{self.big}", "CLAUDE.md"),
+            (f"project:{self.big.lower()}", "AGENTS.md"),
+            (f"project:{self.acme}", "CLAUDE.md"),
+            ("global", "CLAUDE.md"),
+        ]
+
+    def config_after(self) -> list[tuple[str, str]]:
+        return sorted(
+            [
+                (f"project:{self.win}", "CLAUDE.md"),  # kept: the new key already exists
+                (f"project:{self.big}", "CLAUDE.md"),
+                (f"project:{self.big}", "AGENTS.md"),
+                (f"project:{self.acme}", "CLAUDE.md"),
+                ("global", "CLAUDE.md"),
+            ]
+        )
+
 
 def _seed(conn, w: World) -> None:
     n = 0
@@ -224,6 +248,13 @@ def _seed(conn, w: World) -> None:
             "VALUES (%s, 'a test skill', 'body', %s, 'active')",
             (name, scope),
         )
+    for scope, file_key in w.config_before():
+        conn.execute(
+            "INSERT INTO config_lane.config_registry "
+            "  (surface_id, file_key, abs_path, content, content_hash, scope) "
+            "VALUES (%s, %s, %s, 'text', 'hash', %s)",
+            (w.restricted, file_key, f"/x/{file_key}", scope),
+        )
 
 
 def _wipe(conn, w: World) -> None:
@@ -237,6 +268,7 @@ def _wipe(conn, w: World) -> None:
     conn.execute("DELETE FROM surfaces WHERE surface_id LIKE %s", (like,))
     conn.execute("DELETE FROM skills_lane.skill_registry WHERE name LIKE %s", (like,))
     conn.execute("DELETE FROM skills_lane.skill_history WHERE name LIKE %s", (like,))
+    conn.execute("DELETE FROM config_lane.config_registry WHERE surface_id LIKE %s", (like,))
     conn.execute(f'DROP SCHEMA IF EXISTS "{w.schema}" CASCADE')
 
 
@@ -295,6 +327,11 @@ def _snapshot(conn, w: World) -> dict[str, list]:
         ),
         "skill_history": (
             "SELECT count(*) FROM skills_lane.skill_history WHERE name LIKE %s",
+            (like,),
+        ),
+        "config": (
+            "SELECT scope, file_key FROM config_lane.config_registry "
+            "WHERE surface_id LIKE %s ORDER BY scope, file_key",
             (like,),
         ),
     }
@@ -377,6 +414,14 @@ def test_dry_run_reports_the_mapping_and_writes_nothing(conn, db_url, world, ali
     assert f"  {w.prefix}-triage: project:{w.win} -> project:{w.big}" in rows
     assert f"  {w.prefix}-deploy: project:{w.acme} -> project:{w.acme}  (unchanged)" in rows
     assert f'"{w.schema}"."jobs": ' in text
+    config = rows[rows.index("config_lane.config_registry.scope:") + 1 :]
+    for line in (
+        f"        1  project:{w.win} -> project:{w.big}",
+        f"        1  project:{w.big.lower()} -> project:{w.big}",
+        f"        1  project:{w.big} -> project:{w.big}  (unchanged)",
+        f"        1  project:{w.acme} -> project:{w.acme}  (unchanged)",
+    ):
+        assert line in config, line
     assert f"  {1:>7}  {w.win} -> {w.big}" in rows
 
 
@@ -427,15 +472,22 @@ def test_apply_moves_every_label_and_a_second_apply_is_a_no_op(
 
     allow = {sid: list(a) for sid, a, _u in snap["surfaces"]}
     assert allow == {w.full: [], w.restricted: w.allowlist_after()}
+    # config_lane: (surface_id, scope, file_key) is the key, so a file already mirrored
+    # under the canonical scope keeps that row and the old one stays for its owner.
+    assert sorted(snap["config"]) == w.config_after()
+    assert f"config_registry: project:{w.big.lower()} -> project:{w.big}: 1 rows" in log
+    assert f"config_registry: project:{w.win} -> project:{w.big}: 0 rows, 1 kept" in log
     assert {n: s for n, s, _u in snap["skills"]} == w.skills_after()
     # A scope change is not a body change: the history trigger stays quiet.
     assert snap["skill_history"] == history_before
 
     # Re-running plans nothing for these rows and writes nothing.
     again = _run(["--apply", "--aliases", str(aliases), "--db-url", db_url], capsys)
-    mentions = [ln for ln in again.splitlines() if w.tag in ln]
-    assert len(mentions) == 1  # the colliding table is reported again, still untouched
+    mentions = sorted(ln for ln in again.splitlines() if w.tag in ln)
+    # Only the two collisions are reported again, both still untouched.
+    assert len(mentions) == 2
     assert mentions[0].startswith(f'"{w.schema}"."registry": SKIPPED')
+    assert mentions[1] == f"config_registry: project:{w.win} -> project:{w.big}: 0 rows, 1 kept"
     assert _snapshot(conn, w) == snap
 
     dry = _run(["--dry-run", "--aliases", str(aliases), "--db-url", db_url], capsys)
@@ -448,7 +500,17 @@ def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes(
 ):
     w = world
     _run(["--apply", "--aliases", str(aliases), "--db-url", db_url], capsys)
-    conn.execute(f'DELETE FROM "{w.schema}".registry')  # the only table still holding w.win
+    # Drop the two rows that still hold w.win (both collisions), so that no table names
+    # the old labels any more.
+    conn.execute(f'DELETE FROM "{w.schema}".registry')
+    conn.execute(
+        "DELETE FROM config_lane.config_registry WHERE surface_id = %s AND scope = %s",
+        (w.restricted, f"project:{w.win}"),
+    )
+    conn.execute(
+        "UPDATE config_lane.config_registry SET scope = %s WHERE surface_id = %s AND scope = %s",
+        (f"project:{w.big.lower()}", w.restricted, f"project:{w.big}"),
+    )
     # The state an interrupted run leaves: episodes and tables moved, the final
     # surfaces + skills transaction never committed.
     conn.execute(
@@ -465,3 +527,46 @@ def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes(
     snap = _snapshot(conn, w)
     assert {sid: list(a) for sid, a, _u in snap["surfaces"]}[w.restricted] == w.allowlist_after()
     assert {n: s for n, s, _u in snap["skills"]} == w.skills_after()
+    assert sorted(snap["config"]) == [c for c in w.config_after() if w.win not in c[0]]
+
+
+# ---------------------------------------------------------------------------
+# The offline inventory: --inventory-sql through psql, then --dry-run --inventory
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(shutil.which("psql") is None, reason="psql not installed")
+def test_the_offline_inventory_is_the_live_one(conn, db_url, world, aliases, tmp_path, capsys):
+    """Prod is reached through ``docker exec ... psql``, not a DSN: the one statement
+    --inventory-sql prints must read exactly what read_inventory reads, and the dry run
+    planned from its output must be the live dry run, byte for byte. It writes nothing."""
+    w = world
+    before = _snapshot(conn, w)
+    sql = tmp_path / "inv.sql"
+    sql.write_text(_run(["--inventory-sql"], capsys), encoding="utf-8")
+    psql = subprocess.run(
+        ["psql", db_url, "-X", "-tA", "-v", "ON_ERROR_STOP=1", "-f", str(sql)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    inv_file = tmp_path / "inv.json"
+    inv_file.write_text(psql.stdout, encoding="utf-8")
+    assert _snapshot(conn, w) == before
+
+    offline = rp.inventory_from_json(psql.stdout)
+    live = rp.read_inventory(conn)
+    assert offline.episode_groups == live.episode_groups
+    assert offline.tables == live.tables
+    assert offline.surfaces == live.surfaces
+    assert offline.skills == live.skills
+    assert offline.config_scopes == live.config_scopes
+    assert offline.tables[f'"{w.schema}"."jobs"'] == {w.win: 1, w.alpha: 1}
+    assert offline.episode_groups[(w.big.lower(), None)] == 1
+
+    live_text = _run(["--dry-run", "--aliases", str(aliases), "--db-url", db_url], capsys)
+    offline_text = _run(
+        ["--dry-run", "--inventory", str(inv_file), "--aliases", str(aliases)], capsys
+    )
+    assert offline_text == live_text
+    assert f"| {w.twin} | {w.home}/code/{w.twin} | {w.big} | 1 | alias |" in offline_text
