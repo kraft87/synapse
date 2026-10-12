@@ -3,6 +3,74 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-10-12 — skills scoped by trust and project (plugin 0.22.0, no schema change)
+
+**What changed**
+
+- **Who is served which skills** (`mcp_server/skill_sync_routes.py::SkillAccess`, the board's
+  trust rule applied to skills): full trust reads and writes every scope; a restricted
+  device is served only `project:<p>` skills whose project is in its allowlist (any case)
+  and may publish only there; a caller with no device credential (the root token included)
+  is served nothing. This covers `/skills/list`, `/skills/fetch`, `/skills/publish`,
+  `/skills/overwrite` and the `skill://` MCP resources (`PgSkillsProvider`). Retire,
+  rescope and the review lane are full-trust only (403). Before this, every approved device
+  was served every global skill (and could fetch any skill by name, list any project's
+  skills, and publish global skills that fanned out to full-trust machines).
+- **One scope per skill, moved explicitly**: a publish from another scope's folder is refused
+  (`scoped`) instead of moving the skill, so an old copy can no longer undo a move.
+  `synapse skill scope <name> global|project:<label>` (`POST /skills/rescope`, full trust)
+  moves it, logged in `skill_history` as `rescoped`.
+- **Withdrawn skills leave like retired ones, through one path**: the client sends the names
+  it holds (`held`); the listing answers `withdrawn` for those still active but no longer
+  served there (moved, or not this device's to read). The client's `_settle_unserved` (the
+  retire path from #222/#223, generalised) deletes a copy that is exactly a version Synapse
+  delivered (current or recent past bodies, `content_hashes`, or a version a pull wrote into
+  that folder: the new `pulled-<folder>.json` record), never pushes it back, and never
+  deletes a folder git tracks or one linked in. `publish: false` keeps a restricted
+  device's own global-folder skills local instead of being refused every session.
+- **Codex project skills**: the Codex session hook passes `--cwd`; `project:<label>` syncs
+  into `<project root>/.agents/skills` (Codex reads it from any subfolder).
+- **`.git/info/exclude`**: every project skill folder a sync pulls into a git repository is
+  listed in that repository's `info/exclude` (a worktree's go to the main repo's), never
+  `.gitignore`. A project skill folder the repository tracks is never pulled over. Empty
+  skill folders are no longer created.
+- **A pull cut short is safe**: SKILL.md is written last (whole, already carrying the
+  server's time), so a sync killed mid-pull (Codex's session-start budget) pulls again
+  next time instead of pushing the half-pulled copy over the server's.
+
+**Order of rollout (matters)**
+
+1. Merge → image (server first; old clients keep working: they ignore `publish`/`withdrawn`,
+   their refused pushes write nothing).
+2. From a full-trust machine, move the work skills the work laptop needs into its project
+   (Kyle to confirm which project each belongs to), e.g.
+   `synapse skill scope <skill> project:<label>`. A skill whose SKILL.md hard-codes
+   its global install path needs that path made project-relative first.
+3. Update the work laptop's client (`synapse update`). At its next session start its
+   exact delivered copies of global skills are removed, and the moved skills arrive in
+   the project folder (and are excluded from that repository).
+
+**Proven**
+
+- Reproduced first on `main` with the real routes, real device credentials and the real
+  sync engine (local ParadeDB): a restricted device was served all global skills, could
+  fetch any skill and list every `skill://` resource, published its own skills as global,
+  and a re-scope was undone at the next sync of a full-trust machine holding the old copy.
+  After: none of that.
+- On a local replica of prod's registry (names/scopes/status, read-only) with the work
+  laptop's real 13-entry allowlist: `main` serves it 30 global skills, a `transcribe_ai`
+  project skill, 37 `skill://` resources and any skill by name; this branch serves exactly
+  the 6 skills of its allowlisted project (in either casing) and returns its 30 held global
+  skills as `withdrawn`.
+
+**Open**
+
+- Kyle: confirm the project for each of the three work skills the work laptop needs, then
+  run the three `synapse skill scope` commands (not run here).
+- Copies of global skills an older client delivered whose bundled files changed on the
+  server since are not recognised (no file history); delete those by hand if any remain.
+- The same before/after against prod itself needs a read-only run Kyle approves.
+
 ## 2026-10-12 — one project label everywhere (plugin 0.21.0, no schema change)
 
 **What changed**

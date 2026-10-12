@@ -28,7 +28,7 @@ def register(
     # these machine-token-gated routes instead of reaching Postgres directly). No-op without DB_URL.
     from mcp_server.skill_sync_routes import register as _register_skill_routes
 
-    _register_skill_routes(mcp, DB_URL, _machine_authorized)
+    _register_skill_routes(mcp, DB_URL, _machine_authorized, lambda r: _request_trust(r))
 
     # Config lane — the plugin mirrors each surface's opted-in config files here (machine-token gated)
     # so the dream pipeline can read them and propose edits. Same DSN-free seam as skills. No-op w/o DB.

@@ -22,6 +22,7 @@ from starlette.testclient import TestClient
 import mcp_server.skill_sync_routes as R
 from dream.skills.skill_doc import body_hash
 from ingestion import schema_check
+from ingestion.surfaces import FULL_TRUST
 from mcp_server.skill_sync_routes import (
     _list_skills,
     _proposal_act,
@@ -162,6 +163,8 @@ def test_list_reports_retired_skills_apart_from_the_active_ones(ret, db_url):
         "name": "ret-backup",
         "scope": "global",
         "content_hash": whole_skill_hash(V1, shas),
+        # every version Synapse delivered: here only the one it was retired with
+        "content_hashes": [whole_skill_hash(V1, shas)],
         "retired_at": r["retired_at"],
     }
     # A name is one registry row, its scope whichever folder published it last: a copy in
@@ -278,7 +281,8 @@ def _client(db_url) -> TestClient:
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-skill-retire")
-    R.register(test_mcp, db_url, authorized)
+    # A full-trust device: retiring changes what every machine is served.
+    R.register(test_mcp, db_url, authorized, lambda request: FULL_TRUST)
     return TestClient(test_mcp.http_app())
 
 

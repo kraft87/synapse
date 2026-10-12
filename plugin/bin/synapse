@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# synapse — the Synapse client CLI (login, config, install, update, skill retire).
+# synapse — the Synapse client CLI (login, config, install, update, skill retire/scope).
 #
 # Claude Code puts a plugin's bin/ on PATH inside sessions, so `! synapse login` works in
 # the Claude prompt. Outside sessions the managed client's own shim (~/.synapse/bin/synapse,

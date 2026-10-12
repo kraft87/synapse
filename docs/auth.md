@@ -137,6 +137,7 @@ Human says nothing means personal; software says nothing means restricted.
 | `POST /timeline/recent` | n/a | same as the board | n/a |
 | `GET /preferences/top` | n/a | preferences from allowlisted projects only | n/a |
 | `/config/*` | n/a | its own mirrored config only; proposals mined only from its own sessions | n/a |
+| `/skills/*`, `skill://` resources | n/a | only `project:<p>` skills for allowlisted projects (any case); no global skill; publish only there; no retire, scope change or review | n/a |
 
 `fetch` and `fetch_session` are filtered because ids are sequential integers: an unfiltered
 drill-down would let a restricted caller enumerate exactly what the board withholds. A session

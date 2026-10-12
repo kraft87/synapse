@@ -13,6 +13,7 @@ import json
 
 import pytest
 
+from ingestion.surfaces import FULL_TRUST
 from mcp_server.skills_provider import PgSkillsProvider
 
 _SKILL = "_pgprov_test_skill"
@@ -38,21 +39,21 @@ def seeded(conn, db_url):
 
 
 async def test_lists_skill_and_manifest(seeded):
-    p = PgSkillsProvider(seeded)
+    p = PgSkillsProvider(seeded, lambda: FULL_TRUST)
     uris = {str(r.uri) for r in await p._list_resources()}
     assert f"skill://{_SKILL}/SKILL.md" in uris
     assert f"skill://{_SKILL}/_manifest" in uris
 
 
 async def test_skill_md_serves_body(seeded):
-    p = PgSkillsProvider(seeded)
+    p = PgSkillsProvider(seeded, lambda: FULL_TRUST)
     res = await p._get_resource(f"skill://{_SKILL}/SKILL.md")
     assert res is not None
     assert "body here" in await res.read()
 
 
 async def test_manifest_shape(seeded):
-    p = PgSkillsProvider(seeded)
+    p = PgSkillsProvider(seeded, lambda: FULL_TRUST)
     res = await p._get_resource(f"skill://{_SKILL}/_manifest")
     assert res is not None
     data = json.loads(await res.read())
@@ -65,7 +66,7 @@ async def test_manifest_shape(seeded):
 
 
 async def test_bundled_file_via_template(seeded):
-    p = PgSkillsProvider(seeded)
+    p = PgSkillsProvider(seeded, lambda: FULL_TRUST)
     # Bundled files are NOT served by _get_resource (return None) ...
     assert await p._get_resource(f"skill://{_SKILL}/scripts/run.py") is None
     # ... they resolve through the template, mirroring the stock provider.
@@ -78,7 +79,7 @@ async def test_inactive_skill_not_served(seeded, conn):
     conn.execute(
         "UPDATE skills_lane.skill_registry SET status = 'proposed' WHERE name = %s", (_SKILL,)
     )
-    p = PgSkillsProvider(seeded)
+    p = PgSkillsProvider(seeded, lambda: FULL_TRUST)
     uris = {str(r.uri) for r in await p._list_resources()}
     assert f"skill://{_SKILL}/SKILL.md" not in uris
     assert await p._get_resource(f"skill://{_SKILL}/SKILL.md") is None

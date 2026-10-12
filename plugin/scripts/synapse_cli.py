@@ -8,6 +8,7 @@
     synapse install [claude|codex] [--dry-run]
     synapse update
     synapse skill retire NAME
+    synapse skill scope NAME global|project:LABEL
     synapse devices|private|import ...     (the synapse-devices/-private/-import tools)
     synapse version
 
@@ -609,6 +610,8 @@ def cmd_update(_args) -> int:
 
 
 def cmd_skill(args) -> int:
+    if args.action == "scope":
+        return _skill_scope(args)
     try:
         r = config.post_json("/skills/retire", {"name": args.name}, timeout=30)
     except urllib.error.HTTPError as e:
@@ -629,6 +632,34 @@ def cmd_skill(args) -> int:
     if status == "not_found":
         return _fail(f"no skill named {args.name!r} in Synapse")
     return _fail(r.get("detail") or f"retire failed: {r}")
+
+
+def _skill_scope(args) -> int:
+    """Move a skill to another scope: `global`, or `project:<label>` (a project as
+    `synapse_project` labels it). Full-trust machines only; the server refuses others."""
+    try:
+        r = config.post_json(
+            "/skills/rescope", {"name": args.name, "scope": args.scope}, timeout=30
+        )
+    except urllib.error.HTTPError as e:
+        why = " (only a full-trust machine can move a skill)" if e.code == 403 else ""
+        return _fail(f"scope change failed: HTTP {e.code}{why}")
+    except (urllib.error.URLError, OSError) as e:
+        return _fail(f"scope change failed: {e}")
+    status = r.get("status")
+    if status == "rescoped":
+        print(
+            f"Moved {r['name']} from {r.get('from')} to {r['scope']}. Machines remove the copy "
+            "Synapse delivered to the old scope's folder at their next session start, and the "
+            "new scope's folders pull it."
+        )
+        return 0
+    if status == "unchanged":
+        print(f"{args.name} is already {r.get('scope')}.")
+        return 0
+    if status == "not_found":
+        return _fail(f"no skill named {args.name!r} in Synapse")
+    return _fail(r.get("detail") or f"scope change failed: {r}")
 
 
 # ---------------------------------------------------------------------- passthrough
@@ -688,6 +719,9 @@ def _parser() -> argparse.ArgumentParser:
     skill_sub = skill.add_subparsers(dest="action", required=True)
     retire = skill_sub.add_parser("retire", help="retire a skill everywhere it was delivered")
     retire.add_argument("name")
+    scope = skill_sub.add_parser("scope", help="move a skill to global or project:LABEL")
+    scope.add_argument("name")
+    scope.add_argument("scope", help="global, or project:<label>")
     skill.set_defaults(func=cmd_skill)
 
     ver = sub.add_parser("version", help="print the client version")
