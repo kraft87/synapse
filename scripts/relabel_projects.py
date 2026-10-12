@@ -31,12 +31,15 @@ How a label is mapped (the dry run prints the reason for every change):
 
 What is rewritten: ``episodes.project`` (per label and cwd; the
 ``episodes_kg_source_projects_relabel`` trigger recomputes the facts that cite each
-episode), the ``project`` column of every other table that has one (found in the
-catalog, so prod-only tables are included), each surface's ``allowed_projects``
-(mapped, de-duplicated case-insensitively, and never widened: an entry naming a
-subfolder of a project the device is not otherwise allowed is kept as it is and flagged),
-and ``project:<label>`` scopes in ``skills_lane.skill_registry`` and
-``config_lane.config_registry``.
+episode), the ``project`` column of every other table the dry run found in the catalog
+(prod-only tables included; a bare subfolder or worktree label there follows its
+sessions when they all land in one project), each surface's ``allowed_projects``
+(mapped, de-duplicated case-insensitively, and never widened: an entry is kept as it is
+and flagged when its new name would let the device read sessions from a folder it reads
+nothing from now, or when it names a subfolder of a project the device is not otherwise
+allowed), and ``project:<label>`` scopes in ``skills_lane.skill_registry`` and
+``config_lane.config_registry``. The dry run also lists, per restricted surface, what
+the server's case-insensitive matching serves it and what it reads after --apply.
 
 The alias file stays OUTSIDE the repository, like the dry run's output: both name
 private projects and paths, and this repository is public. Format, one per line:
@@ -47,13 +50,17 @@ private projects and paths, and this repository is public. Format, one per line:
 
 Usage:
     scripts/relabel_projects.py --dry-run [--aliases FILE] [--db-url DSN] [--out FILE]
-    scripts/relabel_projects.py --apply   [--aliases FILE] [--db-url DSN]
+                                [--plan-out PLAN]
+    scripts/relabel_projects.py --apply --plan PLAN [--db-url DSN]
     scripts/relabel_projects.py --inventory-sql
     scripts/relabel_projects.py --dry-run --inventory FILE [--aliases FILE] [--out FILE]
+                                [--plan-out PLAN]
 
 The DSN comes from --db-url, else $SYNAPSE_DB_URL. --dry-run runs in a READ ONLY
-transaction and writes nothing. --apply re-plans from the live data and commits one
-label at a time, so it can be re-run after an interruption.
+transaction and writes nothing; --plan-out saves what it decided (JSON, outside the
+repository too). --apply executes exactly that approved plan and never plans again:
+labels, tables and allowlists that appeared or changed since the dry run are left alone.
+It commits one label at a time, so the same plan can be re-run after an interruption.
 
 Without a DSN on hand (the database only reachable through ``docker exec ... psql``), dry
 run in two steps: ``--inventory-sql`` prints ONE read-only statement whose JSON cell is
@@ -219,6 +226,11 @@ class Plan:
     #: Labels whose canonical name is a PARENT project (a subfolder or worktree folded
     #: into its root). Mapping such an allowlist entry would widen what a device reads.
     folded: frozenset[str] = frozenset()
+    #: (label, cwd) -> the project root (path key) its folder lies in, or None.
+    group_roots: dict[tuple[str, str | None], str | None] = field(default_factory=dict)
+    #: Bare labels whose sessions map to different names: left as they are outside
+    #: episodes (rows there carry no cwd to tell them apart).
+    ambiguous: dict[str, list[str]] = field(default_factory=dict)
 
     def map_label(self, label: str | None) -> str | None:
         if label is None:
@@ -342,59 +354,127 @@ class Planner:
                 why = "case merge" if why == "kept" else f"{why}, case merge"
             return final, why
 
+        def root_key(label: str, cwd: str | None) -> str | None:
+            p = self._derived_path(label, cwd) or (norm_path(cwd) if cwd else None)
+            if p is None:
+                return None
+            return next((a for a in _ancestors_or_self(path_key(p)) if a in roots), None)
+
         groups: dict[tuple[str, str | None], str] = {}
+        group_roots: dict[tuple[str, str | None], str | None] = {}
         agg: dict[tuple[str, str | None, str, str], int] = defaultdict(int)
         for key, n in episode_groups.items():
             name, root, why = pre[key]
             final, why = finish(name, why)
             groups[key] = final
+            group_roots[key] = root_key(*key)
             if final != key[0]:
                 agg[(key[0], root, final, why)] += n
         labels: dict[str, str] = {}
         for label, (name, why) in label_pre.items():
             final, _why = finish(name, why)
             labels[label] = final
+
+        # A bare label the old server stored for a subfolder or worktree ('scripts',
+        # 'agent-x') also names rows outside episodes (timeline events, notes, scopes,
+        # allowlist entries) that carry no cwd. When every session of it that has a cwd
+        # lands on one name, those rows go there too; when they disagree it is left.
+        finals: dict[str, set[str]] = defaultdict(set)
+        via_subfolder: set[str] = set()
+        for (label, cwd), final in groups.items():
+            if cwd and not is_path_label(label):
+                finals[label].add(final)
+                if pre[(label, cwd)][2].startswith("subfolder"):
+                    via_subfolder.add(label)
+        ambiguous: dict[str, list[str]] = {}
+        for label, found in finals.items():
+            if len(found) > 1:
+                ambiguous[label] = sorted(found)
+                continue
+            (final,) = found
+            if final.casefold() != label.casefold():
+                labels[label] = final
+                if label in via_subfolder:
+                    folded.add(label)
         changes = [
             Change(label, root, canonical, rows, why)
             for (label, root, canonical, why), rows in agg.items()
         ]
         changes.sort(key=lambda c: (c.canonical.casefold(), c.label, c.cwd_root or ""))
         return Plan(
-            groups=groups, changes=changes, labels=labels, roots=roots, folded=frozenset(folded)
+            groups=groups,
+            changes=changes,
+            labels=labels,
+            roots=roots,
+            folded=frozenset(folded),
+            group_roots=group_roots,
+            ambiguous=ambiguous,
         )
+
+
+def _reads(entries: Iterable[str]) -> set[str]:
+    """What an allowlist matches now: its entries in any case (the server's matching)."""
+    return {e.lower() for e in entries}
+
+
+def exposure(
+    plan: Plan, entries: Iterable[str], mapped: Iterable[str]
+) -> list[tuple[tuple[str, str | None], bool]]:
+    """The episode groups the ``mapped`` allowlist reads after --apply that ``entries``
+    can't read now, each with whether it lies in a project folder (root) none of the
+    groups read now lies in: ``[((label, cwd), foreign)]``."""
+    now, after = _reads(entries), _reads(mapped)
+    seen = {r for k, r in plan.group_roots.items() if k[0].lower() in now and r}
+    return [
+        (k, plan.group_roots.get(k) not in seen)
+        for k, c in plan.groups.items()
+        if c.lower() in after and k[0].lower() not in now
+    ]
+
+
+def _allowlist_decisions(plan: Plan, entries: list[str]) -> list[tuple[str, str, str | None]]:
+    """``(entry, project, why_kept)`` per entry: ``why_kept`` is None when the entry is
+    mapped to ``project``, else why mapping it would widen what the device reads."""
+    now = _reads(entries)
+    allowed = {(plan.map_label(e) or e).casefold() for e in entries if e not in plan.folded}
+    out = []
+    for e in entries:
+        m = plan.map_label(e) or e
+        why = None
+        if e in plan.folded and m.casefold() not in allowed:
+            why = "subfolder"
+        elif m.lower() != e.lower() and m.lower() not in now:
+            # A new name for this device: only when every session it would add lies in
+            # a project folder the device already reads (a basename shared by another
+            # folder, an alias or a merged casing can name a different project).
+            if any(foreign for _k, foreign in exposure(plan, entries, [m])):
+                why = "other-folder"
+        out.append((e, m, why))
+    return out
 
 
 def map_allowlist(plan: Plan, entries: Iterable[str]) -> list[str]:
     """Each entry mapped, first spelling of each name kept, case-insensitively unique.
 
-    Never wider than before: an entry that names a subfolder or worktree of a project
-    (it only reaches its canonical name by folding into the parent) is mapped only when
-    that project is already allowed through another entry. Otherwise it is kept as it is,
-    which after the relabel matches nothing (fail-closed); the dry run says so
+    Never wider than before: an entry is kept as it is (which after the relabel matches
+    nothing: fail-closed) when its canonical name would let the device read sessions it
+    can't read now from a folder it reads nothing from, or when it names a subfolder or
+    worktree of a project the device is not otherwise allowed. The dry run says so
     (``widening_entries``) and the owner decides whether the device gets the project."""
-    entries = list(entries)
-    allowed = {(plan.map_label(e) or e).casefold() for e in entries if e not in plan.folded}
     out: list[str] = []
     seen: set[str] = set()
-    for e in entries:
-        m = plan.map_label(e) or e
-        if e in plan.folded and m.casefold() not in allowed:
-            m = e
-        if m.casefold() not in seen:
-            seen.add(m.casefold())
-            out.append(m)
+    for e, m, why in _allowlist_decisions(plan, list(entries)):
+        name = e if why else m
+        if name.casefold() not in seen:
+            seen.add(name.casefold())
+            out.append(name)
     return out
 
 
-def widening_entries(plan: Plan, entries: Iterable[str]) -> list[tuple[str, str]]:
-    """``(entry, project)`` for each entry map_allowlist leaves as it is rather than widen."""
-    entries = list(entries)
-    allowed = {(plan.map_label(e) or e).casefold() for e in entries if e not in plan.folded}
-    return [
-        (e, plan.map_label(e) or e)
-        for e in entries
-        if e in plan.folded and (plan.map_label(e) or e).casefold() not in allowed
-    ]
+def widening_entries(plan: Plan, entries: Iterable[str]) -> list[tuple[str, str, str]]:
+    """``(entry, project, why)`` for each entry map_allowlist leaves as it is rather than
+    widen: ``why`` is 'subfolder' or 'other-folder'."""
+    return [(e, m, why) for e, m, why in _allowlist_decisions(plan, list(entries)) if why]
 
 
 def case_matches(entries: Iterable[str], labels: Iterable[str]) -> list[str]:
@@ -637,12 +717,26 @@ def report(inv: Inventory, plan: Plan) -> str:
         new = map_allowlist(plan, s["allowed_projects"])
         mark = "" if new != s["allowed_projects"] else "  (unchanged)"
         out.append(f"  {s['surface_id']}: {s['allowed_projects']} -> {new}{mark}")
-        for entry, project in widening_entries(plan, s["allowed_projects"]):
+        for entry, project, why in widening_entries(plan, s["allowed_projects"]):
+            what = (
+                f"is part of {project!r}, which this device is not allowed"
+                if why == "subfolder"
+                else f"would become {project!r}, which also names sessions from a folder "
+                "this device reads nothing from"
+            )
             out.append(
-                f"    ! {entry!r} is part of {project!r}, which this device is not allowed: "
-                "kept as is (it will match nothing). Add the project yourself to grant it."
+                f"    ! {entry!r} {what}: kept as is (it will match nothing). "
+                "Add the project yourself to grant it."
             )
     out.extend(_case_matching_section(inv, plan))
+    out.extend(_exposure_section(inv, plan))
+    if plan.ambiguous:
+        out.append(
+            "\nbare labels whose sessions map to different projects: left as they are "
+            "outside episodes (relabel those rows by hand):"
+        )
+        for label, names in sorted(plan.ambiguous.items()):
+            out.append(f"  {label}: {', '.join(names)}")
     out.append("\nconfig_lane.config_registry.scope:")
     for scope, n in sorted(inv.config_scopes.items()):
         new = map_scope(plan, scope)
@@ -690,50 +784,131 @@ def _case_matching_section(inv: Inventory, plan: Plan) -> list[str]:
     return out
 
 
-def apply(conn: Any, inv: Inventory, plan: Plan, log=print) -> None:
-    """Write the plan, one committed transaction per label (and one for the small
-    tables), so an interrupted run resumes by planning again."""
-    by_label: dict[str, list[tuple[str | None, str]]] = defaultdict(list)
-    for (label, cwd), canonical in plan.groups.items():
-        by_label[label].append((cwd, canonical))
-    for label, targets in sorted(by_label.items()):
-        changed = [(cwd, c) for cwd, c in targets if c != label]
-        if not changed:
+def _exposure_section(inv: Inventory, plan: Plan) -> list[str]:
+    """Per restricted surface, the sessions it reads after --apply that it can't read now
+    (its mapped allowlist against the relabelled episodes). '!' marks sessions from a
+    project folder it reads nothing from now: a different project that shares a name."""
+    out = [
+        "\nrestricted surfaces: sessions readable after --apply, not now "
+        "('!' = from a folder the device reads nothing from now):"
+    ]
+    for s in inv.surfaces:
+        if s["surface_id"] in inv.full_surfaces:
             continue
+        mapped = map_allowlist(plan, s["allowed_projects"])
+        rows: dict[tuple[str, str, bool], int] = defaultdict(int)
+        for key, foreign in exposure(plan, s["allowed_projects"], mapped):
+            where = plan.roots.get(plan.group_roots.get(key) or "", key[1] or "")
+            rows[(key[0], where, foreign)] += inv.episode_groups.get(key, 0)
+        if not rows:
+            out.append(f"  {s['surface_id']}: none")
+            continue
+        out.append(f"  {s['surface_id']}:")
+        for (label, where, foreign), n in sorted(rows.items()):
+            out.append(f"    {'!' if foreign else ' '} {n:>7}  {label}  ({where or 'no folder'})")
+    return out
+
+
+PLAN_VERSION = 1
+
+
+def plan_document(inv: Inventory, plan: Plan) -> dict[str, Any]:
+    """Everything --apply writes, decided by the dry run: --apply executes exactly this
+    and never plans again, so nothing that arrives between the two (a new label, a new
+    folder that would absorb others, a table created since) changes what is written."""
+    episodes = sorted(
+        (
+            [label, cwd, canonical]
+            for (label, cwd), canonical in plan.groups.items()
+            if canonical != label
+        ),
+        key=lambda r: (r[0], r[1] or ""),
+    )
+    tables: dict[str, dict[str, str]] = {}
+    for q, labels in sorted(inv.tables.items()):
+        ch = {lb: plan.map_label(lb) or lb for lb in sorted(labels)}
+        ch = {lb: new for lb, new in ch.items() if new != lb}
+        if ch and q not in inv.unique_tables:
+            tables[q] = ch
+    surfaces = [
+        {"surface_id": s["surface_id"], "from": s["allowed_projects"], "to": allow}
+        for s in inv.surfaces
+        if (allow := map_allowlist(plan, s["allowed_projects"])) != s["allowed_projects"]
+    ]
+    skills = [
+        {"name": s["name"], "from": s["scope"], "to": to}
+        for s in inv.skills
+        if (to := map_scope(plan, s["scope"])) != s["scope"]
+    ]
+    config = [
+        {"from": scope, "to": moved}
+        for scope in sorted(inv.config_scopes)
+        if (moved := map_scope(plan, scope)) != scope
+    ]
+    return {
+        "version": PLAN_VERSION,
+        "episodes": episodes,
+        "tables": tables,
+        "surfaces": surfaces,
+        "skills": skills,
+        "config_scopes": config,
+    }
+
+
+def _plan_entries(doc: Any) -> dict[str, Any]:
+    if not isinstance(doc, dict) or doc.get("version") != PLAN_VERSION:
+        raise ValueError("not a relabel plan: write one with --dry-run --plan-out FILE")
+    return doc
+
+
+def apply_plan(conn: Any, doc: dict[str, Any], log=print) -> None:
+    """Write exactly the approved plan (``plan_document``): one committed transaction per
+    label, then one for the allowlists and skill scopes. A table the plan does not name
+    is never touched, and an allowlist or scope that changed since the dry run is left
+    alone, so a re-run of the same plan after an interruption only finishes it."""
+    doc = _plan_entries(doc)
+    by_label: dict[str, list[tuple[str | None, str]]] = defaultdict(list)
+    for label, cwd, canonical in doc.get("episodes") or []:
+        by_label[label].append((cwd, canonical))
+    tables = doc.get("tables") or {}
+    log(
+        f"plan: {sum(len(t) for t in by_label.values())} episode groups under "
+        f"{len(by_label)} labels, {len(tables)} other tables, "
+        f"{len(doc.get('surfaces') or [])} allowlists, {len(doc.get('skills') or [])} skill "
+        f"scopes, {len(doc.get('config_scopes') or [])} config scopes"
+    )
+    for label, targets in sorted(by_label.items()):
         with conn.transaction():
-            if len(changed) == len(targets) and len({c for _, c in changed}) == 1:
-                n = conn.execute(
-                    "UPDATE episodes SET project = %s WHERE project = %s",
-                    (changed[0][1], label),
+            n = sum(
+                conn.execute(
+                    "UPDATE episodes SET project = %s WHERE project = %s "
+                    "AND (metadata->>'cwd') IS NOT DISTINCT FROM %s",
+                    (canonical, label, cwd),
                 ).rowcount
-            else:
-                n = 0
-                for cwd, canonical in changed:
-                    n += conn.execute(
-                        "UPDATE episodes SET project = %s WHERE project = %s "
-                        "AND (metadata->>'cwd') IS NOT DISTINCT FROM %s",
-                        (canonical, label, cwd),
-                    ).rowcount
-        log(f"episodes: {label} -> {sorted({c for _, c in changed})}: {n} rows")
-    for q, labels in inv.tables.items():
-        ch = {lb: plan.map_label(lb) for lb in labels if plan.map_label(lb) != lb}
-        if not ch:
+                for cwd, canonical in targets
+            )
+        log(f"episodes: {label} -> {sorted({c for _, c in targets})}: {n} rows")
+    live = {_qual(sc, t) for sc, t in conn.execute(_PROJECT_TABLES).fetchall()}
+    live.discard(_qual("public", "episodes"))
+    for q, ch in sorted(tables.items()):
+        if q not in live:  # only a catalog name is ever put into SQL
+            log(f"{q}: not a table with a project column here: skipped")
             continue
         clash = _unique_project_indexes(conn, q)
         if clash:
             log(f"{q}: SKIPPED, unique index on project ({', '.join(clash)}); relabel by hand")
             continue
         with conn.transaction():
-            for lb, new in ch.items():
+            n = sum(
                 conn.execute(
                     f"UPDATE {q} SET project = %s WHERE project = %s",  # nosec B608
-                    (new, lb),
-                )
-        log(f"{q}: {sum(labels[lb] for lb in ch)} rows")
-    for scope in sorted(inv.config_scopes):
-        new = map_scope(plan, scope)
-        if new == scope:
-            continue
+                    (new, old),
+                ).rowcount
+                for old, new in ch.items()
+            )
+        log(f"{q}: {n} rows")
+    for c in doc.get("config_scopes") or []:
+        old, new = c["from"], c["to"]
         # (surface_id, scope, file_key) is the key: a file already mirrored under the new
         # scope keeps that row, and the old-scope one stays for its owner to drop.
         with conn.transaction():
@@ -741,29 +916,39 @@ def apply(conn: Any, inv: Inventory, plan: Plan, log=print) -> None:
                 "UPDATE config_lane.config_registry r SET scope = %s WHERE r.scope = %s "
                 "AND NOT EXISTS (SELECT 1 FROM config_lane.config_registry x WHERE "
                 "x.surface_id = r.surface_id AND x.scope = %s AND x.file_key = r.file_key)",
-                (new, scope, new),
+                (new, old, new),
             ).rowcount
-        left = inv.config_scopes[scope] - moved
-        log(f"config_registry: {scope} -> {new}: {moved} rows" + (f", {left} kept" if left else ""))
+            left = conn.execute(
+                "SELECT count(*) FROM config_lane.config_registry WHERE scope = %s", (old,)
+            ).fetchone()[0]
+        log(f"config_registry: {old} -> {new}: {moved} rows" + (f", {left} kept" if left else ""))
     with conn.transaction():
-        for s in inv.surfaces:
-            new = map_allowlist(plan, s["allowed_projects"])
-            if new != s["allowed_projects"]:
-                conn.execute(
-                    "UPDATE surfaces SET allowed_projects = %s, updated_at = now() "
-                    "WHERE surface_id = %s",
-                    (new, s["surface_id"]),
-                )
-                log(f"surfaces: {s['surface_id']} -> {new}")
-        for s in inv.skills:
-            new = map_scope(plan, s["scope"])
-            if new != s["scope"]:
-                conn.execute(
-                    "UPDATE skills_lane.skill_registry SET scope = %s, updated_at = now() "
-                    "WHERE name = %s",
-                    (new, s["name"]),
-                )
-                log(f"skill_registry: {s['name']} -> {new}")
+        for sf in doc.get("surfaces") or []:
+            n = conn.execute(
+                "UPDATE surfaces SET allowed_projects = %s, updated_at = now() "
+                "WHERE surface_id = %s AND allowed_projects = %s::text[]",
+                (sf["to"], sf["surface_id"], sf["from"]),
+            ).rowcount
+            log(f"surfaces: {sf['surface_id']} -> {sf['to']}" if n else _left(conn, sf))
+        for sk in doc.get("skills") or []:
+            n = conn.execute(
+                "UPDATE skills_lane.skill_registry SET scope = %s, updated_at = now() "
+                "WHERE name = %s AND scope = %s",
+                (sk["to"], sk["name"], sk["from"]),
+            ).rowcount
+            if n:
+                log(f"skill_registry: {sk['name']} -> {sk['to']}")
+            else:
+                log(f"skill_registry: {sk['name']}: not {sk['from']} any more, left alone")
+
+
+def _left(conn: Any, sf: dict[str, Any]) -> str:
+    row = conn.execute(
+        "SELECT allowed_projects FROM surfaces WHERE surface_id = %s", (sf["surface_id"],)
+    ).fetchone()
+    if row is not None and list(row[0] or []) == sf["to"]:
+        return f"surfaces: {sf['surface_id']}: already {sf['to']}"
+    return f"surfaces: {sf['surface_id']}: changed since the dry run, left alone"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -772,10 +957,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     mode = p.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true", help="print the mapping, write nothing")
-    mode.add_argument("--apply", action="store_true", help="rewrite the stored labels")
+    mode.add_argument("--apply", action="store_true", help="write an approved plan (--plan FILE)")
     mode.add_argument("--inventory-sql", action="store_true", help="print the inventory SQL")
     p.add_argument("--aliases", type=Path, help="alias file (keep it outside the repo)")
     p.add_argument("--out", type=Path, help="--dry-run: also write the report here")
+    p.add_argument(
+        "--plan-out", type=Path, help="--dry-run: write the plan --apply executes (JSON)"
+    )
+    p.add_argument("--plan", type=Path, help="--apply: the plan file the dry run wrote")
     p.add_argument("--inventory", type=Path, help="--dry-run: plan from --inventory-sql output")
     p.add_argument("--db-url", default=os.environ.get("SYNAPSE_DB_URL", ""))
     args = p.parse_args(argv)
@@ -785,15 +974,26 @@ def main(argv: list[str] | None = None) -> int:
     cfg = AliasConfig()
     if args.aliases:
         cfg = AliasConfig.parse(args.aliases.expanduser().read_text(encoding="utf-8"))
-    if args.inventory is not None:
-        if not args.dry_run:
-            print("--inventory plans offline, so it only goes with --dry-run", file=sys.stderr)
+    doc: dict[str, Any] = {}
+    if (args.plan is not None) != bool(args.apply) or (args.plan_out and not args.dry_run):
+        print("--plan goes with --apply, --plan-out with --dry-run", file=sys.stderr)
+        return 2
+    if args.apply:
+        if args.aliases or args.inventory:
+            print(
+                "--apply writes the plan a dry run wrote: --apply --plan FILE (aliases and "
+                "inventories go to the dry run)",
+                file=sys.stderr,
+            )
             return 2
+        try:
+            doc = _plan_entries(json.loads(args.plan.expanduser().read_text(encoding="utf-8")))
+        except (OSError, ValueError) as e:
+            print(f"cannot read the plan: {e}", file=sys.stderr)
+            return 2
+    if args.inventory is not None:
         inv = inventory_from_json(args.inventory.expanduser().read_text(encoding="utf-8"))
-        text = report(inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels()))
-        print(text, end="")
-        if args.out:
-            args.out.expanduser().write_text(text, encoding="utf-8")
+        _dry_run(inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels()), args)
         return 0
     if not args.db_url:
         print("no database URL — pass --db-url or set SYNAPSE_DB_URL", file=sys.stderr)
@@ -802,21 +1002,26 @@ def main(argv: list[str] | None = None) -> int:
     import psycopg
 
     with psycopg.connect(args.db_url, autocommit=True) as conn:
-        if args.dry_run:
-            with conn.transaction():
-                conn.execute("SET TRANSACTION READ ONLY")
-                inv = read_inventory(conn)
-        else:
-            inv = read_inventory(conn)
-        plan = Planner(cfg).plan(inv.episode_groups, inv.other_labels())
-        text = report(inv, plan)
-        if args.dry_run:
-            print(text, end="")
-            if args.out:
-                args.out.expanduser().write_text(text, encoding="utf-8")
+        if args.apply:
+            apply_plan(conn, doc)
             return 0
-        apply(conn, inv, plan)
+        with conn.transaction():
+            conn.execute("SET TRANSACTION READ ONLY")
+            inv = read_inventory(conn)
+    _dry_run(inv, Planner(cfg).plan(inv.episode_groups, inv.other_labels()), args)
     return 0
+
+
+def _dry_run(inv: Inventory, plan: Plan, args: argparse.Namespace) -> None:
+    text = report(inv, plan)
+    print(text, end="")
+    if args.out:
+        args.out.expanduser().write_text(text, encoding="utf-8")
+    if args.plan_out:
+        args.plan_out.expanduser().write_text(
+            json.dumps(plan_document(inv, plan), indent=1, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ tests/test_relabel_projects_db.py.
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -489,7 +490,9 @@ def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes():
     plan = _plan(inv.episode_groups, other=inv.other_labels())
     assert plan.changes == []
     assert rp.map_allowlist(plan, inv.surfaces[0]["allowed_projects"]) == ["BigProj", "acme"]
-    assert rp.map_allowlist(plan, inv.surfaces[1]["allowed_projects"]) == ["BigProj"]
+    # An alias entry names no session left to show it is the same folder: kept (the
+    # approved plan file, not a re-plan, is what a re-run after an interruption executes).
+    assert rp.map_allowlist(plan, inv.surfaces[1]["allowed_projects"]) == ["big-proj"]
     assert rp.map_scope(plan, inv.skills[0]["scope"]) == "project:BigProj"
     assert {rp.map_scope(plan, s) for s in inv.config_scopes} == {"project:BigProj"}
 
@@ -516,12 +519,33 @@ def test_a_path_label_seen_only_outside_episodes_still_becomes_a_name():
     assert plan.labels == {WIN + r"\tickets": "tickets", "/home/u/code/beta/": "beta"}
 
 
-def test_a_bare_subfolder_label_is_not_widened_without_its_cwd():
-    """Without a cwd, ``scripts`` names nothing provable (every repo has one), so the
-    label map keeps it; only the episode group that carries the cwd moves."""
+def test_a_bare_subfolder_label_follows_its_sessions_outside_episodes():
+    """Rows outside episodes (timeline events, notes, scopes) were copied from the
+    episode's label and carry no cwd: when every session of ``scripts`` lands in one
+    project, they go there too, and the label counts as folded for allowlists."""
     plan = _plan()
     assert plan.groups[("scripts", REPO + "/scripts")] == "acme"
+    assert plan.map_label("scripts") == "acme"
+    assert "scripts" in plan.folded
+    assert plan.ambiguous == {}
+
+
+def test_a_bare_label_whose_sessions_disagree_is_left_and_reported():
+    groups = {
+        ("scripts", REPO + "/scripts"): 2,
+        ("acme", REPO): 5,
+        ("scripts", "/home/u/code/widget/scripts"): 1,
+        ("widget", "/home/u/code/widget"): 4,
+    }
+    plan = _plan(groups, aliases="")
+    assert plan.groups[("scripts", "/home/u/code/widget/scripts")] == "widget"
     assert plan.map_label("scripts") == "scripts"
+    assert plan.ambiguous == {"scripts": ["acme", "widget"]}
+    inv = rp.Inventory(groups, {'"public"."notes"': {"scripts": 3}}, [], [])
+    text = rp.report(inv, plan)
+    assert "bare labels whose sessions map to different projects" in text
+    assert "  scripts: acme, widget" in text
+    assert '"public"."notes": no change' in text
 
 
 def test_map_allowlist_maps_and_dedupes_case_insensitively_in_order():
@@ -774,7 +798,7 @@ def test_an_offline_dry_run_plans_from_the_inventory_file(tmp_path, monkeypatch,
     assert text == rp.report(inv, rp.Planner(cfg).plan(inv.episode_groups, inv.other_labels()))
     assert "| scripts | /home/u/code/acme | acme | 2 | subfolder → project root |" in text
     assert "| bigproj |  | BigProj | 1 | alias |" in text
-    assert "  dev-laptop: ['scripts', 'acme', 'bigproj'] -> ['scripts', 'acme', 'BigProj']" in text
+    assert "  dev-laptop: ['scripts', 'acme', 'bigproj'] -> ['acme', 'BigProj']" in text
     assert "        2  project:bigproj -> project:BigProj" in text
 
 
@@ -783,7 +807,11 @@ def test_an_inventory_file_never_goes_with_apply(tmp_path, monkeypatch, capsys):
     inv_file = tmp_path / "inv.json"
     inv_file.write_text(_PSQL_OUTPUT, encoding="utf-8")
     assert rp.main(["--apply", "--inventory", str(inv_file)]) == 2
-    assert "only goes with --dry-run" in capsys.readouterr().err
+    assert "--plan goes with --apply" in capsys.readouterr().err
+    plan = tmp_path / "plan.json"
+    plan.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    assert rp.main(["--apply", "--plan", str(plan), "--inventory", str(inv_file)]) == 2
+    assert "inventories go to the dry run" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
@@ -813,7 +841,7 @@ def test_a_bad_alias_file_stops_before_touching_the_database(tmp_path, monkeypat
 
     monkeypatch.setattr("psycopg.connect", _no_connect)
     with pytest.raises(ValueError, match="line 1"):
-        rp.main(["--apply", "--aliases", str(bad), "--db-url", "postgresql://unused/x_test"])
+        rp.main(["--dry-run", "--aliases", str(bad), "--db-url", "postgresql://unused/x_test"])
 
 
 # ---------------------------------------------------------------------------
@@ -828,7 +856,7 @@ def test_an_allowlisted_subfolder_is_never_widened_to_its_whole_project():
     plan = _plan({(WIN, WIN): 10, (WIN + r"\tickets", WIN + r"\tickets"): 3}, aliases="")
     only_sub = [WIN + r"\tickets", "other-proj"]
     assert rp.map_allowlist(plan, only_sub) == only_sub
-    assert rp.widening_entries(plan, only_sub) == [(WIN + r"\tickets", "BigProj")]
+    assert rp.widening_entries(plan, only_sub) == [(WIN + r"\tickets", "BigProj", "subfolder")]
     both = [WIN + r"\tickets", WIN, "bigproj"]
     assert rp.map_allowlist(plan, both) == ["BigProj"]
     assert rp.widening_entries(plan, both) == []
@@ -897,3 +925,157 @@ def test_inventory_json_carries_full_trust_surfaces():
     inv = rp.inventory_from_json('{"surfaces": [], "full_surfaces": ["dev-a"]}')
     assert inv.full_surfaces == {"dev-a"}
     assert rp.inventory_from_json('{"surfaces": []}').full_surfaces == set()
+
+
+# ---------------------------------------------------------------------------
+# An allowlist never widens: other folders, aliases, merged casings
+# ---------------------------------------------------------------------------
+
+WIN_TOOLS = r"C:\Users\pat\work\tools"
+
+
+def test_a_path_entry_whose_name_another_folder_shares_is_kept():
+    """The work laptop's path entry would become 'tools', which also names 900 personal
+    sessions from another machine's folder: kept as is, and flagged."""
+    groups = {
+        (WIN_TOOLS, WIN_TOOLS): 40,
+        ("tools", "/home/pat/code/tools"): 900,
+        ("acme", REPO): 100,
+    }
+    plan = _plan(groups, aliases="")
+    entries = [WIN_TOOLS, "acme"]
+    assert rp.map_allowlist(plan, entries) == entries
+    assert rp.widening_entries(plan, entries) == [(WIN_TOOLS, "tools", "other-folder")]
+    inv = rp.Inventory(groups, {}, [{"surface_id": "dev-work", "allowed_projects": entries}], [])
+    text = rp.report(inv, plan)
+    assert "which also names sessions from a folder this device reads nothing from" in text
+
+
+def test_an_alias_or_a_merged_home_casing_is_not_a_way_in_either():
+    groups = {
+        (r"C:\x\transcribe-ai", r"C:\x\transcribe-ai"): 4,
+        ("transcribe_ai", "/home/pat/code/transcribe_ai"): 9,
+        (r"C:\Users\Pat", r"C:\Users\Pat"): 3,
+        ("pat", "/home/pat"): 50,
+    }
+    entries = ["transcribe-ai", "transcribe_ai", r"C:\Users\Pat"]
+    plan = _plan(groups, aliases="transcribe-ai = transcribe_ai", other=entries)
+    assert plan.map_label("transcribe-ai") == "transcribe_ai"
+    assert rp.map_allowlist(plan, ["transcribe-ai"]) == ["transcribe-ai"]
+    assert rp.map_allowlist(plan, [r"C:\Users\Pat"]) == [r"C:\Users\Pat"]
+    # A device that already reads the target is not widened by the mapping.
+    assert rp.map_allowlist(plan, ["transcribe-ai", "transcribe_ai"]) == ["transcribe_ai"]
+
+
+def test_an_entry_that_only_gains_its_own_folders_sessions_is_mapped():
+    """The path entry becomes the project's name; the sessions it adds (the folder's
+    subfolders, a 0.21 client's label) lie in the folder it already reads."""
+    groups = {
+        (WIN, WIN): 10,
+        (WIN + r"\tickets", WIN + r"\tickets"): 3,
+        ("BigProj", WIN + r"\src"): 2,
+    }
+    plan = _plan(groups, aliases="")
+    assert rp.map_allowlist(plan, [WIN]) == ["BigProj"]
+    assert rp.widening_entries(plan, [WIN]) == []
+    assert {k for k, foreign in rp.exposure(plan, [WIN], ["BigProj"]) if foreign} == set()
+
+
+def test_the_report_lists_sessions_a_device_reads_after_apply_and_marks_other_folders():
+    """An entry that is already the canonical name gains the relabelled path sessions of
+    another folder that shares the name: the dry run shows them with '!'."""
+    groups = {
+        ("tools", "/home/pat/code/tools"): 900,
+        (WIN_TOOLS, WIN_TOOLS): 40,
+        (WIN, WIN): 10,
+        (WIN + r"\tickets", WIN + r"\tickets"): 3,
+    }
+    plan = _plan(groups, aliases="")
+    inv = rp.Inventory(
+        groups,
+        {},
+        [
+            {"surface_id": "dev-a", "allowed_projects": ["tools"]},
+            {"surface_id": "dev-b", "allowed_projects": [WIN]},
+            {"surface_id": "dev-full", "allowed_projects": []},
+        ],
+        [],
+        full_surfaces={"dev-full"},
+    )
+    lines = rp.report(inv, plan).splitlines()
+    i = lines.index(
+        "restricted surfaces: sessions readable after --apply, not now "
+        "('!' = from a folder the device reads nothing from now):"
+    )
+    section = lines[i + 1 : i + 6]
+    assert section[0] == "  dev-a:"
+    assert section[1] == f"    ! {40:>7}  {WIN_TOOLS}  (C:/Users/pat/work/tools)"
+    assert section[2] == "  dev-b:"
+    assert section[3].startswith(f"      {3:>7}  {WIN}\\tickets  (")
+    assert not any("dev-full" in ln for ln in section)
+
+
+# ---------------------------------------------------------------------------
+# The plan file: --apply writes what the dry run decided, nothing else
+# ---------------------------------------------------------------------------
+
+
+def test_the_dry_run_writes_the_plan_apply_executes(tmp_path, monkeypatch, capsys):
+    _no_connect(monkeypatch)
+    inv_file = tmp_path / "inv.json"
+    inv_file.write_text(_PSQL_OUTPUT, encoding="utf-8")
+    plan_file = tmp_path / "plan.json"
+    argv = ["--dry-run", "--inventory", str(inv_file), "--plan-out", str(plan_file)]
+    assert rp.main(argv) == 0
+    capsys.readouterr()
+    inv = rp.inventory_from_json(_PSQL_OUTPUT)
+    doc = json.loads(plan_file.read_text(encoding="utf-8"))
+    assert doc == rp.plan_document(inv, rp.Planner().plan(inv.episode_groups, inv.other_labels()))
+    assert doc["version"] == rp.PLAN_VERSION
+    assert ["scripts", "/home/u/code/acme/scripts", "acme"] in doc["episodes"]
+    assert all(old != new for old, _cwd, new in doc["episodes"])
+    assert doc["tables"] == {'"public"."notes"': {"scripts": "acme"}}
+    assert doc["surfaces"] == [
+        {
+            "surface_id": "dev-laptop",
+            "from": ["scripts", "acme", "bigproj"],
+            "to": ["acme", "BigProj"],
+        }
+    ]
+
+
+def test_a_table_apply_skips_is_not_in_the_plan():
+    groups = {(WIN, WIN): 1}
+    inv = rp.Inventory(
+        groups, {'"x"."uniq"': {WIN: 2}, '"x"."jobs"': {WIN: 1}}, [], [], {}, {'"x"."uniq"'}
+    )
+    doc = rp.plan_document(inv, _plan(groups, aliases=""))
+    assert doc["tables"] == {'"x"."jobs"': {WIN: "BigProj"}}
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["{}", '{"version": 2}', "[]", "not json"],
+    ids=["no-version", "other-version", "a-list", "not-json"],
+)
+def test_apply_refuses_anything_but_a_plan_file(tmp_path, monkeypatch, capsys, content):
+    _no_connect(monkeypatch)
+    plan = tmp_path / "plan.json"
+    plan.write_text(content, encoding="utf-8")
+    assert rp.main(["--apply", "--plan", str(plan), "--db-url", "postgresql://unused/x_test"]) == 2
+    assert "cannot read the plan" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--apply", "--db-url", "postgresql://unused/x_test"],
+        ["--dry-run", "--plan", "p.json", "--db-url", "postgresql://unused/x_test"],
+        ["--apply", "--plan", "p.json", "--plan-out", "q.json"],
+    ],
+    ids=["apply-without-plan", "plan-with-dry-run", "plan-out-with-apply"],
+)
+def test_plan_flags_go_with_their_mode(monkeypatch, capsys, argv):
+    _no_connect(monkeypatch)
+    assert rp.main(argv) == 2
+    assert "--plan goes with --apply" in capsys.readouterr().err

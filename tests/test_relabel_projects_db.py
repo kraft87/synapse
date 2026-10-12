@@ -444,7 +444,12 @@ def test_apply_moves_every_label_and_a_second_apply_is_a_no_op(
     first = _snapshot(conn, w)
     history_before = first["skill_history"]
 
-    log = _run(["--apply", "--aliases", str(aliases), "--db-url", db_url], capsys)
+    plan = aliases.parent / "plan.json"
+    dry = _run(
+        ["--dry-run", "--aliases", str(aliases), "--db-url", db_url, "--plan-out", str(plan)],
+        capsys,
+    )
+    log = _run(["--apply", "--plan", str(plan), "--db-url", db_url], capsys)
 
     # episodes: every (label, cwd) group moved to its canonical name; cwd untouched.
     expected = {key: {canonical} for key, _l, _c, _n, canonical in w.episode_plan()}
@@ -466,9 +471,11 @@ def test_apply_moves_every_label_and_a_second_apply_is_a_no_op(
     assert snap["timeline_events"] == [(w.big,)]
     assert snap["preferences"] == [(w.big,)]
     assert [p for _id, p in snap["jobs"]] == [w.big, w.alpha]
-    # A unique index on project could collide: that table is reported and left alone.
+    # A unique index on project could collide: the dry run reports that table and the
+    # plan leaves it out, so --apply never touches it.
     assert snap["registry"] == [(w.win,)]
-    assert f'"{w.schema}"."registry": SKIPPED, unique index on project' in log
+    assert f'"{w.schema}"."registry": 1 rows WOULD change, but --apply SKIPS' in dry
+    assert '"registry"' not in log
 
     allow = {sid: list(a) for sid, a, _u in snap["surfaces"]}
     assert allow == {w.full: [], w.restricted: w.allowlist_after()}
@@ -481,13 +488,14 @@ def test_apply_moves_every_label_and_a_second_apply_is_a_no_op(
     # A scope change is not a body change: the history trigger stays quiet.
     assert snap["skill_history"] == history_before
 
-    # Re-running plans nothing for these rows and writes nothing.
-    again = _run(["--apply", "--aliases", str(aliases), "--db-url", db_url], capsys)
-    mentions = sorted(ln for ln in again.splitlines() if w.tag in ln)
-    # Only the two collisions are reported again, both still untouched.
-    assert len(mentions) == 2
-    assert mentions[0].startswith(f'"{w.schema}"."registry": SKIPPED')
-    assert mentions[1] == f"config_registry: project:{w.win} -> project:{w.big}: 0 rows, 1 kept"
+    # Running the same plan again writes nothing.
+    again = _run(["--apply", "--plan", str(plan), "--db-url", db_url], capsys)
+    mentions = [ln for ln in again.splitlines() if w.tag in ln]
+    assert mentions
+    for line in mentions:
+        assert line.endswith(
+            (": 0 rows", ": 0 rows, 1 kept", f"already {w.allowlist_after()}", "left alone")
+        ), line
     assert _snapshot(conn, w) == snap
 
     dry = _run(["--dry-run", "--aliases", str(aliases), "--db-url", db_url], capsys)
@@ -495,11 +503,54 @@ def test_apply_moves_every_label_and_a_second_apply_is_a_no_op(
     assert f"  {w.restricted}: {w.allowlist_after()} -> {w.allowlist_after()}  (unchanged)" in dry
 
 
+def test_apply_writes_the_approved_plan_and_nothing_that_appeared_since(
+    conn, db_url, world, aliases, capsys
+):
+    """Between the dry run and --apply, a backup copy of a table is made and new sessions
+    arrive (a label the plan never saw, and more rows of a group it did). --apply writes
+    exactly the approved plan: the copy is never touched, the new label stays, and the
+    planned group moves whole."""
+    w = world
+    plan = aliases.parent / "plan.json"
+    _run(
+        ["--dry-run", "--aliases", str(aliases), "--db-url", db_url, "--plan-out", str(plan)],
+        capsys,
+    )
+    conn.execute(
+        f'CREATE TABLE "{w.schema}".jobs_backup AS SELECT id, project FROM "{w.schema}".jobs'
+    )
+    later = w.win + r"\later"
+    for n, (label, cwd) in enumerate([(later, later), (w.win, w.win)]):
+        conn.execute(
+            "INSERT INTO episodes (session_id, sequence, project, content, metadata) "
+            "VALUES (%s, 1, %s, 'a later turn', %s)",
+            (f"{w.prefix}-later-{n}", label, Jsonb({"cwd": cwd})),
+        )
+
+    log = _run(["--apply", "--plan", str(plan), "--db-url", db_url], capsys)
+
+    backup = conn.execute(f'SELECT project FROM "{w.schema}".jobs_backup ORDER BY id').fetchall()
+    assert [p for (p,) in backup] == [w.win, w.alpha]
+    assert "jobs_backup" not in log
+    stored = dict(
+        conn.execute(
+            "SELECT session_id, project FROM episodes WHERE session_id LIKE %s",
+            (f"{w.prefix}-later-%",),
+        ).fetchall()
+    )
+    assert stored == {f"{w.prefix}-later-0": later, f"{w.prefix}-later-1": w.big}
+
+
 def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes(
     conn, db_url, world, aliases, capsys
 ):
     w = world
-    _run(["--apply", "--aliases", str(aliases), "--db-url", db_url], capsys)
+    plan = aliases.parent / "plan.json"
+    _run(
+        ["--dry-run", "--aliases", str(aliases), "--db-url", db_url, "--plan-out", str(plan)],
+        capsys,
+    )
+    _run(["--apply", "--plan", str(plan), "--db-url", db_url], capsys)
     # Drop the two rows that still hold w.win (both collisions), so that no table names
     # the old labels any more.
     conn.execute(f'DELETE FROM "{w.schema}".registry')
@@ -522,7 +573,7 @@ def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes(
             "UPDATE skills_lane.skill_registry SET scope = %s WHERE name = %s", (scope, name)
         )
 
-    _run(["--apply", "--aliases", str(aliases), "--db-url", db_url], capsys)
+    _run(["--apply", "--plan", str(plan), "--db-url", db_url], capsys)
 
     snap = _snapshot(conn, w)
     assert {sid: list(a) for sid, a, _u in snap["surfaces"]}[w.restricted] == w.allowlist_after()

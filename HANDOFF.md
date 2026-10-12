@@ -30,7 +30,10 @@ changed, what to do on each machine, what was proven, and what is still open.
   `episodes.project` (the 056 trigger keeps KG `source_projects` in step), every other
   `project` column, `surfaces.allowed_projects`, and `project:` scopes in the skill
   registry and config lane. `--dry-run` (or `--inventory-sql` + `--dry-run --inventory`,
-  which needs no DSN) writes nothing. Keep the alias file outside the repo.
+  which needs no DSN) writes nothing; `--plan-out` saves its plan and `--apply --plan`
+  executes exactly that plan, never a fresh one. An allowlist entry whose new name would
+  reach another folder's sessions is kept and flagged. Keep the alias file and the plan
+  outside the repo.
 
 **On each machine**: `synapse update` (or the plugin update) to 0.21.0. Optional: put a
 `.synapse-project` file in a repository whose folder name differs between machines.
@@ -39,7 +42,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 server matches a restricted allowlist case-insensitively from its deploy on, and an old
 subfolder entry (`dev`, `src`) can match another project's `Dev`. If it lists one, run the
 relabel first or drop that entry. Then merge → image, and only after Kyle approves the
-dry-run table: `scripts/relabel_projects.py --apply --aliases <file>` from a checkout.
+dry-run table: `scripts/relabel_projects.py --apply --plan <the dry run's plan file>`.
 Until the relabel runs, old labels stay as they are (new sessions arrive under canonical
 names; a replay of an old session is still recognised by its folder).
 
