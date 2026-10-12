@@ -493,9 +493,7 @@ def test_apply_moves_every_label_and_a_second_apply_is_a_no_op(
     mentions = [ln for ln in again.splitlines() if w.tag in ln]
     assert mentions
     for line in mentions:
-        assert line.endswith(
-            (": 0 rows", ": 0 rows, 1 kept", f"already {w.allowlist_after()}", "left alone")
-        ), line
+        assert line.endswith((": 0 rows", ": 0 rows, 1 kept")) or ": already " in line, line
     assert _snapshot(conn, w) == snap
 
     dry = _run(["--dry-run", "--aliases", str(aliases), "--db-url", db_url], capsys)
@@ -579,6 +577,49 @@ def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes(
     assert {sid: list(a) for sid, a, _u in snap["surfaces"]}[w.restricted] == w.allowlist_after()
     assert {n: s for n, s, _u in snap["skills"]} == w.skills_after()
     assert sorted(snap["config"]) == [c for c in w.config_after() if w.win not in c[0]]
+
+
+def test_an_allowlist_or_scope_edited_since_the_dry_run_is_left_alone_and_apply_fails(
+    conn, db_url, world, aliases, capsys
+):
+    """An allowlist edited between the dry run and --apply (here only reordered) is left
+    as it is: the plan was decided for the old one. The labels still move, so its old
+    path entries now match nothing: --apply says so and exits non-zero instead of 0, so
+    an operator can't miss the device that just lost access."""
+    w = world
+    plan = aliases.parent / "plan.json"
+    _run(
+        ["--dry-run", "--aliases", str(aliases), "--db-url", db_url, "--plan-out", str(plan)],
+        capsys,
+    )
+    edited = list(reversed(w.allowlist_before()))
+    conn.execute(
+        "UPDATE surfaces SET allowed_projects = %s WHERE surface_id = %s", (edited, w.restricted)
+    )
+    name, _scope = next(iter(w.skills_before().items()))
+    conn.execute("UPDATE skills_lane.skill_registry SET scope = 'global' WHERE name = %s", (name,))
+
+    assert rp.main(["--apply", "--plan", str(plan), "--db-url", db_url]) == 1
+    out, err = capsys.readouterr()
+    assert f"surfaces: {w.restricted}: changed since the dry run, left alone" in out
+    assert w.restricted in err and name in err and "changed since the dry run" in err
+    snap = _snapshot(conn, w)
+    assert {sid: list(a) for sid, a, _u in snap["surfaces"]}[w.restricted] == edited
+    assert {n: s for n, s, _u in snap["skills"]}[name] == "global"
+    expected = {key: {canonical} for key, _l, _c, _n, canonical in w.episode_plan()}
+    assert _labels_by_key(conn, w) == expected
+
+    # Once the plan has run, re-running it is not drift: 'already' lines, exit 0.
+    conn.execute(
+        "UPDATE surfaces SET allowed_projects = %s WHERE surface_id = %s",
+        (w.allowlist_after(), w.restricted),
+    )
+    conn.execute(
+        "UPDATE skills_lane.skill_registry SET scope = %s WHERE name = %s",
+        (w.skills_after()[name], name),
+    )
+    again = _run(["--apply", "--plan", str(plan), "--db-url", db_url], capsys)
+    assert f"skill_registry: {name}: already {w.skills_after()[name]}" in again
 
 
 # ---------------------------------------------------------------------------

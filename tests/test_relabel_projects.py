@@ -1004,7 +1004,8 @@ def test_the_report_lists_sessions_a_device_reads_after_apply_and_marks_other_fo
     )
     lines = rp.report(inv, plan).splitlines()
     i = lines.index(
-        "restricted surfaces: sessions readable after --apply, not now "
+        "restricted surfaces: rows readable after --apply, not now: sessions, then "
+        "[timeline_events], [preferences] and [skill] rows; KG facts follow their sessions "
         "('!' = from a folder the device reads nothing from now):"
     )
     section = lines[i + 1 : i + 6]
@@ -1013,6 +1014,73 @@ def test_the_report_lists_sessions_a_device_reads_after_apply_and_marks_other_fo
     assert section[2] == "  dev-b:"
     assert section[3].startswith(f"      {3:>7}  {WIN}\\tickets  (")
     assert not any("dev-full" in ln for ln in section)
+
+
+OTHER_ACME = "/home/bob/old/BigProj"  # another machine's folder; its sessions are gone
+
+
+def _table_only_world() -> tuple[rp.Inventory, rp.Plan]:
+    """The work laptop allows its own BigProj (path entry and name). Only timeline events
+    and a preference are left of another machine's same-named folder: no episode says
+    where they came from, but their label does, and it becomes 'BigProj' too."""
+    groups = {(WIN, WIN): 10, (WIN + r"\tickets", WIN + r"\tickets"): 4}
+    tables = {
+        '"public"."timeline_events"': {WIN: 5, WIN + r"\tickets": 3, OTHER_ACME: 6},
+        '"public"."preferences"': {WIN + r"\tickets": 2, OTHER_ACME: 1},
+        '"public"."kg_entities"': {OTHER_ACME: 50},
+    }
+    inv = rp.Inventory(
+        groups,
+        tables,
+        [{"surface_id": "dev-work", "allowed_projects": [WIN]}],
+        [{"name": "triage", "scope": f"project:{OTHER_ACME}"}],
+    )
+    plan = rp.Planner().plan(groups, inv.other_labels(), inv.served_labels())
+    return inv, plan
+
+
+def test_a_label_only_tables_hold_counts_for_what_a_device_reads_after_apply():
+    """A row outside episodes is served by its label like a session: a foreign folder's
+    timeline event, preference or project skill that would become an allowlisted name is
+    exposure, and keeps the entry from mapping (the device would read it)."""
+    inv, plan = _table_only_world()
+    assert plan.map_label(OTHER_ACME) == "BigProj"
+    assert inv.served_labels() == {WIN, WIN + r"\tickets", OTHER_ACME}
+    assert ((OTHER_ACME, None), True) in rp.exposure(plan, [WIN], ["BigProj"])
+    assert rp.map_allowlist(plan, [WIN]) == [WIN]
+    assert rp.widening_entries(plan, [WIN]) == [(WIN, "BigProj", "other-folder")]
+    # Without the foreign rows the same entry maps: its own subfolder is no way in.
+    own = rp.Inventory(
+        inv.episode_groups,
+        {q: {lb: n for lb, n in c.items() if lb != OTHER_ACME} for q, c in inv.tables.items()},
+        inv.surfaces,
+        [],
+    )
+    plan2 = rp.Planner().plan(own.episode_groups, own.other_labels(), own.served_labels())
+    assert rp.map_allowlist(plan2, [WIN]) == ["BigProj"]
+
+
+def test_the_exposure_section_counts_timeline_preference_and_skill_rows():
+    inv, _ = _table_only_world()
+    # An entry already named 'BigProj' can't be kept from the relabel: the dry run shows
+    # every row that joins it, sessions and served tables alike.
+    inv.surfaces[0]["allowed_projects"] = [WIN, "BigProj"]
+    plan = rp.Planner().plan(inv.episode_groups, inv.other_labels(), inv.served_labels())
+    lines = rp.report(inv, plan).splitlines()
+    i = next(n for n, ln in enumerate(lines) if ln.startswith("restricted surfaces: rows"))
+    section = lines[i + 1 : i + 8]
+    root = "C:/Users/pat/OneDrive - Acme Ltd/projects/BigProj"
+    assert section == [
+        "  dev-work:",
+        f"      {4:>7}  {WIN}\\tickets  ({root})",
+        f"    ! {6:>7}  {OTHER_ACME}  ({OTHER_ACME})  [timeline_events]",
+        f"      {3:>7}  {WIN}\\tickets  ({root})  [timeline_events]",
+        f"    ! {1:>7}  {OTHER_ACME}  ({OTHER_ACME})  [preferences]",
+        f"      {2:>7}  {WIN}\\tickets  ({root})  [preferences]",
+        f"    ! {1:>7}  {OTHER_ACME}  ({OTHER_ACME})  [skill]",
+    ]
+    # kg_entities is not served by label: its 50 rows are not exposure.
+    assert not any("50" in ln for ln in section)
 
 
 # ---------------------------------------------------------------------------
