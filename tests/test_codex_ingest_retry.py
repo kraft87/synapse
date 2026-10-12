@@ -144,14 +144,14 @@ def _stop(hook: ModuleType, path: str) -> tuple[int, int]:
 
 
 def _fail(exc: BaseException):
-    def post(records, session_id):
+    def post(records, session_id, project=None):
         raise exc
 
     return post
 
 
 def _ok(posted: list[list[dict]] | None = None):
-    def post(records, session_id):
+    def post(records, session_id, project=None):
         if posted is not None:
             posted.append(records)
         return {"ingested": len(records)}

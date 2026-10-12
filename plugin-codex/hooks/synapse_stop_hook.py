@@ -88,6 +88,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 # imports.
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
 import synapse_ingest_retry as retry
+import synapse_project
 from common import INGEST_URL, TOKEN
 from synapse_filelock import lock_exclusive
 
@@ -227,13 +228,41 @@ def _find_rollout(session_id: str) -> Path | None:
     return matches[-1] if matches else None
 
 
-def _post(records: list[dict[str, Any]], session_id: str) -> dict[str, Any]:
+def _rollout_cwd(payload: dict[str, Any], records: list[dict[str, Any]], path: Path) -> str | None:
+    """The session's working directory: the Stop payload's, else the newest
+    session_meta/turn_context in the records being shipped, else the rollout's first
+    line (session_meta), which a catch-up tail no longer carries."""
+    if payload.get("cwd"):
+        return str(payload["cwd"])
+    for rec in reversed(records):
+        p = rec.get("payload") if isinstance(rec, dict) else None
+        if isinstance(p, dict) and rec.get("type") in ("session_meta", "turn_context"):
+            if p.get("cwd"):
+                return str(p["cwd"])
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            first = json.loads(f.readline() or "{}")
+        p = first.get("payload") if isinstance(first, dict) else None
+        if isinstance(p, dict) and p.get("cwd"):
+            return str(p["cwd"])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _post(
+    records: list[dict[str, Any]], session_id: str, project: str | None = None
+) -> dict[str, Any]:
     body = {
         "records": records,
         "format": "codex",
         "session_id": session_id,
         "source": "codex-hook",
     }
+    if project:
+        # Resolved the way every client labels a project (synapse_project). Without it
+        # the server labels the turns from the rollout's cwd: just the folder's name.
+        body["project"] = project
     headers = {"Content-Type": "application/json", "User-Agent": "synapse-codex-hook/0.1"}
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
@@ -290,8 +319,10 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
 
     if not records:
         return (0, 0)
+    cwd = _rollout_cwd(payload, records, path)
+    project = synapse_project.project_label(cwd) if cwd else None
     try:
-        resp = _post(records, session_id)
+        resp = _post(records, session_id, project)
     except Exception as e:
         _log(f"POST failed for {session_id} ({len(records)} records): {e}")
         try:

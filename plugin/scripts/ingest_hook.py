@@ -101,6 +101,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import synapse_ingest_retry as retry
+import synapse_project
 from synapse_filelock import lock_exclusive
 
 INGEST_URL = config.INGEST_URL
@@ -389,13 +390,38 @@ def _is_private(session_id: str) -> bool:
     return True
 
 
+def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
+    """Each cwd the records carry, with its project label, resolved the way every client
+    labels a project (synapse_project: marker file, git toplevel, folder).
+
+    The records, not the hook payload, because the catch-up sweep and the history import
+    have no payload, and a swept transcript's session ran somewhere other than this one."""
+    cwds = {c for r in records if isinstance(r, dict) and isinstance(c := r.get("cwd"), str) and c}
+    return {c: lb for c in cwds if (lb := synapse_project.project_label(c))}
+
+
+def _records_project(records: list[dict[str, Any]]) -> str | None:
+    """The batch's one project label, or None when no record carries a cwd or the cwds
+    resolve to different projects (then the body carries ``cwd_projects`` instead)."""
+    labels = set(_cwd_labels(records).values())
+    return labels.pop() if len(labels) == 1 else None
+
+
 def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     """POST a batch of raw transcript records to /ingest; returns the (truncated)
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
     bulk history import (import_history.py), so all resolve URL/token identically
-    through config.py. Raises on transport/HTTP errors — callers decide how to
-    fail-soft."""
-    body = json.dumps({"records": records, "source": source}).encode()
+    through config.py, and all send the batch's project label (_records_project).
+    Raises on transport/HTTP errors — callers decide how to fail-soft."""
+    payload: dict[str, Any] = {"records": records, "source": source}
+    by_cwd = _cwd_labels(records)
+    if len(set(by_cwd.values())) == 1:
+        payload["project"] = next(iter(by_cwd.values()))
+    elif by_cwd:
+        # A session that moved between repositories: each turn is labelled from its own
+        # cwd (an older server ignores this and labels each turn from the cwd's basename).
+        payload["cwd_projects"] = by_cwd
+    body = json.dumps(payload).encode()
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
     # soft, so without it every ingest is silently dropped.

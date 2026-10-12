@@ -11,6 +11,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from ingestion.project_label import clean_label
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
@@ -68,7 +69,17 @@ def register(
         if not isinstance(records, list):
             return err("body must contain a 'records' list", 400)
         source_label = body.get("source") or "hook"
-        project_override = body.get("project")
+        # The client resolves the label (marker file, git toplevel, folder name); without
+        # one the parser labels from the transcript's cwd. Either way, never a path.
+        project_override = clean_label(body.get("project"))
+        # A batch spanning several projects (a session that moved between repositories)
+        # carries each cwd's label instead; every turn is then labelled from its own cwd.
+        raw_by_cwd = body.get("cwd_projects")
+        project_by_cwd = {
+            c: lb
+            for c, v in (raw_by_cwd.items() if isinstance(raw_by_cwd, dict) else ())
+            if isinstance(c, str) and (lb := clean_label(v))
+        }
         record_format = body.get("format") or "claude_code"
         session_id_hint = body.get("session_id")
         if record_format not in ("claude_code", "codex"):
@@ -80,7 +91,7 @@ def register(
             from ingestion.jsonl_client import JSONLParser
             from ingestion.models import ExtractionItem
             from ingestion.private_sessions import PrivateSessions
-            from ingestion.scratch_projects import is_scratch_project
+            from ingestion.scratch_projects import is_scratch_turn
 
             if record_format == "codex":
                 from ingestion.codex_client import CodexRolloutParser
@@ -89,7 +100,9 @@ def register(
                     records, source_label, project_override, session_id_hint=session_id_hint
                 )
             else:
-                episodes = JSONLParser().parse_records(records, source_label, project_override)
+                episodes = JSONLParser().parse_records(
+                    records, source_label, project_override, project_by_cwd=project_by_cwd or None
+                )
             if not episodes:
                 return 0
             # Resolved from the credential only. Assigned unconditionally so nothing a
@@ -129,7 +142,7 @@ def register(
                     # Throwaway smoke-test workspaces are not a memory source. The KG
                     # extractor cannot tell a story prompt from biography — see
                     # scratch_projects for the fiction that reached the personal graph.
-                    if is_scratch_project(ep.project):
+                    if is_scratch_turn(ep.project, ep.metadata):
                         dropped += 1
                         continue
                     # Private mode (schema/050): the user took this session off the record.
@@ -149,7 +162,9 @@ def register(
                     # above can't see them. SYNAPSE_CONTENT_DEDUP=0 is the kill switch.
                     if os.environ.get(
                         "SYNAPSE_CONTENT_DEDUP", "1"
-                    ) != "0" and db.content_dup_exists(ep.project, ep.content):
+                    ) != "0" and db.content_dup_exists(
+                        ep.project, ep.content, (ep.metadata or {}).get("cwd")
+                    ):
                         content_dups += 1
                         continue
                     max_seq += 1

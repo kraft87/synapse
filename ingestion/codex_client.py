@@ -35,6 +35,7 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.project_label import label_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -136,9 +137,8 @@ def _is_user_turn(record: dict[str, Any]) -> bool:
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    return cwd.rstrip("/").rsplit("/", 1)[-1] or None
+    """Fallback label for a body sent without ``project`` (see ingestion.project_label)."""
+    return label_from_path(cwd)
 
 
 def session_id_from_path(path: Path | str) -> str | None:

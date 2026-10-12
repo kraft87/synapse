@@ -6,7 +6,8 @@ Folds three Claude-plugin SessionStart hooks into one script (Codex runs each
 hook entry as a separate process; one fetch pass is cheaper):
 
   * board_block     — GET /context, the always-injected index of explicit
-                      memories, project-scoped by cwd basename
+                      memories, project-scoped by the shared project resolver
+                      (plugin/scripts/synapse_project.py), as every hook labels it
   * preferences_block — GET /preferences/top, max 8 lines
   * ingest catchup  — detached ``synapse_stop_hook.py --catchup`` sweep that
                       ships any rollout tails the live hook missed, and retries
@@ -35,6 +36,12 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+# The project resolver is the Claude plugin's, so both plugins label a folder the same
+# way. Appended, not prepended, so nothing there can shadow a module this hook imports.
+sys.path.append(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugin", "scripts")
+)
+import synapse_project
 from common import _cfg, get_json, token_override_notice
 
 _SCRIPTS = sys.path[0]
@@ -42,12 +49,6 @@ _STOP_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "synapse_s
 
 _MAX_PREF_LINES = 7
 _PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
-
-
-def _cwd_to_project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    return cwd.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or None
 
 
 def _board_text(project: str | None) -> str | None:
@@ -140,7 +141,9 @@ def main() -> None:
     warning = _upload_warning()
     _spawn_catchup(str(payload.get("transcript_path") or ""))
     _sync_skills()
-    project = _cwd_to_project(payload.get("cwd")) or _cwd_to_project(os.getcwd())
+    project = synapse_project.project_label(payload.get("cwd")) or synapse_project.project_label(
+        os.getcwd()
+    )
     # The credential notice is local and leads: an env token silently overridden by the
     # device token is exactly the split this line exists to surface. The upload warning,
     # also local, follows it.

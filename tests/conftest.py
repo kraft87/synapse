@@ -85,6 +85,8 @@ _DB_FILES = {
     "test_config_scope.py",
     "test_local_tz_dates.py",
     "test_pg_pool.py",
+    "test_project_identity_db.py",
+    "test_relabel_projects_db.py",
 }
 
 
@@ -170,6 +172,17 @@ def _reset_dedup_index_cache():
     dedup._index_cache_reset()
     yield
     dedup._index_cache_reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_allowlist_variant_cache():
+    """ingestion.surfaces caches each allowlist's stored casings for a minute; a test
+    that relabels or seeds episodes must not be served the previous test's variants."""
+    from ingestion import surfaces
+
+    surfaces._variant_cache.clear()
+    yield
+    surfaces._variant_cache.clear()
 
 
 @pytest.fixture(autouse=True)

@@ -3,6 +3,70 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-10-12 — one project label everywhere (plugin 0.21.0, no schema change)
+
+**What changed**
+
+- **One resolver** (`plugin/scripts/synapse_project.py`, loaded by the Codex plugin too):
+  a `.synapse-project` marker file (first non-comment line; searched from the working
+  directory up to the git toplevel, and in a linked worktree also at the main checkout's
+  root; UTF-8 with or without BOM, or UTF-16 from PowerShell 5.1), else the git toplevel's
+  name (a linked worktree, Claude Code's `.claude/worktrees/<id>` included, is its main
+  checkout; a bare repo's worktree is the repo's name), else the folder's name. Both
+  separators, case kept. A folder that is gone (a removed worktree swept by catch-up) takes
+  the label of the repository its nearest surviving parent is in. No subprocess.
+- **Every client uses it**: the Claude ingest hook (Stop, catch-up, `synapse-import`) and
+  the Codex Stop hook now send `"project"` with every `/ingest` body; the board hook and
+  Codex session start ask `/context` for it; skills sync, skill review, config sync and the
+  git feeder label with it. Claude project skills now sync into `.claude/skills` at the
+  project ROOT (Claude Code reads it from any subfolder), not into each subfolder.
+- **Server**: `ingestion/project_label.py` is the parsers' fallback for bodies without a
+  label (both parsers used to split on "/" only, so a Windows cwd became the whole path);
+  `/ingest` cuts a client-sent label to a bare name (a non-string `project` used to 500).
+  A restricted allowlist matches case-insensitively (`resolve_caller` widens it to every
+  stored casing via a skip scan on the `project` index, cached 60 s); skill scopes match
+  case-insensitively. `ingestion/project_id.py` (dead) and `MEMORY_PROJECT` are gone.
+- **`scripts/relabel_projects.py`**: maps stored labels to canonical names and rewrites
+  `episodes.project` (the 056 trigger keeps KG `source_projects` in step), every other
+  `project` column, `surfaces.allowed_projects`, and `project:` scopes in the skill
+  registry and config lane. `--dry-run` (or `--inventory-sql` + `--dry-run --inventory`,
+  which needs no DSN) writes nothing; `--plan-out` saves its plan and `--apply --plan`
+  executes exactly that plan, never a fresh one. An allowlist entry whose new name would
+  reach another folder's sessions is kept and flagged. Keep the alias file and the plan
+  outside the repo.
+
+**On each machine**: `synapse update` (or the plugin update) to 0.21.0. Optional: put a
+`.synapse-project` file in a repository whose folder name differs between machines.
+
+**Server**: before deploying, read the dry run's "case-insensitive matching" section: the
+server matches a restricted allowlist case-insensitively from its deploy on, and an old
+subfolder entry (`dev`, `src`) can match another project's `Dev`. If it lists one, run the
+relabel first or drop that entry. Then merge → image, and only after Kyle approves the
+dry-run table: `scripts/relabel_projects.py --apply --plan <the dry run's plan file>`.
+Until the relabel runs, old labels stay as they are (new sessions arrive under canonical
+names; a replay of an old session is still recognised by its folder).
+
+**Proven**
+
+- Real failures reproduced first, then fixed: the server parsers labelled
+  a work project's `C:\Users\…\<repo>` (and a lowercase-drive variant) with the whole path, from
+  both harnesses; main's real hooks, run as subprocesses against a local server in a real
+  repo, labelled a session in `MyRepo/tickets/lab` as `lab`, a worktree as `agent-x`, sent no
+  `project` from either ingest hook, and synced `project:lab`. After: all five hooks send
+  `MyRepo`.
+- Prod (read-only, 2026-10-12): 189 label/source rows; 1,858 episodes under Windows paths;
+  the work laptop's allowlist has 13 entries for its few projects. The mapping table names
+  private projects and paths, so it goes to Kyle directly and is not committed.
+- Tests: resolver on real git layouts (worktrees, bare, submodule, markers), hook wiring with
+  real subprocesses, case-insensitive allowlists end to end on ParadeDB, relabel planner +
+  apply/idempotency on ParadeDB.
+
+**Open**
+
+- Kyle approves the relabel mapping; then `--apply` on prod.
+- Windows not run on a real host (paths exercised as strings; the resolver's filesystem
+  walk is OS-neutral).
+
 ## 2026-10-12 — `synapse login` is the single setup step (#222, plugin 0.20.0, schema 060)
 
 **What changed**

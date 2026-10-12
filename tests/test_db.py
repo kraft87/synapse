@@ -175,6 +175,28 @@ class TestEpisodeWriter:
         )
         assert db.content_dup_exists(None, "null-project turn") is True
 
+    def test_content_dup_matches_the_same_folder_under_an_older_label(self, db):
+        """A turn first stored under the label an older plugin gave its folder (a
+        subfolder name, a whole Windows path) and replayed with today's label is
+        still a replay: same content, same working directory."""
+        cwd = "C:\\Users\\someone\\src\\Acme\\tickets"
+        db.upsert_episode(
+            Episode(
+                session_id="db-test-dup-d",
+                sequence=1,
+                project="tickets",
+                content="replayed across the label change",
+                span_id="jsonl:dup-d1",
+                metadata={"cwd": cwd},
+            )
+        )
+        text = "replayed across the label change"
+        assert db.content_dup_exists("Acme", text, cwd) is True
+        # another folder, or no folder at all, is still project-scoped
+        assert db.content_dup_exists("Acme", text, "C:\\Users\\someone\\src\\Other") is False
+        assert db.content_dup_exists("Acme", text) is False
+        assert db.content_dup_exists("Acme", text, "") is False
+
 
 class TestTimelineDedup:
     """timeline_near_candidates + bump_timeline_reported (schema 037)."""

@@ -198,7 +198,7 @@ flowchart TD
 
 ### 4.1 The `/ingest` endpoint
 
-A Starlette custom route on the FastMCP server: `@mcp.custom_route("/ingest", methods=["POST"])`. The Stop hook posts `{"records": [...], "source": "hook"}`; the body is parsed with the same `JSONLParser` the disk-sweep backstop uses. The dedup loop:
+A Starlette custom route on the FastMCP server: `@mcp.custom_route("/ingest", methods=["POST"])`. The Stop hook posts `{"records": [...], "source": "hook", "project": "<label>"}`; the body is parsed with the same `JSONLParser` the disk-sweep backstop uses. The dedup loop:
 
 ```python
 for ep in episodes:
@@ -219,11 +219,28 @@ for ep in episodes:
 ```
 
 - **Dedup by `span_id`** — a turn's stable last-record UUID. The session's `(seen span_ids, max_seq)` index is loaded once per session. The tail's own positional sequence is discarded (a tail renumbers from 1 and would collide).
-- **Cross-session content guard** (schema 036, `SYNAPSE_CONTENT_DEDUP=0` to disable) — the span guard is per-session, so a retry session or re-import that replays a turn under a *fresh* session/span id sails through it. A second check skips any turn whose content is byte-identical (`md5(content)` index) to an episode already stored in the same project. Measured on a real corpus: ~4.6% of episodes were exact replays (agent re-runs, mid-session forks, re-imports) before this guard.
+- **Cross-session content guard** (schema 036, `SYNAPSE_CONTENT_DEDUP=0` to disable) — the span guard is per-session, so a retry session or re-import that replays a turn under a *fresh* session/span id sails through it. A second check skips any turn whose content is byte-identical (`md5(content)` index) to an episode already stored in the same project, or stored from the same working directory under any label (so a replay whose first copy carries an older label for that folder, before `scripts/relabel_projects.py` merges them, is still caught). Measured on a real corpus: ~4.6% of episodes were exact replays (agent re-runs, mid-session forks, re-imports) before this guard.
 - **Append at `max(seq)+1`** — new turns extend the session.
 - **Contamination filter** — `is_transcript_contamination` drops PII-bearing third-party transcript payloads (produced by another agent project sharing the same hooks).
 - **Private-mode filter** (schema 050) — `PrivateSessions.is_private` drops every turn whose `session_id` sits in `private_sessions`. Same chokepoint, same shape as the contamination predicate, and `ingestion/backfill.py` applies it too, so a session taken off the record can't be ingested by a path that bypasses the hook (catch-up sweep, disk backfill, a re-import months later). Rows are permanent by design: the transcript survives on disk, so deleting the row would re-expose exactly the turns the user hid.
 - Runs in a threadpool so the async route never blocks.
+
+
+**Project labels.** Every client labels a session's project with one resolver,
+`plugin/scripts/synapse_project.py` (the Codex plugin loads the same file): a
+`.synapse-project` marker file (its first non-comment line; searched from the working
+directory up to the git toplevel, and in a linked worktree also at the main checkout's
+root), else the git toplevel's name (a linked worktree, including Claude Code's
+`.claude/worktrees/<id>`, is its main checkout; a bare repository's worktree is the
+repository's name), else the folder's name. Both separators, case kept. The ingest hooks
+send it as `"project"`, the board asks for that project, and the skills sync syncs
+`project:<label>`, so a session started in a subfolder or a worktree is filed, shown and
+served as its repository. A body without a label (a catch-up of a transcript whose folder
+is gone, an older plugin) is labelled server-side from the transcript's `cwd` by
+`ingestion/project_label.py`: the last component of the path, either separator. A restricted
+device's allowlist matches labels case-insensitively (`resolve_caller` widens it to every
+stored casing of its entries). `scripts/relabel_projects.py` maps labels stored before this
+onto canonical names (`--dry-run` first; the alias file stays outside the repository).
 
 ### 4.2 The Stop hook
 
@@ -802,7 +819,6 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_TIMELINE_GATE` | `1` | LLM gate that promotes ingested turns to timeline events (`0` = off) |
 | `SYNAPSE_TIMELINE_DEDUP` | `1` | write-time confirm-merge of re-told timeline events ([§3.5](#35-timeline-events--the-episodic-date-log); `0` = off) |
 | `SYNAPSE_CONTENT_DEDUP` | `1` | cross-session byte-identical replay guard at `/ingest` (`0` = off) |
-| `MEMORY_PROJECT` | empty | explicit project id for ingested episodes (fallback when `.memory-project` / git detection doesn't apply) |
 
 ### Dream, skills lane & config lane
 

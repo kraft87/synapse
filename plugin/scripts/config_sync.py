@@ -23,6 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+import synapse_project
 
 _GLOBAL_GLOBS = ["CLAUDE.md", "rules/**/*.md"]
 _PROJECT_GLOBS = ["CLAUDE.md", ".claude/CLAUDE.md", ".claude/rules/**/*.md"]
@@ -41,9 +42,11 @@ def _scan(root: Path, globs: list[str], scope: str) -> list[tuple[str, str, Path
 def _targets() -> list[tuple[str, str, Path]]:
     out = _scan(config.CONFIG_DIR, _GLOBAL_GLOBS + config.CONFIG_PATHS, "global")
     proj = os.environ.get("CLAUDE_PROJECT_DIR")
-    if proj:
-        root = Path(proj)
-        out += _scan(root, _PROJECT_GLOBS, f"project:{root.name}")
+    # The project ROOT's files (marker folder or git toplevel), whichever subfolder the
+    # session started in: one (surface, scope, file_key) row per file, never two files.
+    label, root = synapse_project.resolve(proj) if proj else (None, None)
+    if proj and label:
+        out += _scan(root or Path(proj), _PROJECT_GLOBS, f"project:{label}")
     return out
 
 

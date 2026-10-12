@@ -23,6 +23,7 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.project_label import label_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -137,9 +138,8 @@ def _extract_blocks(
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
-    if not cwd:
-        return None
-    return cwd.rstrip("/").rsplit("/", 1)[-1] or None
+    """Fallback label for a body sent without ``project`` (see ingestion.project_label)."""
+    return label_from_path(cwd)
 
 
 class JSONLParser:
@@ -160,9 +160,14 @@ class JSONLParser:
         source_label: str,
         project_override: str | None = None,
         *,
+        project_by_cwd: dict[str, str] | None = None,
         _filtered: bool = False,
     ) -> list[Episode]:
         """Parse already-loaded transcript records into Episodes.
+
+        ``project_by_cwd`` (a client's labels for each cwd in a batch that spans several
+        projects) labels each turn from its own cwd when no ``project_override`` applies;
+        a cwd it doesn't name falls back to :func:`_cwd_to_project`.
 
         The seam shared by the disk sweep (``parse_file``) and the real-time
         ``/ingest`` push: both feed the SAME records through the SAME grouping
@@ -177,7 +182,7 @@ class JSONLParser:
         if not recs:
             return []
         groups = self._group_into_turns(recs)
-        return self._groups_to_episodes(groups, source_label, project_override)
+        return self._groups_to_episodes(groups, source_label, project_override, project_by_cwd)
 
     @classmethod
     def _load_records(cls, path: Path) -> list[dict[str, Any]]:
@@ -253,6 +258,7 @@ class JSONLParser:
         groups: list[list[dict[str, Any]]],
         source_path: str,
         project_override: str | None,
+        project_by_cwd: dict[str, str] | None = None,
     ) -> list[Episode]:
         episodes: list[Episode] = []
         prev_assistant: str | None = None
@@ -324,7 +330,11 @@ class JSONLParser:
             except (ValueError, TypeError):
                 created_at = None
 
-            project = project_override or _cwd_to_project(cwd)
+            project = (
+                project_override
+                or ((project_by_cwd or {}).get(cwd) if cwd else None)
+                or _cwd_to_project(cwd)
+            )
 
             episodes.append(
                 Episode(

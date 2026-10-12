@@ -60,20 +60,23 @@ class EpisodeStore(DatabaseConnection):
             ).fetchone()
         return row is not None
 
-    def content_dup_exists(self, project: str | None, content: str) -> bool:
-        """True if an identical-content episode already exists in this project.
+    def content_dup_exists(self, project: str | None, content: str, cwd: str | None = None) -> bool:
+        """True if an identical-content episode already exists in this project, or was
+        stored from the same working directory under any label.
 
         Cross-session replay guard: retried sessions re-ship byte-identical turns
         under fresh session ids AND fresh span ids, which the per-session span
         index cannot catch. Byte-identical content across sessions is always a
         replay — a genuine repeat of the same user request differs in the
-        assistant/tool half of the turn. Probe is an index hit via
-        episodes_content_md5_idx (schema 036)."""
+        assistant/tool half of the turn. The ``cwd`` leg catches a replay whose first
+        copy was stored under an older label for the same folder (a subfolder or
+        worktree name, a whole Windows path) until relabel_projects merges them.
+        Probe is an index hit via episodes_content_md5_idx (schema 036)."""
         with self._conn() as conn:
             row = conn.execute(
                 "SELECT 1 FROM episodes WHERE md5(content) = md5(%s) "
-                "AND project IS NOT DISTINCT FROM %s LIMIT 1",
-                (content, project),
+                "AND (project IS NOT DISTINCT FROM %s OR metadata->>'cwd' = %s) LIMIT 1",
+                (content, project, cwd or None),
             ).fetchone()
         return row is not None
 

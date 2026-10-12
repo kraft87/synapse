@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import synapse_project
 from config import _cfg, post_json
 
 _US = "\x1f"
@@ -91,7 +92,7 @@ def _read_commits(repo: Path, since_days: int) -> list[dict]:
 
 
 def _push_repo(repo: Path, since_days: int) -> tuple[int, int]:
-    project = repo.name
+    project = synapse_project.project_label(repo) or repo.name  # as the sessions there are filed
     commits = _read_commits(repo, since_days)
     if not commits:
         return 0, 0
@@ -99,7 +100,9 @@ def _push_repo(repo: Path, since_days: int) -> tuple[int, int]:
         {
             "t_valid": c["t_valid"],
             "fact": f"committed to {project}: {c['subject']}",
-            "source": f"git:{project}",
+            # The dedup key stays the folder's name: a label that changes (a marker, a
+            # worktree) must not re-insert every commit already in the window.
+            "source": f"git:{repo.name}",
             "source_ref": c["sha"],
             "project": project,
             "salience": _salience(c["subject"], c["is_merge"], c["churn"]),

@@ -24,8 +24,13 @@ found identical), so an older copy that missed later edits is still recognised.
 
 Scope routes the target dir:
   * 'global'          <-> CLAUDE_SKILLS_DIR (~/.claude/skills)
-  * 'project:<name>'  <-> $CLAUDE_PROJECT_DIR/.claude/skills, only when the session is in a
-                         project whose dir basename matches <name>.
+  * 'project:<label>' <-> <project root>/.claude/skills, where <label> is the session's
+                         project as every hook labels it and <project root> the folder it
+                         belongs to (synapse_project: a .synapse-project marker's folder,
+                         else the git toplevel, else $CLAUDE_PROJECT_DIR itself). Claude Code
+                         reads .claude/skills from the start folder up to the repository
+                         root, so a session started in a subfolder sees them, and a
+                         repository has one copy rather than one per subfolder.
 
 DSN-FREE: talks to the server's /skills/* HTTP routes (machine-token gated), never Postgres.
 Without a reachable server it is a silent no-op. Fail-open: never blocks/fails session start;
@@ -52,6 +57,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
+import synapse_project
 
 
 def _skill_description(text: str) -> str:
@@ -274,7 +280,7 @@ def _retired_copy(scope, target_dir: Path, name: str, disk, entry: dict, ledger:
     if retired_at is None:
         return "kept"
     folder = target_dir / name
-    own_scope = entry.get("scope") in (None, scope)
+    own_scope = entry.get("scope") is None or str(entry["scope"]).lower() == scope.lower()
     if digest == entry.get("content_hash") or (own_scope and digest in ledger.get(name, [])):
         if _is_link(folder):
             return "kept"  # linked in from somewhere else: not a folder Synapse made
@@ -384,13 +390,14 @@ def main() -> None:
     try:
         n = _sync("global", config.SKILLS_DIR)
         proj = os.environ.get("CLAUDE_PROJECT_DIR")
-        proj_dir = Path(proj) / ".claude" / "skills" if proj else None
+        label, root = synapse_project.resolve(proj) if proj else (None, None)
+        proj_dir = (root or Path(proj)) / ".claude" / "skills" if proj else None
         # A session whose project dir IS the home dir (cwd=~) resolves the project skills
         # folder to the global one. Syncing that folder twice under two scopes flips every
         # skill's scope on each session start (the registry is unique on name), so the global
         # list is empty between sessions and no other host or plugin ever sees the skills.
-        if proj_dir and proj_dir.resolve() != config.SKILLS_DIR.resolve():
-            m = _sync(f"project:{Path(proj).name}", proj_dir)
+        if label and proj_dir and proj_dir.resolve() != config.SKILLS_DIR.resolve():
+            m = _sync(f"project:{label}", proj_dir)
             n = tuple(a + b for a, b in zip(n, m, strict=True))
     except Exception:
         return  # fail-open: server/token/permission issues never break session start
