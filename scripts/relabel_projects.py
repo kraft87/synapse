@@ -286,7 +286,8 @@ class Planner:
                     name = label_from_path(roots[a]) or label
                     why = "path → its name" if a == path_key(p) else "subfolder → project root"
                     if a == path_key(p) and not is_path_label(label):
-                        why = "kept"
+                        # its own folder: unchanged, unless the folder is spelled otherwise
+                        why = "kept" if name == label else "case merge"
                     return name, roots[a], why
             return (
                 label_from_path(p) or label,

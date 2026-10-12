@@ -427,6 +427,14 @@ def test_the_canonical_casing_does_not_depend_on_group_order():
     assert set(_plan(groups, aliases="").groups.values()) == {"BigProj"}
 
 
+def test_every_change_names_why_it_changes():
+    """The dry-run table is what a person approves: a row that changes must say why."""
+    groups = {**deployment(), ("bigproj", WIN.lower()): 1}
+    plan = _plan(groups)
+    assert plan.groups[("bigproj", WIN.lower())] == "BigProj"
+    assert [c for c in plan.changes if c.reason == "kept"] == []
+
+
 # ---------------------------------------------------------------------------
 # Re-running
 # ---------------------------------------------------------------------------
@@ -443,6 +451,47 @@ def test_re_planning_the_relabelled_data_plans_nothing():
     assert second.changes == []
     assert all(second.groups[k] == k[0] for k in after)
     assert all(second.map_label(lb) == lb for lb in other)
+
+
+def _stale_inventory(episode_groups: Groups) -> rp.Inventory:
+    """Allowlists and scopes still on the old labels: what --apply leaves when it is
+    interrupted after the episode commits, before the surfaces/skills transaction."""
+    return rp.Inventory(
+        episode_groups=episode_groups,
+        tables={'"public"."notes"': {"BigProj": 2}},
+        surfaces=[
+            {"surface_id": "dev-laptop", "allowed_projects": [WIN, WIN_LC, "bigproj", "acme"]},
+            {"surface_id": "dev-other", "allowed_projects": ["big-proj"]},
+        ],
+        skills=[{"name": "triage", "scope": f"project:{WIN}\\tickets"}],
+        config_scopes={f"project:{WIN_LC}": 2, "project:big-proj": 1},
+    )
+
+
+def test_other_labels_include_allowlists_and_every_kind_of_scope():
+    inv = _stale_inventory({})
+    assert inv.other_labels() == {
+        "BigProj",
+        WIN,
+        WIN_LC,
+        "bigproj",
+        "acme",
+        "big-proj",
+        WIN + r"\tickets",
+    }
+
+
+def test_a_re_run_after_an_interruption_still_maps_allowlists_and_scopes():
+    """The episodes already carry canonical names, so no table holds the old path, case
+    or alias labels any more; the allowlists and scopes that do must still map."""
+    first = _plan()
+    inv = _stale_inventory(_relabelled(deployment(), first))
+    plan = _plan(inv.episode_groups, other=inv.other_labels())
+    assert plan.changes == []
+    assert rp.map_allowlist(plan, inv.surfaces[0]["allowed_projects"]) == ["BigProj", "acme"]
+    assert rp.map_allowlist(plan, inv.surfaces[1]["allowed_projects"]) == ["BigProj"]
+    assert rp.map_scope(plan, inv.skills[0]["scope"]) == "project:BigProj"
+    assert {rp.map_scope(plan, s) for s in inv.config_scopes} == {"project:BigProj"}
 
 
 # ---------------------------------------------------------------------------
@@ -630,6 +679,111 @@ def test_report_of_a_clean_store_lists_no_changes():
     assert [ln for ln in text.splitlines() if ln.startswith("| ") and "label" not in ln] == [
         "| --- | --- | --- | ---: | --- |"
     ]
+
+
+def test_report_lists_config_lane_scopes_with_their_row_counts():
+    inv = _stale_inventory(_relabelled(deployment(), _plan()))
+    inv.config_scopes["project:acme"] = 4
+    plan = _plan(inv.episode_groups, other=inv.other_labels())
+    lines = rp.report(inv, plan).splitlines()
+    block = lines[lines.index("config_lane.config_registry.scope:") + 1 :]
+    assert block[:3] == [
+        "        4  project:acme -> project:acme  (unchanged)",
+        "        1  project:big-proj -> project:BigProj",
+        f"        2  project:{WIN_LC} -> project:BigProj",
+    ]
+    assert lines.index("config_lane.config_registry.scope:") < lines.index(
+        "skills_lane.skill_registry.scope:"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The offline inventory (--inventory-sql, then --dry-run --inventory)
+# ---------------------------------------------------------------------------
+
+#: What ``psql -tA < inv.sql`` prints: the command tags around one JSON line.
+_PSQL_OUTPUT = (
+    "BEGIN\n"
+    '{"episodes" : [["acme", "/home/u/code/acme", 3], ["scripts", "/home/u/code/acme/scripts", 2]'
+    ', ["bigproj", null, 1], ["BigProj", null, 5]], '
+    '"tables" : { "\\"public\\".\\"notes\\"" : {"scripts" : 1}, "\\"public\\".\\"chunks\\"" : {} }, '
+    '"surfaces" : [{"surface_id" : "dev-laptop", "allowed_projects" : ["scripts", "acme", "bigproj"]}'
+    ', {"surface_id" : "dev-full", "allowed_projects" : []}], '
+    '"skills" : [{"name" : "triage", "scope" : "project:bigproj"}], '
+    '"config_scopes" : {"project:bigproj" : 2}}\n'
+    "ROLLBACK\n"
+)
+
+
+def test_inventory_from_psql_output():
+    inv = rp.inventory_from_json(_PSQL_OUTPUT)
+    assert inv.episode_groups == {
+        ("acme", "/home/u/code/acme"): 3,
+        ("scripts", "/home/u/code/acme/scripts"): 2,
+        ("bigproj", None): 1,
+        ("BigProj", None): 5,
+    }
+    assert inv.tables == {'"public"."notes"': {"scripts": 1}, '"public"."chunks"': {}}
+    assert inv.surfaces == [
+        {"surface_id": "dev-laptop", "allowed_projects": ["scripts", "acme", "bigproj"]},
+        {"surface_id": "dev-full", "allowed_projects": []},
+    ]
+    assert inv.skills == [{"name": "triage", "scope": "project:bigproj"}]
+    assert inv.config_scopes == {"project:bigproj": 2}
+
+
+def test_inventory_from_json_tolerates_missing_and_null_sections():
+    inv = rp.inventory_from_json('{"episodes": null, "surfaces": [{"surface_id": "s"}]}')
+    assert (inv.episode_groups, inv.tables, inv.skills, inv.config_scopes) == ({}, {}, [], {})
+    assert inv.surfaces == [{"surface_id": "s", "allowed_projects": []}]
+
+
+def _no_connect(monkeypatch) -> None:
+    def refuse(*_a, **_k):  # pragma: no cover - reaching it is the failure
+        raise AssertionError("connected to a database")
+
+    monkeypatch.setattr("psycopg.connect", refuse)
+    monkeypatch.delenv("SYNAPSE_DB_URL", raising=False)
+
+
+def test_inventory_sql_is_printed_without_a_database(monkeypatch, capsys):
+    _no_connect(monkeypatch)
+    assert rp.main(["--inventory-sql"]) == 0
+    out = capsys.readouterr().out
+    assert out == rp.INVENTORY_SQL.strip() + "\n"
+    statements = [s.strip() for s in out.split(";") if s.strip()]
+    assert statements[0] == "BEGIN READ ONLY"
+    assert statements[-1] == "ROLLBACK"
+    body = " ".join(statements[1:-1]).upper()
+    assert not any(f" {verb} " in f" {body} " for verb in ("INSERT", "UPDATE", "DELETE", "DROP"))
+
+
+def test_an_offline_dry_run_plans_from_the_inventory_file(tmp_path, monkeypatch, capsys):
+    _no_connect(monkeypatch)
+    inv_file = tmp_path / "inv.json"
+    inv_file.write_text(_PSQL_OUTPUT, encoding="utf-8")
+    out = tmp_path / "dry-run.md"
+    aliases = tmp_path / "aliases.txt"
+    aliases.write_text("bigproj = BigProj\n", encoding="utf-8")
+    argv = ["--dry-run", "--inventory", str(inv_file), "--aliases", str(aliases)]
+    assert rp.main([*argv, "--out", str(out)]) == 0
+    text = capsys.readouterr().out
+    assert out.read_text(encoding="utf-8") == text
+    inv = rp.inventory_from_json(_PSQL_OUTPUT)
+    cfg = rp.AliasConfig.parse(aliases.read_text(encoding="utf-8"))
+    assert text == rp.report(inv, rp.Planner(cfg).plan(inv.episode_groups, inv.other_labels()))
+    assert "| scripts | /home/u/code/acme | acme | 2 | subfolder → project root |" in text
+    assert "| bigproj |  | BigProj | 1 | alias |" in text
+    assert "  dev-laptop: ['scripts', 'acme', 'bigproj'] -> ['scripts', 'acme', 'BigProj']" in text
+    assert "        2  project:bigproj -> project:BigProj" in text
+
+
+def test_an_inventory_file_never_goes_with_apply(tmp_path, monkeypatch, capsys):
+    _no_connect(monkeypatch)
+    inv_file = tmp_path / "inv.json"
+    inv_file.write_text(_PSQL_OUTPUT, encoding="utf-8")
+    assert rp.main(["--apply", "--inventory", str(inv_file)]) == 2
+    assert "only goes with --dry-run" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------
