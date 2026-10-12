@@ -304,9 +304,9 @@ def test_board_banner_and_digest_include_own_rows(corpus, clean, db_url):
     from mcp_server.board import _banner_stats
     from mcp_server.timeline_routes import _recent_events
 
-    n, projects = _banner_stats(db_url, allowed_projects=[], own_surface="dev-a")
-    assert n == 2 and projects == ["work-x"]
-    assert _banner_stats(db_url, allowed_projects=[], own_surface=None) == (0, [])
+    n, n_projects, projects = _banner_stats(db_url, allowed_projects=[], own_surface="dev-a")
+    assert n == 2 and n_projects == 1 and projects == ["work-x"]
+    assert _banner_stats(db_url, allowed_projects=[], own_surface=None) == (0, 0, [])
 
     db = Database(db_url)
     try:
@@ -603,7 +603,11 @@ def test_pre057_restricted_reads_serve_the_allowlist_only(pre057, clean):
     fetched = r.fetch([f"e:{allowed}", f"e:{other}"], trust=dev)["episodes"]
     assert [e["id"] for e in fetched] == [f"e:{allowed}"]
     assert len(r.fetch_session(sid, trust=dev)["turns"]) == 1
-    assert _banner_stats(url, allowed_projects=["work-x"], own_surface="dev-a") == (1, ["work-x"])
+    assert _banner_stats(url, allowed_projects=["work-x"], own_surface="dev-a") == (
+        1,
+        1,
+        ["work-x"],
+    )
     events = _recent_events(
         url, 36500, 2, 10, None, allowed_projects=["work-x"], own_surface="dev-a"
     )

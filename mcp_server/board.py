@@ -34,6 +34,7 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.db_notes import select_board_notes
+from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     SurfaceTrust,
@@ -75,10 +76,44 @@ _SECTION_TITLES = {
 }
 
 
+# How many project names the banner lists, newest activity first.
+_RECENT_PROJECTS = 12
+
+# Schema 061: (project, created_at) on episodes, which the skip scan below needs. Without
+# it the per-project max(created_at) is far slower than one pass over every episode, so
+# the GROUP BY stays until a valid index exists (an interrupted CONCURRENTLY build leaves
+# an invalid one).
+PROJECT_RECENCY_INDEX = ColumnProbe(
+    "SELECT 1 FROM pg_index "
+    "WHERE indexrelid = to_regclass('episodes_project_created_idx') AND indisvalid",
+    "schema 061 (episodes (project, created_at) index)",
+)
+
+# Every labeled project with its latest episode, as a skip scan: walk the distinct
+# projects through the index, then read each one's newest created_at from it. Two index
+# probes per project instead of a pass over the whole heap (~3 ms vs ~19 ms on a copy of
+# prod's 52K episodes and 157 projects; 61 ms in prod). `project > ''` is both the start
+# of the walk and the "labeled" test: NULL and '' fail it.
+_RECENT_PROJECTS_SKIP_SCAN = """
+WITH RECURSIVE labeled(project) AS (
+  (SELECT project FROM episodes WHERE project > '' ORDER BY project LIMIT 1)
+  UNION ALL
+  SELECT (SELECT e.project FROM episodes e WHERE e.project > labeled.project
+          ORDER BY e.project LIMIT 1)
+  FROM labeled WHERE labeled.project IS NOT NULL
+), latest AS (
+  SELECT labeled.project,
+         (SELECT max(e.created_at) FROM episodes e WHERE e.project = labeled.project) AS last_at
+  FROM labeled WHERE labeled.project IS NOT NULL
+)
+SELECT project, count(*) OVER () FROM latest ORDER BY last_at DESC, project LIMIT %s
+"""
+
+
 def _banner_stats(
     db_url: str, allowed_projects: list[str] | None = None, own_surface: str | None = None
-) -> tuple[int, list[str]]:
-    """(total episodes, project names newest-activity first, capped at 12).
+) -> tuple[int, int, list[str]]:
+    """(total episodes, labeled projects, the newest-activity ones' names, capped at 12).
 
     The episode total comes from pg_class.reltuples (approximate but O(1)) rather
     than count(*): at ~40K rows / 1.5GB the exact count degrades to ~650ms of
@@ -87,14 +122,19 @@ def _banner_stats(
     deploy, or a truncated test fixture), so fall back to an exact count while it's
     unpopulated — which also keeps the exact-count board tests green.
 
-    ``allowed_projects`` (a restricted surface, schema 053) narrows BOTH numbers to the
-    allowlist: the project names are the leak that matters ("most recent: family-health"
-    on a work laptop is exactly the disclosure this feature exists to stop), and a
-    corpus-wide episode count next to an allowlisted project list would misdescribe what
-    the caller can actually reach. The reltuples shortcut is skipped in that branch —
-    it cannot answer a filtered question — but the filtered count is over a small slice.
-    ``own_surface`` (schema 057) widens both numbers to the episodes the calling surface
-    ingested itself, matching what recall will actually serve it.
+    The project count is every labeled project, not the length of the capped list: the
+    banner said "across 12 projects" with 157 in the corpus. Projects order by their
+    newest episode, then by name, so same-day projects no longer come out in whatever
+    order the aggregate produced.
+
+    ``allowed_projects`` (a restricted surface, schema 053) narrows ALL three numbers to
+    the allowlist: the project names are the leak that matters ("most recent:
+    family-health" on a work laptop is exactly the disclosure this feature exists to
+    stop), and corpus-wide counts next to an allowlisted project list would misdescribe
+    what the caller can actually reach. The reltuples shortcut and the skip scan are
+    skipped in that branch — neither can answer a filtered question — but the filtered
+    queries run over a small slice. ``own_surface`` (schema 057) widens them to the
+    episodes the calling surface ingested itself, matching what recall will serve it.
     """
     with pg_pool.connection(db_url) as conn:
         own = own_surface_if_ready(conn, db_url, own_surface)  # None before schema 057
@@ -107,27 +147,32 @@ def _banner_stats(
             ).fetchone()
             n_episodes = int(row[0]) if row else 0
             rows = conn.execute(
-                "SELECT project, max(created_at)::date FROM episodes "  # nosec B608 — as above
+                "SELECT project, count(*) OVER () FROM episodes "  # nosec B608 — as above
                 f"WHERE {pred} AND project IS NOT NULL AND project <> '' "
-                "GROUP BY project ORDER BY 2 DESC LIMIT 12",
-                args,
+                "GROUP BY project ORDER BY max(created_at) DESC, project LIMIT %s",
+                [*args, _RECENT_PROJECTS],
             ).fetchall()
-            return n_episodes, [r[0] for r in rows]
-        row = conn.execute(
-            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'episodes'::regclass"
-        ).fetchone()
-        n_episodes = int(row[0]) if row and row[0] is not None else 0
-        if n_episodes <= 0:  # never analyzed (reltuples = -1) or genuinely empty
-            row = conn.execute("SELECT count(*) FROM episodes").fetchone()
-            n_episodes = int(row[0]) if row else 0
-        # Unlabeled episodes (NULL — and '', defensively) are excluded in SQL so they
-        # never consume one of the 12 LIMIT slots or inflate/deflate the project count.
-        rows = conn.execute(
-            "SELECT project, max(created_at)::date FROM episodes "
-            "WHERE project IS NOT NULL AND project <> '' "
-            "GROUP BY project ORDER BY 2 DESC LIMIT 12"
-        ).fetchall()
-        return n_episodes, [r[0] for r in rows]
+        else:
+            row = conn.execute(
+                "SELECT reltuples::bigint FROM pg_class WHERE oid = 'episodes'::regclass"
+            ).fetchone()
+            n_episodes = int(row[0]) if row and row[0] is not None else 0
+            if n_episodes <= 0:  # never analyzed (reltuples = -1) or genuinely empty
+                row = conn.execute("SELECT count(*) FROM episodes").fetchone()
+                n_episodes = int(row[0]) if row else 0
+            # Unlabeled episodes (NULL — and '', defensively) are excluded in SQL so they
+            # never consume one of the LIMIT slots or inflate the project count.
+            if PROJECT_RECENCY_INDEX.ready(conn, db_url):
+                rows = conn.execute(_RECENT_PROJECTS_SKIP_SCAN, (_RECENT_PROJECTS,)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT project, count(*) OVER () FROM episodes "
+                    "WHERE project IS NOT NULL AND project <> '' "
+                    "GROUP BY project ORDER BY max(created_at) DESC, project LIMIT %s",
+                    (_RECENT_PROJECTS,),
+                ).fetchall()
+    n_projects = int(rows[0][1]) if rows else 0
+    return n_episodes, n_projects, [r[0] for r in rows]
 
 
 def _note_line(note: dict[str, Any]) -> str:
@@ -147,13 +192,15 @@ def _render(
     dropped: int,
     events: list[dict[str, Any]],
     notice: str | None = None,
+    n_projects: int | None = None,
 ) -> str:
     lines = [f"[Synapse board — project: {project or 'all'}]"]
     if notice:
         # Directly under the header, ahead of the "0 episodes" banner it explains.
         lines.append(f"WARNING: {notice}")
     recent = f" (most recent: {', '.join(project_names)})" if project_names else ""
-    lines.append(f"{n_episodes} episodes across {len(project_names)} projects{recent}.")
+    n_projects = len(project_names) if n_projects is None else n_projects
+    lines.append(f"{n_episodes} episodes across {n_projects} projects{recent}.")
     lines.append(
         "Absence from this board means SEARCH (recall), not doesn't-exist. "
         "Note bodies: fetch by id."
@@ -195,6 +242,7 @@ def _fit_notes(
     notes: list[dict[str, Any]],
     events: list[dict[str, Any]],
     notice: str | None,
+    n_projects: int | None = None,
 ) -> tuple[str, list[dict[str, Any]], int]:
     """Drop the fewest notes that brings the board under both caps: ``(text, kept,
     dropped)``. Notes leave in drop order (drop class, then oldest updated_at, then id);
@@ -218,7 +266,9 @@ def _fit_notes(
     """
 
     def render(kept: list[dict[str, Any]], dropped: int) -> str:
-        return _render(project, n_episodes, project_names, kept, dropped, events, notice)
+        return _render(
+            project, n_episodes, project_names, kept, dropped, events, notice, n_projects
+        )
 
     text = render(notes, 0)
     if not notes or _fits(text):
@@ -313,9 +363,13 @@ def build_board(
     except psycopg.errors.UndefinedTable:
         events = []
 
-    n_episodes, project_names = _banner_stats(db_url, allowed_projects=allowed, own_surface=own)
+    n_episodes, n_projects, project_names = _banner_stats(
+        db_url, allowed_projects=allowed, own_surface=own
+    )
 
-    text, kept, dropped = _fit_notes(project, n_episodes, project_names, notes, events, notice)
+    text, kept, dropped = _fit_notes(
+        project, n_episodes, project_names, notes, events, notice, n_projects
+    )
 
     out: dict[str, Any] = {
         "status": "ok",

@@ -125,6 +125,89 @@ def test_banner_null_project_episodes_do_not_consume_slots(conn, db_url):
         assert f"proj{i:02d}" in text
 
 
+def _many_projects(conn):
+    """20 labeled projects plus unlabeled rows: newest activity runs proj00 (newest) to
+    proj19, except that proj03 and proj04 share proj01's newest timestamp exactly (ties
+    break by name), and every project has an older episode too, so "newest" means
+    max(created_at)."""
+    _wipe(conn)
+    for i in range(20):
+        days = 1 if i in (3, 4) else i
+        conn.execute(
+            "INSERT INTO episodes (session_id, sequence, project, content, created_at) "
+            "VALUES (%s, 1, %s, 'old', '2026-01-01'), "
+            "       (%s, 2, %s, 'new', timestamptz '2026-10-01 12:00' - make_interval(days => %s))",
+            (f"s{i}", f"proj{i:02d}", f"s{i}", f"proj{i:02d}", days),
+        )
+    _episode(conn, "s-null", 1, None, days_ago=0)
+    conn.execute(
+        "INSERT INTO episodes (session_id, sequence, project, content) VALUES ('s-blank', 1, '', 'x')"
+    )
+
+
+# proj01, proj03 and proj04 share a newest timestamp, so they order by name.
+_NEWEST_FIRST = ["proj00", "proj01", "proj03", "proj04", "proj02"] + [
+    f"proj{i:02d}" for i in range(5, 12)
+]
+
+
+def test_banner_counts_every_project_and_lists_the_newest_twelve(conn, db_url):
+    """The count is every labeled project, not the length of the capped list (it said
+    "across 12 projects" with 157 in prod). Same-day projects order by their newest
+    episode, then by name."""
+    from mcp_server.board import _banner_stats
+
+    _many_projects(conn)
+    n_episodes, n_projects, names = _banner_stats(db_url)
+    assert (n_episodes, n_projects) == (42, 20)
+    assert names == _NEWEST_FIRST
+    text = _board(db_url, None)["text"]
+    assert f"42 episodes across 20 projects (most recent: {', '.join(_NEWEST_FIRST)})." in text
+
+
+def test_skip_scan_and_group_by_agree(conn, db_url):
+    """The index-backed skip scan returns exactly what the GROUP BY it replaces returns,
+    count and order included, on labeled, unlabeled and tied rows."""
+    from mcp_server.board import _RECENT_PROJECTS_SKIP_SCAN
+
+    _many_projects(conn)
+    group_by = conn.execute(
+        "SELECT project, count(*) OVER () FROM episodes "
+        "WHERE project IS NOT NULL AND project <> '' "
+        "GROUP BY project ORDER BY max(created_at) DESC, project LIMIT %s",
+        (12,),
+    ).fetchall()
+    skip_scan = conn.execute(_RECENT_PROJECTS_SKIP_SCAN, (12,)).fetchall()
+    assert skip_scan == group_by
+    assert [r[0] for r in skip_scan] == _NEWEST_FIRST and skip_scan[0][1] == 20
+    _wipe(conn)  # and on an empty table
+    assert conn.execute(_RECENT_PROJECTS_SKIP_SCAN, (12,)).fetchall() == []
+
+
+def test_banner_keeps_the_group_by_until_the_index_exists(conn, db_url, monkeypatch):
+    """Without schema 061's index the skip scan's per-project max is far slower than the
+    seq scan, so the banner must not run it where the index is missing (the probe also
+    requires indisvalid, for an interrupted CONCURRENTLY build)."""
+    from ingestion.schema_check import ColumnProbe
+    from mcp_server import board
+
+    _many_projects(conn)
+    assert ColumnProbe(board.PROJECT_RECENCY_INDEX._sql, "t").ready(conn, "with-index")
+
+    monkeypatch.setattr(board, "_RECENT_PROJECTS_SKIP_SCAN", "SELECT no_such_column")
+    monkeypatch.setattr(
+        board, "PROJECT_RECENCY_INDEX", ColumnProbe(board.PROJECT_RECENCY_INDEX._sql, "t")
+    )
+    conn.execute("DROP INDEX episodes_project_created_idx")
+    try:
+        assert board._banner_stats(db_url)[1:] == (20, _NEWEST_FIRST)  # the GROUP BY served
+    finally:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS episodes_project_created_idx "
+            "ON episodes (project, created_at)"
+        )
+
+
 def test_grouping_order_and_line_format(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
