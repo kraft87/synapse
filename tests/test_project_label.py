@@ -849,3 +849,42 @@ def test_a_folder_that_is_gone_takes_its_surviving_repository_label(ws):
     assert client.project_label(ws / "loose" / "gone") == "gone"
     # A path from another machine (relative here: a Windows path on POSIX) is its basename.
     assert client.project_label("C:\\Users\\pat\\acme-main\\gone") == "gone"
+
+
+def test_a_home_directory_repository_is_not_the_project_of_folders_under_it(ws, monkeypatch):
+    """A dotfiles repository at ~ would otherwise fold every non-repo folder under ~ into
+    one '<username>' project (and turn project skills sync off: its root is ~)."""
+    home = _init_repo(ws / "pat")
+    monkeypatch.setenv("HOME", str(home))
+    (home / "notes" / "deep").mkdir(parents=True)
+    assert client.resolve(home / "notes" / "deep") == ("deep", home / "notes" / "deep")
+    assert client.project_label(home) == "pat"  # a session in ~ itself is still ~'s
+    nested = _init_repo(home / "code" / "acme")
+    (nested / "src").mkdir()
+    assert client.project_label(nested / "src") == "acme"  # a real repo under ~ still is one
+
+
+def test_the_bare_plus_worktrees_layout_is_named_for_its_folder(ws):
+    """`acme/.bare` + `acme/main`, `acme/feature`: every worktree is acme, and a second
+    such repository is not merged with the first under the name '.bare'."""
+    for name in ("acme", "widget"):
+        src = _init_repo(ws / f"src-{name}")
+        _git(ws, "clone", "-q", "--bare", str(src), str(ws / name / ".bare"))
+        (ws / name / ".git").write_text("gitdir: ./.bare\n")
+        _git(ws / name, "worktree", "add", "-q", "--detach", str(ws / name / "feature"))
+        assert client.project_label(ws / name / "feature") == name
+
+
+def test_a_fifo_named_git_never_blocks_the_resolver(ws):
+    import os
+    import threading
+
+    folder = ws / "odd"
+    folder.mkdir()
+    os.mkfifo(folder / ".git")
+    out: list = []
+    t = threading.Thread(target=lambda: out.append(client.resolve(folder)), daemon=True)
+    t.start()
+    t.join(5)
+    assert out, "resolve() blocked on a FIFO named .git"
+    assert out[0][0] == "odd"

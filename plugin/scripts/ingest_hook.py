@@ -390,16 +390,20 @@ def _is_private(session_id: str) -> bool:
     return True
 
 
-def _records_project(records: list[dict[str, Any]]) -> str | None:
-    """The project label for a batch, resolved from the records' own ``cwd`` the way
-    every client labels a project (synapse_project: marker file, git toplevel, folder).
+def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
+    """Each cwd the records carry, with its project label, resolved the way every client
+    labels a project (synapse_project: marker file, git toplevel, folder).
 
     The records, not the hook payload, because the catch-up sweep and the history import
-    have no payload, and a swept transcript's session ran somewhere other than this one.
-    None when no record carries a cwd, or when the cwds resolve to different projects:
-    the server then labels each turn from its own cwd, as it does for an old plugin."""
+    have no payload, and a swept transcript's session ran somewhere other than this one."""
     cwds = {c for r in records if isinstance(r, dict) and isinstance(c := r.get("cwd"), str) and c}
-    labels = {synapse_project.project_label(c) for c in cwds} - {None}
+    return {c: lb for c in cwds if (lb := synapse_project.project_label(c))}
+
+
+def _records_project(records: list[dict[str, Any]]) -> str | None:
+    """The batch's one project label, or None when no record carries a cwd or the cwds
+    resolve to different projects (then the body carries ``cwd_projects`` instead)."""
+    labels = set(_cwd_labels(records).values())
     return labels.pop() if len(labels) == 1 else None
 
 
@@ -410,9 +414,13 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     through config.py, and all send the batch's project label (_records_project).
     Raises on transport/HTTP errors — callers decide how to fail-soft."""
     payload: dict[str, Any] = {"records": records, "source": source}
-    project = _records_project(records)
-    if project:
-        payload["project"] = project
+    by_cwd = _cwd_labels(records)
+    if len(set(by_cwd.values())) == 1:
+        payload["project"] = next(iter(by_cwd.values()))
+    elif by_cwd:
+        # A session that moved between repositories: each turn is labelled from its own
+        # cwd (an older server ignores this and labels each turn from the cwd's basename).
+        payload["cwd_projects"] = by_cwd
     body = json.dumps(payload).encode()
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails

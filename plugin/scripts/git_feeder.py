@@ -100,7 +100,9 @@ def _push_repo(repo: Path, since_days: int) -> tuple[int, int]:
         {
             "t_valid": c["t_valid"],
             "fact": f"committed to {project}: {c['subject']}",
-            "source": f"git:{project}",
+            # The dedup key stays the folder's name: a label that changes (a marker, a
+            # worktree) must not re-insert every commit already in the window.
+            "source": f"git:{repo.name}",
             "source_ref": c["sha"],
             "project": project,
             "salience": _salience(c["subject"], c["is_merge"], c["churn"]),

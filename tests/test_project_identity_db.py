@@ -724,3 +724,24 @@ def test_codex_ingest_stores_a_label_never_a_path(ident, conn, db_url, project, 
     assert r.status_code == 200, r.text
     assert r.json()["ingested"] == 1
     assert _stored_projects(conn, sid) == ["Alpha"]
+
+
+def test_a_batch_spanning_two_projects_labels_each_turn_from_its_own_cwd(ident, conn, db_url):
+    """A session that moved between repositories: the client sends each cwd's label
+    (cwd_projects) and the route labels every turn from its own cwd, path-cleaned."""
+    sid_a, recs_a = _cc_records(ident, "/work/Alpha/sub")
+    _sid_b, recs_b = _cc_records(ident, "/work/Other/deep")
+    for r in recs_b:
+        r["sessionId"] = sid_a
+        r["timestamp"] = "2026-09-01T12:05:00Z"
+    body = {
+        "records": recs_a + recs_b,
+        "source": "hook",
+        "cwd_projects": {"/work/Alpha/sub": "Alpha", "/work/Other/deep": "C:\\x\\Other", "x": 3},
+    }
+    assert _post(db_url, body).status_code == 200
+    rows = conn.execute(
+        "SELECT metadata->>'cwd', project FROM episodes WHERE session_id = %s ORDER BY sequence",
+        (sid_a,),
+    ).fetchall()
+    assert rows == [("/work/Alpha/sub", "Alpha"), ("/work/Other/deep", "Other")]

@@ -22,7 +22,9 @@ Resolution order for a directory:
 2. The basename of the git toplevel. A linked worktree (``git worktree add``, including
    the ones Claude Code makes under ``.claude/worktrees``) resolves to its main
    checkout, so a worktree is the same project as the checkout it came from; one of a
-   bare repository to the repository's name without ``.git``.
+   bare repository to the repository's name without ``.git`` (or to the folder holding
+   a hidden one, e.g. ``acme/.bare``). A repository at the home directory itself
+   (dotfiles) is not the project of the folders under it.
 3. The basename of the directory itself.
 
 Every label is normalised the same way: both path separators are treated alike,
@@ -81,8 +83,11 @@ def _gitdir_of(top: Path) -> Path | None:
     dot = top / ".git"
     if dot.is_dir():
         return dot
+    if not dot.is_file():
+        return None  # a FIFO or device named .git: never read (it could block forever)
     try:
-        first = dot.read_text(encoding="utf-8", errors="replace").splitlines()[0]
+        with open(dot, "rb") as f:
+            first = f.read(4096).decode("utf-8", errors="replace").splitlines()[0]
     except (OSError, IndexError):
         return None
     if not first.startswith("gitdir:"):
@@ -98,7 +103,8 @@ def _main_checkout(top: Path) -> Path:
     ``commondir`` file pointing back at ``<main>/.git``. A submodule's git dir has no
     ``commondir``, so it stays itself. A bare repository has no main working tree: its
     worktrees are named for it (``acme.git`` -> ``acme``), and so are a submodule's
-    (``<super>/.git/modules/<name>``)."""
+    (``<super>/.git/modules/<name>``). A hidden bare repository inside the project
+    folder (``acme/.bare``, the bare-plus-worktrees layout) is named for that folder."""
     gitdir = _gitdir_of(top)
     if gitdir is None or (top / ".git").is_dir():
         return top
@@ -111,19 +117,29 @@ def _main_checkout(top: Path) -> Path:
         common_dir = common_dir.resolve()
     except OSError:
         return top
-    if common_dir.name == ".git":
+    if common_dir.name.startswith("."):  # .git, or a hidden bare repo such as .bare
         return common_dir.parent
     if common_dir.name.endswith(".git") and len(common_dir.name) > 4:
         return common_dir.parent / common_dir.name[:-4]
     return common_dir
 
 
-def _toplevel(start: Path) -> Path | None:
-    """The nearest directory at or above ``start`` holding a ``.git`` entry."""
+def _home() -> Path | None:
+    try:
+        return Path.home().resolve()
+    except (OSError, RuntimeError, KeyError):
+        return None
+
+
+def _toplevel(start: Path, *, projects_only: bool = True) -> Path | None:
+    """The nearest directory at or above ``start`` holding a ``.git`` entry. With
+    ``projects_only``, a repository at the home directory itself (dotfiles) is no project
+    for the folders under it: it counts only for a session in the home directory."""
+    home = _home() if projects_only else None
     for d in (start, *start.parents):
         try:
             if (d / ".git").exists():
-                return d
+                return None if (d == home and start != home) else d
         except OSError:
             return None
     return None

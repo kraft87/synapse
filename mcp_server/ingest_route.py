@@ -72,6 +72,14 @@ def register(
         # The client resolves the label (marker file, git toplevel, folder name); without
         # one the parser labels from the transcript's cwd. Either way, never a path.
         project_override = clean_label(body.get("project"))
+        # A batch spanning several projects (a session that moved between repositories)
+        # carries each cwd's label instead; every turn is then labelled from its own cwd.
+        raw_by_cwd = body.get("cwd_projects")
+        project_by_cwd = {
+            c: lb
+            for c, v in (raw_by_cwd.items() if isinstance(raw_by_cwd, dict) else ())
+            if isinstance(c, str) and (lb := clean_label(v))
+        }
         record_format = body.get("format") or "claude_code"
         session_id_hint = body.get("session_id")
         if record_format not in ("claude_code", "codex"):
@@ -92,7 +100,9 @@ def register(
                     records, source_label, project_override, session_id_hint=session_id_hint
                 )
             else:
-                episodes = JSONLParser().parse_records(records, source_label, project_override)
+                episodes = JSONLParser().parse_records(
+                    records, source_label, project_override, project_by_cwd=project_by_cwd or None
+                )
             if not episodes:
                 return 0
             # Resolved from the credential only. Assigned unconditionally so nothing a

@@ -438,10 +438,15 @@ def test_post_records_body_carries_the_resolved_project(
     assert body["records"] == records
     assert body["source"] == "sweep"
     if expected is None:
-        # No key at all: the server then labels each turn from its own cwd.
+        # No single label: each cwd's label instead (none at all when no record has a cwd).
         assert "project" not in body
+        cwds = {r["cwd"] for r in records if r.get("cwd")}
+        expect_map = {c: ingest.synapse_project.project_label(c) for c in cwds}
+        assert body.get("cwd_projects", {}) == expect_map
+        assert len(set(expect_map.values())) != 1
     else:
         assert body["project"] == expected
+        assert "cwd_projects" not in body
 
 
 @pytest.mark.parametrize(
@@ -870,15 +875,25 @@ def test_skill_review_local_dir_never_the_global_folder(monkeypatch, tmp_path):
     assert mod._local_dir("project:HOME") is None
 
 
-@pytest.mark.parametrize("where", ["sub", "wt_sub"])
-def test_config_sync_targets_label_project_files_with_the_resolved_name(monkeypatch, layout, where):
+@pytest.mark.parametrize(("where", "root"), [("sub", "root"), ("wt_sub", "wt")])
+def test_config_sync_targets_label_project_files_with_the_resolved_name(
+    monkeypatch, layout, where, root
+):
+    """The project ROOT's files, under the project's label, whichever subfolder the session
+    started in: a subfolder's own CLAUDE.md would otherwise share the root's (surface,
+    scope, file_key) row and the two would overwrite each other."""
     proj = Path(_where(layout, where))
+    top = Path(_where(layout, root))
+    for base, text in ((top, "root"), (proj, "subfolder")):
+        (base / ".claude" / "rules").mkdir(parents=True, exist_ok=True)
+        (base / "CLAUDE.md").write_text(text)
+        (base / ".claude" / "rules" / "style.md").write_text(text)
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
     mod = _load(_CONFIG_SYNC, "config_sync_project_wiring_test")
     project = sorted((scope, key, p) for scope, key, p in mod._targets() if scope != "global")
     assert project == [
-        ("project:MyRepo", ".claude/rules/style.md", proj / ".claude" / "rules" / "style.md"),
-        ("project:MyRepo", "CLAUDE.md", proj / "CLAUDE.md"),
+        ("project:MyRepo", ".claude/rules/style.md", top / ".claude" / "rules" / "style.md"),
+        ("project:MyRepo", "CLAUDE.md", top / "CLAUDE.md"),
     ]
 
 
@@ -916,7 +931,8 @@ def test_git_feeder_files_commits_under_the_resolved_label(monkeypatch, layout, 
     assert mod._push_repo(Path(_where(layout, where)), 30) == (1, 0)
     (ev,) = events
     assert ev["project"] == expected
-    assert ev["source"] == f"git:{expected}"
+    # the dedup key stays the folder's name, so a new label never re-inserts old commits
+    assert ev["source"] == f"git:{Path(_where(layout, where)).name}"
     assert ev["fact"] == f"committed to {expected}: fix: tidy"
 
 
@@ -941,4 +957,4 @@ def test_git_feeder_process_files_worktree_commits_under_the_checkout(layout, se
     posts = [r for r in server.seen if r.path == "/timeline/events"]
     assert len(posts) == 1
     assert {e["project"] for e in posts[0].body["events"]} == {"MyRepo"}
-    assert {e["source"] for e in posts[0].body["events"]} == {"git:MyRepo"}
+    assert {e["source"] for e in posts[0].body["events"]} == {f"git:{layout.worktree.name}"}

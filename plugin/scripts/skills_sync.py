@@ -280,7 +280,7 @@ def _retired_copy(scope, target_dir: Path, name: str, disk, entry: dict, ledger:
     if retired_at is None:
         return "kept"
     folder = target_dir / name
-    own_scope = entry.get("scope") in (None, scope)
+    own_scope = entry.get("scope") is None or str(entry["scope"]).lower() == scope.lower()
     if digest == entry.get("content_hash") or (own_scope and digest in ledger.get(name, [])):
         if _is_link(folder):
             return "kept"  # linked in from somewhere else: not a folder Synapse made
