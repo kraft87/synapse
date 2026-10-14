@@ -557,16 +557,6 @@ One mirrored file's content + meta + parsed `[[wikilinks]]`. Reuses the `_fetch_
 - `links` = unique `[[target]]` values in first-seen order (an `|alias` suffix is dropped).
   **No history** (honesty note) — the response carries no versions.
 
-### GET /dash/api/behavior/linkgraph
-Adjacency over every registry file's `[[wikilinks]]`.
-```json
-{"nodes": [{"file_key": "CLAUDE.md", "scope": "global", "group": "CLAUDE.md"}],
- "edges": [{"source": "CLAUDE.md", "target": "rules/voice.md"}]}
-```
-- Nodes are keyed by logical `file_key` (deduped across surfaces). Edges are
-  `file_key → wikilink target`; a target need not be a node (many point at memory notes, which
-  are not mirrored files) — the client resolves what it can (exact `file_key`, or basename
-  without extension) and renders the rest as inert leaves.
 ## Phase 6 endpoints (Graph explorer)
 
 Two read-only endpoints backing the KG explorer page (README §3, spec §4). Machine-token
@@ -744,7 +734,7 @@ All spec §8 phases are shipped; no reserved paths remain. `POST /recall`'s `deb
 flag + `/dash/api/recall/history` (phase 2); `/dash/api/proposals*` (phase 2b);
 `/dash/api/stream` SSE (phase 3); `/dash/api/metrics/{recall,ingestion,corpus}` (phase 4);
 `/dash/api/timeline`, `/dash/api/preferences`, `/dash/api/dream/report`,
-`/dash/api/behavior/{files,file,linkgraph}` (phase 5);
+`/dash/api/behavior/{files,file}` (phase 5);
 `/dash/api/graph/{entities,neighborhood}` (phase 6);
 `DELETE /dash/api/episodes/{id}` + `DELETE /dash/api/facts/{id}` (phase 7) — all
 documented above.

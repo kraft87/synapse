@@ -26,6 +26,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
+from ingestion.db_connection import _vector_literal
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.scope import coerce_group
 from ingestion.surfaces import (
@@ -39,10 +40,6 @@ from mcp_server.http_helpers import err, unauthorized
 logger = logging.getLogger(__name__)
 
 _MAX_BATCH = 1000  # bounds per-call embed cost
-
-
-def _vec_literal(vec: list[float]) -> str:
-    return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 
 def _embed_text(project: str | None, fact: str) -> str:
@@ -120,7 +117,7 @@ def _ingest_events(
                 e["source_ref"],
                 e["project"],
                 e["salience"],
-                _vec_literal(vec) if vec is not None else None,
+                _vector_literal(vec),
                 embed_model if vec is not None else None,
                 e.get("event_type"),
                 _event_domain(e),

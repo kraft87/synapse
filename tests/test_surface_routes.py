@@ -157,7 +157,8 @@ def test_delete_revokes_back_to_the_unregistered_default(clean, db_url):
         client.put(f"/surfaces/{_SID}", json={"trust": "full"}, headers=_H)
         assert lookup_surface(db_url, _SID).trust == "full"
         r = client.delete(f"/surfaces/{_SID}", headers=_H)
-        assert r.status_code == 200 and r.json()["revoked"] == 1
+        assert r.status_code == 200
+        assert r.json() == {"status": "ok", "surface_id": _SID, "revoked": 1}
         # Idempotent: revoking an already-revoked (or absent) row is a no-op.
         assert client.delete(f"/surfaces/{_SID}", headers=_H).json()["revoked"] == 0
 

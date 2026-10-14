@@ -20,8 +20,8 @@ how /auth/callback/dash coexists with the MCP leg on one OAuth App; OIDC provide
 match exactly, so register both /auth/callback and /auth/callback/dash on the client.
 
 Identity + authorization are the SAME gate as the MCP leg and `synapse login`: the
-IdP confirms the account, the allowlist authorizes it, and what's handed back is the
-machine token. The state is HMAC-signed (key = machine token, never sent) with a
+IdP confirms the account, the allowlist authorizes it, and what's handed back is that
+identity's device token. The state is HMAC-signed (key = machine token, never sent) with a
 10-minute TTL, and the return origin must be in SYNAPSE_DASH_ORIGINS (plus the public
 base) — without that check the cross-host bounce would be an open redirect that
 exfiltrates the token to an attacker-supplied Host header.
@@ -42,6 +42,8 @@ from urllib.parse import quote
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
+
+from mcp_server.http_helpers import request_origin
 
 logger = logging.getLogger(__name__)
 
@@ -105,14 +107,9 @@ def register(
     }
     redirect_uri = public_origin + _CALLBACK_PATH
 
-    def _request_origin(request: Request) -> str:
-        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
-        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
-        return f"{proto}://{host}".rstrip("/")
-
     @mcp.custom_route("/dash/oauth/start", methods=["GET"])  # type: ignore[misc]
     async def oauth_start(request: Request) -> Response:
-        origin = _request_origin(request)
+        origin = request_origin(request)
         if origin not in allowed_origins:
             # Not redirected anywhere attacker-chosen — just refused.
             return JSONResponse(

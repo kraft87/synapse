@@ -28,13 +28,14 @@ from pathlib import Path
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from mcp_server.http_helpers import request_origin
+
 logger = logging.getLogger(__name__)
 
 #: Where plugin/ and plugin-codex/ live: /app in the image, the checkout in development.
 _CLIENT_ROOT = Path(__file__).resolve().parent.parent
 _TREES = ("plugin", "plugin-codex")
 _TEMPLATE = Path(__file__).resolve().with_name("install_script.py")
-_ORIGIN_RE = re.compile(r"^https?://(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$")
 _FIXED_TIME = (1980, 1, 1, 0, 0, 0)  # zip mtimes, so equal trees give equal bundles
 
 _cache: dict[str, tuple[str, bytes, str]] = {}
@@ -70,16 +71,6 @@ def bundle(root: Path | None = None) -> tuple[str, bytes, str]:
     data = buf.getvalue()
     _cache[str(root)] = (version, data, hashlib.sha256(data).hexdigest())
     return _cache[str(root)]
-
-
-def request_origin(request: Request) -> str:
-    """The origin this request was addressed to, as the client sees it."""
-    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
-    origin = f"{proto or request.url.scheme}://{host or request.headers.get('host', '')}"
-    if _ORIGIN_RE.match(origin):
-        return origin
-    return str(request.base_url).rstrip("/")
 
 
 def render(server: str, root: Path | None = None) -> str:

@@ -55,6 +55,8 @@ from starlette.responses import (
 )
 
 from ingestion import pg_pool
+from ingestion.db_connection import bm25_query_text
+from ingestion.dedup import _normalize_name
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -231,12 +233,6 @@ def _label_filter(col: str, value: str) -> tuple[str, list[Any]]:
     if value == "untagged":
         return f"({col} IS NULL OR {col} = '' OR {col} = 'untagged')", []
     return f"{col} = %s", [value]
-
-
-def _bm25_sanitize(q: str) -> str:
-    """Alnum/space-only, mirroring recall/kg_pg: keeps identifiers/error strings while
-    stripping the ParadeDB query-language metacharacters that would raise a parse error."""
-    return "".join(c if (c.isalnum() or c.isspace()) else " " for c in q).strip()
 
 
 def _encode_cursor(ts_iso: str, type_: str, id_str: str) -> str:
@@ -779,13 +775,6 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
 # ---------------------------------------------------------------------------
 
 
-def _normalize_seed_name(name: str) -> str:
-    """Mirror ingestion.dedup._normalize_name for the exact-name seed lookup:
-    lowercase, collapse internal whitespace, strip bookend whitespace/punctuation."""
-    collapsed = " ".join(name.lower().split())
-    return collapsed.strip(" \t\n\r\f\v.,;:!?\"'()[]{}<>")
-
-
 def _parse_as_of(raw: str | None) -> datetime | None:
     """Parse the as-of ISO timestamp, or None (unset / unparseable → no time filter)."""
     if not raw:
@@ -826,7 +815,7 @@ def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict
     row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
     if row:
         return row
-    norm = _normalize_seed_name(entity)
+    norm = _normalize_name(entity)
     if norm:
         row = conn.execute(
             f"SELECT {cols} FROM kg_entities WHERE normalized_name = %s "
@@ -1008,7 +997,7 @@ def _search(
     }
     if not q:
         return empty
-    safe = _bm25_sanitize(q)
+    safe = bm25_query_text(q)
     like = f"%{q}%"
 
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
@@ -2207,25 +2196,6 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
     }
 
 
-def _behavior_linkgraph(db_url: str) -> dict[str, Any]:
-    """Adjacency over every registry file's [[wikilinks]]. Nodes are keyed by logical
-    file_key (deduped across surfaces); edges are file_key → wikilink target. A target need
-    not be a node (many point at memory notes, which are not mirrored files) — the client
-    resolves what it can and renders the rest as inert leaves."""
-    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            "SELECT scope, file_key, content FROM config_lane.config_registry"
-        ).fetchall()
-    nodes: dict[str, dict[str, Any]] = {}
-    edges: list[dict[str, str]] = []
-    for r in rows:
-        fk = r["file_key"]
-        nodes.setdefault(fk, {"file_key": fk, "scope": r["scope"], "group": _behavior_group(fk)})
-        for target in _wikilinks(r["content"]):
-            edges.append({"source": fk, "target": target})
-    return {"nodes": list(nodes.values()), "edges": edges}
-
-
 # ---------------------------------------------------------------------------
 # Phase 3 — SSE live stream (LISTEN/NOTIFY + ring buffer)
 # ---------------------------------------------------------------------------
@@ -2819,10 +2789,6 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             not_found="file not found",
             label="behavior file",
         )
-
-    @mcp.custom_route("/dash/api/behavior/linkgraph", methods=["GET"])  # type: ignore[misc]
-    async def dash_behavior_linkgraph(request: Request) -> JSONResponse:
-        return await _api(request, lambda: _behavior_linkgraph(db_url))
 
     @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
     async def dash_flags(request: Request) -> JSONResponse:

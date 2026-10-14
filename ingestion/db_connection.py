@@ -24,6 +24,13 @@ def _vector_literal(embedding: Sequence[float] | None) -> str | None:
     return "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
 
 
+def bm25_query_text(query: str) -> str:
+    """A free-text query made safe for ParadeDB's ``paradedb.match``: alphanumerics and
+    whitespace only, so identifiers and error strings survive while the query-language
+    metacharacters that would raise a parse error become spaces. May return ''."""
+    return "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
+
+
 class DatabaseConnection:
     def __init__(self, url: str) -> None:
         self._url = url

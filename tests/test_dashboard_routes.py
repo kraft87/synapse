@@ -733,6 +733,17 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
         }
 
 
+def test_search_survives_query_language_metacharacters(clean, conn, db_url):
+    from ingestion.db_connection import bm25_query_text
+
+    assert bm25_query_text('  err:"E42" (retry)* ') == "err  E42   retry"
+    tok = "metachar"
+    _episode(conn, session="mc", seq=1, content=f"the {tok} E42 failure")
+    with _client(db_url) as client:
+        r = client.get(f"/dash/api/search?q={tok}%3A%22E42%22*&type=episodes", headers=_H)
+        assert r.status_code == 200 and len(r.json()["hits"]) == 1
+
+
 def test_search_load_more_skips_the_tab_counts(clean, conn, db_url):
     """The four counts belong to the first page of a query; a later page carries only hits
     (the client keeps the totals it already holds)."""
@@ -1913,7 +1924,7 @@ def test_dream_report_empty(clean, conn, db_url):
 # ---- Behavior files ----
 
 
-def test_behavior_files_grouping_content_and_linkgraph(clean_behavior, conn, db_url):
+def test_behavior_files_grouping_and_content(clean_behavior, conn, db_url):
     _config_reg(
         conn,
         file_key="CLAUDE.md",
@@ -1950,17 +1961,6 @@ def test_behavior_files_grouping_content_and_linkgraph(clean_behavior, conn, db_
             == 404
         )
 
-        # linkgraph: node per logical file_key + one edge per [[wikilink]] instance
-        lg = client.get("/dash/api/behavior/linkgraph", headers=_H).json()
-        node_keys = {n["file_key"] for n in lg["nodes"]}
-        assert node_keys == {"CLAUDE.md", "rules/voice.md", "memory/note1.md", "AGENTS.md"}
-        edge_pairs = {(e["source"], e["target"]) for e in lg["edges"]}
-        assert ("CLAUDE.md", "voice") in edge_pairs and ("CLAUDE.md", "job_crons") in edge_pairs
-        assert ("rules/voice.md", "CLAUDE") in edge_pairs
-        assert ("memory/note1.md", "voice") in edge_pairs
-        # CLAUDE.md's duplicate [[voice]] is deduped in links but the edge list holds one 'voice'.
-        assert sum(1 for e in lg["edges"] if e["source"] == "CLAUDE.md") == 2
-
 
 def test_behavior_file_surface_disambiguation(clean_behavior, conn, db_url):
     # Same file_key on two surfaces (PK includes surface_id) — explicit surface selects one.
@@ -1984,7 +1984,6 @@ def test_phase5_routes_require_machine_token(clean, conn, db_url):
             "/dash/api/dream/report",
             "/dash/api/behavior/files",
             "/dash/api/behavior/file?key=CLAUDE.md",
-            "/dash/api/behavior/linkgraph",
         ):
             r = client.get(path)
             assert r.status_code == 401

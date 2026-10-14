@@ -65,12 +65,10 @@ logger = logging.getLogger(__name__)
 
 AUDIENCES = ("personal", "work-safe")
 TRUST_LEVELS = ("full", "restricted")
-STATUSES = ("approved", "revoked")
 
 #: Only this status serves anything. Revoking clears the token hash too, so a revoked
 #: credential matches no row at all.
 APPROVED = "approved"
-REVOKED = "revoked"
 
 #: The default audience for an unclassified note — never leaves a trusted host.
 DEFAULT_AUDIENCE = "personal"
@@ -724,8 +722,3 @@ def revoke_surface(db_url: str, surface_id: str) -> int:
             (surface_id,),
         )
         return cur.rowcount
-
-
-#: Pre-054 name. Revocation replaced deletion (the row is the audit trail), but the
-#: DELETE /surfaces/{id} verb and its callers kept their spelling.
-delete_surface = revoke_surface

@@ -63,6 +63,15 @@ def test_start_accepts_configured_lan_origin(client):
     assert wl._verify_state(_MT, q["state"][0]) == _LAN
 
 
+def test_start_reads_the_first_entry_of_a_proxy_chain(client):
+    """A proxy chain joins X-Forwarded-* values with commas; the client-facing origin is
+    the first entry (install_routes reads it the same way)."""
+    r = _start(client, host="synapse.example.net, app.internal", proto="https, http")
+    assert r.status_code == 302
+    q = parse_qs(urlparse(r.headers["location"]).query)
+    assert wl._verify_state(_MT, q["state"][0]) == _PUB
+
+
 def test_start_refuses_unlisted_origin(client):
     r = _start(client, host="evil.example.com")
     assert r.status_code == 403

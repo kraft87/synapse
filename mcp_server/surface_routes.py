@@ -306,7 +306,4 @@ def register(
         out = await _run(request, lambda: revoke_surface(db_url, surface_id), admin)
         if isinstance(out, JSONResponse):
             return out
-        return JSONResponse(
-            # "deleted" kept alongside "revoked" for the 0.16.x clients still reading it.
-            {"status": "ok", "surface_id": surface_id, "revoked": int(out), "deleted": int(out)}
-        )
+        return JSONResponse({"status": "ok", "surface_id": surface_id, "revoked": int(out)})
