@@ -421,6 +421,29 @@ def test_last_seen_is_stamped_on_use(clean):
     assert _last_seen(clean, "dev-seen") is not None
 
 
+def test_last_seen_is_not_rewritten_inside_its_window(clean, monkeypatch):
+    """Every device request resolves its bearer; only the first in a window may write.
+    The window is read with the row, so a fresh stamp costs no UPDATE round trip."""
+    from ingestion import surfaces
+
+    writes: list[str] = []
+    real_touch = surfaces._touch_last_seen
+    monkeypatch.setattr(
+        surfaces, "_touch_last_seen", lambda conn, th: (writes.append(th), real_touch(conn, th))
+    )
+    register_device(clean, "tok", trust="full", surface_id="dev-seen")
+    resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
+    resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
+    assert writes == [token_hash("tok")]
+    clean.execute(
+        "UPDATE surfaces SET last_seen_at = now() - interval '6 minutes' "
+        "WHERE surface_id = 'dev-seen'"
+    )
+    before = _last_seen(clean, "dev-seen")
+    resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
+    assert len(writes) == 2 and _last_seen(clean, "dev-seen") > before
+
+
 def _last_seen(conn, sid):
     return conn.execute(
         "SELECT last_seen_at FROM surfaces WHERE surface_id = %s", (sid,)

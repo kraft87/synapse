@@ -333,8 +333,11 @@ def _row_to_trust(surface_id: str, row: Any, credential_bound: bool = False) -> 
 #: Written out in full rather than interpolated: every SQL string in this module is a
 #: literal, so a reader (and a static scanner) can see there is no query construction
 #: anywhere near a credential.
+#: ``seen_recently`` rides along so a device inside its last-seen window costs no write.
 _SELECT_BY_TOKEN = (
-    "SELECT surface_id, trust, allowed_projects, status FROM surfaces WHERE token_hash = %s"
+    "SELECT surface_id, trust, allowed_projects, status, "
+    "coalesce(last_seen_at >= now() - %s::interval, false) AS seen_recently "
+    "FROM surfaces WHERE token_hash = %s"
 )
 #: The id lane only ever matches a CREDENTIAL-LESS row (``oauth:<login>``, a legacy
 #: hostname). A device row, the dashboard's full-trust ``dash:<login>`` rows included,
@@ -349,10 +352,7 @@ _SELECT_BY_ID = (
 #: all an operator "is this laptop still alive" column needs.
 _LAST_SEEN_WINDOW = "5 minutes"
 
-_TOUCH_SQL = (
-    "UPDATE surfaces SET last_seen_at = now() WHERE token_hash = %s "
-    "AND (last_seen_at IS NULL OR last_seen_at < now() - %s::interval)"
-)
+_TOUCH_SQL = "UPDATE surfaces SET last_seen_at = now() WHERE token_hash = %s"
 
 
 def _touch_last_seen(conn: Any, th: str) -> None:
@@ -362,7 +362,7 @@ def _touch_last_seen(conn: Any, th: str) -> None:
     disk, or a lock wait would otherwise turn a liveness nicety into a total outage.
     """
     try:
-        conn.execute(_TOUCH_SQL, (th, _LAST_SEEN_WINDOW))
+        conn.execute(_TOUCH_SQL, (th,))
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("last_seen_at stamp failed: %s", e)
 
@@ -399,8 +399,8 @@ def resolve_caller(
     try:
         with pg_pool.connection(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
             if th:
-                row = cur.execute(_SELECT_BY_TOKEN, (th,)).fetchone()
-                if row is not None:
+                row = cur.execute(_SELECT_BY_TOKEN, (_LAST_SEEN_WINDOW, th)).fetchone()
+                if row is not None and not row["seen_recently"]:
                     _touch_last_seen(conn, th)
             else:
                 row = cur.execute(_SELECT_BY_ID, (sid,)).fetchone()

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -42,8 +43,13 @@ def _reload(monkeypatch, env):
 
 
 class _Req:
+    """The slice of a Starlette request the gates read: headers, scope and state. The
+    scope carries no ``user``: no auth middleware ran, so the gates look the bearer up."""
+
     def __init__(self, headers):
         self.headers = headers
+        self.scope: dict = {}
+        self.state = SimpleNamespace()
 
 
 def test_open_mode_has_no_auth(monkeypatch):

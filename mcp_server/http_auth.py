@@ -1,10 +1,20 @@
-"""Credential gates for custom HTTP routes, independent of FastMCP middleware."""
+"""Credential gates for custom HTTP routes.
+
+FastMCP enforces auth on /mcp only; every custom route gates itself through here. Its
+app-wide auth middleware still VERIFIES each bearer, though, and the gates reuse that
+verdict (:func:`request_trust`) rather than paying for a second lookup.
+"""
 
 import hmac
 
 from starlette.requests import Request
 
-from ingestion.surfaces import resolve_caller, token_hash
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
+from mcp_server import caller_trust
+from mcp_server.auth_tokens import KIND_DEVICE, claims_of
+
+#: ``request.state`` attribute holding the bearer's verdict once it has been resolved.
+_TRUST_STATE = "synapse_trust"
 
 
 def bearer(request: Request) -> str:
@@ -31,6 +41,35 @@ def authenticated(request: Request, machine_token: str) -> bool:
     return bool(machine_token) and bool(bearer(request))
 
 
+def request_trust(request: Request, machine_token: str, db_url: str) -> SurfaceTrust:
+    """The bearer's trust verdict, resolved at most once per request.
+
+    Both gates and every route's trust read go through here. On a credentialed server
+    FastMCP's app-wide auth middleware has already run SynapseTokenVerifier on this
+    request's bearer (off the event loop) and left the verdict on ``scope["user"]``, so
+    this reads that result rather than repeating the lookup: device claims become the
+    trust, and a bearer the verifier rejected (pending, revoked, unknown, or a database
+    it could not reach) is UNKNOWN. Without that middleware (an open server, a bare test
+    app) it falls back to :func:`caller_trust.request_trust`.
+
+    The verdict is kept on ``request.state`` and dies with the request. Nothing is
+    cached across requests, so a revoke or a demotion bites on the very next call
+    (ingestion.surfaces explains why that matters).
+    """
+    st = getattr(request.state, _TRUST_STATE, None)
+    if st is None:
+        if "user" in request.scope:
+            claims = claims_of(getattr(request.scope["user"], "access_token", None))
+            is_device = claims.get("kind") == KIND_DEVICE
+            st = caller_trust.trust_from_claims(claims) if is_device else UNKNOWN_SURFACE
+        else:
+            st = caller_trust.request_trust(
+                db_url=db_url, machine_token=machine_token, bearer=bearer(request)
+            )
+        setattr(request.state, _TRUST_STATE, st)
+    return st
+
+
 def machine_authorized(request: Request, machine_token: str, db_url: str) -> bool:
     """ "Is this a Synapse client?" — the CLIENT gate on the custom routes.
 
@@ -49,8 +88,7 @@ def machine_authorized(request: Request, machine_token: str, db_url: str) -> boo
         return True
     if is_root(request, machine_token):
         return True
-    tok = bearer(request)
-    return bool(tok) and resolve_caller(db_url, token_hash_hex=token_hash(tok)).known
+    return request_trust(request, machine_token, db_url).known
 
 
 def admin_authorized(request: Request, machine_token: str, db_url: str) -> bool:
@@ -63,9 +101,9 @@ def admin_authorized(request: Request, machine_token: str, db_url: str) -> bool:
 
     Every machine that runs the plugin ends up holding the enrollment credential at
     install time. If that credential also approved devices, an attacker who read it off
-    any one machine could self-approve to full trust and the TOFU gate would be
-    decoration. So approval, minting, revocation, the surface list and the dashboard all
-    demand a credential that only an already-trusted machine has.
+    any one machine could self-approve to full trust, and the device trust levels would
+    be decoration. So approval, minting, revocation, the surface list and the dashboard
+    all demand a credential that only an already-trusted machine has.
 
     The dashboard reaches this gate through the login flow, which mints a full-trust
     device token for an OAuth-allowlisted identity rather than handing out the root
@@ -78,8 +116,7 @@ def admin_authorized(request: Request, machine_token: str, db_url: str) -> bool:
     """
     if not machine_token:
         return True
-    tok = bearer(request)
-    if not tok or is_root(request, machine_token):
+    if not bearer(request) or is_root(request, machine_token):
         return False
-    st = resolve_caller(db_url, token_hash_hex=token_hash(tok))
+    st = request_trust(request, machine_token, db_url)
     return st.known and not st.restricted
