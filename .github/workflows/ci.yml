@@ -67,12 +67,14 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
+      # Unit tests for the pure helpers (node --test, no extra dependencies), then
       # tsc --noEmit + esbuild (web/package.json's "build"). A broken bundle fails
       # here and, via the push job's needs, can never ship in an image.
-      - name: Install and build
+      - name: Install, test and build
         working-directory: web
         run: |
           npm ci
+          npm test
           npm run build
 
   test:

@@ -45,8 +45,12 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
 - `limit` ≤ 100. Filters apply where the column exists (episodes: project+source;
   facts: group_id; timeline: project + group_id via its `domain` column, schema 038) —
   a filter a type lacks does not exclude that type.
-- Feed timestamps: episode `created_at`, fact `t_created`, timeline `ingested_at`
-  (the feed shows when memory was WRITTEN; the event's own date is `t_valid` in data).
+- Feed timestamps: episode `created_at`, fact `t_created`, timeline `ingested_at`.
+  Facts and timeline events are ordered by when they were WRITTEN (the event's own date is
+  `t_valid` in data); an episode is ordered by its CONVERSATION time, so a backfilled or
+  late-synced episode sits at its own time, not at the top. The live client inserts each
+  streamed item by the same order (ts descending, then id as text descending), so a live
+  feed lists what a reload would.
   The KG is read through its own columns (`t_created`, `entity_subtype`), never the
   FalkorDB-era `created_at` / `entity_type` mirrors.
 - The `project` / `source` filter value `untagged` matches NULL, `''` and a literal
@@ -333,43 +337,71 @@ API. So the client reads the stream with `fetch` + a `ReadableStream` line parse
 usual 401 `{"status":"error","detail":"unauthorized"}` (a plain JSON body, not a stream).
 
 **Events**
+- `ready` — `data` is `{}`, no `id:`. The first frame of every connection, sent once the
+  LISTEN worker is up and this connection's position is fixed: every row committed from then
+  on is delivered. The client refetches page 1 on it (see *Resync* below).
 - `new_episode` | `new_fact` | `new_timeline_event` — `data` is the FeedItem JSON, the SAME
   shape `/dash/api/feed` items carry (produced by the same hydration code path). Each carries
   an `id:` — a monotonically increasing integer event id.
-- `processing_status` — `data` is `{"queue_depth": N, "active": bool}` from `extraction_queue`
-  (pending count + whether anything is processing). Emitted on connect and then ~1/s. It has
-  **no `id:`** (only feed events advance Last-Event-ID). The refresh is a single shared query
-  throttled to ~1/s across ALL connected clients — never a per-connection query.
+- `processing_status` — `data` is `{"queue_depth": N, "processing": N, "failed": N,
+  "active": bool}` from `extraction_queue`: `queue_depth` is the pending count (the name the
+  wire has always used), `processing` the claimed rows, `failed` the rows with status
+  `failed`, `active` whether anything is processing. The first frame of a connection is
+  computed fresh for it (the connection waits up to 2 s for it, and for the LISTEN), then ~1/s.
+  It has **no `id:`** (only feed events advance Last-Event-ID). The refresh is a single shared
+  query throttled to ~1/s across ALL connected clients — never a per-connection query. The
+  snapshot is dropped when the last client leaves, and withdrawn (no frames) when a refresh
+  fails, so a count nothing is refreshing is never sent.
+- `reset` — `data` is `{}`, no `id:`. Events were lost: the ring buffer outran a slow
+  connection (the live loop checks it against the oldest buffered id), or the LISTEN worker
+  lost its connection and reconnected. The client refetches page 1.
 - Heartbeat — a `: heartbeat` SSE comment every 15s so idle proxies don't kill the stream.
+
+**Resync (`ready`).** Nothing in the stream can prove a client saw every row: the LISTEN
+worker only runs while a client is connected (rows written between two connections are never
+notified), and a client's first `/feed` can predate the LISTEN. So on every `ready` the client
+refetches page 1 (`GET /feed`) and merges it under the rows it holds; because the fetch
+starts after `ready`, no row falls between the snapshot and the stream. The merge inserts
+unseen rows in feed order and keeps the rest of the list; if page 1 shares no row with the
+list (more than a page was written meanwhile) it replaces the list and takes the page's
+cursor, so no hole is left between page 1 and the old tail.
 
 **Resume / reset (Last-Event-ID).** The server keeps the last 512 feed events in an
 in-process ring buffer. On connect the client may present its last seen event id via the
 `Last-Event-ID` request header (or `?last_event_id=`):
-- still inside the buffer → the server **replays** every event after it, then streams live;
+- still inside the buffer → the server **replays** every event after it (after `ready`), then
+  streams live;
 - aged out of the buffer, or ahead of the server (buffer was reset, e.g. a server restart) →
-  the server sends a `reset` event (`data: {}`, no id) and the client **refetches page 1**
-  (`GET /feed`) to resync, then resumes live;
-- absent → the client already has page 1 from its initial `/feed` fetch, so the server
-  streams live only (from the current buffer head).
+  no replay: the client's page-1 refetch on `ready` covers it;
+- absent → streams live only (from the current buffer head).
 
 If the LISTEN connection itself drops (a Postgres restart or network blip), the worker
 reconnects with 1s→30s backoff while any client is subscribed, and appends a `reset` event
 to the ring once it is listening again (this one carries an `id` and `data: {"type":"reset"}`);
 notifications sent during the gap are not replayed, so clients refetch page 1.
 
-**Client reconnect (spec §2).** The reader reconnects manually with 1s→30s exponential
-backoff, resending `Last-Event-ID`. A transient loss turns the header live dot amber
-("reconnecting") and keeps the stale items on screen. After >5 consecutive failed
-reconnects the client gives up on the stream and falls back to the original 30s `/feed`
-polling automatically. New items that pass the CURRENT filter cluster prepend with the
-slidein animation; items filtered out client-side are dropped (they reappear correctly on
-the next full reload). `MOCK` mode has no server and stays on polling.
+**Client link (spec §2).** The stream is owned by the app shell, not by the Feed page: it is
+open on every page while signed in, and the header's queue badge reads it everywhere. The
+reader reconnects manually with 1s→30s exponential backoff, resending `Last-Event-ID`; a
+connection counts as healthy only once `ready` arrives. The header shows one of four states:
+`connecting`; `queue N` with `· M running` and `· K failed` (warn colour when K > 0) while the
+stream is live (the count is withdrawn if no status frame arrives for 10 s); `reconnecting`
+after a transient loss (stale rows stay on screen); `polling` after >5 consecutive failed
+reconnects, when the Feed refetches page 1 every 30s. While polling the shell retries the
+stream every 2 minutes, and at once on the window `online` event or when the tab becomes
+visible; a retry that connects returns the link to live and the Feed resyncs. New items that
+pass the CURRENT filter cluster are inserted in feed order (animated only when they land at
+the top; an item older than the last loaded row is left for paging while more pages exist);
+items filtered out client-side are dropped (they reappear correctly on the next full reload).
+A Feed response that belongs to a previous filter selection is discarded, so the list and its
+cursor always match the filters in the header. `MOCK` mode has no server and stays on polling.
 
 **Zero cost when idle.** The LISTEN worker (one dedicated psycopg connection) starts lazily
 on the first subscriber and stops when the last disconnects; with no client connected there
 is no LISTEN connection and NOTIFY is discarded by Postgres.
 
 **Deviations from spec §7.**
+- `ready` is an addition to the spec's event names (the resync point described above).
 - Timeline FeedItems now carry a top-level `group_id` (mirroring the `domain` column, schema
   038) so the live client can apply the group filter uniformly across all three feed types.
   Additive — episodes/facts are unchanged; `/feed` timeline items gain the same field.

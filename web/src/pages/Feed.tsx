@@ -1,15 +1,16 @@
-// Feed — "watch it remember". Keyset pagination via next_cursor; a live SSE stream
-// (phase 3) prepends new writes with the slidein animation, with 30s polling kept as the
-// automatic fallback if the stream fails persistently. Skeleton / empty / error states
-// (companion spec §2). The live dot + queue badge reflect the stream's processing_status.
+// Feed — "watch it remember". Keyset pagination via next_cursor; the app shell's live SSE
+// stream (liveLink.ts, phase 3) puts new writes in order with the slidein animation, and the
+// Feed refetches page 1 whenever the stream (re)connects or loses events. When the stream is
+// down ('polling') it does the same every 30s. Skeleton / empty / error states (companion
+// spec §2). The live dot + queue badge are the header's, from the same stream.
 import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
-import { fetchFeed, openFeedStream, feedItemPassesFilter, MOCK, type FeedItem } from '../api';
+import { fetchFeed, feedItemPassesFilter, type Feed as FeedPage, type FeedItem } from '../api';
+import { insertFeedItem, keyOf, mergePage1 } from '../feedOrder';
 import { useStore } from '../state';
 import { FeedCard } from '../components/FeedCard';
 import { ErrorBox, EmptyState } from '../components/ui';
 
-const keyOf = (it: FeedItem) => it.type + ':' + it.id;
 const POLL_MS = 30_000;
 
 const wrap: React.CSSProperties = { flex: 1, maxWidth: '860px', width: '100%', margin: '0 auto', padding: '20px 16px 80px', boxSizing: 'border-box' };
@@ -33,97 +34,100 @@ function Skeletons() {
 
 export function Feed() {
   const s = useStore();
-  const { project, group, source, setOnline, setQueueDepth } = s;
-  const [items, setItems] = useState<FeedItem[]>([]);
-  const [cursor, setCursor] = useState<string | null>(null);
+  const { project, group, source, link, subscribeFeed } = s;
+  const [items, setItemsState] = useState<FeedItem[]>([]);
+  const [cursor, setCursorState] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(false);
   const [fresh, setFresh] = useState<Set<string>>(new Set());
+  // The refs are what async handlers read: always the latest list and cursor, never a closure's.
   const itemsRef = useRef<FeedItem[]>([]);
-  itemsRef.current = items;
+  const cursorRef = useRef<string | null>(null);
+  // Bumped by every filter change: a response from an older epoch is dropped on arrival, so
+  // the list and its cursor always belong to the filters in the header.
+  const epoch = useRef(0);
+
+  const setItems = (next: FeedItem[]) => { itemsRef.current = next; setItemsState(next); };
+  const setCursor = (next: string | null) => { cursorRef.current = next; setCursorState(next); };
 
   const filters = { project, group_id: group, source };
 
-  const load = () => {
-    setLoading(true); setError(false);
-    fetchFeed({ ...filters })
-      .then((r) => { setItems(r.items); setCursor(r.next_cursor); setFresh(new Set()); setOnline(true); })
-      .catch(() => { setError(true); setOnline(false); })
-      .finally(() => setLoading(false));
+  // Fold a fetched page 1 into the list (see mergePage1); `replace` = trust it over what's shown.
+  const fold = (r: FeedPage, replace: boolean) => {
+    const m = mergePage1(itemsRef.current, r.items, replace, cursorRef.current !== null);
+    setItems(m.items);
+    if (m.replaced) setCursor(r.next_cursor);
+    if (m.fresh.length) setFresh(new Set(m.fresh));
   };
 
-  // (re)load page 1 whenever the filters change, then subscribe to the live SSE stream.
-  // The stream prepends new writes that pass the current filter; a persistent stream
-  // failure (>5 reconnect attempts) trips the 30s polling fallback. MOCK has no server,
-  // so it stays on polling.
+  // Start over for the current filters: nothing from the previous ones stays on screen.
+  const load = () => {
+    const mine = ++epoch.current;
+    setItems([]); setCursor(null); setFresh(new Set());
+    setLoading(true); setLoadingMore(false); setError(false);
+    fetchFeed({ ...filters })
+      .then((r) => { if (mine === epoch.current) fold(r, true); })
+      .catch(() => { if (mine === epoch.current) setError(true); })
+      .finally(() => { if (mine === epoch.current) setLoading(false); });
+  };
+
+  // Refetch page 1 and fold it in under the rows already shown: the stream (re)connected and
+  // may have missed writes, or the stream is down and this is the poll.
+  const resync = () => {
+    const mine = epoch.current;
+    fetchFeed({ ...filters })
+      .then((r) => { if (mine === epoch.current) { fold(r, false); setError(false); } })
+      .catch(() => { if (mine === epoch.current) setError(true); });
+  };
+
+  // (re)load page 1 whenever the filters change, and take the shell stream's rows that pass
+  // the current filter (items filtered out are dropped; they reappear on the next reload).
+  // Subscribing first means nothing written during the load is missed: a row committed after
+  // the snapshot streams in and mergePage1 keeps it.
   useEffect(() => {
-    load();
-
-    // One incremental poll: fetch page 1 and prepend anything unseen (the fallback path
-    // and the only path in MOCK). Captures the current filters at effect creation.
-    const pollOnce = () => {
-      fetchFeed({ ...filters }).then((r) => {
-        const seen = new Set(itemsRef.current.map(keyOf));
-        const incoming = r.items.filter((it) => !seen.has(keyOf(it)));
-        setOnline(true);
-        if (incoming.length) {
-          setFresh(new Set(incoming.map(keyOf)));
-          setItems((prev) => incoming.concat(prev));
-        }
-      }).catch(() => setOnline(false));
-    };
-
-    if (MOCK) {
-      const t = setInterval(pollOnce, POLL_MS);
-      return () => clearInterval(t);
-    }
-
-    let pollTimer: ReturnType<typeof setInterval> | null = null;
-    const startPolling = () => {
-      if (pollTimer != null) return;
-      pollTimer = setInterval(pollOnce, POLL_MS);
-    };
-
-    const prepend = (item: FeedItem) => {
-      if (!feedItemPassesFilter(item, { project, group, source })) return; // filtered out -> drop
-      const k = keyOf(item);
-      setItems((prev) => (prev.some((it) => keyOf(it) === k) ? prev : [item, ...prev]));
-      setFresh(new Set([k]));
-    };
-
-    const stream = openFeedStream({
-      onOpen: () => setOnline(true),
-      onStatus: (st) => { setOnline(true); setQueueDepth(st.queue_depth); },
-      onItem: (item) => { setOnline(true); prepend(item); },
-      onReset: () => load(),                 // buffer aged out -> refetch page 1
-      onDisconnect: () => setOnline(false),  // transient loss -> amber, keep stale items
-      onGiveUp: () => { setOnline(false); startPolling(); }, // persistent -> 30s polling
+    const unsubscribe = subscribeFeed({
+      onItem: (item) => {
+        if (!feedItemPassesFilter(item, { project, group, source })) return;
+        const r = insertFeedItem(itemsRef.current, item, cursorRef.current !== null);
+        if (r.at < 0) return;
+        setItems(r.items);
+        if (r.at === 0) setFresh(new Set([keyOf(item)]));
+      },
+      onResync: resync,
     });
-
-    return () => {
-      stream.close();
-      if (pollTimer != null) clearInterval(pollTimer);
-    };
+    load();
+    return () => { epoch.current += 1; unsubscribe(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, group, source]);
 
+  // With the stream down, page 1 is refetched every POLL_MS (and the shell retries the stream).
+  useEffect(() => {
+    if (link !== 'polling') return;
+    const t = setInterval(resync, POLL_MS);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [link, project, group, source]);
+
   const loadMore = () => {
-    if (!cursor || loadingMore) return;
+    const sent = cursor;
+    if (!sent || loadingMore) return;
+    const mine = epoch.current;
     setLoadingMore(true);
-    fetchFeed({ ...filters, cursor })
+    fetchFeed({ ...filters, cursor: sent })
       .then((r) => {
+        // Dropped if the filters changed, or a resync replaced the list under this page.
+        if (mine !== epoch.current || cursorRef.current !== sent) return;
         const seen = new Set(itemsRef.current.map(keyOf));
-        setItems((prev) => prev.concat(r.items.filter((it) => !seen.has(keyOf(it)))));
+        setItems(itemsRef.current.concat(r.items.filter((it) => !seen.has(keyOf(it)))));
         setCursor(r.next_cursor);
-        setOnline(true);
       })
-      .catch(() => setError(true))
-      .finally(() => setLoadingMore(false));
+      .catch(() => { if (mine === epoch.current) setError(true); })
+      .finally(() => { if (mine === epoch.current) setLoadingMore(false); });
   };
 
   const filtersActive = group !== 'all' || project !== 'all' || source !== 'all';
-  const empty = !loading && items.length === 0;
+  const empty = !loading && !error && items.length === 0;
 
   return (
     <main style={wrap}>
@@ -135,7 +139,9 @@ export function Feed() {
       </div>
 
       {error && (
-        <ErrorBox onRetry={() => load()} style={{ marginBottom: '10px' }}>Feed request failed — showing the last loaded items.</ErrorBox>
+        <ErrorBox onRetry={() => load()} style={{ marginBottom: '10px' }}>
+          {items.length === 0 ? 'Feed request failed.' : 'Feed request failed — showing the last loaded items.'}
+        </ErrorBox>
       )}
 
       {loading && items.length === 0 && <Skeletons />}

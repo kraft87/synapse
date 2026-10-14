@@ -1,8 +1,9 @@
 // Global/header state. Theme, group, project, source, and token are persisted
 // to localStorage (README §State Management). Catalog + live status live here so
 // the header can render them on every page.
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
-import { fetchCatalog, fetchProposals, getToken, clearToken, onAuthFail, type Catalog } from './api';
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { fetchCatalog, fetchProposals, getToken, clearToken, onAuthFail, type Catalog, type ProcessingStatus } from './api';
+import { startLiveLink, sameQueue, type FeedListener, type LinkState } from './liveLink';
 import { MOCK } from './mode';
 
 export type Group = 'all' | 'technical' | 'personal';
@@ -29,10 +30,11 @@ interface Store {
   searchQuery: string;
   setSearchQuery: (q: string) => void;
   catalog: Catalog | null;
-  online: boolean;
-  setOnline: (b: boolean) => void;
-  queueDepth: number;
-  setQueueDepth: (n: number) => void;
+  // The live stream's state and its last queue snapshot (null: none to show). The stream is
+  // the shell's, open on every page; the Feed subscribes for its rows and resyncs.
+  link: LinkState;
+  queue: ProcessingStatus | null;
+  subscribeFeed: (l: FeedListener) => () => void;
   reviewPending: number;
   setReviewPending: (n: number) => void;
   // Graph seed handoff (phase 6): the entity dossier's "view in graph" sets this, then
@@ -58,8 +60,10 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [page, setPage] = useState<Page>('feed');
   const [searchQuery, setSearchQuery] = useState('');
   const [catalog, setCatalog] = useState<Catalog | null>(null);
-  const [online, setOnline] = useState(true);
-  const [queueDepth, setQueueDepth] = useState(0);
+  // MOCK has no server to stream from; its Feed polls the fixtures.
+  const [link, setLink] = useState<LinkState>(MOCK ? 'polling' : 'connecting');
+  const [queue, setQueue] = useState<ProcessingStatus | null>(null);
+  const feedListeners = useRef(new Set<FeedListener>());
   const [reviewPending, setReviewPending] = useState(0);
   const [graphSeed, setGraphSeed] = useState<{ uuid: string; name: string } | null>(null);
 
@@ -69,13 +73,24 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   // a 401 anywhere clears the token and returns to the login screen
   useEffect(() => { onAuthFail(() => { clearToken(); setToken(null); }); }, []);
 
+  // the live stream lives as long as the session, not as long as the Feed page
+  useEffect(() => {
+    if (MOCK || !token) return;
+    return startLiveLink({
+      onLink: setLink,
+      onQueue: (q) => setQueue((prev) => (sameQueue(prev, q) ? prev : q)),
+      onItem: (item) => feedListeners.current.forEach((l) => l.onItem(item)),
+      onResync: () => feedListeners.current.forEach((l) => l.onResync()),
+    });
+  }, [token]);
+
   // load the catalog + the Review pending-proposal count once we have a token (or in
   // mock). The count seeds the nav badge before Review is ever opened; the Review page
   // keeps it in sync after decisions.
   useEffect(() => {
     if (!MOCK && !token) return;
     let live = true;
-    fetchCatalog().then((c) => { if (live) { setCatalog(c); setOnline(true); } }).catch(() => {});
+    fetchCatalog().then((c) => { if (live) setCatalog(c); }).catch(() => {});
     fetchProposals({ status: 'proposed' }).then((r) => { if (live) setReviewPending(r.pending_count || 0); }).catch(() => {});
     return () => { live = false; };
   }, [token]);
@@ -85,14 +100,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const setGroup = useCallback((g: Group) => { setGroupState(g); ls.set('synapse.group', g); }, []);
   const setProject = useCallback((p: string) => { setProjectState(p); ls.set('synapse.project', p); }, []);
   const setSource = useCallback((s: string) => { setSourceState(s); ls.set('synapse.source', s); }, []);
+  const subscribeFeed = useCallback((l: FeedListener) => {
+    feedListeners.current.add(l);
+    return () => { feedListeners.current.delete(l); };
+  }, []);
   const seedGraph = useCallback((uuid: string, name: string) => setGraphSeed({ uuid, name }), []);
   const clearGraphSeed = useCallback(() => setGraphSeed(null), []);
 
   const value = useMemo<Store>(() => ({
     token, setTokenValue, theme, toggleTheme, group, setGroup, project, setProject,
-    source, setSource, page, setPage, searchQuery, setSearchQuery, catalog, online, setOnline,
-    queueDepth, setQueueDepth, reviewPending, setReviewPending, graphSeed, seedGraph, clearGraphSeed,
-  }), [token, theme, group, project, source, page, searchQuery, catalog, online, queueDepth, reviewPending, graphSeed, setTokenValue, toggleTheme, setGroup, setProject, setSource, seedGraph, clearGraphSeed]);
+    source, setSource, page, setPage, searchQuery, setSearchQuery, catalog, link, queue, subscribeFeed,
+    reviewPending, setReviewPending, graphSeed, seedGraph, clearGraphSeed,
+  }), [token, theme, group, project, source, page, searchQuery, catalog, link, queue, reviewPending, graphSeed, setTokenValue, toggleTheme, setGroup, setProject, setSource, subscribeFeed, seedGraph, clearGraphSeed]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

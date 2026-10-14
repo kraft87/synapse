@@ -313,19 +313,20 @@ export const postProposalDecision = (
 // GET /dash/api/stream is SSE, but EventSource cannot send the Authorization header, so we
 // read it with fetch + a ReadableStream line parser instead (contract §Phase 3). The parser
 // honors event:/data:/id: fields; `id:` rides only on feed events, so lastEventId tracks the
-// resumable feed stream (not processing_status / heartbeats). Manual reconnect with 1s→30s
-// backoff resends Last-Event-ID; after >5 consecutive failures we give up so the caller can
-// fall back to 30s polling (contract §Phase 3, spec §2 reconnect states).
-export interface ProcessingStatus { queue_depth: number; active: boolean; }
+// resumable feed stream (not ready / processing_status / heartbeats). Manual reconnect with
+// 1s→30s backoff resends Last-Event-ID; after >5 consecutive failures we give up so the
+// caller can fall back to polling (contract §Phase 3, spec §2 reconnect states). A connection
+// only counts as healthy once the server's `ready` frame arrives.
+export interface ProcessingStatus { queue_depth: number; processing: number; failed: number; active: boolean; }
 
 const STREAM_EVENTS = new Set(['new_episode', 'new_fact', 'new_timeline_event']);
 const STREAM_MAX_BACKOFF_MS = 30_000;
 const STREAM_GIVE_UP_AFTER = 5;
 
 export interface StreamHandlers {
-  onOpen?: () => void;
+  onReady: () => void;      // connected and positioned: whatever is written from now on streams, so refetch page 1
   onItem: (item: FeedItem) => void;
-  onReset: () => void;
+  onReset: () => void;      // the server lost events it could not replay -> refetch page 1
   onStatus: (s: ProcessingStatus) => void;
   onDisconnect: () => void; // transient loss -> header amber "reconnecting", keep stale items
   onGiveUp: () => void;     // persistent failure -> caller starts the polling fallback
@@ -342,6 +343,9 @@ export function openFeedStream(handlers: StreamHandlers): StreamHandle {
   const dispatch = (event: string, data: string) => {
     if (event === 'processing_status') {
       try { handlers.onStatus(JSON.parse(data) as ProcessingStatus); } catch { /* ignore */ }
+    } else if (event === 'ready') {
+      failures = 0;
+      handlers.onReady();
     } else if (event === 'reset') {
       lastEventId = null; // resynced to page 1; a stale id would just force another reset
       handlers.onReset();
@@ -407,8 +411,6 @@ export function openFeedStream(handlers: StreamHandlers): StreamHandle {
       const res = await fetch(BASE + '/stream', { headers, signal: controller.signal });
       if (res.status === 401) { closed = true; authFailHandler(); return; }
       if (!res.ok || !res.body) { scheduleReconnect(); return; }
-      failures = 0;
-      handlers.onOpen?.();
       await readStream(res.body);
       if (!closed) scheduleReconnect(); // server closed the stream -> reconnect
     } catch {

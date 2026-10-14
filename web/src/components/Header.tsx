@@ -3,6 +3,7 @@
 // theme toggle.
 import { useState, type CSSProperties } from 'react';
 import { useStore, type Page } from '../state';
+import { queueBadge } from '../liveLink';
 
 const NAV: { key: Page; label: string }[] = [
   { key: 'feed', label: 'Feed' },
@@ -38,6 +39,7 @@ export function Header() {
   const scope = SCOPE[s.page];
   // Review pending-proposal count (phase 2b) — accent pill, dark text; hidden at 0.
   const reviewBadge = s.reviewPending;
+  const queue = queueBadge(s.link, s.queue);
   const dim = (applies: boolean): CSSProperties =>
     applies ? {} : { opacity: 0.4 };
   const dimTitle = (applies: boolean) => (applies ? undefined : 'not scoped on this page');
@@ -113,9 +115,11 @@ export function Header() {
 
       {/* live status + theme */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-        <div title={s.online ? 'live stream connected — extraction queue depth' : 'stream lost — reconnecting (showing last loaded items)'} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt2)' }}>
-          <span style={{ width: 7, height: 7, borderRadius: '50%', background: s.online ? 'var(--ok)' : 'var(--warn)', animation: s.online ? 'pulse 1.6s ease-in-out infinite' : 'none' }} />
-          <span>{s.online ? `queue ${s.queueDepth}` : 'reconnecting'}</span>
+        <div title={queue.title} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt2)' }}>
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: queue.live ? 'var(--ok)' : 'var(--warn)', animation: queue.live ? 'pulse 1.6s ease-in-out infinite' : 'none' }} />
+          <span>{queue.label}</span>
+          {queue.running > 0 && <span>· {queue.running} running</span>}
+          {queue.failed > 0 && <span style={{ color: 'var(--warn)' }}>· {queue.failed} failed</span>}
         </div>
         <button className="iconbtn" onClick={s.toggleTheme} title="Toggle theme"
           style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', borderRadius: '6px', width: 28, height: 28, color: 'var(--txt2)', fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
