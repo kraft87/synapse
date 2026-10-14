@@ -11,11 +11,15 @@ either side. Design source of truth: the handoff bundle (prototype + spec), not 
   `GET /dash/app.js`, `GET /dash/assets/{file}` (self-hosted IBM Plex woff2; whitelist
   served from the build's `assets/` dir — no path traversal). Static routes are
   UNAUTHENTICATED (the code is public; no data in the bundle).
-- Every `/dash/api/*` route requires `Authorization: Bearer <SYNAPSE_MACHINE_TOKEN>`
-  via the existing `_machine_authorized` seam. 401 → `{"status":"error","detail":"unauthorized"}`.
-  The client keeps the token in `localStorage` (paste-once login screen; also accepts
-  `#token=...` in the URL fragment on first load, then strips it). Fragment, not query
-  param — fragments never reach server logs.
+- Every `/dash/api/*` route requires `Authorization: Bearer <token>` through the ADMIN
+  gate (`http_auth.admin_authorized`): an approved, full-trust device token. The root
+  `SYNAPSE_MACHINE_TOKEN` is refused, because every machine that ran the plugin holds it.
+  The dashboard login (`/dash/oauth/start`, `mcp_server/web_login_routes`) mints a
+  full-trust device token for an allowlisted identity and hands it back as `#token=...`
+  in the URL fragment; the client stores it in `localStorage` and strips the fragment.
+  The login screen also takes a pasted full-trust device token as a fallback.
+  Fragment, not query param — fragments never reach server logs.
+  401 → `{"status":"error","detail":"unauthorized"}`.
 - Spec §7 names endpoints bare (`/feed`, `/search`); they are namespaced under
   `/dash/api/` here to avoid colliding with existing routes (`/timeline/*`,
   `/preferences/top`, `/recall`, `/context`).
@@ -133,8 +137,9 @@ Phase 2 adds the Recall debugging page. It reuses the existing `POST /recall` ro
 
 ### POST /recall — `debug` flag
 
-`POST /recall` already accepts `{query, group_id?, write_feedback?, source?}` (machine-token
-gated, same bearer as `/dash/api/*`). Phase 2 adds two body fields:
+`POST /recall` already accepts `{query, group_id?, write_feedback?, source?}` (client
+gate; the dashboard sends the same bearer it uses for `/dash/api/*`). Phase 2 adds two
+body fields:
 
 - `project?` (string) — scopes the episode legs, same as the MCP `recall(project=…)` arg.
 - `debug?` (bool, default false) — when true the response gains a `debug` envelope.
@@ -196,7 +201,7 @@ never sees it. `fetch` and `fetch_session` gain the key on the same terms, and t
 ### GET /dash/api/recall/history?limit=50
 
 Recent `recall()` calls from the `recall_metrics` log (`kind = 'recall'`), newest first.
-`limit` ≤ 200 (default 50). Machine-token gated like every `/dash/api/*` route.
+`limit` ≤ 200 (default 50). Admin-gated like every `/dash/api/*` route.
 Deviation from spec §8 (which routed history through the phase-4 `/metrics/recall` aggregate):
 a dedicated slim endpoint ships now and can be superseded by the aggregate later.
 
@@ -304,7 +309,7 @@ server-side LISTEN worker hydrates each notification into a full FeedItem and fa
 to connected clients over `GET /dash/api/stream`.
 
 ### GET /dash/api/stream
-Machine-token gated like every `/dash/api/*` route, `Content-Type: text/event-stream`.
+Admin-gated like every `/dash/api/*` route, `Content-Type: text/event-stream`.
 
 **Auth is why the client uses `fetch`, not `EventSource`.** `EventSource` cannot set the
 `Authorization` header, and this route requires the same `Bearer` token as the rest of the
@@ -358,7 +363,7 @@ is no LISTEN connection and NOTIFY is discarded by Postgres.
 ## Phase 4 endpoints (Metrics ops page)
 
 Three read-only aggregate endpoints backing the Metrics page's Recall / Ingestion / Corpus
-tabs. Machine-token gated, threadpool, bounded — same posture as every `/dash/api/*` route.
+tabs. Admin-gated, threadpool, bounded — same posture as every `/dash/api/*` route.
 
 **Honesty notes (read before consuming a series):**
 - **Estimated corpus counts.** A table's headline `rows` uses `pg_class.reltuples` (a fast
@@ -441,8 +446,7 @@ are the expensive part).
 
 Read-only surfaces over the episodic timeline (schema 033), the preference log (035), the
 dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as every
-`/dash/api/*` route: machine-token gated, threadpool, one short-lived connection, bounded,
-fail-soft. No new migration — these read existing tables.
+`/dash/api/*` route: admin-gated, threadpool, one pooled connection, bounded, fail-soft. No new migration — these read existing tables.
 
 **Honesty notes (read before consuming a payload):**
 - **`timeline_events.event_type` is sparse.** Schema 033 deferred typed events, so most rows
@@ -614,7 +618,7 @@ read-only plus the `dashboard_flags` soft-flag (schema 042 explicitly called its
 "deliberately NOT a delete"); phase 7 adds the real thing, because a flag does not
 satisfy "get this out of my memory". Both routes are **hard deletes** (no tombstone, no
 soft-delete column) and each runs in ONE transaction — a partial cascade is never
-committed. Machine-token gated like every `/dash/api/*` route.
+committed. Admin-gated like every `/dash/api/*` route.
 
 Route naming note: these are `/dash/api/episodes/{id}` and `/dash/api/facts/{id}`
 (**plural**), while the phase-1 read routes are `/dash/api/episode/{id}` (singular) and a

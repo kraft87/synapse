@@ -87,8 +87,8 @@ def register(
     # contract docs/dashboard-contract.md). Static routes are unauthenticated (public bundle, no
     # data); every api route rides the ADMIN gate, not the client one. That move is required, not
     # cosmetic: /dash/api serves the whole corpus unfiltered and can flag/edit, so leaving it on the
-    # root token would let anything holding the enrollment credential read everything the TOFU gate
-    # was meant to withhold. No-op w/o DB_URL, like the siblings.
+    # root token would let anything holding the enrollment credential read the unfiltered corpus
+    # that audience scoping withholds from restricted devices. No-op w/o DB_URL, like the siblings.
     from mcp_server.dashboard_routes import register as _register_dashboard_routes
 
     _register_dashboard_routes(mcp, DB_URL, _admin_authorized)

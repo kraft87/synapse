@@ -8,13 +8,15 @@ Two auth postures, by design (mirrors the contract's Namespace & auth section):
   * The static routes (/dash, /dash/app.js, /dash/assets/*) are UNAUTHENTICATED — the
     bundle is public code carrying no memory, so gating it buys nothing and would break
     the paste-once login screen (which needs to load before it has a token).
-  * Every /dash/api/* route is machine-token gated through the same ``authorized`` seam
-    the other route modules use (custom routes bypass FastMCP's auth middleware by
-    design — issue #3704 — so each handler checks explicitly). 401 body is the contract's
-    {"status":"error","detail":"unauthorized"}.
+  * Every /dash/api/* route rides the ADMIN gate (``http_auth.admin_authorized``: an
+    approved full-trust device token, such as the one the dashboard login mints; the
+    root token is refused), passed in as ``authorized``. Custom routes bypass FastMCP's
+    auth enforcement by design (issue #3704), so each handler checks explicitly. 401
+    body is the contract's {"status":"error","detail":"unauthorized"}.
 
-Shape rules shared by every api route: PG work runs in a threadpool on ONE short-lived
-psycopg connection per request, and the boundary is fail-soft — an exception becomes a
+Shape rules shared by every api route: PG work runs in a threadpool on ONE connection
+borrowed from the server's pool (ingestion/pg_pool) per request, and the boundary is
+fail-soft — an exception becomes a
 500 JSON and is logged, never raised past the JSONResponse. Reads are owner-agnostic
 (an operator sees the whole store); the only group_id/project/source scoping is the
 per-endpoint filtering the contract spells out.
@@ -1908,7 +1910,7 @@ def _proposal_decision(
 #
 # Read-only surfaces over the episodic timeline (033), the preference log (035), the
 # dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as
-# the rest of /dash/api: one short-lived connection per call, bounded, fail-soft. Honesty
+# the rest of /dash/api: one pooled connection per call, bounded, fail-soft. Honesty
 # notes (mirrored into docs/dashboard-contract.md §"Phase 5"):
 #   * timeline_events.event_type is sparsely populated (schema 033 deferred it) — a `type`
 #     chip filter narrows to rows with that exact event_type; UNTYPED events show only when
@@ -2377,8 +2379,8 @@ def _serve_static_file(name: str) -> Response:
 
 
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
-    """Mount /dash (static bundle) + /dash/api/* (machine-token gated). No-op w/o DB_URL,
-    matching the sibling route modules."""
+    """Mount /dash (static bundle) + /dash/api/* (gated by ``authorized``, which the server
+    wires to the admin gate). No-op w/o DB_URL, matching the sibling route modules."""
     if not db_url:
         logger.info("dashboard routes disabled (no DB_URL)")
         return
@@ -2477,7 +2479,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         )
         return FileResponse(path, media_type=media, headers=headers)
 
-    # ---- api (machine-token gated) ----
+    # ---- api (admin gated) ----
 
     @mcp.custom_route("/dash/api/catalog", methods=["GET"])  # type: ignore[misc]
     async def dash_catalog(request: Request) -> JSONResponse:
@@ -2497,7 +2499,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[misc]
     async def dash_stream(request: Request) -> Response:
-        """SSE live feed (Phase 3). Machine-token gated like every /dash/api/* route — the
+        """SSE live feed (Phase 3). Admin-gated like every /dash/api/* route — the
         client uses fetch + a ReadableStream parser (not EventSource) so it CAN send the
         Authorization header. On connect: if Last-Event-ID (header or ?last_event_id=) is
         still inside the ring buffer, replay from it; if it aged out or is ahead of us, emit
