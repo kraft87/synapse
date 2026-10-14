@@ -11,11 +11,12 @@ What has to hold, and each gets a section below:
     widens. A self-reported hostname never does, nor an unknown caller, nor the root token.
   * The widening is exact: another surface's rows and unstamped rows stay out.
   * Every restricted read path applies it the same way (recall, recall_full_turns,
-    fetch, fetch_session, board banner + digest, /timeline/recent).
-  * The write side stamps from the bearer and ignores anything in the request body.
+    fetch, fetch_session, board banner + digest).
+  * The write side (/ingest, /timeline/events, remember) stamps from the bearer and
+    ignores anything in the request body.
   * Deploy order: with the columns absent (code shipped, 057 not applied yet) ingest and
     serving behave exactly as before 057, with no errors.
-  * /timeline/recent and /preferences/top are scoped by the bearer, like the board.
+  * /preferences/top is scoped by the bearer, like the board.
 """
 
 from __future__ import annotations
@@ -439,6 +440,63 @@ def test_ingest_with_the_root_token_stamps_null(clean, db_url):
 
 
 # ---------------------------------------------------------------------------
+# Write side: /timeline/events stamps from the bearer too
+# ---------------------------------------------------------------------------
+
+
+def _events_client(db_url):
+    from fastmcp import FastMCP
+    from starlette.testclient import TestClient
+
+    from mcp_server.timeline_routes import register
+
+    m = FastMCP("test-timeline-provenance")
+    register(m, db_url, lambda r: True, "", _bearer_trust(db_url))
+    return TestClient(m.http_app())
+
+
+def _push_event(db_url, headers, ref):
+    event = {
+        "t_valid": "2099-01-01T00:00:00+00:00",
+        "fact": f"{ref} commit",
+        "source": "git:scratch",
+        "source_ref": ref,
+        "project": "scratch-git",
+        "salience": 2,
+    }
+    return _events_client(db_url).post(
+        "/timeline/events", json={"events": [event]}, headers=headers
+    )
+
+
+def test_timeline_events_from_a_device_are_served_back_to_it(clean, db_url):
+    """A work laptop's git feeder pushes its commits; with an empty allowlist the board
+    digest must still show them, exactly as it shows the milestones of its own chats."""
+    from mcp_server.timeline_routes import _recent_events
+    from tests.helpers.surfaces import register_device
+
+    tok = "device-token-" + uuid.uuid4().hex
+    sid = register_device(clean, tok, trust="restricted", projects=[])
+    r = _push_event(db_url, {"Authorization": f"Bearer {tok}"}, "sha-dev")
+    assert r.status_code == 200 and r.json()["inserted"] == 1, r.text
+    stamp = clean.execute(
+        "SELECT surface_id FROM timeline_events WHERE source_ref = 'sha-dev'"
+    ).fetchone()[0]
+    assert stamp == sid
+    served = _recent_events(db_url, 36500, 0, 10, None, allowed_projects=[], own_surface=sid)
+    assert [e["fact"] for e in served] == ["sha-dev commit"]
+
+
+def test_timeline_events_from_the_root_token_stamp_null(clean, db_url):
+    r = _push_event(db_url, {"Authorization": f"Bearer {_ROOT}"}, "sha-root")
+    assert r.status_code == 200 and r.json()["inserted"] == 1, r.text
+    stamp = clean.execute(
+        "SELECT surface_id FROM timeline_events WHERE source_ref = 'sha-root'"
+    ).fetchone()[0]
+    assert stamp is None
+
+
+# ---------------------------------------------------------------------------
 # Write side: remember() and the spool replay
 # ---------------------------------------------------------------------------
 
@@ -550,8 +608,8 @@ def test_pre057_probe_reports_the_columns_missing(pre057, db_url):
 
 
 def test_pre057_ingest_and_timeline_write_as_before(pre057, clean, caplog):
-    """A device-token ingest and a gate timeline write succeed, unstamped, on a database
-    without the columns. Nothing errors."""
+    """A device-token ingest, a gate timeline write and a feeder push succeed, unstamped,
+    on a database without the columns. Nothing errors."""
     from ingestion.db import Database
     from tests.helpers.surfaces import register_device
 
@@ -570,8 +628,11 @@ def test_pre057_ingest_and_timeline_write_as_before(pre057, clean, caplog):
         _timeline_event(db, "pre", "work-x", eid)
     finally:
         db.close()
-    facts = clean.execute(f"SELECT fact FROM {schema}.timeline_events").fetchall()
-    assert facts == [("pre event",)]
+    with caplog.at_level(logging.ERROR):
+        r = _push_event(url, {"Authorization": f"Bearer {tok}"}, "sha-pre")
+    assert r.status_code == 200 and r.json()["inserted"] == 1, r.text
+    facts = clean.execute(f"SELECT fact FROM {schema}.timeline_events ORDER BY fact").fetchall()
+    assert facts == [("pre event",), ("sha-pre commit",)]
     assert not [rec for rec in caplog.records if rec.levelno >= logging.ERROR]
 
 
@@ -672,14 +733,14 @@ def test_a_negative_probe_is_rechecked_after_the_ttl(clean, db_url, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# Session-start read routes: /timeline/recent and /preferences/top are scoped too
+# Session-start read route: /preferences/top is scoped too
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture()
 def route_corpus(clean, db_url):
-    """Three devices (own restricted, other restricted, full) and one row of each
-    provenance class in both timeline_events and preferences."""
+    """Three devices (own restricted, other restricted, full) and one preference of each
+    provenance class."""
     from ingestion.db import Database
     from tests.helpers.surfaces import register_device
 
@@ -702,7 +763,6 @@ def route_corpus(clean, db_url):
     db = Database(db_url)
     try:
         for key, (project, ep) in rows.items():
-            _timeline_event(db, key, project, ep)
             db.insert_preference(
                 owner_id="default",
                 group_id="technical",
@@ -723,51 +783,40 @@ def _route_client(db_url, *, wired: bool = True):
     from starlette.testclient import TestClient
 
     from mcp_server.preferences_routes import register as reg_prefs
-    from mcp_server.timeline_routes import register as reg_timeline
 
     m = FastMCP("test-route-scope")
     if wired:
-        reg_timeline(m, db_url, lambda r: True, "", _bearer_trust(db_url))
         reg_prefs(m, db_url, lambda r: True, _bearer_trust(db_url))
     else:
-        reg_timeline(m, db_url, lambda r: True, "")
         reg_prefs(m, db_url, lambda r: True)
     return TestClient(m.http_app())
 
 
 def _served(client, headers):
-    tl = client.post(
-        "/timeline/recent",
-        json={"days": 36500, "limit": 20, "project": None, "surface": "ignored"},
-        headers=headers,
-    )
     pr = client.get("/preferences/top?limit=50&surface=ignored", headers=headers)
-    assert tl.status_code == 200 and pr.status_code == 200
-    return (
-        sorted(i["fact"].removesuffix(" event") for i in tl.json()["items"]),
-        sorted(i["pref"].removesuffix(" pref") for i in pr.json()["items"]),
-    )
+    assert pr.status_code == 200
+    return sorted(i["pref"].removesuffix(" pref") for i in pr.json()["items"])
 
 
-def test_session_start_routes_scope_a_restricted_device(route_corpus, db_url):
-    """Timeline: the allowlist plus the device's own events. Preferences: the allowlist
-    only (a preference's text can be merged from later turns, so its first turn's ref
-    proves nothing about which device the text came from)."""
+def test_preferences_route_scopes_a_restricted_device_to_its_allowlist(route_corpus, db_url):
+    """The allowlist only, never the device's own rows: a preference's text can be merged
+    from later turns, so its first turn's ref proves nothing about which device the text
+    came from."""
     c = _route_client(db_url)
-    assert _served(c, route_corpus["own"]) == (["allowlisted", "own"], ["allowlisted"])
-    assert _served(c, route_corpus["other"]) == (["other"], [])
+    assert _served(c, route_corpus["own"]) == ["allowlisted"]
+    assert _served(c, route_corpus["other"]) == []
 
 
-def test_session_start_routes_full_trust_unchanged(route_corpus, db_url):
+def test_preferences_route_full_trust_unchanged(route_corpus, db_url):
     everything = ["allowlisted", "other", "own", "personal"]
-    assert _served(_route_client(db_url), route_corpus["full"]) == (everything, everything)
+    assert _served(_route_client(db_url), route_corpus["full"]) == everything
 
 
-def test_session_start_routes_unknown_caller_gets_nothing(route_corpus, db_url):
+def test_preferences_route_unknown_caller_gets_nothing(route_corpus, db_url):
     c = _route_client(db_url)
-    assert _served(c, {"Authorization": f"Bearer {_ROOT}"}) == ([], [])
-    assert _served(c, {}) == ([], [])
+    assert _served(c, {"Authorization": f"Bearer {_ROOT}"}) == []
+    assert _served(c, {}) == []
 
 
-def test_session_start_routes_fail_closed_without_a_resolver(route_corpus, db_url):
-    assert _served(_route_client(db_url, wired=False), route_corpus["full"]) == ([], [])
+def test_preferences_route_fails_closed_without_a_resolver(route_corpus, db_url):
+    assert _served(_route_client(db_url, wired=False), route_corpus["full"]) == []

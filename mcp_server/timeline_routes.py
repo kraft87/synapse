@@ -67,13 +67,18 @@ def _event_domain(e: dict[str, Any]) -> str | None:
 
 
 def _ingest_events(
-    db_url: str, voyage_api_key: str, cleaned: list[dict[str, Any]]
+    db_url: str, voyage_api_key: str, cleaned: list[dict[str, Any]], stamp: str | None = None
 ) -> tuple[int, int]:
     """Embed + upsert validated events. Returns (inserted, skipped).
 
     Already-present (source, source_ref) pairs are filtered BEFORE embedding so
     re-pushes cost nothing. Without a Voyage key, rows land with NULL embedding
     (keyless dev/test; a later re-embed pass can fill them) rather than failing.
+
+    ``stamp`` is the pushing device's provenance (schema 057, ``stamp_surface_id``), so
+    a restricted device's own feeder events are served back to it like its chat-derived
+    ones. None (the root token, an unknown caller) and a database without 057 write the
+    pre-057 row. A re-push of an existing (source, source_ref) keeps the first stamp.
     """
     with pg_pool.connection(db_url) as conn:
         # Composite-tuple ANY isn't supported by psycopg; two plain ANYs over-fetch
@@ -105,26 +110,29 @@ def _ingest_events(
 
     inserted = 0
     with pg_pool.connection(db_url) as conn:
+        own = own_surface_if_ready(conn, db_url, stamp)  # None before schema 057
+        cols = "event_type, domain, surface_id" if own else "event_type, domain"
+        marks = "%s,%s,%s" if own else "%s,%s"
         for e, vec in zip(fresh, vecs, strict=True):
-            domain = _event_domain(e)
+            params: list[Any] = [
+                e["t_valid"],
+                e["fact"],
+                e["source"],
+                e["source_ref"],
+                e["project"],
+                e["salience"],
+                _vec_literal(vec) if vec is not None else None,
+                embed_model if vec is not None else None,
+                e.get("event_type"),
+                _event_domain(e),
+            ]
             inserted += conn.execute(
-                "INSERT INTO timeline_events "
+                "INSERT INTO timeline_events "  # nosec B608 — fixed column lists and a validated int
                 "(t_valid, fact, source, source_ref, project, salience, embedding, embed_model, "
-                " event_type, domain) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({embed_dims()}),%s,%s,%s) "
+                f" {cols}) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s::vector({embed_dims()}),%s,{marks}) "
                 "ON CONFLICT (source, source_ref) DO NOTHING",
-                (
-                    e["t_valid"],
-                    e["fact"],
-                    e["source"],
-                    e["source_ref"],
-                    e["project"],
-                    e["salience"],
-                    _vec_literal(vec) if vec is not None else None,
-                    embed_model if vec is not None else None,
-                    e.get("event_type"),
-                    domain,
-                ),
+                [*params, own] if own else params,
             ).rowcount
     return inserted, len(cleaned) - inserted
 
@@ -200,51 +208,12 @@ def register(
     voyage_api_key: str,
     resolve_trust: Callable[[Request], SurfaceTrust] | None = None,
 ) -> None:
-    """``resolve_trust`` maps a request to its bearer-resolved verdict (schema 054). The
-    read route filters by it; when it is not supplied the route treats every caller as
-    an unknown surface and serves nothing, so a wiring slip fails closed, never open."""
+    """``resolve_trust`` maps a request to its bearer-resolved verdict (schema 054). Its
+    provenance stamp goes on every event the caller pushes; when it is not supplied
+    nothing is stamped, which serves the events by project alone, as before 057."""
     if not db_url:
         logger.info("timeline routes disabled (no DB_URL)")
         return
-
-    @mcp.custom_route("/timeline/recent", methods=["POST"])  # type: ignore[misc]
-    async def timeline_recent(request: Request) -> JSONResponse:
-        """Recent high-salience events for the plugin's session-start milestones block.
-        Body: {days?=7, min_salience?=2, limit?=5, project?}. Time-scoped and tiny by
-        design — this is a bounded factual block, not query-blind recall injection.
-
-        Scoped like the board digest (schema 053/057): a restricted caller sees only
-        events in its project allowlist or derived from turns it ingested itself; an
-        unknown caller sees nothing. The scope comes from the bearer, never the body."""
-        if not authorized(request):
-            return unauthorized()
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        days = min(int(body.get("days") or 7), 90)
-        min_sal = int(body.get("min_salience") or 2)
-        limit = min(int(body.get("limit") or 5), 20)
-        try:
-            st = (
-                await run_in_threadpool(resolve_trust, request)
-                if resolve_trust
-                else UNKNOWN_SURFACE
-            )
-            items = await run_in_threadpool(
-                _recent_events,
-                db_url,
-                days,
-                min_sal,
-                limit,
-                body.get("project"),
-                st.project_filter,
-                st.own_surface,
-            )
-        except Exception as e:
-            logger.warning("timeline recent failed: %s", e)
-            return err(str(e)[:200], 500)
-        return JSONResponse({"status": "ok", "items": items})
 
     @mcp.custom_route("/timeline/events", methods=["POST"])  # type: ignore[misc]
     async def timeline_events(request: Request) -> JSONResponse:
@@ -283,8 +252,13 @@ def register(
             )
 
         try:
+            st = (
+                await run_in_threadpool(resolve_trust, request)
+                if resolve_trust
+                else UNKNOWN_SURFACE
+            )
             inserted, skipped = await run_in_threadpool(
-                _ingest_events, db_url, voyage_api_key, cleaned
+                _ingest_events, db_url, voyage_api_key, cleaned, st.stamp_surface_id
             )
         except psycopg.errors.UndefinedTable:
             return err("timeline_events missing (apply schema/033)", 503)
