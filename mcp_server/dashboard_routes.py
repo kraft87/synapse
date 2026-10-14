@@ -102,12 +102,15 @@ _STREAM_EVENT_NAMES = {
     "episode": "new_episode",
     "fact": "new_fact",
     "timeline_event": "new_timeline_event",
+    "reset": "reset",  # the LISTEN worker's reconnect marker, not a feed item
 }
 _STREAM_CHANNEL = "dash_feed"  # matches schema/043_dash_notify.sql
 _STREAM_BUFFER_CAP = 512  # ring-buffer slots (contract: 512-event replay window)
 _STREAM_POLL_S = 0.25  # per-connection buffer poll cadence (new-event latency ceiling)
 _STREAM_STATUS_S = 1.0  # processing_status emit cadence (contract: ~1/s)
 _STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the stream
+_STREAM_RECONNECT_MIN_S = 1.0  # LISTEN reconnect backoff: first retry delay ...
+_STREAM_RECONNECT_MAX_S = 30.0  # ... doubling up to this
 
 # Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
 # statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals
@@ -2364,38 +2367,57 @@ class _StreamManager:
         """One dedicated async connection LISTENing on the dash_feed channel; hydrates each
         notification off the event loop (a thread executor) and appends it to the ring
         buffer. run_in_executor (not starlette's run_in_threadpool) keeps this background
-        task off anyio's request-scoped context."""
+        task off anyio's request-scoped context.
+
+        A dropped connection (a Postgres restart, a network blip) is retried with backoff
+        for as long as the task lives, i.e. while a client is subscribed. Notifications sent
+        during the gap are lost, so each reconnect appends a `reset` event: connected clients
+        refetch page 1 instead of sitting on a feed that silently went stale."""
         loop = asyncio.get_running_loop()
-        aconn = None
-        try:
-            aconn = await psycopg.AsyncConnection.connect(self._db_url, autocommit=True)
-            await aconn.execute(f"LISTEN {_STREAM_CHANNEL}")
-            self.listening.set()
-            async for notify in aconn.notifies():
-                try:
-                    payload = json.loads(notify.payload)
-                    item = await loop.run_in_executor(
-                        None,
-                        _hydrate_feed_item,
-                        self._db_url,
-                        payload.get("type"),
-                        payload.get("id"),
-                    )
-                    if item is not None:
-                        self.buffer.append(item)
-                except Exception as e:  # one bad notification must not kill the stream
-                    logger.warning("dash stream: hydrate failed: %s", e)
-        except asyncio.CancelledError:
-            pass  # intended shutdown when the last subscriber leaves
-        except Exception as e:  # pragma: no cover - defensive (connect/LISTEN failure)
-            logger.warning("dash stream: listen loop error: %s", e)
-        finally:
-            self.listening.clear()
-            if aconn is not None:
-                try:
-                    await aconn.close()
-                except Exception:  # pragma: no cover - best-effort close during cancel
-                    pass
+        delay = _STREAM_RECONNECT_MIN_S
+        gap = False
+        while True:
+            aconn = None
+            try:
+                aconn = await psycopg.AsyncConnection.connect(self._db_url, autocommit=True)
+                await aconn.execute(f"LISTEN {_STREAM_CHANNEL}")
+                delay = _STREAM_RECONNECT_MIN_S
+                if gap:
+                    self.buffer.append({"type": "reset"})
+                    gap = False
+                self.listening.set()
+                async for notify in aconn.notifies():
+                    try:
+                        payload = json.loads(notify.payload)
+                        item = await loop.run_in_executor(
+                            None,
+                            _hydrate_feed_item,
+                            self._db_url,
+                            payload.get("type"),
+                            payload.get("id"),
+                        )
+                        if item is not None:
+                            self.buffer.append(item)
+                    except Exception as e:  # one bad notification must not kill the stream
+                        logger.warning("dash stream: hydrate failed: %s", e)
+                logger.warning("dash stream: listen connection closed; reconnecting")
+            except asyncio.CancelledError:
+                return  # intended shutdown when the last subscriber leaves
+            except Exception as e:
+                logger.warning("dash stream: listen connection lost, retrying: %s", e)
+            finally:
+                self.listening.clear()
+                if aconn is not None:
+                    try:
+                        await aconn.close()
+                    except Exception:  # pragma: no cover - best-effort close during cancel
+                        pass
+            gap = True
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            delay = min(delay * 2, _STREAM_RECONNECT_MAX_S)
 
     async def _status_loop(self) -> None:
         """Refresh the shared processing_status snapshot once/second (one query total, not

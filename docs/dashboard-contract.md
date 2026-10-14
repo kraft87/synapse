@@ -352,6 +352,11 @@ in-process ring buffer. On connect the client may present its last seen event id
 - absent → the client already has page 1 from its initial `/feed` fetch, so the server
   streams live only (from the current buffer head).
 
+If the LISTEN connection itself drops (a Postgres restart or network blip), the worker
+reconnects with 1s→30s backoff while any client is subscribed, and appends a `reset` event
+to the ring once it is listening again (this one carries an `id` and `data: {"type":"reset"}`);
+notifications sent during the gap are not replayed, so clients refetch page 1.
+
 **Client reconnect (spec §2).** The reader reconnects manually with 1s→30s exponential
 backoff, resending `Last-Event-ID`. A transient loss turns the header live dot amber
 ("reconnecting") and keeps the stale items on screen. After >5 consecutive failed

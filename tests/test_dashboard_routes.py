@@ -1299,6 +1299,42 @@ async def test_stream_manager_hydrates_notify_into_buffer(clean, conn, db_url):
         mgr.unsubscribe()
 
 
+async def test_stream_manager_relistens_after_the_connection_drops(
+    clean, conn, db_url, monkeypatch
+):
+    """A dropped LISTEN connection (Postgres restart, network blip) must not leave the
+    feed silently stale while clients stay subscribed: the worker reconnects, marks the
+    gap with a `reset` event in the ring (clients refetch page 1), and delivers again."""
+    from mcp_server.dashboard_routes import _StreamManager
+
+    monkeypatch.setattr(dr, "_STREAM_RECONNECT_MIN_S", 0.05)
+    mgr = _StreamManager(db_url)
+    mgr.subscribe()
+    try:
+        await asyncio.wait_for(mgr.listening.wait(), timeout=10)
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND query LIKE 'LISTEN dash_feed%'"
+        )
+        for _ in range(100):  # the drop is seen, then the worker is listening again
+            await asyncio.sleep(0.1)
+            if mgr.buffer.head >= 1 and mgr.listening.is_set():
+                break
+        assert mgr.buffer.head == 1 and mgr.listening.is_set(), "worker did not re-LISTEN"
+        assert mgr.buffer._events[-1][1] == {"type": "reset"}
+
+        eid = _episode(conn, session="strm2", seq=1, content="after the drop")
+        for _ in range(100):
+            if mgr.buffer.head >= 2:
+                break
+            await asyncio.sleep(0.1)
+        assert mgr.buffer.head == 2, "delivery did not resume after the reconnect"
+        assert mgr.buffer._events[-1][1]["id"] == str(eid)
+    finally:
+        mgr.unsubscribe()
+
+
 def test_sse_frame_format():
     """The wire framing helper: `event:` line, optional `id:` line (feed events only), a
     `data:` line, blank-line terminated. This + the manager-seam test above cover the SSE
