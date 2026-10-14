@@ -35,8 +35,9 @@ const FIX: Record<string, unknown> = {
     mentions: { items: [{ episode_id: 1, created_at: iso(0.4), gist: 'wired service A to library B' }, { episode_id: 2, created_at: iso(30), gist: 'refactored the widget cache' }], offset: 0, limit: 20, total: 2 },
   },
   flags: { flags: [
-    { id: 1, kind: 'timeline_event', item_id: '10', note: null, created_at: iso(2), gist: 'example event: service A shipped v2', episode_id: 1 },
-    { id: 2, kind: 'fact', item_id: 'ent-edge-1', note: null, created_at: iso(3), gist: 'example fact: service A depends on library B', episode_id: null },
+    { id: 1, kind: 'timeline_event', item_id: '10', note: null, created_at: iso(2), gist: 'example event: service A shipped v2', episode_id: 1, body: null },
+    { id: 2, kind: 'fact', item_id: 'ent-edge-1', note: null, created_at: iso(3), gist: 'example fact: service A depends on library B', episode_id: null, body: null },
+    { id: 3, kind: 'note', item_id: '4', note: null, created_at: iso(5), gist: 'example note: prefers small reviewable commits', episode_id: null, body: 'Keep each commit to one concern.\nSplit refactors from behaviour changes so a revert stays cheap.' },
   ] },
   proposals: {
     pending_count: 2,
@@ -329,7 +330,6 @@ export function mockDeleteEpisode<T>(id: string): Promise<T> {
     facts_deleted: 2,
     facts_unlinked: 1,
     events_deleted: 1,
-    events_kept: 0,
     deleted_fact_ids: [],
     deleted_event_ids: [],
   } as T);

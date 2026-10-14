@@ -595,7 +595,8 @@ function FlagsTab() {
 
   // Where a flag leads: the episode behind it (the item itself for an episode, a fact's
   // provenance, the turn an event or note was born from), or the Preferences tab. A row with
-  // no episode to open (a git event, a note from `remember`) has no jump: its gist is shown.
+  // no episode to open (a git event, a note from `remember`) has no jump: its gist is shown,
+  // and a note's body with it.
   const canJump = (f: FlagRow): boolean => f.kind === 'preference' || f.episode_id != null;
   const jump = (f: FlagRow) => {
     if (f.kind === 'preference') {
@@ -624,7 +625,10 @@ function FlagsTab() {
           <div key={f.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', border: '1px solid var(--line)', borderRadius: '9px', background: 'var(--bg1)', padding: '10px 13px' }}>
             <span style={{ color: 'var(--warn)', fontSize: '13px' }}>⚑</span>
             <span style={{ ...mono, fontSize: '10.5px', border: '1px solid var(--line2)', color: FLAG_KIND_COLOR[f.kind] || 'var(--txt2)', borderRadius: '4px', padding: '2px 7px', whiteSpace: 'nowrap' }}>{f.kind}</span>
-            <span style={{ flex: 1, minWidth: 0, fontSize: '13px', lineHeight: 1.45, color: 'var(--txt)', overflowWrap: 'anywhere' }}>{f.gist || <span style={{ color: 'var(--txt3)' }}>({f.kind} #{f.item_id})</span>}</span>
+            <span style={{ flex: 1, minWidth: 0, fontSize: '13px', lineHeight: 1.45, color: 'var(--txt)', overflowWrap: 'anywhere' }}>
+              {f.gist || <span style={{ color: 'var(--txt3)' }}>({f.kind} #{f.item_id})</span>}
+              {f.body && <div style={{ marginTop: '5px', maxHeight: '14em', overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: '12.5px', color: 'var(--txt2)' }}>{f.body}</div>}
+            </span>
             {f.note && <span style={{ ...mono, fontSize: '11px', color: 'var(--txt3)' }}>{f.note}</span>}
             {canJump(f) && <button className="linkbtn" onClick={() => jump(f)}
               style={{ border: 'none', background: 'none', color: 'var(--acc)', cursor: 'pointer', ...mono, fontSize: '11.5px' }}>jump ↗</button>}

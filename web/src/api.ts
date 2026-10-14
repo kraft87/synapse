@@ -122,8 +122,9 @@ export interface SearchResult {
   total_by_type?: Record<SearchTab, number>; // first page only; later pages keep the client's
   offset: number; limit: number;
 }
-// episode_id: the episode the Flags tab opens for the row (null: nothing to open).
-export interface FlagRow { id: number; kind: string; item_id: string; note: string | null; created_at: string; gist: string; episode_id: number | null; }
+// episode_id: the episode the Flags tab opens for the row (null: nothing to open). body: a
+// note's full text, shown inline under its hook (null for every other kind).
+export interface FlagRow { id: number; kind: string; item_id: string; note: string | null; created_at: string; gist: string; episode_id: number | null; body: string | null; }
 
 // ---------- proposals (phase 2b) ----------
 export type ProposalKind = 'skill' | 'config-edit';
@@ -238,7 +239,6 @@ export interface DeleteEpisodeResult {
   facts_deleted: number;
   facts_unlinked: number;
   events_deleted: number;
-  events_kept: number; // re-told by a surviving turn
   deleted_fact_ids: string[];
   deleted_event_ids: number[];
 }
@@ -300,7 +300,6 @@ export function cascadeSummary(r: DeleteEpisodeResult): string {
   if (r.events_deleted) gone.push(plural(r.events_deleted, 'event'));
   const parts = ['episode deleted' + (gone.length ? ': ' + gone.join(', ') : '')];
   if (r.facts_unlinked) parts.push(plural(r.facts_unlinked, 'fact') + ' unlinked (shared provenance)');
-  if (r.events_kept) parts.push(plural(r.events_kept, 'event') + ' kept (also told by other turns)');
   if (r.chunks_mixed_deleted) parts.push(plural(r.chunks_mixed_deleted, 'chunk') + ' also spanned other episodes');
   return parts.join(' · ');
 }

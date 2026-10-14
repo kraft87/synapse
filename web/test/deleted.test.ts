@@ -28,7 +28,7 @@ test('ids of one kind never match another kind, and entities are never deleted',
 
 const result = (over: Partial<DeleteEpisodeResult> = {}): DeleteEpisodeResult => ({
   episode_id: 12, chunks_deleted: 0, chunks_mixed_deleted: 0, facts_deleted: 1, facts_unlinked: 0,
-  events_deleted: 1, events_kept: 0, deleted_fact_ids: ['f-sole'], deleted_event_ids: [7], ...over,
+  events_deleted: 1, deleted_fact_ids: ['f-sole'], deleted_event_ids: [7], ...over,
 });
 
 test('deleting an episode announces its cascade: the facts and events the server listed', async () => {
@@ -49,7 +49,10 @@ test('deleting a fact announces just that fact', async () => {
   assert.deepEqual(seen, [{ episodes: [], facts: ['f1'], events: [] }]);
 });
 
-test('the summary says when a re-told event was kept', () => {
-  assert.match(cascadeSummary(result({ events_kept: 2 })), /2 events kept \(also told by other turns\)/);
-  assert.doesNotMatch(cascadeSummary(result()), /kept/);
+test('the summary lists what went and admits the collateral', () => {
+  assert.equal(cascadeSummary(result()), 'episode deleted: 1 fact, 1 event');
+  assert.equal(
+    cascadeSummary(result({ chunks_deleted: 2, chunks_mixed_deleted: 1, facts_unlinked: 3 })),
+    'episode deleted: 2 chunks, 1 fact, 1 event · 3 facts unlinked (shared provenance) · 1 chunk also spanned other episodes',
+  );
 });
