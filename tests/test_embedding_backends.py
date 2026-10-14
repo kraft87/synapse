@@ -21,7 +21,7 @@ No network: every HTTP test uses ``httpx.MockTransport``.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx
 import pytest
@@ -35,6 +35,7 @@ from ingestion.embedding import (
     TransientEmbeddingHTTPError,
     VoyageEmbeddingModel,
     _pack_batches,
+    _voyage_stop,
     check_embedding_meta,
     create_embedder,
     create_reranker,
@@ -393,6 +394,90 @@ class TestEmbeddingMetaCheck:
 
     def test_blank_recorded_model_passes(self):
         check_embedding_meta({"embed_dims": "2048", "embed_model": ""}, 2048, "anything")
+
+
+# ---------------------------------------------------------------------------
+# Voyage backend — request timeouts and retry budget
+# ---------------------------------------------------------------------------
+
+
+class _FakeVoyageClient:
+    """Records the timeout each client was built with and the calls made on it."""
+
+    built: ClassVar[list[_FakeVoyageClient]] = []
+
+    def __init__(self, api_key: str = "", timeout: float | None = None, **_: Any) -> None:
+        self.timeout = timeout
+        self.calls: list[str] = []
+        _FakeVoyageClient.built.append(self)
+
+    def count_tokens(self, texts: list[str], model: str = "") -> int:
+        return 1
+
+    def embed(self, texts: list[str], **kwargs: Any) -> Any:
+        self.calls.append(f"embed:{kwargs['input_type']}")
+        return type("R", (), {"embeddings": [[0.0] for _ in texts]})()
+
+    def rerank(self, query: str, documents: list[str], **kwargs: Any) -> Any:
+        self.calls.append("rerank")
+        return type("R", (), {"results": []})()
+
+
+class _VoyageError(Exception):
+    pass
+
+
+def _named_error(name: str) -> Exception:
+    return type(name, (_VoyageError,), {})()
+
+
+class TestVoyageTimeouts:
+    @pytest.fixture
+    def emb(self, monkeypatch):
+        import voyageai
+
+        _FakeVoyageClient.built = []
+        monkeypatch.setattr(voyageai, "Client", _FakeVoyageClient)
+        return VoyageEmbeddingModel(api_key="k")
+
+    def test_interactive_calls_time_out_in_seconds_not_ten_minutes(self, emb):
+        """voyageai's default request timeout is 600 s. A stalled query embed or rerank
+        inside recall() must fail over to the RRF fallback, not hang the recall."""
+        emb.embed(["what did I decide"], task="query")
+        emb.rerank_scored("q", ["d1", "d2"])
+        (interactive,) = [c for c in _FakeVoyageClient.built if c.calls]
+        assert interactive.timeout == 30
+        assert interactive.calls == ["embed:query", "rerank"]
+
+    def test_bulk_document_embeds_get_a_longer_timeout(self, emb):
+        """A 100K-token document batch legitimately takes longer than a query embed."""
+        emb.embed(["a turn", "another turn"], task="document")
+        emb.embed(["an entity"], task="entity")
+        (bulk,) = [c for c in _FakeVoyageClient.built if c.calls]
+        assert bulk.timeout == 120
+        assert bulk.calls == ["embed:document", "embed:document"]
+
+    @staticmethod
+    def _state(exc: Exception, attempt: int, elapsed: float) -> Any:
+        from unittest.mock import MagicMock
+
+        state = MagicMock()
+        state.outcome.exception.return_value = exc
+        state.attempt_number = attempt
+        state.seconds_since_start = elapsed
+        return state
+
+    def test_non_rate_limit_retries_stop_after_a_minute(self):
+        """Six 30-s timeouts plus backoff would hold a caller for minutes."""
+        timeout = _named_error("Timeout")
+        assert not _voyage_stop(self._state(timeout, attempt=2, elapsed=31))
+        assert _voyage_stop(self._state(timeout, attempt=3, elapsed=61))
+        assert _voyage_stop(self._state(timeout, attempt=6, elapsed=5))
+
+    def test_rate_limit_keeps_its_three_minute_patience(self):
+        rate_limit = _named_error("RateLimitError")
+        assert not _voyage_stop(self._state(rate_limit, attempt=8, elapsed=61))
+        assert _voyage_stop(self._state(rate_limit, attempt=9, elapsed=181))
 
 
 # ---------------------------------------------------------------------------

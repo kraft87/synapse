@@ -85,12 +85,18 @@ _RERANK_MODEL = os.environ.get("SYNAPSE_RERANK_MODEL", "rerank-3-lite")
 # the rolling-minute token window clears on its own — so be patient: bigger backoff and
 # ride it out for up to 3 min (this is what eliminates the rare _rerank_pool->RRF fallback
 # under heavy parallel load). Other transient errors (5xx / timeout / connection) might be a
-# real outage, so retry briefly then re-raise and let the caller degrade gracefully rather
-# than hang a live recall() for minutes.
+# real outage, so retry briefly — at most 6 attempts and about a minute — then re-raise and
+# let the caller degrade gracefully rather than hang a live recall() for minutes.
 _RATE_LIMIT_WAIT = wait_random_exponential(multiplier=2, max=90)
 _OTHER_WAIT = wait_random_exponential(multiplier=1, max=20)
 _RATE_LIMIT_STOP = stop_after_delay(180)
-_OTHER_STOP = stop_after_attempt(6)
+_OTHER_STOP = stop_after_attempt(6) | stop_after_delay(60)
+
+# Per-request timeouts. voyageai's default is 600 s, so one stalled request (retried as a
+# Timeout) could hold a recall() for most of an hour. Query embeds and reranks are small and
+# interactive; document batches pack up to _TARGET_BATCH_TOKENS and get longer.
+_VOYAGE_TIMEOUT_S = 30.0
+_VOYAGE_BULK_TIMEOUT_S = 120.0
 
 
 def _is_rate_limit(retry_state: Any) -> bool:
@@ -164,7 +170,9 @@ class VoyageEmbeddingModel:
     ) -> None:
         from voyageai import Client  # type: ignore[attr-defined]
 
-        self._client = Client(api_key=api_key)
+        self._client = Client(api_key=api_key, timeout=_VOYAGE_TIMEOUT_S)
+        # Document/entity embeds (ingest batches) — same key, longer request timeout.
+        self._bulk_client = Client(api_key=api_key, timeout=_VOYAGE_BULK_TIMEOUT_S)
         self.model_name = model
         self._dims = dims
 
@@ -227,7 +235,8 @@ class VoyageEmbeddingModel:
     # are retried (dynamic rate negotiation) instead of bubbling up as a hard failure.
     @_voyage_retry
     def _embed_batch(self, batch: list[str], input_type: str) -> Any:
-        return self._client.embed(
+        client = self._client if input_type == "query" else self._bulk_client
+        return client.embed(
             batch, model=self.model_name, input_type=input_type, output_dimension=self._dims
         )
 
