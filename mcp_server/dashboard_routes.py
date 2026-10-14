@@ -1542,46 +1542,51 @@ def _metrics_corpus(db_url: str) -> dict[str, Any]:
 # Flags
 # ---------------------------------------------------------------------------
 
-# Per-kind resolver for the best-effort gist and source episode shown on the flags list. The
-# flags list is operator-sized (a handful of rows), so a small lookup per row is cheap.
-# kind -> (table, text column, id column, column naming the row's source episode)
+# Per-kind resolver for the best-effort gist, source episode and (notes only) full body
+# shown on the flags list. The flags list is operator-sized (a handful of rows), so a small
+# lookup per row is cheap.
+# kind -> (table, text column, id column, column naming the row's source episode, body column)
 _FLAG_SOURCES = {
-    "episode": ("episodes", "content", "id", None),
-    "fact": ("kg_relationships", "fact", "uuid", "episodes"),
-    "timeline_event": ("timeline_events", "fact", "id", "source_ref"),
-    "preference": ("preferences", "pref", "id", "source_ref"),
-    "note": ("notes", "hook", "id", "source_ref"),
+    "episode": ("episodes", "content", "id", None, None),
+    "fact": ("kg_relationships", "fact", "uuid", "episodes", None),
+    "timeline_event": ("timeline_events", "fact", "id", "source_ref", None),
+    "preference": ("preferences", "pref", "id", "source_ref", None),
+    "note": ("notes", "hook", "id", "source_ref", "body"),
 }
 
 
 def _resolve_flag_item(
     conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str
-) -> tuple[str, int | None]:
-    """A flagged row's gist and the episode the Flags tab can open for it: the episode
-    itself, a fact's first provenance episode, or the ``ep:<id>`` turn a timeline event,
-    preference or note was born from. None when the row or its episode is gone, or the
-    ref names something that isn't a turn (a git SHA)."""
+) -> tuple[str, int | None, str | None]:
+    """A flagged row's gist, the episode the Flags tab can open for it, and its body.
+
+    The episode is the episode itself, a fact's first provenance episode, or the
+    ``ep:<id>`` turn a timeline event, preference or note was born from; None when the
+    row or its episode is gone, or the ref names something that isn't a turn (a git SHA).
+    The body is a note's full text (the Flags tab shows it inline beside the hook), None
+    for every other kind."""
     spec = _FLAG_SOURCES.get(kind)
     if not spec:
-        return "", None
-    table, text_col, id_col, ref_col = spec
+        return "", None, None
+    table, text_col, id_col, ref_col, body_col = spec
     # id_col is a fixed identifier from the trusted map above, never user input; item_id
     # is bound as a parameter. Numeric-keyed tables get a digit guard so a bad id can't
     # raise a cast error inside the read.
     if id_col == "id" and not str(item_id).isdigit():
-        return "", None
+        return "", None, None
     ref_sql = f", {ref_col} AS ref" if ref_col else ""
+    body_sql = f", {body_col} AS body" if body_col else ""
     try:
         row = conn.execute(
-            f"SELECT {text_col} AS t{ref_sql} FROM {table} WHERE {id_col} = %s LIMIT 1",  # nosec B608
+            f"SELECT {text_col} AS t{ref_sql}{body_sql} FROM {table} WHERE {id_col} = %s LIMIT 1",  # nosec B608
             (item_id,),
         ).fetchone()
     except Exception:  # pragma: no cover - defensive, e.g. a missing table
-        return "", None
+        return "", None, None
     if row is None:
-        return "", None
+        return "", None, None
     if kind == "episode":
-        return _gist(row["t"]), int(item_id)
+        return _gist(row["t"]), int(item_id), None
     ref = row["ref"]
     episode_id = _provenance(ref) if isinstance(ref, list) else _episode_id_from_ref(ref)
     if (
@@ -1589,7 +1594,7 @@ def _resolve_flag_item(
         and conn.execute("SELECT 1 FROM episodes WHERE id = %s", (episode_id,)).fetchone() is None
     ):
         episode_id = None
-    return _gist(row["t"]), episode_id
+    return _gist(row["t"]), episode_id, row.get("body")
 
 
 def _flags_list(db_url: str) -> dict[str, Any]:
@@ -1600,7 +1605,7 @@ def _flags_list(db_url: str) -> dict[str, Any]:
         ).fetchall()
         flags = []
         for r in rows:
-            gist, episode_id = _resolve_flag_item(conn, r["kind"], r["item_id"])
+            gist, episode_id, body = _resolve_flag_item(conn, r["kind"], r["item_id"])
             flags.append(
                 {
                     "id": r["id"],
@@ -1610,6 +1615,7 @@ def _flags_list(db_url: str) -> dict[str, Any]:
                     "created_at": _iso(r["created_at"]),
                     "gist": gist,
                     "episode_id": episode_id,
+                    "body": body,
                 }
             )
         return {"flags": flags}
@@ -1712,10 +1718,7 @@ def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[
 
 
 def delete_episode_content(
-    conn: psycopg.Connection[dict[str, Any]],
-    episode_ids: list[int],
-    *,
-    keep_retold_events: bool = False,
+    conn: psycopg.Connection[dict[str, Any]], episode_ids: list[int]
 ) -> dict[str, Any]:
     """The episode-delete cascade: everything carrying the content of ``episode_ids``.
 
@@ -1728,12 +1731,6 @@ def delete_episode_content(
     events, so a client can drop them from its lists. Shared by the dashboard's
     single-turn delete and private mode's session purge
     (``mcp_server/private_session_routes``).
-
-    ``keep_retold_events``: schema 037's dedup merge folds a later turn's re-telling into
-    an existing event and only bumps its ``reported_count``, so a count above 1 means
-    another turn backs the row too, but not which one. True keeps those rows (one telling
-    fewer; their ``source_ref`` then names the deleted turn). The purge leaves it False:
-    a privacy wipe errs toward removal.
 
     Set-based on purpose: the purge passes every turn of a session, and the provenance
     arrays have no usable index (029's GIN is partial), so each lookup is one pass over
@@ -1801,24 +1798,15 @@ def delete_episode_content(
     # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
     # makes the first telling's turn the row's owner, so the rule resolves to delete;
     # keeping them would go on serving the deleted turn from recall()'s timeline leg.
-    # The exception is a row a later turn re-told (reported_count > 1, see the docstring).
-    refs = ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids])
-    owned = "(source_ref = ANY(%s) OR source_ref LIKE ANY(%s))"
-    kept_events: list[int] = []
-    if keep_retold_events:
-        kept_events = [
-            r["id"]
-            for r in conn.execute(
-                "UPDATE timeline_events SET reported_count = reported_count - 1 "  # nosec B608 — owned is a fixed fragment
-                f"WHERE {owned} AND reported_count > 1 RETURNING id",
-                refs,
-            ).fetchall()
-        ]
+    # That includes a row a later turn re-told: schema 037's dedup merge only bumps
+    # reported_count and records no list of re-telling turns, so there is no telling
+    # whether one survives, and a kept row would still carry the deleted turn's text.
     deleted_events = [
         r["id"]
         for r in conn.execute(
-            f"DELETE FROM timeline_events WHERE {owned} AND id <> ALL(%s) RETURNING id",  # nosec B608
-            (*refs, kept_events),
+            "DELETE FROM timeline_events WHERE source_ref = ANY(%s) OR source_ref LIKE ANY(%s) "
+            "RETURNING id",
+            ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids]),
         ).fetchall()
     ]
     if deleted_events:
@@ -1834,7 +1822,6 @@ def delete_episode_content(
         "facts_deleted": len(sole),
         "facts_unlinked": len(shared),
         "events_deleted": len(deleted_events),
-        "events_kept": len(kept_events),
         "deleted_fact_ids": sole,
         "deleted_event_ids": deleted_events,
     }
@@ -1854,7 +1841,7 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
                 return None
             summary = {
                 "episode_id": episode_id,
-                **delete_episode_content(conn, [episode_id], keep_retold_events=True),
+                **delete_episode_content(conn, [episode_id]),
             }
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
@@ -3002,6 +2989,8 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/timeline", methods=["GET"])  # type: ignore[misc]
     async def dash_timeline(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _unauthorized()
         qp = request.query_params
         limit = _limit(qp.get("limit"), _TIMELINE_LIMIT_DEFAULT, _TIMELINE_LIMIT_MAX)
         before = qp.get("before") or None
@@ -3013,6 +3002,8 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/timeline/months", methods=["GET"])  # type: ignore[misc]
     async def dash_timeline_months(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _unauthorized()
         qp = request.query_params
         type_ = qp.get("type") or None
         group_id = qp.get("group_id") or None

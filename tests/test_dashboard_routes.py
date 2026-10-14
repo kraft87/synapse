@@ -1041,6 +1041,20 @@ def test_flags_list_resolves_gist_per_kind(clean, conn, db_url):
     assert flags[("preference", str(pid))] == "pref gist line"
 
 
+def test_flags_list_carries_a_notes_full_body_for_inline_display(clean, conn, db_url):
+    """A note has no turn to jump to, so the Flags tab shows its hook and body in place;
+    every other kind reports no body."""
+    nid = _note(conn, hook="note hook")
+    conn.execute("UPDATE notes SET body = %s WHERE id = %s", ("line one\nline two", nid))
+    evid = _event(conn, fact="event text", source_ref="tb:b")
+    with _client(db_url) as client:
+        for kind, item in (("note", str(nid)), ("timeline_event", str(evid))):
+            client.post("/dash/api/flag", json={"kind": kind, "id": item}, headers=_H)
+        flags = client.get("/dash/api/flags", headers=_H).json()["flags"]
+    bodies = {f["kind"]: f["body"] for f in flags}
+    assert bodies == {"note": "line one\nline two", "timeline_event": None}
+
+
 def test_flags_list_names_the_episode_each_flag_leads_to(clean, conn, db_url):
     """Jump needs a target: a fact's first provenance episode, the ep:<id> turn an event,
     preference or note was born from, and the episode itself. A ref that is not a turn
@@ -2634,6 +2648,11 @@ def test_phase5_routes_require_machine_token(clean, conn, db_url):
     with _client(db_url) as client:
         for path in (
             "/dash/api/timeline",
+            "/dash/api/timeline?type=work",
+            "/dash/api/timeline?tz=Not/AZone",
+            "/dash/api/timeline/months",
+            "/dash/api/timeline/months?tz=UTC",
+            "/dash/api/timeline/months?tz=Not/AZone",
             "/dash/api/preferences",
             "/dash/api/dream/report",
             "/dash/api/behavior/files",
@@ -3105,20 +3124,21 @@ def test_delete_episode_retires_flags_on_cascaded_facts_and_events(clean, conn, 
     assert [(f["kind"], f["item_id"]) for f in flags] == [("fact", "j-shared")]
 
 
-def test_delete_episode_keeps_events_other_turns_retold(clean, conn, db_url):
-    """Schema 037's merge bumps reported_count when a later turn re-tells an event, so a
-    count above 1 means a surviving turn also backs the row: the single-turn delete keeps
-    it (one telling fewer) and deletes the rest."""
+def test_delete_episode_deletes_retold_events_with_their_owner_turn(clean, conn, db_url):
+    """Schema 037's merge bumps reported_count when a later turn re-tells an event but
+    records no list of re-telling turns, so the cascade cannot tell whether one still
+    exists. Keeping the row would leave text from the deleted turn that no stored turn
+    backs; the owner's delete removes it whatever its count."""
     doomed = _episode(conn, session="d9", seq=1, content="doomed turn")
     sole = _event(conn, fact="told once", source_ref=f"ep:{doomed}", reported_count=1)
     retold = _event(conn, fact="told twice", source_ref=f"ep:{doomed}#2", reported_count=2)
 
     with _client(db_url) as client:
         body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
-    assert body["events_deleted"] == 1 and body["deleted_event_ids"] == [sole]
-    assert body["events_kept"] == 1
-    left = conn.execute("SELECT id, reported_count FROM timeline_events").fetchall()
-    assert left == [(retold, 1)]
+    assert body["events_deleted"] == 2
+    assert sorted(body["deleted_event_ids"]) == sorted([sole, retold])
+    assert "events_kept" not in body
+    assert conn.execute("SELECT count(*) FROM timeline_events").fetchone()[0] == 0
 
 
 def test_delete_bad_id_missing_row_and_auth(clean, conn, db_url):

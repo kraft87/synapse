@@ -156,7 +156,7 @@ POST body: {"kind": "fact", "id": "<item_id>", "flagged": true, "note": "optiona
 POST resp: {"status": "ok", "flagged": true}
 GET  resp: {"flags": [{"id": 3, "kind": "fact", "item_id": "…", "note": null,
                         "created_at": "…", "gist": "<resolved item text, best effort>",
-                        "episode_id": 227168}]}
+                        "episode_id": 227168, "body": null}]}
 ```
 `flagged` (optional boolean) is the state the operator wants: `true` always ends flagged and
 `false` always ends unflagged, idempotently (a repeat changes nothing and writes no audit
@@ -168,6 +168,8 @@ feed/entity payloads comes from the active set.
 `episode_id` on a flag row is the episode the Flags tab opens for it: the episode itself, a
 fact's first provenance episode, or the `ep:<id>` turn a timeline event, preference or note
 was born from. `null` when the ref names no turn (a git SHA) or the episode is gone.
+`body` is a note's full text (the Flags tab shows hook and body inline); `null` for every
+other kind.
 
 ## Phase 2 endpoints (Recall console)
 
@@ -745,7 +747,7 @@ Deletes the episode row and everything that carries ITS CONTENT. Non-numeric id 
 no such episode → 404 `episode not found`.
 ```json
 {"episode_id": 227168, "chunks_deleted": 3, "chunks_mixed_deleted": 1,
- "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1, "events_kept": 0,
+ "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1,
  "deleted_fact_ids": ["<edge-uuid>", "<edge-uuid>"], "deleted_event_ids": [8841]}
 ```
 `deleted_fact_ids` / `deleted_event_ids` name the rows the cascade removed (not the unlinked
@@ -780,12 +782,11 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
   multi-event-per-turn form written by `ingestion/timeline_gate.py`) → DELETED
   (`events_deleted`). `UNIQUE (source, source_ref)` makes the first telling's turn the
   owner, so the sole-vs-shared rule resolves to "delete"; leaving them would keep serving
-  the deleted turn's content out of `recall()`'s timeline leg. The exception is an event a
-  later turn re-told: the dedup merge (schema 037) only bumps `reported_count`, so a count
-  above 1 means a surviving turn backs the row too. The single-turn delete KEEPS such an
-  event (`events_kept`), lowering its count by one; its `source_ref` keeps naming the
-  deleted turn, because nothing records which turn re-told it. The private-session purge
-  deletes them anyway (a privacy wipe errs toward removal).
+  the deleted turn's content out of `recall()`'s timeline leg. That includes an event a later
+  turn re-told: the dedup merge (schema 037) only bumps `reported_count` and records no
+  list of re-telling turns, so the cascade cannot tell whether one survives, and a kept row
+  would still carry the deleted turn's text. The private-session purge deletes them the same
+  way.
 - **extraction_queue** rows. Those with an `episode_id` (FK, `ON DELETE CASCADE`, schema
   001) carry a verbatim copy of `episodes.content`, and the FK takes them. Chunk rows
   (`content_type = 'chunk'`) are keyed by `(session_id, content)` with no `episode_id`, so
