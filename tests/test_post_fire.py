@@ -3,7 +3,7 @@
 No DB, no LLM: fetchers and the judge call are monkeypatched, merge_candidate is stubbed
 to the pinned v2 contract. Guards the two data-quality rules (fire position resolved from
 content markers — never fired_at alone; session-tail fires marked unassessable and never
-judged), the outcome tally, and the retune call shapes (signal='post_fire_deviation',
+judged), the outcome tally, the per-run cap, and the retune call shapes (signal='post_fire_deviation',
 proposed_patch bullets, direction fallback). All fixtures synthetic.
 """
 
@@ -123,16 +123,10 @@ def _stub_merge(calls):
 def _wire(
     monkeypatch, *, fires, episodes, verdict_json, calls, doc=("desc", "body"), registered=None
 ):
-    seen = {}
+    """Stub the fetchers, the judge and the ledger. Returns (prompts, run): run() judges
+    `fires` against a catalog of the `registered` skills (default: every fired skill)."""
     if registered is None:
         registered = {f["skill"] for f in fires}
-    monkeypatch.setattr(PF, "_registered_skills", lambda conn: set(registered))
-
-    def fetch_fires(conn, since):
-        seen["since"] = since
-        return fires
-
-    monkeypatch.setattr(PF, "_fetch_fires", fetch_fires)
     monkeypatch.setattr(PF, "_fetch_session_episodes", lambda conn, sid: episodes[sid])
     monkeypatch.setattr(PF, "_load_skill_doc", lambda conn, name: doc)
     prompts = []
@@ -143,7 +137,11 @@ def _wire(
 
     monkeypatch.setattr(PF, "_judge_call", judge)
     monkeypatch.setattr(PF.L, "merge_candidate", _stub_merge(calls))
-    return prompts, seen
+
+    def run():
+        return PF.run(None, fires=fires, catalog=[(n, "") for n in sorted(registered)])
+
+    return prompts, run
 
 
 def _fire(skill="widget-deploy", sid="s1", minutes=1):
@@ -172,16 +170,14 @@ _DEVIATION_VERDICT = {
 
 def test_deviation_emits_retune_call_shape(monkeypatch):
     calls = []
-    prompts, seen = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=_SESSION,
         verdict_json=json.dumps(_DEVIATION_VERDICT),
         calls=calls,
     )
-    since = _T0 - timedelta(days=1)
-    stats = PF.run(None, since=since)
-    assert seen["since"] == since  # watermark passed through untouched
+    stats = run()
     assert stats == {
         "fires": 1,
         "clean": 0,
@@ -193,6 +189,7 @@ def test_deviation_emits_retune_call_shape(monkeypatch):
         "candidates": 1,
         "judge_failures": 0,
         "unregistered": 0,
+        "over_cap": 0,
     }
     c = calls[0]
     assert c["kind"] == "retune" and c["name"] == "widget-deploy"
@@ -214,28 +211,28 @@ def test_deviation_emits_retune_call_shape(monkeypatch):
 def test_fight_emits_candidate_clean_does_not(monkeypatch):
     for outcome, want in (("fight", 1), ("clean", 0)):
         calls = []
-        _wire(
+        _, run = _wire(
             monkeypatch,
             fires=[_fire()],
             episodes=_SESSION,
             verdict_json=json.dumps(dict(_DEVIATION_VERDICT, outcome=outcome)),
             calls=calls,
         )
-        stats = PF.run(None, since=None)
+        stats = run()
         assert stats[outcome] == 1 and stats["candidates"] == want and len(calls) == want
 
 
 def test_session_tail_fire_skipped_not_judged(monkeypatch):
     calls = []
     episodes = {"s1": [_ep(1, human="deploy it"), _ep(2, content=_FIRE, minutes=1)]}
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=episodes,
         verdict_json=json.dumps(_DEVIATION_VERDICT),
         calls=calls,
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["unassessable"] == 1 and stats["last_episode"] == 1
     assert not prompts and not calls  # never judged, never merged
 
@@ -243,54 +240,54 @@ def test_session_tail_fire_skipped_not_judged(monkeypatch):
 def test_unlocated_fire_is_unassessable(monkeypatch):
     calls = []
     episodes = {"s1": [_ep(1, content="[tool:Bash] echo no fires here")]}
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=episodes,
         verdict_json="{}",
         calls=calls,
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["unassessable"] == 1 and stats["unlocated"] == 1
     assert not prompts and not calls
 
 
 def test_judge_garbage_counts_failure_and_unassessable(monkeypatch):
     calls = []
-    _wire(
+    _, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=_SESSION,
         verdict_json="no json in sight",
         calls=calls,
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["judge_failures"] == 1 and stats["unassessable"] == 1 and not calls
 
 
 def test_unknown_outcome_falls_back_to_unassessable(monkeypatch):
     calls = []
-    _wire(
+    _, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=_SESSION,
         verdict_json=json.dumps(dict(_DEVIATION_VERDICT, outcome="glorious")),
         calls=calls,
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["unassessable"] == 1 and not calls
 
 
 def test_invalid_direction_defaults_to_fix(monkeypatch):
     calls = []
-    _wire(
+    _, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=_SESSION,
         verdict_json=json.dumps(dict(_DEVIATION_VERDICT, direction="sideways")),
         calls=calls,
     )
-    PF.run(None, since=None)
+    run()
     assert calls[0]["direction"] == "fix"
 
 
@@ -304,14 +301,14 @@ def test_window_stops_before_next_fire(monkeypatch):
         _ep(5, content="[tool:Skill] {'skill': 'other-skill'}", minutes=4),
         _ep(6, human="now the other thing is wrong too", minutes=5),
     ]
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes={"s1": eps},
         verdict_json=json.dumps(_DEVIATION_VERDICT),
         calls=calls,
     )
-    PF.run(None, since=None)
+    run()
     # aftermath ends before the NEXT fire: seq 5 (the fire) and seq 6 (its aftermath) excluded
     assert "[seq 3]" in prompts[0] and "[seq 4]" in prompts[0]
     assert "[seq 5]" not in prompts[0] and "[seq 6]" not in prompts[0]
@@ -326,14 +323,14 @@ def test_immediate_refire_is_unassessable(monkeypatch):
         _ep(2, content="[tool:Skill] {'skill': 'other-skill'}", minutes=1),
         _ep(3, human="more work", minutes=2),
     ]
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes={"s1": eps},
         verdict_json=json.dumps(_DEVIATION_VERDICT),
         calls=calls,
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["unassessable"] == 1 and stats["last_episode"] == 0
     assert not prompts and not calls
 
@@ -341,26 +338,26 @@ def test_immediate_refire_is_unassessable(monkeypatch):
 def test_window_caps_at_ten_episodes(monkeypatch):
     calls = []
     eps = [_ep(1, content=_FIRE)] + [_ep(i, human=f"turn {i}", minutes=i) for i in range(2, 20)]
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes={"s1": eps},
         verdict_json=json.dumps(dict(_DEVIATION_VERDICT, outcome="clean")),
         calls=calls,
     )
-    PF.run(None, since=None)
+    run()
     assert "[seq 11]" in prompts[0] and "[seq 12]" not in prompts[0]
 
 
 def test_run_signature_is_keyword_only():
     with pytest.raises(TypeError):
-        PF.run(None, None)  # since must be keyword-only
+        PF.run(None, [], [])  # fires and catalog must be keyword-only
 
 
 def test_unregistered_skill_fire_is_skipped_unjudged(monkeypatch):
     # A built-in or third-party skill has no registry row: no judge call, no proposal.
     calls = []
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire()],
         episodes=_SESSION,
@@ -368,7 +365,7 @@ def test_unregistered_skill_fire_is_skipped_unjudged(monkeypatch):
         calls=calls,
         registered=set(),
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["unregistered"] == 1
     assert stats["candidates"] == 0
     assert prompts == [] and calls == []
@@ -376,7 +373,7 @@ def test_unregistered_skill_fire_is_skipped_unjudged(monkeypatch):
 
 def test_registered_skill_still_judged_alongside_unregistered(monkeypatch):
     calls = []
-    prompts, _ = _wire(
+    prompts, run = _wire(
         monkeypatch,
         fires=[_fire(skill="built-in-thing"), _fire()],
         episodes=_SESSION,
@@ -384,8 +381,34 @@ def test_registered_skill_still_judged_alongside_unregistered(monkeypatch):
         calls=calls,
         registered={"widget-deploy"},
     )
-    stats = PF.run(None, since=None)
+    stats = run()
     assert stats["unregistered"] == 1
     assert stats["candidates"] == 1
     assert [c["name"] for c in calls] == ["widget-deploy"]
     assert len(prompts) == 1  # only the registered fire reached the judge
+
+
+def test_judges_at_most_the_cap_newest_first(monkeypatch):
+    """A --backfill window can hold hundreds of fires; one run judges FIRE_CAP of them,
+    the newest, and counts the rest."""
+    calls = []
+    n = PF.FIRE_CAP + 5
+    fires, episodes = [], {}
+    for i in range(n):
+        skill, sid = f"skill-{i:02d}", f"s{i}"
+        fires.append(_fire(skill=skill, sid=sid, minutes=i))
+        episodes[sid] = [
+            _ep(1, content=f"[tool:Skill] {{'skill': '{skill}'}}", minutes=i),
+            _ep(2, human="that skipped a step", minutes=i + 1),
+        ]
+    prompts, run = _wire(
+        monkeypatch,
+        fires=fires,
+        episodes=episodes,
+        verdict_json=json.dumps(dict(_DEVIATION_VERDICT, outcome="clean")),
+        calls=calls,
+    )
+    stats = run()
+    assert stats["fires"] == n and stats["over_cap"] == 5 and stats["clean"] == PF.FIRE_CAP
+    judged = {m.group(1) for p in prompts for m in [re.search(r'SKILL "(skill-\d+)"', p)]}
+    assert judged == {f"skill-{i:02d}" for i in range(5, n)}

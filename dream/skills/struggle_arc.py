@@ -7,12 +7,12 @@ The v1 gap scan asks "what procedure has no skill?" — this asks the sharper qu
 ("didn't work", "same error", "you sure") clustered in one session. Two stages, so the
 LLM only ever reads the worst few windows:
 
-  A. lexical prescreen (SQL + pure python, cheap): score correction markers per NEW
-     episode (hard markers weigh 2, soft markers 1 and only count mid-session — a fresh
-     request containing "wrong" is not a correction), drop transcript machinery
-     (task notifications, session-continuation summaries — they quote error text and
-     false-positive hard), group survivors into arcs by (session, sequence proximity),
-     keep the top `limit` arcs by score.
+  A. lexical prescreen (SQL + pure python, cheap): score correction markers per episode
+     in the lane's window (hard markers weigh 2, soft markers 1 and only count
+     mid-session — a fresh request containing "wrong" is not a correction), drop
+     transcript machinery (task notifications, session-continuation summaries — they
+     quote error text and false-positive hard), group survivors into arcs by (session,
+     sequence proximity), keep the top `limit` arcs by score.
   B. windowed LLM judge (arc +/- 3 episodes): genuine struggle? skill-worthy per the
      negative capture list? UPDATE-FIRST — the judge sees the full active skill catalog
      IN THE PROMPT (no embedding routing — at catalog scale that misroutes) and must
@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import os
 import re
+
+from dream import lane
 
 from . import config
 from . import skill_db_source as DB
@@ -211,15 +213,12 @@ def group_arcs(flagged: list[dict], gap: int = ARC_GAP) -> list[dict]:
     return arcs
 
 
-def _fetch_new_episodes(conn, since) -> list[dict]:
-    """Episodes newer than `since` (None -> 30d), claude_code only, foreign skill
-    environments excluded. With STRUGGLE_INCLUDE_PROJECTS set, only allowlisted
-    projects are scanned (untagged episodes drop too). Only prescreen fields."""
+def _fetch_new_episodes(conn, window) -> list[dict]:
+    """The episodes in the lane's `window`, claude_code only, foreign skill environments
+    excluded. With STRUGGLE_INCLUDE_PROJECTS set, only allowlisted projects are scanned
+    (untagged episodes drop too). Only prescreen fields."""
     cur = conn.cursor()
-    where_time = (
-        "created_at > %s" if since is not None else "created_at > now() - interval '30 days'"
-    )
-    params: list = [] if since is None else [since]
+    params: list = [window.after_id, window.until_id]
     include = _include_projects()
     if include:
         where_project = "project = ANY(%s)"
@@ -230,7 +229,7 @@ def _fetch_new_episodes(conn, since) -> list[dict]:
     cur.execute(
         f"""SELECT session_id, sequence, created_at, human_turn, LEFT(content, 400)
               FROM episodes
-             WHERE platform = 'claude_code' AND {where_time} AND {where_project}
+             WHERE platform = 'claude_code' AND id > %s AND id <= %s AND {where_project}
              ORDER BY session_id, sequence""",
         tuple(params),
     )
@@ -259,11 +258,6 @@ def _fetch_window(conn, session_id: str, lo: int, hi: int) -> list[dict]:
         {"sequence": seq, "human_turn": human or "", "content": content or ""}
         for seq, human, content in cur.fetchall()
     ]
-
-
-def _load_catalog(conn) -> list[tuple[str, str]]:
-    """(name, description) for ACTIVE skills, name-ordered — the lane's shared load_catalog."""
-    return SM.load_catalog(conn)
 
 
 def _judge_call(prompt: str, model: str | None = None) -> str:
@@ -358,16 +352,17 @@ def _window_tools(window: list[dict]) -> list[str]:
     tools: set[str] = set()
     for ep in window:
         for line in (ep.get("content") or "").splitlines():
-            m = DB._MARKER.match(line)
+            m = lane.TOOL_MARKER.match(line)
             if m:
                 tools.add(m.group(1))
     return sorted(tools)[:8]
 
 
 # ------------------------------------------------------------------ entry
-def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
-    """One nightly pass: prescreen episodes newer than `since`, judge the top `limit`
-    arcs, merge verdicts into the ledger. The caller owns cursor state."""
+def run(conn, *, window, catalog, limit: int = 10, model: str | None = None) -> dict:
+    """One nightly pass: prescreen the episodes in the lane's `window`, judge the top
+    `limit` arcs against `catalog` ((name, description) of the active skills), merge
+    verdicts into the ledger. The caller owns cursor state."""
     stats = {
         "scanned": 0,
         "flagged": 0,
@@ -379,7 +374,7 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
         "retunes": 0,
         "derives": 0,
     }
-    episodes = _fetch_new_episodes(conn, since)
+    episodes = _fetch_new_episodes(conn, window)
     stats["scanned"] = len(episodes)
 
     flagged = []
@@ -406,22 +401,21 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
     if not arcs:
         return stats
 
-    catalog = _load_catalog(conn)
     catalog_text = SM.format_catalog(catalog)
     skill_names = {n for n, _ in catalog}
 
     for arc in arcs:
-        window = _fetch_window(
+        arc_window = _fetch_window(
             conn,
             arc["session_id"],
             max(0, arc["seq_min"] - WINDOW_PAD),
             arc["seq_max"] + WINDOW_PAD,
         )
-        if not has_tool_evidence(window):
+        if not has_tool_evidence(arc_window):
             # topic gate half 2: correction phrasing with zero tool work = conversation
             stats["skipped_no_tools"] += 1
             continue
-        verdict = judge_arc(window, catalog_text, model)
+        verdict = judge_arc(arc_window, catalog_text, model)
         if verdict is None:
             stats["judge_failures"] += 1
             continue
@@ -429,7 +423,7 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
         if not (verdict.get("struggle") and verdict.get("skill_worthy")):
             stats["skipped"] += 1
             continue
-        res, kind = _emit(conn, arc, window, verdict, skill_names)
+        res, kind = _emit(conn, arc, arc_window, verdict, skill_names)
         stats[kind + "s"] += 1
         print(f"  struggle arc -> {kind} cand#{res['id']} ({res['status']})")
     return stats

@@ -1,7 +1,6 @@
 """dream/skills/procedure_miner.py — weekly deterministic procedure detector.
 
-Pure-Python: the SQL seam (_fetch_rows), registry seam (_load_registry), LLM seam
-(_confirm_llm) and the ledger writer (skill_ledger.merge_candidate, pinned v2 contract)
+Pure-Python: the SQL seam (_fetch_rows), LLM seam (_confirm_llm) and the ledger writer (skill_ledger.merge_candidate, pinned v2 contract)
 are stubbed. All transcript text is synthetic.
 """
 
@@ -74,7 +73,7 @@ CONFIRM_OK = json.dumps(
 SWEEP_SIGNATURE = "script:health-report.sh ssh:nas>docker:ps"  # sorted fingerprint set
 
 
-def wire(monkeypatch, rows, registry=None, confirm_raw=CONFIRM_OK):
+def wire(monkeypatch, rows, confirm_raw=CONFIRM_OK):
     """Stub every external seam; return the merge_candidate call recorder."""
     calls = []
 
@@ -83,7 +82,6 @@ def wire(monkeypatch, rows, registry=None, confirm_raw=CONFIRM_OK):
         return {"id": len(calls), "status": "observe", "score": 0.5, "merged": False}
 
     monkeypatch.setattr(pm, "_fetch_rows", lambda conn, wd: rows)
-    monkeypatch.setattr(pm, "_load_registry", lambda conn: dict(registry or {}))
     monkeypatch.setattr(pm, "_confirm_llm", lambda prompt, model: confirm_raw)
     monkeypatch.setattr(pm.skill_ledger, "merge_candidate", fake_merge)
     return calls
@@ -283,7 +281,7 @@ class TestRun:
     def test_emits_derive_candidate_with_v2_contract_fields(self, monkeypatch):
         calls = wire(monkeypatch, health_sweep_rows(5))
         conn = FakeConn()
-        stats = pm.run(conn, window_days=35, min_sessions=4, model=None)
+        stats = pm.run(conn, catalog=[], window_days=35, min_sessions=4, model=None)
 
         assert stats["derived"] == 1 and stats["llm_calls"] == 1
         (call,) = calls
@@ -307,18 +305,18 @@ class TestRun:
 
     def test_salience_4_at_eight_sessions(self, monkeypatch):
         calls = wire(monkeypatch, health_sweep_rows(8))
-        pm.run(FakeConn(), min_sessions=4)
+        pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert calls[0]["salience"] == 4
 
     def test_evidence_capped_at_ten_sessions(self, monkeypatch):
         calls = wire(monkeypatch, health_sweep_rows(13))
-        pm.run(FakeConn(), min_sessions=4)
+        pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert len(calls[0]["evidence"]) == pm.EVIDENCE_SESSION_CAP
 
     def test_registry_prescreen_skips_without_llm(self, monkeypatch):
         registry = {"nas-health": "ssh nas docker ps health report sweep for the lab"}
-        calls = wire(monkeypatch, health_sweep_rows(5), registry=registry)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        calls = wire(monkeypatch, health_sweep_rows(5))
+        stats = pm.run(FakeConn(), catalog=sorted(registry.items()), min_sessions=4)
         assert stats["covered"] == 1 and stats["llm_calls"] == 0
         assert calls == []
 
@@ -327,8 +325,8 @@ class TestRun:
         raw = json.dumps(
             {"procedure": True, "name": "x", "summary": "s", "covered_by": "ops-check"}
         )
-        calls = wire(monkeypatch, health_sweep_rows(5), registry=registry, confirm_raw=raw)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        calls = wire(monkeypatch, health_sweep_rows(5), confirm_raw=raw)
+        stats = pm.run(FakeConn(), catalog=sorted(registry.items()), min_sessions=4)
         assert stats["covered"] == 1 and stats["llm_calls"] == 1
         assert calls == []
 
@@ -342,8 +340,8 @@ class TestRun:
                 "extends": "deploy-verify",
             }
         )
-        calls = wire(monkeypatch, health_sweep_rows(5), registry=registry, confirm_raw=raw)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        calls = wire(monkeypatch, health_sweep_rows(5), confirm_raw=raw)
+        stats = pm.run(FakeConn(), catalog=sorted(registry.items()), min_sessions=4)
         assert stats["retuned"] == 1 and stats["derived"] == 0
         (call,) = calls
         assert call["kind"] == "retune"
@@ -365,7 +363,7 @@ class TestRun:
             }
         )
         calls = wire(monkeypatch, health_sweep_rows(5), confirm_raw=raw)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert stats["script_candidates"] == 1 and stats["derived"] == 1
         assert calls[0]["summary"].startswith("[script-candidate] ")
         assert calls[0]["signature"] == SWEEP_SIGNATURE  # still a normal derive otherwise
@@ -373,21 +371,21 @@ class TestRun:
     def test_missing_disposition_defaults_to_skill(self, monkeypatch):
         raw = json.dumps({"procedure": True, "name": "x-y", "summary": "1. a\n2. b"})
         calls = wire(monkeypatch, health_sweep_rows(5), confirm_raw=raw)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert stats["script_candidates"] == 0
         assert not calls[0]["summary"].startswith("[script-candidate]")
 
     def test_name_collision_with_registry_becomes_retune(self, monkeypatch):
         registry = {"service-health-sweep": "Existing skill with this exact name"}
-        calls = wire(monkeypatch, health_sweep_rows(5), registry=registry)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        calls = wire(monkeypatch, health_sweep_rows(5))
+        stats = pm.run(FakeConn(), catalog=sorted(registry.items()), min_sessions=4)
         assert stats["retuned"] == 1
         assert calls[0]["kind"] == "retune"
 
     def test_llm_rejection_emits_nothing(self, monkeypatch):
         raw = json.dumps({"procedure": False, "name": "", "summary": ""})
         calls = wire(monkeypatch, health_sweep_rows(5), confirm_raw=raw)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert stats["rejected"] == 1
         assert calls == []
 
@@ -399,7 +397,7 @@ class TestRun:
             )
             rows += [episode(f"s{j}", i * 100, content) for j in range(4)]
         calls = wire(monkeypatch, rows)
-        stats = pm.run(FakeConn(), min_sessions=4)
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert stats["clusters"] == 10
         assert stats["llm_calls"] == pm.MAX_CONFIRM
         assert len(calls) == pm.MAX_CONFIRM
@@ -408,8 +406,8 @@ class TestRun:
         """Idempotency: same week, same corpus -> byte-identical evidence entries, so the
         ledger's (session_id, signal, class, scan_night) dedup collapses the re-run."""
         calls = wire(monkeypatch, health_sweep_rows(6))
-        pm.run(FakeConn(), min_sessions=4)
-        pm.run(FakeConn(), min_sessions=4)
+        pm.run(FakeConn(), catalog=[], min_sessions=4)
+        pm.run(FakeConn(), catalog=[], min_sessions=4)
         assert len(calls) == 2
         assert calls[0]["evidence"] == calls[1]["evidence"]
         assert calls[0]["name"] == calls[1]["name"]
@@ -417,7 +415,7 @@ class TestRun:
     def test_watermark_stamped_via_config_merge(self, monkeypatch):
         wire(monkeypatch, health_sweep_rows(5))
         conn = FakeConn()
-        pm.run(conn, min_sessions=4)
+        pm.run(conn, catalog=[], min_sessions=4)
         stamps = [
             (sql, params)
             for sql, params in conn.executed
@@ -449,10 +447,12 @@ class TestCadence:
 
         sig = inspect.signature(pm.run)
         params = list(sig.parameters.values())
-        assert [p.name for p in params] == ["conn", "window_days", "min_sessions", "model"]
+        names = ["conn", "catalog", "window_days", "min_sessions", "model"]
+        assert [p.name for p in params] == names
         assert params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
         assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params[1:])
-        assert params[1].default == 35 and params[2].default == 4 and params[3].default is None
+        assert params[1].default is inspect.Parameter.empty  # the lane passes its catalog
+        assert params[2].default == 35 and params[3].default == 4 and params[4].default is None
 
 
 if __name__ == "__main__":

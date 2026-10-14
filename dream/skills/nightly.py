@@ -14,7 +14,9 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
                       draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
   7. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
                       throttled Discord digest (top 5, pings only on NEW proposals)
-Incremental via skill_scan_cursor (whole-session scan since last_scan_at). --backfill ignores the watermark.
+Incremental over an episode-id window (dream/lane.py): every stage covers the same episodes,
+and the cursor advances only past the sessions the run got to (at most `limit` are judged a
+night, oldest first; the rest roll to the next night). --backfill starts 30 days back.
 
 The LLM finders honor SKILL_MEASURE_MODEL (deepseek for cheap backfill); drafting uses Opus.
 Propose-only: nothing here writes skill_registry or sets status='promoted' — the review
@@ -28,6 +30,9 @@ import json
 import os
 import re
 import urllib.request
+from dataclasses import replace
+
+from dream import lane
 
 from . import config, post_fire, procedure_miner, skill_draft, struggle_arc
 from . import skill_db_source as DB
@@ -103,9 +108,11 @@ def consolidate_pass(conn, seen_ids):
 
 
 # -------------------------------------------------------------------- 2. usage sync
-def sync_usage(conn, last_scan_at):
+def sync_usage(conn, window):
+    """Record the window's skill fires in skill_usage and roll them up into the registry.
+    Returns (stats, events): the events feed the dismissal and post-fire stages too."""
     cur = conn.cursor()
-    events = DB.fire_events(last_scan_at)
+    events = DB.fire_events(conn, window)
     for e in events:
         cur.execute(
             """INSERT INTO skills_lane.skill_usage (skill, fired_at, session_id, via, dismissed)
@@ -121,7 +128,8 @@ def sync_usage(conn, last_scan_at):
            WHERE r.name = u.skill"""
     )
     conn.commit()
-    return {"fire_events": len(events), "dismissals": sum(1 for e in events if e["dismissed"])}
+    stats = {"fire_events": len(events), "dismissals": sum(1 for e in events if e["dismissed"])}
+    return stats, events
 
 
 # --------------------------------------------------------------- 3+4+5 candidate gen
@@ -214,9 +222,9 @@ def run_retune(conn, substantive, catalog, seen_ids, descriptions):
     return stats
 
 
-def capture_grounded(conn, last_scan_at, seen_ids):
-    # dismissals -> retune/narrow (grounded)
-    dis = [e for e in DB.fire_events(last_scan_at) if e["dismissed"]]
+def capture_grounded(conn, window, fires, seen_ids):
+    # dismissals -> retune/narrow (grounded); `fires` is sync_usage's read of the same window
+    dis = [e for e in fires if e["dismissed"]]
     for e in dis:
         ev = [
             {
@@ -238,7 +246,7 @@ def capture_grounded(conn, last_scan_at, seen_ids):
         )
         seen_ids.add(res["id"])
     # explicit "make this a skill" -> derive (grounded). Attach session so identity can resolve.
-    reqs = DB.explicit_skill_requests(last_scan_at)
+    reqs = DB.explicit_skill_requests(conn, window)
     for r in reqs:
         ev = [
             {
@@ -351,26 +359,33 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     cur = conn.cursor()
     cur.execute("SELECT now()")
     run_started = cur.fetchone()[0]
-    cur_state = L.get_cursor(conn)
-    last = None if backfill else cur_state.get("last_scan_at")
+    window = lane.open_window(
+        conn, "skills", legacy_since=L.get_cursor(conn).get("last_scan_at"), backfill=backfill
+    )
+    substantive, carry = lane.sessions(conn, window, limit=limit, wanted=SM.is_substantive)
+    # Every stage covers the episodes up to where the session walk stopped, so the stages
+    # agree on what this run consumed and the next run starts right after it.
+    covered = replace(window, until_id=carry)
 
-    skills = SM.load_skills()
-    catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(skills.items()))
+    catalog = SM.load_catalog(conn)
+    skills = dict(catalog)
+    catalog_text = SM.format_catalog(catalog)
     seen: set[int] = set()
 
     print(
-        f"[dream→skills] last_scan_at={last}  model={os.environ.get('SKILL_MEASURE_MODEL', 'opus')}"
+        f"[dream→skills] episodes {covered.after_id}..{covered.until_id} "
+        f"(newest {window.until_id})  model={os.environ.get('SKILL_MEASURE_MODEL', 'opus')}"
     )
     print("consolidate:", consolidate_pass(conn, seen))
-    print("usage:", sync_usage(conn, last))
-
-    views = DB.sessions_since(last, max_sessions=limit * 4)
-    substantive = [v for v in views if SM.is_substantive(v)][:limit]
+    usage, fires = sync_usage(conn, covered)
+    print("usage:", usage)
     print(f"substantive sessions to judge: {len(substantive)}")
 
-    print("derive:", run_derive(conn, substantive, catalog, seen))
-    print("retune:", run_retune(conn, substantive, catalog, seen, skills))
-    print("grounded:", capture_grounded(conn, last, seen))
+    print("derive:", run_derive(conn, substantive, catalog_text, seen))
+    print("retune:", run_retune(conn, substantive, catalog_text, seen, skills))
+    lane.mark_judged(conn, "skills", substantive)
+    conn.commit()
+    print("grounded:", capture_grounded(conn, covered, fires, seen))
 
     # v2 detectors — on by default; SYNAPSE_SKILLS_DETECTORS is the kill switch
     # (comma list to run a subset, empty string to disable all).
@@ -382,16 +397,19 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
         if d.strip()
     }
     if "struggle_arc" in detectors:
-        print("struggle_arc:", struggle_arc.run(conn, since=last))
+        print("struggle_arc:", struggle_arc.run(conn, window=covered, catalog=catalog))
     if "post_fire" in detectors:
-        print("post_fire:", post_fire.run(conn, since=last))
+        print("post_fire:", post_fire.run(conn, fires=fires, catalog=catalog))
     if "procedure_miner" in detectors and procedure_miner.due(conn):
-        print("procedure_miner:", procedure_miner.run(conn))
+        print("procedure_miner:", procedure_miner.run(conn, catalog=catalog))
 
     print("drafts:", skill_draft.draft_pending(conn))
     print("decay:", L.decay_stale(conn))
     print("digest:", discord_digest(conn, no_discord))
 
+    lane.advance(conn, window, carry)
+    # last_scan_at is the cursor a database without the dream lane cursor tables (and an
+    # older image) reads; see dream/lane.py.
     L.update_cursor(
         conn,
         run_started,
@@ -408,7 +426,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--backfill", action="store_true", help="ignore watermark; scan 30d")
+    ap.add_argument("--backfill", action="store_true", help="ignore the cursor; scan 30d")
     ap.add_argument("--limit", type=int, default=40, help="max substantive sessions to judge")
     ap.add_argument("--no-discord", action="store_true")
     args = ap.parse_args()

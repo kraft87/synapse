@@ -16,6 +16,7 @@ from datetime import UTC, datetime
 import pytest
 
 import dream.skills.struggle_arc as SA
+from dream.lane import Window
 
 _TS = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -145,9 +146,10 @@ def _window(sid="s1", turns=None):
 
 
 def _wire(monkeypatch, *, episodes, window, catalog, verdict_json, calls):
-    monkeypatch.setattr(SA, "_fetch_new_episodes", lambda conn, since: episodes)
+    """Stub the fetchers, the judge and the ledger. Returns (prompts, run): run(**kw) runs
+    the detector over `episodes` against `catalog`."""
+    monkeypatch.setattr(SA, "_fetch_new_episodes", lambda conn, lane_window: episodes)
     monkeypatch.setattr(SA, "_fetch_window", lambda conn, sid, lo, hi: window)
-    monkeypatch.setattr(SA, "_load_catalog", lambda conn: catalog)
     prompts = []
 
     def judge(prompt, model=None):
@@ -156,7 +158,11 @@ def _wire(monkeypatch, *, episodes, window, catalog, verdict_json, calls):
 
     monkeypatch.setattr(SA, "_judge_call", judge)
     monkeypatch.setattr(SA.L, "merge_candidate", _stub_merge(calls))
-    return prompts
+
+    def run(**kw):
+        return SA.run(None, window=Window("skills", 0, 100), catalog=catalog, **kw)
+
+    return prompts, run
 
 
 _DERIVE_VERDICT = {
@@ -177,7 +183,7 @@ _DERIVE_VERDICT = {
 
 def test_run_derive_call_shape(monkeypatch):
     calls = []
-    prompts = _wire(
+    prompts, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=_window(),
@@ -185,7 +191,7 @@ def test_run_derive_call_shape(monkeypatch):
         verdict_json=json.dumps(_DERIVE_VERDICT),
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["flagged"] == 2 and stats["arcs"] == 1
     assert stats["derives"] == 1 and stats["retunes"] == 0
     assert len(calls) == 1
@@ -213,7 +219,7 @@ def test_run_retune_call_shape(monkeypatch):
         direction="extend",
         proposed_patch="- add a log-check step\n- verify the service restarted",
     )
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=_window(),
@@ -221,7 +227,7 @@ def test_run_retune_call_shape(monkeypatch):
         verdict_json=json.dumps(verdict),
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["retunes"] == 1 and stats["derives"] == 0
     c = calls[0]
     assert c["kind"] == "retune" and c["target_skills"] == ["widget-deploy"]
@@ -232,7 +238,7 @@ def test_run_retune_call_shape(monkeypatch):
 def test_retune_of_unknown_skill_downgrades_to_derive(monkeypatch):
     calls = []
     verdict = dict(_DERIVE_VERDICT, kind="retune", name="No Such Skill!")
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=_window(),
@@ -240,7 +246,7 @@ def test_retune_of_unknown_skill_downgrades_to_derive(monkeypatch):
         verdict_json=json.dumps(verdict),
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["derives"] == 1 and stats["retunes"] == 0
     assert calls[0]["kind"] == "derive"
     assert calls[0]["name"] == "nosuchskill"  # kebab-cleaned
@@ -251,7 +257,7 @@ def test_explicit_ask_in_window_grounds_evidence(monkeypatch):
     window = _window(
         turns=["that didn't work", "same error", "turn this into a skill so it stops happening"]
     )
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=window,
@@ -259,7 +265,7 @@ def test_explicit_ask_in_window_grounds_evidence(monkeypatch):
         verdict_json=json.dumps(_DERIVE_VERDICT),
         calls=calls,
     )
-    SA.run(None, since=None)
+    run()
     assert calls[0]["evidence"][0]["class"] == "grounded"
 
 
@@ -267,7 +273,7 @@ def test_derive_never_emitted_without_signature(monkeypatch):
     # SEV1 guard: signatureless derives wildcard-merge in the ledger resolver
     calls = []
     verdict = {k: v for k, v in _DERIVE_VERDICT.items() if k != "signature"}
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=_window(),
@@ -275,7 +281,7 @@ def test_derive_never_emitted_without_signature(monkeypatch):
         verdict_json=json.dumps(verdict),
         calls=calls,
     )
-    SA.run(None, since=None)
+    run()
     assert calls[0]["signature"]  # synthesized fallback, never empty
     assert "widget" in calls[0]["signature"]
 
@@ -290,7 +296,7 @@ def test_arc_without_tool_evidence_skipped(monkeypatch):
             "content": "[user] that's not the case",
         }
     ]
-    prompts = _wire(
+    prompts, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=window,
@@ -298,7 +304,7 @@ def test_arc_without_tool_evidence_skipped(monkeypatch):
         verdict_json=json.dumps(_DERIVE_VERDICT),
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["skipped_no_tools"] == 1
     assert not prompts and not calls  # never judged, never merged
 
@@ -312,7 +318,7 @@ def test_tool_evidence_accepts_file_paths():
 def test_not_skill_worthy_emits_nothing(monkeypatch):
     calls = []
     verdict = dict(_DERIVE_VERDICT, skill_worthy=False)
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=_window(),
@@ -320,13 +326,13 @@ def test_not_skill_worthy_emits_nothing(monkeypatch):
         verdict_json=json.dumps(verdict),
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["skipped"] == 1 and not calls
 
 
 def test_judge_garbage_counts_failure(monkeypatch):
     calls = []
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=_episodes(),
         window=_window(),
@@ -334,14 +340,14 @@ def test_judge_garbage_counts_failure(monkeypatch):
         verdict_json="I could not decide, sorry — no JSON here",
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["judge_failures"] == 1 and not calls
 
 
 def test_limit_caps_judged_arcs(monkeypatch):
     calls = []
     episodes = _episodes("s1") + _episodes("s2") + _episodes("s3")
-    prompts = _wire(
+    prompts, run = _wire(
         monkeypatch,
         episodes=episodes,
         window=_window(),
@@ -349,7 +355,7 @@ def test_limit_caps_judged_arcs(monkeypatch):
         verdict_json=json.dumps(_DERIVE_VERDICT),
         calls=calls,
     )
-    stats = SA.run(None, since=None, limit=1)
+    stats = run(limit=1)
     assert stats["arcs"] == 3
     assert len(prompts) == 1  # only the top arc reached the judge
 
@@ -365,7 +371,7 @@ def test_noise_episodes_never_flag(monkeypatch):
             "content_head": "",
         }
     ]
-    _wire(
+    _, run = _wire(
         monkeypatch,
         episodes=episodes,
         window=[],
@@ -373,7 +379,7 @@ def test_noise_episodes_never_flag(monkeypatch):
         verdict_json="{}",
         calls=calls,
     )
-    stats = SA.run(None, since=None)
+    stats = run()
     assert stats["flagged"] == 0 and stats["arcs"] == 0 and not calls
 
 
@@ -387,4 +393,4 @@ def test_salience_clamp():
 
 def test_run_signature_is_keyword_only():
     with pytest.raises(TypeError):
-        SA.run(None, None)  # since must be keyword-only
+        SA.run(None, None, [])  # window and catalog must be keyword-only

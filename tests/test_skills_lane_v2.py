@@ -10,6 +10,7 @@ Covers:
   - decay_stale: 'proposed' rows are exempt, 'observe' rows retire
   - throttled discord digest: top-5 cap and new-proposals-only pinging
   - fire_events resolves fired_at from the episode's own transcript timestamp
+  - the window stages read episodes by insertion order, bounded above
   - migration 045 idempotency + the ghost skill_usage repair
 """
 
@@ -21,9 +22,11 @@ from pathlib import Path
 
 import pytest
 
+import dream.lane as lane_mod
 import dream.skills.nightly as N
 import dream.skills.skill_db_source as DBSRC
 import dream.skills.skill_ledger as L
+import dream.skills.struggle_arc as SA
 from mcp_server.skill_sync_routes import _proposal_detail, _proposals_list
 
 MIGRATION = Path(__file__).resolve().parent.parent / "schema" / "045_skills_v2_foundation.sql"
@@ -442,40 +445,91 @@ def test_run_config_update_does_not_clobber_digest_state(lane):
 # ------------------------------------------------------- fired_at resolution
 
 
-def test_fire_events_use_transcript_time_not_ingest_clock(lane, db_url, monkeypatch):
-    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+def _max_id(conn):
+    return conn.execute("SELECT COALESCE(max(id), 0) FROM episodes").fetchone()[0]
+
+
+def _window_over(conn, insert):
+    """A lane window holding exactly the episodes `insert()` adds."""
+    after = _max_id(conn)
+    insert()
+    return lane_mod.Window("v2t", after, _max_id(conn))
+
+
+def test_fire_events_use_transcript_time_not_ingest_clock(lane):
     event_ts = "2026-05-14T10:00:00Z"
-    lane.execute(
-        "INSERT INTO episodes (session_id, sequence, platform, content, metadata, created_at) "
-        "VALUES ('v2t-fire-sess', 1, 'claude_code', %s, %s::jsonb, now())",
-        (
-            "[user] synthetic request\n[tool:Skill] {'skill': 'v2t-demo-skill'}",
-            json.dumps({"ts": event_ts}),
+    window = _window_over(
+        lane,
+        lambda: lane.execute(
+            "INSERT INTO episodes (session_id, sequence, platform, content, metadata, created_at) "
+            "VALUES ('v2t-fire-sess', 1, 'claude_code', %s, %s::jsonb, now())",
+            (
+                "[user] synthetic request\n[tool:Skill] {'skill': 'v2t-demo-skill'}",
+                json.dumps({"ts": event_ts}),
+            ),
         ),
     )
-    events = [e for e in DBSRC.fire_events(days=30) if e["session_id"] == "v2t-fire-sess"]
+    events = DBSRC.fire_events(lane, window)
     assert len(events) == 1
     assert events[0]["skill"] == "v2t-demo-skill"
     assert events[0]["fired_at"] == datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
 
 
-def test_fire_events_fall_back_to_created_at(lane, db_url, monkeypatch):
-    """A metadata-less episode falls back to created_at for its fire timestamp.
-
-    The row is dated RELATIVE to now (30 days back, inside the 90-day window). It was
-    pinned at a literal 2026-06-01, which quietly aged out of that window on 2026-08-30
-    and turned a real assertion into a calendar failure — the fallback under test has
-    nothing to do with any particular date."""
-    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+def test_fire_events_fall_back_to_created_at(lane):
+    """A metadata-less episode falls back to created_at for its fire timestamp."""
     fired_at = datetime.now(UTC).replace(microsecond=0) - timedelta(days=30)
-    lane.execute(
-        "INSERT INTO episodes (session_id, sequence, platform, content, metadata, created_at) "
-        "VALUES ('v2t-fire-sess2', 1, 'claude_code', %s, '{}'::jsonb, %s)",
-        ("[tool:Skill] {'skill': 'v2t-demo-skill'}", fired_at),
+    window = _window_over(
+        lane,
+        lambda: lane.execute(
+            "INSERT INTO episodes (session_id, sequence, platform, content, metadata, created_at) "
+            "VALUES ('v2t-fire-sess2', 1, 'claude_code', %s, '{}'::jsonb, %s)",
+            ("[tool:Skill] {'skill': 'v2t-demo-skill'}", fired_at),
+        ),
     )
-    events = [e for e in DBSRC.fire_events(days=90) if e["session_id"] == "v2t-fire-sess2"]
+    events = DBSRC.fire_events(lane, window)
     assert len(events) == 1
     assert events[0]["fired_at"] == fired_at
+
+
+def test_fire_events_read_an_offset_less_transcript_time_as_utc(lane):
+    """post_fire orders the window's fires by fired_at; a naive timestamp among aware ones
+    would make that sort raise."""
+    window = _window_over(
+        lane,
+        lambda: lane.execute(
+            "INSERT INTO episodes (session_id, sequence, platform, content, metadata) "
+            "VALUES ('v2t-fire-naive', 1, 'claude_code', %s, %s::jsonb)",
+            ("[tool:Skill] {'skill': 'v2t-demo-skill'}", json.dumps({"ts": "2026-05-14T10:00:00"})),
+        ),
+    )
+    (event,) = DBSRC.fire_events(lane, window)
+    assert event["fired_at"] == datetime(2026, 5, 14, 10, 0, tzinfo=UTC)
+
+
+def test_window_stages_see_late_uploads_and_nothing_past_the_bound(lane):
+    """The window stages (fire_events, explicit_skill_requests, the struggle-arc prescreen)
+    read the window by insertion order: a turn uploaded today with a month-old transcript
+    timestamp is in it, and a turn stored after the run read its bound is not (it belongs
+    to the next run)."""
+    old = datetime.now(UTC) - timedelta(days=30)
+    ask = "please make this into a skill"
+
+    def insert():
+        lane.execute(
+            "INSERT INTO episodes (session_id, sequence, platform, human_turn, content, "
+            "created_at) VALUES ('v2t-late', 1, 'claude_code', %s, %s, %s)",
+            (ask, "[tool:Skill] {'skill': 'v2t-demo-skill'}", old),
+        )
+
+    window = _window_over(lane, insert)
+    lane.execute(
+        "INSERT INTO episodes (session_id, sequence, platform, human_turn, content) "
+        "VALUES ('v2t-after', 1, 'claude_code', %s, %s)",
+        (ask, "[tool:Skill] {'skill': 'v2t-demo-skill'}"),
+    )
+    assert [e["session_id"] for e in DBSRC.fire_events(lane, window)] == ["v2t-late"]
+    assert [r["session_id"] for r in DBSRC.explicit_skill_requests(lane, window)] == ["v2t-late"]
+    assert [e["session_id"] for e in SA._fetch_new_episodes(lane, window)] == ["v2t-late"]
 
 
 # ------------------------------------------------- migration 045 / data repair

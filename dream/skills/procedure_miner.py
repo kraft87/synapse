@@ -379,12 +379,6 @@ _STRUCTURAL_TOKENS = frozenset(
 )
 
 
-def _load_registry(conn) -> dict[str, str]:
-    """name -> description for ACTIVE skills (dict view over the lane's shared load_catalog).
-    _covered_by_registry wants the dict; the catalog formatter re-sorts the items itself."""
-    return dict(skill_measure.load_catalog(conn))
-
-
 def _covered_by_registry(steps: list[str], registry: dict[str, str]) -> str | None:
     """Deterministic prescreen: if one existing skill's name+description mentions most of a
     cluster's distinctive tokens, the procedure is already skill-covered — don't spend LLM
@@ -535,15 +529,16 @@ def _stamp_watermark(conn, scan_night: str) -> None:
 
 
 # -------------------------------------------------------------------------- run
-def run(conn, *, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, model=None) -> dict:
-    """One weekly pass: fingerprint -> cluster -> confirm -> merge_candidate. Returns stats."""
+def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, model=None) -> dict:
+    """One weekly pass: fingerprint -> cluster -> confirm -> merge_candidate, against
+    `catalog` ((name, description) of the active skills). Returns stats."""
     scan_night = skill_measure.scan_night()
     rows = _fetch_rows(conn, window_days)
     sess_fp_pos, sess_date, examples = _occurrences(rows)
     fp_sessions = _fp_sessions(sess_fp_pos)
     clusters = _cluster(_pairs(sess_fp_pos), fp_sessions, min_sessions)
-    registry = _load_registry(conn)
-    catalog = skill_measure.format_catalog(sorted(registry.items()))
+    registry = dict(catalog)
+    catalog_text = skill_measure.format_catalog(sorted(registry.items()))
 
     stats = {
         "scan_night": scan_night,
@@ -569,7 +564,7 @@ def run(conn, *, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, model=None)
             to_confirm.append(c)
 
     for c in to_confirm[:MAX_CONFIRM]:
-        verdict = _confirm(c, sess_fp_pos, fp_sessions, examples, catalog, window_days, model)
+        verdict = _confirm(c, sess_fp_pos, fp_sessions, examples, catalog_text, window_days, model)
         stats["llm_calls"] += 1
         if not verdict or not verdict.get("procedure"):
             stats["rejected"] += 1
@@ -649,6 +644,7 @@ if __name__ == "__main__":
             json.dumps(
                 run(
                     c,
+                    catalog=skill_measure.load_catalog(c),
                     window_days=args.window_days,
                     min_sessions=args.min_sessions,
                     model=args.model,

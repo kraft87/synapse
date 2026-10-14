@@ -4,8 +4,9 @@
 
 Mines transcripts for BEHAVIORAL CORRECTIONS — moments the user corrected HOW the agent
 writes/works/behaves (not task content) — and accumulates them into config_lane.config_proposals.
-Mirrors dream/skills: scan sessions touched since the watermark -> LLM finds corrections -> union
-evidence by session in the ledger -> gate observe->proposed at N distinct sessions.
+Mirrors dream/skills: scan the sessions its episode window touched (dream/lane.py: oldest first,
+overflow rolls to the next night) -> LLM finds corrections -> union evidence by session in the
+ledger -> gate observe->proposed at N distinct sessions.
 
 PROPOSE-ONLY: writes config_proposals (the review CLI + apply phase land edits on disk). Proposals
 target a dedicated `rules/learned.md` (global) so dream's contributions never rewrite a hand-kept
@@ -21,7 +22,7 @@ from datetime import UTC, datetime
 
 import psycopg
 
-from dream.skills import skill_db_source as DB
+from dream import lane
 from dream.skills import skill_measure as SM
 from dream.skills.config import db_url
 from dream.skills.skill_measure import _extract_json
@@ -193,11 +194,15 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
         cur = conn.cursor()
         cur.execute("SELECT last_scan_at FROM config_lane.config_scan_cursor WHERE id")
         row = cur.fetchone()
-        last = None if backfill else (row[0] if row else None)
         scan_started = datetime.now(UTC)
-
-        views = DB.sessions_since(last, max_sessions=limit * 4)
-        print(f"[dream→config] last_scan_at={last}  sessions={len(views)}")
+        window = lane.open_window(
+            conn, "config", legacy_since=row[0] if row else None, backfill=backfill
+        )
+        views, carry = lane.sessions(conn, window, limit=limit * 4)
+        print(
+            f"[dream→config] episodes {window.after_id}..{carry} (newest {window.until_id})  "
+            f"sessions={len(views)}"
+        )
         found = proposed = 0
         for s in views:
             for c in scan_corrections(s):
@@ -208,6 +213,10 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
                 print(f"  [{status} n={n}] {c['rule'][:70]}")
         conn.commit()
 
+        lane.mark_judged(conn, "config", views)
+        lane.advance(conn, window, carry)
+        # last_scan_at is the cursor a database without the dream lane cursor tables (and an
+        # older image) reads; see dream/lane.py.
         cur.execute(
             "INSERT INTO config_lane.config_scan_cursor (id, last_scan_at) VALUES (true, %s) "
             "ON CONFLICT (id) DO UPDATE SET last_scan_at=EXCLUDED.last_scan_at",
