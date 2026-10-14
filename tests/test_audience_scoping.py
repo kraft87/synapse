@@ -600,7 +600,7 @@ def as_oauth_caller(monkeypatch):
 
 def test_oauth_identity_becomes_its_own_surface_id(as_oauth_caller):
     as_oauth_caller("Kyle")
-    assert server._caller_surface() == "oauth:kyle"  # lowercased, namespaced
+    assert server._caller_trust().surface_id == "oauth:kyle"  # lowercased, namespaced
 
 
 def test_machine_token_callers_resolve_to_no_surface(monkeypatch):
@@ -611,7 +611,7 @@ def test_machine_token_callers_resolve_to_no_surface(monkeypatch):
         "get_access_token",
         lambda: _OAuthToken({"preferred_username": "kyle"}, server._MACHINE_CLIENT_ID),
     )
-    assert server._caller_surface() is None
+    assert server._caller_trust().surface_id is None
     assert server._caller_trust() == UNKNOWN_SURFACE
 
 
@@ -619,7 +619,7 @@ def test_no_token_context_resolves_to_no_surface(monkeypatch):
     """Open dev/stdio servers and any call outside a request: no credential evidence,
     so the fail-closed verdict applies."""
     monkeypatch.setattr(server, "get_access_token", lambda: None)
-    assert server._caller_surface() is None
+    assert server._caller_trust().surface_id is None
     assert server._caller_trust() == UNKNOWN_SURFACE
 
 
@@ -627,7 +627,7 @@ def test_an_oauth_token_with_no_identity_claim_derives_nothing(monkeypatch):
     """Fail-closed on a malformed token: no claim means no derived id, never a guess."""
     monkeypatch.setattr(server, "_IDENTITY_CLAIMS", ("preferred_username",))
     monkeypatch.setattr(server, "get_access_token", lambda: _OAuthToken({}))
-    assert server._caller_surface() is None
+    assert server._caller_trust().surface_id is None
 
 
 @pytest.fixture()

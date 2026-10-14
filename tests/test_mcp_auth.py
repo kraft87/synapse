@@ -219,7 +219,7 @@ def test_identity_claims_track_the_active_leg(monkeypatch):
     # derivation stays inert and a call with no device credential resolves to no surface.
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
     assert s._IDENTITY_CLAIMS == ()
-    assert s._caller_surface() is None
+    assert s._caller_trust().surface_id is None
 
 
 def test_machine_authorized_constant_time_check(monkeypatch):

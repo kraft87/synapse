@@ -162,7 +162,7 @@ def _claims_identity(claims: dict, claim_keys: tuple[str, ...]) -> str:
     """First non-empty identity claim, lowercased; "" when none is present.
 
     Deliberately ONE definition: the allowlist gate below and the audience-scoping
-    surface derivation (:func:`_caller_surface`) must never disagree about who a caller
+    surface derivation (:func:`_caller_trust`) must never disagree about who a caller
     is, or a login could clear the gate as one identity and be served as another.
     """
     return next((str(claims[k]).lower() for k in claim_keys if claims.get(k)), "")
@@ -240,14 +240,6 @@ def _access_token() -> Any:
         return get_access_token()
     except Exception:  # pragma: no cover - defensive
         return None
-
-
-def _caller_surface() -> str | None:
-    """The surface ID for this call, for display and telemetry.
-
-    See :func:`_caller_trust` for the verdict itself; this is the id that goes with it.
-    """
-    return _caller_trust().surface_id
 
 
 def _caller_trust() -> SurfaceTrust:
