@@ -409,14 +409,16 @@ class _FakeVoyageClient:
     def __init__(self, api_key: str = "", timeout: float | None = None, **_: Any) -> None:
         self.timeout = timeout
         self.calls: list[str] = []
+        self.tokenized: list[list[str]] = []
         _FakeVoyageClient.built.append(self)
 
-    def count_tokens(self, texts: list[str], model: str = "") -> int:
-        return 1
+    def tokenize(self, texts: list[str], model: str = "") -> list[list[int]]:
+        self.tokenized.append(list(texts))
+        return [[0] * len(t.split()) for t in texts]
 
     def embed(self, texts: list[str], **kwargs: Any) -> Any:
         self.calls.append(f"embed:{kwargs['input_type']}")
-        return type("R", (), {"embeddings": [[0.0] for _ in texts]})()
+        return type("R", (), {"embeddings": [[float(len(t))] for t in texts]})()
 
     def rerank(self, query: str, documents: list[str], **kwargs: Any) -> Any:
         self.calls.append("rerank")
@@ -478,6 +480,179 @@ class TestVoyageTimeouts:
         rate_limit = _named_error("RateLimitError")
         assert not _voyage_stop(self._state(rate_limit, attempt=8, elapsed=61))
         assert _voyage_stop(self._state(rate_limit, attempt=9, elapsed=181))
+
+
+@pytest.fixture
+def fake_voyage(monkeypatch):
+    """Fake voyageai.Client and an empty backend registry, so factory calls build fresh
+    instances over the fake instead of returning one an earlier test built."""
+    import voyageai
+
+    import ingestion.embedding as emb_mod
+
+    _FakeVoyageClient.built = []
+    monkeypatch.setattr(voyageai, "Client", _FakeVoyageClient)
+    monkeypatch.setattr(emb_mod, "_SHARED", {})
+    return _FakeVoyageClient
+
+
+class _FakeClock:
+    """Stands in for tenacity's clock and its backoff sleep: sleeping advances time."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+class TestVoyageRetryPolicy:
+    """Recall waits on its query embed and reranks; batch work can wait out a 429."""
+
+    @pytest.fixture
+    def clock(self, monkeypatch, fake_voyage):
+        import tenacity
+
+        clock = _FakeClock()
+        monkeypatch.setattr(tenacity, "time", clock)
+        monkeypatch.setattr(tenacity.nap, "time", clock)
+        return clock
+
+    @staticmethod
+    def _rate_limited(emb: VoyageEmbeddingModel, clock: _FakeClock) -> list[float]:
+        """Make every Voyage call on ``emb`` a 429; return the times of the attempts."""
+        attempts: list[float] = []
+
+        def _429(*_a: Any, **_k: Any) -> Any:
+            attempts.append(clock.now)
+            raise _named_error("RateLimitError")
+
+        emb._client.embed = _429
+        emb._client.rerank = _429
+        return attempts
+
+    def test_interactive_429_gives_up_within_seconds(self, clock):
+        emb = create_embedder(voyage_api_key="k", interactive=True)
+        attempts = self._rate_limited(emb, clock)
+        with pytest.raises(_VoyageError):
+            emb.embed(["what did I decide"], task="query")
+        assert len(attempts) > 1  # a blip still gets retried
+        assert clock.now < 5
+
+    def test_interactive_rerank_429_gives_up_within_seconds(self, clock):
+        rr = create_reranker(voyage_api_key="k", interactive=True)
+        assert isinstance(rr, VoyageEmbeddingModel)
+        attempts = self._rate_limited(rr, clock)
+        with pytest.raises(_VoyageError):
+            rr.rerank_scored("q", ["d1", "d2"])
+        assert len(attempts) > 1
+        assert clock.now < 5
+
+    def test_batch_429_keeps_three_minute_patience(self, clock):
+        emb = create_embedder(voyage_api_key="k")
+        attempts = self._rate_limited(emb, clock)
+        with pytest.raises(_VoyageError):
+            emb.embed(["what did I decide"], task="query")
+        assert attempts[-1] >= 120
+
+    def test_interactive_and_batch_are_separate_instances(self, fake_voyage):
+        batch = create_embedder(voyage_api_key="k")
+        interactive = create_embedder(voyage_api_key="k", interactive=True)
+        assert batch is not interactive
+        assert interactive._interactive and not batch._interactive
+
+
+class TestSharedBackends:
+    """A voyageai Client pins its ~43 MB tokenizer for the life of the process, so the
+    factories hand every caller with the same configuration the same instance."""
+
+    def test_same_config_returns_one_embedder(self, fake_voyage):
+        first = create_embedder(voyage_api_key="k")
+        assert create_embedder(voyage_api_key="k") is first
+        assert len(fake_voyage.built) == 2  # one model: its query and bulk clients
+
+    def test_changed_config_builds_a_new_embedder(self, fake_voyage, monkeypatch):
+        first = create_embedder(voyage_api_key="k")
+        assert create_embedder(voyage_api_key="other") is not first
+        monkeypatch.setenv("SYNAPSE_EMBED_DIMS", "1024")
+        resized = create_embedder(voyage_api_key="k")
+        assert resized is not first
+        assert resized.dimensions == 1024
+
+    def test_openai_embedder_is_shared(self, monkeypatch):
+        import ingestion.embedding as emb_mod
+
+        monkeypatch.setattr(emb_mod, "_SHARED", {})
+        monkeypatch.setenv("SYNAPSE_EMBED_PROVIDER", "openai")
+        monkeypatch.setenv("SYNAPSE_EMBED_BASE_URL", "http://x:7997")
+        monkeypatch.setenv("SYNAPSE_EMBED_MODEL", "m")
+        monkeypatch.setenv("SYNAPSE_EMBED_DIMS", "768")
+        assert create_embedder() is create_embedder()
+
+    def test_same_config_returns_one_reranker(self, fake_voyage, monkeypatch):
+        assert create_reranker(voyage_api_key="k") is create_reranker(voyage_api_key="k")
+        monkeypatch.setenv("SYNAPSE_RERANK_PROVIDER", "http")
+        monkeypatch.setenv("SYNAPSE_RERANK_BASE_URL", "http://local-inference:7997")
+        assert create_reranker() is create_reranker()
+
+
+class TestVoyageTokenCounting:
+    def test_a_batch_is_tokenized_in_one_call(self, fake_voyage):
+        emb = VoyageEmbeddingModel(api_key="k")
+        emb.embed(["one turn", "another turn here", "a third"], task="document")
+        (counter,) = [c for c in fake_voyage.built if c.tokenized]
+        assert counter.tokenized == [["one turn", "another turn here", "a third"]]
+
+    def test_a_single_text_needs_no_tokenizer(self, fake_voyage):
+        emb = VoyageEmbeddingModel(api_key="k")
+        emb.embed(["what did I decide"], task="query")
+        emb.embed(["a lone document"], task="document")
+        assert not any(c.tokenized for c in fake_voyage.built)
+
+
+class TestQueryCache:
+    def test_repeated_query_is_embedded_once(self, fake_voyage):
+        emb = VoyageEmbeddingModel(api_key="k")
+        first = emb.embed(["what did I decide"], task="query")
+        first[0].append(99.0)  # callers own what they get back
+        again = emb.embed(["what did I decide"], task="query")
+        assert again == [[17.0]]
+        calls = [call for c in fake_voyage.built for call in c.calls]
+        assert calls == ["embed:query"]
+
+    def test_documents_and_batches_are_not_cached(self, fake_voyage):
+        emb = VoyageEmbeddingModel(api_key="k")
+        emb.embed(["same text"], task="document")
+        emb.embed(["same text"], task="document")
+        emb.embed(["q1", "q2"], task="query")
+        emb.embed(["q1", "q2"], task="query")
+        calls = sorted(call for c in fake_voyage.built for call in c.calls)
+        assert calls == ["embed:document", "embed:document", "embed:query", "embed:query"]
+
+    def test_least_recent_query_is_evicted(self, fake_voyage, monkeypatch):
+        import ingestion.embedding as emb_mod
+
+        monkeypatch.setattr(emb_mod, "_QUERY_CACHE_SIZE", 2)
+        emb = VoyageEmbeddingModel(api_key="k")
+        for q in ("a", "b", "a", "c", "a", "b"):
+            emb.embed([q], task="query")
+        # a, b, (a hit), c evicts b, (a hit), b again
+        calls = [call for c in fake_voyage.built for call in c.calls]
+        assert len(calls) == 4
+
+    def test_openai_backend_caches_queries(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(200, json=_embeddings_body([[0.5] * 4]))
+
+        emb = _openai_model(handler)
+        assert emb.embed(["q"], task="query") == emb.embed(["q"], task="query") == [[0.5] * 4]
+        assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -563,22 +738,6 @@ class TestHTTPReranker:
 
         rr = _http_reranker(handler)
         assert rr.rerank_scored("q", ["a", "b"]) == [(1, 0.8), (0, 0.3)]
-
-    def test_rerank_returns_indices_only(self):
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                200,
-                json={
-                    "results": [
-                        {"index": 2, "relevance_score": 0.9},
-                        {"index": 0, "relevance_score": 0.5},
-                        {"index": 1, "relevance_score": 0.1},
-                    ]
-                },
-            )
-
-        rr = _http_reranker(handler)
-        assert rr.rerank("q", ["a", "b", "c"]) == [2, 0, 1]
 
     def test_top_k_slices(self):
         def handler(request: httpx.Request) -> httpx.Response:

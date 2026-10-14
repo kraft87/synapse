@@ -2,17 +2,22 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator, Mapping
+import threading
+from array import array
+from collections import OrderedDict
+from collections.abc import Callable, Iterator, Mapping
 from typing import Any, Literal, Protocol, cast
 
 import httpx
 from tenacity import (
+    Retrying,
     before_sleep_log,
     retry,
     retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     stop_after_delay,
+    stop_before_delay,
     wait_exponential,
     wait_random_exponential,
 )
@@ -81,16 +86,23 @@ def _is_voyage_retryable(exc: BaseException) -> bool:
 _RERANK_MODEL = os.environ.get("SYNAPSE_RERANK_MODEL", "rerank-3-lite")
 
 
-# Retry policy differs by failure type. A 429 (TPM rate-limit) is GUARANTEED transient —
-# the rolling-minute token window clears on its own — so be patient: bigger backoff and
-# ride it out for up to 3 min (this is what eliminates the rare _rerank_pool->RRF fallback
-# under heavy parallel load). Other transient errors (5xx / timeout / connection) might be a
-# real outage, so retry briefly — at most 6 attempts and about a minute — then re-raise and
-# let the caller degrade gracefully rather than hang a live recall() for minutes.
+# Batch retry policy (poller, dream, note and timeline writes) differs by failure type. A 429
+# (TPM rate-limit) is GUARANTEED transient — the rolling-minute token window clears on its
+# own — so be patient: bigger backoff and ride it out for up to 3 min. Other transient errors
+# (5xx / timeout / connection) might be a real outage, so retry briefly — at most 6 attempts
+# and about a minute — then re-raise and let the caller decide.
 _RATE_LIMIT_WAIT = wait_random_exponential(multiplier=2, max=90)
 _OTHER_WAIT = wait_random_exponential(multiplier=1, max=20)
 _RATE_LIMIT_STOP = stop_after_delay(180)
 _OTHER_STOP = stop_after_attempt(6) | stop_after_delay(60)
+
+# Interactive policy (an embedder or reranker built with interactive=True: recall's query
+# embed and reranks). A client waiting on recall() times out long before the batch patience
+# runs out, and recall degrades on its own (BM25-only legs, RRF order), so every retryable
+# error, 429 included, gets short backoffs that stop before _INTERACTIVE_RETRY_S have passed.
+_INTERACTIVE_RETRY_S = 5.0
+_INTERACTIVE_WAIT = wait_random_exponential(multiplier=0.5, max=2)
+_INTERACTIVE_STOP = stop_before_delay(_INTERACTIVE_RETRY_S)
 
 # Per-request timeouts. voyageai's default is 600 s, so one stalled request (retried as a
 # Timeout) could hold a recall() for most of an hour. Query embeds and reranks are small and
@@ -112,15 +124,53 @@ def _voyage_stop(retry_state: Any) -> bool:
     return (_RATE_LIMIT_STOP if _is_rate_limit(retry_state) else _OTHER_STOP)(retry_state)
 
 
-_voyage_retry = retry(
-    retry=retry_if_exception(_is_voyage_retryable),
-    wait=_voyage_wait,
-    stop=_voyage_stop,
-    # cast: tenacity's before_sleep_log wants a LoggerProtocol; stdlib Logger.log has a
-    # stricter (compatible) signature the stubs reject. Not a redundant cast under strict.
-    before_sleep=before_sleep_log(cast(Any, logger), logging.WARNING),
-    reraise=True,
-)
+def _voyage_retrying(interactive: bool) -> Retrying:
+    """The tenacity controller for one Voyage call: transient errors retry, permanent
+    ones (auth / invalid-request / malformed) raise at once, and after the last retry
+    the error re-raises so the caller decides the fallback."""
+    return Retrying(
+        retry=retry_if_exception(_is_voyage_retryable),
+        wait=_INTERACTIVE_WAIT if interactive else _voyage_wait,
+        stop=_INTERACTIVE_STOP if interactive else _voyage_stop,
+        # cast: tenacity's before_sleep_log wants a LoggerProtocol; stdlib Logger.log has a
+        # stricter (compatible) signature the stubs reject. Not a redundant cast under strict.
+        before_sleep=before_sleep_log(cast(Any, logger), logging.WARNING),
+        reraise=True,
+    )
+
+
+# Recent query vectors per embedder. Recall embeds its query on every call, and agents retry
+# a thin recall() with recall_full_turns on the same query; a hit skips that round trip.
+# Stored as packed doubles (16 KB per 2048-dim vector) rather than lists of float objects.
+_QUERY_CACHE_SIZE = 256
+
+
+class _QueryCache:
+    """LRU of single-query embeds. Only ``task="query"`` calls with one text are cached:
+    that is recall's shape, and a document batch is never repeated verbatim."""
+
+    def __init__(self) -> None:
+        self._vectors: OrderedDict[str, array[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(self, texts: list[str], task: str) -> list[list[float]] | None:
+        if task != "query" or len(texts) != 1:
+            return None
+        with self._lock:
+            vec = self._vectors.get(texts[0])
+            if vec is None:
+                return None
+            self._vectors.move_to_end(texts[0])
+        return [list(vec)]  # a fresh list: callers may mutate what they get
+
+    def put(self, texts: list[str], task: str, vectors: list[list[float]]) -> None:
+        if task != "query" or len(texts) != 1 or len(vectors) != 1:
+            return
+        with self._lock:
+            self._vectors[texts[0]] = array("d", vectors[0])
+            self._vectors.move_to_end(texts[0])
+            while len(self._vectors) > _QUERY_CACHE_SIZE:
+                self._vectors.popitem(last=False)
 
 
 def _pack_batches(
@@ -157,7 +207,11 @@ class EmbeddingModel(Protocol):
 
 class VoyageEmbeddingModel:
     """Voyage AI embeddings + rerank (the default backend): voyage-4-large at
-    2048 dims unless overridden via ``create_embedder()``."""
+    2048 dims unless overridden via ``create_embedder()``.
+
+    ``interactive`` picks the retry policy: True for a caller someone is waiting
+    on (``_INTERACTIVE_STOP``, a few seconds), False for batch work
+    (``_voyage_stop``, up to 3 minutes on a 429)."""
 
     _client: Any
     model_name: str
@@ -167,6 +221,8 @@ class VoyageEmbeddingModel:
         api_key: str,
         model: str = DEFAULT_VOYAGE_EMBED_MODEL,
         dims: int = DEFAULT_EMBED_DIMS,
+        *,
+        interactive: bool = False,
     ) -> None:
         from voyageai import Client  # type: ignore[attr-defined]
 
@@ -175,6 +231,8 @@ class VoyageEmbeddingModel:
         self._bulk_client = Client(api_key=api_key, timeout=_VOYAGE_BULK_TIMEOUT_S)
         self.model_name = model
         self._dims = dims
+        self._interactive = interactive
+        self._queries = _QueryCache()
 
     @property
     def dimensions(self) -> int:
@@ -191,41 +249,35 @@ class VoyageEmbeddingModel:
         texts: list[str],
         task: Literal["query", "document", "entity"] = "document",
     ) -> list[list[float]]:
+        if (hit := self._queries.get(texts, task)) is not None:
+            return hit
         input_type = "query" if task == "query" else "document"
         capped = [
             t[: self._PER_ITEM_CHAR_CAP] if len(t) > self._PER_ITEM_CHAR_CAP else t for t in texts
         ]
         if not capped:
             return []
-        item_tokens = [self._client.count_tokens([t], model=self.model_name) for t in capped]
+        if len(capped) == 1:
+            # A lone text is one request whatever its size (24K chars is far under the
+            # 120K-token cap): no need to load the local tokenizer.
+            item_tokens = [0]
+        else:
+            # One encode_batch over every text, not one tokenizer call per text.
+            item_tokens = [len(e) for e in self._client.tokenize(capped, model=self.model_name)]
         out: list[list[float]] = []
         for batch in _pack_batches(capped, item_tokens, self._MAX_BATCH, self._TARGET_BATCH_TOKENS):
             result = self._embed_batch(batch, input_type)
             out.extend(result.embeddings)
+        self._queries.put(texts, task, out)
         return out
-
-    def rerank(self, query: str, documents: list[str], top_k: int | None = None) -> list[int]:
-        """Voyage cross-encoder (``_RERANK_MODEL``): return document indices ordered
-        most→least relevant to the query. Used by recall() to pick which pooled
-        summary/chunk candidates to surface. Transient failures are retried with
-        backoff (_voyage_retry); a permanent failure still raises so the caller
-        decides the fallback."""
-        if not documents:
-            return []
-        res = self._rerank_call(query, documents, top_k or len(documents))
-        return [r.index for r in res.results]
 
     def rerank_scored(
         self, query: str, documents: list[str], top_k: int | None = None
     ) -> list[tuple[int, float]]:
-        """Same Voyage rerank call as ``rerank()`` but returns
-        ``(doc_index, relevance_score)`` pairs in most→least relevant order.
-
-        ``rerank()`` discards the scores; callers that want a RELATIVE score
-        cutoff (variable-k serving — keep docs scoring >= tau*top) need them.
-        Transient failures retry via ``_voyage_retry``; permanent ones raise so
-        the caller decides the fallback (recall._rerank_pool_scored degrades to
-        RRF order)."""
+        """Voyage cross-encoder (``_RERANK_MODEL``): ``(doc_index, relevance_score)``
+        pairs in most→least relevant order. Transient failures retry under this
+        instance's policy; permanent ones raise so the caller decides the fallback
+        (recall's rerank legs degrade to RRF order)."""
         if not documents:
             return []
         res = self._rerank_call(query, documents, top_k or len(documents))
@@ -233,16 +285,20 @@ class VoyageEmbeddingModel:
 
     # Raw Voyage API calls, wrapped in tenacity backoff so transient 429/5xx/timeout
     # are retried (dynamic rate negotiation) instead of bubbling up as a hard failure.
-    @_voyage_retry
     def _embed_batch(self, batch: list[str], input_type: str) -> Any:
         client = self._client if input_type == "query" else self._bulk_client
-        return client.embed(
-            batch, model=self.model_name, input_type=input_type, output_dimension=self._dims
+        return _voyage_retrying(self._interactive)(
+            client.embed,
+            batch,
+            model=self.model_name,
+            input_type=input_type,
+            output_dimension=self._dims,
         )
 
-    @_voyage_retry
     def _rerank_call(self, query: str, documents: list[str], top_k: int) -> Any:
-        return self._client.rerank(query, documents, model=_RERANK_MODEL, top_k=top_k)
+        return _voyage_retrying(self._interactive)(
+            self._client.rerank, query, documents, model=_RERANK_MODEL, top_k=top_k
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -385,6 +441,7 @@ class OpenAIEmbeddingModel:
             timeout=_EMBED_HTTP_TIMEOUT,
             transport=transport,
         )
+        self._queries = _QueryCache()
 
     @property
     def dimensions(self) -> int:
@@ -397,8 +454,9 @@ class OpenAIEmbeddingModel:
     ) -> list[list[float]]:
         # The OpenAI /embeddings protocol has no input_type / task field —
         # symmetric-embedding models (bge, gte, e5-base usage without prefixes)
-        # are the fit here; ``task`` is accepted for interface parity.
-        del task
+        # are the fit here; ``task`` only selects the query cache.
+        if (hit := self._queries.get(texts, task)) is not None:
+            return hit
         capped = [
             t[: self._PER_ITEM_CHAR_CAP] if len(t) > self._PER_ITEM_CHAR_CAP else t for t in texts
         ]
@@ -407,6 +465,7 @@ class OpenAIEmbeddingModel:
             capped, [len(t) for t in capped], self._MAX_BATCH, self._TARGET_BATCH_CHARS
         ):
             out.extend(self._embed_batch(batch))
+        self._queries.put(texts, task, out)
         return out
 
     @_HTTP_RETRY
@@ -479,10 +538,6 @@ class HTTPReranker:
             timeout=_EMBED_HTTP_TIMEOUT,
             transport=transport,
         )
-
-    def rerank(self, query: str, documents: list[str], top_k: int | None = None) -> list[int]:
-        """Document indices ordered most→least relevant (Voyage-interface parity)."""
-        return [i for i, _ in self.rerank_scored(query, documents, top_k)]
 
     def rerank_scored(
         self, query: str, documents: list[str], top_k: int | None = None
@@ -602,11 +657,31 @@ def _validate_embedding_meta(db_url: str, dims: int, model: str) -> None:
 # Factories — backend selection via SYNAPSE_EMBED_PROVIDER / SYNAPSE_RERANK_PROVIDER
 # ---------------------------------------------------------------------------
 
+# One backend instance per resolved configuration, for the life of the process. A voyageai
+# Client loads its tokenizer (~0.3 s, ~43 MB) on first use into a functools.lru_cache keyed
+# on the Client, which then keeps it alive: building an embedder per remember() or per
+# timeline push reloaded the tokenizer every time and grew the MCP server by ~43 MB a call.
+# Every backend is safe to share across threads (voyageai keeps a requests session per
+# thread; httpx.Client is thread-safe).
+_SHARED: dict[tuple[Any, ...], Any] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def _shared[T](key: tuple[Any, ...], build: Callable[[], T]) -> T:
+    with _SHARED_LOCK:
+        if key not in _SHARED:
+            _SHARED[key] = build()
+        return cast(T, _SHARED[key])
+
 
 def create_embedder(
-    voyage_api_key: str | None = None, db_url: str | None = None
+    voyage_api_key: str | None = None,
+    db_url: str | None = None,
+    *,
+    interactive: bool = False,
 ) -> VoyageEmbeddingModel | OpenAIEmbeddingModel:
-    """Build the embedding backend from env. All construction sites route here.
+    """The embedding backend configured in env. All construction sites route here,
+    and calls with the same configuration share one instance (see ``_SHARED``).
 
     ``SYNAPSE_EMBED_PROVIDER``:
 
@@ -619,6 +694,11 @@ def create_embedder(
       ``SYNAPSE_EMBED_MODEL``, ``SYNAPSE_EMBED_DIMS`` — all but the key
       required, so a half-configured backend fails at startup, not mid-ingest).
 
+    ``interactive=True`` is for callers someone is waiting on (recall): Voyage
+    retries give up within ``_INTERACTIVE_RETRY_S`` instead of riding out a 429
+    for 3 minutes. The openai backend's retry budget (3 attempts, ~6 s of
+    backoff) is already that short, so it ignores the flag.
+
     When ``db_url`` is given, the configured dims/model are validated against
     the values recorded in synapse_meta at provision time (schema 034) and a
     mismatch raises ``EmbeddingConfigError`` — see ``_validate_embedding_meta``.
@@ -629,7 +709,12 @@ def create_embedder(
     if provider == "voyage":
         key = voyage_api_key if voyage_api_key is not None else os.environ.get("VOYAGE_API_KEY", "")
         model = os.environ.get("SYNAPSE_EMBED_MODEL", "").strip() or DEFAULT_VOYAGE_EMBED_MODEL
-        emb = VoyageEmbeddingModel(api_key=key, model=model, dims=dims)
+        emb = _shared(
+            ("voyage-embed", key, model, dims, interactive),
+            lambda: VoyageEmbeddingModel(
+                api_key=key, model=model, dims=dims, interactive=interactive
+            ),
+        )
     elif provider == "openai":
         base_url = os.environ.get("SYNAPSE_EMBED_BASE_URL", "").strip()
         model = os.environ.get("SYNAPSE_EMBED_MODEL", "").strip()
@@ -653,12 +738,16 @@ def create_embedder(
             )
         send_dims_env = os.environ.get("SYNAPSE_EMBED_SEND_DIMS", "").strip().lower()
         send_dimensions = {"1": True, "true": True, "0": False, "false": False}.get(send_dims_env)
-        emb = OpenAIEmbeddingModel(
-            base_url=base_url,
-            api_key=os.environ.get("SYNAPSE_EMBED_API_KEY", ""),
-            model=model,
-            dims=dims,
-            send_dimensions=send_dimensions,
+        api_key = os.environ.get("SYNAPSE_EMBED_API_KEY", "")
+        emb = _shared(
+            ("openai-embed", base_url, api_key, model, dims, send_dimensions),
+            lambda: OpenAIEmbeddingModel(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                dims=dims,
+                send_dimensions=send_dimensions,
+            ),
         )
     else:
         raise EmbeddingConfigError(
@@ -671,8 +760,11 @@ def create_embedder(
 
 def create_reranker(
     voyage_api_key: str | None = None,
+    *,
+    interactive: bool = False,
 ) -> VoyageEmbeddingModel | HTTPReranker | None:
-    """Build the rerank backend from env, or ``None`` when rerank is disabled.
+    """The rerank backend configured in env, or ``None`` when rerank is disabled.
+    Calls with the same configuration share one instance (see ``_SHARED``).
 
     ``SYNAPSE_RERANK_PROVIDER``:
 
@@ -682,13 +774,18 @@ def create_reranker(
       (``SYNAPSE_RERANK_BASE_URL``, optional ``SYNAPSE_RERANK_API_KEY``,
       ``SYNAPSE_RERANK_MODEL`` = the served model id).
     * ``none`` — no rerank calls at all; recall serves the pre-rerank fusion
-      (RRF) candidate order. Logged once here (factory runs once per process),
-      not per-query.
+      (RRF) candidate order. Logged here (recall builds its reranker once),
+      not per query.
+
+    ``interactive`` as for ``create_embedder``: Voyage only.
     """
     provider = rerank_provider()
     if provider == "voyage":
         key = voyage_api_key if voyage_api_key is not None else os.environ.get("VOYAGE_API_KEY", "")
-        return VoyageEmbeddingModel(api_key=key)
+        return _shared(
+            ("voyage-rerank", key, interactive),
+            lambda: VoyageEmbeddingModel(api_key=key, interactive=interactive),
+        )
     if provider == "http":
         base_url = os.environ.get("SYNAPSE_RERANK_BASE_URL", "").strip()
         if not base_url:
@@ -696,10 +793,11 @@ def create_reranker(
                 "SYNAPSE_RERANK_PROVIDER=http requires SYNAPSE_RERANK_BASE_URL "
                 "(e.g. http://local-inference:7997 for the bundled compose profile)."
             )
-        return HTTPReranker(
-            base_url=base_url,
-            api_key=os.environ.get("SYNAPSE_RERANK_API_KEY", ""),
-            model=os.environ.get("SYNAPSE_RERANK_MODEL", "").strip(),
+        api_key = os.environ.get("SYNAPSE_RERANK_API_KEY", "")
+        model = os.environ.get("SYNAPSE_RERANK_MODEL", "").strip()
+        return _shared(
+            ("http-rerank", base_url, api_key, model),
+            lambda: HTTPReranker(base_url=base_url, api_key=api_key, model=model),
         )
     if provider == "none":
         logger.info(
