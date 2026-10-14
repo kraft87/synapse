@@ -103,29 +103,29 @@ def test_retune_without_quote_stays_observe(lane):
     assert r["status"] == "observe"
 
 
-def test_derive_proposes_on_second_scan_night(lane):
-    ev1 = [
+def _arc(night, date):
+    return [
         {
             "session_id": "v2t-sess-a",
             "class": "judge",
             "signal": "struggle_arc",
-            "scan_night": "2026-07-17",
+            "scan_night": night,
+            "date": date,
         }
     ]
-    r1 = _mc(lane, "derive", "v2t-proc", ev1, signature="synthetic restic nas backup rclone")
+
+
+def test_derive_proposes_when_the_work_recurs_on_a_second_day(lane):
+    sig = "synthetic restic nas backup rclone"
+    r1 = _mc(lane, "derive", "v2t-proc", _arc("2026-07-17", "2026-07-17"), signature=sig)
     assert r1["status"] == "observe"
-    ev2 = [
-        {
-            "session_id": "v2t-sess-a",
-            "class": "judge",
-            "signal": "struggle_arc",
-            "scan_night": "2026-07-18",
-        }
-    ]
-    r2 = _mc(lane, "derive", "v2t-proc", ev2, signature="synthetic restic nas backup rclone")
-    assert r2["merged"] is True
-    assert r2["id"] == r1["id"]
-    assert r2["status"] == "proposed"
+    # the same arc seen again by a later scan is not recurrence
+    r2 = _mc(lane, "derive", "v2t-proc", _arc("2026-07-18", "2026-07-17"), signature=sig)
+    assert r2["merged"] is True and r2["id"] == r1["id"]
+    assert r2["status"] == "observe"
+    r3 = _mc(lane, "derive", "v2t-proc", _arc("2026-07-19", "2026-07-19"), signature=sig)
+    assert r3["id"] == r1["id"]
+    assert r3["status"] == "proposed"
 
 
 def test_derive_proposes_on_salience(lane):
@@ -175,8 +175,8 @@ def test_salience_ratchets_up_never_down(lane):
     assert r3["status"] == "proposed"  # 5 >= PROPOSE_SALIENCE
 
 
-def test_legacy_evidence_without_scan_night_counts_one_bucket(lane):
-    # two legacy sightings (no scan_night) = one recurrence bucket -> still observe
+def test_legacy_evidence_without_scan_night_is_not_recurrence(lane):
+    # two legacy sightings (no scan_night, no date) collapse to one entry -> still observe
     for _ in range(2):
         r = _mc(
             lane,

@@ -10,7 +10,7 @@ retune/consolidate = (name,direction)/target), evidence accumulation (dedup by
 (session, signal, class, scan_night), recompute weights from the FULL evidence every
 merge — never incrementally), the 0.5x judge discount (the score column does it),
 observe->proposed classification (v2 gates: retune proposes on one quote-carrying
-instance; derive on recurrence across scan nights, high salience, or the legacy
+instance; derive on recurrence across distinct days, high salience, or the legacy
 score), and decay of unseen 'observe' candidates ('proposed' rows wait for human
 review). Grounded signals advance; the LLM judge only nominates. promoted is NEVER
 set here (only the review accept, which applies the proposal to skill_registry).
@@ -34,7 +34,7 @@ SIGNATURE_JACCARD = 0.6  # derive identity: signature-token overlap (secondary)
 SIGNATURE_VETO_FLOOR = 0.15  # session-overlap match vetoed when both signatures exist below this
 PROPOSE_SCORE = 1.5  # legacy observe -> proposed gate (3 judge sessions, or 1 grounded + 1 judge)
 PROPOSE_SALIENCE = 4  # derive: propose when detector-rated pain/severity reaches this (1-5)
-PROPOSE_SCAN_NIGHTS = 2  # derive: propose when seen on this many distinct nightly scans
+PROPOSE_DAYS = 2  # derive: propose when its evidence dates span this many distinct days
 DECAY_TTL_DAYS = 28  # last_seen older than this -> retired (time-based; no nightly mass-bump)
 EVIDENCE_CAP = 60  # bound the JSONB
 
@@ -150,10 +150,12 @@ def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
     return out[-EVIDENCE_CAP:]
 
 
-def _scan_nights(evidence: list[dict]) -> int:
-    """DISTINCT scan nights across the evidence — the v2 recurrence unit. All legacy entries
-    (no scan_night) collectively count as ONE bucket (None is one set element)."""
-    return len({e.get("scan_night") for e in evidence}) if evidence else 0
+def _recurrence_days(evidence: list[dict]) -> int:
+    """DISTINCT evidence dates (the day the sighted work happened) — the derive recurrence
+    unit. Not scan nights: the scanner seeing the same work again (procedure_miner's weekly
+    35-day window, a re-run after a crash) is not the work recurring. Entries without a
+    date (gap_scan, explicit requests, legacy rows) never count."""
+    return len({e["date"] for e in evidence if e.get("date")})
 
 
 def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
@@ -222,7 +224,7 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
     kind (compat with existing rows/config); the new per-kind gates are ADDITIVE looseners:
       - retune: ONE strong instance — an evidence entry carrying a verbatim quote (the
         deviation/correction moment). Cheap to review, high prior.
-      - derive: recurrence (distinct scan nights) OR high detector salience.
+      - derive: recurrence (distinct evidence dates) OR high detector salience.
       - consolidate: legacy score path only (overlap nominations carry no quotes; one
         cosine sighting is not review-worthy on its own).
     Junk is controlled downstream (candidate decay + human review), not at this gate."""
@@ -233,7 +235,7 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
     if kind == "derive":
         if salience is not None and salience >= PROPOSE_SALIENCE:
             return True
-        return _scan_nights(evidence) >= PROPOSE_SCAN_NIGHTS
+        return _recurrence_days(evidence) >= PROPOSE_DAYS
     return False
 
 
