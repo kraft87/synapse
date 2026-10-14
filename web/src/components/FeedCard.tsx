@@ -5,7 +5,7 @@ import { useState, type CSSProperties } from 'react';
 import type { Derived, FeedItem } from '../api';
 import { hasToolTrace, localDay, relTime, turnBody, validityLine } from '../tokens';
 import { openEpisode, openSession } from '../hash';
-import { FlagButton, ProjectChip, SalLabel, SourceChip, TypeChip } from './ui';
+import { FlagButton, ProjectChip, SalLabel, SourceChip, SupersededChip, TypeChip } from './ui';
 import { useEpisode } from '../hooks';
 
 const provBtn: CSSProperties = {
@@ -114,6 +114,7 @@ export function FeedCard({ item, fresh }: { item: FeedItem; fresh?: boolean }) {
         <ProjectChip project={item.project} />
         <SourceChip source={item.source} />
         {item.type === 'timeline_event' && <SalLabel sal={sal} />}
+        {item.type === 'fact' && <SupersededChip at={item.data.t_invalid} />}
         <span style={{ flex: 1 }} />
         <FlagButton kind={item.type} itemId={item.id} initial={item.flagged} />
         <span style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)' }}>{relTime(item.ts)}</span>

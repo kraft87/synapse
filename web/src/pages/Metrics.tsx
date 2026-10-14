@@ -15,6 +15,7 @@ import { useStore } from '../state';
 import { LEG_COLOR, LEG_ORDER, cssValue, srcColor, relTime, mono } from '../tokens';
 import { UPlotChart } from '../components/UPlotChart';
 import { useAsync } from '../hooks';
+import { runDuration } from '../dream';
 
 type Tab = 'recall' | 'ingestion' | 'corpus';
 
@@ -77,19 +78,6 @@ function RecallTab() {
   const { theme } = useStore();
   const { data, loading, error } = useAsync<MetricsRecall>(() => fetchMetricsRecall('7d'), []);
 
-  const cards = useMemo(() => {
-    const s = data?.series || [];
-    const totalCalls = s.reduce((a, p) => a + p.calls, 0);
-    const wavg = (sel: (p: MetricsRecall['series'][number]) => number | null) => {
-      let num = 0, den = 0;
-      for (const p of s) { const v = sel(p); if (v != null) { num += v * p.calls; den += p.calls; } }
-      return den ? num / den : null;
-    };
-    return {
-      p50: wavg((p) => p.p50), p95: wavg((p) => p.p95), calls: totalCalls, tokens: wavg((p) => p.tokens_p50),
-    };
-  }, [data]);
-
   // stacked per-leg latency chart: cumulative sums, drawn largest-first so bars stack.
   const chart = useMemo(() => {
     const s = data?.series || [];
@@ -125,13 +113,14 @@ function RecallTab() {
   if (loading) return (<><StatGridSkel /><div style={panel({ marginBottom: '14px' })}><ChartSkel /></div></>);
 
   const fmt = (v: number | null, unit = '') => (v == null ? '—' : Math.round(v) + unit);
+  const sum = data?.summary ?? { calls: 0, p50: null, p95: null, tokens_p50: null };
   return (
     <>
       <div className="statgrid" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '10px', marginBottom: '14px' }}>
-        <StatCard label="p50 total" value={fmt(cards.p50, ' ms')} sub="median over window" />
-        <StatCard label="p95 total" value={fmt(cards.p95, ' ms')} sub="tail latency" />
-        <StatCard label="calls" value={cards.calls.toLocaleString()} sub="in window (7d)" />
-        <StatCard label="tokens / call" value={cards.tokens == null ? '—' : Math.round(cards.tokens).toLocaleString()} sub="median served" />
+        <StatCard label="p50 total" value={fmt(sum.p50, ' ms')} sub="median over window" />
+        <StatCard label="p95 total" value={fmt(sum.p95, ' ms')} sub="tail latency" />
+        <StatCard label="calls" value={sum.calls.toLocaleString()} sub="in window (7d)" />
+        <StatCard label="tokens / call" value={sum.tokens_p50 == null ? '—' : Math.round(sum.tokens_p50).toLocaleString()} sub="median served" />
       </div>
 
       <section style={panel({ marginBottom: '14px' })}>
@@ -239,7 +228,7 @@ function IngestionTab() {
         <StatCard label="queue depth" value={String(data.queue_depth)} sub={`${data.queue.processing} processing`} valueColor={data.queue_depth > 90 ? 'var(--warn)' : 'var(--txt)'} />
         <StatCard label="throughput" value={compTotal.toLocaleString()} sub="completed / 48h" />
         <StatCard label="failures" value={String(data.queue.failed)} sub="status=failed" valueColor={data.queue.failed > 0 ? 'var(--err)' : 'var(--txt)'} />
-        <StatCard label="last run" value={ld?.duration_s != null ? Math.round(ld.duration_s) + ' s' : '—'} sub={ld ? relTime(ld.started_at) : 'no runs yet'} />
+        <StatCard label="last run" value={ld ? runDuration(ld) : '—'} sub={ld ? relTime(ld.started_at) : 'no runs yet'} />
       </div>
 
       <section style={panel({ marginBottom: '14px' })}>
@@ -282,7 +271,7 @@ function DreamRunPanel({ run }: { run: DreamRun | null }) {
   if (run) {
     const stg = Object.entries(run.stages).map(([k, v]) => `${k}:${v?.ok === false ? 'ERR' : 'ok'}`).join('  ');
     lines.push(`started   ${run.started_at?.replace('T', ' ').slice(0, 19)} UTC`);
-    lines.push(`duration  ${run.duration_s != null ? run.duration_s + ' s' : '(in flight)'}`);
+    lines.push(`duration  ${runDuration(run)}`);
     lines.push(`ok        ${run.ok == null ? '—' : run.ok}`);
     if (stg) lines.push(`stages    ${stg}`);
     for (const [k, v] of Object.entries(run.counts)) lines.push(`${(k + '            ').slice(0, 24)}${v}`);

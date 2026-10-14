@@ -3,7 +3,7 @@
 import type React from 'react';
 import { useEffect, useState, type CSSProperties } from 'react';
 import { onFlagged, postFlag } from '../api';
-import { srcColor, typeColor, typeLabel } from '../tokens';
+import { localDay, srcColor, typeColor, typeLabel } from '../tokens';
 
 const chipBase: CSSProperties = {
   fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 7px',
@@ -18,6 +18,10 @@ export const TypeChip = ({ type }: { type: string }) => (
 
 export const ProjectChip = ({ project }: { project?: string | null }) =>
   project ? <span style={{ ...chipBase, background: 'var(--acc-bg)', color: 'var(--acc)' }}>{project}</span> : null;
+
+// A fact a later one replaced (t_invalid set): still true of its time, no longer current.
+export const SupersededChip = ({ at }: { at?: string | null }) =>
+  at ? <span title={'superseded ' + localDay(at)} style={{ ...chipBase, border: '1px solid var(--warn)', color: 'var(--warn)' }}>superseded</span> : null;
 
 export const SourceChip = ({ source }: { source?: string | null }) =>
   source ? <span style={{ ...chipBase, border: '1px solid ' + srcColor(source), color: srcColor(source) }}>{source}</span> : null;

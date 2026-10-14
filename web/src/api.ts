@@ -109,7 +109,7 @@ export interface Entity {
 export type SearchTab = 'episodes' | 'facts' | 'entities' | 'events';
 export interface SearchHit {
   type: SearchTab; id: string; snippet: string;
-  meta: { project?: string; source?: string; ts?: string; t_valid?: string; session_id?: string; episode_id?: number | null; name?: string; entity_type?: string; degree?: number };
+  meta: { project?: string; source?: string; ts?: string; t_valid?: string; t_invalid?: string | null; session_id?: string; episode_id?: number | null; source_ref?: string | null; name?: string; entity_type?: string; degree?: number };
 }
 export interface SearchResult {
   hits: SearchHit[];
@@ -168,8 +168,10 @@ export const fetchDerived = (id: string): Promise<Derived> =>
 export const fetchSession = (id: string, highlight?: string | null): Promise<Session> =>
   MOCK ? mockApi('/session/' + id) : req('/session/' + encodeURIComponent(id) + qs({ highlight }));
 
-export const fetchEntity = (uuid: string, mentionsOffset = 0): Promise<Entity> =>
-  MOCK ? mockApi('/entity/' + uuid) : req('/entity/' + encodeURIComponent(uuid) + qs({ mentions_offset: mentionsOffset }));
+// One page of each list: `mentionsOffset` / `factsOffset` pick which (stats.facts and
+// mentions.total are the full counts the lists page against).
+export const fetchEntity = (uuid: string, mentionsOffset = 0, factsOffset = 0): Promise<Entity> =>
+  MOCK ? mockApi('/entity/' + uuid) : req('/entity/' + encodeURIComponent(uuid) + qs({ mentions_offset: mentionsOffset, facts_offset: factsOffset }));
 
 export interface SearchParams { q: string; type: SearchTab; offset?: number; limit?: number; project?: string; group_id?: string; source?: string; }
 export const fetchSearch = (p: SearchParams): Promise<SearchResult> =>
@@ -291,8 +293,7 @@ export const factDeleteSummary = (r: DeleteFactResult): string =>
 // ---------- recall debug console (phase 2) ----------
 // The debug envelope surfaces the SAME per-leg timing / pool / rerank numbers the engine
 // already measures for recall_metrics (docs/dashboard-contract.md §Phase 2). legs_ms omits
-// a leg the engine did not time (timeline/prefs when disabled) — the waterfall renders it
-// as skipped. Served items carry no per-item score in the real payload (only the mock adds
+// a leg the engine did not time (notes when disabled) — the waterfall renders it as skipped. Served items carry no per-item score in the real payload (only the mock adds
 // `score` for demo); the Served column falls back to a muted meta token otherwise.
 export interface RecallDebug {
   total_ms: number;
@@ -305,10 +306,8 @@ export interface RecallResult {
   query: string;
   facts?: { fact: string; date?: string; score?: number }[];
   episodes?: { id?: string; content: string; project?: string; date?: string; role?: string; superseded_by?: string[]; score?: number }[];
-  entities?: { name: string; summary: string; score?: number }[];
-  communities?: { name?: string; summary?: string; score?: number }[];
-  timeline?: { date: string; fact: string; type?: string; salience?: number; score?: number }[];
-  preferences?: { pref: string; polarity?: string; since?: string; asserted?: number; score?: number }[];
+  // Curated notes (the board's searchable half): present when the notes leg served any.
+  notes?: { id: string; hook: string; note: string }[];
   web?: { context?: string; excerpt?: string; url?: string; title?: string; date?: string; score?: number }[];
   superseded_facts?: { fact: string; superseded_by: string }[];
   // Present only when a retrieval leg degraded (dead embed/rerank backend, failed KG or
@@ -498,6 +497,8 @@ export interface MetricsRecallPoint {
   tokens_p50: number | null; legs_p50: Record<string, number>;
 }
 export interface MetricsRecall {
+  // The window's own percentiles: hourly percentiles do not average into a window percentile.
+  summary: { calls: number; p50: number | null; p95: number | null; tokens_p50: number | null };
   series: MetricsRecallPoint[];
   slowest: { query: string; ms_total: number | null; created_at: string }[];
   score_hist: { lo: number; hi: number; n: number }[];

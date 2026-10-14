@@ -81,7 +81,7 @@ const FIX: Record<string, unknown> = {
 };
 
 // ---- metrics fixtures (phase 4) — obviously synthetic ----
-const LEGS = ['embed', 'bm25', 'vector', 'kg', 'timeline', 'prefs', 'web', 'rerank'];
+const LEGS = ['embed', 'bm25', 'vector', 'kg', 'notes', 'web', 'rerank'];
 const metricsSeries = Array.from({ length: 24 }, (_, i) => {
   const legs: Record<string, number> = {};
   for (const l of LEGS) legs[l] = Math.round((4 + Math.random() * 40) * (l === 'rerank' ? 3 : l === 'kg' ? 2 : 1));
@@ -90,6 +90,7 @@ const metricsSeries = Array.from({ length: 24 }, (_, i) => {
 });
 const FIX_METRICS = {
   recall: {
+    summary: { calls: metricsSeries.reduce((a, p) => a + p.calls, 0), p50: 213, p95: 412, tokens_p50: 1560 },
     series: metricsSeries,
     slowest: [
       { query: 'everything I know about the lisbon trip planning and who is coming', ms_total: 612, created_at: iso(3) },
@@ -262,19 +263,13 @@ export function mockRecall<T>(query: string): Promise<T> {
       { id: 'e:1', content: 'Wired service A to library B; added a shared asyncpg pool (min 2 / max 10) and a smoke test.', project: 'service-a', date: '2026-07-01', role: 'assistant', score: 0.91 },
       { id: 'e:2', content: 'Refactored the widget cache into a WidgetCache class; hit rate unchanged.', project: 'service-b', date: '2026-06-15', score: 0.71 },
     ],
-    entities: [
-      { name: 'service A', summary: 'Example project used to demonstrate the recall debug surface.', score: 0.81 },
-    ],
-    timeline: [
-      { date: '2026-06-30', fact: 'service A shipped v2', type: 'milestone', salience: 2, score: 0.74 },
-    ],
-    preferences: [
-      { pref: 'prefers boring, well-understood infra over clever abstractions', polarity: 'like', since: '2026-03-02', asserted: 7, score: 0.62 },
+    notes: [
+      { id: 'n:7', hook: 'prefers boring, well-understood infra over clever abstractions', note: 'Stated in the service A design review; applies to new dependencies too.' },
     ],
     web: [],
     debug: {
       total_ms: 341,
-      legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, timeline: 33, prefs: 9 },
+      legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, notes: 33 },
       pool_sizes: { bm25: 100, vector: 100, fused: 100, kg_candidates: 12 },
       rerank: { model: 'rerank-3-lite', top_score: 0.91 },
       est_tokens: 1874,

@@ -16,6 +16,7 @@ import { openEpisode, openSession } from '../hash';
 import { relTime, monoHead, localMinute } from '../tokens';
 import { ErrorBox, EmptyState } from '../components/ui';
 import { useAsync } from '../hooks';
+import { defaultRun, runDuration, runState } from '../dream';
 
 const TABS = [
   { key: 'proposals', label: 'Proposals' },
@@ -361,7 +362,7 @@ const DREAM_CARDS: { count: string; sample: string; label: string; color: string
   { count: 'proposals_raised', sample: 'proposals', label: 'proposals raised', color: 'var(--acc)' },
 ];
 
-const runLabel = (r: DreamRun): string => localMinute(r.started_at);
+const runLabel = (r: DreamRun): string => localMinute(r.started_at) + (r.finished_at ? '' : ' · ' + runState(r));
 const sampleText = (s: unknown): string => {
   if (typeof s === 'string') return s;
   if (s && typeof s === 'object') {
@@ -374,9 +375,10 @@ const sampleText = (s: unknown): string => {
 function DreamTab() {
   const { data, error } = useAsync(() => fetchDreamReport(), []);
   const runs = data?.runs ?? null;
-  // default-select the newest run without an effect (avoids an empty-state flash on load).
+  // default-select the newest finished run without an effect (avoids an empty-state flash
+  // on load); a crashed run stays in the list but does not pin the report.
   const [selRaw, setSel] = useState<number | null>(null);
-  const sel = selRaw ?? runs?.[0]?.id ?? null;
+  const sel = selRaw ?? (runs ? defaultRun(runs)?.id : undefined) ?? null;
   const [drill, setDrill] = useState<string>('proposals_raised');
 
   const run = useMemo(() => runs?.find((r) => r.id === sel) || null, [runs, sel]);
@@ -387,7 +389,6 @@ function DreamTab() {
     return <EmptyState title="no runs recorded yet" subtitle="the nightly dream pipeline writes a row per run." />;
   }
 
-  const mins = run.duration_s != null ? Math.round(run.duration_s / 60) : null;
   const samples = (run.samples || {}) as Record<string, unknown[]>;
   const drillCard = DREAM_CARDS.find((c) => c.count === drill);
   const drillItems: unknown[] = drillCard ? (samples[drillCard.sample] || []) : [];
@@ -402,7 +403,7 @@ function DreamTab() {
           {runs.map((r) => <option key={r.id} value={r.id}>{runLabel(r)}</option>)}
         </select>
         <span style={{ ...mono, fontSize: '11.5px', color: 'var(--txt3)' }}>
-          {mins != null ? `${mins} min` : 'in flight'} · {run.errors.length} error{run.errors.length === 1 ? '' : 's'}
+          {runDuration(run)} · {run.errors.length} error{run.errors.length === 1 ? '' : 's'}
           {run.ok === false ? ' · failed' : ''}
         </span>
       </div>

@@ -3,7 +3,7 @@
 // opens the episode overlay. "view in graph" is disabled until the Graph phase.
 import type React from 'react';
 import { useEffect, useState } from 'react';
-import { fetchEntity, onDeleted, type Entity } from '../api';
+import { fetchEntity, onDeleted, type Entity, type EntityFact } from '../api';
 import { closeOverlay, openEpisode } from '../hash';
 import { appendUnique } from '../paging';
 import { etColor, validityLine } from '../tokens';
@@ -20,14 +20,17 @@ export function EntityDossier({ id }: { id: string }) {
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreFailed, setMoreFailed] = useState(false);
+  const [facts, setFacts] = useState<EntityFact[]>([]);
+  const [loadingFacts, setLoadingFacts] = useState(false);
+  const [factsFailed, setFactsFailed] = useState(false);
 
   // A delete made while the dossier is open (the episode overlay stacks over it) can take
   // facts and mentions with it: refetch rather than patch three lists.
   useEffect(() => onDeleted(reload), [reload]);
 
-  // seed the paginated mentions list from the base fetch; "load more" appends past this.
+  // seed the paginated lists from the base fetch; "load more" appends past this.
   useEffect(() => {
-    if (data) setMentions(data.mentions.items);
+    if (data) { setMentions(data.mentions.items); setFacts(data.facts); }
   }, [data]);
 
   // One page at a time, from the end of the list; a page can repeat rows the list holds
@@ -40,6 +43,16 @@ export function EntityDossier({ id }: { id: string }) {
       .then((d) => setMentions((prev) => appendUnique(prev, d.mentions.items, (m) => String(m.episode_id))))
       .catch(() => setMoreFailed(true))
       .finally(() => setLoadingMore(false));
+  };
+
+  // Same for facts (live ones first, so what is still to load is the superseded tail).
+  const loadMoreFacts = () => {
+    if (loadingFacts) return;
+    setLoadingFacts(true); setFactsFailed(false);
+    fetchEntity(id, 0, facts.length)
+      .then((d) => setFacts((prev) => appendUnique(prev, d.facts, (f) => f.uuid)))
+      .catch(() => setFactsFailed(true))
+      .finally(() => setLoadingFacts(false));
   };
 
   const e = data?.entity;
@@ -81,7 +94,7 @@ export function EntityDossier({ id }: { id: string }) {
 
             <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: '8px' }}>facts · valid + superseded</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '16px' }}>
-              {data.facts.map((f) => {
+              {facts.map((f) => {
                 const dead = f.t_invalid != null;
                 return (
                   <div key={f.uuid} style={{ border: '1px solid var(--line)', borderRadius: '8px', padding: '8px 11px', opacity: dead ? 0.55 : 1 }}>
@@ -97,6 +110,13 @@ export function EntityDossier({ id }: { id: string }) {
                 );
               })}
             </div>
+            {facts.length < data.stats.facts && (
+              <div style={{ textAlign: 'center', margin: '-6px 0 16px' }}>
+                <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', marginBottom: '6px' }}>showing {facts.length} of {data.stats.facts} facts</div>
+                {factsFailed && <div style={{ color: 'var(--err)', fontSize: '12px', fontFamily: 'var(--font-data)', marginBottom: '6px' }}>couldn't load more facts.</div>}
+                <button className="softbtn" onClick={loadMoreFacts} disabled={loadingFacts} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>{loadingFacts ? 'loading…' : 'load more facts'}</button>
+              </div>
+            )}
 
             <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: '8px' }}>mentions · {total} episodes</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>

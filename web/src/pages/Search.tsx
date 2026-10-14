@@ -9,7 +9,8 @@ import {
 import { useStore } from '../state';
 import { openEntity, openEpisode, openSession } from '../hash';
 import { appendUnique } from '../paging';
-import { relTime, typeColor } from '../tokens';
+import { typeColor } from '../tokens';
+import { hasTarget, isSuperseded, metaLine } from '../searchHits';
 import { DeleteButton } from '../components/ui';
 
 const TABS: { key: SearchTab; label: string }[] = [
@@ -25,13 +26,6 @@ const LIMIT = 20;
 const DELETABLE: SearchTab[] = ['episodes', 'facts'];
 const NOTICE_MS = 8000;
 
-function metaLine(h: SearchHit): string {
-  if (h.type === 'entities') return [h.meta.entity_type, h.meta.degree != null ? h.meta.degree + ' edges' : ''].filter(Boolean).join(' · ');
-  // Events: show when the event happened (t_valid), not when the row was
-  // ingested — backfills stamp thousands of events with one ingested_at.
-  const ts = h.type === 'events' ? (h.meta.t_valid ?? h.meta.ts) : h.meta.ts;
-  return [h.meta.project, h.meta.source, relTime(ts)].filter(Boolean).join(' · ');
-}
 const hitKey = (h: SearchHit): string => h.type + ':' + h.id;
 function openHit(h: SearchHit) {
   if (h.type === 'entities') return openEntity(h.id);
@@ -153,10 +147,13 @@ export function Search() {
                   onError={() => setNotice({ text: 'delete failed — the ' + singular[h.type] + ' is still in memory.', bad: true })}
                 />
               )}
-              <button className="linkbtn" onClick={() => openHit(h)} title={'open ' + singular[h.type]}
-                style={{ border: 'none', background: 'none', padding: '2px 4px', cursor: 'pointer', fontFamily: 'var(--font-data)', fontSize: '10.5px', color: 'var(--txt3)' }}>↗</button>
+              {hasTarget(h) && (
+                <button className="linkbtn" onClick={() => openHit(h)} title={'open ' + singular[h.type]}
+                  style={{ border: 'none', background: 'none', padding: '2px 4px', cursor: 'pointer', fontFamily: 'var(--font-data)', fontSize: '10.5px', color: 'var(--txt3)' }}>↗</button>
+              )}
             </div>
-            <div onClick={() => openHit(h)} style={{ fontSize: '13.5px', lineHeight: 1.5, color: 'var(--txt)', cursor: 'pointer' }}>{h.snippet}</div>
+            <div onClick={hasTarget(h) ? () => openHit(h) : undefined}
+              style={{ fontSize: '13.5px', lineHeight: 1.5, color: 'var(--txt)', cursor: hasTarget(h) ? 'pointer' : 'default', ...(isSuperseded(h) ? { textDecoration: 'line-through', opacity: 0.6 } : {}) }}>{h.snippet}</div>
           </div>
         ))}
       </div>
