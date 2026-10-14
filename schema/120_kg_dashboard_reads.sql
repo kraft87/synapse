@@ -11,14 +11,17 @@
 -- 2. Index. The feed's facts leg pages kg_relationships newest-first by
 --    (t_created, uuid). Without this index every feed page sorts the whole table.
 --
--- On a POPULATED table, build the index CONCURRENTLY by hand instead of running this
--- file, so the build doesn't block extraction writes:
+-- On a POPULATED table (prod), don't run this file whole: its CREATE INDEX holds a write
+-- lock on kg_relationships while it builds. Run the three UPDATEs below (they are safe on
+-- the old image), then build the index by hand without the lock:
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS kg_rel_t_created_idx
 --     ON kg_relationships (t_created DESC, uuid DESC) WHERE t_created IS NOT NULL;
 -- A failed CONCURRENTLY build leaves an INVALID index: drop it and build it again.
 --
--- Optional: the dashboard runs the same queries with or without it. Before the backfill
--- a legacy-only row shows without its date or type; before the index the feed sorts.
+-- Optional: the code ships first and runs without this file, but apply it soon after
+-- deploy. Until the UPDATEs have run, a legacy-only fact (t_created NULL) is absent from
+-- the feed altogether and a legacy-only entity shows no type or date; until the index
+-- exists, every feed page sorts the whole facts table.
 
 UPDATE kg_relationships SET t_created = created_at
  WHERE t_created IS NULL AND created_at IS NOT NULL;
