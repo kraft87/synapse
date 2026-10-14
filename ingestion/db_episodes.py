@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, cast
 
 import orjson
@@ -7,8 +8,15 @@ import psycopg
 
 from ingestion.db_connection import DatabaseConnection
 from ingestion.models import Episode
+from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import OWN_SURFACE_PROBE, own_surface_columns_ready
 from ingestion.textsafe import strip_nul
+
+#: The ``deleted_turns`` tombstone table (an optional migration): until it exists nothing is
+#: tombstoned and the ingest check is skipped, which is the pre-migration behaviour.
+DELETED_TURNS_PROBE = ColumnProbe(
+    "SELECT 1 WHERE to_regclass('deleted_turns') IS NOT NULL", "deleted_turns tombstones"
+)
 
 _UPSERT_COLUMNS = """
     (session_id, sequence, project, platform, model,
@@ -52,6 +60,13 @@ _UPSERT_STAMPED = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(
 )
 
 
+def content_md5(content: str) -> str:
+    """Hex md5 of ``content`` as Postgres's ``md5(text)`` computes it (UTF-8 bytes): the
+    key of ``episodes_content_md5_idx`` and of ``deleted_turns.content_md5``. A dedup
+    key, not a security hash."""
+    return hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()
+
+
 class EpisodeStore(DatabaseConnection):
     def span_id_exists(self, span_id: str) -> bool:
         with self._conn() as conn:
@@ -71,12 +86,31 @@ class EpisodeStore(DatabaseConnection):
         assistant/tool half of the turn. The ``cwd`` leg catches a replay whose first
         copy was stored under an older label for the same folder (a subfolder or
         worktree name, a whole Windows path) until relabel_projects merges them.
-        Probe is an index hit via episodes_content_md5_idx (schema 036)."""
+        Probe is an index hit via episodes_content_md5_idx (schema 036); the digest is
+        computed here so the turn's text crosses the wire once, in the INSERT."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT 1 FROM episodes WHERE md5(content) = md5(%s) "
+                "SELECT 1 FROM episodes WHERE md5(content) = %s "
                 "AND (project IS NOT DISTINCT FROM %s OR metadata->>'cwd' = %s) LIMIT 1",
-                (content, project, cwd or None),
+                (content_md5(content), project, cwd or None),
+            ).fetchone()
+        return row is not None
+
+    def is_tombstoned(
+        self, span_id: str | None, project: str | None, content: str, cwd: str | None
+    ) -> bool:
+        """True if this turn was deleted from memory (``deleted_turns``) and must not come
+        back: its span_id was deleted, or byte-identical content was deleted from this
+        project or working directory (the same scope as :meth:`content_dup_exists`, and
+        for the same reason: a re-shipped session carries fresh span ids). Always False
+        until the tombstone migration is applied."""
+        with self._conn() as conn:
+            if not DELETED_TURNS_PROBE.ready(conn, self._url):
+                return False
+            row = conn.execute(
+                "SELECT 1 FROM deleted_turns WHERE span_id = %s "
+                "OR (content_md5 = %s AND (project IS NOT DISTINCT FROM %s OR cwd = %s)) LIMIT 1",
+                (span_id, content_md5(content), project, cwd or None),
             ).fetchone()
         return row is not None
 
@@ -88,13 +122,14 @@ class EpisodeStore(DatabaseConnection):
         schema/050 has no private sessions to honour, so it reads as not-private rather
         than blocking all ingestion. Every other error propagates — see
         ``ingestion.private_sessions.PrivateSessions`` for why this leg fails closed."""
-        try:
-            with self._conn() as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
-                ).fetchone()
-        except psycopg.errors.UndefinedTable:
-            return False
+        with self._conn() as conn:
+            try:
+                with conn.transaction():  # a savepoint, so a caller's open transaction survives
+                    row = conn.execute(
+                        "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
+                    ).fetchone()
+            except psycopg.errors.UndefinedTable:
+                return False
         return row is not None
 
     def upsert_episode(self, ep: Episode) -> int:
@@ -105,34 +140,33 @@ class EpisodeStore(DatabaseConnection):
         # ranking, and the KG's fact t_valid via get_episodes_valid_at. NULL
         # (no transcript ts) falls back to now(), right for live ingestion.
         #
-        # strip_nul on the text/metadata fields: TEXT columns reject NUL bytes
-        # and jsonb rejects the u0000 escape, so one stray byte in a transcript
-        # would fail the whole INSERT.
+        # The text fields arrive NUL-free (Episode strips them); metadata is stripped here
+        # because jsonb rejects the u0000 escape and one stray byte would fail the INSERT.
         params = {
             "session_id": ep.session_id,
             "sequence": ep.sequence,
             "project": ep.project,
             "platform": ep.platform,
             "model": ep.model,
-            "human_turn": strip_nul(ep.human_turn),
-            "assistant_turn": strip_nul(ep.assistant_turn),
-            "content": strip_nul(ep.content),
+            "human_turn": ep.human_turn,
+            "assistant_turn": ep.assistant_turn,
+            "content": ep.content,
             "span_id": ep.span_id,
             "metadata": orjson.dumps(strip_nul(ep.metadata)).decode(),
             "source": ep.source,
             "created_at": ep.created_at,
             "surface_id": ep.surface_id,
         }
-        try:
-            with self._conn() as conn:
-                # Schema 057 names the provenance column; before it is applied the
-                # statement is exactly the pre-057 one and the stamp is dropped.
-                sql = _UPSERT_STAMPED if own_surface_columns_ready(conn, self._url) else _UPSERT
-                row = conn.execute(sql, params).fetchone()
-        except psycopg.errors.UndefinedColumn as e:
-            # 057 rolled back under a running process: note it, write the pre-057 row.
-            OWN_SURFACE_PROBE.missing(self._url, e)
-            with self._conn() as conn:
+        with self._conn() as conn:
+            # Schema 057 names the provenance column; before it is applied the
+            # statement is exactly the pre-057 one and the stamp is dropped.
+            sql = _UPSERT_STAMPED if own_surface_columns_ready(conn, self._url) else _UPSERT
+            try:
+                with conn.transaction():  # a savepoint, so a caller's open transaction survives
+                    row = conn.execute(sql, params).fetchone()
+            except psycopg.errors.UndefinedColumn as e:
+                # 057 rolled back under a running process: note it, write the pre-057 row.
+                OWN_SURFACE_PROBE.missing(self._url, e)
                 row = conn.execute(_UPSERT, params).fetchone()
 
         assert row is not None, "INSERT RETURNING id returned nothing"
@@ -154,12 +188,12 @@ class EpisodeStore(DatabaseConnection):
     def get_session_span_index(self, session_id: str) -> tuple[set[str], int]:
         """Return (stored span_ids, max sequence) for a session.
 
-        Lean companion to :meth:`get_session_episodes` for the /ingest hot path.
-        The push keys turns by span_id (the stable identity — a turn's last record
-        uuid) and appends new ones at ``max(sequence) + 1``, so a bounded-tail POST
-        renumbers from the DB high-water mark instead of the parser's positional
-        counter. Pulls two columns instead of full rows since that's all the dedup
-        needs.
+        Lean companion to :meth:`get_session_episodes` for the episode writer (/ingest
+        and every backfill). It keys turns by span_id (the stable identity — a turn's
+        last record uuid) and appends new ones at ``max(sequence) + 1``, so a
+        bounded-tail POST renumbers from the DB high-water mark instead of the parser's
+        positional counter. Pulls two columns instead of full rows (the 2048-dim vector
+        alone is ~20KB of text per row) since that's all the dedup needs.
         """
         with self._conn() as conn:
             rows = conn.execute(

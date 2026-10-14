@@ -6,7 +6,7 @@ Three legs, tested here without a database or a live server:
     stops every POST for that session, a stale marker is ignored AND deleted, and an
     unreadable marker directory counts as private (fail-safe direction: silently
     capturing a believed-private session is the unacceptable failure);
-  * the SERVER chokepoint (``ingestion.private_sessions`` + ``ingestion.backfill``) —
+  * the SERVER chokepoint (``ingestion.private_sessions`` + ``ingestion.episode_writer``) —
     the predicate that drops private turns wherever a parsed turn becomes an episode,
     which is what covers the paths that bypass the hook entirely;
   * the TOGGLE CLI (``plugin/scripts/private_mode.py``) round-tripped against a stubbed
@@ -25,6 +25,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
@@ -258,11 +259,21 @@ class _StubDB:
         self.lookups.append(session_id)
         return session_id in self.private
 
-    # backfill leg
-    def get_session_episodes(self, session_id: str) -> list[dict]:
-        return []
+    # episode-writer leg: nothing is stored yet, nothing is a replay or tombstoned
+    @contextmanager
+    def atomic(self):
+        yield
+
+    def get_session_span_index(self, session_id: str) -> tuple[set[str], int]:
+        return set(), 0
 
     def span_id_exists(self, span_id: str) -> bool:
+        return False
+
+    def content_dup_exists(self, project: str | None, content: str, cwd: str | None = None) -> bool:
+        return False
+
+    def is_tombstoned(self, span_id, project, content, cwd) -> bool:
         return False
 
     def upsert_episode(self, ep: object) -> int:
@@ -299,21 +310,21 @@ def test_predicate_drops_private_and_memoizes():
 
 def test_backfill_drops_a_private_session():
     """The disk sweep is the path the marker file can't cover (the transcript outlives
-    the marker), so the row has to stop it here."""
-    from ingestion.backfill import _write_session_episodes, write_backfill_session
+    the marker), so the row has to stop it here: every backfill stores through the
+    episode writer."""
+    from ingestion.episode_writer import store_episodes
 
     db = _StubDB(private={"s-private"})
-    eps = [_episode("s-private", 1), _episode("s-private", 2)]
-    assert _write_session_episodes(db, "s-private", eps, "demo") == 0
-    assert write_backfill_session(db, "s-private", eps) == 0
+    stats = store_episodes(db, [_episode("s-private", 1), _episode("s-private", 2)], "demo")
+    assert stats.written == 0 and stats.private == 2
     assert db.written == [] and db.enqueued == []
 
 
 def test_backfill_still_writes_a_normal_session():
-    from ingestion.backfill import _write_session_episodes
+    from ingestion.episode_writer import store_episodes
 
     db = _StubDB(private={"s-private"})
-    assert _write_session_episodes(db, "s-public", [_episode("s-public", 1)], "demo") == 1
+    assert store_episodes(db, [_episode("s-public", 1)], "demo").written == 1
     assert len(db.written) == 1
 
 

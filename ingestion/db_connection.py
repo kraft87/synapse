@@ -43,6 +43,9 @@ class DatabaseConnection:
         # reuse it and commit on exit exactly as below. Without a pool the instance keeps
         # one connection until close(), which the poller and the backfills rely on.
         self._borrowed = False
+        # Depth of atomic() blocks: while > 0 a nested _conn() exit leaves the commit and
+        # the rollback to the block, so everything inside commits together or not at all.
+        self._atomic = 0
 
     @contextmanager
     def _conn(self) -> Generator[psycopg.Connection[Any], None, None]:
@@ -60,10 +63,27 @@ class DatabaseConnection:
         try:
             yield self._connection
         except Exception:
-            self._connection.rollback()
+            if not self._atomic:
+                self._connection.rollback()
             raise
         else:
-            self._connection.commit()
+            if not self._atomic:
+                self._connection.commit()
+
+    @contextmanager
+    def atomic(self) -> Generator[psycopg.Connection[Any], None, None]:
+        """One borrow and one transaction for the block. Store methods called inside reuse
+        the connection but neither commit nor roll back, so the block's writes land together
+        on a clean exit and any exception rolls all of them back (an episode never commits
+        without its queue row). Code inside that catches a failed statement and carries on
+        must wrap it in ``conn.transaction()`` (a savepoint here), or the aborted
+        transaction fails the next statement."""
+        with self._conn() as conn, conn.transaction():
+            self._atomic += 1
+            try:
+                yield conn
+            finally:
+                self._atomic -= 1
 
     def close(self) -> None:
         if self._connection and not self._connection.closed and not self._borrowed:

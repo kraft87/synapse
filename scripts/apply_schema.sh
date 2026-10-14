@@ -102,6 +102,7 @@ FILES=(
   060_skill_retired_at.sql
   061_episodes_project_recency_index.sql
   120_kg_dashboard_reads.sql
+  123_deleted_turns.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

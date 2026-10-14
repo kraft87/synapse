@@ -210,9 +210,9 @@ def test_failed_old_rollout_is_retried(hook, tmp_path, monkeypatch):
 
 
 def test_never_attempted_old_rollout_is_excluded(hook):
-    """History from before the hook was installed is codex_backfill's job: an old rollout
-    with no state, or one that last shipped cleanly and has no failure on record, is not
-    swept just because it exists."""
+    """History from before the hook was installed is ``ingestion.backfill --source codex``'s
+    job: an old rollout with no state, or one that last shipped cleanly and has no failure on
+    record, is not swept just because it exists."""
     now = time.time()
     age = hook.CATCHUP_DAYS * DAY + 3600
     pre_install = _mk(hook.SESSIONS_ROOT, age_s=age, now=now)

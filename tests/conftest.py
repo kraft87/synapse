@@ -88,6 +88,7 @@ _DB_FILES = {
     "test_project_identity_db.py",
     "test_relabel_projects_db.py",
     "test_skill_trust_scoping.py",
+    "test_episode_writer.py",
 }
 
 

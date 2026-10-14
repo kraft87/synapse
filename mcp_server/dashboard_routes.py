@@ -57,6 +57,7 @@ from starlette.responses import (
 
 from ingestion import pg_pool
 from ingestion.db_connection import bm25_query_text
+from ingestion.db_episodes import DELETED_TURNS_PROBE
 from ingestion.dedup import _normalize_name
 from ingestion.llm_schemas import _EVENT_TYPES
 
@@ -1725,11 +1726,13 @@ def delete_episode_content(
     Runs on ``conn`` inside the CALLER's transaction, with the episode rows already locked:
     chunks citing any of them and those chunks' extraction_queue rows (keyed by session and
     text, so the 001 FK misses them), their sole-provenance facts (shared ones are
-    unlinked), their chat timeline events, the rows themselves (their own extraction_queue
-    rows follow via the 001 FK), and any active flag on the facts, events and episodes that
-    went. Returns the counts plus the uuids of the deleted facts and the ids of the deleted
-    events, so a client can drop them from its lists. Shared by the dashboard's
-    single-turn delete and private mode's session purge
+    unlinked), their chat timeline events, a tombstone per turn (``deleted_turns``, so a
+    re-ship, catch-up sweep or backfill of the transcript on disk cannot bring the turn
+    back; ``ingestion.episode_writer`` checks it), the rows themselves (their own
+    extraction_queue rows follow via the 001 FK), and any active flag on the facts, events
+    and episodes that went. Returns the counts plus the uuids of the deleted facts and the
+    ids of the deleted events, so a client can drop them from its lists. Shared by the
+    dashboard's single-turn delete and private mode's session purge
     (``mcp_server/private_session_routes``).
 
     Set-based on purpose: the purge passes every turn of a session, and the provenance
@@ -1812,6 +1815,18 @@ def delete_episode_content(
     if deleted_events:
         retire_flags(conn, "timeline_event", [str(i) for i in deleted_events])
 
+    # --- tombstones, while the rows still say what the turns were ------------------------
+    # Without the table (its migration is optional) there is nothing to record and the
+    # turn can return; the probe logs that once.
+    tombstoned = 0
+    if DELETED_TURNS_PROBE.ready(conn):
+        tombstoned = conn.execute(
+            "INSERT INTO deleted_turns (span_id, session_id, content_md5, project, cwd) "
+            "SELECT span_id, session_id, md5(content), project, metadata->>'cwd' "
+            "FROM episodes WHERE id = ANY(%s)",
+            (episode_ids,),
+        ).rowcount
+
     # --- the episodes themselves (their extraction_queue rows follow via the 001 FK) ----
     conn.execute("DELETE FROM episodes WHERE id = ANY(%s)", (episode_ids,))
 
@@ -1822,6 +1837,7 @@ def delete_episode_content(
         "facts_deleted": len(sole),
         "facts_unlinked": len(shared),
         "events_deleted": len(deleted_events),
+        "tombstoned": tombstoned,
         "deleted_fact_ids": sole,
         "deleted_event_ids": deleted_events,
     }
