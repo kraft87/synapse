@@ -87,7 +87,7 @@ _MENTIONS_PAGE = 20
 _SESSION_CAP = 500
 _RECALL_HISTORY_DEFAULT = 50
 _RECALL_HISTORY_MAX = 200
-_ENTITY_FACTS_CAP = 200  # bound the dossier payload; the example has ~15
+_ENTITY_FACTS_PAGE = 200  # dossier facts per page; the example has ~15
 _DERIVED_CAP = 200
 _GIST_MAX = 200
 # Episode text read for a gist: _gist keeps the first non-empty line, so the head of
@@ -670,15 +670,29 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
         }
 
 
+# kg_entities.degree is a one-off backfill (schema 017) that nothing maintains: stale for
+# older entities, 0 for every one extraction wrote since. Reads count live edges instead.
+# One scalar subquery per side keeps each count on kg_rel_src / kg_rel_tgt (an src-OR-tgt
+# predicate can use neither). `e` is the kg_entities alias of the surrounding query.
+_LIVE_DEGREE_SQL = (
+    "((SELECT count(*) FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+    "AND r.group_id = e.group_id AND r.src_uuid = e.uuid AND r.t_invalid IS NULL) "
+    "+ (SELECT count(*) FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+    "AND r.group_id = e.group_id AND r.tgt_uuid = e.uuid AND r.t_invalid IS NULL))"
+)
+
+
 # ---------------------------------------------------------------------------
 # Entity dossier
 # ---------------------------------------------------------------------------
 
 
-def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | None:
+def _entity(
+    db_url: str, uuid: str, mentions_offset: int, facts_offset: int = 0
+) -> dict[str, Any] | None:
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         ent = conn.execute(
-            "SELECT uuid, owner_id, group_id, name, entity_subtype, summary, degree, t_created "
+            "SELECT uuid, owner_id, group_id, name, entity_subtype, summary, t_created "
             "FROM kg_entities WHERE uuid = %s",
             (uuid,),
         ).fetchone()
@@ -691,8 +705,9 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
         scope = {"u": uuid, "o": ent["owner_id"], "g": ent["group_id"]}
         touching = "r.owner_id = %(o)s AND r.group_id = %(g)s AND (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s)"
 
-        # Facts = live + superseded edges touching the uuid; the "other" endpoint's name
-        # comes from a join on whichever side isn't this entity.
+        # Facts = live + superseded edges touching the uuid, live first so a page cut never
+        # hides a current fact behind superseded ones; the "other" endpoint's name comes from
+        # a join on whichever side isn't this entity. Paged: stats.facts is the total.
         fact_rows = conn.execute(
             "SELECT r.uuid, r.name, r.fact, r.t_valid, r.t_invalid, r.episodes, "
             "       CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END AS other_uuid, "
@@ -701,8 +716,9 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             "LEFT JOIN kg_entities oe "
             "  ON oe.uuid = CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END "
             f"WHERE {touching} "
-            "ORDER BY r.t_valid DESC NULLS LAST, r.uuid LIMIT %(lim)s",
-            {**scope, "lim": _ENTITY_FACTS_CAP},
+            "ORDER BY (r.t_invalid IS NOT NULL), r.t_valid DESC NULLS LAST, r.uuid "
+            "OFFSET %(off)s LIMIT %(lim)s",
+            {**scope, "off": facts_offset, "lim": _ENTITY_FACTS_PAGE},
         ).fetchall()
 
         stats = (
@@ -750,7 +766,7 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 # (schema 020), not the FalkorDB-era raw entity_type column.
                 "entity_type": ent["entity_subtype"],
                 "summary": ent["summary"],
-                "degree": ent["degree"],
+                "degree": int(stats.get("edges") or 0),
                 "created_at": _iso(ent["t_created"]),
             },
             "stats": {
@@ -804,13 +820,14 @@ def _parse_as_of(raw: str | None) -> datetime | None:
 
 def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
     """Typeahead over entity names — shares the search endpoint's entity leg SQL
-    (name ILIKE, degree DESC). Global (no group scope): the graph is seeded explicitly."""
+    (name ILIKE, live degree DESC). Global (no group scope): the graph is seeded explicitly."""
     if not q:
         return []
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
-            "SELECT uuid, name, entity_subtype, entity_supertype, degree FROM kg_entities "
-            "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
+            "SELECT e.uuid, e.name, e.entity_subtype, e.entity_supertype, "  # nosec B608
+            f"       {_LIVE_DEGREE_SQL} AS degree FROM kg_entities e "
+            "WHERE e.name ILIKE %s ORDER BY degree DESC, e.name LIMIT %s",
             (_like_contains(q), limit),
         ).fetchall()
         return [
@@ -827,22 +844,23 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
 
 def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
     """Resolve a seed given a uuid OR a name: exact uuid → exact normalized_name →
-    best ILIKE match (highest degree). None when nothing matches."""
-    cols = "uuid, owner_id, group_id, name, degree, summary"
-    row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
+    best ILIKE match (highest live degree). None when nothing matches."""
+    cols = "e.uuid, e.owner_id, e.group_id"
+    row = conn.execute(f"SELECT {cols} FROM kg_entities e WHERE e.uuid = %s", (entity,)).fetchone()  # nosec B608
     if row:
         return row
     norm = _normalize_name(entity)
     if norm:
         row = conn.execute(
-            f"SELECT {cols} FROM kg_entities WHERE normalized_name = %s "
-            "ORDER BY degree DESC LIMIT 1",
+            f"SELECT {cols} FROM kg_entities e WHERE e.normalized_name = %s "  # nosec B608
+            f"ORDER BY {_LIVE_DEGREE_SQL} DESC LIMIT 1",
             (norm,),
         ).fetchone()
         if row:
             return row
     return conn.execute(
-        f"SELECT {cols} FROM kg_entities WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT 1",
+        f"SELECT {cols} FROM kg_entities e WHERE e.name ILIKE %s "  # nosec B608
+        f"ORDER BY {_LIVE_DEGREE_SQL} DESC, e.name LIMIT 1",
         (_like_contains(entity),),
     ).fetchone()
 
@@ -912,8 +930,8 @@ def _graph_neighborhood(
         # Materialize real entity rows for the reached uuids (edge endpoints without an
         # entity row are dropped — edges aren't FKs, so a dangling endpoint has no node).
         ent_rows = conn.execute(
-            "SELECT uuid, name, entity_subtype, entity_supertype, degree, summary "
-            "FROM kg_entities WHERE uuid = ANY(%s)",
+            "SELECT e.uuid, e.name, e.entity_subtype, e.entity_supertype, e.summary, "  # nosec B608
+            f"       {_LIVE_DEGREE_SQL} AS degree FROM kg_entities e WHERE e.uuid = ANY(%s)",
             (list(visited),),
         ).fetchall()
 
@@ -1141,14 +1159,17 @@ def _search(
                             "source": r["source"],
                             "ts": _iso(r["ingested_at"]),
                             "episode_id": _episode_id_from_ref(r["source_ref"]),
+                            # the only provenance a git-sourced event has (a SHA)
+                            "source_ref": r["source_ref"],
                         },
                     }
                 )
         elif type_ == "entities":
             for r in conn.execute(
-                "SELECT uuid, name, entity_subtype, summary, degree FROM kg_entities "
-                f"WHERE name ILIKE %s{en_and} "
-                "ORDER BY degree DESC, name OFFSET %s LIMIT %s",
+                "SELECT e.uuid, e.name, e.entity_subtype, e.summary, "  # nosec B608
+                f"       {_LIVE_DEGREE_SQL} AS degree FROM kg_entities e "
+                f"WHERE e.name ILIKE %s{en_and} "
+                "ORDER BY degree DESC, e.name OFFSET %s LIMIT %s",
                 (like, *en_p, offset, limit),
             ).fetchall():
                 hits.append(
@@ -1224,9 +1245,10 @@ def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
 _METRICS_WINDOW_MAX_S = 30 * 86400  # window is capped at 30d (contract)
 _RECALL_WINDOW_DEFAULT_S = 7 * 86400  # /metrics/recall default 7d
 _INGEST_WINDOW_DEFAULT_S = 48 * 3600  # /metrics/ingestion default 48h
-# Recall legs timed by the engine (recall_metrics ms_* columns). timeline/prefs are only
-# populated when those legs are enabled — a bucket with none stays absent for that leg.
-_RECALL_LEGS = ("embed", "bm25", "vector", "kg", "web", "rerank", "timeline", "prefs")
+# Recall legs timed by the engine (recall_metrics ms_* columns). notes is only populated
+# when the notes leg ran — a bucket with none stays absent for that leg. The retired
+# timeline/prefs legs (ms_timeline/ms_prefs) are no longer reported.
+_RECALL_LEGS = ("embed", "bm25", "vector", "kg", "web", "rerank", "notes")
 _SLOWEST_CAP = 10
 _SCORE_BINS = 10
 _INGEST_FAILURES_CAP = 20
@@ -1272,9 +1294,10 @@ def _r1(v: Any) -> float | None:
 
 def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
     """Hourly recall latency percentiles + per-leg p50 + slowest queries + rerank-score
-    histogram, over recall_metrics (kind='recall') within the window. percentile_cont is a
-    true continuous percentile; NULL leg timings are ignored by the aggregate (a disabled
-    leg simply doesn't contribute)."""
+    histogram, over recall_metrics (kind='recall') within the window, plus `summary`: the
+    window's own p50/p95/tokens (percentiles do not average across hourly buckets).
+    percentile_cont is a true continuous percentile; NULL leg timings are ignored by the
+    aggregate (a disabled leg simply doesn't contribute)."""
     leg_select = ", ".join(
         f"percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_{leg}::double precision) AS leg_{leg}"
         for leg in _RECALL_LEGS
@@ -1305,6 +1328,24 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
                     "legs_p50": legs,
                 }
             )
+
+        summary_row = (
+            conn.execute(
+                "SELECT count(*) AS calls, "
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_total::double precision) AS p50, "
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY ms_total::double precision) AS p95, "
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY est_tokens::double precision) AS tok "
+                "FROM recall_metrics WHERE kind = 'recall' AND created_at >= now() - %s::interval",
+                (f"{window_s} seconds",),
+            ).fetchone()
+            or {}
+        )
+        summary = {
+            "calls": int(summary_row.get("calls") or 0),
+            "p50": _r1(summary_row.get("p50")),
+            "p95": _r1(summary_row.get("p95")),
+            "tokens_p50": int(summary_row["tok"]) if summary_row.get("tok") is not None else None,
+        }
 
         slow_rows = conn.execute(
             "SELECT query, ms_total, created_at FROM recall_metrics "
@@ -1338,13 +1379,14 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
             {"lo": round(i / _SCORE_BINS, 2), "hi": round((i + 1) / _SCORE_BINS, 2), "n": n}
             for i, n in enumerate(counts_by_bin)
         ]
-        return {"series": series, "slowest": slowest, "score_hist": score_hist}
+        return {"summary": summary, "series": series, "slowest": slowest, "score_hist": score_hist}
 
 
 def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
     """Extraction-queue health. queue_depth is a LIVE snapshot (pending/processing/failed
     right now); throughput series are enqueue/hour (enqueued_at) + completions/hour
-    (processed_at) — the ONLY honest series the columns support. There is no historical
+    (processed_at of the rows that finished 'done'; a failed row stamps processed_at too and
+    is no completion) — the ONLY honest series the columns support. There is no historical
     depth series because a row's status is overwritten in place (contract §Phase 4)."""
     interval = f"{window_s} seconds"
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
@@ -1364,21 +1406,23 @@ def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
         ).fetchall()
         comp = conn.execute(
             "SELECT date_trunc('hour', processed_at) AS t, count(*) AS n FROM extraction_queue "
-            "WHERE processed_at IS NOT NULL AND processed_at >= now() - %s::interval "
+            "WHERE status = 'done' AND processed_at >= now() - %s::interval "
             "GROUP BY 1 ORDER BY 1",
             (interval,),
         ).fetchall()
         fails = conn.execute(
             "SELECT id, episode_id, error, enqueued_at, processed_at, attempts "
             "FROM extraction_queue WHERE status = 'failed' "
+            "AND COALESCE(processed_at, enqueued_at) >= now() - %s::interval "
             "ORDER BY COALESCE(processed_at, enqueued_at) DESC, id DESC LIMIT %s",
-            (_INGEST_FAILURES_CAP,),
+            (interval, _INGEST_FAILURES_CAP),
         ).fetchall()
 
         last = conn.execute(
             "SELECT id, started_at, finished_at, stages, counts, samples, errors, ok, "
             "  EXTRACT(EPOCH FROM (finished_at - started_at)) AS duration_s "
-            "FROM dream_runs ORDER BY started_at DESC, id DESC LIMIT 1"
+            # A run that never finished (crashed mid-way) must not hide the last real one.
+            "FROM dream_runs ORDER BY (finished_at IS NULL), started_at DESC, id DESC LIMIT 1"
         ).fetchone()
 
         return {
@@ -2858,9 +2902,10 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             return _unauthorized()
         uuid = request.path_params["uuid"]
         m_off = _offset(request.query_params.get("mentions_offset"))
+        f_off = _offset(request.query_params.get("facts_offset"))
         return await _api(
             request,
-            lambda: _entity(db_url, uuid, m_off),
+            lambda: _entity(db_url, uuid, m_off, f_off),
             not_found="entity not found",
             label="entity",
         )

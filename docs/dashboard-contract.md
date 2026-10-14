@@ -106,7 +106,7 @@ A session longer than the cap returns a window around the highlighted turn (abou
 before it, sliding to stay full at either end); without a highlight in the session, the
 first 500. No `content`: the drawer renders the two turn fields (`/episode/{id}` has it).
 
-### GET /dash/api/entity/{uuid}?mentions_offset=0
+### GET /dash/api/entity/{uuid}?mentions_offset=0&facts_offset=0
 ```json
 {"entity": {"uuid": "…", "name": "…", "entity_type": "…", "summary": "…",
              "degree": 12, "created_at": "…"},
@@ -118,7 +118,10 @@ first 500. No `content`: the drawer renders the two turn fields (`/episode/{id}`
                "offset": 0, "limit": 20, "total": 63}}
 ```
 Facts = live + superseded edges touching the uuid (superseded have `t_invalid` set), read
-within the entity's own `(owner_id, group_id)`. `entity_type` is the taxonomy subtype
+within the entity's own `(owner_id, group_id)`, live first (newest `t_valid` first, undated
+last), then superseded. One page of 200 per request; `facts_offset` walks the rest and
+`stats.facts` is the total the client pages against. `entity.degree` is the live-edge count
+(equal to `stats.edges`), not the `kg_entities.degree` column. `entity_type` is the taxonomy subtype
 (`entity_subtype`, schema 020); `created_at` is the entity's `t_created`.
 `served` = sum of edge `retrieval_count`. Mentions = distinct provenance episodes, newest
 first, paged. (Timeline/preference cross-links: reserved for a later phase.)
@@ -135,9 +138,11 @@ substring (`%`, `_` and `\` in `q` are text, not wildcards). NOT recall().
 `total_by_type` is computed for all four types (tab counts) on a query's first page
 (`offset=0`) and omitted from later pages (the client keeps the totals it has); `hits` only
 for the requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`
-(`entity_type` = `entity_subtype`). Fact hits' `meta.ts` is the edge's `t_created`.
-Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
-resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link.
+(`entity_type` = `entity_subtype`; `degree` = live edges, which also orders the hits).
+Fact hits' `meta.ts` is the edge's `t_created`; `meta.t_invalid` is set on a superseded
+fact. Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
+resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link; event
+hits also carry `meta.source_ref` (a git-sourced event's only provenance, a commit SHA).
 
 ### GET /dash/api/flags · POST /dash/api/flag
 Flag kinds: `episode | fact | timeline_event | preference | note`.
@@ -193,9 +198,17 @@ The `debug` envelope surfaces the SAME numbers the engine already measures for t
 ```
 
 `legs_ms` carries only legs the engine timed. `embed / bm25 / vector / kg / web / rerank`
-are always present; `timeline` is no longer emitted (the inline timeline leg was
-removed from `recall()` on 2026-08-07) and the waterfall renders an omitted leg as
-untimed/skipped. Absent `debug` key ⇒ `debug` was not requested. The waterfall
+are always present; `notes` is present when the notes leg ran (`SYNAPSE_RECALL_NOTES`, on by
+default); `timeline` is no longer emitted (the inline timeline leg was removed from
+`recall()` on 2026-08-07) and the waterfall renders an omitted leg as untimed/skipped. The
+Served tab shows what the payload carries: `episodes`, `facts`, `notes` (`{id, hook, note}`),
+`web` and `superseded_facts`; the entity, community, timeline and preference buckets are
+retired and never drawn.
+
+The console sends the scope `recall()` honors: it searches exactly one group, so a header
+group of `all` goes out as `technical` (stated beside the query bar), and `untagged` is not a
+project `recall()` can match (its episode legs compare `project` literally), so it goes out
+as no project, also stated. Absent `debug` key ⇒ `debug` was not requested. The waterfall
 UI models the parallel band schematically (all parallel legs start at embed-end, rerank at the
 max parallel end) from these durations; the payload carries durations, not start offsets.
 
@@ -446,8 +459,8 @@ tabs. Admin-gated, threadpool, bounded — same posture as every `/dash/api/*` r
 - **No ingestion depth history.** `extraction_queue` overwrites a row's `status` in place, so
   historical queue depth is NOT reconstructable and is never fabricated. `queue_depth` is a
   LIVE snapshot only. The only honest throughput series the columns support are
-  **enqueued/hour** (`enqueued_at`) and **completed/hour** (`processed_at` — the single
-  completion timestamp; set when a row goes done/failed).
+  **enqueued/hour** (`enqueued_at`) and **completed/hour** (`processed_at` of the rows whose
+  `status` is `done`; a failed row stamps `processed_at` too and is no completion).
 
 ### GET /dash/api/metrics/recall?window=7d&bucket=1h
 Percentiles over `recall_metrics` where `kind='recall'`, hour-bucketed, within the window.
@@ -456,16 +469,20 @@ Percentiles over `recall_metrics` where `kind='recall'`, hour-bucketed, within t
 `percentile_cont` (continuous); NULL leg timings are ignored by the aggregate, so a disabled
 leg simply doesn't contribute to that bucket's `legs_p50`.
 ```json
-{"series": [
+{"summary": {"calls": 412, "p50": 213.0, "p95": 3225.0, "tokens_p50": 1520},
+ "series": [
    {"t": "2026-07-01T12:00:00+00:00", "p50": 218.0, "p95": 389.0, "calls": 12,
     "tokens_p50": 1540,
     "legs_p50": {"embed": 12.0, "bm25": 48.0, "vector": 96.0, "kg": 141.0,
-                 "web": 4.0, "rerank": 168.0, "timeline": 33.0, "prefs": 9.0}}],
+                 "web": 4.0, "rerank": 168.0, "notes": 33.0}}],
  "slowest": [{"query": "…", "ms_total": 612.0, "created_at": "…"}],
  "score_hist": [{"lo": 0.0, "hi": 0.1, "n": 0}, {"lo": 0.9, "hi": 1.0, "n": 41}]}
 ```
+- `summary`: the window's own p50 / p95 / median tokens over all its calls (the page's tiles).
+  Percentiles of hourly percentiles are not window percentiles, so the tiles never derive
+  from `series`; `p50`, `p95` and `tokens_p50` are null for an empty window.
 - `series` ordered oldest→newest; a leg key is present in `legs_p50` only when that leg was
-  timed in the bucket. `p50/p95/tokens_p50` are null for a bucket with no non-null values.
+  timed in the bucket (`ms_timeline` / `ms_prefs` rows from the retired legs are not reported). `p50/p95/tokens_p50` are null for a bucket with no non-null values.
 - `slowest`: top 10 recalls by `ms_total` desc within the window.
 - `score_hist`: 10 fixed bins over `rerank_top_score` in [0,1] (`width_bucket`); a 1.0 score
   folds into the top bin, sub-0 into the bottom bin.
@@ -490,9 +507,12 @@ Extraction-queue health. `window` parsing identical to `/metrics/recall` (defaul
 - `queue_depth` = live pending count (headline). `queue` breaks out pending/processing/failed.
 - `throughput.*_per_hour`: hour-bucketed, oldest→newest, over the window. These are the two
   honest series (see honesty note); there is deliberately no depth history.
-- `failures`: up to 20 most-recent `status='failed'` rows.
-- `last_dream`: the latest `dream_runs` row (schema 044), or `null` when the table is empty
-  ("no runs recorded yet"). `duration_s` = finished−started; `null` while a run is in flight.
+- `failures`: up to 20 most-recent `status='failed'` rows whose `processed_at` (else
+  `enqueued_at`) falls inside the window; `queue.failed` is the all-time live count.
+- `last_dream`: the latest FINISHED `dream_runs` row (schema 044) — a run that crashed
+  leaves `finished_at` NULL and does not pin it — else the latest unfinished one, or `null`
+  when the table is empty ("no runs recorded yet"). `duration_s` = finished−started; `null`
+  while a run is in flight.
   `counts`/`samples`/`stages` carry only what the nightly lanes cheaply report today
   (`proposals_raised` + the config lane's session/correction/proposal counts); the fuller
   set (facts_extracted, superseded, dedup_merges, timeline_events) is honestly absent until a
@@ -595,6 +615,9 @@ shape as `/metrics/ingestion`'s `last_dream`. `limit` ≤ 100. Empty table → `
    "samples": {"proposals": [{"id": "config:4", "kind": "config-edit", "name": "rules/x.md"}]},
    "errors": []}]}
 ```
+- The page opens on the newest run that has a `finished_at`; an unfinished run stays in the
+  picker, labelled "in flight" (started within 6 h) or "abandoned" (older: it crashed). A
+  duration under two minutes shows in seconds.
 - The 5 stat cards read `counts.{facts_extracted, superseded, dedup_merges, timeline_events,
   proposals_raised}`; an **absent** count renders "—" (the dream lanes propose, they do not
   extract facts, so most of these are honestly absent today — see the Phase 4 honesty note).
@@ -639,7 +662,7 @@ uuid; an edge to a uuid with no `kg_entities` row is simply dropped (no phantom 
 
 ### GET /dash/api/graph/entities?q&limit=10
 Seed typeahead — shares the search endpoint's entity leg SQL (`name ILIKE '%q%'` with `q`
-taken literally, `degree DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
+taken literally, live `degree DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
 Empty `q` → `[]`. Returns a bare array:
 ```json
 [{"uuid": "…", "name": "Synapse", "entity_type": "Project", "degree": 10}]
@@ -660,10 +683,13 @@ orphaned, and sets `truncated`.
 ```
 - **Seed resolution:** exact `uuid` → exact `normalized_name` (input lowercased +
   whitespace-collapsed + bookend-punctuation-stripped, mirroring `ingestion.dedup`) → best
-  `name ILIKE` substring match (`q` taken literally) by `degree DESC`. No match → **404** `entity not found`. Missing/empty
+  `name ILIKE` substring match (`q` taken literally) by live `degree DESC`. No match → **404** `entity not found`. Missing/empty
   `entity` → **400**.
 - **`supertype`** (nodes + typeahead) is the canonical coarse layer (`kg_entities.entity_supertype`,
   schema 020) — the client colors by it; `entity_type` stays the fine-grained label.
+- **`degree`** (nodes, typeahead, search) is the entity's count of live edges, read from
+  `kg_relationships` per request. `kg_entities.degree` is a one-off backfill (schema 017) that
+  nothing maintains, so no dashboard read uses it.
 - **Truncation:** when the reachable set exceeds `limit`, keep the highest-degree nodes (the
   seed is always kept) and set `truncated: true`. Edges are returned only when BOTH endpoints
   survive truncation. Ranking is best-effort over the scanned candidates (per-level BFS scans
@@ -814,9 +840,8 @@ No such uuid → 404 `fact not found`.
   dangling-pointer cleanup the episode cascade does for its sole-provenance deletes.
 - Retires an active `dashboard_flags` row for the uuid; appends a `delete_fact`
   `dashboard_audit` row.
-- The entity endpoints are NOT touched: `kg_entities.degree` is a denormalized counter
-  that the KG backfill recomputes; this route does not try to keep it in sync (it is
-  already stale by design on the dual-write path — schema 017).
+- The entity endpoints are NOT touched: `degree` is counted live from `kg_relationships`
+  on every read (the `kg_entities.degree` column is an unmaintained backfill value).
 
 ## Shipped surface
 

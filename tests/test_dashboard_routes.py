@@ -104,14 +104,18 @@ def _episode(
 # The KG helpers write only the bitemporal t_* columns and entity_subtype, never the
 # FalkorDB-era created_at / valid_at / invalid_at / entity_type mirrors: the dashboard
 # reads the former, so a read that slips back onto a legacy column fails here.
-def _entity(
-    conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0, group_id="technical"
-):
+def _entity(conn, uuid, *, name, entity_type="Technology", summary="a thing", group_id="technical"):
     return conn.execute(
-        "INSERT INTO kg_entities (uuid, group_id, name, entity_subtype, summary, degree, t_created) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
-        (uuid, group_id, name, entity_type, summary, degree, _t(0)),
+        "INSERT INTO kg_entities (uuid, group_id, name, entity_subtype, summary, t_created) "
+        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        (uuid, group_id, name, entity_type, summary, _t(0)),
     ).fetchone()[0]
+
+
+def _spokes(conn, hub, n, *, prefix=None):
+    """n live edges from `hub` to throwaway endpoints: gives it a live degree of n."""
+    for i in range(n):
+        _rel(conn, f"{prefix or hub}-sp{i}", src=hub, tgt=f"{prefix or hub}-leaf{i}")
 
 
 def _rel(
@@ -217,14 +221,14 @@ def _metric(
     est_tokens=100,
     rerank_top_score=0.5,
     created_at=None,
-    legs=None,  # optional {embed,bm25,vector,kg,web,rerank,timeline,prefs} → ms_* columns
+    legs=None,  # optional {embed,bm25,vector,kg,web,rerank,notes} → ms_* columns
 ):
     legs = legs or {}
     return conn.execute(
         "INSERT INTO recall_metrics (kind, source, query, ms_total, est_tokens, "
         " rerank_top_score, created_at, ms_embed, ms_bm25, ms_vector, ms_kg, ms_web, "
-        " ms_rerank, ms_timeline, ms_prefs) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        " ms_rerank, ms_notes) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
             kind,
             source,
@@ -239,8 +243,7 @@ def _metric(
             legs.get("kg"),
             legs.get("web"),
             legs.get("rerank"),
-            legs.get("timeline"),
-            legs.get("prefs"),
+            legs.get("notes"),
         ),
     ).fetchone()[0]
 
@@ -652,7 +655,6 @@ def test_entity_dossier(clean, conn, db_url):
         name="MainThing",
         entity_type="Technology",
         summary="the subject",
-        degree=1,
     )
     _entity(conn, "ent-o1", name="OtherOne")
     _entity(conn, "ent-o2", name="OtherTwo")
@@ -713,6 +715,80 @@ def test_entity_dossier(clean, conn, db_url):
         assert client.get("/dash/api/entity/nope", headers=_H).status_code == 404
 
 
+def test_entity_dossier_pages_facts_live_first(clean, conn, db_url, monkeypatch):
+    """The header counts every fact, so the list pages to match: live facts first (newest
+    first), superseded ones after, `facts_offset` walks the rest."""
+    monkeypatch.setattr(dr, "_ENTITY_FACTS_PAGE", 3)
+    _entity(conn, "hub", name="Hub")
+    _entity(conn, "o", name="Other")
+    # Five facts. The two superseded ones are the NEWEST by t_valid, and one live fact has no
+    # t_valid at all: a plain t_valid-DESC cut would fill page 1 with the dead ones.
+    for name, t_valid, t_invalid in (
+        ("dead-new", _t(50), _t(60)),
+        ("dead-newer", _t(40), _t(45)),
+        ("live-old", _t(1), None),
+        ("live-mid", _t(10), None),
+        ("live-undated", None, None),
+    ):
+        _rel(conn, name, src="hub", tgt="o", t_valid=t_valid, t_invalid=t_invalid)
+    with _client(db_url) as client:
+        p1 = client.get("/dash/api/entity/hub", headers=_H).json()
+        p2 = client.get("/dash/api/entity/hub?facts_offset=3", headers=_H).json()
+        p3 = client.get("/dash/api/entity/hub?facts_offset=99", headers=_H).json()
+    assert [f["uuid"] for f in p1["facts"]] == ["live-mid", "live-old", "live-undated"]
+    assert [f["uuid"] for f in p2["facts"]] == ["dead-new", "dead-newer"]
+    assert p3["facts"] == []
+    assert p1["stats"]["facts"] == p2["stats"]["facts"] == 5  # the count the UI pages against
+
+
+def test_entity_degree_counts_live_edges_not_the_stored_column(clean, conn, db_url):
+    """kg_entities.degree is a one-off backfill that nothing maintains (0 for every entity
+    extraction wrote since). Every dashboard read counts live edges instead."""
+    _entity(conn, "fresh", name="Fresh entity")  # stored degree 0: what the extractor writes
+    _entity(conn, "stale", name="Stale entity")
+    conn.execute("UPDATE kg_entities SET degree = 57 WHERE uuid = 'stale'")  # old backfill
+    _spokes(conn, "fresh", 5)
+    _spokes(conn, "stale", 2)
+    _rel(conn, "gone", src="stale", tgt="x", t_invalid=_t(3))  # superseded: not an edge
+    with _client(db_url) as client:
+        dossier = client.get("/dash/api/entity/fresh", headers=_H).json()
+        search = client.get(
+            "/dash/api/search", params={"q": "entity", "type": "entities"}, headers=_H
+        ).json()
+        ta = client.get("/dash/api/graph/entities", params={"q": "entity"}, headers=_H).json()
+        nb = client.get("/dash/api/graph/neighborhood?entity=fresh&depth=1", headers=_H).json()
+    assert dossier["entity"]["degree"] == dossier["stats"]["edges"] == 5
+    # Ranked by live degree: fresh (5) outranks stale (2) although its stored column says 0.
+    assert [(h["id"], h["meta"]["degree"]) for h in search["hits"]] == [("fresh", 5), ("stale", 2)]
+    assert [(e["uuid"], e["degree"]) for e in ta] == [("fresh", 5), ("stale", 2)]
+    assert {n["uuid"]: n["degree"] for n in nb["nodes"]}["fresh"] == 5
+
+
+def test_graph_seed_and_truncation_use_live_degree(clean, conn, db_url):
+    # Two same-name nodes: the stored column favours the dead one, live edges the real one.
+    _gent(conn, "dup-dead", name="Twin")
+    _gent(conn, "dup-live", name="Twin")
+    conn.execute("UPDATE kg_entities SET degree = 99 WHERE uuid = 'dup-dead'")
+    _spokes(conn, "dup-live", 3)
+    # Truncation keeps the highest LIVE degree: 'busy' has stored 0 but three edges.
+    _gent(conn, "t-seed", name="Seed")
+    _gent(conn, "t-busy", name="Busy")
+    _gent(conn, "t-idle", name="Idle")
+    conn.execute("UPDATE kg_entities SET degree = 50 WHERE uuid = 't-idle'")
+    _rel(conn, "t1", src="t-seed", tgt="t-busy")
+    _rel(conn, "t2", src="t-seed", tgt="t-idle")
+    _spokes(conn, "t-busy", 3, prefix="tb")
+    with _client(db_url) as client:
+        by_norm = client.get("/dash/api/graph/neighborhood?entity=Twin", headers=_H).json()
+        by_like = client.get("/dash/api/graph/neighborhood?entity=twi", headers=_H).json()
+        cut = client.get(
+            "/dash/api/graph/neighborhood?entity=t-seed&depth=1&limit=2", headers=_H
+        ).json()
+    assert by_norm["seed"] == by_like["seed"] == "dup-live"
+    assert cut["truncated"] is True
+    assert {n["uuid"] for n in cut["nodes"]} == {"t-seed", "t-busy"}
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -723,7 +799,8 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
     epid = _episode(conn, session="q", seq=1, content=f"the {tok} subsystem failed")
     _rel(conn, "sr", src="a", tgt="b", fact=f"{tok} relates to widget", episodes=[epid])
     evid = _event(conn, fact=f"shipped {tok}", source_ref="tb:z")
-    _entity(conn, "se", name=f"{tok} engine", degree=4)
+    _entity(conn, "se", name=f"{tok} engine")
+    _spokes(conn, "se", 4)
 
     with _client(db_url) as client:
         ep = client.get(f"/dash/api/search?q={tok}&type=episodes", headers=_H).json()
@@ -739,6 +816,9 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
 
         ev = client.get(f"/dash/api/search?q={tok}&type=events", headers=_H).json()
         assert ev["hits"][0]["type"] == "events" and ev["hits"][0]["id"] == str(evid)
+        # a git-sourced event has no episode to open: the SHA is all the hit can show
+        assert ev["hits"][0]["meta"]["episode_id"] is None
+        assert ev["hits"][0]["meta"]["source_ref"] == "tb:z"
 
         en = client.get(f"/dash/api/search?q={tok}&type=entities", headers=_H).json()
         assert en["hits"][0]["type"] == "entities" and en["hits"][0]["id"] == "se"
@@ -752,9 +832,10 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
 def test_entity_name_matching_is_a_literal_substring(clean, conn, db_url):
     """'%' and '_' typed into the omnibox, the graph typeahead or the seed box are text, not
     LIKE wildcards: 'my_skill' must not pull in 'myXskill' ahead of the real entity."""
-    _entity(conn, "w1", name="myXskill", degree=9)
-    _entity(conn, "w2", name="my_skill", degree=1)
-    _entity(conn, "w3", name="100% done", degree=1)
+    _entity(conn, "w1", name="myXskill")
+    _spokes(conn, "w1", 3)
+    _entity(conn, "w2", name="my_skill")
+    _entity(conn, "w3", name="100% done")
     with _client(db_url) as client:
         for q, want in (("my_skill", ["w2"]), ("_", ["w2"]), ("%", ["w3"]), ("y_s", ["w2"])):
             se = client.get(
@@ -1763,7 +1844,15 @@ def test_parse_window_caps_and_defaults():
 def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url):
     now = datetime.now(UTC)
     h = now.replace(minute=0, second=0, microsecond=0)  # current hour-bucket start
-    legs = {"embed": 10.0, "bm25": 20.0, "vector": 30.0, "kg": 40.0, "web": 5.0, "rerank": 50.0}
+    legs = {
+        "embed": 10.0,
+        "bm25": 20.0,
+        "vector": 30.0,
+        "kg": 40.0,
+        "web": 5.0,
+        "rerank": 50.0,
+        "notes": 15.0,
+    }
     # bucket A (current hour): three recall rows, ms 100/200/300 (float32-exact)
     _metric(
         conn,
@@ -1820,7 +1909,7 @@ def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url
     assert big["p50"] == 200.0  # percentile_cont(0.5) over [100,200,300]
     assert big["p95"] == 290.0  # percentile_cont(0.95) interpolates 200→300
     assert big["tokens_p50"] == 1000
-    # only timed legs appear; timeline/prefs were NULL so they're absent
+    # only timed legs appear (notes included; the retired timeline/prefs legs never do)
     assert big["legs_p50"] == {
         "embed": 10.0,
         "bm25": 20.0,
@@ -1828,6 +1917,7 @@ def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url
         "kg": 40.0,
         "web": 5.0,
         "rerank": 50.0,
+        "notes": 15.0,
     }
 
     slow = body["slowest"]
@@ -1841,6 +1931,42 @@ def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url
     # 0.35→[0.3,0.4), 0.55→[0.5,0.6), 0.72→[0.7,0.8), 0.95→[0.9,1.0)
     assert by_lo[0.3] == 1 and by_lo[0.5] == 1 and by_lo[0.7] == 1 and by_lo[0.9] == 1
     assert sum(b["n"] for b in hist) == 4
+
+
+def test_metrics_recall_retired_legs_are_not_reported(clean, conn, db_url):
+    """Rows written while the timeline/prefs legs ran still carry their timings; the engine
+    no longer produces those legs, so the per-leg stack must not draw them."""
+    mid = _metric(conn, created_at=datetime.now(UTC) - timedelta(minutes=5))
+    conn.execute("UPDATE recall_metrics SET ms_timeline = 7, ms_prefs = 9 WHERE id = %s", (mid,))
+    with _client(db_url) as client:
+        series = client.get("/dash/api/metrics/recall?window=7d", headers=_H).json()["series"]
+    assert series[0]["legs_p50"] == {}
+
+
+def test_metrics_recall_summary_is_window_percentiles(clean, conn, db_url):
+    """The tiles are percentiles of the window's calls, not an average of per-hour
+    percentiles: nine calls at 100 ms in one hour and one at 2000 ms in another average out
+    to ~290 ms, but the window p50 is 100 and p95 is 1145."""
+    h = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    for i in range(9):
+        _metric(
+            conn,
+            ms_total=100.0,
+            est_tokens=500,
+            created_at=h - timedelta(hours=3) + timedelta(minutes=i),
+        )
+    _metric(conn, ms_total=2000.0, est_tokens=1500, created_at=h - timedelta(hours=1))
+    _metric(conn, kind="episodes", ms_total=9999.0, created_at=h - timedelta(hours=1))
+    with _client(db_url) as client:
+        body = client.get("/dash/api/metrics/recall?window=7d", headers=_H).json()
+    assert body["summary"] == {"calls": 10, "p50": 100.0, "p95": 1145.0, "tokens_p50": 500}
+    assert [p["calls"] for p in body["series"]] == [9, 1]
+
+
+def test_metrics_recall_summary_empty_window(clean, conn, db_url):
+    with _client(db_url) as client:
+        body = client.get("/dash/api/metrics/recall?window=7d", headers=_H).json()
+    assert body["summary"] == {"calls": 0, "p50": None, "p95": None, "tokens_p50": None}
 
 
 def test_metrics_ingestion_shape(clean, conn, db_url):
@@ -1884,14 +2010,59 @@ def test_metrics_ingestion_shape(clean, conn, db_url):
     assert b["queue"] == {"pending": 3, "processing": 1, "failed": 1}
     # enqueued/hour: only rows enqueued within 48h (5 of 6; the 5-day-old one is out)
     assert sum(p["n"] for p in b["throughput"]["enqueued_per_hour"]) == 5
-    # completed/hour: rows with processed_at within 48h (failed + done)
-    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 2
+    # completed/hour: rows that finished (status done) within 48h; the failed row is no completion
+    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 1
     assert len(b["failures"]) == 1
     assert b["failures"][0]["error"] == "boom timeout" and b["failures"][0]["attempts"] == 3
     assert b["last_dream"]["id"] == run_id
     assert b["last_dream"]["counts"]["proposals_raised"] == 2
     assert round(b["last_dream"]["duration_s"]) == 41
     assert b["last_dream"]["samples"]["proposals"][0]["id"] == "config:4"
+
+
+def test_metrics_ingestion_failures_stay_inside_the_window(clean, conn, db_url):
+    """A failed row stamps processed_at too, so it must not count as a completion; and the
+    failures panel is the window's, not every failure since the table began."""
+    now = datetime.now(UTC)
+    _queue(
+        conn,
+        status="failed",
+        error="recent",
+        enqueued_at=now - timedelta(hours=3),
+        processed_at=now - timedelta(hours=2),
+    )
+    _queue(
+        conn,
+        status="failed",
+        error="last month",
+        enqueued_at=now - timedelta(days=30),
+        processed_at=now - timedelta(days=29),
+    )
+    _queue(conn, status="done", enqueued_at=now - timedelta(hours=3), processed_at=now)
+    with _client(db_url) as client:
+        b = client.get("/dash/api/metrics/ingestion?window=48h", headers=_H).json()
+    assert [f["error"] for f in b["failures"]] == ["recent"]
+    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 1
+    assert b["queue"]["failed"] == 2  # the live snapshot still counts both
+
+
+def test_metrics_ingestion_last_dream_prefers_a_finished_run(clean, conn, db_url):
+    """A crashed run (finished_at NULL) must not pin the 'last run' tile until the next
+    nightly run: the latest FINISHED run wins; an unfinished one is the fallback."""
+    now = datetime.now(UTC)
+    done = _dream_run(
+        conn, started_at=now - timedelta(hours=30), finished_at=now - timedelta(hours=29), counts={}
+    )
+    crashed = _dream_run(
+        conn, started_at=now - timedelta(hours=6), finished_at=None, counts={}, ok=None
+    )
+    with _client(db_url) as client:
+        assert (
+            client.get("/dash/api/metrics/ingestion", headers=_H).json()["last_dream"]["id"] == done
+        )
+        conn.execute("DELETE FROM dream_runs WHERE id = %s", (done,))
+        only = client.get("/dash/api/metrics/ingestion", headers=_H).json()["last_dream"]
+    assert only["id"] == crashed and only["finished_at"] is None
 
 
 def test_metrics_ingestion_empty_last_dream(clean, conn, db_url):
@@ -2055,15 +2226,15 @@ def _pref_row(
 # ---------------------------------------------------------------------------
 
 
-def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name=None):
+def _gent(conn, uuid, *, name, entity_type="Technology", normalized_name=None):
     """Entity insert that ALSO sets normalized_name (the shared _entity helper doesn't),
     so the exact-normalized-name seed path is exercisable. entity_supertype mirrors
     the subtype — the graph payloads serve BOTH (client colors by supertype)."""
     return conn.execute(
         "INSERT INTO kg_entities "
         "(uuid, group_id, name, normalized_name, entity_subtype, entity_supertype, summary, "
-        " degree, t_created) "
-        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        " t_created) "
+        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             name,
@@ -2071,7 +2242,6 @@ def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name
             entity_type,
             entity_type,
             f"{name} summary",
-            degree,
             _t(0),
         ),
     ).fetchone()[0]
@@ -2464,17 +2634,18 @@ def test_phase5_routes_require_machine_token(clean, conn, db_url):
 
 
 def _mini_graph(conn):
-    """6-8 entities, ~10 edges, one superseded + one not-yet-valid. Degrees are set so
-    truncation order is deterministic. Returns the seed episode id for provenance checks."""
-    _gent(conn, "g-hub", name="Synapse", degree=10, entity_type="Project")
-    _gent(conn, "g-pg", name="Postgres", degree=8)
-    _gent(conn, "g-cc", name="Claude Code", degree=6)
-    _gent(conn, "g-kg", name="knowledge graph", degree=5, entity_type="Concept")
-    _gent(conn, "g-anthropic", name="Anthropic", degree=4, entity_type="Organization")
-    _gent(conn, "g-nuc", name="homelab NUC", degree=3)  # depth-2 (via g-pg)
-    _gent(conn, "g-sse", name="SSE stream", degree=2)  # depth-2 (via g-cc)
-    _gent(conn, "g-far", name="embedding cache", degree=1)  # depth-2 (via g-pg)
-    _gent(conn, "g-future", name="future thing", degree=0)  # only via a not-yet-valid edge
+    """9 entities, ~10 edges, one superseded + one not-yet-valid. Live degrees come out
+    hub 5 > pg 3 > cc 2 > the rest 1, so truncation order is deterministic. Returns the
+    seed episode id for provenance checks."""
+    _gent(conn, "g-hub", name="Synapse", entity_type="Project")
+    _gent(conn, "g-pg", name="Postgres")
+    _gent(conn, "g-cc", name="Claude Code")
+    _gent(conn, "g-kg", name="knowledge graph", entity_type="Concept")
+    _gent(conn, "g-anthropic", name="Anthropic", entity_type="Organization")
+    _gent(conn, "g-nuc", name="homelab NUC")  # depth-2 (via g-pg)
+    _gent(conn, "g-sse", name="SSE stream")  # depth-2 (via g-cc)
+    _gent(conn, "g-far", name="embedding cache")  # depth-2 (via g-pg)
+    _gent(conn, "g-future", name="future thing")  # only via a not-yet-valid edge
 
     ep = _episode(conn, session="g", seq=1, content="synapse stores in postgres")
     # Depth-1 (from g-hub) live edges.
@@ -2677,7 +2848,7 @@ def test_graph_neighborhood_truncation_keeps_highest_degree(clean, conn, db_url)
         ).json()
         assert r["truncated"] is True
         kept = {n["uuid"] for n in r["nodes"]}
-        # budget 3 -> seed (always) + the two highest-degree reachable nodes (g-pg=8, g-cc=6).
+        # budget 3 -> seed (always) + the two highest-degree reachable nodes (g-pg=3, g-cc=2 live edges).
         assert kept == {"g-hub", "g-pg", "g-cc"}
         # every returned edge connects two kept nodes.
         for e in r["edges"]:
@@ -2689,9 +2860,9 @@ def test_graph_neighborhood_edge_cap_prunes_orphans(clean, conn, db_url):
     most-retrieved edges win, truncated flips, and nodes the cut orphaned are pruned
     (regression: the live 707-degree hub returned 150 nodes / ~2K edges and hung the
     browser in layout)."""
-    _gent(conn, "ec-hub", name="Hub", degree=9)
+    _gent(conn, "ec-hub", name="Hub")
     for i in range(4):
-        _gent(conn, f"ec-n{i}", name=f"Node {i}", degree=4 - i)
+        _gent(conn, f"ec-n{i}", name=f"Node {i}")
     # 4 seed-adjacent edges with distinct retrieval_counts + 2 leaf-leaf edges.
     for i in range(4):
         _rel(conn, f"ec-e{i}", src="ec-hub", tgt=f"ec-n{i}", retrieval_count=10 - i)
