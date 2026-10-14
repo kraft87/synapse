@@ -13,7 +13,7 @@ import {
 } from '../api';
 import { useStore } from '../state';
 import { openEpisode } from '../hash';
-import { relTime, monoHead } from '../tokens';
+import { relTime, monoHead, localMinute } from '../tokens';
 import { ErrorBox, EmptyState } from '../components/ui';
 import { useAsync } from '../hooks';
 
@@ -348,7 +348,7 @@ const DREAM_CARDS: { count: string; sample: string; label: string; color: string
   { count: 'proposals_raised', sample: 'proposals', label: 'proposals raised', color: 'var(--acc)' },
 ];
 
-const runLabel = (r: DreamRun): string => (r.started_at || '').replace('T', ' ').slice(0, 16);
+const runLabel = (r: DreamRun): string => localMinute(r.started_at);
 const sampleText = (s: unknown): string => {
   if (typeof s === 'string') return s;
   if (s && typeof s === 'object') {

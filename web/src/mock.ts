@@ -140,12 +140,18 @@ const day = (d: string) => new Date(d + 'T12:00:00Z').toISOString();
 const FIX_P5 = {
   timeline: {
     events: [
-      { id: 3, t_valid: day('2026-07-03'), fact: 'Rerank latency regression fixed — candidate pool capped at 96.', source: 'chat', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
-      { id: 2, t_valid: day('2026-07-03'), fact: 'SSE Last-Event-ID resume shipped.', source: 'git:example', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
-      { id: 1, t_valid: day('2026-07-01'), fact: 'Embedding cache moved into Postgres (pgvector table).', source: 'git:example', project: 'synapse', salience: 1, sal: 0.6, event_type: 'work', episode_id: 88101, flagged: false },
-      { id: 0, t_valid: day('2026-06-30'), fact: 'Took a proper rest day.', source: 'chat', project: null, salience: 1, sal: 0.6, event_type: 'health', episode_id: null, flagged: true },
+      { id: 3, t_valid: day('2026-07-03'), fact: 'Rerank latency regression fixed — candidate pool capped at 96.', source: 'chat', project: 'synapse', salience: 2, sal: 0.9, event_type: 'decision', episode_id: 88412, flagged: false },
+      { id: 2, t_valid: day('2026-07-03'), fact: 'SSE Last-Event-ID resume shipped.', source: 'git:example', project: 'synapse', salience: 2, sal: 0.9, event_type: 'milestone', episode_id: 88412, flagged: false },
+      { id: 1, t_valid: day('2026-07-01'), fact: 'Embedding cache moved into Postgres (pgvector table).', source: 'git:example', project: 'synapse', salience: 1, sal: 0.6, event_type: 'action', episode_id: 88101, flagged: false },
+      { id: 0, t_valid: day('2026-06-30'), fact: 'Took a proper rest day.', source: 'chat', project: null, salience: 1, sal: 0.6, event_type: 'finding', episode_id: null, flagged: true },
     ],
     next_before: null,
+  },
+  months: {
+    months: [
+      { month: '2026-07', n: 3, before: '2026-08-01T00:00:00+00:00' },
+      { month: '2026-06', n: 1, before: '2026-07-01T00:00:00+00:00' },
+    ],
   },
   preferences: {
     preferences: [
@@ -284,6 +290,7 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'metrics/ingestion') out = FIX_METRICS.ingestion;
   else if (p === 'metrics/corpus') out = FIX_METRICS.corpus;
   else if (p === 'timeline') out = FIX_P5.timeline;
+  else if (p === 'timeline/months') out = FIX_P5.months;
   else if (p === 'preferences') out = FIX_P5.preferences;
   else if (p === 'dream/report') out = FIX_P5.dreamReport;
   else if (p === 'behavior/files') out = FIX_P5.behaviorFiles;

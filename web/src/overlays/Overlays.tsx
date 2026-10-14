@@ -19,7 +19,7 @@ export function Overlays() {
 
   switch (route.kind) {
     case 'episode': return <EpisodeModal id={route.id} />;
-    case 'entity': return <EntityDossier id={route.id} />;
+    case 'entity': return <EntityDossier key={route.id} id={route.id} />;
     case 'session': return <SessionDrawer id={route.id} highlight={route.highlight} />;
     default: return null;
   }

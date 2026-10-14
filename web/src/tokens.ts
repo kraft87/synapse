@@ -105,6 +105,38 @@ export function relTime(ts?: string): string {
   return Math.round(dh / 24) + 'd ago';
 }
 
+// ---- calendar days, in the viewer's zone ----
+// An instant's calendar day is the viewer's, not the one its UTC string spells: said at 20:30
+// EDT on the 30th, an event is stored as 00:30Z on the 1st, and slicing the string files it a
+// day (a month, at month end) late. Every date the dashboard shows or buckets goes through
+// these; the zone is the browser's, and the tests pass one.
+export const browserTz = (): string => Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+const zoneFmt = new Map<string, Intl.DateTimeFormat>();
+function zoneParts(iso: string, tz: string): Record<string, string> | null {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  let fmt = zoneFmt.get(tz);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    });
+    zoneFmt.set(tz, fmt);
+  }
+  return Object.fromEntries(fmt.formatToParts(t).map((p) => [p.type, p.value]));
+}
+// YYYY-MM-DD ('' for a missing or unparseable instant).
+export function localDay(iso?: string | null, tz: string = browserTz()): string {
+  const p = iso ? zoneParts(iso, tz) : null;
+  return p ? `${p.year}-${p.month}-${p.day}` : '';
+}
+export const localMonth = (iso?: string | null, tz?: string): string => localDay(iso, tz).slice(0, 7);
+// YYYY-MM-DD HH:MM, 24-hour.
+export function localMinute(iso?: string | null, tz: string = browserTz()): string {
+  const p = iso ? zoneParts(iso, tz) : null;
+  return p ? `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}` : '';
+}
+
 // A tool-call trace is detected heuristically from stored episode content — the
 // contract delegates display derivation to the client.
 const TOOL_RE = /(^|\n)\s*(Read|Edit|Write|MultiEdit|Bash|Grep|Glob|LS|NotebookEdit|Task|WebFetch|WebSearch|Tool)\b/;
@@ -116,6 +148,6 @@ export const hasToolTrace = (content?: string): boolean => !!content && TOOL_RE.
 
 // Build a human validity string from bitemporal fields.
 export function validityLine(t_valid?: string, t_invalid?: string | null): string {
-  const v = t_valid ? 'valid since ' + t_valid.slice(0, 10) : 'valid';
-  return t_invalid ? v + ' · superseded ' + t_invalid.slice(0, 10) : v;
+  const v = t_valid ? 'valid since ' + localDay(t_valid) : 'valid';
+  return t_invalid ? v + ' · superseded ' + localDay(t_invalid) : v;
 }

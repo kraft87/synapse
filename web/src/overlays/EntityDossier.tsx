@@ -5,6 +5,7 @@ import type React from 'react';
 import { useEffect, useState } from 'react';
 import { fetchEntity, type Entity } from '../api';
 import { closeOverlay, openEpisode } from '../hash';
+import { appendUnique } from '../paging';
 import { etColor, validityLine } from '../tokens';
 import { Dot, FlagButton, Spinner } from '../components/ui';
 import { useStore } from '../state';
@@ -17,15 +18,24 @@ export function EntityDossier({ id }: { id: string }) {
   const { data, error } = useAsync(() => fetchEntity(id, 0), [id]);
   const err = error != null;
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
-  const [offset, setOffset] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreFailed, setMoreFailed] = useState(false);
 
   // seed the paginated mentions list from the base fetch; "load more" appends past this.
   useEffect(() => {
-    if (data) { setMentions(data.mentions.items); setOffset(data.mentions.items.length); }
+    if (data) setMentions(data.mentions.items);
   }, [data]);
 
+  // One page at a time, from the end of the list; a page can repeat rows the list holds
+  // (offsets move under a live corpus). A late page for another entity cannot land here:
+  // Overlays remounts the dossier per entity.
   const loadMoreMentions = () => {
-    fetchEntity(id, offset).then((d) => { setMentions((prev) => prev.concat(d.mentions.items)); setOffset((o) => o + d.mentions.items.length); }).catch(() => {});
+    if (loadingMore) return;
+    setLoadingMore(true); setMoreFailed(false);
+    fetchEntity(id, mentions.length)
+      .then((d) => setMentions((prev) => appendUnique(prev, d.mentions.items, (m) => String(m.episode_id))))
+      .catch(() => setMoreFailed(true))
+      .finally(() => setLoadingMore(false));
   };
 
   const e = data?.entity;
@@ -86,15 +96,16 @@ export function EntityDossier({ id }: { id: string }) {
 
             <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: '8px' }}>mentions · {total} episodes</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-              {mentions.map((m, i) => (
-                <button key={i} className="result" onClick={() => openEpisode(m.episode_id)} style={{ textAlign: 'left', border: '1px solid var(--line)', background: 'var(--bg2)', borderRadius: '7px', padding: '7px 11px', cursor: 'pointer', fontSize: '12.5px', lineHeight: 1.4, color: 'var(--txt2)' }}>
+              {mentions.map((m) => (
+                <button key={m.episode_id} className="result" onClick={() => openEpisode(m.episode_id)} style={{ textAlign: 'left', border: '1px solid var(--line)', background: 'var(--bg2)', borderRadius: '7px', padding: '7px 11px', cursor: 'pointer', fontSize: '12.5px', lineHeight: 1.4, color: 'var(--txt2)' }}>
                   <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', color: 'var(--acc)' }}>ep-{m.episode_id}</span> · {m.gist}
                 </button>
               ))}
             </div>
             {mentions.length < total && (
               <div style={{ textAlign: 'center', marginTop: '10px' }}>
-                <button className="softbtn" onClick={loadMoreMentions} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>load more mentions</button>
+                {moreFailed && <div style={{ color: 'var(--err)', fontSize: '12px', fontFamily: 'var(--font-data)', marginBottom: '6px' }}>couldn't load more mentions.</div>}
+                <button className="softbtn" onClick={loadMoreMentions} disabled={loadingMore} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>{loadingMore ? 'loading…' : 'load more mentions'}</button>
               </div>
             )}
           </>

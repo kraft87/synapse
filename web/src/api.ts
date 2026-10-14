@@ -3,6 +3,7 @@
 // static shell. When location.hash contains "mock", the mock dataset is served instead
 // so every screen renders offline.
 import { MOCK } from './mode';
+import { browserTz } from './tokens';
 
 export { MOCK };
 
@@ -135,14 +136,16 @@ export interface ProposalDetail {
   audit_log: { ts: string | null; action: string; note: string | null }[];
 }
 
-const qs = (params: Record<string, string | number | undefined | null>): string => {
+export const qs = (params: Record<string, string | number | undefined | null>): string => {
   const p = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '' && v !== 'all') p.set(k, String(v));
+    if (v !== undefined && v !== null && v !== '') p.set(k, String(v));
   }
   const s = p.toString();
   return s ? '?' + s : '';
 };
+// The header filters say 'all' for "no filter"; user text (a search for "all") is never dropped.
+export const filterVal = (v?: string): string | undefined => (v === 'all' ? undefined : v);
 
 // ---------- endpoints ----------
 export interface FeedParams { cursor?: string | null; project?: string; group_id?: string; source?: string; limit?: number; }
@@ -151,7 +154,7 @@ export const fetchCatalog = (tokenOverride?: string): Promise<Catalog> =>
   MOCK ? mockApi('/catalog') : req('/catalog', undefined, tokenOverride);
 
 export const fetchFeed = (p: FeedParams): Promise<Feed> =>
-  MOCK ? mockApi('/feed') : req('/feed' + qs({ cursor: p.cursor, project: p.project, group_id: p.group_id, source: p.source, limit: p.limit ?? 30 }));
+  MOCK ? mockApi('/feed') : req('/feed' + qs({ cursor: p.cursor, project: filterVal(p.project), group_id: filterVal(p.group_id), source: filterVal(p.source), limit: p.limit ?? 30 }));
 
 export const fetchEpisode = (id: string): Promise<Episode> =>
   MOCK ? mockApi('/episode/' + id) : req('/episode/' + encodeURIComponent(id));
@@ -167,7 +170,7 @@ export const fetchEntity = (uuid: string, mentionsOffset = 0): Promise<Entity> =
 
 export interface SearchParams { q: string; type: SearchTab; offset?: number; limit?: number; project?: string; group_id?: string; source?: string; }
 export const fetchSearch = (p: SearchParams): Promise<SearchResult> =>
-  MOCK ? mockApi('/search?type=' + p.type) : req('/search' + qs({ q: p.q, type: p.type, offset: p.offset ?? 0, limit: p.limit ?? 20, project: p.project, group_id: p.group_id, source: p.source }));
+  MOCK ? mockApi('/search?type=' + p.type) : req('/search' + qs({ q: p.q, type: p.type, offset: p.offset ?? 0, limit: p.limit ?? 20, project: filterVal(p.project), group_id: filterVal(p.group_id), source: filterVal(p.source) }));
 
 export const fetchFlags = (): Promise<{ flags: FlagRow[] }> =>
   MOCK ? mockApi('/flags') : req('/flags');
@@ -442,7 +445,9 @@ export function feedItemPassesFilter(
     if ((item.source || 'untagged') !== f.source) return false;
   }
   if (f.group !== 'all' && (item.type === 'fact' || item.type === 'timeline_event')) {
-    if ((item.group_id || '') !== f.group) return false;
+    // An unlabelled event (no domain) fails open at read (schema 038): it passes any group.
+    const unlabelled = item.type === 'timeline_event' && !item.group_id;
+    if (!unlabelled && (item.group_id || '') !== f.group) return false;
   }
   return true;
 }
@@ -501,9 +506,18 @@ export interface TimelineEvent {
 }
 export interface TimelinePage { events: TimelineEvent[]; next_before: string | null; }
 export interface TimelineParams { before?: string | null; limit?: number; type?: string; group_id?: string; }
+// The event types the pipeline writes (ingestion/llm_schemas.py _EVENT_TYPES); the API
+// answers 400 to any other `type`.
+export const TIMELINE_TYPES = ['decision', 'action', 'finding', 'milestone'] as const;
+// One month that has events under the active filters, bucketed in the browser's zone;
+// `before` is the cursor that makes /timeline start at that month's last event.
+export interface TimelineMonth { month: string; n: number; before: string; }
 
 export const fetchTimeline = (p: TimelineParams): Promise<TimelinePage> =>
-  MOCK ? mockApi('/timeline') : req('/timeline' + qs({ before: p.before, limit: p.limit ?? 50, type: p.type, group_id: p.group_id }));
+  MOCK ? mockApi('/timeline') : req('/timeline' + qs({ before: p.before, limit: p.limit ?? 50, type: p.type, group_id: filterVal(p.group_id) }));
+
+export const fetchTimelineMonths = (p: { type?: string; group_id?: string }): Promise<{ months: TimelineMonth[] }> =>
+  MOCK ? mockApi('/timeline/months') : req('/timeline/months' + qs({ type: p.type, group_id: filterVal(p.group_id), tz: browserTz() }));
 
 export interface Preference {
   id: number; pref: string; polarity: string; first_seen: string; last_asserted: string;

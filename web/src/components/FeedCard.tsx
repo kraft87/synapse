@@ -3,7 +3,7 @@
 // the feed payload. All expansion is in place — provenance opens overlays.
 import { useState, type CSSProperties } from 'react';
 import type { Derived, FeedItem } from '../api';
-import { hasToolTrace, relTime, turnBody, validityLine } from '../tokens';
+import { hasToolTrace, localDay, relTime, turnBody, validityLine } from '../tokens';
 import { openEpisode, openSession } from '../hash';
 import { FlagButton, ProjectChip, SalLabel, SourceChip, TypeChip } from './ui';
 import { useEpisode } from '../hooks';
@@ -80,7 +80,7 @@ function InlineExpansion({ item }: { item: FeedItem }) {
     ? (d.src_name && d.tgt_name ? `${d.src_name} — ${d.fact} → ${d.tgt_name}` : d.fact || '')
     : d.fact || '';
   const provEp = isFact ? d.provenance_episode_id : d.episode_id;
-  const validity = isFact ? validityLine(d.t_valid, d.t_invalid) : (d.t_valid ? 'dated ' + d.t_valid.slice(0, 10) : '');
+  const validity = isFact ? validityLine(d.t_valid, d.t_invalid) : (d.t_valid ? 'dated ' + localDay(d.t_valid) : '');
   return (
     <>
       {detail && detail !== item.gist && (
