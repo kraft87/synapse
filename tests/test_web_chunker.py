@@ -138,3 +138,55 @@ client.embed(texts, model="voyage-3-large")
         reconstructed = "".join(c.content for c in chunks)
         # With overlap, total length will be > original
         assert reconstructed.replace("x", "") == ""  # only x's
+
+
+class TestCodeFenceBounds:
+    """A fence used to be a ~10-char sentinel while merging, so it was weighed as tiny,
+    rode along whole in the next chunk's overlap, and broke the offset lookup."""
+
+    @staticmethod
+    def _doc() -> tuple[str, str]:
+        fence = "```python\n" + "value = compute(x)  # step\n" * 175 + "```"  # ~4.7K chars
+        prose = "This paragraph explains the code that follows in plain words. " * 22
+        return prose + "\n\n" + fence + "\n\n" + prose + "\n\n" + prose, fence
+
+    def test_offsets_slice_the_document(self):
+        doc, _ = self._doc()
+        for c in chunk_markdown(doc):
+            assert 0 <= c.char_start < c.char_end <= len(doc)
+            assert doc[c.char_start : c.char_end] == c.content
+
+    def test_fence_appears_in_exactly_one_chunk(self):
+        doc, fence = self._doc()
+        assert sum(fence in c.content for c in chunk_markdown(doc)) == 1
+
+    def test_only_the_fence_chunk_exceeds_the_target(self):
+        doc, fence = self._doc()
+        for c in chunk_markdown(doc):
+            if fence in c.content:
+                assert len(c.content) <= len(fence) + CHUNK_OVERLAP + 4
+            else:
+                assert len(c.content) <= CHUNK_TARGET + CHUNK_OVERLAP
+
+    def test_overlap_never_starts_inside_a_fence(self):
+        doc, _ = self._doc()
+        for c in chunk_markdown(doc):
+            assert c.content.count("```") % 2 == 0, "chunk cuts a fence open"
+
+    def test_hard_cut_keeps_fence_whole(self):
+        # No separators at all outside the fence: the last-resort character cut
+        # must step around it, not slice it.
+        fence = "```\n" + "y" * 2000 + "\n```"
+        doc = "a" * 1400 + fence + "b" * 1400
+        chunks = chunk_markdown(doc)
+        assert sum(fence in c.content for c in chunks) == 1
+        for c in chunks:
+            assert doc[c.char_start : c.char_end] == c.content
+
+    def test_fence_free_documents_keep_their_chunks(self):
+        """Without fences the output is what the old chunker produced."""
+        text = "## Header\n\n" + ("Some paragraph content. " * 50 + "\n\n") * 5
+        chunks = chunk_markdown(text)
+        assert [len(c.content) for c in chunks] == [1211, 1499, 1499, 1499, 1501]
+        for c in chunks:
+            assert text[c.char_start : c.char_end] == c.content

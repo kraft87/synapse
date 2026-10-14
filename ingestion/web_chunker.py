@@ -1,19 +1,21 @@
 """
-Markdown-aware recursive chunker for web_artifacts.content_markdown.
+Markdown-aware recursive chunker: web_artifacts.content_markdown, and every
+episode recall compacts into passages (mcp_server/recall_passages.py).
 
 Targets ~400-token chunks (1500 chars) with 20% overlap. Splits on the
 strongest available natural boundary, falling back to weaker ones if the
 chunk is still too big. Preserves fenced code blocks (```...```) as atomic
-units — never splits inside one.
+units — never splits inside one, and never repeats one in an overlap.
 
-Output shape: list[Chunk] where each Chunk knows its byte offset in the
-parent doc, idx (0-based), and whether it ends/starts inside a code block.
+Output shape: list[Chunk] where each Chunk knows its character span in the
+parent doc (overlap included) and its idx (0-based).
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import pairwise
 
 CHUNK_TARGET = 1500  # ~400 tokens at voyage-4-large; fits cross-encoder 512-token cap
 CHUNK_OVERLAP = 300  # 20% overlap
@@ -31,7 +33,7 @@ SEPARATORS: tuple[str, ...] = (
     " ",
 )
 
-# Fenced code block — captured as an atomic unit so we never split inside.
+# Fenced code block — an atomic unit we never split inside.
 # Matches ```lang?\n ... \n``` or ~~~lang?\n ... \n~~~.
 _CODE_FENCE_RE = re.compile(r"```[^\n]*\n.*?\n```|~~~[^\n]*\n.*?\n~~~", re.DOTALL)
 
@@ -44,99 +46,100 @@ class Chunk:
     char_end: int
 
 
-def _protect_code_fences(text: str) -> tuple[str, list[str]]:
-    """Replace fenced code blocks with sentinels so they survive splitting.
-
-    Returns (protected_text, blocks). Caller must restore via _restore_fences.
-    """
-    blocks: list[str] = []
-
-    def _sub(m: re.Match[str]) -> str:
-        blocks.append(m.group(0))
-        return f"\x00FENCE{len(blocks) - 1}\x00"
-
-    return _CODE_FENCE_RE.sub(_sub, text), blocks
+# Every step works on (start, end) spans of the original text, so a piece's size is
+# its real size (a fence counts at full length), offsets are exact by construction,
+# and a cut is legal anywhere except strictly inside a fence.
 
 
-def _restore_fences(text: str, blocks: list[str]) -> str:
-    def _sub(m: re.Match[str]) -> str:
-        return blocks[int(m.group(1))]
-
-    return re.sub(r"\x00FENCE(\d+)\x00", _sub, text)
-
-
-def _split_on(text: str, sep: str) -> list[str]:
-    """Split keeping the separator attached to the *following* piece."""
-    if sep not in text:
-        return [text]
-    parts = text.split(sep)
-    out = [parts[0]]
-    for p in parts[1:]:
-        out.append(sep + p)
-    return [p for p in out if p]
+def _fence_at(pos: int, fences: list[tuple[int, int]]) -> tuple[int, int] | None:
+    """The fence that a cut at ``pos`` would split, if any."""
+    for start, end in fences:
+        if start < pos < end:
+            return start, end
+    return None
 
 
-def _split_recursive(text: str, sep_idx: int = 0) -> list[str]:
-    """Split text into pieces <= CHUNK_TARGET using the separator ladder."""
-    if len(text) <= CHUNK_TARGET:
-        return [text]
+def _cuts(text: str, sep: str, lo: int, hi: int, fences: list[tuple[int, int]]) -> list[int]:
+    """Positions in (lo, hi) where ``sep`` starts outside a fence. The separator stays
+    attached to the *following* piece."""
+    out: list[int] = []
+    pos = text.find(sep, lo, hi)
+    while pos >= 0:
+        if pos > lo and _fence_at(pos, fences) is None:
+            out.append(pos)
+        pos = text.find(sep, pos + len(sep), hi)
+    return out
+
+
+def _hard_cut(lo: int, hi: int, fences: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Last resort: CHUNK_TARGET-sized pieces, stepping around any fence."""
+    out: list[tuple[int, int]] = []
+    a = lo
+    while hi - a > CHUNK_TARGET:
+        b = a + CHUNK_TARGET
+        if fence := _fence_at(b, fences):
+            b = fence[0] if fence[0] > a else fence[1]
+        if b >= hi:
+            break
+        out.append((a, b))
+        a = b
+    out.append((a, hi))
+    return out
+
+
+def _split_recursive(
+    text: str, lo: int, hi: int, fences: list[tuple[int, int]], sep_idx: int = 0
+) -> list[tuple[int, int]]:
+    """Split text[lo:hi] into spans <= CHUNK_TARGET using the separator ladder."""
+    if hi - lo <= CHUNK_TARGET:
+        return [(lo, hi)]
     if sep_idx >= len(SEPARATORS):
-        # Hard cut on character boundary as last resort
-        return [text[i : i + CHUNK_TARGET] for i in range(0, len(text), CHUNK_TARGET)]
-    pieces = _split_on(text, SEPARATORS[sep_idx])
-    if len(pieces) == 1:
+        return _hard_cut(lo, hi, fences)
+    cuts = _cuts(text, SEPARATORS[sep_idx], lo, hi, fences)
+    if not cuts:
         # This separator didn't help; try the next weaker one.
-        return _split_recursive(text, sep_idx + 1)
-    out: list[str] = []
-    for p in pieces:
-        if len(p) <= CHUNK_TARGET:
-            out.append(p)
+        return _split_recursive(text, lo, hi, fences, sep_idx + 1)
+    bounds = [lo, *cuts, hi]
+    out: list[tuple[int, int]] = []
+    for a, b in pairwise(bounds):
+        if b - a <= CHUNK_TARGET:
+            out.append((a, b))
         else:
-            out.extend(_split_recursive(p, sep_idx + 1))
+            out.extend(_split_recursive(text, a, b, fences, sep_idx + 1))
     return out
 
 
-def _merge_small_pieces(pieces: list[str]) -> list[str]:
-    """Greedily combine small adjacent pieces up to CHUNK_TARGET.
+def _merge_small_pieces(pieces: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Greedily combine adjacent spans up to CHUNK_TARGET.
 
-    Pieces are kept in order. Each output chunk is <= CHUNK_TARGET (unless
-    a single piece already exceeds that, in which case we pass it through).
+    Spans are kept in order. Each output span is <= CHUNK_TARGET unless a
+    single piece already exceeds that (a large fence), which passes through.
     """
-    out: list[str] = []
-    buf = ""
-    for p in pieces:
-        if not buf:
-            buf = p
-            continue
-        if len(buf) + len(p) <= CHUNK_TARGET:
-            buf += p
+    out: list[tuple[int, int]] = []
+    for start, end in pieces:
+        if out and end - out[-1][0] <= CHUNK_TARGET:
+            out[-1] = (out[-1][0], end)
         else:
-            out.append(buf)
-            buf = p
-    if buf:
-        out.append(buf)
+            out.append((start, end))
     return out
 
 
-def _apply_overlap(chunks: list[str], overlap: int) -> list[str]:
-    """Prepend last `overlap` chars of chunk N-1 to chunk N.
+def _overlap_start(
+    text: str, prev: tuple[int, int], start: int, overlap: int, fences: list[tuple[int, int]]
+) -> int:
+    """Where chunk N begins once the last ``overlap`` chars of chunk N-1 are prepended.
 
-    Skipped for the first chunk. Boundary is snapped to the nearest whitespace
-    on the left so we don't start mid-word.
+    The boundary is snapped right past the first space so the chunk doesn't start
+    mid-word, and past any fence in the tail: a fence is served once, in its own chunk.
     """
-    if overlap <= 0 or len(chunks) < 2:
-        return chunks
-    out = [chunks[0]]
-    for i in range(1, len(chunks)):
-        prev = chunks[i - 1]
-        take = min(overlap, len(prev))
-        tail = prev[-take:]
-        # Snap to whitespace on the left to avoid starting mid-word
-        ws = tail.find(" ")
-        if ws > 0:
-            tail = tail[ws + 1 :]
-        out.append(tail + chunks[i])
-    return out
+    tail = max(prev[0], start - overlap)
+    ws = text.find(" ", tail, start)
+    if ws > tail:
+        tail = ws + 1
+    for f_start, f_end in fences:
+        if f_start < start and f_end > tail:
+            tail = max(tail, f_end)
+    return tail
 
 
 def chunk_markdown(content: str) -> list[Chunk]:
@@ -144,28 +147,18 @@ def chunk_markdown(content: str) -> list[Chunk]:
 
     Documents <= CHUNK_TARGET return as a single chunk with no overlap.
     Code fences are preserved as atomic units; chunks split around them.
+    ``content[c.char_start:c.char_end] == c.content`` for every chunk.
     """
     if not content:
         return []
     if len(content) <= CHUNK_TARGET:
         return [Chunk(idx=0, content=content, char_start=0, char_end=len(content))]
 
-    protected, blocks = _protect_code_fences(content)
-    raw_pieces = _split_recursive(protected)
-    merged = _merge_small_pieces(raw_pieces)
-    with_overlap = _apply_overlap(merged, CHUNK_OVERLAP)
-    restored = [_restore_fences(p, blocks) for p in with_overlap]
-
-    # Compute character offsets in the *original* (unprotected) text.
+    fences = [m.span() for m in _CODE_FENCE_RE.finditer(content)]
+    spans = _merge_small_pieces(_split_recursive(content, 0, len(content), fences))
     chunks: list[Chunk] = []
-    cursor = 0
-    for i, piece in enumerate(restored):
-        # For chunks with prepended overlap, the cursor logic is approximate —
-        # the overlap region overlaps the previous chunk by design.
-        start = content.find(piece, max(0, cursor - CHUNK_OVERLAP * 2))
-        if start < 0:
-            start = cursor  # fallback if find fails (overlap snap shifted bytes)
-        end = start + len(piece)
-        chunks.append(Chunk(idx=i, content=piece, char_start=start, char_end=end))
-        cursor = end - CHUNK_OVERLAP
+    for i, (start, end) in enumerate(spans):
+        if i and CHUNK_OVERLAP > 0:
+            start = _overlap_start(content, spans[i - 1], start, CHUNK_OVERLAP, fences)
+        chunks.append(Chunk(idx=i, content=content[start:end], char_start=start, char_end=end))
     return chunks
