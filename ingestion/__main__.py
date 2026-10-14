@@ -17,8 +17,8 @@ logging.basicConfig(
 )
 
 # Logfire spans for the extraction pipeline. Explicit spans on stage
-# 6+7 + auto-instrumentation of every LLM call (claude_agent_sdk +
-# anthropic) and HTTP request so the trace UI shows the full tree:
+# 6+7 + auto-instrumentation of every Claude CLI call (claude_agent_sdk) and
+# HTTP request so the trace UI shows the full tree:
 #
 #   process_facts_for_group
 #     stage6b_batch_confirm
@@ -34,7 +34,6 @@ logfire.configure(
     send_to_logfire="if-token-present",
 )
 logfire.instrument_claude_agent_sdk()
-logfire.instrument_anthropic()
 logfire.instrument_httpx()
 
 from ingestion.config import get_settings  # noqa: E402

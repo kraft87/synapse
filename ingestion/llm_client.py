@@ -8,9 +8,8 @@ Single module providing two interfaces over the Claude Code Agent SDK
     callers in ``ingestion/extractor.py``, ``dream/*``, etc. work
     unchanged.
 
-  * ``agent_call`` / ``agent_call_batch`` — native async API with an
-    asyncio.Semaphore for parallel concurrency control. Use these from
-    any async-aware caller that wants to fan out N independent calls.
+  * ``agent_call`` — the native async call underneath it: one prompt, one
+    CLI process, the response text back.
 
 Plus an alternative backend for users without a Claude subscription:
 
@@ -39,12 +38,9 @@ Plus an alternative backend for users without a Claude subscription:
     pydantic-ai Agent (``NativeOutput`` + a stage model from
     ``ingestion.llm_schemas``) on whichever backend the client selects —
     ``OpenAIChatModel`` for the HTTP path, ``ClaudeAgentSDKModel``
-    (``ingestion.pydantic_ai_claude_sdk``) for the subscription CLI, and a
-    legacy duck-type adapter for anything else — and returns a validated
-    model instance.
-
-Follows the same Agent-SDK client pattern used across the Synapse stack
-for Claude Code interaction at scale.
+    (``ingestion.pydantic_ai_claude_sdk``) for the subscription CLI, and the
+    same text-call adapter over ``messages.create`` for anything else — and
+    returns a validated model instance.
 
 Auth: a Claude subscription OAuth token or ``ANTHROPIC_API_KEY``, consumed
 by the spawned ``claude`` CLI (or an OpenAI-compatible endpoint via
@@ -55,16 +51,20 @@ Resilience
 Retries are layered by failure mode, at the client so every caller —
 dedup, contradiction, edge dates, extractor, dream/* — inherits them:
 
-  * Transport transients (429/5xx, connection errors, timeouts) — a
-    ``tenacity`` exponential backoff around each call
-    (``_run_agent_sync`` on the structured path, the ``messages.create``
-    proxies on the text path).
+  * Transport failures — one ``tenacity`` policy (3 attempts, exponential
+    backoff) around the wire call of each backend: the CLI exchange inside
+    ``agent_call`` (crash, hang past ``_CLI_TIMEOUT_S``, no result), and the
+    HTTP call inside ``_run_agent_sync`` (429/5xx, connection errors,
+    timeouts). Once retries are exhausted the failure is always a member of
+    ``LLM_TRANSPORT_ERRORS``, so no stage can mistake an outage for "found
+    nothing".
   * Content failures (schema-invalid output) — pydantic-ai's output
     validation retries on the structured path; ``parse_with_retry``'s
     retry-with-feedback loop on the legacy text path.
   * NOT retried — malformed-prompt 4xx (retrying burns budget), auth
-    errors, and ``UsageLimitError`` (quota window exhausted; the caller
-    needs to STOP the cycle, not retry).
+    errors, the CLI's own error results (it already retried API errors), and
+    ``UsageLimitError`` (quota window exhausted; the caller needs to STOP the
+    cycle, not retry).
 """
 
 from __future__ import annotations
@@ -77,7 +77,6 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -86,14 +85,16 @@ from pydantic import BaseModel
 from pydantic_ai import UnexpectedModelBehavior
 from pydantic_ai.exceptions import ModelAPIError as PydanticAIModelAPIError
 from pydantic_ai.exceptions import ModelHTTPError as PydanticAIModelHTTPError
-from pydantic_ai.models import Model as PydanticAIModel
 from tenacity import (
+    AsyncRetrying,
     before_sleep_log,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
+
+from ingestion.llm_schemas import first_json_object
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
@@ -161,7 +162,6 @@ def _ranked_openrouter_providers(model: str) -> list[str]:
 
 
 DEFAULT_MODEL = "claude-haiku-4-5"
-_MAX_RETRIES = 2
 
 # Cap on extended-thinking reasoning tokens per call (maps to the CLI's
 # ``--max-thinking-tokens``). The extraction pipeline's calls are
@@ -173,23 +173,23 @@ _MAX_RETRIES = 2
 # entity-equivalence cases while killing the runaway reasoning. Tune here.
 _MAX_THINKING_TOKENS = 2048
 
-# Tenacity retry config: 3 attempts total, exponential 2s → 4s → 8s capped
-# at 30s. Tight enough to recover from a transient rate-limit blip; bounded
+# Transport retry policy shared by both backends (agent_call's CLI exchange,
+# _run_agent_sync's HTTP call): 3 attempts total, exponential 2s → 4s → 8s
+# capped at 30s. Tight enough to recover from a transient blip; bounded
 # enough not to stall the pipeline.
 _RETRY_STOP = stop_after_attempt(3)
 _RETRY_WAIT = wait_exponential(multiplier=1, min=2, max=30)
 
+# One CLI exchange (spawn, prompt, result) may take at most this long — the
+# same budget as the HTTP backend's read timeout (_HTTP_TIMEOUT). Without it a
+# hung CLI pins a drain thread, and the batch waiting on it, for good.
+_CLI_TIMEOUT_S = 300.0
+
 # Substrings that indicate the Max-subscription session is over its window.
-# Matched case-insensitively against the raw text the CLI sends back.
-#
-# NB: this is the *content-based* detector — it triggers when the CLI
-# returns a SUCCESS response whose text body looks like a rate-limit
-# message (the false-positive case where the model paraphrases the
-# limit notice). The tenacity retry above catches the *structured*
-# ``anthropic.RateLimitError`` exception path — a different code path
-# from a different SDK error mode. Keep both.
+# Matched case-insensitively — but only against what can be a CLI quota
+# notice, never against a completion (see ``_is_usage_limit_result``).
 _USAGE_LIMIT_PATTERNS = (
-    "claude usage limit reached",
+    "usage limit reached",
     "your limit will reset at",
     "rate_limit_error",
     "credit balance is too low",
@@ -197,6 +197,10 @@ _USAGE_LIMIT_PATTERNS = (
     "quota exceeded",
     "you've hit your limit",
 )
+
+# A quota notice is one short line ("You've hit your limit · resets 5pm");
+# a reply longer than this is a completion, whatever it mentions.
+_USAGE_NOTICE_MAX_CHARS = 300
 
 
 class UsageLimitError(Exception):
@@ -206,10 +210,9 @@ class UsageLimitError(Exception):
     to STOP the current cycle and leave items in ``pending`` for later retry,
     rather than marking them failed and burning the rest of the queue.
 
-    Distinct from ``anthropic.RateLimitError``: that's a transient
-    structured exception worth retrying; this signals the whole
-    Max-subscription window is gone — retrying within the window just
-    burns more time, the caller should pause until reset.
+    Distinct from a transient 429 (``TransientLLMHTTPError``, retried):
+    this signals the whole Max-subscription window is gone — retrying within
+    the window just burns more time, the caller should pause until reset.
     """
 
 
@@ -235,7 +238,8 @@ class LLMUnavailableError(Exception):
     fair reading of it), while this means the call never really happened. Every attempt
     came back blank: a model id the backend does not recognise (``claude -p --model
     anthropic/claude-haiku-4.5`` exits 0 with an empty completion), a missing or expired
-    token, an endpoint that is not there.
+    token, an endpoint that is not there. Or every attempt failed in transport: the CLI
+    crashed, hung, or ended without a result.
 
     Nothing about the item was decided, so a stage must not swallow this into "found
     nothing" and let the row be marked done. It raises, the row is marked failed with the
@@ -281,83 +285,144 @@ LLM_TRANSPORT_ERRORS: tuple[type[BaseException], ...] = (
 
 
 def _is_usage_limit(text: str | None) -> bool:
-    """Content-based usage-limit detector.
-
-    Pairs with ``UsageLimitError`` above — see that class's docstring for
-    why this lives separately from the tenacity retry on
-    ``anthropic.RateLimitError``.
-    """
+    """Does ``text`` contain one of the known quota phrases?"""
     if not text:
         return False
     lower = text.lower()
     return any(p in lower for p in _USAGE_LIMIT_PATTERNS)
 
 
-# ---------------------------------------------------------------------------
-# Transient exception detection for tenacity
-# ---------------------------------------------------------------------------
-#
-# The Claude Code Agent SDK does not export typed transient errors; it
-# wraps everything in plain ``Exception``s. We still want tenacity to
-# retry the structured ``anthropic.*`` exceptions when callers wire those
-# in directly (e.g. tests that pass a real ``anthropic.Anthropic()`` to
-# a deduper). Import them lazily so the SDK is optional at runtime — if
-# the import fails, the tuple just falls back to ``UsageLimitError``
-# (which is excluded from retry below) so no spurious retries happen.
+def _is_usage_limit_result(text: str, *, is_error: bool) -> bool:
+    """Is this CLI result a quota notice rather than a completion?
 
-try:
-    from anthropic import (
-        APIConnectionError as _AnthropicAPIConnectionError,
-    )
-    from anthropic import (
-        APITimeoutError as _AnthropicAPITimeoutError,
-    )
-    from anthropic import (
-        RateLimitError as _AnthropicRateLimitError,
-    )
+    The CLI has no status codes, so its result text is the only quota signal on
+    this path. But a completion can quote a quota message: Synapse ingests its
+    own development sessions, so an extraction about this module legitimately
+    contains "quota exceeded" (the HTTP path hit exactly that false positive on
+    2026-07-17). A false UsageLimitError makes the drain release the batch, back
+    off up to 30 minutes and re-claim the same item first, forever.
 
-    _TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
-        _AnthropicRateLimitError,
-        _AnthropicAPIConnectionError,
-        _AnthropicAPITimeoutError,
-    )
-except ImportError:  # pragma: no cover - anthropic is a direct dep
-    _TRANSIENT_ERRORS = ()
-
-
-def _is_transient(exc: BaseException) -> bool:
-    """Return True for SDK-level transient errors worth retrying.
-
-    Explicitly excludes:
-      * ``UsageLimitError`` — whole window is exhausted; retrying within
-        the window just burns time.
-      * ``MalformedResponseError`` — that's a content / parse failure;
-        the structured-feedback retry in ``parse_with_retry`` handles
-        it, not the wire-level retry here.
-      * ``BadRequestError`` / ``AuthenticationError`` — non-transient,
-        retrying loops on the same failure.
+    The CLI reports quota notices as error results, so an ``is_error`` result is
+    checked. Anything else counts only in the shape of a notice: short, with no
+    JSON object in it — never the shape of an extraction.
     """
-    if isinstance(exc, UsageLimitError | MalformedResponseError):
+    if not _is_usage_limit(text):
         return False
-    return isinstance(exc, _TRANSIENT_ERRORS)
+    if is_error:
+        return True
+    if len(text.strip()) > _USAGE_NOTICE_MAX_CHARS:
+        return False
+    try:
+        first_json_object(text)
+    except ValueError:
+        return True
+    return False
 
 
-def _find_cli_path() -> str:
-    """Locate the latest installed Claude Code CLI version."""
-    versions_dir = Path.home() / ".local/share/claude/versions"
-    if versions_dir.exists():
-        versions = sorted(versions_dir.iterdir(), key=lambda p: p.name, reverse=True)
-        if versions:
-            return str(versions[0])
-    return "claude"  # fallback to PATH
+def _with_json_schema(prompt: str, schema: dict[str, Any]) -> str:
+    """Append a JSON-schema response contract to ``prompt``.
+
+    The text surfaces' only enforcement: the CLI gets no ``--json-schema`` (the
+    SDK forwards one only for ``output_format`` type ``json_schema``, which adds a
+    StructuredOutput tool turn), and hand-written ``response_format`` dicts can't
+    be trusted to satisfy a provider's strict json_schema mode. Callers validate
+    the reply themselves.
+    """
+    return (
+        f"{prompt}\n\n"
+        f"Respond with ONLY valid JSON matching this schema — "
+        f"no markdown, no explanation:\n{json.dumps(schema)}"
+    )
 
 
-_CLI_PATH = _find_cli_path()
+def _flatten_chat(
+    messages: list[dict[str, Any]] | None,
+    *,
+    system: str | None = None,
+    prompt: str | None = None,
+) -> tuple[str | None, str]:
+    """Collapse anthropic-shaped chat messages into ``(instructions, prompt)``.
+
+    ``system`` and every system-role message join the instructions; ``prompt``
+    and every other message's content join the prompt, in order. One flattening
+    for every text surface, so the backends can't diverge on what reaches the
+    model.
+    """
+    instruction_parts: list[str] = [system] if system else []
+    user_parts: list[str] = [prompt] if prompt else []
+    for msg in messages or []:
+        content = str(msg.get("content", ""))
+        if str(msg.get("role", "user")) == "system":
+            instruction_parts.append(content)
+        else:
+            user_parts.append(content)
+    return "\n\n".join(instruction_parts) or None, "\n\n".join(user_parts)
 
 
 # ---------------------------------------------------------------------------
-# Async API
+# Claude CLI backend (Agent SDK)
 # ---------------------------------------------------------------------------
+
+# The SDK runs ``claude -v`` before every session (one extra process spawn,
+# ~120 ms) only to warn about a CLI older than it supports. agent_call runs the
+# SDK's own bundled CLI, pinned with it by uv.lock, so the warning can't fire.
+os.environ.setdefault("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
+
+
+def _cli_options(model: str) -> ClaudeAgentOptions:
+    """The options every ``agent_call`` spawns the CLI with.
+
+    A one-shot extraction call wants none of an interactive session's features,
+    and each one costs tokens, time or data hygiene. No ``cli_path``: the SDK
+    runs its bundled CLI, pinned by uv.lock, rather than whatever is installed.
+    """
+    return ClaudeAgentOptions(
+        # No built-in tools. allowed_tools=[] only removes auto-approval: without
+        # this the CLI still ships its ~23 tool definitions (about 10K prompt
+        # tokens on every call, measured) and Read/Grep stay callable while the
+        # model reads untrusted transcripts and scraped pages.
+        tools=[],
+        # Nothing can use a second turn once there are no tools.
+        max_turns=1,
+        model=model,
+        max_thinking_tokens=_MAX_THINKING_TOKENS,
+        # Never load filesystem settings into the spawned CLI. On a host
+        # whose user settings carry the Stop ingest hook, every
+        # agent_call otherwise ships its own transcript into /ingest and
+        # the corpus eats the harness's prompts — 1,895 judge/extraction
+        # episodes purged 2026-06-12. Hooks, CLAUDE.md, and output styles
+        # are all interactive-session concerns; extraction wants none.
+        setting_sources=[],
+        # Each call is a new process with a unique prompt, so the CLI's
+        # prompt-cache write (1.25-2x the input price) is never read back.
+        env={"DISABLE_PROMPT_CACHING": "1"},
+        extra_args={
+            # The CLI otherwise saves every prompt, turn text included, as a
+            # session transcript under ~/.claude/projects: disk churn, and a
+            # copy of conversation text outside Postgres that deletes can't reach.
+            "no-session-persistence": None,
+            # No MCP servers from user or project config.
+            "strict-mcp-config": None,
+        },
+    )
+
+
+async def _cli_exchange(prompt: str, model: str) -> tuple[str, bool]:
+    """One CLI session: send ``prompt``, return the result text and its ``is_error`` flag.
+
+    Every failure in here is a transport failure (crash, hang, no result) and
+    ``agent_call`` retries it.
+    """
+    result: ResultMessage | None = None
+    async with asyncio.timeout(_CLI_TIMEOUT_S):
+        async with ClaudeSDKClient(options=_cli_options(model)) as client:
+            await client.query(prompt)
+            async for msg in client.receive_response():
+                if isinstance(msg, ResultMessage):
+                    result = msg
+    if result is None or result.result is None:
+        raise RuntimeError("claude CLI ended the session without a result")
+    return result.result, bool(result.is_error)
 
 
 async def agent_call(
@@ -365,142 +430,53 @@ async def agent_call(
     *,
     system_prompt: str | None = None,
     model: str = DEFAULT_MODEL,
-    max_turns: int = 3,
-    semaphore: asyncio.Semaphore | None = None,
-    log_name: str | None = None,
-    output_format: dict[str, Any] | None = None,
+    json_schema: dict[str, Any] | None = None,
 ) -> str:
-    """Single async call to the Agent SDK. Returns the response text.
+    """One prompt through the Claude CLI; returns the response text.
 
-    ``semaphore`` (optional) gates concurrency when several ``agent_call``s
-    run inside the same event loop. Pass the same instance to all callers
-    that should share a quota.
+    ``json_schema`` (optional) is appended to the prompt as the response
+    contract (``_with_json_schema``) and the reply comes back with any ```json
+    fence stripped. The caller validates it.
 
-    ``output_format`` (optional) constrains the response to a JSON schema.
-    Shape: ``{"type": "json", "schema": {...}}`` — the SDK's structured-output
-    pattern. When set, ``ResultMessage.structured_output`` carries the
-    parsed dict; we serialize it back to a JSON string for the caller.
-    Requires ``max_turns >= 3`` so the SDK's StructuredOutput tool can
-    resolve before the stop hook fires.
+    Raises:
+      * ``UsageLimitError`` — the CLI reported the subscription window or the
+        credit balance exhausted. Not retried.
+      * ``LLMUnavailableError`` — the CLI answered with its own error (no login,
+        an unrecognised model, an API error it already retried), or the exchange
+        failed (crash, hang past ``_CLI_TIMEOUT_S``, no result) on every attempt
+        of the transport retry policy (``_RETRY_STOP``, backoff ``_RETRY_WAIT``).
     """
     full_prompt = prompt if not system_prompt else f"{system_prompt}\n\n{prompt}"
-    if output_format is not None:
-        schema_str = json.dumps(output_format.get("schema", {}))
-        full_prompt = (
-            f"{full_prompt}\n\n"
-            f"Respond with ONLY valid JSON matching this schema — "
-            f"no markdown, no explanation:\n{schema_str}"
-        )
+    if json_schema is not None:
+        full_prompt = _with_json_schema(full_prompt, json_schema)
 
-    for attempt in range(_MAX_RETRIES + 1):
-        opts = ClaudeAgentOptions(
-            allowed_tools=[],
-            max_turns=max_turns,
-            model=model,
-            cli_path=_CLI_PATH,
-            output_format=output_format,
-            max_thinking_tokens=_MAX_THINKING_TOKENS,
-            # Never load filesystem settings into the spawned CLI. On a host
-            # whose user settings carry the Stop ingest hook, every
-            # agent_call otherwise ships its own transcript into /ingest and
-            # the corpus eats the harness's prompts — 1,895 judge/extraction
-            # episodes purged 2026-06-12. Hooks, CLAUDE.md, and output styles
-            # are all interactive-session concerns; extraction wants none.
-            setting_sources=[],
-        )
-        ctx_sem = semaphore if semaphore is not None else _NULL_CTX
-        async with ctx_sem:
-            try:
-                async with ClaudeSDKClient(options=opts) as client:
-                    await client.query(full_prompt)
-                    result_text: str | None = None
-                    structured: dict[str, Any] | None = None
-                    is_error = False
-                    async for msg in client.receive_response():
-                        if isinstance(msg, ResultMessage):
-                            result_text = msg.result
-                            structured = getattr(msg, "structured_output", None)
-                            is_error = bool(getattr(msg, "is_error", False))
-                if structured is not None:
-                    return json.dumps(structured)
-                if result_text is None:
-                    raise RuntimeError("agent_call: no ResultMessage")
-                if _is_usage_limit(result_text):
-                    raise UsageLimitError(result_text.strip()[:300])
-                if is_error:
-                    # The CLI answered, but the "answer" is its own error text — no
-                    # login ("Not logged in · Please run /login"), an unrecognised
-                    # model id, a spawn failure. Callers must not parse that as a
-                    # model response: it looks exactly like a content failure
-                    # (unparseable text) while being a config failure that will
-                    # repeat identically until someone fixes the environment.
-                    raise LLMUnavailableError(
-                        f"claude CLI returned an error result: {result_text.strip()[:300]}"
-                    )
-                # When output_format is requested but the SDK delivered
-                # plain text, strip ```json fences so callers can json.loads
-                # the result directly.
-                if output_format is not None:
-                    return _strip_json_fence(result_text)
-                return result_text
-            except UsageLimitError:
-                raise  # do not retry usage limits — bubble up immediately
-            except LLMUnavailableError:
-                # Same shape: a missing login or a bad model id is identical on every
-                # attempt, and wrapping it in RuntimeError here would hide the one
-                # signal that tells the queue to retry the item later.
-                raise
-            except Exception as e:
-                if attempt < _MAX_RETRIES:
-                    logger.debug(
-                        "agent_call(%s) attempt %d/%d failed: %s",
-                        log_name,
-                        attempt + 1,
-                        _MAX_RETRIES + 1,
-                        str(e)[:120],
-                    )
-                    continue
-                raise RuntimeError(f"agent_call({log_name}): failed after retries: {e}") from e
+    retrying = AsyncRetrying(
+        stop=_RETRY_STOP,
+        wait=_RETRY_WAIT,
+        before_sleep=before_sleep_log(cast(Any, logger), logging.WARNING),
+        reraise=True,
+    )
+    try:
+        exchange: tuple[str, bool] = await retrying(_cli_exchange, full_prompt, model)
+    except Exception as e:
+        raise LLMUnavailableError(
+            f"claude CLI failed on every attempt: {type(e).__name__}: {e}"
+        ) from e
 
-    raise RuntimeError(f"agent_call({log_name}): unreachable")
-
-
-async def agent_call_batch(
-    prompts: list[str],
-    *,
-    system_prompt: str | None = None,
-    model: str = DEFAULT_MODEL,
-    max_turns: int = 1,
-    concurrency: int = 6,
-    log_prefix: str | None = None,
-) -> list[str]:
-    """Run N prompts concurrently, gated by an asyncio.Semaphore."""
-    sem = asyncio.Semaphore(concurrency)
-
-    async def _one(i: int, p: str) -> str:
-        return await agent_call(
-            p,
-            system_prompt=system_prompt,
-            model=model,
-            max_turns=max_turns,
-            semaphore=sem,
-            log_name=f"{log_prefix}_{i}" if log_prefix else None,
-        )
-
-    return await asyncio.gather(*[_one(i, p) for i, p in enumerate(prompts)])
-
-
-class _NullCtx:
-    """No-op async context manager — used when no semaphore is provided."""
-
-    async def __aenter__(self) -> None:
-        return None
-
-    async def __aexit__(self, *exc: Any) -> None:
-        return None
-
-
-_NULL_CTX = _NullCtx()
+    text, is_error = exchange
+    if _is_usage_limit_result(text, is_error=is_error):
+        raise UsageLimitError(text.strip()[:300])
+    if is_error:
+        # The CLI answered, but the "answer" is its own error text — no
+        # login ("Not logged in · Please run /login"), an unrecognised
+        # model id, a spawn failure. Callers must not parse that as a
+        # model response: it looks exactly like a content failure
+        # (unparseable text) while being a config failure that will
+        # repeat identically until someone fixes the environment.
+        raise LLMUnavailableError(f"claude CLI returned an error result: {text.strip()[:300]}")
+    if json_schema is not None:
+        return _strip_json_fence(text)
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -519,29 +495,12 @@ class _Response:
 
 
 class _MessagesProxy:
-    """``ClaudeCLIClient.messages`` — wraps every ``create`` in tenacity retry.
-
-    The retry decorator lives at this layer (not inside ``agent_call``) so
-    that callers using the ``anthropic.Anthropic()`` shape — every dedup,
-    contradiction, edge-dates, and dream-pipeline call site — get
-    exponential backoff on transient errors for free, without each call
-    site repeating its own ``@retry`` boilerplate.
-    """
+    """``ClaudeCLIClient.messages`` — the anthropic-shaped text surface over
+    ``agent_call``, which owns the retry policy."""
 
     def __init__(self, default_model: str) -> None:
         self._default_model = default_model
 
-    @retry(
-        stop=_RETRY_STOP,
-        wait=_RETRY_WAIT,
-        retry=retry_if_exception_type(_TRANSIENT_ERRORS),
-        # `logger` is a stdlib `Logger`; tenacity's `LoggerProtocol` is
-        # structurally compatible (the `log` method differs only in
-        # parameter naming), but mypy's strict mode doesn't recognise
-        # that. Cast keeps the runtime call identical.
-        before_sleep=before_sleep_log(cast(Any, logger), logging.WARNING),
-        reraise=True,
-    )
     def create(
         self,
         model: str | None = None,
@@ -550,19 +509,14 @@ class _MessagesProxy:
         system: str | None = None,
         response_format: dict[str, Any] | None = None,
     ) -> _Response:
-        m = model or self._default_model
-        content = ""
-        if messages:
-            for msg in messages:
-                if msg.get("role") == "user":
-                    content = str(msg["content"])
-
+        del max_tokens  # the CLI has no output-token flag
+        instructions, prompt = _flatten_chat(messages, system=system)
         text = asyncio.run(
             agent_call(
-                content,
-                system_prompt=system,
-                model=m,
-                output_format=response_format,
+                prompt,
+                system_prompt=instructions,
+                model=model or self._default_model,
+                json_schema=None if response_format is None else response_format.get("schema", {}),
             )
         )
         return _Response(text)
@@ -574,11 +528,11 @@ class ClaudeCLIClient:
     Internally routes to the async ``agent_call`` via ``asyncio.run``. Each
     call has its own event loop — appropriate for sync callers that don't
     have one already and don't need parallelism. Loop-bound callers should
-    use ``agent_call`` / ``agent_call_batch`` directly.
+    await ``agent_call`` directly.
 
-    Resilience: ``messages.create()`` retries transient SDK errors
-    (rate-limit, network, timeout) with exponential backoff. Non-transient
-    errors (BadRequest, Auth, UsageLimit) propagate immediately.
+    Resilience: ``agent_call`` retries a failed CLI exchange with backoff and
+    then raises ``LLMUnavailableError``; the CLI's own error results and
+    ``UsageLimitError`` propagate immediately.
     """
 
     def __init__(self, model: str = DEFAULT_MODEL) -> None:
@@ -738,12 +692,19 @@ def _run_agent_sync(
       result — the OpenRouter-credits incident started with empties being
       treated as "the model found nothing".
 
+    Transport failures still standing after the last attempt (a connection-level
+    ``ModelAPIError``, a raw ``httpx.TransportError``) raise as
+    ``TransientLLMHTTPError``: pydantic-ai's ``ModelAPIError`` is a ``RuntimeError``,
+    outside ``LLM_TRANSPORT_ERRORS``, and a stage that swallows everything else
+    would read an outage as "found nothing" and let the row be marked done.
+
     No ``_is_usage_limit(text)`` sniffing on this path: real quota errors
     arrive as status 402/429 (mapped above). Scanning completion CONTENT
     misfires when the extraction subject itself discusses usage limits (a KG
     entity list containing "usage limit" raised a false UsageLimitError and a
-    5-minute backoff, seen live 2026-07-17). The Claude-CLI backend keeps its
-    sniffing inside ``agent_call`` — text is the only quota signal there.
+    5-minute backoff, seen live 2026-07-17). The Claude-CLI backend sniffs only
+    the CLI's own quota notices (``_is_usage_limit_result``) — text is the only
+    quota signal there.
     """
     from pydantic_ai import capture_run_messages
 
@@ -783,7 +744,10 @@ def _run_agent_sync(
                 # LLM_TRANSPORT_ERRORS covers both, so the queue treats them alike.
                 raise LLMHTTPError(f"empty or invalid completion: {exc}") from exc
 
-    return _attempt()
+    try:
+        return _attempt()
+    except (PydanticAIModelAPIError, httpx.TransportError) as exc:
+        raise TransientLLMHTTPError(f"chat completions unreachable after retries: {exc}") from exc
 
 
 class _OpenAIMessagesProxy:
@@ -793,9 +757,9 @@ class _OpenAIMessagesProxy:
     client's chat-completions model, preserving the legacy text surface for
     callers that haven't moved to ``structured_call`` (dream/*, notes,
     preferences gate, ``parse_with_retry``). Legacy ``response_format``
-    dicts still travel in-prompt as schema text — same wording as the SDK
-    path — because arbitrary hand-written dicts can't be trusted to satisfy
-    a provider's strict json_schema mode.
+    dicts still travel in-prompt as schema text (``_with_json_schema``, as on
+    the CLI path) because arbitrary hand-written dicts can't be trusted to
+    satisfy a provider's strict json_schema mode.
     """
 
     def __init__(self, client: OpenAIChatClient) -> None:
@@ -812,25 +776,9 @@ class _OpenAIMessagesProxy:
         from pydantic_ai import Agent
 
         c = self._client
-        instruction_parts: list[str] = [system] if system else []
-        user_parts: list[str] = []
-        for msg in messages or []:
-            role = str(msg.get("role", "user"))
-            content = str(msg.get("content", ""))
-            if role == "system":
-                instruction_parts.append(content)
-                continue
-            if response_format is not None and role == "user":
-                # Providers disagree on structured-output support, so the
-                # schema constraint travels in-prompt — same wording as
-                # ``agent_call`` uses for the SDK path.
-                schema_str = json.dumps(response_format.get("schema", {}))
-                content = (
-                    f"{content}\n\n"
-                    f"Respond with ONLY valid JSON matching this schema — "
-                    f"no markdown, no explanation:\n{schema_str}"
-                )
-            user_parts.append(content)
+        instructions, prompt = _flatten_chat(messages, system=system)
+        if response_format is not None:
+            prompt = _with_json_schema(prompt, response_format.get("schema", {}))
 
         # retries=0: this surface has no output validation, so pydantic-ai
         # retries could only re-fire empty completions — the legacy client
@@ -841,12 +789,7 @@ class _OpenAIMessagesProxy:
             model_settings=c.model_settings(max_tokens),
             retries=0,
         )
-        result = _run_agent_sync(
-            agent,
-            "\n\n".join(user_parts),
-            instructions="\n\n".join(instruction_parts) or None,
-            structured=False,
-        )
+        result = _run_agent_sync(agent, prompt, instructions=instructions, structured=False)
         text = str(result.output)
         if response_format is not None:
             return _Response(_strip_json_fence(text))
@@ -1089,16 +1032,34 @@ def _resolve_pydantic_ai_model(llm_client: Any, model: str) -> Any:
     pydantic-ai Model here: ``OpenAIChatClient`` → ``OpenAIChatModel`` over
     its OpenRouter/OpenAI-compatible connection, ``ClaudeCLIClient`` →
     ``ClaudeAgentSDKModel`` over the subscription CLI. Anything else (test
-    doubles, third-party clients with the ``messages.create`` duck type) is
-    adapted via ``_LegacyClientModel``.
+    doubles, third-party clients with the ``messages.create(model=...,
+    max_tokens=..., messages=..., system=..., response_format=...) ->
+    .content[0].text`` duck type) gets the same text-call adapter over its
+    ``messages.create``, with native output delivered as the legacy
+    ``{"type": "json", "schema": ...}`` response_format.
     """
+    from ingestion.pydantic_ai_claude_sdk import ClaudeAgentSDKModel, TextCallModel
+
     if isinstance(llm_client, OpenAIChatClient):
         return llm_client.pydantic_ai_model(model)
     if isinstance(llm_client, ClaudeCLIClient):
-        from ingestion.pydantic_ai_claude_sdk import ClaudeAgentSDKModel
-
         return ClaudeAgentSDKModel(model)
-    return _LegacyClientModel(llm_client, model)
+
+    async def messages_create(
+        prompt: str, system: str | None, json_schema: dict[str, Any] | None, max_tokens: int
+    ) -> str:
+        response = llm_client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+            system=system,
+            response_format=None
+            if json_schema is None
+            else {"type": "json", "schema": json_schema},
+        )
+        return str(response.content[0].text)
+
+    return TextCallModel(model, messages_create, system="legacy-client")
 
 
 def structured_call[M: BaseModel](
@@ -1120,8 +1081,8 @@ def structured_call[M: BaseModel](
     the OpenRouter path this sends the provider-native
     ``response_format={"type": "json_schema", ...}`` (strict json_schema —
     Fireworks supports it) AND the schema in-prompt for providers that ignore
-    ``response_format``; on the Claude-CLI path it maps to the Agent SDK's
-    ``output_format``.
+    ``response_format``; on the Claude-CLI path the schema travels in-prompt
+    (``agent_call``'s ``json_schema``).
 
     ``max_attempts`` bounds output-validation attempts (``max_attempts - 1``
     pydantic-ai retries with the validation error quoted back — the same
@@ -1136,15 +1097,7 @@ def structured_call[M: BaseModel](
     from pydantic_ai import Agent, NativeOutput
     from pydantic_ai.settings import ModelSettings
 
-    instruction_parts: list[str] = [system] if system else []
-    user_parts: list[str] = [base_prompt] if base_prompt else []
-    for msg in messages or []:
-        role = str(msg.get("role", "user"))
-        content = str(msg.get("content", ""))
-        if role == "system":
-            instruction_parts.append(content)
-        else:
-            user_parts.append(content)
+    instructions, prompt = _flatten_chat(messages, system=system, prompt=base_prompt)
 
     if isinstance(llm_client, OpenAIChatClient):
         settings: Any = llm_client.model_settings(max_tokens)
@@ -1159,92 +1112,8 @@ def structured_call[M: BaseModel](
         model_settings=settings,
         retries=max(0, max_attempts - 1),
     )
-    result = _run_agent_sync(
-        agent,
-        "\n\n".join(user_parts),
-        instructions="\n\n".join(instruction_parts) or None,
-        structured=True,
-    )
+    result = _run_agent_sync(agent, prompt, instructions=instructions, structured=True)
     return cast(M, result.output)
-
-
-class _LegacyClientModel(PydanticAIModel):
-    """pydantic-ai Model adapter over any duck-typed legacy client.
-
-    Anything exposing ``messages.create(model=..., max_tokens=...,
-    messages=..., system=..., response_format=...) -> .content[0].text``
-    (test doubles, MagicMocks, third-party shims) keeps working with
-    ``structured_call`` through this adapter: the pydantic-ai message history
-    is flattened to the legacy call shape and the text response is handed
-    back for output validation. Native structured output is delivered as the
-    legacy ``{"type": "json", "schema": ...}`` response_format.
-    """
-
-    def __init__(self, client: Any, model_name: str) -> None:
-        from pydantic_ai.profiles import ModelProfile
-
-        super().__init__(
-            profile=ModelProfile(
-                supports_json_schema_output=True,
-                default_structured_output_mode="native",
-                supports_tools=False,
-            )
-        )
-        self._client = client
-        self._model_name = model_name
-
-    @property
-    def model_name(self) -> str:
-        return str(self._model_name)
-
-    @property
-    def system(self) -> str:
-        return "legacy-client"
-
-    async def request(
-        self,
-        messages: list[Any],
-        model_settings: Any,
-        model_request_parameters: Any,
-    ) -> Any:
-        from pydantic_ai.messages import ModelResponse, TextPart
-
-        from ingestion.llm_schemas import first_json_object
-        from ingestion.pydantic_ai_claude_sdk import flatten_messages
-
-        system, prompt = flatten_messages(messages)
-        instructions = "\n\n".join(
-            p.content for p in (model_request_parameters.instruction_parts or []) if p.content
-        )
-        if instructions:
-            system = f"{system}\n\n{instructions}" if system else instructions
-        response_format = None
-        output_object = model_request_parameters.output_object
-        if model_request_parameters.output_mode == "native" and output_object is not None:
-            response_format = {"type": "json", "schema": output_object.json_schema}
-        max_tokens = (model_settings or {}).get("max_tokens", 1024)
-        response = self._client.messages.create(
-            model=self._model_name,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
-            system=system,
-            response_format=response_format,
-        )
-        text = str(response.content[0].text)
-        if response_format is not None:
-            # Tolerate fenced / prose-wrapped JSON (raw_decode parses the
-            # first object; models can ramble after it) — the posture the
-            # legacy dict-walking call sites had.
-            try:
-                text = first_json_object(_strip_json_fence(text))
-            except ValueError:
-                pass  # leave as-is; output validation will retry/fail
-        return ModelResponse(parts=[TextPart(text)], model_name=str(self._model_name))
-
-    async def request_stream(  # type: ignore[override]
-        self, *args: Any, **kwargs: Any
-    ) -> Any:
-        raise NotImplementedError("legacy client adapter does not stream")
 
 
 # ---------------------------------------------------------------------------
@@ -1278,10 +1147,10 @@ def parse_with_retry[T](
     ``MalformedResponseError``) on bad input; returning ``None`` is
     treated as a successful parse to a ``None`` value, NOT a retry signal.
 
-    Note: this does NOT replicate the wire-level retry inside
-    ``_MessagesProxy.create`` — the two layers compose. A transient
-    ``RateLimitError`` is handled by tenacity inside ``create``; a parse
-    failure is handled by this loop on top.
+    Note: this does NOT replicate the backends' transport retries — the two
+    layers compose. A transport failure is retried inside ``messages.create``
+    (``agent_call`` / ``_run_agent_sync``); a parse failure is handled by this
+    loop on top.
     """
     feedback = ""
     last_error: Exception | None = None
@@ -1310,8 +1179,15 @@ def parse_with_retry[T](
         saw_text = saw_text or bool(raw.strip())
         try:
             return parser(raw)
-        except MalformedResponseError as exc:
-            last_error = exc
+        except (MalformedResponseError, ValueError) as exc:  # JSONDecodeError is a ValueError
+            # Wrap raw parser exceptions so the caller catches a uniform type
+            # after retries exhaust.
+            failure = (
+                exc
+                if isinstance(exc, MalformedResponseError)
+                else MalformedResponseError(str(exc), raw_response=raw)
+            )
+            last_error = failure
             feedback = (
                 "\n\nYour last response failed to parse: "
                 f"{exc}. Output ONLY valid JSON matching the schema above."
@@ -1324,25 +1200,7 @@ def parse_with_retry[T](
                     str(exc)[:120],
                 )
                 continue
-            raise _exhausted(exc) from exc
-        except (json.JSONDecodeError, ValueError) as exc:
-            # Wrap raw parser exceptions in MalformedResponseError so the
-            # caller catches a uniform type after retries exhaust.
-            wrapped = MalformedResponseError(str(exc), raw_response=raw)
-            last_error = wrapped
-            feedback = (
-                "\n\nYour last response failed to parse: "
-                f"{exc}. Output ONLY valid JSON matching the schema above."
-            )
-            if attempt < max_attempts:
-                logger.warning(
-                    "parse_with_retry attempt %d/%d failed: %s",
-                    attempt,
-                    max_attempts,
-                    str(exc)[:120],
-                )
-                continue
-            raise _exhausted(wrapped) from exc
+            raise _exhausted(failure) from exc
 
     # Defensive — the for-loop returns or raises on each iteration.
     if last_error is not None:  # pragma: no cover - unreachable

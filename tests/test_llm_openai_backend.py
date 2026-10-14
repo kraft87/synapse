@@ -580,6 +580,26 @@ class TestHTTPErrors:
         assert resp.content[0].text == "ok"
         assert len(calls) == 2
 
+    def test_exhausted_connect_error_is_a_transport_error(self):
+        """A connection failure on every attempt surfaced as pydantic-ai's ModelAPIError,
+        a RuntimeError outside LLM_TRANSPORT_ERRORS: the gates and dedup stages swallowed
+        an outage as "found nothing" and the queue row was marked done."""
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            raise httpx.ConnectError("connection refused")
+
+        client = _client_with(handler)
+        with pytest.raises(TransientLLMHTTPError, match="unreachable after retries") as text_err:
+            client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        with pytest.raises(TransientLLMHTTPError) as structured_err:
+            structured_call(client, output_model=_StrictVerdict, base_prompt="hi")
+        for err in (text_err.value, structured_err.value):
+            assert isinstance(err, llm_client_mod.LLM_TRANSPORT_ERRORS)
+            assert _API_KEY not in str(err)
+        assert len(calls) == 6  # three attempts per call
+
     def test_200_wrapped_402_error_body_raises_usage_limit(self):
         """OpenRouter quirk: HTTP 200 carrying {"error": {"code": 402}}."""
 

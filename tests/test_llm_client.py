@@ -1,241 +1,303 @@
-"""Tests for ``ingestion.llm_client`` — Phase 5 resilience layer.
+"""Tests for ``ingestion.llm_client`` — the Claude CLI backend and ``parse_with_retry``.
 
 Covers:
 
-* The tenacity-wrapped ``_MessagesProxy.create`` retries on transient
-  errors (``RateLimitError``, ``APIConnectionError``, ``APITimeoutError``)
-  and gives up immediately on non-transient errors
-  (``BadRequestError``, ``AuthenticationError``).
-* The ``parse_with_retry`` helper that re-fires the LLM call with
-  feedback on parse failure (mirrors Graphiti's
-  ``generate_response`` retry loop).
+* ``agent_call``: the options every CLI spawn carries (no tools, one turn, no prompt
+  cache, no session transcript, the thinking cap), its one retry policy (transport
+  failures only, then ``LLMUnavailableError``), the per-exchange timeout, and when a
+  result counts as a quota notice.
+* ``ClaudeCLIClient.messages.create`` flattening chat messages the same way the
+  OpenAI-compatible proxy does.
+* The ``parse_with_retry`` helper that re-fires the LLM call with feedback on parse
+  failure (mirrors Graphiti's ``generate_response`` retry loop).
 
-All tests run without any external services — the SDK is mocked at the
-``messages.create`` boundary or, where the retry decorator itself is
-under test, at the ``asyncio.run(agent_call(...))`` boundary by
-patching ``agent_call`` directly.
+No ``claude`` CLI is ever spawned: the SDK is replaced at the ``ClaudeSDKClient``
+boundary, or ``agent_call`` itself is patched.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-import httpx
 import pytest
-from anthropic import (
-    APIConnectionError,
-    APITimeoutError,
-    AuthenticationError,
-    BadRequestError,
-    RateLimitError,
-)
-from tenacity import wait_exponential
+from tenacity import wait_none
 
+import ingestion.llm_client as llm_mod
 from ingestion.llm_client import (
     _MAX_THINKING_TOKENS,
+    LLM_TRANSPORT_ERRORS,
     ClaudeCLIClient,
     LLMUnavailableError,
     MalformedResponseError,
+    UsageLimitError,
     _is_usage_limit,
-    _MessagesProxy,
     agent_call,
     parse_with_retry,
 )
 from tests.helpers.llm import mock_llm_message
 
-# ---------------------------------------------------------------------------
-# Helpers for constructing the structured ``anthropic`` exceptions.
-# Their constructors all require a request/response object so we fabricate
-# a minimal ``httpx.Request`` once and reuse it.
-# ---------------------------------------------------------------------------
 
-_FAKE_REQUEST = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+class _FakeResult:
+    """Stands in for the SDK's ``ResultMessage`` (patched over it below)."""
 
-
-def _rate_limit_error() -> RateLimitError:
-    response = httpx.Response(429, request=_FAKE_REQUEST)
-    return RateLimitError("rate limit", response=response, body=None)
+    def __init__(self, result: str | None, is_error: bool = False) -> None:
+        self.result = result
+        self.is_error = is_error
 
 
-def _bad_request_error() -> BadRequestError:
-    response = httpx.Response(400, request=_FAKE_REQUEST)
-    return BadRequestError("bad request", response=response, body=None)
+def _fake_sdk(sessions: list[Any], log: list[str] | None = None) -> type:
+    """A ``ClaudeSDKClient`` stand-in. Each session pops the next entry of ``sessions``:
+    an exception is raised from the exchange, ``"hang"`` never answers, ``None`` ends
+    the stream with no result, anything else is yielded as the result message. Prompts
+    sent are appended to ``log``."""
+
+    class _Client:
+        def __init__(self, options: Any = None) -> None:
+            self._entry = sessions.pop(0)
+
+        async def __aenter__(self) -> _Client:
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        async def query(self, prompt: str) -> None:
+            if log is not None:
+                log.append(prompt)
+            if isinstance(self._entry, BaseException):
+                raise self._entry
+            if self._entry == "hang":
+                await asyncio.sleep(3600)
+
+        async def receive_response(self):  # type: ignore[no-untyped-def]
+            if self._entry is not None:
+                yield self._entry
+
+    return _Client
 
 
-def _auth_error() -> AuthenticationError:
-    response = httpx.Response(401, request=_FAKE_REQUEST)
-    return AuthenticationError("auth", response=response, body=None)
+@pytest.fixture
+def cli(monkeypatch):
+    """Install a fake SDK: ``cli(sessions)`` returns the list of prompts the CLI received.
+    Retry backoff is zeroed so exhausted-retry tests don't sleep."""
+    monkeypatch.setattr(llm_mod, "ResultMessage", _FakeResult)
+    monkeypatch.setattr(llm_mod, "_RETRY_WAIT", wait_none())
 
+    def install(sessions: list[Any]) -> list[str]:
+        log: list[str] = []
+        monkeypatch.setattr(llm_mod, "ClaudeSDKClient", _fake_sdk(sessions, log))
+        return log
 
-def _connection_error() -> APIConnectionError:
-    return APIConnectionError(request=_FAKE_REQUEST)
-
-
-def _timeout_error() -> APITimeoutError:
-    return APITimeoutError(request=_FAKE_REQUEST)
-
-
-# ---------------------------------------------------------------------------
-# _MessagesProxy.create — retry on transient errors
-# ---------------------------------------------------------------------------
-
-
-class TestMessagesProxyRetry:
-    """``_MessagesProxy.create`` wraps ``agent_call`` with tenacity.
-
-    The retry config matches Graphiti's defaults: 3 attempts, exponential
-    backoff (2s → 4s → 8s, capped at 30s), retry only on the structured
-    transient exceptions.
-
-    All tests patch ``agent_call`` (the inner SDK boundary) so we don't
-    spin up a real CLI.
-    """
-
-    @pytest.fixture(autouse=True)
-    def _no_retry_sleep(self, no_retry_sleep):
-        # Short-circuit the tenacity wait so retries don't actually sleep — we
-        # still want to verify the call_count, not the wait. The shared conftest
-        # fixture patches ``tenacity.nap.time.sleep``; this autouse shim applies
-        # it to every method in the class.
-        yield
-
-    def test_retries_on_rate_limit_error(self):
-        """RateLimitError raised twice, success on third → 3 calls total."""
-        proxy = _MessagesProxy(default_model="claude-haiku-4-5")
-
-        call_log: list[int] = []
-
-        async def fake_agent_call(*args: Any, **kwargs: Any) -> str:
-            call_log.append(1)
-            if len(call_log) < 3:
-                raise _rate_limit_error()
-            return "ok"
-
-        with patch("ingestion.llm_client.agent_call", fake_agent_call):
-            response = proxy.create(messages=[{"role": "user", "content": "hi"}])
-
-        assert response.content[0].text == "ok"
-        assert len(call_log) == 3
-
-    def test_retries_on_api_connection_error(self):
-        """APIConnectionError is also transient → retried."""
-        proxy = _MessagesProxy(default_model="claude-haiku-4-5")
-
-        call_log: list[int] = []
-
-        async def fake_agent_call(*args: Any, **kwargs: Any) -> str:
-            call_log.append(1)
-            if len(call_log) < 2:
-                raise _connection_error()
-            return "ok"
-
-        with patch("ingestion.llm_client.agent_call", fake_agent_call):
-            response = proxy.create(messages=[{"role": "user", "content": "hi"}])
-
-        assert response.content[0].text == "ok"
-        assert len(call_log) == 2
-
-    def test_retries_on_api_timeout_error(self):
-        """APITimeoutError is transient → retried."""
-        proxy = _MessagesProxy(default_model="claude-haiku-4-5")
-
-        call_log: list[int] = []
-
-        async def fake_agent_call(*args: Any, **kwargs: Any) -> str:
-            call_log.append(1)
-            if len(call_log) < 2:
-                raise _timeout_error()
-            return "ok"
-
-        with patch("ingestion.llm_client.agent_call", fake_agent_call):
-            response = proxy.create(messages=[{"role": "user", "content": "hi"}])
-
-        assert response.content[0].text == "ok"
-        assert len(call_log) == 2
-
-    def test_no_retry_on_bad_request(self):
-        """BadRequestError is non-transient → 1 call, exception re-raised."""
-        proxy = _MessagesProxy(default_model="claude-haiku-4-5")
-        call_log: list[int] = []
-
-        async def fake_agent_call(*args: Any, **kwargs: Any) -> str:
-            call_log.append(1)
-            raise _bad_request_error()
-
-        with patch("ingestion.llm_client.agent_call", fake_agent_call):
-            with pytest.raises(BadRequestError):
-                proxy.create(messages=[{"role": "user", "content": "hi"}])
-
-        assert len(call_log) == 1
-
-    def test_no_retry_on_auth_error(self):
-        """AuthenticationError is non-transient → 1 call, re-raised."""
-        proxy = _MessagesProxy(default_model="claude-haiku-4-5")
-        call_log: list[int] = []
-
-        async def fake_agent_call(*args: Any, **kwargs: Any) -> str:
-            call_log.append(1)
-            raise _auth_error()
-
-        with patch("ingestion.llm_client.agent_call", fake_agent_call):
-            with pytest.raises(AuthenticationError):
-                proxy.create(messages=[{"role": "user", "content": "hi"}])
-
-        assert len(call_log) == 1
-
-    def test_gives_up_after_three_attempts(self):
-        """RateLimitError on every attempt → 3 calls then raise."""
-        proxy = _MessagesProxy(default_model="claude-haiku-4-5")
-        call_log: list[int] = []
-
-        async def fake_agent_call(*args: Any, **kwargs: Any) -> str:
-            call_log.append(1)
-            raise _rate_limit_error()
-
-        with patch("ingestion.llm_client.agent_call", fake_agent_call):
-            with pytest.raises(RateLimitError):
-                proxy.create(messages=[{"role": "user", "content": "hi"}])
-
-        # 3 total attempts (Graphiti default: stop_after_attempt(3)).
-        assert len(call_log) == 3
+    return install
 
 
 # ---------------------------------------------------------------------------
-# Exponential backoff bounds
+# The CLI command every agent_call spawns
 # ---------------------------------------------------------------------------
 
 
-def test_exponential_backoff_respects_min_max():
-    """``wait_exponential(multiplier=1, min=2, max=30)`` produces 2s → 4s → 8s
-    on the first three retries, all within the 2s..30s envelope.
+def _cli_command() -> list[str]:
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-    Uses tenacity's wait helper directly (instead of timing real sleeps)
-    so the test is deterministic and fast. Mirrors Graphiti's
-    ``client.py`` configuration shape — keeps the spec-mandated bounds
-    enforced by the type system instead of by side effect.
-    """
-    wait = wait_exponential(multiplier=1, min=2, max=30)
+    transport = SubprocessCLITransport(prompt="", options=llm_mod._cli_options("claude-haiku-4-5"))
+    transport._cli_path = "claude"
+    return transport._build_command()
 
-    # tenacity passes a RetryCallState; we only need the attempt number.
-    state = MagicMock()
-    state.outcome = MagicMock()
-    state.outcome.failed = True
 
-    waits: list[float] = []
-    for attempt in range(1, 8):
-        state.attempt_number = attempt
-        waits.append(wait(state))
+def test_cli_spawns_with_no_tools_and_one_turn():
+    """``allowed_tools=[]`` only removes auto-approval: without ``--tools ""`` the CLI
+    loads its whole built-in toolset (23 definitions, ~10K prompt tokens per call) and
+    Read/Grep stay callable while the model reads untrusted transcripts. Nothing needs
+    a second turn once there are no tools."""
+    cmd = _cli_command()
+    assert cmd[cmd.index("--tools") + 1] == ""
+    assert cmd[cmd.index("--max-turns") + 1] == "1"
+    assert "--allowedTools" not in cmd
 
-    # Every wait must be in [2, 30] — the spec's bounds.
-    assert all(2 <= w <= 30 for w in waits), waits
-    # First wait should be 2s (the min, not the raw 2**0 == 1).
-    assert waits[0] == 2
-    # Higher attempts saturate at the 30s cap.
-    assert waits[-1] == 30
+
+def test_cli_spawns_without_mcp_servers_or_session_transcripts():
+    """No user-scoped MCP servers load, and no prompt is saved under
+    ~/.claude/projects — a second copy of conversation text outside Postgres that the
+    dashboard delete cannot reach."""
+    cmd = _cli_command()
+    assert "--strict-mcp-config" in cmd
+    assert "--no-session-persistence" in cmd
+    assert "--setting-sources=" in cmd
+
+
+def test_cli_spawns_with_prompt_caching_off():
+    """Every call is a fresh process with a unique prompt, so a cache write is never read."""
+    assert llm_mod._cli_options("claude-haiku-4-5").env == {"DISABLE_PROMPT_CACHING": "1"}
+
+
+def test_cli_spawns_with_the_thinking_cap():
+    """Left unset, Haiku 4.5 burned ~12-16K reasoning tokens per call — the dominant
+    cost/quota driver. Pins the cap so a refactor can't drop it back to unbounded."""
+    cmd = _cli_command()
+    assert cmd[cmd.index("--max-thinking-tokens") + 1] == str(_MAX_THINKING_TOKENS)
+    assert _MAX_THINKING_TOKENS <= 4096  # guard the intent: a real reduction
+
+
+def test_cli_sends_no_json_schema_flag():
+    """The schema travels in-prompt only. The SDK forwards ``--json-schema`` solely for
+    ``output_format`` type ``json_schema`` (a StructuredOutput tool turn); the old
+    ``{"type": "json"}`` value was silently dropped."""
+    assert "--json-schema" not in _cli_command()
+
+
+def test_cli_runs_the_sdk_bundled_binary_without_a_version_probe():
+    """No ``cli_path``: the SDK runs its own lock-pinned CLI. And no ``claude -v`` spawn
+    before every session (the probe only warns about a CLI too old for the SDK)."""
+    assert llm_mod._cli_options("claude-haiku-4-5").cli_path is None
+    assert llm_mod.os.environ.get("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK") == "1"
+
+
+def test_agent_call_appends_the_schema_and_strips_the_fence(cli):
+    prompts = cli([_FakeResult('```json\n{"ok": true}\n```')])
+    out = asyncio.run(agent_call("extract", system_prompt="be terse", json_schema={"a": 1}))
+    assert out == '{"ok": true}'
+    assert prompts[0].startswith("be terse\n\nextract")
+    assert prompts[0].endswith(
+        'Respond with ONLY valid JSON matching this schema — no markdown, no explanation:\n{"a": 1}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# agent_call — one retry policy: transport failures only, then LLMUnavailableError
+# ---------------------------------------------------------------------------
+
+
+def test_transport_failure_recovers_on_retry(cli):
+    prompts = cli([RuntimeError("CLI crashed"), _FakeResult("hello")])
+    assert asyncio.run(agent_call("hi")) == "hello"
+    assert len(prompts) == 2
+
+
+def test_exhausted_transport_failure_is_llm_unavailable(cli):
+    """A CLI crash on every attempt must end in a member of LLM_TRANSPORT_ERRORS. A bare
+    RuntimeError is swallowed as "found nothing" by every stage that catches broadly,
+    and the queue row is marked done with nothing extracted."""
+    prompts = cli([RuntimeError("Control request timeout: initialize")] * 3)
+    with pytest.raises(LLMUnavailableError, match="Control request timeout") as e:
+        asyncio.run(agent_call("hi"))
+    assert isinstance(e.value, LLM_TRANSPORT_ERRORS)
+    assert len(prompts) == 3
+
+
+def test_missing_result_is_a_transport_failure(cli):
+    cli([None, None, None])
+    with pytest.raises(LLMUnavailableError, match="without a result"):
+        asyncio.run(agent_call("hi"))
+
+
+def test_hung_cli_times_out(cli, monkeypatch):
+    """A CLI that never answers used to pin a drain thread for good."""
+    monkeypatch.setattr(llm_mod, "_CLI_TIMEOUT_S", 0.05)
+    prompts = cli(["hang", "hang", "hang"])
+    with pytest.raises(LLMUnavailableError, match="TimeoutError"):
+        asyncio.run(agent_call("hi"))
+    assert len(prompts) == 3
+
+
+def test_error_result_is_not_retried(cli):
+    """The CLI reports its own failures as a normal result with ``is_error=True`` and
+    error TEXT in the result field — "Not logged in · Please run /login" for a stack
+    with no token, an unrecognised-model notice for a bad id. Parsed as a model answer
+    that is exactly a content failure (unparseable text), which is how a whole queue of
+    turns got marked done and extracted nothing. It has to be its own signal, and it
+    repeats identically, so it is not retried (the CLI already retried API errors)."""
+    prompts = cli([_FakeResult("Not logged in · Please run /login", is_error=True)])
+    with pytest.raises(LLMUnavailableError, match="Not logged in"):
+        asyncio.run(agent_call("hi"))
+    assert len(prompts) == 1
+
+
+# ---------------------------------------------------------------------------
+# Usage-limit detection — CLI quota notices, never the model's own completions
+# ---------------------------------------------------------------------------
+
+
+def test_quota_notice_error_result_raises_usage_limit(cli):
+    prompts = cli([_FakeResult("You've hit your limit · resets 5pm (UTC)", is_error=True)])
+    with pytest.raises(UsageLimitError):
+        asyncio.run(agent_call("hi"))
+    assert len(prompts) == 1
+
+
+def test_short_quota_notice_without_error_flag_raises_usage_limit(cli):
+    cli([_FakeResult("Claude AI usage limit reached|1760000000")])
+    with pytest.raises(UsageLimitError):
+        asyncio.run(agent_call("hi"))
+
+
+def test_completion_quoting_a_quota_message_is_returned(cli):
+    """Synapse ingests its own development sessions, so an extraction can legitimately
+    contain 'quota exceeded'. Raising UsageLimitError on it made the drain release the
+    batch, back off up to 30 minutes and re-claim the same item first, forever."""
+    completion = json.dumps(
+        {"facts": [{"fact": "agent_call raises UsageLimitError when the CLI says quota exceeded"}]}
+    )
+    cli([_FakeResult(completion)])
+    assert asyncio.run(agent_call("extract", json_schema={"type": "object"})) == completion
+
+
+def test_long_plain_text_mentioning_a_rate_limit_is_returned(cli):
+    text = "The rate_limit_error branch backs off. " * 20
+    cli([_FakeResult(text)])
+    assert asyncio.run(agent_call("summarise")) == text
+
+
+class TestUsageLimitDetector:
+    """The substring detector stays scoped to known phrases."""
+
+    def test_detects_known_phrases(self):
+        assert _is_usage_limit("Claude usage limit reached")
+        assert _is_usage_limit("Your limit will reset at 5pm")
+        assert _is_usage_limit("rate_limit_error from API")
+        assert _is_usage_limit("Out of usage credits")
+        assert _is_usage_limit("You've hit your limit")
+
+    def test_does_not_false_positive_on_unrelated_text(self):
+        assert not _is_usage_limit("here is your extraction result")
+        assert not _is_usage_limit("entity: rate")  # 'rate' alone, not the phrase
+        assert not _is_usage_limit("")
+        assert not _is_usage_limit(None)
+
+
+# ---------------------------------------------------------------------------
+# ClaudeCLIClient.messages.create — same message flattening as the OpenAI proxy
+# ---------------------------------------------------------------------------
+
+
+def test_messages_create_folds_system_messages_and_keeps_every_turn():
+    """System-role messages join the system prompt and every other message joins the
+    prompt in order — the OpenAI proxy's flattening. The CLI proxy used to keep only the
+    last user message and drop system-role messages."""
+    seen: dict[str, Any] = {}
+
+    async def fake_agent_call(prompt: str, **kwargs: Any) -> str:
+        seen.update(prompt=prompt, **kwargs)
+        return '{"ok": true}'
+
+    with patch.object(llm_mod, "agent_call", fake_agent_call):
+        resp = ClaudeCLIClient(model="claude-sonnet-4-5").messages.create(
+            messages=[
+                {"role": "system", "content": "rules"},
+                {"role": "user", "content": "first"},
+                {"role": "user", "content": "second"},
+            ],
+            system="persona",
+            response_format={"type": "json", "schema": {"type": "object"}},
+        )
+
+    assert resp.content[0].text == '{"ok": true}'
+    assert seen["system_prompt"] == "persona\n\nrules"
+    assert seen["prompt"] == "first\n\nsecond"
+    assert seen["model"] == "claude-sonnet-4-5"
+    assert seen["json_schema"] == {"type": "object"}
 
 
 # ---------------------------------------------------------------------------
@@ -367,133 +429,3 @@ class TestParseWithRetry:
             )
 
         assert client.messages.create.call_count == 2
-
-
-# ---------------------------------------------------------------------------
-# _is_usage_limit — content-based detector (kept distinct from RateLimitError)
-# ---------------------------------------------------------------------------
-
-
-class TestUsageLimitDetector:
-    """The substring detector stays scoped to known phrases — pairs with the
-    structured tenacity retry above on different error modes."""
-
-    def test_detects_known_phrases(self):
-        assert _is_usage_limit("Claude usage limit reached")
-        assert _is_usage_limit("Your limit will reset at 5pm")
-        assert _is_usage_limit("rate_limit_error from API")
-        assert _is_usage_limit("Out of usage credits")
-        assert _is_usage_limit("You've hit your limit")
-
-    def test_does_not_false_positive_on_unrelated_text(self):
-        assert not _is_usage_limit("here is your extraction result")
-        assert not _is_usage_limit("entity: rate")  # 'rate' alone, not the phrase
-        assert not _is_usage_limit("")
-        assert not _is_usage_limit(None)
-
-
-# ---------------------------------------------------------------------------
-# ClaudeCLIClient smoke test — verify the wired-up sync shim still works
-# ---------------------------------------------------------------------------
-
-
-def test_claude_cli_client_routes_through_messages_proxy():
-    """ClaudeCLIClient.messages is a _MessagesProxy with the configured model."""
-    client = ClaudeCLIClient(model="claude-sonnet-4-5")
-    assert isinstance(client.messages, _MessagesProxy)
-    assert client.messages._default_model == "claude-sonnet-4-5"
-
-
-# Suppress an unused-import warning while keeping ``time`` available
-# for any future timing-based tests.
-_ = time
-
-
-# ---------------------------------------------------------------------------
-# Extended-thinking budget cap
-# ---------------------------------------------------------------------------
-
-
-def test_agent_call_caps_thinking_budget():
-    """``agent_call`` must construct ``ClaudeAgentOptions`` with the thinking
-    budget capped at ``_MAX_THINKING_TOKENS``. Left unset, Haiku 4.5 burned
-    ~12-16K reasoning tokens per call — the dominant cost/quota driver. This
-    pins the cap so a future refactor can't silently drop it back to unbounded.
-    """
-    import ingestion.llm_client as mod
-
-    captured: dict[str, Any] = {}
-
-    def spy_options(**kwargs: Any) -> object:
-        captured.update(kwargs)
-        return object()
-
-    class _FakeResult:
-        def __init__(self) -> None:
-            self.result = "hello"
-            self.structured_output = None
-
-    class _FakeClient:
-        def __init__(self, options: Any = None) -> None:
-            pass
-
-        async def __aenter__(self) -> _FakeClient:
-            return self
-
-        async def __aexit__(self, *exc: Any) -> bool:
-            return False
-
-        async def query(self, prompt: str) -> None:
-            return None
-
-        async def receive_response(self):  # type: ignore[no-untyped-def]
-            yield _FakeResult()
-
-    with (
-        patch.object(mod, "ClaudeAgentOptions", spy_options),
-        patch.object(mod, "ClaudeSDKClient", _FakeClient),
-        patch.object(mod, "ResultMessage", _FakeResult),
-    ):
-        out = asyncio.run(agent_call("hi"))
-
-    assert out == "hello"
-    assert captured.get("max_thinking_tokens") == _MAX_THINKING_TOKENS
-    assert _MAX_THINKING_TOKENS <= 4096  # guard the intent: a real reduction
-
-
-def test_agent_call_refuses_an_error_result():
-    """The CLI reports its own failures as a normal result with ``is_error=True`` and
-    error TEXT in the result field — "Not logged in · Please run /login" for a stack
-    with no token, an unrecognised-model notice for a bad id. Parsed as a model answer
-    that is exactly a content failure (unparseable text), which is how a whole queue of
-    turns got marked done and extracted nothing. It has to be its own signal."""
-    import ingestion.llm_client as mod
-
-    class _FakeResult:
-        def __init__(self) -> None:
-            self.result = "Not logged in · Please run /login"
-            self.structured_output = None
-            self.is_error = True
-
-    class _FakeClient:
-        def __init__(self, options: Any = None) -> None:
-            pass
-
-        async def __aenter__(self) -> _FakeClient:
-            return self
-
-        async def __aexit__(self, *exc: Any) -> bool:
-            return False
-
-        async def query(self, prompt: str) -> None:
-            return None
-
-        async def receive_response(self):  # type: ignore[no-untyped-def]
-            yield _FakeResult()
-
-    with (
-        patch.object(mod, "ClaudeSDKClient", _FakeClient),
-        patch.object(mod, "ResultMessage", _FakeResult),
-    ):
-        with pytest.raises(LLMUnavailableError, match="Not logged in"):
-            asyncio.run(agent_call("hi"))

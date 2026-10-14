@@ -47,9 +47,8 @@ class _ContextsResponse(BaseModel):
     contexts: list[_ContextItem]
 
 
-# JSON schema enforced by the Agent SDK's structured-output mode. No more
-# fragile regex parsing of free-form text — the SDK guarantees the response
-# matches this shape (or fails the call).
+# Response contract. It travels in-prompt (the CLI enforces nothing), so the
+# reply is validated against _ContextsResponse in parse_contexts.
 _CONTEXTS_SCHEMA = {
     "type": "json",
     "schema": {

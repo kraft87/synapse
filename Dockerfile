@@ -10,13 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# Bake the Claude Code CLI into the image. The extraction pipeline
-# (ingestion/llm_client.py) spawns it via the Agent SDK; auth comes from
-# CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in the environment at runtime.
-# The native installer drops the binary at /root/.local/share/claude/versions/<v>
-# (which _find_cli_path discovers) and a launcher at /root/.local/bin/claude
-# (the PATH fallback). Unpinned: an image rebuild picks up the current stable,
-# same behavior the old host-mounted install had.
+# Bake the Claude Code CLI into the image for the dream lanes that still shell
+# out to a bare `claude -p` on PATH (dream/skills, dream/config). The extraction
+# pipeline (ingestion/llm_client.py) does not use it: the Agent SDK runs its own
+# bundled CLI, pinned by uv.lock. Drop this layer once those lanes call through
+# ingestion.llm_client. Auth comes from CLAUDE_CODE_OAUTH_TOKEN or
+# ANTHROPIC_API_KEY in the environment at runtime. The installer puts a launcher
+# at /root/.local/bin/claude. Unpinned: an image rebuild picks up the current
+# stable, same behavior the old host-mounted install had.
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
 ENV PATH="/root/.local/bin:$PATH"

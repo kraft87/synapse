@@ -1,9 +1,9 @@
 """Tests for the Claude Agent SDK pydantic-ai connector.
 
 The SDK boundary (``agent_call``) is monkeypatched — no real ``claude`` CLI is
-ever spawned. Covers message flattening, structured-output translation to the
-SDK's ``output_format``, tool-definition rejection, streaming rejection, and
-usage-limit propagation.
+ever spawned. Covers message flattening, the structured-output schema handed to
+``agent_call``, tool-definition rejection, streaming rejection, and usage-limit
+propagation.
 """
 
 from __future__ import annotations
@@ -45,17 +45,9 @@ def _fake_agent_call(seen: dict[str, Any], response_text: str):
         *,
         system_prompt: str | None = None,
         model: str = "m",
-        max_turns: int = 3,
-        semaphore: Any = None,
-        log_name: str | None = None,
-        output_format: dict[str, Any] | None = None,
+        json_schema: dict[str, Any] | None = None,
     ) -> str:
-        seen.update(
-            prompt=prompt,
-            system=system_prompt,
-            model=model,
-            output_format=output_format,
-        )
+        seen.update(prompt=prompt, system=system_prompt, model=model, json_schema=json_schema)
         return response_text
 
     return fake
@@ -88,7 +80,7 @@ class TestFlattenMessages:
 
 
 class TestRequest:
-    def test_structured_output_translated_to_sdk_output_format(self, monkeypatch):
+    def test_structured_output_schema_handed_to_agent_call(self, monkeypatch):
         seen: dict[str, Any] = {}
         monkeypatch.setattr(
             sdk_mod,
@@ -107,9 +99,9 @@ class TestRequest:
         # System text travels via agent_call's system_prompt flattening.
         assert "be a judge" in seen["system"]
         assert seen["prompt"] == "judge this"
-        # Native output mode → the SDK's {"type": "json", "schema": ...}.
-        assert seen["output_format"]["type"] == "json"
-        assert "contradicted_facts" in seen["output_format"]["schema"]["properties"]
+        # Native output mode → the output model's schema, which agent_call puts
+        # in-prompt (the CLI itself gets no schema flag).
+        assert "contradicted_facts" in seen["json_schema"]["properties"]
 
     def test_trailing_prose_is_tolerated(self, monkeypatch):
         seen: dict[str, Any] = {}
@@ -163,4 +155,31 @@ class TestRequest:
         )
         assert isinstance(response.parts[0], TextPart)
         assert response.parts[0].content == "plain answer"
-        assert seen["output_format"] is None
+        assert seen["json_schema"] is None
+
+
+class TestLegacyClient:
+    """Duck-typed ``messages.create`` clients ride the same text-call Model as the CLI."""
+
+    def test_schema_travels_as_legacy_response_format(self):
+        from tests.helpers.llm import mock_llm_client
+
+        client = mock_llm_client('```json\n{"contradicted_facts": [2]}\n``` trailing prose')
+        result = structured_call(
+            client,
+            output_model=_Verdict,
+            messages=[
+                {"role": "system", "content": "be a judge"},
+                {"role": "user", "content": "x"},
+            ],
+            model="claude-haiku-4-5",
+            max_tokens=77,
+        )
+        assert result.contradicted_facts == [2]
+        kwargs = client.messages.create.call_args.kwargs
+        assert kwargs["model"] == "claude-haiku-4-5"
+        assert kwargs["max_tokens"] == 77
+        assert kwargs["messages"] == [{"role": "user", "content": "x"}]
+        assert "be a judge" in kwargs["system"]
+        assert kwargs["response_format"]["type"] == "json"
+        assert "contradicted_facts" in kwargs["response_format"]["schema"]["properties"]
