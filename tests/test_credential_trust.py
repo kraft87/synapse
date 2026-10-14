@@ -80,22 +80,19 @@ class _FakeIdP:
 
 
 def _client(db_url, *, admin_token: str | None = _ADMIN, idp: object | None = None):
-    """A surfaces-routes app with the real gates wired the way the server wires them.
+    """A surfaces-routes app with the admin gate wired the way the server wires it.
 
-    ``authorized`` = any bearer at all; ``admin`` = one specific full-trust device token.
-    Keeping them separate is the point of the file: a test that cleared both gates with
-    one credential would prove nothing about the property under test.
+    ``admin`` = one specific full-trust device token; any other bearer (the root token
+    included) is refused. A test that let every credential clear it would prove nothing
+    about the property under test.
     """
     from fastmcp import FastMCP
-
-    def authorized(request):
-        return bool(_bearer(request))
 
     def admin(request):
         return admin_token is not None and _bearer(request) == admin_token
 
     test_mcp = FastMCP("test-credential-trust")
-    register(test_mcp, db_url, authorized, admin, idp=idp)
+    register(test_mcp, db_url, admin, idp=idp)
     return TestClient(test_mcp.http_app())
 
 
@@ -274,6 +271,17 @@ def test_each_enrollment_gets_its_own_credential(clean, db_url):
 # ---------------------------------------------------------------------------
 # Mint: the no-browser path, and it needs an already-trusted machine
 # ---------------------------------------------------------------------------
+
+
+def test_the_admin_gate_has_no_fallback():
+    """The routes that create and list credentials take the admin gate and nothing else.
+    They used to fall back to the client gate when none was passed, which the root token
+    clears: fail-open on exactly the routes that must not be."""
+    import inspect
+
+    params = inspect.signature(register).parameters
+    assert "authorized" not in params
+    assert params["admin"].default is inspect.Parameter.empty
 
 
 def test_mint_issues_a_ready_scoped_token(clean, db_url):

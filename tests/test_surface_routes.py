@@ -40,16 +40,16 @@ _SID = "route-test-host"
 
 
 def _client(db_url):
-    """Both gates satisfied by the one test token. The gates' ASYMMETRY (root enrolls,
-    only a full-trust device approves) is what test_credential_trust.py exists for;
-    conflating them here would just make these registration tests noisier."""
+    """The admin gate satisfied by the one test token. Who may clear it (only a
+    full-trust device, never root) is what test_credential_trust.py exists for; these
+    registration tests only need a gate that admits one credential."""
     from fastmcp import FastMCP
 
-    def authorized(request):
+    def admin(request):
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-surfaces")
-    register(test_mcp, db_url, authorized, authorized)
+    register(test_mcp, db_url, admin)
     return TestClient(test_mcp.http_app())
 
 

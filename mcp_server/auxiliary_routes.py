@@ -66,7 +66,7 @@ def register(
     # AFTER _idp is built, since enrollment needs it. Doing nothing is already the safe state.
     from mcp_server.surface_routes import register as _register_surface_routes
 
-    _register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized, idp=_idp)
+    _register_surface_routes(mcp, DB_URL, _admin_authorized, idp=_idp)
 
     # Board read route — GET /context?project=X serves the rendered explicit-memory board
     # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
