@@ -58,14 +58,15 @@ def request_trust(request: Request, machine_token: str, db_url: str) -> SurfaceT
     """
     st = getattr(request.state, _TRUST_STATE, None)
     if st is None:
+        tok = bearer(request)
         if "user" in request.scope:
+            # The verifier parsed this same header; a bearer these gates do not accept
+            # (no "Bearer " prefix) is no credential here, whatever the verifier made of it.
             claims = claims_of(getattr(request.scope["user"], "access_token", None))
-            is_device = claims.get("kind") == KIND_DEVICE
+            is_device = bool(tok) and claims.get("kind") == KIND_DEVICE
             st = caller_trust.trust_from_claims(claims) if is_device else UNKNOWN_SURFACE
         else:
-            st = caller_trust.request_trust(
-                db_url=db_url, machine_token=machine_token, bearer=bearer(request)
-            )
+            st = caller_trust.request_trust(db_url=db_url, machine_token=machine_token, bearer=tok)
         setattr(request.state, _TRUST_STATE, st)
     return st
 
@@ -73,8 +74,8 @@ def request_trust(request: Request, machine_token: str, db_url: str) -> SurfaceT
 def machine_authorized(request: Request, machine_token: str, db_url: str) -> bool:
     """ "Is this a Synapse client?" — the CLIENT gate on the custom routes.
 
-    Custom routes bypass FastMCP's auth middleware (by design, issue #3704), so gate
-    them here. Passes for the root token (the services on the Docker host, and any
+    FastMCP enforces auth on /mcp only (custom routes are exempt by design, issue
+    #3704), so gate them here. Passes for the root token (the services on the Docker host, and any
     not-yet-enrolled client, which may ingest but is SERVED nothing: its read scope
     resolves to unknown in ``mcp_server/caller_trust``) and for an APPROVED device
     token. A pending enrollment fails it: a device that has not been approved holds a

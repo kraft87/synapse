@@ -101,6 +101,14 @@ def test_a_rejected_bearer_is_unknown_without_a_second_lookup(lookups):
     assert [where for where, _ in lookups] == ["verifier"]
 
 
+def test_the_gates_accept_only_the_bearer_form_they_parse(lookups):
+    """The verifier takes "bearer <token>" in any case; the gates read "Bearer " only.
+    Reusing the verifier's verdict must not widen what the gates accept."""
+    client = _server()
+    out = client.get("/probe", headers={"Authorization": "bearer work-dev"}).json()
+    assert (out["client"], out["admin"], out["surface"]) == (False, False, None)
+
+
 def test_root_and_no_bearer_never_touch_the_database(lookups):
     client = _server()
     out = _get(client, _ROOT)
