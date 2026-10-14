@@ -226,6 +226,17 @@ def test_purge_must_be_asked_for_exactly(clean, conn, db_url):
     assert n == 1
 
 
+def test_a_missing_private_sessions_table_is_reported_as_the_error_it_is(conn, db_url):
+    """Schema 050 is not optional (the boot guard refuses to start without it). A
+    deployment that got past the guard anyway sees the database's own error, never a
+    success: the CLI must not tell the user "off the record" on a write that failed."""
+    from tests.helpers.schemaless import schemaless_dsn
+
+    with schemaless_dsn(conn, db_url) as dsn, _client(dsn) as client:
+        r = client.put(f"/private-sessions/{_SID}", headers=_H)
+    assert r.status_code == 500 and "private_sessions" in r.json()["detail"]
+
+
 def test_db_predicate_sees_the_flag(clean, db_url):
     """``Database.is_private_session`` is what the ingest chokepoint calls."""
     from ingestion.db import Database

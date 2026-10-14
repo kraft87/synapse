@@ -21,7 +21,6 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-import psycopg
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -260,8 +259,6 @@ def register(
             inserted, skipped = await run_in_threadpool(
                 _ingest_events, db_url, voyage_api_key, cleaned, st.stamp_surface_id
             )
-        except psycopg.errors.UndefinedTable:
-            return err("timeline_events missing (apply schema/033)", 503)
         except Exception as e:
             logger.warning("timeline ingest failed: %s", e)
             return err(str(e)[:200], 500)

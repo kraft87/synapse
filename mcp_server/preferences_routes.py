@@ -24,7 +24,6 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-import psycopg
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -43,8 +42,7 @@ _MAX_LIMIT = 50
 def _top_preferences(
     db_url: str, limit: int, allowed_projects: list[str] | None = None
 ) -> list[dict[str, Any]]:
-    """Live preferences for the session-start block, strongest first. Degrades to []
-    if migration 035 hasn't been applied on this deployment yet.
+    """Live preferences for the session-start block, strongest first.
 
     ``allowed_projects`` is the restricted caller's allowlist (None = full trust, no
     filter); ``project = ANY('{}')`` matches nothing, NULL project included, so an
@@ -64,13 +62,8 @@ def _top_preferences(
     sql += " ORDER BY assert_count DESC, last_asserted DESC LIMIT %s"
     params.append(limit)
     with pg_pool.connection(db_url) as conn:
-        try:
-            rows = conn.execute(sql, params).fetchall()
-            return [
-                {"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows
-            ]
-        except psycopg.errors.UndefinedTable:
-            return []
+        rows = conn.execute(sql, params).fetchall()
+    return [{"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows]
 
 
 def register(

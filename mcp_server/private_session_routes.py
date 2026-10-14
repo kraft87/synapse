@@ -37,7 +37,6 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 from starlette.concurrency import run_in_threadpool
@@ -53,10 +52,6 @@ logger = logging.getLogger(__name__)
 _MAX_ID_LEN = 200
 
 
-class _SchemaMissing(Exception):
-    """schema/050 not applied on this deployment — reported as 503, never as success."""
-
-
 #: The cascade counts a session purge reports, summed over its turns. A chunk's "mixed"
 #: count is left out: a session's chunk windows only span that session's own turns.
 _PURGE_COUNTS = ("chunks_deleted", "facts_deleted", "facts_unlinked", "events_deleted")
@@ -68,14 +63,11 @@ def _mark_private(db_url: str, session_id: str, purge: bool) -> dict[str, Any]:
     The flag commits first and on its own, so a purge that fails still leaves the session
     private, and every ingest that starts after the flag is refused rather than racing the
     purge. ``stored_turns`` is read last: it is what is still stored when PUT returns."""
-    try:
-        with pg_pool.connection(db_url) as conn:
-            conn.execute(
-                "INSERT INTO private_sessions (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
-                (session_id,),
-            )
-    except psycopg.errors.UndefinedTable as e:
-        raise _SchemaMissing from e
+    with pg_pool.connection(db_url) as conn:
+        conn.execute(
+            "INSERT INTO private_sessions (session_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (session_id,),
+        )
     out: dict[str, Any] = {}
     if purge:
         out["purged"] = _purge_session(db_url, session_id)
@@ -133,23 +125,17 @@ def _purge_session(db_url: str, session_id: str) -> dict[str, int]:
 
 
 def _unmark_private(db_url: str, session_id: str) -> int:
-    try:
-        with pg_pool.connection(db_url) as conn:
-            cur = conn.execute("DELETE FROM private_sessions WHERE session_id = %s", (session_id,))
-            return cur.rowcount
-    except psycopg.errors.UndefinedTable as e:
-        raise _SchemaMissing from e
+    with pg_pool.connection(db_url) as conn:
+        cur = conn.execute("DELETE FROM private_sessions WHERE session_id = %s", (session_id,))
+        return cur.rowcount
 
 
 def _is_private(db_url: str, session_id: str) -> bool:
-    try:
-        with pg_pool.connection(db_url) as conn:
-            row = conn.execute(
-                "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
-            ).fetchone()
-            return row is not None
-    except psycopg.errors.UndefinedTable as e:
-        raise _SchemaMissing from e
+    with pg_pool.connection(db_url) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
+        ).fetchone()
+        return row is not None
 
 
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
@@ -172,9 +158,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             return err("session_id required", 400)
         try:
             return await run_in_threadpool(work, session_id)
-        except _SchemaMissing:
-            return err("private_sessions missing (apply schema/050)", 503)
-        except Exception as e:  # pragma: no cover - defensive
+        except Exception as e:
             logger.warning("private-session route failed: %s", e)
             return err(str(e)[:200], 500)
 

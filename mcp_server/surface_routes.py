@@ -65,7 +65,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.surfaces import (
-    SchemaMissing,
     enroll_surface,
     list_surfaces,
     mint_surface,
@@ -119,8 +118,6 @@ def register(
             return unauthorized()
         try:
             return await run_in_threadpool(work)
-        except SchemaMissing:
-            return err("surfaces table missing (apply schema/053+054)", 503)
         except ValueError as e:
             return err(str(e)[:200], 400)
         except Exception as e:  # pragma: no cover - defensive

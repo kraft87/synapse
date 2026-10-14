@@ -171,3 +171,23 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     assert top["since"] and len(top["since"]) == 10  # YYYY-MM-DD
     db.close()
     _wipe(conn)
+
+
+def test_a_missing_preferences_table_is_an_error_not_an_empty_block(conn, db_url):
+    """Schema 035 is not optional (the boot guard refuses to start without it), so the
+    route does not dress its absence up as "no preferences": the database's error comes
+    back as a 500 naming the relation."""
+    from fastmcp import FastMCP
+    from starlette.testclient import TestClient
+
+    from ingestion.surfaces import FULL_TRUST
+    from mcp_server.preferences_routes import register
+    from tests.helpers.schemaless import schemaless_dsn
+
+    with schemaless_dsn(conn, db_url) as dsn:
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            _top_preferences(dsn, 8)
+        m = FastMCP("test-prefs-missing")
+        register(m, dsn, lambda r: True, lambda r: FULL_TRUST)
+        r = TestClient(m.http_app()).get("/preferences/top")
+    assert r.status_code == 500 and "preferences" in r.json()["detail"]
