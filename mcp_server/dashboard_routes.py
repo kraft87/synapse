@@ -648,14 +648,23 @@ def _session_rows(
     return before[::-1] + after[: cap - len(before)]
 
 
-def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
+def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any] | None:
+    """The session drawer's payload, or None when no turn is stored under the id (the route
+    turns that into the 404). ``total`` counts the whole session: ``episodes`` is only the
+    window of it that _SESSION_CAP allows."""
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = _session_rows(conn, session_id, highlight)
-        first = rows[0] if rows else None
+        if not rows:
+            return None
+        first = rows[0]
+        total = conn.execute(
+            "SELECT count(*) AS n FROM episodes WHERE session_id = %s", (session_id,)
+        ).fetchone()
         return {
             "session_id": session_id,
-            "project": first["project"] if first else None,
-            "source": first["source"] if first else None,
+            "project": first["project"],
+            "source": first["source"],
+            "total": total["n"] if total else len(rows),
             "highlight": highlight,
             "episodes": [
                 {
@@ -2894,7 +2903,12 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         if raw_hl is not None:
             highlight = int(raw_hl) if raw_hl.isdigit() else raw_hl
         session_id = request.path_params["id"]
-        return await _api(request, lambda: _session(db_url, session_id, highlight))
+        return await _api(
+            request,
+            lambda: _session(db_url, session_id, highlight),
+            not_found="session not found",
+            label="session",
+        )
 
     @mcp.custom_route("/dash/api/entity/{uuid}", methods=["GET"])  # type: ignore[misc]
     async def dash_entity(request: Request) -> JSONResponse:

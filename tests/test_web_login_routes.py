@@ -142,3 +142,19 @@ def test_callback_user_cancel_surfaces_error_fragment(client):
     r = client.get(f"/auth/callback/dash?error=access_denied&state={state}", follow_redirects=False)
     assert r.status_code == 302
     assert f"{_LAN}/dash#login_error=" in r.headers["location"]
+
+
+def test_available_reports_that_an_idp_is_configured(client):
+    r = client.get("/dash/oauth/available")
+    assert r.status_code == 200
+    assert r.json() == {"available": True}
+
+
+def test_available_is_false_without_an_idp():
+    """A bearer-only deployment registers no sign-in flow; the login screen asks first
+    instead of offering a button that 404s."""
+    mcp = FastMCP("t")
+    wl.register(mcp, None, _MT, _PUB)
+    with TestClient(mcp.http_app(), base_url=_PUB) as c:
+        assert c.get("/dash/oauth/available").json() == {"available": False}
+        assert c.get("/dash/oauth/start", follow_redirects=False).status_code == 404

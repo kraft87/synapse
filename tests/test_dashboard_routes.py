@@ -614,6 +614,7 @@ def test_session_ordering_and_highlight_echo(clean, conn, db_url):
     assert body["session_id"] == "sess"
     assert body["project"] == "synapse" and body["source"] == "claude-code"
     assert body["highlight"] == first  # echoed as int
+    assert body["total"] == 3
     assert [e["sequence"] for e in body["episodes"]] == [1, 2, 3]
     # The drawer renders human_turn/assistant_turn only; content is not shipped.
     assert set(body["episodes"][0]) == {
@@ -641,6 +642,16 @@ def test_session_cap_windows_around_the_highlight(clean, conn, db_url, monkeypat
         assert [e["sequence"] for e in plain["episodes"]] == [1, 2, 3, 4]
         stray = client.get("/dash/api/session/long?highlight=999999", headers=_H).json()
         assert [e["sequence"] for e in stray["episodes"]] == [1, 2, 3, 4]
+        # The window is not the session: the drawer is told how many turns there are.
+        assert hl["total"] == end["total"] == plain["total"] == stray["total"] == 10
+
+
+def test_session_unknown_id_is_a_404(clean, conn, db_url):
+    """A session with no stored turns is not an empty session: the drawer says so."""
+    with _client(db_url) as client:
+        r = client.get("/dash/api/session/nope", headers=_H)
+    assert r.status_code == 404
+    assert r.json() == {"status": "error", "detail": "session not found"}
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 The dashboard is served on hosts the IdP can't redirect to (the registered callback
 lives on the PUBLIC base URL), so the flow bounces:
 
+  LAN /dash → GET /dash/oauth/available        ({"available": bool}: is there a flow to offer?)
   LAN /dash → GET /dash/oauth/start            (302 to the IdP's authorize endpoint;
                                                  signed state carries the return origin)
   → IdP approves → PUBLIC /auth/callback/dash  (code→token exchange, allowlist gate)
@@ -94,7 +95,15 @@ def register(
     browser receives. None (no DB configured) falls back to the root machine token —
     the pre-054 behaviour, and the only thing a DB-less deployment can do.
     """
-    if not (idp and machine_token):
+    enabled = bool(idp and machine_token)
+
+    # The login screen asks before it offers "sign in": on a bearer-only deployment the
+    # start route below does not exist. Unauthenticated, like the shell it serves.
+    @mcp.custom_route("/dash/oauth/available", methods=["GET"])  # type: ignore[misc]
+    async def oauth_available(request: Request) -> Response:
+        return JSONResponse({"available": enabled})
+
+    if not enabled:
         logger.info("web-login routes disabled (need an identity provider + SYNAPSE_MACHINE_TOKEN)")
         return
 

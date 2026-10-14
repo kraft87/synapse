@@ -17,7 +17,9 @@ either side. Design source of truth: the handoff bundle (prototype + spec), not 
   The dashboard login (`/dash/oauth/start`, `mcp_server/web_login_routes`) mints a
   full-trust device token for an allowlisted identity and hands it back as `#token=...`
   in the URL fragment; the client stores it in `localStorage` and strips the fragment.
-  The login screen also takes a pasted full-trust device token as a fallback.
+  The login screen also takes a pasted full-trust device token as a fallback, and asks the
+  unauthenticated `GET /dash/oauth/available` (`{"available": bool}`: is an identity provider
+  configured?) before it offers "sign in", so a bearer-only deployment shows no dead button.
   Fragment, not query param — fragments never reach server logs.
   401 → `{"status":"error","detail":"unauthorized"}`.
 - Spec §7 names endpoints bare (`/feed`, `/search`); they are namespaced under
@@ -97,14 +99,16 @@ Facts whose `episodes` jsonb array contains the id; events with `source_ref` `ep
 
 ### GET /dash/api/session/{id}?highlight=<episode_id>
 ```json
-{"session_id": "…", "project": "…", "source": "…", "highlight": 227168,
+{"session_id": "…", "project": "…", "source": "…", "total": 520, "highlight": 227168,
  "episodes": [{"id": 1, "sequence": 1, "created_at": "…",
                 "human_turn": "…", "assistant_turn": "…"}]}
 ```
 Ordered by sequence, cap 500 rows. `highlight` echoes the query param (client scrolls to it).
 A session longer than the cap returns a window around the highlighted turn (about half
 before it, sliding to stay full at either end); without a highlight in the session, the
-first 500. No `content`: the drawer renders the two turn fields (`/episode/{id}` has it).
+first 500. `total` counts every stored turn of the session, so the drawer can say "of N" when
+`episodes` is a window. A session with no stored turns is `404 {"detail":"session not found"}`.
+No `content`: the drawer renders the two turn fields (`/episode/{id}` has it).
 
 ### GET /dash/api/entity/{uuid}?mentions_offset=0&facts_offset=0
 ```json
