@@ -16,6 +16,7 @@ predicate, toggle CLI — lives in test_private_mode.py).
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -125,6 +126,8 @@ class _Req:
     def __init__(self, body: dict) -> None:
         self._body = body
         self.headers: dict[str, str] = {}
+        self.scope: dict = {}
+        self.state = SimpleNamespace()
 
     async def json(self) -> dict:
         return self._body
