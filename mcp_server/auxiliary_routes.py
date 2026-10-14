@@ -53,10 +53,11 @@ def register(
     # Private mode — the plugin's toggle CLI flips a session's "off the record" flag here
     # (schema 050). The flag is what ingest_turns/backfill check, so a session marked private
     # can never be ingested by ANY path, including one that bypasses the plugin's hook.
-    # Same machine-token seam. No-op w/o DB.
+    # Same machine-token seam, except that deleting what the session already stored
+    # (?purge=1) needs full trust or the session's own stamps. No-op w/o DB.
     from mcp_server.private_session_routes import register as _register_private_routes
 
-    _register_private_routes(mcp, DB_URL, _machine_authorized)
+    _register_private_routes(mcp, DB_URL, _machine_authorized, _request_trust)
 
     # Surface enrollment + registration — audience scoping's operator seam (schema 053/054).
     # Which DEVICES get the full corpus and which get only work-safe notes + an allowlisted

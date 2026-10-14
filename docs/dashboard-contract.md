@@ -709,9 +709,14 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
 Private mode's session purge (`PUT /private-sessions/{id}?purge=1`,
 `mcp_server/private_session_routes`) runs it over every stored turn of a session in one
 transaction and, unlike this route, also deletes the preferences those turns gave birth to
-(a privacy purge errs toward removal). It writes one `dashboard_audit` row with
+(a privacy purge errs toward removal). The cascade is set-based, so a fact citing several
+purged turns is counted once. The purge sits behind the client gate, not the admin gate,
+so it checks trust itself: a full-trust device may purge any session; a restricted device
+only a session whose every stored turn carries its own provenance stamp (schema 057);
+the root token and every other caller get 403, with the privacy flag still set and
+nothing deleted. It writes one `dashboard_audit` row with
 `action = 'purge_private_session'`, `kind = 'session'`, `item_id` = the session id, and
-the summed counts as `detail`.
+the summed counts plus the caller's `surface_id` as `detail`.
 
 ### DELETE /dash/api/facts/{id}
 Deletes ONE KG edge by uuid — no cascade, no provenance arithmetic (a fact is the leaf).

@@ -32,6 +32,7 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     pytest.skip("no test DB reachable", allow_module_level=True)
 
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust  # noqa: E402
 from mcp_server.private_session_routes import register  # noqa: E402
 
 _TOKEN = "test-machine-token"
@@ -39,15 +40,20 @@ _H = {"Authorization": f"Bearer {_TOKEN}"}
 _SID = "s-private-route-test"
 _PUBLIC = "s-public-route-test"
 
+#: Who a request resolves to. The root token and any unrecognised bearer are UNKNOWN; a
+#: device token yields the credential-bound verdict of its surfaces row.
+_FULL = SurfaceTrust(surface_id="dev-full", trust="full", known=True, credential_bound=True)
+_WORK = SurfaceTrust(surface_id="dev-work", known=True, credential_bound=True)
 
-def _client(db_url):
+
+def _client(db_url, trust: SurfaceTrust = UNKNOWN_SURFACE):
     from fastmcp import FastMCP
 
     def authorized(request):
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-private")
-    register(test_mcp, db_url, authorized)
+    register(test_mcp, db_url, authorized, lambda request: trust)
     return TestClient(test_mcp.http_app())
 
 
@@ -105,18 +111,18 @@ def test_put_get_delete_round_trip(clean, conn, db_url):
 # ---------------------------------------------------------------------------
 
 
-def _turn(conn, session_id: str, seq: int) -> int:
+def _turn(conn, session_id: str, seq: int, surface_id: str | None = None) -> int:
     return conn.execute(
-        "INSERT INTO episodes (session_id, sequence, project, content) "
-        "VALUES (%s, %s, 'demo', 'turn') RETURNING id",
-        (session_id, seq),
+        "INSERT INTO episodes (session_id, sequence, project, content, surface_id) "
+        "VALUES (%s, %s, 'demo', 'turn', %s) RETURNING id",
+        (session_id, seq, surface_id),
     ).fetchone()[0]
 
 
 @pytest.fixture()
 def derived(clean, conn):
-    """Two stored turns of the private session, one of a public one, and one row of each
-    kind derived from them. Everything is tagged so the fixture can wipe it."""
+    """Two stored turns of the private session, one of a public one, and rows derived from
+    them. Everything is tagged so the fixture can wipe it."""
     from psycopg.types.json import Json
 
     a, b = _turn(conn, _SID, 1), _turn(conn, _SID, 2)
@@ -124,7 +130,14 @@ def derived(clean, conn):
     conn.execute(
         "INSERT INTO kg_entities (uuid, group_id, name) VALUES ('pm-e', 'technical', 'pm-e')"
     )
-    for uuid, eps in (("pm-sole", [a]), ("pm-shared", [b, pub]), ("pm-pub", [pub])):
+    for uuid, eps in (
+        ("pm-sole", [a]),
+        ("pm-shared", [b, pub]),
+        ("pm-pub", [pub]),
+        # Cite both private turns: one fact each, however many of its turns are deleted.
+        ("pm-both", [a, b]),
+        ("pm-both-shared", [a, b, pub]),
+    ):
         conn.execute(
             "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, name, fact, "
             "episodes) VALUES (%s, 'technical', 'pm-e', 'pm-e', 'rel', %s, %s)",
@@ -178,7 +191,7 @@ def test_put_reports_the_turns_already_stored_and_keeps_them(derived, conn, db_u
 
 def test_put_with_purge_deletes_the_turns_and_what_was_derived_from_them(derived, conn, db_url):
     pub, prefs = derived["public"], derived["prefs"]
-    with _client(db_url) as client:
+    with _client(db_url, _FULL) as client:
         r = client.put(f"/private-sessions/{_SID}?purge=1", headers=_H)
         assert r.status_code == 200, r.text
         body = r.json()
@@ -187,8 +200,8 @@ def test_put_with_purge_deletes_the_turns_and_what_was_derived_from_them(derived
     assert body["purged"] == {
         "episodes_deleted": 2,
         "chunks_deleted": 1,
-        "facts_deleted": 1,
-        "facts_unlinked": 1,
+        "facts_deleted": 2,
+        "facts_unlinked": 2,
         "events_deleted": 1,
         "preferences_deleted": 1,
     }
@@ -201,7 +214,7 @@ def test_put_with_purge_deletes_the_turns_and_what_was_derived_from_them(derived
     }
     assert ids("SELECT content FROM chunks WHERE content = 'pm-chunk'") == set()
     facts = dict(conn.execute("SELECT uuid, episodes FROM kg_relationships WHERE uuid LIKE 'pm-%'"))
-    assert facts == {"pm-shared": [pub], "pm-pub": [pub]}
+    assert facts == {"pm-shared": [pub], "pm-both-shared": [pub], "pm-pub": [pub]}
     assert ids("SELECT fact FROM timeline_events WHERE fact LIKE 'pm-%'") == {"pm-pub-event"}
     assert ids("SELECT pref FROM preferences WHERE pref LIKE 'pm-%'") == {"pm-public", "pm-older"}
     older = conn.execute(
@@ -211,19 +224,122 @@ def test_put_with_purge_deletes_the_turns_and_what_was_derived_from_them(derived
     audit = conn.execute(
         "SELECT action, detail FROM dashboard_audit WHERE item_id = %s", (_SID,)
     ).fetchall()
-    assert audit == [("purge_private_session", body["purged"])]
+    assert audit == [("purge_private_session", {**body["purged"], "surface_id": "dev-full"})]
 
 
 def test_purge_must_be_asked_for_exactly(clean, conn, db_url):
     """A destructive flag is never guessed at: anything but 0 or 1 is refused before the
     session is touched."""
     _turn(conn, _SID, 1)
-    with _client(db_url) as client:
+    with _client(db_url, _FULL) as client:
         r = client.put(f"/private-sessions/{_SID}?purge=yes", headers=_H)
         assert r.status_code == 400
         assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is False
     n = conn.execute("SELECT count(*) FROM episodes WHERE session_id = %s", (_SID,)).fetchone()[0]
     assert n == 1
+
+
+def _stored(conn, session_id: str = _SID) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM episodes WHERE session_id = %s", (session_id,)
+    ).fetchone()[0]
+
+
+def _audits(conn) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM dashboard_audit WHERE item_id = %s", (_SID,)
+    ).fetchone()[0]
+
+
+def test_the_root_token_flags_but_cannot_purge(derived, conn, db_url):
+    """The root token is on every machine that ever ran the plugin, and deleting memory is
+    not a client-gate act: the purge is refused, the flag it came with stays set, and
+    nothing is deleted or audited."""
+    with _client(db_url, UNKNOWN_SURFACE) as client:
+        r = client.put(f"/private-sessions/{_SID}?purge=1", headers=_H)
+        assert r.status_code == 403
+        assert r.json()["status"] == "error" and "nothing was deleted" in r.json()["detail"]
+        assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is True
+        # The flag alone is still the client gate's to set.
+        assert client.put(f"/private-sessions/{_SID}", headers=_H).json()["stored_turns"] == 2
+    assert _stored(conn) == 2 and _audits(conn) == 0
+
+
+def test_a_restricted_device_purges_only_sessions_it_wrote(clean, conn, db_url):
+    """Provenance (057) is what lets a restricted work laptop clear its own session without
+    being able to wipe one another device wrote, or one stamped before 057."""
+    _turn(conn, _SID, 1, "dev-work")
+    _turn(conn, _SID, 2, "dev-work")
+    _turn(conn, _PUBLIC, 1, "dev-work")
+    _turn(conn, _PUBLIC, 2, "dev-other")
+    with _client(db_url, _WORK) as client:
+        # Another surface's turn in the session: refused, nothing deleted.
+        r = client.put(f"/private-sessions/{_PUBLIC}?purge=1", headers=_H)
+        assert r.status_code == 403
+        assert _stored(conn, _PUBLIC) == 2
+        # An unstamped (pre-057) turn is nobody's to delete but a full-trust device's.
+        conn.execute("UPDATE episodes SET surface_id = NULL WHERE session_id = %s", (_PUBLIC,))
+        assert client.put(f"/private-sessions/{_PUBLIC}?purge=1", headers=_H).status_code == 403
+        assert _stored(conn, _PUBLIC) == 2
+
+        r = client.put(f"/private-sessions/{_SID}?purge=1", headers=_H)
+        assert r.status_code == 200, r.text
+        assert r.json()["purged"]["episodes_deleted"] == 2 and r.json()["stored_turns"] == 0
+    assert _stored(conn) == 0 and _stored(conn, _PUBLIC) == 2
+    audit = conn.execute(
+        "SELECT detail FROM dashboard_audit WHERE item_id = %s", (_SID,)
+    ).fetchall()
+    assert [d["surface_id"] for (d,) in audit] == ["dev-work"]
+
+
+def test_a_restricted_device_cannot_purge_before_provenance_exists(
+    clean, conn, db_url, monkeypatch
+):
+    """Without schema 057 no stamp can prove a turn is the device's own."""
+    from ingestion.surfaces import OWN_SURFACE_PROBE
+
+    _turn(conn, _SID, 1, "dev-work")
+    monkeypatch.setattr(OWN_SURFACE_PROBE, "ready", lambda *a, **k: False)
+    with _client(db_url, _WORK) as client:
+        assert client.put(f"/private-sessions/{_SID}?purge=1", headers=_H).status_code == 403
+    assert _stored(conn) == 1
+
+
+def test_a_self_reported_surface_is_not_provenance(clean, conn, db_url):
+    """A known restricted row reached through the hostname lane is not credential-bound,
+    so it carries no stamp to match."""
+    _turn(conn, _SID, 1, "dev-work")
+    legacy = SurfaceTrust(surface_id="dev-work", known=True)
+    with _client(db_url, legacy) as client:
+        assert client.put(f"/private-sessions/{_SID}?purge=1", headers=_H).status_code == 403
+    assert _stored(conn) == 1
+
+
+def test_purging_a_long_session_scans_the_provenance_tables_once(clean, conn, db_url, monkeypatch):
+    """The cascade is set-based: statements against the big tables do not grow with the
+    session, or a 200-turn purge outruns the plugin's request timeout. Counted by watching
+    the SQL the purge sends."""
+    import psycopg
+
+    seen: list[str] = []
+    real = psycopg.Cursor.execute
+
+    def spy(self, query, *a, **k):
+        seen.append(query if isinstance(query, str) else query.as_string())
+        return real(self, query, *a, **k)
+
+    monkeypatch.setattr(psycopg.Cursor, "execute", spy)
+    for seq in range(1, 41):
+        _turn(conn, _SID, seq)
+    seen.clear()
+    with _client(db_url, _FULL) as client:
+        assert client.put(f"/private-sessions/{_SID}?purge=1", headers=_H).status_code == 200
+    scans = [
+        q
+        for q in seen
+        if q.startswith("SELECT") and ("FROM kg_relationships" in q or "FROM chunks" in q)
+    ]
+    assert len(scans) == 2, scans
 
 
 def test_a_missing_private_sessions_table_is_reported_as_the_error_it_is(conn, db_url):

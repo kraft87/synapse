@@ -1575,8 +1575,8 @@ def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool
 # clients see it gone on their next full fetch.
 
 
-def _is_episode_ref(elem: Any, episode_id: int) -> bool:
-    """True when a provenance-array element names ``episode_id``.
+def _is_episode_ref(elem: Any, episode_ids: set[int]) -> bool:
+    """True when a provenance-array element names one of ``episode_ids``.
 
     Matches the JSON number and (defensively) the numeric-string form — the extractor's
     array element type isn't guaranteed, which is why every read path here checks both.
@@ -1584,21 +1584,20 @@ def _is_episode_ref(elem: Any, episode_id: int) -> bool:
     if isinstance(elem, bool):
         return False
     if isinstance(elem, int):
-        return elem == episode_id
+        return elem in episode_ids
     if isinstance(elem, str):
-        return elem.strip().isdigit() and int(elem) == episode_id
+        return elem.strip().isdigit() and int(elem) in episode_ids
     return False
 
 
-def _other_episode_refs(raw: Any, episode_id: int) -> list[Any]:
-    """The provenance elements that are NOT ``episode_id`` (order preserved).
+def _other_episode_refs(raw: Any, episode_ids: set[int]) -> list[Any]:
+    """The provenance elements that are NOT in ``episode_ids`` (order preserved).
 
     Empty ⇒ SOLE provenance (delete the row). Non-empty ⇒ SHARED (unlink and keep). A
-    malformed / non-array ``episodes`` value counts as sole: it names nothing that would
-    survive."""
+    malformed / non-array value counts as sole: it names nothing that would survive."""
     if not isinstance(raw, list):
         return []
-    return [e for e in raw if not _is_episode_ref(e, episode_id)]
+    return [e for e in raw if not _is_episode_ref(e, episode_ids)]
 
 
 def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[str]) -> int:
@@ -1614,44 +1613,54 @@ def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[
 
 
 def delete_episode_content(
-    conn: psycopg.Connection[dict[str, Any]], episode_id: int
+    conn: psycopg.Connection[dict[str, Any]], episode_ids: list[int]
 ) -> dict[str, int]:
-    """The episode-delete cascade: everything carrying episode ``episode_id``'s content.
+    """The episode-delete cascade: everything carrying the content of ``episode_ids``.
 
-    Runs on ``conn`` inside the CALLER's transaction, with the episode row already locked:
-    chunks citing it, its sole-provenance facts (shared ones are unlinked), its chat
-    timeline events, the row itself (its extraction_queue rows follow via the 001 FK),
-    and any active flag on it. Returns the counts. Shared by the dashboard's single-turn
-    delete and private mode's session purge (``mcp_server/private_session_routes``)."""
+    Runs on ``conn`` inside the CALLER's transaction, with the episode rows already locked:
+    chunks citing any of them, their sole-provenance facts (shared ones are unlinked),
+    their chat timeline events, the rows themselves (their extraction_queue rows follow
+    via the 001 FK), and any active flag on them. Returns the counts. Shared by the
+    dashboard's single-turn delete and private mode's session purge
+    (``mcp_server/private_session_routes``).
+
+    Set-based on purpose: the purge passes every turn of a session, and the provenance
+    arrays have no usable index (029's GIN is partial), so each lookup is one pass over
+    the table. "Sole" and "shared" are judged against the whole set, so a fact citing two
+    deleted turns and one surviving turn is unlinked once, not once per turn."""
+    ids = set(episode_ids)
+    id_texts = [str(i) for i in episode_ids]
     # --- chunks -------------------------------------------------------------
     # A chunk's `content` is the verbatim concatenation of its 3-5 episode window
     # (schema 008), so there is no way to excise one turn from it: every chunk
-    # citing this episode goes. Chunks whose window ALSO named surviving episodes
-    # are counted separately — that's real collateral the UI has to admit to.
+    # citing one of these episodes goes. Chunks whose window ALSO named surviving
+    # episodes are counted separately — that's real collateral the UI has to admit to.
+    # jsonb_array_elements_text renders the number 12 and the string "12" alike, which is
+    # both forms _is_episode_ref accepts; a non-array value is read as a one-element array.
     chunk_rows = conn.execute(
-        "SELECT id, episode_ids FROM chunks "
-        "WHERE episode_ids @> to_jsonb(%s::bigint) "
-        "   OR episode_ids @> to_jsonb(%s::text) "
-        "FOR UPDATE",
-        (episode_id, str(episode_id)),
+        "SELECT id, episode_ids FROM chunks c WHERE EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(c.episode_ids) = 'array' "
+        "THEN c.episode_ids ELSE jsonb_build_array(c.episode_ids) END) AS v "
+        "WHERE v = ANY(%s::text[])) FOR UPDATE",
+        (id_texts,),
     ).fetchall()
     chunk_ids = [r["id"] for r in chunk_rows]
-    chunks_mixed = sum(1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], episode_id))
+    chunks_mixed = sum(1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], ids))
     if chunk_ids:
         conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
 
     # --- KG facts (sole vs shared provenance) --------------------------------
     fact_rows = conn.execute(
-        "SELECT uuid, episodes FROM kg_relationships "
-        "WHERE episodes @> to_jsonb(%s::bigint) "
-        "   OR episodes @> to_jsonb(%s::text) "
-        "FOR UPDATE",
-        (episode_id, str(episode_id)),
+        "SELECT uuid, episodes FROM kg_relationships r WHERE EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(r.episodes) = 'array' "
+        "THEN r.episodes ELSE jsonb_build_array(r.episodes) END) AS v "
+        "WHERE v = ANY(%s::text[])) FOR UPDATE",
+        (id_texts,),
     ).fetchall()
     sole: list[str] = []
     shared: list[tuple[str, list[Any]]] = []
     for r in fact_rows:
-        others = _other_episode_refs(r["episodes"], episode_id)
+        others = _other_episode_refs(r["episodes"], ids)
         if others:
             shared.append((r["uuid"], others))
         else:
@@ -1671,15 +1680,15 @@ def delete_episode_content(
     # makes them sole-provenance by construction, so the rule resolves to delete;
     # keeping them would go on serving the deleted turn from recall()'s timeline leg.
     ev = conn.execute(
-        "DELETE FROM timeline_events WHERE source_ref = %s OR source_ref LIKE %s",
-        (f"ep:{episode_id}", f"ep:{episode_id}#%"),
+        "DELETE FROM timeline_events WHERE source_ref = ANY(%s) OR source_ref LIKE ANY(%s)",
+        ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids]),
     )
     events_deleted = ev.rowcount if ev.rowcount and ev.rowcount > 0 else 0
 
-    # --- the episode itself (extraction_queue rows follow via the 001 FK) -----
-    conn.execute("DELETE FROM episodes WHERE id = %s", (episode_id,))
+    # --- the episodes themselves (extraction_queue rows follow via the 001 FK) ----
+    conn.execute("DELETE FROM episodes WHERE id = ANY(%s)", (episode_ids,))
 
-    _retire_flag(conn, "episode", str(episode_id))
+    retire_flags(conn, "episode", id_texts)
     return {
         "chunks_deleted": len(chunk_ids),
         "chunks_mixed_deleted": chunks_mixed,
@@ -1701,7 +1710,7 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
             ).fetchone()
             if row is None:
                 return None
-            summary = {"episode_id": episode_id, **delete_episode_content(conn, episode_id)}
+            summary = {"episode_id": episode_id, **delete_episode_content(conn, [episode_id])}
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
                 "VALUES ('delete_episode', 'episode', %s, %s)",
@@ -1727,7 +1736,7 @@ def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
                 "deleted": True,
                 "supersession_links_cleared": links_cleared,
             }
-            _retire_flag(conn, "fact", uuid)
+            retire_flags(conn, "fact", [uuid])
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
                 "VALUES ('delete_fact', 'fact', %s, %s)",
@@ -1736,14 +1745,14 @@ def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
             return result
 
 
-def _retire_flag(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str) -> None:
-    """Retire the active flag (if any) on an item we just deleted, so the Flags list can't
+def retire_flags(conn: psycopg.Connection[dict[str, Any]], kind: str, item_ids: list[str]) -> None:
+    """Retire the active flag (if any) on items we just deleted, so the Flags list can't
     point at a row that no longer exists. The dashboard_audit trail is NOT touched — it is
     append-only and deliberately outlives the content."""
     conn.execute(
         "UPDATE dashboard_flags SET removed_at = now() "
-        "WHERE kind = %s AND item_id = %s AND removed_at IS NULL",
-        (kind, item_id),
+        "WHERE kind = %s AND item_id = ANY(%s) AND removed_at IS NULL",
+        (kind, item_ids),
     )
 
 
