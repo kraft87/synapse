@@ -17,8 +17,8 @@ logging.basicConfig(
 )
 
 # Logfire spans for the extraction pipeline. Explicit spans on stage
-# 6+7 + auto-instrumentation of every Claude CLI call (claude_agent_sdk) and
-# HTTP request so the trace UI shows the full tree:
+# 6+7 + auto-instrumentation of every Claude CLI call (claude_agent_sdk),
+# pydantic-ai run and HTTP request so the trace UI shows the full tree:
 #
 #   process_facts_for_group
 #     stage6b_batch_confirm
@@ -34,6 +34,10 @@ logfire.configure(
     send_to_logfire="if-token-present",
 )
 logfire.instrument_claude_agent_sdk()
+# Every structured_call (both backends) and every OpenAI-compatible call is a
+# pydantic-ai run: model, token usage and cost per call, named by stage. Content
+# stays out: the CLI spans above already carry the prompts on that backend.
+logfire.instrument_pydantic_ai(include_content=False)
 logfire.instrument_httpx()
 
 from ingestion.config import get_settings  # noqa: E402

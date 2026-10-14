@@ -13,8 +13,6 @@ class Settings(BaseSettings):
 
     # Postgres
     db_url: str = Field(alias="SYNAPSE_DB_URL")
-    db_pool_min: int = 2
-    db_pool_max: int = 10
 
     # Maintenance loop cadence (summaries + embed). Episodes arrive via the
     # /ingest push hook, not a poll, so this only paces post-ingest work.

@@ -328,6 +328,50 @@ class TestSuccessfulCompletion:
         client.messages.create(messages=[{"role": "user", "content": "hi"}])
         assert calls["n"] == 1
 
+    def test_auto_provider_order_ranks_the_per_call_model(self, monkeypatch):
+        """A stage model override (SYNAPSE_<STAGE>_MODEL) is what goes on the wire, so its
+        endpoints, not the client default's, decide the provider order."""
+        monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
+        llm_client_mod._provider_rank_cache.clear()
+        ranked: list[str] = []
+
+        def fetch(model: str) -> list[dict[str, Any]]:
+            ranked.append(model)
+            return [
+                {
+                    "tag": f"{model.split('/')[0]}-host/fp8",
+                    "status": 0,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000003"},
+                }
+            ]
+
+        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", fetch)
+        seen: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(json.loads(request.content))
+            text = '{"contradicted_facts": []}' if "response_format" in seen[-1] else "ok"
+            return httpx.Response(200, json=_completion_body(text))
+
+        client = _client_with(handler, model="deepseek/deepseek-v4-flash")
+        client.messages.create(
+            model="qwen/qwen-2.5-72b-instruct", messages=[{"role": "user", "content": "hi"}]
+        )
+        structured_call(
+            client, output_model=_StrictVerdict, base_prompt="judge", model="z-ai/glm-5.2"
+        )
+        client.messages.create(messages=[{"role": "user", "content": "hi"}])
+        assert ranked == [
+            "qwen/qwen-2.5-72b-instruct",
+            "z-ai/glm-5.2",
+            "deepseek/deepseek-v4-flash",
+        ]
+        assert [p["provider"]["order"] for p in seen] == [
+            ["qwen-host"],
+            ["z-ai-host"],
+            ["deepseek-host"],
+        ]
+
     def test_non_openrouter_payload_has_no_reasoning_field(self):
         """Other OpenAI-compatible servers may reject unknown params."""
         seen: dict[str, Any] = {}
@@ -747,6 +791,27 @@ class TestStructuredCall:
         # that ignore response_format.
         system_text = " ".join(m["content"] for m in payload["messages"] if m["role"] == "system")
         assert "contradicted_facts" in system_text
+
+    def test_agent_run_span_names_the_stage(self):
+        """With pydantic-ai instrumented (the poller does), each structured call's span
+        carries its output model's name, so token use can be read per stage."""
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+        from pydantic_ai import Agent, InstrumentationSettings
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_completion_body('{"contradicted_facts": []}'))
+
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+        Agent.instrument_all(InstrumentationSettings(tracer_provider=provider))
+        try:
+            structured_call(_client_with(handler), output_model=_StrictVerdict, base_prompt="x")
+        finally:
+            Agent.instrument_all(False)
+        assert "invoke_agent strict_verdict" in [s.name for s in exporter.get_finished_spans()]
 
     def test_wrapped_indices_coerced_over_http(self):
         from ingestion.llm_schemas import ContradictionVerdict

@@ -786,7 +786,7 @@ class _OpenAIMessagesProxy:
         agent = Agent(
             c.pydantic_ai_model(model),
             output_type=str,
-            model_settings=c.model_settings(max_tokens),
+            model_settings=c.model_settings(max_tokens, model),
             retries=0,
         )
         result = _run_agent_sync(agent, prompt, instructions=instructions, structured=False)
@@ -894,8 +894,10 @@ class OpenAIChatClient:
             profile=_openai_compat_profile(),
         )
 
-    def model_settings(self, max_tokens: int) -> Any:
-        """Per-call model settings, carrying the OpenRouter must-haves."""
+    def model_settings(self, max_tokens: int, model: str | None = None) -> Any:
+        """Per-call model settings, carrying the OpenRouter must-haves. ``model`` is
+        the call's model as passed to ``pydantic_ai_model``: the provider order is
+        ranked for the model that actually goes on the wire."""
         from pydantic_ai.models.openai import OpenAIChatModelSettings
 
         settings = OpenAIChatModelSettings(max_tokens=max_tokens)
@@ -909,7 +911,7 @@ class OpenAIChatClient:
             # failed exactly that way on deepseek-v4-pro (2026-07-17).
             extra["reasoning"] = {"enabled": False}
             providers = (
-                _ranked_openrouter_providers(self.model)
+                _ranked_openrouter_providers(self.resolve_model(model))
                 if self.openrouter_providers_auto
                 else self.openrouter_providers
             )
@@ -964,8 +966,8 @@ def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     (in openai-provider mode the fallback is ``DEFAULT_OPENAI_MODEL``, never a
     bare Claude id the provider wouldn't recognise).
 
-    Stages: EXTRACTOR, TIMELINE, PREFERENCES, DEDUP, CONTRADICTION,
-    EDGE_DATES, DREAM, QUERY_GRAPH, NOTES_CONFIRM. The A/B work behind this (Flash-vs-Haiku,
+    Stages: EXTRACTOR, TIMELINE, PREFERENCES, DEDUP, CONTRADICTION, EDGE_DATES,
+    NOTES_CONFIRM, NOTES_CURATE, SKILLS. The A/B work behind this (Flash-vs-Haiku,
     DeepSeek-vs-Haiku) showed model choice matters per stage — a cheap model
     can be fine for binary confirms while extraction wants a stronger one.
     """
@@ -1100,17 +1102,19 @@ def structured_call[M: BaseModel](
     instructions, prompt = _flatten_chat(messages, system=system, prompt=base_prompt)
 
     if isinstance(llm_client, OpenAIChatClient):
-        settings: Any = llm_client.model_settings(max_tokens)
+        settings: Any = llm_client.model_settings(max_tokens, model)
     else:
         settings = ModelSettings(max_tokens=max_tokens)
 
+    stage = _snake_name(output_model.__name__)
     agent = Agent(
         _resolve_pydantic_ai_model(llm_client, model),
-        output_type=NativeOutput(
-            output_model, name=_snake_name(output_model.__name__), strict=True
-        ),
+        output_type=NativeOutput(output_model, name=stage, strict=True),
         model_settings=settings,
         retries=max(0, max_attempts - 1),
+        # Names the run's span ("invoke_agent <stage>") where pydantic-ai is
+        # instrumented, so token use and cost can be read per stage.
+        name=stage,
     )
     result = _run_agent_sync(agent, prompt, instructions=instructions, structured=True)
     return cast(M, result.output)
