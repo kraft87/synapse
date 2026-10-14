@@ -16,30 +16,18 @@ import re
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import orjson
 
 from ingestion.models import Episode
+from ingestion.project_label import label_from_path
+from ingestion.turns import MIN_RESULT_CHARS, TurnSequence, parse_iso
 
 logger = logging.getLogger(__name__)
 
 _BUBBLE_KEY_RE = re.compile(r"^bubbleId:([0-9a-f-]{36}):([0-9a-f-]{36})$")
-
-
-def _strip_nulls(text: str) -> str:
-    return text.replace("\x00", "") if "\x00" in text else text
-
-
-def _parse_iso(ts: Any) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
 
 
 def _project_from_uris(uris: Any) -> str | None:
@@ -55,14 +43,11 @@ def _project_from_uris(uris: Any) -> str | None:
             path = unquote(urlparse(raw).path)
         except (ValueError, TypeError):
             continue
-        path = path.rstrip("/")
-        if not path:
-            continue
-        # Strip Windows drive prefix like /c:/...
-        path = re.sub(r"^/[a-zA-Z]:", "", path)
-        basename = path.rsplit("/", 1)[-1]
-        if basename and basename.lower() not in ("projects", "users"):
-            return basename
+        # Strip Windows drive prefix like /c:/..., then take the last component the way
+        # every other source labels a working directory.
+        label = label_from_path(re.sub(r"^/[a-zA-Z]:", "", path))
+        if label and label.lower() not in ("projects", "users"):
+            return label
     return None
 
 
@@ -128,23 +113,16 @@ class CursorSQLiteParser:
         if current:
             groups.append(current)
 
-        prev_assistant: str | None = None
-        seq = 0
+        turns = TurnSequence()
 
         for group in groups:
             if not group:
                 continue
-            seq += 1
-            content_parts: list[str] = []
-            human_turn: str | None = None
-            assistant_turn: str | None = None
+            turn = turns.begin()
             model: str | None = None
             ts: str | None = None
             project: str | None = None
             last_bubble_id: str | None = None
-
-            if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
 
             for b in group:
                 ts = ts or b.get("createdAt")
@@ -158,13 +136,9 @@ class CursorSQLiteParser:
                     model = model or model_info.get("model")
 
                 if btype == 1:  # user
-                    if text and human_turn is None:
-                        human_turn = text[:3000]
-                        content_parts.append(f"[user] {human_turn}")
+                    turn.user(text)
                 elif btype == 2:  # assistant
-                    if text:
-                        assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:3000]}")
+                    turn.assistant_text(text)
                     # surface tool invocations
                     tool_results = b.get("toolResults") or []
                     for tr in tool_results if isinstance(tool_results, list) else []:
@@ -175,32 +149,27 @@ class CursorSQLiteParser:
                         if isinstance(result, dict | list):
                             result = orjson.dumps(result).decode()[:300]
                         result_text = str(result).strip()
-                        if len(result_text) > 20:
-                            content_parts.append(f"[tool:{name}] {result_text[:300]}")
+                        if len(result_text) > MIN_RESULT_CHARS:
+                            turn.line(f"[tool:{name}] {result_text[:300]}")
 
-            if not content_parts or not (human_turn or assistant_turn):
+            span_id = f"cursor-sqlite:{composer_id}:{last_bubble_id}" if last_bubble_id else None
+            if not turns.accept(turn, span_id):
                 continue
-
-            try:
-                created_at = _parse_iso(ts)
-            except (ValueError, TypeError):
-                created_at = None
 
             yield Episode(
                 session_id=composer_id,
-                sequence=seq,
+                sequence=turn.sequence,
                 project=project,
                 platform="cursor",
                 model=model,
-                human_turn=_strip_nulls(human_turn) if human_turn else None,
-                assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                content=_strip_nulls("\n\n".join(content_parts)),
-                span_id=f"cursor-sqlite:{composer_id}:{last_bubble_id}" if last_bubble_id else None,
+                human_turn=turn.human,
+                assistant_turn=turn.assistant,
+                content=turn.content,
+                span_id=span_id,
                 source="cursor_sqlite",
                 metadata={
                     "composer_id": composer_id,
                     "ts": ts,
                 },
-                created_at=created_at,
+                created_at=parse_iso(ts),
             )
-            prev_assistant = assistant_turn

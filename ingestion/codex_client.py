@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +35,7 @@ import orjson
 
 from ingestion.models import Episode
 from ingestion.project_label import label_from_path
+from ingestion.turns import TurnSequence, parse_iso
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +72,6 @@ _ITEM_TYPES = (
 
 def _is_machinery_text(text: str) -> bool:
     return text.lstrip().startswith(_MACHINERY_PREFIXES)
-
-
-def _strip_nulls(text: str) -> str:
-    """Postgres TEXT columns reject NUL bytes — strip them defensively."""
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _content_text(content: Any) -> str:
@@ -238,23 +233,15 @@ class CodexRolloutParser:
             groups.append(current)
 
         episodes: list[Episode] = []
-        prev_assistant: str | None = None
-        seq = 0
-        seen_span_ids: set[str] = set()
+        turns = TurnSequence()
 
         for group in groups:
             if not group:
                 continue
-            seq += 1
+            turn = turns.begin()
 
-            content_parts: list[str] = []
-            human_turn: str | None = None
-            assistant_turn: str | None = None
             last_item_id: str | None = None
             ts: str | None = None
-
-            if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
 
             for rec in group:
                 ts = ts or rec.get("timestamp")
@@ -264,48 +251,32 @@ class CodexRolloutParser:
 
                 if ptype == "message":
                     text = _content_text(payload.get("content"))
-                    if not text:
-                        continue
                     if payload.get("role") == "user":
-                        if human_turn is None:
-                            human_turn = text[:3000]
-                            content_parts.append(f"[user] {human_turn}")
+                        turn.user(text)
                     else:
-                        assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:3000]}")
+                        turn.assistant_text(text)
                 elif ptype in ("custom_tool_call_output", "function_call_output"):
-                    txt = _tool_output_text(payload)
-                    if len(txt) > 20:
-                        content_parts.append(f"[result] {txt[:500]}")
+                    turn.result(_tool_output_text(payload))
                 else:
                     line = _tool_call_line(payload)
                     if line:
-                        content_parts.append(line)
+                        turn.line(line)
 
-            if not content_parts:
-                continue
-
+            # A replayed item (resume/fork re-dump) is the same turn as its first telling.
             span_id = f"codex:{last_item_id}" if last_item_id else None
-            if span_id is not None:
-                if span_id in seen_span_ids:
-                    continue  # replayed item (resume/fork re-dump) — already emitted
-                seen_span_ids.add(span_id)
-
-            try:
-                created_at = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
-            except (ValueError, TypeError):
-                created_at = None
+            if not turns.accept(turn, span_id):
+                continue
 
             episodes.append(
                 Episode(
                     session_id=session_id,
-                    sequence=seq,
+                    sequence=turn.sequence,
                     project=project_override or _cwd_to_project(cwd),
                     platform="codex",
                     model=model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=turn.human,
+                    assistant_turn=turn.assistant,
+                    content=turn.content,
                     span_id=span_id,
                     source="codex",
                     metadata={
@@ -315,9 +286,8 @@ class CodexRolloutParser:
                         "cli_version": cli_version,
                         "originator": originator,
                     },
-                    created_at=created_at,
+                    created_at=parse_iso(ts),
                 )
             )
-            prev_assistant = assistant_turn
 
         return episodes

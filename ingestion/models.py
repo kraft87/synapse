@@ -9,6 +9,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingestion.secret_redact import redact_secrets
+from ingestion.textsafe import strip_nul
 
 logger = logging.getLogger(__name__)
 
@@ -158,29 +159,14 @@ class Episode(BaseModel):
     surface_id: str | None = None
 
     # Every ingest path builds an Episode, so this is the one place a credential in a
-    # transcript is stopped before it is stored, chunked, extracted or served.
+    # transcript is stopped before it is stored, chunked, extracted or served, and the
+    # one place NUL bytes go (TEXT columns reject them, so one stray byte would fail the
+    # episode INSERT and its queue row). NULs first, so one cannot split a credential.
     @field_validator("human_turn", "assistant_turn", "content")
     @classmethod
-    def _redact(cls, v: str | None) -> str | None:
-        return redact_secrets(v)
-
-
-class SessionSummary(BaseModel):
-    session_id: str
-    project: str | None = None
-    platform: str | None = None
-    summary: str
-    last_summarized_sequence: int
-
-
-class LogfireSpan(BaseModel):
-    span_id: str
-    trace_id: str
-    message: str
-    model: str | None = None
-    input_messages: Any = None  # raw JSON from Logfire
-    output_messages: Any = None  # raw JSON from Logfire
-    start_timestamp: str
+    def _clean(cls, v: str | None) -> str | None:
+        text: str | None = strip_nul(v)
+        return redact_secrets(text)
 
 
 class ExtractionItem(BaseModel):
