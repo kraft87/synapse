@@ -16,9 +16,8 @@ _EMBED_DIMS = embed_dims()
 
 
 def _vector_literal(embedding: Sequence[float] | None) -> str | None:
-    """Format an embedding as a pgvector text literal. The ``.6f`` precision is a
-    correctness invariant: the write literal must match the query-cast literal
-    byte-for-byte, or vector comparisons drift. Returns ``None`` for a NULL embedding."""
+    """Format an embedding as a pgvector text literal, six decimals per component.
+    Returns ``None`` for a NULL embedding."""
     if embedding is None:
         return None
     return "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"

@@ -559,8 +559,8 @@ One mirrored file's content + meta + parsed `[[wikilinks]]`. Reuses the `_fetch_
 
 ## Phase 6 endpoints (Graph explorer)
 
-Two read-only endpoints backing the KG explorer page (README §3, spec §4). Machine-token
-gated, threadpool, bounded — same posture as every `/dash/api/*` route. No migration:
+Two read-only endpoints backing the KG explorer page (README §3, spec §4). Admin-gated,
+threadpool, bounded — same posture as every `/dash/api/*` route. No migration:
 they read `kg_entities` / `kg_relationships` (schema 017 + 020 supertype + 028/029
 supersession) directly. `src_uuid`/`tgt_uuid` are NOT FKs — edges match endpoints by
 uuid; an edge to a uuid with no `kg_entities` row is simply dropped (no phantom node).
