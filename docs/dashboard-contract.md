@@ -44,7 +44,10 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
 - `cursor`: opaque string from a previous response (`next_cursor`); absent = newest.
 - `limit` ≤ 100. Filters apply where the column exists (episodes: project+source;
   facts: group_id; timeline: project + group_id via its `domain` column, schema 038) —
-  a filter a type lacks does not exclude that type.
+  a filter a type lacks does not exclude that type. A timeline event with no domain
+  (`NULL`: legacy rows, a gate parse miss, a pushed non-git event) fails open, as 038
+  specifies: it passes either group filter (here, in search and in `/timeline`, and in the
+  client's live filter). Facts keep the strict match.
 - Feed timestamps: episode `created_at`, fact `t_created`, timeline `ingested_at`.
   Facts and timeline events are ordered by when they were WRITTEN (the event's own date is
   `t_valid` in data); an episode is ordered by its CONVERSATION time, so a backfilled or
@@ -121,7 +124,8 @@ within the entity's own `(owner_id, group_id)`. `entity_type` is the taxonomy su
 first, paged. (Timeline/preference cross-links: reserved for a later phase.)
 
 ### GET /dash/api/search?q&type=episodes|facts|entities|events&offset=0&limit=20&project&group_id&source
-ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE. NOT recall().
+ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE, as a literal
+substring (`%`, `_` and `\` in `q` are text, not wildcards). NOT recall().
 ```json
 {"hits": [{"type": "episodes", "id": "227168", "snippet": "…",
             "meta": {"project": "…", "source": "…", "ts": "…", "session_id": "…"}}],
@@ -503,9 +507,11 @@ dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same pos
 
 **Honesty notes (read before consuming a payload):**
 - **`timeline_events.event_type` is sparse.** Schema 033 deferred typed events, so most rows
-  have `event_type = NULL`. A `type` chip filter narrows to rows with that exact `event_type`;
-  **untyped events show only in the unfiltered view** (the default). This is why the type
-  filter is single-select and the default Events view is the whole stream.
+  have `event_type = NULL`; the rest are `decision | action | finding | milestone` (every
+  writer emits only those, ingestion/llm_schemas.py `_EVENT_TYPES`). A `type` chip filter
+  narrows to rows with that exact `event_type`; **untyped events show only in the unfiltered
+  view** (the default). This is why the type filter is single-select and the default Events
+  view is the whole stream.
 - **No behavior-file history.** `config_lane.config_registry` keeps only the CURRENT version of
   a file (`content` + `content_hash` + `updated_at`); there is NO versions table. So
   `/behavior/file` returns no history and the client's change-history timeline stays hidden —
@@ -517,17 +523,34 @@ dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same pos
 {"events": [
   {"id": 8841, "t_valid": "2026-07-03T…", "fact": "rerank pool capped at 96",
    "source": "chat", "project": "synapse", "salience": 2, "sal": 0.9,
-   "event_type": "work", "episode_id": 88412, "flagged": false}],
+   "event_type": "decision", "episode_id": 88412, "flagged": false}],
  "next_before": "2026-07-03T…|8841"}
 ```
 - `limit` ≤ 200 (default 50). `sal` maps salience `0/1/2 → 0.3/0.6/0.9` (the feed mapping); the
   salience type ramp reads `sal`. `episode_id` is the resolved `ep:N` `source_ref` (git SHAs → null).
-- `type` filters `event_type` (see honesty note). `group_id` filters the `domain` column (schema 038).
+- `type` filters `event_type` (see honesty note); any value outside the four types is a **400**
+  (`unknown type`), so a drifting client shows up instead of listing nothing. `group_id`
+  filters the `domain` column (schema 038); an unlabelled (`NULL`) event passes either group.
 - `before` is the keyset cursor: a **bare ISO timestamp** (the jump-to-date case → strict
   `t_valid < ts`) OR a compound **`ts|id`** (a prior `next_before` → the full `(t_valid, id)`
   keyset, so ties on `t_valid` never drop or duplicate a row). `next_before` is set whenever a
   full page (`len == limit`) is returned — the next fetch drains the stream (empty page, no
   cursor), exactly like `/feed`.
+
+### GET /dash/api/timeline/months?tz&type&group_id
+The Events tab's jump-to-date options: every month that has events under the same `type` /
+`group_id` filters, newest first, bucketed in the viewer's zone.
+```json
+{"months": [{"month": "2026-09", "n": 41, "before": "2026-10-01T04:00:00+00:00"}]}
+```
+- `tz` (required) is an IANA zone name, the browser's; a missing or unknown one is a **400**, as
+  is an unknown `type`. An event said at 20:30 on Sep 30 in Toronto is stored as 00:30Z on Oct 1
+  and counts under `2026-09`.
+- `before` is the first instant after the month: pass it to `/timeline` as `before` and the page
+  starts at that month's last event and runs back through older months.
+- **Client date rule.** The client shows and buckets every date as the viewer's calendar day in
+  the browser's zone (card dates, month sections, validity lines, preference `since`, the Dream
+  run picker), never by slicing the UTC string.
 
 ### GET /dash/api/preferences?sort=recency|assert_count
 The full standing-preference log (the Preferences tab). LIVE rows first, then superseded
@@ -598,8 +621,8 @@ supersession) directly. `src_uuid`/`tgt_uuid` are NOT FKs — edges match endpoi
 uuid; an edge to a uuid with no `kg_entities` row is simply dropped (no phantom node).
 
 ### GET /dash/api/graph/entities?q&limit=10
-Seed typeahead — shares the search endpoint's entity leg SQL (`name ILIKE '%q%'`, `degree
-DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
+Seed typeahead — shares the search endpoint's entity leg SQL (`name ILIKE '%q%'` with `q`
+taken literally, `degree DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
 Empty `q` → `[]`. Returns a bare array:
 ```json
 [{"uuid": "…", "name": "Synapse", "entity_type": "Project", "degree": 10}]
@@ -620,7 +643,7 @@ orphaned, and sets `truncated`.
 ```
 - **Seed resolution:** exact `uuid` → exact `normalized_name` (input lowercased +
   whitespace-collapsed + bookend-punctuation-stripped, mirroring `ingestion.dedup`) → best
-  `name ILIKE` match by `degree DESC`. No match → **404** `entity not found`. Missing/empty
+  `name ILIKE` substring match (`q` taken literally) by `degree DESC`. No match → **404** `entity not found`. Missing/empty
   `entity` → **400**.
 - **`supertype`** (nodes + typeahead) is the canonical coarse layer (`kg_entities.entity_supertype`,
   schema 020) — the client colors by it; `entity_type` stays the fine-grained label.
@@ -770,7 +793,7 @@ No such uuid → 404 `fact not found`.
 All spec §8 phases are shipped; no reserved paths remain. `POST /recall`'s `debug: true`
 flag + `/dash/api/recall/history` (phase 2); `/dash/api/proposals*` (phase 2b);
 `/dash/api/stream` SSE (phase 3); `/dash/api/metrics/{recall,ingestion,corpus}` (phase 4);
-`/dash/api/timeline`, `/dash/api/preferences`, `/dash/api/dream/report`,
+`/dash/api/timeline{,/months}`, `/dash/api/preferences`, `/dash/api/dream/report`,
 `/dash/api/behavior/{files,file}` (phase 5);
 `/dash/api/graph/{entities,neighborhood}` (phase 6);
 `DELETE /dash/api/episodes/{id}` + `DELETE /dash/api/facts/{id}` (phase 7) — all

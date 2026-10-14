@@ -40,6 +40,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg.rows import dict_row
@@ -57,6 +58,7 @@ from starlette.responses import (
 from ingestion import pg_pool
 from ingestion.db_connection import bm25_query_text
 from ingestion.dedup import _normalize_name
+from ingestion.llm_schemas import _EVENT_TYPES
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -234,6 +236,20 @@ def _label_filter(col: str, value: str) -> tuple[str, list[Any]]:
     if value == "untagged":
         return f"({col} IS NULL OR {col} = '' OR {col} = 'untagged')", []
     return f"{col} = %s", [value]
+
+
+def _domain_filter(group_id: str) -> tuple[str, list[Any]]:
+    """WHERE fragment for the group filter on timeline_events. ``domain`` is NULL for an
+    unlabelled event (legacy rows, a gate parse miss, a pushed non-git event) and schema 038
+    makes a NULL FAIL OPEN at read, so it stays visible under either group."""
+    return "(domain = %s OR domain IS NULL)", [group_id]
+
+
+def _like_contains(q: str) -> str:
+    """ILIKE pattern for "name contains q" with q taken literally: '%' and '_' in user text
+    are not wildcards. Backslash is Postgres's default LIKE escape, so it is escaped too."""
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def _encode_cursor(ts_iso: str, type_: str, id_str: str) -> str:
@@ -477,8 +493,9 @@ def _feed(
             # 038 added `domain` (technical/personal) as the timeline's group scope; the
             # contract's feed-filter line names only project for timeline, but the domain
             # column IS a group_id-equivalent, so the group filter applies here too.
-            t_where.append("domain = %s")
-            t_params.append(group_id)
+            clause, args = _domain_filter(group_id)
+            t_where.append(clause)
+            t_params += args
         if cts is not None:
             t_where.append(
                 "(ingested_at < %s::timestamptz OR (ingested_at = %s::timestamptz AND id::text < %s))"
@@ -795,7 +812,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
         rows = conn.execute(
             "SELECT uuid, name, entity_subtype, entity_supertype, degree FROM kg_entities "
             "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
-            (f"%{q}%", limit),
+            (_like_contains(q), limit),
         ).fetchall()
         return [
             {
@@ -827,7 +844,7 @@ def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict
             return row
     return conn.execute(
         f"SELECT {cols} FROM kg_entities WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT 1",
-        (f"%{entity}%",),
+        (_like_contains(entity),),
     ).fetchone()
 
 
@@ -999,7 +1016,7 @@ def _search(
     if not q:
         return empty
     safe = bm25_query_text(q)
-    like = f"%{q}%"
+    like = _like_contains(q)
 
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         # --- per-type filter fragments (applied to both count and hit queries) ---
@@ -1023,8 +1040,9 @@ def _search(
             ev_filt.append(clause)
             ev_p += args
         if group_id is not None:
-            ev_filt.append("domain = %s")
-            ev_p.append(group_id)
+            clause, args = _domain_filter(group_id)
+            ev_filt.append(clause)
+            ev_p += args
         ev_and = "".join(f" AND {c}" for c in ev_filt)
 
         en_and, en_p = "", []
@@ -1988,9 +2006,10 @@ def _proposal_decision(
 # dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as
 # the rest of /dash/api: one pooled connection per call, bounded, fail-soft. Honesty
 # notes (mirrored into docs/dashboard-contract.md §"Phase 5"):
-#   * timeline_events.event_type is sparsely populated (schema 033 deferred it) — a `type`
-#     chip filter narrows to rows with that exact event_type; UNTYPED events show only when
-#     no chip is active (the default view is the full stream).
+#   * timeline_events.event_type is decision|action|finding|milestone or NULL (untyped, the
+#     sparse legacy majority) — a `type` chip filter narrows to rows with that exact
+#     event_type and any other value is a 400; UNTYPED events show only when no chip is
+#     active (the default view is the full stream).
 #   * config_lane.config_registry stores the CURRENT file content only (content + hash +
 #     updated_at) — there is NO version history table, so /behavior/file returns no history
 #     and the client's change-history timeline stays hidden. Not fabricated this phase.
@@ -2013,9 +2032,10 @@ def _timeline(
     db_url: str, before: str | None, limit: int, type_: str | None, group_id: str | None
 ) -> dict[str, Any]:
     """t_valid-DESC keyset page of timeline events. `type` filters event_type (sparse —
-    see honesty note); `group_id` maps to the `domain` column (schema 038). Each event
-    carries the coarse `salience` plus the 0.3/0.6/0.9 `sal` readout the type ramp reads,
-    the resolved `ep:N` episode id, and its flag state."""
+    see honesty note); `group_id` maps to the `domain` column (schema 038), an unlabelled
+    event passing either group. Each event carries the coarse `salience` plus the
+    0.3/0.6/0.9 `sal` readout the type ramp reads, the resolved `ep:N` episode id, and its
+    flag state."""
     cur = _parse_before(before)
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         where = ["1=1"]
@@ -2024,8 +2044,9 @@ def _timeline(
             where.append("event_type = %s")
             params.append(type_)
         if group_id is not None:
-            where.append("domain = %s")
-            params.append(group_id)
+            clause, args = _domain_filter(group_id)
+            where.append(clause)
+            params += args
         if cur is not None:
             ts, cid = cur
             if cid is not None:
@@ -2063,6 +2084,38 @@ def _timeline(
             last = rows[-1]
             next_before = f"{_iso(last['t_valid'])}|{last['id']}"
         return {"events": events, "next_before": next_before}
+
+
+def _timeline_months(
+    db_url: str, type_: str | None, group_id: str | None, tz: str
+) -> dict[str, Any]:
+    """Every month that has events under the Events tab's filters, newest first, bucketed
+    in the viewer's zone `tz` (an event said at 20:30 on the 30th belongs to that month,
+    not to the next one its UTC stamp falls in). `before` is the first instant after the
+    month, the cursor that makes /timeline start at the month's last event."""
+    where = ["1=1"]
+    params: list[Any] = [tz]
+    if type_ is not None:
+        where.append("event_type = %s")
+        params.append(type_)
+    if group_id is not None:
+        clause, args = _domain_filter(group_id)
+        where.append(clause)
+        params += args
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT to_char(m, 'YYYY-MM') AS month, n, "
+            "       (m + interval '1 month') AT TIME ZONE %s AS before "
+            "FROM (SELECT date_trunc('month', t_valid AT TIME ZONE %s) AS m, count(*) AS n "
+            f"      FROM timeline_events WHERE {' AND '.join(where)} GROUP BY 1) AS s "  # nosec B608
+            "ORDER BY m DESC",
+            (tz, *params),
+        ).fetchall()
+        return {
+            "months": [
+                {"month": r["month"], "n": r["n"], "before": _iso(r["before"])} for r in rows
+            ]
+        }
 
 
 def _preferences(db_url: str, sort: str) -> dict[str, Any]:
@@ -2807,7 +2860,23 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         before = qp.get("before") or None
         type_ = qp.get("type") or None
         group_id = qp.get("group_id") or None
+        if type_ is not None and type_ not in _EVENT_TYPES:
+            return _err(f"unknown type {type_!r}", 400)
         return await _api(request, lambda: _timeline(db_url, before, limit, type_, group_id))
+
+    @mcp.custom_route("/dash/api/timeline/months", methods=["GET"])  # type: ignore[misc]
+    async def dash_timeline_months(request: Request) -> JSONResponse:
+        qp = request.query_params
+        type_ = qp.get("type") or None
+        group_id = qp.get("group_id") or None
+        tz = qp.get("tz") or ""
+        if type_ is not None and type_ not in _EVENT_TYPES:
+            return _err(f"unknown type {type_!r}", 400)
+        try:
+            ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            return _err("missing or unknown 'tz' (an IANA zone name)", 400)
+        return await _api(request, lambda: _timeline_months(db_url, type_, group_id, tz))
 
     @mcp.custom_route("/dash/api/preferences", methods=["GET"])  # type: ignore[misc]
     async def dash_preferences(request: Request) -> JSONResponse:

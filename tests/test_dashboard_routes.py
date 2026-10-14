@@ -733,6 +733,29 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
         }
 
 
+def test_entity_name_matching_is_a_literal_substring(clean, conn, db_url):
+    """'%' and '_' typed into the omnibox, the graph typeahead or the seed box are text, not
+    LIKE wildcards: 'my_skill' must not pull in 'myXskill' ahead of the real entity."""
+    _entity(conn, "w1", name="myXskill", degree=9)
+    _entity(conn, "w2", name="my_skill", degree=1)
+    _entity(conn, "w3", name="100% done", degree=1)
+    with _client(db_url) as client:
+        for q, want in (("my_skill", ["w2"]), ("_", ["w2"]), ("%", ["w3"]), ("y_s", ["w2"])):
+            se = client.get(
+                "/dash/api/search", params={"q": q, "type": "entities"}, headers=_H
+            ).json()
+            assert [h["id"] for h in se["hits"]] == want, q
+            assert se["total_by_type"]["entities"] == len(want), q
+            ta = client.get("/dash/api/graph/entities", params={"q": q}, headers=_H).json()
+            assert [e["uuid"] for e in ta] == want, q
+        # The seed fallback (no uuid, no normalized_name hit) resolves to the literal match.
+        for q, want in (("my_skill", "w2"), ("%", "w3")):
+            nb = client.get("/dash/api/graph/neighborhood", params={"entity": q}, headers=_H).json()
+            assert nb["seed"] == want, q
+        # A backslash is text too, not an escape that swallows the next character.
+        assert client.get("/dash/api/graph/entities", params={"q": "\\"}, headers=_H).json() == []
+
+
 def test_search_survives_query_language_metacharacters(clean, conn, db_url):
     from ingestion.db_connection import bm25_query_text
 
@@ -1888,7 +1911,7 @@ def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
         source_ref=f"ep:{eid}",
         salience=2,
         domain="technical",
-        event_type="work",
+        event_type="decision",
         t_valid=_t(30),
     )
     e_mid = _event(
@@ -1898,7 +1921,7 @@ def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
         source_ref="deadbeef",  # git-style ref -> episode_id None
         salience=1,
         domain="personal",
-        event_type="health",
+        event_type="finding",
         t_valid=_t(20),
     )
     e_lo = _event(
@@ -1918,7 +1941,7 @@ def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
     assert ids == [e_hi, e_mid, e_lo]  # t_valid DESC
     by_id = {e["id"]: e for e in body["events"]}
     assert by_id[e_hi]["sal"] == 0.9 and by_id[e_hi]["salience"] == 2
-    assert by_id[e_hi]["event_type"] == "work" and by_id[e_hi]["episode_id"] == eid
+    assert by_id[e_hi]["event_type"] == "decision" and by_id[e_hi]["episode_id"] == eid
     assert by_id[e_mid]["sal"] == 0.6 and by_id[e_mid]["episode_id"] is None
     assert by_id[e_lo]["sal"] == 0.3 and by_id[e_lo]["event_type"] is None  # untyped shown
     assert by_id[e_hi]["flagged"] is False
@@ -1956,19 +1979,118 @@ def test_timeline_keyset_pagination_with_ties(clean, conn, db_url):
 
 
 def test_timeline_type_and_domain_filters(clean, conn, db_url):
-    work = _event(conn, fact="work event", source_ref="tb:w", event_type="work", domain="technical")
-    life = _event(conn, fact="life event", source_ref="tb:l", event_type="life", domain="personal")
+    decision = _event(
+        conn, fact="decided", source_ref="tb:w", event_type="decision", domain="technical"
+    )
+    finding = _event(
+        conn, fact="found out", source_ref="tb:l", event_type="finding", domain="personal"
+    )
     untyped = _event(conn, fact="untyped", source_ref="tb:u", event_type=None, domain="technical")
     with _client(db_url) as client:
         # type chip narrows to that event_type; untyped rows drop out when a chip is active.
-        only_work = client.get("/dash/api/timeline?type=work", headers=_H).json()
-        assert {e["id"] for e in only_work["events"]} == {work}
+        only = client.get("/dash/api/timeline?type=decision", headers=_H).json()
+        assert {e["id"] for e in only["events"]} == {decision}
         # group_id maps to the domain column (schema 038).
         personal = client.get("/dash/api/timeline?group_id=personal", headers=_H).json()
-        assert {e["id"] for e in personal["events"]} == {life}
+        assert {e["id"] for e in personal["events"]} == {finding}
         # No filter -> everything, including the untyped row.
         allrows = client.get("/dash/api/timeline", headers=_H).json()
-        assert {e["id"] for e in allrows["events"]} == {work, life, untyped}
+        assert {e["id"] for e in allrows["events"]} == {decision, finding, untyped}
+
+
+def test_timeline_rejects_a_type_the_pipeline_never_writes(clean, conn, db_url):
+    """Every writer emits decision|action|finding|milestone; any other chip value is a
+    client bug, so it is a 400 rather than a silently empty list."""
+    _event(conn, fact="decided", source_ref="tb:w", event_type="decision")
+    with _client(db_url) as client:
+        for t in ("decision", "action", "finding", "milestone"):
+            assert client.get(f"/dash/api/timeline?type={t}", headers=_H).status_code == 200
+        r = client.get("/dash/api/timeline?type=work", headers=_H)
+        assert r.status_code == 400 and "type" in r.json()["detail"]
+
+
+def test_group_filter_keeps_events_with_no_domain(clean, conn, db_url):
+    """schema 038: a NULL domain FAILS OPEN at read. An unlabelled event (legacy row, gate
+    parse miss, pushed non-git event) stays visible under either group filter, in the
+    timeline, the feed and the search tab (count and hits alike)."""
+    tok = "unlabelledquux"
+    tech = _event(conn, fact=f"{tok} tech", source_ref="tb:t", domain="technical")
+    pers = _event(conn, fact=f"{tok} personal", source_ref="tb:p", domain="personal")
+    blank = _event(conn, fact=f"{tok} blank", source_ref="tb:n", domain=None)
+    with _client(db_url) as client:
+        for group, want in (
+            ("technical", {tech, blank}),
+            ("personal", {pers, blank}),
+            (None, {tech, pers, blank}),
+        ):
+            params = {"group_id": group} if group else {}
+            tl = client.get("/dash/api/timeline", params=params, headers=_H).json()
+            assert {e["id"] for e in tl["events"]} == want, group
+            feed = _feed_page(client, **params)
+            got = {int(i["id"]) for i in feed["items"] if i["type"] == "timeline_event"}
+            assert got == want, group
+            se = client.get(
+                "/dash/api/search",
+                params={"q": tok, "type": "events", **params},
+                headers=_H,
+            ).json()
+            assert {int(h["id"]) for h in se["hits"]} == want, group
+            assert se["total_by_type"]["events"] == len(want), group
+
+
+def test_timeline_months_counts_each_month_in_the_requested_zone(clean, conn, db_url):
+    """The jump-to-date options come from the server: every month that has events under the
+    active filters, newest first, bucketed in the viewer's zone. An evening event the UTC
+    string files under the next month belongs to the month the viewer lived it in, and
+    `before` is that month's end, the cursor that loads the month and everything older."""
+    # 2026-10-01T00:30Z is 2026-09-30 20:30 in Toronto; 2026-09-15 and 2026-07-04 are plain.
+    late = _event(
+        conn, fact="evening", source_ref="m:1", t_valid=datetime(2026, 10, 1, 0, 30, tzinfo=UTC)
+    )
+    sep = _event(
+        conn, fact="mid", source_ref="m:2", t_valid=datetime(2026, 9, 15, 16, 0, tzinfo=UTC)
+    )
+    jul = _event(
+        conn, fact="old", source_ref="m:3", event_type="decision",
+        t_valid=datetime(2026, 7, 4, 16, 0, tzinfo=UTC), domain="personal",
+    )  # fmt: skip
+    with _client(db_url) as client:
+        got = client.get(
+            "/dash/api/timeline/months", params={"tz": "America/Toronto"}, headers=_H
+        ).json()
+        assert [(m["month"], m["n"]) for m in got["months"]] == [("2026-09", 2), ("2026-07", 1)]
+        # The jump boundary is the first instant of October in Toronto (EDT, UTC-4).
+        assert got["months"][0]["before"].startswith("2026-10-01T04:00:00")
+        utc = client.get("/dash/api/timeline/months", params={"tz": "UTC"}, headers=_H).json()
+        assert [(m["month"], m["n"]) for m in utc["months"]] == [
+            ("2026-10", 1), ("2026-09", 1), ("2026-07", 1),
+        ]  # fmt: skip
+        # Same filters as the events list: type, group.
+        typed = client.get(
+            "/dash/api/timeline/months", params={"tz": "UTC", "type": "decision"}, headers=_H
+        ).json()
+        assert [m["month"] for m in typed["months"]] == ["2026-07"]
+        grp = client.get(
+            "/dash/api/timeline/months", params={"tz": "UTC", "group_id": "personal"}, headers=_H
+        ).json()
+        assert [m["month"] for m in grp["months"]] == ["2026-07"]
+        # Loading a month through its `before` returns that month and older, nothing newer.
+        page = client.get(
+            "/dash/api/timeline", params={"before": got["months"][0]["before"]}, headers=_H
+        ).json()
+        assert [e["id"] for e in page["events"]] == [late, sep, jul]
+        july = client.get(
+            "/dash/api/timeline", params={"before": got["months"][1]["before"]}, headers=_H
+        ).json()
+        assert [e["id"] for e in july["events"]] == [jul]
+        # A zone Postgres cannot resolve is a 400, not a 500.
+        assert (
+            client.get(
+                "/dash/api/timeline/months", params={"tz": "Mars/Olympus"}, headers=_H
+            ).status_code
+            == 400
+        )
+        assert client.get("/dash/api/timeline/months", headers=_H).status_code == 400
 
 
 def test_timeline_flag_reflection(clean, conn, db_url):
