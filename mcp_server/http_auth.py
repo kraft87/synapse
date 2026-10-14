@@ -75,13 +75,13 @@ def machine_authorized(request: Request, machine_token: str, db_url: str) -> boo
     """ "Is this a Synapse client?" — the CLIENT gate on the custom routes.
 
     FastMCP enforces auth on /mcp only (custom routes are exempt by design, issue
-    #3704), so gate them here. Passes for the root token (the services on the Docker host, and any
-    not-yet-enrolled client, which may ingest but is SERVED nothing: its read scope
-    resolves to unknown in ``mcp_server/caller_trust``) and for an APPROVED device
-    token. A pending enrollment fails it: a device that has not been approved holds a
-    real token that authenticates as nothing, which is the whole point of pending. Its
-    transcripts are not lost — the ingest hook's ``--catchup`` sweep re-posts them
-    after approval.
+    #3704), so gate them here. Passes for the root token (the services on the Docker
+    host, and any not-yet-enrolled client, which may ingest but is SERVED nothing: its
+    read scope resolves to unknown in ``mcp_server/caller_trust``) and for an APPROVED
+    device token. A pending enrollment fails it: a device that has not been approved
+    holds a real token that authenticates as nothing, which is the whole point of
+    pending. Its transcripts are not lost — the ingest hook's ``--catchup`` sweep
+    re-posts them after approval.
 
     Open when no machine token is set (dev / pre-cutover).
     """
