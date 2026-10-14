@@ -733,6 +733,22 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
         }
 
 
+def test_search_load_more_skips_the_tab_counts(clean, conn, db_url):
+    """The four counts belong to the first page of a query; a later page carries only hits
+    (the client keeps the totals it already holds)."""
+    tok = "quibblesome"
+    for i in range(3):
+        _episode(conn, session="lm", seq=i + 1, content=f"the {tok} thing number {i}")
+
+    with _client(db_url) as client:
+        first = client.get(f"/dash/api/search?q={tok}&type=episodes&limit=2", headers=_H).json()
+        assert first["total_by_type"]["episodes"] == 3 and len(first["hits"]) == 2
+        more = client.get(
+            f"/dash/api/search?q={tok}&type=episodes&limit=2&offset=2", headers=_H
+        ).json()
+        assert len(more["hits"]) == 1 and "total_by_type" not in more
+
+
 # ---------------------------------------------------------------------------
 # Flags — toggle + audit + feed reflection + gist resolution
 # ---------------------------------------------------------------------------
@@ -1011,6 +1027,30 @@ def test_proposals_unified_list_and_pending_count(clean_proposals, conn, db_url)
         # kind filter narrows to one lane.
         only_skill = client.get("/dash/api/proposals?kind=skill", headers=_H).json()
         assert {r["kind"] for r in only_skill["proposals"]} == {"skill"}
+
+
+def test_proposals_list_keeps_old_proposed_rows_behind_a_decided_backlog(
+    clean_proposals, conn, db_url, monkeypatch
+):
+    """The per-lane cap must not hide a still-'proposed' row behind newer decided ones:
+    proposed rows come first inside each lane's window, and ?status= is applied in SQL."""
+    monkeypatch.setattr(dr, "_PROPOSALS_LANE_CAP", 3)
+    old_skill = _skill_proposal(conn, name="old-skill", status="proposed", created_at=_t(1))
+    old_cfg = _config_proposal(conn, file_key="old.md", status="proposed", created_at=_t(1))
+    for i in range(4):  # newer decided rows that would fill each lane's window
+        _skill_proposal(conn, name=f"done-{i}", status="rejected", created_at=_t(10 + i))
+        _config_proposal(conn, file_key=f"done-{i}.md", status="rejected", created_at=_t(10 + i))
+
+    with _client(db_url) as client:
+        ids = [r["id"] for r in client.get("/dash/api/proposals", headers=_H).json()["proposals"]]
+        assert f"skill:{old_skill}" in ids and f"config:{old_cfg}" in ids
+        only = client.get("/dash/api/proposals?status=rejected", headers=_H).json()
+        assert {r["status"] for r in only["proposals"]} == {"rejected"}
+        assert len(only["proposals"]) == 6  # the cap applies per lane, after the filter
+        # a status no row has is an empty view, not an error
+        assert (
+            client.get("/dash/api/proposals?status=applied", headers=_H).json()["proposals"] == []
+        )
 
 
 def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_url):

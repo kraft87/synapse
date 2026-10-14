@@ -104,7 +104,7 @@ export interface SearchHit {
 }
 export interface SearchResult {
   hits: SearchHit[];
-  total_by_type: Record<SearchTab, number>;
+  total_by_type?: Record<SearchTab, number>; // first page only; later pages keep the client's
   offset: number; limit: number;
 }
 export interface FlagRow { id: number; kind: string; item_id: string; note: string | null; created_at: string; gist: string; }

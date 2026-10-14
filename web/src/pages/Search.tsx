@@ -53,7 +53,10 @@ export function Search() {
     if (offset === 0) setLoading(true);
     setError(false);
     fetchSearch({ q: searchQuery, type: tab, offset, limit: LIMIT, project, group_id: group, source })
-      .then((r) => { setRes(r); setHits((prev) => (offset === 0 ? r.hits : prev.concat(r.hits))); })
+      .then((r) => {
+        setRes((prev) => ({ ...r, total_by_type: r.total_by_type ?? prev?.total_by_type }));
+        setHits((prev) => (offset === 0 ? r.hits : prev.concat(r.hits)));
+      })
       .catch(() => setError(true))
       .finally(() => setLoading(false));
   };
@@ -64,7 +67,7 @@ export function Search() {
   // list drops the row on the shared event rather than only in its own success handler.
   useEffect(() => onDeleted(({ kind, id }) => {
     setHits((prev) => prev.filter((h) => !(h.type === kind && h.id === id)));
-    setRes((prev) => prev && { ...prev, total_by_type: { ...prev.total_by_type, [kind]: Math.max(0, prev.total_by_type[kind] - 1) } });
+    setRes((prev) => prev?.total_by_type ? { ...prev, total_by_type: { ...prev.total_by_type, [kind]: Math.max(0, prev.total_by_type[kind] - 1) } } : prev);
   }), []);
 
   useEffect(() => {

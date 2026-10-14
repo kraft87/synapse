@@ -76,7 +76,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     if (!MOCK && !token) return;
     let live = true;
     fetchCatalog().then((c) => { if (live) { setCatalog(c); setOnline(true); } }).catch(() => {});
-    fetchProposals().then((r) => { if (live) setReviewPending(r.pending_count || 0); }).catch(() => {});
+    fetchProposals({ status: 'proposed' }).then((r) => { if (live) setReviewPending(r.pending_count || 0); }).catch(() => {});
     return () => { live = false; };
   }, [token]);
 

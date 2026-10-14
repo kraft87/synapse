@@ -992,8 +992,9 @@ def _search(
 ) -> dict[str, Any]:
     """BM25 (ParadeDB @@@) for episodes/facts/events, ILIKE-on-name for entities.
 
-    total_by_type is always computed for all four tabs; `hits` only for the requested
-    type. Snippet is the first 240 chars of the matched text — paradedb.snippet() with
+    total_by_type is computed for all four tabs on a query's first page (offset 0) and left
+    out of later pages, which the client pages with the totals it already holds; `hits`
+    only for the requested type. Snippet is the first 240 chars of the matched text — paradedb.snippet() with
     real term highlighting is a later upgrade.
     """
     empty = {
@@ -1037,29 +1038,31 @@ def _search(
         if group_id is not None:
             en_and, en_p = " AND group_id = %s", [group_id]
 
-        # --- total_by_type: all four counts, every call ---
-        total: dict[str, int] = dict.fromkeys(_SEARCH_TYPES, 0)
-        if safe:
-            total["episodes"] = _count(
+        # --- total_by_type: all four counts, first page only ---
+        total: dict[str, int] | None = None
+        if offset == 0:
+            total = dict.fromkeys(_SEARCH_TYPES, 0)
+            if safe:
+                total["episodes"] = _count(
+                    conn,
+                    f"SELECT count(*) AS c FROM episodes WHERE id @@@ paradedb.match('content', %s){ep_and}",
+                    (safe, *ep_p),
+                )
+                total["facts"] = _count(
+                    conn,
+                    f"SELECT count(*) AS c FROM kg_relationships WHERE id @@@ paradedb.match('fact', %s){f_and}",
+                    (safe, *f_p),
+                )
+                total["events"] = _count(
+                    conn,
+                    f"SELECT count(*) AS c FROM timeline_events WHERE id @@@ paradedb.match('fact', %s){ev_and}",
+                    (safe, *ev_p),
+                )
+            total["entities"] = _count(
                 conn,
-                f"SELECT count(*) AS c FROM episodes WHERE id @@@ paradedb.match('content', %s){ep_and}",
-                (safe, *ep_p),
+                f"SELECT count(*) AS c FROM kg_entities WHERE name ILIKE %s{en_and}",
+                (like, *en_p),
             )
-            total["facts"] = _count(
-                conn,
-                f"SELECT count(*) AS c FROM kg_relationships WHERE id @@@ paradedb.match('fact', %s){f_and}",
-                (safe, *f_p),
-            )
-            total["events"] = _count(
-                conn,
-                f"SELECT count(*) AS c FROM timeline_events WHERE id @@@ paradedb.match('fact', %s){ev_and}",
-                (safe, *ev_p),
-            )
-        total["entities"] = _count(
-            conn,
-            f"SELECT count(*) AS c FROM kg_entities WHERE name ILIKE %s{en_and}",
-            (like, *en_p),
-        )
 
         # --- hits for the requested type only ---
         hits: list[dict[str, Any]] = []
@@ -1151,7 +1154,8 @@ def _search(
                     }
                 )
 
-        return {"hits": hits, "total_by_type": total, "offset": offset, "limit": limit}
+        page = {"hits": hits, "offset": offset, "limit": limit}
+        return page if total is None else {**page, "total_by_type": total}
 
 
 # ---------------------------------------------------------------------------
@@ -1828,11 +1832,15 @@ def _provenance_episodes(conn: psycopg.Connection[dict[str, Any]], evidence: Any
 
 
 def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dict[str, Any]:
-    """Lane-merged proposal list + the nav-badge pending_count. Bounded per lane (newest
-    first), then merged and re-sorted by created_at. ``status``/``kind`` narrow the view;
-    ``pending_count`` is always both lanes' 'proposed' rows, independent of the view."""
+    """Lane-merged proposal list + the nav-badge pending_count. Each lane is bounded
+    (still-'proposed' rows first, then newest first, so a backlog of decided rows can't
+    push an unreviewed candidate out of the window), then merged and re-sorted by
+    created_at. ``status``/``kind`` narrow the view; ``pending_count`` is always both
+    lanes' 'proposed' rows, independent of the view."""
     want_skill = kind in (None, "skill")
     want_config = kind in (None, "config-edit")
+    skill_statuses = [s for s in _SKILL_REVIEW_STATUSES if status in (None, s)]
+    config_statuses = [s for s in _CONFIG_REVIEW_STATUSES if status in (None, s)]
 
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         out: list[dict[str, Any]] = []
@@ -1840,11 +1848,9 @@ def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dic
             for r in conn.execute(
                 "SELECT id, name, summary, status, created_at "
                 "FROM skills_lane.skill_gap_candidates WHERE status = ANY(%s) "
-                "ORDER BY created_at DESC, id DESC LIMIT %s",
-                (list(_SKILL_REVIEW_STATUSES), _PROPOSALS_LANE_CAP),
+                "ORDER BY (status = 'proposed') DESC, created_at DESC, id DESC LIMIT %s",
+                (skill_statuses, _PROPOSALS_LANE_CAP),
             ).fetchall():
-                if status and r["status"] != status:
-                    continue
                 out.append(
                     {
                         "id": f"skill:{r['id']}",
@@ -1860,11 +1866,9 @@ def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dic
             for r in conn.execute(
                 "SELECT id, file_key, summary, status, created_at "
                 "FROM config_lane.config_proposals WHERE status = ANY(%s) "
-                "ORDER BY created_at DESC, id DESC LIMIT %s",
-                (list(_CONFIG_REVIEW_STATUSES), _PROPOSALS_LANE_CAP),
+                "ORDER BY (status = 'proposed') DESC, created_at DESC, id DESC LIMIT %s",
+                (config_statuses, _PROPOSALS_LANE_CAP),
             ).fetchall():
-                if status and r["status"] != status:
-                    continue
                 out.append(
                     {
                         "id": f"config:{r['id']}",

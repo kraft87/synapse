@@ -124,8 +124,9 @@ ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE. NOT
  "total_by_type": {"episodes": 41, "facts": 7, "entities": 2, "events": 12},
  "offset": 0, "limit": 20}
 ```
-`total_by_type` is always computed for all four types (tab counts); `hits` only for the
-requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`
+`total_by_type` is computed for all four types (tab counts) on a query's first page
+(`offset=0`) and omitted from later pages (the client keeps the totals it has); `hits` only
+for the requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`
 (`entity_type` = `entity_subtype`). Fact hits' `meta.ts` is the edge's `t_created`.
 Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
 resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link.
@@ -246,11 +247,13 @@ Unified, lane-merged list + the nav-badge count.
  "pending_count": 2}
 ```
 - `name`: skill candidate name / config `file_key`. `gist`: the lane `summary` (capped 200).
-- Rows capped 200 **per lane**, newest first, then merged and re-sorted by `created_at`.
+- Rows capped 200 **per lane**: still-`proposed` rows first, then newest first (so a backlog of
+  decided rows never pushes an unreviewed candidate out of the window), then merged and
+  re-sorted by `created_at`.
 - Statuses shown: skills `{proposed, accepted, promoted, rejected}`, config
   `{proposed, accepted, applied, rejected}`. `observe` (pre-graduation) and skills'
   `retired` (decayed) are NOT proposals and are excluded.
-- `status` filters to one status; `kind` (`skill`|`config-edit`) to one lane. `status=all` == unset.
+- `status` filters to one status (in SQL, before the cap); `kind` (`skill`|`config-edit`) to one lane. `status=all` == unset.
 - `pending_count` = `status='proposed'` across BOTH lanes, **independent** of the view
   filters — the header Review badge reads it (accent pill, dark text; hidden at 0).
 
