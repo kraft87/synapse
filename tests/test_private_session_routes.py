@@ -100,6 +100,132 @@ def test_put_get_delete_round_trip(clean, conn, db_url):
         assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is False
 
 
+# ---------------------------------------------------------------------------
+# Turning private mode on mid-session: what was already stored
+# ---------------------------------------------------------------------------
+
+
+def _turn(conn, session_id: str, seq: int) -> int:
+    return conn.execute(
+        "INSERT INTO episodes (session_id, sequence, project, content) "
+        "VALUES (%s, %s, 'demo', 'turn') RETURNING id",
+        (session_id, seq),
+    ).fetchone()[0]
+
+
+@pytest.fixture()
+def derived(clean, conn):
+    """Two stored turns of the private session, one of a public one, and one row of each
+    kind derived from them. Everything is tagged so the fixture can wipe it."""
+    from psycopg.types.json import Json
+
+    a, b = _turn(conn, _SID, 1), _turn(conn, _SID, 2)
+    pub = _turn(conn, _PUBLIC, 1)
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, group_id, name) VALUES ('pm-e', 'technical', 'pm-e')"
+    )
+    for uuid, eps in (("pm-sole", [a]), ("pm-shared", [b, pub]), ("pm-pub", [pub])):
+        conn.execute(
+            "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, name, fact, "
+            "episodes) VALUES (%s, 'technical', 'pm-e', 'pm-e', 'rel', %s, %s)",
+            (uuid, uuid, Json(eps)),
+        )
+    conn.execute(
+        "INSERT INTO chunks (session_id, start_sequence, end_sequence, episode_ids, project, "
+        "content) VALUES (%s, 1, 2, %s, 'demo', 'pm-chunk')",
+        (_SID, Json([a, b])),
+    )
+    conn.execute(
+        "INSERT INTO timeline_events (t_valid, fact, source, source_ref) "
+        "VALUES (now(), 'pm-event', 'chat', %s), (now(), 'pm-pub-event', 'chat', %s)",
+        (f"ep:{a}#2", f"ep:{pub}"),
+    )
+    prefs = {}
+    for key, ref in (("private", f"ep:{b}"), ("public", f"ep:{pub}"), ("older", f"ep:{pub}")):
+        prefs[key] = conn.execute(
+            "INSERT INTO preferences (owner_id, group_id, pref, polarity, source_ref) "
+            "VALUES ('default', 'technical', %s, 'like', %s) RETURNING id",
+            (f"pm-{key}", ref),
+        ).fetchone()[0]
+    # The private turn's preference superseded an older one; the pointer must not dangle.
+    conn.execute(
+        "UPDATE preferences SET t_invalid = now(), superseded_by = %s WHERE id = %s",
+        (prefs["private"], prefs["older"]),
+    )
+    yield {"turns": (a, b), "public": pub, "prefs": prefs}
+    conn.execute("DELETE FROM chunks WHERE content = 'pm-chunk'")
+    conn.execute("DELETE FROM kg_relationships WHERE uuid LIKE 'pm-%'")
+    conn.execute("DELETE FROM kg_entities WHERE uuid = 'pm-e'")
+    conn.execute("DELETE FROM timeline_events WHERE fact LIKE 'pm-%'")
+    conn.execute("DELETE FROM preferences WHERE pref LIKE 'pm-%'")
+    conn.execute("DELETE FROM dashboard_audit WHERE item_id = %s", (_SID,))
+
+
+def test_put_reports_the_turns_already_stored_and_keeps_them(derived, conn, db_url):
+    """Private mode covers what happens from now on. Turns stored before the toggle are
+    counted so the client can say so, and stay unless a purge is asked for by name."""
+    with _client(db_url) as client:
+        r = client.put(f"/private-sessions/{_SID}", headers=_H)
+        assert r.status_code == 200
+        assert r.json()["private"] is True and r.json()["stored_turns"] == 2
+        assert "purged" not in r.json()
+        r = client.put(f"/private-sessions/{_PUBLIC}-unseen", headers=_H)
+        assert r.json()["stored_turns"] == 0
+    conn.execute("DELETE FROM private_sessions WHERE session_id = %s", (f"{_PUBLIC}-unseen",))
+    n = conn.execute("SELECT count(*) FROM episodes WHERE session_id = %s", (_SID,)).fetchone()[0]
+    assert n == 2
+
+
+def test_put_with_purge_deletes_the_turns_and_what_was_derived_from_them(derived, conn, db_url):
+    pub, prefs = derived["public"], derived["prefs"]
+    with _client(db_url) as client:
+        r = client.put(f"/private-sessions/{_SID}?purge=1", headers=_H)
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is True
+    assert body["stored_turns"] == 0
+    assert body["purged"] == {
+        "episodes_deleted": 2,
+        "chunks_deleted": 1,
+        "facts_deleted": 1,
+        "facts_unlinked": 1,
+        "events_deleted": 1,
+        "preferences_deleted": 1,
+    }
+
+    def ids(sql):
+        return {r[0] for r in conn.execute(sql).fetchall()}
+
+    assert ids(f"SELECT session_id FROM episodes WHERE session_id IN ('{_SID}', '{_PUBLIC}')") == {
+        _PUBLIC
+    }
+    assert ids("SELECT content FROM chunks WHERE content = 'pm-chunk'") == set()
+    facts = dict(conn.execute("SELECT uuid, episodes FROM kg_relationships WHERE uuid LIKE 'pm-%'"))
+    assert facts == {"pm-shared": [pub], "pm-pub": [pub]}
+    assert ids("SELECT fact FROM timeline_events WHERE fact LIKE 'pm-%'") == {"pm-pub-event"}
+    assert ids("SELECT pref FROM preferences WHERE pref LIKE 'pm-%'") == {"pm-public", "pm-older"}
+    older = conn.execute(
+        "SELECT superseded_by FROM preferences WHERE id = %s", (prefs["older"],)
+    ).fetchone()[0]
+    assert older is None
+    audit = conn.execute(
+        "SELECT action, detail FROM dashboard_audit WHERE item_id = %s", (_SID,)
+    ).fetchall()
+    assert audit == [("purge_private_session", body["purged"])]
+
+
+def test_purge_must_be_asked_for_exactly(clean, conn, db_url):
+    """A destructive flag is never guessed at: anything but 0 or 1 is refused before the
+    session is touched."""
+    _turn(conn, _SID, 1)
+    with _client(db_url) as client:
+        r = client.put(f"/private-sessions/{_SID}?purge=yes", headers=_H)
+        assert r.status_code == 400
+        assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is False
+    n = conn.execute("SELECT count(*) FROM episodes WHERE session_id = %s", (_SID,)).fetchone()[0]
+    assert n == 1
+
+
 def test_db_predicate_sees_the_flag(clean, db_url):
     """``Database.is_private_session`` is what the ingest chokepoint calls."""
     from ingestion.db import Database

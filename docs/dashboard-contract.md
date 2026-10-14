@@ -688,6 +688,14 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
   facts can leave a zero-degree orphan entity; that is graph hygiene for a sweeper, not
   for this route.
 
+**One cascade, two callers.** The cascade above is `dashboard_routes.delete_episode_content`.
+Private mode's session purge (`PUT /private-sessions/{id}?purge=1`,
+`mcp_server/private_session_routes`) runs it over every stored turn of a session in one
+transaction and, unlike this route, also deletes the preferences those turns gave birth to
+(a privacy purge errs toward removal). It writes one `dashboard_audit` row with
+`action = 'purge_private_session'`, `kind = 'session'`, `item_id` = the session id, and
+the summed counts as `detail`.
+
 ### DELETE /dash/api/facts/{id}
 Deletes ONE KG edge by uuid — no cascade, no provenance arithmetic (a fact is the leaf).
 No such uuid → 404 `fact not found`.

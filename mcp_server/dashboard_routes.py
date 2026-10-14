@@ -1545,6 +1545,82 @@ def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
+def delete_episode_content(
+    conn: psycopg.Connection[dict[str, Any]], episode_id: int
+) -> dict[str, int]:
+    """The episode-delete cascade: everything carrying episode ``episode_id``'s content.
+
+    Runs on ``conn`` inside the CALLER's transaction, with the episode row already locked:
+    chunks citing it, its sole-provenance facts (shared ones are unlinked), its chat
+    timeline events, the row itself (its extraction_queue rows follow via the 001 FK),
+    and any active flag on it. Returns the counts. Shared by the dashboard's single-turn
+    delete and private mode's session purge (``mcp_server/private_session_routes``)."""
+    # --- chunks -------------------------------------------------------------
+    # A chunk's `content` is the verbatim concatenation of its 3-5 episode window
+    # (schema 008), so there is no way to excise one turn from it: every chunk
+    # citing this episode goes. Chunks whose window ALSO named surviving episodes
+    # are counted separately — that's real collateral the UI has to admit to.
+    chunk_rows = conn.execute(
+        "SELECT id, episode_ids FROM chunks "
+        "WHERE episode_ids @> to_jsonb(%s::bigint) "
+        "   OR episode_ids @> to_jsonb(%s::text) "
+        "FOR UPDATE",
+        (episode_id, str(episode_id)),
+    ).fetchall()
+    chunk_ids = [r["id"] for r in chunk_rows]
+    chunks_mixed = sum(1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], episode_id))
+    if chunk_ids:
+        conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
+
+    # --- KG facts (sole vs shared provenance) --------------------------------
+    fact_rows = conn.execute(
+        "SELECT uuid, episodes FROM kg_relationships "
+        "WHERE episodes @> to_jsonb(%s::bigint) "
+        "   OR episodes @> to_jsonb(%s::text) "
+        "FOR UPDATE",
+        (episode_id, str(episode_id)),
+    ).fetchall()
+    sole: list[str] = []
+    shared: list[tuple[str, list[Any]]] = []
+    for r in fact_rows:
+        others = _other_episode_refs(r["episodes"], episode_id)
+        if others:
+            shared.append((r["uuid"], others))
+        else:
+            sole.append(r["uuid"])
+    for uuid, others in shared:
+        conn.execute(
+            "UPDATE kg_relationships SET episodes = %s WHERE uuid = %s",
+            (Json(others), uuid),
+        )
+    if sole:
+        _clear_invalidated_by(conn, sole)
+        conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
+
+    # --- timeline events -----------------------------------------------------
+    # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
+    # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
+    # makes them sole-provenance by construction, so the rule resolves to delete;
+    # keeping them would go on serving the deleted turn from recall()'s timeline leg.
+    ev = conn.execute(
+        "DELETE FROM timeline_events WHERE source_ref = %s OR source_ref LIKE %s",
+        (f"ep:{episode_id}", f"ep:{episode_id}#%"),
+    )
+    events_deleted = ev.rowcount if ev.rowcount and ev.rowcount > 0 else 0
+
+    # --- the episode itself (extraction_queue rows follow via the 001 FK) -----
+    conn.execute("DELETE FROM episodes WHERE id = %s", (episode_id,))
+
+    _retire_flag(conn, "episode", str(episode_id))
+    return {
+        "chunks_deleted": len(chunk_ids),
+        "chunks_mixed_deleted": chunks_mixed,
+        "facts_deleted": len(sole),
+        "facts_unlinked": len(shared),
+        "events_deleted": events_deleted,
+    }
+
+
 def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
     """Hard-delete an episode and everything carrying ITS content, in one transaction.
 
@@ -1557,74 +1633,7 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
             ).fetchone()
             if row is None:
                 return None
-
-            # --- chunks -------------------------------------------------------------
-            # A chunk's `content` is the verbatim concatenation of its 3-5 episode window
-            # (schema 008), so there is no way to excise one turn from it: every chunk
-            # citing this episode goes. Chunks whose window ALSO named surviving episodes
-            # are counted separately — that's real collateral the UI has to admit to.
-            chunk_rows = conn.execute(
-                "SELECT id, episode_ids FROM chunks "
-                "WHERE episode_ids @> to_jsonb(%s::bigint) "
-                "   OR episode_ids @> to_jsonb(%s::text) "
-                "FOR UPDATE",
-                (episode_id, str(episode_id)),
-            ).fetchall()
-            chunk_ids = [r["id"] for r in chunk_rows]
-            chunks_mixed = sum(
-                1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], episode_id)
-            )
-            if chunk_ids:
-                conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
-
-            # --- KG facts (sole vs shared provenance) --------------------------------
-            fact_rows = conn.execute(
-                "SELECT uuid, episodes FROM kg_relationships "
-                "WHERE episodes @> to_jsonb(%s::bigint) "
-                "   OR episodes @> to_jsonb(%s::text) "
-                "FOR UPDATE",
-                (episode_id, str(episode_id)),
-            ).fetchall()
-            sole: list[str] = []
-            shared: list[tuple[str, list[Any]]] = []
-            for r in fact_rows:
-                others = _other_episode_refs(r["episodes"], episode_id)
-                if others:
-                    shared.append((r["uuid"], others))
-                else:
-                    sole.append(r["uuid"])
-            for uuid, others in shared:
-                conn.execute(
-                    "UPDATE kg_relationships SET episodes = %s WHERE uuid = %s",
-                    (Json(others), uuid),
-                )
-            if sole:
-                _clear_invalidated_by(conn, sole)
-                conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
-
-            # --- timeline events -----------------------------------------------------
-            # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
-            # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
-            # makes them sole-provenance by construction, so the rule resolves to delete;
-            # keeping them would go on serving the deleted turn from recall()'s timeline leg.
-            ev = conn.execute(
-                "DELETE FROM timeline_events WHERE source_ref = %s OR source_ref LIKE %s",
-                (f"ep:{episode_id}", f"ep:{episode_id}#%"),
-            )
-            events_deleted = ev.rowcount if ev.rowcount and ev.rowcount > 0 else 0
-
-            # --- the episode itself (extraction_queue rows follow via the 001 FK) -----
-            conn.execute("DELETE FROM episodes WHERE id = %s", (episode_id,))
-
-            summary = {
-                "episode_id": episode_id,
-                "chunks_deleted": len(chunk_ids),
-                "chunks_mixed_deleted": chunks_mixed,
-                "facts_deleted": len(sole),
-                "facts_unlinked": len(shared),
-                "events_deleted": events_deleted,
-            }
-            _retire_flag(conn, "episode", str(episode_id))
+            summary = {"episode_id": episode_id, **delete_episode_content(conn, episode_id)}
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
                 "VALUES ('delete_episode', 'episode', %s, %s)",
