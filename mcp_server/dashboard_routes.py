@@ -86,6 +86,9 @@ _RECALL_HISTORY_MAX = 200
 _ENTITY_FACTS_CAP = 200  # bound the dossier payload; the example has ~15
 _DERIVED_CAP = 200
 _GIST_MAX = 200
+# Episode text read for a gist: _gist keeps the first non-empty line, so the head of
+# the content is enough, and a 100 KB turn never leaves Postgres to make 200 chars.
+_GIST_SOURCE_MAX = 2000
 _SNIPPET_MAX = 240
 _CATALOG_TTL_S = 300  # ~5 min in-process cache
 
@@ -203,14 +206,28 @@ def _provenance(episodes: Any) -> int | None:
     return None
 
 
+_EP_REF_RE = re.compile(r"ep:(\d+)(?:#\d+)?")
+
+
 def _episode_id_from_ref(source_ref: Any) -> int | None:
-    """Resolve a timeline event's 'ep:<id>' source_ref to an episode id, else None
-    (git-sourced refs are SHAs, which resolve to null)."""
-    if isinstance(source_ref, str) and source_ref.startswith("ep:"):
-        rest = source_ref[3:].strip()
-        if rest.isdigit():
-            return int(rest)
+    """Resolve a timeline event's source_ref to an episode id, else None. A turn's first
+    event carries 'ep:<id>' and its k-th 'ep:<id>#<k>' (ingestion/timeline_gate.py);
+    git-sourced refs are SHAs, which resolve to null."""
+    if isinstance(source_ref, str):
+        m = _EP_REF_RE.fullmatch(source_ref.strip())
+        if m:
+            return int(m.group(1))
     return None
+
+
+def _label_filter(col: str, value: str) -> tuple[str, list[Any]]:
+    """WHERE fragment for a project/source filter. 'untagged' is the catalog's bucket for
+    NULL and '' (a literal 'untagged' label lands in it too); a real label is a plain
+    equality, so the column's index can serve it. ``col`` is a fixed identifier from
+    this module, never user input."""
+    if value == "untagged":
+        return f"({col} IS NULL OR {col} = '' OR {col} = 'untagged')", []
+    return f"{col} = %s", [value]
 
 
 def _bm25_sanitize(q: str) -> str:
@@ -308,9 +325,14 @@ def _catalog(db_url: str) -> dict[str, Any]:
 # a "WHERE <pk> = %s". The mappers emit the final item minus `flagged` (added after the
 # per-request flag set is loaded) and minus the internal `_ts`/`_idstr` merge-sort keys.
 
-_EP_SELECT = "SELECT id, created_at, project, source, session_id, sequence, content FROM episodes"
+_EP_SELECT = (
+    "SELECT id, created_at, project, source, session_id, sequence, "
+    f"left(content, {_GIST_SOURCE_MAX}) AS content FROM episodes"
+)
+# A fact's feed time is t_created, its write time (schema 017); the FalkorDB-era
+# created_at mirror is not read.
 _FACT_SELECT = (
-    "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
+    "SELECT r.uuid, r.t_created, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
     "       se.name AS src_name, te.name AS tgt_name "
     "FROM kg_relationships r "
     "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
@@ -338,7 +360,7 @@ def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "fact",
         "id": r["uuid"],
-        "ts": _iso(r["created_at"]),
+        "ts": _iso(r["t_created"]),
         "group_id": r["group_id"],
         "gist": _gist(r["fact"]),
         "data": {
@@ -353,7 +375,7 @@ def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def _timeline_item(r: dict[str, Any]) -> dict[str, Any]:
-    sal = {0: 0.3, 1: 0.6, 2: 0.9}.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6)
+    sal = _SAL_MAP.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6)
     return {
         "type": "timeline_event",
         "id": str(r["id"]),
@@ -400,12 +422,11 @@ def _feed(
         # --- episodes (ts = created_at). Filters: project, source. No group_id column. ---
         ep_where = ["1=1"]
         ep_params: list[Any] = []
-        if project is not None:
-            ep_where.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            ep_params.append(project)
-        if source is not None:
-            ep_where.append("COALESCE(NULLIF(source, ''), 'untagged') = %s")
-            ep_params.append(source)
+        for col, value in (("project", project), ("source", source)):
+            if value is not None:
+                clause, args = _label_filter(col, value)
+                ep_where.append(clause)
+                ep_params += args
         if cts is not None:
             ep_where.append(
                 "(created_at < %s::timestamptz OR (created_at = %s::timestamptz AND id::text < %s))"
@@ -422,26 +443,26 @@ def _feed(
             item["_idstr"] = str(r["id"])
             candidates.append(item)
 
-        # --- facts (ts = created_at). Filter: group_id. No project/source column. ---
-        # Columns are r.-qualified: the entity joins below also expose created_at/group_id.
-        f_where = ["r.created_at IS NOT NULL"]
+        # --- facts (ts = t_created). Filter: group_id. No project/source column. ---
+        # Columns are r.-qualified: the entity joins below also expose t_created/group_id.
+        # The row-wise keyset and ORDER BY match kg_rel_t_created_idx (a later optional
+        # migration); without that index the same query sorts.
+        f_where = ["r.t_created IS NOT NULL"]
         f_params: list[Any] = []
         if group_id is not None:
             f_where.append("r.group_id = %s")
             f_params.append(group_id)
         if cts is not None:
-            f_where.append(
-                "(r.created_at < %s::timestamptz OR (r.created_at = %s::timestamptz AND r.uuid < %s))"
-            )
-            f_params += [cts, cts, cid]
+            f_where.append("(r.t_created, r.uuid) < (%s::timestamptz, %s)")
+            f_params += [cts, cid]
         fact_rows = conn.execute(
             f"{_FACT_SELECT} WHERE {' AND '.join(f_where)} "
-            "ORDER BY r.created_at DESC, r.uuid DESC LIMIT %s",
+            "ORDER BY r.t_created DESC, r.uuid DESC LIMIT %s",
             (*f_params, limit),
         ).fetchall()
         for r in fact_rows:
             item = _fact_item(r)
-            item["_ts"] = r["created_at"]
+            item["_ts"] = r["t_created"]
             item["_idstr"] = str(r["uuid"])
             candidates.append(item)
 
@@ -449,8 +470,9 @@ def _feed(
         t_where = ["1=1"]
         t_params: list[Any] = []
         if project is not None:
-            t_where.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            t_params.append(project)
+            clause, args = _label_filter("project", project)
+            t_where.append(clause)
+            t_params += args
         if group_id is not None:
             # 038 added `domain` (technical/personal) as the timeline's group scope; the
             # contract's feed-filter line names only project for timeline, but the domain
@@ -540,10 +562,11 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
             "ORDER BY t_valid DESC NULLS LAST, uuid LIMIT %s",
             (episode_id, str(episode_id), _DERIVED_CAP),
         ).fetchall()
+        # A turn's events carry 'ep:<id>', then 'ep:<id>#<k>' (ingestion/timeline_gate.py).
         events = conn.execute(
             "SELECT id, fact, t_valid, salience FROM timeline_events "
-            "WHERE source_ref = %s ORDER BY t_valid DESC LIMIT %s",
-            (f"ep:{episode_id}", _DERIVED_CAP),
+            "WHERE source_ref = %s OR source_ref LIKE %s ORDER BY t_valid DESC LIMIT %s",
+            (f"ep:{episode_id}", f"ep:{episode_id}#%", _DERIVED_CAP),
         ).fetchall()
         return {
             "facts": [
@@ -573,13 +596,45 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_SESSION_COLS = "id, sequence, created_at, project, source, human_turn, assistant_turn"
+
+
+def _session_rows(
+    conn: psycopg.Connection[dict[str, Any]], session_id: str, highlight: Any
+) -> list[dict[str, Any]]:
+    """Up to _SESSION_CAP turns of the session, in sequence order: the first ones, or,
+    when ``highlight`` is a turn of this session, a window around it (about half before,
+    sliding toward whichever side has the turns) so the drawer can show the turn it was
+    opened for however long the session is."""
+    cap = _SESSION_CAP
+    hl = None
+    if isinstance(highlight, int):
+        hl = conn.execute(
+            "SELECT sequence FROM episodes WHERE id = %s AND session_id = %s",
+            (highlight, session_id),
+        ).fetchone()
+    if hl is None:
+        return conn.execute(
+            f"SELECT {_SESSION_COLS} FROM episodes "  # nosec B608 - fixed column list
+            "WHERE session_id = %s ORDER BY sequence LIMIT %s",
+            (session_id, cap),
+        ).fetchall()
+    after = conn.execute(
+        f"SELECT {_SESSION_COLS} FROM episodes "  # nosec B608 - fixed column list
+        "WHERE session_id = %s AND sequence >= %s ORDER BY sequence LIMIT %s",
+        (session_id, hl["sequence"], cap),
+    ).fetchall()
+    before = conn.execute(
+        f"SELECT {_SESSION_COLS} FROM episodes "  # nosec B608 - fixed column list
+        "WHERE session_id = %s AND sequence < %s ORDER BY sequence DESC LIMIT %s",
+        (session_id, hl["sequence"], cap - min(len(after), cap - cap // 2)),
+    ).fetchall()
+    return before[::-1] + after[: cap - len(before)]
+
+
 def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            "SELECT id, sequence, created_at, project, source, human_turn, assistant_turn, content "
-            "FROM episodes WHERE session_id = %s ORDER BY sequence LIMIT %s",
-            (session_id, _SESSION_CAP),
-        ).fetchall()
+        rows = _session_rows(conn, session_id, highlight)
         first = rows[0] if rows else None
         return {
             "session_id": session_id,
@@ -593,7 +648,6 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
                     "created_at": _iso(r["created_at"]),
                     "human_turn": r["human_turn"],
                     "assistant_turn": r["assistant_turn"],
-                    "content": r["content"],
                 }
                 for r in rows
             ],
@@ -608,7 +662,7 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
 def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | None:
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         ent = conn.execute(
-            "SELECT uuid, name, entity_type, summary, degree, created_at "
+            "SELECT uuid, owner_id, group_id, name, entity_subtype, summary, degree, t_created "
             "FROM kg_entities WHERE uuid = %s",
             (uuid,),
         ).fetchone()
@@ -616,6 +670,10 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             return None
 
         flags = _flag_set(conn)
+        # An entity's edges live in its own (owner_id, group_id): extraction and dedup run
+        # per group. Naming both lets kg_rel_src / kg_rel_tgt serve the src-OR-tgt reads.
+        scope = {"u": uuid, "o": ent["owner_id"], "g": ent["group_id"]}
+        touching = "r.owner_id = %(o)s AND r.group_id = %(g)s AND (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s)"
 
         # Facts = live + superseded edges touching the uuid; the "other" endpoint's name
         # comes from a join on whichever side isn't this entity.
@@ -626,9 +684,9 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             "FROM kg_relationships r "
             "LEFT JOIN kg_entities oe "
             "  ON oe.uuid = CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END "
-            "WHERE r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s "
+            f"WHERE {touching} "
             "ORDER BY r.t_valid DESC NULLS LAST, r.uuid LIMIT %(lim)s",
-            {"u": uuid, "lim": _ENTITY_FACTS_CAP},
+            {**scope, "lim": _ENTITY_FACTS_CAP},
         ).fetchall()
 
         stats = (
@@ -636,8 +694,8 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 "SELECT count(*) FILTER (WHERE t_invalid IS NULL) AS edges, "
                 "       count(*) AS facts, "
                 "       COALESCE(sum(retrieval_count), 0) AS served "
-                "FROM kg_relationships WHERE src_uuid = %(u)s OR tgt_uuid = %(u)s",
-                {"u": uuid},
+                f"FROM kg_relationships r WHERE {touching}",
+                scope,
             ).fetchone()
             or {}
         )
@@ -645,37 +703,39 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
         # Mentions = distinct episode ids across the touching edges' `episodes` arrays,
         # resolved to real episodes, newest first, paged. Non-numeric elements are skipped.
         # The CASE guard coerces NULL / non-array episodes to '[]' so the lateral never
-        # errors on a malformed row (it would raise at execution, before any WHERE).
-        _mentions_from = (
-            "kg_relationships r "
+        # errors on a malformed row (it would raise at execution, before any WHERE). The
+        # ids are deduplicated before the episodes join, so no episode text is sorted.
+        mentioned = (
+            "SELECT elem.v::bigint FROM kg_relationships r "
             "CROSS JOIN LATERAL jsonb_array_elements_text("
             "  CASE WHEN jsonb_typeof(r.episodes) = 'array' THEN r.episodes ELSE '[]'::jsonb END"
             ") AS elem(v) "
-            "JOIN episodes e ON e.id = elem.v::bigint "
-            "WHERE (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s) AND elem.v ~ '^[0-9]+$'"
+            f"WHERE {touching} AND elem.v ~ '^[0-9]+$'"
         )
         total_row = (
             conn.execute(
-                f"SELECT count(*) AS total FROM (SELECT DISTINCT e.id FROM {_mentions_from}) m",
-                {"u": uuid},
+                f"SELECT count(*) AS total FROM episodes e WHERE e.id IN ({mentioned})",
+                scope,
             ).fetchone()
             or {}
         )
         mention_rows = conn.execute(
-            "SELECT e.id, e.created_at, e.content FROM ("
-            f"  SELECT DISTINCT e.id, e.created_at, e.content FROM {_mentions_from}"
-            ") e ORDER BY e.created_at DESC, e.id DESC OFFSET %(off)s LIMIT %(lim)s",
-            {"u": uuid, "off": mentions_offset, "lim": _MENTIONS_PAGE},
+            f"SELECT e.id, e.created_at, left(e.content, {_GIST_SOURCE_MAX}) AS content "
+            f"FROM episodes e WHERE e.id IN ({mentioned}) "
+            "ORDER BY e.created_at DESC, e.id DESC OFFSET %(off)s LIMIT %(lim)s",
+            {**scope, "off": mentions_offset, "lim": _MENTIONS_PAGE},
         ).fetchall()
 
         return {
             "entity": {
                 "uuid": ent["uuid"],
                 "name": ent["name"],
-                "entity_type": ent["entity_type"],
+                # The wire keeps the name entity_type; the value is the taxonomy subtype
+                # (schema 020), not the FalkorDB-era raw entity_type column.
+                "entity_type": ent["entity_subtype"],
                 "summary": ent["summary"],
                 "degree": ent["degree"],
-                "created_at": _iso(ent["created_at"]),
+                "created_at": _iso(ent["t_created"]),
             },
             "stats": {
                 "edges": int(stats.get("edges") or 0),
@@ -740,7 +800,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
         return []
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
-            "SELECT uuid, name, entity_type, entity_supertype, degree FROM kg_entities "
+            "SELECT uuid, name, entity_subtype, entity_supertype, degree FROM kg_entities "
             "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
             (f"%{q}%", limit),
         ).fetchall()
@@ -748,7 +808,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
             {
                 "uuid": r["uuid"],
                 "name": r["name"],
-                "entity_type": r["entity_type"],
+                "entity_type": r["entity_subtype"],
                 "supertype": r["entity_supertype"],
                 "degree": r["degree"],
             }
@@ -759,7 +819,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
 def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
     """Resolve a seed given a uuid OR a name: exact uuid → exact normalized_name →
     best ILIKE match (highest degree). None when nothing matches."""
-    cols = "uuid, name, entity_type, degree, summary"
+    cols = "uuid, owner_id, group_id, name, degree, summary"
     row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
     if row:
         return row
@@ -810,7 +870,11 @@ def _graph_neighborhood(
             return None
         seed_uuid = seed["uuid"]
 
-        # Shared as-of edge-visibility fragment (empty when unset).
+        # Edges stay within the seed's (owner_id, group_id) — extraction and dedup run per
+        # group — and naming both lets kg_rel_src / kg_rel_tgt / kg_rel_pair serve every
+        # scan below. Plus the shared as-of edge-visibility fragment (empty when unset).
+        edge_scope = "owner_id = %s AND group_id = %s"
+        edge_params: list[Any] = [seed["owner_id"], seed["group_id"]]
         as_of_sql, as_of_params = "", []
         if as_of is not None:
             as_of_sql = " AND (t_valid IS NULL OR t_valid <= %s)"
@@ -824,8 +888,9 @@ def _graph_neighborhood(
                 break
             rows = conn.execute(
                 "SELECT src_uuid, tgt_uuid FROM kg_relationships "
-                f"WHERE (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} LIMIT %s",
-                (frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+                f"WHERE {edge_scope} AND (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} "
+                "LIMIT %s",
+                (*edge_params, frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
             ).fetchall()
             nxt: list[str] = []
             for r in rows:
@@ -838,7 +903,7 @@ def _graph_neighborhood(
         # Materialize real entity rows for the reached uuids (edge endpoints without an
         # entity row are dropped — edges aren't FKs, so a dangling endpoint has no node).
         ent_rows = conn.execute(
-            "SELECT uuid, name, entity_type, entity_supertype, degree, summary "
+            "SELECT uuid, name, entity_subtype, entity_supertype, degree, summary "
             "FROM kg_entities WHERE uuid = ANY(%s)",
             (list(visited),),
         ).fetchall()
@@ -854,8 +919,9 @@ def _graph_neighborhood(
         edge_rows = conn.execute(
             "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "
             "       retrieval_count FROM kg_relationships "
-            f"WHERE src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
-            (kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+            f"WHERE {edge_scope} AND src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} "
+            "LIMIT %s",
+            (*edge_params, kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
         ).fetchall()
 
         # Edge cap (see _GRAPH_EDGE_CAP): keep seed-adjacent edges first, then the
@@ -882,7 +948,7 @@ def _graph_neighborhood(
                 {
                     "uuid": r["uuid"],
                     "name": r["name"],
-                    "entity_type": r["entity_type"],
+                    "entity_type": r["entity_subtype"],
                     # canonical coarse layer (020) — the client colors by this
                     "supertype": r["entity_supertype"],
                     "degree": r["degree"],
@@ -943,23 +1009,25 @@ def _search(
 
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         # --- per-type filter fragments (applied to both count and hit queries) ---
-        ep_filt, ep_p = [], []
-        if project is not None:
-            ep_filt.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            ep_p.append(project)
-        if source is not None:
-            ep_filt.append("COALESCE(NULLIF(source, ''), 'untagged') = %s")
-            ep_p.append(source)
+        ep_filt: list[str] = []
+        ep_p: list[Any] = []
+        for col, value in (("project", project), ("source", source)):
+            if value is not None:
+                clause, args = _label_filter(col, value)
+                ep_filt.append(clause)
+                ep_p += args
         ep_and = "".join(f" AND {c}" for c in ep_filt)
 
         f_and, f_p = "", []
         if group_id is not None:
             f_and, f_p = " AND group_id = %s", [group_id]
 
-        ev_filt, ev_p = [], []
+        ev_filt: list[str] = []
+        ev_p: list[Any] = []
         if project is not None:
-            ev_filt.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            ev_p.append(project)
+            clause, args = _label_filter("project", project)
+            ev_filt.append(clause)
+            ev_p += args
         if group_id is not None:
             ev_filt.append("domain = %s")
             ev_p.append(group_id)
@@ -997,8 +1065,8 @@ def _search(
         hits: list[dict[str, Any]] = []
         if type_ == "episodes" and safe:
             for r in conn.execute(
-                "SELECT id, content, project, source, created_at, session_id, "
-                "       paradedb.score(id) AS sc FROM episodes "
+                f"SELECT id, left(content, {_SNIPPET_MAX}) AS snippet, project, source, "
+                "       created_at, session_id, paradedb.score(id) AS sc FROM episodes "
                 f"WHERE id @@@ paradedb.match('content', %s){ep_and} "
                 "ORDER BY sc DESC, id DESC OFFSET %s LIMIT %s",
                 (safe, *ep_p, offset, limit),
@@ -1007,7 +1075,7 @@ def _search(
                     {
                         "type": "episodes",
                         "id": str(r["id"]),
-                        "snippet": (r["content"] or "")[:_SNIPPET_MAX],
+                        "snippet": r["snippet"] or "",
                         "meta": {
                             "project": r["project"],
                             "source": r["source"],
@@ -1018,7 +1086,7 @@ def _search(
                 )
         elif type_ == "facts" and safe:
             for r in conn.execute(
-                "SELECT uuid, fact, group_id, t_valid, t_invalid, created_at, episodes, "
+                "SELECT uuid, fact, group_id, t_valid, t_invalid, t_created, episodes, "
                 "       paradedb.score(id) AS sc FROM kg_relationships "
                 f"WHERE id @@@ paradedb.match('fact', %s){f_and} "
                 "ORDER BY sc DESC, uuid DESC OFFSET %s LIMIT %s",
@@ -1036,7 +1104,7 @@ def _search(
                             "group_id": r["group_id"],
                             "t_valid": _iso(r["t_valid"]),
                             "t_invalid": _iso(r["t_invalid"]),
-                            "ts": _iso(r["created_at"]),
+                            "ts": _iso(r["t_created"]),
                             "episode_id": _provenance(r["episodes"]),
                         },
                     }
@@ -1065,7 +1133,7 @@ def _search(
                 )
         elif type_ == "entities":
             for r in conn.execute(
-                "SELECT uuid, name, entity_type, summary, degree FROM kg_entities "
+                "SELECT uuid, name, entity_subtype, summary, degree FROM kg_entities "
                 f"WHERE name ILIKE %s{en_and} "
                 "ORDER BY degree DESC, name OFFSET %s LIMIT %s",
                 (like, *en_p, offset, limit),
@@ -1077,7 +1145,7 @@ def _search(
                         "snippet": ((r["summary"] or r["name"]) or "")[:_SNIPPET_MAX],
                         "meta": {
                             "name": r["name"],
-                            "entity_type": r["entity_type"],
+                            "entity_type": r["entity_subtype"],
                             "degree": r["degree"],
                         },
                     }
@@ -1154,8 +1222,8 @@ _CORPUS_ESTIMATE_FLOOR = 50000
 # (table, time_column|None) — the corpus tables to report + which column drives spark_30d.
 _CORPUS_TABLES: tuple[tuple[str, str | None], ...] = (
     ("episodes", "created_at"),
-    ("kg_entities", "created_at"),
-    ("kg_relationships", "created_at"),
+    ("kg_entities", "t_created"),
+    ("kg_relationships", "t_created"),
     ("timeline_events", "ingested_at"),
     ("preferences", "ingested_at"),
     ("notes", "created_at"),
@@ -1270,7 +1338,9 @@ def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
             "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, "
             "  count(*) FILTER (WHERE status = 'processing') AS processing, "
             "  count(*) FILTER (WHERE status = 'failed') AS failed "
-            "FROM extraction_queue"
+            # Finished rows are kept (with their content) and outnumber these by far;
+            # naming the live statuses lets extraction_queue_status_idx skip them.
+            "FROM extraction_queue WHERE status IN ('pending', 'processing', 'failed')"
         ).fetchone() or {"pending": 0, "processing": 0, "failed": 0}
 
         enq = conn.execute(

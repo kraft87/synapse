@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 import psycopg
@@ -100,11 +101,14 @@ def _episode(
     ).fetchone()[0]
 
 
+# The KG helpers write only the bitemporal t_* columns and entity_subtype, never the
+# FalkorDB-era created_at / valid_at / invalid_at / entity_type mirrors: the dashboard
+# reads the former, so a read that slips back onto a legacy column fails here.
 def _entity(
     conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0, group_id="technical"
 ):
     return conn.execute(
-        "INSERT INTO kg_entities (uuid, group_id, name, entity_type, summary, degree, created_at) "
+        "INSERT INTO kg_entities (uuid, group_id, name, entity_subtype, summary, degree, t_created) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (uuid, group_id, name, entity_type, summary, degree, _t(0)),
     ).fetchone()[0]
@@ -128,7 +132,7 @@ def _rel(
     return conn.execute(
         "INSERT INTO kg_relationships "
         "(uuid, group_id, src_uuid, tgt_uuid, name, fact, episodes, retrieval_count, "
-        " created_at, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        " t_created, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             group_id,
@@ -439,6 +443,83 @@ def test_feed_filters_apply_only_where_column_exists(clean, conn, db_url):
         assert ("fact", "ft") in got and ("timeline_event", str(et)) in got  # not excluded
 
 
+def test_feed_untagged_filter_matches_null_empty_and_literal(clean, conn, db_url):
+    """'untagged' is the catalog's bucket for NULL and '' (and a literal 'untagged'
+    label lands in the same bucket); a real label is a plain equality the
+    (project, created_at) index can serve."""
+    null_ep = _episode(conn, session="u", seq=1, project=None, source=None, created_at=_t(4))
+    blank_ep = _episode(conn, session="u", seq=2, project="", source="", created_at=_t(3))
+    lit_ep = _episode(conn, session="u", seq=3, project="untagged", created_at=_t(2))
+    tagged = _episode(conn, session="u", seq=4, project="synapse", created_at=_t(1))
+    null_ev = _event(conn, fact="unlabelled event", source_ref="tb:u", project=None)
+    tagged_ev = _event(conn, fact="labelled event", source_ref="tb:t", project="synapse")
+
+    with _client(db_url) as client:
+        got = {(i["type"], i["id"]) for i in _feed_page(client, project="untagged")["items"]}
+        assert {("episode", str(e)) for e in (null_ep, blank_ep, lit_ep)} <= got
+        assert ("timeline_event", str(null_ev)) in got
+        assert ("episode", str(tagged)) not in got
+        assert ("timeline_event", str(tagged_ev)) not in got
+
+        got = {(i["type"], i["id"]) for i in _feed_page(client, source="untagged")["items"]}
+        assert {("episode", str(null_ep)), ("episode", str(blank_ep))} <= got
+        assert ("episode", str(tagged)) not in got
+
+        got = {(i["type"], i["id"]) for i in _feed_page(client, project="synapse")["items"]}
+        assert ("episode", str(tagged)) in got and ("timeline_event", str(tagged_ev)) in got
+        assert ("episode", str(null_ep)) not in got
+
+        hits = client.get(
+            "/dash/api/search", params={"q": "turn", "project": "untagged"}, headers=_H
+        ).json()["hits"]
+        assert {h["id"] for h in hits} == {str(null_ep), str(blank_ep), str(lit_ep)}
+
+
+def test_timeline_item_resolves_the_kth_event_ref(clean, conn, db_url):
+    eid = _episode(conn, session="k", seq=1, content="turn with two events", created_at=_t(0))
+    ev = _event(conn, fact="second event of the turn", source_ref=f"ep:{eid}#2", ingested_at=_t(5))
+    with _client(db_url) as client:
+        items = _feed_page(client)["items"]
+        tl = client.get("/dash/api/timeline", headers=_H).json()["events"]
+    by_key = {(i["type"], i["id"]): i for i in items}
+    assert by_key[("timeline_event", str(ev))]["data"]["episode_id"] == eid
+    assert tl[0]["episode_id"] == eid
+
+
+def test_kg_reads_migration_backfills_legacy_only_rows(clean, conn, db_url):
+    """The optional migration behind the t_created / entity_subtype reads copies the
+    FalkorDB-era mirror into rows that only ever had it, so they stay on the feed and
+    keep their type; a re-run changes nothing. The image runs without it (marker)."""
+    from ingestion.schema_check import is_optional_migration
+
+    schema = Path(__file__).resolve().parent.parent / "schema"
+    (path,) = schema.glob("*_kg_dashboard_reads.sql")
+    assert is_optional_migration(path)
+
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, group_id, name, entity_type, created_at) "
+        "VALUES ('legacy-e', 'technical', 'Old Tool', 'Tool', %s)",
+        (_t(0),),
+    )
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, created_at) "
+        "VALUES ('legacy-r', 'technical', 'legacy-e', 'legacy-e', 'an old fact', %s)",
+        (_t(1),),
+    )
+    with _client(db_url) as client:
+        before = _feed_page(client)["items"]
+        assert ("fact", "legacy-r") not in {(i["type"], i["id"]) for i in before}
+
+        conn.execute(path.read_text())
+        conn.execute(path.read_text())  # idempotent
+
+        items = {(i["type"], i["id"]): i for i in _feed_page(client)["items"]}
+        assert datetime.fromisoformat(items[("fact", "legacy-r")]["ts"]) == _t(1)
+        ent = client.get("/dash/api/entity/legacy-e", headers=_H).json()["entity"]
+        assert ent["entity_type"] == "Tool"
+        assert datetime.fromisoformat(ent["created_at"]) == _t(0)
+
+
 # ---------------------------------------------------------------------------
 # Episode detail + derived
 # ---------------------------------------------------------------------------
@@ -477,14 +558,26 @@ def test_episode_derived_containment_and_ep_ref(clean, conn, db_url):
     _rel(conn, "dn", src="a", tgt="b", fact="numeric-linked", episodes=[eid])
     _rel(conn, "ds", src="a", tgt="b", fact="string-linked", episodes=[str(eid)])
     _rel(conn, "dx", src="a", tgt="b", fact="other-linked", episodes=[other])
-    # Timeline event via ep:<id> source_ref.
-    ev = _event(conn, fact="linked event", source_ref=f"ep:{eid}")
+    # Timeline events via source_ref: 'ep:<id>' for a turn's first event, 'ep:<id>#<k>'
+    # for the k-th (ingestion/timeline_gate.py). The id-prefix near-miss must not match.
+    ev = _event(conn, fact="linked event", source_ref=f"ep:{eid}", t_valid=_t(2))
+    ev2 = _event(conn, fact="second event", source_ref=f"ep:{eid}#2", t_valid=_t(1))
     _event(conn, fact="other event", source_ref=f"ep:{other}")
+    _event(conn, fact="prefix near-miss", source_ref=f"ep:{eid}9")
     with _client(db_url) as client:
         body = client.get(f"/dash/api/episode/{eid}/derived", headers=_H).json()
     fact_uuids = {f["uuid"] for f in body["facts"]}
     assert fact_uuids == {"dn", "ds"}  # both containment forms, other excluded
-    assert [e["id"] for e in body["timeline_events"]] == [ev]
+    assert [e["id"] for e in body["timeline_events"]] == [ev, ev2]
+
+
+def test_episode_id_from_ref_reads_the_kth_event_form():
+    assert dr._episode_id_from_ref("ep:12") == 12
+    assert dr._episode_id_from_ref("ep:12#3") == 12
+    assert dr._episode_id_from_ref("ep:12#") is None
+    assert dr._episode_id_from_ref("ep:x#2") is None
+    assert dr._episode_id_from_ref("deadbeef") is None
+    assert dr._episode_id_from_ref(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +596,32 @@ def test_session_ordering_and_highlight_echo(clean, conn, db_url):
     assert body["project"] == "synapse" and body["source"] == "claude-code"
     assert body["highlight"] == first  # echoed as int
     assert [e["sequence"] for e in body["episodes"]] == [1, 2, 3]
-    assert body["episodes"][0]["content"] == "first"
+    # The drawer renders human_turn/assistant_turn only; content is not shipped.
+    assert set(body["episodes"][0]) == {
+        "id",
+        "sequence",
+        "created_at",
+        "human_turn",
+        "assistant_turn",
+    }
+
+
+def test_session_cap_windows_around_the_highlight(clean, conn, db_url, monkeypatch):
+    """A session longer than the cap is cut to a window around the highlighted turn,
+    so the drawer can always show the turn it was opened for."""
+    monkeypatch.setattr(dr, "_SESSION_CAP", 4)
+    ids = {seq: _episode(conn, session="long", seq=seq, created_at=_t(seq)) for seq in range(1, 11)}
+    with _client(db_url) as client:
+        hl = client.get(f"/dash/api/session/long?highlight={ids[8]}", headers=_H).json()
+        assert [e["sequence"] for e in hl["episodes"]] == [6, 7, 8, 9]
+        # The window slides back from the session's end to stay full.
+        end = client.get(f"/dash/api/session/long?highlight={ids[10]}", headers=_H).json()
+        assert [e["sequence"] for e in end["episodes"]] == [7, 8, 9, 10]
+        # No highlight (or one outside the session): the first turns, as before.
+        plain = client.get("/dash/api/session/long", headers=_H).json()
+        assert [e["sequence"] for e in plain["episodes"]] == [1, 2, 3, 4]
+        stray = client.get("/dash/api/session/long?highlight=999999", headers=_H).json()
+        assert [e["sequence"] for e in stray["episodes"]] == [1, 2, 3, 4]
 
 
 # ---------------------------------------------------------------------------
@@ -1352,6 +1470,7 @@ def test_metrics_corpus_shape_and_cache(clean, conn, db_url):
     )  # outside the 30d sparkline
     _note(conn)
     _pref(conn)
+    _rel(conn, "c-r1", src="x", tgt="y", created_at=now - timedelta(days=1))
 
     with _client(db_url) as client:
         first = client.get("/dash/api/metrics/corpus", headers=_H).json()
@@ -1373,6 +1492,7 @@ def test_metrics_corpus_shape_and_cache(clean, conn, db_url):
     assert ep["rows"] == 3 and ep["rows_estimated"] is False  # exact count on a small table
     assert len(ep["spark_30d"]) == 30
     assert ep["delta_30d"] == 2  # only the two within 30d
+    assert tables["kg_relationships"]["delta_30d"] == 1  # sparkline off t_created
     proj = {p["name"]: p["n"] for p in first["by_project"]}
     assert proj["alpha"] == 2 and proj["beta"] == 1
     src = {p["name"]: p["n"] for p in first["by_source"]}
@@ -1477,11 +1597,11 @@ def _pref_row(
 def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name=None):
     """Entity insert that ALSO sets normalized_name (the shared _entity helper doesn't),
     so the exact-normalized-name seed path is exercisable. entity_supertype mirrors
-    entity_type — the graph payloads serve BOTH (client colors by supertype)."""
+    the subtype — the graph payloads serve BOTH (client colors by supertype)."""
     return conn.execute(
         "INSERT INTO kg_entities "
-        "(uuid, group_id, name, normalized_name, entity_type, entity_supertype, summary, "
-        " degree, created_at) "
+        "(uuid, group_id, name, normalized_name, entity_subtype, entity_supertype, summary, "
+        " degree, t_created) "
         "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
@@ -1911,8 +2031,11 @@ def test_graph_nodes_carry_supertype(clean, conn, db_url):
     with _client(db_url) as client:
         nb = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=1", headers=_H).json()
         assert all("supertype" in n for n in nb["nodes"])
+        # entity_type on the wire is the taxonomy subtype (entity_subtype, schema 020).
+        assert {n["uuid"]: n["entity_type"] for n in nb["nodes"]}["g-hub"] == "Project"
         ta = client.get("/dash/api/graph/entities?q=Synapse", headers=_H).json()
         assert all("supertype" in e for e in ta)
+        assert [e["entity_type"] for e in ta] == ["Project"]
 
 
 def test_graph_typeahead(clean, conn, db_url):

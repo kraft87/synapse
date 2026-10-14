@@ -45,8 +45,12 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
 - `limit` ≤ 100. Filters apply where the column exists (episodes: project+source;
   facts: group_id; timeline: project + group_id via its `domain` column, schema 038) —
   a filter a type lacks does not exclude that type.
-- Feed timestamps: episode `created_at`, fact `created_at`, timeline `ingested_at`
+- Feed timestamps: episode `created_at`, fact `t_created`, timeline `ingested_at`
   (the feed shows when memory was WRITTEN; the event's own date is `t_valid` in data).
+  The KG is read through its own columns (`t_created`, `entity_subtype`), never the
+  FalkorDB-era `created_at` / `entity_type` mirrors.
+- The `project` / `source` filter value `untagged` matches NULL, `''` and a literal
+  `untagged` label; any other value is an exact match.
 
 ```json
 {"items": [
@@ -65,7 +69,8 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
 ```
 `sal` maps salience 0/1/2 → 0.3/0.6/0.9 (timeline items only). Fact/timeline items are
 fully inline (no expand fetch); episode expansion fetches `/dash/api/episode/:id`.
-`data.episode_id` on timeline items is the resolved `ep:N` source_ref or null.
+`data.episode_id` on timeline items is the episode named by an `ep:N` or `ep:N#k` source_ref
+(a turn's k-th event, ingestion/timeline_gate.py), or null.
 
 ### GET /dash/api/episode/{id}
 ```json
@@ -80,15 +85,19 @@ fully inline (no expand fetch); episode expansion fetches `/dash/api/episode/:id
 {"facts": [{"uuid": "…", "fact": "…", "group_id": "…", "t_valid": "…", "t_invalid": null}],
  "timeline_events": [{"id": 8841, "fact": "…", "t_valid": "…", "salience": 2}]}
 ```
-Facts whose `episodes` jsonb array contains the id; events with `source_ref = 'ep:<id>'`.
+Facts whose `episodes` jsonb array contains the id; events with `source_ref` `ep:<id>` or
+`ep:<id>#<k>`.
 
 ### GET /dash/api/session/{id}?highlight=<episode_id>
 ```json
 {"session_id": "…", "project": "…", "source": "…", "highlight": 227168,
  "episodes": [{"id": 1, "sequence": 1, "created_at": "…",
-                "human_turn": "…", "assistant_turn": "…", "content": "…"}]}
+                "human_turn": "…", "assistant_turn": "…"}]}
 ```
 Ordered by sequence, cap 500 rows. `highlight` echoes the query param (client scrolls to it).
+A session longer than the cap returns a window around the highlighted turn (about half
+before it, sliding to stay full at either end); without a highlight in the session, the
+first 500. No `content`: the drawer renders the two turn fields (`/episode/{id}` has it).
 
 ### GET /dash/api/entity/{uuid}?mentions_offset=0
 ```json
@@ -101,7 +110,9 @@ Ordered by sequence, cap 500 rows. `highlight` echoes the query param (client sc
  "mentions": {"items": [{"episode_id": 227001, "created_at": "…", "gist": "…"}],
                "offset": 0, "limit": 20, "total": 63}}
 ```
-Facts = live + superseded edges touching the uuid (superseded have `t_invalid` set).
+Facts = live + superseded edges touching the uuid (superseded have `t_invalid` set), read
+within the entity's own `(owner_id, group_id)`. `entity_type` is the taxonomy subtype
+(`entity_subtype`, schema 020); `created_at` is the entity's `t_created`.
 `served` = sum of edge `retrieval_count`. Mentions = distinct provenance episodes, newest
 first, paged. (Timeline/preference cross-links: reserved for a later phase.)
 
@@ -114,7 +125,8 @@ ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE. NOT
  "offset": 0, "limit": 20}
 ```
 `total_by_type` is always computed for all four types (tab counts); `hits` only for the
-requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`.
+requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`
+(`entity_type` = `entity_subtype`). Fact hits' `meta.ts` is the edge's `t_created`.
 Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
 resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link.
 
@@ -437,7 +449,8 @@ are the expensive part).
 ```
 - `tables`: episodes, kg_entities, kg_relationships, timeline_events, preferences, notes,
   chunks (each only if the table exists). `spark_30d` = 30 daily counts (oldest→newest) off
-  the table's own time column (`created_at`, or `ingested_at` for timeline/preferences);
+  the table's own time column (`created_at`; `t_created` for the KG tables; `ingested_at`
+  for timeline/preferences);
   `[]` when the table has no time column. `delta_30d` = sum of `spark_30d`.
 - `rows_estimated` — see the honesty note. `by_project`/`by_source` are exact, top 12,
   `untagged` for NULL/empty.
@@ -590,8 +603,10 @@ orphaned, and sets `truncated`.
   (`t_invalid ≤ as_of`) — the client renders those dashed (spec §4). When unset, return live
   + superseded and let the client scrub client-side; the client re-queries with `as_of` only
   when a neighborhood was `truncated`. Edges with `t_valid IS NULL` are always visible.
-- Bounded end to end: `kg_rel_src`/`kg_rel_tgt` make per-node expansion cheap; no unbounded
-  scan touches the ~75K-edge table. `node.color` is by `entity_type` (client `etColor`,
+- Bounded end to end: every edge scan names the seed's `(owner_id, group_id)` (an entity's
+  edges live in its own group), so `kg_rel_src`/`kg_rel_tgt`/`kg_rel_pair` make per-node
+  expansion cheap; no unbounded scan touches the ~75K-edge table. Node `entity_type` is
+  `entity_subtype`. `node.color` is by `entity_type` (client `etColor`,
   matching the dossier/search surfaces); the legend shows the six supertype colors.
 
 ## Schema (migrations 042, 044)

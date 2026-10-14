@@ -81,7 +81,7 @@ export interface Derived {
 }
 export interface SessionEpisode {
   id: number; sequence: number; created_at: string;
-  human_turn: string; assistant_turn: string; content: string;
+  human_turn: string; assistant_turn: string;
 }
 export interface Session {
   session_id: string; project: string; source: string; highlight: number | null;
