@@ -8,6 +8,7 @@ import {
   postRecall, fetchRecallHistory,
   type RecallResult, type RecallHistoryRow,
 } from '../api';
+import { copyText } from '../clipboard';
 import { useStore } from '../state';
 import { LEG_COLOR, LEG_ORDER, scoreColor, relTime, mono } from '../tokens';
 import { bucketItems, recallScope, servedBuckets, waterfall } from '../recallView';
@@ -22,7 +23,8 @@ export function Recall() {
   const [result, setResult] = useState<RecallResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('history');
-  const [copied, setCopied] = useState(false);
+  // The Raw tab's copy button: what the last press did, shown for a moment.
+  const [copied, setCopied] = useState<'ok' | 'failed' | null>(null);
   const [history, setHistory] = useState<RecallHistoryRow[] | null>(null);
   const [histErr, setHistErr] = useState(false);
   const reqId = useRef(0);
@@ -56,10 +58,10 @@ export function Recall() {
 
   const copyRaw = () => {
     if (!result) return;
-    navigator.clipboard?.writeText(JSON.stringify(result, null, 2)).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    }).catch(() => {});
+    void copyText(JSON.stringify(result, null, 2)).then((ok) => {
+      setCopied(ok ? 'ok' : 'failed');
+      setTimeout(() => setCopied(null), 1500);
+    });
   };
 
   const rows = waterfall(result?.debug ?? null);
@@ -185,7 +187,7 @@ export function Recall() {
       {ran && tab === 'raw' && (
         <div style={{ position: 'relative', marginTop: '14px' }}>
           <button className="copybtn" onClick={copyRaw}
-            style={{ position: 'absolute', top: '10px', right: '10px', border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '5px', padding: '4px 10px', fontSize: '11.5px', fontFamily: mono, cursor: 'pointer' }}>{copied ? 'copied ✓' : 'copy'}</button>
+            style={{ position: 'absolute', top: '10px', right: '10px', border: '1px solid var(--line2)', background: 'var(--bg2)', color: copied === 'failed' ? 'var(--err)' : 'var(--txt2)', borderRadius: '5px', padding: '4px 10px', fontSize: '11.5px', fontFamily: mono, cursor: 'pointer' }}>{copied === 'ok' ? 'copied ✓' : copied === 'failed' ? 'copy failed' : 'copy'}</button>
           <pre style={{ margin: 0, background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '10px', padding: '14px 16px', fontFamily: mono, fontSize: '12px', lineHeight: 1.6, color: 'var(--txt2)', overflowX: 'auto', maxHeight: '520px', overflowY: 'auto' }}>
             {result ? JSON.stringify(result, null, 2) : loading ? 'running recall…' : ''}
           </pre>
@@ -194,23 +196,25 @@ export function Recall() {
 
       {/* history */}
       {tab === 'history' && (
-        <div className="scrollx" style={{ marginTop: '14px', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '10px', overflow: 'hidden' }}>
-          <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 76px 76px 70px 90px', gap: '10px', padding: '8px 14px', borderBottom: '1px solid var(--line)', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
-            <div>query</div><div style={{ textAlign: 'right' }}>total</div><div style={{ textAlign: 'right' }}>tokens</div><div style={{ textAlign: 'right' }}>top</div><div style={{ textAlign: 'right' }}>when</div>
+        <div className="scrollx" style={{ marginTop: '14px', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '10px' }}>
+          <div style={{ minWidth: '480px' }}>
+            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 76px 76px 70px 90px', gap: '10px', padding: '8px 14px', borderBottom: '1px solid var(--line)', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+              <div>query</div><div style={{ textAlign: 'right' }}>total</div><div style={{ textAlign: 'right' }}>tokens</div><div style={{ textAlign: 'right' }}>top</div><div style={{ textAlign: 'right' }}>when</div>
+            </div>
+            {histErr && <div style={{ padding: '12px 14px', color: 'var(--err)', fontFamily: mono, fontSize: '12px' }}>history request failed.</div>}
+            {!histErr && history === null && <div style={{ padding: '12px 14px', color: 'var(--txt3)', fontFamily: mono, fontSize: '12px' }}>loading…</div>}
+            {!histErr && history?.length === 0 && <div style={{ padding: '12px 14px', color: 'var(--txt3)', fontFamily: mono, fontSize: '12px' }}>no recalls recorded yet.</div>}
+            {history?.map((h) => (
+              <button key={h.id} className="hist-row" onClick={() => run(h.query)}
+                style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 76px 76px 70px 90px', gap: '10px', padding: '9px 14px', border: 'none', borderBottom: '1px solid var(--line)', background: 'none', width: '100%', textAlign: 'left', cursor: 'pointer', alignItems: 'center' }}>
+                <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{h.query}</div>
+                <div style={{ fontFamily: mono, fontSize: '12px', color: (h.ms_total ?? 0) > 380 ? 'var(--err)' : 'var(--txt2)', textAlign: 'right' }}>{h.ms_total != null ? Math.round(h.ms_total) + ' ms' : '—'}</div>
+                <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt2)', textAlign: 'right' }}>{h.est_tokens ?? '—'}</div>
+                <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt2)', textAlign: 'right' }}>{h.rerank_top_score != null ? h.rerank_top_score.toFixed(2) : '—'}</div>
+                <div style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)', textAlign: 'right' }}>{relTime(h.created_at)}</div>
+              </button>
+            ))}
           </div>
-          {histErr && <div style={{ padding: '12px 14px', color: 'var(--err)', fontFamily: mono, fontSize: '12px' }}>history request failed.</div>}
-          {!histErr && history === null && <div style={{ padding: '12px 14px', color: 'var(--txt3)', fontFamily: mono, fontSize: '12px' }}>loading…</div>}
-          {!histErr && history?.length === 0 && <div style={{ padding: '12px 14px', color: 'var(--txt3)', fontFamily: mono, fontSize: '12px' }}>no recalls recorded yet.</div>}
-          {history?.map((h) => (
-            <button key={h.id} className="hist-row" onClick={() => run(h.query)}
-              style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) 76px 76px 70px 90px', gap: '10px', padding: '9px 14px', border: 'none', borderBottom: '1px solid var(--line)', background: 'none', width: '100%', textAlign: 'left', cursor: 'pointer', alignItems: 'center' }}>
-              <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{h.query}</div>
-              <div style={{ fontFamily: mono, fontSize: '12px', color: (h.ms_total ?? 0) > 380 ? 'var(--err)' : 'var(--txt2)', textAlign: 'right' }}>{h.ms_total != null ? Math.round(h.ms_total) + ' ms' : '—'}</div>
-              <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt2)', textAlign: 'right' }}>{h.est_tokens ?? '—'}</div>
-              <div style={{ fontFamily: mono, fontSize: '12px', color: 'var(--txt2)', textAlign: 'right' }}>{h.rerank_top_score != null ? h.rerank_top_score.toFixed(2) : '—'}</div>
-              <div style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)', textAlign: 'right' }}>{relTime(h.created_at)}</div>
-            </button>
-          ))}
         </div>
       )}
     </main>

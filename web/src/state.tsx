@@ -2,7 +2,7 @@
 // to localStorage (README §State Management). Catalog + live status live here so
 // the header can render them on every page.
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { fetchCatalog, fetchProposals, getToken, clearToken, onAuthFail, type Catalog, type ProcessingStatus } from './api';
+import { fetchCatalog, fetchProposals, getToken, clearToken, knownFilter, onAuthFail, type Catalog, type ProcessingStatus } from './api';
 import { startLiveLink, sameQueue, type FeedListener, type LinkState } from './liveLink';
 import { MOCK } from './mode';
 
@@ -10,6 +10,8 @@ export type Group = 'all' | 'technical' | 'personal';
 export type Page = 'feed' | 'recall' | 'graph' | 'timeline' | 'metrics' | 'review' | 'search';
 
 const PENDING_REFRESH_MS = 60_000;
+// The server caches the catalog for 5 minutes (_CATALOG_TTL_S), so asking more often gains nothing.
+const CATALOG_REFRESH_MS = 300_000;
 
 const ls = {
   get: (k: string, d: string) => localStorage.getItem(k) ?? d,
@@ -86,12 +88,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   }, [token]);
 
-  // load the catalog once we have a token (or in mock)
+  // load the catalog once we have a token (or in mock), and again every few minutes and when
+  // the tab is looked at again, so a project created since shows up in the filter without a reload
   useEffect(() => {
     if (!MOCK && !token) return;
     let live = true;
-    fetchCatalog().then((c) => { if (live) setCatalog(c); }).catch(() => {});
-    return () => { live = false; };
+    const load = () => { fetchCatalog().then((c) => { if (live) setCatalog(c); }).catch(() => {}); };
+    const onVisible = () => { if (document.visibilityState === 'visible') load(); };
+    load();
+    const timer = window.setInterval(() => { if (document.visibilityState !== 'hidden') load(); }, CATALOG_REFRESH_MS);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      live = false;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [token]);
 
   // The Review badge follows the server: proposals are decided from the CLI or another tab
@@ -122,6 +133,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const setGroup = useCallback((g: Group) => { setGroupState(g); ls.set('synapse.group', g); }, []);
   const setProject = useCallback((p: string) => { setProjectState(p); ls.set('synapse.project', p); }, []);
   const setSource = useCallback((s: string) => { setSourceState(s); ls.set('synapse.source', s); }, []);
+
+  // The restored project/source may not be in the catalog (renamed, emptied): drop it rather
+  // than filter by a value the header shows as "all".
+  useEffect(() => {
+    if (!catalog) return;
+    const p = knownFilter(project, catalog.projects);
+    if (p !== project) setProject(p);
+    const src = knownFilter(source, catalog.sources);
+    if (src !== source) setSource(src);
+  }, [catalog, project, source, setProject, setSource]);
   const subscribeFeed = useCallback((l: FeedListener) => {
     feedListeners.current.add(l);
     return () => { feedListeners.current.delete(l); };

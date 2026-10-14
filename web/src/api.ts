@@ -1,6 +1,6 @@
 // API layer for the phase-1 dashboard. Wire shapes match docs/dashboard-contract.md
 // (owned by the server agent). Everything is Bearer-token authenticated except the
-// static shell. When location.hash contains "mock", the mock dataset is served instead
+// static shell. When the page is opened at "#mock", the mock dataset is served instead
 // so every screen renders offline.
 import { MOCK } from './mode';
 import { browserTz } from './tokens';
@@ -23,6 +23,11 @@ export const setToken = (t: string) => localStorage.setItem(TOKEN_KEY, t);
 export const clearToken = () => localStorage.removeItem(TOKEN_KEY);
 
 export class AuthError extends Error {}
+// Any other non-2xx answer; `status` lets a caller treat one (a 404) as an answer, not a failure.
+export class HttpError extends Error {
+  status: number;
+  constructor(status: number, message: string) { super(message); this.status = status; }
+}
 
 // A 401 anywhere kicks the app back to the login screen.
 let authFailHandler: () => void = () => {};
@@ -37,7 +42,7 @@ async function reqAt<T>(fullPath: string, init?: RequestInit, tokenOverride?: st
     },
   });
   if (res.status === 401) { authFailHandler(); throw new AuthError('unauthorized'); }
-  if (!res.ok) throw new Error('request failed (' + res.status + '): ' + fullPath);
+  if (!res.ok) throw new HttpError(res.status, 'request failed (' + res.status + '): ' + fullPath);
   return res.json() as Promise<T>;
 }
 
@@ -92,8 +97,9 @@ export interface SessionEpisode {
   id: number; sequence: number; created_at: string;
   human_turn: string; assistant_turn: string;
 }
+// episodes is at most the server's window of the session; total counts every stored turn.
 export interface Session {
-  session_id: string; project: string; source: string; highlight: number | null;
+  session_id: string; project: string; source: string; total: number; highlight: number | null;
   episodes: SessionEpisode[];
 }
 export interface EntityFact {
@@ -149,9 +155,21 @@ export const qs = (params: Record<string, string | number | undefined | null>): 
 };
 // The header filters say 'all' for "no filter"; user text (a search for "all") is never dropped.
 export const filterVal = (v?: string): string | undefined => (v === 'all' ? undefined : v);
+// A restored filter the catalog no longer lists (a renamed or emptied project) falls back to
+// 'all': the select can only show 'all' for it, so it must not keep filtering unseen.
+export const knownFilter = (value: string, known: { name: string }[]): string =>
+  value === 'all' || known.some((k) => k.name === value) ? value : 'all';
 
 // ---------- endpoints ----------
 export interface FeedParams { cursor?: string | null; project?: string; group_id?: string; source?: string; limit?: number; }
+
+// Is a browser sign-in (an identity provider) configured? Unauthenticated, like the shell; a
+// failed probe reads as no, leaving the pasted-token form.
+export const fetchSsoAvailable = (): Promise<boolean> =>
+  fetch('/dash/oauth/available')
+    .then((r) => (r.ok ? r.json() : { available: false }))
+    .then((j: { available?: boolean }) => j.available === true)
+    .catch(() => false);
 
 export const fetchCatalog = (tokenOverride?: string): Promise<Catalog> =>
   MOCK ? mockApi('/catalog') : req('/catalog', undefined, tokenOverride);
@@ -165,8 +183,10 @@ export const fetchEpisode = (id: string): Promise<Episode> =>
 export const fetchDerived = (id: string): Promise<Derived> =>
   MOCK ? mockApi('/episode/' + id + '/derived') : req('/episode/' + encodeURIComponent(id) + '/derived');
 
-export const fetchSession = (id: string, highlight?: string | null): Promise<Session> =>
-  MOCK ? mockApi('/session/' + id) : req('/session/' + encodeURIComponent(id) + qs({ highlight }));
+// null: no turn is stored under this id (404), which the drawer shows as "not found".
+export const fetchSession = (id: string, highlight?: string | null): Promise<Session | null> =>
+  (MOCK ? mockApi<Session>('/session/' + id) : req<Session>('/session/' + encodeURIComponent(id) + qs({ highlight })))
+    .catch((e) => { if (e instanceof HttpError && e.status === 404) return null; throw e; });
 
 // One page of each list: `mentionsOffset` / `factsOffset` pick which (stats.facts and
 // mentions.total are the full counts the lists page against).

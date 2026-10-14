@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { feedItemPassesFilter, fetchSearch, fetchTimeline, fetchTimelineMonths, filterVal, qs, type FeedItem } from '../src/api';
+import { feedItemPassesFilter, fetchSearch, fetchSession, fetchSsoAvailable, fetchTimeline, fetchTimelineMonths, filterVal, knownFilter, qs, type FeedItem } from '../src/api';
 
 const g = globalThis as unknown as Record<string, unknown>;
 g.localStorage = { getItem: () => 'token' };
@@ -64,4 +64,41 @@ test('facts keep the strict group match', () => {
   assert.equal(feedItemPassesFilter(fact(null), f('technical')), false);
   assert.equal(feedItemPassesFilter(fact('technical'), f('technical')), true);
   assert.equal(feedItemPassesFilter(fact('personal'), f('all')), true);
+});
+
+test('an unknown session is null (the drawer says "not found"); other failures still throw', async () => {
+  const real = g.fetch;
+  try {
+    g.fetch = async () => ({ status: 404, ok: false, json: async () => ({ detail: 'session not found' }) }) as Response;
+    assert.equal(await fetchSession('nope'), null);
+    g.fetch = async () => ({ status: 500, ok: false, json: async () => ({}) }) as Response;
+    await assert.rejects(fetchSession('nope'), /request failed \(500\)/);
+  } finally {
+    g.fetch = real;
+  }
+});
+
+test('a restored filter the catalog does not list falls back to "all"', () => {
+  const projects = [{ name: 'synapse' }, { name: 'untagged' }];
+  assert.equal(knownFilter('synapse', projects), 'synapse');
+  assert.equal(knownFilter('old-project', projects), 'all');
+  assert.equal(knownFilter('all', projects), 'all');
+  assert.equal(knownFilter('synapse', []), 'all');
+});
+
+test('the sign-in probe is true only when the server says an identity provider is configured', async () => {
+  const real = g.fetch;
+  try {
+    const answer = (status: number, body: unknown) => async () => ({ status, ok: status < 400, json: async () => body }) as Response;
+    g.fetch = answer(200, { available: true });
+    assert.equal(await fetchSsoAvailable(), true);
+    g.fetch = answer(200, { available: false });
+    assert.equal(await fetchSsoAvailable(), false);
+    g.fetch = answer(404, {});
+    assert.equal(await fetchSsoAvailable(), false);
+    g.fetch = async () => { throw new Error('offline'); };
+    assert.equal(await fetchSsoAvailable(), false);
+  } finally {
+    g.fetch = real;
+  }
 });

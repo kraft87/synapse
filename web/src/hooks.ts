@@ -1,5 +1,5 @@
 // Shared React hooks.
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type RefObject } from 'react';
 import { fetchDerived, fetchEpisode, type Derived, type Episode } from './api';
 
 // One-shot async fetch: loading / data / error, runs fn on mount and whenever a dep
@@ -39,4 +39,32 @@ export function useEpisode(id: string): { ep: Episode | null; derived: Derived |
     fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
   ]).then(([ep, derived]) => ({ ep, derived })), [id]);
   return { ep: data?.ep ?? null, derived: data?.derived ?? null, error };
+}
+
+// A modal overlay's keyboard contract: focus moves into the panel on open (to its close
+// button, which is there before the data is), Tab and Shift+Tab wrap inside it, and focus
+// goes back to what held it when the overlay closes.
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+export function useModal(panel: RefObject<HTMLElement>): void {
+  useEffect(() => {
+    const el = panel.current;
+    const opener = document.activeElement as HTMLElement | null;
+    el?.querySelector<HTMLElement>('button[aria-label="close"]')?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab' || !el) return;
+      const items = [...el.querySelectorAll<HTMLElement>(FOCUSABLE)];
+      if (items.length === 0) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      const at = document.activeElement;
+      if (!el.contains(at)) { e.preventDefault(); first.focus(); }
+      else if (e.shiftKey && at === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && at === last) { e.preventDefault(); first.focus(); }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('keydown', onKey);
+      opener?.focus?.();
+    };
+  }, [panel]);
 }

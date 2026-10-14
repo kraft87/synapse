@@ -11,6 +11,7 @@ import {
   type EvidenceItem, type ProposalDetail, type ProposalSummary,
   type DreamRun, type BehaviorFileEntry, type BehaviorFile, type FlagRow,
 } from '../api';
+import { copyText } from '../clipboard';
 import { useStore } from '../state';
 import { openEpisode, openSession } from '../hash';
 import { relTime, monoHead, localMinute } from '../tokens';
@@ -186,7 +187,8 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
+  // What the last press of "discuss" did, shown for a moment.
+  const [copied, setCopied] = useState<'ok' | 'failed' | null>(null);
   // Why a decision did not go through. A refusal (200, status 'refused') changed nothing: the
   // row is no longer 'proposed', or a skills approve can't apply it (no draft yet, a stale
   // draft, a taken name). A failed request says nothing about the outcome, so the pane is
@@ -213,9 +215,10 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
 
   const discuss = (d: ProposalDetail) => {
     const text = summaryText(d);
-    const done = () => { setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
-    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done).catch(done);
-    else done();
+    void copyText(text).then((ok) => {
+      setCopied(ok ? 'ok' : 'failed');
+      window.setTimeout(() => setCopied(null), 1600);
+    });
   };
 
   if (loading && !detail) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading proposal…</div>;
@@ -269,7 +272,7 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
                 style={{ borderRadius: '6px', padding: '7px 14px', fontSize: '13px' }}>reject…</button>
               <span style={{ flex: 1 }} />
               <button className="softbtn" onClick={() => discuss(detail)}
-                style={{ color: copied ? 'var(--ok)' : 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '12.5px', ...mono }}>{copied ? 'copied for chat ✓' : 'discuss →'}</button>
+                style={{ color: copied === 'ok' ? 'var(--ok)' : copied === 'failed' ? 'var(--err)' : 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '12.5px', ...mono }}>{copied === 'ok' ? 'copied for chat ✓' : copied === 'failed' ? 'copy failed' : 'discuss →'}</button>
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>

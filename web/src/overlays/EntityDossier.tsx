@@ -2,14 +2,14 @@
 // All facts (valid + superseded struck), paginated mentions, provenance that
 // opens the episode overlay. "view in graph" is disabled until the Graph phase.
 import type React from 'react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { fetchEntity, onDeleted, type Entity, type EntityFact } from '../api';
 import { closeOverlay, openEpisode } from '../hash';
 import { appendUnique } from '../paging';
 import { etColor, validityLine } from '../tokens';
 import { Dot, FlagButton, Spinner } from '../components/ui';
 import { useStore } from '../state';
-import { useAsync } from '../hooks';
+import { useAsync, useModal } from '../hooks';
 
 const provBtn: React.CSSProperties = { border: 'none', background: 'none', padding: 0, color: 'var(--acc)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', textDecoration: 'underline', textUnderlineOffset: '2px' };
 
@@ -17,6 +17,8 @@ export function EntityDossier({ id }: { id: string }) {
   const store = useStore();
   const { data, error, reload } = useAsync(() => fetchEntity(id, 0), [id]);
   const err = error != null;
+  const panel = useRef<HTMLDivElement>(null);
+  useModal(panel);
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreFailed, setMoreFailed] = useState(false);
@@ -61,10 +63,10 @@ export function EntityDossier({ id }: { id: string }) {
 
   return (
     <div onClick={closeOverlay} style={{ position: 'fixed', inset: 0, background: 'var(--scrim)', zIndex: 60, display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '24px', backdropFilter: 'blur(2px)', overflowY: 'auto' }}>
-      <div onClick={(ev) => ev.stopPropagation()} style={{ background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '14px', maxWidth: '760px', width: '100%', padding: '22px 24px', boxSizing: 'border-box', margin: 'auto' }}>
+      <div ref={panel} role="dialog" aria-modal="true" aria-labelledby="overlay-title" onClick={(ev) => ev.stopPropagation()} style={{ background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '14px', maxWidth: '760px', width: '100%', padding: '22px 24px', boxSizing: 'border-box', margin: 'auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
           <Dot color={color} size={12} />
-          <span style={{ fontFamily: 'var(--font-data)', fontSize: '18px', fontWeight: 500 }}>{e?.name || '…'}</span>
+          <span id="overlay-title" style={{ fontFamily: 'var(--font-data)', fontSize: '18px', fontWeight: 500 }}>{e?.name || '…'}</span>
           {e?.entity_type && <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 8px', borderRadius: '4px', border: '1px solid ' + color, color }}>{e.entity_type}</span>}
           <span style={{ flex: 1 }} />
           <button
@@ -79,7 +81,7 @@ export function EntityDossier({ id }: { id: string }) {
             }}
             style={{ border: '1px solid var(--acc)', background: 'var(--acc-bg)', color: 'var(--acc)', borderRadius: '6px', padding: '5px 12px', fontSize: '12px', fontFamily: 'var(--font-data)', cursor: e ? 'pointer' : 'not-allowed', opacity: e ? 1 : 0.55 }}
           >view in graph</button>
-          <button className="iconbtn" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
+          <button className="iconbtn" aria-label="close" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
         </div>
 
         {err && <div style={{ color: 'var(--err)', fontSize: '13px', fontFamily: 'var(--font-data)', marginTop: '14px' }}>couldn't load entity.</div>}

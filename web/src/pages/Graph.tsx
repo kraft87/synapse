@@ -72,7 +72,8 @@ function stylesheet(pal: Palette, sizeRef: { current: number }): cytoscape.Style
     } as unknown as cytoscape.Css.Node },
     { selector: 'node.cluster', style: {
       'background-color': pal.bg3, 'border-width': 1, 'border-color': pal.line2, shape: 'round-rectangle',
-      color: pal.acc, 'text-halign': 'center', 'text-margin-x': 0, width: 'label', height: 20,
+      color: pal.acc, 'text-halign': 'center', 'text-margin-x': 0,
+      width: (e: cytoscape.NodeSingular) => Math.max(48, String(e.data('name')).length * 6.5 + 20), height: 20,
       padding: 6, 'font-size': 10.5,
     } as unknown as cytoscape.Css.Node },
     { selector: 'node:selected', style: { 'border-width': 2, 'border-color': pal.acc } },
@@ -199,7 +200,6 @@ export function Graph() {
       autounselectify: true, // selection is driven by our selId, not cytoscape's tap toggle
       boxSelectionEnabled: false,
       minZoom: 0.2, maxZoom: 3,
-      wheelSensitivity: 0.25,
     });
     cyRef.current = cy;
     cy.on('tap', 'node', (ev) => {
@@ -420,14 +420,14 @@ export function Graph() {
         </div>
         <button className="chipbtn" onClick={() => runSeed(seedText)} style={{ border: '1px solid var(--acc)', background: 'var(--acc-bg)', color: 'var(--acc)', borderRadius: '7px', padding: '7px 13px', fontSize: '12.5px', fontFamily: mono, cursor: 'pointer' }}>seed</button>
         <div style={{ display: 'flex', border: '1px solid var(--line2)', borderRadius: '7px', overflow: 'hidden' }}>
-          <button onClick={() => changeDepth(1)} style={depthBtn(1)}>depth 1</button>
-          <button onClick={() => changeDepth(2)} style={{ ...depthBtn(2), borderLeft: '1px solid var(--line2)' }}>depth 2</button>
+          <button aria-pressed={depth === 1} onClick={() => changeDepth(1)} style={depthBtn(1)}>depth 1</button>
+          <button aria-pressed={depth === 2} onClick={() => changeDepth(2)} style={{ ...depthBtn(2), borderLeft: '1px solid var(--line2)' }}>depth 2</button>
         </div>
         <button className="gbtn" onClick={relayout} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '7px', padding: '7px 13px', fontSize: '12.5px', fontFamily: mono, cursor: 'pointer' }}>re-run layout</button>
         <div style={{ flex: 1 }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)' }}>as-of</span>
-          <input type="range" min={0} max={AS_OF_TODAY} value={asOfIdx} onChange={(e) => setAsOfIdx(Number(e.target.value))} style={{ width: '180px', accentColor: 'var(--acc)' }} />
+          <input type="range" aria-label="as-of date" aria-valuetext={asOfLabel(asOfIdx)} min={0} max={AS_OF_TODAY} value={asOfIdx} onChange={(e) => setAsOfIdx(Number(e.target.value))} style={{ width: '180px', accentColor: 'var(--acc)' }} />
           <span style={{ fontFamily: mono, fontSize: '12px', color: 'var(--acc)', minWidth: '86px' }}>{asOfLabel(asOfIdx)}</span>
         </div>
       </div>
@@ -436,7 +436,7 @@ export function Graph() {
       {/* body */}
       <div style={{ display: 'flex', gap: '12px', flex: 1, minHeight: 0, flexWrap: 'wrap' }}>
         {/* canvas */}
-        <div style={{ flex: 2, minWidth: '380px', position: 'relative', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '12px', overflow: 'hidden', minHeight: '540px' }}>
+        <div style={{ flex: 2, minWidth: 'min(380px, 100%)', position: 'relative', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '12px', overflow: 'hidden', minHeight: '540px' }}>
           <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
           {loading && (
             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>

@@ -120,10 +120,10 @@ export function FeedCard({ item, fresh }: { item: FeedItem; fresh?: boolean }) {
         <span style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)' }}>{relTime(item.ts)}</span>
       </div>
 
-      <div onClick={() => setExpanded((v) => !v)}
-        style={{ cursor: 'pointer', marginTop: '8px', fontSize: gistSize, fontWeight: gistWeight, lineHeight: 1.5, color: 'var(--txt)' }}>
+      <button type="button" aria-expanded={expanded} onClick={() => setExpanded((v) => !v)}
+        style={{ display: 'block', width: '100%', textAlign: 'left', border: 'none', background: 'none', padding: 0, cursor: 'pointer', overflowWrap: 'anywhere', marginTop: '8px', fontSize: gistSize, fontWeight: gistWeight, lineHeight: 1.5, color: 'var(--txt)' }}>
         {item.gist}
-      </div>
+      </button>
 
       {expanded && (item.type === 'episode' ? <EpisodeExpansion item={item} /> : <InlineExpansion item={item} />)}
     </article>

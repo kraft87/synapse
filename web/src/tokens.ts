@@ -93,15 +93,17 @@ export const LEG_ORDER = ['embed', 'bm25', 'vector', 'kg', 'notes', 'web', 'rera
 export const scoreColor = (score?: number): string =>
   score == null ? 'var(--txt3)' : score > 0.8 ? 'var(--acc)' : score > 0.6 ? 'var(--txt2)' : 'var(--txt3)';
 
-export function relTime(ts?: string): string {
+// How long ago, in whole units rounded DOWN: 23.6 h is "23h ago" (24h would claim a day that
+// has not passed), and anything under a minute reads "1m ago".
+export function relTime(ts?: string, now: number = Date.now()): string {
   if (!ts) return '';
   const then = new Date(ts).getTime();
   if (Number.isNaN(then)) return '';
-  const dh = (Date.now() - then) / 3600e3;
+  const dh = (now - then) / 3600e3;
   if (dh < 0) return 'now';
-  if (dh < 1) return Math.max(1, Math.round(dh * 60)) + 'm ago';
-  if (dh < 24) return Math.round(dh) + 'h ago';
-  return Math.round(dh / 24) + 'd ago';
+  if (dh < 1) return Math.max(1, Math.floor(dh * 60)) + 'm ago';
+  if (dh < 24) return Math.floor(dh) + 'h ago';
+  return Math.floor(dh / 24) + 'd ago';
 }
 
 // ---- calendar days, in the viewer's zone ----
@@ -136,12 +138,21 @@ export function localMinute(iso?: string | null, tz: string = browserTz()): stri
   return p ? `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}` : '';
 }
 
-// A tool-call trace is detected heuristically from stored episode content — the
-// contract delegates display derivation to the client.
-const TOOL_RE = /(^|\n)\s*(Read|Edit|Write|MultiEdit|Bash|Grep|Glob|LS|NotebookEdit|Task|WebFetch|WebSearch|Tool)\b/;
+// A tool-call trace is detected from stored episode content — the contract delegates display
+// derivation to the client. Every client writes the trace as its own lines: `[tool:<name>] <input>`
+// for a call and `[result] <output>` for what came back (ingestion/jsonl_client.py,
+// codex_client.py, cursor_sqlite_client.py). Prose that merely starts with "Read" or "Task" is not one.
+const TOOL_RE = /(^|\n)\[(tool:[^\]\n]+|result)\] /;
 // A turn pair as one readable block ("user: …" / "assistant: …"); either side may be empty.
 export const turnBody = (t: { human_turn?: string; assistant_turn?: string }): string =>
   [t.human_turn && 'user: ' + t.human_turn, t.assistant_turn && 'assistant: ' + t.assistant_turn].filter(Boolean).join('\n\n');
+
+// "12 turns", or "seq 3–502 of 520 turns" when the drawer holds only the server's window of a longer session.
+export function turnsLabel(episodes: { sequence: number }[], total: number): string {
+  if (episodes.length === 0 || episodes.length >= total) return total + (total === 1 ? ' turn' : ' turns');
+  const seqs = episodes.map((e) => e.sequence);
+  return `seq ${Math.min(...seqs)}–${Math.max(...seqs)} of ${total} turns`;
+}
 
 export const hasToolTrace = (content?: string): boolean => !!content && TOOL_RE.test(content);
 

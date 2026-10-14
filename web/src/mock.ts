@@ -4,7 +4,7 @@
 
 const now = Date.now();
 const iso = (hAgo: number) => new Date(now - hAgo * 3600e3).toISOString();
-const trace = 'user: wire service A to library B\n\nRead   src/service_a.py\nEdit   src/service_a.py:42\nBash   pytest tests/ — 3 passed';
+const trace = '[user] wire service A to library B\n\n[tool:Read] src/service_a.py\n[tool:Edit] src/service_a.py:42\n[tool:Bash] pytest tests/\n\n[result] ===== 3 passed in 0.41s =====\n\n[assistant] Done — added the dependency and a smoke test.';
 
 const FIX: Record<string, unknown> = {
   catalog: {
@@ -24,7 +24,7 @@ const FIX: Record<string, unknown> = {
   'episode/1': { id: 1, session_id: 'sess-1', sequence: 3, project: 'service-a', source: 'claude-code', platform: 'cli', model: 'example-model', created_at: iso(0.4), flagged: false, human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency and a smoke test.', content: trace },
   'episode/2': { id: 2, session_id: 'sess-2', sequence: 1, project: 'service-b', source: 'cursor', platform: 'ide', model: 'example-model', created_at: iso(30), flagged: false, human_turn: 'Refactor the widget cache.', assistant_turn: 'Extracted a WidgetCache class; hit rate unchanged.', content: 'user: refactor the widget cache\n\nassistant: extracted a WidgetCache class.' },
   derived: { facts: [{ uuid: 'ent-edge-1', fact: 'service A depends on library B', group_id: 'technical', t_valid: iso(24), t_invalid: null }], timeline_events: [{ id: 10, fact: 'service A shipped v2', t_valid: iso(48), salience: 2 }] },
-  session: { session_id: 'sess-1', project: 'service-a', source: 'claude-code', highlight: 1, episodes: [{ id: 0, sequence: 1, created_at: iso(1), human_turn: 'Set up the project.', assistant_turn: 'Scaffolded service A.' }, { id: 1, sequence: 3, created_at: iso(0.4), human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency.' }] },
+  session: { session_id: 'sess-1', project: 'service-a', source: 'claude-code', total: 2, highlight: 1, episodes: [{ id: 0, sequence: 1, created_at: iso(1), human_turn: 'Set up the project.', assistant_turn: 'Scaffolded service A.' }, { id: 1, sequence: 3, created_at: iso(0.4), human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency.' }] },
   entity: {
     entity: { uuid: 'ent-1', name: 'service A', entity_type: 'Project', summary: 'Example service used to demonstrate the dossier surface.', degree: 4, created_at: iso(200) },
     stats: { edges: 4, served: 42, facts: 3 },
