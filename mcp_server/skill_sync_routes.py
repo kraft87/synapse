@@ -60,8 +60,12 @@ from psycopg.types.json import Json
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
-from dream.skills.skill_measure import skill_description
+from dream.skills.skill_doc import (
+    body_hash,
+    frontmatter_name,
+    skill_description,
+    valid_skill_name,
+)
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe

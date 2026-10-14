@@ -24,7 +24,8 @@ from __future__ import annotations
 
 from . import skill_derive as SD
 from . import skill_doc as D
-from .skill_measure import _extract_json, skill_description
+from .skill_doc import skill_description
+from .skill_measure import _extract_json
 
 DRAFT_CAP = 12  # drafts per nightly run (each is an Opus call); the rest wait a night
 MAX_PHRASINGS = 8

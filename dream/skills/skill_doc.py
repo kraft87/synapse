@@ -2,8 +2,8 @@
 """SKILL.md helpers shared by the nightly drafter and the review accept path.
 
 Pure functions, no DB and no LLM:
-  * frontmatter reads (`name`; `description` is skill_measure.skill_description, the same
-    reader the lane catalog and the client sync use),
+  * frontmatter reads (`name`, and `description`: skill_description, the reader the lane
+    and the publish/accept routes share),
   * body_hash: the pin that ties a drafted proposal to the registry body it was drafted
     against, so accept can refuse a draft whose skill changed underneath it,
   * the description-only splice a retune/widen draft is built from, and the deterministic
@@ -16,8 +16,6 @@ from __future__ import annotations
 import hashlib
 import re
 
-from .skill_measure import skill_description
-
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _KEY_RE = r"^(\s*){key}:\s*(.*?)\s*$"
 
@@ -27,6 +25,32 @@ MIN_SHRINK = 0.4
 MAX_GROWTH = 3
 GROWTH_SLACK = 2000
 MAX_DESCRIPTION = 1024  # Claude Code's skill description cap
+
+
+def skill_description(text: str) -> str:
+    """Parse the frontmatter `description`, handling YAML block scalars (`>` / `|`),
+    plain, and quoted forms. The naive `^description:\\s*(.+)$` grabbed just ">" for
+    multi-line block-scalar descriptions — which silently fed the judge garbage."""
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return ""
+    lines = m.group(1).split("\n")
+    for i, line in enumerate(lines):
+        dm = re.match(r"^(\s*)description:\s*(.*)$", line)
+        if not dm:
+            continue
+        base_indent, val = len(dm.group(1)), dm.group(2).strip()
+        if val[:1] in ("|", ">"):  # block scalar — collect more-indented following lines
+            collected = []
+            for nxt in lines[i + 1 :]:
+                if not nxt.strip():
+                    continue
+                if len(nxt) - len(nxt.lstrip()) <= base_indent:
+                    break  # dedent = next key
+                collected.append(nxt.strip())
+            return " ".join(collected).strip()
+        return val.strip("\"'")
+    return ""
 
 
 def body_hash(body: str | None) -> str | None:

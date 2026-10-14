@@ -16,7 +16,7 @@ import pytest
 import dream.skills.skill_derive as SD
 import dream.skills.skill_doc as D
 import dream.skills.skill_draft as DR
-from dream.skills.skill_measure import skill_description
+from dream.skills.skill_doc import skill_description
 
 _BODY = (
     "---\n"

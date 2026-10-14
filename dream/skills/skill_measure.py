@@ -38,32 +38,6 @@ PROJECTS_DIR = config.PROJECTS_DIR  # dev-only --source jsonl path; the nightly 
 OUT_DIR = config.DATA_DIR
 
 
-def skill_description(text: str) -> str:
-    """Parse the frontmatter `description`, handling YAML block scalars (`>` / `|`),
-    plain, and quoted forms. The naive `^description:\\s*(.+)$` grabbed just ">" for
-    multi-line block-scalar descriptions — which silently fed the judge garbage."""
-    m = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
-    if not m:
-        return ""
-    lines = m.group(1).split("\n")
-    for i, line in enumerate(lines):
-        dm = re.match(r"^(\s*)description:\s*(.*)$", line)
-        if not dm:
-            continue
-        base_indent, val = len(dm.group(1)), dm.group(2).strip()
-        if val[:1] in ("|", ">"):  # block scalar — collect more-indented following lines
-            collected = []
-            for nxt in lines[i + 1 :]:
-                if not nxt.strip():
-                    continue
-                if len(nxt) - len(nxt.lstrip()) <= base_indent:
-                    break  # dedent = next key
-                collected.append(nxt.strip())
-            return " ".join(collected).strip()
-        return val.strip("\"'")
-    return ""
-
-
 def load_catalog(conn) -> list[tuple[str, str]]:
     """(name, description) for ACTIVE skills, ordered by name — the lane-wide registry read
     every detector shares. Server-side the registry IS the catalog (the dream container has no
