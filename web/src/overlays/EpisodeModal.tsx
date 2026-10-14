@@ -2,29 +2,24 @@
 // both-directions provenance for verifying extraction (spec §IA).
 import type React from 'react';
 import { useState } from 'react';
-import { cascadeSummary, deleteEpisode, fetchDerived, fetchEpisode, type Derived } from '../api';
+import { cascadeSummary, deleteEpisode } from '../api';
 import { closeOverlay } from '../hash';
 import { srcColor } from '../tokens';
 import { DerivedBlock } from '../components/FeedCard';
 import { DeleteButton, Spinner } from '../components/ui';
-import { useAsync } from '../hooks';
+import { useEpisode } from '../hooks';
 
 const chip = (bg: string, color: string, border?: string): React.CSSProperties => ({
   fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 7px', borderRadius: '4px', background: bg, color, border: border || 'none',
 });
 
 export function EpisodeModal({ id }: { id: string }) {
-  const { data, error } = useAsync(() => Promise.all([
-    fetchEpisode(id),
-    fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
-  ]).then(([e, d]) => ({ ep: e, derived: d })), [id]);
+  const { ep, derived, error } = useEpisode(id);
   // After a successful delete the episode no longer exists, so the overlay stops showing
   // it and shows the cascade summary instead — closing straight away would hide the one
   // line that says what else went (mixed chunks, unlinked facts). Dismiss closes.
   const [deleted, setDeleted] = useState<string | null>(null);
   const [delErr, setDelErr] = useState(false);
-  const ep = data?.ep ?? null;
-  const derived = data?.derived ?? null;
   const err = error != null;
 
   const turns = ep ? [

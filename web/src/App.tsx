@@ -2,7 +2,7 @@
 // selection is React state; overlays live in the URL hash.
 import { Component, Suspense, lazy, type ReactNode } from 'react';
 import { StoreProvider, useStore } from './state';
-import { MOCK } from './mock';
+import { MOCK } from './mode';
 import { Header } from './components/Header';
 import { Login } from './components/Login';
 import { Feed } from './pages/Feed';

@@ -3,7 +3,7 @@
 // the header can render them on every page.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { fetchCatalog, fetchProposals, getToken, clearToken, onAuthFail, type Catalog } from './api';
-import { MOCK } from './mock';
+import { MOCK } from './mode';
 
 export type Group = 'all' | 'technical' | 'personal';
 export type Page = 'feed' | 'recall' | 'graph' | 'timeline' | 'metrics' | 'review' | 'search';

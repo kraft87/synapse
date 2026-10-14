@@ -2,9 +2,17 @@
 // (owned by the server agent). Everything is Bearer-token authenticated except the
 // static shell. When location.hash contains "mock", the mock dataset is served instead
 // so every screen renders offline.
-import { mockApi, mockDeleteEpisode, mockDeleteFact, mockFlag, mockRecall, MOCK } from './mock';
+import { MOCK } from './mode';
 
 export { MOCK };
+
+// The #mock fixtures load on demand (their own chunk), so a normal page never fetches them.
+const mock = () => import('./mock');
+const mockApi = <T,>(path: string): Promise<T> => mock().then((m) => m.mockApi<T>(path));
+const mockRecall = <T,>(query: string): Promise<T> => mock().then((m) => m.mockRecall<T>(query));
+const mockDeleteEpisode = <T,>(id: string): Promise<T> => mock().then((m) => m.mockDeleteEpisode<T>(id));
+const mockDeleteFact = <T,>(id: string): Promise<T> => mock().then((m) => m.mockDeleteFact<T>(id));
+const mockFlag = (kind: string, id: string) => mock().then((m) => m.mockFlag(kind, id));
 
 const BASE = '/dash/api';
 const TOKEN_KEY = 'synapse.token';
@@ -165,7 +173,7 @@ export const fetchFlags = (): Promise<{ flags: FlagRow[] }> =>
   MOCK ? mockApi('/flags') : req('/flags');
 
 export const postFlag = (kind: string, id: string, note?: string): Promise<{ status: string; flagged: boolean }> =>
-  MOCK ? Promise.resolve(mockFlag(kind, id)) : req('/flag', {
+  MOCK ? mockFlag(kind, id) : req('/flag', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ kind, id, note }),

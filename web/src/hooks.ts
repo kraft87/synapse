@@ -1,5 +1,6 @@
 // Shared React hooks.
 import { useEffect, useState } from 'react';
+import { fetchDerived, fetchEpisode, type Derived, type Episode } from './api';
 
 // One-shot async fetch: loading / data / error, runs fn on mount and whenever a dep
 // changes (or reload() is called). A `live` mount-guard drops stale resolutions so a
@@ -28,4 +29,14 @@ export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]): AsyncResult<
   }, [...deps, tick]);
   const reload = () => setTick((t) => t + 1);
   return { ...state, reload };
+}
+
+// An episode and what was extracted from it. The derived panel is garnish: a failed
+// derived fetch leaves it empty rather than failing the whole episode.
+export function useEpisode(id: string): { ep: Episode | null; derived: Derived | null; error: string | null } {
+  const { data, error } = useAsync(() => Promise.all([
+    fetchEpisode(id),
+    fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
+  ]).then(([ep, derived]) => ({ ep, derived })), [id]);
+  return { ep: data?.ep ?? null, derived: data?.derived ?? null, error };
 }

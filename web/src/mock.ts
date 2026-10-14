@@ -1,9 +1,6 @@
 // Offline fixture dataset for `#mock` mode — obviously synthetic, no real data
 // (this repo is public). Enough to render every phase-1 screen without a server.
-export const MOCK =
-  typeof location !== 'undefined' &&
-  (location.hash.includes('mock') || (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('synapse.mock') === '1'));
-if (MOCK && typeof sessionStorage !== 'undefined') sessionStorage.setItem('synapse.mock', '1');
+// Loaded on demand by api.ts when MOCK (mode.ts) is set; a normal page never fetches it.
 
 const now = Date.now();
 const iso = (hAgo: number) => new Date(now - hAgo * 3600e3).toISOString();

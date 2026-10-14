@@ -108,6 +108,10 @@ export function relTime(ts?: string): string {
 // A tool-call trace is detected heuristically from stored episode content — the
 // contract delegates display derivation to the client.
 const TOOL_RE = /(^|\n)\s*(Read|Edit|Write|MultiEdit|Bash|Grep|Glob|LS|NotebookEdit|Task|WebFetch|WebSearch|Tool)\b/;
+// A turn pair as one readable block ("user: …" / "assistant: …"); either side may be empty.
+export const turnBody = (t: { human_turn?: string; assistant_turn?: string }): string =>
+  [t.human_turn && 'user: ' + t.human_turn, t.assistant_turn && 'assistant: ' + t.assistant_turn].filter(Boolean).join('\n\n');
+
 export const hasToolTrace = (content?: string): boolean => !!content && TOOL_RE.test(content);
 
 // Build a human validity string from bitemporal fields.

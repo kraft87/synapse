@@ -2,11 +2,11 @@
 // fetching /episode/:id (+ /derived); fact & timeline items expand inline from
 // the feed payload. All expansion is in place — provenance opens overlays.
 import { useState, type CSSProperties } from 'react';
-import { fetchDerived, fetchEpisode, type Derived, type FeedItem } from '../api';
-import { hasToolTrace, relTime, validityLine } from '../tokens';
+import type { Derived, FeedItem } from '../api';
+import { hasToolTrace, relTime, turnBody, validityLine } from '../tokens';
 import { openEpisode, openSession } from '../hash';
 import { FlagButton, ProjectChip, SalLabel, SourceChip, TypeChip } from './ui';
-import { useAsync } from '../hooks';
+import { useEpisode } from '../hooks';
 
 const provBtn: CSSProperties = {
   border: 'none', background: 'none', padding: 0, color: 'var(--acc)', cursor: 'pointer',
@@ -42,18 +42,13 @@ export function DerivedBlock({ derived, heading = 'extracted from this episode',
 }
 
 function EpisodeExpansion({ item }: { item: FeedItem }) {
-  const { data, error } = useAsync(() => Promise.all([
-    fetchEpisode(item.id),
-    fetchDerived(item.id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
-  ]).then(([e, d]) => ({ ep: e, derived: d })), [item.id]);
+  const { ep, derived, error } = useEpisode(item.id);
   const [traceOpen, setTraceOpen] = useState(false);
-  const ep = data?.ep ?? null;
-  const derived = data?.derived ?? null;
 
   if (error) return <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--line)', color: 'var(--err)', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>couldn't load episode</div>;
   if (!ep) return <div style={{ marginTop: '10px', paddingTop: '10px', borderTop: '1px solid var(--line)', color: 'var(--txt3)', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>loading…</div>;
 
-  const body = [ep.human_turn && 'user: ' + ep.human_turn, ep.assistant_turn && 'assistant: ' + ep.assistant_turn].filter(Boolean).join('\n\n');
+  const body = turnBody(ep);
   const showTrace = hasToolTrace(ep.content);
   const sessionId = item.data.session_id;
 

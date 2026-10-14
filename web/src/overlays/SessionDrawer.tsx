@@ -5,6 +5,7 @@ import { fetchSession } from '../api';
 import { closeOverlay } from '../hash';
 import { Spinner } from '../components/ui';
 import { useAsync } from '../hooks';
+import { turnBody } from '../tokens';
 
 export function SessionDrawer({ id, highlight }: { id: string; highlight?: string }) {
   const { data: sess, error } = useAsync(() => fetchSession(id, highlight), [id, highlight]);
@@ -37,14 +38,13 @@ export function SessionDrawer({ id, highlight }: { id: string; highlight?: strin
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
               {sess.episodes.map((ep) => {
                 const target = hl != null && String(ep.id) === hl;
-                const body = [ep.human_turn && 'user: ' + ep.human_turn, ep.assistant_turn && 'assistant: ' + ep.assistant_turn].filter(Boolean).join('\n\n');
                 return (
                   <div key={ep.id} ref={target ? targetRef : undefined} style={{ border: '1px solid ' + (target ? 'var(--line2)' : 'var(--line)'), borderRadius: '9px', padding: '10px 13px', background: target ? 'var(--bg2)' : 'transparent' }}>
                     <div style={{ display: 'flex', gap: '8px', alignItems: 'baseline', marginBottom: '5px' }}>
                       <span style={{ fontFamily: 'var(--font-data)', fontSize: '10px', color: 'var(--txt3)' }}>seq {ep.sequence}</span>
                       {target && <span style={{ fontFamily: 'var(--font-data)', fontSize: '9.5px', padding: '1px 6px', borderRadius: '3px', background: 'var(--acc-bg)', color: 'var(--acc)' }}>viewing</span>}
                     </div>
-                    <div style={{ fontSize: '13px', lineHeight: 1.55, color: 'var(--txt2)', whiteSpace: 'pre-wrap' }}>{body}</div>
+                    <div style={{ fontSize: '13px', lineHeight: 1.55, color: 'var(--txt2)', whiteSpace: 'pre-wrap' }}>{turnBody(ep)}</div>
                   </div>
                 );
               })}
