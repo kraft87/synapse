@@ -1304,7 +1304,8 @@ async def test_stream_manager_hydrates_notify_into_buffer(clean, conn, db_url):
         assert item["gist"] == "stream me" and item["flagged"] is False
         assert item["project"] == "synapse"
         # The status refresher populated the shared snapshot the header badge reads.
-        assert set(mgr.status) == {"queue_depth", "active"}
+        await asyncio.wait_for(mgr.status_ready.wait(), timeout=10)
+        assert set(mgr.status) == {"queue_depth", "processing", "failed", "active"}
         assert isinstance(mgr.status["queue_depth"], int)
     finally:
         mgr.unsubscribe()
@@ -1344,6 +1345,152 @@ async def test_stream_manager_relistens_after_the_connection_drops(
         assert mgr.buffer._events[-1][1]["id"] == str(eid)
     finally:
         mgr.unsubscribe()
+
+
+async def _never_disconnected() -> bool:
+    return False
+
+
+async def _frames_until(stream, event: str, limit: int = 30) -> list[str]:
+    """Pull frames off an _event_stream until one is `event:`-named (inclusive)."""
+    out: list[str] = []
+    for _ in range(limit):
+        frame = await asyncio.wait_for(stream.__anext__(), timeout=10)
+        out.append(frame)
+        if frame.startswith(f"event: {event}\n"):
+            return out
+    raise AssertionError(f"no {event} frame in {limit} frames: {out}")
+
+
+def _frame_payload(frame: str) -> dict:
+    import json as _json
+
+    return _json.loads(frame.split("data: ", 1)[1])
+
+
+def test_processing_status_counts_pending_processing_and_failed(clean, conn, db_url):
+    """The header badge needs more than the pending count: claimed rows (processing) used to
+    vanish from it, and failed rows never showed. queue_depth/active stay for compatibility."""
+    for status in ("pending", "pending", "processing", "failed", "done"):
+        _queue(conn, status=status, enqueued_at=_t(0))
+    assert dr._processing_status(db_url) == {
+        "queue_depth": 2,
+        "processing": 1,
+        "failed": 1,
+        "active": True,
+    }
+
+
+async def test_stream_first_frames_are_ready_then_a_fresh_status(clean, conn, db_url):
+    """A connection opens with `ready` (the stream is positioned and LISTENing: the client
+    refetches page 1 now) and then a status snapshot computed for THIS connection, not the
+    zeros the manager starts with or the previous run's leftovers."""
+    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+
+    _queue(conn, status="pending", enqueued_at=_t(0))
+    _queue(conn, status="processing", enqueued_at=_t(0))
+    mgr = _StreamManager(db_url)
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        frames = await _frames_until(stream, "processing_status")
+        assert frames[0] == "event: ready\ndata: {}\n\n"
+        assert _frame_payload(frames[-1]) == {
+            "queue_depth": 1,
+            "processing": 1,
+            "failed": 0,
+            "active": True,
+        }
+    finally:
+        await stream.aclose()
+    assert mgr.status is None  # the last client left: the snapshot is dropped, not kept stale
+
+    # Next connection, after the queue changed: its first status reflects the change.
+    _queue(conn, status="pending", enqueued_at=_t(0))
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        frames = await _frames_until(stream, "processing_status")
+        assert _frame_payload(frames[-1])["queue_depth"] == 2
+    finally:
+        await stream.aclose()
+
+
+async def test_stream_delivers_a_row_committed_right_after_ready(clean, conn, db_url):
+    """`ready` means the lazily-started worker is LISTENing: a row committed the moment the
+    client sees it (the client's page-1 fetch follows it) is delivered, not lost to the
+    worker's startup the way a first-subscriber NOTIFY used to be."""
+    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+
+    mgr = _StreamManager(db_url)
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        await _frames_until(stream, "ready")
+        assert mgr.listening.is_set()
+        eid = _episode(conn, session="after-ready", seq=1, content="right after ready")
+        frames = await _frames_until(stream, "new_episode")
+        assert _frame_payload(frames[-1])["id"] == str(eid)
+    finally:
+        await stream.aclose()
+
+
+async def test_stream_status_is_dropped_when_the_refresh_fails(clean, db_url, monkeypatch):
+    """A count that can no longer be read is withdrawn (no status frames), not served stale."""
+    from mcp_server.dashboard_routes import _StreamManager
+
+    def boom(_url):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(dr, "_processing_status", boom)
+    mgr = _StreamManager(db_url)
+    mgr.status = {"queue_depth": 9, "active": False}
+    mgr.subscribe()
+    try:
+        await asyncio.wait_for(mgr.status_ready.wait(), timeout=10)
+        assert mgr.status is None
+    finally:
+        mgr.unsubscribe()
+
+
+async def test_stream_replays_buffered_events_after_ready(clean, db_url):
+    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+
+    mgr = _StreamManager(db_url)
+    for i in (1, 2, 3):
+        mgr.buffer.append({"type": "episode", "id": str(i)})
+    stream = _event_stream(mgr, _never_disconnected, 1)  # client has event 1, missed 2 and 3
+    try:
+        frames = await _frames_until(stream, "processing_status")
+        assert [f.split("\n")[0] for f in frames] == [
+            "event: ready",
+            "event: new_episode",
+            "event: new_episode",
+            "event: processing_status",
+        ]
+        assert [f.split("\n")[1] for f in frames[1:3]] == ["id: 2", "id: 3"]
+    finally:
+        await stream.aclose()
+
+
+async def test_stream_resets_a_connection_the_ring_buffer_outran(clean, db_url):
+    """A reader blocked on a yield while the ring evicts events it has not sent must be told
+    (`reset`: refetch page 1), the same as a resume across the gap, not skipped silently."""
+    from mcp_server.dashboard_routes import _event_stream, _FeedEventBuffer, _StreamManager
+
+    mgr = _StreamManager(db_url)
+    mgr.buffer = _FeedEventBuffer(capacity=3)
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        await _frames_until(stream, "processing_status")  # suspended on that yield
+        for i in range(1, 6):  # a burst of 5 into 3 slots: events 1 and 2 are evicted
+            mgr.buffer.append({"type": "episode", "id": str(i)})
+        frame = await asyncio.wait_for(stream.__anext__(), timeout=10)
+        assert frame == "event: reset\ndata: {}\n\n"
+        # It resumed from the head: later events stream normally, the evicted ones are not
+        # replayed as if nothing happened.
+        mgr.buffer.append({"type": "episode", "id": "6"})
+        frames = await _frames_until(stream, "new_episode")
+        assert frames[-1].splitlines()[1] == "id: 6"
+    finally:
+        await stream.aclose()
 
 
 def test_sse_frame_format():

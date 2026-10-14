@@ -36,7 +36,7 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -111,6 +111,7 @@ _STREAM_BUFFER_CAP = 512  # ring-buffer slots (contract: 512-event replay window
 _STREAM_POLL_S = 0.25  # per-connection buffer poll cadence (new-event latency ceiling)
 _STREAM_STATUS_S = 1.0  # processing_status emit cadence (contract: ~1/s)
 _STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the stream
+_STREAM_READY_S = 2.0  # a new connection waits at most this long for LISTEN + a first status
 _STREAM_RECONNECT_MIN_S = 1.0  # LISTEN reconnect backoff: first retry delay ...
 _STREAM_RECONNECT_MAX_S = 30.0  # ... doubling up to this
 
@@ -2215,7 +2216,8 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
 # the last disconnects) hydrates each notification into a full FeedItem — via the SAME
 # per-type SELECT + mapper the /feed endpoint uses — and appends it to a 512-slot ring
 # buffer keyed by a monotonically increasing integer event id. The /dash/api/stream route
-# replays from the buffer on resume (Last-Event-ID) and streams live thereafter.
+# opens each connection with `ready` (the client refetches page 1 on it), replays from the
+# buffer on resume (Last-Event-ID) and streams live thereafter.
 
 
 def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | None:
@@ -2245,21 +2247,26 @@ def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | No
 
 
 def _processing_status(db_url: str) -> dict[str, Any]:
-    """Extraction-queue health for the header live badge: {queue_depth, active}. ONE cheap
+    """Extraction-queue health for the header live badge: pending (queue_depth, the name the
+    wire has always used), processing, failed and active (anything processing). ONE cheap
     indexed count (extraction_queue_status_idx) — the status refresher runs it once/second,
     shared across all connected SSE clients, never per-connection."""
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         row = (
             conn.execute(
-                "SELECT count(*) FILTER (WHERE status = 'pending') AS queue_depth, "
-                "       count(*) FILTER (WHERE status = 'processing') AS processing "
-                "FROM extraction_queue WHERE status IN ('pending', 'processing')"
+                "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, "
+                "       count(*) FILTER (WHERE status = 'processing') AS processing, "
+                "       count(*) FILTER (WHERE status = 'failed') AS failed "
+                "FROM extraction_queue WHERE status IN ('pending', 'processing', 'failed')"
             ).fetchone()
             or {}
         )
+        processing = int(row.get("processing") or 0)
         return {
-            "queue_depth": int(row.get("queue_depth") or 0),
-            "active": int(row.get("processing") or 0) > 0,
+            "queue_depth": int(row.get("pending") or 0),
+            "processing": processing,
+            "failed": int(row.get("failed") or 0),
+            "active": processing > 0,
         }
 
 
@@ -2317,10 +2324,14 @@ class _StreamManager:
     def __init__(self, db_url: str) -> None:
         self._db_url = db_url
         self.buffer = _FeedEventBuffer()
-        self.status: dict[str, Any] = {"queue_depth": 0, "active": False}
+        # The shared processing_status snapshot; None while there is none to serve (no
+        # subscriber yet, or the last refresh failed), so a stale count is never sent.
+        self.status: dict[str, Any] | None = None
         # Set once the LISTEN is actually issued — lets a caller (and the tests) know a
         # NOTIFY inserted from now on will be delivered, not raced against worker startup.
         self.listening = asyncio.Event()
+        # Set once the status loop has made its first refresh attempt (success or not).
+        self.status_ready = asyncio.Event()
         self._subscribers = 0
         self._tasks: list[asyncio.Task[Any]] = []
 
@@ -2341,6 +2352,20 @@ class _StreamManager:
                 t.cancel()
             self._tasks = []
             self.listening.clear()
+            self.status = None  # the next first subscriber must not be handed this run's count
+            self.status_ready.clear()
+
+    async def wait_ready(self) -> None:
+        """Block until the LISTEN is issued and the first status snapshot is in, so what a
+        new connection sends first is current. Gives up after _STREAM_READY_S when the DB is
+        unreachable: the connection streams anyway, and the worker's gap marker resyncs the
+        client once the DB is back."""
+        try:
+            async with asyncio.timeout(_STREAM_READY_S):
+                await self.listening.wait()
+                await self.status_ready.wait()
+        except TimeoutError:
+            logger.warning("dash stream: not ready after %.0fs; streaming anyway", _STREAM_READY_S)
 
     async def _listen_loop(self) -> None:
         """One dedicated async connection LISTENing on the dash_feed channel; hydrates each
@@ -2406,8 +2431,10 @@ class _StreamManager:
             while True:
                 try:
                     self.status = await loop.run_in_executor(None, _processing_status, self._db_url)
-                except Exception as e:  # pragma: no cover - defensive
+                except Exception as e:
+                    self.status = None  # withdraw the count rather than serve it stale
                     logger.warning("dash stream: status refresh failed: %s", e)
+                self.status_ready.set()
                 await asyncio.sleep(_STREAM_STATUS_S)
         except asyncio.CancelledError:
             pass
@@ -2422,6 +2449,61 @@ def _sse_frame(event: str, data: str, event_id: int | None = None) -> str:
         lines.append(f"id: {event_id}")
     lines.append(f"data: {data}")
     return "\n".join(lines) + "\n\n"
+
+
+async def _event_stream(
+    manager: _StreamManager,
+    is_disconnected: Callable[[], Awaitable[bool]],
+    last_id: int | None,
+) -> AsyncIterator[str]:
+    """One SSE connection's frames: `ready`, the resume replay, then live feed events, a
+    processing_status snapshot ~1/s and a heartbeat comment every 15s.
+
+    `ready` is sent once the LISTEN is up and this connection's position is fixed: every row
+    committed from then on is delivered, so the client refetches page 1 on it and holds
+    everything older. That fetch is what closes the gaps (rows written while the client was
+    away, before the worker was listening, or between its first /feed and the connect); the
+    replay is only the shortcut for rows still in the ring, so a Last-Event-ID the ring can
+    no longer resume simply gets no replay."""
+    manager.subscribe()
+    try:
+        await manager.wait_ready()
+        buf = manager.buffer
+        sent = buf.head
+        replay: list[tuple[int, dict[str, Any]]] = []
+        if last_id is not None:
+            mode, events = buf.resume(last_id)
+            if mode == "replay":
+                sent, replay = last_id, events
+        yield _sse_frame("ready", "{}")
+        for eid, item in replay:
+            yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
+            sent = eid
+        last_status = 0.0  # the first pass sends the status at once
+        last_hb = time.monotonic()
+        while True:
+            if await is_disconnected():
+                break
+            oldest = buf.oldest()
+            if oldest is not None and sent < oldest - 1:
+                # The ring outran this connection (a slow reader through a burst): the
+                # evicted events are gone, so the client refetches rather than skip them.
+                sent = buf.head  # before the yield: events appended while we're suspended are new
+                yield _sse_frame("reset", "{}")
+                continue
+            for eid, item in buf.since(sent):
+                yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
+                sent = eid
+            now = time.monotonic()
+            if now - last_status >= _STREAM_STATUS_S and manager.status is not None:
+                yield _sse_frame("processing_status", json.dumps(manager.status))
+                last_status = now
+            if now - last_hb >= _STREAM_HEARTBEAT_S:
+                yield ": heartbeat\n\n"
+                last_hb = now
+            await asyncio.sleep(_STREAM_POLL_S)
+    finally:
+        manager.unsubscribe()
 
 
 # ---------------------------------------------------------------------------
@@ -2576,58 +2658,19 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     async def dash_stream(request: Request) -> Response:
         """SSE live feed (Phase 3). Admin-gated like every /dash/api/* route — the
         client uses fetch + a ReadableStream parser (not EventSource) so it CAN send the
-        Authorization header. On connect: if Last-Event-ID (header or ?last_event_id=) is
-        still inside the ring buffer, replay from it; if it aged out or is ahead of us, emit
-        a `reset` event (client refetches page 1). Then stream live feed events
-        (new_episode|new_fact|new_timeline_event, data = the FeedItem JSON) plus a
-        processing_status snapshot ~1/s and a heartbeat comment every 15s."""
+        Authorization header. Frames: `ready` first (the client refetches page 1 on it), then
+        the Last-Event-ID (header or ?last_event_id=) replay while that id is still inside the
+        ring buffer, then live feed events (new_episode|new_fact|new_timeline_event, data =
+        the FeedItem JSON), `reset` when the ring outran this connection or the LISTEN worker
+        lost its connection (refetch page 1 again), a processing_status snapshot ~1/s and a
+        heartbeat comment every 15s."""
         if not authorized(request):
             return _unauthorized()
         raw = request.headers.get("last-event-id") or request.query_params.get("last_event_id")
         last_id = int(raw) if (raw and raw.lstrip("-").isdigit()) else None
 
-        async def gen() -> Any:
-            stream_manager.subscribe()
-            try:
-                buf = stream_manager.buffer
-                if last_id is not None:
-                    mode, events = buf.resume(last_id)
-                    if mode == "reset":
-                        yield _sse_frame("reset", "{}")
-                        sent = buf.head
-                    else:
-                        sent = last_id
-                        for eid, item in events:
-                            yield _sse_frame(
-                                _STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid
-                            )
-                            sent = eid
-                else:
-                    # Fresh connect: the client already has page 1 from /feed, so start live
-                    # from the current head — only genuinely new events stream.
-                    sent = buf.head
-                # Push status immediately so the header live badge is correct on connect.
-                yield _sse_frame("processing_status", json.dumps(stream_manager.status))
-                last_status = last_hb = time.monotonic()
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    for eid, item in buf.since(sent):
-                        yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
-                        sent = eid
-                    now = time.monotonic()
-                    if now - last_status >= _STREAM_STATUS_S:
-                        yield _sse_frame("processing_status", json.dumps(stream_manager.status))
-                        last_status = now
-                    if now - last_hb >= _STREAM_HEARTBEAT_S:
-                        yield ": heartbeat\n\n"
-                        last_hb = now
-                    await asyncio.sleep(_STREAM_POLL_S)
-            finally:
-                stream_manager.unsubscribe()
-
         return StreamingResponse(
-            gen(),
+            _event_stream(stream_manager, request.is_disconnected, last_id),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
