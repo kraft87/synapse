@@ -143,13 +143,22 @@ resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link.
 Flag kinds: `episode | fact | timeline_event | preference | note`.
 `item_id`: episode/timeline/preference/note → numeric id as string; fact → edge uuid.
 ```json
-POST body: {"kind": "fact", "id": "<item_id>", "note": "optional"}
+POST body: {"kind": "fact", "id": "<item_id>", "flagged": true, "note": "optional"}
 POST resp: {"status": "ok", "flagged": true}
 GET  resp: {"flags": [{"id": 3, "kind": "fact", "item_id": "…", "note": null,
-                        "created_at": "…", "gist": "<resolved item text, best effort>"}]}
+                        "created_at": "…", "gist": "<resolved item text, best effort>",
+                        "episode_id": 227168}]}
 ```
-POST toggles: no active row → insert; active row → set `removed_at`. Every toggle appends
-a `dashboard_audit` row. Flag state on feed/entity payloads comes from the active set.
+`flagged` (optional boolean) is the state the operator wants: `true` always ends flagged and
+`false` always ends unflagged, idempotently (a repeat changes nothing and writes no audit
+row), and the response carries the state it ended in. Without `flagged` the POST toggles (no
+active row → insert; active row → set `removed_at`), the shape older clients send. A
+non-boolean `flagged` is a 400. Every change appends a `dashboard_audit` row. Flag state on
+feed/entity payloads comes from the active set.
+
+`episode_id` on a flag row is the episode the Flags tab opens for it: the episode itself, a
+fact's first provenance episode, or the `ep:<id>` turn a timeline event, preference or note
+was born from. `null` when the ref names no turn (a git SHA) or the episode is gone.
 
 ## Phase 2 endpoints (Recall console)
 
@@ -271,14 +280,16 @@ Normalized detail over the lane's `_proposal_detail`.
 {"id": "skill:12", "kind": "skill", "name": "latency-triage", "status": "proposed",
  "evidence": [{"session_id": "…", "class": "grounded", "signal": "explicit_request", "why": "…"}],
  "provenance_episodes": [227168, 227201],
+ "provenance_sessions": ["…"],
  "payload": {"type": "markdown", "content": "# latency-triage\n…"},
  "audit_log": [{"ts": "…", "action": "proposal_approve", "note": "…"}]}
 ```
 - `evidence` (`str | list`): the lane's raw evidence list (both lanes store a list).
-- `provenance_episodes`: best-effort episode ids behind the evidence — explicit
-  `episode_id` / `ep:<id>` refs on entries, plus the episodes of each distinct evidence
-  `session_id` (bounded 40). `[]` when nothing resolves (lane evidence is keyed by
-  session, not episode, so this is genuinely best-effort).
+- `provenance_episodes`: the episode ids the evidence names outright — an `episode_id` or
+  `ep:<id>` ref on an entry. `[]` when none does (lane evidence is keyed by session, not
+  turn, so most proposals have none).
+- `provenance_sessions`: every distinct evidence `session_id`, first-seen order, uncapped.
+  The client links each to the session drawer instead of guessing turns.
 - `payload.type`: `markdown` (skills SKILL.md draft from `proposal_body`; falls back to
   `summary`) or `diff` (config unified `diff`).
 - `audit_log`: `dashboard_audit` rows for this id, oldest first; plus the lane's own
@@ -289,6 +300,12 @@ Normalized detail over the lane's `_proposal_detail`.
 ```json
 body: {"action": "approve" | "reject", "note": "…"}
 ```
+- A decision applies only to a `proposed` row. Any other status (an applied config, a
+  promoted or already-rejected skill, a double click) returns
+  `{"status": "refused", "detail": "proposal is '<status>', not 'proposed'"}`, changes
+  nothing and writes no audit row; the Review page reloads to show the real status. The
+  check is a read before the lane's update, so two decisions landing in the same instant can
+  still both pass; closing that is the lanes' job.
 - `approve` → the lane's `_proposal_act(..., "accept", ...)`, delegating the lane's own accept:
   - **skills**: applies the proposal. The drafted `proposal_body` is written to
     `skills_lane.skill_registry` through the same upsert `/skills/publish` uses (the two-way
@@ -698,8 +715,12 @@ Deletes the episode row and everything that carries ITS CONTENT. Non-numeric id 
 no such episode → 404 `episode not found`.
 ```json
 {"episode_id": 227168, "chunks_deleted": 3, "chunks_mixed_deleted": 1,
- "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1}
+ "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1, "events_kept": 0,
+ "deleted_fact_ids": ["<edge-uuid>", "<edge-uuid>"], "deleted_event_ids": [8841]}
 ```
+`deleted_fact_ids` / `deleted_event_ids` name the rows the cascade removed (not the unlinked
+or kept ones), so a client can drop them from its lists. The audit row's `detail` is this
+same object.
 
 **Cascade semantics (the sole-vs-shared rule).** Provenance that names ONLY the deleted
 episode is deleted; provenance SHARED with surviving episodes is unlinked, not deleted.
@@ -727,14 +748,23 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
     NULLed so no edge cites a uuid that no longer exists.
 - **timeline events** (`timeline_events.source_ref` = `ep:<id>` or `ep:<id>#<k>` — the
   multi-event-per-turn form written by `ingestion/timeline_gate.py`) → DELETED
-  (`events_deleted`). `UNIQUE (source, source_ref)` makes a chat event sole-provenance by
-  construction, so the sole-vs-shared rule resolves to "delete"; leaving them would keep
-  serving the deleted turn's content out of `recall()`'s timeline leg.
-- **extraction_queue** rows (`episode_id` FK, `ON DELETE CASCADE`, schema 001) carry a
-  verbatim copy of `episodes.content`, so they must go — the existing FK already does it.
-  Not counted in the response (the operator never sees the queue as memory).
-- **dashboard_flags**: an ACTIVE flag on the deleted item is retired (`removed_at`) so the
-  Flags list can't point at a row that no longer exists. `dashboard_audit` gains a
+  (`events_deleted`). `UNIQUE (source, source_ref)` makes the first telling's turn the
+  owner, so the sole-vs-shared rule resolves to "delete"; leaving them would keep serving
+  the deleted turn's content out of `recall()`'s timeline leg. The exception is an event a
+  later turn re-told: the dedup merge (schema 037) only bumps `reported_count`, so a count
+  above 1 means a surviving turn backs the row too. The single-turn delete KEEPS such an
+  event (`events_kept`), lowering its count by one; its `source_ref` keeps naming the
+  deleted turn, because nothing records which turn re-told it. The private-session purge
+  deletes them anyway (a privacy wipe errs toward removal).
+- **extraction_queue** rows. Those with an `episode_id` (FK, `ON DELETE CASCADE`, schema
+  001) carry a verbatim copy of `episodes.content`, and the FK takes them. Chunk rows
+  (`content_type = 'chunk'`) are keyed by `(session_id, content)` with no `episode_id`, so
+  the FK misses them: the cascade deletes the ones matching each deleted chunk, in every
+  status. A pending one would otherwise re-extract the deleted text into facts with no
+  provenance, and a done one still stores it. Not counted in the response (the operator
+  never sees the queue as memory).
+- **dashboard_flags**: an ACTIVE flag on a deleted episode, fact or timeline event is
+  retired (`removed_at`) so the Flags list can't point at a row that no longer exists. `dashboard_audit` gains a
   `delete_episode` row carrying the cascade summary as `detail` (append-only; the audit
   log deliberately OUTLIVES the content — it records that a delete happened, not what was
   deleted).

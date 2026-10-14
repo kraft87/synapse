@@ -161,11 +161,13 @@ def _event(
     event_type=None,
     t_valid=None,
     ingested_at=None,
+    reported_count=1,
 ):
     return conn.execute(
         "INSERT INTO timeline_events "
-        "(t_valid, fact, source, source_ref, project, salience, domain, event_type, ingested_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "(t_valid, fact, source, source_ref, project, salience, domain, event_type, ingested_at, "
+        " reported_count) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
             t_valid or _t(0),
             fact,
@@ -176,6 +178,7 @@ def _event(
             domain,
             event_type,
             ingested_at or _t(0),
+            reported_count,
         ),
     ).fetchone()[0]
 
@@ -252,12 +255,25 @@ def _queue(
     attempts=0,
     enqueued_at=None,
     processed_at=None,
+    content_type="episode",
+    session_id=None,
 ):
     return conn.execute(
         "INSERT INTO extraction_queue "
-        "(episode_id, content, status, error, attempts, enqueued_at, processed_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-        (episode_id, content, status, error, attempts, enqueued_at, processed_at),
+        "(episode_id, content, status, error, attempts, enqueued_at, processed_at, "
+        " content_type, session_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (
+            episode_id,
+            content,
+            status,
+            error,
+            attempts,
+            enqueued_at,
+            processed_at,
+            content_type,
+            session_id,
+        ),
     ).fetchone()[0]
 
 
@@ -836,6 +852,77 @@ def test_flag_toggle_audit_and_feed_reflection(clean, conn, db_url):
     assert [a[0] for a in audit] == ["flag", "unflag", "flag"]
 
 
+def test_flag_with_explicit_state_is_idempotent(clean, conn, db_url):
+    """`flagged` says which state the operator wants, so a stale button or the Flags tab's
+    'unflag' can't invert the intent; a repeat changes nothing and writes no audit row.
+    Without `flagged` the route still toggles (older clients)."""
+    eid = _episode(conn, session="f2", seq=1, content="flag me", created_at=_t(1))
+
+    def post(**body):
+        with _client(db_url) as client:
+            r = client.post(
+                "/dash/api/flag", json={"kind": "episode", "id": str(eid), **body}, headers=_H
+            )
+        assert r.status_code == 200
+        return r.json()["flagged"]
+
+    assert [post(flagged=True), post(flagged=True)] == [True, True]
+    assert [post(flagged=False), post(flagged=False)] == [False, False]
+    assert post() is True  # no state given: toggle
+    assert post() is False
+    assert post(flagged=False) is False
+
+    active = conn.execute(
+        "SELECT count(*) FROM dashboard_flags WHERE item_id=%s AND removed_at IS NULL",
+        (str(eid),),
+    ).fetchone()[0]
+    assert active == 0
+    audit = conn.execute(
+        "SELECT action FROM dashboard_audit WHERE item_id=%s ORDER BY id", (str(eid),)
+    ).fetchall()
+    assert [a[0] for a in audit] == ["flag", "unflag", "flag", "unflag"]
+
+
+def test_flag_concurrent_requests_settle_without_error(clean, conn, db_url):
+    """Two simultaneous requests used to collide on the partial-unique index (500) while
+    the server ended up flagged. Whatever the interleaving, every request now answers 200
+    with a state, and exactly one active row exists."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    eid = _episode(conn, session="f3", seq=1, content="flag me", created_at=_t(1))
+    n = 8
+    gate = Barrier(n)
+
+    def hit(_):
+        gate.wait()
+        return dr._set_flag(db_url, "episode", str(eid), None, True)
+
+    with ThreadPoolExecutor(n) as pool:
+        assert list(pool.map(hit, range(n))) == [True] * n
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_flags WHERE item_id=%s AND removed_at IS NULL",
+            (str(eid),),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (str(eid),)
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_flag_rejects_non_boolean_state(clean, conn, db_url):
+    with _client(db_url) as client:
+        r = client.post(
+            "/dash/api/flag", json={"kind": "note", "id": "1", "flagged": "yes"}, headers=_H
+        )
+    assert r.status_code == 400
+
+
 def test_flags_list_resolves_gist_per_kind(clean, conn, db_url):
     eid = _episode(conn, session="g", seq=1, content="episode gist line")
     _rel(conn, "gf", src="a", tgt="b", fact="fact gist line")
@@ -860,6 +947,46 @@ def test_flags_list_resolves_gist_per_kind(clean, conn, db_url):
     assert flags[("timeline_event", str(evid))] == "event gist line"
     assert flags[("note", str(nid))] == "note gist line"
     assert flags[("preference", str(pid))] == "pref gist line"
+
+
+def test_flags_list_names_the_episode_each_flag_leads_to(clean, conn, db_url):
+    """Jump needs a target: a fact's first provenance episode, the ep:<id> turn an event,
+    preference or note was born from, and the episode itself. A ref that is not a turn
+    (a git SHA) or whose episode is gone resolves to null."""
+    ep = _episode(conn, session="g2", seq=1, content="source turn")
+    gone = ep + 1000
+    _entity(conn, "ge1", name="Widget")
+    _rel(conn, "gf-ok", src="ge1", tgt="ge1", episodes=[ep, gone])
+    _rel(conn, "gf-none", src="ge1", tgt="ge1", episodes=None)
+    ev_ok = _event(conn, source_ref=f"ep:{ep}#2")
+    ev_sha = _event(conn, source="git:synapse", source_ref="deadbeef")
+    ev_gone = _event(conn, source_ref=f"ep:{gone}")
+    pid = _pref(conn, pref="p", source_ref=f"ep:{ep}")
+    nid = _note(conn, hook="n", source_ref=f"ep:{ep}")
+    with _client(db_url) as client:
+        for kind, item in (
+            ("episode", str(ep)),
+            ("fact", "gf-ok"),
+            ("fact", "gf-none"),
+            ("timeline_event", str(ev_ok)),
+            ("timeline_event", str(ev_sha)),
+            ("timeline_event", str(ev_gone)),
+            ("preference", str(pid)),
+            ("note", str(nid)),
+        ):
+            client.post("/dash/api/flag", json={"kind": kind, "id": item}, headers=_H)
+        flags = client.get("/dash/api/flags", headers=_H).json()["flags"]
+    got = {(f["kind"], f["item_id"]): f["episode_id"] for f in flags}
+    assert got == {
+        ("episode", str(ep)): ep,
+        ("fact", "gf-ok"): ep,
+        ("fact", "gf-none"): None,
+        ("timeline_event", str(ev_ok)): ep,
+        ("timeline_event", str(ev_sha)): None,
+        ("timeline_event", str(ev_gone)): None,
+        ("preference", str(pid)): ep,
+        ("note", str(nid)): ep,
+    }
 
 
 def test_flag_rejects_bad_input(clean, conn, db_url):
@@ -1088,7 +1215,7 @@ def test_proposals_list_keeps_old_proposed_rows_behind_a_decided_backlog(
 
 
 def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_url):
-    # Episode sharing the skill evidence's session_id → best-effort provenance resolves.
+    # Episode sharing the skill evidence's session_id: the session is named, the turn is not.
     ep = _episode(conn, session="sess-sk", seq=1, content="the p95 regression session")
     sk = _skill_proposal(conn, name="latency-triage", status="proposed")
     cf = _config_proposal(conn, file_key="CLAUDE.md", status="proposed")
@@ -1101,7 +1228,8 @@ def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_
         assert (
             isinstance(sd["evidence"], list) and sd["evidence"][0]["signal"] == "explicit_request"
         )
-        assert ep in sd["provenance_episodes"]  # resolved from evidence session_id
+        assert sd["provenance_sessions"] == ["sess-sk"]
+        assert ep not in sd["provenance_episodes"]  # nothing in the evidence names a turn
         assert sd["audit_log"] == []  # not decided yet
 
         cd = client.get(f"/dash/api/proposals/config:{cf}", headers=_H).json()
@@ -1112,6 +1240,30 @@ def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_
         # malformed id -> 400, missing -> 404.
         assert client.get("/dash/api/proposals/bogus", headers=_H).status_code == 400
         assert client.get("/dash/api/proposals/skill:999999", headers=_H).status_code == 404
+
+
+def test_proposal_provenance_names_cited_turns_and_every_evidence_session(
+    clean_proposals, conn, db_url
+):
+    """Chips used to be the lowest-id turns of the evidence sessions under one global cap of
+    40, so later sessions got none and the turns shown were not the ones cited. Now explicit
+    refs are the episode chips, and every evidence session is listed once, in order."""
+    cited = _episode(conn, session="sess-a", seq=5, content="the cited turn")
+    for i in range(1, 60):  # more early turns than the old cap would have shown
+        _episode(conn, session="sess-a", seq=100 + i, content=f"filler {i}")
+    _episode(conn, session="sess-b", seq=1, content="late session turn")
+    evidence = [
+        {"session_id": "sess-a", "signal": "correction", "episode_id": cited},
+        {"session_id": "sess-b", "signal": "correction", "source_ref": f"ep:{cited}#2"},
+        {"session_id": "sess-a", "signal": "correction"},
+        {"session_id": "sess-c", "signal": "correction", "episode_id": str(cited + 1)},
+        {"signal": "correction", "why": "no session"},
+    ]
+    sk = _skill_proposal(conn, name="latency-triage", evidence=evidence)
+    with _client(db_url) as client:
+        d = client.get(f"/dash/api/proposals/skill:{sk}", headers=_H).json()
+    assert d["provenance_episodes"] == [cited, cited + 1]
+    assert d["provenance_sessions"] == ["sess-a", "sess-b", "sess-c"]
 
 
 def test_proposal_decision_approve_writes_state_and_audit(clean_proposals, conn, db_url):
@@ -1172,6 +1324,58 @@ def test_proposal_approve_without_draft_is_refused_and_not_audited(clean_proposa
             "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (f"skill:{sk}",)
         ).fetchone()[0]
         == 0
+    )
+
+
+def test_proposal_decision_only_applies_to_a_proposed_row(clean_proposals, conn, db_url):
+    """A pane loaded earlier (another tab, the CLI) can show 'proposed' for a row that
+    has moved on. Approving an applied config proposal used to put it back to 'accepted'
+    (the CLI would apply it again) and rejecting a promoted skill left it live in the
+    registry with a 30-day cooldown. Anything but 'proposed' is refused and not audited."""
+    applied = _config_proposal(conn, file_key="a.md", status="applied")
+    rejected = _config_proposal(conn, file_key="b.md", status="rejected")
+    promoted = _skill_proposal(conn, name="latency-triage", status="promoted")
+    with _client(db_url) as client:
+        for pid, action in (
+            (f"config:{applied}", "approve"),
+            (f"config:{applied}", "reject"),
+            (f"config:{rejected}", "approve"),
+            (f"skill:{promoted}", "reject"),
+            (f"skill:{promoted}", "approve"),
+        ):
+            r = client.post(
+                f"/dash/api/proposals/{pid}/decision",
+                json={"action": action, "note": "second thoughts"},
+                headers=_H,
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["status"] == "refused", (pid, action)
+            assert "not 'proposed'" in body["detail"]
+    assert conn.execute(
+        "SELECT status FROM config_lane.config_proposals WHERE id = ANY(%s) ORDER BY id",
+        ([applied, rejected],),
+    ).fetchall() == [("applied",), ("rejected",)]
+    assert conn.execute(
+        "SELECT status, rejected_until FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (promoted,),
+    ).fetchone() == ("promoted", None)
+    assert conn.execute("SELECT count(*) FROM dashboard_audit").fetchone()[0] == 0
+
+
+def test_proposal_double_decision_is_refused_the_second_time(clean_proposals, conn, db_url):
+    cf = _config_proposal(conn, file_key="rules/testing.md", status="proposed")
+    with _client(db_url) as client:
+        url = f"/dash/api/proposals/config:{cf}/decision"
+        first = client.post(url, json={"action": "reject", "note": "too generic"}, headers=_H)
+        again = client.post(url, json={"action": "reject", "note": "too generic"}, headers=_H)
+    assert first.json()["status"] == "rejected"
+    assert again.json()["status"] == "refused"
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (f"config:{cf}",)
+        ).fetchone()[0]
+        == 1
     )
 
 
@@ -2646,6 +2850,93 @@ def test_delete_episode_retires_flag_and_audits(clean, conn, db_url):
     assert [a[0] for a in audit] == ["flag", "delete_episode"]
     assert audit[1][1] == "episode"
     assert audit[1][2] == body  # the cascade summary IS the audit detail
+
+
+def test_delete_episode_removes_chunk_queue_rows_in_every_status(clean, conn, db_url):
+    """Chunk queue rows are keyed by (session_id, content) with no episode_id, so the 001
+    FK never reaches them. A pending one would re-extract the deleted text into facts with
+    no provenance; a done one still stores it verbatim. Both must go with the chunk."""
+    keep = _episode(conn, session="d6", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d6", seq=2, content="doomed turn with sk-SECRET")
+    window = "survivor turn\ndoomed turn with sk-SECRET"
+    _chunk(conn, session="d6", start=1, end=2, episode_ids=[keep, doomed], content=window)
+    _chunk(conn, session="d6", start=3, end=4, episode_ids=[keep], content="untouched window")
+    for status in ("pending", "processing", "done", "failed"):
+        _queue(
+            conn,
+            content=window,
+            status=status,
+            content_type="chunk",
+            session_id="d6",
+            enqueued_at=_t(0),
+        )
+    _queue(
+        conn, content=window, content_type="chunk", session_id="other-session", enqueued_at=_t(0)
+    )
+    _queue(
+        conn, content="untouched window", content_type="chunk", session_id="d6", enqueued_at=_t(0)
+    )
+
+    with _client(db_url) as client:
+        r = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H)
+    assert r.status_code == 200
+    left = conn.execute("SELECT content, session_id FROM extraction_queue ORDER BY id").fetchall()
+    assert left == [(window, "other-session"), ("untouched window", "d6")]
+
+
+def test_delete_episode_reports_cascaded_fact_and_event_ids(clean, conn, db_url):
+    """The client drops the cascade's rows from its lists: the response names the facts
+    and events that went, and only those (an unlinked fact is still there)."""
+    keep = _episode(conn, session="d7", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d7", seq=2, content="doomed turn")
+    _entity(conn, "i-e1", name="Widget")
+    _rel(conn, "i-sole", src="i-e1", tgt="i-e1", episodes=[doomed])
+    _rel(conn, "i-shared", src="i-e1", tgt="i-e1", episodes=[keep, doomed])
+    ev = _event(conn, fact="event one", source_ref=f"ep:{doomed}")
+    _event(conn, fact="other episode", source_ref=f"ep:{keep}")
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["deleted_fact_ids"] == ["i-sole"]
+    assert body["deleted_event_ids"] == [ev]
+
+
+def test_delete_episode_retires_flags_on_cascaded_facts_and_events(clean, conn, db_url):
+    """A flag on a row the cascade removed must not outlive it as a ghost in the Flags
+    list; flags on rows that survive (an unlinked fact) stay."""
+    keep = _episode(conn, session="d8", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d8", seq=2, content="doomed turn")
+    _entity(conn, "j-e1", name="Widget")
+    _rel(conn, "j-sole", src="j-e1", tgt="j-e1", episodes=[doomed])
+    _rel(conn, "j-shared", src="j-e1", tgt="j-e1", episodes=[keep, doomed])
+    ev = _event(conn, fact="event one", source_ref=f"ep:{doomed}")
+    with _client(db_url) as client:
+        for kind, item in (
+            ("episode", str(doomed)),
+            ("fact", "j-sole"),
+            ("fact", "j-shared"),
+            ("timeline_event", str(ev)),
+        ):
+            client.post("/dash/api/flag", json={"kind": kind, "id": item}, headers=_H)
+        client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H)
+        flags = client.get("/dash/api/flags", headers=_H).json()["flags"]
+    assert [(f["kind"], f["item_id"]) for f in flags] == [("fact", "j-shared")]
+
+
+def test_delete_episode_keeps_events_other_turns_retold(clean, conn, db_url):
+    """Schema 037's merge bumps reported_count when a later turn re-tells an event, so a
+    count above 1 means a surviving turn also backs the row: the single-turn delete keeps
+    it (one telling fewer) and deletes the rest."""
+    doomed = _episode(conn, session="d9", seq=1, content="doomed turn")
+    sole = _event(conn, fact="told once", source_ref=f"ep:{doomed}", reported_count=1)
+    retold = _event(conn, fact="told twice", source_ref=f"ep:{doomed}#2", reported_count=2)
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["events_deleted"] == 1 and body["deleted_event_ids"] == [sole]
+    assert body["events_kept"] == 1
+    left = conn.execute("SELECT id, reported_count FROM timeline_events").fetchall()
+    assert left == [(retold, 1)]
 
 
 def test_delete_bad_id_missing_row_and_auth(clean, conn, db_url):

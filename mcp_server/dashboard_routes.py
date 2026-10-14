@@ -126,7 +126,6 @@ _STREAM_RECONNECT_MAX_S = 30.0  # ... doubling up to this
 _PROPOSALS_LANE_CAP = 200
 _SKILL_REVIEW_STATUSES = ("proposed", "accepted", "promoted", "rejected")
 _CONFIG_REVIEW_STATUSES = ("proposed", "accepted", "applied", "rejected")
-_PROVENANCE_CAP = 40  # bound the best-effort session→episode resolution
 
 # Phase 5 (Timeline / Preferences / Dream report / Behavior files).
 _TIMELINE_LIMIT_DEFAULT = 50
@@ -1490,35 +1489,54 @@ def _metrics_corpus(db_url: str) -> dict[str, Any]:
 # Flags
 # ---------------------------------------------------------------------------
 
-# Per-kind resolver for the best-effort gist shown on the flags list. The flags list is
-# operator-sized (a handful of rows), so a small lookup per row is cheap.
-_GIST_SOURCES = {
-    "episode": ("episodes", "content", "id"),
-    "fact": ("kg_relationships", "fact", "uuid"),
-    "timeline_event": ("timeline_events", "fact", "id"),
-    "preference": ("preferences", "pref", "id"),
-    "note": ("notes", "hook", "id"),
+# Per-kind resolver for the best-effort gist and source episode shown on the flags list. The
+# flags list is operator-sized (a handful of rows), so a small lookup per row is cheap.
+# kind -> (table, text column, id column, column naming the row's source episode)
+_FLAG_SOURCES = {
+    "episode": ("episodes", "content", "id", None),
+    "fact": ("kg_relationships", "fact", "uuid", "episodes"),
+    "timeline_event": ("timeline_events", "fact", "id", "source_ref"),
+    "preference": ("preferences", "pref", "id", "source_ref"),
+    "note": ("notes", "hook", "id", "source_ref"),
 }
 
 
-def _resolve_flag_gist(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str) -> str:
-    spec = _GIST_SOURCES.get(kind)
+def _resolve_flag_item(
+    conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str
+) -> tuple[str, int | None]:
+    """A flagged row's gist and the episode the Flags tab can open for it: the episode
+    itself, a fact's first provenance episode, or the ``ep:<id>`` turn a timeline event,
+    preference or note was born from. None when the row or its episode is gone, or the
+    ref names something that isn't a turn (a git SHA)."""
+    spec = _FLAG_SOURCES.get(kind)
     if not spec:
-        return ""
-    table, text_col, id_col = spec
+        return "", None
+    table, text_col, id_col, ref_col = spec
     # id_col is a fixed identifier from the trusted map above, never user input; item_id
     # is bound as a parameter. Numeric-keyed tables get a digit guard so a bad id can't
     # raise a cast error inside the read.
     if id_col == "id" and not str(item_id).isdigit():
-        return ""
+        return "", None
+    ref_sql = f", {ref_col} AS ref" if ref_col else ""
     try:
         row = conn.execute(
-            f"SELECT {text_col} AS t FROM {table} WHERE {id_col} = %s LIMIT 1",  # nosec B608
+            f"SELECT {text_col} AS t{ref_sql} FROM {table} WHERE {id_col} = %s LIMIT 1",  # nosec B608
             (item_id,),
         ).fetchone()
     except Exception:  # pragma: no cover - defensive, e.g. a missing table
-        return ""
-    return _gist(row["t"]) if row else ""
+        return "", None
+    if row is None:
+        return "", None
+    if kind == "episode":
+        return _gist(row["t"]), int(item_id)
+    ref = row["ref"]
+    episode_id = _provenance(ref) if isinstance(ref, list) else _episode_id_from_ref(ref)
+    if (
+        episode_id is not None
+        and conn.execute("SELECT 1 FROM episodes WHERE id = %s", (episode_id,)).fetchone() is None
+    ):
+        episode_id = None
+    return _gist(row["t"]), episode_id
 
 
 def _flags_list(db_url: str) -> dict[str, Any]:
@@ -1527,50 +1545,59 @@ def _flags_list(db_url: str) -> dict[str, Any]:
             "SELECT id, kind, item_id, note, created_at FROM dashboard_flags "
             "WHERE removed_at IS NULL ORDER BY created_at DESC, id DESC"
         ).fetchall()
-        return {
-            "flags": [
+        flags = []
+        for r in rows:
+            gist, episode_id = _resolve_flag_item(conn, r["kind"], r["item_id"])
+            flags.append(
                 {
                     "id": r["id"],
                     "kind": r["kind"],
                     "item_id": r["item_id"],
                     "note": r["note"],
                     "created_at": _iso(r["created_at"]),
-                    "gist": _resolve_flag_gist(conn, r["kind"], r["item_id"]),
+                    "gist": gist,
+                    "episode_id": episode_id,
                 }
-                for r in rows
-            ]
-        }
+            )
+        return {"flags": flags}
 
 
-def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool:
-    """Insert a flag if none is active, else retire the active one. Returns the new
-    flagged state and appends a dashboard_audit row either way."""
-    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        active = conn.execute(
-            "SELECT id FROM dashboard_flags "
-            "WHERE kind = %s AND item_id = %s AND removed_at IS NULL",
-            (kind, item_id),
-        ).fetchone()
-        if active is not None:
-            conn.execute(
-                "UPDATE dashboard_flags SET removed_at = now() WHERE id = %s", (active["id"],)
-            )
-            conn.execute(
-                "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
-                "VALUES ('unflag', %s, %s, %s)",
-                (kind, item_id, Json({"note": note}) if note else None),
-            )
-            return False
-        conn.execute(
-            "INSERT INTO dashboard_flags (kind, item_id, note) VALUES (%s, %s, %s)",
-            (kind, item_id, note),
-        )
-        conn.execute(
-            "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
-            "VALUES ('flag', %s, %s, %s)",
-            (kind, item_id, Json({"note": note}) if note else None),
-        )
-        return True
+def _set_flag(db_url: str, kind: str, item_id: str, note: str | None, flagged: bool | None) -> bool:
+    """Put a flag in the state the operator asked for and return the state it ends in.
+
+    ``flagged`` True / False is idempotent (a repeat changes nothing and appends no audit
+    row), so a stale button or list can't invert the intent; None toggles, for older
+    clients. Each branch is one statement against the partial-unique index, so concurrent
+    requests settle instead of colliding on it. A change appends a dashboard_audit row."""
+    detail = Json({"note": note}) if note else None
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
+        with conn.transaction():
+            if flagged is not True:
+                retired = conn.execute(
+                    "UPDATE dashboard_flags SET removed_at = now() "
+                    "WHERE kind = %s AND item_id = %s AND removed_at IS NULL RETURNING id",
+                    (kind, item_id),
+                ).fetchone()
+                if retired is not None:
+                    conn.execute(
+                        "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
+                        "VALUES ('unflag', %s, %s, %s)",
+                        (kind, item_id, detail),
+                    )
+                if retired is not None or flagged is False:
+                    return False
+            created = conn.execute(
+                "INSERT INTO dashboard_flags (kind, item_id, note) VALUES (%s, %s, %s) "
+                "ON CONFLICT (kind, item_id) WHERE removed_at IS NULL DO NOTHING RETURNING id",
+                (kind, item_id, note),
+            ).fetchone()
+            if created is not None:
+                conn.execute(
+                    "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
+                    "VALUES ('flag', %s, %s, %s)",
+                    (kind, item_id, detail),
+                )
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -1632,16 +1659,28 @@ def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[
 
 
 def delete_episode_content(
-    conn: psycopg.Connection[dict[str, Any]], episode_ids: list[int]
-) -> dict[str, int]:
+    conn: psycopg.Connection[dict[str, Any]],
+    episode_ids: list[int],
+    *,
+    keep_retold_events: bool = False,
+) -> dict[str, Any]:
     """The episode-delete cascade: everything carrying the content of ``episode_ids``.
 
     Runs on ``conn`` inside the CALLER's transaction, with the episode rows already locked:
-    chunks citing any of them, their sole-provenance facts (shared ones are unlinked),
-    their chat timeline events, the rows themselves (their extraction_queue rows follow
-    via the 001 FK), and any active flag on them. Returns the counts. Shared by the
-    dashboard's single-turn delete and private mode's session purge
+    chunks citing any of them and those chunks' extraction_queue rows (keyed by session and
+    text, so the 001 FK misses them), their sole-provenance facts (shared ones are
+    unlinked), their chat timeline events, the rows themselves (their own extraction_queue
+    rows follow via the 001 FK), and any active flag on the facts, events and episodes that
+    went. Returns the counts plus the uuids of the deleted facts and the ids of the deleted
+    events, so a client can drop them from its lists. Shared by the dashboard's
+    single-turn delete and private mode's session purge
     (``mcp_server/private_session_routes``).
+
+    ``keep_retold_events``: schema 037's dedup merge folds a later turn's re-telling into
+    an existing event and only bumps its ``reported_count``, so a count above 1 means
+    another turn backs the row too, but not which one. True keeps those rows (one telling
+    fewer; their ``source_ref`` then names the deleted turn). The purge leaves it False:
+    a privacy wipe errs toward removal.
 
     Set-based on purpose: the purge passes every turn of a session, and the provenance
     arrays have no usable index (029's GIN is partial), so each lookup is one pass over
@@ -1666,6 +1705,16 @@ def delete_episode_content(
     chunk_ids = [r["id"] for r in chunk_rows]
     chunks_mixed = sum(1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], ids))
     if chunk_ids:
+        # The poller enqueues each chunk for extraction keyed by (session_id, content),
+        # with no episode_id, so the episode FK never reaches those rows: a pending one
+        # would re-extract the deleted text into facts with no provenance, and a done one
+        # still stores it verbatim. Every status goes, before the chunk text is gone.
+        conn.execute(
+            "DELETE FROM extraction_queue q USING chunks c "
+            "WHERE c.id = ANY(%s) AND q.content_type = 'chunk' "
+            "AND q.session_id = c.session_id AND q.content = c.content",
+            (chunk_ids,),
+        )
         conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
 
     # --- KG facts (sole vs shared provenance) --------------------------------
@@ -1692,19 +1741,37 @@ def delete_episode_content(
     if sole:
         _clear_invalidated_by(conn, sole)
         conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
+        retire_flags(conn, "fact", sole)
 
     # --- timeline events -----------------------------------------------------
     # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
     # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
-    # makes them sole-provenance by construction, so the rule resolves to delete;
+    # makes the first telling's turn the row's owner, so the rule resolves to delete;
     # keeping them would go on serving the deleted turn from recall()'s timeline leg.
-    ev = conn.execute(
-        "DELETE FROM timeline_events WHERE source_ref = ANY(%s) OR source_ref LIKE ANY(%s)",
-        ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids]),
-    )
-    events_deleted = ev.rowcount if ev.rowcount and ev.rowcount > 0 else 0
+    # The exception is a row a later turn re-told (reported_count > 1, see the docstring).
+    refs = ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids])
+    owned = "(source_ref = ANY(%s) OR source_ref LIKE ANY(%s))"
+    kept_events: list[int] = []
+    if keep_retold_events:
+        kept_events = [
+            r["id"]
+            for r in conn.execute(
+                "UPDATE timeline_events SET reported_count = reported_count - 1 "  # nosec B608 — owned is a fixed fragment
+                f"WHERE {owned} AND reported_count > 1 RETURNING id",
+                refs,
+            ).fetchall()
+        ]
+    deleted_events = [
+        r["id"]
+        for r in conn.execute(
+            f"DELETE FROM timeline_events WHERE {owned} AND id <> ALL(%s) RETURNING id",  # nosec B608
+            (*refs, kept_events),
+        ).fetchall()
+    ]
+    if deleted_events:
+        retire_flags(conn, "timeline_event", [str(i) for i in deleted_events])
 
-    # --- the episodes themselves (extraction_queue rows follow via the 001 FK) ----
+    # --- the episodes themselves (their extraction_queue rows follow via the 001 FK) ----
     conn.execute("DELETE FROM episodes WHERE id = ANY(%s)", (episode_ids,))
 
     retire_flags(conn, "episode", id_texts)
@@ -1713,7 +1780,10 @@ def delete_episode_content(
         "chunks_mixed_deleted": chunks_mixed,
         "facts_deleted": len(sole),
         "facts_unlinked": len(shared),
-        "events_deleted": events_deleted,
+        "events_deleted": len(deleted_events),
+        "events_kept": len(kept_events),
+        "deleted_fact_ids": sole,
+        "deleted_event_ids": deleted_events,
     }
 
 
@@ -1729,7 +1799,10 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
             ).fetchone()
             if row is None:
                 return None
-            summary = {"episode_id": episode_id, **delete_episode_content(conn, [episode_id])}
+            summary = {
+                "episode_id": episode_id,
+                **delete_episode_content(conn, [episode_id], keep_retold_events=True),
+            }
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
                 "VALUES ('delete_episode', 'episode', %s, %s)",
@@ -1816,15 +1889,16 @@ def _age_days(created: Any) -> int:
     return max(0, int((now - created).total_seconds() // 86400))
 
 
-def _provenance_episodes(conn: psycopg.Connection[dict[str, Any]], evidence: Any) -> list[int]:
-    """Best-effort episode ids behind a proposal, from its evidence entries. Two sources:
-    an explicit episode ref on an entry (``episode_id`` / an ``ep:<id>`` ``source_ref``),
-    and — since lane evidence is keyed by session, not episode — the episodes of each
-    distinct evidence ``session_id`` (bounded). Empty list when nothing resolves."""
+def _proposal_provenance(evidence: Any) -> tuple[list[int], list[str]]:
+    """What a proposal's evidence points at: the episodes it names outright (an
+    ``episode_id`` or an ``ep:<id>`` ``source_ref`` on an entry), and the distinct
+    ``session_id``s in first-seen order. Lane evidence is keyed by session, not turn, so
+    a session is as precise as it gets; guessing turns from it would show arbitrary
+    ones, and the starting turns of the earliest sessions at that."""
     if not isinstance(evidence, list):
-        return []
+        return [], []
     explicit: set[int] = set()
-    sessions: set[str] = set()
+    sessions: dict[str, None] = {}
     for e in evidence:
         if not isinstance(e, dict):
             continue
@@ -1840,15 +1914,8 @@ def _provenance_episodes(conn: psycopg.Connection[dict[str, Any]], evidence: Any
             explicit.add(rid)
         sid = e.get("session_id")
         if isinstance(sid, str) and sid:
-            sessions.add(sid)
-    ids = set(explicit)
-    if sessions:
-        rows = conn.execute(
-            "SELECT id FROM episodes WHERE session_id = ANY(%s) ORDER BY id LIMIT %s",
-            (list(sessions), _PROVENANCE_CAP),
-        ).fetchall()
-        ids.update(int(r["id"]) for r in rows)
-    return sorted(ids)
+            sessions[sid] = None
+    return sorted(explicit), list(sessions)
 
 
 def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dict[str, Any]:
@@ -1932,8 +1999,8 @@ def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
         rr_sql = "SELECT reject_reason FROM config_lane.config_proposals WHERE id=%s"
 
     full_id = f"{lane}:{n}"
+    provenance_episodes, provenance_sessions = _proposal_provenance(evidence)
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        provenance = _provenance_episodes(conn, evidence)
         audit_rows = conn.execute(
             "SELECT ts, action, detail FROM dashboard_audit WHERE item_id = %s ORDER BY ts, id",
             (full_id,),
@@ -1959,7 +2026,8 @@ def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
         "name": name,
         "status": status,
         "evidence": evidence,
-        "provenance_episodes": provenance,
+        "provenance_episodes": provenance_episodes,
+        "provenance_sessions": provenance_sessions,
         "payload": payload,
         "audit_log": audit_log,
     }
@@ -1970,8 +2038,28 @@ def _proposal_decision(
 ) -> dict[str, Any] | None:
     """Delegate to the lane's _proposal_act (approve→accept, reject→reject-with-reason),
     then append a dashboard_audit row. Returns the lane result, or None if the row is gone.
-    A lane refusal (skills accept: no draft yet, stale draft, name taken) changed nothing,
-    so it is returned as-is and leaves no audit row."""
+    Only a 'proposed' row takes a decision: the lanes' reject and config-accept updates are
+    unconditional, so a stale pane or a double click would otherwise overwrite an applied,
+    promoted or already-decided row. A refusal (not proposed; skills accept: no draft yet,
+    stale draft, name taken) changed nothing, so it is returned as-is and leaves no audit
+    row. The status read and the lane's update are separate statements, so two decisions
+    landing in the same instant can both pass; the lanes own closing that window."""
+    table = (
+        "skills_lane.skill_gap_candidates" if lane == "skill" else "config_lane.config_proposals"
+    )
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        current = conn.execute(
+            f"SELECT status FROM {table} WHERE id = %s",  # nosec B608 — table is one of two literals
+            (n,),
+        ).fetchone()
+    if current is None:
+        return None
+    if current["status"] != "proposed":
+        return {
+            "status": "refused",
+            "detail": f"proposal is '{current['status']}', not 'proposed'",
+        }
+
     lane_action = "accept" if action == "approve" else "reject"
     if lane == "skill":
         result = _skill_proposal_act(db_url, n, lane_action, note, _skill_routing_eval_stub)
@@ -2926,14 +3014,17 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         kind = body.get("kind")
         item_id = body.get("id")
         note = body.get("note")
+        want = body.get("flagged")
         if kind not in _FLAG_KINDS:
             return _err(f"invalid kind {kind!r}", 400)
         if not item_id or not isinstance(item_id, str):
             return _err("missing 'id' (item_id string)", 400)
         if note is not None and not isinstance(note, str):
             return _err("'note' must be a string", 400)
+        if want is not None and not isinstance(want, bool):
+            return _err("'flagged' must be a boolean", 400)
         try:
-            flagged = await run_in_threadpool(_flag_toggle, db_url, kind, item_id, note)
+            flagged = await run_in_threadpool(_set_flag, db_url, kind, item_id, note, want)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("dashboard flag failed: %s", e)
             return _err(str(e)[:200], 500)
