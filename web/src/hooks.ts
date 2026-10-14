@@ -1,5 +1,5 @@
 // Shared React hooks.
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { fetchDerived, fetchEpisode, type Derived, type Episode } from './api';
 
 // One-shot async fetch: loading / data / error, runs fn on mount and whenever a dep
@@ -27,7 +27,7 @@ export function useAsync<T>(fn: () => Promise<T>, deps: unknown[]): AsyncResult<
     return () => { live = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [...deps, tick]);
-  const reload = () => setTick((t) => t + 1);
+  const reload = useCallback(() => setTick((t) => t + 1), []);
   return { ...state, reload };
 }
 

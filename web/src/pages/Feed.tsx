@@ -5,7 +5,7 @@
 // spec §2). The live dot + queue badge are the header's, from the same stream.
 import type React from 'react';
 import { useEffect, useRef, useState } from 'react';
-import { fetchFeed, feedItemPassesFilter, type Feed as FeedPage, type FeedItem } from '../api';
+import { fetchFeed, feedItemPassesFilter, onDeleted, wasDeleted, type Feed as FeedPage, type FeedItem } from '../api';
 import { insertFeedItem, keyOf, mergePage1 } from '../feedOrder';
 import { useStore } from '../state';
 import { FeedCard } from '../components/FeedCard';
@@ -100,6 +100,13 @@ export function Feed() {
     return () => { epoch.current += 1; unsubscribe(); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, group, source]);
+
+  // A delete made anywhere (the episode overlay, a search hit) takes its cascade with it: the
+  // episode's card and the facts and events derived only from it leave the list at once.
+  useEffect(() => onDeleted((d) => {
+    const kept = itemsRef.current.filter((it) => !wasDeleted(d, it.type, it.id));
+    if (kept.length !== itemsRef.current.length) setItems(kept);
+  }), []);
 
   // With the stream down, page 1 is refetched every POLL_MS (and the shell retries the stream).
   useEffect(() => {

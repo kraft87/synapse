@@ -3,7 +3,7 @@
 // opens the episode overlay. "view in graph" is disabled until the Graph phase.
 import type React from 'react';
 import { useEffect, useState } from 'react';
-import { fetchEntity, type Entity } from '../api';
+import { fetchEntity, onDeleted, type Entity } from '../api';
 import { closeOverlay, openEpisode } from '../hash';
 import { appendUnique } from '../paging';
 import { etColor, validityLine } from '../tokens';
@@ -15,11 +15,15 @@ const provBtn: React.CSSProperties = { border: 'none', background: 'none', paddi
 
 export function EntityDossier({ id }: { id: string }) {
   const store = useStore();
-  const { data, error } = useAsync(() => fetchEntity(id, 0), [id]);
+  const { data, error, reload } = useAsync(() => fetchEntity(id, 0), [id]);
   const err = error != null;
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreFailed, setMoreFailed] = useState(false);
+
+  // A delete made while the dossier is open (the episode overlay stacks over it) can take
+  // facts and mentions with it: refetch rather than patch three lists.
+  useEffect(() => onDeleted(reload), [reload]);
 
   // seed the paginated mentions list from the base fetch; "load more" appends past this.
   useEffect(() => {

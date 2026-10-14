@@ -9,6 +9,8 @@ import { MOCK } from './mode';
 export type Group = 'all' | 'technical' | 'personal';
 export type Page = 'feed' | 'recall' | 'graph' | 'timeline' | 'metrics' | 'review' | 'search';
 
+const PENDING_REFRESH_MS = 60_000;
+
 const ls = {
   get: (k: string, d: string) => localStorage.getItem(k) ?? d,
   set: (k: string, v: string) => localStorage.setItem(k, v),
@@ -84,15 +86,35 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     });
   }, [token]);
 
-  // load the catalog + the Review pending-proposal count once we have a token (or in
-  // mock). The count seeds the nav badge before Review is ever opened; the Review page
-  // keeps it in sync after decisions.
+  // load the catalog once we have a token (or in mock)
   useEffect(() => {
     if (!MOCK && !token) return;
     let live = true;
     fetchCatalog().then((c) => { if (live) setCatalog(c); }).catch(() => {});
-    fetchProposals({ status: 'proposed' }).then((r) => { if (live) setReviewPending(r.pending_count || 0); }).catch(() => {});
     return () => { live = false; };
+  }, [token]);
+
+  // The Review badge follows the server: proposals are decided from the CLI or another tab
+  // and raised by the nightly dream while this page sits open, so the count is refetched
+  // every minute and when the tab is looked at again. The Proposals tab also sets it from
+  // its own list as soon as it loads.
+  useEffect(() => {
+    if (!MOCK && !token) return;
+    let live = true;
+    const refresh = () => {
+      fetchProposals({ status: 'proposed' }).then((r) => { if (live) setReviewPending(r.pending_count || 0); }).catch(() => {});
+    };
+    const onVisible = () => { if (document.visibilityState === 'visible') refresh(); };
+    refresh();
+    const timer = window.setInterval(() => { if (document.visibilityState !== 'hidden') refresh(); }, PENDING_REFRESH_MS);
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', refresh);
+    return () => {
+      live = false;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', refresh);
+    };
   }, [token]);
 
   const setTokenValue = useCallback((t: string | null) => { setToken(t); if (!t) clearToken(); }, []);

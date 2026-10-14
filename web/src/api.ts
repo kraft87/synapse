@@ -13,7 +13,7 @@ const mockApi = <T,>(path: string): Promise<T> => mock().then((m) => m.mockApi<T
 const mockRecall = <T,>(query: string): Promise<T> => mock().then((m) => m.mockRecall<T>(query));
 const mockDeleteEpisode = <T,>(id: string): Promise<T> => mock().then((m) => m.mockDeleteEpisode<T>(id));
 const mockDeleteFact = <T,>(id: string): Promise<T> => mock().then((m) => m.mockDeleteFact<T>(id));
-const mockFlag = (kind: string, id: string) => mock().then((m) => m.mockFlag(kind, id));
+const mockFlag = (kind: string, id: string, flagged: boolean) => mock().then((m) => m.mockFlag(kind, id, flagged));
 
 const BASE = '/dash/api';
 const TOKEN_KEY = 'synapse.token';
@@ -116,7 +116,8 @@ export interface SearchResult {
   total_by_type?: Record<SearchTab, number>; // first page only; later pages keep the client's
   offset: number; limit: number;
 }
-export interface FlagRow { id: number; kind: string; item_id: string; note: string | null; created_at: string; gist: string; }
+// episode_id: the episode the Flags tab opens for the row (null: nothing to open).
+export interface FlagRow { id: number; kind: string; item_id: string; note: string | null; created_at: string; gist: string; episode_id: number | null; }
 
 // ---------- proposals (phase 2b) ----------
 export type ProposalKind = 'skill' | 'config-edit';
@@ -131,7 +132,9 @@ export interface EvidenceItem {
 }
 export interface ProposalDetail {
   id: string; kind: ProposalKind; name: string; status: string;
-  evidence: string | EvidenceItem[]; provenance_episodes: number[];
+  // The episodes the evidence names outright, and every session it cites (lane evidence is
+  // keyed by session, so most proposals have sessions and no episodes).
+  evidence: string | EvidenceItem[]; provenance_episodes: number[]; provenance_sessions: string[];
   payload: { type: 'markdown' | 'diff'; content: string };
   audit_log: { ts: string | null; action: string; note: string | null }[];
 }
@@ -175,12 +178,30 @@ export const fetchSearch = (p: SearchParams): Promise<SearchResult> =>
 export const fetchFlags = (): Promise<{ flags: FlagRow[] }> =>
   MOCK ? mockApi('/flags') : req('/flags');
 
-export const postFlag = (kind: string, id: string, note?: string): Promise<{ status: string; flagged: boolean }> =>
-  MOCK ? mockFlag(kind, id) : req('/flag', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind, id, note }),
-  });
+// The same row has a ⚑ in several places at once (a fact in the Feed and in a dossier opened
+// over it): each button follows a flag change made anywhere, through one DOM CustomEvent like
+// the delete announcement below.
+export interface FlaggedDetail { kind: string; id: string; flagged: boolean }
+const FLAGGED_EVENT = 'synapse:flagged';
+export const onFlagged = (fn: (d: FlaggedDetail) => void): (() => void) => {
+  const h = (e: Event) => fn((e as CustomEvent<FlaggedDetail>).detail);
+  window.addEventListener(FLAGGED_EVENT, h);
+  return () => window.removeEventListener(FLAGGED_EVENT, h);
+};
+
+// `flagged` is the state the operator wants, so a stale button can't invert it; the
+// server answers with the state it ended in.
+export const postFlag = async (kind: string, id: string, flagged: boolean, note?: string): Promise<{ status: string; flagged: boolean }> => {
+  const r: { status: string; flagged: boolean } = MOCK
+    ? await mockFlag(kind, id, flagged)
+    : await req('/flag', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ kind, id, flagged, note }),
+    });
+  window.dispatchEvent(new CustomEvent<FlaggedDetail>(FLAGGED_EVENT, { detail: { kind, id, flagged: r.flagged } }));
+  return r;
+};
 
 // ---------- delete (phase 7) ----------
 // The ONLY destructive calls in this client. Wire shapes pinned in
@@ -195,6 +216,9 @@ export interface DeleteEpisodeResult {
   facts_deleted: number;
   facts_unlinked: number;
   events_deleted: number;
+  events_kept: number; // re-told by a surviving turn
+  deleted_fact_ids: string[];
+  deleted_event_ids: number[];
 }
 export interface DeleteFactResult {
   fact_id: string;
@@ -202,24 +226,36 @@ export interface DeleteFactResult {
   supersession_links_cleared: number;
 }
 
-// A delete can fire from a search hit or from the episode overlay, and the list showing
-// the item is often not the component that deleted it. One DOM CustomEvent keeps them in
-// sync without threading state through the hash router.
-export interface DeletedDetail { kind: 'episodes' | 'facts'; id: string }
+// A delete can fire from a search hit or from the episode overlay, and the lists showing
+// the item (Feed, Timeline, Search, the entity dossier) are not the component that deleted
+// it. One DOM CustomEvent keeps them in sync without threading state through the hash
+// router. It names every row that went, ids as strings: an episode's cascade takes the facts
+// and events derived only from it, and the server lists them in its response.
+export interface DeletedDetail { episodes: string[]; facts: string[]; events: string[] }
 const DELETED_EVENT = 'synapse:deleted';
 export const onDeleted = (fn: (d: DeletedDetail) => void): (() => void) => {
   const h = (e: Event) => fn((e as CustomEvent<DeletedDetail>).detail);
   window.addEventListener(DELETED_EVENT, h);
   return () => window.removeEventListener(DELETED_EVENT, h);
 };
-const announceDeleted = (kind: DeletedDetail['kind'], id: string) =>
-  window.dispatchEvent(new CustomEvent<DeletedDetail>(DELETED_EVENT, { detail: { kind, id } }));
+const announceDeleted = (detail: DeletedDetail) =>
+  window.dispatchEvent(new CustomEvent<DeletedDetail>(DELETED_EVENT, { detail }));
+
+// Did this delete take the row a list is showing? `type` is a feed item type or a search tab.
+const DELETED_BUCKET: Record<FeedType | SearchTab, keyof DeletedDetail | null> = {
+  episode: 'episodes', fact: 'facts', timeline_event: 'events',
+  episodes: 'episodes', facts: 'facts', events: 'events', entities: null,
+};
+export const wasDeleted = (d: DeletedDetail, type: FeedType | SearchTab, id: string | number): boolean => {
+  const bucket = DELETED_BUCKET[type];
+  return bucket !== null && d[bucket].includes(String(id));
+};
 
 export const deleteEpisode = async (id: string): Promise<DeleteEpisodeResult> => {
   const r: DeleteEpisodeResult = MOCK
     ? await mockDeleteEpisode(id)
     : await req('/episodes/' + encodeURIComponent(id), { method: 'DELETE' });
-  announceDeleted('episodes', id);
+  announceDeleted({ episodes: [id], facts: r.deleted_fact_ids, events: r.deleted_event_ids.map(String) });
   return r;
 };
 
@@ -227,7 +263,7 @@ export const deleteFact = async (id: string): Promise<DeleteFactResult> => {
   const r: DeleteFactResult = MOCK
     ? await mockDeleteFact(id)
     : await req('/facts/' + encodeURIComponent(id), { method: 'DELETE' });
-  announceDeleted('facts', id);
+  announceDeleted({ episodes: [], facts: [id], events: [] });
   return r;
 };
 
@@ -242,6 +278,7 @@ export function cascadeSummary(r: DeleteEpisodeResult): string {
   if (r.events_deleted) gone.push(plural(r.events_deleted, 'event'));
   const parts = ['episode deleted' + (gone.length ? ': ' + gone.join(', ') : '')];
   if (r.facts_unlinked) parts.push(plural(r.facts_unlinked, 'fact') + ' unlinked (shared provenance)');
+  if (r.events_kept) parts.push(plural(r.events_kept, 'event') + ' kept (also told by other turns)');
   if (r.chunks_mixed_deleted) parts.push(plural(r.chunks_mixed_deleted, 'chunk') + ' also spanned other episodes');
   return parts.join(' · ');
 }

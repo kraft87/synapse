@@ -3,7 +3,7 @@
 // cards that deep-link (entity → dossier, others → episode overlay).
 import { useEffect, useRef, useState } from 'react';
 import {
-  cascadeSummary, deleteEpisode, deleteFact, factDeleteSummary, fetchSearch, onDeleted,
+  cascadeSummary, deleteEpisode, deleteFact, factDeleteSummary, fetchSearch, onDeleted, wasDeleted,
   type SearchHit, type SearchResult, type SearchTab,
 } from '../api';
 import { useStore } from '../state';
@@ -46,6 +46,8 @@ export function Search() {
   const [tab, setTab] = useState<SearchTab>('episodes');
   const [res, setRes] = useState<SearchResult | null>(null);
   const [hits, setHits] = useState<SearchHit[]>([]);
+  const hitsRef = useRef<SearchHit[]>([]);
+  hitsRef.current = hits;
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(false);
@@ -75,10 +77,16 @@ export function Search() {
   }, [searchQuery, tab, project, group, source]);
 
   // A delete can also fire from the episode overlay opened off one of these hits, so the
-  // list drops the row on the shared event rather than only in its own success handler.
-  useEffect(() => onDeleted(({ kind, id }) => {
-    setHits((prev) => prev.filter((h) => !(h.type === kind && h.id === id)));
-    setRes((prev) => prev?.total_by_type ? { ...prev, total_by_type: { ...prev.total_by_type, [kind]: Math.max(0, prev.total_by_type[kind] - 1) } } : prev);
+  // list drops the row on the shared event rather than only in its own success handler, and
+  // with it the facts and events the episode's cascade took. The tab's count falls by the
+  // hits that were shown and went.
+  useEffect(() => onDeleted((d) => {
+    const gone = hitsRef.current.filter((h) => wasDeleted(d, h.type, h.id));
+    if (!gone.length) return;
+    const goneKeys = new Set(gone.map(hitKey));
+    const type = gone[0].type; // the hits are one tab's
+    setHits((prev) => prev.filter((h) => !goneKeys.has(hitKey(h))));
+    setRes((prev) => prev?.total_by_type ? { ...prev, total_by_type: { ...prev.total_by_type, [type]: Math.max(0, prev.total_by_type[type] - gone.length) } } : prev);
   }), []);
 
   useEffect(() => {

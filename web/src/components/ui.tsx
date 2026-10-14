@@ -2,7 +2,7 @@
 // optimistic ⚑ flag toggle (spec §5c — quiet, txt3 at rest, warn when set).
 import type React from 'react';
 import { useEffect, useState, type CSSProperties } from 'react';
-import { postFlag } from '../api';
+import { onFlagged, postFlag } from '../api';
 import { srcColor, typeColor, typeLabel } from '../tokens';
 
 const chipBase: CSSProperties = {
@@ -37,13 +37,17 @@ export const Dot = ({ color, size = 10 }: { color: string; size?: number }) => (
 export function FlagButton({ kind, itemId, initial, size = 12 }: { kind: string; itemId: string; initial: boolean; size?: number }) {
   const [on, setOn] = useState(initial);
   const [busy, setBusy] = useState(false);
+  // The row can change under the button: a reloaded list brings its flagged state, and the
+  // same row's other ⚑ (the dossier over the Feed) announces the flag it just set.
+  useEffect(() => setOn(initial), [initial]);
+  useEffect(() => onFlagged((d) => { if (d.kind === kind && d.id === itemId) setOn(d.flagged); }), [kind, itemId]);
   const toggle = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (busy) return;
     const next = !on;
     setOn(next); // optimistic
     setBusy(true);
-    postFlag(kind, itemId).then((r) => { if (typeof r.flagged === 'boolean') setOn(r.flagged); })
+    postFlag(kind, itemId, next).then((r) => { if (typeof r.flagged === 'boolean') setOn(r.flagged); })
       .catch(() => setOn(!next)) // revert on failure
       .finally(() => setBusy(false));
   };

@@ -8,7 +8,7 @@
 // cross-domain (spec §1), so they ignore it.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
-  fetchTimeline, fetchTimelineMonths, fetchPreferences, TIMELINE_TYPES,
+  fetchTimeline, fetchTimelineMonths, fetchPreferences, onDeleted, TIMELINE_TYPES,
   type TimelineEvent, type Preference,
 } from '../api';
 import { useStore } from '../state';
@@ -111,6 +111,7 @@ function Events() {
   // Every month that has events under the active filters, from the server: the jump-to-date
   // options are not just the months of the page on screen.
   const months = useAsync(() => fetchTimelineMonths({ type: activeType || undefined, group_id: groupId }), [activeType, group]);
+  const reloadMonths = months.reload;
 
   const loadMore = () => {
     if (!nextBefore || loadingMore) return;
@@ -138,6 +139,14 @@ function Events() {
     }
     return [...map.entries()]; // events already t_valid DESC, so keys land newest-first
   }, [events]);
+
+  // An episode's cascade takes the events derived only from it: they leave the list, and the
+  // jump-to-date counts are refetched.
+  useEffect(() => onDeleted((d) => {
+    if (!d.events.length) return;
+    setEvents((prev) => prev.filter((e) => !d.events.includes(String(e.id))));
+    reloadMonths();
+  }), [reloadMonths]);
 
   const monthList = months.data?.months ?? [];
 
@@ -211,7 +220,7 @@ function PolarityChip({ polarity }: { polarity: string }) {
   return <span style={{ fontFamily: mono, fontSize: '10.5px', border: '1px solid ' + c, color: c, borderRadius: '4px', padding: '2px 8px', justifySelf: 'start' }}>{polarity}</span>;
 }
 
-const PREF_GRID = 'minmax(0,1fr) 74px 96px 74px';
+const PREF_GRID = 'minmax(0,1fr) 74px 96px 74px 28px';
 
 function PrefRow({ p }: { p: Preference }) {
   const superseded = p.t_invalid != null;
@@ -228,6 +237,7 @@ function PrefRow({ p }: { p: Preference }) {
       <PolarityChip polarity={p.polarity} />
       <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)', textAlign: 'right' }}>{localDay(p.first_seen)}</span>
       <span style={{ fontFamily: mono, fontSize: '12px', color: superseded ? 'var(--txt3)' : 'var(--txt2)', textAlign: 'right' }}>{p.assert_count}×</span>
+      <FlagButton kind="preference" itemId={String(p.id)} initial={p.flagged} />
     </div>
   );
 }
@@ -268,6 +278,7 @@ function Preferences() {
             <span style={{ ...monoHead, justifySelf: 'start' }}>polarity</span>
             <span style={{ ...monoHead, textAlign: 'right' }}>since</span>
             <span style={{ ...monoHead, textAlign: 'right' }}>asserts</span>
+            <span />
           </div>
           {prefs.map((p) => <PrefRow key={p.id} p={p} />)}
         </div>
