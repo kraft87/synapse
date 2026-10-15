@@ -81,8 +81,8 @@ def served_chars(out: dict[str, Any]) -> int:
         size += len(fact.get("fact") or "")
     for episode in out.get("episodes", []):
         size += len(episode.get("content") or "") + len(str(episode.get("date") or ""))
-    for entity in out.get("entities", []):
-        size += len(entity.get("name") or "") + len(entity.get("summary") or "")
+    for note in out.get("notes", []):
+        size += len(note.get("hook") or "") + len(note.get("note") or "")
     for web in out.get("web", []):
         size += (
             len(web.get("context") or "")

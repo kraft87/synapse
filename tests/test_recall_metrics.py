@@ -1,13 +1,11 @@
-"""DB-backed tests for the recall_metrics write path (mcp_server/recall.py::_do_record).
+"""DB-backed tests for the recall_metrics write path (mcp_server/recall_metrics.py::_do_record).
 
-Covers issue #10 (served_ids JSONB round-trips per bucket) and the schema-039 repair:
-n_timeline / ms_timeline / n_prefs / ms_prefs were passed by the writer since the
-033/035 legs shipped but silently dropped because _METRIC_COLS never gained them.
+Covers issue #10: served_ids JSONB round-trips per bucket.
 
-n_prefs / ms_prefs are LEGACY as of 2026-07-27 — the preferences recall leg was removed,
-so recall() no longer passes them and live rows carry NULL. These tests drive _do_record
-directly, pinning that the WRITER still maps the columns (historical rows stay readable);
-that the recall path stops populating them is pinned in test_telemetry_kinds.py.
+The timeline and preferences legs left recall() (2026-08-07, 2026-07-27); their
+n_timeline / ms_timeline / n_prefs / ms_prefs columns (schema 039) and n_entities (021) are
+no longer written, and old rows keep their values until a later migration drops the
+columns.
 """
 
 from __future__ import annotations
@@ -15,25 +13,16 @@ from __future__ import annotations
 from mcp_server.recall import Recall
 
 
-def test_served_ids_and_leg_columns_round_trip(conn, db_url):
+def test_served_ids_round_trip(conn, db_url):
     conn.execute("TRUNCATE recall_metrics RESTART IDENTITY")
     r = Recall(db_url, "")
-    served = {
-        "episodes": ["e:12", "e:7"],
-        "facts": ["uuid-a", "uuid-b"],
-        "timeline": [3, 9],
-        "prefs": [1],
-    }
+    served = {"episodes": ["e:12", "e:7"], "facts": ["f:41", "f:42"]}
     r._do_record(
         {
             "kind": "recall",
             "source": "test",
             "query": "q",
             "group_id": "technical",
-            "n_timeline": 2,
-            "ms_timeline": 12.5,
-            "n_prefs": 1,
-            "ms_prefs": 3.0,
             "served_ids": served,
         }
     )
@@ -43,8 +32,7 @@ def test_served_ids_and_leg_columns_round_trip(conn, db_url):
     ).fetchone()
     assert row is not None, "metrics row was not inserted (writer swallowed an error)"
     assert row[0] == served
-    assert row[1] == 2 and row[2] == 12.5
-    assert row[3] == 1 and row[4] == 3.0
+    assert row[1:] == (None, None, None, None)
 
 
 def test_missing_served_ids_inserts_null(conn, db_url):

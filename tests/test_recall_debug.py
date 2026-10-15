@@ -128,3 +128,30 @@ def test_disabled_legs_are_omitted_from_legs_ms(monkeypatch):
     assert set(d["legs_ms"]) == {"embed", "bm25", "vector", "kg", "web", "rerank"}
     assert "timeline" not in d["legs_ms"] and "prefs" not in d["legs_ms"]
     assert "notes" not in d["legs_ms"]
+
+
+def test_notes_count_toward_the_served_size():
+    """The notes bucket is served text like any other: est_tokens is the number the bucket
+    decisions are made on, so it cannot leave a bucket out."""
+    base = {"query": "q", "facts": [{"fact": "abc"}]}
+    with_notes = {
+        **base,
+        "notes": [
+            {"id": "n:1", "hook": "A hook", "note": "A note body"},
+            {"id": "n:2", "hook": "Another", "note": "Second body"},
+        ],
+    }
+    extra = len("A hook") + len("A note body") + len("Another") + len("Second body")
+    served = recall_module._served_chars
+    assert served(with_notes) - served(base) == extra
+
+
+def test_recall_est_tokens_include_the_notes_it_served():
+    r = Recall(_NO_DB, "")
+    _wire_stubs(r)
+    r._search_notes = lambda q, emb, proj, audience=None: [  # type: ignore[method-assign]
+        {"id": "n:1", "hook": "Pool config", "note": "x" * 400}
+    ]
+    out = r.recall("connection pooling decisions", debug=True)
+    assert out["notes"]
+    assert out["debug"]["est_tokens"] >= 400 // 4
