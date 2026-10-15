@@ -1,9 +1,9 @@
 """Pure tests for the dream→notes curation lane (dream/notes/nightly.py).
 
 No database and no network: verdict parsing, the both-orders consensus collapse,
-winner selection, and the orchestrator's apply budget, all driven through a fake
-DB + a stubbed ``parse_with_retry`` (the same seam ingestion/notes.py's tests use
-for NOTES_CONFIRM). The DB-backed half lives in tests/test_notes_curation.py.
+winner selection, the scope guards, and the orchestrator's apply budget, all driven
+through a fake DB + a stubbed judge (the pair judge, ``judge_pair``, is shared with
+ingestion/notes.py's write path). The DB-backed half lives in tests/test_notes_curation.py.
 """
 
 from __future__ import annotations
@@ -13,24 +13,30 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 import dream.notes.nightly as lane
-from dream.notes.nightly import (
-    parse_pair_verdict,
-    parse_scope_verdict,
-    resolve_pair,
-    run_lane,
-)
+from dream.notes.nightly import parse_scope_verdict, resolve_pair, run_lane
 from ingestion.llm_client import MalformedResponseError
+from ingestion.notes import parse_pair_verdict
 
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def _note(note_id: int, *, type="user", project=None, days=0, hook=None, body="Body."):
+def _note(
+    note_id: int,
+    *,
+    type="user",
+    project=None,
+    days=0,
+    hook=None,
+    body="Body.",
+    audience="personal",
+):
     return {
         "id": note_id,
         "hook": hook or f"Example note {note_id}",
         "body": body,
         "type": type,
         "project": project,
+        "audience": audience,
         "updated_at": _T0 + timedelta(days=days),
     }
 
@@ -132,9 +138,9 @@ def test_duplicate_tie_on_updated_at_breaks_on_id():
 @pytest.mark.parametrize(
     ("v_ab", "v_ba", "reason"),
     [
-        (_DIS, _DIS, "both-distinct"),
+        (_DIS, _DIS, "first-order-distinct"),
+        (_DIS, None, "first-order-distinct"),
         (_DUP, _DIS, "order-disagreement"),
-        (_DIS, _DUP, "order-disagreement"),
         (_DUP, _corr(1), "order-disagreement"),
     ],
 )
@@ -143,21 +149,29 @@ def test_disagreement_and_distinct_collapse_to_the_safe_verdict(v_ab, v_ba, reas
     assert res == {"verdict": "DISTINCT", "winner": None, "loser": None, "reason": reason}
 
 
+def test_a_pair_the_first_order_did_not_settle_needs_the_second():
+    with pytest.raises(ValueError, match="both orderings"):
+        resolve_pair(_note(10), _note(11, days=1), _DUP, None)
+
+
 def test_cross_type_duplicate_is_left_alone():
     """A 'duplicate' spanning two types is a mis-typing, not a redundancy — merging
-    would silently pick one shelf. Stage C owns that case."""
+    would silently pick one shelf. Stage C owns that case. The first order settles it."""
     a = _note(10, type="feedback")
     b = _note(11, type="project", project="demo-api", days=1)
-    res = resolve_pair(a, b, _DUP, _DUP)
-    assert res["verdict"] == "DISTINCT" and res["reason"] == "cross-type-duplicate"
+    for v_ba in (_DUP, None):
+        res = resolve_pair(a, b, _DUP, v_ba)
+        assert res["verdict"] == "DISTINCT" and res["reason"] == "cross-type-duplicate"
 
 
 def test_cross_type_correction_is_allowed():
+    """A correction may cross types when the winner's board covers the loser's: here the
+    global rule corrects a project note that had restated it differently."""
     a = _note(10, type="feedback")
     b = _note(11, type="project", project="demo-api", days=1)
-    # keep=2 in the (a,b) ordering and keep=1 in the (b,a) ordering both name note 11.
-    res = resolve_pair(a, b, _corr(2), _corr(1))
-    assert res == {"verdict": "CORRECTION", "winner": 11, "loser": 10, "reason": "consensus"}
+    # keep=1 in the (a,b) ordering and keep=2 in the (b,a) ordering both name note 10.
+    res = resolve_pair(a, b, _corr(1), _corr(2))
+    assert res == {"verdict": "CORRECTION", "winner": 10, "loser": 11, "reason": "consensus"}
 
 
 def test_correction_direction_must_agree_on_the_id_not_the_slot():
@@ -179,6 +193,53 @@ def test_correction_can_retire_the_newer_note():
 def test_correction_without_direction_is_distinct():
     res = resolve_pair(_note(10), _note(11, days=1), _corr(None), _corr(None))
     assert res["verdict"] == "DISTINCT" and res["reason"] == "missing-direction"
+
+
+# ---------------------------------------------------------------------------
+# The winner must be visible wherever the loser was
+# ---------------------------------------------------------------------------
+
+
+def test_a_project_note_never_retires_a_note_of_another_project():
+    alpha = _note(10, type="project", project="alpha")
+    beta = _note(11, type="project", project="beta", days=1)
+    res = resolve_pair(alpha, beta, _DUP, _DUP)
+    assert res["verdict"] == "DISTINCT" and res["reason"] == "winner-narrower-than-loser"
+    res = resolve_pair(alpha, beta, _corr(2), _corr(1))
+    assert res["verdict"] == "DISTINCT" and res["reason"] == "winner-narrower-than-loser"
+
+
+def test_a_project_note_does_not_retire_a_global_rule():
+    """A correction filed under one project must not remove the rule from every other."""
+    rule = _note(10, type="feedback")
+    scoped = _note(11, type="project", project="alpha", days=1)
+    res = resolve_pair(rule, scoped, _corr(2), _corr(1))  # keep = the project note
+    assert res["verdict"] == "DISTINCT" and res["reason"] == "winner-narrower-than-loser"
+
+
+def test_a_global_note_may_retire_a_project_note():
+    """The reverse direction loses nothing: a global winner is on every board."""
+    rule = _note(10, type="feedback")
+    scoped = _note(11, type="project", project="alpha", days=1)
+    res = resolve_pair(rule, scoped, _corr(1), _corr(2))  # keep = the global rule
+    assert res == {"verdict": "CORRECTION", "winner": 10, "loser": 11, "reason": "consensus"}
+
+
+def test_same_project_notes_merge():
+    a = _note(10, type="project", project="alpha")
+    b = _note(11, type="project", project="alpha", days=1)
+    assert resolve_pair(a, b, _DUP, _DUP)["verdict"] == "DUPLICATE"
+
+
+def test_a_personal_note_does_not_retire_a_work_safe_one():
+    """The work board would lose the line and gain nothing."""
+    work = _note(10, audience="work-safe")
+    personal = _note(11, days=1)  # the newer wins a duplicate
+    res = resolve_pair(work, personal, _DUP, _DUP)
+    assert res["verdict"] == "DISTINCT" and res["reason"] == "audience-narrowing"
+    # ...but a work-safe winner may retire a personal duplicate, and equal tiers merge.
+    res = resolve_pair(personal, _note(12, days=2, audience="work-safe"), _DUP, _DUP)
+    assert res["verdict"] == "DUPLICATE" and res["loser"] == 11
 
 
 # ---------------------------------------------------------------------------
@@ -206,9 +267,6 @@ class _FakeDB:
     def known_project_slugs(self, limit=40):
         return list(self.projects)
 
-    def project_slug_exists(self, slug):
-        return slug in self.projects
-
     def supersede_note(self, old_id, new_id):
         self.superseded.append((old_id, new_id))
 
@@ -229,18 +287,21 @@ class _FakeDB:
 
 
 def _stub_llm(monkeypatch, pair_verdicts=(), scope_verdicts=(), fail_pairs=False):
-    """Replace parse_with_retry: pair calls pop from one queue, scope calls the other."""
+    """Replace the judges: pair calls pop from one queue, scope calls the other."""
     pairs, scopes, calls = list(pair_verdicts), list(scope_verdicts), []
 
-    def _fake(llm, *, base_prompt, parser, model, max_tokens):
+    def _fake_pair(llm, first, second):
+        calls.append((first["id"], second["id"]))
+        if fail_pairs:
+            raise RuntimeError("judge backend down")
+        return pairs.pop(0)
+
+    def _fake_scope(llm, *, base_prompt, parser, model, max_tokens):
         calls.append(parser.__name__)
-        if parser is lane.parse_pair_verdict:
-            if fail_pairs:
-                raise RuntimeError("judge backend down")
-            return pairs.pop(0)
         return scopes.pop(0)
 
-    monkeypatch.setattr(lane, "parse_with_retry", _fake)
+    monkeypatch.setattr(lane, "judge_pair", _fake_pair)
+    monkeypatch.setattr(lane, "parse_with_retry", _fake_scope)
     return calls
 
 
@@ -264,6 +325,45 @@ def test_distinct_pair_is_memoized_but_not_applied(monkeypatch):
     res = run_lane(db=db, llm=object())
     assert db.superseded == [] and res["counts"]["applied_supersede"] == 0
     assert db.curation[0]["verdict"] == "DISTINCT" and db.curation[0]["applied"] is False
+
+
+def test_a_first_order_distinct_costs_one_judge_call(monkeypatch):
+    """The swapped order could not change a DISTINCT, so it is never asked. The audit row
+    keeps the one verdict and says why the pair ended there."""
+    calls = _stub_llm(monkeypatch, pair_verdicts=[_DIS])
+    db = _FakeDB(pairs=[(_note(1), _note(2), 0.71)])
+    run_lane(db=db, llm=object())
+    assert calls == [(1, 2)]
+    (row,) = db.curation
+    assert row["detail"]["reason"] == "first-order-distinct" and row["detail"]["orders"] == [_DIS]
+
+
+def test_a_cross_type_duplicate_costs_one_judge_call(monkeypatch):
+    calls = _stub_llm(monkeypatch, pair_verdicts=[_DUP])
+    pair = (_note(1, type="feedback"), _note(2, type="project", project="demo-api"), 0.8)
+    db = _FakeDB(pairs=[pair])
+    run_lane(db=db, llm=object())
+    assert calls == [(1, 2)] and db.superseded == []
+    assert db.curation[0]["detail"]["reason"] == "cross-type-duplicate"
+
+
+def test_a_merge_still_needs_both_orders(monkeypatch):
+    calls = _stub_llm(monkeypatch, pair_verdicts=[_DUP, _DUP])
+    db = _FakeDB(pairs=[(_note(1), _note(2, days=1), 0.9)])
+    run_lane(db=db, llm=object())
+    assert calls == [(1, 2), (2, 1)] and db.superseded == [(1, 2)]
+
+
+def test_a_refused_merge_is_memoized_with_its_reason(monkeypatch):
+    """Two project notes would never reach the lane (the SQL drops them); a project winner
+    over a global loser can, and is refused after the judge has spoken."""
+    _stub_llm(monkeypatch, pair_verdicts=[_corr(2), _corr(1)])
+    rule, scoped = _note(1, type="feedback"), _note(2, type="project", project="alpha", days=1)
+    db = _FakeDB(pairs=[(rule, scoped, 0.8)])
+    res = run_lane(db=db, llm=object())
+    assert db.superseded == [] and res["counts"]["applied_supersede"] == 0
+    assert db.curation[0]["verdict"] == "DISTINCT"
+    assert db.curation[0]["detail"]["reason"] == "winner-narrower-than-loser"
 
 
 def test_sim_floor_filters_candidates(monkeypatch):
@@ -335,6 +435,8 @@ def test_retype_applies_for_a_known_project(monkeypatch):
     assert row["verdict"] == "PROJECT" and row["applied"] is True
     assert row["detail"] == {
         "from_type": "feedback",
+        "from_project": None,
+        "from_audience": "personal",
         "project": "demo-api",
         "audience": "personal",
     }
@@ -364,17 +466,31 @@ def test_injected_db_is_not_closed_by_the_lane(monkeypatch):
     assert db.closed is False  # the caller owns an injected connection
 
 
-def test_caps_read_from_env_when_not_passed(monkeypatch):
-    monkeypatch.setenv("NOTES_LANE_MAX_APPLY", "1")
-    monkeypatch.setenv("NOTES_LANE_SIM_FLOOR", "0.85")
+def test_limits_are_arguments_with_constant_defaults(monkeypatch):
     _stub_llm(monkeypatch, pair_verdicts=[_DUP, _DUP])
     db = _FakeDB(pairs=[(_note(1), _note(2, days=1), 0.90), (_note(3), _note(4, days=1), 0.86)])
-    res = run_lane(db=db, llm=object())
+    res = run_lane(db=db, llm=object(), max_apply=1, sim_floor=0.85)
     assert res["counts"]["applied_supersede"] == 1  # budget of 1 stopped the second
+    db2 = _FakeDB(pairs=[(_note(5), _note(6), 0.70)])
+    _stub_llm(monkeypatch, pair_verdicts=[_DIS])
+    assert run_lane(db=db2, llm=object(), sim_floor=0.85)["counts"]["pairs_judged"] == 0
+    assert run_lane(db=db2, llm=object())["counts"]["pairs_judged"] == 1  # default floor 0.60
 
 
-def test_bad_env_value_falls_back_to_the_default(monkeypatch):
-    monkeypatch.setenv("NOTES_LANE_MAX_JUDGE", "not-a-number")
-    _stub_llm(monkeypatch, pair_verdicts=[_DIS, _DIS])
-    db = _FakeDB(pairs=[(_note(1), _note(2), 0.9)])
-    assert run_lane(db=db, llm=object())["counts"]["pairs_judged"] == 1
+def test_retype_slug_match_is_case_folded_and_filed_under_the_stored_casing(monkeypatch):
+    _stub_llm(monkeypatch, scope_verdicts=[{"scope": "PROJECT", "project": "demo-api"}])
+    db = _FakeDB(retypes=[_note(7, type="feedback")], projects=("Demo-API",))
+    res = run_lane(db=db, llm=object())
+    assert db.retyped == [(7, "project", "Demo-API")]
+    assert res["counts"]["applied_retype"] == 1
+    assert db.curation[0]["detail"]["project"] == "Demo-API"
+
+
+def test_retype_audience_follows_the_case_folded_allowlist(monkeypatch):
+    """remember() and the retype stage apply one rule: an allowlist entry 'Synapse' makes a
+    note retyped to 'synapse' work-safe."""
+    _stub_llm(monkeypatch, scope_verdicts=[{"scope": "PROJECT", "project": "synapse"}])
+    db = _FakeDB(retypes=[_note(7, type="feedback")], projects=("synapse",))
+    db.restricted_surface_projects = lambda: ["Synapse"]
+    run_lane(db=db, llm=object())
+    assert db.retyped_audience == ["work-safe"]

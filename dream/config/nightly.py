@@ -35,9 +35,7 @@ from dream.skills.config import db_url
 from dream.skills.skill_measure import _extract_json
 
 LEARNED_FILE = os.environ.get("CONFIG_LEARNED_FILE", "rules/learned.md")
-PROPOSE_SESSIONS = int(
-    os.environ.get("CONFIG_PROPOSE_SESSIONS", "2")
-)  # distinct sessions -> proposed
+PROPOSE_SESSIONS = 2  # distinct sessions a correction must recur in before it is proposed
 IDENTITY_JACCARD = 0.5  # rule-token overlap above which two corrections are "the same rule".
 # Rough dedup; the LLM tends to normalize phrasing for the same correction, and the review gate
 # catches any duplicates. Embedding-based semantic identity is the robustness upgrade (later).
