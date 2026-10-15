@@ -493,7 +493,20 @@ def test_on_purge_server_error_still_reports_private_mode_on(toggle, stub_server
     assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]
 
 
-def test_on_purge_timeout_says_the_outcome_is_unknown(toggle, stub_server, monkeypatch, capsys):
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        # urlopen raises the bare form when the request went out and the reply never came
+        # (http.client.getresponse() runs outside do_open's URLError wrapper)...
+        TimeoutError("timed out"),
+        # ...and the wrapped form only when connect or send timed out.
+        urllib.error.URLError(TimeoutError("timed out")),
+    ],
+    ids=["bare", "wrapped"],
+)
+def test_on_purge_timeout_says_the_outcome_is_unknown(
+    toggle, stub_server, monkeypatch, capsys, timeout
+):
     """The purge runs in one long transaction; when the answer does not come in time it may
     still finish. The flag is read back, and the output claims neither state of the turns."""
     real = toggle.config.request_json
@@ -501,7 +514,7 @@ def test_on_purge_timeout_says_the_outcome_is_unknown(toggle, stub_server, monke
     def slow_purge(method, path, *args, **kwargs):
         if method == "PUT" and "purge=1" in path:
             real(method, path.split("?")[0], *args, **kwargs)  # the flag lands server-side
-            raise urllib.error.URLError(TimeoutError("timed out"))
+            raise timeout
         return real(method, path, *args, **kwargs)
 
     monkeypatch.setattr(toggle.config, "request_json", slow_purge)
