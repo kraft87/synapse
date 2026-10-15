@@ -38,6 +38,14 @@ def unauthorized() -> JSONResponse:
     return err("unauthorized", 401)
 
 
+def status_conflict(cid: int, current: str, expected: tuple[str, ...]) -> dict:
+    """A proposal decision found its row in a status the decision does not act on (a stale
+    pane, a double click, a CLI that got there first). Nothing changed; the dashboard
+    answers it with a 409, the CLI prints the detail."""
+    wanted = " / ".join(repr(s) for s in expected)
+    return {"status": "conflict", "id": cid, "detail": f"proposal is '{current}', not {wanted}"}
+
+
 def _iso(dt: Any) -> str | None:
     """A datetime's ISO string, or None when it's absent."""
     return dt.isoformat() if dt is not None else None

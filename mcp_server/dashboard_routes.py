@@ -2126,38 +2126,21 @@ def _proposal_decision(
 ) -> dict[str, Any] | None:
     """Delegate to the lane's _proposal_act (approve→accept, reject→reject-with-reason),
     then append a dashboard_audit row. Returns the lane result, or None if the row is gone.
-    Only a 'proposed' row takes a decision: the lanes' reject and config-accept updates are
-    unconditional, so a stale pane or a double click would otherwise overwrite an applied,
-    promoted or already-decided row. A refusal (not proposed; skills accept: no draft yet,
-    stale draft, name taken) changed nothing, so it is returned as-is and leaves no audit
-    row. The status read and the lane's update are separate statements, so two decisions
-    landing in the same instant can both pass; the lanes own closing that window."""
-    table = (
-        "skills_lane.skill_gap_candidates" if lane == "skill" else "config_lane.config_proposals"
-    )
-    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        current = conn.execute(
-            f"SELECT status FROM {table} WHERE id = %s",  # nosec B608 — table is one of two literals
-            (n,),
-        ).fetchone()
-    if current is None:
-        return None
-    if current["status"] != "proposed":
-        return {
-            "status": "refused",
-            "detail": f"proposal is '{current['status']}', not 'proposed'",
-        }
-
+    Only a 'proposed' row takes a decision: the lane checks that status in the same statement
+    that changes it, so a stale pane, a double click or a CLI decision that landed first gets a
+    'conflict' result (the route answers 409) instead of overwriting an applied, promoted or
+    already-decided row. A refusal the lane makes (skills accept: no draft yet, stale draft,
+    name taken) changed nothing too, so both are returned as-is and leave no audit row."""
     lane_action = "accept" if action == "approve" else "reject"
     if lane == "skill":
-        result = _skill_proposal_act(db_url, n, lane_action, note)
+        result = _skill_proposal_act(db_url, n, lane_action, note, expected=("proposed",))
     else:
         # config accept takes an optional scope override; the dashboard never re-scopes,
         # so pass None (the lane keeps the proposal's stored blast radius).
-        result = _config_proposal_act(db_url, n, lane_action, note, None)
+        result = _config_proposal_act(db_url, n, lane_action, note, None, expected=("proposed",))
     if isinstance(result, dict) and result.get("found") is False:
         return None
-    if isinstance(result, dict) and result.get("status") == "refused":
+    if isinstance(result, dict) and result.get("status") in ("refused", "conflict"):
         return result
 
     audit_action = "proposal_approve" if action == "approve" else "proposal_reject"
@@ -2789,8 +2772,10 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         label: str = "api",
     ) -> JSONResponse:
         """Shared api boundary: auth gate + threadpool + fail-soft 500. When ``not_found``
-        is given and ``work()`` returns None, emit the contract's 404 with that detail.
-        ``label`` names the handler in the 500 log line (e.g. 'episode')."""
+        is given and ``work()`` returns None, emit the contract's 404 with that detail. A
+        result whose status is 'conflict' (a proposal decision that found the row moved) goes
+        out as a 409 with that body. ``label`` names the handler in the 500 log line (e.g.
+        'episode')."""
         if not authorized(request):
             return _unauthorized()
         try:
@@ -2800,6 +2785,8 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             return _err(str(e)[:200], 500)
         if not_found is not None and result is None:
             return _err(not_found, 404)
+        if isinstance(result, dict) and result.get("status") == "conflict":
+            return JSONResponse(result, status_code=409)
         return JSONResponse(result)
 
     async def _api_cached(

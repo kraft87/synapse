@@ -74,7 +74,7 @@ from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
-from mcp_server.http_helpers import _iso, err, guarded_json
+from mcp_server.http_helpers import _iso, err, guarded_json, status_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -824,9 +824,11 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
     return d
 
 
-def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool) -> dict:
-    """One transaction: lock the candidate, re-check the plan, write the registry the way a
-    publish does, and mark the candidate promoted with the grounded accept recorded."""
+def _apply_accept(
+    c, cid: int, body: str | None, scope: str | None, force: bool, allowed: tuple[str, ...]
+) -> dict:
+    """One transaction: lock the candidate, re-check its status and the plan, write the registry
+    the way a publish does, and mark the candidate promoted with the grounded accept recorded."""
     row = c.execute(
         f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE",
         (cid,),
@@ -834,17 +836,12 @@ def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool)
     if not row:
         c.rollback()
         return {"found": False}
+    if row["status"] not in allowed:
+        c.rollback()
+        return status_conflict(cid, row["status"], allowed)
     for target in row["target_skills"] or [row["name"]]:
         if isinstance(target, str):
             _lock_name(c, target)  # the same lock a publish takes
-    if row["status"] == "promoted":
-        c.rollback()
-        return {
-            "status": "refused",
-            "id": cid,
-            "reason": "already_applied",
-            "detail": f"[{cid}] {row['name']} was already applied",
-        }
     text = body if body is not None else (row["proposal_body"] or "")
     plan = _plan_apply(c, row, text, scope, lock=True)
     blocking = [i for i in plan["issues"] if not (force and i["force"])]
@@ -889,6 +886,11 @@ def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool)
     }
 
 
+# The statuses accept and reject act on: a decision is final, so a promoted, rejected or
+# retired candidate refuses both (a late click must not restart a rejection's cooling window).
+_DECIDABLE = ("observe", "proposed", "accepted")
+
+
 def _proposal_act(
     db_url: str,
     cid: int,
@@ -898,25 +900,32 @@ def _proposal_act(
     body: str | None = None,
     scope: str | None = None,
     force: bool = False,
+    expected: tuple[str, ...] | None = None,
 ) -> dict:
+    """accept applies the proposal (see _apply_accept); reject drops it for 30 days. ``expected``
+    narrows the statuses the action acts on (the dashboard decides only from 'proposed'); the
+    status is checked under the candidate's row lock, so two decisions landing together cannot
+    both win: the loser gets a 'conflict' result and the row is untouched."""
+    allowed = expected or _DECIDABLE
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
-        cur = c.cursor()
-        row = c.execute(
-            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s",
-            (cid,),
-        ).fetchone()
-        if not row:
-            return {"found": False}
-
         if action == "accept":
-            c.commit()  # close the read; the apply runs in its own locked transaction
-            return _apply_accept(c, cid, body, scope, force)
+            return _apply_accept(c, cid, body, scope, force, allowed)
 
         if action == "reject":
+            row = c.execute(
+                "SELECT status, evidence FROM skills_lane.skill_gap_candidates "
+                "WHERE id=%s FOR UPDATE",
+                (cid,),
+            ).fetchone()
+            if not row:
+                return {"found": False}
+            if row["status"] not in allowed:
+                c.rollback()
+                return status_conflict(cid, row["status"], allowed)
             ev = row["evidence"] or []
             ev.append({"session_id": None, "class": "grounded", "signal": "reject"})
             _js, gs, _jw, gw = _rollup(ev)
-            cur.execute(
+            c.execute(
                 "UPDATE skills_lane.skill_gap_candidates SET status='rejected', reject_reason=%s, "
                 "rejected_until=now() + interval '30 days', evidence=%s::jsonb, "
                 "grounded_sessions=%s, grounded_weight=%s, updated_at=now() WHERE id=%s",

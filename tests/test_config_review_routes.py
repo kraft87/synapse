@@ -4,7 +4,8 @@ Covers the accept/reject/apply lifecycle the review CLI and the dashboard drive:
 rows awaiting a decision ('proposed') or a disk write ('accepted', e.g. approved on the
 dashboard), accept flips to 'accepted' and can override the blast radius to local, apply requires
 accepted first (so a failed disk write stays recoverable), reject records a reason, and a
-decision once made (applied, rejected) is final.
+decision once made (applied, rejected) is final, whoever asks and however close together the
+two decisions land.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from mcp_server.config_sync_routes import _proposal_act, _proposal_detail, _proposals_list
+from tests.helpers.db import decide_behind_a_writer
 
 
 def _seed(conn, rule="Do not use em-dashes", scope="general", status="proposed"):
@@ -58,7 +60,7 @@ def test_a_final_decision_cannot_be_redone(conn, db_url, final, action):
         "SELECT updated_at FROM config_lane.config_proposals WHERE id=%s", (pid,)
     ).fetchone()[0]
     r = _proposal_act(db_url, pid, action, "late click", None)
-    assert r["status"] == "refused" and final in r["detail"]
+    assert r["status"] == "conflict" and final in r["detail"]
     row = conn.execute(
         "SELECT status, updated_at, reject_reason FROM config_lane.config_proposals WHERE id=%s",
         (pid,),
@@ -79,7 +81,7 @@ def test_apply_requires_accepted(conn, db_url):
     conn.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY")
     pid = _seed(conn)  # still 'proposed'
     r = _proposal_act(db_url, pid, "apply", None, None)
-    assert r["status"] == "refused"
+    assert r["status"] == "conflict"
     assert _proposal_detail(db_url, pid)["status"] == "proposed"  # unchanged
 
 
@@ -97,6 +99,35 @@ def test_reject_records_reason(conn, db_url):
     r = _proposal_act(db_url, pid, "reject", "too vague", None)
     assert r["status"] == "rejected" and r["reason"] == "too vague"
     assert _proposal_detail(db_url, pid)["status"] == "rejected"
+
+
+@pytest.mark.parametrize("action", ["accept", "reject"])
+def test_a_caller_names_the_status_it_decides_from(conn, db_url, action):
+    # the dashboard decides only from 'proposed': an approved row is for the CLI to finish
+    conn.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY")
+    pid = _seed(conn, status="accepted")
+    r = _proposal_act(db_url, pid, action, "second thoughts", None, expected=("proposed",))
+    assert r["status"] == "conflict" and "'accepted'" in r["detail"]
+    assert _proposal_detail(db_url, pid)["status"] == "accepted"
+
+
+@pytest.mark.parametrize("action", ["accept", "reject"])
+def test_a_decision_that_loses_the_race_changes_nothing(conn, db_url, action):
+    """Two decisions landing in the same instant: the second read 'proposed', then waited for
+    the first one's row lock, and must not overwrite what it committed."""
+    conn.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY")
+    pid = _seed(conn)
+    r = decide_behind_a_writer(
+        db_url,
+        "UPDATE config_lane.config_proposals SET status='rejected', reject_reason='first' "
+        "WHERE id=%s",
+        (pid,),
+        lambda: _proposal_act(db_url, pid, action, "second", None),
+    )
+    assert r["status"] == "conflict"
+    assert conn.execute(
+        "SELECT status, reject_reason FROM config_lane.config_proposals WHERE id=%s", (pid,)
+    ).fetchone() == ("rejected", "first")
 
 
 def test_act_missing(conn, db_url):

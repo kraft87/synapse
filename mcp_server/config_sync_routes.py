@@ -45,7 +45,7 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, own_surface_columns_ready
-from mcp_server.http_helpers import err, guarded_json
+from mcp_server.http_helpers import err, guarded_json, status_conflict
 
 logger = logging.getLogger(__name__)
 
@@ -189,8 +189,18 @@ def _proposal_detail(db_url: str, cid: int, own_surface: str | None = None) -> d
     return d
 
 
+# The statuses accept and reject act on. 'accepted' stays in: accepting it again is how the CLI
+# finishes a dashboard approval.
+_DECIDABLE = ("observe", "proposed", "accepted")
+
+
 def _proposal_act(
-    db_url: str, cid: int, action: str, reason: str | None, scope: str | None
+    db_url: str,
+    cid: int,
+    action: str,
+    reason: str | None,
+    scope: str | None,
+    expected: tuple[str, ...] | None = None,
 ) -> dict:
     """Walk a proposal through the gate. accept records the human yes (and can override the blast
     radius via scope); apply marks it written-to-disk (the client did the actual write); reject drops
@@ -198,61 +208,55 @@ def _proposal_act(
     on disk, so a failed disk write leaves it recoverable at 'accepted'.
 
     A decision is final: an applied or rejected proposal refuses accept and reject (a late click
-    must not un-reject a rule or restart its cooling window). Accepting an accepted one is how the
-    CLI finishes a dashboard approval, so it is allowed."""
+    must not un-reject a rule or restart its cooling window). ``expected`` narrows the statuses the
+    action acts on (the dashboard decides only from 'proposed'). The status check is part of the
+    UPDATE, so two decisions landing together cannot both win: the loser gets a 'conflict' result
+    and the row is untouched."""
+    if action not in ("accept", "reject", "apply"):
+        return {"status": "error", "detail": f"unknown action {action!r}"}
+    allowed = expected or (("accepted",) if action == "apply" else _DECIDABLE)
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
-        cur = conn.cursor()
-        row = conn.execute(
-            "SELECT status, kind, file_key, scope, diff, summary "
-            "FROM config_lane.config_proposals WHERE id=%s",
-            (cid,),
-        ).fetchone()
-        if not row:
-            return {"found": False}
-        if action in ("accept", "reject") and row["status"] in ("rejected", "applied"):
-            return {"status": "refused", "detail": f"proposal is already '{row['status']}'"}
-
         if action == "accept":
-            new_scope = scope if scope in ("local", "general") else row["scope"]
-            cur.execute(
-                "UPDATE config_lane.config_proposals SET status='accepted', scope=%s, updated_at=now() "
-                "WHERE id=%s",
-                (new_scope, cid),
-            )
-            conn.commit()
-            return {
+            new_scope = (
+                scope if scope in ("local", "general") else None
+            )  # None keeps the stored one
+            row = conn.execute(
+                "UPDATE config_lane.config_proposals SET status='accepted', "
+                "scope=COALESCE(%s, scope), updated_at=now() WHERE id=%s AND status = ANY(%s) "
+                "RETURNING kind, file_key, scope, diff, summary",
+                (new_scope, cid, list(allowed)),
+            ).fetchone()
+            result = row and {
                 "status": "accepted",
                 "id": cid,
                 "kind": row["kind"],
                 "file_key": row["file_key"],
-                "scope": new_scope,
+                "scope": row["scope"],
                 "rule": row["diff"] or row["summary"],
                 "summary": row["summary"],
             }
-
-        if action == "reject":
-            cur.execute(
+        elif action == "reject":
+            row = conn.execute(
                 "UPDATE config_lane.config_proposals SET status='rejected', reject_reason=%s, "
-                "updated_at=now() WHERE id=%s",
-                (reason or "user_rejected", cid),
-            )
-            conn.commit()
-            return {"status": "rejected", "id": cid, "reason": reason or "user_rejected"}
-
-        if action == "apply":
-            if row["status"] != "accepted":
-                return {
-                    "status": "refused",
-                    "detail": f"proposal is '{row['status']}', not 'accepted'",
-                }
-            cur.execute(
-                "UPDATE config_lane.config_proposals SET status='applied', updated_at=now() WHERE id=%s",
-                (cid,),
-            )
-            conn.commit()
-            return {"status": "applied", "id": cid}
-
-    return {"status": "error", "detail": f"unknown action {action!r}"}
+                "updated_at=now() WHERE id=%s AND status = ANY(%s) RETURNING id",
+                (reason or "user_rejected", cid, list(allowed)),
+            ).fetchone()
+            result = row and {"status": "rejected", "id": cid, "reason": reason or "user_rejected"}
+        else:
+            row = conn.execute(
+                "UPDATE config_lane.config_proposals SET status='applied', updated_at=now() "
+                "WHERE id=%s AND status = ANY(%s) RETURNING id",
+                (cid, list(allowed)),
+            ).fetchone()
+            result = row and {"status": "applied", "id": cid}
+        if result is None:  # gone, or in a status this action does not act on
+            current = conn.execute(
+                "SELECT status FROM config_lane.config_proposals WHERE id=%s", (cid,)
+            ).fetchone()
+            if current is None:
+                return {"found": False}
+            return status_conflict(cid, current["status"], allowed)
+    return result
 
 
 def _target_surface(st: SurfaceTrust, body_surface: str | None) -> str | None:

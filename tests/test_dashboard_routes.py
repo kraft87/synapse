@@ -1425,15 +1425,17 @@ def test_proposal_decision_only_applies_to_a_proposed_row(clean_proposals, conn,
     """A pane loaded earlier (another tab, the CLI) can show 'proposed' for a row that
     has moved on. Approving an applied config proposal used to put it back to 'accepted'
     (the CLI would apply it again) and rejecting a promoted skill left it live in the
-    registry with a 30-day cooldown. Anything but 'proposed' is refused and not audited."""
+    registry with a 30-day cooldown. Anything but 'proposed' is a 409 and not audited."""
     applied = _config_proposal(conn, file_key="a.md", status="applied")
     rejected = _config_proposal(conn, file_key="b.md", status="rejected")
+    approved = _config_proposal(conn, file_key="c.md", status="accepted")
     promoted = _skill_proposal(conn, name="latency-triage", status="promoted")
     with _client(db_url) as client:
         for pid, action in (
             (f"config:{applied}", "approve"),
             (f"config:{applied}", "reject"),
             (f"config:{rejected}", "approve"),
+            (f"config:{approved}", "approve"),
             (f"skill:{promoted}", "reject"),
             (f"skill:{promoted}", "approve"),
         ):
@@ -1442,14 +1444,14 @@ def test_proposal_decision_only_applies_to_a_proposed_row(clean_proposals, conn,
                 json={"action": action, "note": "second thoughts"},
                 headers=_H,
             )
-            assert r.status_code == 200
+            assert r.status_code == 409, (pid, action)
             body = r.json()
-            assert body["status"] == "refused", (pid, action)
+            assert body["status"] == "conflict", (pid, action)
             assert "not 'proposed'" in body["detail"]
     assert conn.execute(
         "SELECT status FROM config_lane.config_proposals WHERE id = ANY(%s) ORDER BY id",
-        ([applied, rejected],),
-    ).fetchall() == [("applied",), ("rejected",)]
+        ([applied, rejected, approved],),
+    ).fetchall() == [("applied",), ("rejected",), ("accepted",)]
     assert conn.execute(
         "SELECT status, rejected_until FROM skills_lane.skill_gap_candidates WHERE id=%s",
         (promoted,),
@@ -1457,14 +1459,14 @@ def test_proposal_decision_only_applies_to_a_proposed_row(clean_proposals, conn,
     assert conn.execute("SELECT count(*) FROM dashboard_audit").fetchone()[0] == 0
 
 
-def test_proposal_double_decision_is_refused_the_second_time(clean_proposals, conn, db_url):
+def test_proposal_double_decision_is_a_conflict_the_second_time(clean_proposals, conn, db_url):
     cf = _config_proposal(conn, file_key="rules/testing.md", status="proposed")
     with _client(db_url) as client:
         url = f"/dash/api/proposals/config:{cf}/decision"
         first = client.post(url, json={"action": "reject", "note": "too generic"}, headers=_H)
         again = client.post(url, json={"action": "reject", "note": "too generic"}, headers=_H)
     assert first.json()["status"] == "rejected"
-    assert again.json()["status"] == "refused"
+    assert again.status_code == 409 and again.json()["status"] == "conflict"
     assert (
         conn.execute(
             "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (f"config:{cf}",)

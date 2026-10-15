@@ -18,6 +18,7 @@ import { relTime, monoHead, localMinute } from '../tokens';
 import { ErrorBox, EmptyState } from '../components/ui';
 import { useAsync } from '../hooks';
 import { defaultRun, runDuration, runState } from '../dream';
+import { decisionProblem } from '../proposals';
 
 const TABS = [
   { key: 'proposals', label: 'Proposals' },
@@ -189,10 +190,10 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
   const [busy, setBusy] = useState(false);
   // What the last press of "discuss" did, shown for a moment.
   const [copied, setCopied] = useState<'ok' | 'failed' | null>(null);
-  // Why a decision did not go through. A refusal (200, status 'refused') changed nothing: the
-  // row is no longer 'proposed', or a skills approve can't apply it (no draft yet, a stale
-  // draft, a taken name). A failed request says nothing about the outcome, so the pane is
-  // reloaded to show the status the server has.
+  // Why a decision did not go through. A 409 (see decisionProblem) and a refusal (200, status
+  // 'refused': a skills approve that can't apply the draft, e.g. no draft yet, a stale draft,
+  // a taken name) both changed nothing. A failed request says nothing about the outcome, so
+  // the pane is reloaded to show the status the server has.
   const [problem, setProblem] = useState<string | null>(null);
   // The pane is mounted per proposal (see Proposals), so nothing here outlives a selection.
   const locked = busy || loading;
@@ -209,7 +210,7 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
         }
         setRejecting(false); setReason(''); reload(); onDecided();
       })
-      .catch((e) => { setProblem('decision failed: ' + String(e?.message || e)); reload(); })
+      .catch((e) => { setProblem(decisionProblem(e)); reload(); onDecided(); })
       .finally(() => setBusy(false));
   };
 
@@ -260,10 +261,12 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
         </div>
       )}
 
+      {/* why the last decision did not go through; a 409 leaves the row decided, so it shows without the bar */}
+      {problem && <div role="alert" style={{ fontSize: '12.5px', color: 'var(--err)', lineHeight: 1.5, marginTop: '16px' }}>{problem}</div>}
+
       {/* decision bar (proposed only) */}
       {!decided && (
         <div style={{ borderTop: '1px solid var(--line)', paddingTop: '14px', marginTop: '16px' }}>
-          {problem && <div role="alert" style={{ fontSize: '12.5px', color: 'var(--err)', lineHeight: 1.5, marginBottom: '10px' }}>{problem}</div>}
           {!rejecting ? (
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
               <button disabled={locked} onClick={() => decide('approve')}

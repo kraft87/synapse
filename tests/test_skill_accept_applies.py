@@ -29,6 +29,7 @@ from mcp_server.skill_sync_routes import (
     _publish_skill,
     _record_overwrite,
 )
+from tests.helpers.db import decide_behind_a_writer
 
 _SCRIPTS = Path(__file__).resolve().parents[1] / "plugin" / "scripts"
 _OLD_TIME = "2026-01-01T00:00:00+00:00"
@@ -271,15 +272,60 @@ def test_legacy_row_without_a_body_is_refused_cleanly(acc, db_url):
     assert _accept(db_url, cid, body=V2)["status"] == "promoted"
 
 
-def test_a_second_accept_is_refused_and_promote_is_gone(acc, db_url):
+def test_a_second_accept_is_a_conflict_and_promote_is_gone(acc, db_url):
     _publish(db_url, "acc-backup", V1)
     cid = _candidate(acc, body=V2, base=body_hash(V1))
     assert _accept(db_url, cid)["status"] == "promoted"
     assert _registry(acc, "acc-backup")[0] == V2
 
     again = _accept(db_url, cid)
-    assert again["status"] == "refused" and again["reason"] == "already_applied"
+    assert again["status"] == "conflict" and "'promoted'" in again["detail"]
     assert _proposal_act(db_url, cid, "promote", None)["status"] == "error"
+
+
+@pytest.mark.parametrize("final", ["promoted", "rejected", "retired"])
+def test_a_final_decision_cannot_be_redone(acc, db_url, final):
+    cid = _candidate(acc, body=V2)
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status = %s, reject_reason = 'earlier', "
+        "grounded_sessions = 1, grounded_weight = 1.0 WHERE id = %s",
+        (final, cid),
+    )
+    before = _cand(acc, cid)
+    for action in ("accept", "reject"):
+        r = _proposal_act(db_url, cid, action, "late click")
+        assert r["status"] == "conflict" and final in r["detail"]
+    assert _cand(acc, cid) == before
+    assert acc.execute(
+        "SELECT reject_reason, rejected_until FROM skills_lane.skill_gap_candidates WHERE id = %s",
+        (cid,),
+    ).fetchone() == ("earlier", None)  # a rejection's cooling window is not restarted
+
+
+def test_a_caller_names_the_status_it_decides_from(acc, db_url):
+    cid = _candidate(acc, body=V2, status="observe")
+    for action in ("accept", "reject"):
+        r = _proposal_act(db_url, cid, action, "early", expected=("proposed",))
+        assert r["status"] == "conflict" and "not 'proposed'" in r["detail"]
+    assert _cand(acc, cid)[0] == "observe"
+
+
+@pytest.mark.parametrize("action", ["accept", "reject"])
+def test_a_decision_that_loses_the_race_changes_nothing(acc, db_url, action):
+    """Two decisions landing in the same instant: the second waits for the first one's row
+    lock and must not overwrite what it committed."""
+    cid = _candidate(acc, body=V2)
+    r = decide_behind_a_writer(
+        db_url,
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', reject_reason='first' "
+        "WHERE id=%s",
+        (cid,),
+        lambda: _proposal_act(db_url, cid, action, "second"),
+    )
+    assert r["status"] == "conflict"
+    assert acc.execute(
+        "SELECT status, reject_reason FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
+    ).fetchone() == ("rejected", "first")
 
 
 def test_a_leftover_consolidate_row_can_be_rejected_but_not_accepted(acc, db_url):
