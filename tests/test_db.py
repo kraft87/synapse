@@ -267,24 +267,14 @@ class TestTimelineDedup:
         assert str(tv).startswith("2026-06-28")
 
 
-class TestIngestionState:
-    def test_get_watermark_returns_none_initially(self, db):
-        wm = db.get_watermark("test-source-new")
-        assert wm is None
-
-    def test_set_and_get_watermark(self, db):
-        ts = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
-        db.set_watermark("test-source", ts)
-        result = db.get_watermark("test-source")
-        assert result is not None
-        assert result.replace(microsecond=0) == ts.replace(microsecond=0)
-
-    def test_update_watermark(self, db):
-        t1 = datetime(2026, 1, 1, tzinfo=UTC)
-        t2 = datetime(2026, 1, 2, tzinfo=UTC)
-        db.set_watermark("wm-update", t1)
-        db.set_watermark("wm-update", t2)
-        assert db.get_watermark("wm-update").date() == t2.date()
+def _pending(db, limit: int) -> list[dict]:
+    """The queue's pending rows, oldest first."""
+    with db._conn() as conn:
+        return conn.execute(
+            "SELECT * FROM extraction_queue WHERE status = 'pending' "
+            "ORDER BY priority, enqueued_at LIMIT %s",
+            (limit,),
+        ).fetchall()
 
 
 class TestExtractionQueue:
@@ -297,7 +287,7 @@ class TestExtractionQueue:
             project="synapse",
         )
         db.enqueue_extraction(item)
-        pending = db.get_pending_extractions(limit=10)
+        pending = _pending(db, 10)
         assert any(p["episode_id"] == ep_id for p in pending)
 
     def test_enqueue_summary(self, db):
@@ -308,7 +298,7 @@ class TestExtractionQueue:
             project="synapse",
         )
         db.enqueue_extraction(item)
-        pending = db.get_pending_extractions(limit=10)
+        pending = _pending(db, 10)
         assert any(p["session_id"] == "eq-sum-1" for p in pending)
 
     def test_no_duplicate_enqueue(self, db):
@@ -316,7 +306,7 @@ class TestExtractionQueue:
         item = ExtractionItem(episode_id=ep_id, content="no dups", content_type="episode")
         db.enqueue_extraction(item)
         db.enqueue_extraction(item)  # second call should be a no-op
-        pending = db.get_pending_extractions(limit=100)
+        pending = _pending(db, 100)
         matches = [p for p in pending if p["episode_id"] == ep_id]
         assert len(matches) == 1
 
@@ -324,10 +314,10 @@ class TestExtractionQueue:
         ep_id = db.upsert_episode(Episode(session_id="eq-done", sequence=1, content="mark me done"))
         item = ExtractionItem(episode_id=ep_id, content="mark me done", content_type="episode")
         db.enqueue_extraction(item)
-        pending = db.get_pending_extractions(limit=10)
+        pending = _pending(db, 10)
         queue_id = next(p["id"] for p in pending if p["episode_id"] == ep_id)
         db.mark_extraction_done(queue_id)
-        still_pending = db.get_pending_extractions(limit=100)
+        still_pending = _pending(db, 100)
         assert not any(p["id"] == queue_id for p in still_pending)
 
     # --- failed items are retried, not buried ---------------------------------
@@ -342,7 +332,7 @@ class TestExtractionQueue:
             ExtractionItem(episode_id=ep_id, content=f"content {tag}", content_type="episode")
         )
         return next(
-            p["id"] for p in db.get_pending_extractions(limit=100) if p["episode_id"] == ep_id
+            p["id"] for p in _pending(db, 100) if p["episode_id"] == ep_id
         )
 
     def _age(self, db, queue_id: int, *, minutes: int, attempts: int = 1) -> None:
@@ -385,7 +375,7 @@ class TestExtractionQueue:
         ep_id = db.upsert_episode(Episode(session_id="eq-fail", sequence=1, content="fail me"))
         item = ExtractionItem(episode_id=ep_id, content="fail me", content_type="episode")
         db.enqueue_extraction(item)
-        pending = db.get_pending_extractions(limit=10)
+        pending = _pending(db, 10)
         queue_id = next(p["id"] for p in pending if p["episode_id"] == ep_id)
         db.mark_extraction_failed(queue_id, error="Connection refused")
         with db._conn() as conn:

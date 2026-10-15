@@ -31,12 +31,13 @@ import pytest
 from psycopg.rows import dict_row
 
 from ingestion import schema_check
-from ingestion.kg_pg_write import KGPostgresWriter
+from ingestion.kg_client import KGClient
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
 from mcp_server import recall_sources as recall_sources_mod
 from mcp_server.recall import Recall
 from mcp_server.recall_warnings import warn_sink
+from tests.helpers.db import DB_URL
 from tests.helpers.embed import GROUP, onehot
 from tests.helpers.surfaces import clear_surfaces, register_full, register_restricted
 
@@ -143,13 +144,13 @@ def test_string_episode_ids_resolve_like_integers(kg):
 
 
 def test_extractor_insert_then_reinforce_with_a_foreign_source_goes_mixed(kg):
-    """The real write path: KGPostgresWriter.create_edges inserts, reinforce_edges unions
+    """The real write path: KGClient.create_edges_batch inserts, reinforce_edges unions
     a new source episode into ``episodes``. A second project arriving makes the fact
     mixed, and a work-only allowlist must stop seeing it."""
     w, p = _ep(kg, WORK), _ep(kg, PERSONAL)
-    writer = KGPostgresWriter()
+    writer = KGClient(DB_URL)
     try:
-        writer.create_edges(
+        writer.create_edges_batch(
             [
                 {
                     "edge_uuid": "ext-1",

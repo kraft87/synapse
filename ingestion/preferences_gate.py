@@ -40,7 +40,7 @@ from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError, p
 
 logger = logging.getLogger(__name__)
 
-# Single-owner constant for the live store today, mirroring kg_pg_write.OWNER — one axis
+# Single-owner constant for the live store today, mirroring kg_client.OWNER — one axis
 # so a future multi-tenant split threads the same env var through preferences too.
 _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 

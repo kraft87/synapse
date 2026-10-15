@@ -1,16 +1,12 @@
-"""Pure-unit tests for KGClient helpers and write orchestration (no DB).
+"""Pure-unit tests for the module-level rrf_merge fusion (no DB).
 
-The storage layer underneath is covered by test_kg_pg_write.py /
-test_kg_pg_read.py (DB-backed); this file covers the module-level rrf_merge
-fusion plus the batch-path orchestration.
+The client's reads and writes are covered by test_kg_client_reads.py /
+test_kg_client_writes.py (DB-backed).
 """
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
-from ingestion.kg_client import KGClient, rrf_merge
-from tests.helpers.kg import make_edge_row
+from ingestion.kg_client import rrf_merge
 
 
 class TestRRFMerge:
@@ -55,37 +51,3 @@ class TestRRFMerge:
         merged = rrf_merge(vec, bm, limit=10)
         assert merged[0]["fact"] == "alpha"
         assert merged[0]["valid_at"] == "2026"
-
-
-def _client_with_mock_writer() -> tuple[KGClient, MagicMock]:
-    client = KGClient.__new__(KGClient)
-    client._writer = MagicMock()
-    client._reader = MagicMock()
-    return client, client._writer
-
-
-class TestCreateEdgesBatch:
-    def _row(self, uuid: str, **over):
-        # Batch path: src/tgt "s"/"t", single episode, no embedding column.
-        return make_edge_row(
-            uuid, src="s", tgt="t", fact=f"fact {uuid}", episodes=[1], drop=("emb",), **over
-        )
-
-    def test_rows_go_to_the_writer_in_one_call(self):
-        client, writer = _client_with_mock_writer()
-        rows = [self._row("r-1"), self._row("r-2")]
-        client.create_edges_batch(rows, "technical")
-        writer.create_edges.assert_called_once_with(rows, "technical")
-        writer.invalidate_edges.assert_not_called()
-
-    def test_empty_rows_short_circuits(self):
-        client, writer = _client_with_mock_writer()
-        client.create_edges_batch([], "technical")
-        writer.create_edges.assert_not_called()
-
-    def test_invalidate_edges_batch_fills_now_for_none(self):
-        client, writer = _client_with_mock_writer()
-        client.invalidate_edges_batch([("r-1", None), ("r-2", "2026-01-01T00:00:00+00:00")], "g")
-        (items, _group) = writer.invalidate_edges.call_args.args
-        assert items[1] == ("r-2", "2026-01-01T00:00:00+00:00")
-        assert items[0][0] == "r-1" and "T" in items[0][1]  # now() filled in

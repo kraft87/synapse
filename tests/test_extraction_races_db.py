@@ -32,6 +32,7 @@ from ingestion.dedup import _index_cache_reset
 from ingestion.extractor import ExtractionPipeline
 from ingestion.kg_client import KGClient
 from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
+from tests.helpers.db import DB_URL
 from tests.helpers.embed import onehot
 
 SEG = "2026-09-01T12:00:00+00:00"
@@ -81,7 +82,7 @@ def _pipeline(
     db.get_chunk_episode_ids.return_value = episodes
     db.get_episodes_valid_at.return_value = SEG
     pipe = ExtractionPipeline(
-        db=db, llm_client=MagicMock(), embedder=embedder, kg_client=KGClient()
+        db=db, llm_client=MagicMock(), embedder=embedder, kg_client=KGClient(DB_URL)
     )
     names = sorted({n for f in facts for n in (f.source, f.target)})
     entities = [ExtractedEntity(name=n, type="Concept", summary=f"{n} summary") for n in names]
@@ -153,8 +154,7 @@ def _run_as_parallel_workers(
 
 
 @pytest.fixture()
-def graph(conn, monkeypatch, db_url):
-    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+def graph(conn):
     conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
     _index_cache_reset()  # the dedup index is process-wide; start each case empty
     yield conn

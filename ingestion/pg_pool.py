@@ -133,6 +133,13 @@ async def held_open(db_url: str) -> AsyncIterator[dict[str, Any]]:
         await asyncio.to_thread(close_pool, db_url)
 
 
+def connect(db_url: str) -> psycopg.Connection[Any]:
+    """One long-lived autocommit connection to ``db_url``, outside the pool, with the
+    session options the pool's connections get. For a worker that holds its connection
+    for its life (the poller's KG client, one per drain thread); the caller closes it."""
+    return psycopg.connect(db_url, autocommit=True, options=_options(db_url))
+
+
 @contextmanager
 def connection(
     db_url: str,

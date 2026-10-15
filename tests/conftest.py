@@ -27,7 +27,7 @@ def _refuse_production(url: str) -> None:
 
 _refuse_production(DB_URL)
 
-# Code under test that reads SYNAPSE_DB_URL directly (ingestion.kg_pg_read/kg_pg_write)
+# Code under test that reads SYNAPSE_DB_URL directly
 # would otherwise pick up the production DSN that .env just loaded into this process.
 # Pin it to the test database so a missing monkeypatch cannot reach prod.
 os.environ["SYNAPSE_DB_URL"] = DB_URL

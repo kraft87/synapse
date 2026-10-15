@@ -1,4 +1,4 @@
-"""DB-backed tests for ingestion/kg_pg_read.py (#67 PR 2 write-side read port).
+"""DB-backed tests for the KGClient reads (#67 PR 2 write-side read port).
 
 Exercises every reader against the real kg_entities / kg_relationships schema
 (017) on the shared test DB, asserting the FalkorDB-mirroring contracts the
@@ -9,9 +9,10 @@ owner/group scoping.
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 
-from ingestion.kg_pg_read import KGPostgresReader, _emb_list, _iso
+from ingestion.kg_client import KGClient, _emb_list, _iso
 from tests.helpers.embed import GROUP
 from tests.helpers.kg import DIM, _axis_list
 
@@ -24,9 +25,8 @@ def _axis(i: int) -> str:
 
 
 @pytest.fixture()
-def kg_tables(conn, monkeypatch, db_url):
-    """Clean KG tables, point the reader at the test DB, seed a small graph."""
-    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+def kg_tables(conn, db_url):
+    """Clean KG tables, seed a small graph, and yield a client on the test DB."""
     conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
 
     conn.execute(
@@ -59,7 +59,9 @@ def kg_tables(conn, monkeypatch, db_url):
         " 'tenant2 edge must not surface', %(v0)s, NULL, NULL, NULL)",
         {"g": GROUP, "v0": _axis(0), "v1": _axis(1)},
     )
-    yield KGPostgresReader()
+    client = KGClient(db_url)
+    yield client
+    client._reset()
 
 
 class TestHelpers:
@@ -74,6 +76,28 @@ class TestHelpers:
 
         assert _iso(None) is None
         assert _iso(datetime(2026, 6, 1, tzinfo=UTC)) == "2026-06-01T00:00:00+00:00"
+
+
+class TestConnection:
+    def test_session_carries_the_pool_options(self, kg_tables):
+        # hnsw.ef_search is a startup option, so the ANN statements need no SET LOCAL for it.
+        assert kg_tables._run(lambda c: c.execute("SHOW hnsw.ef_search").fetchone()[0]) == "200"
+
+    def test_a_dropped_connection_is_replaced_not_surfaced(self, kg_tables, conn):
+        # A Postgres restart under an idle worker kills its connection; the next call
+        # reconnects instead of failing the extraction item.
+        assert kg_tables.entity_uuid_by_normalized_name("synapse", GROUP) == "e-syn"
+        pid = kg_tables._run(lambda c: c.info.backend_pid)
+        conn.execute("SELECT pg_terminate_backend(%s)", (pid,))
+        assert kg_tables.entity_uuid_by_normalized_name("synapse", GROUP) == "e-syn"
+        assert kg_tables._run(lambda c: c.info.backend_pid) != pid
+
+    def test_a_failed_statement_raises_and_the_next_call_gets_a_fresh_connection(self, kg_tables):
+        pid = kg_tables._run(lambda c: c.info.backend_pid)
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            kg_tables._run(lambda c: c.execute("SELECT * FROM no_such_table"))
+        assert kg_tables.entity_uuid_by_normalized_name("synapse", GROUP) == "e-syn"
+        assert kg_tables._run(lambda c: c.info.backend_pid) != pid
 
 
 class TestEntityReads:
@@ -111,7 +135,6 @@ class TestEdgeReads:
         assert "r-dead" not in uuids  # invalidated edges must not re-enter the pool
         assert "r-other" not in uuids
         live = next(h for h in hits if h["uuid"] == "r-live")
-        # contradiction detector calls list(cand_emb) and cosine() on this
         assert isinstance(live["fact_embedding"], list)
         assert len(live["fact_embedding"]) == DIM
         assert live["fact_embedding"][0] == 1.0
@@ -168,8 +191,7 @@ class TestNearestLiveEdges:
     the distance bound, nearest first, in one statement."""
 
     @pytest.fixture()
-    def reader(self, conn, monkeypatch, db_url):
-        monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    def reader(self, conn, db_url):
         conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
         rows = [
             # uuid, owner, group, vector, retired
@@ -196,7 +218,9 @@ class TestNearestLiveEdges:
                     "2026-06-01T00:00:00+00:00" if retired else None,
                 ),
             )
-        return KGPostgresReader()
+        client = KGClient(db_url)
+        yield client
+        client._reset()
 
     def test_in_scope_live_neighbours_inside_the_bound_nearest_first(self, reader):
         (hits,) = reader.nearest_live_edges([_tilted(1.0)], GROUP, max_distance=0.10, limit=5)

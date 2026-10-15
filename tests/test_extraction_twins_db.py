@@ -21,11 +21,10 @@ SEG = "2026-09-01T12:00:00+00:00"
 
 
 @pytest.fixture()
-def pipe(conn, monkeypatch, db_url):
-    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+def pipe(conn, db_url):
     conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
     p = ExtractionPipeline.__new__(ExtractionPipeline)
-    p._kg = KGClient()
+    p._kg = KGClient(db_url)
     # Release-notes twins share one vector, the two PR facts another: cosine alone would
     # merge both pairs.
     p._embedder = MagicMock()

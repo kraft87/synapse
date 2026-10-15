@@ -43,7 +43,7 @@ def _drain_concurrency() -> int:
 _HEARTBEAT = Path(tempfile.gettempdir()) / "poller.alive"
 
 # Daily, on the master replica's full cycle: entities with no edges are deleted once a day
-# old (KGPostgresWriter.delete_orphan_entities). Drain-only replicas never sweep.
+# old (KGClient.delete_orphan_entities). Drain-only replicas never sweep.
 _ORPHAN_SWEEP_INTERVAL_S = 24 * 3600
 _ORPHAN_MIN_AGE_H = 24
 
@@ -75,7 +75,7 @@ class Poller:
         self._stop_requested.set()
 
     def sweep_orphan_entities(self) -> int:
-        """Delete KG entities no edge references (see KGPostgresWriter.delete_orphan_entities)."""
+        """Delete KG entities no edge references (see KGClient.delete_orphan_entities)."""
         if self._extraction is None:
             return 0
         return int(self._extraction._kg.delete_orphan_entities(_ORPHAN_MIN_AGE_H))
@@ -483,7 +483,7 @@ def make_poller(
         db=db,
         llm_client=llm,
         embedder=embedder,
-        kg_client=KGClient(),
+        kg_client=KGClient(db_url),
         llm_model=llm_model,
     )
 
@@ -497,7 +497,7 @@ def make_poller(
             db=wdb,
             llm_client=create_llm_client(),
             embedder=create_embedder(voyage_api_key=voyage_api_key, db_url=db_url),
-            kg_client=KGClient(),
+            kg_client=KGClient(db_url),
             llm_model=llm_model,
         )
         return wdb, wpipe

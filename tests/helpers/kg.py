@@ -5,9 +5,9 @@ Two things the KG tests all reach for:
 * ``_axis_list`` / ``DIM`` — a one-hot unit vector (cosine-orthogonal set) used
   to seed deterministic embeddings without a real embedder.
 * ``make_edge_row`` — the edge-row factory mirroring the writer's row contract
-  (``ingestion.kg_pg_write.create_edges`` / ``KGClient.create_edges_batch``
-  destructure these dicts). Each call site passes the keys that differ for its
-  case via kwargs, and drops keys its contract omits via ``drop=(...)``.
+  (``KGClient.create_edges_batch`` destructures these dicts). Each call site passes
+  the keys that differ for its case via kwargs, and drops keys its contract omits via
+  ``drop=(...)``.
 """
 
 from __future__ import annotations
