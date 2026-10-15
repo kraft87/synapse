@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Any
 
@@ -13,7 +14,6 @@ from psycopg.rows import tuple_row
 from mcp_server.kg_pg import _vec_literal, scope_predicate, search_kg_postgres
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
-from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import warn as _warn
 
@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # a running server takes effect without a restart. Until then every restricted KG path
 # serves nothing, which is exactly the pre-056 posture.
 _KG_SCOPE_REPROBE_S = 60.0
+# One probe at a time: the KG-derived legs run concurrently, and a leg arriving while another
+# is mid-probe must wait for its answer, not read "probed a moment ago" as "column absent".
+_KG_SCOPE_LOCK = threading.Lock()
 _KG_SCOPE_PROBE_SQL = (
     "SELECT 1 FROM pg_attribute "
     "WHERE attrelid = to_regclass('kg_relationships') "
@@ -56,9 +59,31 @@ def _link_close_sql(old: str, new: str, dims: int) -> str:
     )
 
 
+def vector_web_sql(dims: int) -> str:
+    """The web vector KNN, nearest first; placeholders: query vector (distance), query vector
+    (order), limit.
+
+    The ORDER BY is the verbatim ``embedding::halfvec(N)`` expression
+    ``web_chunks_embedding_hnsw`` is built on (schema 014), so the index serves it; ordering
+    by the full-precision ``vector`` column reads every embedded chunk. It sits in a LIMITed
+    subquery so the join to web_artifacts only touches the rows that survive."""
+    return f"""
+        SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
+               c.content_ts AS created_at, a.url, a.title, a.tool_name, c.vec_distance
+        FROM (
+            SELECT id, content, context_prefix, web_artifact_id, content_ts,
+                   (embedding::halfvec({dims}) <=> %s::halfvec({dims})) AS vec_distance
+            FROM web_chunks
+            WHERE is_embedded = TRUE
+            ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) LIMIT %s
+        ) c
+        JOIN web_artifacts a ON a.id = c.web_artifact_id
+        ORDER BY c.vec_distance
+        """
+
+
 class RecallSourcesMixin:
-    # Schema-056 probe state (per engine). Plain attributes: the leg threads race only to
-    # write the same answer, and the worst case is one extra probe.
+    # Schema-056 probe state (per engine); probes serialise on _KG_SCOPE_LOCK.
     _kg_scope_ok: bool = False
     _kg_scope_probed_at: float | None = None
     _kg_scope_warned: bool = False
@@ -71,21 +96,26 @@ class RecallSourcesMixin:
         the column, so its absence cannot break them."""
         if self._kg_scope_ok:
             return True
-        last = self._kg_scope_probed_at
-        if last is not None and time.monotonic() - last < _KG_SCOPE_REPROBE_S:
-            return False
-        self._kg_scope_probed_at = time.monotonic()
-        try:
-            with self._pg() as pg:
-                row = pg.execute(_KG_SCOPE_PROBE_SQL).fetchone()
-        except Exception as e:
-            logger.warning("KG provenance probe failed (%s): restricted KG serving stays off", e)
-            return False
-        if row is None:
-            self._kg_scope_missing()
-            return False
-        self._kg_scope_ok = True
-        return True
+        with _KG_SCOPE_LOCK:
+            if self._kg_scope_ok:
+                return True
+            last = self._kg_scope_probed_at
+            if last is not None and time.monotonic() - last < _KG_SCOPE_REPROBE_S:
+                return False
+            self._kg_scope_probed_at = time.monotonic()
+            try:
+                with self._pg() as pg:
+                    row = pg.execute(_KG_SCOPE_PROBE_SQL).fetchone()
+            except Exception as e:
+                logger.warning(
+                    "KG provenance probe failed (%s): restricted KG serving stays off", e
+                )
+                return False
+            if row is None:
+                self._kg_scope_missing()
+                return False
+            self._kg_scope_ok = True
+            return True
 
     def _kg_scope_missing(self, err: BaseException | None = None) -> None:
         """Note that source_projects is absent: restricted KG serving stays off until a
@@ -148,17 +178,8 @@ class RecallSourcesMixin:
         try:
             with self._pg() as pg:
                 rows = pg.execute(
-                    """
-                    SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
-                           c.content_ts AS created_at,
-                           a.url, a.title, a.tool_name,
-                           (c.embedding <=> %s::vector) AS vec_distance
-                    FROM web_chunks c
-                    JOIN web_artifacts a ON a.id = c.web_artifact_id
-                    WHERE c.is_embedded = TRUE
-                    ORDER BY vec_distance ASC LIMIT %s
-                    """,
-                    (emb_literal, limit),
+                    vector_web_sql(self._settings()._EMBED_DIMS),
+                    (emb_literal, emb_literal, limit),
                 ).fetchall()
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
@@ -521,19 +542,17 @@ class RecallSourcesMixin:
         self,
         query_emb: list[float] | None,
         group_id: str,
-        served_uuids: set[str],
-        cap: int = _SUP_LIMIT,
         allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """A query that matches a now-INVALID fact should still return the CURRENT answer.
 
         Finds superseded edges near the query that carry a precise successor link (invalidated_by,
-        schema 028), resolves the live successor, and returns those not already served — deduped by
-        uuid and distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
-        correction in. Go-forward coverage only (no link => skipped); never returns the stale fact
-        itself. Shape matches the KG fact leg ({fact, _uuid, _date, _ongoing, _supported}) so it
-        flows through fact serving.
-        Fail-open — a lookup error just yields no extras.
+        schema 028), resolves the live successor, and returns the distinct successors, nearest
+        first, distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
+        correction in. The caller drops those it already serves and caps the rest. Go-forward
+        coverage only (no link => skipped); never returns the stale fact itself. Shape matches
+        the KG fact leg ({fact, _uuid, _date, _ongoing, _supported}) so it flows through fact
+        serving. Fail-open — a lookup error just yields no extras.
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
         and its served successor to pass the schema-056 provenance rule."""
@@ -576,12 +595,13 @@ class RecallSourcesMixin:
             logger.warning("supersession surface failed: %s", e)
             return []
         out: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for r in rows:
             d = r.get("d")
             if d is None or d > settings._SUP_MAX_DIST:
                 continue
             u, fact = r.get("uuid"), r.get("fact")
-            if u and fact and u not in served_uuids:
+            if u and fact and u not in seen:
                 out.append(
                     {
                         "fact": fact,
@@ -591,7 +611,5 @@ class RecallSourcesMixin:
                         "_supported": r.get("last_supported_at"),
                     }
                 )
-                served_uuids.add(u)
-                if len(out) >= cap:
-                    break
+                seen.add(u)
         return out

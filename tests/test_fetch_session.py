@@ -14,6 +14,7 @@ instance, no live DB.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from typing import Any, ClassVar
 
@@ -25,6 +26,7 @@ from mcp_server.recall import Recall, _to_recall_item
 def _bare() -> Recall:
     r = object.__new__(Recall)
     r._db_url = "postgresql://stub"
+    r._leg_executor = ThreadPoolExecutor(max_workers=2)
     return r
 
 
@@ -235,15 +237,15 @@ def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
 
     r._ensure_embedder = lambda: (_ for _ in ()).throw(RuntimeError("no embedder"))  # type: ignore[method-assign]
 
-    def _pool(q, e, p, session_id=None, allowed_projects=None, own_surface=None):
-        seen["session_id"] = session_id
+    def _bm25(q, p, limit, sid=None, allowed=None, own=None):
+        seen["session_id"] = sid
         return []
 
     def _excl(pool, sid):
         seen["excluded"] = True
         return pool
 
-    r._episode_pool = _pool  # type: ignore[method-assign]
+    r._search_bm25_episodes = _bm25  # type: ignore[method-assign]
     r._exclude_self = _excl  # type: ignore[method-assign]
     r._select_episodes = lambda q, pool, limit: (pool, 0, 0.0)  # type: ignore[method-assign]
     r._record_metrics = lambda m: seen.setdefault("metrics", m)  # type: ignore[method-assign]

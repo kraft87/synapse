@@ -227,6 +227,36 @@ def test_restricted_recall_scopes_the_kg_leg_to_the_allowlist(clean, db_url, mon
     assert "allowed_projects" not in full_calls[0]
 
 
+def test_restricted_recall_serves_no_web_bucket(clean, db_url, monkeypatch):
+    """Web rows carry no project provenance and the web SQL has no scope predicate, so a
+    restricted or unknown caller must not be served the bucket at all. Everything under
+    _search_web_reranked stays real here: stubbing the whole leg is what hid the leak."""
+    chunk = {
+        "id": "w:1",
+        "content": "private research page",
+        "web_artifact_id": 1,
+        "url": "https://example.org/private",
+        "title": "Personal medical lookup",
+    }
+    legs: list[str] = []
+
+    def _engine_with_web():
+        r = _engine(db_url, monkeypatch)
+        del r._search_web_reranked  # the real fuse -> rerank -> floor path
+        r._search_bm25_web = lambda q, n: legs.append("bm25") or [chunk]
+        r._search_vector_web = lambda emb, n: legs.append("vector") or []
+        r._rerank_pool_scored = lambda q, pool: [(i, 0.9) for i in range(len(pool))]
+        return r
+
+    for surface in (register_restricted(clean, ["alpha"]), "never-registered"):
+        assert "web" not in _engine_with_web().recall("research", surface=surface)
+    assert legs == []  # nothing even queried the table
+
+    full = register_full(clean)
+    out = _engine_with_web().recall("research", surface=full)
+    assert [w["id"] for w in out["web"]] == ["w:1"]
+
+
 def test_unknown_surface_skips_every_kg_read(clean, db_url, monkeypatch):
     """An unknown caller's allowlist is empty, and no fact can be a non-empty subset of
     nothing, so the facts leg and every KG-derived extra are skipped without a query."""

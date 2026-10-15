@@ -6,14 +6,10 @@ import logging
 import time
 from typing import Any
 
-from ingestion import embedding as _embedding
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
 from mcp_server.recall_settings import _EPISODE_LIMIT
-from mcp_server.recall_warnings import config_hint as _config_hint
-from mcp_server.recall_warnings import error_brief as _err_brief
-from mcp_server.recall_warnings import warn as _warn
 from mcp_server.recall_warnings import warn_sink as _warn_sink
 
 logger = logging.getLogger(__name__)
@@ -84,41 +80,24 @@ class RecallEpisodesMixin:
         """recall_episodes()'s body, run with ``warnings`` bound as the degradation sink."""
         st = self._resolve_trust(surface, trust)
         allowed = st.project_filter
-        try:
-            query_emb = self._ensure_embedder().embed([query], task="query")[0]
-        except Exception as e:
-            logger.error("Embedding query failed: %s", e)
-            detail = _err_brief(e)
-            backend = _embedding.embed_provider()
-            _warn(
-                f"embedding failed ({backend}: {detail}): vector legs skipped, "
-                f"results are BM25-only."
-                + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_EMBED")
-            )
-            query_emb = None
-
         # Deep-fetch both legs (golds rank up to ~88 in a single leg), fuse, then
-        # rerank the WIDE pool and select what to serve (WIN1 — see _episode_pool).
+        # rerank the WIDE pool and select what to serve (WIN1 — see _start_episode_legs).
         # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
         # _select_episodes / _EPISODE_CUTOFF_TAU).
-        pool = self._episode_pool(
+        legs = self._start_episode_legs(
             query,
-            query_emb,
             project,
             session_id=session_id,
             allowed_projects=allowed,
             own_surface=self._own_surface(st),
         )
-        # Same self-exclusion as recall(): the caller's own turns are already in
-        # its context window. Pool-level so excluded slots backfill before rerank.
-        # Skipped under a session filter — the caller explicitly asked for that
-        # session's turns, including when it is its own.
-        n_self_excluded = 0
-        if self_session and not session_id:
-            pre_excl = len(pool)
-            pool = self._exclude_self(pool, self_session)
-            n_self_excluded = pre_excl - len(pool)
-        episodes, n_echo_suppressed, rerank_top = self._select_episodes(query, pool, limit)
+        query_emb = legs.query_emb
+        # Same self-exclusion as recall(): the caller's own turns are already in its
+        # context window. Skipped under a session filter — the caller explicitly asked
+        # for that session's turns, including when it is its own.
+        pool = self._join_episode_pool(legs, None if session_id else self_session)
+        n_self_excluded = pool.n_self_excluded
+        episodes, n_echo_suppressed, rerank_top = self._select_episodes(query, pool.items, limit)
 
         # Increment feedback counts BEFORE slimming (we lose the parseable id afterwards)
         ep_ids = [

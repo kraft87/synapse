@@ -18,7 +18,7 @@ from contextlib import nullcontext
 
 import ingestion.db as db_mod
 import mcp_server.recall as recall_mod
-from ingestion.surfaces import SurfaceTrust
+from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server.recall import Recall, _config_hint, _err_brief, _warn, _warn_sink
 
 # Poison DSN (same rationale as test_recall_floor): an unstubbed leg must fail loudly
@@ -88,9 +88,6 @@ def _wired(*, embed_fail: bool = False, rerank_fail: bool = False, pool: list[di
     ]
     r._increment_fact_retrieval_counts = lambda *a, **k: None
     r._increment_retrieval_counts = lambda ids: None
-    r._episode_pool = (
-        lambda q, emb, proj, session_id=None, allowed_projects=None, own_surface=None: list(p)
-    )
     r._select_episodes = lambda q, pl, limit: (pl[:limit], 0, 0.9)
     r._record_metrics = lambda m: None
     return r
@@ -259,7 +256,7 @@ def test_web_leg_failures_warn():
     del r._search_bm25_web
     del r._search_vector_web
     r._pg = lambda: nullcontext(_DeadPG())
-    msg = _joined(r.recall("anything"))
+    msg = _joined(r.recall("anything", trust=FULL_TRUST))  # a restricted caller gets no web leg
     assert "BM25 web search failed" in msg
     assert "vector web search failed" in msg
     assert "web bucket is degraded" in msg

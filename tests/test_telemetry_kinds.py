@@ -132,6 +132,7 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
         "notes",
         "n_echo_suppressed",
         "n_dup_passages",
+        "n_chunks_cut",
         "trust",  # schema 053 — which trust regime produced these numbers
     }
     assert served["trust"] == "full"
@@ -225,11 +226,7 @@ def test_recall_without_self_session_never_looks_up_fact_provenance(db_url, full
 def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry shape pin episodes {uuid.uuid4().hex[:8]}"
-    p = _pool()
     engine = _wired(db_url, [0.31, 0.22, 0.11, 0.05])  # real scores, below the floor
-    engine._episode_pool = (
-        lambda q_, emb, proj, session_id=None, allowed_projects=None, own_surface=None: list(p)
-    )
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q)  # the MCP surface path for the drill-down
@@ -267,11 +264,7 @@ def test_episodes_kind_records_self_exclusion(conn, db_url, monkeypatch):
     for i, ep in enumerate(p):
         ep["session_id"] = "MY-SESSION" if i < 2 else f"other-{i}"
     engine = _wired(db_url, [0.9, 0.8])  # scores for the 2 survivors
-    engine._episode_pool = (
-        lambda q_, emb, proj, session_id=None, allowed_projects=None, own_surface=None: [
-            dict(e) for e in p
-        ]
-    )
+    engine._search_bm25_episodes = lambda *a, **k: [dict(e) for e in p]
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q, self_session="MY-SESSION")

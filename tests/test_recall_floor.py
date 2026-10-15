@@ -92,16 +92,6 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
     return r, captured
 
 
-def _episodes_wired(scores: list[float], *, pool: list[dict] | None = None):
-    """Same harness routed through recall_episodes()' pool primitive."""
-    p = _pool() if pool is None else pool
-    r, captured = _wired(scores, pool=p)
-    r._episode_pool = (
-        lambda q, emb, proj, session_id=None, allowed_projects=None, own_surface=None: list(p)
-    )
-    return r, captured
-
-
 # --- _floor_shadow unit ----------------------------------------------------------
 
 
@@ -253,7 +243,7 @@ def test_recall_empty_pool_no_marker_no_crash(monkeypatch):
 
 def test_recall_episodes_records_rerank_top_score(monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _episodes_wired([0.7712, 0.50, 0.40, 0.30])
+    r, captured = _wired([0.7712, 0.50, 0.40, 0.30])
     out = r.recall_episodes("q")
     assert len(out["episodes"]) == 4
     (m,) = captured
@@ -264,7 +254,7 @@ def test_recall_episodes_records_rerank_top_score(monkeypatch):
 
 def test_recall_episodes_below_floor_marks_envelope(monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _episodes_wired([0.31, 0.22, 0.11, 0.05])
+    r, captured = _wired([0.31, 0.22, 0.11, 0.05])
     out = r.recall_episodes("q")
     assert len(out["episodes"]) == 4  # served in full — shadow only
     (m,) = captured
@@ -276,10 +266,10 @@ def test_recall_episodes_below_floor_marks_envelope(monkeypatch):
 def test_recall_episodes_payload_identical_with_and_without_floor(monkeypatch):
     scores = [0.31, 0.22, 0.11, 0.05]
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r1, c1 = _episodes_wired(scores)
+    r1, c1 = _wired(scores)
     out_marked = r1.recall_episodes("q")  # floor still ON — the marked leg
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.0)  # floor off
-    r2, c2 = _episodes_wired(scores)
+    r2, c2 = _wired(scores)
     out_plain = r2.recall_episodes("q")
     assert out_marked == out_plain  # the full response object — byte-identical payload
     assert c1[0]["served_ids"]["would_abstain"] is True  # marked leg really ran with floor on
@@ -289,14 +279,14 @@ def test_recall_episodes_payload_identical_with_and_without_floor(monkeypatch):
 
 def test_recall_episodes_exactly_at_floor_no_marker(monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _episodes_wired([0.58, 0.40, 0.30, 0.20])
+    r, captured = _wired([0.58, 0.40, 0.30, 0.20])
     r.recall_episodes("q")
     assert "would_abstain" not in captured[0]["served_ids"]
 
 
 def test_recall_episodes_empty_pool_no_marker_no_crash(monkeypatch):
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _episodes_wired([], pool=[])
+    r, captured = _wired([], pool=[])
     out = r.recall_episodes("q")
     assert out["episodes"] == []
     (m,) = captured

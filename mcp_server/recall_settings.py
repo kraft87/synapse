@@ -2,9 +2,7 @@
 
 from dataclasses import dataclass
 
-# Fixed signature defaults shared by the public APIs and candidate searches.
-_EPISODE_FETCH = 100
-_EPISODE_RERANK_POOL = 100
+# Fixed signature defaults shared by the public APIs.
 _EPISODE_LIMIT = 5
 _SUP_LIMIT = 3
 

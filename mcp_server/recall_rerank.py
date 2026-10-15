@@ -215,40 +215,62 @@ class RecallRerankMixin:
         settings = self._settings()
         return self._floor_by_rerank(query, facts, settings._RECALL_FACT_FLOOR, keep_min=1)
 
+    def _rank_episodes(
+        self,
+        query: str,
+        pool: list[dict[str, Any]],
+        scored: list[tuple[int, float]],
+        need: int,
+    ) -> tuple[list[dict[str, Any]], list[float], float, int]:
+        """The ranking contract shared by recall() and recall_episodes(): re-inject recency
+        into the rerank order and suppress query echoes.
+
+        ``scored`` is ``_rerank_pool_scored``'s output for ``pool``; ``need`` is how many
+        episodes the caller can serve (the echo scan's lazy bound). Returns ``(ranked,
+        scores, rerank_top, n_echo)``: the episodes in final order with their
+        recency-adjusted scores, the echoes dropped, and ``rerank_top``, the RAW
+        pre-recency top rerank score among the first ``need`` survivors. That is the value
+        recall_metrics.rerank_top_score records and the abstention floor judges, so an echo
+        of the prompt that scores high cannot hold the floor open for passages that are
+        weak. 0.0 when nothing survives or the rerank degraded/was disabled. Echoed
+        episodes are dropped BEFORE the caller slices, so the next-ranked candidates
+        backfill the freed slots. The caller excludes its own session's turns from ``pool``
+        first (``_join_episode_pool``), so they never take a slot nor a rerank token."""
+        raw = dict(scored)
+        adjusted = self._apply_rerank_recency(scored, pool)  # no-op when disabled/degraded
+        order = [i for i, _ in adjusted]
+        ranked = [pool[i] for i in order]
+        scores = [s for _, s in adjusted]
+        keep, n_echo = self._filter_query_echo(query, ranked, need)
+        if n_echo:
+            order = [order[i] for i in keep]
+            ranked = [ranked[i] for i in keep]
+            scores = [scores[i] for i in keep]
+        return ranked, scores, max((raw[i] for i in order[:need]), default=0.0), n_echo
+
     def _select_episodes(
         self, query: str, pool: list[dict[str, Any]], limit: int
     ) -> tuple[list[dict[str, Any]], int, float]:
-        """Rerank `pool`, re-inject recency + suppress query echo, and pick what to serve.
+        """Rerank `pool` (see ``_rank_episodes``) and pick what to serve.
 
-        Returns ``(episodes, n_echo_suppressed, rerank_top)``. ``rerank_top`` is the RAW
-        pre-recency top rerank score — the value recall_metrics.rerank_top_score records and
-        the shadow abstention floor compares against — 0.0 when the pool is empty or the
-        rerank degraded/was disabled. Default (SYNAPSE_EPISODE_CUTOFF_TAU <= 0):
-        fixed top-`limit` in the recency-adjusted rerank order. With tau > 0: adaptive relative
-        score-cutoff (keep score >= tau*top, clamped [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K])
-        over the recency-adjusted scores. Echoed episodes (the query quoting itself) are dropped
-        BEFORE the final slice/cutoff so the next-ranked candidates backfill the freed slots. Always
-        degrades to RRF order on rerank failure; never hard-fails."""
+        Returns ``(episodes, n_echo_suppressed, rerank_top)``. Default
+        (SYNAPSE_EPISODE_CUTOFF_TAU <= 0): fixed top-`limit` in the recency-adjusted rerank
+        order. With tau > 0: adaptive relative score-cutoff (keep score >= tau*top, clamped
+        [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K]) over the recency-adjusted scores.
+        Always degrades to RRF order on rerank failure; never hard-fails."""
         settings = self._settings()
         if not pool:
             return [], 0, 0.0
         scored = self._rerank_pool_scored(query, pool)
         if not scored:
             return [], 0, 0.0
-        rerank_top = scored[0][1]  # RAW top score (telemetry + shadow floor) — pre-recency
-        degraded = rerank_top <= 0.0  # reranker down/disabled -> RRF order, fixed-k
-        scored = self._apply_rerank_recency(scored, pool)  # no-op when disabled/degraded
-        ranked = [pool[i] for i, _ in scored]
-        ranked_scores = [s for _, s in scored]
+        degraded = scored[0][1] <= 0.0  # reranker down/disabled -> RRF order, fixed-k
         fixed_k = settings._EPISODE_CUTOFF_TAU <= 0 or degraded
         # Echo suppression's lazy scan only needs enough survivors to cover the serve
         # window: `limit` on the fixed-k path, at most _EPISODE_CUTOFF_MAX_K on the tau
         # path (k is clamped there, so ranked[:k] never reaches past the scanned prefix).
         need = limit if fixed_k else max(limit, settings._EPISODE_CUTOFF_MAX_K)
-        keep, n_echo = self._filter_query_echo(query, ranked, need)
-        if n_echo:
-            ranked = [ranked[i] for i in keep]
-            ranked_scores = [ranked_scores[i] for i in keep]
+        ranked, ranked_scores, rerank_top, n_echo = self._rank_episodes(query, pool, scored, need)
         if fixed_k:
             return ranked[:limit], n_echo, rerank_top
         k = _cutoff_k(

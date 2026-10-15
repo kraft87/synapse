@@ -13,16 +13,20 @@ from ingestion.surfaces import SurfaceTrust
 from mcp_server.recall_presentation import apply_supersessions as _apply_supersessions
 from mcp_server.recall_presentation import parse_episode_ids as _parse_episode_ids
 from mcp_server.recall_presentation import to_web_recall_item as _to_web_recall_item
-from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_ranking import served_chars as _served_chars
 from mcp_server.recall_ranking import timed as _timed
-from mcp_server.recall_warnings import config_hint as _config_hint
+from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import submit_with_context as _submit_ctx
 from mcp_server.recall_warnings import warn as _warn
 from mcp_server.recall_warnings import warn_sink as _warn_sink
 
 logger = logging.getLogger(__name__)
+
+#: Extra facts asked of the KG leg when the call carries ``self_session``, so facts sourced
+#: only from the calling session (2.6% of served facts before exclusion) can drop out
+#: without leaving the bucket short.
+_SELF_FACT_HEADROOM = 5
 
 
 class RecallOverviewMixin:
@@ -133,44 +137,21 @@ class RecallOverviewMixin:
         kg_scope: dict[str, Any] = {"allowed_projects": allowed} if st.restricted else {}
         kg_off = st.restricted and not allowed
 
-        # BM25 is pure text search — it does NOT need the query embedding. Start it
-        # FIRST so its ~165ms fetch overlaps the ~170ms Voyage query-embedding call
-        # below, instead of running after it (the embed gates the vector/KG/web legs,
-        # but not BM25). Each leg owns a thread-local PG connection, so concurrent
-        # psycopg use is safe. Legs run through _timed for per-leg latency telemetry.
-        f_bm25 = _submit_ctx(
-            ex,
-            _timed,
-            self._search_bm25_episodes,
-            query,
-            project,
-            settings._EPISODE_FETCH,
-            None,
-            allowed,
-            own,
-        )
+        # The episode legs: BM25 starts before the query embedding so its fetch overlaps
+        # that Voyage call, and the vector leg follows the embedding (see
+        # _start_episode_legs). Each leg owns a pooled PG connection, so concurrent psycopg
+        # use is safe. Legs run through _timed for per-leg latency telemetry.
+        legs = self._start_episode_legs(query, project, allowed_projects=allowed, own_surface=own)
+        query_emb = legs.query_emb
+        ms_embed = legs.ms_embed
 
-        t_emb = time.perf_counter()
-        try:
-            query_emb = self._ensure_embedder().embed([query], task="query")[0]
-        except Exception as e:
-            logger.error("Embedding query failed: %s", e)
-            detail = _err_brief(e)
-            backend = _embedding.embed_provider()
-            _warn(
-                f"embedding failed ({backend}: {detail}): vector legs skipped, "
-                f"results are BM25-only."
-                + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_EMBED")
-            )
-            query_emb = None
-        ms_embed = (time.perf_counter() - t_emb) * 1000.0
+        # Self-exclusion asks the KG for a few extra facts, so those the calling session
+        # sourced alone can drop out and the bucket still fills to _FACT_LIMIT.
+        fact_limit = settings._FACT_LIMIT + (_SELF_FACT_HEADROOM if self_session else 0)
 
         # The remaining legs all need the embedding; fan them out concurrently (they
         # no-op when it's unavailable). Summaries were retired (task #63): the KG owns
         # facts and the wide episode leg owns broad/needle, so no synth_documents leg.
-        def _web_leg() -> list[dict[str, Any]]:
-            return self._search_web_reranked(query, query_emb) if query_emb is not None else []
-
         def _kg_leg() -> tuple[list[Any], list[Any]]:
             # Restricted surface: serve only facts whose cached provenance set
             # (kg_relationships.source_projects, schema 056) is known, non-empty and a
@@ -187,27 +168,32 @@ class RecallOverviewMixin:
                 query_emb,
                 group_id,
                 session_focus or [],
-                fact_limit=settings._FACT_LIMIT,
+                fact_limit=fact_limit,
                 **kg_scope,
             )
 
-        f_vec = (
-            _submit_ctx(
-                ex,
-                _timed,
-                self._search_vector_episodes,
-                query_emb,
-                project,
-                settings._EPISODE_FETCH,
-                None,
-                allowed,
-                own,
-            )
-            if query_emb is not None
+        # Web rows carry no project provenance and the web SQL has no scope predicate, so a
+        # restricted caller (an unknown one included) is served no web bucket at all.
+        f_web = (
+            _submit_ctx(ex, _timed, self._search_web_reranked, query, query_emb)
+            if query_emb is not None and not st.restricted
             else None
         )
-        f_web = _submit_ctx(ex, _timed, _web_leg)
         f_kg = _submit_ctx(ex, _timed, _kg_leg)
+        # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT
+        # successor so a query about something that changed still gets today's answer. It
+        # needs only the embedding, so it runs beside the KG leg; dedupe against the served
+        # facts happens once both are in.
+        f_sup = (
+            _submit_ctx(
+                ex,
+                functools.partial(self._surface_supersessions, **kg_scope),
+                query_emb,
+                group_id,
+            )
+            if query_emb is not None and not kg_off
+            else None
+        )
 
         # Notes leg: hook-KNN + rerank floor over the curated notes store (the board's
         # searchable other half). Reuses this call's query embedding; no-ops without it.
@@ -218,38 +204,38 @@ class RecallOverviewMixin:
 
         f_notes = _submit_ctx(ex, _timed, _notes_leg) if settings._NOTES_IN_RECALL else None
 
-        # Fuse BM25 + vector into the rerank pool — identical to _episode_pool's output
-        # (used by recall_episodes), just with BM25 hoisted ahead of the embed.
-        bm25_eps, ms_bm25 = f_bm25.result()
-        vec_eps, ms_vec = f_vec.result() if f_vec is not None else ([], 0.0)
-        ep_pool = _merge_rrf(bm25_eps, vec_eps, id_key="id")[: settings._EPISODE_RERANK_POOL]
-        web_ranked, ms_web = f_web.result()
-        (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
+        # Join the episode legs and start the cross-encoder rerank (Voyage HTTP, the largest
+        # call) at once: it needs only this pool, so it runs while the web and KG legs and
+        # the fact bookkeeping below are still in flight. Use the SCORED rerank: it also
+        # yields the top relevance score (a recall-confidence signal, and the basis for the
+        # abstention floor). The calling session's own turns are already out of the pool.
+        pool = self._join_episode_pool(legs, self_session)
+        ep_pool = pool.items
+        f_rerank = _submit_ctx(ex, _timed, self._rerank_pool_scored, query, ep_pool)
 
-        facts_internal = kg_results[
-            : settings._FACT_LIMIT
-        ]  # carry _uuid for bump + superseded pairs
-        # Self-exclusion, facts half: drop facts sourced only from the calling session.
-        # Runs before the retrieval_count bump so an unserved fact is not reinforced.
+        (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
+        sup_candidates = f_sup.result() if f_sup is not None else []
+        # Self-exclusion, facts half: drop facts sourced only from the calling session, in
+        # ONE provenance lookup over the facts and the supersession successors. Runs before
+        # the retrieval_count bump so an unserved fact is not reinforced.
         n_self_facts_excluded = 0
-        if self_session and facts_internal:
+        if self_session:
             own_facts = self._self_session_facts(
-                [f["_uuid"] for f in facts_internal if f.get("_uuid")], self_session
+                [f["_uuid"] for f in (*kg_results, *sup_candidates) if f.get("_uuid")],
+                self_session,
             )
             if own_facts:
-                facts_internal = [f for f in facts_internal if f.get("_uuid") not in own_facts]
+                kg_results = [f for f in kg_results if f.get("_uuid") not in own_facts]
+                sup_candidates = [f for f in sup_candidates if f.get("_uuid") not in own_facts]
                 n_self_facts_excluded = len(own_facts)
+        facts_internal = kg_results[: settings._FACT_LIMIT]  # carry _uuid for bump + superseded
         # Feedback loop: bump retrieval_count on every surfaced edge so frequent hits
         # float higher next time. Already fire-and-forget — never blocks the response.
         surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
         if surfaced_edge_uuids and write_feedback:
             self._increment_fact_retrieval_counts(surfaced_edge_uuids, group_id)
 
-        # Second wave, also concurrent: the cross-encoder rerank (Voyage HTTP) and the
-        # bi-temporal superseded-pairs fetch hit different backends. Use the SCORED rerank — same
-        # ordering as _rerank_pool, but it also yields the top relevance score (a recall-
-        # confidence signal, and the basis for an eventual inject-only-if-relevant gate).
-        f_rerank = _submit_ctx(ex, _timed, self._rerank_pool_scored, query, ep_pool)
+        # The bi-temporal superseded-pairs fetch hits a different backend than the rerank.
         f_superseded = (
             None
             if kg_off
@@ -263,28 +249,21 @@ class RecallOverviewMixin:
         )
         scored, ms_rerank = f_rerank.result()
         superseded_facts = f_superseded.result() if f_superseded is not None else []
-        rerank_top = scored[0][1] if scored else 0.0  # RAW top score (telemetry) — pre-recency
-        # Post-rerank recency re-injection: the cross-encoder is recency-blind, so an old
-        # *definitive* claim out-ranks a newer *correction* when both make the pool. Re-weight
-        # the FINAL ordering only; the rerank call, the pool, and rerank_top above are untouched.
-        scored = self._apply_rerank_recency(scored, ep_pool)
-        ranked = [ep_pool[i] for i, _ in scored]
-
-        # Episodes: rerank order (recency-adjusted above).
-        ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
-        n_self_excluded = 0
-        if self_session:
-            pre_excl = len(ranked_eps)
-            ranked_eps = self._exclude_self(ranked_eps, self_session)
-            n_self_excluded = pre_excl - len(ranked_eps)
-        # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
-        # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
+        # Post-rerank recency re-injection (the cross-encoder is recency-blind, so an old
+        # *definitive* claim out-ranks a newer *correction* when both make the pool), then
+        # query-echo suppression, in _rank_episodes: the same ranking contract
+        # recall_episodes() serves. The slices below backfill freed slots from next-ranked.
         # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
-        keep, n_echo_suppressed = self._filter_query_echo(
-            query, ranked_eps, max(settings._RECALL_EPISODE_LIMIT, settings._RECALL_PASSAGE_SRC_K)
+        # ``rerank_top`` is the RAW (pre-recency) top score among the episodes that survive
+        # echo suppression, i.e. of what gets mined; ``rerank_top_all`` is the pool's own
+        # top, recorded when the two differ so SYNAPSE_RECALL_FLOOR can be recalibrated.
+        ranked_eps, _scores, rerank_top, n_echo_suppressed = self._rank_episodes(
+            query,
+            ep_pool,
+            scored,
+            max(settings._RECALL_EPISODE_LIMIT, settings._RECALL_PASSAGE_SRC_K),
         )
-        if n_echo_suppressed:
-            ranked_eps = [ranked_eps[i] for i in keep]
+        rerank_top_all = scored[0][1] if scored else 0.0
         # Stage 2: serve compact passages of the top reranked episodes instead of whole
         # turns. NO fallback: compaction yielding nothing means no passage cleared the
         # bar — LOW relevance — and low relevance must cost FEWER tokens, not more. The
@@ -320,8 +299,8 @@ class RecallOverviewMixin:
             else:
                 ep_items = None
         # Web bucket: fused (BM25+vector) -> cross-encoder rerank -> _WEB_FLOOR -> dedupe, all done
-        # in _web_leg (_search_web_reranked). Floor self-gates on intent, so this is often empty.
-        web_chunks = web_ranked
+        # in _search_web_reranked. Floor self-gates on intent, so this is often empty.
+        web_chunks, ms_web = f_web.result() if f_web is not None else ([], 0.0)
 
         # Surface the internal _uuid to the caller as a "f:<uuid>" id (below) so facts
         # are citable in recall_feedback, same as episodes carry "e:N".
@@ -331,24 +310,17 @@ class RecallOverviewMixin:
         served_facts = facts_internal
         if settings._RECALL_FACT_FLOOR > 0 and len(served_facts) > 1:
             served_facts = self._floor_facts(query, served_facts)
-        # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
-        # (deduped) so a query about something that changed still gets today's answer, not nothing.
-        sup_extras = (
-            []
-            if kg_off
-            else self._surface_supersessions(
-                query_emb,
-                group_id,
-                {f.get("_uuid") for f in served_facts if f.get("_uuid")},
-                **kg_scope,
-            )
-        )
-        if sup_extras and self_session:
-            own_facts = self._self_session_facts(
-                [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
-            )
-            sup_extras = [f for f in sup_extras if f.get("_uuid") not in own_facts]
-            n_self_facts_excluded += len(own_facts)
+        # Supersession extras: the successors not already served, up to _SUP_LIMIT, added
+        # beyond _FACT_LIMIT. Go-forward coverage only; the stale fact itself is never served.
+        served_uuids = {f.get("_uuid") for f in served_facts if f.get("_uuid")}
+        sup_extras = []
+        for f in sup_candidates:
+            if f["_uuid"] in served_uuids:
+                continue
+            served_uuids.add(f["_uuid"])
+            sup_extras.append(f)
+            if len(sup_extras) >= _SUP_LIMIT:
+                break
         if sup_extras:
             served_facts = list(served_facts) + sup_extras
         # Slim facts to {fact, date, ongoing?, supported?}. date = t_valid: when the fact became
@@ -438,6 +410,8 @@ class RecallOverviewMixin:
             "n_echo_suppressed": n_echo_suppressed,
             # Passages skipped as repeats of another episode's chosen passage.
             "n_dup_passages": passage_stats.get("n_dup_passages", 0),
+            # Chunks the rerank never saw because the episodes overran _RECALL_PASSAGE_CAND.
+            "n_chunks_cut": passage_stats.get("n_chunks_cut", 0),
             # Trust verdict (schema 053): a restricted serve is narrower by design, so
             # the metrics have to say which regime produced these numbers.
             "trust": st.trust,
@@ -448,8 +422,10 @@ class RecallOverviewMixin:
         # from "exclusion never ran" (keys absent).
         if self_session:
             served_ids["self_session"] = self_session
-            served_ids["n_self_excluded"] = n_self_excluded
+            served_ids["n_self_excluded"] = pool.n_self_excluded
             served_ids["n_self_facts_excluded"] = n_self_facts_excluded
+        if rerank_top_all != rerank_top:
+            served_ids["rerank_top_all"] = round(float(rerank_top_all), 4)
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.
@@ -463,8 +439,8 @@ class RecallOverviewMixin:
             "write_feedback": write_feedback,
             "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
             "ms_embed": round(ms_embed, 1),
-            "ms_bm25": round(ms_bm25, 1),
-            "ms_vector": round(ms_vec, 1),
+            "ms_bm25": round(pool.ms_bm25, 1),
+            "ms_vector": round(pool.ms_vector, 1),
             "ms_kg": round(ms_kg, 1),
             "ms_web": round(ms_web, 1),
             "ms_rerank": round(ms_rerank, 1),
@@ -476,8 +452,8 @@ class RecallOverviewMixin:
             "ms_notes": round(ms_notes, 1),
             "chars": chars,
             "est_tokens": chars // 4,
-            "pool_bm25": len(bm25_eps),
-            "pool_vector": len(vec_eps),
+            "pool_bm25": pool.n_bm25,
+            "pool_vector": pool.n_vector,
             "pool_fused": len(ep_pool),
             "kg_candidates": len(kg_results),
             "rerank_model": _embedding._RERANK_MODEL,

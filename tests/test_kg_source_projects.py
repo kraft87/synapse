@@ -455,9 +455,9 @@ def test_superseded_pairs_need_both_sides_in_scope(kg, db_url):
 def test_supersession_surface_needs_both_edges_in_scope(kg, db_url):
     _supersession_fixture(kg)
     r = Recall(db_url, "")
-    scoped = r._surface_supersessions(onehot(1), GROUP, set(), cap=10, allowed_projects=[WORK])
+    scoped = r._surface_supersessions(onehot(1), GROUP, allowed_projects=[WORK])
     assert _uuids(scoped) == {"n-ok"}
-    assert _uuids(r._surface_supersessions(onehot(1), GROUP, set(), cap=10)) == {
+    assert _uuids(r._surface_supersessions(onehot(1), GROUP)) == {
         "n-ok",
         "n-2",
         "n-3",
@@ -563,7 +563,7 @@ def test_full_trust_sql_never_mentions_the_provenance_column():
     conn = _RecordingConn()
     r._pg = lambda: nullcontext(conn)
     r._fetch_superseded_pairs_pg(GROUP, ["u1"], 2)
-    r._surface_supersessions(onehot(0), GROUP, set())
+    r._surface_supersessions(onehot(0), GROUP)
     r._episode_supersessions([1, 2], GROUP)
     statements = cur.sql + conn.sql
     assert len(statements) >= 6
@@ -620,7 +620,7 @@ def test_restricted_kg_paths_serve_nothing_without_the_column(no_column, caplog)
             [],
         )
         assert r._fetch_superseded_pairs_pg(GROUP, ["n-ok"], 5, allowed_projects=allowed) == []
-        assert r._surface_supersessions(onehot(1), GROUP, set(), allowed_projects=allowed) == []
+        assert r._surface_supersessions(onehot(1), GROUP, allowed_projects=allowed) == []
         assert r._episode_supersessions([ids["w"]], GROUP, allowed_projects=allowed) == {}
     assert sink == [], "the pre-056 restricted skip added no response warning"
     missing = [m for m in caplog.messages if "source_projects is missing" in m]

@@ -54,18 +54,11 @@ def test_query_matching_invalid_fact_surfaces_successor(conn, db_url):
     _seed(conn)
     r = Recall(db_url, "")
     # query aligns with the SUPERSEDED fact P (axis 1) -> surface its successor N.
-    out = r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
+    out = r._surface_supersessions(_axis_list(1), GROUP)
     assert len(out) == 1
     assert out[0]["_uuid"] == "n-1"
     assert out[0]["fact"] == "Synapse uses Postgres now"  # the CURRENT fact, not the stale one
     assert str(out[0]["_date"]).startswith("2026-06-10")  # successor's t_valid
-
-
-def test_already_served_successor_is_deduped(conn, db_url):
-    _seed(conn)
-    r = Recall(db_url, "")
-    out = r._surface_supersessions(_axis_list(1), GROUP, served_uuids={"n-1"})
-    assert out == []  # successor already in the facts bucket -> not added again
 
 
 def test_off_topic_superseded_fact_is_gated_out(conn, db_url):
@@ -73,7 +66,7 @@ def test_off_topic_superseded_fact_is_gated_out(conn, db_url):
     r = Recall(db_url, "")
     # query aligns with the SUCCESSOR (axis 0); the superseded P (axis 1) is cosine-distance 1.0
     # away -> beyond _SUP_MAX_DIST -> nothing surfaced (the live leg already owns this case).
-    assert r._surface_supersessions(_axis_list(0), GROUP, served_uuids=set()) == []
+    assert r._surface_supersessions(_axis_list(0), GROUP) == []
 
 
 def _seed_pairs(conn) -> None:
@@ -141,9 +134,7 @@ def _seed_far_link(conn) -> dict[str, int]:
 def test_far_successor_link_is_not_believed_by_any_leg(conn, db_url):
     ids = _seed_far_link(conn)
     r = Recall(db_url, "")
-    surfaced = {
-        x["_uuid"] for x in r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
-    }
+    surfaced = {x["_uuid"] for x in r._surface_supersessions(_axis_list(1), GROUP)}
     assert "n-far" not in surfaced and "n-1" in surfaced  # the close link still surfaces
     assert r._episode_supersessions([ids["episode"]], GROUP) == {}
     assert r._fetch_superseded_pairs_pg(GROUP, ["n-far"], 10) == []

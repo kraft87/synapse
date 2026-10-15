@@ -193,8 +193,9 @@ _RECALL_EPISODE_LIMIT = 5  # direct episode turns served by recall()
 # on FULL episodes. Passages are picked by a SECOND cross-encoder rerank over the markdown chunks of
 # the top _RECALL_PASSAGE_SRC_K episodes. The bench's hybrid->rerank cascade collapses to a DIRECT
 # rerank here because the chunk count is bounded (~20-80 from 20 episodes, capped at
-# _RECALL_PASSAGE_CAND) and a direct rerank IS that cascade's quality ceiling — and rerank-only
-# (no live passage embedding) keeps the second pass ~0.2s, not the ~2.2s a cosine leg would add.
+# _RECALL_PASSAGE_CAND, which the episodes share when they overrun it) and a direct rerank IS
+# that cascade's quality ceiling — and rerank-only (no live passage embedding) keeps the second
+# pass ~0.2s, not the ~2.2s a cosine leg would add.
 # 6 passages: the benches ran at 6 and prod ran SYNAPSE_RECALL_PASSAGE_N=6 from 2026-06-30
 # (default 3 until 2026-10-09). Still overridable: it is the episode bucket's token budget.
 _RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "6") or "6")  # passages served
@@ -435,10 +436,12 @@ class Recall(
         self._async_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="recall-feedback"
         )
-        # Leg executor: runs recall()'s independent search legs (summaries, episodes,
-        # web, KG) concurrently, each borrowing its own connection (_pg). Legs never
-        # submit here, so concurrent recalls queue rather than deadlock.
-        self._leg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="recall-leg")
+        # Leg executor: runs recall()'s independent legs (episode BM25 + vector, web, KG,
+        # supersession surface, notes, then the rerank and the superseded pairs) concurrently,
+        # each borrowing its own connection (_pg) or making its own Voyage call. Legs never
+        # submit here, so concurrent recalls queue rather than deadlock. 8 = one recall's
+        # widest wave; the connection pool (ingestion/pg_pool) holds 16.
+        self._leg_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="recall-leg")
 
     def _pg(self) -> AbstractContextManager[Any]:
         """A dict-row autocommit connection for one query or a short run of them: borrowed
@@ -450,8 +453,10 @@ class Recall(
 
     def _ensure_embedder(self) -> Any:
         if self._embedder is None:
+            # Interactive: a Voyage 429 gives up within seconds and recall degrades to
+            # BM25 / RRF order, instead of the 3-minute patience batch work keeps.
             self._embedder = _embedding.create_embedder(
-                voyage_api_key=self._voyage_key, db_url=self._db_url
+                voyage_api_key=self._voyage_key, db_url=self._db_url, interactive=True
             )
         return self._embedder
 
@@ -459,7 +464,9 @@ class Recall(
         """Lazily-built rerank backend. ``None`` = rerank disabled
         (SYNAPSE_RERANK_PROVIDER=none) — callers serve the fusion (RRF) order."""
         if self._reranker is _RERANKER_UNSET:
-            self._reranker = _embedding.create_reranker(voyage_api_key=self._voyage_key)
+            self._reranker = _embedding.create_reranker(
+                voyage_api_key=self._voyage_key, interactive=True
+            )
         return self._reranker
 
     @staticmethod

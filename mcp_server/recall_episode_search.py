@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import logging
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
+from ingestion import embedding as _embedding
 from ingestion.surfaces import (
     OWN_SURFACE_PROBE,
     SurfaceTrust,
@@ -14,19 +17,49 @@ from ingestion.surfaces import (
 )
 from mcp_server.kg_pg import _vec_literal
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
-from mcp_server.recall_settings import _EPISODE_FETCH, _EPISODE_RERANK_POOL
+from mcp_server.recall_ranking import timed as _timed
+from mcp_server.recall_settings import RecallSettings
+from mcp_server.recall_warnings import config_hint as _config_hint
 from mcp_server.recall_warnings import error_brief as _err_brief
+from mcp_server.recall_warnings import submit_with_context as _submit_ctx
 from mcp_server.recall_warnings import warn as _warn
 
 logger = logging.getLogger(__name__)
 
 
+class EpisodeLegs(NamedTuple):
+    """The episode candidate legs in flight (see ``_start_episode_legs``)."""
+
+    f_bm25: Future[tuple[list[dict[str, Any]], float]]
+    f_vec: Future[tuple[list[dict[str, Any]], float]] | None  # None: no query embedding
+    query_emb: list[float] | None
+    ms_embed: float
+
+
+class EpisodePool(NamedTuple):
+    """The rerank input and what it took to build (see ``_join_episode_pool``)."""
+
+    items: list[dict[str, Any]]
+    n_bm25: int
+    n_vector: int
+    n_self_excluded: int
+    ms_bm25: float
+    ms_vector: float
+
+
 class RecallEpisodeSearchMixin:
     _db_url: str
+    _leg_executor: ThreadPoolExecutor
 
     if TYPE_CHECKING:
 
         def _pg(self) -> AbstractContextManager[Any]: ...
+        def _settings(self) -> RecallSettings: ...
+        def _ensure_embedder(self) -> Any: ...
+        @staticmethod
+        def _exclude_self(
+            ranked_eps: list[dict[str, Any]], self_session: str
+        ) -> list[dict[str, Any]]: ...
 
     def _own_surface(self, st: SurfaceTrust) -> str | None:
         """The caller's own-surface widening (schema 057), or None.
@@ -217,35 +250,87 @@ class RecallEpisodeSearchMixin:
             own_surface,
         )
 
-    def _episode_pool(
+    def _embed_query(self, query: str) -> tuple[list[float] | None, float]:
+        """Embed the query for the vector legs: ``(embedding, ms)``. A dead backend yields
+        ``None`` and a degradation notice; the legs then run BM25-only."""
+        started = time.perf_counter()
+        try:
+            query_emb = self._ensure_embedder().embed([query], task="query")[0]
+        except Exception as e:
+            logger.error("Embedding query failed: %s", e)
+            detail = _err_brief(e)
+            backend = _embedding.embed_provider()
+            _warn(
+                f"embedding failed ({backend}: {detail}): vector legs skipped, "
+                f"results are BM25-only."
+                + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_EMBED")
+            )
+            query_emb = None
+        return query_emb, (time.perf_counter() - started) * 1000.0
+
+    def _start_episode_legs(
         self,
         query: str,
-        query_emb: list[float] | None,
         project: str | None,
-        fetch: int = _EPISODE_FETCH,
-        pool_size: int = _EPISODE_RERANK_POOL,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
         own_surface: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Fused BM25+vector episode candidate pool, PRE-rerank (WIN1 deep-fetch).
+    ) -> EpisodeLegs:
+        """Start the BM25 and vector episode legs on the leg executor (WIN1 deep-fetch).
 
-        Shared primitive: recall_episodes() reranks it and serves top-k (deep
-        drill-down); recall() merges it with the summary candidates and co-reranks
-        in a single cross-encoder pass, then partitions by doc_type. The deep fetch
-        is what lets the reranker recover a rank-16..88 gold; plain RRF can't.
-        BM25-only when the query embedding is unavailable. ``session_id`` scopes
-        both legs to one conversation (the fetch_session/Grep drill-down).
-        ``allowed_projects`` applies a restricted surface's project allowlist to BOTH
-        legs — filtering the pool, not the served slice, so the allowlisted content
-        still gets the full deep-fetch width. ``own_surface`` widens that filter to the
-        rows the calling surface ingested itself (schema 057)."""
-        bm25_eps = self._search_bm25_episodes(
-            query, project, fetch, session_id, allowed_projects, own_surface
+        BM25 is pure text search: it starts FIRST so its ~165ms fetch overlaps the ~170ms
+        Voyage query-embedding call, and the vector leg follows the embedding. The caller
+        can start its own embedding-dependent legs before joining with
+        ``_join_episode_pool``. ``session_id`` scopes both legs to one conversation (the
+        fetch_session/Grep drill-down). ``allowed_projects`` applies a restricted surface's
+        project allowlist to BOTH legs: it filters the pool, not the served slice, so the
+        allowlisted content still gets the full deep-fetch width. ``own_surface`` widens
+        that filter to the rows the calling surface ingested itself (schema 057)."""
+        fetch = self._settings()._EPISODE_FETCH
+        f_bm25 = _submit_ctx(
+            self._leg_executor,
+            _timed,
+            self._search_bm25_episodes,
+            query,
+            project,
+            fetch,
+            session_id,
+            allowed_projects,
+            own_surface,
         )
-        vec_eps: list[dict[str, Any]] = []
-        if query_emb is not None:
-            vec_eps = self._search_vector_episodes(
-                query_emb, project, fetch, session_id, allowed_projects, own_surface
+        query_emb, ms_embed = self._embed_query(query)
+        f_vec = (
+            _submit_ctx(
+                self._leg_executor,
+                _timed,
+                self._search_vector_episodes,
+                query_emb,
+                project,
+                fetch,
+                session_id,
+                allowed_projects,
+                own_surface,
             )
-        return _merge_rrf(bm25_eps, vec_eps, id_key="id")[:pool_size]
+            if query_emb is not None
+            else None
+        )
+        return EpisodeLegs(f_bm25, f_vec, query_emb, ms_embed)
+
+    def _join_episode_pool(self, legs: EpisodeLegs, self_session: str | None = None) -> EpisodePool:
+        """Fuse the legs (RRF) into the PRE-rerank pool the cross-encoder scores.
+
+        The deep fetch is what lets the reranker recover a rank-16..88 gold; plain RRF
+        can't. ``self_session`` drops the calling session's own turns BEFORE the pool is
+        cut, so their slots backfill with real history instead of costing rerank tokens
+        and a place in the pool. Pass it only when the caller wants self-exclusion (a
+        session-scoped drill-down never does)."""
+        bm25_eps, ms_bm25 = legs.f_bm25.result()
+        vec_eps, ms_vec = legs.f_vec.result() if legs.f_vec is not None else ([], 0.0)
+        fused = _merge_rrf(bm25_eps, vec_eps, id_key="id")
+        n_self_excluded = 0
+        if self_session:
+            kept = self._exclude_self(fused, self_session)
+            n_self_excluded = len(fused) - len(kept)
+            fused = kept
+        pool = fused[: self._settings()._EPISODE_RERANK_POOL]
+        return EpisodePool(pool, len(bm25_eps), len(vec_eps), n_self_excluded, ms_bm25, ms_vec)
