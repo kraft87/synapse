@@ -15,7 +15,7 @@ from ingestion.surfaces import (
     episode_scope_sql,
     own_surface_if_ready,
 )
-from mcp_server.kg_pg import _vec_literal
+from ingestion.vector import QueryVector, vec_literal
 from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_ranking import timed as _timed
@@ -145,7 +145,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
         allowed_projects: list[str] | None = None,
         own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
-        emb_literal = _vec_literal(query_emb)
+        emb_literal = vec_literal(query_emb)
         dims = self._config.embed_dims
         # Distance is computed over halfvec(N), NOT vector(N). The default embeddings are
         # 2048-dim (voyage-4-large), which exceeds pgvector's 2000-dim limit for HNSW on
@@ -156,7 +156,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
         # Half precision is loss-free for what's served: recall@10 vs exact scan = 1.000,
         # recall@100 = 0.981 (and the reranker re-scores the pool). 878ms -> 23ms on episodes.
         where = ["is_embedded = TRUE"]
-        params: list[Any] = [emb_literal]
+        params: list[Any] = []
         if project:
             where.append("project = %s")
             params.append(project)
@@ -171,8 +171,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
             with self._pg() as pg:
                 rows = pg.execute(
                     f"""
-                    SELECT id, content, project, created_at, retrieval_count, session_id,
-                           (embedding::halfvec({dims}) <=> %s::halfvec({dims})) AS vec_distance
+                    SELECT id, content, project, created_at, retrieval_count, session_id
                     FROM episodes
                     WHERE {" AND ".join(where)}
                     ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) ASC LIMIT %s
@@ -263,7 +262,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
         vector index; without it the source says so and serves nothing, because the
         alternative is an exact scan of every chunk on every recall."""
         dims = self._config.embed_dims
-        emb_literal = _vec_literal(query_emb)
+        emb_literal = vec_literal(query_emb)
         where = ["is_embedded = TRUE"]
         params: list[Any] = []
         if project:
@@ -293,10 +292,11 @@ class RecallEpisodeSearchMixin(RecallEngine):
 
     def _embed_query(self, query: str) -> tuple[list[float] | None, float]:
         """Embed the query for the vector legs: ``(embedding, ms)``. A dead backend yields
-        ``None`` and a degradation notice; the legs then run BM25-only."""
+        ``None`` and a degradation notice; the legs then run BM25-only. The embedding is a
+        :class:`QueryVector`, so every leg binds the one literal formatted here."""
         started = time.perf_counter()
         try:
-            query_emb = self._ensure_embedder().embed([query], task="query")[0]
+            query_emb = QueryVector(self._ensure_embedder().embed([query], task="query")[0])
         except Exception as e:
             logger.error("Embedding query failed: %s", e)
             detail = _err_brief(e)

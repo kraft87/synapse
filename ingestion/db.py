@@ -1,7 +1,6 @@
 """Database facade combining stores on one transaction-aware connection."""
 
 from ingestion.db_connection import _EMBED_DIMS as _EMBED_DIMS
-from ingestion.db_connection import _vector_literal as _vector_literal
 from ingestion.db_documents import DocumentStore
 from ingestion.db_episodes import EpisodeStore
 from ingestion.db_notes import NoteStore

@@ -35,6 +35,7 @@ from typing import Any
 
 from ingestion.db_connection import bm25_query_text
 from ingestion.embedding import embed_dims
+from ingestion.vector import vec_literal
 
 # Embedding width for the halfvec casts below — must match the provisioned schema
 # (and its HNSW index expressions) verbatim. Default 2048 (Voyage prod, unchanged).
@@ -69,10 +70,6 @@ def _rrf_fuse(lists: list[list[str]], k: int = _RRF_K) -> dict[str, float]:
     return scores
 
 
-def _vec_literal(emb: list[float]) -> str:
-    return "[" + ",".join(map(str, emb)) + "]"
-
-
 def search_kg_postgres(
     cur: Any,
     query: str,
@@ -103,7 +100,7 @@ def search_kg_postgres(
     # restricted call appends the predicate and its one bound allowlist parameter.
     scope_sql = f"  AND {scope_predicate()} " if restricted else ""
     scope_args: tuple[Any, ...] = (allowed_projects,) if restricted else ()
-    emb_s = _vec_literal(query_emb)
+    emb_s = vec_literal(query_emb)
     # uuid -> (id, fact text, t_valid, ongoing, last_supported_at). t_valid = when the fact became
     # true (bitemporal valid-from), surfaced as the fact's "as-of" date; ongoing +
     # last_supported_at (schema 058) say whether the claim can lapse silently and when the

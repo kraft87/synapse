@@ -6,6 +6,7 @@ from typing import Any, Literal, cast
 import orjson
 
 from ingestion.db_connection import DatabaseConnection
+from ingestion.vector import vec_literal
 from ingestion.web_chunker import Chunk
 
 
@@ -77,7 +78,7 @@ class DocumentStore(DatabaseConnection):
         if not rows:
             return
         ids = [i for i, _ in rows]
-        vectors = ["[" + ",".join(map(str, v)) + "]" for _, v in rows]
+        vectors = [vec_literal(v) for _, v in rows]
         with self._conn() as conn:
             conn.execute(
                 f"UPDATE {table} t SET embedding = v.e::vector, is_embedded = TRUE "  # nosec B608 — table is one of three literals

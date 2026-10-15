@@ -24,7 +24,6 @@ from typing import Any
 from starlette.requests import Request
 
 from ingestion import pg_pool
-from ingestion.db_connection import _vector_literal
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
 from ingestion.llm_schemas import EVENT_TYPES
 from ingestion.localtime import local_date, user_tz
@@ -35,6 +34,7 @@ from ingestion.surfaces import (
     episode_scope_sql,
     own_surface_if_ready,
 )
+from ingestion.vector import vec_literal
 from mcp_server.http_helpers import RouteError, route
 
 logger = logging.getLogger(__name__)
@@ -117,7 +117,7 @@ def _ingest_events(
                 e["source_ref"],
                 e["project"],
                 e["salience"],
-                _vector_literal(vec),
+                vec_literal(vec),
                 embed_model if vec is not None else None,
                 e.get("event_type"),
                 _event_domain(e),

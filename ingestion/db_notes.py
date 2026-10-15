@@ -6,8 +6,9 @@ import orjson
 import psycopg
 from psycopg.rows import dict_row
 
-from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_literal
+from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection
 from ingestion.schema_check import ColumnProbe
+from ingestion.vector import vec_literal
 
 #: The ``notes_history`` table (an optional migration): until it exists an in-place update
 #: keeps no record of the wording it replaces, which is how it behaved before the table.
@@ -24,7 +25,7 @@ class NoteStore(DatabaseConnection):
         HOOK — the embed target). Returns ``[{id, hook, body, type, project, updated_at,
         sim}]`` in DESCENDING similarity. The reconcile path's dedup/supersession decision
         reads this; recall's notes leg reads ``search_live_notes`` (module level)."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT id, hook, body, type, project, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -68,7 +69,7 @@ class NoteStore(DatabaseConnection):
         ``audience=None`` leaves the column at its schema default ('personal') — the
         fail-closed tier. Callers that know better (remember(), the backfill apply)
         pass it explicitly; see ingestion/surfaces.derive_audience for the rule."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -115,7 +116,7 @@ class NoteStore(DatabaseConnection):
         ``audience=None`` PRESERVES the stored tier. A restatement must never silently
         re-classify a note: the only thing that moves an existing note between audiences
         is an explicit override (COALESCE keeps the current value otherwise)."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         with self._conn() as conn:
             history = NOTES_HISTORY_PROBE.ready(conn, self._url)
             if history:
@@ -419,7 +420,7 @@ def search_live_notes(
 
     Takes the connection, like ``select_board_notes``, so recall can run it on a pooled
     autocommit borrow (one statement, no BEGIN/COMMIT around it)."""
-    vlit = _vector_literal(embedding)
+    vlit = vec_literal(embedding)
     clauses = [
         "owner_id = %s",
         "superseded_by IS NULL",

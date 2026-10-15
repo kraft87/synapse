@@ -45,6 +45,7 @@ from ingestion import pg_pool
 from ingestion.db_connection import bm25_query_text
 from ingestion.embedding import embed_dims
 from ingestion.textsafe import strip_nul
+from ingestion.vector import vec_literal
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +62,6 @@ _OVERFETCH = 200
 # restatement sits within cosine distance 0.10, among the very nearest live edges of any
 # scope, so a short pool is enough and keeps the per-fact heap fetches cheap.
 _RESTATED_OVERFETCH = 32
-
-
-def _vec(v: Any) -> str | None:
-    """Format an embedding list for pgvector text input ('[a,b,c]'), or None."""
-    if not v:
-        return None
-    return "[" + ",".join(map(str, v)) + "]"
 
 
 def _ts(v: Any) -> str | None:
@@ -191,7 +185,7 @@ class KGClient:
         self, query_embedding: list[float], group_id: str, limit: int = 20
     ) -> list[dict[str, Any]]:
         """Top-k entities by embedding distance. Score is cosine distance (0=identical)."""
-        emb_s = _vec(query_embedding)
+        emb_s = vec_literal(query_embedding)
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             with conn.transaction():
@@ -281,7 +275,7 @@ class KGClient:
 
         distance_threshold=0.20 corresponds to cosine similarity >= 0.80.
         """
-        emb_s = _vec(fact_embedding)
+        emb_s = vec_literal(fact_embedding)
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             with conn.transaction():
@@ -336,7 +330,7 @@ class KGClient:
                     "  ORDER BY dist LIMIT %s"
                     ") n ORDER BY q.i, n.dist",
                     (
-                        [_vec(e) for e in fact_embeddings],
+                        [vec_literal(e) for e in fact_embeddings],
                         _RESTATED_OVERFETCH,
                         OWNER,
                         group_id,
@@ -375,7 +369,7 @@ class KGClient:
                 f"ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) "
                 "  NULLS LAST, id "
                 "LIMIT %s",
-                (OWNER, group_id, source_uuid, target_uuid, _vec(fact_embedding), limit),
+                (OWNER, group_id, source_uuid, target_uuid, vec_literal(fact_embedding), limit),
             ).fetchall()
             return [{"uuid": u, "fact": f} for u, f in rows]
 
@@ -403,7 +397,7 @@ class KGClient:
             dist_sql, args = "NULL", (safe, OWNER, group_id, limit)
         else:
             dist_sql = f"fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})"
-            args = (_vec(fact_embedding), safe, OWNER, group_id, limit)
+            args = (vec_literal(fact_embedding), safe, OWNER, group_id, limit)
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             rows = conn.execute(
@@ -461,7 +455,7 @@ class KGClient:
             strip_nul(name or ""),
             strip_nul(_normalize_name(name) or ""),
             strip_nul(summary or ""),
-            _vec(embedding),
+            vec_literal(embedding),
             now,
             now,
             supertype,
@@ -547,7 +541,7 @@ class KGClient:
                     r["tgt"],
                     strip_nul(r.get("name") or ""),
                     strip_nul(r.get("fact") or ""),
-                    _vec(r.get("emb")),
+                    vec_literal(r.get("emb")),
                     json.dumps(eps) if eps is not None else None,
                     0,
                     created,

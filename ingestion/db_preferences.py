@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_literal
+from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection
+from ingestion.vector import vec_literal
 
 
 class PreferenceStore(DatabaseConnection):
@@ -12,7 +13,7 @@ class PreferenceStore(DatabaseConnection):
         """Live preferences for one owner/group, nearest to ``embedding`` by cosine.
         Returns ``[{id, pref, polarity, source_ref, sim}]`` in DESCENDING similarity (sim
         = 1 - cosine_distance in [0, 2]). The gate's dedup/supersession decision reads this."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT id, pref, polarity, source_ref, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
@@ -52,7 +53,7 @@ class PreferenceStore(DatabaseConnection):
         is written and None comes back: a delete that ran while the gate was thinking has
         already purged the turn's preferences and would not run again. The turn stays
         locked until the insert commits, so a delete that starts meanwhile waits for it."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         with self._conn() as conn:
             if (
                 source_episode_id is not None
@@ -93,7 +94,7 @@ class PreferenceStore(DatabaseConnection):
                 "UPDATE preferences "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 f"SET pref = %s, embedding = %s::vector({_EMBED_DIMS}), embed_model = %s, "
                 "assert_count = assert_count + 1, last_asserted = now() WHERE id = %s",
-                (pref, _vector_literal(embedding), embed_model, pref_id),
+                (pref, vec_literal(embedding), embed_model, pref_id),
             )
 
     def reassert_preference(self, pref_id: int) -> None:

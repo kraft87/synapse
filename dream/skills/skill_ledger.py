@@ -23,6 +23,7 @@ import logging
 import re
 
 from ingestion.schema_check import ColumnProbe
+from ingestion.vector import vec_literal
 
 from . import config
 
@@ -116,10 +117,6 @@ def embed(texts: list[str], input_type: str = "document") -> list[list[float]]:
         _embedder = create_embedder(voyage_api_key=key)
     task = "query" if input_type == "query" else "document"
     return _embedder.embed(texts, task=task)
-
-
-def vec_literal(v: list[float]) -> str:
-    return "[" + ",".join(f"{x:.7g}" for x in v) + "]"
 
 
 # ----------------------------------------------------------------------- identity

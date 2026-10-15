@@ -11,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from ingestion.vector import vec_literal
 from mcp_server import kg_pg
 from tests.helpers.embed import GROUP, onehot
 
@@ -28,7 +29,7 @@ def graph(conn):
         conn.execute(
             "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, embedding) "
             "VALUES (%s, 'default', %s, %s, %s, %s::vector)",
-            (uid, GROUP, uid, uid, kg_pg._vec_literal(onehot(axis))),
+            (uid, GROUP, uid, uid, vec_literal(onehot(axis))),
         )
     yield conn
     conn.execute("TRUNCATE kg_relationships, kg_entities RESTART IDENTITY CASCADE")

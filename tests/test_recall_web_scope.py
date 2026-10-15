@@ -12,7 +12,7 @@ import pytest
 from psycopg.types.json import Json
 
 from ingestion.surfaces import web_scope_sql
-from mcp_server.kg_pg import _vec_literal
+from ingestion.vector import vec_literal
 from mcp_server.recall import Recall
 
 pytestmark = pytest.mark.db
@@ -47,7 +47,7 @@ def pages(conn):
         conn.execute(
             "INSERT INTO web_chunks (web_artifact_id, idx, content, char_start, char_end, "
             "  embedding, is_embedded) VALUES (%s, 0, %s, 0, 1, %s, TRUE)",
-            (aid, f"quokka habitat notes from {name}", _vec_literal(_axis(i))),
+            (aid, f"quokka habitat notes from {name}", vec_literal(_axis(i))),
         )
     yield
     conn.execute("TRUNCATE web_artifacts RESTART IDENTITY CASCADE")

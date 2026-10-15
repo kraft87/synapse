@@ -13,7 +13,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from ingestion.kg_client import KGClient, _ts, _vec
+from ingestion.kg_client import KGClient, _ts
 from tests.helpers.embed import GROUP
 from tests.helpers.kg import _axis_list, make_edge_row
 
@@ -36,11 +36,6 @@ class TestHelpers:
         assert _ts("2026-06-01T00:00:00Z") == "2026-06-01T00:00:00Z"
         assert _ts(None) is None
         assert _ts("") is None
-
-    def test_vec_literal(self):
-        assert _vec([1.0, 2.5]) == "[1.0,2.5]"
-        assert _vec(None) is None
-        assert _vec([]) is None
 
 
 class TestInsertNode:

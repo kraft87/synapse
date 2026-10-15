@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from mcp_server.kg_pg import _vec_literal
+from ingestion.vector import vec_literal
 from mcp_server.recall import Recall
 from mcp_server.recall_web import vector_web_sql
 
@@ -34,7 +34,7 @@ def web(conn):
         conn.execute(
             "INSERT INTO web_chunks (web_artifact_id, idx, content, char_start, char_end, "
             "  embedding, is_embedded) VALUES (%s, %s, %s, 0, 1, %s, %s)",
-            (aid, idx, f"chunk {idx}", _vec_literal(vec) if embedded else None, embedded),
+            (aid, idx, f"chunk {idx}", vec_literal(vec) if embedded else None, embedded),
         )
     yield aid
     conn.execute("TRUNCATE web_artifacts RESTART IDENTITY CASCADE")
@@ -58,7 +58,7 @@ def test_vector_web_query_is_served_by_the_hnsw_index(conn):
             r[0]
             for r in conn.execute(
                 "EXPLAIN " + vector_web_sql(DIMS),
-                (_vec_literal(_axis(0)), _vec_literal(_axis(0)), 5),
+                (vec_literal(_axis(0)), vec_literal(_axis(0)), 5),
             ).fetchall()
         )
     finally:

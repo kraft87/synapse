@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Any, cast
 
-from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_literal
+from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import own_surface_columns_ready
+from ingestion.vector import vec_literal
 
 #: ``timeline_events.reported_refs`` (an optional migration): until it exists a merge records
 #: nothing about the re-telling turn, and the delete cascade removes a re-told row with its
@@ -45,7 +46,7 @@ class TimelineStore(DatabaseConnection):
         An event whose turn is gone writes nothing (returns 0): the delete cascade already
         ran, and an event inserted after it would keep serving the deleted turn's text. The
         turn is locked until the insert commits, so a delete that starts meanwhile waits."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         params: list[Any] = [
             t_valid,
             fact,
@@ -101,7 +102,7 @@ class TimelineStore(DatabaseConnection):
         under ``max_dist`` cosine distance — the dedup confirm call's candidate pool.
         Excludes the new event's own turn (the ``ep:<id>`` base ref and its ``#k``
         siblings): a turn's multiple events are intentionally distinct, never dups."""
-        vlit = _vector_literal(embedding)
+        vlit = vec_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
                 f"SELECT id, fact, t_valid, source_ref, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input

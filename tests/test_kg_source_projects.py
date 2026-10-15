@@ -33,6 +33,7 @@ from psycopg.rows import dict_row
 from ingestion import schema_check
 from ingestion.kg_client import KGClient
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
+from ingestion.vector import vec_literal
 from mcp_server import kg_pg
 from mcp_server.recall import Recall
 from mcp_server.recall_sources import KG_SCOPE_PROBE
@@ -96,7 +97,7 @@ def _fact(
             src,
             tgt,
             fact,
-            None if emb is None else kg_pg._vec_literal(onehot(emb)),
+            None if emb is None else vec_literal(onehot(emb)),
             episodes,
             t_invalid,
             invalidated_by,
@@ -311,7 +312,7 @@ def _seed_kg(conn) -> dict[str, int]:
         "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, summary, "
         "  embedding) VALUES ('seed-ent', 'default', %s, 'Seed', 'seed', 'seed summary', "
         "  %s::vector)",
-        (GROUP, kg_pg._vec_literal(onehot(0))),
+        (GROUP, vec_literal(onehot(0))),
     )
     # vector leg
     _fact(conn, "v-ok", "alpha beta", f"[{w}]", emb=0)
@@ -385,7 +386,7 @@ def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
     kg.execute(
         "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, embedding) "
         "VALUES ('lonely', 'default', %s, 'Lonely', 'lonely', %s::vector)",
-        (GROUP, kg_pg._vec_literal(onehot(0))),
+        (GROUP, vec_literal(onehot(0))),
     )
     _fact(kg, "lonely-edge", "omega", f"[{p}]", emb=None, src="lonely")
     executed: list[tuple[str, Any]] = []

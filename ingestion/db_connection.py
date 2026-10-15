@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Generator, Sequence
+from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
@@ -13,14 +13,6 @@ from ingestion.embedding import embed_dims
 # Embedding width for the vector casts below — matches the provisioned schema.
 # Default 2048 (Voyage prod, unchanged).
 _EMBED_DIMS = embed_dims()
-
-
-def _vector_literal(embedding: Sequence[float] | None) -> str | None:
-    """Format an embedding as a pgvector text literal, six decimals per component.
-    Returns ``None`` for a NULL embedding."""
-    if embedding is None:
-        return None
-    return "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
 
 
 def bm25_query_text(query: str) -> str:

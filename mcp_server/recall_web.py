@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from ingestion.surfaces import web_scope_sql
-from mcp_server.kg_pg import _vec_literal
+from ingestion.vector import vec_literal
 from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_warnings import error_brief as _err_brief
@@ -88,7 +88,7 @@ class RecallWebMixin(RecallEngine):
         allowed_projects: list[str] | None = None,
         own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
-        emb_literal = _vec_literal(query_emb)
+        emb_literal = vec_literal(query_emb)
         scope = web_scope_sql(allowed_projects, own_surface)
         try:
             with self._pg() as pg:
