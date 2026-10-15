@@ -113,6 +113,18 @@ def test_an_unreachable_model_raises_through_every_judge_path(fake, error):
             call()
 
 
+def test_config_scan_tells_an_unreadable_reply_from_no_corrections(fake):
+    session = {"session": "s1", "user_msgs": ["no em-dashes please"]}
+    fake.reply = '{"corrections": []}'
+    assert CN.scan_corrections(session) == []  # the judge looked and found none
+    fake.reply = "I could not find a JSON answer, sorry"
+    assert CN.scan_corrections(session) is None  # told apart: the lane counts these
+    fake.reply = 'Here: {"corrections": [{"rule": " Avoid em-dashes ", "quote": "no em-dashes"}, {"rule": ""}]}'
+    assert CN.scan_corrections(session) == [
+        {"rule": "Avoid em-dashes", "session_id": "s1", "quote": "no em-dashes"}
+    ]
+
+
 def test_usage_limit_text_from_the_cli_raises_end_to_end(monkeypatch):
     """Through the real ClaudeCLIClient: the usage-limit text agent_call detects reaches the
     lane as UsageLimitError (the subprocess path returned it as stdout and parsed it as

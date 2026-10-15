@@ -11,6 +11,12 @@ ledger -> gate observe->proposed at N distinct sessions.
 PROPOSE-ONLY: writes config_proposals (the review CLI + apply phase land edits on disk). Proposals
 target a dedicated `rules/learned.md` (global) so dream's contributions never rewrite a hand-kept
 file. ON by default; CONFIG_LANE_ENABLED=0 (read by dream/__main__) turns it off.
+
+A row's status decides what a sighting of its rule does: observe and proposed rows gather
+evidence toward (and wait at) review; accepted and applied rows gather it as a measure of
+recurrence (an applied rule that is corrected again is a rule the agent does not follow); a
+rejected row inside its cooling window does the same and raises nothing. A rule the user already
+has in a mirrored config file or a live feedback note is not proposed at all.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ import json
 import os
 import re
 from datetime import UTC, datetime
+from typing import NamedTuple
 
 import psycopg
 
@@ -34,6 +41,8 @@ PROPOSE_SESSIONS = int(
 IDENTITY_JACCARD = 0.5  # rule-token overlap above which two corrections are "the same rule".
 # Rough dedup; the LLM tends to normalize phrasing for the same correction, and the review gate
 # catches any duplicates. Embedding-based semantic identity is the robustness upgrade (later).
+REJECT_COOLING_DAYS = 30  # a rejected rule is not proposed again this long after the rejection
+OBSERVE_TTL_DAYS = 28  # an observe row no session has re-sighted for this long is dropped
 
 _STOP = {
     "the",
@@ -124,11 +133,14 @@ def _best_match(rule_tokens: set[str], candidates: list[dict]) -> dict | None:
 
 
 # --------------------------------------------------------------------------- LLM finder
-def scan_corrections(s: dict) -> list[dict]:
-    """The corrections the judge finds in one session (none when its reply has no JSON
-    object). Raises when the model cannot be reached (lane.judge)."""
+def scan_corrections(s: dict) -> list[dict] | None:
+    """The corrections the judge finds in one session, or None when its reply has no JSON
+    object (told apart from "found nothing", which is an empty list). Raises when the model
+    cannot be reached (lane.judge)."""
     raw = lane.judge(_FIND_PROMPT.format(user_msgs=SM._sample(s.get("user_msgs", []))))
-    obj = _extract_json(raw) or {}
+    obj = _extract_json(raw)
+    if obj is None:
+        return None
     out = []
     for c in obj.get("corrections", []):
         rule = (c.get("rule") or "").strip()
@@ -144,17 +156,36 @@ def scan_corrections(s: dict) -> list[dict]:
 
 
 # --------------------------------------------------------------------------- ledger
-def _upsert_correction(cur, c: dict) -> tuple[int, str, int]:
-    """Resolve identity (rule-token jaccard) against active config proposals, union this session's
-    evidence, recompute distinct sessions, gate observe->proposed. Returns (id, status, n_sessions)."""
+class Upsert(NamedTuple):
+    """What one correction did to the ledger. `sessions` is the distinct sessions in the row's
+    evidence; `raised` that this call put the rule in front of review (inserted as proposed, or
+    observe -> proposed); `recurred` that an applied rule was corrected again, in a session its
+    evidence lacked."""
+
+    id: int
+    status: str
+    sessions: int
+    raised: bool
+    recurred: bool
+
+
+def _upsert_correction(cur, c: dict) -> Upsert:
+    """Resolve identity (rule-token jaccard) against the config proposals, union this session's
+    evidence, recompute distinct sessions, gate observe->proposed.
+
+    Every status takes part in identity except a rejected row past its cooling window, which is
+    history: a sighting then opens a fresh observe row. Only observe and proposed rows are still
+    moving; the sighting of an accepted, applied or cooling rejected rule is added to its
+    evidence and nothing else changes (updated_at dates a rejection, so it stays)."""
     toks = _sig_tokens(c["rule"])
     ev_new = [
         {"session_id": c["session_id"], "ts": datetime.now(UTC).isoformat(), "quote": c["quote"]}
     ]
     cur.execute(
         "SELECT id, summary, evidence, status FROM config_lane.config_proposals "
-        "WHERE file_key=%s AND status IN ('observe','proposed')",
-        (LEARNED_FILE,),
+        "WHERE file_key=%s AND (status <> 'rejected' "
+        "OR updated_at > now() - make_interval(days => %s))",
+        (LEARNED_FILE, REJECT_COOLING_DAYS),
     )
     match = _best_match(
         toks,
@@ -163,15 +194,27 @@ def _upsert_correction(cur, c: dict) -> tuple[int, str, int]:
     if match:
         evidence = _union_evidence(match["evidence"], ev_new)
         n = _distinct_sessions(evidence)
-        status = (
-            "proposed" if (match["status"] == "proposed" or n >= PROPOSE_SESSIONS) else "observe"
-        )
-        cur.execute(
-            "UPDATE config_lane.config_proposals SET evidence=%s::jsonb, status=%s, updated_at=now() "
-            "WHERE id=%s",
-            (json.dumps(evidence), status, match["id"]),
-        )
-        return match["id"], status, n
+        if match["status"] in ("observe", "proposed"):
+            status = (
+                "proposed"
+                if (match["status"] == "proposed" or n >= PROPOSE_SESSIONS)
+                else "observe"
+            )
+            cur.execute(
+                "UPDATE config_lane.config_proposals SET evidence=%s::jsonb, status=%s, "
+                "updated_at=now() WHERE id=%s",
+                (json.dumps(evidence), status, match["id"]),
+            )
+            raised = match["status"] == "observe" and status == "proposed"
+            return Upsert(match["id"], status, n, raised, False)
+        new_session = len(evidence) > len(match["evidence"])
+        if new_session:
+            cur.execute(
+                "UPDATE config_lane.config_proposals SET evidence=%s::jsonb WHERE id=%s",
+                (json.dumps(evidence), match["id"]),
+            )
+        recurred = new_session and match["status"] == "applied"
+        return Upsert(match["id"], match["status"], n, False, recurred)
     # new candidate at observe (or proposed if the gate is 1)
     n = 1
     status = "proposed" if n >= PROPOSE_SESSIONS else "observe"
@@ -182,7 +225,34 @@ def _upsert_correction(cur, c: dict) -> tuple[int, str, int]:
         "VALUES ('add', %s, 'general', %s, %s, %s::jsonb, %s) RETURNING id",
         (LEARNED_FILE, c["rule"], c["rule"], json.dumps(ev_new), status),
     )
-    return cur.fetchone()[0], status, n
+    return Upsert(cur.fetchone()[0], status, n, status == "proposed", False)
+
+
+def _expire_observed(cur) -> int:
+    """Drop the observe rows no session has re-sighted for OBSERVE_TTL_DAYS. A rule corrected
+    once and never again is not a standing preference, and the paraphrases nothing matched
+    would otherwise pile up for every later correction to read. Proposed rows wait for a human
+    and never expire. Returns how many went."""
+    cur.execute(
+        "DELETE FROM config_lane.config_proposals "
+        "WHERE status='observe' AND updated_at < now() - make_interval(days => %s)",
+        (OBSERVE_TTL_DAYS,),
+    )
+    return cur.rowcount
+
+
+def _known_rules(cur) -> list[set[str]]:
+    """The rules the user already has, as token sets: every line of every mirrored config file
+    (the lane's own learned file apart: a correction that matches an applied rule there is a
+    recurrence, which the ledger counts) and the hook of every live feedback note. A correction
+    that restates one is not a new rule. One-word lines (headings) are too thin to match on."""
+    cur.execute(
+        "SELECT content FROM config_lane.config_registry WHERE file_key <> %s", (LEARNED_FILE,)
+    )
+    lines = [ln for (content,) in cur.fetchall() for ln in content.splitlines()]
+    cur.execute("SELECT hook FROM notes WHERE type='feedback' AND superseded_by IS NULL")
+    lines += [hook for (hook,) in cur.fetchall()]
+    return [t for t in map(_sig_tokens, lines) if len(t) >= 2]
 
 
 # --------------------------------------------------------------------------- orchestrator
@@ -206,14 +276,24 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
             f"[dream→config] episodes {window.after_id}..{carry} (newest {window.until_id})  "
             f"sessions={len(views)}"
         )
-        found = proposed = 0
+        expired = _expire_observed(cur)
+        known = _known_rules(cur)
+        found = proposed = recurred = already_known = unparsed = 0
         for corrections in lane.run_parallel(scan_corrections, views):
+            if corrections is None:
+                unparsed += 1
+                continue
             for c in corrections:
                 found += 1
-                _id, status, n = _upsert_correction(cur, c)
-                if status == "proposed":
-                    proposed += 1
-                print(f"  [{status} n={n}] {c['rule'][:70]}")
+                toks = _sig_tokens(c["rule"])
+                if any(_jaccard(toks, k) >= IDENTITY_JACCARD for k in known):
+                    already_known += 1
+                    print(f"  [known] {c['rule'][:70]}")
+                    continue
+                u = _upsert_correction(cur, c)
+                proposed += u.raised
+                recurred += u.recurred
+                print(f"  [{u.status} n={u.sessions}] {c['rule'][:70]}")
 
         lane.mark_judged(conn, "config", views)
         lane.advance(conn, window, carry)
@@ -224,7 +304,15 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
             "ON CONFLICT (id) DO UPDATE SET last_scan_at=EXCLUDED.last_scan_at",
             (scan_started,),
         )
-        return {"sessions": len(views), "found": found, "proposed": proposed}
+        return {
+            "sessions": len(views),
+            "found": found,
+            "proposed": proposed,
+            "recurred": recurred,
+            "already_known": already_known,
+            "unparsed": unparsed,
+            "expired": expired,
+        }
     finally:
         conn.close()
 

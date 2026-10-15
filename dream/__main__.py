@@ -103,8 +103,12 @@ def _config_lane() -> LaneResult:
     res = run_lane(limit=int(os.environ.get("CONFIG_LANE_LIMIT", "30")))
     counts = {
         "config_sessions_scanned": res["sessions"],  # one judge call each
+        "config_judge_unparsed": res["unparsed"],  # replies with no JSON object
         "config_corrections_found": res["found"],
-        "config_proposals": res["proposed"],
+        "config_already_known": res["already_known"],  # restated a config line or feedback note
+        "config_proposals": res["proposed"],  # rules that reached review tonight
+        "config_applied_recurrences": res["recurred"],  # an applied rule, corrected again
+        "config_observe_expired": res["expired"],
     }
     return {"counts": counts, "errors": []}
 

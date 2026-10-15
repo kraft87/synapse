@@ -460,6 +460,62 @@ def test_config_lane_holds_its_cursor_when_the_model_is_unreachable(db, db_url, 
     assert _memo(db, "lanet-c-down", "config") is None
 
 
+def test_config_lane_reports_what_each_correction_did(db, db_url, monkeypatch):
+    """The counts behind dream_runs: a rule is `proposed` only on the night it graduates, an
+    applied rule's repeat is a `recurred`, a rule the user already has is `already_known`, and
+    a reply with no JSON is `unparsed` rather than "nothing found"."""
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    db.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY")
+    db.execute("DELETE FROM config_lane.config_registry WHERE surface_id = 'lanet'")
+    db.execute(
+        "INSERT INTO config_lane.config_registry "
+        "  (surface_id, scope, file_key, abs_path, content, content_hash) "
+        "VALUES ('lanet', 'global', 'CLAUDE.md', '', '- Run the tests before committing', 'h')"
+    )
+    db.execute(
+        "INSERT INTO config_lane.config_proposals (kind, file_key, diff, summary, evidence, status) "
+        "VALUES ('add', 'rules/learned.md', 'Keep answers short', 'Keep answers short', "
+        "'[{\"session_id\": \"old\"}]', 'applied')"
+    )
+    replies = {
+        "lanet-c1": [("Avoid em-dashes in prose", "em-dashes")],
+        "lanet-c2": [("Do not use em-dashes in prose", "again"), ("Keep answers short", "short")],
+        "lanet-c3": None,
+        "lanet-c4": [("Run the tests before committing", "tests")],
+    }
+
+    def scan(s):
+        got = replies[s["session"]]
+        if got is None:
+            return None
+        return [{"rule": r, "session_id": s["session"], "quote": q} for r, q in got]
+
+    monkeypatch.setattr(CN, "scan_corrections", scan)
+    _seed(db, "config")
+    for sid in replies:
+        _ep(db, sid, 1)
+        _ep(db, sid, 2)
+    try:
+        res = CN.run_lane(limit=10)
+    finally:
+        db.execute("DELETE FROM config_lane.config_registry WHERE surface_id = 'lanet'")
+
+    assert res == {
+        "sessions": 4,
+        "found": 4,
+        "proposed": 1,  # the em-dashes rule: observe on c1, graduated by c2
+        "recurred": 1,  # "Keep answers short", applied, corrected again in c2
+        "already_known": 1,  # c4 restates a line of the mirrored CLAUDE.md
+        "unparsed": 1,  # c3
+        "expired": 0,
+    }
+    statuses = dict(
+        db.execute("SELECT summary, status FROM config_lane.config_proposals").fetchall()
+    )
+    assert statuses == {"Avoid em-dashes in prose": "proposed", "Keep answers short": "applied"}
+    db.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY")
+
+
 def _states_of(db, app):
     return {
         r[0]

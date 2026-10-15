@@ -198,7 +198,7 @@ def test_lane_limits_come_from_the_environment(monkeypatch):
     )
     monkeypatch.setattr(
         "dream.config.nightly.run_lane",
-        lambda limit: seen.update(config=limit) or {"sessions": 0, "found": 0, "proposed": 0},
+        lambda limit: seen.update(config=limit) or _CONFIG_RESULT,
     )
     dm._skills_lane()
     dm._config_lane()
@@ -213,16 +213,39 @@ def test_a_malformed_limit_fails_that_lane_not_the_run(monkeypatch):
     assert rec["errors"][0].startswith("skills lane: invalid literal")
 
 
+_CONFIG_RESULT = {
+    "sessions": 0,
+    "found": 0,
+    "proposed": 0,
+    "recurred": 0,
+    "already_known": 0,
+    "unparsed": 0,
+    "expired": 0,
+}
+
+
 def test_config_lane_counts_keep_their_names(monkeypatch):
     monkeypatch.setattr(
         "dream.config.nightly.run_lane",
-        lambda limit: {"sessions": 12, "found": 5, "proposed": 2},
+        lambda limit: {
+            "sessions": 12,
+            "found": 5,
+            "proposed": 2,
+            "recurred": 1,
+            "already_known": 3,
+            "unparsed": 4,
+            "expired": 6,
+        },
     )
     assert dm._config_lane() == {
         "counts": {
             "config_sessions_scanned": 12,
+            "config_judge_unparsed": 4,
             "config_corrections_found": 5,
+            "config_already_known": 3,
             "config_proposals": 2,
+            "config_applied_recurrences": 1,
+            "config_observe_expired": 6,
         },
         "errors": [],
     }
