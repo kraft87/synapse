@@ -2,8 +2,8 @@
 
 Runs the real script against a scratch database with a few fake migrations
 (SCHEMA_DIR), so the version gating is tested without paying for the real schema.
-The real schema's re-run safety is CI's job (it runs the script a second time with
---all after provisioning)."""
+One test applies the real schema twice (--all the second time) and checks that the
+re-run leaves the episodes embedding index alone; CI repeats that on its own database."""
 
 import os
 import subprocess
@@ -13,7 +13,8 @@ import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
-SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "apply_schema.sh"
+REPO = Path(__file__).resolve().parent.parent
+SCRIPT = REPO / "scripts" / "apply_schema.sh"
 
 # 001 stands in for the early migrations (it creates the tables the script probes); each
 # file logs its own number, so a test can see exactly which ones ran.
@@ -30,20 +31,26 @@ FAKE_MIGRATIONS = {
 
 
 @pytest.fixture()
-def scratch(db_url, tmp_path):
-    """(dsn, schema_dir) of an empty scratch database plus a directory of fake migrations."""
+def scratch_db(db_url):
+    """DSN of an empty scratch database, dropped afterwards."""
     name = f"{conninfo_to_dict(db_url)['dbname']}_apply"
     admin = make_conninfo(db_url, dbname="postgres")
     with psycopg.connect(admin, autocommit=True) as c:
         c.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
         c.execute(f'CREATE DATABASE "{name}"')
+    yield make_conninfo(db_url, dbname=name)
+    with psycopg.connect(admin, autocommit=True) as c:
+        c.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+@pytest.fixture()
+def scratch(scratch_db, tmp_path):
+    """(dsn, schema_dir) of an empty scratch database plus a directory of fake migrations."""
     schema_dir = tmp_path / "schema"
     schema_dir.mkdir()
     for fname, sql in FAKE_MIGRATIONS.items():
         (schema_dir / fname).write_text(sql)
-    yield make_conninfo(db_url, dbname=name), schema_dir
-    with psycopg.connect(admin, autocommit=True) as c:
-        c.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    return scratch_db, schema_dir
 
 
 def _run(dsn, schema_dir, *args):
@@ -131,3 +138,24 @@ def test_a_misnamed_migration_is_an_error_not_a_silent_skip(scratch):
     r = _run(dsn, schema_dir)
     assert r.returncode != 0
     assert "4_late.sql" in r.stderr
+
+
+def test_all_on_the_real_schema_leaves_the_embedding_index_alone(scratch_db):
+    """The documented upgrade is `--all`. 003 narrows episodes.embedding with an ALTER
+    COLUMN TYPE that, even to the type the column already has, rewrites the table and
+    rebuilds the HNSW index under ACCESS EXCLUSIVE; 003 skips it when the width already
+    matches. A rebuilt relation gets a new relfilenode, so an unchanged one proves the
+    guard held (and, with it, that every file re-ran without error)."""
+    r = _run(scratch_db, REPO / "schema")
+    assert r.returncode == 0, r.stderr
+
+    probe = (
+        "SELECT relname, relfilenode FROM pg_class "
+        "WHERE relname IN ('episodes', 'episodes_embedding_hnsw') ORDER BY relname"
+    )
+    before = _sql(scratch_db, probe)
+    assert len(before) == 2
+
+    r = _run(scratch_db, REPO / "schema", "--all")
+    assert r.returncode == 0, r.stderr
+    assert _sql(scratch_db, probe) == before
