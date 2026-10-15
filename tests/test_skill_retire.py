@@ -23,10 +23,9 @@ import mcp_server.skill_sync_routes as R
 from dream.skills.skill_doc import body_hash
 from ingestion import schema_check
 from ingestion.surfaces import FULL_TRUST
+from mcp_server.skill_review_routes import _proposal_act, _proposal_detail
 from mcp_server.skill_sync_routes import (
     _list_skills,
-    _proposal_act,
-    _proposal_detail,
     _publish_skill,
     _retire_skill,
     whole_skill_hash,

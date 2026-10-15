@@ -190,7 +190,7 @@ def _recurrence_days(evidence: list[dict]) -> int:
     return len({e["date"] for e in evidence if e.get("date")})
 
 
-def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
+def rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
     """Recompute (judge_sessions, grounded_sessions, judge_weight, grounded_weight) from FULL evidence."""
     j_sess, g_sess = set(), set()
     jw = gw = 0.0
@@ -329,7 +329,7 @@ def merge_candidate(
         evidence = _union_evidence([], evidence_entries)
         phrasings = _union_phrasings([], trigger_phrasings)
 
-    js, gs, jw, gw = _rollup(evidence)
+    js, gs, jw, gw = rollup(evidence)
     emb_lit = None
     if do_embed and kind == "derive" and summary:
         try:

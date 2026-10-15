@@ -1,7 +1,7 @@
 # mypy: ignore-errors
 """dream->skills: give every proposal a complete, ready-to-apply SKILL.md.
 
-Accept applies proposal_body as-is (mcp_server/skill_sync_routes.py), so a proposal without
+Accept applies proposal_body as-is (mcp_server/skill_review_routes.py), so a proposal without
 one can't be accepted. This pass runs once per nightly lane, after the detectors, over
 'proposed' rows with no body yet — and retune rows whose draft went stale because the skill
 changed underneath it — and stores proposal_body + base_body_hash (the hash of the registry

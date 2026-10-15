@@ -29,7 +29,7 @@ the window holds the cursor, so the next run covers the same episodes again.
 The judges use SYNAPSE_SKILLS_JUDGE_MODEL and the drafters SYNAPSE_SKILLS_DRAFT_MODEL, both
 through ingestion.llm_client (default Opus).
 Propose-only: nothing here writes skill_registry or sets status='promoted' — the review
-accept does both (mcp_server/skill_sync_routes.py).
+accept does both (mcp_server/skill_review_routes.py).
 """
 
 from __future__ import annotations

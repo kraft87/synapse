@@ -16,8 +16,8 @@ from mcp_server.config_sync_routes import _proposal_act as _config_proposal_act
 from mcp_server.config_sync_routes import _proposal_detail as _config_proposal_detail
 from mcp_server.dash.common import _count, _episode_id_from_ref, _gist
 from mcp_server.http_helpers import RouteError, _iso, route
-from mcp_server.skill_sync_routes import _proposal_act as _skill_proposal_act
-from mcp_server.skill_sync_routes import _proposal_detail as _skill_proposal_detail
+from mcp_server.skill_review_routes import _proposal_act as _skill_proposal_act
+from mcp_server.skill_review_routes import _proposal_detail as _skill_proposal_detail
 
 # Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
 # statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals

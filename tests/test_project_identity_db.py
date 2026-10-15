@@ -524,7 +524,7 @@ def test_list_skills_matches_a_project_scope_in_any_case(ident, db_url):
 
 
 def _evidence_scope_of(db_url, sessions: list[str]) -> str:
-    from mcp_server.skill_sync_routes import _evidence_scope
+    from mcp_server.skill_review_routes import _evidence_scope
 
     with psycopg.connect(db_url, autocommit=True, row_factory=dict_row) as c:
         return _evidence_scope(c, [{"session_id": s, "class": "judge"} for s in sessions])

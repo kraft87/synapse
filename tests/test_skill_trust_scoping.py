@@ -167,6 +167,7 @@ def _app(db_url: str, *, wired: bool = True):
     from starlette.testclient import TestClient
 
     from mcp_server.http_auth import bearer
+    from mcp_server.skill_review_routes import register as register_review
     from mcp_server.skill_sync_routes import register
 
     def trust(request):
@@ -174,6 +175,7 @@ def _app(db_url: str, *, wired: bool = True):
 
     m = FastMCP("test-skill-trust-scoping")
     register(m, db_url, lambda request: True, trust if wired else None)
+    register_review(m, db_url, lambda request: True, trust if wired else None)
     return TestClient(m.http_app())
 
 

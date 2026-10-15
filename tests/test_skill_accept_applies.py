@@ -1,4 +1,4 @@
-"""Accept applies a skill proposal — DB-backed tests (migration 055 + skill_sync_routes).
+"""Accept applies a skill proposal — DB-backed tests (migration 055 + skill_review_routes).
 
 The review accept writes the proposal into skills_lane.skill_registry through the same
 upsert /skills/publish uses and marks the candidate 'promoted' in one transaction; the
@@ -21,11 +21,10 @@ import dream.skills.skill_draft as DR
 from dream import lane
 from dream.skills.skill_doc import body_hash
 from ingestion.llm_client import UsageLimitError
+from mcp_server.skill_review_routes import _proposal_act, _proposal_detail
 from mcp_server.skill_sync_routes import (
     _fetch_skill,
     _list_skills,
-    _proposal_act,
-    _proposal_detail,
     _publish_skill,
     _record_overwrite,
 )

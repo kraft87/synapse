@@ -12,8 +12,8 @@ from dream.skills.skill_ledger import (
     PROPOSE_SCORE,
     _passes_gate,
     _recurrence_days,
-    _rollup,
     _union_evidence,
+    rollup,
 )
 
 
@@ -40,7 +40,7 @@ def test_the_cap_trims_judge_entries_and_never_the_grounded_ones():
     merged = _union_evidence([_ev(sid="s-first", signal="under_trigger"), accept], sightings)
     assert accept in merged
     assert len(merged) == EVIDENCE_CAP
-    assert _rollup(merged)[3] > 0
+    assert rollup(merged)[3] > 0
     assert merged[-1] == sightings[-1]  # the oldest judge entries went, not the newest
 
 
@@ -64,7 +64,7 @@ def test_union_rescan_of_the_same_work_adds_nothing():
     b = _ev(signal="struggle_arc", night="2026-07-18", date="2026-07-16")
     merged = _union_evidence([a], [b])
     assert merged == [a]
-    assert _rollup(merged) == _rollup([a])
+    assert rollup(merged) == rollup([a])
     assert not _passes_gate("derive", merged, 1.0, None)
 
 

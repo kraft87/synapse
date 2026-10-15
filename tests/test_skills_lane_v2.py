@@ -29,7 +29,7 @@ import dream.skills.nightly as N
 import dream.skills.skill_db_source as DBSRC
 import dream.skills.skill_ledger as L
 import dream.skills.struggle_arc as SA
-from mcp_server.skill_sync_routes import _proposal_detail, _proposals_list
+from mcp_server.skill_review_routes import _proposal_detail, _proposals_list
 
 SCHEMA = Path(__file__).resolve().parent.parent / "schema"
 MIGRATION = SCHEMA / "045_skills_v2_foundation.sql"
