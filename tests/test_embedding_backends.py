@@ -828,14 +828,14 @@ class TestRerankNoneRecallPath:
         facts = [{"fact": f"f{i}"} for i in range(3)]
         assert r._floor_facts("q", facts) == facts
 
-    def test_passages_fall_back_to_full_episodes(self):
-        # many chunks + no reranker -> [] so the caller serves full episodes.
+    def test_passages_are_picked_without_a_reranker(self):
+        # many chunks + no reranker -> passages chosen by keyword overlap, never an empty bucket.
         # Same multi-chunk markdown shape as test_recall_passages._LONG.
         r = Recall("", "")
         r._reranker = None
         long = "".join(f"\n## Section {i}\nlorem ipsum dolor sit amet " * 6 for i in range(24))
         out = r._compact_to_passages("q", [{"content": long, "id": "e:1"}], n=2)
-        assert out == []
+        assert [it["id"] for it in out] == ["e:1"]
 
     def test_single_doc_pool_needs_no_reranker(self):
         r = Recall("", "")

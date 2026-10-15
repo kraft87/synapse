@@ -43,24 +43,19 @@ def bm25_tokenize(text: str) -> list[str]:
     return re.findall(r"[a-z0-9_./#+-]+", text.lower())
 
 
-def bm25_best_window(content: str, query_tokens: list[str], cap: int) -> str:
-    """Return the cap-sized region with the strongest BM25 match to the query."""
-    starts = list(range(0, len(content), _RERANK_WINDOW_SIZE))
-    windows = [bm25_tokenize(content[start : start + _RERANK_WINDOW_SIZE]) for start in starts]
-    n_windows = len(windows)
-    if n_windows <= 1:
-        return content[:cap]
-    average_length = sum(len(window) for window in windows) / n_windows
+def bm25_scores(docs: list[list[str]], query_tokens: list[str]) -> list[float]:
+    """BM25 score of each tokenised doc against the query, with IDF and the average
+    length taken over ``docs`` itself. An empty doc scores 0.0."""
+    n_docs = len(docs)
+    average_length = sum(len(doc) for doc in docs) / n_docs if n_docs else 0.0
     document_frequency: dict[str, int] = {}
-    for window in windows:
-        for token in set(window):
+    for doc in docs:
+        for token in set(doc):
             document_frequency[token] = document_frequency.get(token, 0) + 1
-    best_index, best_score = 0, -1.0
-    for index, window in enumerate(windows):
-        if not window:
-            continue
+    scores: list[float] = []
+    for doc in docs:
         term_frequency: dict[str, int] = {}
-        for token in window:
+        for token in doc:
             term_frequency[token] = term_frequency.get(token, 0) + 1
         score = 0.0
         for token in set(query_tokens):
@@ -68,16 +63,27 @@ def bm25_best_window(content: str, query_tokens: list[str], cap: int) -> str:
             if not frequency:
                 continue
             inverse_frequency = math.log(
-                1
-                + (n_windows - document_frequency[token] + 0.5) / (document_frequency[token] + 0.5)
+                1 + (n_docs - document_frequency[token] + 0.5) / (document_frequency[token] + 0.5)
             )
             score += (
                 inverse_frequency
                 * frequency
                 * 2.5
-                / (frequency + 1.5 * (0.25 + 0.75 * len(window) / average_length))
+                / (frequency + 1.5 * (0.25 + 0.75 * len(doc) / average_length))
             )
-        if score > best_score:
-            best_score, best_index = score, index
+        scores.append(score)
+    return scores
+
+
+def bm25_best_window(content: str, query_tokens: list[str], cap: int) -> str:
+    """Return the cap-sized region with the strongest BM25 match to the query."""
+    starts = list(range(0, len(content), _RERANK_WINDOW_SIZE))
+    windows = [bm25_tokenize(content[start : start + _RERANK_WINDOW_SIZE]) for start in starts]
+    if len(windows) <= 1:
+        return content[:cap]
+    scores = bm25_scores(windows, query_tokens)
+    best_index = max(
+        (index for index, window in enumerate(windows) if window), key=scores.__getitem__, default=0
+    )
     start = max(0, starts[best_index] + _RERANK_WINDOW_SIZE // 2 - cap // 2)
     return content[start : start + cap]

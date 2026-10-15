@@ -177,16 +177,17 @@ def test_rerank_warning_is_deduped_across_legs():
     assert len(hits) == 1
 
 
-def test_passage_rerank_failure_warns_passages_dropped():
+def test_passage_rerank_failure_warns_and_picks_by_keyword():
     long_doc = "".join(f"\n## Section {i}\nlorem ipsum dolor sit amet " * 6 for i in range(24))
     r = Recall(_NO_DB, "")
     r._reranker = _FakeReranker(fail=True)
     sink: list[str] = []
     with _warn_sink(sink):
-        assert r._compact_to_passages("q", [{"content": long_doc, "created_at": None}], n=2) == []
+        out = r._compact_to_passages("q", [{"content": long_doc, "created_at": None}], n=2)
+    assert out and out[0]["content"].strip()
     msg = " || ".join(sink)
     assert "passage rerank failed (voyage: Unauthorized)" in msg
-    assert "episode passages dropped" in msg
+    assert "picked by keyword match" in msg
 
 
 def test_relevance_floor_rerank_failure_warns_unfiltered():

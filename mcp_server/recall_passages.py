@@ -11,6 +11,8 @@ from ingestion.localtime import local_date
 from ingestion.web_chunker import CHUNK_OVERLAP, chunk_markdown
 from mcp_server.recall_presentation import passage_role as _passage_role
 from mcp_server.recall_presentation import role_spans as _role_spans
+from mcp_server.recall_query import bm25_scores as _bm25_scores
+from mcp_server.recall_query import bm25_tokenize as _bm25_tokenize
 from mcp_server.recall_warnings import config_hint as _config_hint
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import warn as _warn
@@ -34,12 +36,16 @@ class RecallPassagesMixin:
         (scripts/passage_bench_v*, 2026-06-26). A direct rerank over the chunks is the bench's
         hybrid->rerank cascade's ceiling at this bounded chunk count, and rerank-only avoids a live
         passage embed. Serves at most n chunks as one item per parent episode, skipping chunks that
-        repeat another episode's chosen chunk; ``stats`` (if given) gets ``n_dup_passages``.
-        Returns [] on chunk/rerank failure so the caller falls back to full episodes."""
+        repeat another episode's chosen chunk; ``stats`` (if given) gets ``n_dup_passages`` and
+        ``n_chunks_cut`` (chunks left out of the rerank by the _RECALL_PASSAGE_CAND budget).
+
+        Without a rerank signal (SYNAPSE_RERANK_PROVIDER=none, or the call failed) the passages
+        are picked by keyword overlap instead: the best-matching chunk of each top episode, in
+        episode order. Returns [] only when no episode has text to chunk."""
         settings = self._settings()
-        passages: list[str] = []
-        owner: list[dict[str, Any]] = []
-        bounds: list[tuple[int, int]] = []  # passage char span in its parent's content
+        q_tokens = _bm25_tokenize(query)
+        eps: list[dict[str, Any]] = []
+        episode_chunks: list[list[tuple[str, int, int]]] = []  # (text, char_start, char_end)
         role_spans: dict[int, list[tuple[int, str]]] = {}  # id(episode) -> marker layout
         for e in episodes:
             content = e.get("content") or ""
@@ -54,17 +60,24 @@ class RecallPassagesMixin:
                 ]
             except Exception:
                 chunks = [(content, 0, len(content))]
-            for ch, lo, hi in chunks:
+            eps.append(e)
+            episode_chunks.append(chunks)
+        passages: list[str] = []
+        owner: list[dict[str, Any]] = []
+        bounds: list[tuple[int, int]] = []  # passage char span in its parent's content
+        for e, chunks, kept in zip(
+            eps,
+            episode_chunks,
+            _share_chunk_budget(episode_chunks, q_tokens, settings._RECALL_PASSAGE_CAND),
+            strict=True,
+        ):
+            for j in kept:
+                ch, lo, hi = chunks[j]
                 passages.append(ch)
                 owner.append(e)
                 bounds.append((lo, hi))
         if not passages:
             return []
-        # Cap the rerank input so a pathologically long episode can't blow up the call.
-        if len(passages) > settings._RECALL_PASSAGE_CAND:
-            passages = passages[: settings._RECALL_PASSAGE_CAND]
-            owner = owner[: settings._RECALL_PASSAGE_CAND]
-            bounds = bounds[: settings._RECALL_PASSAGE_CAND]
         # Every path walks the full ranking: a passage redundant with one already chosen is
         # skipped and its slot backfills from the next-ranked passage.
         redundant = _Redundancy(passages, owner)
@@ -83,21 +96,22 @@ class RecallPassagesMixin:
                     chosen.append(i)
                     redundant.keep(i)
         else:
+            scored: list[tuple[int, float]] | None = None
             reranker = self._ensure_reranker()
-            if reranker is None:  # rerank disabled — no selection signal, serve full episodes
-                return []
-            try:
-                scored = reranker.rerank_scored(query, passages)
-            except Exception as e:
-                logger.warning("Passage rerank failed, serving full episodes: %s", e)
-                detail = _err_brief(e)
-                backend = _embedding.rerank_provider()
-                _warn(
-                    f"passage rerank failed ({backend}: {detail}): episode passages dropped "
-                    f"from this result, retry with recall_full_turns for raw turns."
-                    + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
-                )
-                return []
+            if reranker is not None:
+                try:
+                    scored = reranker.rerank_scored(query, passages)
+                except Exception as e:
+                    logger.warning("Passage rerank failed, picking passages by keyword: %s", e)
+                    detail = _err_brief(e)
+                    backend = _embedding.rerank_provider()
+                    _warn(
+                        f"passage rerank failed ({backend}: {detail}): episode passages are "
+                        f"picked by keyword match, not relevance."
+                        + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
+                    )
+            if scored is None:  # rerank disabled or failed: no network signal to order by
+                scored = _keyword_order(q_tokens, passages, owner)
             per_sess: dict[Any, int] = {}
             for i, _s in scored:
                 if not _fresh(i):
@@ -125,6 +139,7 @@ class RecallPassagesMixin:
                             break
         if stats is not None:
             stats["n_dup_passages"] = len(dup_ix)
+            stats["n_chunks_cut"] = sum(len(c) for c in episode_chunks) - len(passages)
         # One item per parent episode, placed at its best chunk's rank. Chunks of one turn used
         # to serve as separate items under the same id, adjacent ones repeating CHUNK_OVERLAP
         # chars, which read as the same episode served twice (recall_feedback, Sep-Oct 2026).
@@ -231,6 +246,50 @@ class _Redundancy:
 
     def keep(self, i: int) -> None:
         self._kept.append((id(self._owner[i]), *self._key(i)))
+
+
+def _share_chunk_budget(
+    episode_chunks: list[list[tuple[str, int, int]]], q_tokens: list[str], cap: int
+) -> list[list[int]]:
+    """Which chunks of each episode go to the rerank: indices in document order.
+
+    Within ``cap`` every chunk goes. Past it the episodes share the budget instead of the
+    first ones taking all of it (the later of the top-K episodes would never be reranked):
+    each episode's chunks are ranked by BM25 overlap with the query and taken round-robin
+    over the episodes in rank order, so room a short episode leaves goes to a long one and
+    the higher-ranked episodes win the odd chunk of the last round."""
+    if sum(len(c) for c in episode_chunks) <= cap:
+        return [list(range(len(c))) for c in episode_chunks]
+    scores = iter(
+        _bm25_scores([_bm25_tokenize(text) for c in episode_chunks for text, _, _ in c], q_tokens)
+    )
+    rounds: list[tuple[int, int, int]] = []  # (round, episode rank, chunk index)
+    for ep, chunks in enumerate(episode_chunks):
+        chunk_scores = [next(scores) for _ in chunks]
+        best_first = sorted(range(len(chunks)), key=lambda j: -chunk_scores[j])
+        rounds.extend((rank, ep, j) for rank, j in enumerate(best_first))
+    kept: list[list[int]] = [[] for _ in episode_chunks]
+    for _round, ep, j in sorted(rounds)[:cap]:
+        kept[ep].append(j)
+    return [sorted(k) for k in kept]
+
+
+def _keyword_order(
+    q_tokens: list[str], passages: list[str], owner: list[dict[str, Any]]
+) -> list[tuple[int, float]]:
+    """Passage order without a reranker: round-robin over the episodes in rank order, each
+    giving its chunks best BM25 match first, so the first n are the best chunk of each of the
+    top n episodes."""
+    scores = _bm25_scores([_bm25_tokenize(p) for p in passages], q_tokens)
+    by_episode: dict[int, list[int]] = {}
+    for i, ep in enumerate(owner):
+        by_episode.setdefault(id(ep), []).append(i)
+    rounds = sorted(
+        (rank, ep_rank, i)
+        for ep_rank, members in enumerate(by_episode.values())
+        for rank, i in enumerate(sorted(members, key=lambda i: -scores[i]))
+    )
+    return [(i, scores[i]) for _round, _ep, i in rounds]
 
 
 def _join_overlap(a: str, b: str) -> str:

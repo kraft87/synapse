@@ -3,7 +3,7 @@
 Pure-logic tests — no DB, no Voyage (fake embedder). Guard the contract that makes passage mode
 safe to flip on: it returns at most n passages, each carrying its PARENT episode's project/date so
 the caller can still attribute and drill down; it skips the rerank entirely when a few chunks already
-fit; and it degrades to [] (caller falls back to full episodes) when the reranker errors.
+fit; and it picks passages by keyword overlap when the reranker is disabled or errors.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ def test_chunks_of_one_episode_serve_as_one_item():
     assert len(out) == 1 and out[0]["id"] == "e:9"
     run = _LONG[chunks[0].char_start : chunks[1].char_end]
     assert out[0]["content"] == run + "\n[…]\n" + chunks[3].content
-    assert stats == {"n_dup_passages": 0}
+    assert stats == {"n_dup_passages": 0, "n_chunks_cut": 0}
 
 
 def test_repeat_of_another_episode_is_skipped_and_backfilled():
@@ -93,7 +93,7 @@ def test_repeat_of_another_episode_is_skipped_and_backfilled():
     stats: dict = {}
     out = r._compact_to_passages("q", eps, n=2, stats=stats)
     assert [it["id"] for it in out] == ["e:1", "e:3"]
-    assert stats == {"n_dup_passages": 1}
+    assert stats == {"n_dup_passages": 1, "n_chunks_cut": 0}
 
 
 def test_repeat_skipped_when_pool_fits_without_rerank():
@@ -113,7 +113,7 @@ def test_near_copy_with_a_different_number_is_kept():
     stats: dict = {}
     out = r._compact_to_passages("q", eps, n=2, stats=stats)
     assert [it["id"] for it in out] == ["e:1", "e:2"]
-    assert stats == {"n_dup_passages": 0}
+    assert stats == {"n_dup_passages": 0, "n_chunks_cut": 0}
 
 
 def test_join_overlap_rebuilds_the_parent_text():
@@ -137,11 +137,77 @@ def test_few_chunks_skip_rerank():
     assert out[0]["content"] == "a short single-chunk turn"
 
 
-def test_rerank_failure_returns_empty():
-    # Many chunks + a failing reranker -> [] so the caller falls back to full episodes.
+def test_rerank_failure_serves_keyword_passages():
+    # A failing reranker must not blank the episode bucket: passages are picked by keyword
+    # overlap instead, and the degradation is announced.
+    from mcp_server.recall_warnings import warn_sink
+
     r = Recall("", "")
     r._reranker = _Boom()
-    assert r._compact_to_passages("q", [_ep(_LONG)], n=2) == []
+    warnings: list[str] = []
+    with warn_sink(warnings):
+        out = r._compact_to_passages("q", [{**_ep(_LONG), "id": "e:1"}], n=2)
+    assert out and out[0]["id"] == "e:1" and out[0]["content"].strip()
+    assert len(warnings) == 1 and "passage rerank failed" in warnings[0]
+
+
+def _marked_episode(tag: str) -> str:
+    """An episode of several chunks of which exactly one, in the middle, mentions ``gizmo``;
+    ``tag`` keeps one episode's filler from reading as a copy of another's."""
+    filler = "".join(
+        f"\n## Part {i}\n{tag} unrelated filler text about nothing at all " * 5 for i in range(8)
+    )
+    cut = len(filler) // 2
+    return filler[:cut] + f"\n## Notes\nthe {tag} gizmo is configured here\n" + filler[cut:]
+
+
+def test_no_rerank_serves_the_best_chunk_of_each_top_episode_in_fusion_order():
+    # SYNAPSE_RERANK_PROVIDER=none: no network signal, so the episode bucket is the top
+    # episodes in fusion order, each represented by its best keyword-matching chunk.
+    r = Recall("", "")
+    r._reranker = None
+    eps = [{**_ep(_marked_episode(t)), "id": f"e:{t}"} for t in ("alpha", "bravo", "charlie")]
+    out = r._compact_to_passages("where is the gizmo configured", eps[:3], n=2)
+    assert [it["id"] for it in out] == ["e:alpha", "e:bravo"]
+    assert all("gizmo is configured here" in it["content"] for it in out)
+
+
+def test_chunk_budget_is_shared_across_episodes():
+    # 20 long episodes make more chunks than the rerank cap. Truncating in episode order
+    # would hand the whole budget to the first ~14 and the 10 -> 20 deepening would never
+    # reach the reranker; each episode keeps its best chunks instead.
+    docs_seen: list[list[str]] = []
+
+    class _Recording:
+        def rerank_scored(self, query, documents, top_k=None):
+            docs_seen.append(list(documents))
+            return [(i, 1.0 - 0.001 * i) for i in range(len(documents))]
+
+    r = Recall("", "")
+    r._reranker = _Recording()
+    eps = [{**_ep(_LONG.replace("lorem", f"tag{j}x")), "id": f"e:{j}"} for j in range(20)]
+    stats: dict = {}
+    r._compact_to_passages("q", eps, n=6, stats=stats)
+    (docs,) = docs_seen
+    assert len(docs) == 80
+    assert all(any(f"tag{j}x" in d for d in docs) for j in range(20))
+    assert stats["n_chunks_cut"] > 0
+
+
+def test_within_budget_every_chunk_reaches_the_reranker():
+    docs_seen: list[list[str]] = []
+
+    class _Recording:
+        def rerank_scored(self, query, documents, top_k=None):
+            docs_seen.append(list(documents))
+            return [(i, 1.0 - 0.001 * i) for i in range(len(documents))]
+
+    r = Recall("", "")
+    r._reranker = _Recording()
+    stats: dict = {}
+    r._compact_to_passages("q", [{**_ep(_LONG), "id": "e:1"}], n=2, stats=stats)
+    assert len(docs_seen[0]) > 2
+    assert stats["n_chunks_cut"] == 0
 
 
 def test_empty_episodes_returns_empty():
