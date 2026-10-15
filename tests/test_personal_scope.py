@@ -82,14 +82,56 @@ def test_classify_entity_group_respects_switch(monkeypatch):
     from ingestion.extraction_policy import _classify_entity_group
 
     monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    assert _classify_entity_group("dentist appointment", None, "technical") == "personal"
-    assert _classify_entity_group("Postgres", None, "personal") == "technical"
+    assert _classify_entity_group("dentist appointment", "technical") == "personal"
+    assert _classify_entity_group("Postgres", "personal") == "technical"
 
     monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
     # The personal regex never runs: "dentist appointment" would otherwise land
     # in a graph the default group_id="technical" search never reads.
-    assert _classify_entity_group("dentist appointment", None, "technical") == "technical"
-    assert _classify_entity_group("Postgres", None, "personal") == "technical"
+    assert _classify_entity_group("dentist appointment", "technical") == "technical"
+    assert _classify_entity_group("Postgres", "personal") == "technical"
+
+
+def _fact(source: str, target: str):
+    from ingestion.models import ExtractedFact
+
+    return ExtractedFact(
+        source=source, target=target, relationship="USES", fact=f"{source}-{target}"
+    )
+
+
+def test_facts_whose_endpoints_disagree_are_settled_in_the_default_group():
+    """A fact used to be dropped, with a debug line, when the name regex put one endpoint
+    in the other graph: ``time.sleep`` -> personal, so its fact about a worker vanished.
+    The endpoint that is not in the item's default group joins it, and the fact is kept."""
+    from ingestion.extraction_policy import _reconcile_fact_groups
+
+    groups = {"time.sleep": "personal", "poller": "technical", "dentist": "personal"}
+    facts = [_fact("poller", "time.sleep"), _fact("dentist", "dentist")]
+
+    moved = _reconcile_fact_groups(facts, groups, "technical")
+
+    assert moved == 1
+    assert groups == {"time.sleep": "technical", "poller": "technical", "dentist": "personal"}
+
+
+def test_a_moved_endpoint_takes_every_fact_it_is_in_with_it():
+    from ingestion.extraction_policy import _reconcile_fact_groups
+
+    groups = {"sleep": "personal", "worker": "technical", "cron": "personal"}
+    # sleep/cron agree, so only the second fact disagrees; moving sleep splits the first.
+    facts = [_fact("sleep", "cron"), _fact("worker", "sleep")]
+
+    assert _reconcile_fact_groups(facts, groups, "technical") == 2
+    assert set(groups.values()) == {"technical"}
+
+
+def test_a_personal_item_settles_in_the_personal_graph():
+    from ingestion.extraction_policy import _reconcile_fact_groups
+
+    groups = {"Postgres": "technical", "my dentist": "personal"}
+    assert _reconcile_fact_groups([_fact("Postgres", "my dentist")], groups, "personal") == 1
+    assert groups == {"Postgres": "personal", "my dentist": "personal"}
 
 
 def test_notes_group_routing_follows_switch(monkeypatch):

@@ -20,6 +20,7 @@ from ingestion.extraction_policy import (
     _apply_canonical_aliases,
     _classify_entity_group,
     _default_group_for_project,
+    _reconcile_fact_groups,
 )
 from ingestion.extraction_recheck import recheck_restated
 from ingestion.extraction_twins import collapse_batch_twins
@@ -92,11 +93,12 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         """Process one extraction queue item. Raises on failure (caller handles retry).
 
         Group routing: each entity is assigned to either the technical or personal
-        graph via _classify_entity_group (project tag → item default, then per-entity
-        regex override), or to technical alone when the personal scope is off. Entities are partitioned by group and resolved/written
-        independently against their target graph. Edges are only written when both
-        endpoints landed in the same group; cross-group facts are dropped (rare —
-        a sign of borderline content the regex misclassified).
+        graph via _classify_entity_group (project tag → item default, then a per-entity
+        override from its name), or to technical alone when the personal scope is off. A
+        fact whose endpoints disagree moves the odd one into the item's default group
+        (_reconcile_fact_groups), so an edge always has both endpoints in one graph.
+        Entities are partitioned by group and resolved/written independently against
+        their target graph.
         """
         content_type: str = item["content_type"]
         project: str | None = item.get("project")
@@ -210,10 +212,20 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         }
         all_entities = [e for e in all_entities if e.name in referenced_names]
 
-        # Per-entity group classification (regex-based override of item default)
+        # Per-entity group classification (name-based override of item default), then one
+        # graph per fact: decided before Stage 4 so both endpoints resolve against it.
         entity_groups: dict[str, str] = {
-            e.name: _classify_entity_group(e.name, e.summary, default_group) for e in all_entities
+            e.name: _classify_entity_group(e.name, default_group) for e in all_entities
         }
+        moved = _reconcile_fact_groups(llm_result.facts, entity_groups, default_group)
+        if moved:
+            logger.info(
+                "Moved %d entit%s into the %s group so the facts joining them keep both "
+                "endpoints in one graph",
+                moved,
+                "y" if moved == 1 else "ies",
+                default_group,
+            )
 
         # Filled by Stage 4 with the vector of every name the dedup did not settle exactly,
         # for its vector search and for Stage 5 to store on the entities that are new.
@@ -252,8 +264,8 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # graph write per entity, check that the LLM extractor actually
         # produced a fact referencing it. Without this filter the
         # deterministic extractor + LLM extractor produce ~92% zero-edge
-        # orphan nodes. A referenced fact can still be dropped later (cross-group,
-        # same-batch twin, 6b/6c duplicate, unresolved endpoint), which used to
+        # orphan nodes. A referenced fact can still be dropped later
+        # (same-batch twin, 6b/6c duplicate, unresolved endpoint), which used to
         # leave a third of the fresh entities edge-less: so NEW entities are held
         # back here and written per group right before Stage 7 writes edges, only
         # for the facts it creates. Poller.sweep_orphan_entities stays as the daily safety net
@@ -306,19 +318,19 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         if not llm_result.facts:
             return
 
-        # Partition facts by the group of their (source, target) entity pair. Drop
-        # cross-group facts — they imply the regex misclassified one endpoint.
+        # Partition facts by the group of their (source, target) entity pair: the same
+        # group for both, after the reconcile above, unless an endpoint is no entity.
         facts_by_group: dict[str, list[ExtractedFact]] = {g: [] for g in active_groups()}
-        cross_group_dropped = 0
+        dropped = 0
         for fact in llm_result.facts:
             src_grp = entity_groups.get(fact.source)
             tgt_grp = entity_groups.get(fact.target)
             if src_grp and tgt_grp and src_grp == tgt_grp and src_grp in facts_by_group:
                 facts_by_group[src_grp].append(fact)
             else:
-                cross_group_dropped += 1
-        if cross_group_dropped:
-            logger.debug("Dropped %d cross-group facts (entities span groups)", cross_group_dropped)
+                dropped += 1
+        if dropped:
+            logger.info("Dropped %d fact(s) whose endpoints resolve to no common group", dropped)
 
         # Web provenance → edge attrs: the artifact id rides every created edge
         # (kg_shadow mirror column), and the page's published/fetched date is the
@@ -348,7 +360,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # Stage 6 + 7 run separately per group — same code path, different graph.
         # reference_time is the relative-date anchor (the segment timestamp), so
         # "last week" resolves against the conversation, not ingest.
-        # A group with no facts left (all cross-group) writes none of its new entities.
+        # A group with no facts writes none of its new entities.
         for grp in active_groups():
             grp_facts = facts_by_group[grp]
             if not grp_facts:

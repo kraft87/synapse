@@ -11,7 +11,7 @@ texts that share a slot are identical vectors.
    the pair. Pinned: one live edge, mention_count 2, the union of both batches' episodes.
 2. Edge-less entities. Stage 5 wrote every new entity a fact named before Stage 6/7 decided
    which facts get written, so an entity whose only fact was then dropped (6b duplicate,
-   6c restatement, same-batch twin, cross-group) was left with no edge. And two workers
+   6c restatement, same-batch twin) was left with no edge. And two workers
    that resolved the same new name both inserted it.
 
 Only symbols that predate the fix are imported, so the file also runs against the
@@ -77,6 +77,7 @@ def _pipeline(
     facts: list[ExtractedFact],
     episodes: list[int],
     judge: Callable[..., Any] = _judge_misses,
+    summaries: dict[str, str] | None = None,
 ) -> ExtractionPipeline:
     db = MagicMock()
     db.get_chunk_episode_ids.return_value = episodes
@@ -85,7 +86,10 @@ def _pipeline(
         db=db, llm_client=MagicMock(), embedder=embedder, kg_client=KGClient(DB_URL)
     )
     names = sorted({n for f in facts for n in (f.source, f.target)})
-    entities = [ExtractedEntity(name=n, type="Concept", summary=f"{n} summary") for n in names]
+    entities = [
+        ExtractedEntity(name=n, type="Concept", summary=(summaries or {}).get(n, f"{n} summary"))
+        for n in names
+    ]
     pipe._stage2_deterministic = MagicMock(return_value=[])  # type: ignore[method-assign]
     pipe._stage3_llm = MagicMock(  # type: ignore[method-assign]
         return_value=ExtractionResult(entities=entities, facts=facts)
@@ -290,19 +294,37 @@ class TestNoEntityWithoutAWrittenFact:
         assert {"Lantern", "Calendar", "Meadow", "Backup"} <= set(_entity_names(graph))
         assert _edgeless(graph) == []
 
-    def test_cross_group_fact(self, graph, monkeypatch):
+    def test_the_summary_does_not_route_an_entity(self, graph, monkeypatch):
+        """The model's per-mention summary is prose full of bare nouns the personal pattern
+        matches ("parent process", "sleep"); routed on it, a technical entity landed in
+        the other graph and its fact was dropped."""
+        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
+        fact = _fact("Worker reads jobs from Queue", "Worker", "Queue")
+        summaries = {"Worker": "forks a child from the parent process, then sleep(5)"}
+
+        _pipeline(_Embedder(), [fact], WINDOW_A, summaries=summaries).process_item(dict(ITEM))
+
+        assert [e[0] for e in _live_edges(graph)] == [fact.fact]
+        groups = set(graph.execute("SELECT group_id FROM kg_entities").fetchall())
+        assert groups == {("technical",)}
+
+    def test_fact_whose_endpoints_the_name_pattern_splits_is_kept_in_one_graph(
+        self, graph, monkeypatch
+    ):
         monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
         monkeypatch.setattr(
             extractor_mod,
             "_classify_entity_group",
-            lambda name, summary, default: "personal" if name == "Pebble" else default,
+            lambda name, default: "personal" if name == "Pebble" else default,
         )
-        cross = _fact("Pebble is moored at the harbor", "Pebble", "Harbor")
+        split = _fact("Pebble is moored at the harbor", "Pebble", "Harbor")
 
-        _pipeline(_Embedder(), [cross, _CONTROL], WINDOW_A).process_item(dict(ITEM))
+        _pipeline(_Embedder(), [split, _CONTROL], WINDOW_A).process_item(dict(ITEM))
 
-        assert [e[0] for e in _live_edges(graph)] == [_CONTROL.fact]
-        assert _entity_names(graph) == ["Backup", "Meadow"]
+        # Pebble joins the item's default group instead of taking its fact down.
+        assert sorted(e[0] for e in _live_edges(graph)) == sorted([split.fact, _CONTROL.fact])
+        groups = dict(graph.execute("SELECT name, group_id FROM kg_entities").fetchall())
+        assert groups["Pebble"] == groups["Harbor"]
         assert _edgeless(graph) == []
 
 

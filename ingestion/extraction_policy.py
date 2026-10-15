@@ -23,10 +23,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 #
 # Replaces the prior hardcoded `group_id = "technical"`. Entities and edges are
-# routed per-item via project tag, then per-entity overridden by content
-# heuristics. Patterns mirror scripts/survey_cross_graph_leaks.py — same
-# regexes that identified the post-hoc leakers — so the writer-side classifier
-# matches the cleanup-side classifier.
+# routed per-item via project tag, then per-entity overridden by the entity's NAME.
+# The patterns are bare words, so they trip on technical names too (``time.sleep``, a
+# ``Book`` model); a fact whose endpoints land in different graphs is settled in the
+# item's default group (``_reconcile_fact_groups``) rather than dropped.
 
 # The whole split is off when SYNAPSE_PERSONAL_SCOPE=0 (ingestion/scope.py): every
 # item and entity below routes to "technical" and the personal graph is never
@@ -89,14 +89,14 @@ def _default_group_for_project(project: str | None) -> str:
     return "technical"
 
 
-def _classify_entity_group(name: str, summary: str | None, default_group: str) -> str:
-    """Per-entity override of the item-level default group.
+def _classify_entity_group(name: str, default_group: str) -> str:
+    """Per-entity override of the item-level default group, from the entity's name.
 
-    A personal-flavored entity name (family, dating, health, job-search) lands
-    in personal even when the surrounding session is technical — and vice
-    versa for clearly-technical names that surface in personal sessions.
-    Borderline cases stay with the default. Matches the cleanup-pass regex
-    in scripts/survey_cross_graph_leaks.py so writer and survey agree.
+    A personal-flavored name (family, dating, health, job-search) lands in personal even
+    when the surrounding session is technical, and a clearly technical name in a personal
+    session lands in technical. Borderline cases stay with the default. The name alone
+    decides: the model's per-mention summary is free prose that varies from chunk to
+    chunk, so routing on it put one entity in different graphs on different days.
 
     With the personal scope off (SYNAPSE_PERSONAL_SCOPE=0) neither pattern runs:
     a technical entity that trips the personal regex would otherwise land in a
@@ -104,12 +104,39 @@ def _classify_entity_group(name: str, summary: str | None, default_group: str) -
     """
     if not personal_scope_enabled():
         return "technical"
-    text = f"{name}\n{summary or ''}"
-    if _PERSONAL_NAME_PATTERN.search(text):
+    if _PERSONAL_NAME_PATTERN.search(name):
         return "personal"
-    if _TECHNICAL_NAME_PATTERN.search(text):
+    if _TECHNICAL_NAME_PATTERN.search(name):
         return "technical"
     return default_group
+
+
+def _reconcile_fact_groups(
+    facts: list[ExtractedFact], entity_groups: dict[str, str], default_group: str
+) -> int:
+    """Settle fact endpoints that landed in different groups, in place; returns how many
+    entities moved.
+
+    An edge lives in one graph, so a fact whose endpoints disagree used to be dropped, with
+    a debug line, and the name patterns misroute often enough (bare nouns) to lose technical
+    facts that way. The endpoint outside the item's default group joins it instead, so both
+    resolve in one graph. An entity moves for every fact it is in, which can split another
+    fact, so this repeats until nothing moves (each move is toward the default, so it ends).
+    """
+    moved: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for fact in facts:
+            src, tgt = entity_groups.get(fact.source), entity_groups.get(fact.target)
+            if src is None or tgt is None or src == tgt:
+                continue
+            for name in (fact.source, fact.target):
+                if entity_groups[name] != default_group:
+                    entity_groups[name] = default_group
+                    moved.add(name)
+                    changed = True
+    return len(moved)
 
 
 # ---------------------------------------------------------------------------

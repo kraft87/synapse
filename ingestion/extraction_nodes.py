@@ -152,8 +152,8 @@ class ExtractionNodesMixin:
 
         Runs right after Stage 6c, inside Stage 7 before its edge writes, with the same
         create guard Stage 7 applies (not skipped, both endpoints resolved). A new entity
-        whose facts were all dropped (cross-group, same-batch twin, 6b or 6c duplicate,
-        unresolved endpoint) is never written, so it cannot be left without an edge.
+        whose facts were all dropped (same-batch twin, 6b or 6c duplicate, unresolved
+        endpoint) is never written, so it cannot be left without an edge.
         ``uuid_map`` is updated in place when the same-name guard routes a name to an
         entity written meanwhile."""
         linked: set[str] = set()
