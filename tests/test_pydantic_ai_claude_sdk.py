@@ -27,7 +27,7 @@ from pydantic_ai.tools import ToolDefinition
 
 import ingestion.pydantic_ai_claude_sdk as sdk_mod
 from ingestion.llm_client import (
-    ClaudeCLIClient,
+    ClaudeAgentClient,
     MalformedResponseError,
     UsageLimitError,
     structured_call,
@@ -88,7 +88,7 @@ class TestRequest:
             _fake_agent_call(seen, '{"contradicted_facts": [3]}'),
         )
         result = structured_call(
-            ClaudeCLIClient(),
+            ClaudeAgentClient(),
             output_model=_Verdict,
             base_prompt="judge this",
             system="be a judge",
@@ -110,7 +110,7 @@ class TestRequest:
             "agent_call",
             _fake_agent_call(seen, '{"contradicted_facts": [1]} — hope that helps!'),
         )
-        result = structured_call(ClaudeCLIClient(), output_model=_Verdict, base_prompt="x")
+        result = structured_call(ClaudeAgentClient(), output_model=_Verdict, base_prompt="x")
         assert result.contradicted_facts == [1]
 
     def test_usage_limit_propagates(self, monkeypatch):
@@ -119,14 +119,14 @@ class TestRequest:
 
         monkeypatch.setattr(sdk_mod, "agent_call", limit_call)
         with pytest.raises(UsageLimitError):
-            structured_call(ClaudeCLIClient(), output_model=_Verdict, base_prompt="x")
+            structured_call(ClaudeAgentClient(), output_model=_Verdict, base_prompt="x")
 
     def test_unparseable_output_maps_to_malformed(self, monkeypatch):
         seen: dict[str, Any] = {}
         monkeypatch.setattr(sdk_mod, "agent_call", _fake_agent_call(seen, "not json"))
         with pytest.raises(MalformedResponseError):
             structured_call(
-                ClaudeCLIClient(), output_model=_Verdict, base_prompt="x", max_attempts=1
+                ClaudeAgentClient(), output_model=_Verdict, base_prompt="x", max_attempts=1
             )
 
     def test_function_tools_rejected(self):

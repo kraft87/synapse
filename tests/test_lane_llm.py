@@ -34,7 +34,7 @@ from ingestion.contamination import is_harness_call
 
 
 class _FakeClient:
-    """Duck-types ClaudeCLIClient: records messages.create calls."""
+    """Duck-types ClaudeAgentClient: records messages.create calls."""
 
     def __init__(self, reply="{}", error=None):
         self.calls: list[dict] = []
@@ -126,7 +126,7 @@ def test_config_scan_tells_an_unreadable_reply_from_no_corrections(fake):
 
 
 def test_usage_limit_text_from_the_cli_raises_end_to_end(monkeypatch):
-    """Through the real ClaudeCLIClient: the usage-limit text agent_call detects reaches the
+    """Through the real ClaudeAgentClient: the usage-limit text agent_call detects reaches the
     lane as UsageLimitError (the subprocess path returned it as stdout and parsed it as
     "no gaps")."""
     seen: dict = {}

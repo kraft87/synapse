@@ -31,7 +31,7 @@ from ingestion import llm_client as llm_client_mod
 from ingestion.llm_client import (
     DEFAULT_OPENAI_BASE_URL,
     DEFAULT_OPENAI_MODEL,
-    ClaudeCLIClient,
+    ClaudeAgentClient,
     LLMHTTPError,
     MalformedResponseError,
     OpenAIChatClient,
@@ -90,15 +90,15 @@ def _no_retry_sleep(no_retry_sleep):
 class TestProviderSelection:
     def test_default_is_claude_code(self, monkeypatch):
         monkeypatch.delenv("SYNAPSE_LLM_PROVIDER", raising=False)
-        assert isinstance(create_llm_client(), ClaudeCLIClient)
+        assert isinstance(create_llm_client(), ClaudeAgentClient)
 
     def test_explicit_claude_code(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "claude-code")
-        assert isinstance(create_llm_client(), ClaudeCLIClient)
+        assert isinstance(create_llm_client(), ClaudeAgentClient)
 
     def test_blank_provider_is_claude_code(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "")
-        assert isinstance(create_llm_client(), ClaudeCLIClient)
+        assert isinstance(create_llm_client(), ClaudeAgentClient)
 
     def test_openai_provider(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_LLM_PROVIDER", "openai")

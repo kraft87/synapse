@@ -102,7 +102,7 @@ def _canonical_branch(convo: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(msgs, key=lambda m: m.get("create_time") or 0)
 
 
-class OpenAIChatParser:
+class ChatGPTExportParser:
     """Convert one ChatGPT-export conversation dict into a list of Episodes."""
 
     @staticmethod
@@ -223,5 +223,5 @@ def parse_export(path: Path) -> tuple[list[Episode], int]:
             if convo.get("is_do_not_remember"):
                 skipped_dnr += 1
                 continue
-            episodes.extend(OpenAIChatParser.parse_conversation(convo, str(f)))
+            episodes.extend(ChatGPTExportParser.parse_conversation(convo, str(f)))
     return episodes, skipped_dnr

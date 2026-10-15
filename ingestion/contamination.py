@@ -43,7 +43,7 @@ def is_transcript_contamination(content: str | None) -> bool:
 # ---------------------------------------------------------------------------
 # Synapse's own LLM calls (extraction / judges) must not become memories.
 # ---------------------------------------------------------------------------
-# ClaudeCLIClient / agent_call spawn the real claude CLI. On a host whose user
+# ClaudeAgentClient / agent_call spawn the real claude CLI. On a host whose user
 # settings carry the Stop ingest hook (cortex), each spawned call used to ship
 # its own transcript into /ingest — so every judged eval run self-ingested:
 # judge prompts (which embed golden-set ground-truth answers) became episodes,

@@ -3,7 +3,7 @@
 Single module providing two interfaces over the Claude Code Agent SDK
 (no subprocess to ``claude --print`` — the SDK manages the CLI handle):
 
-  * ``ClaudeCLIClient`` — sync, drop-in replacement that mimics
+  * ``ClaudeAgentClient`` — sync, drop-in replacement that mimics
     ``anthropic.Anthropic()``'s ``messages.create()`` shape. Existing
     callers in ``ingestion/extractor.py``, ``dream/*``, etc. work
     unchanged.
@@ -495,7 +495,7 @@ class _Response:
 
 
 class _MessagesProxy:
-    """``ClaudeCLIClient.messages`` — the anthropic-shaped text surface over
+    """``ClaudeAgentClient.messages`` — the anthropic-shaped text surface over
     ``agent_call``, which owns the retry policy."""
 
     def __init__(self, default_model: str) -> None:
@@ -522,7 +522,7 @@ class _MessagesProxy:
         return _Response(text)
 
 
-class ClaudeCLIClient:
+class ClaudeAgentClient:
     """Sync drop-in for ``anthropic.Anthropic()``.
 
     Internally routes to the async ``agent_call`` via ``asyncio.run``. Each
@@ -967,9 +967,10 @@ def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     bare Claude id the provider wouldn't recognise).
 
     Stages: EXTRACTOR, TIMELINE, PREFERENCES, DEDUP, CONTRADICTION, EDGE_DATES,
-    NOTES_CONFIRM, NOTES_CURATE, SKILLS_JUDGE, SKILLS_DRAFT. The A/B work behind this (Flash-vs-Haiku,
-    DeepSeek-vs-Haiku) showed model choice matters per stage — a cheap model
-    can be fine for binary confirms while extraction wants a stronger one.
+    NOTES_CONFIRM, NOTES_CURATE, SKILLS_JUDGE, SKILLS_DRAFT, CONTEXTUALIZE. The A/B
+    work behind this (Flash-vs-Haiku, DeepSeek-vs-Haiku) showed model choice matters
+    per stage — a cheap model can be fine for binary confirms while extraction wants
+    a stronger one.
     """
     stage_var = f"SYNAPSE_{stage.upper()}_MODEL"
     v = os.environ.get(stage_var, "").strip()
@@ -983,12 +984,12 @@ def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     return default
 
 
-def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAIChatClient:
+def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeAgentClient | OpenAIChatClient:
     """Build the extraction LLM client from env. All construction sites route here.
 
     ``SYNAPSE_LLM_PROVIDER``:
 
-    * ``claude-code`` (default, also blank) — ``ClaudeCLIClient`` over the
+    * ``claude-code`` (default, also blank) — ``ClaudeAgentClient`` over the
       Agent SDK; auth via the local ``claude`` CLI login,
       ``CLAUDE_CODE_OAUTH_TOKEN``, or ``ANTHROPIC_API_KEY``. ``model`` is
       the per-client default Claude model name.
@@ -1003,7 +1004,7 @@ def create_llm_client(model: str = DEFAULT_MODEL) -> ClaudeCLIClient | OpenAICha
     if provider in ("", "claude-code"):
         # Startup validation: every construction site routes here, so a mis-spelled
         # model id fails loudly at client creation instead of as empty completions.
-        return ClaudeCLIClient(model=check_model_id(model, "SYNAPSE_LLM_MODEL"))
+        return ClaudeAgentClient(model=check_model_id(model, "SYNAPSE_LLM_MODEL"))
     if provider == "openai":
         return OpenAIChatClient(
             base_url=os.environ.get("SYNAPSE_LLM_BASE_URL", DEFAULT_OPENAI_BASE_URL)
@@ -1032,7 +1033,7 @@ def _resolve_pydantic_ai_model(llm_client: Any, model: str) -> Any:
     The same env selection that picks the backend today
     (``SYNAPSE_LLM_PROVIDER`` → ``create_llm_client``) transitively picks the
     pydantic-ai Model here: ``OpenAIChatClient`` → ``OpenAIChatModel`` over
-    its OpenRouter/OpenAI-compatible connection, ``ClaudeCLIClient`` →
+    its OpenRouter/OpenAI-compatible connection, ``ClaudeAgentClient`` →
     ``ClaudeAgentSDKModel`` over the subscription CLI. Anything else (test
     doubles, third-party clients with the ``messages.create(model=...,
     max_tokens=..., messages=..., system=..., response_format=...) ->
@@ -1044,7 +1045,7 @@ def _resolve_pydantic_ai_model(llm_client: Any, model: str) -> Any:
 
     if isinstance(llm_client, OpenAIChatClient):
         return llm_client.pydantic_ai_model(model)
-    if isinstance(llm_client, ClaudeCLIClient):
+    if isinstance(llm_client, ClaudeAgentClient):
         return ClaudeAgentSDKModel(model)
 
     async def messages_create(

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from ingestion.openai_client import OpenAIChatParser, parse_export
+from ingestion.chatgpt_export import ChatGPTExportParser, parse_export
 
 CONV_ID = "67e1e894-0000-4000-8000-000000000001"
 
@@ -69,7 +69,7 @@ def _conversation(**overrides) -> dict:
 
 class TestParseConversation:
     def test_two_turns_canonical_branch(self):
-        eps = OpenAIChatParser.parse_conversation(_conversation())
+        eps = ChatGPTExportParser.parse_conversation(_conversation())
         assert len(eps) == 2
         first, second = eps
         assert first.session_id == CONV_ID
@@ -88,25 +88,25 @@ class TestParseConversation:
         assert second.content.startswith("[context] Use sorted(xs).")
 
     def test_abandoned_branch_excluded(self):
-        eps = OpenAIChatParser.parse_conversation(_conversation())
+        eps = ChatGPTExportParser.parse_conversation(_conversation())
         assert "ABANDONED BRANCH" not in "\n".join(e.content for e in eps)
 
     def test_thoughts_excluded(self):
-        eps = OpenAIChatParser.parse_conversation(_conversation())
+        eps = ChatGPTExportParser.parse_conversation(_conversation())
         assert "hidden reasoning" not in "\n".join(e.content for e in eps)
 
     def test_do_not_remember_skipped(self):
-        assert OpenAIChatParser.parse_conversation(_conversation(is_do_not_remember=True)) == []
+        assert ChatGPTExportParser.parse_conversation(_conversation(is_do_not_remember=True)) == []
 
     def test_broken_chain_falls_back_to_time_order(self):
-        eps = OpenAIChatParser.parse_conversation(_conversation(current_node="missing-node"))
+        eps = ChatGPTExportParser.parse_conversation(_conversation(current_node="missing-node"))
         # fallback takes ALL message nodes by create_time, including the
         # abandoned sibling — degraded but complete
         assert len(eps) == 2
         assert eps[0].human_turn == "how do I sort a list?"
 
     def test_event_time_from_message_epoch(self):
-        eps = OpenAIChatParser.parse_conversation(_conversation())
+        eps = ChatGPTExportParser.parse_conversation(_conversation())
         assert eps[0].created_at.isoformat().startswith("2025-06-15")
 
     def test_default_model_fallback(self):
@@ -114,7 +114,7 @@ class TestParseConversation:
         for node in convo["mapping"].values():
             if node["message"]:
                 node["message"]["metadata"] = {}
-        eps = OpenAIChatParser.parse_conversation(convo)
+        eps = ChatGPTExportParser.parse_conversation(convo)
         assert eps[0].model == "gpt-4o"
 
     def test_multimodal_image_part(self):
@@ -123,7 +123,7 @@ class TestParseConversation:
             "content_type": "multimodal_text",
             "parts": [{"asset_pointer": "file-abc"}, "what is this?"],
         }
-        eps = OpenAIChatParser.parse_conversation(convo)
+        eps = ChatGPTExportParser.parse_conversation(convo)
         assert eps[0].human_turn == "[image]\n\nwhat is this?"
 
 

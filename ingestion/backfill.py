@@ -29,6 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from ingestion.chatgpt_export import parse_export as parse_chatgpt_export
 from ingestion.chunks import rebuild_chunks
 from ingestion.claude_ai_client import parse_export as parse_claude_ai_export
 from ingestion.codex_client import CodexRolloutParser
@@ -38,7 +39,6 @@ from ingestion.db import Database
 from ingestion.episode_writer import StoreStats, store_episodes
 from ingestion.jsonl_client import JSONLParser
 from ingestion.models import Episode
-from ingestion.openai_client import parse_export as parse_chatgpt_export
 
 logger = logging.getLogger(__name__)
 

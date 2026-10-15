@@ -6,7 +6,7 @@ Covers:
   cache, no session transcript, the thinking cap), its one retry policy (transport
   failures only, then ``LLMUnavailableError``), the per-exchange timeout, and when a
   result counts as a quota notice.
-* ``ClaudeCLIClient.messages.create`` flattening chat messages the same way the
+* ``ClaudeAgentClient.messages.create`` flattening chat messages the same way the
   OpenAI-compatible proxy does.
 * The ``parse_with_retry`` helper that re-fires the LLM call with feedback on parse
   failure (mirrors Graphiti's ``generate_response`` retry loop).
@@ -29,7 +29,7 @@ import ingestion.llm_client as llm_mod
 from ingestion.llm_client import (
     _MAX_THINKING_TOKENS,
     LLM_TRANSPORT_ERRORS,
-    ClaudeCLIClient,
+    ClaudeAgentClient,
     LLMUnavailableError,
     MalformedResponseError,
     UsageLimitError,
@@ -268,7 +268,7 @@ class TestUsageLimitDetector:
 
 
 # ---------------------------------------------------------------------------
-# ClaudeCLIClient.messages.create — same message flattening as the OpenAI proxy
+# ClaudeAgentClient.messages.create — same message flattening as the OpenAI proxy
 # ---------------------------------------------------------------------------
 
 
@@ -283,7 +283,7 @@ def test_messages_create_folds_system_messages_and_keeps_every_turn():
         return '{"ok": true}'
 
     with patch.object(llm_mod, "agent_call", fake_agent_call):
-        resp = ClaudeCLIClient(model="claude-sonnet-4-5").messages.create(
+        resp = ClaudeAgentClient(model="claude-sonnet-4-5").messages.create(
             messages=[
                 {"role": "system", "content": "rules"},
                 {"role": "user", "content": "first"},
