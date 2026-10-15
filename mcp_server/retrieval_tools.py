@@ -186,9 +186,8 @@ def register(
                         "error": "session_id='self' requires the client hook to inject the caller's id; none arrived"
                     }
                 session_id = self_session
-            # Same engine path as the retired recall_episodes tool and the interim
-            # recall(mode="turns") — telemetry keeps kind='episodes' so historical
-            # per-tool metrics stay comparable.
+            # Telemetry keeps kind='episodes' (the retired recall_episodes tool's name) so
+            # historical per-tool metrics stay comparable.
             trust = _caller_trust()
             out = _get_recall().recall_episodes(
                 query=query,

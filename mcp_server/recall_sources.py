@@ -151,8 +151,8 @@ class RecallSourcesMixin(RecallEngine):
         never adds a response warning, matching the pre-056 skip. ``None`` = full trust.
 
         Runs inside one transaction so the planner GUCs are SET LOCAL — scoped
-        to this query, not the thread-local connection that other legs may
-        reuse later (enable_seqscan=off session-wide would be a foot-gun for
+        to this query, not the pooled connection that other legs may
+        borrow later (enable_seqscan=off session-wide would be a foot-gun for
         any future unindexed query). hnsw.ef_search is already set
         on every connection by ingestion/pg_pool. A failure degrades to an empty facts
         bucket rather than failing the whole recall.
@@ -219,11 +219,10 @@ class RecallSourcesMixin(RecallEngine):
         cap: int,
         allowed_projects: list[str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Superseded-fact pairs for served edges (Postgres port of the old
-        FalkorDB _fetch_history_pairs).
+        """Superseded-fact pairs for served edges.
 
         DISTINCT ON picks the most recently invalidated predecessor per active
-        edge in SQL (the FalkorDB path does this dedup in Python).
+        edge in SQL.
 
         A predecessor must actually be one: either it carries the schema-028
         ``invalidated_by`` link to the served edge, or it has no link at all and
@@ -400,7 +399,7 @@ class RecallSourcesMixin(RecallEngine):
 
         Finds superseded edges near the query that carry a precise successor link (invalidated_by,
         schema 028), resolves the live successor, and returns the distinct successors, nearest
-        first, distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
+        first, distance-gated (sup_max_dist) so only on-topic superseded facts pull their
         correction in. The caller drops those it already serves and caps the rest. Go-forward
         coverage only (no link => skipped); never returns the stale fact itself. Shape matches
         the KG fact leg ({fact, _uuid, _id, _date, _ongoing, _supported}) so it flows through fact

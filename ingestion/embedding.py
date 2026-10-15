@@ -60,7 +60,7 @@ class TransientEmbeddingHTTPError(EmbeddingHTTPError):
 
 
 # Voyage's client defaults to max_retries=0, so a transient rate-limit (429) or 5xx
-# RAISES immediately. In recall() that means _rerank_pool silently degrades to RRF
+# RAISES immediately. In recall() that means _rerank_pool_scored silently degrades to RRF
 # order — worse retrieval with no alarm. Retry the transient Voyage errors with
 # exponential backoff + jitter so the API and client negotiate the rate DYNAMICALLY
 # (no hardcoded TPM/worker guesses); permanent errors (auth / invalid-request /
