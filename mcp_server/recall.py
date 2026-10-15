@@ -69,6 +69,7 @@ from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import submit_with_context as _submit_ctx
 from mcp_server.recall_warnings import warn as _warn
 from mcp_server.recall_warnings import warn_sink as _warn_sink
+from mcp_server.recall_web import RecallWebMixin
 
 _KG_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
@@ -363,6 +364,7 @@ class Recall(
     RecallRerankMixin,
     RecallPassagesMixin,
     RecallSourcesMixin,
+    RecallWebMixin,
     RecallOverviewMixin,
     RecallEpisodesMixin,
     RecallFetchMixin,

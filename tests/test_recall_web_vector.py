@@ -10,7 +10,7 @@ import pytest
 
 from mcp_server.kg_pg import _vec_literal
 from mcp_server.recall import Recall
-from mcp_server.recall_sources import vector_web_sql
+from mcp_server.recall_web import vector_web_sql
 
 pytestmark = pytest.mark.db
 
