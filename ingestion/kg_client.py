@@ -236,16 +236,31 @@ class KGClient:
 
         return self._run(_q)
 
-    def load_entities(self, group_id: str) -> list[tuple[str, str, str, str | None]]:
-        """(uuid, name, summary, entity_supertype) for every entity in the group (LSH hydrate)."""
+    def load_entities(self, group_id: str) -> list[tuple[str, str, str | None]]:
+        """(uuid, name, entity_supertype) for every entity in the group (LSH hydrate)."""
 
-        def _q(conn: psycopg.Connection[Any]) -> list[tuple[str, str, str, str | None]]:
+        def _q(conn: psycopg.Connection[Any]) -> list[tuple[str, str, str | None]]:
             rows = conn.execute(
-                "SELECT uuid, COALESCE(name, ''), COALESCE(summary, ''), entity_supertype "
+                "SELECT uuid, COALESCE(name, ''), entity_supertype "
                 "FROM kg_entities WHERE owner_id = %s AND group_id = %s",
                 (OWNER, group_id),
             ).fetchall()
-            return [(str(u), n, s, st) for u, n, s, st in rows]
+            return [(str(u), n, st) for u, n, st in rows]
+
+        return self._run(_q)
+
+    def entity_summaries(self, uuids: list[str], group_id: str) -> dict[str, str]:
+        """uuid -> summary of the given entities (LSH candidates handed to the LLM confirm)."""
+        if not uuids:
+            return {}
+
+        def _q(conn: psycopg.Connection[Any]) -> dict[str, str]:
+            rows = conn.execute(
+                "SELECT uuid, COALESCE(summary, '') FROM kg_entities "
+                "WHERE owner_id = %s AND group_id = %s AND uuid = ANY(%s)",
+                (OWNER, group_id, uuids),
+            ).fetchall()
+            return {str(u): s for u, s in rows}
 
         return self._run(_q)
 
@@ -409,7 +424,7 @@ class KGClient:
     # Writes
     # ------------------------------------------------------------------
 
-    def upsert_node(
+    def insert_node(
         self,
         node_uuid: str,
         name: str,
@@ -420,17 +435,14 @@ class KGClient:
         embedding: list[float] | None = None,
         supertype: str | None = None,
     ) -> str:
-        """Insert-or-update an entity. Returns the node UUID.
+        """Insert a NEW entity. Returns the node UUID.
 
         ``normalized_name`` (lowercase, whitespace-collapsed, leading/trailing
-        punctuation stripped) is recomputed on every write so
-        ``ingestion.dedup.NodeDeduper`` can serve the exact-name short-circuit
-        via an indexed lookup, and a rename propagates to the dedup index
-        immediately. On conflict updates only the fields an update is allowed to
-        change (name/summary/normalized_name, embedding-if-present,
-        entity_supertype/subtype); created_at/entity_type/valid_at are insert-only.
-        entity_subtype = the raw entity_type; supertype is the caller-derived taxonomy
-        rollup (updatable so the fluid map propagates).
+        punctuation stripped) is what ``ingestion.dedup.NodeDeduper`` serves the
+        exact-name short-circuit from, via an indexed lookup. entity_subtype = the raw
+        entity_type; supertype is the caller-derived taxonomy rollup. Re-inserting an
+        existing uuid is a retry no-op; a mention that matched an existing entity goes
+        through :meth:`update_node`, which never touches its identity.
         """
         from ingestion.dedup import _normalize_name
 
@@ -460,18 +472,36 @@ class KGClient:
                 "   entity_type, summary, embedding, created_at, t_created, "
                 "   valid_at, t_valid, entity_supertype, entity_subtype) "
                 f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,%s,%s,%s) "
-                "ON CONFLICT (uuid) DO UPDATE SET "
-                "   name = EXCLUDED.name, "
-                "   summary = EXCLUDED.summary, "
-                "   normalized_name = EXCLUDED.normalized_name, "
-                "   embedding = COALESCE(EXCLUDED.embedding, kg_entities.embedding), "
-                "   entity_supertype = EXCLUDED.entity_supertype, "
-                "   entity_subtype = EXCLUDED.entity_subtype",
+                "ON CONFLICT (uuid) DO NOTHING",
                 params,
             )
 
         self._run(_do)
         return node_uuid
+
+    def update_node(self, node_uuid: str, summary: str = "", supertype: str | None = None) -> None:
+        """What a mention that matched an existing entity may change on it: the summary,
+        when the mention's is longer, and the supertype, when the taxonomy map is loaded
+        (``supertype`` not None; the map is fluid, so it propagates). The name,
+        normalized_name, embedding and subtype are whatever the entity was first written
+        with: a fuzzy match from "Postgres" must not rename "PostgreSQL", and every
+        rewrite of the 8 KB embedding costs a new HNSW tuple. A mention that adds nothing
+        writes nothing."""
+        new_summary = strip_nul(summary or "").strip()
+
+        def _do(conn: psycopg.Connection[Any]) -> None:
+            conn.execute(
+                "UPDATE kg_entities SET "
+                "  summary = CASE WHEN length(%(s)s::text) > length(COALESCE(summary, '')) "
+                "                 THEN %(s)s ELSE summary END, "
+                "  entity_supertype = COALESCE(%(st)s, entity_supertype) "
+                "WHERE uuid = %(u)s AND owner_id = %(o)s "
+                "  AND (length(%(s)s::text) > length(COALESCE(summary, '')) "
+                "       OR entity_supertype IS DISTINCT FROM COALESCE(%(st)s, entity_supertype))",
+                {"s": new_summary, "st": supertype, "u": node_uuid, "o": OWNER},
+            )
+
+        self._run(_do)
 
     def create_edges_batch(self, rows: list[dict[str, Any]], group_id: str) -> None:
         """Insert relationship edges. One multi-row INSERT, ON CONFLICT (uuid)

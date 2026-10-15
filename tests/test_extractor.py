@@ -673,6 +673,66 @@ class TestEntityResolver:
         mock.embed.side_effect = list(vectors)
         return mock
 
+    def test_embeds_only_what_the_deduper_did_not_settle_and_hands_the_vectors_back(self):
+        v_pg, v_new = self._make_embedding(0.0), self._make_embedding(0.4)
+        embedder = self._mock_embedder([v_new])
+        deduper = MagicMock()
+        deduper.classify.side_effect = lambda name, summary, entity_type=None: (
+            ("exact", "u-pg") if name == "Postgres" else ("none", None)
+        )
+        falkordb = _mock_falkordb(similar_nodes=[])
+        embeddings: dict[str, list[float]] = {}
+        resolver = EntityResolver(embedder=embedder, llm_client=None)
+
+        mapping = resolver.resolve(
+            [_entity("Postgres"), _entity("FalkorDB")],
+            kg_client=falkordb,
+            group_id="technical",
+            deduper=deduper,
+            embeddings=embeddings,
+        )
+
+        assert mapping["Postgres"] == "u-pg"
+        # one request, for the one name that is not an exact hit; Stage 5 stores this vector
+        embedder.embed.assert_called_once_with(["FalkorDB"], task="entity")
+        assert embeddings == {"FalkorDB": v_new}
+        assert falkordb.find_similar_nodes.call_args.args[0] == v_new
+        assert v_pg not in embeddings.values()
+
+    def test_a_name_with_candidates_is_embedded_too_it_may_still_turn_out_new(self):
+        v = self._make_embedding(0.2)
+        embedder = self._mock_embedder([v])
+        deduper = MagicMock()
+        deduper.classify.return_value = ("candidates", [("u-1", "FalkorDB graph", "", 0.8)])
+        llm = MagicMock()
+        embeddings: dict[str, list[float]] = {}
+        resolver = EntityResolver(embedder=embedder, llm_client=llm)
+        # the batched confirm finds no duplicate: the entity is new and needs its vector
+        resolver._batch_confirm = MagicMock(return_value={})  # type: ignore[method-assign]
+
+        mapping = resolver.resolve(
+            [_entity("FalkorDB")],
+            kg_client=_mock_falkordb(),
+            group_id="technical",
+            deduper=deduper,
+            embeddings=embeddings,
+        )
+
+        assert mapping["FalkorDB"].startswith("new:")
+        assert embeddings == {"FalkorDB": v}
+
+    def test_vectors_already_in_the_dict_are_not_requested_again(self):
+        v = self._make_embedding(0.3)
+        embedder = MagicMock()
+        resolver = EntityResolver(embedder=embedder, llm_client=None)
+        resolver.resolve(
+            [_entity("FalkorDB")],
+            kg_client=_mock_falkordb(),
+            group_id="technical",
+            embeddings={"FalkorDB": v},
+        )
+        embedder.embed.assert_not_called()
+
     def test_no_existing_nodes_assigns_new_uuid(self):
         v = self._make_embedding(0.1)
         embedder = self._mock_embedder([v])
@@ -1324,7 +1384,7 @@ class TestProcessItemOrphanPrefilter:
 
         seen: set[str] = set()
 
-        def _fake_resolve(entities, group_id, deduper=None):
+        def _fake_resolve(entities, group_id, deduper=None, embeddings=None):
             for e in entities:
                 seen.add(e.name)
             return {e.name: f"new:{e.name}" for e in entities}
@@ -1605,9 +1665,7 @@ class TestDeduperCache:
 
     def test_register_visible_across_instances(self):
         pipe_a, pipe_b = self._pipeline(), self._pipeline()
-        pipe_a._deduper_for("technical").register(
-            "Shared Register Probe", "uuid-shared-probe", summary="s"
-        )
+        pipe_a._deduper_for("technical").register("Shared Register Probe", "uuid-shared-probe")
         assert (
             pipe_b._deduper_for("technical").exact_match("shared register probe")
             == "uuid-shared-probe"

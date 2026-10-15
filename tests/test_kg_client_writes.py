@@ -2,9 +2,8 @@
 
 Exercises every mutation against the real kg_entities / kg_relationships
 schema (017) on the shared test DB, asserting the contracts the pipeline
-depends on: upsert updates only the rename-able fields (created_at /
-entity_type are insert-only, embedding survives a no-embedding update),
-edge re-creation is a retry no-op, invalidation sets both t_invalid and the
+depends on: a matched entity's update carries only a longer summary and a known
+supertype (never its name, embedding or subtype), edge re-creation is a retry no-op, invalidation sets both t_invalid and the
 legacy invalid_at, and failures RAISE (Postgres is the source of truth now —
 no best-effort swallowing).
 """
@@ -43,11 +42,11 @@ class TestHelpers:
         assert _vec([]) is None
 
 
-class TestUpsertNode:
+class TestInsertNode:
     def test_nul_bytes_stripped_from_text_fields(self, kg_writer, conn):
         # Postgres TEXT rejects NUL bytes — an LLM response carrying one must
         # not fail the write (and the queue-item retry loop behind it).
-        kg_writer.upsert_node(
+        kg_writer.insert_node(
             node_uuid="e-nul",
             name="Name\x00X",
             entity_type="Tool",
@@ -59,8 +58,8 @@ class TestUpsertNode:
         ).fetchone()
         assert row == ("NameX", "namex", "summary")
 
-    def test_insert_then_update_semantics(self, kg_writer, conn):
-        kg_writer.upsert_node(
+    def test_insert_round_trip(self, kg_writer, conn):
+        kg_writer.insert_node(
             node_uuid="e-1",
             name="Synapse",
             entity_type="Tool",
@@ -68,35 +67,109 @@ class TestUpsertNode:
             group_id=GROUP,
             project="synapse",
             embedding=_axis_list(0),
+            supertype="Service",
         )
         row = conn.execute(
-            "SELECT owner_id, group_id, name, normalized_name, entity_type, summary, "
-            "created_at, embedding IS NOT NULL FROM kg_entities WHERE uuid = 'e-1'"
+            "SELECT owner_id, group_id, project, name, normalized_name, entity_type, summary, "
+            "entity_subtype, entity_supertype, embedding IS NOT NULL "
+            "FROM kg_entities WHERE uuid = 'e-1'"
         ).fetchone()
-        assert row[:6] == ("default", GROUP, "Synapse", "synapse", "Tool", "memory layer")
-        created_at_first, has_emb = row[6], row[7]
+        assert row == (
+            "default",
+            GROUP,
+            "synapse",
+            "Synapse",
+            "synapse",
+            "Tool",
+            "memory layer",
+            "Tool",
+            "Service",
+            True,
+        )
+
+    def test_reinserting_a_uuid_is_a_retry_no_op(self, kg_writer, conn):
+        kg_writer.insert_node(
+            node_uuid="e-1", name="Synapse", entity_type="Tool", summary="a", group_id=GROUP
+        )
+        kg_writer.insert_node(
+            node_uuid="e-1", name="Renamed", entity_type="Other", summary="b", group_id=GROUP
+        )
+        assert conn.execute(
+            "SELECT name, summary FROM kg_entities WHERE uuid = 'e-1'"
+        ).fetchone() == (
+            "Synapse",
+            "a",
+        )
+
+
+class TestUpdateNode:
+    """A mention that matched an existing entity may only carry a longer summary and a
+    newly known supertype onto it. Its identity (name, normalized_name, embedding,
+    subtype) is whatever the entity was first written with."""
+
+    @pytest.fixture()
+    def entity(self, kg_writer, conn):
+        kg_writer.insert_node(
+            node_uuid="e-pg",
+            name="PostgreSQL",
+            entity_type="Database",
+            summary="relational database",
+            group_id=GROUP,
+            embedding=_axis_list(0),
+            supertype="Database",
+        )
+        return kg_writer
+
+    def _row(self, conn):
+        return conn.execute(
+            "SELECT name, normalized_name, entity_subtype, entity_supertype, summary, "
+            "embedding IS NOT NULL, xmin::text FROM kg_entities WHERE uuid = 'e-pg'"
+        ).fetchone()
+
+    def test_longer_summary_wins_and_identity_is_untouched(self, entity, conn):
+        entity.update_node("e-pg", summary="relational database used for the memory layer")
+        name, norm, subtype, supertype, summary, has_emb, _ = self._row(conn)
+        assert (name, norm, subtype, supertype) == (
+            "PostgreSQL",
+            "postgresql",
+            "Database",
+            "Database",
+        )
+        assert summary == "relational database used for the memory layer"
         assert has_emb
 
-        # Update: rename + longer summary, NO embedding this time. The
-        # existing embedding and the insert-only fields must survive.
-        kg_writer.upsert_node(
-            node_uuid="e-1",
-            name="Synapse v2",
-            entity_type="SHOULD-NOT-CHANGE",
-            summary="memory layer, renamed",
-            group_id=GROUP,
-            project="synapse",
-        )
-        row = conn.execute(
-            "SELECT name, normalized_name, entity_type, summary, created_at, "
-            "embedding IS NOT NULL FROM kg_entities WHERE uuid = 'e-1'"
-        ).fetchone()
-        assert row[0] == "Synapse v2"
-        assert row[1] == "synapse v2"
-        assert row[2] == "Tool"  # insert-only
-        assert row[3] == "memory layer, renamed"
-        assert row[4] == created_at_first  # insert-only
-        assert row[5]  # embedding preserved through a no-embedding update
+    def test_shorter_or_empty_summary_keeps_the_stored_one(self, entity, conn):
+        entity.update_node("e-pg", summary="database")
+        entity.update_node("e-pg", summary="")
+        assert self._row(conn)[4] == "relational database"
+
+    def test_supertype_is_set_when_known_and_kept_when_not(self, entity, conn):
+        entity.update_node("e-pg", summary="", supertype="Tool")
+        assert self._row(conn)[3] == "Tool"
+        entity.update_node("e-pg", summary="")  # taxonomy map not loaded: nothing to say
+        assert self._row(conn)[3] == "Tool"
+
+    def test_a_mention_that_adds_nothing_writes_nothing(self, entity, conn):
+        before = self._row(conn)[6]
+        entity.update_node("e-pg", summary="database", supertype="Database")
+        assert self._row(conn)[6] == before  # same row version: no write, no new HNSW tuple
+
+    def test_unknown_uuid_is_a_zero_row_update(self, entity):
+        entity.update_node("never-existed", summary="x")
+
+
+class TestEntitySummaries:
+    def test_summaries_of_the_asked_uuids_in_the_group(self, kg_writer, conn):
+        for uuid, name, summary, group in [
+            ("e-1", "A", "first", GROUP),
+            ("e-2", "B", "second", GROUP),
+            ("e-3", "C", "other group", "personal"),
+        ]:
+            kg_writer.insert_node(
+                node_uuid=uuid, name=name, entity_type="Tool", summary=summary, group_id=group
+            )
+        assert kg_writer.entity_summaries(["e-1", "e-3", "e-9"], GROUP) == {"e-1": "first"}
+        assert kg_writer.entity_summaries([], GROUP) == {}
 
 
 class TestCreateEdges:

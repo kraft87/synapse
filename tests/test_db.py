@@ -331,9 +331,7 @@ class TestExtractionQueue:
         db.enqueue_extraction(
             ExtractionItem(episode_id=ep_id, content=f"content {tag}", content_type="episode")
         )
-        return next(
-            p["id"] for p in _pending(db, 100) if p["episode_id"] == ep_id
-        )
+        return next(p["id"] for p in _pending(db, 100) if p["episode_id"] == ep_id)
 
     def _age(self, db, queue_id: int, *, minutes: int, attempts: int = 1) -> None:
         """Backdate a failed row so the retry window is expressible without sleeping."""

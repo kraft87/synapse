@@ -3,7 +3,7 @@
 The deduper runs three LLM-free strategies in order: exact normalized-name
 short-circuit, entropy gate, MinHash/LSH Jaccard (the LLM confirm over its
 candidates is the resolver's batched call). These tests cover each strategy
-independently and the summary-merge helper.
+independently.
 
 The graph client is mocked — ``NodeDeduper`` only touches it through
 ``entity_uuid_by_normalized_name`` (exact-name pass) and ``load_entities``
@@ -82,8 +82,12 @@ class _FakeKGClient:
     def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
         return self._graph_obj._exact_match.get(normalized)
 
-    def load_entities(self, group_id: str) -> list[tuple[str, ...]]:
-        return list(self._graph_obj._entities)
+    def load_entities(self, group_id: str) -> list[tuple[str, str, str | None]]:
+        # (uuid, name, supertype): the index keeps no summaries
+        return [(e[0], e[1], e[3] if len(e) > 3 else None) for e in self._graph_obj._entities]
+
+    def entity_summaries(self, uuids: list[str], group_id: str) -> dict[str, str]:
+        return {e[0]: e[2] for e in self._graph_obj._entities if e[0] in uuids}
 
     def load_type_map(self) -> dict[str, str]:
         return dict(self._graph_obj._type_map)
@@ -172,7 +176,7 @@ class TestExactNameMatch:
         graph = _FakeGraph(exact_match={})
         client = _FakeKGClient(graph)
         deduper = NodeDeduper(client, group_id="technical")
-        deduper.register("Synapse", "uuid-syn", summary="memory layer")
+        deduper.register("Synapse", "uuid-syn")
         # Next call on the same normalized name resolves via the in-memory
         # map, not the database.
         assert deduper.exact_match("synapse") == "uuid-syn"
@@ -303,7 +307,7 @@ class _FlakyKGClient(_FakeKGClient):
             raise ConnectionError("database down")
         return super().entity_uuid_by_normalized_name(normalized, group_id)
 
-    def load_entities(self, group_id: str) -> list[tuple[str, ...]]:
+    def load_entities(self, group_id: str) -> list[tuple[str, str, str | None]]:
         if self.load_fails:
             raise ConnectionError("database down")
         return super().load_entities(group_id)
@@ -331,29 +335,6 @@ class TestDatabaseErrorsSurface:
         kind, payload = deduper.classify("synapse poller")
         assert kind == "candidates"
         assert payload[0][0] == "uuid-poller"
-
-
-# ---------------------------------------------------------------------------
-# Summary merge
-# ---------------------------------------------------------------------------
-
-
-class TestSummaryMerge:
-    def test_longer_summary_wins(self):
-        short = "short"
-        long_ = "this is a much longer summary with more detail"
-        assert NodeDeduper.merge_summary(short, long_) == long_
-        assert NodeDeduper.merge_summary(long_, short) == long_
-
-    def test_empty_existing_keeps_incoming(self):
-        assert NodeDeduper.merge_summary("", "new") == "new"
-
-    def test_empty_incoming_keeps_existing(self):
-        assert NodeDeduper.merge_summary("existing", "") == "existing"
-
-    def test_both_empty_returns_empty(self):
-        assert NodeDeduper.merge_summary("", "") == ""
-        assert NodeDeduper.merge_summary(None, None) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -393,10 +374,22 @@ class TestClassify:
         kind, payload = deduper.classify("synapse-poller", summary="...")
         assert kind == "candidates"
         assert isinstance(payload, list) and payload
-        cand_uuid, cand_name, _cand_summary, jacc = payload[0]
+        cand_uuid, cand_name, cand_summary, jacc = payload[0]
         assert cand_uuid == "uuid-sp"
         assert cand_name == "synapse poller"
+        assert cand_summary == "the poller"
         assert 0.0 <= jacc <= 1.0
+
+    def test_candidate_summaries_are_read_when_asked_not_from_the_index(self):
+        # The index is built once per TTL and shared across replicas' writes: a summary it
+        # held would be stale after another worker extended it.
+        entities = [("uuid-sp", "synapse poller", "the poller")]
+        graph = _FakeGraph(entities=entities)
+        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
+        deduper.classify("synapse-poller")  # builds the index
+        graph._entities = [("uuid-sp", "synapse poller", "the poller, extended since")]
+        _kind, payload = deduper.classify("synapse-poller")
+        assert payload[0][2] == "the poller, extended since"
 
 
 # ---------------------------------------------------------------------------

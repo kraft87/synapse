@@ -121,10 +121,12 @@ class TestEntityReads:
 
     def test_load_entities_scoped_tuples(self, kg_tables):
         rows = kg_tables.load_entities(GROUP)
-        by_uuid = {u: (n, s) for u, n, s, _supertype in rows}
-        assert set(by_uuid) == {"e-syn", "e-fdb", "e-old"}
-        assert by_uuid["e-syn"] == ("Synapse", "memory layer")
-        assert by_uuid["e-old"] == ("  Voyage AI ", "")  # NULLs coalesced
+        by_uuid = {u: name for u, name, _supertype in rows}
+        assert by_uuid == {"e-syn": "Synapse", "e-fdb": "FalkorDB", "e-old": "  Voyage AI "}
+
+    def test_entity_summaries_are_read_for_the_asked_uuids_only(self, kg_tables):
+        got = kg_tables.entity_summaries(["e-syn", "e-old", "e-other-group"], GROUP)
+        assert got == {"e-syn": "memory layer", "e-old": ""}  # NULL coalesced, other group absent
 
 
 class TestEdgeReads:

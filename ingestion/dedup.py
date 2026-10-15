@@ -280,7 +280,6 @@ class _GroupIndex:
 
     def __init__(self, lsh: Any) -> None:
         self.lsh = lsh
-        self.summary_by_uuid: dict[str, str] = {}
         self.name_by_uuid: dict[str, str] = {}
         self.uuid_by_normalized_name: dict[str, str] = {}
         self.supertype_by_uuid: dict[str, str | None] = {}
@@ -316,7 +315,7 @@ class NodeDeduper:
     """Per-group write-time entity deduplicator.
 
     Instances are thin and thread-affine: they hold the calling thread's
-    KG/LLM clients (DB connections must not cross threads) plus config.
+    KG client (DB connections must not cross threads) plus config.
     The expensive hydrated index is NOT per-instance — every deduper for a
     group shares one process-wide ``_GroupIndex``, built lazily on first
     fuzzy lookup and rebuilt on TTL expiry by whichever caller trips it.
@@ -327,7 +326,6 @@ class NodeDeduper:
         - ``classify(name, summary, entity_type)`` → exact hit, LSH candidates or none
         - ``exact_match(name)`` → existing UUID or None, exact-name only (pre-INSERT guard)
         - ``register(name, uuid)`` — call after INSERT so the index stays warm
-        - ``merge_summary(existing_summary, new_summary)`` → str (longer wins)
         - ``type_map`` — read-through index accessor
     """
 
@@ -406,14 +404,14 @@ class NodeDeduper:
                 if not candidates:
                     return ("none", None)
 
+        top = candidates[: self._top_k]
+        # Summaries are read now, not kept in the index: it is built once per TTL, so a
+        # held summary would be stale after another worker extended the entity, and 48K of
+        # them cost RAM for the few candidates that are ever shown to the LLM.
+        summaries = self._kg.entity_summaries([u for u, _ in top], self._group_id)
         enriched = [
-            (
-                cand_uuid,
-                idx.name_by_uuid.get(cand_uuid, ""),
-                idx.summary_by_uuid.get(cand_uuid, ""),
-                jacc,
-            )
-            for cand_uuid, jacc in candidates[: self._top_k]
+            (cand_uuid, idx.name_by_uuid.get(cand_uuid, ""), summaries.get(cand_uuid, ""), jacc)
+            for cand_uuid, jacc in top
         ]
         return ("candidates", enriched)
 
@@ -425,7 +423,7 @@ class NodeDeduper:
         normalized = _normalize_name(name)
         return self._exact_name_lookup(normalized) if normalized else None
 
-    def register(self, name: str, node_uuid: str, summary: str = "") -> None:
+    def register(self, name: str, node_uuid: str) -> None:
         """Add a freshly-inserted node to the shared in-memory index.
 
         Call after a successful INSERT so that subsequent ``classify``
@@ -439,7 +437,6 @@ class NodeDeduper:
         with idx.lock:
             idx.uuid_by_normalized_name.setdefault(normalized, node_uuid)
             idx.name_by_uuid[node_uuid] = name
-            idx.summary_by_uuid[node_uuid] = summary or ""
             if not isinstance(idx.lsh, _NullLSH):
                 try:
                     # insert() no-ops on already-known keys and empty shingles.
@@ -447,35 +444,11 @@ class NodeDeduper:
                 except Exception as exc:
                     logger.debug("dedup: register %s failed to update LSH: %s", node_uuid[:8], exc)
 
-    def summary_of(self, node_uuid: str) -> str:
-        """Canonical summary for ``node_uuid`` from the shared index ('' if unknown)."""
-        idx = self._peek_index()
-        return idx.summary_by_uuid.get(node_uuid, "") if idx is not None else ""
-
     @property
     def type_map(self) -> dict[str, str]:
         """The subtype->supertype taxonomy map ({} until the index is hydrated)."""
         idx = self._peek_index()
         return idx.type_map if idx is not None else {}
-
-    @staticmethod
-    def merge_summary(existing: str | None, incoming: str | None) -> str:
-        """Pick the longer of two summaries, preferring non-empty over empty.
-
-        Conservative: doesn't synthesize, doesn't call an LLM. The longer
-        summary is almost always the one with more detail. If the caller
-        wants LLM-merged summaries, that's the nightly-dream pipeline's
-        job — write-time dedup stays cheap.
-        """
-        a = (existing or "").strip()
-        b = (incoming or "").strip()
-        if not a and not b:
-            return ""
-        if not a:
-            return b
-        if not b:
-            return a
-        return b if len(b) > len(a) else a
 
     # ------------------------------------------------------------------
     # Internals
@@ -559,16 +532,12 @@ class NodeDeduper:
         if _TYPE_GATE_ON:
             idx.type_map = self._kg.load_type_map()
 
-        for row in rows:
-            node_uuid = row[0]
-            name = row[1] or ""
-            summary = row[2] or ""
-            idx.supertype_by_uuid[node_uuid] = row[3] if len(row) > 3 else None
+        for node_uuid, name, supertype in rows:
+            idx.supertype_by_uuid[node_uuid] = supertype
             normalized = _normalize_name(name)
             if not normalized:
                 continue
             idx.name_by_uuid[node_uuid] = name
-            idx.summary_by_uuid[node_uuid] = summary
             idx.uuid_by_normalized_name.setdefault(normalized, node_uuid)
             shingles = _shingles(_normalize_for_fuzzy(name))
             if not shingles:

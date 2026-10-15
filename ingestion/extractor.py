@@ -216,12 +216,9 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             e.name: _classify_entity_group(e.name, e.summary, default_group) for e in all_entities
         }
 
-        # Pre-embed all entity names once (re-used per-group below)
+        # Filled by Stage 4 with the vector of every name the dedup did not settle exactly,
+        # for its vector search and for Stage 5 to store on the entities that are new.
         entity_embeddings: dict[str, list[float]] = {}
-        if all_entities:
-            names = [e.name for e in all_entities]
-            embs = self._embedder.embed(names, task="entity")
-            entity_embeddings = dict(zip(names, embs, strict=True))
 
         # Resolve nodes separately per group, defer the write until after the
         # orphan-drop pass below. Resolving (Stage 4) first is safe — it only
@@ -245,7 +242,9 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             if not grp_entities:
                 continue
             dedupers[grp] = self._deduper_for(grp)
-            grp_uuid_map = self._stage4_resolve(grp_entities, grp, deduper=dedupers[grp])
+            grp_uuid_map = self._stage4_resolve(
+                grp_entities, grp, deduper=dedupers[grp], embeddings=entity_embeddings
+            )
             uuid_map.update(grp_uuid_map)
             grp_entities_map[grp] = grp_entities
 

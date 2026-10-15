@@ -66,7 +66,9 @@ def _pipeline(valid_at: str):
     pipe._stage2_deterministic = MagicMock(return_value=[])
     pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=entities, facts=facts))
     pipe._stage4_resolve = MagicMock(
-        side_effect=lambda ents, group_id, deduper=None: {e.name: f"new:{e.name}" for e in ents}
+        side_effect=lambda ents, group_id, deduper=None, embeddings=None: {
+            e.name: f"new:{e.name}" for e in ents
+        }
     )
     pipe._stage5_write_nodes = MagicMock()
     pipe._process_facts_for_group = MagicMock()

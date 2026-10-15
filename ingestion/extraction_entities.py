@@ -92,6 +92,7 @@ class EntityResolver:
         kg_client: Any,
         group_id: str,
         deduper: Any | None = None,
+        embeddings: dict[str, list[float]] | None = None,
     ) -> dict[str, str]:
         """Resolve entities using write-time dedup then Postgres vector search.
 
@@ -100,6 +101,12 @@ class EntityResolver:
         (exact normalized-name → entropy gate → MinHash/LSH → LLM confirm).
         A hit short-circuits the vector path entirely; a miss falls through
         to the existing vector-similarity logic for backward compatibility.
+
+        ``embeddings`` (name -> vector) is the caller's cache and is filled in place with
+        the vector of every name the deduper did not settle exactly: the vector search
+        below uses it, and Stage 5 stores it on the entity if it turns out to be new.
+        Names already in it are not embedded again, and an exact hit is never embedded:
+        matching an existing entity writes no vector.
 
         The write-time dedup is the conservative path — it catches the
         exact-name and high-Jaccard cases the vector search misses,
@@ -131,12 +138,17 @@ class EntityResolver:
         # ``classify`` settles exact-name hits, surfaces LSH candidates for
         # confirmation, or returns "none" so the entity falls through to the
         # vector search.
+        if embeddings is None:
+            embeddings = {}
+        unsettled: list[str] = []
         vector_needed: list[ExtractedEntity] = []
         if deduper is not None:
             for entity in entities:
                 kind, payload = deduper.classify(
                     entity.name, entity.summary, entity_type=entity.type
                 )
+                if kind != "exact":
+                    unsettled.append(entity.name)
                 if kind == "exact":
                     mapping[entity.name] = cast(str, payload)
                 elif kind == "candidates":
@@ -148,15 +160,22 @@ class EntityResolver:
                     vector_needed.append(entity)
         else:
             vector_needed = list(entities)
+            unsettled = [e.name for e in entities]
 
-        # Phase 1b: vector-similarity pass for the deduper misses. Only this
-        # tail gets an embedding — saves Voyage calls when the deduper settled
-        # the majority exactly.
+        # One embedding request for everything the deduper did not settle exactly. A name
+        # with LSH candidates skips the vector search but may still be judged new.
+        to_embed = list(dict.fromkeys(n for n in unsettled if n not in embeddings))
+        if to_embed:
+            embeddings.update(
+                zip(to_embed, self._embedder.embed(to_embed, task="entity"), strict=True)
+            )
+
+        # Phase 1b: vector-similarity pass for the deduper misses.
         if vector_needed:
-            names = [e.name for e in vector_needed]
-            embeddings = self._embedder.embed(names, task="entity")
-            for entity, emb in zip(vector_needed, embeddings, strict=True):
-                candidates = kg_client.find_similar_nodes(emb, group_id, limit=5)
+            for entity in vector_needed:
+                candidates = kg_client.find_similar_nodes(
+                    embeddings[entity.name], group_id, limit=5
+                )
                 if not candidates:
                     mapping[entity.name] = _new_uuid()
                     continue

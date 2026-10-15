@@ -236,8 +236,15 @@ def _pending(*names: str, deduper=None) -> PendingNodes:
     return PendingNodes([_entity(n) for n in names], "proj", {}, deduper)
 
 
-def _upserted(pipe) -> list[tuple[str, str]]:
-    return [(c.kwargs["name"], c.kwargs["node_uuid"]) for c in pipe._kg.upsert_node.call_args_list]
+def _inserted(pipe) -> list[tuple[str, str]]:
+    return [(c.kwargs["name"], c.kwargs["node_uuid"]) for c in pipe._kg.insert_node.call_args_list]
+
+
+def _updated(pipe) -> list[tuple[str, str, str | None]]:
+    return [
+        (c.args[0], c.kwargs["summary"], c.kwargs["supertype"])
+        for c in pipe._kg.update_node.call_args_list
+    ]
 
 
 class TestNewEntityDeferral:
@@ -259,7 +266,7 @@ class TestNewEntityDeferral:
         )
 
         # Cache's only fact restated a live edge; NAS is an existing entity (not pending).
-        assert sorted(_upserted(pipe)) == [("PR #7", "p"), ("main", "m")]
+        assert sorted(_inserted(pipe)) == [("PR #7", "p"), ("main", "m")]
 
     def test_entity_of_a_fact_missing_its_other_endpoint_is_not_written(self):
         facts = [_fact("Ghost depends on the cache", "Ghost", "Cache")]
@@ -267,7 +274,7 @@ class TestNewEntityDeferral:
         pipe._process_facts_for_group(
             facts, {"Cache": "new:c"}, [4], "g", default_valid_at=SEG, new_nodes=_pending("Cache")
         )
-        assert _upserted(pipe) == []
+        assert _inserted(pipe) == []
         assert _created(pipe) == []
 
     def test_name_written_meanwhile_is_reused_and_the_edge_follows_it(self):
@@ -277,7 +284,6 @@ class TestNewEntityDeferral:
         deduper.exact_match.side_effect = lambda name: (
             "e-cache-other-worker" if name == "Cache" else None
         )
-        deduper.summary_of.return_value = "Cache summary from the other worker"
         deduper.type_map = {}
         pipe = _pipe()
 
@@ -290,8 +296,10 @@ class TestNewEntityDeferral:
             new_nodes=_pending("Cache", "NAS", deduper=deduper),
         )
 
-        assert sorted(_upserted(pipe)) == [("Cache", "e-cache-other-worker"), ("NAS", "n")]
-        deduper.register.assert_called_once_with("NAS", "n", "NAS summary")
+        # the other worker's entity keeps its identity: this mention only offers its summary
+        assert _inserted(pipe) == [("NAS", "n")]
+        assert _updated(pipe) == [("e-cache-other-worker", "Cache summary", None)]
+        deduper.register.assert_called_once_with("NAS", "n")
         assert uuid_map["Cache"] == "e-cache-other-worker"
         (row,) = _created(pipe)
         assert (row["src"], row["tgt"]) == ("e-cache-other-worker", "n")
@@ -327,3 +335,51 @@ class TestProcessItemSplit:
         assert [e.name for e in call.args[0]] == ["NAS"]
         pending = pipe._process_facts_for_group.call_args.kwargs["new_nodes"]
         assert [e.name for e in pending.entities] == ["Cache"]
+
+
+class TestStage5MatchedEntities:
+    """A mention that resolved to an existing entity must not rewrite it."""
+
+    def _pipe(self):
+        pipe = ExtractionPipeline.__new__(ExtractionPipeline)
+        pipe._kg = MagicMock()
+        return pipe
+
+    def test_a_matched_entity_is_never_renamed_or_re_embedded(self):
+        pipe = self._pipe()
+        pipe._stage5_write_nodes(
+            [ExtractedEntity(name="Postgres", type="Database", summary="the SQL database")],
+            {"Postgres": "u-pg"},
+            None,
+            "g",
+            {"Postgres": EMB},
+        )
+        pipe._kg.insert_node.assert_not_called()
+        assert _updated(pipe) == [("u-pg", "the SQL database", None)]
+
+    def test_a_new_entity_is_inserted_with_its_embedding(self):
+        pipe = self._pipe()
+        pipe._stage5_write_nodes(
+            [ExtractedEntity(name="Pebble", type="Project", summary="a project")],
+            {"Pebble": "new:p"},
+            "proj",
+            "g",
+            {"Pebble": EMB},
+        )
+        pipe._kg.update_node.assert_not_called()
+        (call,) = pipe._kg.insert_node.call_args_list
+        assert call.kwargs["node_uuid"] == "p"
+        assert call.kwargs["embedding"] == EMB
+        assert call.kwargs["project"] == "proj"
+
+    def test_supertype_follows_the_taxonomy_only_when_the_map_is_loaded(self):
+        pipe = self._pipe()
+        entity = ExtractedEntity(name="Postgres", type="Database", summary="")
+        unloaded = MagicMock(type_map={})
+        loaded = MagicMock(type_map={"Database": "Tool"})
+        loaded.exact_match.return_value = None
+        unloaded.exact_match.return_value = None
+        pipe._stage5_write_nodes([entity], {"Postgres": "u-pg"}, None, "g", {}, deduper=unloaded)
+        pipe._stage5_write_nodes([entity], {"Postgres": "u-pg"}, None, "g", {}, deduper=loaded)
+        # an unloaded map must not blank the stored supertype (it used to write NULL)
+        assert [c[2] for c in _updated(pipe)] == [None, "Tool"]

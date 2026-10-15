@@ -67,6 +67,7 @@ class ExtractionNodesMixin:
         entities: list[ExtractedEntity],
         group_id: str,
         deduper: Any | None = None,
+        embeddings: dict[str, list[float]] | None = None,
     ) -> dict[str, str]:
         import logfire
 
@@ -75,7 +76,9 @@ class ExtractionNodesMixin:
             grp=group_id,
             n=len(entities),
         ):
-            return self._resolver.resolve(entities, self._kg, group_id, deduper=deduper)
+            return self._resolver.resolve(
+                entities, self._kg, group_id, deduper=deduper, embeddings=embeddings
+            )
 
     def _stage5_write_nodes(
         self,
@@ -86,13 +89,10 @@ class ExtractionNodesMixin:
         embeddings: dict[str, list[float]] | None = None,
         deduper: Any | None = None,
     ) -> None:
-        from ingestion.dedup import NodeDeduper
-
         for entity in entities:
             raw_uuid = uuid_map.get(entity.name, f"new:{uuid.uuid4()}")
             is_new = raw_uuid.startswith("new:")
             clean_uuid = raw_uuid.removeprefix("new:")
-            emb = (embeddings or {}).get(entity.name)
 
             # Same-name guard: Stage 4 resolved this name as new, but another worker (or
             # an earlier entity of this batch with the same normalized name) may have
@@ -105,18 +105,6 @@ class ExtractionNodesMixin:
                     uuid_map[entity.name] = existing
                     is_new, clean_uuid = False, existing
 
-            # When dedup matched an EXISTING entity, prefer the longer
-            # summary so the more-detailed text survives. Without this
-            # the freshly-extracted (often shorter) summary would
-            # overwrite the canonical one. ``merge_summary`` is the same
-            # rule used by the nightly dream pipeline.
-            summary_to_write = entity.summary
-            if not is_new:
-                existing_summary = ""
-                if deduper is not None:
-                    existing_summary = deduper.summary_of(clean_uuid)
-                summary_to_write = NodeDeduper.merge_summary(existing_summary, entity.summary)
-
             # Auto-type: roll the extracted subtype up to a canonical supertype via the
             # taxonomy map (already loaded on the deduper). Unknown subtype -> 'other'
             # (queryable as the to-map backlog); no map -> None (backfill fills later).
@@ -124,22 +112,30 @@ class ExtractionNodesMixin:
             type_map = deduper.type_map if deduper is not None else {}
             if type_map:
                 supertype = type_map.get(entity.type, "other")
-            self._kg.upsert_node(
-                node_uuid=clean_uuid,
-                name=entity.name,
-                entity_type=entity.type,
-                summary=summary_to_write,
-                group_id=group_id,
-                project=project,
-                embedding=emb,
-                supertype=supertype,
-            )
-            # Register the freshly-INSERTED node in the deduper so any
-            # later extraction in the same run dedupes against it instead
-            # of writing a duplicate. Updates (non-new) are already in
-            # the deduper's exact-name index from its initial hydration.
-            if is_new and deduper is not None:
-                deduper.register(entity.name, clean_uuid, entity.summary)
+
+            if is_new:
+                self._kg.insert_node(
+                    node_uuid=clean_uuid,
+                    name=entity.name,
+                    entity_type=entity.type,
+                    summary=entity.summary,
+                    group_id=group_id,
+                    project=project,
+                    embedding=(embeddings or {}).get(entity.name),
+                    supertype=supertype,
+                )
+                # Register the freshly-INSERTED node in the deduper so any later
+                # extraction in the same run dedupes against it instead of writing a
+                # duplicate. Matched nodes are already in the deduper's exact-name
+                # index from its initial hydration.
+                if deduper is not None:
+                    deduper.register(entity.name, clean_uuid)
+            else:
+                # A mention of an entity that already has its identity: it keeps its name,
+                # embedding and subtype. The longer summary survives (the freshly
+                # extracted one is often shorter than the canonical one), decided in SQL
+                # against the stored text: another replica may have extended it since.
+                self._kg.update_node(clean_uuid, summary=entity.summary, supertype=supertype)
 
     def _stage5_write_new_nodes(
         self,
