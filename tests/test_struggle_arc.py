@@ -152,11 +152,11 @@ def _wire(monkeypatch, *, episodes, window, catalog, verdict_json, calls):
     monkeypatch.setattr(SA, "_fetch_window", lambda conn, sid, lo, hi: window)
     prompts = []
 
-    def judge(prompt, model=None):
+    def judge(prompt):
         prompts.append(prompt)
         return verdict_json
 
-    monkeypatch.setattr(SA, "_judge_call", judge)
+    monkeypatch.setattr(SA.lane, "judge", judge)
     monkeypatch.setattr(SA.L, "merge_candidate", _stub_merge(calls))
 
     def run(**kw):

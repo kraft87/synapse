@@ -22,6 +22,8 @@ A draft that fails its checks is not stored: the row stays body-less, the review
 
 from __future__ import annotations
 
+from dream import lane
+
 from . import skill_derive as SD
 from . import skill_doc as D
 from .skill_doc import skill_description
@@ -69,12 +71,6 @@ Rules:
 - Output ONLY the complete revised SKILL.md (frontmatter + body), nothing else."""
 
 
-def _llm(prompt: str) -> str:
-    """The drafting model (Opus by default, SKILL_DERIVE_DRAFT_MODEL to override) — the same
-    call skill_derive.draft_skill makes. Resolved at call time so tests can stub it."""
-    return SD._draft_call(prompt)
-
-
 def target_skill(row: dict) -> str:
     """The registry skill a retune edits (target_skills[0], else the candidate name)."""
     return (row.get("target_skills") or [row["name"]])[0]
@@ -101,7 +97,7 @@ def draft_widen(name: str, current: str, evidence) -> str | None:
     old = skill_description(current)
     if not phrasings or not old:
         return None
-    raw = _llm(
+    raw = lane.draft(
         _WIDEN_PROMPT.format(
             name=name,
             description=old,
@@ -135,7 +131,7 @@ def _change_text(row: dict) -> str:
 def draft_revision(row: dict, current: str) -> str | None:
     """`current` with the extend/fix/narrow change applied, or None when the model's
     revision fails the sanity checks (renamed, emptied, rewritten wholesale)."""
-    raw = _llm(
+    raw = lane.draft(
         _REVISE_PROMPT.format(
             direction=row.get("direction") or "fix",
             summary=row.get("summary") or "",

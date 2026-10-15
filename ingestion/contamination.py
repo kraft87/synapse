@@ -76,6 +76,18 @@ _HARNESS_PREFIXES = (
     # KG fact-dedup prompt — distinct wording from the "knowledge graph deduplication
     # assistant" above (60 stranded)
     "You are a fact deduplication assistant",
+    # dream/ lane prompts (skill_measure, skill_derive, skill_draft, struggle_arc, post_fire,
+    # procedure_miner, config/nightly). They go through llm_client, which never loads the Stop
+    # hook; these cover a lane run by hand on a workstation that has one.
+    "You audit AI-agent skill routing and skill coverage.",
+    'You are consolidating candidate "skill gaps"',
+    "Write a Claude Code SKILL.md for the procedure below",
+    "You maintain the trigger DESCRIPTION of one Claude Code skill.",
+    "You revise one Claude Code skill: a SKILL.md",
+    "You review one WINDOW of an AI coding-agent transcript",
+    "You audit ONE firing of an agent SKILL",
+    "You audit an AI coding agent's RECURRING SHELL PROCEDURES",
+    "You audit how well an AI agent follows its user's BEHAVIORAL preferences.",
 )
 # scripts/recall_benchmark.py::_JUDGE — starts "QUESTION: " (too generic alone),
 # so it must be paired with the template's second stanza nearby.

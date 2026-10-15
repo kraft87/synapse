@@ -45,6 +45,8 @@ import re
 from collections import defaultdict
 from datetime import date
 
+from dream import lane
+
 from . import config, skill_ledger, skill_measure
 
 # ------------------------------------------------------------------------- knobs
@@ -438,13 +440,7 @@ Output ONLY a JSON object, no prose:
 "varies": "one sentence", "disposition": "script|skill", "covered_by": null, "extends": null}}"""
 
 
-def _confirm_llm(prompt: str, model: str | None) -> str:
-    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
-    Kept as a named seam so tests can stub the LLM out."""
-    return skill_measure.run_judge(prompt, model)
-
-
-def _confirm(cluster, sess_fp_pos, fp_sessions, examples, catalog, window_days, model):
+def _confirm(cluster, sess_fp_pos, fp_sessions, examples, catalog, window_days):
     step_lines = "\n".join(
         f"- {fp}  ({len(fp_sessions.get(fp, ()))} sessions)" for fp in cluster["steps"]
     )
@@ -465,11 +461,7 @@ def _confirm(cluster, sess_fp_pos, fp_sessions, examples, catalog, window_days, 
         sequences="\n".join(seq_lines) or "(none)",
         catalog=catalog,
     )
-    try:
-        raw = _confirm_llm(prompt, model)
-    except Exception:
-        return None
-    return skill_measure._extract_json(raw)
+    return skill_measure._extract_json(lane.judge(prompt))
 
 
 # --------------------------------------------------------------------- evidence
@@ -529,7 +521,7 @@ def _stamp_watermark(conn, scan_night: str) -> None:
 
 
 # -------------------------------------------------------------------------- run
-def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, model=None) -> dict:
+def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) -> dict:
     """One weekly pass: fingerprint -> cluster -> confirm -> merge_candidate, against
     `catalog` ((name, description) of the active skills). Returns stats."""
     scan_night = skill_measure.scan_night()
@@ -564,7 +556,7 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS, mo
             to_confirm.append(c)
 
     for c in to_confirm[:MAX_CONFIRM]:
-        verdict = _confirm(c, sess_fp_pos, fp_sessions, examples, catalog_text, window_days, model)
+        verdict = _confirm(c, sess_fp_pos, fp_sessions, examples, catalog_text, window_days)
         stats["llm_calls"] += 1
         if not verdict or not verdict.get("procedure"):
             stats["rejected"] += 1
@@ -636,7 +628,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="weekly procedure-fingerprint miner (one pass)")
     ap.add_argument("--window-days", type=int, default=WINDOW_DAYS)
     ap.add_argument("--min-sessions", type=int, default=MIN_SESSIONS)
-    ap.add_argument("--model", default=None)
     args = ap.parse_args()
     c = skill_ledger.connect()
     try:
@@ -647,7 +638,6 @@ if __name__ == "__main__":
                     catalog=skill_measure.load_catalog(c),
                     window_days=args.window_days,
                     min_sessions=args.min_sessions,
-                    model=args.model,
                 ),
                 indent=2,
             )

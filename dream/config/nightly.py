@@ -125,11 +125,9 @@ def _best_match(rule_tokens: set[str], candidates: list[dict]) -> dict | None:
 
 # --------------------------------------------------------------------------- LLM finder
 def scan_corrections(s: dict) -> list[dict]:
-    try:
-        raw = SM._run_judge(_FIND_PROMPT.format(user_msgs=SM._sample(s.get("user_msgs", []))))
-    except Exception as e:
-        print(f"  config scan failed for {s['session'][:8]}: {e}")
-        return []
+    """The corrections the judge finds in one session (none when its reply has no JSON
+    object). Raises when the model cannot be reached (lane.judge)."""
+    raw = lane.judge(_FIND_PROMPT.format(user_msgs=SM._sample(s.get("user_msgs", []))))
     obj = _extract_json(raw) or {}
     out = []
     for c in obj.get("corrections", []):
@@ -189,7 +187,9 @@ def _upsert_correction(cur, c: dict) -> tuple[int, str, int]:
 
 # --------------------------------------------------------------------------- orchestrator
 def run_lane(limit: int = 30, backfill: bool = False) -> dict:
-    conn = psycopg.connect(db_url())
+    # Autocommit: every write below stands alone, and a transaction opened by the first read
+    # would sit idle (holding locks) through all of the judge calls.
+    conn = psycopg.connect(db_url(), autocommit=True)
     try:
         cur = conn.cursor()
         cur.execute("SELECT last_scan_at FROM config_lane.config_scan_cursor WHERE id")
@@ -198,20 +198,22 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
         window = lane.open_window(
             conn, "config", legacy_since=row[0] if row else None, backfill=backfill
         )
-        views, carry = lane.sessions(conn, window, limit=limit * 4)
+        # A correction needs a turn to correct, so a single-turn session is not worth a call.
+        views, carry = lane.sessions(
+            conn, window, limit=limit, wanted=lambda v: v["user_turns"] >= 2
+        )
         print(
             f"[dream→config] episodes {window.after_id}..{carry} (newest {window.until_id})  "
             f"sessions={len(views)}"
         )
         found = proposed = 0
-        for s in views:
-            for c in scan_corrections(s):
+        for corrections in lane.run_parallel(scan_corrections, views):
+            for c in corrections:
                 found += 1
                 _id, status, n = _upsert_correction(cur, c)
                 if status == "proposed":
                     proposed += 1
                 print(f"  [{status} n={n}] {c['rule'][:70]}")
-        conn.commit()
 
         lane.mark_judged(conn, "config", views)
         lane.advance(conn, window, carry)
@@ -222,7 +224,6 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
             "ON CONFLICT (id) DO UPDATE SET last_scan_at=EXCLUDED.last_scan_at",
             (scan_started,),
         )
-        conn.commit()
         return {"sessions": len(views), "found": found, "proposed": proposed}
     finally:
         conn.close()

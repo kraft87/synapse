@@ -23,8 +23,6 @@ PROPOSALS_DIR = DATA_DIR / "proposals"
 # dev-only --source jsonl path (the nightly reads episodes from Postgres, not disk).
 PROJECTS_DIR = Path(os.path.expanduser(os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")))
 
-JUDGE_MODEL = os.environ.get("SKILLS_JUDGE_MODEL", "claude-opus-4-8")
-JUDGE_BACKEND = os.environ.get("SKILLS_JUDGE_BACKEND", "claude")
 DISCORD_WEBHOOK = os.environ.get("SKILLS_DISCORD_WEBHOOK", "")
 EXCLUDE_PROJECTS = tuple(
     p.strip() for p in os.environ.get("SKILLS_EXCLUDE_PROJECTS", "").split(",") if p.strip()
@@ -50,7 +48,7 @@ def db_url() -> str:
 
 
 def secret(key: str) -> str:
-    """Resolve an API key (VOYAGE_API_KEY, OPENROUTER_API_KEY, ...): env then .env fallback."""
+    """Resolve an API key (VOYAGE_API_KEY, ...): env then .env fallback."""
     return os.environ.get(key) or _from_env_file(key) or ""
 
 

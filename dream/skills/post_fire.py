@@ -180,15 +180,7 @@ def _load_skill_doc(conn, name: str) -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------ judge
-def _judge_call(prompt: str, model: str | None = None) -> str:
-    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
-    Kept as a named seam so tests can stub the LLM out."""
-    return SM.run_judge(prompt, model)
-
-
-def judge_fire(
-    skill: str, desc: str, body: str, window: list[dict], model: str | None = None
-) -> dict | None:
+def judge_fire(skill: str, desc: str, body: str, window: list[dict]) -> dict | None:
     prompt = _JUDGE_PROMPT.format(
         negative_list=NEGATIVE_LIST,
         name=skill,
@@ -196,12 +188,7 @@ def judge_fire(
         body=body or "(no body in registry)",
         window=_excerpt(window),
     )
-    try:
-        raw = _judge_call(prompt, model)
-    except Exception as e:
-        print(f"  post-fire judge failed for {skill}: {e}")
-        return None
-    return _extract_json(raw)
+    return _extract_json(lane.judge(prompt))
 
 
 def _patch_text(patch) -> str | None:
@@ -215,7 +202,7 @@ def _patch_text(patch) -> str | None:
 
 
 # ------------------------------------------------------------------ entry
-def run(conn, *, fires, catalog, model: str | None = None) -> dict:
+def run(conn, *, fires, catalog) -> dict:
     """Judge the window's skill `fires` (fire_events dicts) of skills in `catalog` ((name,
     description) of the active skills), newest first and at most FIRE_CAP of them;
     deviations/fights become retune candidates. Returns the per-outcome tally."""
@@ -272,7 +259,7 @@ def run(conn, *, fires, catalog, model: str | None = None) -> dict:
             continue
 
         desc, body = _load_skill_doc(conn, fire["skill"])
-        verdict = judge_fire(fire["skill"], desc, body, window, model)
+        verdict = judge_fire(fire["skill"], desc, body, window)
         if verdict is None:
             stats["judge_failures"] += 1
             stats["unassessable"] += 1

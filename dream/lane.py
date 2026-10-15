@@ -15,6 +15,11 @@ flight at the instant a run reads max(id) can commit below that run's bound and 
 Every episode write is one autocommit statement, so that gap is milliseconds wide, once a
 night; accepted.
 
+LLM CALLS. Every judge and drafter call of the lanes goes through :func:`judge` / :func:`draft`,
+which use ingestion.llm_client like the rest of Synapse (the claude-code or openai provider,
+SYNAPSE_<STAGE>_MODEL). A failure to reach the model RAISES: a lane that cannot judge must stop
+with its cursor where it was, not read the failure as "nothing found" and move on.
+
 SESSIONS. The judges' unit is the whole session (Oracle Q2: a partial tail re-fragments the
 derive signature_key across runs), so :func:`sessions` returns full views of the sessions
 the window touched, oldest last touch first, up to the ``limit`` a lane judges per run. A
@@ -29,9 +34,11 @@ is skipped as already judged.
 
 from __future__ import annotations
 
+import functools
 import re
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -39,6 +46,7 @@ from typing import Any
 import psycopg
 
 from dream.skills import config
+from ingestion.llm_client import create_llm_client, stage_model
 from ingestion.schema_check import ColumnProbe
 
 #: A session view: {session, first_user, user_turns, user_msgs, tools, bash_heads, fired}.
@@ -47,6 +55,17 @@ View = dict[str, Any]
 PLATFORM = "claude_code"
 FIRST_RUN_DAYS = 30  # a lane with no cursor yet, or a --backfill, starts this many days back
 REJUDGE_TURNS = 3  # a judged session is judged again once it has this many more user turns
+
+#: The lanes' judges and drafters run a few dozen times a night and a bad proposal pollutes the
+#: review queue, so they default to the strongest model. SYNAPSE_SKILLS_JUDGE_MODEL and
+#: SYNAPSE_SKILLS_DRAFT_MODEL override (llm_client.stage_model); the config lane's judge shares
+#: the first.
+OPUS = "claude-opus-4-8"
+JUDGE_STAGE = "SKILLS_JUDGE"
+DRAFT_STAGE = "SKILLS_DRAFT"
+JUDGE_TOKENS = 4096  # reply budgets; only the openai provider reads them
+DRAFT_TOKENS = 8192
+LLM_WORKERS = 3  # calls in flight at once; the poller shares the subscription quota
 
 TOOL_MARKER = re.compile(r"^\[tool:([\w-]+)\]\s*(.*)$")
 SKILL_NAME = re.compile(r"skill'?\s*[:=]\s*'?([\w-]+)")
@@ -260,3 +279,44 @@ def mark_judged(conn: psycopg.Connection[Any], lane: str, views: Sequence[View])
             "SET user_turns = EXCLUDED.user_turns, judged_at = now()",
             [(lane, v["session"], v["user_turns"]) for v in views],
         )
+
+
+# --------------------------------------------------------------------------- LLM calls
+@functools.cache
+def _llm() -> Any:
+    return create_llm_client()
+
+
+def _complete(prompt: str, stage: str, max_tokens: int) -> str:
+    reply = _llm().messages.create(
+        model=stage_model(stage, OPUS),
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return str(reply.content[0].text)
+
+
+def judge(prompt: str) -> str:
+    """The reply to one judge prompt (SKILLS_JUDGE stage). Raises when the model cannot be
+    reached (llm_client.LLM_TRANSPORT_ERRORS: a usage limit, no login, an outage): the callers
+    let it stop the lane rather than count the session as having nothing to report."""
+    return _complete(prompt, JUDGE_STAGE, JUDGE_TOKENS)
+
+
+def draft(prompt: str) -> str:
+    """The reply to one drafting prompt (SKILLS_DRAFT stage); raises like :func:`judge`."""
+    return _complete(prompt, DRAFT_STAGE, DRAFT_TOKENS)
+
+
+def run_parallel[T, R](
+    fn: Callable[[T], R], items: Sequence[T], workers: int = LLM_WORKERS
+) -> list[R]:
+    """``fn(item)`` for every item, `workers` at a time, results in item order. The first
+    failure cancels the calls not yet started, waits for the running ones and is raised, so
+    a usage limit stops the lane instead of burning through the rest of the night's calls."""
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fn, item) for item in items]
+        _, pending = wait(futures, return_when=FIRST_EXCEPTION)
+        for f in pending:
+            f.cancel()
+        return [f.result() for f in futures]

@@ -36,9 +36,7 @@ def _session(sid="sess-1", first_user="can you run this SQL for me", fired=()):
     }
 
 
-def _wire(monkeypatch, verdict, calls):
-    monkeypatch.setattr(N.SM, "judge_session", lambda s, catalog: verdict)
-
+def _wire(monkeypatch, calls):
     def fake_merge(conn, kind, name, evidence, **kw):
         calls.append({"kind": kind, "name": name, "evidence": evidence, **kw})
         return {"id": len(calls), "status": "observe", "score": 0.5, "merged": False}
@@ -46,9 +44,10 @@ def _wire(monkeypatch, verdict, calls):
     monkeypatch.setattr(N.L, "merge_candidate", fake_merge)
 
 
-def _run(sessions):
+def _run(sessions, verdict):
+    """run_retune over `sessions`, each analysed as `verdict`."""
     seen: set[int] = set()
-    stats = N.run_retune(None, sessions, "(catalog)", seen, _CATALOG)
+    stats = N.run_retune(None, sessions, [verdict] * len(sessions), seen, _CATALOG)
     return stats, seen
 
 
@@ -67,8 +66,8 @@ def test_covered_request_creates_no_widen_candidate(monkeypatch):
             }
         ]
     }
-    _wire(monkeypatch, verdict, calls)
-    stats, seen = _run([_session()])
+    _wire(monkeypatch, calls)
+    stats, seen = _run([_session()], verdict)
     assert calls == [] and seen == set()
     assert stats["under_trigger"] == 0
     assert stats["covered_not_fired"] == 1 and stats["backstop_covered"] == 0
@@ -88,8 +87,8 @@ def test_real_gap_creates_widen_with_missing_phrasing(monkeypatch, covers):
             }
         ]
     }
-    _wire(monkeypatch, verdict, calls)
-    stats, seen = _run([_session(first_user="update build_c.yml to add a lint stage")])
+    _wire(monkeypatch, calls)
+    stats, seen = _run([_session(first_user="update build_c.yml to add a lint stage")], verdict)
     assert stats["under_trigger"] == 1 and stats["covered_not_fired"] == 0
     assert seen == {1}
     (c,) = calls
@@ -114,8 +113,8 @@ def test_backstop_overrides_judge_when_phrasing_is_in_description(monkeypatch):
             }
         ]
     }
-    _wire(monkeypatch, verdict, calls)
-    stats, _ = _run([_session()])
+    _wire(monkeypatch, calls)
+    stats, _ = _run([_session()], verdict)
     assert calls == []
     assert stats["under_trigger"] == 0
     assert stats["covered_not_fired"] == 1 and stats["backstop_covered"] == 1
@@ -133,8 +132,8 @@ def test_backstop_also_checks_the_session_phrasing(monkeypatch):
             }
         ]
     }
-    _wire(monkeypatch, verdict, calls)
-    stats, _ = _run([_session(first_user="check the table")])  # a declared trigger
+    _wire(monkeypatch, calls)
+    stats, _ = _run([_session(first_user="check the table")], verdict)  # a declared trigger
     assert calls == [] and stats["backstop_covered"] == 1
 
 
@@ -142,8 +141,8 @@ def test_legacy_judge_output_without_gap_fields_does_not_widen(monkeypatch):
     # pre-gate judge output: {skill, why} only. Safe default: no stated gap -> no widen.
     calls: list[dict] = []
     verdict = {"would_have_helped": [{"skill": "db-query", "why": "ran psql"}]}
-    _wire(monkeypatch, verdict, calls)
-    stats, _ = _run([_session()])
+    _wire(monkeypatch, calls)
+    stats, _ = _run([_session()], verdict)
     assert calls == []
     assert stats["no_gap_stated"] == 1 and stats["under_trigger"] == 0
     assert stats["covered_not_fired"] == 0
@@ -161,8 +160,8 @@ def test_legacy_judge_output_without_gap_fields_does_not_widen(monkeypatch):
 def test_unstated_or_malformed_gap_does_not_widen(monkeypatch, item):
     calls: list[dict] = []
     verdict = {"would_have_helped": [{"skill": "pipeline-edit", "why": "x", **item}]}
-    _wire(monkeypatch, verdict, calls)
-    stats, _ = _run([_session(first_user="update build_c.yml")])
+    _wire(monkeypatch, calls)
+    stats, _ = _run([_session(first_user="update build_c.yml")], verdict)
     assert calls == [] and stats["no_gap_stated"] == 1
 
 
@@ -175,8 +174,8 @@ def test_fired_and_uncatalogued_skills_are_skipped(monkeypatch):
             {"skill": "no-such-skill", "why": "x", **gap},  # not in the catalog
         ]
     }
-    _wire(monkeypatch, verdict, calls)
-    stats, _ = _run([_session(fired=["pipeline-edit"])])
+    _wire(monkeypatch, calls)
+    stats, _ = _run([_session(fired=["pipeline-edit"])], verdict)
     assert calls == []
     assert stats == {
         "under_trigger": 0,
@@ -226,19 +225,28 @@ def test_under_trigger_verdict_classes():
     assert v(gap, _DB_DESC, phrasing="psql") == "backstop"  # session phrasing is covered
 
 
-# --------------------------------------------------------------------- judge prompt
+# ------------------------------------------------------------------- analysis prompt
 
 
-def test_judge_prompt_carries_descriptions_and_gap_schema(monkeypatch):
+def test_analysis_prompt_carries_descriptions_and_both_schemas(monkeypatch):
     prompts: list[str] = []
 
     def fake_judge(prompt):
         prompts.append(prompt)
-        return '{"would_have_helped": [], "dismissed": []}'
+        return '{"would_have_helped": [], "gaps": []}'
 
-    monkeypatch.setattr(SM, "_run_judge", fake_judge)
-    catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(_CATALOG.items()))
-    assert SM.judge_session(_session(), catalog) == {"would_have_helped": [], "dismissed": []}
+    monkeypatch.setattr(SM.lane, "judge", fake_judge)
+    catalog = SM.format_catalog(sorted(_CATALOG.items()))
+    assert SM.analyze_session(_session(), catalog) == {"would_have_helped": [], "gaps": []}
     (p,) = prompts
     assert "- db-query: Query the app Postgres with psql." in p  # description reaches judge
-    assert "description_covers" in p and "missing_phrasing" in p
+    assert "description_covers" in p and "missing_phrasing" in p  # the retune half
+    assert "trigger_phrasings" in p and "signature" in p  # the derive half
+    assert "dismissed" not in p  # nothing reads it: dismissals come from the fire events
+    # the catalog comes before the session, so the part shared by a night's calls is a prefix
+    assert p.index("SKILL CATALOG") < p.index("SESSION:")
+
+
+def test_analysis_of_an_unparseable_reply_is_none(monkeypatch):
+    monkeypatch.setattr(SM.lane, "judge", lambda prompt: "I could not do that.")
+    assert SM.analyze_session(_session(), "(none)") is None

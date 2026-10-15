@@ -17,8 +17,8 @@ from pathlib import Path
 import pytest
 from psycopg.types.json import Json
 
-import dream.skills.skill_derive as SD
 import dream.skills.skill_draft as DR
+from dream import lane
 from dream.skills.skill_doc import body_hash
 from mcp_server.skill_sync_routes import (
     _fetch_skill,
@@ -393,7 +393,7 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
             return V2
         return _NEW
 
-    monkeypatch.setattr(SD, "_draft_call", fake_llm)
+    monkeypatch.setattr(lane, "draft", fake_llm)
 
     stats = DR.draft_pending(acc)
 
@@ -412,7 +412,7 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
     assert row(derive) == (_NEW, None)
     assert row(merge) == (None, None)
     # drafted and current: a second pass leaves them alone
-    monkeypatch.setattr(SD, "_draft_call", lambda prompt: pytest.fail("re-drafted"))
+    monkeypatch.setattr(lane, "draft", lambda prompt: pytest.fail("re-drafted"))
     ours = {widen, fix, derive}
     monkeypatch.setattr(DR, "needs_draft", lambda r, _f=DR.needs_draft: r["id"] in ours and _f(r))
     assert DR.draft_pending(acc)["pending"] == 0

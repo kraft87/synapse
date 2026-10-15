@@ -15,20 +15,22 @@ calls (incl. which skills fired) + the user requests. Skills live in
 Run dry first (no LLM) to see the landscape, then add the judge:
     skill-measure.py --days 2 --dry-run
     skill-measure.py --days 1 --max-sessions 40            # nightly, Opus judge
-    SKILL_MEASURE_MODEL=deepseek skill-measure.py --days 30 # cheap backfill
+
+The judge model is SYNAPSE_SKILLS_JUDGE_MODEL (llm_client.stage_model; default Opus).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
-import subprocess
 import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
+
+from dream import lane
+from ingestion.llm_client import stage_model
 
 from . import config
 
@@ -199,14 +201,13 @@ def main() -> None:
             print(f"      tools: {dict(sorted(s['tools'].items(), key=lambda x: -x[1]))}")
         return
 
-    # --- judge phase: one call per session -> under-trigger + dismissal signals ---
+    # --- judge phase: one call per session -> under-trigger signal ---
     catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(skills.items()))
     under = Counter()  # skill -> applicable-but-didn't-fire count
-    dismissed = Counter()  # skill -> fired-but-looked-like-a-mismatch count
     per_session = []
     judged = 0
     for s in sessions[: args.max_sessions]:
-        verdict = judge_session(s, catalog)
+        verdict = analyze_session(s, catalog)
         if verdict is None:
             continue
         judged += 1
@@ -215,27 +216,20 @@ def main() -> None:
             for m in verdict.get("would_have_helped", [])
             if m.get("skill") in skill_names and m.get("skill") not in s["fired"]
         ]
-        dis = [m for m in verdict.get("dismissed", []) if m.get("skill") in s["fired"]]
         for m in miss:
             under[m["skill"]] += 1
-        for m in dis:
-            dismissed[m["skill"]] += 1
-        per_session.append(
-            {"session": s["session"], "fired": s["fired"], "missed": miss, "dismissed": dis}
-        )
-        time.sleep(0.3)
+        per_session.append({"session": s["session"], "fired": s["fired"], "missed": miss})
 
     report = {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "window_days": args.days,
         "substantive_sessions": len(sessions),
         "judged": judged,
-        "model": os.environ.get("SKILL_MEASURE_MODEL", "opus"),
+        "model": stage_model(lane.JUDGE_STAGE, lane.OPUS),
         "per_skill": {
             n: {
                 "fired": fired_hist.get(n, 0),
                 "under_trigger": under.get(n, 0),  # recall gap
-                "dismissed": dismissed.get(n, 0),  # precision gap
             }
             for n in sorted(skills)
         },
@@ -245,10 +239,10 @@ def main() -> None:
     out_path.write_text(json.dumps(report, indent=2))
 
     print(f"\n=== baseline (judged {judged}/{len(sessions)} sessions, model={report['model']}) ===")
-    print(f"{'skill':28s} {'fired':>6} {'under':>6} {'dismiss':>8}")
+    print(f"{'skill':28s} {'fired':>6} {'under':>6}")
     for n in sorted(skills):
         ps = report["per_skill"][n]
-        print(f"{n:28s} {ps['fired']:>6} {ps['under_trigger']:>6} {ps['dismissed']:>8}")
+        print(f"{n:28s} {ps['fired']:>6} {ps['under_trigger']:>6}")
     print(f"\nwrote {out_path}")
     # surface the actual missed-trigger evidence (this is the RETUNE fuel)
     print("\n=== under-trigger evidence (would've helped but didn't fire) ===")
@@ -257,15 +251,21 @@ def main() -> None:
             print(f"  [{p['session'][:8]}] {m['skill']}: {m.get('why', '')[:140]}")
 
 
-_JUDGE_PROMPT = """You audit AI-agent skill routing. Below is one coding-session summary and the full skill catalog.
-Skills auto-fire when the user's phrasing matches a skill's description. Judge two things STRICTLY:
+_ANALYZE_PROMPT = """You audit AI-agent skill routing and skill coverage. Below are the full skill catalog and one coding-session summary.
+Skills auto-fire when the user's phrasing matches a skill's description. Judge two things STRICTLY, each on its own:
 
 1. would_have_helped: skills that did NOT fire this session but CLEARLY should have (the work squarely matches the skill's purpose). Be conservative — empty list if none obviously apply. Do NOT list a skill that did fire.
-   For EACH would_have_helped skill, compare the user's wording against that skill's CURRENT catalog description (the text after its name below — its trigger surface):
+   For EACH would_have_helped skill, compare the user's wording against that skill's CURRENT catalog description (the text after its name in the catalog — its trigger surface):
    - description_covers: true when the description ALREADY names what the user asked for (the same words, tool, command, product, file or concept). The skill was a match and simply was not invoked; adding trigger words would change nothing.
    - description_covers: false ONLY when there is a real vocabulary gap: the user used wording, a file, a tool, a setting name or a concept that the description does not mention.
    - missing_phrasing: when description_covers is false, the specific user wording or concept the description lacks (a few words, quoted from the user where possible). Use "" when description_covers is true.
-2. dismissed: skills that DID fire but look like a MISMATCH (the work diverged from the skill's purpose / it shouldn't have fired).
+
+2. gaps: a "gap" = a RECURRING, GENERALIZABLE, multi-step PROCEDURE the agent carried out (visible in the tools / bash commands / user requests) that NO catalog skill covers and that a skill SHOULD exist for.
+   STRICT — false positives are expensive (a bad skill pollutes every future session):
+   - It must be a repeatable PROCEDURE with an OBSERVABLE tool/command signature, not a one-off and not pure deliberation/chat.
+   - It must NOT be covered by any catalog skill. If a skill NEARLY covers it, that's a retune of that skill (item 1), NOT a gap -> skip it.
+   - It must generalize beyond this exact task (would plausibly recur on a different day or topic).
+   - Most sessions have NO gap. Return an empty list rather than reaching.
 
 SKILL CATALOG (name: current description):
 {catalog}
@@ -278,7 +278,11 @@ SESSION:
 {user_msgs}
 
 Output ONLY a JSON object, no prose:
-{{"would_have_helped": [{{"skill": "name", "why": "one sentence", "description_covers": true or false, "missing_phrasing": "the user wording the description lacks; empty string when covered"}}], "dismissed": [{{"skill": "name", "why": "one sentence"}}]}}"""
+{{"would_have_helped": [{{"skill": "name", "why": "one sentence", "description_covers": true or false, "missing_phrasing": "the user wording the description lacks; empty string when covered"}}],
+"gaps": [{{"procedure": "short-kebab-name", "what": "one sentence describing the procedure",
+"trigger_phrasings": ["how a user would ask for it", "another phrasing"],
+"signature": "the tool/command pattern observed (e.g. rg -> Read -> Edit -> Bash pytest)",
+"why_generalizable": "one sentence"}}]}}"""
 
 
 # --- under-trigger gate: does a would_have_helped item show a real description gap? ---
@@ -350,52 +354,6 @@ def under_trigger_verdict(item: dict, description: str, phrasing: str = "") -> s
     return "gap"
 
 
-def run_judge(prompt: str, model: str | None = None, timeout: int = 240) -> str:
-    """The lane-wide LLM judge dispatch (shared by every dream->skills detector).
-
-    model=None -> the default backend: env SKILL_MEASURE_MODEL or config.JUDGE_BACKEND;
-    a "deepseek"/"openrouter" backend goes to OpenRouter, otherwise the claude CLI on
-    config.JUDGE_MODEL (no API key, runs on the Max subscription; nightly volume is tiny).
-    An explicit `model` overrides: "deepseek"/"openrouter" -> OpenRouter, anything else ->
-    the claude CLI with that model. `timeout` bounds the subprocess call."""
-    if model is None:
-        backend = os.environ.get("SKILL_MEASURE_MODEL", config.JUDGE_BACKEND)
-        if backend in ("deepseek", "openrouter"):
-            return _openrouter_judge(prompt)
-        model = config.JUDGE_MODEL
-    elif model in ("deepseek", "openrouter"):
-        return _openrouter_judge(prompt)
-    r = subprocess.run(
-        ["claude", "-p", prompt, "--model", model],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return r.stdout
-
-
-def _run_judge(prompt: str) -> str:
-    """Back-compat alias: the default-backend judge path. Delegates to run_judge()."""
-    return run_judge(prompt)
-
-
-def _openrouter_judge(prompt: str) -> str:
-    import urllib.request
-
-    key = config.secret("OPENROUTER_API_KEY")
-    body = json.dumps(
-        {"model": "deepseek/deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
-    ).encode()
-    req = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
-    return json.loads(urllib.request.urlopen(req, timeout=240).read())["choices"][0]["message"][
-        "content"
-    ]
-
-
 def _extract_json(raw: str) -> dict | None:
     """Lenient JSON extraction from a judge response: the first `{` .. last `}` slice.
     None on no-brace or parse failure. Shared by every dream->skills detector."""
@@ -441,20 +399,18 @@ def _sample(msgs: list[str], cap: int = 40) -> str:
     return "\n".join(f"  - {m}" for m in msgs)
 
 
-def judge_session(s: dict, catalog: str) -> dict | None:
-    prompt = _JUDGE_PROMPT.format(
+def analyze_session(s: dict, catalog: str) -> dict | None:
+    """The lane's one LLM read of a session: {would_have_helped, gaps} against the skill
+    `catalog` (format_catalog). None when the reply carries no JSON object. Raises when the
+    model cannot be reached (lane.judge)."""
+    prompt = _ANALYZE_PROMPT.format(
         catalog=catalog,
         fired=s["fired"] or "(none)",
         tools=dict(sorted(s["tools"].items(), key=lambda x: -x[1])),
         bash=" | ".join(s["bash_heads"][:12]),
         user_msgs=_sample(s.get("user_msgs", [])),
     )
-    try:
-        raw = _run_judge(prompt)
-    except Exception as e:
-        print(f"  judge failed for {s['session'][:8]}: {e}")
-        return None
-    return _extract_json(raw)
+    return _extract_json(lane.judge(prompt))
 
 
 if __name__ == "__main__":

@@ -131,11 +131,11 @@ def _wire(
     monkeypatch.setattr(PF, "_load_skill_doc", lambda conn, name: doc)
     prompts = []
 
-    def judge(prompt, model=None):
+    def judge(prompt):
         prompts.append(prompt)
         return verdict_json
 
-    monkeypatch.setattr(PF, "_judge_call", judge)
+    monkeypatch.setattr(PF.lane, "judge", judge)
     monkeypatch.setattr(PF.L, "merge_candidate", _stub_merge(calls))
 
     def run():

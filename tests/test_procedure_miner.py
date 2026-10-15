@@ -1,6 +1,6 @@
 """dream/skills/procedure_miner.py — weekly deterministic procedure detector.
 
-Pure-Python: the SQL seam (_fetch_rows), LLM seam (_confirm_llm) and the ledger writer (skill_ledger.merge_candidate, pinned v2 contract)
+Pure-Python: the SQL seam (_fetch_rows), LLM seam (lane.judge) and the ledger writer (skill_ledger.merge_candidate, pinned v2 contract)
 are stubbed. All transcript text is synthetic.
 """
 
@@ -82,7 +82,7 @@ def wire(monkeypatch, rows, confirm_raw=CONFIRM_OK):
         return {"id": len(calls), "status": "observe", "score": 0.5, "merged": False}
 
     monkeypatch.setattr(pm, "_fetch_rows", lambda conn, wd: rows)
-    monkeypatch.setattr(pm, "_confirm_llm", lambda prompt, model: confirm_raw)
+    monkeypatch.setattr(pm.lane, "judge", lambda prompt: confirm_raw)
     monkeypatch.setattr(pm.skill_ledger, "merge_candidate", fake_merge)
     return calls
 
@@ -281,7 +281,7 @@ class TestRun:
     def test_emits_derive_candidate_with_v2_contract_fields(self, monkeypatch):
         calls = wire(monkeypatch, health_sweep_rows(5))
         conn = FakeConn()
-        stats = pm.run(conn, catalog=[], window_days=35, min_sessions=4, model=None)
+        stats = pm.run(conn, catalog=[], window_days=35, min_sessions=4)
 
         assert stats["derived"] == 1 and stats["llm_calls"] == 1
         (call,) = calls
@@ -447,12 +447,12 @@ class TestCadence:
 
         sig = inspect.signature(pm.run)
         params = list(sig.parameters.values())
-        names = ["conn", "catalog", "window_days", "min_sessions", "model"]
+        names = ["conn", "catalog", "window_days", "min_sessions"]
         assert [p.name for p in params] == names
         assert params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
         assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params[1:])
         assert params[1].default is inspect.Parameter.empty  # the lane passes its catalog
-        assert params[2].default == 35 and params[3].default == 4 and params[4].default is None
+        assert params[2].default == 35 and params[3].default == 4
 
 
 if __name__ == "__main__":

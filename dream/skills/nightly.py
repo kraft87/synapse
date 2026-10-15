@@ -7,9 +7,12 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
   1. consolidate    — embed any active skills missing a description embedding; overlap ->
                       consolidate candidates (no disk access, no auto-merge)
   2. sync_usage     — episode [tool:Skill] markers -> skill_usage (+ dismissal); rollup into registry
-  3. DERIVE         — gap scan -> cluster -> ledger (judge evidence); draft SKILL.md for proposed
-  4. RETUNE         — under-trigger judge -> ledger retune/widen (judge evidence)
-  5. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
+  3. judge          — ONE analysis call per session returns its gaps and its would-have-helped
+                      skills (a few calls in flight at once):
+                      DERIVE: gaps -> cluster -> ledger (judge evidence); draft SKILL.md for proposed
+                      RETUNE: under-trigger judge -> ledger retune/widen (judge evidence)
+  4. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
+  5. detectors      — struggle_arc, post_fire, and the weekly procedure_miner (each its own stage)
   6. draft          — every proposed derive/retune without a body (or with a stale retune
                       draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
   7. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
@@ -18,7 +21,12 @@ Incremental over an episode-id window (dream/lane.py): every stage covers the sa
 and the cursor advances only past the sessions the run got to (at most `limit` are judged a
 night, oldest first; the rest roll to the next night). --backfill starts 30 days back.
 
-The LLM finders honor SKILL_MEASURE_MODEL (deepseek for cheap backfill); drafting uses Opus.
+Every stage runs on its own: one that fails is reported and the rest still run. A model that
+cannot be reached (usage limit, outage) stops the lane instead, and a failed stage that reads
+the window holds the cursor, so the next run covers the same episodes again.
+
+The judges use SYNAPSE_SKILLS_JUDGE_MODEL and the drafters SYNAPSE_SKILLS_DRAFT_MODEL, both
+through ingestion.llm_client (default Opus).
 Propose-only: nothing here writes skill_registry or sets status='promoted' — the review
 accept does both (mcp_server/skill_sync_routes.py).
 """
@@ -27,12 +35,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import logging
 import re
 import urllib.request
 from dataclasses import replace
+from typing import Any
 
 from dream import lane
+from ingestion.llm_client import LLM_TRANSPORT_ERRORS, stage_model
 
 from . import config, post_fire, procedure_miner, skill_draft, struggle_arc
 from . import skill_db_source as DB
@@ -41,6 +51,7 @@ from . import skill_doc as D
 from . import skill_ledger as L
 
 SM = SD.skill_measure
+logger = logging.getLogger(__name__)
 
 PROPOSALS_DIR = config.PROPOSALS_DIR
 OVERLAP_COS = 0.90  # description-embedding cosine above this = consolidate candidate
@@ -108,11 +119,10 @@ def consolidate_pass(conn, seen_ids):
 
 
 # -------------------------------------------------------------------- 2. usage sync
-def sync_usage(conn, window):
-    """Record the window's skill fires in skill_usage and roll them up into the registry.
-    Returns (stats, events): the events feed the dismissal and post-fire stages too."""
+def sync_usage(conn, events):
+    """Record the window's skill fire events in skill_usage and roll them up into the
+    registry. The events (DB.fire_events) feed the dismissal and post-fire stages too."""
     cur = conn.cursor()
-    events = DB.fire_events(conn, window)
     for e in events:
         cur.execute(
             """INSERT INTO skills_lane.skill_usage (skill, fired_at, session_id, via, dismissed)
@@ -128,15 +138,25 @@ def sync_usage(conn, window):
            WHERE r.name = u.skill"""
     )
     conn.commit()
-    stats = {"fire_events": len(events), "dismissals": sum(1 for e in events if e["dismissed"])}
-    return stats, events
+    return {"fire_events": len(events), "dismissals": sum(1 for e in events if e["dismissed"])}
 
 
 # --------------------------------------------------------------- 3+4+5 candidate gen
-def run_derive(conn, substantive, catalog, seen_ids):
-    gaps = []
-    for s in substantive:
-        gaps += SD.scan_session(s, catalog)
+def judge_sessions(conn, substantive, catalog_text, descriptions, seen_ids):
+    """The lane's per-session LLM pass. One analysis call per session (lane.LLM_WORKERS in
+    flight at once) returns both its gaps and its would-have-helped skills; they feed DERIVE
+    and RETUNE. `unparsed` counts replies with no JSON object (their session adds nothing)."""
+    analyses = lane.run_parallel(lambda s: SM.analyze_session(s, catalog_text), substantive)
+    return {
+        "sessions": len(substantive),
+        "unparsed": sum(1 for a in analyses if a is None),
+        "derive": run_derive(conn, substantive, analyses, seen_ids),
+        "retune": run_retune(conn, substantive, analyses, seen_ids, descriptions),
+    }
+
+
+def run_derive(conn, substantive, analyses, seen_ids):
+    gaps = [g for s, a in zip(substantive, analyses, strict=True) for g in SD.session_gaps(s, a)]
     clusters = SD.cluster_gaps(gaps)
     n_proposed = 0
     for c in clusters:
@@ -161,7 +181,7 @@ def run_derive(conn, substantive, catalog, seen_ids):
     return {"gaps": len(gaps), "clusters": len(clusters), "proposed": n_proposed}
 
 
-def run_retune(conn, substantive, catalog, seen_ids, descriptions):
+def run_retune(conn, substantive, analyses, seen_ids, descriptions):
     """Under-trigger judge -> retune/widen candidates, gated on a REAL description gap.
 
     A would_have_helped skill whose current description already covers the request was a
@@ -170,14 +190,14 @@ def run_retune(conn, substantive, catalog, seen_ids, descriptions):
     rest is counted, never merged: covered / backstop-covered items are tallied per skill
     (matched-but-not-invoked telemetry), and items with no stated gap (incl. legacy judge
     output without description_covers / missing_phrasing) are dropped as `no_gap_stated`.
+    `analyses` holds each session's analysis (SM.analyze_session; None = no usable reply);
     `descriptions` is name -> current description (the catalog the judge saw)."""
     stats = {"under_trigger": 0, "covered_not_fired": 0, "backstop_covered": 0, "no_gap_stated": 0}
     covered_by_skill: dict[str, int] = {}
-    for s in substantive:
-        v = SM.judge_session(s, catalog)
+    for s, v in zip(substantive, analyses, strict=True):
         if not v:
             continue
-        for m in v.get("would_have_helped", []):
+        for m in v.get("would_have_helped") or []:
             sk = m.get("skill")
             # a skill missing from the catalog has no description to widen
             if not sk or sk in s["fired"] or sk not in descriptions:
@@ -293,6 +313,13 @@ def _draft_if_needed(conn, cid, cluster):
     conn.commit()
 
 
+def run_procedure_miner(conn, catalog):
+    """The weekly procedure miner, when it is due."""
+    if not procedure_miner.due(conn):
+        return {"due": False}
+    return procedure_miner.run(conn, catalog=catalog)
+
+
 # --------------------------------------------------------------------- 6. digest
 DIGEST_CAP = 5  # proposals shown per digest — flood control, the rest is a "+N pending" footer
 
@@ -352,76 +379,97 @@ def discord_digest(conn, no_discord):
     return {"proposed": len(rows), "new": len(new)}
 
 
-def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) -> None:
+#: The stages that consume the run's episode window: when one fails, the cursor holds.
+WINDOW_STAGES = ("usage", "judge", "grounded", "struggle_arc", "post_fire")
+
+
+def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) -> dict:
     """Run the whole dream→skills lane once. No argparse, so the dream container's run_once
-    can call it directly (the catalog comes from the registry, not disk)."""
-    conn = L.connect()
-    cur = conn.cursor()
-    cur.execute("SELECT now()")
-    run_started = cur.fetchone()[0]
-    window = lane.open_window(
-        conn, "skills", legacy_since=L.get_cursor(conn).get("last_scan_at"), backfill=backfill
-    )
-    substantive, carry = lane.sessions(conn, window, limit=limit, wanted=SM.is_substantive)
-    # Every stage covers the episodes up to where the session walk stopped, so the stages
-    # agree on what this run consumed and the next run starts right after it.
-    covered = replace(window, until_id=carry)
+    can call it directly (the catalog comes from the registry, not disk).
 
-    catalog = SM.load_catalog(conn)
-    skills = dict(catalog)
-    catalog_text = SM.format_catalog(catalog)
-    seen: set[int] = set()
+    Returns {"stages": {stage: stats}, "errors": ["stage: ExcType: message"], "advanced": bool}.
+    A stage that raises lands in "errors" and the stages after it still run. A model that
+    cannot be reached (llm_client.LLM_TRANSPORT_ERRORS: usage limit, outage, no login) stops
+    the lane instead, since every later judge call would fail the same way: the exception
+    propagates and the cursor holds. The cursor also holds when a WINDOW_STAGES stage failed;
+    it moves only past work that finished."""
+    stages: dict[str, Any] = {}
+    errors: dict[str, str] = {}
 
-    print(
-        f"[dream→skills] episodes {covered.after_id}..{covered.until_id} "
-        f"(newest {window.until_id})  model={os.environ.get('SKILL_MEASURE_MODEL', 'opus')}"
-    )
-    print("consolidate:", consolidate_pass(conn, seen))
-    usage, fires = sync_usage(conn, covered)
-    print("usage:", usage)
-    print(f"substantive sessions to judge: {len(substantive)}")
+    def stage(name, fn, *args, **kwargs):
+        try:
+            stages[name] = fn(*args, **kwargs)
+        except LLM_TRANSPORT_ERRORS:
+            raise
+        except Exception as e:
+            logger.error("dream→skills %s failed: %s", name, e, exc_info=True)
+            errors[name] = f"{type(e).__name__}: {e}"
+        else:
+            print(f"{name}:", stages[name])
 
-    print("derive:", run_derive(conn, substantive, catalog_text, seen))
-    print("retune:", run_retune(conn, substantive, catalog_text, seen, skills))
-    lane.mark_judged(conn, "skills", substantive)
-    conn.commit()
-    print("grounded:", capture_grounded(conn, covered, fires, seen))
+    with L.connect() as conn:
+        # Autocommit: every write below commits on its own, and a transaction opened by a
+        # read would sit idle through the minutes of judge calls, holding locks on episodes
+        # and the skill tables (and blocking a migration's ALTER TABLE queued behind them).
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT now()")
+        run_started = cur.fetchone()[0]
+        window = lane.open_window(
+            conn, "skills", legacy_since=L.get_cursor(conn).get("last_scan_at"), backfill=backfill
+        )
+        substantive, carry = lane.sessions(conn, window, limit=limit, wanted=SM.is_substantive)
+        # Every stage covers the episodes up to where the session walk stopped, so the stages
+        # agree on what this run consumed and the next run starts right after it.
+        covered = replace(window, until_id=carry)
 
-    # v2 detectors — on by default; SYNAPSE_SKILLS_DETECTORS is the kill switch
-    # (comma list to run a subset, empty string to disable all).
-    detectors = {
-        d.strip()
-        for d in os.environ.get(
-            "SYNAPSE_SKILLS_DETECTORS", "struggle_arc,post_fire,procedure_miner"
-        ).split(",")
-        if d.strip()
-    }
-    if "struggle_arc" in detectors:
-        print("struggle_arc:", struggle_arc.run(conn, window=covered, catalog=catalog))
-    if "post_fire" in detectors:
-        print("post_fire:", post_fire.run(conn, fires=fires, catalog=catalog))
-    if "procedure_miner" in detectors and procedure_miner.due(conn):
-        print("procedure_miner:", procedure_miner.run(conn, catalog=catalog))
+        catalog = SM.load_catalog(conn)
+        catalog_text = SM.format_catalog(catalog)
+        fires = DB.fire_events(conn, covered)
+        seen: set[int] = set()
 
-    print("drafts:", skill_draft.draft_pending(conn))
-    print("decay:", L.decay_stale(conn))
-    print("digest:", discord_digest(conn, no_discord))
+        print(
+            f"[dream→skills] episodes {covered.after_id}..{covered.until_id} "
+            f"(newest {window.until_id})  judge={stage_model(lane.JUDGE_STAGE, lane.OPUS)} "
+            f"draft={stage_model(lane.DRAFT_STAGE, lane.OPUS)}"
+        )
+        print(f"substantive sessions to judge: {len(substantive)}")
+        stage("consolidate", consolidate_pass, conn, seen)
+        stage("usage", sync_usage, conn, fires)
+        stage("judge", judge_sessions, conn, substantive, catalog_text, dict(catalog), seen)
+        if "judge" not in errors:
+            lane.mark_judged(conn, "skills", substantive)
+        stage("grounded", capture_grounded, conn, covered, fires, seen)
+        stage("struggle_arc", struggle_arc.run, conn, window=covered, catalog=catalog)
+        stage("post_fire", post_fire.run, conn, fires=fires, catalog=catalog)
+        stage("procedure_miner", run_procedure_miner, conn, catalog)
+        stage("drafts", skill_draft.draft_pending, conn)
+        stage("decay", L.decay_stale, conn)
+        stage("digest", discord_digest, conn, no_discord)
 
-    lane.advance(conn, window, carry)
-    # last_scan_at is the cursor a database without the dream lane cursor tables (and an
-    # older image) reads; see dream/lane.py.
-    L.update_cursor(
-        conn,
-        run_started,
-        config={
-            "excluded_projects": ["transcribe_ai"],
-            "propose_score": L.PROPOSE_SCORE,
-            "session_jaccard": L.SESSION_JACCARD,
-            "limit": limit,
-        },
-    )
-    conn.close()
+        held = [name for name in WINDOW_STAGES if name in errors]
+        if held:
+            print(f"cursor held at episode {window.after_id}: {', '.join(held)} failed")
+        else:
+            lane.advance(conn, window, carry)
+            # last_scan_at is the cursor a database without the dream lane cursor tables (and
+            # an older image) reads; see dream/lane.py.
+            L.update_cursor(
+                conn,
+                run_started,
+                config={
+                    "excluded_projects": ["transcribe_ai"],
+                    "propose_score": L.PROPOSE_SCORE,
+                    "session_jaccard": L.SESSION_JACCARD,
+                    "limit": limit,
+                },
+            )
     print("done.")
+    return {
+        "stages": stages,
+        "errors": [f"{name}: {msg}" for name, msg in errors.items()],
+        "advanced": not held,
+    }
 
 
 def main():
@@ -430,7 +478,9 @@ def main():
     ap.add_argument("--limit", type=int, default=40, help="max substantive sessions to judge")
     ap.add_argument("--no-discord", action="store_true")
     args = ap.parse_args()
-    run_lane(limit=args.limit, backfill=args.backfill, no_discord=args.no_discord)
+    res = run_lane(limit=args.limit, backfill=args.backfill, no_discord=args.no_discord)
+    if res["errors"]:
+        raise SystemExit("stages failed: " + "; ".join(res["errors"]))
 
 
 if __name__ == "__main__":

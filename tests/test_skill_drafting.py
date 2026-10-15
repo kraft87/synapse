@@ -13,9 +13,9 @@ import json
 
 import pytest
 
-import dream.skills.skill_derive as SD
 import dream.skills.skill_doc as D
 import dream.skills.skill_draft as DR
+from dream import lane
 from dream.skills.skill_doc import skill_description
 
 _BODY = (
@@ -49,7 +49,7 @@ def _stub_llm(monkeypatch, reply):
         calls.append(prompt)
         return reply(prompt) if callable(reply) else reply
 
-    monkeypatch.setattr(SD, "_draft_call", fake)
+    monkeypatch.setattr(lane, "draft", fake)
     return calls
 
 

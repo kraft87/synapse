@@ -23,6 +23,7 @@ import pytest
 import dream.config.nightly as CN
 import dream.lane as lane
 import dream.skills.nightly as N
+from ingestion.llm_client import LLMUnavailableError, UsageLimitError
 
 
 @pytest.fixture()
@@ -258,12 +259,15 @@ def test_config_lane_judges_its_cap_and_carries_the_rest(db, db_url, monkeypatch
     sids = [f"lanet-c{i}" for i in range(5)]
     for sid in sids:
         _ep(db, sid, 1)
+        _ep(db, sid, 2)
+    _ep(db, "lanet-c-single", 1)  # one user turn: nothing yet to correct, never judged
 
-    assert CN.run_lane(limit=1)["sessions"] == 4  # the lane's cap is limit * 4
-    assert judged == sids[:4]
-    assert CN.run_lane(limit=1)["sessions"] == 1
-    assert judged == sids
-    assert CN.run_lane(limit=1)["sessions"] == 0  # all judged, nothing new
+    assert CN.run_lane(limit=2)["sessions"] == 2  # the lane's cap is its limit
+    assert sorted(judged) == sids[:2]
+    assert CN.run_lane(limit=2)["sessions"] == 2
+    assert CN.run_lane(limit=2)["sessions"] == 1
+    assert sorted(judged) == sids
+    assert CN.run_lane(limit=2)["sessions"] == 0  # all judged, nothing new
 
 
 def test_skills_lane_carries_overflow_and_bounds_every_stage(db, db_url, monkeypatch):
@@ -282,9 +286,7 @@ def test_skills_lane_carries_overflow_and_bounds_every_stage(db, db_url, monkeyp
         return real_fire_events(conn, window)
 
     monkeypatch.setattr(N, "consolidate_pass", lambda conn, ids: {})
-    monkeypatch.setattr(N.SD, "scan_session", lambda s, cat: scanned.append(s["session"]) or [])
-    monkeypatch.setattr(N.SD, "cluster_gaps", lambda gaps: [])
-    monkeypatch.setattr(N.SM, "judge_session", lambda s, cat: None)
+    monkeypatch.setattr(N.SM, "analyze_session", lambda s, cat: scanned.append(s["session"]))
     monkeypatch.setattr(N.DB, "fire_events", fire_events)
     monkeypatch.setattr(
         N.struggle_arc, "run", lambda conn, **kw: seen["struggle"].append(kw["window"]) or {}
@@ -303,13 +305,185 @@ def test_skills_lane_carries_overflow_and_bounds_every_stage(db, db_url, monkeyp
     _substantive(db, "lanet-s3", extra="[tool:Skill] {'skill': 'lanet-skill'}\n")
 
     N.run_lane(limit=2, no_discord=True)
-    assert scanned == ["lanet-s1", "lanet-s2"]
+    assert sorted(scanned) == ["lanet-s1", "lanet-s2"]
     (w1,) = seen["struggle"]
     assert w1.until_id == second  # stops where the session walk stopped
     assert [f["session_id"] for f in seen["post_fire"][0]] == ["lanet-s1"]
     assert len(fire_reads) == 1  # one read of the window's fires per run
 
     N.run_lane(limit=2, no_discord=True)
-    assert scanned == ["lanet-s1", "lanet-s2", "lanet-s3"]
+    assert sorted(scanned) == ["lanet-s1", "lanet-s2", "lanet-s3"]
     assert seen["struggle"][1].after_id == second
     assert [f["session_id"] for f in seen["post_fire"][1]] == ["lanet-s3"]
+
+
+# ------------------------------------------------------------- stage isolation, cursor
+def _stub_skills_stages(monkeypatch, ran, *, fail=None):
+    """Stub every skills-lane stage with a recorder that appends its name to `ran`; the one
+    named `fail` raises instead. The per-session analysis returns no usable reply."""
+
+    def stage(name):
+        def run(*args, **kwargs):
+            ran.append(name)
+            if name == fail:
+                raise RuntimeError(f"{name} boom")
+            return {}
+
+        return run
+
+    judge = stage("judge")
+    monkeypatch.setattr(N, "consolidate_pass", stage("consolidate"))
+    monkeypatch.setattr(N, "sync_usage", stage("usage"))
+    monkeypatch.setattr(N, "capture_grounded", stage("grounded"))
+    monkeypatch.setattr(N.SM, "analyze_session", lambda s, cat: judge() and None)
+    monkeypatch.setattr(N.struggle_arc, "run", stage("struggle_arc"))
+    monkeypatch.setattr(N.post_fire, "run", stage("post_fire"))
+    monkeypatch.setattr(N.procedure_miner, "due", lambda conn: False)
+    monkeypatch.setattr(N.skill_draft, "draft_pending", stage("drafts"))
+    monkeypatch.setattr(N.L, "decay_stale", stage("decay"))
+    monkeypatch.setattr(N, "discord_digest", stage("digest"))
+
+
+def _memo(conn, sid, lane_name="skills"):
+    return conn.execute(
+        "SELECT user_turns FROM dream_session_memo WHERE lane = %s AND session_id = %s",
+        (lane_name, sid),
+    ).fetchone()
+
+
+def test_a_failing_stage_does_not_skip_the_later_ones(db, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    monkeypatch.setenv("SYNAPSE_SKILLS_DETECTORS", "")  # the retired kill switch is ignored
+    ran: list[str] = []
+    _stub_skills_stages(monkeypatch, ran, fail="drafts")
+    _seed(db, "skills")
+    last = _substantive(db, "lanet-f1")
+
+    res = N.run_lane(limit=5, no_discord=True)
+
+    assert res["errors"] == ["drafts: RuntimeError: drafts boom"]
+    assert ran[-2:] == ["decay", "digest"]  # the stages after the failed one still ran
+    assert {"struggle_arc", "post_fire", "decay", "digest"} <= set(res["stages"])
+    assert "drafts" not in res["stages"]
+    # drafting is not a window stage: the night's judged work stands and the cursor moves on
+    assert res["advanced"] is True
+    assert lane._stored_cursor(db, "skills") == last
+
+
+@pytest.mark.parametrize("failing", ["usage", "grounded", "struggle_arc", "post_fire"])
+def test_a_failed_window_stage_holds_the_cursor_and_the_next_run_does_not_rejudge(
+    db, db_url, monkeypatch, failing
+):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    ran: list[str] = []
+    _stub_skills_stages(monkeypatch, ran, fail=failing)
+    cursor = _seed(db, "skills")
+    last = _substantive(db, "lanet-f2")
+
+    res = N.run_lane(limit=5, no_discord=True)
+
+    assert res["errors"] == [f"{failing}: RuntimeError: {failing} boom"]
+    assert res["advanced"] is False and lane._stored_cursor(db, "skills") == cursor
+    assert ran[-3:] == ["drafts", "decay", "digest"]
+    assert _memo(db, "lanet-f2") == (2,)  # the session WAS judged; the memo remembers it
+
+    ran.clear()
+    _stub_skills_stages(monkeypatch, ran)
+    res = N.run_lane(limit=5, no_discord=True)
+    assert res["errors"] == [] and res["advanced"] is True
+    assert failing in ran  # the window was read again...
+    assert "judge" not in ran  # ...but the session was not sent to the judge again
+    assert lane._stored_cursor(db, "skills") == last
+
+
+def test_a_failed_judge_stage_holds_the_cursor_and_records_nothing_as_judged(
+    db, db_url, monkeypatch
+):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    ran: list[str] = []
+    _stub_skills_stages(monkeypatch, ran, fail="judge")
+    cursor = _seed(db, "skills")
+    _substantive(db, "lanet-f3")
+
+    res = N.run_lane(limit=5, no_discord=True)
+
+    assert res["errors"] == ["judge: RuntimeError: judge boom"]
+    assert res["advanced"] is False and lane._stored_cursor(db, "skills") == cursor
+    assert _memo(db, "lanet-f3") is None  # not judged, so tomorrow judges it
+    assert ran[-1] == "digest"  # the later stages still ran
+
+
+def test_an_unreachable_model_stops_the_skills_lane_with_the_cursor_held(db, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    ran: list[str] = []
+    _stub_skills_stages(monkeypatch, ran)
+
+    def limit_hit(s, cat):
+        raise UsageLimitError("Claude usage limit reached")
+
+    monkeypatch.setattr(N.SM, "analyze_session", limit_hit)
+    cursor = _seed(db, "skills")
+    _substantive(db, "lanet-f4")
+
+    with pytest.raises(UsageLimitError):
+        N.run_lane(limit=5, no_discord=True)
+
+    assert lane._stored_cursor(db, "skills") == cursor
+    assert _memo(db, "lanet-f4") is None
+    assert "decay" not in ran and "digest" not in ran  # every later judge call would fail too
+
+
+def test_config_lane_holds_its_cursor_when_the_model_is_unreachable(db, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+
+    def unavailable(s):
+        raise LLMUnavailableError("claude CLI returned an error result: Not logged in")
+
+    monkeypatch.setattr(CN, "scan_corrections", unavailable)
+    cursor = _seed(db, "config")
+    _ep(db, "lanet-c-down", 1)
+    _ep(db, "lanet-c-down", 2)
+
+    with pytest.raises(LLMUnavailableError):
+        CN.run_lane(limit=5)
+
+    assert lane._stored_cursor(db, "config") == cursor
+    assert _memo(db, "lanet-c-down", "config") is None
+
+
+def _states_of(db, app):
+    return {
+        r[0]
+        for r in db.execute(
+            "SELECT state FROM pg_stat_activity WHERE application_name = %s", (app,)
+        ).fetchall()
+    }
+
+
+def test_the_lanes_hold_no_transaction_open_while_the_judge_runs(db, db_url, monkeypatch):
+    """A read inside psycopg's implicit transaction would leave the lane's connection `idle
+    in transaction` (locks held on episodes and the skill tables) for the whole judge pass."""
+    skills_app, config_app = "lanet-skills-idle", "lanet-config-idle"
+    seen: dict[str, set] = {}
+    _stub_skills_stages(monkeypatch, [])
+
+    def watch(app):
+        seen.setdefault(app, set()).update(_states_of(db, app))
+
+    monkeypatch.setattr(N.SM, "analyze_session", lambda s, cat: watch(skills_app))
+    # the detectors judge after the lane has read the window: probe there too
+    monkeypatch.setattr(N.struggle_arc, "run", lambda *a, **kw: watch(skills_app) or {})
+    monkeypatch.setattr(N.post_fire, "run", lambda *a, **kw: watch(skills_app) or {})
+    monkeypatch.setattr(CN, "scan_corrections", lambda s: watch(config_app) or [])
+    sep = "&" if "?" in db_url else "?"
+    monkeypatch.setenv("SYNAPSE_DB_URL", f"{db_url}{sep}application_name={skills_app}")
+    _seed(db, "skills")
+    _substantive(db, "lanet-idle-s")
+    N.run_lane(limit=5, no_discord=True)
+    monkeypatch.setenv("SYNAPSE_DB_URL", f"{db_url}{sep}application_name={config_app}")
+    _seed(db, "config")
+    _ep(db, "lanet-idle-c", 1)
+    _ep(db, "lanet-idle-c", 2)
+    CN.run_lane(limit=5)
+
+    assert seen == {skills_app: {"idle"}, config_app: {"idle"}}
