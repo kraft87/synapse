@@ -278,7 +278,7 @@ _INSTRUCTIONS = (
     "device, purchase, tool, project, person, or preference — search with "
     "recall(query) first. fetch(ids) expands episode ids (e:N) and note ids "
     "(n:N) from earlier results. "
-    "questions; recall_full_turns searches complete raw turns — the retry when an "
+    "recall_full_turns searches raw turns, long ones as excerpts — the retry when an "
     "overview recall comes back thin. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "
     "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "

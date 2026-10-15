@@ -137,10 +137,13 @@ def register(
         drill-down and retry sibling of recall().
 
         recall() serves compressed ~1400-char passage slices blended with facts and
-        timeline; this serves WHOLE turns and nothing else, ranked by relevance +
+        notes; this serves whole turns and nothing else, ranked by relevance +
         recency (keyword + semantic search + rerank over the full archive). `limit`
         sizes the response: 1-2 turns for a pinpoint quote, the default 5 to
-        reconstruct a discussion (weak trailing matches drop automatically).
+        reconstruct a discussion (weak trailing matches drop automatically). A call
+        serves up to ~40K characters of turn text: a turn that would pass that comes
+        back as its opening plus the stretch that best matches the query, with
+        `full_chars` giving its real length; fetch its e:N id for the rest.
 
         Three triggers —
         - Exact wording: "what exactly did we say about X", quoting the actual
@@ -210,7 +213,10 @@ def register(
 
         Do NOT search with this — it only expands ids you already hold; recall()
         finds things. Do NOT re-fetch ids already expanded this session. Unknown or
-        unparseable ids are returned under "skipped"; at most 20 ids per call.
+        unparseable ids are returned under "skipped"; at most 20 ids per call. The
+        first episode comes back whole; later ones share a ~40K-character budget, and
+        one that would pass it comes back as its opening with `full_chars` (fetch it
+        alone for the rest).
 
         Args:
             ids: Ids to expand — "e:N" episodes, "n:N" notes, bare N = episode.

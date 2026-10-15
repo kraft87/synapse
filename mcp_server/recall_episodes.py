@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.recall_presentation import fit_turns_to_budget as _fit_turns_to_budget
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
 from mcp_server.recall_settings import _EPISODE_LIMIT
@@ -30,7 +31,9 @@ class RecallEpisodesMixin:
         """Raw episode drill-down: individual conversation turns.
 
         Best for 'show me exactly what was said about X' queries.
-        Returns full episode content ranked by relevance + recency.
+        Returns full episode content ranked by relevance + recency, up to a size budget
+        per call (``FULL_TURN_BUDGET``): a turn that would pass it comes back as an
+        excerpt with ``full_chars``, and fetch(e:N) returns it whole.
 
         ``session_id`` scopes the search to ONE conversation (the Grep-within-a-
         session drill-down): same BM25+vector+rerank pipeline, pool restricted to
@@ -108,10 +111,9 @@ class RecallEpisodesMixin:
         if ep_ids:
             self._increment_retrieval_counts(ep_ids)
 
-        out: dict[str, Any] = {
-            "query": query,
-            "episodes": [_to_recall_item(r) for r in episodes],
-        }
+        items = [_to_recall_item(r) for r in episodes]
+        n_excerpted = _fit_turns_to_budget(items, query)  # whole turns, up to the call's budget
+        out: dict[str, Any] = {"query": query, "episodes": items}
         # Same contract as recall(): key present only when a leg degraded.
         if warnings:
             out["warnings"] = list(warnings)
@@ -126,6 +128,8 @@ class RecallEpisodesMixin:
             served_ids["n_self_excluded"] = n_self_excluded
         if session_id:
             served_ids["session_id"] = session_id  # session-scoped drill-down call
+        if n_excerpted:  # tunes FULL_TURN_BUDGET: how often a call outgrows it
+            served_ids["n_excerpted"] = n_excerpted
         # Shadow abstention floor (telemetry only) — same RAW pre-recency score contract
         # as recall(); the served episodes above are untouched.
         self._floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)

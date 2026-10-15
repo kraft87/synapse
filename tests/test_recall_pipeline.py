@@ -266,6 +266,32 @@ def test_recall_full_turns_backfills_past_the_callers_own_turns():
     assert captured[0]["served_ids"]["n_self_excluded"] == 3
 
 
+def test_recall_full_turns_stays_inside_the_per_call_budget():
+    from mcp_server.recall_presentation import FULL_TURN_BUDGET
+
+    pool = _pool(6)
+    for ep in pool:
+        ep["content"] = f"turn {ep['id']} " + "tool trace line " * 3_000  # ~48K chars each
+    r, captured = _engine(pool)
+    out = r.recall_episodes("where is the gizmo", trust=FULL_TRUST, limit=6)
+    served = out["episodes"]
+    assert [it["id"] for it in served] == [f"e:{i}" for i in range(6)]  # same turns, same order
+    assert all(it["full_chars"] > 40_000 for it in served)  # each alone passes the budget
+    assert sum(len(it["content"]) for it in served) <= 6 * 3_100
+    assert sum(len(it["content"]) for it in served) < FULL_TURN_BUDGET
+    assert captured[0]["served_ids"]["n_excerpted"] == 6
+    query = "where is the gizmo"
+    assert captured[0]["chars"] == len(query) + sum(len(it["content"]) for it in served)
+
+
+def test_recall_full_turns_serves_ordinary_turns_whole():
+    r, captured = _engine(_pool(5))
+    out = r.recall_episodes("where is the gizmo", trust=FULL_TRUST)
+    assert [it["content"] for it in out["episodes"]] == [f"pool doc {i}" for i in range(5)]
+    assert all("full_chars" not in it for it in out["episodes"])
+    assert "n_excerpted" not in captured[0]["served_ids"]
+
+
 # --- recall-19: interactive recall does not ride out a Voyage 429 --------------------
 
 

@@ -10,6 +10,8 @@ columns.
 
 from __future__ import annotations
 
+import uuid
+
 from mcp_server.recall import Recall
 
 
@@ -74,7 +76,7 @@ def _episode(conn, content: str) -> int:
     return conn.execute(
         "INSERT INTO episodes (session_id, sequence, content, project) "
         "VALUES (%s, 1, %s, 'bump-test') RETURNING id",
-        (f"bump-{content}", content),
+        (f"bump-{uuid.uuid4().hex[:12]}", content),
     ).fetchone()[0]
 
 
@@ -109,3 +111,24 @@ def test_an_empty_bump_queues_nothing(db_url):
     r._async_executor = deferred  # type: ignore[assignment]
     r._increment_retrieval_counts([])
     assert deferred.jobs == []
+
+
+def test_fetch_stays_inside_the_per_call_budget(clean_tables, conn, db_url):
+    """Twenty ids can name twenty 100K-character turns. The first is whole (fetch is the
+    only way to read it), the rest share what the budget has left and come back as
+    openings with full_chars."""
+    from ingestion.surfaces import FULL_TRUST
+
+    ids = [_episode(conn, "x" * 30_000 + f" turn {i}") for i in range(3)]
+    r = Recall(db_url, "")
+    r._async_executor = _DeferredExecutor()  # type: ignore[assignment]
+    sent: list[dict] = []
+    r._record_metrics = sent.append  # type: ignore[method-assign]
+
+    out = r.fetch([f"e:{i}" for i in ids], trust=FULL_TRUST)
+
+    first, second, third = out["episodes"]
+    assert len(first["content"]) == 30_000 + len(" turn 0") and "full_chars" not in first
+    assert len(second["content"]) <= 1_000 and second["full_chars"] == 30_000 + len(" turn 1")
+    assert len(third["content"]) <= 1_000 and third["full_chars"] == 30_000 + len(" turn 2")
+    assert sent[0]["served_ids"]["n_excerpted"] == 2

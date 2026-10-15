@@ -8,12 +8,24 @@ from datetime import UTC, datetime, time
 from typing import Any
 
 from ingestion.localtime import local_date
+from mcp_server.recall_query import bm25_best_window, bm25_tokenize
 
 _ROLE_MARKER_RE = re.compile(
     r"(?m)^\[(user|attachments|assistant|context|result|title|tool:[^\]\n]{0,80})\]"
 )
 _USER_MARKERS = {"user", "attachments"}
 _FETCH_MAX = 20
+
+#: Characters of whole turns one recall_full_turns / fetch call serves. Claude Code cuts an
+#: MCP result off past MAX_MCP_OUTPUT_TOKENS (25K tokens by default) and a tool-heavy turn
+#: runs to 100K+ characters (the median is 4-5K), so a few of them unbudgeted came back
+#: truncated at a point the client chose, or filled the caller's context with tool traces.
+#: About 10K tokens: a default call of five ordinary turns is untouched.
+FULL_TURN_BUDGET = 40_000
+#: A turn that does not fit is served as its first _EXCERPT_HEAD characters plus the
+#: _EXCERPT_WINDOW characters that best match the query.
+_EXCERPT_HEAD = 1_000
+_EXCERPT_WINDOW = 2_000
 
 
 def fact_day(ts: Any) -> str:
@@ -34,6 +46,47 @@ def fact_day(ts: Any) -> str:
         if utc.time() == time(0):
             return utc.date().isoformat()
     return local_date(ts)
+
+
+def _excerpt(content: str, query_tokens: list[str]) -> str:
+    """The opening of a turn plus, when the query matches further in, the stretch around the match."""
+    head = content[:_EXCERPT_HEAD]
+    if not query_tokens:
+        return head
+    window = bm25_best_window(content, query_tokens, _EXCERPT_WINDOW)
+    start = content.find(window)
+    if start <= len(head):  # the match sits in or against the opening: one contiguous stretch
+        return content[: start + len(window)]
+    return f"{head}\n…\n{window}"
+
+
+def fit_turns_to_budget(
+    items: list[dict[str, Any]],
+    query: str | None,
+    *,
+    budget: int = FULL_TURN_BUDGET,
+    keep_first: bool = False,
+) -> int:
+    """Cap the whole turns of one call at ``budget`` characters; returns how many were cut.
+
+    Turns are served whole in rank order while they fit. One that does not is replaced, in
+    place, by an excerpt (see ``_excerpt``; just the opening when there is no ``query``) and
+    gains ``full_chars``, the length ``fetch`` would return it at. A later, smaller turn can
+    still fit what is left. ``keep_first`` never cuts the first item: fetch(ids) is the only
+    way to read a turn whole, so the one asked for first comes back whole whatever its size."""
+    tokens = bm25_tokenize(query) if query else []
+    used = 0
+    n_cut = 0
+    for index, item in enumerate(items):
+        content = item.get("content") or ""
+        if (keep_first and index == 0) or used + len(content) <= budget:
+            used += len(content)
+            continue
+        item["content"] = _excerpt(content, tokens)
+        item["full_chars"] = len(content)
+        used += len(item["content"])
+        n_cut += 1
+    return n_cut
 
 
 def to_web_recall_item(row: dict[str, Any]) -> dict[str, Any]:

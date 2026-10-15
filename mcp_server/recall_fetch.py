@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 from ingestion.localtime import local_date
 from ingestion.surfaces import SurfaceTrust, episode_scope_sql
+from mcp_server.recall_presentation import fit_turns_to_budget as _fit_turns_to_budget
 from mcp_server.recall_presentation import parse_fetch_ids as _parse_fetch_ids
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
@@ -51,7 +52,10 @@ class RecallFetchMixin:
         Episodes come back in the recall-item shape ({id, content, project, date}),
         notes as {id, hook, body, type, project, updated}; both ordered to match the
         request. Unknown prefixes / unparseable ids are reported under ``skipped``;
-        the total expanded is capped at _FETCH_MAX across both kinds.
+        the total expanded is capped at _FETCH_MAX across both kinds. Episode text is
+        capped at FULL_TURN_BUDGET characters per call: the first turn asked for is whole,
+        a later one that would pass the budget comes back as its opening plus
+        ``full_chars`` (fetch it alone for the rest).
 
         ``surface`` applies the calling host's filters (schema 053). This is not
         belt-and-braces: e:N / n:N ids are sequential integers, so an unfiltered fetch
@@ -71,6 +75,8 @@ class RecallFetchMixin:
         out["notes"] = (
             self._fetch_note_records(note_ids, audience=st.audience_filter) if note_ids else []
         )
+        # Whole turns up to the call's budget; the first one asked for is never cut.
+        n_excerpted = _fit_turns_to_budget(out["episodes"], None, keep_first=True)
         chars = _served_chars({"episodes": out["episodes"]}) + sum(
             len(n.get("hook") or "") + len(n.get("body") or "") for n in out["notes"]
         )
@@ -89,6 +95,7 @@ class RecallFetchMixin:
                 "served_ids": {
                     "kinds": {"e": len(out["episodes"]), "n": len(out["notes"])},
                     "notes": [n["id"] for n in out["notes"]],
+                    **({"n_excerpted": n_excerpted} if n_excerpted else {}),
                 },
             }
         )
