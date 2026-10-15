@@ -28,6 +28,7 @@ import pytest
 from pydantic import BaseModel
 
 from ingestion import llm_client as llm_client_mod
+from ingestion import llm_openai as llm_openai_mod
 from ingestion.llm_client import (
     DEFAULT_OPENAI_BASE_URL,
     DEFAULT_OPENAI_MODEL,
@@ -244,7 +245,7 @@ class TestSuccessfulCompletion:
         """SYNAPSE_OPENROUTER_PROVIDERS=auto orders providers by blended price,
         skipping deranked endpoints, unpriced rows, and dupe-slug pricier rows."""
         monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
-        llm_client_mod._provider_rank_cache.clear()
+        llm_openai_mod._provider_rank_cache.clear()
         endpoints = [
             {
                 "tag": "pricey/fp8",
@@ -273,7 +274,7 @@ class TestSuccessfulCompletion:
                 "pricing": {"prompt": "0.0000006", "completion": "0.0000020"},
             },
         ]
-        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", lambda model: endpoints)
+        monkeypatch.setattr(llm_openai_mod, "_fetch_model_endpoints", lambda model: endpoints)
         seen: dict[str, Any] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -287,12 +288,12 @@ class TestSuccessfulCompletion:
     def test_auto_provider_order_fail_soft(self, monkeypatch):
         """A ranking-fetch failure degrades to default routing, not an error."""
         monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
-        llm_client_mod._provider_rank_cache.clear()
+        llm_openai_mod._provider_rank_cache.clear()
 
         def boom(model: str) -> list[dict[str, Any]]:
             raise httpx.ConnectError("down")
 
-        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", boom)
+        monkeypatch.setattr(llm_openai_mod, "_fetch_model_endpoints", boom)
         seen: dict[str, Any] = {}
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -305,7 +306,7 @@ class TestSuccessfulCompletion:
 
     def test_auto_provider_ranking_cached_across_calls(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
-        llm_client_mod._provider_rank_cache.clear()
+        llm_openai_mod._provider_rank_cache.clear()
         calls = {"n": 0}
 
         def fetch(model: str) -> list[dict[str, Any]]:
@@ -318,7 +319,7 @@ class TestSuccessfulCompletion:
                 }
             ]
 
-        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", fetch)
+        monkeypatch.setattr(llm_openai_mod, "_fetch_model_endpoints", fetch)
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=_completion_body("ok"))
@@ -332,7 +333,7 @@ class TestSuccessfulCompletion:
         """A stage model override (SYNAPSE_<STAGE>_MODEL) is what goes on the wire, so its
         endpoints, not the client default's, decide the provider order."""
         monkeypatch.setenv("SYNAPSE_OPENROUTER_PROVIDERS", "auto")
-        llm_client_mod._provider_rank_cache.clear()
+        llm_openai_mod._provider_rank_cache.clear()
         ranked: list[str] = []
 
         def fetch(model: str) -> list[dict[str, Any]]:
@@ -345,7 +346,7 @@ class TestSuccessfulCompletion:
                 }
             ]
 
-        monkeypatch.setattr(llm_client_mod, "_fetch_model_endpoints", fetch)
+        monkeypatch.setattr(llm_openai_mod, "_fetch_model_endpoints", fetch)
         seen: list[dict[str, Any]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -911,7 +912,7 @@ class TestThreadLocalConnectionState:
     def test_thread_loop_is_persistent_per_thread(self):
         import threading as _threading
 
-        from ingestion.llm_client import _thread_loop
+        from ingestion.llm_openai import _thread_loop
 
         loop = _thread_loop()
         assert _thread_loop() is loop  # reused, not per-call

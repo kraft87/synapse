@@ -29,6 +29,7 @@ import dream.skills.skill_derive as SD
 import dream.skills.skill_draft as DR
 import dream.skills.skill_measure as SM
 import dream.skills.struggle_arc as SA
+import ingestion.llm_claude_cli as llm_cli
 import ingestion.llm_client as llm
 from ingestion.contamination import is_harness_call
 
@@ -135,7 +136,7 @@ def test_usage_limit_text_from_the_cli_raises_end_to_end(monkeypatch):
         seen.update(kw, prompt=prompt)
         raise llm.UsageLimitError("Claude usage limit reached")
 
-    monkeypatch.setattr(llm, "agent_call", agent_call)
+    monkeypatch.setattr(llm_cli, "agent_call", agent_call)
     monkeypatch.setattr(lane, "_llm", lambda: llm.create_llm_client())
     monkeypatch.delenv("SYNAPSE_SKILLS_JUDGE_MODEL", raising=False)
     monkeypatch.delenv("SYNAPSE_LLM_MODEL", raising=False)

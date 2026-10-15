@@ -9,7 +9,7 @@ Design: ``TextCallModel`` adapts any plain text call — prompt and system text
 in, completion text out — to a pydantic-ai ``Model``. ``request()`` flattens the
 pydantic-ai message history into a single prompt string (system parts + user
 parts) and hands it to the text call. ``ClaudeAgentSDKModel`` is that adapter
-over ``ingestion.llm_client.agent_call``; ``llm_client`` builds the same adapter
+over ``ingestion.llm_claude_cli.agent_call``; ``llm_client`` builds the same adapter
 over a duck-typed ``messages.create`` client (test doubles, third-party shims).
 
 Delegating to ``agent_call`` — not reimplementing it — is deliberate: it
@@ -58,7 +58,8 @@ from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.profiles import ModelProfile
 from pydantic_ai.settings import ModelSettings
 
-from ingestion.llm_client import DEFAULT_MODEL, agent_call
+from ingestion.llm_claude_cli import agent_call
+from ingestion.llm_common import DEFAULT_MODEL
 from ingestion.llm_schemas import first_json_object
 
 #: ``(prompt, system, json_schema, max_tokens) -> completion text``

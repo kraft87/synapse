@@ -1,4 +1,4 @@
-"""Tests for ``ingestion.llm_client`` — the Claude CLI backend and ``parse_with_retry``.
+"""Tests for ``ingestion.llm_claude_cli`` (the Claude CLI backend) and ``llm_client.parse_with_retry``.
 
 Covers:
 
@@ -25,16 +25,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 from tenacity import wait_none
 
-import ingestion.llm_client as llm_mod
-from ingestion.llm_client import (
+import ingestion.llm_claude_cli as llm_mod
+from ingestion.llm_claude_cli import (
     _MAX_THINKING_TOKENS,
-    LLM_TRANSPORT_ERRORS,
     ClaudeAgentClient,
+    _is_usage_limit,
+    agent_call,
+)
+from ingestion.llm_client import (
+    LLM_TRANSPORT_ERRORS,
     LLMUnavailableError,
     MalformedResponseError,
     UsageLimitError,
-    _is_usage_limit,
-    agent_call,
     parse_with_retry,
 )
 from tests.helpers.llm import mock_llm_message

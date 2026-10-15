@@ -316,7 +316,7 @@ class LLMExtractor:
         ``structured_call``:
 
         * Transient wire errors (rate-limit, timeout) → tenacity around the
-          pydantic-ai run (see ``ingestion.llm_client._run_agent_sync``).
+          pydantic-ai run (see ``ingestion.llm_openai._run_agent_sync``).
         * Malformed / schema-violating output → pydantic-ai's
           retry-with-validation-feedback loop (``max_attempts`` total tries).
 
