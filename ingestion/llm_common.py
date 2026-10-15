@@ -60,6 +60,22 @@ class MalformedResponseError(Exception):
         self.raw_response = raw_response
 
 
+def extract_json_object(text: str) -> dict[str, Any]:
+    """The outermost JSON object in an LLM reply (first ``{`` to last ``}``), as the first
+    step of a ``parse_with_retry`` parser. Prose or a code fence around it is ignored;
+    anything else raises ``MalformedResponseError`` so the retry quotes the failure back."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        raise MalformedResponseError("no JSON object in response", text[:200])
+    try:
+        obj = json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise MalformedResponseError(f"JSON decode error: {exc}", text[:200]) from exc
+    if not isinstance(obj, dict):
+        raise MalformedResponseError("expected a JSON object", text[:200])
+    return obj
+
+
 class LLMUnavailableError(Exception):
     """The LLM produced no usable output at all — a transport/config failure, not content.
 

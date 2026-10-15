@@ -124,6 +124,14 @@ def spool(monkeypatch, tmp_path, stub_server) -> ModuleType:
     return _load(monkeypatch, tmp_path, stub_server.url)
 
 
+def test_the_spool_validates_the_note_types_the_server_stores(spool):
+    """The plugin cannot import ingestion.notes (it ships to machines without the server), so
+    its copy of the type list is pinned to the server's here."""
+    from ingestion.notes import _VALID_TYPES
+
+    assert spool._VALID_TYPES == _VALID_TYPES
+
+
 @pytest.fixture()
 def offline(monkeypatch, tmp_path) -> ModuleType:
     """Same module, pointed at a port nothing is listening on — the outage case."""

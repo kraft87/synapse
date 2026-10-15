@@ -34,12 +34,16 @@ worker thread (``anyio.to_thread.run_sync``), never on the event loop —
 
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from ingestion.llm_client import MalformedResponseError, parse_with_retry, stage_model
+from ingestion.llm_client import (
+    MalformedResponseError,
+    extract_json_object,
+    parse_with_retry,
+    stage_model,
+)
 from ingestion.preferences_gate import _group_for
 from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import derive_audience
@@ -84,27 +88,13 @@ Output ONLY JSON, no prose. One of:
 {{"verdict": "DISTINCT"}}"""
 
 
-def extract_obj(text: str) -> dict[str, Any]:
-    """The outermost JSON object in an LLM reply, as a parser for ``parse_with_retry``."""
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise MalformedResponseError("no JSON object in response", text[:200])
-    try:
-        obj = json.loads(text[start : end + 1])
-    except json.JSONDecodeError as exc:
-        raise MalformedResponseError(f"JSON decode error: {exc}", text[:200]) from exc
-    if not isinstance(obj, dict):
-        raise MalformedResponseError("expected a JSON object", text[:200])
-    return obj
-
-
 def parse_pair_verdict(text: str) -> dict[str, Any]:
     """Parser for parse_with_retry: ``{"verdict": ..., "keep": 1|2}``.
 
     ``keep`` is REQUIRED for CORRECTION — without it there is no direction, and
     guessing one would be exactly the destructive coin-flip the judge must not make.
     Raising instead lets the retry loop quote the failure back to the model."""
-    obj = extract_obj(text)
+    obj = extract_json_object(text)
     verdict = str(obj.get("verdict", "")).strip().upper()
     if verdict not in _PAIR_VERDICTS:
         raise MalformedResponseError(f"'verdict' must be one of {_PAIR_VERDICTS}", text[:200])

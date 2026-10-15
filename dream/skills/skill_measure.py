@@ -11,11 +11,11 @@ The judge model is SYNAPSE_SKILLS_JUDGE_MODEL (llm_client.stage_model; default O
 
 from __future__ import annotations
 
-import json
 import re
 from datetime import UTC, datetime
 
 from dream import lane
+from ingestion.llm_client import MalformedResponseError, extract_json_object
 
 
 def load_catalog(conn) -> list[tuple[str, str]]:
@@ -173,14 +173,11 @@ def under_trigger_verdict(item: dict, description: str, phrasing: str = "") -> s
 
 
 def _extract_json(raw: str) -> dict | None:
-    """Lenient JSON extraction from a judge response: the first `{` .. last `}` slice.
-    None on no-brace or parse failure. Shared by every dream->skills detector."""
-    start, end = raw.find("{"), raw.rfind("}")
-    if start < 0 or end < 0:
-        return None
+    """Lenient reading of a judge response: its JSON object, None when it has none (or not a
+    parseable one). Shared by every dream->skills detector."""
     try:
-        return json.loads(raw[start : end + 1])
-    except Exception:
+        return extract_json_object(raw)
+    except MalformedResponseError:
         return None
 
 

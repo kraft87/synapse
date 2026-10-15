@@ -30,13 +30,17 @@ swallowed so KG extraction never breaks on the preference gate's account.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 from typing import Any
 
 from ingestion.extraction_policy import _default_group_for_project
-from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError, parse_with_retry
+from ingestion.llm_client import (
+    LLM_TRANSPORT_ERRORS,
+    MalformedResponseError,
+    extract_json_object,
+    parse_with_retry,
+)
 from ingestion.settings import KG_OWNER_ID
 from ingestion.turns import compact_turn, user_text
 
@@ -115,10 +119,7 @@ def _parse_confirm(text: str) -> dict[str, Any]:
     """Parser for parse_with_retry: ``{"duplicate": bool, "updated_pref": str|None}``.
     ``updated_pref`` is normalized to None unless duplicate is true and it is a
     non-empty string — the judge's merge offer only exists on the duplicate path."""
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise MalformedResponseError("no JSON object in response", text[:200])
-    d = json.loads(text[start : end + 1])
+    d = extract_json_object(text)
     dup = d.get("duplicate")
     if not isinstance(dup, bool):
         raise MalformedResponseError("'duplicate' must be a boolean", text[:200])
@@ -140,10 +141,7 @@ def _valid_merged_pref(updated: str, existing: str) -> bool:
 def _parse_prefs(text: str) -> list[dict[str, Any]]:
     """Parser for parse_with_retry: extract the {"preferences": [...]} list. Returns a
     (possibly empty) list of validated {pref, polarity} dicts; raises on malformed JSON."""
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise MalformedResponseError("no JSON object in response", text[:200])
-    d = json.loads(text[start : end + 1])
+    d = extract_json_object(text)
     prefs = d.get("preferences")
     if prefs is None:
         return []

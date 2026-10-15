@@ -37,6 +37,7 @@ from ingestion.llm_client import (
     LLMUnavailableError,
     MalformedResponseError,
     UsageLimitError,
+    extract_json_object,
     parse_with_retry,
 )
 from tests.helpers.llm import mock_llm_message
@@ -456,3 +457,44 @@ class TestParseWithRetry:
             )
 
         assert client.messages.create.call_count == 2
+
+
+# --- extract_json_object: the one first-"{"-to-last-"}" reader for every judge parser ---
+
+
+def test_extract_json_object_ignores_prose_and_fences():
+    assert extract_json_object('Sure.\n```json\n{"a": {"b": 1}}\n```\nDone.') == {"a": {"b": 1}}
+
+
+@pytest.mark.parametrize("text", ["", "no braces at all", "} backwards {", "{"])
+def test_extract_json_object_without_an_object_is_malformed(text):
+    with pytest.raises(MalformedResponseError, match="no JSON object") as exc:
+        extract_json_object(text)
+    assert exc.value.raw_response == text[:200]
+
+
+def test_extract_json_object_bad_json_is_malformed_not_a_decode_error():
+    with pytest.raises(MalformedResponseError, match="JSON decode error"):
+        extract_json_object('{"verdict": DUPLICATE}')
+
+
+def test_every_judge_parser_fails_the_same_way_on_bad_json():
+    """notes pair verdict, preferences confirm/extract and the dream detectors all read the
+    reply through it, so a parse_with_retry caller always sees MalformedResponseError."""
+    from ingestion.notes import parse_pair_verdict
+    from ingestion.preferences_gate import _parse_confirm, _parse_prefs
+
+    for parser in (parse_pair_verdict, _parse_confirm, _parse_prefs):
+        with pytest.raises(MalformedResponseError, match="JSON decode error"):
+            parser("{not json}")
+        with pytest.raises(MalformedResponseError, match="no JSON object"):
+            parser("nothing here")
+
+
+def test_the_dream_detectors_read_a_judge_reply_leniently():
+    from dream.skills.skill_measure import _extract_json
+
+    assert _extract_json('verdict: {"covers": 2} ok') == {"covers": 2}
+    assert _extract_json("no object") is None
+    assert _extract_json("{broken") is None
+    assert _extract_json("{not json}") is None

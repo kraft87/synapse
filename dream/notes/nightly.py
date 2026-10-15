@@ -60,8 +60,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from ingestion.llm_client import MalformedResponseError, create_llm_client, parse_with_retry
-from ingestion.notes import extract_obj, fmt_note, judge_model, judge_pair
+from ingestion.llm_client import (
+    MalformedResponseError,
+    create_llm_client,
+    extract_json_object,
+    parse_with_retry,
+)
+from ingestion.notes import fmt_note, judge_model, judge_pair
 from ingestion.settings import KG_OWNER_ID, require_setting
 from ingestion.surfaces import RESTRICTED_AUDIENCE, project_audience, restricted_project_union
 
@@ -104,7 +109,7 @@ Output ONLY JSON, no prose. One of:
 def parse_scope_verdict(text: str) -> dict[str, Any]:
     """Parser for parse_with_retry: ``{"scope": "GLOBAL"}`` or
     ``{"scope": "PROJECT", "project": "<slug>"}``."""
-    obj = extract_obj(text)
+    obj = extract_json_object(text)
     scope = str(obj.get("scope", "")).strip().upper()
     if scope not in ("GLOBAL", "PROJECT"):
         raise MalformedResponseError("'scope' must be GLOBAL or PROJECT", text[:200])

@@ -84,6 +84,7 @@ from ingestion.llm_common import (
     TransientLLMHTTPError,
     UsageLimitError,
     _flatten_chat,
+    extract_json_object,
 )
 from ingestion.llm_openai import (
     DEFAULT_OPENAI_BASE_URL,
@@ -107,6 +108,7 @@ __all__ = [
     "agent_call",
     "check_model_id",
     "create_llm_client",
+    "extract_json_object",
     "parse_with_retry",
     "stage_model",
     "structured_call",
