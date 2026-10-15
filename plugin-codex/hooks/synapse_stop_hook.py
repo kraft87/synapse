@@ -408,10 +408,13 @@ def main() -> int:
     except ValueError:
         return 0
     # Detach the actual work so the Stop hook returns instantly even if the
-    # server is slow or down.
+    # server is slow or down. The child gets only what _ship reads: the payload also
+    # carries the whole final answer, which must not ride in argv (Windows caps it at
+    # 32,767 characters, and any process listing shows it).
+    child = {k: payload.get(k) for k in ("session_id", "transcript_path", "cwd")}
     try:
         subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--ship", json.dumps(payload)],
+            [sys.executable, os.path.abspath(__file__), "--ship", json.dumps(child)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

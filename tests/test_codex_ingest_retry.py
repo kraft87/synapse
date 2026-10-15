@@ -412,6 +412,30 @@ def test_catchup_entry_passes_the_live_rollout_to_skip(hook, monkeypatch):
     assert calls == ["/x/live.jsonl", ""]
 
 
+def test_stop_hook_hands_the_child_only_the_ids_it_ships_by(hook, monkeypatch):
+    """Codex's Stop payload carries the whole final answer (last_assistant_message). It
+    went through the child's argv, which Windows caps at 32,767 characters (a long answer
+    made Popen raise, so the turn was not shipped) and which any process listing shows."""
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda argv, **kw: spawned.append(argv))
+    payload = {
+        "session_id": "sess-1",
+        "transcript_path": "/x/rollout-sess-1.jsonl",
+        "cwd": "/work/repo",
+        "hook_event_name": "Stop",
+        "last_assistant_message": "A" * 40_000,
+    }
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    assert hook.main() == 0
+    (argv,) = spawned
+    assert argv[2] == "--ship" and sum(len(a) for a in argv) < 1_000
+    assert json.loads(argv[3]) == {
+        "session_id": "sess-1",
+        "transcript_path": "/x/rollout-sess-1.jsonl",
+        "cwd": "/work/repo",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Session-start warning
 # ---------------------------------------------------------------------------
