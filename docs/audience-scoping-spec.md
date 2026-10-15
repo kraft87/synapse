@@ -45,7 +45,9 @@ Write-time tagging at the single chokepoint, `ingestion/notes.py:reconcile_note`
    from decaying to empty without inventing new classification machinery.
 
 The dream notes judge (retype / re-project / supersede) preserves `audience` on update,
-and re-derives it by rule 3 if it changes a note's `project`.
+and re-derives it by rule 3 (a case-folded comparison, the same helper `derive_audience`
+uses) if it changes a note's `project`. The lane never lets a personal note retire a
+work-safe one.
 
 ### 2. Timeline
 
@@ -179,11 +181,13 @@ project included, so an unknown caller serves *nothing* rather than everything.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
-- **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**: project
+- **`/preferences/top`**: project
   allowlist only (a merged preference's text has no per-turn provenance). **`/config/*`**:
   a restricted device reads and writes only its own mirror, and sees only proposals whose
   every evidence session consists solely of its own turns. All resolved from the bearer;
-  the root token and unknown callers get nothing.
+  the root token and unknown callers get nothing. (`POST /timeline/recent` is gone: the
+  board reads its digest directly, and `/timeline/events` stamps each pushed event with the
+  pushing device's surface, so the digest follows the same rule.)
 
 ## Rollout order (schema 054)
 

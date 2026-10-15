@@ -17,20 +17,24 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   web research, and fact history. Served passages carry a `role` label
   (`user` / `assistant` / `mixed`) and a date, so a caller can weight a human-stated fact
   over the agent's own past output. Every served item carries an id (`e:N` episode, `n:N`
-  note, `f:<uuid>` fact, `w:N` web); only `e:` and `n:` are fetchable, the
-  rest are feedback-only. `group_id` scopes the knowledge graph to `technical` (default) or
+  note, `f:N` fact, `w:N` web, `t:N` timeline event on the board); only `e:` and `n:` are
+  fetchable, the rest are feedback-only. A fact id is the `kg_relationships.id`; the older
+  `f:<uuid>` form is still accepted wherever ids are (`recall_feedback`). `group_id` scopes the knowledge graph to `technical` (default) or
   `personal`.
 - **`recall_full_turns(query, project=None, limit=5, session_id=None)`**: the drill-down and
   retry sibling. `recall()` serves compressed ~1400-char passage slices; this serves whole
   turns and nothing else, ranked by relevance plus recency. It is the right call for exact
   wording, for the retry when an overview recall comes back thin, and when a passage was cut
-  off mid-thought. It replaced the former `recall(mode="turns")`, which in turn had absorbed
+  off mid-thought. A call serves up to ~40,000 characters of turn text: a turn that would
+  pass that comes back as its opening plus the stretch that best matches the query, with
+  `full_chars` giving its real length (`fetch` its `e:N` id for the rest). It replaced the former `recall(mode="turns")`, which in turn had absorbed
   the standalone `recall_episodes` tool.
 - **`fetch(ids)`** expands ids into full records: `e:N` episode ids from recall results
   (bare `N` also accepted) and `n:N` note ids, so the session-start board block's `n:ID`
   lines resolve to their full note bodies. Mixed lists are fine, unknown ids come back under
-  `skipped`, and at most 20 ids expand per call. It only expands ids you already hold; it
-  does not search.
+  `skipped`, and at most 20 ids expand per call. The first episode comes back whole; later
+  ones share a ~40,000-character budget and come back as an opening with `full_chars` once it
+  is spent. It only expands ids you already hold; it does not search.
 - **`fetch_session(session_id, around=None, radius=3, offset=0, limit=10)`** reads one
   conversation sequentially, like opening the transcript file at a spot instead of searching
   it. Every recall/fetch episode carries a `session` field; pass it here to see what
@@ -44,9 +48,13 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   `project` / `reference`); the legacy `content`-only form still works and derives the hook
   from the first sentence. Both forms also archive the text as an episode and enqueue
   knowledge-graph extraction. Notes land in a dedicated store that is reconciled on write: a
-  new note that restates an existing one updates it in place, and one that contradicts it
-  supersedes the old note while keeping the lineage — so the curated set stays small and
-  current instead of accumulating duplicates.
+  new note that restates an existing one updates it in place (the old wording goes to
+  `notes_history`), one that corrects it supersedes the old note keeping the lineage, and
+  anything else, including a second distinct rule on the same topic, is added beside it
+  — when the judge is unsure it adds, and a nightly lane merges what is left. A call from a
+  device that names its `session_id` is archived but not queued for extraction, because the
+  Stop hook ingests that session; in a private session, whose turns the hook never ships,
+  the statement is queued like a hookless caller's.
 - **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, project=None)`**
   reports retrieval quality after a recall whose results you used: which served ids were
   load-bearing, which were noise, and what was missing. It writes one row of offline labeled data for eval
@@ -73,23 +81,24 @@ are fail-soft: an unreachable server is a silent no-op.
 
 | Event | Script | What it does |
 |-------|--------|--------------|
-| `Stop` | `ingest_hook.py` | Pushes a bounded tail of the session transcript to `/ingest` after every turn. This is how sessions become memory, and it works over the network, so a work laptop can feed a central Synapse. |
-| `SessionStart` | `skills_sync.py` | Two-way sync between the server and `~/.claude/skills` (plus `.claude/skills` at the session's project root: the marker's folder or the git toplevel, which Claude Code reads from any subfolder). Newest edit wins per skill, with an append-only server-side history. A local delete never retires anything; a skill retired on the server, moved to another scope, or not this machine's to read (a work-role machine gets only its allowlisted projects' skills) is removed from machines whose copy is still exactly a version Synapse delivered (whatever its timestamp); a copy edited after a retirement is pushed back instead. Off by default. |
-| `SessionStart` | `config_sync.py` | Mirrors your `CLAUDE.md` and `rules/*.md` to the server so the dream lane can propose config edits. Off by default. |
-| `SessionStart` | `git_feeder.py` | Pushes commit subjects from repos listed in `SYNAPSE_TIMELINE_REPOS` to the server's timeline. Off until configured. |
+| `Stop` | `ingest_hook.py` | Pushes the part of the session transcript past a durable per-file cursor to `/ingest` after every turn (the cursor advances only after a successful POST; the last turn is re-shipped once because Claude Code may still be writing it). A first run on a transcript ships its last 400 records. While the server captures web research it also ships the session's sub-agent transcripts (`subagents/**/agent-*.jsonl`) and inlines large saved tool outputs of web-research calls. This is how sessions become memory, and it works over the network, so a work laptop can feed a central Synapse. |
+| `SessionStart` (startup, resume) | `skills_sync.py` | Two-way sync between the server and `~/.claude/skills` (plus `.claude/skills` at the session's project root: the marker's folder or the git toplevel, which Claude Code reads from any subfolder). Newest edit wins per skill, with an append-only server-side history. A local delete never retires anything; a skill retired on the server, moved to another scope, or not this machine's to read (a work-role machine gets only its allowlisted projects' skills) is removed from machines whose copy is still exactly a version Synapse delivered (whatever its timestamp); a copy edited after a retirement is pushed back instead. Off by default. |
+| `SessionStart` (startup, resume) | `config_sync.py` | Mirrors your `CLAUDE.md` and `rules/*.md` to the server (all files in one request) so the dream lane can propose config edits. Off by default. |
+| `SessionStart` (startup, resume) | `git_feeder.py` | Pushes commit subjects from repos listed in `SYNAPSE_TIMELINE_REPOS` to the server's timeline. Off until configured. |
 | `SessionStart` | `board_block.py` | Prints the board (`GET /context`) into the session's context: curated note hooks, the last week's milestones, and what memory exists at all. Server-rendered, hard-capped (~80 lines / ~2K tokens), scoped to the session's project (labelled like every hook: `.synapse-project` marker, else git toplevel, else folder name). On a 401 from an unenrolled machine it prints why instead. |
 | `SessionStart` | `preferences_block.py` | Prints your top standing preferences (max 8 lines) from `/preferences/top`. Not query-scoped, because preferences are few and apply to every turn. |
-| `SessionStart` | `ingest_hook.py --catchup` | Sweeps up transcripts from sessions that ended without the `Stop` hook shipping them: anything modified in the last `SYNAPSE_INGEST_CATCHUP_DAYS` (default 3), plus any transcript whose upload failed, however old. When uploads keep failing, it prints one line saying since when and why. Transcripts the hook never tried to upload, such as history from before install, are left to `synapse-import`. |
+| `SessionStart` (every start) | `ingest_hook.py --catchup` | Sweeps up transcripts from sessions that ended without the `Stop` hook shipping them: anything modified in the last 3 days (a constant, at most 20 files per start), plus any transcript whose upload failed, however old. When uploads keep failing, it prints one line saying since when and why; on `/clear` or compaction it only repeats that warning. Transcripts the hook never tried to upload, such as history from before install, are left to `synapse-import`. |
 | `SessionStart` | `remember_spool.py session-start` | Probes the write lane. Server up and the spool non-empty means it flushes; server down means it tells the model to route memory writes through the CLI until it recovers. |
-| `SessionEnd` | `private_mode.py --session-end` | Removes the local private-mode marker for the session that just ended. The server-side row is left in place on purpose. |
-| `UserPromptSubmit` | `recall_nudge.py` | One static ~45-token line per prompt reminding the model to use recall/remember, plus a wall-clock timestamp so `remember()` and timeline references know the current moment. Zero latency, zero API calls. Off with `SYNAPSE_RECALL_NUDGE=0`. |
-| `PostToolUse` (recall, recall_full_turns) | `recall_feedback_nudge.py` | One line reminding the model to close the retrieval-quality loop with `recall_feedback`. Off by default: the labels only help whoever is tuning the retrieval stack. |
+| `SessionEnd` | `private_mode.py --session-end` | Removes the local private-mode marker for the session that just ended. The server-side row is left in place on purpose. Private mode covers a session from the toggle onward; `private_mode.py on <id> --purge` also deletes the turns already stored. |
+| `UserPromptSubmit` | `recall_nudge.py` | One static ~45-token line per prompt reminding the model to use recall/remember, plus a wall-clock timestamp so `remember()` and timeline references know the current moment. Zero latency, zero API calls. Off with `SYNAPSE_RECALL_NUDGE=0` (or `synapse config recall_nudge off`). |
+| `PostToolUse` (recall, recall_full_turns) | `recall_feedback_nudge.py` | One line reminding the model to close the retrieval-quality loop with `recall_feedback`. Off by default, on Codex too: the labels only help whoever is tuning the retrieval stack. |
 | `PostToolUse` (remember) | `remember_spool.py post-tool-use` | When `remember()` comes back without a confirmed write, spools the intent locally and tells the model it is queued, not saved. |
 | `PreToolUse` (synapse tools) | `self_session_inject.py` | Injects the calling session's id so serving can exclude the session's own episodes (already in the model's context) and so feedback and remembered episodes attach to the right session. The model cannot know its own session id. |
 
-The dream to skills lane (mines your transcripts, proposes new skills, retunes triggers,
-nominates merges) runs server-side in the `dream` container. You do not run a cron; you
-review what it proposes with `/synapse:skill-review`.
+The dream lanes (skills: mines your transcripts, proposes new skills and retunes triggers;
+config: proposes behavioral rules you corrected the agent on; notes: merges duplicate notes)
+run server-side in the `dream` container, all on by default. You do not run a cron; you
+review what the first two propose with `/synapse:skill-review` and `/synapse:config-review`.
 
 > Recall-injection (a `UserPromptSubmit` hook that pushed memory *results* into every prompt)
 > was removed: unconditional top-k injection added noise and anchored the model on stale
@@ -122,6 +131,12 @@ Set by `synapse login`, changed with `synapse config <key> <value>`:
 | `skills_sync` (`SYNAPSE_SKILLS_SYNC`) | Two-way skill sync. `synapse login` asks ("Sync skills to this machine?"); off when unanswered. |
 | `config_sync` (`SYNAPSE_CONFIG_SYNC`) | Mirrors config for the dream lane. Off by default. |
 | `config_paths` (`SYNAPSE_CONFIG_PATHS`) | Optional extra globs (relative to `~/.claude`) to mirror. |
+| `timeline_repos` (`SYNAPSE_TIMELINE_REPOS`) | Repo paths for the timeline git feeder. |
+| `board` (`SYNAPSE_BOARD`) | The session-start board block. |
+| `prefs_block` (`SYNAPSE_PREFS_BLOCK`) | The session-start preferences block. |
+| `recall_nudge` (`SYNAPSE_RECALL_NUDGE`) | The per-prompt recall/remember reminder. |
+| `prompt_timestamp` (`SYNAPSE_PROMPT_TIMESTAMP`) | The per-prompt timestamp line. |
+| `recall_feedback_nudge` (`SYNAPSE_RECALL_FEEDBACK_NUDGE`) | The post-recall `recall_feedback` reminder (off by default). |
 
 The Claude plugin's install prompt asks only for `SYNAPSE_URL` and an optional fallback
 token; `synapse login` fills in the URL.
@@ -134,10 +149,14 @@ Env or `settings.json` only:
 | `SYNAPSE_BOARD` | `0` disables the session-start board block. |
 | `SYNAPSE_PREFS_BLOCK` | `0` disables the session-start preferences block. |
 | `SYNAPSE_RECALL_NUDGE` | `0` disables the per-prompt recall/remember reminder. |
-| `SYNAPSE_RECALL_FEEDBACK_NUDGE` | `1` enables the post-recall reminder to label results via `recall_feedback` (default off: the labels are offline tuning data). |
-| `SYNAPSE_PROMPT_TIMESTAMP` | `0` disables the per-prompt timestamp line (`[Wed 2026-08-26 15:55:01 EDT]`, host-local time; on by default so `remember()` and timeline references know the current moment, weekday included). |
-| `SYNAPSE_DATA_DIR` | Where the memory-write spool and lane state live (default `~/.local/share/synapse-skills`). |
+| `SYNAPSE_RECALL_FEEDBACK_NUDGE` | `1` enables the post-recall reminder to label results via `recall_feedback` (default off in both harnesses: the labels are offline tuning data). |
+| `SYNAPSE_PROMPT_TIMESTAMP` | `0` disables the per-prompt timestamp line (`[Wed 2026-08-26 15:55:01 EDT]`, host-local time; on by default, in both harnesses, so `remember()` and timeline references know the current moment, weekday included). |
+| `SYNAPSE_DATA_DIR` | Where the ingest cursors, the retry bookkeeping and the memory-write spool live (default `~/.local/share/synapse-skills`). |
+| `CLAUDE_PROJECTS_DIR` | Transcript root for the ingest hook's catch-up sweep and `synapse import` (default `~/.claude/projects`). |
+| `SYNAPSE_HOME` | The client's config directory (default `~/.synapse`): `config.json`, the installed client, and the hook logs. |
 | `SYNAPSE_INGEST_URL` | Legacy full-endpoint override, still honored. |
+
+The six switches above (`SYNAPSE_TIMELINE_REPOS` through `SYNAPSE_PROMPT_TIMESTAMP`) are also `synapse config` keys, so they can be set without editing the environment. The sweep window (3 days, 20 files per start, 300 s grace for a live session) is a constant shared by the Claude and Codex hooks, not a knob. Every client hook logs to `~/.synapse/logs/<name>.log` (`ingest-hook`, `codex-hook`, `remember-spool`, `mcp_headers`), each capped at 64 KB; the `SYNAPSE_INGEST_*`, `SYNAPSE_SPOOL_*` and `SYNAPSE_CODEX_CATCHUP*` variables of earlier releases are no longer read.
 
 Server-side configuration is a separate list:
 [ARCHITECTURE.md §13](../ARCHITECTURE.md#13-configuration).
@@ -147,10 +166,15 @@ Server-side configuration is a separate list:
 Everything below goes only to the Synapse URL **you** configure. All hooks are fail-soft: an
 unreachable server is a silent no-op.
 
-- **Transcript ingest** — **on** (the core function). Sends the raw JSONL tail of each
-  session transcript: your prompts, Claude's replies, tool calls. Per-session opt-out is
-  [private mode](../plugin/README.md#private-mode). No global toggle: if transcripts
-  shouldn't leave the machine at all, don't install the plugin.
+- **Transcript ingest** — **on** (the core function). Sends the raw JSONL of each session
+  transcript past the upload cursor: your prompts, Claude's replies, tool calls. Per-session
+  opt-out is [private mode](../plugin/README.md#private-mode) (from the toggle onward;
+  `--purge` also deletes what was already stored). No global toggle: if transcripts
+  shouldn't leave the machine at all, don't install the plugin. Once the server says it
+  captures web research (`SYNAPSE_WEB_CAPTURE`, off by default), the hook also sends the
+  session's sub-agent transcripts and, for web-research-shaped calls only, the text of the
+  large tool outputs Claude Code saved under `~/.claude/projects` (at most 1 MB each, 2 MB
+  per upload); a private session sends neither.
 - **Skill sync** — **off** (opt-in). When enabled, sends skill bodies and bundled files and
   pulls server versions back into `~/.claude/skills` at session start. On:
   `SYNAPSE_SKILLS_SYNC=1`.

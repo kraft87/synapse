@@ -10,7 +10,7 @@ dream→skills lane all run server-side.
 ## What it does
 
 Thirteen hooks (`hooks/hooks.json`) plus MCP wiring. In short: a `Stop` hook ships each
-session's transcript tail to `/ingest`, a set of `SessionStart` hooks print the board and
+session's transcript, past a durable upload cursor, to `/ingest`, a set of `SessionStart` hooks print the board and
 your standing preferences into context (and optionally sync skills and config), a
 `UserPromptSubmit` hook keeps recall/remember present, and `PreToolUse`/`PostToolUse` hooks
 wire session identity and the memory-write spool. Every hook is fail-soft: an unreachable
@@ -19,9 +19,9 @@ server is a silent no-op.
 The per-hook table, the MCP tool list, every configuration variable, and exactly what leaves
 your machine: **[docs/tools.md](../docs/tools.md)**.
 
-The dream→skills lane (mines your transcripts → proposes new skills, retunes triggers,
-nominates merges) runs server-side in the `dream` container — you don't run a cron. You
-just review what it proposes with `/synapse:skill-review`.
+The dream→skills lane (mines your transcripts → proposes new skills and trigger retunes)
+runs server-side in the `dream` container, on by default — you don't run a cron. You just
+review what it proposes with `/synapse:skill-review`.
 
 ## Setup
 
@@ -124,7 +124,11 @@ POST). Safe to Ctrl-C and re-run: the server dedups turns by `span_id`, so a re-
 where it left off, and one bad file never stops the rest.
 
 Cursor history is importable too, but only as a server-side dev path for now
-(`python -m ingestion.cursor_sqlite_backfill` on the Synapse host).
+(`python -m ingestion.backfill --source cursor <path>` on the Synapse host; the same driver
+takes `--source codex|claude-ai|chatgpt`). `synapse import` inlines the large tool outputs
+Claude Code saved to disk only while the server's last upload reply said it captures web
+research, so the first batch on a fresh install goes without; use `synapse capture
+--backfill` (below) for research history.
 
 ### 5. Verify it's working
 
@@ -151,13 +155,15 @@ you installed the plugin still needs `synapse-import` (step 4).
 
 Slash commands:
 
-- **`/synapse:skill-review`** — triage dream→skills proposals (new skills, trigger retunes,
-  merges): list → show (a diff against the current skill) → accept or reject. Accept applies
+- **`/synapse:skill-review`** — triage dream→skills proposals (new skills, trigger retunes):
+  list → show (a diff against the current skill) → accept or reject. Accept applies
   the change: the server writes it into its skill registry and the two-way skills sync
   delivers it to the machine that owns the skill at its next session start. Nothing touches
   your live skills without an explicit accept.
-- **`/synapse:config-review`** — triage dream→config proposals. Only relevant with config
-  mirroring on.
+- **`/synapse:config-review`** — triage dream→config proposals (accept or reject), and
+  `apply` writes every accepted rule, including the ones approved on the dashboard, to the
+  learned-rules file on this machine. Only relevant with config mirroring on; the mirror
+  is sent in one request.
 - **`/synapse-devices`** lists, mints, or revokes the per-device credentials that decide
   what each machine is served ([docs/auth.md](../docs/auth.md)).
 
@@ -174,6 +180,11 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
 - **`synapse import`** / **`! synapse-import`** — backfill your existing history (step 4).
+- **`synapse capture --dry-run|--backfill [--since 30d]`** — web-research capture. `--dry-run`
+  asks the server what it would store from your Claude Code and Codex history (sub-agent
+  transcripts included) and writes nothing; `--backfill` posts that history (and asks first,
+  because turns the server has not stored are ingested and extracted too) and needs the
+  server to have `SYNAPSE_WEB_CAPTURE=on`. An older server answers "update the server".
 - **`synapse private on [--purge]|off [--forget]|status <session-id>`** — private mode (below).
 
 ## Retiring a skill

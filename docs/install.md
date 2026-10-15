@@ -44,7 +44,7 @@ the `CHANGEME` placeholder, and prints what to do about it. The one exception is
 serves **every** caller restricted, which means an empty board and empty recalls. It is for
 poking at a throwaway stack, not for running one.
 
-Optional knobs (`SYNAPSE_INGEST_TAIL`, `POLL_INTERVAL_SECONDS`, recall-serving tuning such
+Optional knobs (`POLL_INTERVAL_SECONDS`, `SYNAPSE_DRAIN_CONCURRENCY`, recall-serving tuning such
 as the `SYNAPSE_RECALL_FLOOR` abstention floor, which every `examples/env` preset pins to
 the value calibrated for its reranker, and more) are listed in
 [ARCHITECTURE.md §13](../ARCHITECTURE.md#13-configuration). Set `LOGFIRE_TOKEN` to stream
@@ -62,7 +62,10 @@ MCP server, and the `dream` container, and applies the schema automatically on P
 first boot.
 
 If the default ports are taken, set `MCP_PORT` and/or `POSTGRES_HOST_PORT` in `.env` before
-starting. See [Ports and a second instance](#ports-and-a-second-instance).
+starting. See [Ports and a second instance](#ports-and-a-second-instance). Postgres (and the
+opt-in local-inference port) publish on `127.0.0.1` only; to reach Postgres from another
+machine, uncomment the override line in `compose.yml`'s `postgres` ports block, or tunnel
+over ssh.
 
 ## 3. Mint this machine's device token
 
@@ -179,7 +182,15 @@ first import by date bounds the spend. The server dedups turns by `span_id`, so 
 and re-running are always safe: an interrupted import resumes where it left off.
 
 Cursor history can be imported too, but only as a server-side dev path for now
-(`python -m ingestion.cursor_sqlite_backfill`).
+(`python -m ingestion.backfill --source cursor <path>`; the same driver takes
+`--source codex|claude-ai|chatgpt`).
+
+Web research is a separate, opt-in capture (`SYNAPSE_WEB_CAPTURE=on`): run
+`synapse capture --dry-run` first to see what it would store from your history, then turn it
+on, and `synapse capture --backfill --since 30d` imports past research. Rules for sources of
+your own go in a directory you mount into the `mcp-server` container
+(`SYNAPSE_CAPTURE_DIR`); they run as code on the server, so keep it read-only and trusted.
+See [ARCHITECTURE.md §8](../ARCHITECTURE.md#8-web-research-subsystem).
 
 ## Model ids: one thing that bites
 
@@ -251,7 +262,9 @@ garbage, and switching stacks after the fact means an empty data volume.
 ## Ports and a second instance
 
 `MCP_PORT` sets both the server's listener and the published host port. `POSTGRES_HOST_PORT`
-does the same for Postgres. To run a second stack on the same host (a test instance
+does the same for Postgres, on `127.0.0.1` only (the compose file has a commented line to
+publish it on every interface; an existing deployment must re-apply `compose.yml` for a
+change to the binding to take effect). To run a second stack on the same host (a test instance
 alongside a live one), set both plus `COMPOSE_PROJECT_NAME`, so the two get separate
 containers and volumes.
 
@@ -259,14 +272,52 @@ containers and volumes.
 
 First-boot init never re-runs on an existing data volume. To bring an existing database up
 to date, run [`scripts/apply_schema.sh`](../scripts/apply_schema.sh) (the single source of
-truth for migration order) against it — see the script's header for caveats.
+truth for migration order) against it. It applies only the files newer than the database's
+`schema_version` stamp (a fresh database gets all of them), so "pull, run `apply_schema.sh`,
+restart" is the whole upgrade. `--all` re-applies every file (each is safe to repeat, but it
+repeats their backfills too, so it is slow on a big database) and `--from NNN` starts at a
+number; a database that has tables but no stamp (it predates migration 034) is refused until
+you pass one of them. The `postgres` service now has `shm_size: 1g`; re-apply `compose.yml`
+(`docker compose up -d --remove-orphans`) to pick that and any other compose change up.
 
 Every service verifies at boot that the database schema matches the code (the script
 stamps the applied version; a mismatch refuses to start with instructions rather than
-failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, restart.
-`SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
-`-- schema-check: optional` boots with a warning: the code shipped with them runs without
-them and keeps its old behaviour until they are applied.
+failing mid-request). `SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind
+only by migrations marked `-- schema-check: optional` boots with a warning: the code shipped
+with them runs without them and keeps its old behaviour until they are applied, so the image
+can land first. A migration that builds an index `CONCURRENTLY` cannot run in a
+transaction: do not use `psql -1`, and if a build fails drop the INVALID index it left and
+run the file again.
+
+**The optional migrations** of the current release, all safe to apply after the image is
+running (HANDOFF.md has the order and what each needs by hand):
+
+- `062` `extraction_queue.chunk_id` and its indexes (on a populated queue build the
+  `episode_id` index `CONCURRENTLY` first; the command is in the file header);
+  `063` the partial index of unembedded episodes (`CONCURRENTLY`).
+- `064` `timeline_events.reported_refs`; `068` the dream lane cursors; `069` / `070` the
+  skills ledger's open-identity index and draft-attempt columns (apply `069` soon after the
+  image, and never roll the image back past it); `071` `notes_history`; `073` `deleted_turns`
+  (delete tombstones); `076` `research_archive`.
+- `065` the live-edge hop indexes, `066` the retrieval-count index drop and fillfactor,
+  `067` the chunks vector index (only needed to turn on `SYNAPSE_RECALL_CHUNK_CANDIDATES`),
+  `074` the GIN on `kg_relationships.episodes`, `075` the redundant-index drop: all
+  `CONCURRENTLY`. Apply `074` before any project relabel.
+- `072` backfills `t_created` / `entity_subtype` for the dashboard. On a populated table run
+  its three `UPDATE`s, then build `kg_rel_t_created_idx` `CONCURRENTLY` by hand with the
+  command in the file header, instead of running the file whole.
+
+Two one-off scripts accompany this release, both idempotent and counts-only (run each with
+`--dry-run` first): `python scripts/backfill_normalized_name.py` (entities with a NULL
+`normalized_name` are invisible to dedup now that the unindexed fallback lookup is gone, with
+no migration involved) and `python scripts/restamp_date_only_dates.py` (fact dates stored at
+UTC midnight move to noon UTC, so the user's calendar day survives).
+
+Anything outside the repo that runs `python -m ingestion.cursor_sqlite_backfill`,
+`ingestion.codex_backfill`, `ingestion.claude_ai_backfill` or `ingestion.openai_backfill`
+must switch to `python -m ingestion.backfill --source {cursor,codex,claude-ai,chatgpt} <path>`
+before the image lands; those modules are gone. A client-side web-capture cron is retired
+the same way once `SYNAPSE_WEB_CAPTURE=on` (ARCHITECTURE.md §8).
 
 Clients follow the server: `synapse update` on each machine fetches the client version the
 server now serves (the same `/install`), updates the Claude Code plugin, and keeps Codex's
@@ -309,9 +360,9 @@ gets a release note saying so.
   `connection refused` or `timed out` means the server is down or unreachable. Nothing is
   lost: every session start retries the failed transcripts, at any age, until they upload.
   The line goes away after the first successful upload. The hook log
-  (`/tmp/synapse-ingest-hook.log`, `SYNAPSE_INGEST_LOG`) has each failure. Codex CLI
+  (`~/.synapse/logs/ingest-hook.log`) has each failure. Codex CLI
   sessions show the same line from the Codex hooks, which log to
-  `/tmp/synapse-codex-hook.log` (`SYNAPSE_CODEX_HOOK_LOG`).
+  `~/.synapse/logs/codex-hook.log`.
 - **"SYNAPSE_INGEST_TOKEN from your environment is ignored" at session start.** An old token
   is still exported from your shell profile or from the `env` block of `settings.json`. This
   machine is enrolled, so the hooks already use its device token. Delete the export from the
@@ -334,8 +385,8 @@ gets a release note saying so.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device
   Flow" on the GitHub OAuth App; fall back to `synapse login --browser`.
 - **A service refuses to start, complaining about the schema version.** Run
-  `scripts/apply_schema.sh` against the database, then restart. See
-  [Upgrading](#upgrading).
+  `scripts/apply_schema.sh` against the database, then restart (`scripts/apply_schema.sh
+  --all` when the database has no stamp). See [Upgrading](#upgrading).
 
 ## Next
 

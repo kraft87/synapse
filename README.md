@@ -37,23 +37,41 @@ on the same reader class.
 
 ```
 Claude Code session
-   │  Stop hook ships a bounded transcript tail
+   │  Stop hook ships the transcript past a durable cursor
    ▼
 POST /ingest ──► episodes (Postgres) ──► sliding-window chunks ──► KG fact extraction (Haiku)
                                                                          │
 session asks synapse:recall ──► MCP server fuses, in parallel:           ▼
    • reranked episode leg (BM25 + vector)                          knowledge graph
    • knowledge-graph fact leg (vector + BM25 + 1-hop)               (Postgres)
+   • notes leg (your curated memories)
    • web-research leg
    • bitemporal history leg ("what was true then vs now")
    ▼
 compact, ranked result
 ```
 
-A `Stop` hook pushes the tail of each session transcript to `/ingest`, detached, never
-blocking the turn; genuinely-new turns are stored as episodes. A background poller groups
-episodes into overlapping chunks and mines them for entities and bitemporal facts. `recall()`
-runs its legs in parallel and returns one compact, ranked result.
+A `Stop` hook pushes the part of each session transcript the server has not stored yet to
+`/ingest`, detached, never blocking the turn; genuinely-new turns are stored as episodes. A
+background poller groups episodes into overlapping chunks and mines them for entities and
+bitemporal facts. `recall()` runs its legs in parallel and returns one compact, ranked
+result.
+
+**What is stored, and what is not.** Everything your agents say and do in a session
+(prompts, replies, tool calls and results) is stored on your server, except sessions you
+mark private (`synapse private on <session>`; `--purge` also deletes what was already
+stored). Known credential shapes are redacted before storage. Web research is captured only if you turn it on
+(`SYNAPSE_WEB_CAPTURE=on`, off by default; `synapse capture --dry-run` shows what it would
+keep): public pages and result lists an agent fetched, with their URL and the
+session, project and device that fetched them. It never stores private sessions, non-public
+URLs, Synapse's own tools, browser automation, personal-data connectors (mail, calendar,
+drive) or shell output, and once the server says it captures, the Stop hook also sends a
+session's sub-agent transcripts and the large tool outputs Claude Code saved to disk (only
+for web-research-shaped calls, at most 1 MB each).
+
+**Upgrading** an existing install is `pull`, apply the migrations
+(`scripts/apply_schema.sh`), restart; [HANDOFF.md](HANDOFF.md) lists what each release needs
+by hand, and a migration marked optional can be applied after the new image is running.
 
 Architecture, design decisions, and the measurements behind them:
 [ARCHITECTURE.md](./ARCHITECTURE.md).

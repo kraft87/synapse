@@ -43,7 +43,12 @@ The rules and the wording are the Claude plugin's: the Stop hook imports
 `../plugin/scripts/synapse_ingest_retry.py` from this checkout instead of keeping
 a copy, the same way the skills sync shares its engine. The sweep never picks up
 a rollout the hook didn't try to upload, so history from before install still
-needs `python -m ingestion.codex_backfill`.
+needs `python -m ingestion.backfill --source codex` (on the Synapse host; it defaults to `~/.codex/sessions`).
+
+Web research is captured server-side (when the server has `SYNAPSE_WEB_CAPTURE=on`) from
+the MCP and function tool calls in a rollout, which carries tool output inline. Codex's
+native `web_search` records the query and no results, so it cannot be captured; an MCP
+search tool can. `synapse capture --dry-run` (Claude plugin CLI) also walks `~/.codex/sessions`.
 
 Not ported (machine-level curation lanes, run them from Claude Code; running
 them from both hosts would double-sync): config_sync, git_feeder (board git

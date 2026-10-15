@@ -1,7 +1,7 @@
 # Dashboard API contract
 
 The operator dashboard (issue #12) is a React/esbuild single-bundle app served by the
-MCP server process. This file pins the wire contract between `mcp_server/dashboard_routes.py`
+MCP server process. This file pins the wire contract between `mcp_server/dash/`
 (server) and `web/` (client) — both sides build to THIS document; change it before changing
 either side. Design source of truth: the handoff bundle (prototype + spec), not committed here.
 
@@ -197,15 +197,14 @@ The `debug` envelope surfaces the SAME numbers the engine already measures for t
  "debug": {
    "total_ms": 341.0,
    "legs_ms": {"embed": 12.0, "bm25": 48.0, "vector": 96.0, "kg": 141.0,
-               "web": 4.0, "rerank": 168.0, "timeline": 33.0},
+               "notes": 21.0, "web": 4.0, "rerank": 168.0},
    "pool_sizes": {"bm25": 100, "vector": 100, "fused": 100, "kg_candidates": 12},
    "rerank": {"model": "rerank-3-lite", "top_score": 0.91},
    "est_tokens": 1874}}
 ```
 
 `legs_ms` carries only legs the engine timed. `embed / bm25 / vector / kg / web / rerank`
-are always present; `notes` is present when the notes leg ran (`SYNAPSE_RECALL_NOTES`, on by
-default); `timeline` is no longer emitted (the inline timeline leg was removed from
+are always present, and so is `notes` (the notes leg always runs); `timeline` is no longer emitted (the inline timeline leg was removed from
 `recall()` on 2026-08-07) and the waterfall renders an omitted leg as untimed/skipped. The
 Served tab shows what the payload carries: `episodes`, `facts`, `notes` (`{id, hook, note}`),
 `web` and `superseded_facts`; the entity, community, timeline and preference buckets are
@@ -265,10 +264,10 @@ a dedicated slim endpoint ships now and can be superseded by the aggregate later
 A THIN review console over the two independent proposal lanes
 (`skills_lane.skill_gap_candidates`, schema 022/027; `config_lane.config_proposals`,
 schema 030). The dashboard REUSES each lane's own `_proposal_act` (state transition +
-side effects) and `_proposal_detail` (row read) from `mcp_server/skill_sync_routes.py`
+side effects) and `_proposal_detail` (row read) from `mcp_server/skill_review_routes.py`
 and `mcp_server/config_sync_routes.py`; it never reimplements them. Approving a skill
-proposal applies it, because the skills lane's accept does; config apply stays with the
-config CLI. Proposal ids are namespaced
+proposal applies it, because the skills lane's accept does; a config approval only marks
+the rule `accepted`, and the config CLI's `apply` writes it to disk. Proposal ids are namespaced
 `"skill:<n>" | "config:<n>"`; kinds normalize to `"skill" | "config-edit"`.
 
 ### GET /dash/api/proposals?status&kind
@@ -287,8 +286,10 @@ Unified, lane-merged list + the nav-badge count.
   decided rows never pushes an unreviewed candidate out of the window), then merged and
   re-sorted by `created_at`.
 - Statuses shown: skills `{proposed, accepted, promoted, rejected}`, config
-  `{proposed, accepted, applied, rejected}`. `observe` (pre-graduation) and skills'
-  `retired` (decayed) are NOT proposals and are excluded.
+  `{proposed, accepted, applied, rejected}`. A skill proposal no longer reaches `accepted`
+  (accept applies and promotes it in one step); the status stays in the filter for rows
+  accepted earlier. `observe` (pre-graduation) and skills' `retired` (decayed) are NOT
+  proposals and are excluded.
 - `status` filters to one status (in SQL, before the cap); `kind` (`skill`|`config-edit`) to one lane. `status=all` == unset.
 - `pending_count` = `status='proposed'` across BOTH lanes, **independent** of the view
   filters — the header Review badge reads it (accent pill, dark text; hidden at 0).
@@ -319,38 +320,39 @@ Normalized detail over the lane's `_proposal_detail`.
 ```json
 body: {"action": "approve" | "reject", "note": "…"}
 ```
-- A decision applies only to a `proposed` row. Any other status (an applied config, a
-  promoted or already-rejected skill, a double click) returns
-  `{"status": "refused", "detail": "proposal is '<status>', not 'proposed'"}`, changes
-  nothing and writes no audit row; the Review page reloads to show the real status. The
-  check is a read before the lane's update, so two decisions landing in the same instant can
-  still both pass; closing that is the lanes' job.
+- A decision applies only to a `proposed` row, and the check is part of the lane's own
+  update (config: the UPDATE's `WHERE status = ANY(...)`; skills: under the candidate's row
+  lock), so two decisions landing together cannot both win. A row that is no longer
+  `proposed` (an applied config, a promoted or already-rejected skill, a double click)
+  answers **HTTP 409** with `{"status": "conflict", "id": …, "detail": "proposal is
+  '<status>', not 'proposed'"}`, changes nothing and writes no audit row; the Review page
+  says the proposal was already decided and reloads. The skills lane's own refusals (no
+  draft yet, a stale draft, a name taken) stay HTTP 200 `{"status": "refused", …}`.
 - `approve` → the lane's `_proposal_act(..., "accept", ...)`, delegating the lane's own accept:
   - **skills**: applies the proposal. The drafted `proposal_body` is written to
     `skills_lane.skill_registry` through the same upsert `/skills/publish` uses (the two-way
     sync then delivers it to the owning machine), a grounded `accept` signal is appended, the
-    roll-ups recomputed, and `status='promoted'`. A merge proposal (consolidate) is only
-    recorded (`status='accepted'`). When the lane refuses (no draft yet, the registry body
+    roll-ups recomputed, and `status='promoted'`. When the lane refuses (no draft yet, the registry body
     changed since drafting, a new skill's name is taken) it returns
     `{"status": "refused", "detail": …}`, nothing changes and no audit row is written; the
     Review page shows the detail. Overrides (`--force`, `--body-file`, `--scope`) are CLI-only.
-    The lane's accept takes an advisory `llm` callable (a routing-eval on RETUNE candidates —
-    an Anthropic call that only annotates the result). The dashboard passes a **stub**
-    returning a skip note; the real eval runs in the skills CLI.
   - **config**: sets `status='accepted'`, keeps the stored blast-radius `scope` (the
     dashboard never re-scopes → `scope=None`). Materializing (`applied` = the disk write)
-    stays with the config CLI.
+    stays with the config CLI, which lists accepted rows (APPROVED) and has
+    `config_review apply` to write them all; until someone runs it on a machine the row
+    stays `accepted`.
 - `reject` → the lane's `_proposal_act(..., "reject", note)`. **`note` is REQUIRED**
   (non-empty; 400 otherwise) and becomes the lane's `reject_reason`.
 - Every decision that changed something appends a `dashboard_audit` row: `action` `proposal_approve|proposal_reject`,
   `kind` (`skill|config-edit`), `item_id` (the namespaced id), `detail` `{note, lane_result}`.
 - Returns the lane's own result dict. 404 when the row is absent.
 
-**30-day reject cooldown.** The **skills** lane implements it (sets
-`rejected_until = now() + interval '30 days'` on reject; its own list hides cooldowned rows)
-— the dashboard reject surfaces it via the lane's act, no extra code. The **config** lane
-has **no cooldown** (`config_proposals` has no `rejected_until` column). This is a GAP,
-left to the config lane to add rather than bolted onto the dashboard.
+**30-day reject cooldown.** Both lanes implement it, and the dashboard reject surfaces it
+via the lane's act, no extra code. The **skills** lane sets
+`rejected_until = now() + interval '30 days'` on reject (its own list hides cooldowned
+rows). The **config** lane derives the window from `config_proposals.updated_at` (no
+`rejected_until` column): a rule corrected again inside the 30 days after its rejection
+only adds evidence.
 
 **Deviations / notes.**
 - The unified list does NOT reuse the lanes' `_proposals_list` (those return only `proposed`
@@ -519,10 +521,21 @@ Extraction-queue health. `window` parsing identical to `/metrics/recall` (defaul
   leaves `finished_at` NULL and does not pin it — else the latest unfinished one, or `null`
   when the table is empty ("no runs recorded yet"). `duration_s` = finished−started; `null`
   while a run is in flight.
-  `counts`/`samples`/`stages` carry only what the nightly lanes cheaply report today
-  (`proposals_raised` + the config lane's session/correction/proposal counts); the fuller
-  set (facts_extracted, superseded, dedup_merges, timeline_events) is honestly absent until a
-  lane reports it — the dream lanes propose, they do not extract facts.
+  `counts`/`samples`/`stages` carry what the nightly lanes report: `proposals_raised`
+  (the number of proposals awaiting review at the end of the run that were not awaiting
+  review at its start, so an older `observe` row promoted tonight counts), the config lane's
+  `config_*` counts (`config_proposals` is the rules that reached review that night, not
+  sightings; also `config_judge_unparsed`, `config_already_known`,
+  `config_applied_recurrences`, `config_observe_expired`), the skills lane's `skills_*`
+  counts (sessions judged, judge and detector unparsed replies, gaps, retune signals, fire
+  events, `skills_fires_over_cap`, dismissals, drafted, draft errors, retired), the notes
+  lane's counts (including `notes_judge_errors`; its samples are `samples.notes`) and
+  `recall_metrics_pruned` from the retention step (`stages` can include `retention`). The
+  fuller set (facts_extracted, superseded, dedup_merges, timeline_events) is honestly absent
+  until a lane reports it — the dream lanes propose, they do not extract facts. An
+  interrupted run (the process stopped mid-run; the next dream start closes the row) is
+  `ok = false` with `finished_at` null and the error `interrupted: the process stopped
+  before the run finished`.
 
 ### GET /dash/api/metrics/corpus
 Per-table row counts + 30-day sparkline, and the episodes-by-project / by-source
@@ -622,8 +635,12 @@ shape as `/metrics/ingestion`'s `last_dream`. `limit` ≤ 100. Empty table → `
    "errors": []}]}
 ```
 - The page opens on the newest run that has a `finished_at`; an unfinished run stays in the
-  picker, labelled "in flight" (started within 6 h) or "abandoned" (older: it crashed). A
-  duration under two minutes shows in seconds.
+  picker, labelled "interrupted" when its `ok` is false (whatever its age), "in flight"
+  (`ok` null, started within 6 h) or "abandoned" (`ok` null, older). A duration under two
+  minutes shows in seconds. Under the five cards the report lists every other count the run
+  recorded (`skills_*`, `config_*`, the notes counts, `recall_metrics_pruned`) as name/value
+  chips, and the Metrics "last nightly-dream run" panel lists all counts, never cutting a
+  long name.
 - The 5 stat cards read `counts.{facts_extracted, superseded, dedup_merges, timeline_events,
   proposals_raised}`; an **absent** count renders "—" (the dream lanes propose, they do not
   extract facts, so most of these are honestly absent today — see the Phase 4 honesty note).
@@ -646,7 +663,7 @@ The config-lane file mirror, grouped for the Behavior-files left list.
   fetch with `scope` + `surface`. `size` is `octet_length(content)`.
 
 ### GET /dash/api/behavior/file?key=…&scope=global&surface=
-One mirrored file's content + meta + parsed `[[wikilinks]]`. Reuses the `_fetch_config` seam.
+One mirrored file's content + meta + parsed `[[wikilinks]]`, read straight from `config_lane.config_registry`.
 ```json
 {"file_key": "CLAUDE.md", "content": "…full text…",
  "meta": {"surface_id": "cortex", "scope": "global", "abs_path": "…",
@@ -706,7 +723,7 @@ orphaned, and sets `truncated`.
   + superseded and let the client scrub client-side; the client re-queries with `as_of` only
   when a neighborhood was `truncated`. Edges with `t_valid IS NULL` are always visible.
 - Bounded end to end: every edge scan names the seed's `(owner_id, group_id)` (an entity's
-  edges live in its own group), so `kg_rel_src`/`kg_rel_tgt`/`kg_rel_pair` make per-node
+  edges live in its own group), so `kg_rel_pair` (owner, group, src, tgt) and `kg_rel_tgt` make per-node
   expansion cheap; no unbounded scan touches the ~75K-edge table. Node `entity_type` is
   `entity_subtype`. `node.color` is by `entity_type` (client `etColor`,
   matching the dossier/search surfaces); the legend shows the six supertype colors.
@@ -733,8 +750,9 @@ Migration 043 (`043_dash_notify.sql`) adds `dash_notify_feed()` + AFTER INSERT t
 The first DESTRUCTIVE surface the dashboard adds. Everything before this phase was
 read-only plus the `dashboard_flags` soft-flag (schema 042 explicitly called itself
 "deliberately NOT a delete"); phase 7 adds the real thing, because a flag does not
-satisfy "get this out of my memory". Both routes are **hard deletes** (no tombstone, no
-soft-delete column) and each runs in ONE transaction — a partial cascade is never
+satisfy "get this out of my memory". Both routes are **hard deletes** (no soft-delete column;
+the episode cascade leaves a `deleted_turns` tombstone so the turn is not re-ingested, see
+below) and each runs in ONE transaction — a partial cascade is never
 committed. Admin-gated like every `/dash/api/*` route.
 
 Route naming note: these are `/dash/api/episodes/{id}` and `/dash/api/facts/{id}`
@@ -748,11 +766,14 @@ no such episode → 404 `episode not found`.
 ```json
 {"episode_id": 227168, "chunks_deleted": 3, "chunks_mixed_deleted": 1,
  "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1,
+ "web_deleted": 0, "tombstoned": 1,
  "deleted_fact_ids": ["<edge-uuid>", "<edge-uuid>"], "deleted_event_ids": [8841]}
 ```
 `deleted_fact_ids` / `deleted_event_ids` name the rows the cascade removed (not the unlinked
-or kept ones), so a client can drop them from its lists. The audit row's `detail` is this
-same object.
+or kept ones), so a client can drop them from its lists. `web_deleted` counts the captured
+web pages and archive rows that went with the turn; `tombstoned` is the number of
+`deleted_turns` rows written (0 on a database without the optional migration). The audit
+row's `detail` is this same object.
 
 **Cascade semantics (the sole-vs-shared rule).** Provenance that names ONLY the deleted
 episode is deleted; provenance SHARED with surviving episodes is unlinked, not deleted.
@@ -782,18 +803,29 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
   multi-event-per-turn form written by `ingestion/timeline_gate.py`) → DELETED
   (`events_deleted`). `UNIQUE (source, source_ref)` makes the first telling's turn the
   owner, so the sole-vs-shared rule resolves to "delete"; leaving them would keep serving
-  the deleted turn's content out of `recall()`'s timeline leg. That includes an event a later
-  turn re-told: the dedup merge (schema 037) only bumps `reported_count` and records no
-  list of re-telling turns, so the cascade cannot tell whether one survives, and a kept row
-  would still carry the deleted turn's text. The private-session purge deletes them the same
-  way.
+  the deleted turn's content out of the board's "Last 7 days" block. An event a later turn
+  re-told is the exception once schema 064 (`reported_refs`) is applied: when it lists a
+  surviving turn, the event moves to the first such turn (its `source_ref` becomes the
+  first free `ep:<id>[#k]`, its `surface_id` takes that turn's stamp) and is not counted in
+  `events_deleted`; its text, written from the deleted turn, stays. Without 064, or with no
+  surviving re-teller, it is deleted. The private-session purge deletes them all.
 - **extraction_queue** rows. Those with an `episode_id` (FK, `ON DELETE CASCADE`, schema
-  001) carry a verbatim copy of `episodes.content`, and the FK takes them. Chunk rows
-  (`content_type = 'chunk'`) are keyed by `(session_id, content)` with no `episode_id`, so
-  the FK misses them: the cascade deletes the ones matching each deleted chunk, in every
-  status. A pending one would otherwise re-extract the deleted text into facts with no
-  provenance, and a done one still stores it. Not counted in the response (the operator
-  never sees the queue as memory).
+  001) follow the episode. A chunk's row follows the chunk via `chunk_id` (`ON DELETE
+  CASCADE`, schema 062); legacy chunk rows without a `chunk_id` are keyed by
+  `(session_id, content)`, so the cascade deletes the ones matching each deleted chunk, in
+  every status. A pending one would otherwise re-extract the deleted text into facts with
+  no provenance. Not counted in the response (the operator never sees the queue as memory).
+- **deleted_turns** (schema 073, optional). One tombstone per deleted turn, by `span_id` and
+  by content md5 within the project or working directory, written in the delete's own
+  transaction before the rows go. `ingestion.episode_writer` drops a matching turn, so a
+  re-shipped transcript, catch-up sweep, import or backfill does not bring it back
+  (`tombstoned` in the response). Tombstones are permanent; there is no undelete.
+- **web_artifacts** and **research_archive** rows captured from these turns, by
+  `parent_episode_id` (and, for a session purge, by `session_id`, which also takes a
+  sub-agent's captures: they belong to no turn, so a single-turn delete leaves them);
+  their chunks and queue rows follow by FK, and so do the facts the web lane extracted from
+  those pages (`kg_relationships.web_artifact_id`): deleted, or unlinked when a surviving
+  episode also backs them (`web_deleted`).
 - **dashboard_flags**: an ACTIVE flag on a deleted episode, fact or timeline event is
   retired (`removed_at`) so the Flags list can't point at a row that no longer exists. `dashboard_audit` gains a
   `delete_episode` row carrying the cascade summary as `detail` (append-only; the audit
@@ -811,8 +843,6 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
 - `recall_metrics` (incl. `served_ids`) and `recall_feedback` — analytics logs that
   reference ids historically; they hold no episode content and rewriting them would
   falsify the retrieval history.
-- `web_artifacts.parent_episode_id` — a soft pointer (no FK, by design) to independently
-  ingested WEB content, which is not the episode's content.
 - `synth_documents.source_ids` — generation is retired and the table is empty; left alone
   rather than given untested cascade code. **Known gap**: if segment-summary generation is
   ever revived, a summary of a deleted episode would retain its content and this route
@@ -821,11 +851,11 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
   facts can leave a zero-degree orphan entity; that is graph hygiene for a sweeper, not
   for this route.
 
-**One cascade, two callers.** The cascade above is `dashboard_routes.delete_episode_content`.
+**One cascade, two callers.** The cascade above is `mcp_server.dash.curation.delete_episode_content`.
 Private mode's session purge (`PUT /private-sessions/{id}?purge=1`,
 `mcp_server/private_session_routes`) runs it over every stored turn of a session in one
 transaction and, unlike this route, also deletes the preferences those turns gave birth to
-(a privacy purge errs toward removal). The cascade is set-based, so a fact citing several
+(a privacy purge errs toward removal); it writes the same tombstones. The cascade is set-based, so a fact citing several
 purged turns is counted once. The purge sits behind the client gate, not the admin gate,
 so it checks trust itself: a full-trust device may purge any session; a restricted device
 only a session whose every stored turn carries its own provenance stamp (schema 057);

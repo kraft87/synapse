@@ -88,8 +88,9 @@ COPY --from=webbuild /app/web/dist /app/web/dist
 # The Claude Code CLI is the one the Agent SDK wheel bundles (the extraction pipeline
 # in ingestion/llm_client.py spawns it; auth comes from CLAUDE_CODE_OAUTH_TOKEN or
 # ANTHROPIC_API_KEY at runtime), so uv.lock pins it and a Dependabot bump of
-# claude-agent-sdk is the only way it changes. The symlink puts it on PATH for the dream
-# lanes, which shell out to `claude -p`; `test -x` fails the build if a wheel stops
+# claude-agent-sdk is the only way it changes. The symlink only puts it on PATH, so an
+# operator can run `claude` by name in the container (the dream lanes call it through
+# ingestion/llm_client like the pipeline does); `test -x` fails the build if a wheel stops
 # bundling it, instead of shipping a dangling link.
 RUN ln -s /app/.venv/lib/python3.12/site-packages/claude_agent_sdk/_bundled/claude /usr/local/bin/claude \
     && test -x /usr/local/bin/claude

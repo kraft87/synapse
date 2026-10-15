@@ -63,6 +63,11 @@ path. `recall()` (the blended overview) does NOT get the filter: drill-down
 belongs in the drill-down tool, and the benchmarked overview serving path stays
 untouched.
 
+A `recall_full_turns` call serves up to ~40,000 characters of turn text (`FULL_TURN_BUDGET`).
+A turn that would pass it comes back as an excerpt (its first 1,000 characters plus the
+best-matching 2,000) with `full_chars`, exactly as `fetch_session` heads do, so the caller
+knows what `fetch(e:N)` expands to; `fetch` itself never cuts the first id it is asked for.
+
 ## Expected flow
 
 1. `recall("postponement of X")` → episode e:231910, `session: "8e92..."`.

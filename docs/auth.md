@@ -134,7 +134,6 @@ Human says nothing means personal; software says nothing means restricted.
 | `recall_full_turns` | n/a | same as recall | n/a |
 | `fetch(ids)` | `audience='work-safe'` only | same as recall | n/a |
 | `fetch_session` | n/a | same as recall, on the probe and both row reads | n/a |
-| `POST /timeline/recent` | n/a | same as the board | n/a |
 | `GET /preferences/top` | n/a | preferences from allowlisted projects only | n/a |
 | `/config/*` | n/a | its own mirrored config only; proposals mined only from its own sessions | n/a |
 | `/skills/*`, `skill://` resources | n/a | only `project:<p>` skills for allowlisted projects (any case); no global skill; publish only there; no retire, scope change or review | n/a |
@@ -151,10 +150,13 @@ turn ingested before 057, carry no stamp and stay reachable only through the all
 turn rewritten by a different credential loses its stamp. Until 057 is applied the server
 behaves exactly as before it: nothing is stamped, and the allowlist alone applies.
 
-The session-start routes (`/timeline/recent`, `/preferences/top`) and the config lane
-(`/config/*`) resolve the machine from its token as well, never from a `surface` field in
-the request. The root token is not a machine: it gets nothing from them, and a 403 on
-config writes.
+The session-start route `/preferences/top` and the config lane (`/config/*`) resolve the
+machine from its token as well, never from a `surface` field in the request. The root token
+is not a machine: it gets nothing from them, and a 403 on config writes. `/timeline/events`
+(the git feeder's push) stamps each event with the pushing device's surface (schema 057,
+probed; NULL for the root token and on a database without 057), so a restricted device's own
+git events are served back to it on the board's digest. `POST /timeline/recent` no longer
+exists: the board reads the digest directly.
 
 Resolution never fails open. No credential, no row, a non-approved row, a missing table, an
 unreachable database, a malformed row: all resolve to restricted with an empty allowlist. An
@@ -185,8 +187,10 @@ the work board next session.
 /synapse-devices revoke <surface_id>   # effective on that device's very next request
 ```
 
-These routes require a full-trust **device** token. The shared machine token is refused by
-design, so if the CLI reports 401 that is the reason.
+These routes (mint, list, `PUT`, revoke) take the admin gate with no fallback: a full-trust
+**device** token. The shared machine token is refused by design, so if the CLI reports 401
+that is the reason. A revoke answers `{status, surface_id, revoked}` (the `deleted` alias of
+0.16.x is gone).
 
 **Break-glass is not a token.** `synapse-admin` (`list` / `mint` / `revoke` / `bootstrap`)
 talks to Postgres over a direct DSN, so recovery needs shell access on the host, a strictly
@@ -243,9 +247,16 @@ claims read for the user's identity).
 ## Private mode
 
 Auth decides what a machine is *served*. Private mode decides what gets *captured*: it takes
-one session off the record, so nothing from it ever becomes memory. It is a plugin-side
-command, documented in
-[plugin/README.md](../plugin/README.md#private-mode).
+one session off the record, so nothing from it becomes memory from then on. It is a
+plugin-side command, documented in
+[plugin/README.md](../plugin/README.md#private-mode). Turns stored before the toggle stay
+unless asked for: the server reports how many (`stored_turns`), and
+`PUT /private-sessions/{id}?purge=1` (`private_mode.py on <id> --purge`) deletes them,
+together with the preferences derived from them and the web pages captured in the session,
+in one audited transaction. A purge is allowed to a full-trust device, or to a restricted
+device purging a session whose every turn carries its own stamp (schema 057); anyone else,
+the root token included, gets 403 with the flag still set and nothing deleted. A restricted
+device can therefore purge only after 057 is applied.
 
 ## Memory-write spool
 
