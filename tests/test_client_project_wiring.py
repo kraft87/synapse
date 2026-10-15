@@ -958,3 +958,40 @@ def test_git_feeder_process_files_worktree_commits_under_the_checkout(layout, se
     assert len(posts) == 1
     assert {e["project"] for e in posts[0].body["events"]} == {"MyRepo"}
     assert {e["source"] for e in posts[0].body["events"]} == {f"git:{layout.worktree.name}"}
+
+
+def test_config_sync_pushes_every_file_in_one_request(monkeypatch, layout, tmp_path):
+    proj = Path(_where(layout, "root"))
+    (proj / "CLAUDE.md").write_text("project rules")
+    config_dir = tmp_path / "claude"
+    (config_dir / "rules").mkdir(parents=True)
+    (config_dir / "CLAUDE.md").write_text("global rules")
+    (config_dir / "rules" / "voice.md").write_text("terse")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
+    mod = _load(_CONFIG_SYNC, "config_sync_batch_test")
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(mod.config, "CONFIG_SYNC", True)
+    monkeypatch.setattr(mod.config, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(mod.config, "post_json", lambda path, body: sent.append((path, body)) or {})
+
+    mod.main()
+
+    assert [path for path, _ in sent] == ["/config/publish"]  # one round trip, not one per file
+    body = sent[0][1]
+    assert body["surface"] == mod.config.SURFACE
+    got = {(f["scope"], f["file_key"]): f["content"] for f in body["files"]}
+    assert got[("global", "CLAUDE.md")] == "global rules"
+    assert got[("global", "rules/voice.md")] == "terse"
+    assert got[("project:MyRepo", "CLAUDE.md")] == "project rules"
+    assert all(f["abs_path"] and f["modified_at"] for f in body["files"])
+
+
+def test_config_sync_posts_nothing_when_there_is_nothing_to_mirror(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    mod = _load(_CONFIG_SYNC, "config_sync_empty_test")
+    sent: list = []
+    monkeypatch.setattr(mod.config, "CONFIG_SYNC", True)
+    monkeypatch.setattr(mod.config, "CONFIG_DIR", tmp_path / "empty")
+    monkeypatch.setattr(mod.config, "post_json", lambda *a: sent.append(a) or {})
+    mod.main()
+    assert sent == []

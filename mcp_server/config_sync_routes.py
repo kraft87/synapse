@@ -7,8 +7,8 @@
 Same shape as skill_sync_routes: machine-token-gated custom routes (they bypass FastMCP's auth
 middleware by design), PG work in a threadpool, fail-soft JSON. The plugin's SessionStart hook
 PUSHES each surface's opted-in config files here; the server keeps them as the mirror the dashboard
-lists (/config/list, /config/read). The nightly config lane mines transcripts for corrections and
-does not read the mirror. The plugin needs only a base URL + bearer — never database access.
+lists, and the nightly config lane skips corrections that restate a line of it. The plugin needs
+only a base URL + bearer — never database access.
 
 A "surface" is a machine/install. file_key is the file's path relative to the config root, stable
 across machines.
@@ -24,10 +24,11 @@ A restricted host mirrors config from employer hardware and must not read (or ov
 personal machines' CLAUDE.md, nor review rules mined from their conversations.
 
 Routes (all POST):
-  /config/publish       {surface, scope?, file_key, abs_path, content, modified_at?} -> upsert mirror row
-  /config/list          {surface}                                  -> [{scope, file_key, hash, mtime}]
-  /config/fetch         {surface, file_key, scope?}                -> {found, content, abs_path}
-  /config/proposals     {id?}                                      -> proposed rule edits, or one's detail
+  /config/publish       {surface, files: [{scope?, file_key, abs_path, content, modified_at?}]}
+                        -> upsert one mirror row per file. A body that is itself one file (the
+                        form clients sent before the batch) is still accepted.
+  /config/proposals     {id?}                                      -> rule edits awaiting a decision
+                        ('proposed') or a disk write ('accepted'), or one's detail
   /config/proposals/act {id, action, reason?, scope?}              -> accept | reject | apply
 """
 
@@ -44,7 +45,7 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, own_surface_columns_ready
-from mcp_server.http_helpers import _iso, err, guarded_json
+from mcp_server.http_helpers import err, guarded_json
 
 logger = logging.getLogger(__name__)
 
@@ -58,75 +59,38 @@ def _dt(iso: str | None) -> datetime | None:
         return None
 
 
-def _publish_config(db_url: str, p: dict) -> dict:
-    """Upsert one mirror row for (surface, scope, file_key). Idempotent: a re-push of unchanged
-    content is a no-op (the hash matches), so a SessionStart that changed nothing writes nothing."""
-    surface = p["surface"]
-    scope = p.get("scope", "global")
-    file_key = p["file_key"]
-    content = p.get("content", "") or ""
-    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
-        row = conn.execute(
-            "INSERT INTO config_lane.config_registry "
-            "  (surface_id, scope, file_key, abs_path, content, content_hash, modified_at, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) "
-            "ON CONFLICT (surface_id, scope, file_key) DO UPDATE SET "
-            "  abs_path = EXCLUDED.abs_path, content = EXCLUDED.content, "
-            "  content_hash = EXCLUDED.content_hash, modified_at = EXCLUDED.modified_at, "
-            "  updated_at = now() "
-            "WHERE config_lane.config_registry.content_hash <> EXCLUDED.content_hash "
-            "RETURNING content_hash",
-            (
-                surface,
-                scope,
-                file_key,
-                p.get("abs_path", ""),
-                content,
-                digest,
-                _dt(p.get("modified_at")),
-            ),
-        ).fetchone()
-    # RETURNING is NULL when the WHERE (hash changed) filtered the UPDATE out — i.e. unchanged.
-    return {"status": "ok", "changed": row is not None, "content_hash": digest}
-
-
-def _list_configs(db_url: str, surface: str) -> dict:
-    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            "SELECT scope, file_key, content_hash, modified_at FROM config_lane.config_registry "
-            "WHERE surface_id = %s ORDER BY scope, file_key",
-            (surface,),
-        ).fetchall()
-    return {
-        "files": [
-            {
-                "scope": r["scope"],
-                "file_key": r["file_key"],
-                "content_hash": r["content_hash"],
-                "modified_at": _iso(r["modified_at"]),
-            }
-            for r in rows
-        ]
-    }
-
-
-def _fetch_config(db_url: str, surface: str, file_key: str, scope: str = "global") -> dict:
-    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
-        row = conn.execute(
-            "SELECT content, abs_path, content_hash, modified_at FROM config_lane.config_registry "
-            "WHERE surface_id = %s AND scope = %s AND file_key = %s",
-            (surface, scope, file_key),
-        ).fetchone()
-    if not row:
-        return {"found": False}
-    return {
-        "found": True,
-        "content": row["content"],
-        "abs_path": row["abs_path"],
-        "content_hash": row["content_hash"],
-        "modified_at": _iso(row["modified_at"]),
-    }
+def _publish_config(db_url: str, surface: str, files: list[dict]) -> dict:
+    """Upsert one mirror row per file for `surface` (keyed by scope and file_key), in one
+    transaction. Idempotent: a re-push of unchanged content is a no-op (the hash matches), so a
+    SessionStart that changed nothing writes nothing. `changed` counts the rows that did."""
+    changed = 0
+    with pg_pool.connection(db_url, autocommit=False) as conn:
+        for p in files:
+            content = p.get("content", "") or ""
+            row = conn.execute(
+                "INSERT INTO config_lane.config_registry "
+                "  (surface_id, scope, file_key, abs_path, content, content_hash, modified_at, "
+                "   updated_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, now()) "
+                "ON CONFLICT (surface_id, scope, file_key) DO UPDATE SET "
+                "  abs_path = EXCLUDED.abs_path, content = EXCLUDED.content, "
+                "  content_hash = EXCLUDED.content_hash, modified_at = EXCLUDED.modified_at, "
+                "  updated_at = now() "
+                "WHERE config_lane.config_registry.content_hash <> EXCLUDED.content_hash "
+                "RETURNING content_hash",
+                (
+                    surface,
+                    p.get("scope", "global"),
+                    p["file_key"],
+                    p.get("abs_path", ""),
+                    content,
+                    hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    _dt(p.get("modified_at")),
+                ),
+            ).fetchone()
+            # RETURNING is NULL when the WHERE (hash changed) filtered the UPDATE out.
+            changed += row is not None
+    return {"status": "ok", "changed": changed}
 
 
 # ----------------------------------------------------------------------- review
@@ -339,25 +303,7 @@ def register(
             target = _target_surface(_trust(request), b.get("surface"))
             if not target:
                 return _forbidden()
-            return _publish_config(db_url, {**b, "surface": target})
-
-        return await _guarded(request, work)
-
-    @mcp.custom_route("/config/list", methods=["POST"])
-    async def _list(request: Request) -> JSONResponse:
-        def work(b):
-            target = _target_surface(_trust(request), b.get("surface"))
-            return _list_configs(db_url, target) if target else {"files": []}
-
-        return await _guarded(request, work)
-
-    @mcp.custom_route("/config/fetch", methods=["POST"])
-    async def _fetch(request: Request) -> JSONResponse:
-        def work(b):
-            target = _target_surface(_trust(request), b.get("surface"))
-            if not target:
-                return {"found": False}
-            return _fetch_config(db_url, target, b["file_key"], b.get("scope", "global"))
+            return _publish_config(db_url, target, b.get("files") or [b])
 
         return await _guarded(request, work)
 
