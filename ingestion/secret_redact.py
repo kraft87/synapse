@@ -33,33 +33,53 @@ _MARK = "[REDACTED:{}]"
 
 #: Provider token formats. Order matters only where formats nest: the Anthropic
 #: rule comes before the generic ``sk-`` rule so the marker names the provider.
-_TOKEN_RULES: tuple[tuple[str, re.Pattern[str]], ...] = (
+#: Each rule lists literals of which at least one must occur for the regex to match
+#: (none for discord's prefix-less format, which always runs): a plain ``in`` scan costs
+#: a fraction of a failing regex pass, and most text holds no token at all.
+_TOKEN_RULES: tuple[tuple[str, tuple[str, ...], re.Pattern[str]], ...] = (
     (
         "private-key",
+        ("PRIVATE KEY",),
         re.compile(
             r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----"
             r"(?:[A-Za-z0-9+/=\s]|\\n)*"
             r"(?:-----END (?:[A-Z0-9]+ )*PRIVATE KEY-----)?"
         ),
     ),
-    ("anthropic", re.compile(r"\bsk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}")),
-    ("openai", re.compile(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}")),
-    ("api-key", re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{30,}")),
-    ("stripe", re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{20,}")),
-    ("github", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})")),
-    ("gitlab", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}")),
-    ("huggingface", re.compile(r"\bhf_[A-Za-z0-9]{30,}")),
-    ("logfire", re.compile(r"\bpylf_v\d+_[a-z]+_[A-Za-z0-9]{20,}")),
-    ("matrix", re.compile(r"\bsyt_[A-Za-z0-9_-]{20,}")),
-    ("voyage", re.compile(r"\bpa-[A-Za-z0-9_-]{40,}")),
-    ("firecrawl", re.compile(r"\bfc-[a-f0-9]{32}\b")),
-    ("elevenlabs", re.compile(r"\bsk_[a-f0-9]{40,}\b")),
-    ("telegram", re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b")),
-    ("slack", re.compile(r"\bxox[abposre]-[A-Za-z0-9-]{10,}")),
-    ("aws-key-id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
-    ("google-api", re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
-    ("discord", re.compile(r"\b[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}")),
-    ("jwt", re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+    ("anthropic", ("sk-ant-",), re.compile(r"\bsk-ant-[a-z0-9]+-[A-Za-z0-9_-]{20,}")),
+    (
+        "openai",
+        ("sk-proj-", "sk-svcacct-", "sk-admin-"),
+        re.compile(r"\bsk-(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}"),
+    ),
+    ("api-key", ("sk-",), re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9_-]{30,}")),
+    ("stripe", ("k_live_", "k_test_"), re.compile(r"\b[rs]k_(?:live|test)_[A-Za-z0-9]{20,}")),
+    (
+        "github",
+        ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"),
+        re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{40,})"),
+    ),
+    ("gitlab", ("glpat-",), re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}")),
+    ("huggingface", ("hf_",), re.compile(r"\bhf_[A-Za-z0-9]{30,}")),
+    ("logfire", ("pylf_v",), re.compile(r"\bpylf_v\d+_[a-z]+_[A-Za-z0-9]{20,}")),
+    ("matrix", ("syt_",), re.compile(r"\bsyt_[A-Za-z0-9_-]{20,}")),
+    ("voyage", ("pa-",), re.compile(r"\bpa-[A-Za-z0-9_-]{40,}")),
+    ("firecrawl", ("fc-",), re.compile(r"\bfc-[a-f0-9]{32}\b")),
+    ("elevenlabs", ("sk_",), re.compile(r"\bsk_[a-f0-9]{40,}\b")),
+    ("telegram", (":AA",), re.compile(r"\b\d{8,10}:AA[A-Za-z0-9_-]{33}\b")),
+    ("slack", ("xox",), re.compile(r"\bxox[abposre]-[A-Za-z0-9-]{10,}")),
+    ("aws-key-id", ("AKIA", "ASIA"), re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    ("google-api", ("AIza",), re.compile(r"\bAIza[0-9A-Za-z_-]{35}")),
+    (
+        "discord",
+        (),
+        re.compile(r"\b[MNO][A-Za-z0-9_-]{23,27}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}"),
+    ),
+    (
+        "jwt",
+        ("eyJ",),
+        re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"),
+    ),
 )
 
 #: The characters a bare credential value is made of. Excludes quotes, shell and
@@ -126,7 +146,9 @@ def redact_secrets(text: str | None) -> str | None:
     """Replace credentials in ``text`` with ``[REDACTED:<kind>]`` markers."""
     if not text:
         return text
-    for kind, pattern in _TOKEN_RULES:
+    for kind, literals, pattern in _TOKEN_RULES:
+        if literals and not any(lit in text for lit in literals):
+            continue
         text = pattern.sub(_MARK.format(kind), text)
     text = _BEARER.sub(_keep_name("bearer"), text)
     text = _URL_CREDS.sub(_url_sub, text)

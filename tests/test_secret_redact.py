@@ -38,6 +38,10 @@ ALNUM = "aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY"  # 32 mixed chars
         ("fc" + "-" + "0a1b2c3d" * 4, "firecrawl"),
         ("sk" + "_" + "0a1b2c3d4e" * 5, "elevenlabs"),
         ("123456789" + ":AA" + ALNUM + "a", "telegram"),
+        ("sk" + "_live_" + ALNUM[:24], "stripe"),
+        ("rk" + "_test_" + ALNUM[:24], "stripe"),
+        ("glp" + "at-" + ALNUM[:20], "gitlab"),
+        ("AS" + "IA" + "ABCDEFGH23456789", "aws-key-id"),
     ],
 )
 def test_provider_tokens_are_replaced(token: str, kind: str) -> None:
