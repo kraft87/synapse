@@ -111,6 +111,25 @@ def test_show_without_a_draft_and_with_warnings(server, capsys):
     assert "--- registry/" not in out
 
 
+@pytest.mark.parametrize(
+    "attempts, said",
+    [(2, "failed (2 attempts, retried"), (1, "failed (1 attempt, retried"), (None, "(1 attempt,")],
+)
+def test_show_says_why_the_nightly_draft_failed(server, capsys, attempts, said):
+    reason = "the model's reply had no description"
+    server.replies["/skills/proposals"] = _detail(
+        proposal_body=None,
+        apply_issues=[{"code": "no_draft", "detail": "no draft yet", "force": False}],
+        draft_attempts=attempts,
+        last_draft_error=reason,
+    )
+    skill_review.cmd_show(7)
+    out = capsys.readouterr().out
+    assert said in out and reason in out
+    assert "accept --body-file, or reject" in out
+    assert "re-drafts on the next nightly run" not in out
+
+
 def test_accept_forwards_body_file_scope_and_force(server, tmp_path, capsys):
     f = tmp_path / "SKILL.md"
     f.write_text(V2, encoding="utf-8")

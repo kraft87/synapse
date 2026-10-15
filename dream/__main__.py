@@ -67,7 +67,7 @@ class Lane(NamedTuple):
 
 
 def _skills_lane() -> LaneResult:
-    """dream→skills: mines past sessions for new-skill / retune / merge proposals and pings
+    """dream→skills: mines past sessions for new-skill / retune proposals and pings
     Discord; nothing changes until a proposal is accepted in review. The lane isolates its
     own stages and lists the ones that failed."""
     from dream.skills.nightly import run_lane

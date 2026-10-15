@@ -15,6 +15,8 @@ import re
 from pathlib import Path
 
 DISCORD_WEBHOOK = os.environ.get("SKILLS_DISCORD_WEBHOOK", "")
+# The only project exclusion: every detector and the config lane skip these project ids, and no
+# project is excluded by default.
 EXCLUDE_PROJECTS = tuple(
     p.strip() for p in os.environ.get("SKILLS_EXCLUDE_PROJECTS", "").split(",") if p.strip()
 )
