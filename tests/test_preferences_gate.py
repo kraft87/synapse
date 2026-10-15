@@ -196,6 +196,7 @@ def test_a_near_empty_user_text_skips_llm_whatever_else_the_turn_holds(monkeypat
     g = _gate(enabled=True, monkeypatch=monkeypatch)
     trace = "\n\n".join(f"[tool:Bash] step {k}\n\n[result] {'x' * 300}" for k in range(20))
     g.process({"id": 1, "episode_id": 5, "content": f"[user] ok\n\n{trace}\n\n[assistant] done"})
+    g.process({"id": 1, "episode_id": 5, "content": f"[user] continue\n\n{trace}"})
     g.process({"id": 1, "episode_id": 5, "content": "[assistant] there is no user text"})
 
 
@@ -288,7 +289,7 @@ class _StubEmb:
         return [[0.0] * 4 for _ in texts]
 
 
-def _run_flow(monkeypatch, prefs, candidates, confirm=None, embedder=None):
+def _run_flow(monkeypatch, prefs, candidates, confirm=None, embedder=None, turn=_TURN):
     """Run the gate end to end over stubs. ``confirm`` drives the gray-band call: a
     verdict dict is returned as-is, bare True/False is shorthand for a no-merge verdict,
     an Exception instance is raised from it, None means the test doesn't expect a
@@ -313,7 +314,7 @@ def _run_flow(monkeypatch, prefs, candidates, confirm=None, embedder=None):
     monkeypatch.setattr(pg, "parse_with_retry", _fake_parse_with_retry)
     db = _RecDB(candidates)
     g = pg.PreferencesGate(db=db, llm_client=object(), embedder=embedder or _StubEmb())
-    g.process({"id": 1, "episode_id": 5, "content": _TURN, "project": "synapse"})
+    g.process({"id": 1, "episode_id": 5, "content": turn, "project": "synapse"})
     return db
 
 
@@ -336,6 +337,44 @@ def test_flow_reassert(monkeypatch):
     )
     assert db.reasserted == [42]
     assert db.inserted == [] and db.superseded == []
+
+
+def test_flow_a_short_standing_preference_reaches_the_llm(monkeypatch):
+    """ "never use emojis" is 16 characters and a stated rule; only acknowledgements skip."""
+    db = _run_flow(
+        monkeypatch,
+        [{"pref": "Never use emojis", "polarity": "rule"}],
+        candidates=[],
+        turn="[user] never use emojis\n\n[assistant] Understood.",
+    )
+    assert [i["pref"] for i in db.inserted] == ["Never use emojis"]
+
+
+def test_flow_a_retry_does_not_count_its_own_turn_twice(monkeypatch):
+    """The first attempt stored the preference from ep:5 and then failed on a later one;
+    the retry finds it as its own near-duplicate and must leave its count alone."""
+    own = {"id": 42, "polarity": "like", "sim": 0.99, "source_ref": "ep:5", "pref": "dark mode"}
+    db = _run_flow(
+        monkeypatch, [{"pref": "User prefers dark mode", "polarity": "like"}], candidates=[own]
+    )
+    assert db.reasserted == [] and db.inserted == [] and db.merged == []
+    # a restatement stored from another turn still counts
+    other = {**own, "source_ref": "ep:4"}
+    db = _run_flow(
+        monkeypatch, [{"pref": "User prefers dark mode", "polarity": "like"}], candidates=[other]
+    )
+    assert db.reasserted == [42]
+
+
+def test_flow_a_retried_confirmed_duplicate_of_its_own_pref_is_not_merged_or_counted(monkeypatch):
+    own = {**_BAND_CANDIDATE[0], "source_ref": "ep:5"}
+    db = _run_flow(
+        monkeypatch,
+        [{"pref": "User dislikes em-dashes in Discord messages", "polarity": "dislike"}],
+        candidates=[own],
+        confirm={"duplicate": True, "updated_pref": _MERGED},
+    )
+    assert db.reasserted == [] and db.inserted == [] and db.merged == []
 
 
 def test_flow_supersede_inserts_then_links(monkeypatch):

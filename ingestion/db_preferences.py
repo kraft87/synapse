@@ -10,12 +10,12 @@ class PreferenceStore(DatabaseConnection):
         self, owner_id: str, group_id: str, embedding: list[float], limit: int = 5
     ) -> list[dict[str, Any]]:
         """Live preferences for one owner/group, nearest to ``embedding`` by cosine.
-        Returns ``[{id, pref, polarity, sim}]`` in DESCENDING similarity (sim = 1 -
-        cosine_distance in [0, 2]). The gate's dedup/supersession decision reads this."""
+        Returns ``[{id, pref, polarity, source_ref, sim}]`` in DESCENDING similarity (sim
+        = 1 - cosine_distance in [0, 2]). The gate's dedup/supersession decision reads this."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT id, pref, polarity, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"SELECT id, pref, polarity, source_ref, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "FROM preferences "
                 "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
                 "AND embedding IS NOT NULL "
@@ -23,7 +23,13 @@ class PreferenceStore(DatabaseConnection):
                 (vlit, owner_id, group_id, vlit, limit),
             ).fetchall()
         return [
-            {"id": r["id"], "pref": r["pref"], "polarity": r["polarity"], "sim": float(r["sim"])}
+            {
+                "id": r["id"],
+                "pref": r["pref"],
+                "polarity": r["polarity"],
+                "source_ref": r["source_ref"],
+                "sim": float(r["sim"]),
+            }
             for r in rows
         ]
 

@@ -45,10 +45,10 @@ logger = logging.getLogger(__name__)
 # so a future multi-tenant split threads the same env var through preferences too.
 _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
-# A turn whose [user] text is shorter than this ("ok", "continue", "yes, do it") asserts no
-# standing preference. Measured on the user's text, not the whole turn: a bare "ok" that
+# A turn whose [user] text is shorter than this ("ok", "continue", "yes do it") asserts no
+# standing preference; short ones that do ("never use emojis", "always use uv") are longer. Measured on the user's text, not the whole turn: a bare "ok" that
 # followed a long tool trace used to pay for the gate call.
-_MIN_USER_CHARS = 20
+_MIN_USER_CHARS = 10
 
 # Dedup / supersession thresholds against the live-set cosine similarity.
 #
@@ -206,6 +206,13 @@ def _candidate_text(candidates: list[dict[str, Any]], target_id: Any) -> str:
     return ""
 
 
+def _stated_by(candidates: list[dict[str, Any]], target_id: Any, episode_id: int) -> bool:
+    """Whether the candidate the decision targeted was stored from this very turn."""
+    return any(
+        c.get("id") == target_id and c.get("source_ref") == f"ep:{episode_id}" for c in candidates
+    )
+
+
 def _group_for(project: str | None) -> str:
     """Group routing derived from the project tag — same axis as the KG."""
     return _default_group_for_project(project)
@@ -332,6 +339,8 @@ class PreferencesGate:
             )
             if verdict["duplicate"]:
                 upd = verdict["updated_pref"]
+                if _stated_by(candidates, action["target_id"], episode_id):
+                    return  # the earlier attempt's preference: already counted
                 if (
                     isinstance(upd, str)
                     and _valid_merged_pref(upd, existing)
@@ -343,6 +352,13 @@ class PreferencesGate:
                 action = {"action": "insert", "target_id": None}
 
         if action["action"] == "reassert":
+            if _stated_by(candidates, action["target_id"], episode_id):
+                # This very turn stored (or counted) the preference on an earlier attempt
+                # that failed later: the retry must not count the turn twice.
+                logger.info(
+                    "preference #%s already counted for ep:%s", action["target_id"], episode_id
+                )
+                return
             self._db.reassert_preference(action["target_id"])
             logger.info("preference re-asserted (#%s): %s", action["target_id"], p["pref"][:80])
             return

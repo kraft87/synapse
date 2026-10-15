@@ -46,6 +46,7 @@ def test_insert_and_cosine_knn(conn, db_url):
     # Query nearest to slot-1: the matching pref comes back with sim ~1, ahead of the other.
     hits = db.find_live_preferences(_OWNER, GROUP, onehot(1), limit=5)
     assert hits[0]["id"] == a
+    assert hits[0]["source_ref"] == "ep:1"  # the gate tells a retry its own turn's row by this
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-4)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-4)
     db.close()
