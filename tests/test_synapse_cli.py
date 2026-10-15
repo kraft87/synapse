@@ -59,7 +59,6 @@ _MODULES = ("config", "enroll", "synapse_login", "harness", "synapse_cli", "syna
 _KEYS = (
     "SYNAPSE_URL",
     "SYNAPSE_INGEST_URL",
-    "SYNAPSE_RECALL_URL",
     "SYNAPSE_MCP_URL",
     "SYNAPSE_INGEST_TOKEN",
     "SYNAPSE_MACHINE_ROLE",

@@ -22,7 +22,6 @@ Every setting resolves env var -> ~/.synapse/config.json (synapse_home.py, writt
                         there); once this machine is enrolled its device token wins over
                         an env value — see _resolve_ingest_token
   SYNAPSE_INGEST_URL    legacy override for /ingest  (else derived from SYNAPSE_URL)
-  SYNAPSE_RECALL_URL    legacy override for /recall  (else derived)
   SYNAPSE_MCP_URL       legacy override for /mcp     (else derived)
   SYNAPSE_SKILLS_SYNC   "1" enables the SessionStart skills sync (default OFF — opt-in)
   SYNAPSE_CONFIG_SYNC   "1" enables config-file mirroring (default OFF — opt-in)
@@ -213,9 +212,7 @@ def _base_url() -> str:
 BASE_URL = _base_url()
 # Legacy per-endpoint keys still win if set (existing installs); else derive from the base.
 INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
-RECALL_URL = _cfg("SYNAPSE_RECALL_URL") or BASE_URL + "/recall"
 MCP_URL = _cfg("SYNAPSE_MCP_URL") or BASE_URL + "/mcp"
-SKILLS_URL = BASE_URL + "/skills"
 # Enrollment state for this device (schema 054): which surface row this machine got and
 # what it was granted. It lives under "device" in ~/.synapse/config.json, beside the
 # credential it describes; its presence is how the hooks know this machine has a
@@ -551,8 +548,6 @@ def machine_role() -> str:
     enrolls in the same process."""
     return (_cfg("SYNAPSE_MACHINE_ROLE", "personal") or "personal").strip().lower()
 
-
-MACHINE_ROLE = machine_role()
 
 #: role -> trust level. Anything unrecognised states nothing, and the server's own
 #: narrow default (restricted, inherited work projects) applies.

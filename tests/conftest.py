@@ -117,11 +117,11 @@ def _reset_dedup_index_cache():
     copy per group instead of one per worker thread). Tests build indexes from
     per-test fake KG clients under the same group ids, so the cache must be
     dropped between tests or one test's entities leak into the next."""
-    from ingestion import dedup
+    from tests.helpers.kg import index_cache_reset
 
-    dedup._index_cache_reset()
+    index_cache_reset()
     yield
-    dedup._index_cache_reset()
+    index_cache_reset()
 
 
 @pytest.fixture(autouse=True)

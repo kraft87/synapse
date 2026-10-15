@@ -8,11 +8,22 @@ Two things the KG tests all reach for:
   (``KGClient.create_edges_batch`` destructures these dicts). Each call site passes
   the keys that differ for its case via kwargs, and drops keys its contract omits via
   ``drop=(...)``.
+
+``index_cache_reset`` empties the dedup module's process-wide group-index cache.
 """
 
 from __future__ import annotations
 
+from ingestion import dedup
+
 DIM = 2048
+
+
+def index_cache_reset() -> None:
+    """Drop every cached dedup group index and its build lock."""
+    with dedup._INDEX_CACHE_GUARD:
+        dedup._INDEX_CACHE.clear()
+        dedup._INDEX_BUILD_LOCKS.clear()
 
 
 def _axis_list(i: int) -> list[float]:

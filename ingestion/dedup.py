@@ -302,13 +302,6 @@ def _index_ttl() -> float:
         return 900.0
 
 
-def _index_cache_reset() -> None:
-    """Drop all cached group indexes (tests)."""
-    with _INDEX_CACHE_GUARD:
-        _INDEX_CACHE.clear()
-        _INDEX_BUILD_LOCKS.clear()
-
-
 class NodeDeduper:
     """Per-group write-time entity deduplicator.
 

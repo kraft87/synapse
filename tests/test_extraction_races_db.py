@@ -28,12 +28,12 @@ from unittest.mock import MagicMock
 import pytest
 
 import ingestion.extractor as extractor_mod
-from ingestion.dedup import _index_cache_reset
 from ingestion.extractor import ExtractionPipeline
 from ingestion.kg_client import KGClient
 from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
 from tests.helpers.db import DB_URL
 from tests.helpers.embed import onehot
+from tests.helpers.kg import index_cache_reset
 
 SEG = "2026-09-01T12:00:00+00:00"
 ITEM = {"content_type": "chunk", "content": "window", "project": None, "session_id": "s1"}
@@ -160,9 +160,9 @@ def _run_as_parallel_workers(
 @pytest.fixture()
 def graph(conn):
     conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
-    _index_cache_reset()  # the dedup index is process-wide; start each case empty
+    index_cache_reset()  # the dedup index is process-wide; start each case empty
     yield conn
-    _index_cache_reset()
+    index_cache_reset()
 
 
 def _live_edges(conn) -> list[tuple[str, str, int, list[int]]]:
@@ -335,7 +335,7 @@ class TestNoEntityWithoutAWrittenFact:
 
 @pytest.mark.parametrize(
     "before_b",
-    [None, _index_cache_reset],
+    [None, index_cache_reset],
     ids=["same-process", "other-process"],  # other process: only the live DB knows it
 )
 def test_same_new_name_from_parallel_workers_is_one_entity(graph, before_b):

@@ -56,7 +56,6 @@ _MODULES = (
 _KEYS = (
     "SYNAPSE_URL",
     "SYNAPSE_INGEST_URL",
-    "SYNAPSE_RECALL_URL",
     "SYNAPSE_MCP_URL",
     "SYNAPSE_INGEST_TOKEN",
     "SYNAPSE_MACHINE_ROLE",
@@ -442,9 +441,7 @@ def test_the_config_json_url_drives_every_endpoint():
     cfg = _load_config()
     assert cfg.BASE_URL == "https://syn.example.net"
     assert cfg.INGEST_URL == "https://syn.example.net/ingest"
-    assert cfg.RECALL_URL == "https://syn.example.net/recall"
     assert cfg.MCP_URL == "https://syn.example.net/mcp"
-    assert cfg.SKILLS_URL == "https://syn.example.net/skills"
 
 
 def test_config_json_beats_settings_json_and_the_plugin_options_claude_code_exports(
@@ -463,7 +460,7 @@ def test_config_json_beats_settings_json_and_the_plugin_options_claude_code_expo
     _write_home({"url": _URL, "role": "work", "skills_sync": True, "config_sync": True})
     cfg = _load_config()
     assert cfg.BASE_URL == _URL and cfg.INGEST_URL == f"{_URL}/ingest"
-    assert cfg.MACHINE_ROLE == "work"
+    assert cfg.machine_role() == "work"
     assert cfg.SKILLS_SYNC is True
     assert cfg.CONFIG_SYNC is True
 
@@ -475,7 +472,7 @@ def test_an_env_var_beats_config_json(monkeypatch):
     monkeypatch.setenv("SYNAPSE_SKILLS_SYNC", "0")
     cfg = _load_config()
     assert cfg.BASE_URL == "http://envhost:1111"
-    assert cfg.MACHINE_ROLE == "personal"
+    assert cfg.machine_role() == "personal"
     assert cfg.SKILLS_SYNC is False
 
 
@@ -517,7 +514,7 @@ def test_an_explicitly_empty_config_paths_list_beats_stale_legacy_globs(monkeypa
 def test_the_role_in_config_json_sets_the_machine_role_and_requested_trust():
     _write_home({"role": "work"})
     cfg = _load_config()
-    assert cfg.MACHINE_ROLE == "work"
+    assert cfg.machine_role() == "work"
     assert cfg.machine_role() == "work"
     assert cfg.requested_trust() == "restricted"
 
