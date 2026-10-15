@@ -7,14 +7,12 @@ authors = [{ name = "kraft87" }]
 requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary,pool]>=3.2",
-    "pgvector>=0.3",
     "httpx>=0.28",
     "pydantic>=2.10",
     "pydantic-settings>=2.14.2",
-    "logfire[httpx,query-client]>=3.0",
+    "logfire[httpx]>=3.0",
     "anthropic>=0.40",
     "orjson>=3.10",
-    "tokenizers>=0.21",
     "voyageai>=0.3",
     "claude-agent-sdk>=0.1.72",
     "tenacity>=8.0",
@@ -31,19 +29,6 @@ dependencies = [
 # On PATH inside the image (/app/.venv/bin), which is what makes the first-device
 # bootstrap one command: `docker compose exec mcp-server synapse-admin bootstrap "<label>"`.
 synapse-admin = "ingestion.surface_admin:main"
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.25",
-    "pytest-xdist>=3.6",
-    # Makes pytest.ini's `env_files = .env` actually load; without it the line
-    # is inert and every DB test needs SYNAPSE_TEST_URL exported by hand.
-    "pytest-dotenv>=0.5.2",
-    "ruff>=0.9",
-    "mypy>=1.14",
-    "types-psycopg2>=2.9",
-]
 
 [build-system]
 requires = ["hatchling"]
@@ -101,11 +86,3 @@ ignore_missing_imports = true
 # still checked; the other mcp_server modules are followed as imports, not reported.
 files = ["ingestion", "mcp_server/__init__.py", "mcp_server/recall.py", "dream"]
 exclude = ["tests/", "mcp_server/", "dream/__main__.py", "plugin/"]
-
-[tool.uv.sources]
-torch = [{ index = "pytorch-cpu" }]
-
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
