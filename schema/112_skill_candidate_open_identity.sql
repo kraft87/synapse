@@ -23,8 +23,10 @@
 -- candidate INSERT fails for every new candidate of any kind, derive included: the judge,
 -- grounded and struggle_arc stages fail every night. No index can serve that clause and still
 -- allow a closed and an open row on one key. A rollback needs DROP INDEX
--- skills_lane.skill_gap_named_idx, retiring or deleting the duplicate (kind, name, direction)
--- retune rows, and recreating the index from schema/022.
+-- skills_lane.skill_gap_named_idx, then deleting (or renaming) all but one row of each
+-- duplicated (kind = 'retune', name, direction) key, for instance the closed promoted or
+-- retired row where an open one now shares its key (the schema/022 index has no status
+-- predicate, so a retired row still holds its key), and recreating the index from schema/022.
 --
 -- Dropping and creating the index in one transaction leaves no window without the guard.
 -- A re-run recreates the same index.
