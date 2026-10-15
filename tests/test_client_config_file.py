@@ -257,6 +257,38 @@ def test_a_failed_save_leaves_the_previous_file_and_no_temp_file():
     assert [p.name for p in _config_json().parent.iterdir()] == ["config.json"]
 
 
+def test_log_appends_timestamped_lines_under_the_synapse_home():
+    """Hook logs used to default to /tmp, which Windows doesn't have (the work laptop
+    logged nothing) and POSIX shares between users."""
+    home = _load_home()
+    home.log("ingest-hook", "OK s.jsonl")
+    home.log("ingest-hook", "ERR boom")
+    lines = (Path(os.environ["SYNAPSE_HOME"]) / "logs" / "ingest-hook.log").read_text().splitlines()
+    assert [line.split(" ", 1)[1] for line in lines] == ["OK s.jsonl", "ERR boom"]
+    assert lines[0].split(" ", 1)[0].startswith("20")  # ISO timestamp
+
+
+def test_log_restarts_a_file_past_64kb():
+    home = _load_home()
+    path = Path(os.environ["SYNAPSE_HOME"]) / "logs" / "spool.log"
+    path.parent.mkdir(parents=True)
+    path.write_text("x" * (64 * 1024 + 1), encoding="utf-8")
+    home.log("spool", "fresh")
+    assert path.read_text().endswith("fresh\n") and len(path.read_text()) < 200
+
+
+def test_log_never_raises(tmp_path, monkeypatch):
+    """The Synapse home can't be created (it is a file) or the message can't be encoded:
+    a hook must not die over its log."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("SYNAPSE_HOME", str(blocker))
+    home = _load_home()
+    home.log("x", "msg")
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path / "ok"))
+    home.log("x", "lone surrogate \ud800")
+
+
 def test_update_merges_changes_and_a_none_value_deletes_the_key():
     home = _load_home()
     assert home.update({"url": _URL}) == {"url": _URL}  # creates the file when absent

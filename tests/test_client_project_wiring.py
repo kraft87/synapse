@@ -206,9 +206,7 @@ def _isolated(monkeypatch, tmp_path) -> Iterator[None]:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_SKILLS_DIR", str(home / ".claude" / "skills"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "ingest-hook.log"))
     monkeypatch.setenv("SYNAPSE_CODEX_CURSORS", str(tmp_path / "state" / "codex_cursors.json"))
-    monkeypatch.setenv("SYNAPSE_CODEX_HOOK_LOG", str(tmp_path / "codex-hook.log"))
     monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(tmp_path / "private"))
     monkeypatch.setenv("SYNAPSE_SURFACE", "test-project-wiring-host")
     for var in _ENV_VARS:
@@ -305,6 +303,12 @@ def _proc_env(url: str, **extra: str) -> dict[str, str]:
         **extra,
     )
     return env
+
+
+def _hook_log(name: str) -> str:
+    """What a hook process wrote to its log (shown when its assertion fails)."""
+    path = Path(os.environ["SYNAPSE_HOME"]) / "logs" / f"{name}.log"
+    return path.read_text(errors="replace") if path.exists() else "(no log)"
 
 
 def _run(args: list[str], url: str, cwd: Path, stdin: str = "", **extra: str):
@@ -461,7 +465,7 @@ def test_ingest_hook_process_ships_the_project(layout, server, tmp_path, where, 
     _run([str(_INGEST_HOOK), "--ship", str(transcript)], server.url, tmp_path)
 
     posts = [r for r in server.seen if r.path == "/ingest"]
-    assert len(posts) == 1, (tmp_path / "ingest-hook.log").read_text(errors="replace")
+    assert len(posts) == 1, _hook_log("ingest-hook")
     body = posts[0].body
     assert [r["uuid"] for r in body["records"]] == ["u1", "a1", "u2", "a2"]
     assert body["source"] == "hook"
@@ -678,7 +682,7 @@ def test_codex_stop_hook_process_ships_the_project(layout, server, tmp_path, mod
     _run([str(_STOP_HOOK), "--ship", json.dumps(payload)], server.url, tmp_path)
 
     posts = [r for r in server.seen if r.path == "/ingest"]
-    assert len(posts) == 1, (tmp_path / "codex-hook.log").read_text(errors="replace")
+    assert len(posts) == 1, _hook_log("codex-hook")
     body = posts[0].body
     assert body["project"] == expected
     assert body["format"] == "codex"

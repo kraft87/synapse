@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 #: config.json key -> the env / plugin-option name the rest of the client resolves by.
@@ -192,3 +193,20 @@ def drop_plugin_options(path: Path, names) -> None:
                 touched = True
     if touched:
         atomic_write_json(path, data)
+
+
+_LOG_CAP = 64 * 1024
+
+
+def log(name: str, msg: str) -> None:
+    """Append a timestamped line to ``logs/<name>.log`` under the Synapse home, the one
+    place every client script logs (hooks run detached, so nothing else would see it).
+    A file past 64 KB starts over. Never raises: a log is not worth failing a hook for."""
+    try:
+        path = home() / "logs" / f"{name}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "w" if path.exists() and path.stat().st_size > _LOG_CAP else "a"
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(f"{datetime.now(UTC).isoformat(timespec='seconds')} {msg}\n")
+    except (OSError, ValueError):
+        pass

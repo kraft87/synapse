@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -110,7 +110,10 @@ def test_header_helper_fails_closed(monkeypatch, capsys, tmp_path, token, url, s
     config.BASE_URL = "https://memory.example"
     config.INGEST_TOKEN = token
     config._FILE_OPTIONS = {}
-    config.synapse_home = SimpleNamespace(home=lambda: tmp_path)
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path))
+    config.synapse_home = _load(
+        "synapse_home_helper_test", _SHARED_HELPER.with_name("synapse_home.py")
+    )
     # config decides whether the device token may go there (config._device_origins).
     withheld = bool(server) and server != "https://memory.example"
     config.TOKEN_OVERRIDE = (

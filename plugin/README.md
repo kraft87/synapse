@@ -252,7 +252,7 @@ python3 <plugin>/scripts/remember_spool.py flush     # replay now
 `add` also accepts the same fields as JSON on stdin, and tries an immediate write-through
 before queueing. Nothing leaves the spool until the server confirms, and each intent carries
 a client-generated id the server dedups on — so a flush interrupted mid-way neither loses an
-intent nor writes one twice. Log: `/tmp/synapse-remember-spool.log` (`SYNAPSE_SPOOL_LOG`).
+intent nor writes one twice. Log: `~/.synapse/logs/remember-spool.log`.
 
 Server requirement: schema 052 (`remember_intents`) and the `/remember/spool` route. Against
 an older server the flush fails loudly into the log and the spool simply keeps its intents.

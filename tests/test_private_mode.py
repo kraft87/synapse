@@ -54,7 +54,6 @@ def _isolate(monkeypatch, tmp_path) -> Path:
     private_dir = tmp_path / "private"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "hook.log"))
     monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(private_dir))
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:

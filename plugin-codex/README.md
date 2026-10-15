@@ -119,6 +119,9 @@ honored alongside `permissionDecision: "allow"`.
 
 ## Env
 
+The Stop hook logs one line per upload or failure to `~/.synapse/logs/codex-hook.log` (capped
+at 64 KB, like the MCP helper's log); there is no setting for it.
+
 | var | default | |
 |---|---|---|
 | `SYNAPSE_URL` | `url` in `~/.synapse/config.json` | base URL |
@@ -128,7 +131,6 @@ honored alongside `permissionDecision: "allow"`.
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
 | `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window for lagging rollouts; failed uploads are retried at any age |
 | `SYNAPSE_CODEX_CATCHUP_MAX` | `20` | rollouts per sweep; the rest wait for the next session start |
-| `SYNAPSE_CODEX_HOOK_LOG` | `/tmp/synapse-codex-hook.log` | Stop-hook log, one line per upload or failure |
 | `SYNAPSE_SKILLS_SYNC` | `skills_sync` in `~/.synapse/config.json` (off) | `1` enables skills sync |
 | `SYNAPSE_CODEX_SKILLS_DIR` | `~/.agents/skills` | folder the sync scans |
 | `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT` | `12` | seconds SessionStart waits for the sync |

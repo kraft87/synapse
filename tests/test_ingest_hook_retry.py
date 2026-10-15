@@ -57,7 +57,6 @@ def hook(monkeypatch, tmp_path) -> ModuleType:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "hook.log"))
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)

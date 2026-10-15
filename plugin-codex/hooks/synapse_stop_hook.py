@@ -51,6 +51,8 @@ copied: plugin/scripts/synapse_ingest_retry.py, imported from this checkout
 both hosts retry and warn by the same rules. Each keeps its own cursor file
 and cursor semantics.
 
+Log: ~/.synapse/logs/codex-hook.log (one line per upload or failure).
+
 Env:
   SYNAPSE_URL                 base URL           (default http://localhost:8765)
   SYNAPSE_INGEST_URL          override /ingest   (else derived from SYNAPSE_URL)
@@ -63,7 +65,6 @@ Env:
   SYNAPSE_CODEX_CATCHUP_MAX   default 20 (rollouts per sweep; the rest defer to
                               the next session start, logged)
   SYNAPSE_PRIVATE_DIR         private markers    (default ~/.synapse/private)
-  SYNAPSE_CODEX_HOOK_LOG      log file           (default /tmp/synapse-codex-hook.log)
 """
 
 from __future__ import annotations
@@ -87,13 +88,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 # checkout. Appended, not prepended, so nothing there can shadow a module this hook
 # imports.
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
+import synapse_home
 import synapse_ingest_retry as retry
 import synapse_project
 from common import INGEST_URL, TOKEN
 from synapse_filelock import lock_exclusive
 
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
-LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
 CURSORS_PATH = Path(
     os.path.expanduser(os.environ.get("SYNAPSE_CODEX_CURSORS", "~/.synapse/codex_cursors.json"))
 )
@@ -122,11 +123,7 @@ _MACHINERY_PREFIXES = (
 
 
 def _log(msg: str) -> None:
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
-    except OSError:
-        pass
+    synapse_home.log("codex-hook", msg)
 
 
 def _is_user_boundary(rec: dict[str, Any]) -> bool:

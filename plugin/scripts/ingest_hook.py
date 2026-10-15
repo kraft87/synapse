@@ -74,8 +74,9 @@ SYNAPSE_INGEST_URL / SYNAPSE_INGEST_TOKEN env vars still win when set, per
 config.py's precedence. The detached child re-imports config, so the same
 resolution applies there.
 
+Log: ~/.synapse/logs/ingest-hook.log (one line per upload or failure).
+
 Env (all optional):
-  SYNAPSE_INGEST_LOG           default /tmp/synapse-ingest-hook.log
   SYNAPSE_INGEST_TIMEOUT       default 30 (seconds per POST)
   SYNAPSE_INGEST_TAIL          default 400 (records per POST chunk; also the
                                first-run seed window on the Stop path)
@@ -98,7 +99,6 @@ import sys
 import time
 import urllib.request
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -109,7 +109,6 @@ from synapse_filelock import lock_exclusive
 
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
-LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", "/tmp/synapse-ingest-hook.log")
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
 TAIL_RECORDS = int(os.environ.get("SYNAPSE_INGEST_TAIL", "400"))
 CATCHUP_DAYS = float(os.environ.get("SYNAPSE_INGEST_CATCHUP_DAYS", "3"))
@@ -134,11 +133,7 @@ _MACHINERY_PREFIXES = (
 
 
 def _log(msg: str) -> None:
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(UTC).isoformat()} {msg}\n")
-    except Exception:
-        pass
+    config.synapse_home.log("ingest-hook", msg)
 
 
 def _is_turn_start(rec: dict[str, Any]) -> bool:

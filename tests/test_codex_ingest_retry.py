@@ -75,7 +75,6 @@ def env(monkeypatch, tmp_path) -> Iterator[Path]:
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("SYNAPSE_CODEX_CURSORS", str(tmp_path / "state" / "codex_cursors.json"))
-    monkeypatch.setenv("SYNAPSE_CODEX_HOOK_LOG", str(tmp_path / "hook.log"))
     monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(tmp_path / "private"))
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
@@ -386,7 +385,10 @@ def test_cap_holds_and_failing_rollouts_rotate(hook, monkeypatch):
     assert attempted == [b, a]  # capped at 2
     hook._catchup()
     assert attempted == [b, a, c, d]  # the two that just failed moved to the back
-    assert "2 deferred to next session start" in Path(hook.LOG_PATH).read_text()
+    assert (
+        "2 deferred to next session start"
+        in (hook.synapse_home.home() / "logs" / "codex-hook.log").read_text()
+    )
 
 
 def test_concurrent_sweeps_collapse_to_one(hook, monkeypatch):

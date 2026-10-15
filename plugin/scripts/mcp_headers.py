@@ -26,7 +26,6 @@ import argparse
 import json
 import os
 import sys
-import time
 from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -35,18 +34,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["SYNAPSE_USER_SETTINGS_ONLY"] = "1"
 import config
 
-_LOG_CAP = 64 * 1024
-
 
 def _log(reason: str) -> None:
-    try:
-        path = config.synapse_home.home() / "logs" / "mcp_headers.log"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mode = "w" if path.exists() and path.stat().st_size > _LOG_CAP else "a"
-        with open(path, mode, encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {reason}\n")
-    except OSError:
-        pass
+    config.synapse_home.log("mcp_headers", reason)
 
 
 def _fail(reason: str) -> int:
