@@ -12,6 +12,10 @@ only from files under the Claude projects directory, never larger than MAX_RESUL
 no more than MAX_POST_BYTES in one POST. Whatever cannot be inlined keeps its redirect. An
 old server ignores the difference: it stores the record's text as it always did.
 
+The Stop hook, the sweep and the history import call it only for a server whose last reply said
+web capture is on (ingest_hook): a server that ignores the files would otherwise be sent
+megabytes it drops on every POST. `synapse capture` always does, having asked the server.
+
 Stdlib only, like every hook. Codex needs nothing like this: its rollouts carry tool output
 inline, truncated by Codex itself.
 """
@@ -27,7 +31,7 @@ from typing import Any
 
 #: Constants, not settings. The server skips a result over 2,000,000 characters anyway.
 MAX_RESULT_BYTES = 1_000_000
-MAX_POST_BYTES = 8_000_000
+MAX_POST_BYTES = 2_000_000  # the hook's 30 s POST timeout must hold on a slow uplink
 
 # The server's reading of a redirect (ingestion.capture.detect._PERSISTED_REDIRECT) and the
 # path it names. The path may contain spaces (a Windows profile name): it runs to the

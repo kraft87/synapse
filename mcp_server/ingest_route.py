@@ -110,8 +110,9 @@ class _Post:
 
 
 def _capture_enabled() -> bool:
-    """Whether the sub-agent records are worth reading. A bad switch is not this route's to
-    report: the episode writer logs it and counts it, and the turns are stored regardless."""
+    """Whether capture is on: the sub-agent records are worth reading, and the reply says so.
+    A bad switch is not this route's to report (it reads as off): the episode writer logs it
+    and counts it, and the turns are stored regardless."""
     from ingestion import capture
 
     try:
@@ -161,7 +162,8 @@ def register(
 
         Web research in the records' tool calls (any tool: ``ingestion.capture`` recognises it
         by shape) is captured too when ``SYNAPSE_WEB_CAPTURE=on``, from stored turns, re-shipped
-        turns and sub-agent records alike; the reply's ``captured`` counts the artifacts stored.
+        turns and sub-agent records alike; the reply's ``captured`` counts the artifacts stored
+        and ``capture`` says whether the switch is on (an older server has neither key).
         """
         if not _machine_authorized(request):
             return unauthorized()
@@ -203,7 +205,16 @@ def register(
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("ingest failed")
             return err(str(exc)[:200], 500)
-        return JSONResponse({"status": "ok", "ingested": stats.written, "captured": stats.captured})
+        return JSONResponse(
+            {
+                "status": "ok",
+                "ingested": stats.written,
+                "captured": stats.captured,
+                # Whether capture is on: the client ships sub-agent transcripts and the large
+                # tool outputs it saved to files only to a server that will use them.
+                "capture": _capture_enabled(),
+            }
+        )
 
     @mcp.custom_route("/capture/dry-run", methods=["POST"])
     async def capture_dry_run(request: Request) -> JSONResponse:

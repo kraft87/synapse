@@ -205,22 +205,33 @@ def _client(db_url):
 def test_ingest_reports_what_it_captured(db_url, conn, capture_on):
     sid = f"r-{uuid.uuid4().hex}"
     r = _client(db_url).post("/ingest", json={"records": records("a", sid), "project": "app"})
-    assert r.status_code == 200 and r.json() == {"status": "ok", "ingested": 1, "captured": 1}
+    assert r.status_code == 200 and r.json() == {
+        "status": "ok",
+        "ingested": 1,
+        "captured": 1,
+        "capture": True,
+    }
     assert [a[:2] for a in artifacts(conn)] == [("toolu_a", sid)]
 
 
 def test_ingest_of_records_that_make_no_turn_is_a_clean_no_op(db_url, conn, capture_on):
     r = _client(db_url).post("/ingest", json={"records": []})
-    assert r.status_code == 200 and r.json() == {"status": "ok", "ingested": 0, "captured": 0}
+    nothing = {"status": "ok", "ingested": 0, "captured": 0, "capture": True}
+    assert r.status_code == 200 and r.json() == nothing
     r = _client(db_url).post("/ingest", json={"records": [{"type": "summary", "summary": "x"}]})
-    assert r.status_code == 200 and r.json() == {"status": "ok", "ingested": 0, "captured": 0}
+    assert r.status_code == 200 and r.json() == nothing
 
 
 def test_ingest_captures_a_post_of_nothing_but_sub_agent_records(db_url, conn, capture_on):
     sid = f"r-{uuid.uuid4().hex}"
     side = [{**r, "isSidechain": True} for r in records("side", sid)[1:3]]
     r = _client(db_url).post("/ingest", json={"records": side, "project": "app"})
-    assert r.status_code == 200 and r.json() == {"status": "ok", "ingested": 0, "captured": 1}
+    assert r.status_code == 200 and r.json() == {
+        "status": "ok",
+        "ingested": 0,
+        "captured": 1,
+        "capture": True,
+    }
     assert conn.execute("SELECT count(*) FROM episodes").fetchone()[0] == 0
     assert [(a[0], a[3]["project"]) for a in artifacts(conn)] == [("toolu_side", "app")]
 
@@ -232,8 +243,15 @@ def test_ingest_with_capture_off_stores_the_turn_and_no_research(db_url, conn, m
         "records": records("a", sid) + [{**r, "isSidechain": True} for r in records("s", sid)[1:3]]
     }
     r = _client(db_url).post("/ingest", json=body)
-    assert r.json() == {"status": "ok", "ingested": 1, "captured": 0}
+    # `capture` tells the hooks whether shipping sub-agent files and saved outputs is of use
+    assert r.json() == {"status": "ok", "ingested": 1, "captured": 0, "capture": False}
     assert artifacts(conn) == []
+
+
+def test_ingest_of_a_misspelled_switch_says_capture_is_off(db_url, conn, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_WEB_CAPTURE", "yes")
+    r = _client(db_url).post("/ingest", json={"records": records("a", f"r-{uuid.uuid4().hex}")})
+    assert r.status_code == 200 and r.json()["capture"] is False
 
 
 def test_ingest_stamps_the_research_with_the_callers_surface(db_url, conn, capture_on):

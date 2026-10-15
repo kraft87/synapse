@@ -181,6 +181,8 @@ def test_the_hooks_post_body_carries_the_inlined_record(root, monkeypatch, tmp_p
     hook = _load_hook(_PLUGIN_HOOK)
     monkeypatch.setattr(hook.config, "PROJECTS_DIR", root)
     recs = pair(*FETCH, redirect(saved(root)))
-    body = hook._payload(recs, "hook")
+    body = hook._payload(recs, "hook", inline=True)
     assert result_of(body["records"]) == _PAGE and body["source"] == "hook"
     assert "persisted-output" in result_of(recs)
+    # a server that does not capture is sent the records as they are
+    assert "persisted-output" in result_of(hook._payload(recs, "hook", inline=False)["records"])

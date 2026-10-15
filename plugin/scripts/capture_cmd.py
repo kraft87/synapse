@@ -97,7 +97,7 @@ def batches_of(path: Path, batch_size: int) -> Iterator[dict[str, Any]]:
     match = _ROLLOUT_ID.search(path.name)
     if match is None:
         for batch in import_history.batches(records, batch_size):
-            yield ingest_hook._payload(batch, "import")
+            yield ingest_hook._payload(batch, "import", inline=True)
         return
     body: dict[str, Any] = {
         "records": records,

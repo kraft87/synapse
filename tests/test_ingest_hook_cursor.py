@@ -414,3 +414,163 @@ def test_post_records_sends_a_real_user_agent(hook, monkeypatch):
     hook._post_records([_u("u1")])
     assert seen.get("user-agent") == hook.config.USER_AGENT
     assert not seen["user-agent"].startswith("Python-urllib")
+
+
+# ---------------------------------------------------------------------------
+# Web capture: sub-agent transcripts and saved tool outputs go to a server that captures
+# ---------------------------------------------------------------------------
+
+
+class _Server:
+    """urlopen, replaced: records every body and answers with ``reply``."""
+
+    def __init__(self, hook, monkeypatch, reply: dict | str | None = None) -> None:
+        self.bodies: list[dict] = []
+        self.reply = {"status": "ok", "ingested": 1} if reply is None else reply
+        monkeypatch.setattr(hook.urllib.request, "urlopen", self._open)
+
+    def _open(self, req, timeout=None):
+        import io
+
+        self.bodies.append(json.loads(req.data))
+        text = self.reply if isinstance(self.reply, str) else json.dumps(self.reply)
+        return io.BytesIO(text.encode())
+
+
+def _subagent_records(sid: str) -> list[dict]:
+    """A sub-agent's transcript: its prompt (the only turn start), a tool call and its result."""
+    use = {"type": "tool_use", "id": "ts", "name": "mcp__acme__fetch", "input": {"url": "https://e.com"}}  # fmt: skip
+    res = {"type": "tool_result", "tool_use_id": "ts", "content": "page"}
+    recs = [
+        _u("s1", "research this"),
+        {**_a("s2"), "message": {"content": [use]}},
+        {**_u("s3"), "message": {"content": [res]}},
+        _a("s4", "done"),
+    ]
+    return [{**r, "sessionId": sid, "isSidechain": True} for r in recs]
+
+
+def _session(root: Path, sid: str = "sess1") -> tuple[Path, Path]:
+    """<root>/-proj/<sid>.jsonl and its sub-agent transcript beside it, as Claude Code writes
+    them (the records carry the parent's sessionId)."""
+    main = root / "-proj" / f"{sid}.jsonl"
+    main.parent.mkdir(parents=True, exist_ok=True)
+    _write_jsonl(main, [{**r, "sessionId": sid} for r in (_u("u1"), _a("a1"))])
+    side = main.parent / sid / "subagents" / "agent-a1.jsonl"
+    side.parent.mkdir(parents=True)
+    _write_jsonl(side, _subagent_records(sid))
+    return main, side
+
+
+def _redirect_records(saved: Path) -> list[dict]:
+    use = {"type": "tool_use", "id": "t1", "name": "mcp__acme__fetch", "input": {"url": "https://e.com"}}  # fmt: skip
+    redirect = f"Output too large (2KB). Full output saved to: {saved}"
+    res = {"type": "tool_result", "tool_use_id": "t1", "content": redirect}
+    return [
+        _u("u1"),
+        {**_a("a1"), "message": {"content": [use]}},
+        {**_u("r1"), "message": {"content": [res]}},
+    ]
+
+
+def test_saved_outputs_are_read_in_only_for_a_server_that_captures(hook, tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    saved = projects / "-proj" / "s" / "tool-results" / "t1.txt"
+    saved.parent.mkdir(parents=True)
+    saved.write_text("the whole page " * 50)
+    monkeypatch.setattr(hook.config, "PROJECTS_DIR", projects)
+    server = _Server(hook, monkeypatch)
+
+    def result_sent() -> str:
+        hook._post_records(_redirect_records(saved))
+        return server.bodies[-1]["records"][2]["message"]["content"][0]["content"]
+
+    assert "saved to:" in result_sent()  # nothing known yet: the redirect goes as it is
+    server.reply = {"status": "ok", "ingested": 1, "capture": True}
+    assert "saved to:" in result_sent()  # still sent without the file; its reply is the news
+    assert result_sent() == "the whole page " * 50  # the server said it captures
+    server.reply = {"status": "ok", "ingested": 1}  # the switch was turned off, or an old server
+    assert result_sent() == "the whole page " * 50  # this POST went out on the old answer
+    assert "saved to:" in result_sent()  # ...and its reply ended it
+
+
+def test_a_reply_that_is_not_the_servers_leaves_what_was_known(hook, monkeypatch):
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook._post_records([_u("u1")])
+    assert hook._server_captures()
+    for junk in ("<html>502 Bad Gateway</html>", "[1, 2]", ""):
+        server.reply = junk
+        hook._post_records([_u("u1")])
+        assert hook._server_captures()
+    server.reply = {"status": "ok", "capture": False}
+    hook._post_records([_u("u1")])
+    assert not hook._server_captures()
+
+
+def test_the_stop_hook_ships_the_sessions_subagent_transcripts(hook, tmp_path, monkeypatch):
+    main, side = _session(tmp_path / "projects")
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook._ship_session(str(main))
+    sent = [[r["uuid"] for r in b["records"]] for b in server.bodies]
+    # the transcript first (its reply says capture is on), then the sub-agent's whole file
+    assert sent == [["u1", "a1"], ["s1", "s2", "s3", "s4"]]
+    assert {r.get("isSidechain") for r in server.bodies[1]["records"]} == {True}
+    state = hook._load_state()
+    assert state[str(side)]["offset"] == 0 and state[str(side)]["size"] == side.stat().st_size
+    hook._ship_session(str(main))  # nothing changed: nothing is sent again
+    assert len(server.bodies) == 2
+
+
+def test_a_subagent_transcript_grown_since_is_shipped_again(hook, tmp_path, monkeypatch):
+    main, side = _session(tmp_path / "projects")
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook._ship_session(str(main))
+    with open(side, "ab") as f:
+        f.write(json.dumps({**_a("s5", "more"), "isSidechain": True}).encode() + b"\n")
+    hook._ship_session(str(main))
+    assert [r["uuid"] for r in server.bodies[-1]["records"]] == ["s1", "s2", "s3", "s4", "s5"]
+
+
+def test_no_subagent_transcript_goes_to_a_server_that_does_not_capture(hook, tmp_path, monkeypatch):
+    main, side = _session(tmp_path / "projects")
+    server = _Server(hook, monkeypatch)  # an older server: no `capture` in the reply
+    hook._ship_session(str(main))
+    assert len(server.bodies) == 1 and str(side) not in hook._load_state()
+
+
+def test_a_private_sessions_subagent_transcripts_are_not_shipped(hook, tmp_path, monkeypatch):
+    main, side = _session(tmp_path / "projects")
+    monkeypatch.setattr(hook, "PRIVATE_DIR", tmp_path / "private")
+    (tmp_path / "private").mkdir()
+    (tmp_path / "private" / "sess1").write_text("")
+    hook.CAPTURE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    hook.CAPTURE_MARKER.touch()  # the server captures...
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook._ship_session(str(main))
+    assert server.bodies == []  # ...but neither file goes: the parent session is private
+    assert hook._ship(str(side), mode="catchup") == (0, 0) and server.bodies == []
+
+
+def test_the_sweep_takes_subagent_transcripts_only_for_a_server_that_captures(hook, tmp_path):
+    root = tmp_path / "projects"
+    main, side = _session(root)
+    old = time.time() - 3600
+    for p in (main, side):
+        os.utime(p, (old, old))
+    assert hook._catchup_candidates(str(root), "", {}, time.time()) == [str(main)]
+    got = hook._catchup_candidates(str(root), "", {}, time.time(), subagents=True)
+    assert sorted(got) == sorted([str(main), str(side)])
+
+
+def test_the_sweep_ships_a_subagent_transcript_from_byte_zero(hook, tmp_path, monkeypatch):
+    root = tmp_path / "projects"
+    main, side = _session(root)
+    old = time.time() - 3600
+    for p in (main, side):
+        os.utime(p, (old, old))
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook.CAPTURE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    hook.CAPTURE_MARKER.touch()
+    hook._catchup(str(root), skip_path="")
+    assert len(server.bodies) == 2
+    assert any(r.get("isSidechain") for b in server.bodies for r in b["records"])

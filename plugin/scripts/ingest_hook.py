@@ -59,11 +59,17 @@ token. That failure bookkeeping lives in synapse_ingest_retry.py, which the
 Codex Stop hook (plugin-codex/hooks/synapse_stop_hook.py) shares, so both
 hosts retry and warn the same way.
 
-A tool result Claude Code saved to a file because it was too large (the transcript keeps
-only "Output too large ... Full output saved to: <path>") is read back into the shipped
-record when the call looks like web research, so the server can capture it
-(persisted_outputs.py: capped per result and per POST, only files that exist under the
-projects directory).
+Web research. The server captures it from the records it receives (SYNAPSE_WEB_CAPTURE, off
+by default) and says whether it does in every /ingest reply (`capture`); the hook remembers
+the last answer (DATA_DIR/server_captures exists while it was yes), and only while it is yes:
+  * a tool result Claude Code saved to a file because it was too large (the transcript keeps
+    only "Output too large ... Full output saved to: <path>") is read back into the shipped
+    record when the call looks like web research (persisted_outputs.py: capped per result
+    and per POST, only files that exist under the projects directory);
+  * the Stop hook and the sweep also ship the session's sub-agent transcripts
+    (<session>/subagents/agent-<id>.jsonl, where most research runs), each under its own
+    cursor, from byte 0 (a sub-agent file has no turns to seed a tail from).
+An old server never says yes, so a disabled or older server is not sent what it would drop.
 
 Design constraints:
   * NEVER block or fail the turn. Claude waits for Stop hooks to exit, so the
@@ -162,6 +168,7 @@ CATCHUP_MAX_FILES = retry.CATCHUP_MAX_FILES
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
+CAPTURE_MARKER = config.DATA_DIR / "server_captures"  # exists while /ingest last said capture is on
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -387,13 +394,37 @@ def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
     return {c: lb for c in cwds if (lb := synapse_project.project_label(c))}
 
 
-def _payload(records: list[dict[str, Any]], source: str) -> dict[str, Any]:
-    """The /ingest body for a batch of raw transcript records: the records themselves (the
-    results of large tool outputs read in from their files, persisted_outputs) and the
-    batch's project label (_cwd_labels). Shared with `synapse capture`, whose dry run posts
-    the same body to /capture/dry-run."""
+def _server_captures() -> bool:
+    """True if the server's last /ingest reply said web capture is on (see _note_capture)."""
+    return CAPTURE_MARKER.exists()
+
+
+def _note_capture(reply: str) -> None:
+    """Remember what an /ingest reply says about web capture. A server that does not say
+    (older, or a capture switch that is off or misspelled) counts as off; a reply that is not
+    the server's JSON (a proxy's error page) changes nothing. Never raises: not knowing means
+    not shipping the extras, which is safe."""
+    try:
+        on = json.loads(reply).get("capture") is True
+    except (ValueError, AttributeError):
+        return
+    try:
+        if on:
+            CAPTURE_MARKER.parent.mkdir(parents=True, exist_ok=True)
+            CAPTURE_MARKER.touch()
+        else:
+            CAPTURE_MARKER.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _payload(records: list[dict[str, Any]], source: str, *, inline: bool) -> dict[str, Any]:
+    """The /ingest body for a batch of raw transcript records: the records themselves, the
+    results of large tool outputs read in from their files when ``inline`` (persisted_outputs:
+    only for a server that captures), and the batch's project label (_cwd_labels). Shared
+    with `synapse capture`, whose dry run posts the same body to /capture/dry-run."""
     payload: dict[str, Any] = {
-        "records": persisted_outputs.inline(records, config.PROJECTS_DIR),
+        "records": persisted_outputs.inline(records, config.PROJECTS_DIR) if inline else records,
         "source": source,
     }
     by_cwd = _cwd_labels(records)
@@ -410,9 +441,10 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     """POST a batch of raw transcript records to /ingest; returns the (truncated)
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
     bulk history import (import_history.py), so all resolve URL/token identically
-    through config.py, and all send the batch's project label (_cwd_labels).
+    through config.py, and all send the batch's project label (_cwd_labels). Reads the
+    server's answer on web capture from the reply (_note_capture) for the next POST.
     Raises on transport/HTTP errors — callers decide how to fail-soft."""
-    body = json.dumps(_payload(records, source)).encode()
+    body = json.dumps(_payload(records, source, inline=_server_captures())).encode()
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
     # soft, so without it every ingest is silently dropped.
@@ -421,7 +453,18 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # user-configured Synapse URL
-        return resp.read().decode()[:200]
+        reply = resp.read().decode()
+    _note_capture(reply)
+    return reply[:200]
+
+
+def _parent_session(transcript_path: str) -> str | None:
+    """The session a sub-agent transcript (<session>/subagents/agent-<id>.jsonl) belongs to;
+    None for any other file. Its records carry the parent's sessionId."""
+    subagents = os.path.dirname(transcript_path)
+    if os.path.basename(subagents) != "subagents":
+        return None
+    return os.path.basename(os.path.dirname(subagents))
 
 
 def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
@@ -429,7 +472,9 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
 
     stop mode seeds a missing cursor from the bounded tail (the pre-cursor hook
     already shipped that session turn-by-turn); catchup mode ships from byte 0 —
-    recovering never-shipped files is its entire point. A failed POST leaves the
+    recovering never-shipped files is its entire point — and so does a sub-agent
+    transcript in either mode: it has no turns to seed a tail from, and the server
+    reads whole tool calls from it. A failed POST leaves the
     cursor at the failure point, so the next Stop or sweep resumes there.
 
     Private mode short-circuits everything: a session with a live marker file posts
@@ -438,8 +483,10 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
     expires the turns are still shippable — the server's private_sessions row, not
     this cursor, is what keeps them out of memory for good.
     """
-    # Cheap check first: the transcript's own name is the session id.
-    session_id = os.path.splitext(os.path.basename(transcript_path))[0]
+    # Cheap check first: the transcript's own name is the session id (a sub-agent's, its
+    # session directory's).
+    parent = _parent_session(transcript_path)
+    session_id = parent or os.path.splitext(os.path.basename(transcript_path))[0]
     if _is_private(session_id):
         _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)}")
         return (0, 0)
@@ -458,7 +505,7 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
         if not offset_recs:
             return (0, 0)
         if cursor is None:
-            if mode == "stop":
+            if mode == "stop" and parent is None:
                 tail = offset_recs[-TAIL_RECORDS:]
                 i = next((j for j, (_, r) in enumerate(tail) if _is_turn_start(r)), None)
                 cursor = tail[i][0] if i is not None else 0
@@ -515,6 +562,22 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
     return (posts, shipped)
 
 
+def _subagent_files(transcript_path: str) -> list[str]:
+    """The session's sub-agent transcripts, which Claude Code writes beside its own."""
+    session_id = os.path.splitext(os.path.basename(transcript_path))[0]
+    subagents = os.path.join(os.path.dirname(transcript_path), session_id, "subagents")
+    return sorted(glob.glob(os.path.join(glob.escape(subagents), "*.jsonl")))
+
+
+def _ship_session(transcript_path: str) -> None:
+    """The Stop hook's work: the session's transcript, then (to a server that captures web
+    research, which the transcript's reply has just told us) its sub-agent transcripts."""
+    _ship(transcript_path, mode="stop")
+    if _server_captures():
+        for path in _subagent_files(transcript_path):
+            _ship(path, mode="stop")
+
+
 # ---------------------------------------------------------------------------
 # SessionStart catch-up sweep
 # ---------------------------------------------------------------------------
@@ -525,6 +588,8 @@ def _catchup_candidates(
     skip_path: str,
     state: dict[str, Any],
     now: float,
+    *,
+    subagents: bool = False,
 ) -> list[str]:
     """Transcripts worth sweeping: not the live session, not mid-write
     (ACTIVE_GRACE — an active session's own Stop hooks own it), with bytes past
@@ -539,9 +604,15 @@ def _catchup_candidates(
     repeated capped sweeps make oldest-first progress and a file that keeps
     failing rotates to the back instead of starving the rest. Pure given
     os.stat results — patchable in tests. The rules are
-    synapse_ingest_retry.sweep_candidates, shared with the Codex hook."""
+    synapse_ingest_retry.sweep_candidates, shared with the Codex hook.
+
+    ``subagents`` adds the sub-agent transcripts (<session>/subagents/agent-<id>.jsonl)
+    under the same rules; the caller asks for them only while the server captures."""
+    paths = glob.glob(os.path.join(projects_root, "*", "*.jsonl"))
+    if subagents:
+        paths += glob.glob(os.path.join(projects_root, "*", "*", "subagents", "*.jsonl"))
     return retry.sweep_candidates(
-        glob.glob(os.path.join(projects_root, "*", "*.jsonl")),
+        paths,
         state,
         now,
         window_days=CATCHUP_DAYS,
@@ -562,7 +633,13 @@ def _catchup(projects_root: str, skip_path: str) -> None:
         except OSError:
             _log("CATCHUP skipped: another sweep is running")
             return
-        candidates = _catchup_candidates(projects_root, skip_path, _load_state(), time.time())
+        candidates = _catchup_candidates(
+            projects_root,
+            skip_path,
+            _load_state(),
+            time.time(),
+            subagents=_server_captures(),
+        )
         deferred = max(0, len(candidates) - CATCHUP_MAX_FILES)
         files = posts = recs = 0
         for path in candidates[:CATCHUP_MAX_FILES]:
@@ -590,7 +667,7 @@ def _projects_root_from(transcript_path: str) -> str:
 def main() -> None:
     # Detached children do the actual work.
     if len(sys.argv) >= 3 and sys.argv[1] == "--ship":
-        _ship(sys.argv[2], mode="stop")
+        _ship_session(sys.argv[2])
         return
     if len(sys.argv) >= 3 and sys.argv[1] == "--catchup-run":
         _catchup(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else "")
