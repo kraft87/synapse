@@ -37,6 +37,10 @@ PROPOSE_SALIENCE = 4  # derive: propose when detector-rated pain/severity reache
 PROPOSE_DAYS = 2  # derive: propose when its evidence dates span this many distinct days
 DECAY_TTL_DAYS = 28  # last_seen older than this -> retired (time-based; no nightly mass-bump)
 EVIDENCE_CAP = 60  # bound the JSONB
+PHRASING_CAP = 12  # trigger phrasings kept on a derive candidate
+# The states a retune's (name, direction) key is unique among (schema 112's index predicate):
+# the ones still waiting on a decision. A promoted or retired row is history.
+_OPEN = "status IN ('observe', 'proposed', 'rejected')"
 
 # grounded signals advance toward apply; judge signals only nominate (and get 0.5x'd by `score`).
 _GROUNDED_W = {
@@ -140,7 +144,11 @@ def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
     work again (a re-run after a held cursor, the miner's overlapping window) adds nothing,
     while the same session on another day is a fresh sighting. Entries without a date
     (gap_scan, explicit requests, legacy rows) key on scan_night instead, so a later night's
-    sighting still counts; entries with neither all key to one bucket."""
+    sighting still counts; entries with neither all key to one bucket.
+
+    The cap drops the oldest judge entries. A grounded entry is a human decision or a user
+    signal (an accept is what lets a row stand as promoted: grounded_required_to_apply) and
+    is never dropped."""
     out, seen = [], set()
     for e in list(old) + list(new):
         k = (
@@ -153,7 +161,18 @@ def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
             continue
         seen.add(k)
         out.append(e)
-    return out[-EVIDENCE_CAP:]
+    excess = len(out) - EVIDENCE_CAP
+    if excess > 0:
+        oldest = {id(e) for e in [e for e in out if e.get("class") != "grounded"][:excess]}
+        out = [e for e in out if id(e) not in oldest]
+    return out
+
+
+def _union_phrasings(old, new) -> list[str]:
+    """Trigger phrasings of a candidate: the stored ones, then the new ones, deduped. A merge
+    that brings none leaves them as they were."""
+    both = [p for p in [*(old or []), *(new or [])] if isinstance(p, str) and p.strip()]
+    return list(dict.fromkeys(both))[:PHRASING_CAP]
 
 
 def _recurrence_days(evidence: list[dict]) -> int:
@@ -182,46 +201,56 @@ def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
 
 
 def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions):
-    """Return (id, evidence, cooling) of the matching candidate, or None. `cooling` is True
-    when the row is rejected inside its 30d suppression window (rejected_until)."""
+    """Return (id, evidence, trigger_phrasings, cooling) of the matching open candidate, or
+    None. `cooling` is True when the row is rejected inside its 30d suppression window
+    (rejected_until)."""
     if kind == "retune":
-        # Match the skill_gap_named_idx unique key EXACTLY — no status filter. A row in a
-        # terminal state (promoted/rejected/retired) still occupies (kind, name, direction);
-        # filtering it out here sent merge_candidate down the INSERT path straight into a
-        # UniqueViolation every night the lane re-derived the same candidate.
+        # Match skill_gap_named_idx's unique key among the open states (schema 112): a
+        # promoted or retired row is history, so a new sighting opens a fresh candidate. On a
+        # database still on the old index (unique across every status) the INSERT then
+        # conflicts with the closed row; merge_candidate reports that row untouched.
         cur.execute(
-            "SELECT id, evidence, "
+            "SELECT id, evidence, trigger_phrasings, "
             "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
             "FROM skills_lane.skill_gap_candidates "
-            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') LIMIT 1",
+            f"WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') AND {_OPEN} "
+            "LIMIT 1",
             (kind, name, direction),
         )
         r = cur.fetchone()
-        return (r[0], r[1], r[2]) if r else None
+        return (r[0], r[1], r[2], r[3]) if r else None
     # derive: semantic identity over active rows. Empty-vs-empty is NOT identity: a candidate
     # submitted without session ids / signature must never wildcard-match (and clobber) an
     # existing empty-keyed row — each leg only counts when BOTH sides are non-empty.
     cur.execute(
-        "SELECT id, evidence, signature_key FROM skills_lane.skill_gap_candidates "
+        "SELECT id, evidence, signature_key, trigger_phrasings, name "
+        "FROM skills_lane.skill_gap_candidates "
         "WHERE kind='derive' AND status IN ('observe','proposed')"
     )
-    best, best_score = None, 0.0
+    rows = cur.fetchall()
     new_toks = set((sigkey or "").split())
-    for cid, ev, rk in cur.fetchall():
+    if not new_toks:
+        # No signature to compare (an explicit "make this a skill" request): a shared session
+        # alone says nothing about the topic, and would rewrite another gap's candidate. Only
+        # the row of the same name is this one.
+        for cid, ev, _rk, phr, row_name in rows:
+            if row_name == name:
+                return cid, ev or [], phr or [], False
+        return None
+    best, best_score = None, 0.0
+    for cid, ev, rk, phr, _row_name in rows:
         old_sessions = _ev_sessions(ev or [])
         old_toks = set((rk or "").split())
         sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
-        tj = _jaccard(new_toks, old_toks) if new_toks and old_toks else 0.0
+        tj = _jaccard(new_toks, old_toks) if old_toks else 0.0
         # Signature disagreement vetoes session-overlap identity: one long session
         # routinely contains several distinct gaps, so a shared session alone is not
         # identity when both sides carry signatures that don't resemble each other.
-        session_match = sj >= SESSION_JACCARD and not (
-            new_toks and old_toks and tj < SIGNATURE_VETO_FLOOR
-        )
+        session_match = sj >= SESSION_JACCARD and not (old_toks and tj < SIGNATURE_VETO_FLOOR)
         if session_match or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
-                best, best_score = (cid, ev or [], False), rank
+                best, best_score = (cid, ev or [], phr or [], False), rank
     return best
 
 
@@ -262,12 +291,14 @@ def merge_candidate(
 ) -> dict:
     """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
 
-    Re-sighting a row in a terminal state (retunes share one unique key per
-    (name, direction) regardless of status):
-      - rejected inside its 30d cooldown: skipped silently, no write;
-      - rejected past cooldown / retired: evidence merges and the row REOPENS to 'observe';
-      - accepted / promoted: evidence merges (the sighting is recorded) but status never
-        changes here — the observe->proposed gate below only fires on 'observe'.
+    A retune's (name, direction) is one row among the OPEN candidates (observe / proposed /
+    rejected; schema 112). A sighting of a skill whose earlier row is promoted or retired
+    therefore opens a fresh candidate holding only the new evidence; the closed row is
+    history. A re-sighted rejected row:
+      - inside its 30d cooldown: skipped silently, no write;
+      - past the cooldown: evidence merges and the row REOPENS to 'observe'.
+    Before schema 112 the closed row still occupies the key: the INSERT does nothing and the
+    row is reported untouched.
 
     salience persists as max(existing, new) — a candidate's pain rating only ratchets up.
     source_detector / proposed_patch: latest non-null wins (a fresh patch draft supersedes)."""
@@ -277,16 +308,19 @@ def merge_candidate(
     match = _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
 
     if match:
-        cid, old_ev, cooling = match
+        cid, old_ev, old_phr, cooling = match
         if cooling:
             # rejected within the 30d suppression window: respect the cooldown — no
             # evidence merge, no write, and no fresh INSERT against the occupied key.
             conn.commit()
             return {"id": cid, "status": "rejected", "score": None, "merged": False}
         evidence = _union_evidence(old_ev, evidence_entries)
+        phrasings = _union_phrasings(old_phr, trigger_phrasings)
         merged = True
     else:
-        cid, evidence, merged = None, _union_evidence([], evidence_entries), False
+        cid, merged = None, False
+        evidence = _union_evidence([], evidence_entries)
+        phrasings = _union_phrasings([], trigger_phrasings)
 
     js, gs, jw, gw = _rollup(evidence)
     emb_lit = None
@@ -295,7 +329,7 @@ def merge_candidate(
             emb_lit = vec_literal(embed([summary], "document")[0])
         except Exception:
             emb_lit = None
-    phr = json.dumps(trigger_phrasings or [])
+    phr = json.dumps(phrasings)
     ev_json = json.dumps(evidence)
     tgt = list(target_skills or [])
 
@@ -305,7 +339,7 @@ def merge_candidate(
                  evidence=%s::jsonb, judge_sessions=%s, grounded_sessions=%s,
                  judge_weight=%s, grounded_weight=%s,
                  summary=COALESCE(NULLIF(%s,''), summary),
-                 signature=COALESCE(%s, signature), signature_key=COALESCE(%s, signature_key),
+                 signature=COALESCE(%s, signature), signature_key=COALESCE(NULLIF(%s,''), signature_key),
                  trigger_phrasings=%s::jsonb, target_skills=%s,
                  summary_embedding=COALESCE(%s::halfvec, summary_embedding),
                  salience=GREATEST(salience, %s::smallint),
@@ -334,14 +368,14 @@ def merge_candidate(
         )
     else:
         cur.execute(
-            """INSERT INTO skills_lane.skill_gap_candidates
+            f"""INSERT INTO skills_lane.skill_gap_candidates
                  (kind, name, signature_key, target_skills, direction, summary, signature,
                   trigger_phrasings, summary_embedding, evidence,
                   judge_sessions, grounded_sessions, judge_weight, grounded_weight,
                   salience, source_detector, proposed_patch)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::halfvec,%s::jsonb,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (kind, name, COALESCE(direction, '-'))
-                 WHERE kind = 'retune' DO NOTHING
+                 WHERE kind = 'retune' AND {_OPEN} DO NOTHING
                RETURNING id, status, score, salience""",
             (
                 kind,
@@ -366,12 +400,14 @@ def merge_candidate(
     row = cur.fetchone()
     if row is None:
         # ON CONFLICT backstop fired: the unique key is occupied by a row the resolver
-        # didn't see (e.g. a concurrent writer landed it between resolve and insert).
-        # Never crash the lane — report the occupying row, untouched.
+        # didn't see (a concurrent writer landed it between resolve and insert, or, before
+        # schema 112, a closed row). Never crash the lane — report the occupying row,
+        # untouched; an open one first.
         conn.commit()
         cur.execute(
             "SELECT id, status, score FROM skills_lane.skill_gap_candidates "
-            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-')",
+            "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') "
+            f"ORDER BY ({_OPEN}) DESC, id DESC LIMIT 1",
             (kind, name, direction),
         )
         r = cur.fetchone()
@@ -383,10 +419,10 @@ def merge_candidate(
         }
     rid, status, score, row_salience = row
 
-    # A re-sighted terminal row REOPENS (rejected past its cooldown, or retired-stale):
-    # back to 'observe' so the gates below re-decide. The old reject evidence merged in
-    # above still weighs against it (-3 grounded), so reopening stays conservative.
-    if status in ("rejected", "retired"):
+    # A re-sighted rejected row past its cooldown REOPENS: back to 'observe' so the gates
+    # below re-decide. The old reject evidence merged in above still weighs against it (-3
+    # grounded), so reopening stays conservative.
+    if status == "rejected":
         cur.execute(
             "UPDATE skills_lane.skill_gap_candidates SET status='observe', "
             "reject_reason=NULL, rejected_until=NULL, updated_at=now() WHERE id=%s",

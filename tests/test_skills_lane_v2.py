@@ -30,7 +30,9 @@ import dream.skills.skill_ledger as L
 import dream.skills.struggle_arc as SA
 from mcp_server.skill_sync_routes import _proposal_detail, _proposals_list
 
-MIGRATION = Path(__file__).resolve().parent.parent / "schema" / "045_skills_v2_foundation.sql"
+SCHEMA = Path(__file__).resolve().parent.parent / "schema"
+MIGRATION = SCHEMA / "045_skills_v2_foundation.sql"
+MIGRATION_112 = SCHEMA / "112_skill_candidate_open_identity.sql"
 
 _GHOSTS = ("research", "multi-research", "deep-research")
 
@@ -43,7 +45,10 @@ def _mc(conn, kind, name, evidence, **kw):
 @pytest.fixture()
 def lane(conn):
     def _clean():
-        conn.execute("DELETE FROM skills_lane.skill_gap_candidates WHERE name LIKE 'v2t-%'")
+        conn.execute(
+            "DELETE FROM skills_lane.skill_gap_candidates "
+            "WHERE name LIKE 'v2t-%' OR name LIKE 'explicit:v2t-%'"
+        )
         conn.execute(
             "DELETE FROM skills_lane.skill_usage WHERE skill LIKE 'v2t-%' "
             "OR skill IN ('research', 'multi-research', 'deep-research', 'run-research')"
@@ -246,10 +251,87 @@ def test_empty_keys_never_wildcard_merge(lane):
     assert stray2["id"] != stray["id"]
 
 
+def _gap(sid, night="2026-07-17"):
+    return [{"session_id": sid, "class": "judge", "signal": "gap_scan", "scan_night": night}]
+
+
+def test_a_sighting_without_a_signature_keeps_the_rows_identity_key(lane):
+    sig = "synthetic restic nas backup rclone"
+    r1 = _mc(lane, "derive", "v2t-keep-key", _gap("v2t-sess-k1"), signature=sig)
+    key = _row(lane, r1["id"], "signature_key, signature")
+    r2 = _mc(lane, "derive", "v2t-keep-key", _gap("v2t-sess-k2", "2026-07-18"))
+    assert r2["id"] == r1["id"] and r2["merged"] is True
+    assert key[0] and _row(lane, r1["id"], "signature_key, signature") == key
+
+
+def test_trigger_phrasings_accumulate_and_are_never_erased(lane):
+    sig = "synthetic restic nas backup rclone"
+    r1 = _mc(
+        lane,
+        "derive",
+        "v2t-phr",
+        _gap("v2t-sess-p1"),
+        signature=sig,
+        trigger_phrasings=["back up the nas", "nas backup"],
+    )
+
+    def phrasings():
+        return _row(lane, r1["id"], "trigger_phrasings")[0]
+
+    # a merge that brings none (procedure_miner, a phrasing-less verdict) leaves them be
+    _mc(lane, "derive", "v2t-phr", _gap("v2t-sess-p2", "2026-07-18"), signature=sig)
+    assert phrasings() == ["back up the nas", "nas backup"]
+    # a merge that brings some adds the new ones, deduped, oldest first
+    _mc(
+        lane,
+        "derive",
+        "v2t-phr",
+        _gap("v2t-sess-p3", "2026-07-19"),
+        signature=sig,
+        trigger_phrasings=["nas backup", "snapshot the nas"],
+    )
+    assert phrasings() == ["back up the nas", "nas backup", "snapshot the nas"]
+
+
+def test_an_explicit_request_is_its_own_candidate_and_leaves_the_sessions_gap_alone(
+    lane, monkeypatch
+):
+    gap = _mc(
+        lane,
+        "derive",
+        "v2t-session-gap",
+        _gap("v2t-sess-x"),
+        signature="synthetic restic nas backup rclone",
+        summary="back up the nas",
+        trigger_phrasings=["nas backup"],
+    )
+    before = _row(
+        lane, gap["id"], "summary, signature_key, trigger_phrasings, grounded_weight, status"
+    )
+    monkeypatch.setattr(
+        N.DB,
+        "explicit_skill_requests",
+        lambda conn, window: [
+            {"session_id": "v2t-sess-x", "ts": None, "phrasing": "make this into a skill"}
+        ],
+    )
+    N.capture_grounded(lane, None, [], set())
+    N.capture_grounded(lane, None, [], set())  # a re-scan of the same request adds nothing
+    assert (
+        _row(lane, gap["id"], "summary, signature_key, trigger_phrasings, grounded_weight, status")
+        == before
+    )
+    (n, weight) = lane.execute(
+        "SELECT count(*), max(grounded_weight) FROM skills_lane.skill_gap_candidates "
+        "WHERE kind='derive' AND name LIKE 'explicit:v2t-sess%'"
+    ).fetchone()
+    assert (n, weight) == (1, 3.0)
+
+
 # ------------------------------------------- terminal-state re-sightings (unique key)
-# retune/consolidate share ONE row per (kind, name, direction) regardless of status
-# (skill_gap_named_idx has no status filter): a nightly re-derivation of a candidate
-# whose row went terminal must merge/skip, never INSERT into a UniqueViolation.
+# A retune's (name, direction) is unique among OPEN rows only (schema 112: observe, proposed,
+# rejected). A promoted or retired row is history: a sighting after it opens a fresh candidate
+# instead of being folded into the closed one, and an INSERT never hits a UniqueViolation.
 
 
 def _under_trigger(sid):
@@ -268,29 +350,59 @@ def _retune(conn, sid, name="v2t-terminal-skill"):
     )
 
 
-def test_resighting_promoted_row_records_evidence_without_insert(lane):
-    r1 = _retune(lane, "v2t-sess-t1")
-    # promote the way the review path does: grounded 'accept' evidence first, then the
-    # status flip (grounded_required_to_apply needs grounded_weight > 0 on promoted rows)
-    lane.execute(
+def _promote(conn, cid):
+    """Promote the way the review path does: grounded 'accept' evidence first, then the status
+    flip (grounded_required_to_apply needs grounded_weight > 0 on promoted rows)."""
+    conn.execute(
         "UPDATE skills_lane.skill_gap_candidates SET status='promoted', "
         'evidence = evidence || \'[{"session_id": null, "class": "grounded", '
         '"signal": "accept"}]\'::jsonb, grounded_weight=3.0 WHERE id=%s',
+        (cid,),
+    )
+
+
+def test_a_sighting_after_an_accept_opens_a_fresh_candidate(lane):
+    r1 = _retune(lane, "v2t-sess-t1")
+    _promote(lane, r1["id"])
+    # the nightly lane sees the same skill under-fire again: a new problem after the change
+    r2 = _retune(lane, "v2t-sess-t2")
+    assert r2["id"] != r1["id"] and r2["merged"] is False
+    assert r2["status"] == "observe"
+    assert _row(lane, r1["id"], "status, jsonb_array_length(evidence)") == ("promoted", 2)
+    (new_ev,) = _row(lane, r2["id"], "evidence")
+    assert {e["session_id"] for e in new_ev} == {"v2t-sess-t2"}  # post-change evidence only
+    # and the next sighting joins the open row, not the history
+    r3 = _retune(lane, "v2t-sess-t3")
+    assert r3["id"] == r2["id"] and r3["merged"] is True
+
+
+def test_a_sighting_after_a_retirement_opens_a_fresh_candidate(lane):
+    r1 = _retune(lane, "v2t-sess-t1")
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='retired', reject_reason='stale' "
+        "WHERE id=%s",
         (r1["id"],),
     )
-    # the nightly lane re-derives the same (kind, name, direction) candidate
     r2 = _retune(lane, "v2t-sess-t2")
-    assert r2["id"] == r1["id"] and r2["merged"] is True
-    assert r2["status"] == "promoted"  # sighting recorded, never re-proposed
-    status, ev, gw, n = lane.execute(
-        "SELECT status, evidence, grounded_weight, "
-        "(SELECT count(*) FROM skills_lane.skill_gap_candidates "
-        "WHERE name='v2t-terminal-skill') FROM skills_lane.skill_gap_candidates WHERE id=%s",
-        (r1["id"],),
-    ).fetchone()
-    assert status == "promoted" and n == 1
-    assert gw > 0  # full-evidence rollup kept the grounded 'accept' — constraint holds
-    assert {e["session_id"] for e in ev} == {"v2t-sess-t1", "v2t-sess-t2", None}
+    assert r2["id"] != r1["id"] and r2["merged"] is False and r2["status"] == "observe"
+    assert _row(lane, r1["id"], "status") == ("retired",)
+
+
+def test_before_schema_112_a_sighting_after_an_accept_is_reported_not_raised(lane):
+    old_index = (
+        "CREATE UNIQUE INDEX skill_gap_named_idx ON skills_lane.skill_gap_candidates "
+        "(kind, name, COALESCE(direction, '-')) WHERE kind IN ('retune', 'consolidate')"
+    )
+    lane.execute("DROP INDEX skills_lane.skill_gap_named_idx")
+    lane.execute(old_index)
+    try:
+        r1 = _retune(lane, "v2t-sess-t1")
+        _promote(lane, r1["id"])
+        r2 = _retune(lane, "v2t-sess-t2")  # the closed row still occupies the key
+        assert r2["id"] == r1["id"] and r2["merged"] is False and r2["status"] == "promoted"
+        assert _row(lane, r1["id"], "jsonb_array_length(evidence)") == (2,)
+    finally:
+        lane.execute(MIGRATION_112.read_text())
 
 
 def test_resighting_rejected_row_in_cooldown_skips_silently(lane):

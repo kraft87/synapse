@@ -30,6 +30,20 @@ def _ev(sid="sess-1", signal="gap_scan", cls="judge", night=None, date=None, **e
 # ------------------------------------------------------------- _union_evidence
 
 
+def test_the_cap_trims_judge_entries_and_never_the_grounded_ones():
+    # a promoted row's grounded 'accept' sat at the front and fell off after 60 more
+    # sightings, so the rollup read grounded_weight 0 and grounded_required_to_apply failed
+    accept = _ev(sid=None, signal="accept", cls="grounded")
+    sightings = [
+        _ev(sid=f"s{i}", signal="under_trigger", date="2026-07-18") for i in range(EVIDENCE_CAP + 1)
+    ]
+    merged = _union_evidence([_ev(sid="s-first", signal="under_trigger"), accept], sightings)
+    assert accept in merged
+    assert len(merged) == EVIDENCE_CAP
+    assert _rollup(merged)[3] > 0
+    assert merged[-1] == sightings[-1]  # the oldest judge entries went, not the newest
+
+
 def test_union_same_night_duplicates_collapse():
     a = _ev(night="2026-07-17")
     b = _ev(night="2026-07-17")
@@ -176,7 +190,8 @@ class _FakeCur:
 
 
 def _row(cid, session, sigkey):
-    return (cid, [{"session_id": session, "class": "judge", "signal": "gap_scan"}], sigkey)
+    ev = [{"session_id": session, "class": "judge", "signal": "gap_scan"}]
+    return (cid, ev, sigkey, [], f"row-{cid}")
 
 
 def test_shared_session_with_disagreeing_signatures_is_not_identity():
@@ -198,6 +213,17 @@ def test_shared_session_with_agreeing_signature_merges():
     got = _resolve_id(
         cur, "derive", "media-admin", None, None, "media preferences subtitles playback", {"s1"}
     )
+    assert got is not None and got[0] == 1
+
+
+def test_a_signatureless_derive_matches_only_the_row_of_its_own_name():
+    from dream.skills.skill_ledger import _resolve_id
+
+    # an explicit "make this a skill" request names no topic: sharing a session with another
+    # gap's candidate is not identity, only its own earlier row (same name) is
+    cur = _FakeCur([_row(1, "s1", "media preferences subtitles playback config")])
+    assert _resolve_id(cur, "derive", "explicit:s1", None, None, "", {"s1"}) is None
+    got = _resolve_id(cur, "derive", "row-1", None, None, "", {"s1"})
     assert got is not None and got[0] == 1
 
 
