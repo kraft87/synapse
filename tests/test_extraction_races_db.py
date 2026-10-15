@@ -334,3 +334,56 @@ def test_same_new_name_from_parallel_workers_is_one_entity(graph, before_b):
     assert sorted(e[0] for e in edges) == sorted([fact_a.fact, fact_b.fact])
     assert {e[1] for e in edges} == {harbors[0][0]}
     assert _edgeless(graph) == []
+
+
+# ---------------------------------------------------------------------------------------
+# 3. Stage 7 is one transaction
+# ---------------------------------------------------------------------------------------
+
+
+class TestStage7IsOneTransaction:
+    """The writer used to commit each statement: the superseded edges were retired (pointing
+    at the new edge) before the new edge was written, so a failed or killed write left them
+    retired by an edge that never existed, and no retry repairs that (a retired edge never
+    re-enters a candidate pool)."""
+
+    OLD = _fact("Orchard stores artifacts in Redis", "Orchard", "Redis")
+    NEW = _fact("Orchard stores artifacts in Valkey", "Orchard", "Valkey")
+
+    def _seed_and_supersede(self, graph):
+        emb = _Embedder({self.OLD.fact: 0, self.NEW.fact: 0})
+        _pipeline(emb, [self.OLD], WINDOW_A).process_item(dict(ITEM))
+        (old_uuid,) = graph.execute("SELECT uuid FROM kg_relationships").fetchone()
+
+        def supersedes_old(facts, candidates_map):
+            return set(), {0: [old_uuid]}, {}, True
+
+        return old_uuid, _pipeline(emb, [self.NEW], WINDOW_B, judge=supersedes_old)
+
+    def test_a_failed_create_retires_nothing_and_writes_no_entity(self, graph, monkeypatch):
+        old_uuid, pipe = self._seed_and_supersede(graph)
+
+        def boom(self, rows, group_id):
+            raise RuntimeError("the insert failed")
+
+        with monkeypatch.context() as m:
+            m.setattr(KGClient, "create_edges_batch", boom)
+            with pytest.raises(RuntimeError, match="the insert failed"):
+                pipe.process_item(dict(ITEM))
+
+        assert graph.execute(
+            "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = %s", (old_uuid,)
+        ).fetchone() == (None, None)
+        assert "Valkey" not in _entity_names(graph)
+
+        # The retry meets no phantom entity (the deduper only learns a node once it
+        # committed) and completes the supersession.
+        pipe.process_item(dict(ITEM))
+        new_uuid, retired_by = graph.execute(
+            "SELECT n.uuid, o.invalidated_by FROM kg_relationships o, kg_relationships n "
+            "WHERE o.uuid = %s AND n.t_invalid IS NULL AND n.fact = %s",
+            (old_uuid, self.NEW.fact),
+        ).fetchone()
+        assert retired_by == new_uuid
+        assert "Valkey" in _entity_names(graph)
+        assert _edgeless(graph) == []

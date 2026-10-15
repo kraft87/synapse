@@ -10,6 +10,7 @@ RAISE (Postgres is the source of truth now — no best-effort swallowing).
 
 from __future__ import annotations
 
+import psycopg
 import pytest
 
 from ingestion.kg_client import KGClient, _ts, _vec
@@ -469,3 +470,57 @@ class TestDeleteOrphanEntities:
         left = {r[0] for r in conn.execute("SELECT uuid FROM kg_entities").fetchall()}
         assert left == {"src", "tgt", "retired-only", "cross-group", "orphan-new", "other"}
         assert kg_writer.delete_orphan_entities(24) == 0  # idempotent
+
+
+class TestTransaction:
+    """Stage 7's writes are one commit: edges retired by a successor never exist without it."""
+
+    def test_the_block_commits_together_on_a_clean_exit(self, kg_writer, conn):
+        with kg_writer.transaction():
+            kg_writer.create_edges_batch([make_edge_row("r-1")], GROUP)
+            kg_writer.insert_node(
+                node_uuid="e-1", name="A", entity_type="Tool", summary="", group_id=GROUP
+            )
+            # still uncommitted from every other connection
+            assert conn.execute("SELECT count(*) FROM kg_relationships").fetchone()[0] == 0
+            assert conn.execute("SELECT count(*) FROM kg_entities").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM kg_relationships").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM kg_entities").fetchone()[0] == 1
+
+    def test_an_error_leaves_none_of_the_blocks_writes(self, kg_writer, conn):
+        kg_writer.create_edges_batch([make_edge_row("r-old")], GROUP)
+        with pytest.raises(RuntimeError, match="boom"), kg_writer.transaction():
+            kg_writer.invalidate_edges_batch([("r-old", None)], GROUP, invalidated_by="r-new")
+            kg_writer.insert_node(
+                node_uuid="e-1", name="A", entity_type="Tool", summary="", group_id=GROUP
+            )
+            raise RuntimeError("boom")
+        assert conn.execute(
+            "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = 'r-old'"
+        ).fetchone() == (None, None)
+        assert conn.execute("SELECT count(*) FROM kg_entities").fetchone()[0] == 0
+
+    def test_a_failed_statement_rolls_the_block_back_and_the_client_recovers(self, kg_writer, conn):
+        kg_writer.create_edges_batch([make_edge_row("r-old")], GROUP)
+        with pytest.raises(psycopg.errors.DivisionByZero), kg_writer.transaction():
+            kg_writer.invalidate_edges_batch([("r-old", None)], GROUP)
+            kg_writer._run(lambda c: c.execute("SELECT 1/0"))
+        assert conn.execute(
+            "SELECT t_invalid FROM kg_relationships WHERE uuid = 'r-old'"
+        ).fetchone() == (None,)
+        kg_writer.invalidate_edges_batch([("r-old", None)], GROUP)  # a fresh connection
+        assert conn.execute(
+            "SELECT t_invalid IS NOT NULL FROM kg_relationships WHERE uuid = 'r-old'"
+        ).fetchone() == (True,)
+
+    def test_reads_inside_the_block_see_its_own_writes(self, kg_writer):
+        with kg_writer.transaction():
+            kg_writer.insert_node(
+                node_uuid="e-1", name="Redis", entity_type="Tool", summary="", group_id=GROUP
+            )
+            assert kg_writer.entity_uuid_by_normalized_name("redis", GROUP) == "e-1"
+
+    def test_it_does_not_nest(self, kg_writer):
+        with pytest.raises(RuntimeError, match="nest"), kg_writer.transaction():
+            with kg_writer.transaction():
+                pass

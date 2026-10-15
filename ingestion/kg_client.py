@@ -34,7 +34,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -121,6 +122,7 @@ class KGClient:
     def __init__(self, db_url: str) -> None:
         self._db_url = db_url
         self._conn: psycopg.Connection[Any] | None = None
+        self._in_transaction = False
 
     # -- connection management ------------------------------------------------
     def _reset(self) -> None:
@@ -137,10 +139,14 @@ class KGClient:
         Any error drops the connection so the next call reconnects instead of reusing one
         a failed statement or a restarted server left unusable. A connection error gets
         one retry on a fresh connection, so a Postgres restart under an idle worker
-        costs the call a reconnect, not the item a failed attempt."""
+        costs the call a reconnect, not the item a failed attempt. Inside
+        :meth:`transaction` neither happens: the block ends the transaction, and a retry
+        on a fresh connection would drop the statements before it."""
         for attempt in (1, 2):
             if self._conn is None:
                 self._conn = pg_pool.connect(self._db_url)
+            if self._in_transaction:
+                return fn(self._conn)
             try:
                 return fn(self._conn)
             except psycopg.OperationalError:
@@ -151,6 +157,31 @@ class KGClient:
                 self._reset()
                 raise
         raise AssertionError("unreachable")  # pragma: no cover
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Run the calls made inside the block as ONE transaction: they commit together
+        when it exits cleanly, and none of them lands when it raises.
+
+        The client's connection is autocommit, so each write is otherwise its own commit.
+        Stage 7 retires the edges a new fact supersedes (pointing ``invalidated_by`` at the
+        new edge) and then creates it: a crash between the two commits left old edges
+        retired by an edge that was never written, which no retry repairs because retired
+        edges never re-enter a candidate pool. After an error the connection is dropped,
+        like any failed call."""
+        if self._in_transaction:
+            raise RuntimeError("KGClient.transaction() does not nest")
+        if self._conn is None:
+            self._conn = pg_pool.connect(self._db_url)
+        self._in_transaction = True
+        try:
+            with self._conn.transaction():
+                yield
+        except Exception:
+            self._reset()
+            raise
+        finally:
+            self._in_transaction = False
 
     # ------------------------------------------------------------------
     # Entity reads
@@ -551,15 +582,16 @@ class KGClient:
         if not items:
             return
 
+        params = [(_ts(inv), invalidated_by, edge_uuid) for edge_uuid, inv in items]
+
         def _do(conn: psycopg.Connection[Any]) -> None:
-            for edge_uuid, inv in items:
-                ts = _ts(inv)
-                conn.execute(
+            with conn.cursor() as cur:
+                cur.executemany(
                     "UPDATE kg_relationships "
                     "SET t_invalid = COALESCE(t_invalid, GREATEST(t_valid, COALESCE(%s, now()))), "
                     "    invalidated_by = COALESCE(%s, invalidated_by) "
                     "WHERE uuid = %s",
-                    (ts, invalidated_by, edge_uuid),
+                    params,
                 )
 
         self._run(_do)
@@ -580,18 +612,34 @@ class KGClient:
         never backward, and only under the same new-provenance condition, so a
         replayed chunk cannot refresh currency. ``last_supported_by`` follows it.
         """
-        if not items:
+        params: list[tuple[Any, ...]] = []
+        for item in items:
+            edge_uuid, eps = item[0], item[1]
+            if not eps:
+                continue
+            support_at = _ts(item[2]) if len(item) > 2 else None
+            support_by = item[3] if len(item) > 3 else None
+            eps_json = json.dumps(eps)
+            params.append(
+                (
+                    eps_json,
+                    eps_json,
+                    support_at,
+                    eps_json,
+                    support_at,
+                    support_by,
+                    support_at,
+                    eps_json,
+                    support_at,
+                    edge_uuid,
+                )
+            )
+        if not params:
             return
 
         def _do(conn: psycopg.Connection[Any]) -> None:
-            for item in items:
-                edge_uuid, eps = item[0], item[1]
-                support_at = _ts(item[2]) if len(item) > 2 else None
-                support_by = item[3] if len(item) > 3 else None
-                if not eps:
-                    continue
-                eps_json = json.dumps(eps)
-                conn.execute(
+            with conn.cursor() as cur:
+                cur.executemany(
                     "UPDATE kg_relationships SET "
                     "  episodes = (SELECT jsonb_agg(DISTINCT e) FROM "
                     "      jsonb_array_elements(COALESCE(episodes, '[]'::jsonb) || %s::jsonb) e), "
@@ -608,18 +656,7 @@ class KGClient:
                     "      THEN last_supported_at "
                     "      ELSE GREATEST(last_supported_at, %s::timestamptz) END "
                     "WHERE uuid = %s",
-                    (
-                        eps_json,
-                        eps_json,
-                        support_at,
-                        eps_json,
-                        support_at,
-                        support_by,
-                        support_at,
-                        eps_json,
-                        support_at,
-                        edge_uuid,
-                    ),
+                    params,
                 )
 
         self._run(_do)

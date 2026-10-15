@@ -287,6 +287,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             existing = [e for e in kept_entities if e not in fresh]
             if not existing:
                 continue
+            # Matched entities only: nothing is inserted here, so nothing to register.
             self._stage5_write_nodes(
                 existing,
                 grp_uuid_map,
@@ -443,6 +444,8 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # LLM calls. 6c rechecks the facts about to be created against the live graph
             # as it is NOW (an edge written since 6a pooled, or one the judge missed); then
             # only the new entities a fact still being created links are written.
+            inserted: list[tuple[str, str]] = []
+
             def recheck_then_write_new_nodes() -> None:
                 with logfire.span("stage6c_recheck") as recheck_span:
                     restated = recheck_restated(
@@ -462,8 +465,10 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     )
                 if new_nodes is not None and new_nodes.entities:
                     with logfire.span("stage5_write_new_nodes"):
-                        self._stage5_write_new_nodes(
-                            facts, uuid_map, skip_indices, group_id, new_nodes
+                        inserted.extend(
+                            self._stage5_write_new_nodes(
+                                facts, uuid_map, skip_indices, group_id, new_nodes
+                            )
                         )
 
             # Stage 7: write edges
@@ -482,3 +487,10 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     reinforce=reinforce,
                     before_write=recheck_then_write_new_nodes,
                 )
+
+            # Stage 7 wrote the new entities in its transaction. Only now that it has
+            # committed may later items dedupe against them: a rolled-back entity found
+            # by name would give the retried item edges to a node that does not exist.
+            if new_nodes is not None and new_nodes.deduper is not None:
+                for name, node_uuid in inserted:
+                    new_nodes.deduper.register(name, node_uuid)

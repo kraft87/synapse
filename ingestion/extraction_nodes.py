@@ -88,7 +88,13 @@ class ExtractionNodesMixin:
         group_id: str,
         embeddings: dict[str, list[float]] | None = None,
         deduper: Any | None = None,
-    ) -> None:
+    ) -> list[tuple[str, str]]:
+        """Insert the entities Stage 4 resolved as new, update the ones that matched.
+
+        Returns the ``(name, uuid)`` of every entity it INSERTED. Registering those with
+        the deduper is the caller's job, once the write has committed: Stage 7 writes
+        them inside a transaction, and a rolled-back insert must not stay findable."""
+        inserted: list[tuple[str, str]] = []
         for entity in entities:
             raw_uuid = uuid_map.get(entity.name, f"new:{uuid.uuid4()}")
             is_new = raw_uuid.startswith("new:")
@@ -124,18 +130,14 @@ class ExtractionNodesMixin:
                     embedding=(embeddings or {}).get(entity.name),
                     supertype=supertype,
                 )
-                # Register the freshly-INSERTED node in the deduper so any later
-                # extraction in the same run dedupes against it instead of writing a
-                # duplicate. Matched nodes are already in the deduper's exact-name
-                # index from its initial hydration.
-                if deduper is not None:
-                    deduper.register(entity.name, clean_uuid)
+                inserted.append((entity.name, clean_uuid))
             else:
                 # A mention of an entity that already has its identity: it keeps its name,
                 # embedding and subtype. The longer summary survives (the freshly
                 # extracted one is often shorter than the canonical one), decided in SQL
                 # against the stored text: another replica may have extended it since.
                 self._kg.update_node(clean_uuid, summary=entity.summary, supertype=supertype)
+        return inserted
 
     def _stage5_write_new_nodes(
         self,
@@ -144,14 +146,16 @@ class ExtractionNodesMixin:
         skip_indices: set[int],
         group_id: str,
         pending: PendingNodes,
-    ) -> None:
+    ) -> list[tuple[str, str]]:
         """Write the group's NEW entities that a fact Stage 7 will create links, no others.
+        Returns the ``(name, uuid)`` pairs it inserted (see ``_stage5_write_nodes``).
 
         Runs right after Stage 6c, inside Stage 7 before its edge writes, with the same
-        create guard Stage 7 applies (not skipped, both endpoints resolved). A new entity whose facts were all
-        dropped (cross-group, same-batch twin, 6b or 6c duplicate, unresolved endpoint) is
-        never written, so it cannot be left without an edge. ``uuid_map`` is updated in
-        place when the same-name guard routes a name to an entity written meanwhile."""
+        create guard Stage 7 applies (not skipped, both endpoints resolved). A new entity
+        whose facts were all dropped (cross-group, same-batch twin, 6b or 6c duplicate,
+        unresolved endpoint) is never written, so it cannot be left without an edge.
+        ``uuid_map`` is updated in place when the same-name guard routes a name to an
+        entity written meanwhile."""
         linked: set[str] = set()
         for idx, fact in enumerate(facts):
             if idx in skip_indices or not (uuid_map.get(fact.source) and uuid_map.get(fact.target)):
@@ -165,15 +169,16 @@ class ExtractionNodesMixin:
         held = len(pending.entities) - len(to_write)
         if held:
             logger.debug("Held back %d new entities no written fact links", held)
-        if to_write:
-            self._stage5_write_nodes(
-                to_write,
-                uuid_map,
-                pending.project,
-                group_id,
-                pending.embeddings,
-                deduper=pending.deduper,
-            )
+        if not to_write:
+            return []
+        return self._stage5_write_nodes(
+            to_write,
+            uuid_map,
+            pending.project,
+            group_id,
+            pending.embeddings,
+            deduper=pending.deduper,
+        )
 
     def _deduper_for(self, group_id: str) -> Any:
         """Cached per-group NodeDeduper (thin shell; see ingestion.dedup).

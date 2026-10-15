@@ -308,11 +308,15 @@ class ExtractionEdgesMixin:
         replacement case), we skip the redundant write but still mark the
         superseded edge as invalid.
 
-        ``before_write`` runs after the LLM pre-pass (edge dates) and before the first
-        write. It may add to ``skip_indices`` and ``reinforce`` and remap ``uuid_map``;
+        ``before_write`` runs after the LLM pre-pass (edge dates) and before the edge
+        writes. It may add to ``skip_indices`` and ``reinforce`` and remap ``uuid_map``;
         everything below reads them after it. The extractor runs Stage 6c and the
         new-entity writes there, so an edge another worker writes while this batch waits
         on the date call is still seen.
+
+        Everything from ``before_write`` on, the new entities included, is one
+        transaction: a crash or a failed insert cannot leave edges retired by a
+        successor that was never written.
         """
         # Pre-extract (valid_at, invalid_at) for ALL facts in ONE LLM call
         # (PR #89): one call per summary instead of one per fact at ~30s each.
@@ -326,155 +330,158 @@ class ExtractionEdgesMixin:
         batched_dates = self._edge_date_extractor.extract_batch(
             eligible_facts, reference_time=reference_time
         )
-        if before_write is not None:
-            before_write()
+        with self._kg.transaction():
+            if before_write is not None:
+                before_write()
 
-        # Assemble the FULL invalidation list before writing edges so we
-        # dispatch ONE UNWIND-batched MATCH+SET round-trip instead of N.
-        # ``invalidate`` (the Stage 6b verdicts: old live edges the new fact
-        # supersedes) is independent of whether the new edge gets written;
-        # always applied, before the new CREATE.
-        # The edge-date extractor's ``invalid_at`` is deliberately NOT a source
-        # (2026-10-09). It used to be applied at birth, so a fact whose text
-        # expressed an end ("User told the assistant on 2026-08-29 to stop X", "the
-        # outage ran Aug-Sep") was written already-retired and dropped out of the
-        # live index on the spot: 616 such edges in prod, with no successor link,
-        # invisible to every recall leg. A fact that records a dated happening or a
-        # bounded past state is a TRUE statement for as long as the graph exists;
-        # ``t_invalid`` means "superseded by a later fact", and only supersession
-        # (Stage 6b) sets it. Currency for the reader
-        # rides ``t_valid`` + the schema-058 fields instead.
-        # Pre-generate the new edge uuid for each fact that WILL be created (same guards as the
-        # create_rows loop below), so a contradiction can record WHICH new edge supersedes the old
-        # one (schema 028, invalidated_by). Facts that won't be created (no resolved src/tgt) can
-        # still contradict an old edge but leave no recoverable superseder -> invalidated_by NULL.
-        new_uuid_by_idx: dict[int, str] = {}
-        for idx, fact in enumerate(facts):
-            if idx in skip_indices:
-                continue
-            if uuid_map.get(fact.source) and uuid_map.get(fact.target):
-                new_uuid_by_idx[idx] = str(uuid.uuid4())
-
-        # Effective valid-from per fact, decided ONCE and shared by the CREATE rows below
-        # and by every invalidation the fact causes. Date precedence: explicit date in
-        # the fact text > source-segment / source-page date > extraction time.
-        now = datetime.now(UTC).isoformat()
-        valid_at_by_idx: dict[int, str] = {}
-        for idx in range(len(facts)):
-            t_valid_pre, _ = batched_dates[idx] if idx < len(batched_dates) else (None, None)
-            valid_at_by_idx[idx] = t_valid_pre or default_valid_at or now
-
-        # Every old edge a new fact retires is invalidated AS OF that fact's evidenced
-        # valid-from (the correction's own date, else the conversation time it was said
-        # in) — not the write clock, which for a backfilled or late-processed chunk can
-        # sit months after the change. The writer clamps t_invalid to >= the old edge's
-        # own t_valid so a correction dated before the stale edge was even written
-        # cannot produce a negative lifetime.
-        #
-        # Superseder resolution — the schema-028 invalidated_by link that recall's
-        # supersession legs REQUIRE to surface a correction (a retired edge without it
-        # is invisible at read time): (a) the new edge when the fact is written; (b) the
-        # existing edge the fact was judged a pure duplicate of when the write is
-        # skipped (drop-in replacement: "now uses X" re-asserting an existing X edge
-        # while retiring the Y edge); (c) none when neither exists (unresolved
-        # endpoints) — the old edge still retires, link NULL.
-        def _superseder(idx: int) -> str | None:
-            if idx in skip_indices:
-                dups = (reinforce or {}).get(idx) or []
-                return dups[0] if dups else None
-            return new_uuid_by_idx.get(idx)
-
-        # Stage 6 verdicts ({new fact idx: [old edge uuids]}) were once flattened
-        # and written with NO superseder, which is why corrections found at
-        # extraction never reached recall's successor lookup.
-        by_superseder: dict[str, list[tuple[str, str | None]]] = {}
-        orphan_invalidations: list[tuple[str, str | None]] = []
-        seen_old: set[tuple[str, str | None]] = set()
-        for idx in range(len(facts)):
-            # A fact 6c absorbed keeps its verdicts, linked to the absorbing edge.
-            olds = invalidate.get(idx, [])
-            if not olds:
-                continue
-            sup = _superseder(idx)
-            inv_at = valid_at_by_idx[idx]
-            for old_uuid in olds:
-                key = (old_uuid, sup)
-                if key in seen_old:
+            # Assemble the FULL invalidation list before writing edges so we
+            # dispatch ONE UNWIND-batched MATCH+SET round-trip instead of N.
+            # ``invalidate`` (the Stage 6b verdicts: old live edges the new fact
+            # supersedes) is independent of whether the new edge gets written;
+            # always applied, before the new CREATE.
+            # The edge-date extractor's ``invalid_at`` is deliberately NOT a source
+            # (2026-10-09). It used to be applied at birth, so a fact whose text
+            # expressed an end ("User told the assistant on 2026-08-29 to stop X", "the
+            # outage ran Aug-Sep") was written already-retired and dropped out of the
+            # live index on the spot: 616 such edges in prod, with no successor link,
+            # invisible to every recall leg. A fact that records a dated happening or a
+            # bounded past state is a TRUE statement for as long as the graph exists;
+            # ``t_invalid`` means "superseded by a later fact", and only supersession
+            # (Stage 6b) sets it. Currency for the reader
+            # rides ``t_valid`` + the schema-058 fields instead.
+            # Pre-generate the new edge uuid for each fact that WILL be created (same guards as the
+            # create_rows loop below), so a contradiction can record WHICH new edge supersedes the old
+            # one (schema 028, invalidated_by). Facts that won't be created (no resolved src/tgt) can
+            # still contradict an old edge but leave no recoverable superseder -> invalidated_by NULL.
+            new_uuid_by_idx: dict[int, str] = {}
+            for idx, fact in enumerate(facts):
+                if idx in skip_indices:
                     continue
-                seen_old.add(key)
-                if sup:
-                    by_superseder.setdefault(sup, []).append((old_uuid, inv_at))
-                else:
-                    orphan_invalidations.append((old_uuid, inv_at))
-        for sup, retired in by_superseder.items():
-            self._kg.invalidate_edges_batch(retired, group_id, invalidated_by=sup)
-        if orphan_invalidations:
-            self._kg.invalidate_edges_batch(orphan_invalidations, group_id)
+                if uuid_map.get(fact.source) and uuid_map.get(fact.target):
+                    new_uuid_by_idx[idx] = str(uuid.uuid4())
 
-        # Build CREATE rows for every eligible fact in one pass, then dispatch
-        # one batched INSERT (see create_edges_batch) instead of a round-trip per
-        # fact.
-        # Evidence metadata (schema 058): support time = when the chunk was SAID
-        # (segment timestamp), never the extracted valid-from — "User ran a marathon
-        # in 2019", said today, is supported today and valid from 2019. Only a
-        # user-attributed fact counts as support; an assistant-stated one is written
-        # with last_supported_at NULL (never user-confirmed) and shows as such.
-        support_at = default_valid_at or now
-        support_by = max(episode_ids) if episode_ids else None
-        create_rows: list[dict[str, Any]] = []
-        for idx, fact in enumerate(facts):
-            if idx in skip_indices:
-                continue
-            src_uuid = uuid_map.get(fact.source)
-            tgt_uuid = uuid_map.get(fact.target)
-            if not src_uuid or not tgt_uuid:
-                continue
-            src_clean = src_uuid.removeprefix("new:")
-            tgt_clean = tgt_uuid.removeprefix("new:")
-            emb = fact_embeddings[idx] if fact_embeddings and idx < len(fact_embeddings) else None
-            valid_at_ts = valid_at_by_idx[idx]
-            user_stated = getattr(fact, "attribution", "unknown") == "user"
-            create_rows.append(
-                {
-                    "src": src_clean,
-                    "tgt": tgt_clean,
-                    "edge_uuid": new_uuid_by_idx[idx],
-                    "name": fact.relationship,
-                    "fact": fact.fact,
-                    "episodes": episode_ids,
-                    "t_created": now,
-                    "t_valid": valid_at_ts,
-                    "emb": emb,
-                    # Web provenance (task #68). None on the episode lane.
-                    "web_artifact_id": web_artifact_id,
-                    # Evidence metadata (schema 058).
-                    "ongoing": bool(getattr(fact, "ongoing", False)),
-                    "last_supported_at": support_at if user_stated else None,
-                    "last_supported_by": support_by if user_stated else None,
-                }
-            )
-        if create_rows:
-            self._kg.create_edges_batch(create_rows, group_id)
+            # Effective valid-from per fact, decided ONCE and shared by the CREATE rows below
+            # and by every invalidation the fact causes. Date precedence: explicit date in
+            # the fact text > source-segment / source-page date > extraction time.
+            now = datetime.now(UTC).isoformat()
+            valid_at_by_idx: dict[int, str] = {}
+            for idx in range(len(facts)):
+                t_valid_pre, _ = batched_dates[idx] if idx < len(batched_dates) else (None, None)
+                valid_at_by_idx[idx] = t_valid_pre or default_valid_at or now
 
-        # Capture dedup hits: a fact skipped as a pure duplicate still ASSERTED
-        # the matched edge(s). Bump their mention_count + union this chunk's
-        # source episodes (provenance) instead of dropping the re-assertion.
-        # Forward-only — historical dupes are already gone. The read-side ranking
-        # boost on mention_count is a later phase. A USER-attributed re-assertion
-        # also refreshes the edge's last_supported_at (schema 058); an assistant
-        # repeat unions provenance but leaves currency untouched.
-        if reinforce:
-            reinforce_items: list[tuple[str, list[int], str | None, int | None]] = []
-            for idx in skip_indices:
-                user_stated = getattr(facts[idx], "attribution", "unknown") == "user"
-                for existing_uuid in reinforce.get(idx, []):
-                    reinforce_items.append(
-                        (
-                            existing_uuid,
-                            episode_ids,
-                            support_at if user_stated else None,
-                            support_by if user_stated else None,
+            # Every old edge a new fact retires is invalidated AS OF that fact's evidenced
+            # valid-from (the correction's own date, else the conversation time it was said
+            # in) — not the write clock, which for a backfilled or late-processed chunk can
+            # sit months after the change. The writer clamps t_invalid to >= the old edge's
+            # own t_valid so a correction dated before the stale edge was even written
+            # cannot produce a negative lifetime.
+            #
+            # Superseder resolution — the schema-028 invalidated_by link that recall's
+            # supersession legs REQUIRE to surface a correction (a retired edge without it
+            # is invisible at read time): (a) the new edge when the fact is written; (b) the
+            # existing edge the fact was judged a pure duplicate of when the write is
+            # skipped (drop-in replacement: "now uses X" re-asserting an existing X edge
+            # while retiring the Y edge); (c) none when neither exists (unresolved
+            # endpoints) — the old edge still retires, link NULL.
+            def _superseder(idx: int) -> str | None:
+                if idx in skip_indices:
+                    dups = (reinforce or {}).get(idx) or []
+                    return dups[0] if dups else None
+                return new_uuid_by_idx.get(idx)
+
+            # Stage 6 verdicts ({new fact idx: [old edge uuids]}) were once flattened
+            # and written with NO superseder, which is why corrections found at
+            # extraction never reached recall's successor lookup.
+            by_superseder: dict[str, list[tuple[str, str | None]]] = {}
+            orphan_invalidations: list[tuple[str, str | None]] = []
+            seen_old: set[tuple[str, str | None]] = set()
+            for idx in range(len(facts)):
+                # A fact 6c absorbed keeps its verdicts, linked to the absorbing edge.
+                olds = invalidate.get(idx, [])
+                if not olds:
+                    continue
+                sup = _superseder(idx)
+                inv_at = valid_at_by_idx[idx]
+                for old_uuid in olds:
+                    key = (old_uuid, sup)
+                    if key in seen_old:
+                        continue
+                    seen_old.add(key)
+                    if sup:
+                        by_superseder.setdefault(sup, []).append((old_uuid, inv_at))
+                    else:
+                        orphan_invalidations.append((old_uuid, inv_at))
+            for sup, retired in by_superseder.items():
+                self._kg.invalidate_edges_batch(retired, group_id, invalidated_by=sup)
+            if orphan_invalidations:
+                self._kg.invalidate_edges_batch(orphan_invalidations, group_id)
+
+            # Build CREATE rows for every eligible fact in one pass, then dispatch
+            # one batched INSERT (see create_edges_batch) instead of a round-trip per
+            # fact.
+            # Evidence metadata (schema 058): support time = when the chunk was SAID
+            # (segment timestamp), never the extracted valid-from — "User ran a marathon
+            # in 2019", said today, is supported today and valid from 2019. Only a
+            # user-attributed fact counts as support; an assistant-stated one is written
+            # with last_supported_at NULL (never user-confirmed) and shows as such.
+            support_at = default_valid_at or now
+            support_by = max(episode_ids) if episode_ids else None
+            create_rows: list[dict[str, Any]] = []
+            for idx, fact in enumerate(facts):
+                if idx in skip_indices:
+                    continue
+                src_uuid = uuid_map.get(fact.source)
+                tgt_uuid = uuid_map.get(fact.target)
+                if not src_uuid or not tgt_uuid:
+                    continue
+                src_clean = src_uuid.removeprefix("new:")
+                tgt_clean = tgt_uuid.removeprefix("new:")
+                emb = (
+                    fact_embeddings[idx] if fact_embeddings and idx < len(fact_embeddings) else None
+                )
+                valid_at_ts = valid_at_by_idx[idx]
+                user_stated = getattr(fact, "attribution", "unknown") == "user"
+                create_rows.append(
+                    {
+                        "src": src_clean,
+                        "tgt": tgt_clean,
+                        "edge_uuid": new_uuid_by_idx[idx],
+                        "name": fact.relationship,
+                        "fact": fact.fact,
+                        "episodes": episode_ids,
+                        "t_created": now,
+                        "t_valid": valid_at_ts,
+                        "emb": emb,
+                        # Web provenance (task #68). None on the episode lane.
+                        "web_artifact_id": web_artifact_id,
+                        # Evidence metadata (schema 058).
+                        "ongoing": bool(getattr(fact, "ongoing", False)),
+                        "last_supported_at": support_at if user_stated else None,
+                        "last_supported_by": support_by if user_stated else None,
+                    }
+                )
+            if create_rows:
+                self._kg.create_edges_batch(create_rows, group_id)
+
+            # Capture dedup hits: a fact skipped as a pure duplicate still ASSERTED
+            # the matched edge(s). Bump their mention_count + union this chunk's
+            # source episodes (provenance) instead of dropping the re-assertion.
+            # Forward-only — historical dupes are already gone. The read-side ranking
+            # boost on mention_count is a later phase. A USER-attributed re-assertion
+            # also refreshes the edge's last_supported_at (schema 058); an assistant
+            # repeat unions provenance but leaves currency untouched.
+            if reinforce:
+                reinforce_items: list[tuple[str, list[int], str | None, int | None]] = []
+                for idx in skip_indices:
+                    user_stated = getattr(facts[idx], "attribution", "unknown") == "user"
+                    for existing_uuid in reinforce.get(idx, []):
+                        reinforce_items.append(
+                            (
+                                existing_uuid,
+                                episode_ids,
+                                support_at if user_stated else None,
+                                support_by if user_stated else None,
+                            )
                         )
-                    )
-            if reinforce_items:
-                self._kg.reinforce_edges(reinforce_items, group_id)
+                if reinforce_items:
+                    self._kg.reinforce_edges(reinforce_items, group_id)
