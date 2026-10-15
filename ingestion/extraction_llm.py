@@ -24,16 +24,9 @@ source about their own work, life, and preferences: treat a user assertion as a 
 when phrased casually ("I'll just go with Postgres" -> a decision), but a user QUESTION is \
 NOT an assertion — never mint a fact from something the user only asked about.
 
-Session date: {session_date}. Resolve every dated mention in the facts against it.
-
-Given the session summary and pre-identified entities below, extract any additional \
-entities and the relationships between all entities.
-
-Pre-identified entities:
-{context_entities}
-
-Session summary:
-{summary}
+Given the session summary and pre-identified entities at the end of this prompt, extract \
+any additional entities and the relationships between all entities. Resolve every dated \
+mention in the facts against the session date, also at the end.
 
 Output ONLY valid JSON (no explanation, no markdown fence):
 {{
@@ -236,19 +229,20 @@ ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
   least one fact. Every fact's `source` and `target` MUST exactly match the `name`
   of an entity declared in `entities`. If you can't write a meaningful fact about
   an entity, don't list it.
+
+Session date: {session_date}.
+
+Pre-identified entities:
+{context_entities}
+
+Session summary:
+{summary}
 """
 
 
 _WEB_EXTRACTION_PROMPT = """\
-The text below is an excerpt from {source_kind}. Extract entities and the \
-relationships between them.
-
-Source: {source_desc}
-Pre-identified entities:
-{context_entities}
-
-Excerpt:
-{summary}
+Extract entities and the relationships between them from the excerpt of third-party \
+content at the end of this prompt, after its source and the pre-identified entities.
 
 Output ONLY valid JSON (no explanation, no markdown fence):
 {{
@@ -284,6 +278,15 @@ ENTITY/FACT CONSISTENCY (strict — orphan entities are dropped on the server):
 - Every entity in `entities` MUST appear as the `source` or `target` of at least
   one fact, and every fact's `source`/`target` MUST exactly match a declared
   entity name.
+
+The text below is an excerpt from {source_kind}.
+
+Source: {source_desc}
+Pre-identified entities:
+{context_entities}
+
+Excerpt:
+{summary}
 """
 
 

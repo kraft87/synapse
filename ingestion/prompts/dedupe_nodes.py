@@ -17,7 +17,8 @@ See ``NOTICE.md`` for Apache 2.0 attribution.
 # Synapse modifications:
 #   - context keys preserved verbatim: previous_episodes, episode_content,
 #     extracted_node, entity_type_description, existing_nodes.
-#   - Prompt text, examples, and rule structure unchanged.
+#   - Prompt text, examples, and rule structure unchanged; the per-call entities come
+#     last so the shared rules form a cacheable prefix.
 #   - to_prompt_json copied verbatim from graphiti_core/prompts/prompt_helpers.py
 #     (same defaults: ensure_ascii=False, indent=None) so JSON serialization is
 #     bit-for-bit identical to Graphiti's prompt rendering.
@@ -62,13 +63,9 @@ def build_batch_prompt(items: list[dict[str, Any]]) -> list[dict[str, str]]:
         Message(
             role="user",
             content=f"""\
-For EACH new entity below, decide whether it is a duplicate of one of ITS OWN
-candidate entities. Each new entity has a unique `id` and its own list of
-`candidates` (each with a `candidate_id`).
-
-<NEW ENTITIES WITH CANDIDATES>
-{_to_prompt_json(items)}
-</NEW ENTITIES WITH CANDIDATES>
+For EACH new entity in NEW ENTITIES WITH CANDIDATES at the end, decide whether it is a
+duplicate of one of ITS OWN candidate entities. Each new entity has a unique `id` and its
+own list of `candidates` (each with a `candidate_id`).
 
 Two entities are duplicates ONLY if they refer to the *same real-world object
 or concept*. Semantic Equivalence: if a descriptive label clearly refers to a
@@ -92,6 +89,10 @@ Result: {{"results": [{{"id": 0, "duplicate_candidate_id": 0}}, {{"id": 1, "dupl
 
 Return ONLY JSON of the form {{"results": [{{"id": <int>, "duplicate_candidate_id": <int>}}, ...]}}
 with exactly one object per new entity `id`.
+
+<NEW ENTITIES WITH CANDIDATES>
+{_to_prompt_json(items)}
+</NEW ENTITIES WITH CANDIDATES>
 """,
         ),
     ]

@@ -225,11 +225,7 @@ _FULLTEXT_MIN_SIM = 0.70
 _SATURATION_MAX_ROUNDS = 8
 
 _BATCH_CONTRADICTION_PROMPT = """\
-You are a knowledge graph deduplication assistant. For EACH new fact below, decide which of ITS OWN existing/candidate facts it duplicates and which it contradicts. Each new fact has a unique `id` and its OWN indexed candidate lists. An idx ONLY refers to facts under the same fact `id`.
-
-<NEW FACTS WITH CANDIDATES>
-{items}
-</NEW FACTS WITH CANDIDATES>
+You are a knowledge graph deduplication assistant. For EACH new fact in NEW FACTS WITH CANDIDATES at the end, decide which of ITS OWN existing/candidate facts it duplicates and which it contradicts. Each new fact has a unique `id` and its OWN indexed candidate lists. An idx ONLY refers to facts under the same fact `id`.
 
 For each new fact:
 - existing_facts share the same source/target entity pair (strongest duplicate prior).
@@ -244,6 +240,10 @@ Rules (apply per-fact):
 - Both lists may be empty if the NEW FACT is genuinely novel.
 
 Return exactly one result object per new fact `id`.
+
+<NEW FACTS WITH CANDIDATES>
+{items}
+</NEW FACTS WITH CANDIDATES>
 """
 
 # Response shape enforced via pydantic-ai structured outputs — see
