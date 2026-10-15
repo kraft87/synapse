@@ -19,12 +19,13 @@ import importlib.util
 import json
 import os
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from tests.helpers.http import LoopbackServer
 
 _REPO = Path(__file__).resolve().parents[1]
 _SPOOL = _REPO / "plugin" / "scripts" / "remember_spool.py"
@@ -85,14 +86,11 @@ class _StubServer:
             def log_message(self, *args) -> None:  # keep pytest output clean
                 pass
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._httpd.server_port}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
+        self._server = LoopbackServer(Handler)
+        self.url = self._server.url
 
     def close(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+        self._server.close()
 
 
 @pytest.fixture()

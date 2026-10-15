@@ -35,7 +35,6 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import urllib.parse
 import uuid
@@ -45,6 +44,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.helpers.http import LoopbackServer
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
@@ -276,15 +277,11 @@ def server() -> Iterator[SimpleNamespace]:
         def log_message(self, *args) -> None:
             pass
 
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
+    server = LoopbackServer(Handler)
     try:
-        yield SimpleNamespace(url=f"http://127.0.0.1:{httpd.server_address[1]}", seen=seen)
+        yield SimpleNamespace(url=server.url, seen=seen)
     finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
+        server.close()
 
 
 def _proc_env(url: str, **extra: str) -> dict[str, str]:

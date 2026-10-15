@@ -24,16 +24,17 @@ import json
 import os
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 from contextlib import contextmanager
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import ModuleType
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+
+from tests.helpers.http import LoopbackServer
 
 _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
@@ -390,14 +391,11 @@ class _StubServer:
             def log_message(self, *args) -> None:  # keep pytest output clean
                 pass
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._httpd.server_port}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
+        self._server = LoopbackServer(Handler)
+        self.url = self._server.url
 
     def close(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+        self._server.close()
 
 
 @pytest.fixture()
