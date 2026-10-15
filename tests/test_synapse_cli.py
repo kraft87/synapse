@@ -1873,6 +1873,24 @@ def test_a_passthrough_tools_exit_code_is_the_commands(cli, monkeypatch):
     assert cli.run("devices", "revoke", "dev-x") == 3
 
 
+def test_devices_revoke_reports_the_row_count_the_server_names(cli, monkeypatch, capsys):
+    """The server answers {"revoked": N}; the old "deleted" key it replaced is not read."""
+    admin = _load("device_admin")
+    seen: list[tuple[str, str]] = []
+
+    def fake_request(method, path, payload=None, timeout=30.0):
+        seen.append((method, path))
+        return {"status": "ok", "revoked": 2, "deleted": 9}
+
+    monkeypatch.setattr(admin.config, "request_json", fake_request)
+    assert admin.main(["revoke", "dev-x"]) == 0
+    assert seen == [("DELETE", "/surfaces/dev-x")]
+    assert "revoked dev-x (2 row(s))" in capsys.readouterr().out
+    monkeypatch.setattr(admin.config, "request_json", lambda *a, **k: {"status": "ok"})
+    assert admin.main(["revoke", "dev-x"]) == 0
+    assert "(0 row(s))" in capsys.readouterr().out
+
+
 def test_version_prints_the_plugin_manifest_version(cli, capsys):
     manifest = json.loads((_REPO / "plugin" / ".claude-plugin" / "plugin.json").read_text())
     assert cli.run("version") == 0
