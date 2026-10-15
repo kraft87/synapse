@@ -20,7 +20,7 @@ from fastmcp import FastMCP
 
 from ingestion.secret_redact import redact_secrets
 from ingestion.surfaces import SurfaceTrust
-from mcp_server.caller_trust import note_ignored_surface
+from mcp_server.caller_trust import OAUTH_SURFACE_PREFIX, note_ignored_surface
 
 logger = logging.getLogger(__name__)
 
@@ -122,12 +122,19 @@ def register(
         project: str | None = None,
         session_id: str | None = None,
         audience: str | None = None,
+        archived_episode_id: int | None = None,
+        on_archived: Callable[[int], None] | None = None,
     ) -> dict:
         """The remember() write, attributed to an already-resolved ``trust``.
 
         ``trust`` must come from the caller's CREDENTIAL (MCP token context or HTTP
         bearer). It decides precedence rule 2 of audience derivation: a registered
         restricted caller defaults its notes to ``work-safe``.
+
+        The spool replay (``mcp_server/remember_routes``) is the only caller of the last
+        two: ``on_archived`` is told the archive episode's id once it is stored, and
+        ``archived_episode_id`` hands a retry that id back so the text is not archived and
+        extracted a second time.
         """
         import time as _time
         import uuid as _uuid
@@ -183,6 +190,16 @@ def register(
             note_type = "project"
 
         sid = session_id or str(_uuid.uuid4())
+        # A device-token caller that names its session is a plugin install: its Stop hook
+        # ingests that session's turns, and the pipeline extracts them, this statement
+        # included. The archive episode is still stored (it is the note's provenance and
+        # the copy of its earlier wording), but queuing it too would extract the same text
+        # again. Hookless callers (the claude.ai connector, the root token) have no such
+        # ingest, so theirs is always queued.
+        stamp = trust.stamp_surface_id
+        hook_ingested = (
+            bool(session_id) and stamp is not None and not stamp.startswith(OAUTH_SURFACE_PREFIX)
+        )
 
         def _work() -> dict:
             t0 = _time.perf_counter()
@@ -190,30 +207,32 @@ def register(
             # recall engine's read connection clean and avoids transaction leakage.
             db = Database(db_url())
             try:
-                existing = db.get_session_episodes(sid)
-                seq = (max(e["sequence"] for e in existing) + 1) if existing else 1
-
-                ep = Episode(
-                    session_id=sid,
-                    sequence=seq,
-                    project=project,
-                    content=ep_content,
-                    source="manual",
-                    # Provenance (schema 057): the credential-resolved caller, never an
-                    # argument. A self-reported `surface` or an unknown caller stamps NULL.
-                    surface_id=trust.stamp_surface_id,
-                )
-                episode_id = db.upsert_episode(ep)
-
-                db.enqueue_extraction(
-                    ExtractionItem(
-                        episode_id=episode_id,
-                        session_id=sid,
-                        content=ep_content,
-                        content_type="manual",
-                        project=project,
+                episode_id = archived_episode_id
+                if episode_id is None:
+                    episode_id = db.append_episode(
+                        Episode(
+                            session_id=sid,
+                            sequence=0,  # append_episode takes the session's next one
+                            project=project,
+                            content=ep_content,
+                            source="manual",
+                            # Provenance (schema 057): the credential-resolved caller, never an
+                            # argument. A self-reported `surface` or an unknown caller stamps NULL.
+                            surface_id=trust.stamp_surface_id,
+                        )
                     )
-                )
+                    if not hook_ingested:
+                        db.enqueue_extraction(
+                            ExtractionItem(
+                                episode_id=episode_id,
+                                session_id=sid,
+                                content=ep_content,
+                                content_type="manual",
+                                project=project,
+                            )
+                        )
+                    if on_archived is not None:
+                        on_archived(episode_id)
 
                 # Audience precedence rule 2 fires only for a REGISTERED restricted surface
                 # (`known`). An unknown surface restricts what this caller READS, but it must
@@ -253,7 +272,8 @@ def register(
                 "note_id": res["note_id"],
                 "outcome": res["outcome"],
                 "episode_id": episode_id,
-                "session_id": sid,
+                # A retry archived nothing, so it has no new session to report.
+                "session_id": session_id if archived_episode_id is not None else sid,
                 # None on a restatement that preserved the stored tier — the caller can tell
                 # "this write classified the note" from "this write left it alone".
                 "audience": res.get("audience"),
