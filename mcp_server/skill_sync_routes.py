@@ -61,18 +61,9 @@ from starlette.responses import JSONResponse
 from ingestion import pg_pool
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
-from mcp_server.http_helpers import _iso, err, guarded_json
+from mcp_server.http_helpers import _iso, err, guarded_json, parse_dt
 
 logger = logging.getLogger(__name__)
-
-
-def _dt(iso: str | None) -> datetime | None:
-    if not iso:
-        return None
-    try:
-        return datetime.fromisoformat(iso)
-    except (TypeError, ValueError):
-        return None
 
 
 def _utc(dt: datetime) -> datetime:
@@ -495,7 +486,7 @@ def _publish_skill(db_url: str, p: dict, access: SkillAccess = FULL_ACCESS) -> d
     if not access.serves(scope):
         # 200, not 403: an older client treats an HTTP error as the end of its whole sync.
         return {"status": "forbidden", "name": name}
-    edited = _dt(p.get("content_modified_at"))
+    edited = parse_dt(p.get("content_modified_at"))
     with pg_pool.connection(db_url, autocommit=False) as c:
         _lock_name(c, name)
         retired_at = _retirement_holds(c, p, edited)
@@ -547,7 +538,7 @@ def _record_overwrite(db_url: str, p: dict, access: SkillAccess = FULL_ACCESS) -
         c.execute(
             "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
             "VALUES (%s,%s,%s,%s,'disk_overwrite')",
-            (p["name"], p.get("scope"), p.get("body", ""), _dt(p.get("content_modified_at"))),
+            (p["name"], p.get("scope"), p.get("body", ""), parse_dt(p.get("content_modified_at"))),
         )
         c.commit()
     return {"status": "ok"}

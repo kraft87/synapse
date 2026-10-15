@@ -21,6 +21,7 @@ from dream.config.nightly import (
     _same_rule,
     _upsert_correction,
 )
+from dream.evidence import EVIDENCE_CAP
 
 
 @pytest.fixture()
@@ -132,6 +133,20 @@ def test_an_applied_rule_counts_one_recurrence_per_new_session(conn, cur):
     assert _upsert_correction(cur, _c("Avoid em-dashes in prose", "s9")).recurred
     assert not _upsert_correction(cur, _c("Avoid em-dashes in prose", "s9")).recurred  # a re-judge
     assert not _upsert_correction(cur, _c("Avoid em-dashes in prose", "s1")).recurred  # known
+
+
+def test_an_applied_rule_at_the_evidence_cap_still_counts_a_new_session(conn, cur):
+    """The row's evidence is capped like the skills ledger's; a full row drops its oldest
+    entry for the new one, so "a session was added" cannot be read off the list length."""
+    pid = _seed(
+        conn,
+        "Do not use em-dashes in prose",
+        "applied",
+        sessions=[f"s{i}" for i in range(EVIDENCE_CAP)],
+    )
+    assert _upsert_correction(cur, _c("Avoid em-dashes in prose", "s-new")).recurred
+    assert _row(conn, pid)[1] == EVIDENCE_CAP
+    assert not _upsert_correction(cur, _c("Avoid em-dashes in prose", "s-new")).recurred
 
 
 def test_expiry_drops_only_stale_observe_rows(conn, cur):

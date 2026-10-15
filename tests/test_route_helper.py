@@ -20,7 +20,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.testclient import TestClient
 
-from mcp_server.http_helpers import RouteError, route
+from mcp_server.http_helpers import RouteError, parse_dt, route
 
 _TOKEN = "route-test-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}
@@ -240,3 +240,14 @@ def test_a_dashboard_route_asks_the_gate_once_even_when_it_refuses_the_request(m
         r = client.request(method, path, json=body, headers=_H)
     assert r.status_code == 400, (path, r.text)
     assert gate.calls == 1, path
+
+
+def test_parse_dt_reads_a_client_timestamp_or_answers_none():
+    """One reader for the sync routes' ``modified_at`` fields: a trailing Z is UTC, anything
+    absent or unreadable (a number, a word) is None rather than a 500."""
+    z = parse_dt("2026-07-01T10:30:00Z")
+    assert z is not None and z.utcoffset().total_seconds() == 0 and z.hour == 10
+    assert parse_dt("2026-07-01T10:30:00+02:00").utcoffset().total_seconds() == 7200
+    assert parse_dt("2026-07-01").day == 1
+    assert parse_dt(None) is None and parse_dt("") is None
+    assert parse_dt("yesterday") is None and parse_dt(1750000000) is None

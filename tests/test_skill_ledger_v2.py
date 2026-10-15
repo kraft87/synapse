@@ -7,12 +7,11 @@ entries), and the observe->proposed gates (_passes_gate). All fixtures are synth
 
 from __future__ import annotations
 
+from dream.evidence import EVIDENCE_CAP, union_evidence
 from dream.skills.skill_ledger import (
-    EVIDENCE_CAP,
     PROPOSE_SCORE,
     _passes_gate,
     _recurrence_days,
-    _union_evidence,
     rollup,
 )
 
@@ -27,7 +26,7 @@ def _ev(sid="sess-1", signal="gap_scan", cls="judge", night=None, date=None, **e
     return e
 
 
-# ------------------------------------------------------------- _union_evidence
+# ------------------------------------------------------------- union_evidence
 
 
 def test_the_cap_trims_judge_entries_and_never_the_grounded_ones():
@@ -37,7 +36,7 @@ def test_the_cap_trims_judge_entries_and_never_the_grounded_ones():
     sightings = [
         _ev(sid=f"s{i}", signal="under_trigger", date="2026-07-18") for i in range(EVIDENCE_CAP + 1)
     ]
-    merged = _union_evidence([_ev(sid="s-first", signal="under_trigger"), accept], sightings)
+    merged = union_evidence([_ev(sid="s-first", signal="under_trigger"), accept], sightings)
     assert accept in merged
     assert len(merged) == EVIDENCE_CAP
     assert rollup(merged)[3] > 0
@@ -47,14 +46,14 @@ def test_the_cap_trims_judge_entries_and_never_the_grounded_ones():
 def test_union_same_night_duplicates_collapse():
     a = _ev(night="2026-07-17")
     b = _ev(night="2026-07-17")
-    assert len(_union_evidence([a], [b])) == 1
+    assert len(union_evidence([a], [b])) == 1
 
 
 def test_union_undated_resighting_on_later_night_counts():
     # no work date to key on (gap_scan, legacy rows): the scan night still separates sightings
     a = _ev(night="2026-07-17")
     b = _ev(night="2026-07-18")
-    assert len(_union_evidence([a], [b])) == 2
+    assert len(union_evidence([a], [b])) == 2
 
 
 def test_union_rescan_of_the_same_work_adds_nothing():
@@ -62,7 +61,7 @@ def test_union_rescan_of_the_same_work_adds_nothing():
     # the second scan night must not add a second entry (or a second helping of weight)
     a = _ev(signal="struggle_arc", night="2026-07-17", date="2026-07-16")
     b = _ev(signal="struggle_arc", night="2026-07-18", date="2026-07-16")
-    merged = _union_evidence([a], [b])
+    merged = union_evidence([a], [b])
     assert merged == [a]
     assert rollup(merged) == rollup([a])
     assert not _passes_gate("derive", merged, 1.0, None)
@@ -71,29 +70,29 @@ def test_union_rescan_of_the_same_work_adds_nothing():
 def test_union_same_session_on_another_day_counts():
     a = _ev(signal="struggle_arc", night="2026-07-17", date="2026-07-16")
     b = _ev(signal="struggle_arc", night="2026-07-18", date="2026-07-17")
-    assert len(_union_evidence([a], [b])) == 2
+    assert len(union_evidence([a], [b])) == 2
 
 
 def test_union_collapses_rescans_already_in_the_ledger():
     # rows written before the date key hold one entry per scan night; the next merge heals them
     old = [_ev(night=f"2026-07-{d}", date="2026-07-16") for d in (17, 18, 19)]
-    assert len(_union_evidence(old, [])) == 1
+    assert len(union_evidence(old, [])) == 1
 
 
 def test_union_legacy_entries_share_one_bucket():
     # entries without scan_night keep the old (session, signal, class) collapse
-    merged = _union_evidence([_ev()], [_ev(), _ev()])
+    merged = union_evidence([_ev()], [_ev(), _ev()])
     assert len(merged) == 1
 
 
 def test_union_legacy_and_dated_coexist():
-    merged = _union_evidence([_ev()], [_ev(night="2026-07-18")])
+    merged = union_evidence([_ev()], [_ev(night="2026-07-18")])
     assert len(merged) == 2
 
 
 def test_union_keeps_first_and_caps():
     old = [_ev(sid=f"sess-{i}") for i in range(EVIDENCE_CAP + 10)]
-    assert len(_union_evidence(old, [])) == EVIDENCE_CAP
+    assert len(union_evidence(old, [])) == EVIDENCE_CAP
 
 
 # ------------------------------------------------------------ _recurrence_days

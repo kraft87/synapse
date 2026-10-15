@@ -13,12 +13,11 @@ from dream.config.nightly import (
     PROPOSE_SESSIONS,
     _best_match,
     _distinct_sessions,
-    _jaccard,
     _rule,
     _same_rule,
     _sig_tokens,
-    _union_evidence,
 )
+from dream.evidence import EVIDENCE_CAP, jaccard, union_evidence
 
 
 def test_sig_tokens_drops_stopwords():
@@ -30,17 +29,29 @@ def test_sig_tokens_drops_stopwords():
 def test_jaccard_same_rule_high():
     a = _sig_tokens("Do not use em-dashes in drafts")
     b = _sig_tokens("Avoid em-dashes when writing drafts")
-    assert _jaccard(a, b) >= 0.4  # shared em/dashes/drafts
+    assert jaccard(a, b) >= 0.4  # shared em/dashes/drafts
     c = _sig_tokens("Filter out contract job postings")
-    assert _jaccard(a, c) == 0.0  # unrelated rules don't collide
+    assert jaccard(a, c) == 0.0  # unrelated rules don't collide
 
 
 def test_union_evidence_dedups_by_session():
     old = [{"session_id": "s1", "quote": "x"}]
     new = [{"session_id": "s1", "quote": "y"}, {"session_id": "s2", "quote": "z"}]
-    merged = _union_evidence(old, new)
+    merged = union_evidence(old, new)
     assert _distinct_sessions(merged) == 2  # s1 not double-counted
     assert len(merged) == 2
+
+
+def test_union_evidence_is_capped_like_the_skills_ledgers():
+    old = [{"session_id": f"s{i}", "quote": "x"} for i in range(EVIDENCE_CAP)]
+    merged = union_evidence(old, [{"session_id": "newest", "quote": "y"}])
+    assert len(merged) == EVIDENCE_CAP
+    assert merged[0]["session_id"] == "s1" and merged[-1]["session_id"] == "newest"  # oldest went
+
+
+def test_a_rule_of_only_stop_words_is_not_the_same_as_another():
+    assert not _same_rule(_rule("do not"), _rule("never ever"))
+    assert _best_match(_rule("do not"), [{"summary": "never ever"}]) is None
 
 
 def test_best_match_finds_same_rule_only():
@@ -57,7 +68,7 @@ def test_best_match_finds_same_rule_only():
 def test_a_rule_and_its_reversal_are_not_the_same_rule():
     # not/never/dont are stop words, so the tokens alone say these are identical
     assert (
-        _jaccard(
+        jaccard(
             _sig_tokens("Run the tests before committing"),
             _sig_tokens("Do not run the tests before committing"),
         )

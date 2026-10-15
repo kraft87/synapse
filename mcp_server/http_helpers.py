@@ -19,6 +19,7 @@ import inspect
 import logging
 import re
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
 
 from starlette.concurrency import run_in_threadpool
@@ -51,6 +52,16 @@ def status_conflict(cid: int, current: str, expected: tuple[str, ...]) -> dict:
 def _iso(dt: Any) -> str | None:
     """A datetime's ISO string, or None when it's absent."""
     return dt.isoformat() if dt is not None else None
+
+
+def parse_dt(iso: Any) -> datetime | None:
+    """A client-sent ISO timestamp (a trailing ``Z`` included), or None when absent or malformed."""
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return None
 
 
 class RouteError(Exception):

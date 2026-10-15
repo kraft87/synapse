@@ -30,6 +30,7 @@ from typing import NamedTuple
 import psycopg
 
 from dream import lane
+from dream.evidence import jaccard, union_evidence
 from dream.skills import skill_measure as SM
 from dream.skills.skill_measure import _extract_json
 from ingestion.settings import require_setting
@@ -101,10 +102,6 @@ def _sig_tokens(rule: str) -> set[str]:
     }
 
 
-def _jaccard(a: set[str], b: set[str]) -> float:
-    return len(a & b) / len(a | b) if (a or b) else 0.0
-
-
 # not/never/dont are stop words, so "Run the tests" and "Do not run the tests" have identical
 # tokens; the polarity is read from the raw words instead.
 _NEGATION = re.compile(r"\b(?:not|never|no|avoid|stop|dont)\b|n['\u2019]t\b")
@@ -121,23 +118,17 @@ def _rule(text: str) -> _Rule:
 
 def _same_rule(a: _Rule, b: _Rule) -> bool:
     """Whether two rules say the same thing: one polarity (a rule and its reversal share every
-    token) and rule-token jaccard at or above IDENTITY_JACCARD."""
-    return a.negated == b.negated and _jaccard(a.tokens, b.tokens) >= IDENTITY_JACCARD
+    token) and rule-token jaccard at or above IDENTITY_JACCARD. A rule with no significant
+    tokens (all stop words) is the same as nothing, not as another such rule."""
+    return (
+        bool(a.tokens | b.tokens)
+        and a.negated == b.negated
+        and jaccard(a.tokens, b.tokens) >= IDENTITY_JACCARD
+    )
 
 
 def _distinct_sessions(evidence: list[dict]) -> int:
     return len({e.get("session_id") for e in evidence if e.get("session_id")})
-
-
-def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
-    """Append new entries, deduped by session_id — keeps distinct-session counting honest."""
-    seen = {e.get("session_id") for e in old}
-    out = list(old)
-    for e in new:
-        if e.get("session_id") not in seen:
-            out.append(e)
-            seen.add(e.get("session_id"))
-    return out
 
 
 def _best_match(rule: _Rule, candidates: list[dict]) -> dict | None:
@@ -145,7 +136,7 @@ def _best_match(rule: _Rule, candidates: list[dict]) -> dict | None:
     best, best_j = None, 0.0
     for c in candidates:
         other = _rule(c["summary"])
-        j = _jaccard(rule.tokens, other.tokens)
+        j = jaccard(rule.tokens, other.tokens)
         if _same_rule(rule, other) and j > best_j:
             best, best_j = c, j
     return best
@@ -211,7 +202,7 @@ def _upsert_correction(cur, c: dict) -> Upsert:
         [{"id": r[0], "summary": r[1], "evidence": r[2], "status": r[3]} for r in cur.fetchall()],
     )
     if match:
-        evidence = _union_evidence(match["evidence"], ev_new)
+        evidence = union_evidence(match["evidence"], ev_new)
         n = _distinct_sessions(evidence)
         if match["status"] in ("observe", "proposed"):
             status = (
@@ -226,7 +217,8 @@ def _upsert_correction(cur, c: dict) -> Upsert:
             )
             raised = match["status"] == "observe" and status == "proposed"
             return Upsert(match["id"], status, n, raised, False)
-        new_session = len(evidence) > len(match["evidence"])
+        # Not len(evidence) > len(match["evidence"]): a full row's union drops its oldest entry.
+        new_session = c["session_id"] not in {e.get("session_id") for e in match["evidence"]}
         if new_session:
             cur.execute(
                 "UPDATE config_lane.config_proposals SET evidence=%s::jsonb WHERE id=%s",

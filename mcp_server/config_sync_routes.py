@@ -37,7 +37,6 @@ from __future__ import annotations
 import hashlib
 import logging
 from collections.abc import Callable
-from datetime import datetime
 
 from psycopg.rows import dict_row
 from starlette.requests import Request
@@ -45,18 +44,9 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, own_surface_columns_ready
-from mcp_server.http_helpers import err, guarded_json, status_conflict
+from mcp_server.http_helpers import err, guarded_json, parse_dt, status_conflict
 
 logger = logging.getLogger(__name__)
-
-
-def _dt(iso: str | None) -> datetime | None:
-    if not iso:
-        return None
-    try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
-    except ValueError:
-        return None
 
 
 def _publish_config(db_url: str, surface: str, files: list[dict]) -> dict:
@@ -85,7 +75,7 @@ def _publish_config(db_url: str, surface: str, files: list[dict]) -> dict:
                     p.get("abs_path", ""),
                     content,
                     hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                    _dt(p.get("modified_at")),
+                    parse_dt(p.get("modified_at")),
                 ),
             ).fetchone()
             # RETURNING is NULL when the WHERE (hash changed) filtered the UPDATE out.

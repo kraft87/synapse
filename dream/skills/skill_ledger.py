@@ -22,6 +22,7 @@ import json
 import logging
 import re
 
+from dream.evidence import jaccard, union_evidence
 from ingestion.schema_check import ColumnProbe
 from ingestion.settings import require_setting
 from ingestion.vector import vec_literal
@@ -36,7 +37,6 @@ PROPOSE_SCORE = 1.5  # legacy observe -> proposed gate (3 judge sessions, or 1 g
 PROPOSE_SALIENCE = 4  # derive: propose when detector-rated pain/severity reaches this (1-5)
 PROPOSE_DAYS = 2  # derive: propose when its evidence dates span this many distinct days
 DECAY_TTL_DAYS = 28  # last_seen older than this -> retired (time-based; no nightly mass-bump)
-EVIDENCE_CAP = 60  # bound the JSONB
 PHRASING_CAP = 12  # trigger phrasings kept on a derive candidate
 # The states a retune's (name, direction) key is unique among (the open-identity migration's
 # index predicate): the ones still waiting on a decision. A promoted or retired row is history.
@@ -122,46 +122,8 @@ def signature_key(signature: str | None, tools: list[str] | None) -> str:
     return " ".join(sorted(toks))
 
 
-def _jaccard(a, b) -> float:
-    a, b = set(a), set(b)
-    if not a and not b:
-        return 1.0
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
 def _ev_sessions(evidence: list[dict]) -> set[str]:
     return {e["session_id"] for e in evidence if e.get("session_id")}
-
-
-def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
-    """Append new, dedup by (session_id, signal, class, work date): a scanner seeing the same
-    work again (a re-run after a held cursor, the miner's overlapping window) adds nothing,
-    while the same session on another day is a fresh sighting. Entries without a date
-    (gap_scan, explicit requests, legacy rows) key on scan_night instead, so a later night's
-    sighting still counts; entries with neither all key to one bucket.
-
-    The cap drops the oldest judge entries. A grounded entry is a human decision or a user
-    signal (an accept is what lets a row stand as promoted: grounded_required_to_apply) and
-    is never dropped."""
-    out, seen = [], set()
-    for e in list(old) + list(new):
-        k = (
-            e.get("session_id"),
-            e.get("signal"),
-            e.get("class"),
-            e.get("date") or e.get("scan_night"),
-        )
-        if k in seen:
-            continue
-        seen.add(k)
-        out.append(e)
-    excess = len(out) - EVIDENCE_CAP
-    if excess > 0:
-        oldest = {id(e) for e in [e for e in out if e.get("class") != "grounded"][:excess]}
-        out = [e for e in out if id(e) not in oldest]
-    return out
 
 
 def _union_phrasings(old, new) -> list[str]:
@@ -236,8 +198,8 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
                 return cid, ev or [], phr or [], False
             continue
         old_sessions = _ev_sessions(ev or [])
-        sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
-        tj = _jaccard(new_toks, old_toks)
+        sj = jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
+        tj = jaccard(new_toks, old_toks)
         # Signature disagreement vetoes session-overlap identity: one long session
         # routinely contains several distinct gaps, so a shared session alone is not
         # identity when both sides carry signatures that don't resemble each other.
@@ -310,12 +272,12 @@ def merge_candidate(
             # evidence merge, no write, and no fresh INSERT against the occupied key.
             conn.commit()
             return {"id": cid, "status": "rejected", "score": None, "merged": False}
-        evidence = _union_evidence(old_ev, evidence_entries)
+        evidence = union_evidence(old_ev, evidence_entries)
         phrasings = _union_phrasings(old_phr, trigger_phrasings)
         merged = True
     else:
         cid, merged = None, False
-        evidence = _union_evidence([], evidence_entries)
+        evidence = union_evidence([], evidence_entries)
         phrasings = _union_phrasings([], trigger_phrasings)
 
     js, gs, jw, gw = rollup(evidence)
