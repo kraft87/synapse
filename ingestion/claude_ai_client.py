@@ -129,7 +129,8 @@ class ClaudeAIParser:
                     turn.assistant_text(text)
 
             span_id = f"claude_ai:{session_id}:{last_msg_uuid}" if last_msg_uuid else None
-            if not turns.accept(turn, span_id):
+            # A group of only attachments (before the first prompt) is not a turn.
+            if not (turn.human or turn.assistant) or not turns.accept(turn, span_id):
                 continue
 
             episodes.append(

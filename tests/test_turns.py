@@ -192,6 +192,23 @@ def test_claude_ai_has_nothing_to_store_without_text_or_an_id():
     assert ClaudeAIParser.parse_conversation(_convo([_msg("m", "human", "", "t")])) == []
 
 
+def test_claude_ai_drops_a_group_that_is_only_attachments():
+    """A file dropped in before the first prompt is not a turn (it never was stored, and each
+    stored turn costs an extraction call); the group still spends its sequence number."""
+    eps = ClaudeAIParser.parse_conversation(
+        _convo(
+            [
+                _msg("m0", "human", "", "2026-09-01T09:59:00Z", attachments=[{"file_name": "a.pdf"}]),
+                _msg("m1", "human", "summarise it", "2026-09-01T10:00:00Z"),
+                _msg("m2", "assistant", "done", "2026-09-01T10:00:05Z"),
+            ]
+        )
+    )  # fmt: skip
+    assert [(e.sequence, e.content) for e in eps] == [
+        (2, "[user] summarise it\n\n[assistant] done")
+    ]
+
+
 def test_claude_ai_export_loads_every_conversation_and_rejects_a_non_list(tmp_path):
     path = tmp_path / "conversations.json"
     path.write_text(json.dumps([_convo([_msg("m1", "human", "hi", "2026-09-01")]), "junk"]))
@@ -249,6 +266,21 @@ def test_cursor_groups_bubbles_into_turns_with_tool_results_and_a_project(tmp_pa
     assert (first.project, first.model, first.platform) == ("Acme", "gpt-x", "cursor")
     assert first.span_id == f"cursor-sqlite:{_COMPOSER}:{_bubble_id(2)}"
     assert first.created_at.isoformat() == "2026-09-01T10:00:00+00:00"
+
+
+def test_cursor_drops_a_group_that_is_only_tool_output(tmp_path):
+    """Tool results ahead of the first prompt are not a turn; the group still spends its sequence."""
+    db = _cursor_db(
+        tmp_path,
+        [
+            {"type": 2, "text": "", "createdAt": "2026-09-01T09:59:00Z",
+             "toolResults": [{"name": "run", "result": "12 passed in 0.4s total"}]},
+            {"type": 1, "text": "hi", "createdAt": "2026-09-01T10:00:00Z"},
+            {"type": 2, "text": "yo", "createdAt": "2026-09-01T10:00:05Z"},
+        ],
+    )  # fmt: skip
+    eps = CursorSQLiteParser.parse_file(db)
+    assert [(e.sequence, e.content) for e in eps] == [(2, "[user] hi\n\n[assistant] yo")]
 
 
 def test_cursor_without_the_kv_table_or_a_readable_file_yields_nothing(tmp_path):

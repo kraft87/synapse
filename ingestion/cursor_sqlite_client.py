@@ -153,7 +153,8 @@ class CursorSQLiteParser:
                             turn.line(f"[tool:{name}] {result_text[:300]}")
 
             span_id = f"cursor-sqlite:{composer_id}:{last_bubble_id}" if last_bubble_id else None
-            if not turns.accept(turn, span_id):
+            # A group of only tool output (before the first prompt) is not a turn.
+            if not (turn.human or turn.assistant) or not turns.accept(turn, span_id):
                 continue
 
             yield Episode(
