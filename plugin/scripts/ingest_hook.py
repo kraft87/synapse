@@ -17,8 +17,11 @@ lifecycle is the scheduler.
 
 Cursor semantics:
   * offset = byte position of the START of the last shipped turn, never EOF —
-    the last turn may still be mid-flight at Stop time, so it is re-shipped on
-    the next run and lands as a span_id no-op once complete;
+    the transcript can lag the hook (Claude Code may write a turn's final
+    message after Stop fires), so the last turn is re-shipped on the next run.
+    A turn that did not grow is a span_id no-op; one that did lands as a new
+    episode under its new span_id (the turn's LAST uuid), beside the shorter
+    episode it grew from;
   * size   = file EOF at the last FULLY successful run; when the current EOF
     matches, there is nothing new and the file is skipped without a POST;
   * a cursor pointing past EOF means the transcript was truncated/rewritten —
@@ -177,8 +180,10 @@ def _parse_lines(lines: list[bytes]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
-    """Read a transcript as [(byte_offset, record), ...] plus the EOF offset.
+def _read_offset_records(path: str, start: int = 0) -> tuple[list[tuple[int, dict[str, Any]]], int]:
+    """Read a transcript from byte `start` as [(byte_offset, record), ...] plus the EOF
+    offset. `start` must be a line start (0, or a cursor from this module): the steady
+    state parses only what is new, never the whole session again.
 
     Offsets are line starts, so any offset this returns is a valid cursor.
     Unparseable/blank lines are skipped (their bytes still count toward EOF).
@@ -186,6 +191,7 @@ def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], i
     out: list[tuple[int, dict[str, Any]]] = []
     eof = 0
     with open(path, "rb") as f:
+        f.seek(start)
         while True:
             off = f.tell()
             line = f.readline()
@@ -204,6 +210,15 @@ def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], i
     return out, eof
 
 
+def _starts_a_line(path: str, offset: int) -> bool:
+    """True if `offset` is 0 or follows a newline, i.e. can be read from."""
+    if offset == 0:
+        return True
+    with open(path, "rb") as f:
+        f.seek(offset - 1)
+        return f.read(1) == b"\n"
+
+
 def _plan_from_cursor(
     offset_recs: list[tuple[int, dict[str, Any]]],
     cursor: int,
@@ -216,8 +231,9 @@ def _plan_from_cursor(
       * chunks split only at turn boundaries — a chunk never ends mid-turn,
         which would mint a bogus span_id for a turn a later chunk completes;
       * the FINAL chunk's cursor_after is the offset of the last turn-start:
-        that turn may still be growing, so it re-ships next run (span_id no-op
-        once complete) instead of leaving a half-turn stranded behind EOF;
+        that turn may still be growing, so it re-ships next run (a span_id no-op
+        if it did not grow, a new episode under its new span_id if it did)
+        instead of leaving a half-turn stranded behind EOF;
       * no turn boundary at/after the cursor → one chunk, cursor_after stays at
         `cursor`, and the mega-turn keeps re-shipping until a boundary appears
         (the server dedups every repeat).
@@ -413,27 +429,19 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
         _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)}")
         return (0, 0)
     try:
-        offset_recs, eof = _read_offset_records(transcript_path)
-        if not offset_recs:
-            return (0, 0)
-
-        # Belt and braces: a resumed/compacted transcript can carry records whose
-        # sessionId differs from the filename, and it's the record's id that the
-        # server stores (and that private_mode.py marked).
-        for sid in {str(r.get("sessionId") or "") for _, r in offset_recs} - {"", session_id}:
-            if _is_private(sid):
-                _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (record sid)")
-                return (0, 0)
-
+        size = os.stat(transcript_path).st_size
         ent = _load_state().get(transcript_path)
         cursor: int | None = None
         force = False
         if isinstance(ent, dict):
             cursor = int(ent.get("offset", 0))
-            if cursor > eof:  # transcript truncated/rewritten — start over
-                cursor, force = None, True
-            elif int(ent.get("size", -1)) == eof:
+            if cursor > size or not _starts_a_line(transcript_path, cursor):
+                cursor, force = None, True  # transcript truncated/rewritten — start over
+            elif int(ent.get("size", -1)) == size:
                 return (0, 0)  # nothing new since the last fully-shipped run
+        offset_recs, eof = _read_offset_records(transcript_path, cursor or 0)
+        if not offset_recs:
+            return (0, 0)
         if cursor is None:
             if mode == "stop":
                 tail = offset_recs[-TAIL_RECORDS:]
@@ -443,6 +451,16 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
                 cursor = 0
 
         plans = _plan_from_cursor(offset_recs, cursor, TAIL_RECORDS)
+
+        # Belt and braces: a resumed/compacted transcript can carry records whose
+        # sessionId differs from the filename, and it's the record's id that the
+        # server stores (and that private_mode.py marked). Only the records about
+        # to ship matter.
+        shipping = {str(r.get("sessionId") or "") for recs, _ in plans for r in recs}
+        for sid in shipping - {"", session_id}:
+            if _is_private(sid):
+                _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (record sid)")
+                return (0, 0)
     except Exception as e:
         _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
         return (0, 0)
