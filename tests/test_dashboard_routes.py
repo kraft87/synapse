@@ -3114,7 +3114,7 @@ def test_delete_episode_retires_flags_on_cascaded_facts_and_events(clean, conn, 
 
 def test_delete_episode_deletes_retold_events_nothing_backs(clean, conn, db_url):
     """A re-told event whose re-telling turns are all gone (or were never recorded: rows
-    merged before schema 104 have an empty list) goes with its owner turn: keeping it
+    merged before reported_refs existed have an empty list) goes with its owner turn: keeping it
     would leave text from the deleted turn that no stored turn backs."""
     doomed = _episode(conn, session="d9", seq=1, content="doomed turn")
     sole = _event(conn, fact="told once", source_ref=f"ep:{doomed}")
@@ -3186,7 +3186,7 @@ def test_delete_episode_repoints_a_retold_event_to_a_surviving_turn(clean, conn,
 def test_delete_episode_without_reported_refs_deletes_retold_events(
     clean, conn, db_url, monkeypatch
 ):
-    """Before schema 104 is applied the cascade cannot tell who re-told an event."""
+    """Before reported_refs exists the cascade cannot tell who re-told an event."""
     from ingestion import db_timeline
 
     monkeypatch.setattr(db_timeline.REPORTED_REFS_PROBE, "ready", lambda *a, **k: False)

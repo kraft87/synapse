@@ -1827,8 +1827,8 @@ def delete_episode_content(
     # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
     # makes the first telling's turn the row's owner. An event no other stored turn
     # backs goes with it: keeping it would go on serving the deleted turn's text. One a
-    # later turn re-told (schema 104's reported_refs) moves to the first such turn that
-    # survives. Rows merged before 104 list no turns, so they are deleted.
+    # later turn re-told (the reported_refs column) moves to the first such turn that
+    # survives. Rows merged before reported_refs existed list no turns, so they are deleted.
     has_refs = REPORTED_REFS_PROBE.ready(conn)
     owned = conn.execute(
         "SELECT id, " + ("reported_refs" if has_refs else "'{}'::text[] AS reported_refs") + " "  # nosec B608 — a fixed fragment
