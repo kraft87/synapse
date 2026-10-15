@@ -391,6 +391,7 @@ def main(argv: list[str]) -> None:
         send_to_logfire="if-token-present",
     )
     logfire.instrument_claude_agent_sdk()
+    logfire.instrument_pydantic_ai(include_content=False)
     logfire.instrument_httpx()
 
     if "--schedule" not in argv:

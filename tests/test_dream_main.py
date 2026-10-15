@@ -307,16 +307,23 @@ class _Stop(Exception):
     pass
 
 
-def _main(monkeypatch, argv, *, missed=False, run_once=None):
+def _main(monkeypatch, argv, *, missed=False, run_once=None, instrumented=None):
     """dm.main(argv) with the schema check, logfire, the clock and the run stubbed; the first
-    sleep ends the scheduler loop. Returns the calls in order."""
+    sleep ends the scheduler loop. Returns the calls in order; ``instrumented`` collects
+    the names of the logfire instrument_* calls."""
     calls: list = []
+    instrumented = instrumented if instrumented is not None else []
     monkeypatch.delenv("LOGFIRE_SERVICE_NAME", raising=False)
     monkeypatch.setattr(dm, "_require_db_url", lambda: "postgresql://unused")
     monkeypatch.setattr("ingestion.schema_check.check_schema_version", lambda url: None)
     monkeypatch.setattr(dm.logfire, "configure", lambda **kw: calls.append(("configure", kw)))
-    monkeypatch.setattr(dm.logfire, "instrument_claude_agent_sdk", lambda: None)
-    monkeypatch.setattr(dm.logfire, "instrument_httpx", lambda: None)
+    monkeypatch.setattr(
+        dm.logfire, "instrument_claude_agent_sdk", lambda: instrumented.append("claude_agent_sdk")
+    )
+    monkeypatch.setattr(
+        dm.logfire, "instrument_pydantic_ai", lambda **kw: instrumented.append("pydantic_ai")
+    )
+    monkeypatch.setattr(dm.logfire, "instrument_httpx", lambda: instrumented.append("httpx"))
     monkeypatch.setattr(dm, "_missed_window", lambda url, now: missed)
     monkeypatch.setattr(dm, "run_once", run_once or (lambda: calls.append("run")))
 
@@ -338,6 +345,13 @@ def test_the_dream_reports_to_logfire_as_its_own_service(monkeypatch):
         "configure",
         {"service_name": "synapse-dream", "send_to_logfire": "if-token-present"},
     )
+
+
+def test_the_dream_instruments_the_same_llm_paths_as_the_poller(monkeypatch):
+    """Both LLM backends and the HTTP client emit spans, as in ingestion/__main__."""
+    instrumented: list[str] = []
+    _main(monkeypatch, [], instrumented=instrumented)
+    assert sorted(instrumented) == ["claude_agent_sdk", "httpx", "pydantic_ai"]
 
 
 def test_a_one_shot_run_runs_once_and_does_not_schedule(monkeypatch):
