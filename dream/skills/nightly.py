@@ -34,7 +34,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import urllib.request
 from dataclasses import replace
 from typing import Any
@@ -45,13 +44,12 @@ from ingestion.llm_client import LLM_TRANSPORT_ERRORS, stage_model
 from . import config, post_fire, procedure_miner, skill_draft, struggle_arc
 from . import skill_db_source as DB
 from . import skill_derive as SD
-from . import skill_doc as D
 from . import skill_ledger as L
+from . import skill_measure as SM
 
-SM = SD.skill_measure
 logger = logging.getLogger(__name__)
 
-PROPOSALS_DIR = config.PROPOSALS_DIR
+BASH_HEADS_KEPT = 8  # shell commands kept per session on a derive's evidence, for its draft
 
 
 # -------------------------------------------------------------------- 1. usage sync
@@ -92,12 +90,24 @@ def judge_sessions(conn, substantive, catalog_text, descriptions, seen_ids):
 
 
 def run_derive(conn, substantive, analyses, seen_ids):
+    """Gaps -> clusters -> derive candidates. A cluster that turns 'proposed' is drafted by the
+    draft stage (skill_draft.draft_pending), which reads the bash heads each session's evidence
+    entry carries."""
     gaps = [g for s, a in zip(substantive, analyses, strict=True) for g in SD.session_gaps(s, a)]
+    heads = {s["session"]: s["bash_heads"][:BASH_HEADS_KEPT] for s in substantive}
     clusters = SD.cluster_gaps(gaps)
     n_proposed = 0
     for c in clusters:
         sessions = c.get("sessions") or []
-        ev = [{"session_id": sid, "class": "judge", "signal": "gap_scan"} for sid in sessions]
+        ev = [
+            {
+                "session_id": sid,
+                "class": "judge",
+                "signal": "gap_scan",
+                "bash": heads.get(sid, []),
+            }
+            for sid in sessions
+        ]
         if not ev:
             continue
         res = L.merge_candidate(
@@ -112,7 +122,6 @@ def run_derive(conn, substantive, analyses, seen_ids):
         )
         seen_ids.add(res["id"])
         if res["status"] == "proposed":
-            _draft_if_needed(conn, res["id"], c)
             n_proposed += 1
     return {"gaps": len(gaps), "clusters": len(clusters), "proposed": n_proposed}
 
@@ -226,27 +235,6 @@ def capture_grounded(conn, window, fires, seen_ids):
 
 def _tools_from_bash(bash_heads):
     return sorted({h.split()[0] for h in bash_heads if h and h.split()})[:8]
-
-
-def _draft_if_needed(conn, cid, cluster):
-    cur = conn.cursor()
-    cur.execute("SELECT proposal_body FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,))
-    if (cur.fetchone() or [None])[0]:
-        return
-    name = re.sub(r"[^a-z0-9-]", "", cluster.get("procedure", "unnamed").lower()) or "unnamed"
-    body = SD.draft_skill(cluster)
-    if D.new_skill_problem(body):
-        return  # unusable draft (no frontmatter name/description): the draft pass retries
-    d = PROPOSALS_DIR / f"cand{cid}-{name}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "SKILL.md").write_text(body)
-    # Store the draft body in the row too (not just the path): the review path runs over HTTP
-    # via mcp-server, which can't read this container's disk. The body makes it self-describing.
-    cur.execute(
-        "UPDATE skills_lane.skill_gap_candidates SET proposal_path=%s, proposal_body=%s WHERE id=%s",
-        (str(d / "SKILL.md"), body, cid),
-    )
-    conn.commit()
 
 
 def run_procedure_miner(conn, catalog):

@@ -32,6 +32,7 @@ from .skill_measure import _extract_json
 DRAFT_CAP = 12  # drafts per nightly run (each is an Opus call); the rest wait a night
 MAX_PHRASINGS = 8
 MAX_CHANGE_LINES = 8
+MAX_BASH = 20  # shell commands shown to the model for a new skill
 
 _WIDEN_PROMPT = """You maintain the trigger DESCRIPTION of one Claude Code skill. The model decides whether
 to invoke a skill by soft-matching the user's request against this description. Users asked
@@ -148,6 +149,7 @@ def draft_derive(row: dict) -> str | None:
     ev = [e for e in row.get("evidence") or [] if isinstance(e, dict)]
     quotes = [str(e["quote"]) for e in ev if e.get("quote")][:6]
     what = row.get("summary") or row["name"]
+    bash = list(dict.fromkeys(h for e in ev for h in e.get("bash") or []))[:MAX_BASH]
     if quotes:
         what += "\nEvidence from the sessions:\n" + "\n".join(f"- {q}" for q in quotes)
     body = SD.draft_skill(
@@ -156,7 +158,7 @@ def draft_derive(row: dict) -> str | None:
             "what": what,
             "trigger_phrasings": row.get("trigger_phrasings") or [],
             "signature": row.get("signature") or "",
-            "bash_evidence": [],
+            "bash_evidence": bash,
             "n_sessions": len({e["session_id"] for e in ev if e.get("session_id")}),
         }
     )

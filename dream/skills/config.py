@@ -14,15 +14,6 @@ import os
 import re
 from pathlib import Path
 
-# Lane state / proposal drafts / logs. In-container default; overridable via env.
-DATA_DIR = Path(
-    os.path.expanduser(os.environ.get("SYNAPSE_DATA_DIR", "~/.local/share/synapse-skills"))
-)
-PROPOSALS_DIR = DATA_DIR / "proposals"
-
-# dev-only --source jsonl path (the nightly reads episodes from Postgres, not disk).
-PROJECTS_DIR = Path(os.path.expanduser(os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")))
-
 DISCORD_WEBHOOK = os.environ.get("SKILLS_DISCORD_WEBHOOK", "")
 EXCLUDE_PROJECTS = tuple(
     p.strip() for p in os.environ.get("SKILLS_EXCLUDE_PROJECTS", "").split(",") if p.strip()

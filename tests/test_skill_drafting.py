@@ -236,6 +236,23 @@ def test_draft_derive_and_unusable_reply(monkeypatch):
     assert DR.draft(row, None) is None
 
 
+def test_draft_derive_shows_the_model_the_shell_commands_in_the_evidence(monkeypatch):
+    calls = _stub_llm(monkeypatch, _BODY)
+    row = {
+        "id": 4,
+        "kind": "derive",
+        "name": "demo-backup",
+        "summary": "back up the demo db",
+        "evidence": [
+            {"session_id": "s-1", "bash": ["pg_dump demo", "aws s3 cp dump.sql s3://bucket"]},
+            {"session_id": "s-2", "bash": ["pg_dump demo"]},
+        ],
+    }
+    assert DR.draft(row, None) == (_BODY, None)
+    assert "pg_dump demo | aws s3 cp dump.sql s3://bucket" in calls[0]
+    assert "(none captured)" not in calls[0]
+
+
 def test_missing_registry_body_is_never_drafted(monkeypatch):
     calls = _stub_llm(monkeypatch, _BODY)
     row = {"id": 6, "kind": "retune", "direction": "fix", "name": "gone", "target_skills": []}

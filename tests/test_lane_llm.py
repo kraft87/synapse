@@ -240,6 +240,28 @@ def test_one_analysis_call_per_session_feeds_derive_and_retune(monkeypatch):
     assert ("derive", "widget-triage", ["s1", "s2"]) in merged
 
 
+def test_a_proposed_derive_is_left_to_the_draft_stage_and_keeps_its_bash_heads(monkeypatch):
+    cluster = {"clusters": [{"procedure": "widget-triage", "sessions": ["s1", "s2"]}]}
+    derived: list[list[dict]] = []
+
+    def merge(conn, kind, name, evidence, **kw):
+        derived.append(evidence)
+        return {"id": 1, "status": "proposed", "score": 2.0, "merged": False}
+
+    monkeypatch.setattr(lane, "judge", lambda prompt: json.dumps(cluster))
+    monkeypatch.setattr(lane, "draft", lambda prompt: pytest.fail("drafted outside the cap"))
+    monkeypatch.setattr(N.L, "merge_candidate", merge)
+    sessions = [_session("s1"), _session("s2")]
+
+    analyses = [{"gaps": [dict(g) for g in _ANALYSIS["gaps"]]} for _ in sessions]
+
+    stats = N.run_derive(None, sessions, analyses, set())
+
+    assert stats["proposed"] == 1
+    # each session's evidence carries the shell commands its draft will show the model
+    assert [e["bash"] for e in derived[0]] == [["widgetctl status"], ["widgetctl status"]]
+
+
 def test_an_unparseable_analysis_adds_nothing_and_is_counted(monkeypatch):
     monkeypatch.setattr(lane, "judge", lambda prompt: "Sorry, I cannot help with that.")
     stats = N.judge_sessions(None, [_session("s1")], "(none)", {}, set())

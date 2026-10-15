@@ -620,7 +620,7 @@ _HOME_DIR_RE = re.compile(
     r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:[\\/]+Users[\\/]+[^\\/]+)[\\/]*$"
 )
 _CANDIDATE_COLS = (
-    "id, kind, name, direction, target_skills, status, score, evidence, proposal_path, "
+    "id, kind, name, direction, target_skills, status, score, evidence, "
     "proposal_body, base_body_hash, summary, salience, source_detector, proposed_patch"
 )
 _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-file"
@@ -630,7 +630,7 @@ def _proposals_list(db_url: str) -> dict:
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         rows = c.execute(
             """SELECT id, kind, name, direction, target_skills, status, score,
-                      grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings,
+                      grounded_sessions, judge_sessions, summary, trigger_phrasings,
                       salience, source_detector, (proposal_body IS NOT NULL) AS has_draft
                  FROM skills_lane.skill_gap_candidates
                 WHERE status='proposed' AND (rejected_until IS NULL OR rejected_until < now())
@@ -862,8 +862,7 @@ def _proposal_act(
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         cur = c.cursor()
         row = c.execute(
-            "SELECT kind, status, name, proposal_path, proposal_body, evidence "
-            "FROM skills_lane.skill_gap_candidates WHERE id=%s",
+            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s",
             (cid,),
         ).fetchone()
         if not row:

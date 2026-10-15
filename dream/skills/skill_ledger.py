@@ -1,9 +1,5 @@
-#!/usr/bin/env python3
 # mypy: ignore-errors
 """skills_lane ledger writer — the dream->skills "writer contract" from schema/022.
-
-Run under the synapse venv (needs psycopg + voyageai):
-    ~/services/synapse/.venv/bin/python ~/scripts/skill_ledger.py --selftest
 
 Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name;
 retune = (name,direction)), evidence accumulation (dedup by
@@ -22,7 +18,6 @@ Evidence entry shape (all fields beyond class/signal optional, backward compatib
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
 
@@ -483,103 +478,3 @@ def update_cursor(conn, last_scan_at, config=None) -> None:
         (last_scan_at, last_scan_at, json.dumps(config) if config is not None else None),
     )
     conn.commit()
-
-
-# ------------------------------------------------------------------------ selftest
-def _selftest() -> None:
-    """Insert two derive candidates for the same procedure under DIFFERENT names (the drift case),
-    confirm they MERGE into one accumulating row, then clean up. Verifies the Oracle Q1 fix."""
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM skills_lane.skill_gap_candidates WHERE name LIKE 'selftest-%'")
-    conn.commit()
-    ev1 = [
-        {
-            "session_id": "sess-A",
-            "ts": "2026-06-21T00:00:00",
-            "class": "judge",
-            "signal": "gap_scan",
-            "tools": ["Bash", "Read"],
-        }
-    ]
-    r1 = merge_candidate(
-        conn,
-        "derive",
-        "selftest-restic-backup",
-        ev1,
-        signature="restic backup to nas rclone",
-        tools=["Bash", "Read"],
-        summary="back up to NAS via restic then rclone to proton",
-        do_embed=False,
-    )
-    # same procedure, DIFFERENT llm name, overlapping session + signature tokens
-    ev2 = [
-        {
-            "session_id": "sess-A",
-            "ts": "2026-06-22T00:00:00",
-            "class": "judge",
-            "signal": "gap_scan",
-            "tools": ["Bash"],
-        },
-        {
-            "session_id": "sess-B",
-            "ts": "2026-06-22T00:00:00",
-            "class": "judge",
-            "signal": "gap_scan",
-        },
-    ]
-    r2 = merge_candidate(
-        conn,
-        "derive",
-        "selftest-nas-backup-workflow",
-        ev2,
-        signature="restic nas backup rclone proton",
-        tools=["Bash"],
-        summary="nightly restic backup workflow",
-        do_embed=False,
-    )
-    cur.execute(
-        "SELECT count(*), max(judge_sessions), max(score) FROM skills_lane.skill_gap_candidates WHERE name LIKE 'selftest-%'"
-    )
-    n, jsess, score = cur.fetchone()
-    print(f"r1={r1}\nr2={r2}")
-    print(
-        f"rows={n} (want 1 = merged despite name drift)  judge_sessions={jsess} (want 2)  score={score}"
-    )
-    # grounded signal advances
-    r3 = merge_candidate(
-        conn,
-        "derive",
-        "selftest-restic-backup",
-        [{"session_id": "sess-C", "class": "grounded", "signal": "explicit_request"}],
-        do_embed=False,
-    )
-    print(
-        f"after explicit_request: status={r3['status']} score={r3['score']} (grounded should push score up)"
-    )
-    # decay: age ONLY the selftest rows, run the normal 28d decay (fresh real rows stay safe),
-    # confirm retire. Reset to 'observe' first — 'proposed' rows are decay-exempt by design.
-    cur.execute(
-        "UPDATE skills_lane.skill_gap_candidates SET status='observe', "
-        "last_seen = now() - interval '60 days' WHERE name LIKE 'selftest-%'"
-    )
-    conn.commit()
-    d = decay_stale(conn)
-    cur.execute(
-        "SELECT count(*) FROM skills_lane.skill_gap_candidates WHERE name LIKE 'selftest-%' AND status='retired'"
-    )
-    print(
-        f"decay retired {cur.fetchone()[0]} aged selftest row(s) (want >=1); total retired this call={d['retired']}"
-    )
-    cur.execute("DELETE FROM skills_lane.skill_gap_candidates WHERE name LIKE 'selftest-%'")
-    conn.commit()
-    print("cleaned up.")
-    conn.close()
-
-
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--selftest", action="store_true")
-    args = ap.parse_args()
-    if args.selftest:
-        _selftest()

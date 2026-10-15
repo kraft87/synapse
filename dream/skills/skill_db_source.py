@@ -12,8 +12,7 @@ KNOWN LOSS vs JSONL: ingestion drops `<command-name>` slash-command records as
 machinery, so SLASH-invoked skill fires are NOT visible here (only Skill-*tool*
 invocations survive, as `[tool:Skill] {'skill': 'name'}`). Fine for DERIVE (the
 guard is the catalog comparison, not fire-detection); matters for RETUNE counting —
-fix later with a `[skill:]` ingest marker or a tiny JSONL fire-scan. Thinking blocks
-are also not stored. Pass source="jsonl" to skill-derive when you need either.
+fix later with a `[skill:]` ingest marker. Thinking blocks are also not stored.
 """
 
 from __future__ import annotations
@@ -24,56 +23,6 @@ from datetime import UTC, datetime
 from dream import lane
 
 from . import config
-
-
-def _dsn() -> str:
-    dsn = config.db_url()
-    if not dsn:
-        raise RuntimeError(f"SYNAPSE_DB_URL not configured (env or {config.ENV_FILE})")
-    return dsn
-
-
-def _connect(dsn: str):
-    try:
-        import psycopg
-
-        return psycopg.connect(dsn, connect_timeout=8)
-    except ImportError:
-        import psycopg2
-
-        return psycopg2.connect(dsn, connect_timeout=8)
-
-
-def db_session_views(
-    days: float,
-    max_sessions: int,
-    platform: str = "claude_code",
-    exclude_projects: tuple[str, ...] = config.EXCLUDE_PROJECTS,
-) -> list[dict]:
-    """Session views for every session with a turn in the last `days` days (skill_derive's
-    dev CLI; the nightly loads only the sessions its window touched, dream/lane.py).
-
-    exclude_projects: drop sessions from foreign skill-environments (e.g. transcribe_ai
-    has its own ~/.claude/skills, so its procedures aren't gaps in this catalog).
-    """
-    conn = _connect(_dsn())
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT session_id, sequence, human_turn, content
-        FROM episodes
-        WHERE platform = %s
-          AND created_at > now() - (%s || ' days')::interval
-          AND (project IS NULL OR project <> ALL(%s))
-        ORDER BY session_id, sequence
-        """,
-        (platform, str(days), list(exclude_projects)),
-    )
-    views = lane.build_views(cur.fetchall())
-    conn.close()
-    views.sort(key=lambda s: s["user_turns"], reverse=True)
-    return views[: max_sessions * 4]  # caller re-filters to substantive + caps
-
 
 # DISMISSAL = a fire immediately followed by a SHORT, STRONG, leading negation. Strict on purpose:
 # this is a GROUNDED signal that gates apply, so precision >> recall (the loose version mislabeled 73%).
