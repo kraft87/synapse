@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from ingestion import backfill
+from ingestion.models import Episode
 
 
 def _run(monkeypatch, *argv: str) -> int:
@@ -54,3 +55,30 @@ def test_the_codex_root_defaults_to_the_codex_sessions_dir(monkeypatch, tmp_path
     )
     assert _run(monkeypatch, "--source", "codex", "--dry-run") == 0
     assert seen == {"source": "codex", "path": tmp_path}
+
+
+def test_a_malformed_single_export_is_an_error_not_an_empty_run(monkeypatch, tmp_path):
+    """The export is the whole run: one that does not parse must fail the command, not print
+    'files: 0' and exit 0 (a directory sweep warns and carries on, below)."""
+    monkeypatch.setattr(backfill, "get_settings", lambda: type("S", (), {"db_url": "x"})())
+    export = tmp_path / "conversations.json"
+    export.write_text("{not json")
+    with pytest.raises(ValueError):
+        _run(monkeypatch, "--source", "claude-ai", str(export))
+    export.write_text('{"not": "a list"}')
+    with pytest.raises(ValueError, match="Expected list"):
+        _run(monkeypatch, "--source", "claude-ai", str(export))
+
+
+def test_a_directory_sweep_skips_a_file_that_does_not_parse(monkeypatch, tmp_path, caplog):
+    def parse(path, project):
+        if path.name == "bad.jsonl":
+            raise ValueError("garbled")
+        return [Episode(session_id="s", sequence=1, content="[user] hi", span_id="x:1")]
+
+    monkeypatch.setitem(backfill.SOURCES, "codex", backfill.Source("*.jsonl", parse))
+    for name in ("bad.jsonl", "good.jsonl"):
+        (tmp_path / name).write_text("")
+    stats = backfill.backfill("codex", tmp_path, db=None, dry_run=True)
+    assert (stats["files"], stats["episodes_parsed"]) == (1, 1)
+    assert "Failed to parse" in caplog.text and "garbled" in caplog.text

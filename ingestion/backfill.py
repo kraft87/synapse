@@ -89,7 +89,8 @@ def backfill(
     backfill a known gap window without re-parsing the whole tree (and holding every
     episode in memory). Storing stays idempotent via span_id, so re-sweeping overlapping
     windows is a no-op. ``project`` labels the episodes (see :class:`Source`; a parser that
-    leaves a turn unlabeled gets it as the default).
+    leaves a turn unlabeled gets it as the default). A file of a directory sweep that fails
+    to parse is skipped with a warning; a single export that fails to parse raises.
     """
     src = SOURCES[source]
     if src.glob is None:
@@ -112,6 +113,8 @@ def backfill(
         try:
             eps = src.parse(f, project)
         except Exception as e:
+            if src.glob is None:
+                raise  # the export is the whole run; carrying on would report an empty success
             logger.warning("Failed to parse %s: %s", f, e)
             continue
         parsed_files += 1
