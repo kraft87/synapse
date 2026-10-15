@@ -1466,6 +1466,42 @@ class TestStage6aCandidateLimit:
         assert _SEMANTIC_POOL_LIMIT < 20
 
 
+class TestStage6aPairPool:
+    """The same-pair pool goes whole into the 6b prompt, so it is capped like the semantic
+    pool (a hub pair holds hundreds of edges), nearest to the new fact first, and a fact
+    with a brand-new endpoint has no pair to look up."""
+
+    def _pipe(self):
+        pipe = ExtractionPipeline.__new__(ExtractionPipeline)
+        pipe._embedder = MagicMock()
+        pipe._embedder.embed.return_value = [[1.0, 0.0, 0.0, 0.0]]
+        kg = MagicMock()
+        kg.find_similar_edges.return_value = []
+        kg.find_edges_by_fulltext.return_value = []
+        kg.find_edges_by_pair.return_value = []
+        pipe._kg = kg
+        return pipe
+
+    def _fact(self):
+        return ExtractedFact(source="A", target="B", relationship="USES", fact="A uses B")
+
+    def test_pair_lookup_is_capped_and_ranked_by_the_new_facts_embedding(self):
+        from ingestion.extraction_policy import _PAIR_POOL_LIMIT
+
+        pipe = self._pipe()
+        pipe._stage6a_embedding_filter([self._fact()], {"A": "ua", "B": "ub"}, "technical")
+        pipe._kg.find_edges_by_pair.assert_called_once_with(
+            "ua", "ub", "technical", [1.0, 0.0, 0.0, 0.0], limit=_PAIR_POOL_LIMIT
+        )
+        assert _PAIR_POOL_LIMIT <= _SEMANTIC_POOL_LIMIT
+
+    def test_no_pair_lookup_when_either_endpoint_is_new(self):
+        pipe = self._pipe()
+        for uuid_map in ({"A": "new:ua", "B": "ub"}, {"A": "ua", "B": "new:ub"}, {"A": "ua"}):
+            pipe._stage6a_embedding_filter([self._fact()], uuid_map, "technical")
+        pipe._kg.find_edges_by_pair.assert_not_called()
+
+
 class TestBM25CandidateFloor:
     """2026-10-09: a BM25-only hit reaches the contradiction judge only when its stored
     embedding is close to the new fact (_FULLTEXT_MIN_SIM). Sharing an identifier is

@@ -12,7 +12,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from ingestion.kg_client import KGClient, _emb_list, _iso
+from ingestion.kg_client import KGClient, _iso
 from tests.helpers.embed import GROUP
 from tests.helpers.kg import DIM, _axis_list
 
@@ -65,12 +65,6 @@ def kg_tables(conn, db_url):
 
 
 class TestHelpers:
-    def test_emb_list_parses_pgvector_text(self):
-        assert _emb_list("[1,2.5,3]") == [1.0, 2.5, 3.0]
-        assert _emb_list(None) is None
-        assert _emb_list([1, 2]) == [1.0, 2.0]
-        assert _emb_list("garbage") is None
-
     def test_iso(self):
         from datetime import UTC, datetime
 
@@ -130,19 +124,28 @@ class TestEntityReads:
 
 
 class TestEdgeReads:
-    def test_find_edges_by_pair_live_only_with_embedding_list(self, kg_tables):
-        hits = kg_tables.find_edges_by_pair("e-syn", "e-fdb", GROUP)
-        uuids = {h["uuid"] for h in hits}
-        assert "r-live" in uuids and "r-noemb" in uuids
+    def test_find_edges_by_pair_live_only_nearest_first(self, kg_tables):
+        hits = kg_tables.find_edges_by_pair("e-syn", "e-fdb", GROUP, _axis_list(0), limit=10)
+        uuids = [h["uuid"] for h in hits]
+        assert set(uuids) == {"r-live", "r-noemb"}
         assert "r-dead" not in uuids  # invalidated edges must not re-enter the pool
         assert "r-other" not in uuids
-        live = next(h for h in hits if h["uuid"] == "r-live")
-        assert isinstance(live["fact_embedding"], list)
-        assert len(live["fact_embedding"]) == DIM
-        assert live["fact_embedding"][0] == 1.0
-        assert live["valid_at"] == "2026-06-01T00:00:00+00:00"  # ISO string, not datetime
-        noemb = next(h for h in hits if h["uuid"] == "r-noemb")
-        assert noemb["fact_embedding"] is None
+        assert uuids[0] == "r-live"  # identical embedding first; the unembedded edge last
+        assert hits[0]["valid_at"] == "2026-06-01T00:00:00+00:00"  # ISO string, not datetime
+        assert "fact_embedding" not in hits[0]  # ~24 KB of text per edge nothing reads
+
+    def test_find_edges_by_pair_cap_keeps_the_nearest(self, kg_tables, conn):
+        for i, cos in enumerate([0.99, 0.5, 0.97, 0.9, 0.7]):
+            v = [0.0] * DIM
+            v[0], v[1] = cos, (1.0 - cos * cos) ** 0.5
+            conn.execute(
+                "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, "
+                "name, fact, fact_embedding) VALUES (%s, 'default', %s, 'e-hub', 'e-spoke', 'R', "
+                "%s, %s::vector)",
+                (f"h-{i}", GROUP, f"hub fact {i}", "[" + ",".join(map(str, v)) + "]"),
+            )
+        hits = kg_tables.find_edges_by_pair("e-hub", "e-spoke", GROUP, _axis_list(0), limit=3)
+        assert [h["uuid"] for h in hits] == ["h-0", "h-2", "h-3"]
 
     def test_find_similar_edges_threshold_gate(self, kg_tables):
         hits = kg_tables.find_similar_edges(_axis_list(0), GROUP, distance_threshold=0.20)

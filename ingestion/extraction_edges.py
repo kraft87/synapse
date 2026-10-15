@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 from ingestion.extraction_policy import (
     _FULLTEXT_MIN_SIM,
+    _PAIR_POOL_LIMIT,
     _SATURATION_MAX_ROUNDS,
     _SATURATION_MIN,
     _SEMANTIC_POOL_LIMIT,
@@ -75,13 +76,22 @@ class ExtractionEdgesMixin:
         per_fact_pools: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {}
 
         for idx, (fact, fact_emb) in enumerate(zip(facts, fact_embeddings, strict=True)):
-            src_uuid = uuid_map.get(fact.source, "").removeprefix("new:")
-            tgt_uuid = uuid_map.get(fact.target, "").removeprefix("new:")
+            src_uuid = uuid_map.get(fact.source, "")
+            tgt_uuid = uuid_map.get(fact.target, "")
 
-            # Pair pool — same source/target endpoints.
+            # Pair pool — same source/target endpoints. An endpoint that is new has no
+            # edges by construction, so there is no pair to look up.
             pair_pool: list[dict[str, Any]] = []
-            if src_uuid and tgt_uuid:
-                pair_pool = list(self._kg.find_edges_by_pair(src_uuid, tgt_uuid, group_id))
+            if (
+                src_uuid
+                and tgt_uuid
+                and not (src_uuid.startswith("new:") or tgt_uuid.startswith("new:"))
+            ):
+                pair_pool = list(
+                    self._kg.find_edges_by_pair(
+                        src_uuid, tgt_uuid, group_id, fact_emb, limit=_PAIR_POOL_LIMIT
+                    )
+                )
 
             # Semantic pool — RRF over vector + BM25 hits. Pull 2x the eventual
             # cap from each modality so the long tail of moderate-rank entries

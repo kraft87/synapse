@@ -165,6 +165,11 @@ _KNOWN_TOOLS = frozenset(
 # choose from. Tune here.
 _SEMANTIC_POOL_LIMIT = 8
 
+# The same cap for the same-pair pool (edges sharing the new fact's source and target),
+# which goes whole into the 6b prompt as EXISTING FACTS: a hub pair holds hundreds of
+# edges. Ranked by distance to the new fact in SQL, so a true duplicate is always in.
+_PAIR_POOL_LIMIT = 8
+
 # Saturation continuation (2026-08-14): a sweeping supersession fact ("the
 # entire X stack was torn down") can contradict far more live edges than fit
 # in one pool — the 2026-08-08 adult-stack teardown fact invalidated 7 of its

@@ -11,9 +11,8 @@ idle worker). That is safe because every statement is a read or idempotent (``ON
 CONFLICT`` upsert/no-op, ``UPDATE`` by uuid).
 
 Return shapes are contracts the callers depend on (they feed prompts and ``rrf_merge``):
-``valid_at`` comes back as an ISO string, ``fact_embedding`` as ``list[float]``, vector
-``score`` as cosine distance (0 = identical) -- the scale the stage-6a
-``distance_threshold=0.20`` gate expects.
+``valid_at`` comes back as an ISO string and the vector ``score`` as cosine distance
+(0 = identical) -- the scale the stage-6a ``distance_threshold=0.20`` gate expects.
 
 The ParadeDB BM25 leg intentionally has NO score floor: the pool is capped by the caller
 (``_SEMANTIC_POOL_LIMIT``), rank-only RRF (k=1) does the weighting, and stage 6b's LLM
@@ -37,7 +36,6 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-import orjson
 import psycopg
 
 from ingestion import pg_pool
@@ -72,19 +70,6 @@ def _vec(v: Any) -> str | None:
 def _iso(v: Any) -> str | None:
     """TIMESTAMPTZ -> ISO string, mirroring FalkorDB's string-property reads."""
     return v.isoformat() if v is not None else None
-
-
-def _emb_list(v: Any) -> list[float] | None:
-    """pgvector text ('[a,b,c]') -> list[float]; tolerates None/pre-parsed."""
-    if v is None:
-        return None
-    if isinstance(v, list):
-        return [float(x) for x in v]
-    try:
-        parsed = orjson.loads(str(v))
-        return [float(x) for x in parsed]
-    except Exception:
-        return None
 
 
 def _ts(v: Any) -> str | None:
@@ -353,24 +338,32 @@ class KGClient:
         return self._run(_q)
 
     def find_edges_by_pair(
-        self, source_uuid: str, target_uuid: str, group_id: str
+        self,
+        source_uuid: str,
+        target_uuid: str,
+        group_id: str,
+        fact_embedding: list[float],
+        limit: int,
     ) -> list[dict[str, Any]]:
-        """Live edges between a source/target pair (duplicate/contradiction candidates).
+        """The ``limit`` live edges between a source/target pair nearest to ``fact_embedding``
+        (duplicate/contradiction candidates), nearest first; an edge with no embedding
+        comes last.
 
         Live only: already-invalidated edges must NOT re-enter the candidate pool, or
-        Stage 6b could re-contradict an edge that was already retired."""
+        Stage 6b could re-contradict an edge that was already retired. The pool goes whole
+        into the 6b prompt, so it is capped, and an exact duplicate is the nearest edge."""
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             rows = conn.execute(
-                "SELECT uuid, fact, valid_at, fact_embedding::text FROM kg_relationships "
+                "SELECT uuid, fact, valid_at FROM kg_relationships "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "WHERE owner_id = %s AND group_id = %s "
-                "  AND src_uuid = %s AND tgt_uuid = %s AND t_invalid IS NULL",
-                (OWNER, group_id, source_uuid, target_uuid),
+                "  AND src_uuid = %s AND tgt_uuid = %s AND t_invalid IS NULL "
+                f"ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) "
+                "  NULLS LAST, id "
+                "LIMIT %s",
+                (OWNER, group_id, source_uuid, target_uuid, _vec(fact_embedding), limit),
             ).fetchall()
-            return [
-                {"uuid": u, "fact": f, "valid_at": _iso(v), "fact_embedding": _emb_list(e)}
-                for u, f, v, e in rows
-            ]
+            return [{"uuid": u, "fact": f, "valid_at": _iso(v)} for u, f, v in rows]
 
         return self._run(_q)
 
