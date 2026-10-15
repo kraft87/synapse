@@ -1196,6 +1196,8 @@ def _full_home() -> dict:
         "skills_sync": True,
         "config_sync": False,
         "config_paths": ["output-styles/*.md", "agents/*.md"],
+        "timeline_repos": ["~/code/synapse"],
+        "recall_nudge": False,
         "device": _record(),
     }
 
@@ -1208,14 +1210,27 @@ def test_config_lists_every_key_and_never_prints_the_token(cli, capsys):
     _no_token_material(out)
     lines = out.splitlines()
     assert lines[0] == f"# {_config_json()}"
-    shown = {line.split()[0]: line for line in lines[1:7]}
-    assert list(shown) == ["url", "token", "role", "skills_sync", "config_sync", "config_paths"]
+    shown = {line.split()[0]: line for line in lines[1:13]}
+    assert list(shown) == [
+        "url",
+        "token",
+        "role",
+        "skills_sync",
+        "config_sync",
+        "config_paths",
+        "timeline_repos",
+        "board",
+        "prefs_block",
+        "recall_nudge",
+        "prompt_timestamp",
+        "recall_feedback_nudge",
+    ]
     assert "(set; not shown)" in shown["token"]
     assert f" {_URL} " in shown["url"]
     assert " work " in shown["role"]
     assert " on " in shown["skills_sync"] and " off " in shown["config_sync"]
     assert "output-styles/*.md, agents/*.md" in shown["config_paths"]
-    assert lines[7].split() == ["(enrolled)", _SURFACE_ID, "(full)"]
+    assert lines[13].split() == ["(enrolled)", _SURFACE_ID, "(full)"]
 
 
 @pytest.mark.parametrize(
@@ -1227,6 +1242,8 @@ def test_config_lists_every_key_and_never_prints_the_token(cli, capsys):
         ("skills_sync", "on"),
         ("config_sync", "off"),
         ("config_paths", "output-styles/*.md, agents/*.md"),
+        ("timeline_repos", "~/code/synapse"),
+        ("recall_nudge", "off"),
     ],
 )
 def test_config_key_prints_its_value(cli, capsys, key, shown):
@@ -1249,6 +1266,10 @@ def test_config_key_prints_unset_for_a_missing_value(cli, capsys):
         ("skills_sync", "YES", True),
         ("config_sync", "1", True),
         ("config_sync", "no", False),
+        ("recall_nudge", "off", False),
+        ("recall_feedback_nudge", "on", True),
+        ("board", "0", False),
+        ("timeline_repos", "~/a, ~/b ~/c", ["~/a", "~/b", "~/c"]),
         (
             "config_paths",
             "output-styles/*.md, agents/*.md  x.md",
@@ -1269,6 +1290,7 @@ def test_config_key_value_validates_and_saves(cli, key, text, stored):
         ("role", "admin", "role must be personal or work"),
         ("skills_sync", "maybe", "skills_sync takes on/off"),
         ("config_sync", "2", "config_sync takes on/off"),
+        ("prompt_timestamp", "sometimes", "prompt_timestamp takes on/off"),
         ("url", "ftp://synapse.example.net", "not a plain http(s) base URL"),
         ("url", "https://synapse.example.net/a b", "not a plain http(s) base URL"),
         ("token", "   ", "token can't be empty; use --unset"),

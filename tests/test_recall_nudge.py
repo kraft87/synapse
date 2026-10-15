@@ -64,3 +64,55 @@ def test_nudge_kill_switch_keeps_timestamp(tmp_path):
 
 def test_both_off_prints_nothing(tmp_path):
     assert _run(tmp_path, {"SYNAPSE_RECALL_NUDGE": "0", "SYNAPSE_PROMPT_TIMESTAMP": "0"}) == ""
+
+
+def test_switches_come_from_config_json_too(tmp_path):
+    """`synapse config recall_nudge off` writes config.json, which the hook reads."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.json").write_text(json.dumps({"recall_nudge": False}))
+    lines = _run(tmp_path, {"SYNAPSE_HOME": str(home)}).splitlines()
+    assert len(lines) == 1 and _TS_RE.match(lines[0])
+    (home / "config.json").write_text(json.dumps({"prompt_timestamp": False}))
+    lines = _run(tmp_path, {"SYNAPSE_HOME": str(home)}).splitlines()
+    assert len(lines) == 1 and lines[0].startswith("[Synapse]")
+
+
+_CODEX_NUDGE_PY = (
+    Path(__file__).resolve().parents[1] / "plugin-codex" / "hooks" / "user_prompt_submit.py"
+)
+
+
+def _run_codex(tmp_path, env: dict | None = None) -> str:
+    full_env = {
+        **{k: v for k, v in os.environ.items() if not k.startswith("SYNAPSE_")},
+        "HOME": str(tmp_path),
+        "SYNAPSE_HOME": str(tmp_path / "synapse-home"),
+        **(env or {}),
+    }
+    out = subprocess.run(
+        [sys.executable, str(_CODEX_NUDGE_PY)],
+        capture_output=True,
+        text=True,
+        env=full_env,
+        cwd=tmp_path,
+        check=True,
+    ).stdout
+    return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else ""
+
+
+def test_codex_default_emits_timestamp_then_its_own_wording(tmp_path):
+    """Codex prompts used to carry no timestamp line, which remember() needs; the two
+    hooks now share the builder and differ only in how they name the tools."""
+    lines = _run_codex(tmp_path).splitlines()
+    assert len(lines) == 2
+    assert _TS_RE.match(lines[0]), lines[0]
+    assert "synapse recall" in lines[1] and "synapse:recall" not in lines[1]
+
+
+def test_codex_switches_match_claudes(tmp_path):
+    assert _run_codex(tmp_path, {"SYNAPSE_RECALL_NUDGE": "0"}).count("\n") == 0
+    assert _run_codex(tmp_path, {"SYNAPSE_PROMPT_TIMESTAMP": "0"}).startswith("[Synapse]")
+    assert (
+        _run_codex(tmp_path, {"SYNAPSE_RECALL_NUDGE": "0", "SYNAPSE_PROMPT_TIMESTAMP": "0"}) == ""
+    )

@@ -121,7 +121,7 @@ def adopt_legacy() -> list[str]:
         text = str(value).strip()
         if key in synapse_home.BOOL_KEYS:
             changes[key] = text != "0"  # the plugin's own reading: anything but "0" is on
-        elif key == "config_paths":
+        elif key in synapse_home.LIST_KEYS:
             changes[key] = [g for g in re.split(r"[,\s]+", text) if g]
         elif key == "role":
             changes[key] = text.lower()

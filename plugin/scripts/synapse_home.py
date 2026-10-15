@@ -16,6 +16,8 @@ as fallbacks, so an existing install keeps working with no action.
       "skills_sync": true,
       "config_sync": false,
       "config_paths": ["output-styles/*.md"],
+      "timeline_repos": ["~/code/synapse"],
+      "recall_nudge": false,
       "device": {"surface_id": ..., "trust": ..., "token_sha256": ..., "server": ...}
     }
 
@@ -41,9 +43,26 @@ KEYS = {
     "skills_sync": "SYNAPSE_SKILLS_SYNC",
     "config_sync": "SYNAPSE_CONFIG_SYNC",
     "config_paths": "SYNAPSE_CONFIG_PATHS",
+    "timeline_repos": "SYNAPSE_TIMELINE_REPOS",
+    "board": "SYNAPSE_BOARD",
+    "prefs_block": "SYNAPSE_PREFS_BLOCK",
+    "recall_nudge": "SYNAPSE_RECALL_NUDGE",
+    "prompt_timestamp": "SYNAPSE_PROMPT_TIMESTAMP",
+    "recall_feedback_nudge": "SYNAPSE_RECALL_FEEDBACK_NUDGE",
 }
 _BY_OPTION = {opt: key for key, opt in KEYS.items()}
-BOOL_KEYS = frozenset({"skills_sync", "config_sync"})
+BOOL_KEYS = frozenset(
+    {
+        "skills_sync",
+        "config_sync",
+        "board",
+        "prefs_block",
+        "recall_nudge",
+        "prompt_timestamp",
+        "recall_feedback_nudge",
+    }
+)
+LIST_KEYS = frozenset({"config_paths", "timeline_repos"})
 
 _TRUE = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE = frozenset({"0", "false", "no", "n", "off"})

@@ -54,6 +54,12 @@ _KEY_HELP = {
     "skills_sync": "two-way sync of your skills library at session start (on/off)",
     "config_sync": "mirror CLAUDE.md + rules/*.md to Synapse for the dream lane (on/off)",
     "config_paths": "extra globs under ~/.claude to mirror, comma-separated",
+    "timeline_repos": "git checkouts whose commits feed the board's last-week block, comma-separated",
+    "board": "print the board (curated notes, last week) at session start (on/off, default on)",
+    "prefs_block": "print your standing preferences at session start (on/off, default on)",
+    "recall_nudge": "remind the model to recall/remember with every prompt (on/off, default on)",
+    "prompt_timestamp": "put the current date and time in every prompt (on/off, default on)",
+    "recall_feedback_nudge": "ask for recall_feedback after each recall (on/off, default off)",
 }
 
 
@@ -460,7 +466,7 @@ def _parse_value(key: str, text: str):
         if parsed is None:
             raise ValueError(f"{key} takes on/off (or yes/no, 1/0)")
         return parsed
-    if key == "config_paths":
+    if key in synapse_home.LIST_KEYS:
         return [g for g in re.split(r"[,\s]+", text) if g]
     if not text.strip():
         raise ValueError(f"{key} can't be empty; use --unset")
@@ -473,10 +479,10 @@ def cmd_config(args) -> int:
         print(f"# {synapse_home.config_file()}")
         for key in synapse_home.KEYS:
             shown = _show(key, home.get(key)) if key in home else _elsewhere(key)
-            print(f"{key:<13} {shown:<28} {_KEY_HELP[key]}")
+            print(f"{key:<22} {shown:<28} {_KEY_HELP[key]}")
         record = config.read_device_state()
         if record.get("surface_id"):
-            print(f"{'(enrolled)':<13} {record['surface_id']} ({record.get('trust') or '?'})")
+            print(f"{'(enrolled)':<22} {record['surface_id']} ({record.get('trust') or '?'})")
         return 0
     key = args.key
     if key not in synapse_home.KEYS:
