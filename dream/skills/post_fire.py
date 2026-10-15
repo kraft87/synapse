@@ -8,7 +8,8 @@ caller owns cursor state, so each fire is judged on one run), reads the aftermat
 that FOLLOWED each fire (up to ~10 episodes, stopping before the session's NEXT skill fire —
 later corrections belong to that fire, not this one) alongside the skill's own registry
 description/body, and judges the outcome. At most FIRE_CAP fires are judged per run, newest
-first; the rest are counted as over_cap (only a --backfill window holds that many):
+first; the rest are counted as over_cap (a --backfill window or a held cursor can hold that
+many; the nightly report carries the count as skills_fires_over_cap):
 
   clean        — the procedure held; nothing to do
   deviation    — a step was wrong, missing, or mis-scoped and the user corrected it

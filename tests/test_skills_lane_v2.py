@@ -132,6 +132,17 @@ def test_derive_proposes_when_the_work_recurs_on_a_second_day(lane):
     assert r3["status"] == "proposed"
 
 
+def test_a_rescan_of_the_same_arc_adds_no_evidence_or_weight(lane):
+    # a held cursor re-runs struggle_arc over the same window; each night stamps a new scan_night
+    sig = "synthetic restic nas backup rclone"
+    r1 = _mc(lane, "derive", "v2t-proc", _arc("2026-07-17", "2026-07-16"), signature=sig)
+    before = _row(lane, r1["id"], "score, jsonb_array_length(evidence)")
+    for night in ("2026-07-18", "2026-07-19", "2026-07-20"):
+        r = _mc(lane, "derive", "v2t-proc", _arc(night, "2026-07-16"), signature=sig)
+        assert r["id"] == r1["id"] and r["status"] == "observe"
+    assert _row(lane, r1["id"], "score, jsonb_array_length(evidence)") == before
+
+
 def test_derive_proposes_on_salience(lane):
     r = _mc(
         lane,

@@ -1,7 +1,7 @@
 """skills-lane v2 ledger units (dream/skills/skill_ledger.py) — pure Python, no DB.
 
-Covers the v2 evidence semantics: the (session_id, signal, class, scan_night) dedup key,
-derive recurrence counted in distinct evidence dates (never scan nights, never undated
+Covers the v2 evidence semantics: the (session_id, signal, class, work date) dedup key
+(scan_night only for entries without a date), derive recurrence counted in distinct evidence dates (never scan nights, never undated
 entries), and the observe->proposed gates (_passes_gate). All fixtures are synthetic.
 """
 
@@ -12,6 +12,7 @@ from dream.skills.skill_ledger import (
     PROPOSE_SCORE,
     _passes_gate,
     _recurrence_days,
+    _rollup,
     _union_evidence,
 )
 
@@ -35,10 +36,34 @@ def test_union_same_night_duplicates_collapse():
     assert len(_union_evidence([a], [b])) == 1
 
 
-def test_union_resighting_on_later_night_counts():
+def test_union_undated_resighting_on_later_night_counts():
+    # no work date to key on (gap_scan, legacy rows): the scan night still separates sightings
     a = _ev(night="2026-07-17")
     b = _ev(night="2026-07-18")
     assert len(_union_evidence([a], [b])) == 2
+
+
+def test_union_rescan_of_the_same_work_adds_nothing():
+    # a held cursor re-runs the detectors over the same window: the arc is the same work, so
+    # the second scan night must not add a second entry (or a second helping of weight)
+    a = _ev(signal="struggle_arc", night="2026-07-17", date="2026-07-16")
+    b = _ev(signal="struggle_arc", night="2026-07-18", date="2026-07-16")
+    merged = _union_evidence([a], [b])
+    assert merged == [a]
+    assert _rollup(merged) == _rollup([a])
+    assert not _passes_gate("derive", merged, 1.0, None)
+
+
+def test_union_same_session_on_another_day_counts():
+    a = _ev(signal="struggle_arc", night="2026-07-17", date="2026-07-16")
+    b = _ev(signal="struggle_arc", night="2026-07-18", date="2026-07-17")
+    assert len(_union_evidence([a], [b])) == 2
+
+
+def test_union_collapses_rescans_already_in_the_ledger():
+    # rows written before the date key hold one entry per scan night; the next merge heals them
+    old = [_ev(night=f"2026-07-{d}", date="2026-07-16") for d in (17, 18, 19)]
+    assert len(_union_evidence(old, [])) == 1
 
 
 def test_union_legacy_entries_share_one_bucket():

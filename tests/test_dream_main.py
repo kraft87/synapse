@@ -167,6 +167,7 @@ def test_skills_lane_counts_are_flattened_from_its_stages(monkeypatch):
             "skills_gaps": 9,
             "skills_retune_signals": 3,
             "skills_fire_events": 7,
+            "skills_fires_over_cap": 4,
             "skills_dismissals": 2,
             "skills_drafted": 3,
             "skills_draft_errors": 1,

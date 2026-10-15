@@ -18,7 +18,7 @@ LLM only ever reads the worst few windows:
      IN THE PROMPT (no embedding routing — at catalog scale that misroutes) and must
      prefer patching an existing skill (retune + proposed_patch) over minting a new one
      (derive). Verdicts land in the ledger via skill_ledger.merge_candidate with
-     signal='struggle_arc' evidence carrying a short verbatim quote + scan_night.
+     signal='struggle_arc' evidence carrying a short verbatim quote + the arc's date.
 
 Topic gate: an arc window with no tool-use evidence (no [tool:*] marker, no file path)
 never reaches the judge — correction phrasing without tool work is conversation, not a

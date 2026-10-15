@@ -86,6 +86,7 @@ def _skills_lane() -> LaneResult:
         "skills_gaps": judge.get("derive", {}).get("gaps", 0),
         "skills_retune_signals": judge.get("retune", {}).get("under_trigger", 0),
         "skills_fire_events": usage.get("fire_events", 0),
+        "skills_fires_over_cap": s.get("post_fire", {}).get("over_cap", 0),
         "skills_dismissals": usage.get("dismissals", 0),
         "skills_drafted": drafts.get("drafted", 0) + drafts.get("redrafted", 0),
         "skills_draft_errors": drafts.get("errors", 0),

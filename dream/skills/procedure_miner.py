@@ -34,8 +34,8 @@ Exclusion rules (the rejected-procedure taxonomy, encoded):
 
 Cadence is the CALLER's job: the nightly integration calls run() only when due() says the
 last pass is >= 7 days old (watermark lives in skill_scan_cursor.config['procedure_miner']).
-run() is idempotent within a scan night — evidence entries carry scan_night and the ledger
-dedups on (session_id, signal, class, scan_night), so a re-run cannot double evidence.
+run() is idempotent — evidence entries carry the session's date and the ledger dedups on
+(session_id, signal, class, date), so a re-run or an overlapping window cannot double evidence.
 """
 
 from __future__ import annotations
@@ -467,7 +467,7 @@ def _confirm(cluster, sess_fp_pos, fp_sessions, examples, catalog, window_days):
 # --------------------------------------------------------------------- evidence
 def _evidence(cluster, sess_fp_pos, sess_date, scan_night: str) -> list[dict]:
     """One judge entry per distinct session (sorted for idempotency, capped), the observed
-    step sequence as the quote. The ledger dedups on (session_id, signal, class, scan_night)."""
+    step sequence as the quote. The ledger dedups on (session_id, signal, class, date)."""
     entries = []
     for sid in sorted(cluster["sessions"])[:EVIDENCE_SESSION_CAP]:
         steps = _session_steps(cluster, sess_fp_pos.get(sid, {}))

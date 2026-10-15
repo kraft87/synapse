@@ -7,7 +7,7 @@ Run under the synapse venv (needs psycopg + voyageai):
 
 Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name;
 retune/consolidate = (name,direction)/target), evidence accumulation (dedup by
-(session, signal, class, scan_night), recompute weights from the FULL evidence every
+(session, signal, class, work date), recompute weights from the FULL evidence every
 merge — never incrementally), the 0.5x judge discount (the score column does it),
 observe->proposed classification (v2 gates: retune proposes on one quote-carrying
 instance; derive on recurrence across distinct days, high salience, or the legacy
@@ -136,13 +136,19 @@ def _ev_sessions(evidence: list[dict]) -> set[str]:
 
 
 def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
-    """Append new, dedup by (session_id, signal, class, scan_night): a re-sighting on a LATER
-    scan night counts as fresh recurrence evidence, while same-night duplicates still collapse.
-    Legacy entries without scan_night all key to one bucket (scan_night=None) — same collapse
-    behavior they had before scan nights existed."""
+    """Append new, dedup by (session_id, signal, class, work date): a scanner seeing the same
+    work again (a re-run after a held cursor, the miner's overlapping window) adds nothing,
+    while the same session on another day is a fresh sighting. Entries without a date
+    (gap_scan, explicit requests, legacy rows) key on scan_night instead, so a later night's
+    sighting still counts; entries with neither all key to one bucket."""
     out, seen = [], set()
     for e in list(old) + list(new):
-        k = (e.get("session_id"), e.get("signal"), e.get("class"), e.get("scan_night"))
+        k = (
+            e.get("session_id"),
+            e.get("signal"),
+            e.get("class"),
+            e.get("date") or e.get("scan_night"),
+        )
         if k in seen:
             continue
         seen.add(k)
