@@ -82,8 +82,8 @@ strict = true
 ignore_missing_imports = true
 # The one list of what is type-checked: CI and pre-commit both run a bare `uv run mypy`.
 # `exclude` only prunes directory walks, so the mcp_server modules named here (the recall
-# engine, its KG leg and the board) are still checked; the other mcp_server modules are
-# followed as imports, not reported.
+# engine, its KG leg, the board and the auth routes) are still checked; the other mcp_server
+# modules are followed as imports, not reported. Add one when it is clean under strict.
 files = [
     "ingestion",
     "dream",
@@ -91,5 +91,12 @@ files = [
     "mcp_server/recall*.py",
     "mcp_server/kg_pg.py",
     "mcp_server/board.py",
+    "mcp_server/server_auth.py",
+    "mcp_server/http_auth.py",
+    "mcp_server/auth_tokens.py",
+    "mcp_server/caller_trust.py",
+    "mcp_server/idp.py",
+    "mcp_server/device_routes.py",
+    "mcp_server/web_login_routes.py",
 ]
 exclude = ["tests/", "mcp_server/", "plugin/"]

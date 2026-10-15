@@ -99,7 +99,7 @@ def register(
 
     # The login screen asks before it offers "sign in": on a bearer-only deployment the
     # start route below does not exist. Unauthenticated, like the shell it serves.
-    @mcp.custom_route("/dash/oauth/available", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/oauth/available", methods=["GET"])  # type: ignore[untyped-decorator]
     async def oauth_available(request: Request) -> Response:
         return JSONResponse({"available": enabled})
 
@@ -116,7 +116,7 @@ def register(
     }
     redirect_uri = public_origin + _CALLBACK_PATH
 
-    @mcp.custom_route("/dash/oauth/start", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/oauth/start", methods=["GET"])  # type: ignore[untyped-decorator]
     async def oauth_start(request: Request) -> Response:
         origin = request_origin(request)
         if origin not in allowed_origins:
@@ -134,7 +134,7 @@ def register(
             )
         return RedirectResponse(target, status_code=302)
 
-    @mcp.custom_route(_CALLBACK_PATH, methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route(_CALLBACK_PATH, methods=["GET"])  # type: ignore[untyped-decorator]
     async def oauth_callback(request: Request) -> Response:
         state = request.query_params.get("state") or ""
         origin = _verify_state(machine_token, state)

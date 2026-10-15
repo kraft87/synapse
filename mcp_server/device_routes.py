@@ -62,17 +62,17 @@ def register(
             else "this server has no SYNAPSE_MACHINE_TOKEN set, so it has no credential to issue"
         )
 
-        @mcp.custom_route("/device/code", methods=["POST"])  # type: ignore[misc]
+        @mcp.custom_route("/device/code", methods=["POST"])  # type: ignore[untyped-decorator]
         async def device_code_unavailable(request: Request) -> JSONResponse:
             return _err(reason, description, 503)
 
-        @mcp.custom_route("/device/token", methods=["POST"])  # type: ignore[misc]
+        @mcp.custom_route("/device/token", methods=["POST"])  # type: ignore[untyped-decorator]
         async def device_token_unavailable(request: Request) -> JSONResponse:
             return _err(reason, description, 503)
 
         return
 
-    @mcp.custom_route("/device/code", methods=["POST"])  # type: ignore[misc]
+    @mcp.custom_route("/device/code", methods=["POST"])  # type: ignore[untyped-decorator]
     async def device_code(request: Request) -> JSONResponse:
         """Start a device login: ask the IdP for a device + user code, pass them to the client."""
         try:
@@ -99,7 +99,7 @@ def register(
             }
         )
 
-    @mcp.custom_route("/device/token", methods=["POST"])  # type: ignore[misc]
+    @mcp.custom_route("/device/token", methods=["POST"])  # type: ignore[untyped-decorator]
     async def device_token(request: Request) -> JSONResponse:
         """Poll: exchange the device_code at the IdP; on approval, gate by allowlist and return
         the machine token. Pending/slow_down pass back so the client keeps polling."""
