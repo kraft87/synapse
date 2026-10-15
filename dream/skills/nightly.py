@@ -329,7 +329,8 @@ def discord_digest(conn, no_discord):
     score), and PINGS only when there are proposals not covered by the previous digest —
     a nightly re-wall of the same pending list is how review queues rot. The seen-ids
     watermark lives in skill_scan_cursor.config['digest_ids'] (update_cursor merges,
-    never clobbers)."""
+    never clobbers); it is written only once the digest was delivered, and a failed Discord
+    POST raises."""
     cur = conn.cursor()
     cur.execute(
         """SELECT id, kind, name, score, grounded_sessions, judge_sessions, salience, source_detector
@@ -354,13 +355,6 @@ def discord_digest(conn, no_discord):
     lines.append("\nReview: `/skill-review` (or skill_review.py list) · accept/reject <id>")
     msg = "\n".join(lines)
 
-    cur.execute(
-        "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
-        "updated_at=now() WHERE id=1",
-        (json.dumps({"digest_ids": ids}),),
-    )
-    conn.commit()
-
     if not new:
         print(f"(digest: {len(rows)} pending, none new since last digest — not pinging)")
         return {"proposed": len(rows), "new": 0}
@@ -372,10 +366,20 @@ def discord_digest(conn, no_discord):
                 config.DISCORD_WEBHOOK, data=body, headers={"Content-Type": "application/json"}
             )
             urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"(notifier failed: {e})\n{msg}")
+        except Exception:
+            # Keep the digest in the log. digest_ids stays unwritten, so the next run pings
+            # again, and the stage error marks tonight's run not ok.
+            print(msg)
+            raise
     else:
         print(msg)
+    # Only a delivered digest counts as seen.
+    cur.execute(
+        "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
+        "updated_at=now() WHERE id=1",
+        (json.dumps({"digest_ids": ids}),),
+    )
+    conn.commit()
     return {"proposed": len(rows), "new": len(new)}
 
 
@@ -458,7 +462,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
                 conn,
                 run_started,
                 config={
-                    "excluded_projects": ["transcribe_ai"],
+                    "excluded_projects": list(config.EXCLUDE_PROJECTS),
                     "propose_score": L.PROPOSE_SCORE,
                     "session_jaccard": L.SESSION_JACCARD,
                     "limit": limit,

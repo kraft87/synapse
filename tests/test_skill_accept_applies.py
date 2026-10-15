@@ -20,6 +20,7 @@ from psycopg.types.json import Json
 import dream.skills.skill_draft as DR
 from dream import lane
 from dream.skills.skill_doc import body_hash
+from ingestion.llm_client import UsageLimitError
 from mcp_server.skill_sync_routes import (
     _fetch_skill,
     _list_skills,
@@ -367,6 +368,31 @@ def test_accepted_new_skill_is_materialized_in_its_project(acc, db_url, tmp_path
 
 
 # ------------------------------------------------------------------ nightly draft pass
+
+
+def test_draft_pending_stops_when_the_model_cannot_be_reached(acc, monkeypatch):
+    """A usage limit raises out of the pass instead of counting every pending row as failed."""
+    _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
+    calls: list[str] = []
+
+    def down(prompt):
+        calls.append(prompt)
+        raise UsageLimitError("5-hour limit reached")
+
+    monkeypatch.setattr(lane, "draft", down)
+    with pytest.raises(UsageLimitError):
+        DR.draft_pending(acc)
+    assert len(calls) == 1
+
+
+def test_draft_pending_counts_a_row_whose_draft_fails_and_goes_on(acc, monkeypatch):
+    _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
+
+    def broken(prompt):
+        raise ValueError("the model rambled")
+
+    monkeypatch.setattr(lane, "draft", broken)
+    assert DR.draft_pending(acc)["errors"] >= 1
 
 
 def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url, monkeypatch):

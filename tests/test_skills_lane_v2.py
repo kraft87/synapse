@@ -17,6 +17,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -430,6 +431,44 @@ def test_digest_caps_at_five_and_pings_only_on_new(lane, capsys):
     )
     r3 = N.discord_digest(lane, no_discord=True)
     assert r3["proposed"] == 8 and r3["new"] == 1
+
+
+def test_a_failed_discord_post_raises_and_the_batch_pings_again_next_run(lane, monkeypatch, capsys):
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='observe' WHERE status='proposed'"
+    )
+    _mc(
+        lane,
+        "retune",
+        "v2t-digest-hook",
+        [
+            {
+                "session_id": "v2t-sess-hook",
+                "class": "judge",
+                "signal": "post_fire_deviation",
+                "quote": "synthetic quote",
+            }
+        ],
+        direction="fix",
+        target_skills=["v2t-digest-hook"],
+    )
+    posts: list[dict] = []
+
+    def urlopen(req, timeout):
+        posts.append(json.loads(req.data))
+        if len(posts) == 1:
+            raise urllib.error.URLError("discord is down")
+
+    monkeypatch.setattr(N.config, "DISCORD_WEBHOOK", "https://discord.example/hook")
+    monkeypatch.setattr(N.urllib.request, "urlopen", urlopen)
+
+    with pytest.raises(urllib.error.URLError):  # the stage fails, so the run is recorded not ok
+        N.discord_digest(lane, no_discord=False)
+    assert "v2t-digest-hook" in capsys.readouterr().out  # the digest is still in the log
+    assert N.discord_digest(lane, no_discord=False) == {"proposed": 1, "new": 1}  # pings again
+    assert [p["content"].count("v2t-digest-hook") for p in posts] == [1, 1]
+    assert N.discord_digest(lane, no_discord=False) == {"proposed": 1, "new": 0}  # delivered
+    assert len(posts) == 2
 
 
 def test_run_config_update_does_not_clobber_digest_state(lane):

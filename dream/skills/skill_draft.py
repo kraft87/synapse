@@ -23,6 +23,7 @@ A draft that fails its checks is not stored: the row stays body-less, the review
 from __future__ import annotations
 
 from dream import lane
+from ingestion.llm_client import LLM_TRANSPORT_ERRORS
 
 from . import skill_derive as SD
 from . import skill_doc as D
@@ -203,7 +204,9 @@ def needs_draft(row: dict) -> bool:
 
 
 def draft_pending(conn, cap: int = DRAFT_CAP) -> dict:
-    """Draft up to `cap` proposed rows that need one. Per-row failures never stop the lane."""
+    """Draft up to `cap` proposed rows that need one. A row whose draft fails for its own reasons
+    is counted and skipped; a model that cannot be reached raises, since every later row
+    would fail the same way."""
     cur = conn.cursor()
     cur.execute(_PENDING_SQL)
     cols = [d.name for d in cur.description]
@@ -212,6 +215,8 @@ def draft_pending(conn, cap: int = DRAFT_CAP) -> dict:
     for row in rows[:cap]:
         try:
             out = draft(row, row.get("registry_body"))
+        except LLM_TRANSPORT_ERRORS:
+            raise
         except Exception as e:
             print(f"  draft failed for cand#{row['id']} ({row['name']}): {e}")
             stats["errors"] += 1
