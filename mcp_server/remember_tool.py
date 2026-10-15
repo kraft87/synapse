@@ -195,7 +195,8 @@ def register(
         # included. The archive episode is still stored (it is the note's provenance and
         # the copy of its earlier wording), but queuing it too would extract the same text
         # again. Hookless callers (the claude.ai connector, the root token) have no such
-        # ingest, so theirs is always queued.
+        # ingest, so theirs is always queued, and so is a private session's: its turns are
+        # dropped at /ingest, and the manual archive is left out of chunk text.
         stamp = trust.stamp_surface_id
         hook_ingested = (
             bool(session_id) and stamp is not None and not stamp.startswith(OAUTH_SURFACE_PREFIX)
@@ -221,7 +222,7 @@ def register(
                             surface_id=trust.stamp_surface_id,
                         )
                     )
-                    if not hook_ingested:
+                    if not hook_ingested or db.is_private_session(sid):
                         db.enqueue_extraction(
                             ExtractionItem(
                                 episode_id=episode_id,

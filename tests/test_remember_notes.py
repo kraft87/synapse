@@ -511,6 +511,17 @@ def test_device_caller_with_a_session_is_archived_but_not_queued(env):
     assert _queued(env) == []
 
 
+def test_device_caller_in_a_private_session_is_queued(env):
+    """A private session's turns are never ingested, so the Stop hook extracts nothing
+    from it: the statement is queued like a hookless caller's."""
+    env.conn.execute("INSERT INTO private_sessions (session_id) VALUES ('s3p')")
+    try:
+        out = _remember_as(_DEVICE, session_id="s3p")
+        assert _queued(env) == [(out["episode_id"],)]
+    finally:
+        env.conn.execute("DELETE FROM private_sessions WHERE session_id = 's3p'")
+
+
 @pytest.mark.parametrize(
     ("trust", "session_id"),
     [
