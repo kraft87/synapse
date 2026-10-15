@@ -43,6 +43,13 @@ def test_repo_schema_dir_is_discovered():
     assert v is not None and v >= "038"
 
 
+def test_repo_migration_numbers_are_unique():
+    # apply_schema.sh orders, gates and stamps by number; a shared number would leave the
+    # order to the filenames and make "applied everything up to the stamp" untrue.
+    numbers = [num for num, _ in schema_check._migrations(None)]
+    assert len(numbers) == len(set(numbers))
+
+
 def test_check_passes_on_match(tmp_path, monkeypatch):
     d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
     monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "039")

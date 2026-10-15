@@ -312,9 +312,7 @@ def test_routes_require_the_machine_token_and_retire_over_http(ret, db_url):
 # ------------------------------------------------------------------ schema 060
 
 
-def test_schema_060_is_registered_and_optional():
-    script = (_ROOT / "scripts" / "apply_schema.sh").read_text()
-    assert "060_skill_retired_at.sql" in script
+def test_schema_060_is_optional():
     # The image lands before 060 is applied by hand; the boot guard must let it start.
     assert schema_check.is_optional_migration(_ROOT / "schema" / "060_skill_retired_at.sql")
 

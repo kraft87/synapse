@@ -119,9 +119,7 @@ def test_the_in_process_id_lane_never_stamps(monkeypatch):
     assert st.known and not st.credential_bound and st.own_surface is None
 
 
-def test_schema_057_is_registered_and_optional():
-    script = (Path(__file__).resolve().parent.parent / "scripts" / "apply_schema.sh").read_text()
-    assert "057_own_surface_episodes.sql" in script
+def test_schema_057_is_optional():
     # The image lands before 057 is applied by hand; the boot guard must let it start.
     assert schema_check.is_optional_migration(_SCHEMA_057)
 

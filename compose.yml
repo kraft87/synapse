@@ -31,6 +31,9 @@ services:
     image: paradedb/paradedb:latest-pg17@sha256:0defbfb50d530e6e875ab584528f1e235662225127c09e7a8d5651e59dabe341
     container_name: ${COMPOSE_PROJECT_NAME:-synapse}-postgres-1
     restart: unless-stopped
+    # Parallel workers (an HNSW build, a parallel scan) share memory through /dev/shm;
+    # Docker's 64 MB default aborts them with "No space left on device".
+    shm_size: 1g
     # Never auto-update the data layer: explicitly disabled for any Watchtower
     # (this label is honored even by an unscoped instance), on top of the digest
     # pin above. The app services opt IN via watchtower.scope=synapse.
