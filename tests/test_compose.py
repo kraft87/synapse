@@ -20,6 +20,42 @@ def test_poller_healthcheck_reads_the_file_run_loop_touches(name):
     assert poller_mod._HEARTBEAT.name in " ".join(test)
 
 
+@pytest.mark.parametrize("name", ["poller", "poller-drain"])
+def test_pollers_get_time_to_finish_their_in_flight_items(name):
+    """An item takes minutes; a stop that kills sooner strands its claim for 45 minutes."""
+    assert _SERVICES[name]["stop_grace_period"] == "5m"
+
+
+@pytest.mark.parametrize(
+    "threads,with_workers,claims", [("3", True, 3), ("1", True, 1), ("4", False, 1)]
+)
+def test_run_loop_claims_one_row_per_worker_thread(
+    tmp_path, monkeypatch, threads, with_workers, claims
+):
+    """A claim that only waits for a free thread is held for nothing, and is stranded
+    for 45 minutes if the worker is killed."""
+
+    class _Db:
+        def release_stale_claims(self) -> int:
+            return 0
+
+    monkeypatch.setattr(poller_mod, "_HEARTBEAT", tmp_path / "poller.alive")
+    monkeypatch.setattr(signal, "signal", lambda *_: None)
+    monkeypatch.setenv("SYNAPSE_DRAIN_ONLY", "1")
+    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", threads)
+    p = Poller(db=_Db(), worker_factory=(lambda: (None, None)) if with_workers else None)  # type: ignore[arg-type,return-value]
+    claimed = []
+
+    def drain(batch_limit: int) -> int:
+        claimed.append(batch_limit)
+        p.request_stop()
+        return 0
+
+    monkeypatch.setattr(p, "drain_extraction_queue", drain)
+    p.run_loop(interval_seconds=3600)
+    assert claimed == [claims]
+
+
 def test_run_loop_touches_the_heartbeat(tmp_path, monkeypatch):
     class _Db:
         def release_stale_claims(self) -> int:
