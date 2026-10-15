@@ -274,7 +274,7 @@ def draft_pending(conn, cap: int = DRAFT_CAP) -> dict:
             stats["errors"] += 1
             continue
         cur.execute(
-            "UPDATE skills_lane.skill_gap_candidates SET proposal_body=%s, base_body_hash=%s, "
+            "UPDATE skills_lane.skill_gap_candidates SET proposal_body=%s, base_body_hash=%s, "  # nosec B608 — a fixed column fragment; the values are bound
             "updated_at=now()"
             + (", draft_attempts=0, last_draft_at=NULL, last_draft_error=NULL" if has_state else "")
             + " WHERE id=%s AND status='proposed'",

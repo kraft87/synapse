@@ -721,7 +721,7 @@ def _entity(
         # hides a current fact behind superseded ones; the "other" endpoint's name comes from
         # a join on whichever side isn't this entity. Paged: stats.facts is the total.
         fact_rows = conn.execute(
-            "SELECT r.uuid, r.name, r.fact, r.t_valid, r.t_invalid, r.episodes, "
+            "SELECT r.uuid, r.name, r.fact, r.t_valid, r.t_invalid, r.episodes, "  # nosec B608 — {touching} is a fixed predicate; the ids are bound
             "       CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END AS other_uuid, "
             "       oe.name AS other_name "
             "FROM kg_relationships r "
@@ -735,7 +735,7 @@ def _entity(
 
         stats = (
             conn.execute(
-                "SELECT count(*) FILTER (WHERE t_invalid IS NULL) AS edges, "
+                "SELECT count(*) FILTER (WHERE t_invalid IS NULL) AS edges, "  # nosec B608 — {touching} is a fixed predicate; the ids are bound
                 "       count(*) AS facts, "
                 "       COALESCE(sum(retrieval_count), 0) AS served "
                 f"FROM kg_relationships r WHERE {touching}",
@@ -758,13 +758,13 @@ def _entity(
         )
         total_row = (
             conn.execute(
-                f"SELECT count(*) AS total FROM episodes e WHERE e.id IN ({mentioned})",
+                f"SELECT count(*) AS total FROM episodes e WHERE e.id IN ({mentioned})",  # nosec B608 — {mentioned} is a fixed subquery; the ids are bound
                 scope,
             ).fetchone()
             or {}
         )
         mention_rows = conn.execute(
-            f"SELECT e.id, e.created_at, left(e.content, {_GIST_SOURCE_MAX}) AS content "
+            f"SELECT e.id, e.created_at, left(e.content, {_GIST_SOURCE_MAX}) AS content "  # nosec B608 — {mentioned} is a fixed subquery, the width a constant; the ids are bound
             f"FROM episodes e WHERE e.id IN ({mentioned}) "
             "ORDER BY e.created_at DESC, e.id DESC OFFSET %(off)s LIMIT %(lim)s",
             {**scope, "off": mentions_offset, "lim": _MENTIONS_PAGE},
@@ -926,7 +926,7 @@ def _graph_neighborhood(
             if not frontier:
                 break
             rows = conn.execute(
-                "SELECT src_uuid, tgt_uuid FROM kg_relationships "
+                "SELECT src_uuid, tgt_uuid FROM kg_relationships "  # nosec B608 — edge_scope and as_of_sql are fixed fragments; the values are bound
                 f"WHERE {edge_scope} AND (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} "
                 "LIMIT %s",
                 (*edge_params, frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
@@ -956,7 +956,7 @@ def _graph_neighborhood(
 
         # Edges with BOTH endpoints kept, under the same as-of visibility.
         edge_rows = conn.execute(
-            "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "
+            "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "  # nosec B608 — edge_scope and as_of_sql are fixed fragments; the values are bound
             "       retrieval_count FROM kg_relationships "
             f"WHERE {edge_scope} AND src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} "
             "LIMIT %s",
@@ -1108,7 +1108,7 @@ def _search(
         hits: list[dict[str, Any]] = []
         if type_ == "episodes" and safe:
             for r in conn.execute(
-                f"SELECT id, left(content, {_SNIPPET_MAX}) AS snippet, project, source, "
+                f"SELECT id, left(content, {_SNIPPET_MAX}) AS snippet, project, source, "  # nosec B608 — ep_and joins fixed column predicates and the snippet width is a constant; the values are bound
                 "       created_at, session_id, paradedb.score(id) AS sc FROM episodes "
                 f"WHERE id @@@ paradedb.match('content', %s){ep_and} "
                 "ORDER BY sc DESC, id DESC OFFSET %s LIMIT %s",
@@ -1129,7 +1129,7 @@ def _search(
                 )
         elif type_ == "facts" and safe:
             for r in conn.execute(
-                "SELECT uuid, fact, group_id, t_valid, t_invalid, t_created, episodes, "
+                "SELECT uuid, fact, group_id, t_valid, t_invalid, t_created, episodes, "  # nosec B608 — f_and is a fixed predicate; the values are bound
                 "       paradedb.score(id) AS sc FROM kg_relationships "
                 f"WHERE id @@@ paradedb.match('fact', %s){f_and} "
                 "ORDER BY sc DESC, uuid DESC OFFSET %s LIMIT %s",
@@ -1154,7 +1154,7 @@ def _search(
                 )
         elif type_ == "events" and safe:
             for r in conn.execute(
-                "SELECT id, fact, project, t_valid, source, source_ref, ingested_at, "
+                "SELECT id, fact, project, t_valid, source, source_ref, ingested_at, "  # nosec B608 — ev_and joins fixed column predicates; the values are bound
                 "       paradedb.score(id) AS sc FROM timeline_events "
                 f"WHERE id @@@ paradedb.match('fact', %s){ev_and} "
                 "ORDER BY sc DESC, id DESC OFFSET %s LIMIT %s",
@@ -1316,7 +1316,7 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
     )
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         series_rows = conn.execute(
-            "SELECT date_trunc('hour', created_at) AS t, count(*) AS calls, "
+            "SELECT date_trunc('hour', created_at) AS t, count(*) AS calls, "  # nosec B608 — leg_select is built from the _RECALL_LEGS constants
             "  percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_total::double precision) AS p50, "
             "  percentile_cont(0.95) WITHIN GROUP (ORDER BY ms_total::double precision) AS p95, "
             "  percentile_cont(0.5) WITHIN GROUP (ORDER BY est_tokens::double precision) AS tok, "
@@ -2217,7 +2217,7 @@ def _timeline(
                 where.append("t_valid < %s::timestamptz")
                 params.append(ts)
         rows = conn.execute(
-            "SELECT id, t_valid, fact, source, project, salience, event_type, source_ref, domain "
+            "SELECT id, t_valid, fact, source, project, salience, event_type, source_ref, domain "  # nosec B608 — where holds fixed predicates; the values are bound
             f"FROM timeline_events WHERE {' AND '.join(where)} "
             "ORDER BY t_valid DESC, id DESC LIMIT %s",
             (*params, limit),
@@ -2388,13 +2388,13 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
         )
         if surface:
             row = conn.execute(
-                f"SELECT {cols} FROM config_lane.config_registry "
+                f"SELECT {cols} FROM config_lane.config_registry "  # nosec B608 — cols is a literal column list
                 "WHERE file_key = %s AND scope = %s AND surface_id = %s",
                 (key, scope, surface),
             ).fetchone()
         else:
             row = conn.execute(
-                f"SELECT {cols} FROM config_lane.config_registry "
+                f"SELECT {cols} FROM config_lane.config_registry "  # nosec B608 — cols is a literal column list
                 "WHERE file_key = %s AND scope = %s ORDER BY updated_at DESC LIMIT 1",
                 (key, scope),
             ).fetchone()

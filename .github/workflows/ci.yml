@@ -68,7 +68,7 @@ jobs:
       - name: Install bandit
         run: uv pip install bandit
       - name: Bandit
-        run: bandit -r ingestion/ -ll -ii
+        run: bandit -r ingestion/ mcp_server/ dream/ -ll -ii
 
   web:
     name: Web bundle

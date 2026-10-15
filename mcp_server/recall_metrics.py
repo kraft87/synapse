@@ -94,7 +94,7 @@ class RecallMetricsMixin(RecallEngine):
                 values[served_ids_index] = PgJson(values[served_ids_index])
             with pg_pool.connection(self._db_url) as connection:
                 connection.execute(
-                    f"INSERT INTO recall_metrics ({','.join(_METRIC_COLS)}) VALUES ({placeholders})",
+                    f"INSERT INTO recall_metrics ({','.join(_METRIC_COLS)}) VALUES ({placeholders})",  # nosec B608 — the columns are the _METRIC_COLS constants; the values are bound
                     values,
                 )
         except Exception as error:

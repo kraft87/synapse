@@ -163,7 +163,7 @@ def _proposal_owned(db_url: str, cid: int, own_surface: str) -> bool:
         if not _own_ready(conn, db_url, own_surface):
             return False
         row = conn.execute(
-            "SELECT 1 FROM config_lane.config_proposals WHERE id = %(id)s" + _OWN_PROPOSAL,
+            "SELECT 1 FROM config_lane.config_proposals WHERE id = %(id)s" + _OWN_PROPOSAL,  # nosec B608 — _OWN_PROPOSAL is a literal predicate; the values are bound
             {"id": cid, "own": own_surface},
         ).fetchone()
     return row is not None

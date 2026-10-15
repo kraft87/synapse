@@ -118,7 +118,7 @@ def search_kg_postgres(
     # scope on the small candidate set. See module docstring for the required GUCs.
     if not restricted:
         cur.execute(
-            "SELECT id, uuid, fact, t_valid, ongoing, last_supported_at FROM ("
+            "SELECT id, uuid, fact, t_valid, ongoing, last_supported_at FROM ("  # nosec B608 — _EMBED_DIMS is a validated int; the values are bound
             "  SELECT id, uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id "
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
@@ -133,7 +133,7 @@ def search_kg_postgres(
         # planner off the HNSW ordering; the provenance filter rides the partial GIN
         # (kg_rel_source_projects_gin). Cost scales with the allowlisted fact count.
         cur.execute(
-            "WITH cand AS MATERIALIZED ("
+            "WITH cand AS MATERIALIZED ("  # nosec B608 — _EMBED_DIMS is a validated int and scope_predicate() a fixed predicate; the values are bound
             "  SELECT id, uuid, fact, t_valid, ongoing, last_supported_at, "
             f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
             "  FROM kg_relationships "
@@ -157,7 +157,7 @@ def search_kg_postgres(
     bm25_uuids: list[str] = []
     if safe:
         cur.execute(
-            "SELECT id, uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
+            "SELECT id, uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "  # nosec B608 — scope_sql is a fixed predicate; the values are bound
             "FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s) "
             "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
@@ -187,7 +187,7 @@ def search_kg_postgres(
     # supernode has thousands), and a correlated (src OR tgt) predicate could not use the
     # btree indexes (kg_rel_pair / kg_rel_tgt) and seq-scanned the whole edge table per seed.
     cur.execute(
-        "WITH seeds AS ("
+        "WITH seeds AS ("  # nosec B608 — _EMBED_DIMS is a validated int and scope_sql a fixed predicate; the values are bound
         "  SELECT uuid, name, summary, dist FROM ("
         "    SELECT uuid, name, summary, owner_id, group_id, "
         f"           embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
@@ -250,7 +250,7 @@ def search_kg_postgres(
             f"{scope_sql}"
         )
         cur.execute(
-            "SELECT h.id, h.uuid, h.fact, h.t_valid, h.ongoing, h.last_supported_at "
+            "SELECT h.id, h.uuid, h.fact, h.t_valid, h.ongoing, h.last_supported_at "  # nosec B608 — hop_side is a fixed statement with scope_sql, a fixed predicate; the values are bound
             "FROM unnest(%s::text[]) WITH ORDINALITY AS s(sd, ord) "
             "CROSS JOIN LATERAL ("
             f"  ({hop_side}AND src_uuid = s.sd ORDER BY t_valid DESC LIMIT 8) "

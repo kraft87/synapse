@@ -154,7 +154,7 @@ OIDC_USER_CLAIMS = tuple(
 import sys as _sys  # noqa: E402
 
 _use_http = "--stdio" not in _sys.argv
-_mcp_host = "0.0.0.0" if _use_http else "127.0.0.1"
+_mcp_host = "0.0.0.0" if _use_http else "127.0.0.1"  # nosec B104 — the container's listen address; the published port is the exposure boundary
 _mcp_port = int(os.environ.get("MCP_PORT", "8765"))
 
 

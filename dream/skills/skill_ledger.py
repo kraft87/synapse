@@ -217,7 +217,7 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         # candidate. On a database still on the old index (unique across every status) the
         # INSERT then conflicts with the closed row, and merge_candidate drops the sighting.
         cur.execute(
-            "SELECT id, evidence, trigger_phrasings, "
+            "SELECT id, evidence, trigger_phrasings, "  # nosec B608 — _OPEN is a literal status predicate; the values are bound
             "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
             "FROM skills_lane.skill_gap_candidates "
             f"WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') AND {_OPEN} "
@@ -383,7 +383,7 @@ def merge_candidate(
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::halfvec,%s::jsonb,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (kind, name, COALESCE(direction, '-'))
                  WHERE kind = 'retune' AND {_OPEN} DO NOTHING
-               RETURNING id, status, score, salience""",
+               RETURNING id, status, score, salience""",  # nosec B608 — _OPEN is a literal status predicate; the values are bound
             (
                 kind,
                 name,
@@ -412,7 +412,7 @@ def merge_candidate(
         # row, untouched; an open one first.
         conn.commit()
         cur.execute(
-            "SELECT id, status, score FROM skills_lane.skill_gap_candidates "
+            "SELECT id, status, score FROM skills_lane.skill_gap_candidates "  # nosec B608 — _OPEN is a literal status predicate; the values are bound
             "WHERE kind=%s AND name=%s AND COALESCE(direction,'-')=COALESCE(%s,'-') "
             f"ORDER BY ({_OPEN}) DESC, id DESC LIMIT 1",
             (kind, name, direction),

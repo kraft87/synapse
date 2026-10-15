@@ -369,7 +369,7 @@ def discord_digest(conn, no_discord, effects=()):
             req = urllib.request.Request(
                 config.DISCORD_WEBHOOK, data=body, headers={"Content-Type": "application/json"}
             )
-            urllib.request.urlopen(req, timeout=10)
+            urllib.request.urlopen(req, timeout=10)  # nosec B310 — the operator-set SKILLS_DISCORD_WEBHOOK, not request input
         except Exception:
             # Keep the digest in the log. digest_ids stays unwritten, so the next run pings
             # again, and the stage error marks tonight's run not ok.

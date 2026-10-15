@@ -203,7 +203,7 @@ class RecallSourcesMixin(RecallEngine):
         try:
             with self._pg() as conn:
                 rows = conn.execute(
-                    "SELECT r.uuid FROM kg_relationships r "
+                    "SELECT r.uuid FROM kg_relationships r "  # nosec B608 — _self_only_sql builds a fixed predicate; the values are bound
                     f"WHERE r.uuid = ANY(%s) AND {_self_only_sql('r')}",
                     (uuids, self_session),
                 ).fetchall()
@@ -266,7 +266,7 @@ class RecallSourcesMixin(RecallEngine):
                            OR (o.invalidated_by IS NULL AND o.name = a.name))
                       AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
                     ORDER BY a.uuid, o.t_invalid DESC
-                    """,
+                    """,  # nosec B608 — scope_sql is a fixed predicate; the values are bound
                     (
                         cfg.kg_owner,
                         group_id,
@@ -351,7 +351,7 @@ class RecallSourcesMixin(RecallEngine):
         try:
             with self._pg() as conn:
                 rows = conn.execute(
-                    "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
+                    "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "  # nosec B608 — ors, scope_sql and the closeness test are fixed fragments; the values are bound
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                     f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
                     "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
@@ -421,7 +421,7 @@ class RecallSourcesMixin(RecallEngine):
         try:
             with self._pg() as conn:
                 rows = conn.execute(
-                    "SELECT n.id, n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
+                    "SELECT n.id, n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "  # nosec B608 — embed_dims is a validated int and scope_sql a fixed predicate; the values are bound
                     f"  (p.fact_embedding::halfvec({cfg.embed_dims}) <=> %s::halfvec({cfg.embed_dims})) AS d "
                     "FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "

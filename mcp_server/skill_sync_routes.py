@@ -717,7 +717,7 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
         fm = frontmatter_name(body)
         skill = fm if valid_skill_name(fm) else re.sub(r"[^a-z0-9-]", "", row["name"].lower())
     reg = c.execute(
-        "SELECT scope, status, COALESCE(body, '') AS body FROM skills_lane.skill_registry "
+        "SELECT scope, status, COALESCE(body, '') AS body FROM skills_lane.skill_registry "  # nosec B608 — a fixed FOR UPDATE suffix; the name is bound
         "WHERE name=%s" + (" FOR UPDATE" if lock else ""),
         (skill,),
     ).fetchone()
@@ -802,7 +802,7 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
 def _proposal_detail(db_url: str, cid: int) -> dict:
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         r = c.execute(
-            f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s",
+            f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s",  # nosec B608 — _CANDIDATE_COLS is a literal column list
             (cid,),
         ).fetchone()
         if not r:
@@ -830,7 +830,7 @@ def _apply_accept(
     """One transaction: lock the candidate, re-check its status and the plan, write the registry
     the way a publish does, and mark the candidate promoted with the grounded accept recorded."""
     row = c.execute(
-        f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE",
+        f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE",  # nosec B608 — _CANDIDATE_COLS is a literal column list
         (cid,),
     ).fetchone()
     if not row:

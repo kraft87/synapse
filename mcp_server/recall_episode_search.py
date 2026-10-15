@@ -122,7 +122,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
                     FROM episodes
                     WHERE {" AND ".join(where)}
                     ORDER BY bm25_score DESC LIMIT %s
-                    """,
+                    """,  # nosec B608 — where holds fixed predicates (the scope from episode_scope_sql); the values are bound
                     (*params, limit),
                 ).fetchall()
             return [{**dict(r), "doc_type": "episode", "id": f"e:{r['id']}"} for r in rows]
@@ -176,7 +176,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
                     FROM episodes
                     WHERE {" AND ".join(where)}
                     ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) ASC LIMIT %s
-                    """,
+                    """,  # nosec B608 — where holds fixed predicates and dims is a validated int; the values are bound
                     (*params, emb_literal, limit),
                 ).fetchall()
             return [{**dict(r), "doc_type": "episode", "id": f"e:{r['id']}"} for r in rows]
@@ -214,7 +214,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
             params.extend(scope[1])
         with self._pg() as pg:
             rows = pg.execute(
-                "SELECT id, content, project, created_at, retrieval_count, session_id "
+                "SELECT id, content, project, created_at, retrieval_count, session_id "  # nosec B608 — where holds fixed predicates; the values are bound
                 f"FROM episodes WHERE {' AND '.join(where)}",
                 params,
             ).fetchall()
@@ -240,7 +240,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
         try:
             with self._pg() as pg:
                 chunks = pg.execute(
-                    "SELECT id, episode_ids, paradedb.score(id) AS bm25_score FROM chunks "
+                    "SELECT id, episode_ids, paradedb.score(id) AS bm25_score FROM chunks "  # nosec B608 — where holds fixed predicates; the values are bound
                     f"WHERE {' AND '.join(where)} ORDER BY bm25_score DESC LIMIT %s",
                     (*params, _CHUNK_FETCH),
                 ).fetchall()
@@ -278,7 +278,7 @@ class RecallEpisodeSearchMixin(RecallEngine):
                     )
                     return []
                 chunks = pg.execute(
-                    "SELECT id, episode_ids FROM chunks "
+                    "SELECT id, episode_ids FROM chunks "  # nosec B608 — where holds fixed predicates and dims is a validated int; the values are bound
                     f"WHERE {' AND '.join(where)} "
                     f"ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) LIMIT %s",
                     (*params, emb_literal, _CHUNK_FETCH),
