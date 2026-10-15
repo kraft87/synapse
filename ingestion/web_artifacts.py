@@ -379,7 +379,10 @@ class WebArtifactsIngester:
                 stats.db_errors += 1
                 failed_in_file += 1
                 logger.warning(
-                    "web_artifacts: insert failed for %s in %s: %s", event.tool_use_id, jsonl_path, e
+                    "web_artifacts: insert failed for %s in %s: %s",
+                    event.tool_use_id,
+                    jsonl_path,
+                    e,
                 )
                 continue
             if inserted:

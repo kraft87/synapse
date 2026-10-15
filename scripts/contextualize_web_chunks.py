@@ -290,7 +290,7 @@ def main() -> int:
                 ORDER BY a.id
                 LIMIT %s
                 """,
-                (args.limit,),
+                (args.limit or None,),
             ).fetchall()
         if args.limit:
             rows = rows[: args.limit]

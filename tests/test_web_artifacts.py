@@ -393,7 +393,14 @@ def _search_pair(tool_use_id: str, query: str, snippet: str = "s") -> str:
     return (
         _jsonl_record(
             "assistant",
-            [{"type": "tool_use", "id": tool_use_id, "name": "WebSearch", "input": {"query": query}}],
+            [
+                {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": "WebSearch",
+                    "input": {"query": query},
+                }
+            ],
             "S",
             "2026-05-14T02:00:00Z",
         )
