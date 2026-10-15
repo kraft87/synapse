@@ -233,7 +233,7 @@ class TestPipelineWiring:
         pipe._kg.nearest_live_edges.side_effect = lambda embs, *a, **k: [[] for _ in embs]
         pipe._edge_date_extractor = MagicMock()
         pipe._edge_date_extractor.extract_batch.side_effect = lambda facts, reference_time=None: [
-            (None, None) for _ in facts
+            None for _ in facts
         ]
         return pipe
 

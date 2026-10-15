@@ -81,7 +81,7 @@ class TestStrictSchema:
 
     def test_optional_fields_are_nullable_but_required(self):
         item = _strict_schema(BatchEdgeDatesResult)["properties"]["results"]["items"]
-        assert sorted(item["required"]) == ["id", "invalid_at", "valid_at"]
+        assert sorted(item["required"]) == ["id", "valid_at"]
         valid_at = item["properties"]["valid_at"]
         rendered = json.dumps(valid_at)
         assert "null" in rendered and "string" in rendered
@@ -141,16 +141,14 @@ class TestBatchTolerance:
 
 class TestEdgeDates:
     def test_empty_strings_normalize_to_none(self):
-        v = BatchEdgeDatesResult.model_validate(
-            {"results": [{"id": 0, "valid_at": "", "invalid_at": None}]}
-        ).results[0]
-        assert v.valid_at is None and v.invalid_at is None
+        v = BatchEdgeDatesResult.model_validate({"results": [{"id": 0, "valid_at": ""}]}).results[0]
+        assert v.valid_at is None
 
     def test_junk_typed_dates_degrade_to_none(self):
         v = BatchEdgeDatesResult.model_validate(
-            {"results": [{"id": 0, "valid_at": 20260101, "invalid_at": {"x": 1}}]}
+            {"results": [{"id": 0, "valid_at": 20260101}]}
         ).results[0]
-        assert v.valid_at is None and v.invalid_at is None
+        assert v.valid_at is None
 
     def test_batch_items_keep_ids(self):
         v = BatchEdgeDatesResult.model_validate(
@@ -158,7 +156,8 @@ class TestEdgeDates:
         )
         assert v.results[0].id == 3
         assert v.results[0].valid_at == "2026-01-01T00:00:00Z"
-        assert v.results[0].invalid_at is None
+        # A model that still answers the old shape is tolerated: the extra key is ignored.
+        assert not hasattr(v.results[0], "invalid_at")
 
 
 class TestTimelineGateEvents:

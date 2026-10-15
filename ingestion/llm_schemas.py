@@ -129,9 +129,8 @@ def _clean_date(v: Any) -> str | None:
 class BatchEdgeDatesItem(BaseModel):
     id: int
     valid_at: str | None = None
-    invalid_at: str | None = None
 
-    @field_validator("valid_at", "invalid_at", mode="before")
+    @field_validator("valid_at", mode="before")
     @classmethod
     def _empty_to_none(cls, v: Any) -> str | None:
         return _clean_date(v)

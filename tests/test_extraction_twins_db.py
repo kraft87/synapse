@@ -33,7 +33,7 @@ def pipe(conn, db_url):
     ]
     p._edge_date_extractor = MagicMock()
     p._edge_date_extractor.extract_batch.side_effect = lambda facts, reference_time=None: [
-        (None, None) for _ in facts
+        None for _ in facts
     ]
     return p
 

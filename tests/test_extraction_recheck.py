@@ -172,7 +172,7 @@ def _pipe(nearest: list[list[dict]] | None = None, judge=None) -> ExtractionPipe
     )
     pipe._edge_date_extractor = MagicMock()
     pipe._edge_date_extractor.extract_batch.side_effect = lambda facts, reference_time=None: [
-        (None, None) for _ in facts
+        None for _ in facts
     ]
     return pipe
 

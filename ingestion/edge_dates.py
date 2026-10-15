@@ -1,16 +1,17 @@
-"""LLM-driven temporal-bounds extractor for newly-written edges.
+"""LLM-driven valid-from extractor for newly-written edges.
 
 Wraps the Graphiti-derived prompt at ``ingestion.prompts.extract_edge_dates``
 with the structured-response schema and error handling needed at write time.
 Stage 7 of the extraction pipeline calls it once per fact batch to read
-``valid_at`` / ``invalid_at`` out of the fact text.
+``valid_at`` out of the fact text. (The prompt used to ask for ``invalid_at`` too;
+a fact is never born retired, so it is no longer asked for.)
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Any
 
 from ingestion.llm_client import MalformedResponseError, structured_call
@@ -19,14 +20,14 @@ from ingestion.prompts.extract_edge_dates import build_batch_prompt
 
 logger = logging.getLogger(__name__)
 
-# Temporal-marker pre-filter. The date extractor is the single most
+# Temporal-marker pre-filter. Before it, the date extractor was the single most
 # expensive stage per item (Logfire 2026-05-28: 20-68s/call, up to ~9.6K
 # output tokens), yet the corpus is overwhelmingly non-temporal structural
 # facts ("config_loader.py defines EligibilityConfig class") for which the
-# LLM just echoes valid_at=REFERENCE_TIME, invalid_at=null.
+# LLM just echoes valid_at=REFERENCE_TIME.
 #
 # Safety: ``extract_batch`` defaults reference_time to now(), and Stage 7's
-# fallback for a (None, None) result is the segment time or now(). So for an
+# fallback for a None result is the segment time or now(). So for an
 # ongoing/present-tense fact the LLM's answer is the same as skipping the
 # call and letting the fallback fill in. Only facts whose
 # TEXT carries a resolvable date / offset / validity-flip can produce a
@@ -41,8 +42,10 @@ _TEMPORAL_RE = re.compile(
     | \d{1,2}:\d{2}                                 # clock times HH:MM
     | \d{4}-\d{2}-\d{2}                             # ISO dates
     | \b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b              # slash dates
-    | \b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)
+    | \b(?:jan|feb|mar|apr|jun|jul|aug|sep|oct|nov|dec)
         (?:uary|ruary|ch|il|e|y|ust|tember|ober|ember)?\b   # month names/abbrevs
+    | \bmay\s+\d                                   # "May 3": the month, not the modal
+    | \b(?:in|since|until|till|of|last|next|early|late|mid|during)\s+may\b
     | \b(?:mon|tues|wednes|thurs|fri|satur|sun)day\b        # weekdays
     | \b(?:yesterday|today|tonight|tomorrow|ago|since|until|till)\b
     | \bas\ of\b
@@ -59,6 +62,28 @@ _TEMPORAL_RE = re.compile(
     """,
     re.IGNORECASE | re.VERBOSE,
 )
+
+
+def _noon_if_date_only(value: str | None) -> str | None:
+    """``value`` as an ISO instant, a bare date read as noon UTC; None for junk.
+
+    The prompt asks for noon when the text names only a date, but a model also answers a
+    date alone, or midnight, and a stored UTC midnight is the previous evening for a viewer
+    west of UTC (the exact bug ``localtime`` fixed for episodes). Noon UTC lands on the same
+    calendar day anywhere from UTC-11 to UTC+11, the convention the timeline gate already
+    writes for a date it resolves. Nothing in the pipeline records a time of day for a
+    date-only fact, so a value at UTC midnight is taken to be one.
+    """
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    instant = (parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)).astimezone(UTC)
+    if instant.time() == time(0):
+        instant = instant.replace(hour=12)
+    return instant.isoformat()
 
 
 def _has_temporal_markers(fact: str) -> bool:
@@ -91,23 +116,23 @@ class EdgeDateExtractor:
 
     def extract_batch(
         self, facts: list[str], reference_time: str | None = None
-    ) -> list[tuple[str | None, str | None]]:
-        """Extract (valid_at, invalid_at) for many facts in ONE LLM call.
+    ) -> list[str | None]:
+        """Extract valid_at for many facts in ONE LLM call.
 
         Returns a list parallel to ``facts`` — index i in the return matches
-        ``facts[i]``. Facts missing in the LLM response (or a response that
-        never validates) fall back to ``(None, None)``, so a date-extraction
-        miss never blocks an edge write. A transport failure raises: writing
-        the batch would stamp every fact with the segment time for good.
+        ``facts[i]``. Each date is an ISO instant, a date with no time at noon UTC
+        (``_noon_if_date_only``). Facts missing in the LLM response (or a response that
+        never validates) fall back to ``None``, so a date-extraction miss never blocks an
+        edge write. A transport failure raises: writing the batch would stamp every fact
+        with the segment time for good.
 
-        Empty/blank fact strings are skipped without an LLM call and return
-        ``(None, None)``; the index alignment with the input list is
-        preserved.
+        Empty/blank fact strings are skipped without an LLM call and return ``None``;
+        the index alignment with the input list is preserved.
         """
         if not facts:
             return []
         n = len(facts)
-        out: list[tuple[str | None, str | None]] = [(None, None)] * n
+        out: list[str | None] = [None] * n
         # Build the indexed item list, skipping blanks AND facts with no
         # temporal markers. The latter resolve to (now(), null) via the
         # caller's fallback, identical to what the LLM would return — so
@@ -128,8 +153,7 @@ class EdgeDateExtractor:
                 output_model=BatchEdgeDatesResult,
                 messages=messages,
                 model=self._model,
-                # Allow headroom per fact for two ISO timestamps + the
-                # wrapping JSON. 80 tokens/fact is generous.
+                # Headroom per fact for an ISO timestamp + the wrapping JSON.
                 max_tokens=max(200, 80 * len(items)),
             )
         except MalformedResponseError as exc:
@@ -143,7 +167,7 @@ class EdgeDateExtractor:
         for r in batch.results:
             if r.id < 0 or r.id >= n:
                 continue
-            out[r.id] = (r.valid_at, r.invalid_at)
+            out[r.id] = _noon_if_date_only(r.valid_at)
         return out
 
 

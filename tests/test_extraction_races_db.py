@@ -97,7 +97,7 @@ def _pipeline(
     pipe._stage6b_batch_confirm = MagicMock(side_effect=judge)  # type: ignore[method-assign]
     pipe._edge_date_extractor = MagicMock()
     pipe._edge_date_extractor.extract_batch.side_effect = lambda fs, reference_time=None: [
-        (None, None) for _ in fs
+        None for _ in fs
     ]
     return pipe
 

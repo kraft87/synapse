@@ -318,7 +318,7 @@ class ExtractionEdgesMixin:
         transaction: a crash or a failed insert cannot leave edges retired by a
         successor that was never written.
         """
-        # Pre-extract (valid_at, invalid_at) for ALL facts in ONE LLM call
+        # Pre-extract valid_at for ALL facts in ONE LLM call
         # (PR #89): one call per summary instead of one per fact at ~30s each.
         # A fact the call returns no date for gets the default valid-time below.
         eligible_facts: list[str] = []
@@ -339,8 +339,8 @@ class ExtractionEdgesMixin:
             # ``invalidate`` (the Stage 6b verdicts: old live edges the new fact
             # supersedes) is independent of whether the new edge gets written;
             # always applied, before the new CREATE.
-            # The edge-date extractor's ``invalid_at`` is deliberately NOT a source
-            # (2026-10-09). It used to be applied at birth, so a fact whose text
+            # No end date is read from the fact text (2026-10-09; the extractor no longer
+            # even asks for one). It used to be applied at birth, so a fact whose text
             # expressed an end ("User told the assistant on 2026-08-29 to stop X", "the
             # outage ran Aug-Sep") was written already-retired and dropped out of the
             # live index on the spot: 616 such edges in prod, with no successor link,
@@ -366,7 +366,7 @@ class ExtractionEdgesMixin:
             now = datetime.now(UTC).isoformat()
             valid_at_by_idx: dict[int, str] = {}
             for idx in range(len(facts)):
-                t_valid_pre, _ = batched_dates[idx] if idx < len(batched_dates) else (None, None)
+                t_valid_pre = batched_dates[idx] if idx < len(batched_dates) else None
                 valid_at_by_idx[idx] = t_valid_pre or default_valid_at or now
 
             # Every old edge a new fact retires is invalidated AS OF that fact's evidenced

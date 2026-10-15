@@ -26,11 +26,11 @@ from ingestion.models import ExtractedFact
 SEG = "2026-09-01T12:00:00+00:00"  # the segment (conversation) timestamp
 
 
-def _pipe(n_facts: int, dates: list[tuple[str | None, str | None]] | None = None):
+def _pipe(n_facts: int, dates: list[str | None] | None = None):
     pipe = ExtractionPipeline.__new__(ExtractionPipeline)
     pipe._kg = MagicMock()
     pipe._edge_date_extractor = MagicMock()
-    pipe._edge_date_extractor.extract_batch.return_value = dates or [(None, None)] * n_facts
+    pipe._edge_date_extractor.extract_batch.return_value = dates or [None] * n_facts
     return pipe
 
 
@@ -105,7 +105,7 @@ class TestSupersederLink:
 
     def test_every_retired_edge_shares_the_link_and_the_facts_own_date(self):
         facts = [_fact(0)]
-        pipe = _pipe(1, dates=[("2026-03-15T00:00:00Z", None)])
+        pipe = _pipe(1, dates=["2026-03-15T12:00:00Z"])
         pipe._stage7_write_edges(
             facts,
             _uuid_map(facts),
@@ -122,10 +122,10 @@ class TestSupersederLink:
         assert sup == rows[0]["edge_uuid"]
         # the fact's own in-text date wins over the segment timestamp
         assert set(items) == {
-            ("old-sem", "2026-03-15T00:00:00Z"),
-            ("old-pair", "2026-03-15T00:00:00Z"),
+            ("old-sem", "2026-03-15T12:00:00Z"),
+            ("old-pair", "2026-03-15T12:00:00Z"),
         }
-        assert rows[0]["t_valid"] == "2026-03-15T00:00:00Z"
+        assert rows[0]["t_valid"] == "2026-03-15T12:00:00Z"
 
     def test_same_old_edge_from_two_facts_is_retired_once_per_superseder(self):
         facts = [_fact(0), _fact(1)]
@@ -159,7 +159,7 @@ class TestEvidenceMetadata:
         self, attribution, ongoing, expect_support
     ):
         facts = [_fact(0, attribution=attribution, ongoing=ongoing)]
-        pipe = _pipe(1, dates=[("2019-01-01T00:00:00Z", None)])
+        pipe = _pipe(1, dates=["2019-01-01T12:00:00Z"])
         pipe._stage7_write_edges(
             facts, _uuid_map(facts), [10, 12, 11], "g", set(), {}, default_valid_at=SEG
         )
@@ -172,7 +172,7 @@ class TestEvidenceMetadata:
         else:
             assert row["last_supported_at"] is None
             assert row["last_supported_by"] is None
-        assert row["t_valid"] == "2019-01-01T00:00:00Z"
+        assert row["t_valid"] == "2019-01-01T12:00:00Z"
 
     def test_reinforcement_refreshes_support_only_for_user_restatements(self):
         facts = [_fact(0, attribution="user"), _fact(1, attribution="assistant")]
@@ -201,23 +201,14 @@ class TestEvidenceMetadata:
 
 
 class TestNeverBornInvalid:
-    def test_extracted_end_date_does_not_retire_the_new_edge(self):
-        # "User told the assistant on 2026-08-29 to stop X": the date extractor reads an
-        # end into it (valid 08-29, invalid 08-29). The fact is a dated happening and stays
-        # true; it must be written LIVE, not already-retired with no successor link.
+    def test_a_dated_fact_is_written_live(self):
+        # "User told the assistant on 2026-08-29 to stop X" is a dated happening that stays
+        # true: it is written LIVE (the extractor returns a valid-from only), not already
+        # retired with no successor link.
         facts = [_fact(0, attribution="user")]
-        pipe = _pipe(1, dates=[("2026-08-29T00:00:00Z", "2026-08-29T00:00:00Z")])
+        pipe = _pipe(1, dates=["2026-08-29T12:00:00Z"])
         pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {}, default_valid_at=SEG)
         (row,) = _created(pipe)
-        assert row["t_valid"] == "2026-08-29T00:00:00Z"
+        assert row["t_valid"] == "2026-08-29T12:00:00Z"
         assert "t_invalid" not in row  # the writer has no column to born-retire an edge with
         pipe._kg.invalidate_edges_batch.assert_not_called()
-
-    def test_bounded_past_state_is_written_live(self):
-        # "the outage ran from 2026-08-01 to 2026-09-01": a true statement about a past
-        # interval, not a fact that stopped being true.
-        facts = [_fact(0)]
-        pipe = _pipe(1, dates=[("2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z")])
-        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {})
-        (row,) = _created(pipe)
-        assert "t_invalid" not in row  # the writer has no column to born-retire an edge with
