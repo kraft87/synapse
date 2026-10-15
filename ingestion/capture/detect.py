@@ -6,11 +6,15 @@ its output is page-shaped (one source URL plus a substantial body) or result-lis
 ``ingestion.web_extractors`` are optional refinements for the operations they know, picked by
 operation name whatever the connector is called; the rest goes through the generic shapes.
 
+What the shapes cannot see is taught by rules (``ingestion.capture.ruleset``): a call a rule
+matches is decided by the rule, ahead of the generic detector, and is stored where the rule
+says (``searchable`` in web_artifacts, or the cold ``archive``).
+
 :func:`decide` returns what to store (:class:`Capture`) or why not (:class:`Skip`), and does
 nothing else, so the dry run reports exactly what a live capture would do. Skip reasons:
 
-* ``own_tool`` ``subagent`` ``browser`` ``denied_family`` ``shell``: the tool is never captured
-  (``ingestion.capture.guards``);
+* ``own_tool`` ``subagent``: the tool is never captured; ``browser`` ``denied_family``
+  ``shell``: never by the generic detector (``ingestion.capture.guards``);
 * ``no_source`` the input carries neither a URL nor a query; ``ambiguous_source`` it carries
   several URLs, so no page is the source of the output;
 * ``non_public_url`` a source URL is not on the public internet;
@@ -28,9 +32,10 @@ import re
 from dataclasses import dataclass
 
 from ingestion.capture.calls import ToolCall
-from ingestion.capture.guards import is_public_url, tool_exclusion
+from ingestion.capture.guards import generic_exclusion, is_public_url, own_exclusion
+from ingestion.capture.ruleset import Rule, active_rules
 from ingestion.capture.shapes import URL_RE, input_queries, input_urls, page_body, result_items
-from ingestion.web_artifacts import canonicalize_url
+from ingestion.web_artifacts import ArchiveEntry, canonicalize_url
 from ingestion.web_extractors import (
     ExtractError,
     ResearchJobRef,
@@ -67,24 +72,29 @@ class Skip:
 
 @dataclass(frozen=True)
 class Capture:
-    parsed: WebScrape | SearchResultSet | ResearchJobRef
-    #: "generic", or the name of the operation whose parser refined it
+    parsed: WebScrape | SearchResultSet | ResearchJobRef | ArchiveEntry
+    #: "generic", the name of the operation whose parser refined it, or the name of the rule
     source: str
+    #: whether the knowledge graph may read it: only a rule that trusts its source says so
+    kg_extract: bool = False
+
+    @property
+    def destination(self) -> str:
+        return "archive" if isinstance(self.parsed, ArchiveEntry) else "searchable"
 
 
 def decide(call: ToolCall) -> Capture | Skip:
     """What to store for ``call``, or why nothing."""
-    if reason := tool_exclusion(call.tool_name, call.tool_input):
+    if reason := own_exclusion(call.tool_name):
         return Skip(reason)
     text = call.result_text
-    if call.is_error:
-        return Skip("error_page")
-    if not text.strip():
-        return Skip("empty")
-    if len(text) > MAX_RESULT_CHARS:
-        return Skip("too_large")
-    if _PERSISTED_REDIRECT.search(text[:500]):
-        return Skip("persisted_output")
+    unusable = _unusable(call)
+    if not unusable and (matched := active_rules().match(call.tool_name, call.tool_input, text)):
+        return _by_rule(call, *matched)
+    if reason := generic_exclusion(call.tool_name, call.tool_input):
+        return Skip(reason)
+    if unusable:
+        return unusable
 
     refined = refine(call.tool_name, call.tool_input, text)
     if isinstance(refined, ExtractError):
@@ -94,6 +104,48 @@ def decide(call: ToolCall) -> Capture | Skip:
     # No parser for this operation, or its format changed: the shapes decide.
     parsed = _generic(call)
     return parsed if isinstance(parsed, Skip) else _vet(parsed, "generic")
+
+
+def _unusable(call: ToolCall) -> Skip | None:
+    """Why the output cannot be content at all, whatever reads it."""
+    text = call.result_text
+    if call.is_error:
+        return Skip("error_page")
+    if not text.strip():
+        return Skip("empty")
+    if len(text) > MAX_RESULT_CHARS:
+        return Skip("too_large")
+    if _PERSISTED_REDIRECT.search(text[:500]):
+        return Skip("persisted_output")
+    return None
+
+
+def _by_rule(call: ToolCall, rule: Rule, fields: dict[str, str]) -> Capture | Skip:
+    """What a matching rule makes of the call: its URL must be public, as for any capture."""
+    if not is_public_url(fields["url"]):
+        return Skip("non_public_url")
+    if rule.destination == "archive":
+        content = fields["body"]
+        if len(content) < rule.min_chars:
+            return Skip("too_short")
+        entry = ArchiveEntry(
+            kind=rule.kind,
+            source_id=fields["source_id"],
+            url=fields["url"],
+            title=fields.get("title"),
+            author=fields.get("author"),
+            content=content,
+        )
+        return Capture(entry, rule.name)
+    page = WebScrape(
+        tool_name=call.tool_name,
+        url=fields["url"],
+        title=fields.get("title"),
+        content_markdown=fields["body"],
+        author=fields.get("author"),
+        raw_chars=len(call.result_text),
+    )
+    return _vet(page, rule.name, min_chars=rule.min_chars, kg_extract=rule.kg_extract)
 
 
 def _error_skip(reason: str) -> str:
@@ -129,8 +181,13 @@ def _generic(call: ToolCall) -> WebScrape | SearchResultSet | Skip:
     )
 
 
-def _vet(parsed: WebScrape | SearchResultSet | ResearchJobRef, source: str) -> Capture | Skip:
-    """The guards and quality floors every parse meets, refined or generic."""
+def _vet(
+    parsed: WebScrape | SearchResultSet | ResearchJobRef,
+    source: str,
+    min_chars: int = MIN_BODY_CHARS,
+    kg_extract: bool = False,
+) -> Capture | Skip:
+    """The guards and quality floors every parse meets, refined, generic or by a rule."""
     if isinstance(parsed, ResearchJobRef):
         return Capture(parsed, source)
     if isinstance(parsed, WebScrape):
@@ -141,10 +198,10 @@ def _vet(parsed: WebScrape | SearchResultSet | ResearchJobRef, source: str) -> C
         body = strip_boilerplate(parsed.content_markdown)
         if reason := error_reason(body):
             return Skip(_error_skip(reason))
-        if len(URL_RE.sub("", body)) < MIN_BODY_CHARS:
+        if len(URL_RE.sub("", body)) < min_chars:
             return Skip("too_short")
         body = body.encode()[:MAX_BODY_BYTES].decode(errors="ignore")
-        return Capture(parsed.model_copy(update={"content_markdown": body}), source)
+        return Capture(parsed.model_copy(update={"content_markdown": body}), source, kg_extract)
 
     items: list[SearchResultItem] = []
     seen: set[str] = set()

@@ -132,6 +132,10 @@ services:
     command: python -m mcp_server.server
     environment:
       - LOGFIRE_SERVICE_NAME=synapse-mcp
+    # Your own capture rules (SYNAPSE_CAPTURE_DIR=/capture-rules in .env; see .env.example).
+    # Uncomment, and put *.toml rule files in ./capture-rules. They run as code on this server.
+    # volumes:
+    #   - ./capture-rules:/capture-rules:ro
     ports:
       # Both sides track MCP_PORT: the server process reads it (via env_file)
       # for its internal listener, so the published port must match it.

@@ -1,10 +1,11 @@
 """
-Write captured web research into Postgres web_artifacts.
+Write captured web research into Postgres web_artifacts, and the cold research_archive.
 
 The persistence half of the web-capture pipeline; the parser half lives in
 ``ingestion.web_extractors`` and the decision of what to capture in ``ingestion.capture``,
 which calls this module for every call it stores. One ``web_artifacts`` row per
-tool_use/tool_result pair.
+tool_use/tool_result pair. A capture rule can send a call to the ``research_archive`` instead:
+the verbatim result, one row per source, never chunked, embedded, extracted or served.
 
 Idempotency is by ``tool_use_id`` (UNIQUE in the schema): shipping the same records again
 inserts nothing and raises nothing. A page or result list that was already stored (same
@@ -15,12 +16,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 
+from ingestion.schema_check import ColumnProbe
 from ingestion.secret_redact import redact_secrets
 from ingestion.textsafe import strip_nul
 from ingestion.web_extractors import ExtractResult, ResearchJobRef, SearchResultSet, WebScrape
@@ -221,3 +224,79 @@ def count_fetched_between(conn: psycopg.Connection[Any], start: datetime, end: d
         (start, end),
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+# ---------- Cold archive ----------
+
+
+@dataclass(frozen=True)
+class ArchiveEntry:
+    """What an ``archive`` capture rule takes from a call."""
+
+    kind: str
+    source_id: str
+    url: str
+    title: str | None
+    author: str | None
+    content: str
+
+
+#: ``research_archive`` with its provenance columns (an optional migration): until it exists
+#: an archive rule's calls are skipped (``archive_unavailable``), as before the rule shipped.
+ARCHIVE_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('research_archive') AND attname = 'parent_episode_id' "
+    "AND NOT attisdropped",
+    "research_archive.parent_episode_id",
+)
+
+
+def build_archive_row(
+    entry: ArchiveEntry,
+    *,
+    tool_use_id: str,
+    session_id: str,
+    parent_episode_id: int | None,
+) -> dict[str, Any]:
+    """A research_archive row for ``entry``, credentials redacted and NULs stripped."""
+    return {
+        "kind": entry.kind,
+        "source_id": _clean(entry.source_id),
+        "url": _clean(entry.url),
+        "title": _clean(entry.title),
+        "author": _clean(entry.author),
+        "captured_from": tool_use_id,
+        "content": _clean(entry.content).strip(),
+        "session_id": session_id,
+        "parent_episode_id": parent_episode_id,
+    }
+
+
+def archive_current(conn: psycopg.Connection[Any], source_id: str, chars: int) -> bool:
+    """True if the archive already holds this source at ``chars`` characters or more: the
+    longer capture of a source wins (a thread re-fetched later may have grown; a truncated
+    result never overwrites a fuller one)."""
+    row = conn.execute(
+        "SELECT 1 FROM research_archive WHERE source_id = %s AND length(content) >= %s",
+        (source_id, chars),
+    ).fetchone()
+    return row is not None
+
+
+_ARCHIVE_SQL = """
+INSERT INTO research_archive
+    (kind, source_id, url, title, author, captured_from, content, session_id, parent_episode_id)
+VALUES (%(kind)s, %(source_id)s, %(url)s, %(title)s, %(author)s, %(captured_from)s, %(content)s,
+        %(session_id)s, %(parent_episode_id)s)
+ON CONFLICT (source_id) DO UPDATE
+    SET content = EXCLUDED.content, captured_from = EXCLUDED.captured_from,
+        session_id = EXCLUDED.session_id, parent_episode_id = EXCLUDED.parent_episode_id
+    WHERE length(EXCLUDED.content) > length(research_archive.content)
+"""
+
+
+def insert_archive(conn: psycopg.Connection[Any], row: dict[str, Any]) -> None:
+    """Store ``row``, or grow the source's row when ``row`` is the longer capture.
+
+    A failed insert aborts the caller's transaction: run it in a savepoint to carry on."""
+    conn.execute(_ARCHIVE_SQL, row)

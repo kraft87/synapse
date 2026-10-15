@@ -9,17 +9,20 @@ stored, after they committed:
   sub-agent records the conversation parser drops);
 * ``detect``: web research recognised by the SHAPE of the call, never by tool name, with the
   existing parsers as optional refinements (``ingestion.web_extractors``);
+* ``ruleset``: the rules users add as files (``rules/`` shipped, ``SYNAPSE_CAPTURE_DIR`` for
+  the operator's): sources the shapes cannot see, stored searchable or in the cold archive;
 * ``guards``: the tools and URLs that are never captured;
 * ``store``: the caps, the dedup and the insert (``ingestion.web_artifacts``).
 
 Off by default: ``SYNAPSE_WEB_CAPTURE=on`` turns it on, once the dry run has shown what it
 would store. A capture failure is logged and counted; it never fails or delays an episode
-write. Generic captures are searchable (recall's web bucket) and not KG-extracted.
+write. Generic captures are searchable (recall's web bucket) and not KG-extracted; the poller
+chunks, contextualises and embeds them (``Maintenance`` in ``ingestion.poller``).
 """
 
 from ingestion.capture.calls import ToolCall, episode_tool_calls, sidechain_tool_calls
 from ingestion.capture.detect import Capture, Skip, decide
-from ingestion.capture.store import CaptureResult, capture_calls, enabled
+from ingestion.capture.store import CaptureResult, capture_calls, check_config, enabled
 
 __all__ = [
     "Capture",
@@ -27,6 +30,7 @@ __all__ = [
     "Skip",
     "ToolCall",
     "capture_calls",
+    "check_config",
     "decide",
     "enabled",
     "episode_tool_calls",

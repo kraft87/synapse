@@ -2,9 +2,11 @@
 
 Two guards, both applied before any shape is looked at:
 
-* the tool: Synapse's own tools, sub-agent results, browser automation (a page may be
-  logged in) and connectors for personal data are never captured; shell commands are never
-  captured by the generic rule (a command's output is whatever it printed);
+* the tool: Synapse's own tools and sub-agent results are never captured. Browser
+  automation (a page may be logged in), connectors for personal data (the editable
+  ``rules/deny.toml``) and shell commands (a command's output is whatever it printed) are
+  never captured by the generic detector; a capture rule (``ingestion.capture.ruleset``) is
+  a deliberate choice and is not held to those;
 * the URL: every source URL must be a public http(s) address. Localhost, private,
   loopback and link-local IPs (v4 and v6), single-label hosts and the names a private
   network uses (``.local``, ``.lan``, ``.home``, ``.internal``, ``.ts.net`` ...) are dropped,
@@ -22,6 +24,7 @@ import re
 from typing import Any
 from urllib.parse import urlsplit
 
+from ingestion.capture.ruleset import active_rules
 from ingestion.web_extractors import tool_id
 
 # Names a private network uses. A bare suffix also matches the host that IS the suffix.
@@ -82,37 +85,6 @@ def _is_public_hostname(host: str) -> bool:
 _OWN_TOOL_IDS = frozenset({"recall", "recall_full_turns", "recall_feedback", "remember"})
 _SUBAGENT_TOOLS = frozenset({"Task", "Agent"})
 _BROWSER_WORDS = frozenset({"playwright", "puppeteer", "selenium", "chrome", "chromium", "browser"})
-# Connectors for personal or workplace data, matched on the words of the server or tool
-# name (the shipped default of the deny-list).
-_DENIED_FAMILY_WORDS = frozenset(
-    {
-        "gmail",
-        "mail",
-        "email",
-        "outlook",
-        "calendar",
-        "drive",
-        "docs",
-        "sheets",
-        "slack",
-        "discord",
-        "teams",
-        "linear",
-        "jira",
-        "github",
-        "gitlab",
-        "bitbucket",
-        "notion",
-        "confluence",
-        "asana",
-        "trello",
-        "dropbox",
-        "onedrive",
-        "sharepoint",
-        "telegram",
-        "whatsapp",
-    }
-)
 _SHELL_TOOLS = frozenset(
     {
         "bash",
@@ -137,20 +109,26 @@ def _words(name: str) -> set[str]:
     return set(re.findall(r"[a-z0-9]+", _CAMEL_BOUNDARY.sub(" ", name).lower()))
 
 
-def tool_exclusion(tool_name: str, tool_input: dict[str, Any]) -> str | None:
-    """The skip reason when this tool's output is never captured by the generic rule, else
-    None: ``own_tool``, ``subagent``, ``browser``, ``denied_family`` or ``shell``."""
+def own_exclusion(tool_name: str) -> str | None:
+    """The skip reason when this tool is never captured, by any rule: ``own_tool`` or
+    ``subagent``."""
     tid = tool_id(tool_name)
     server = tool_name.rsplit("__", 1)[0] if "__" in tool_name else ""
     if tid in _OWN_TOOL_IDS or "synapse" in _words(server):
         return "own_tool"
     if tid in _SUBAGENT_TOOLS:
         return "subagent"
+    return None
+
+
+def generic_exclusion(tool_name: str, tool_input: dict[str, Any]) -> str | None:
+    """The skip reason when the generic detector must not look at this tool's output:
+    ``browser``, ``denied_family`` or ``shell``."""
     words = _words(tool_name)
     if words & _BROWSER_WORDS:
         return "browser"
-    if words & _DENIED_FAMILY_WORDS:
+    if words & active_rules().deny_words:
         return "denied_family"
-    if tid.lower() in _SHELL_TOOLS or "command" in tool_input or "cmd" in tool_input:
+    if tool_id(tool_name).lower() in _SHELL_TOOLS or "command" in tool_input or "cmd" in tool_input:
         return "shell"
     return None

@@ -17,11 +17,17 @@ from datetime import UTC, datetime, timedelta
 
 from ingestion.capture.calls import ToolCall
 from ingestion.capture.detect import Capture, Skip, decide
+from ingestion.capture.ruleset import active_rules
 from ingestion.db import Database
 from ingestion.web_artifacts import (
+    ARCHIVE_PROBE,
+    ArchiveEntry,
+    archive_current,
     artifact_stored,
+    build_archive_row,
     build_row,
     count_fetched_between,
+    insert_archive,
     insert_artifact,
 )
 
@@ -42,6 +48,14 @@ def enabled() -> bool:
     if value not in ("", "on", "off"):
         raise ValueError(f"SYNAPSE_WEB_CAPTURE must be 'on' or 'off', not {value!r}")
     return value == "on"
+
+
+def check_config() -> None:
+    """Fail now, with the file or variable named, if ``SYNAPSE_WEB_CAPTURE`` or a capture
+    rule is invalid: a service calls this at startup, so a bad file is not found on the
+    first POST (or by the dry run)."""
+    enabled()
+    active_rules()
 
 
 @dataclass
@@ -71,13 +85,14 @@ def capture_calls(
 
     A call from a private session is never captured (``is_private`` fails closed: a lookup
     that raises skips the call). A call is stored once per ``tool_use_id`` and once per
-    (canonical URL, content hash)."""
+    (canonical URL, content hash); an archived source is kept once, at its longest."""
     calls = list(calls)
     result = CaptureResult()
     if not calls:
         return result
     # What this call has stored (a dry run: would have stored), for the dedup and the caps.
     seen: set[str] = set()
+    archived: dict[str, int] = {}  # source_id -> characters
     per_day: dict[datetime, int] = {}
     stored = 0
     unlinked = {c.span_id for c in calls if c.span_id and c.episode_id is None}
@@ -94,19 +109,22 @@ def capture_calls(
             fetched_at = call.timestamp or datetime.now(UTC)
             if fetched_at.tzinfo is None:
                 fetched_at = fetched_at.replace(tzinfo=UTC)
+            parent_episode_id = call.episode_id or episode_ids.get(call.span_id or "")
+            if isinstance(decision.parsed, ArchiveEntry):
+                return archive(call, decision, decision.parsed, parent_episode_id)
             row = build_row(
                 decision.parsed,
                 tool_name=call.tool_name,
                 tool_use_id=call.tool_use_id,
                 session_id=call.session_id,
                 fetched_at=fetched_at,
-                parent_episode_id=call.episode_id or episode_ids.get(call.span_id or ""),
+                parent_episode_id=parent_episode_id,
                 metadata={
                     "capture": decision.source,
                     "project": call.project,
                     "surface_id": call.surface_id,
                     # Generic captures are searchable, not KG-extracted; a rule opts in.
-                    "kg_extract": False,
+                    "kg_extract": decision.kg_extract,
                 },
             )
             url, digest = row.get("url_canonical"), row.get("content_hash")
@@ -124,6 +142,29 @@ def capture_calls(
                 insert_artifact(conn, row)
             seen.update(keys)
             per_day[day] += 1
+            return decision
+
+        def archive(
+            call: ToolCall, decision: Capture, entry: ArchiveEntry, parent_episode_id: int | None
+        ) -> Capture | Skip:
+            if not ARCHIVE_PROBE.ready(conn, conn.info.dsn):
+                return Skip("archive_unavailable")
+            row = build_archive_row(
+                entry,
+                tool_use_id=call.tool_use_id,
+                session_id=call.session_id,
+                parent_episode_id=parent_episode_id,
+            )
+            chars = len(row["content"])
+            if archived.get(entry.source_id, 0) >= chars or archive_current(
+                conn, row["source_id"], chars
+            ):
+                return Skip("duplicate")
+            if stored >= MAX_CAPTURES_PER_POST:
+                return Skip("cap_post")
+            if not dry_run:
+                insert_archive(conn, row)
+            archived[entry.source_id] = chars
             return decision
 
         for call in calls:

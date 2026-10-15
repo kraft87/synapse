@@ -1,0 +1,20 @@
+[
+ {
+  "id": "1790000000000000001",
+  "text": "Thread on how we cut recall latency in half: the trick was moving the rerank behind a score floor so most queries never pay for it. More detail follows in the replies. More detail follows in the replies. More detail follows in the replies. ",
+  "author": {
+   "username": "steipete",
+   "name": "Peter"
+  },
+  "createdAt": "2026-09-02T10:00:00Z"
+ },
+ {
+  "id": "1790000000000000002",
+  "text": "Second post: the floor is calibrated per reranker, not per corpus, so swapping the model means re-measuring it. Second post: the floor is calibrated per reranker, not per corpus, so swapping the model means re-measuring it. ",
+  "author": {
+   "username": "steipete",
+   "name": "Peter"
+  },
+  "createdAt": "2026-09-02T10:01:00Z"
+ }
+]

@@ -1,0 +1,34 @@
+# Connector families the generic detector never captures: personal or workplace data. A
+# connector (or tool) is denied when its name, split into words, contains one of these
+# (claude_ai_Gmail -> claude, ai, gmail). Rules are not held to this list: a rule is a
+# deliberate choice, the generic detector is a guess.
+#
+# This file is the shipped default. To change it, copy it into SYNAPSE_CAPTURE_DIR and edit
+# the copy; the copy replaces this file.
+words = [
+    "gmail",
+    "mail",
+    "email",
+    "outlook",
+    "calendar",
+    "drive",
+    "docs",
+    "sheets",
+    "slack",
+    "discord",
+    "teams",
+    "linear",
+    "jira",
+    "github",
+    "gitlab",
+    "bitbucket",
+    "notion",
+    "confluence",
+    "asana",
+    "trello",
+    "dropbox",
+    "onedrive",
+    "sharepoint",
+    "telegram",
+    "whatsapp",
+]

@@ -29,10 +29,14 @@ def db(db_url):
 
 @pytest.fixture(autouse=True)
 def _clean(clean_tables, conn):
-    conn.execute("TRUNCATE web_artifacts, private_sessions RESTART IDENTITY CASCADE")
+    conn.execute(
+        "TRUNCATE web_artifacts, research_archive, private_sessions RESTART IDENTITY CASCADE"
+    )
     DELETED_TURNS_PROBE.reset()
     yield
-    conn.execute("TRUNCATE web_artifacts, private_sessions RESTART IDENTITY CASCADE")
+    conn.execute(
+        "TRUNCATE web_artifacts, research_archive, private_sessions RESTART IDENTITY CASCADE"
+    )
     DELETED_TURNS_PROBE.reset()
 
 
@@ -42,14 +46,20 @@ def capture_on(monkeypatch):
 
 
 def records(
-    tag: str, session: str, *, url: str = "https://example.com/post", text: str = PAGE
+    tag: str,
+    session: str,
+    *,
+    url: str = "https://example.com/post",
+    text: str = PAGE,
+    name: str = "mcp__acme__read",
+    tool_input: dict | None = None,
 ) -> list[dict]:
     base = {"sessionId": session, "cwd": "/work/app", "timestamp": "2026-09-01T12:00:00Z"}
     use = {
         "type": "tool_use",
         "id": f"toolu_{tag}",
-        "name": "mcp__acme__read",
-        "input": {"url": url},
+        "name": name,
+        "input": tool_input or {"url": url},
     }
     res = {"type": "tool_result", "tool_use_id": f"toolu_{tag}", "content": text}
 
@@ -232,3 +242,22 @@ def test_ingest_stamps_the_research_with_the_callers_surface(db_url, conn, captu
     body = {"records": records("a", f"r-{uuid.uuid4().hex}"), "surface_id": "dev-evil"}
     assert TestClient(m.http_app()).post("/ingest", json=body).json()["captured"] == 1
     assert artifacts(conn)[0][3]["surface_id"] == "dev-1"
+
+
+def test_a_shell_command_is_captured_only_by_its_rule_into_the_archive(db, conn, capture_on):
+    thread = (
+        '[{"author": {"username": "steipete"}, "text": "' + "A point worth keeping. " * 20 + '"}]'
+    )
+    recs = records(
+        "a", "s-3", name="Bash", tool_input={"command": "bird thread 1790000000000000001 --json"},
+        text=thread,
+    )  # fmt: skip
+    recs += records("b", "s-3", name="Bash", tool_input={"command": "curl https://example.com"})
+    stats = store_episodes(db, parse(recs))
+    assert stats.captured == 1 and artifacts(conn) == []
+    ((kind, source_id, session, parent),) = conn.execute(
+        "SELECT kind, source_id, session_id, parent_episode_id FROM research_archive"
+    ).fetchall()
+    episode_id = conn.execute("SELECT id FROM episodes WHERE session_id = 's-3'").fetchone()[0]
+    assert (kind, source_id, session) == ("x_thread", "thread:x:1790000000000000001", "s-3")
+    assert parent == episode_id

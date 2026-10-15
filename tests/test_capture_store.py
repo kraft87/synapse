@@ -10,7 +10,9 @@ import pytest
 from ingestion.capture import ToolCall, capture_calls, enabled
 from ingestion.capture import store as store_mod
 from ingestion.capture.detect import Skip
+from ingestion.capture.ruleset import load_rules
 from ingestion.db import Database
+from ingestion.schema_check import ColumnProbe
 
 PAGE = "# A Real Article\n\n" + "The measured latency was low and the design held up well. " * 12
 RESULTS = json.dumps(
@@ -30,9 +32,15 @@ def db(db_url):
 
 @pytest.fixture(autouse=True)
 def _clean(conn):
-    conn.execute("TRUNCATE web_artifacts, episodes, private_sessions RESTART IDENTITY CASCADE")
+    conn.execute(
+        "TRUNCATE web_artifacts, research_archive, episodes, private_sessions "
+        "RESTART IDENTITY CASCADE"
+    )
     yield
-    conn.execute("TRUNCATE web_artifacts, episodes, private_sessions RESTART IDENTITY CASCADE")
+    conn.execute(
+        "TRUNCATE web_artifacts, research_archive, episodes, private_sessions "
+        "RESTART IDENTITY CASCADE"
+    )
 
 
 def fetch(tid: str, url: str = "https://example.com/p", text: str = PAGE, **kw) -> ToolCall:
@@ -239,3 +247,113 @@ def test_enabled_reads_the_switch(monkeypatch):
     monkeypatch.setenv("SYNAPSE_WEB_CAPTURE", "true")
     with pytest.raises(ValueError, match="SYNAPSE_WEB_CAPTURE"):
         enabled()
+
+
+# ---------- the cold archive and rule-made captures ----------
+
+THREAD = json.dumps(
+    [{"author": {"username": "steipete"}, "text": "Thread on the recall floor. " * 12}]
+)
+
+
+def thread(tid: str, post: str = "1790000000000000001", text: str = THREAD, **kw) -> ToolCall:
+    return fetch(
+        tid, tool_name="Bash", tool_input={"command": f"bird thread {post} --json"}, text=text, **kw
+    )
+
+
+def archive_rows(conn) -> list[tuple]:
+    return conn.execute(
+        "SELECT kind, source_id, url, author, captured_from, session_id, parent_episode_id, "
+        "length(content) FROM research_archive ORDER BY id"
+    ).fetchall()
+
+
+def test_an_archive_rule_stores_the_thread_verbatim_with_its_provenance(db, conn):
+    result = run(db, [thread("toolu_t", episode_id=77)])
+    assert result.captured == 1 and result.errors == 0
+    assert archive_rows(conn) == [
+        (
+            "x_thread",
+            "thread:x:1790000000000000001",
+            "https://x.com/i/status/1790000000000000001",
+            "@steipete",
+            "toolu_t",
+            "s1",
+            77,
+            len(THREAD),
+        )
+    ]
+    assert stored(conn) == []  # the archive is not web_artifacts: nothing to chunk or serve
+    assert conn.execute("SELECT content FROM research_archive").fetchone()[0] == THREAD
+
+
+def test_archived_text_has_its_credentials_redacted(db, conn):
+    secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+    run(db, [thread("toolu_t", text=THREAD + f" token={secret} " + "pad " * 80)])
+    content = conn.execute("SELECT content FROM research_archive").fetchone()[0]
+    assert secret not in content
+
+
+def test_the_longer_capture_of_a_source_wins_and_a_re_ship_is_a_duplicate(db, conn):
+    assert reasons(run(db, [thread("a")])) == ["captured"]
+    assert reasons(run(db, [thread("a")])) == ["duplicate"]  # the same records shipped again
+    assert reasons(run(db, [thread("b", text=THREAD[:-40] + " " * 5)])) == ["duplicate"]  # shorter
+    longer = THREAD + " A reply that arrived later. " * 5
+    assert reasons(run(db, [thread("c", text=longer)])) == ["captured"]
+    (row,) = archive_rows(conn)
+    assert (row[4], row[7]) == ("c", len(longer.strip()))
+    # another thread is another source
+    assert reasons(run(db, [thread("d", post="1790000000000000002")])) == ["captured"]
+    assert len(archive_rows(conn)) == 2
+
+
+def test_in_one_post_the_same_source_is_kept_once_at_its_longest(db, conn):
+    longer = THREAD + " A reply that arrived later. " * 5
+    result = run(db, [thread("a"), thread("b", text=longer), thread("c")])
+    assert reasons(result) == ["captured", "captured", "duplicate"]
+    assert [r[7] for r in archive_rows(conn)] == [len(longer.strip())]
+
+
+def test_a_dry_run_reports_the_archive_and_writes_nothing(db, conn):
+    calls = [thread("a")]
+    dry = run(db, calls, dry_run=True)
+    assert reasons(dry) == ["captured"] and dry.outcomes[0][1].destination == "archive"
+    assert archive_rows(conn) == []
+    run(db, calls)
+    assert reasons(run(db, calls, dry_run=True)) == ["duplicate"]
+
+
+def test_a_private_session_is_never_archived(db, conn):
+    result = run(db, [thread("a")], is_private=lambda s: True)
+    assert reasons(result) == ["private"] and archive_rows(conn) == []
+
+
+def test_without_the_migration_archive_captures_are_skipped_not_failed(db, conn, monkeypatch):
+    absent = ColumnProbe("SELECT 1 WHERE false", "research_archive")
+    monkeypatch.setattr(store_mod, "ARCHIVE_PROBE", absent)
+    result = run(db, [thread("a"), fetch("b")])
+    assert reasons(result) == ["archive_unavailable", "captured"]
+    assert result.errors == 0 and archive_rows(conn) == []
+
+
+def test_archive_captures_count_against_the_post_cap(db, conn, monkeypatch):
+    monkeypatch.setattr(store_mod, "MAX_CAPTURES_PER_POST", 1)
+    result = run(db, [thread("a"), thread("b", post="1790000000000000002"), fetch("c")])
+    assert reasons(result) == ["captured", "cap_post", "cap_post"]
+
+
+def test_a_trusting_rule_marks_its_pages_for_the_graph(db, conn, tmp_path, monkeypatch):
+    (tmp_path / "docs_site.toml").write_text(
+        'destination = "searchable"\nkg_extract = true\n'
+        '[match]\ntool = "mcp__acme__*"\n'
+        '[fields]\nurl = "{input.url}"\nbody = "{output}"\n'
+    )
+    monkeypatch.setenv("SYNAPSE_CAPTURE_DIR", str(tmp_path))
+    load_rules.cache_clear()
+    try:
+        run(db, [fetch("a")])
+    finally:
+        load_rules.cache_clear()
+    meta = conn.execute("SELECT metadata FROM web_artifacts").fetchone()[0]
+    assert meta["capture"] == "docs_site" and meta["kg_extract"] is True

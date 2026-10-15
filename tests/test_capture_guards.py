@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from ingestion.capture.guards import is_public_url, tool_exclusion
+from ingestion.capture.guards import generic_exclusion, is_public_url, own_exclusion
 
 
 @pytest.mark.parametrize(
@@ -98,9 +98,18 @@ def test_non_public_urls_are_refused(url):
     ],
 )
 def test_tool_exclusion(name, expected):
-    assert tool_exclusion(name, {}) == expected
+    assert (own_exclusion(name) or generic_exclusion(name, {})) == expected
+
+
+def test_a_rule_is_held_only_to_the_exclusions_of_own_tools_and_sub_agents():
+    assert own_exclusion("mcp__Synapse__recall") == "own_tool"
+    assert own_exclusion("Task") == "subagent"
+    assert own_exclusion("Bash") is None  # a shell, a browser, a personal connector: a rule's call
+    assert own_exclusion("mcp__playwright__browser_navigate") is None
+    assert own_exclusion("mcp__claude_ai_Gmail__search_threads") is None
 
 
 def test_a_tool_that_takes_a_command_is_a_shell_whatever_it_is_called():
-    assert tool_exclusion("mcp__ops__run", {"command": "curl https://example.com"}) == "shell"
-    assert tool_exclusion("mcp__ops__run", {"url": "https://example.com"}) is None
+    shell = generic_exclusion("mcp__ops__run", {"command": "curl https://example.com"})
+    assert shell == "shell"
+    assert generic_exclusion("mcp__ops__run", {"url": "https://example.com"}) is None

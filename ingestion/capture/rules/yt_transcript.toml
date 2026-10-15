@@ -1,0 +1,12 @@
+description = "A YouTube transcript printed by the step that cleans yt-dlp's VTT file, kept cold."
+destination = "archive"
+
+# The cleaning step (it reads /tmp/yt_<id>*.vtt and names WEBVTT), not the yt-dlp download,
+# whose stdout is empty, nor a stray `ls /tmp/yt_*`.
+[match]
+command = '''(?s)^(?=.*WEBVTT).*?/tmp/yt_(?P<id>[A-Za-z0-9_-]{6,})'''
+
+[fields]
+url = "https://www.youtube.com/watch?v={id}"
+source_id = "transcript:{id}"
+body = "{output}"

@@ -554,11 +554,16 @@ def _startup_auth_mode() -> str:
 if __name__ == "__main__":
     import sys
 
+    from ingestion.capture import check_config as check_capture_config
     from ingestion.schema_check import check_schema_version
 
     logging.basicConfig(level=logging.INFO)
     _mode = _startup_auth_mode()
     check_schema_version(DB_URL)
+    try:
+        check_capture_config()
+    except ValueError as e:  # a RuleError names the file and field
+        raise SystemExit(f"Web capture is misconfigured: {e}") from e
 
     if "--stdio" not in sys.argv:
         import contextlib

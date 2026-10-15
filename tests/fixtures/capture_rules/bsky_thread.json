@@ -1,0 +1,24 @@
+{
+ "posts": [
+  {
+   "uri": "at://did:plc:abc/app.bsky.feed.post/3mki3hqjyj22d",
+   "author": {
+    "handle": "druce.ai",
+    "displayName": "Druce"
+   },
+   "record": {
+    "text": "Notes on evaluating retrieval pipelines: hold the goldens fixed and change one stage at a time, otherwise nothing you measure is attributable. Notes on evaluating retrieval pipelines: hold the goldens fixed and change one stage at a time, otherwise nothing you measure is attributable. "
+   }
+  },
+  {
+   "uri": "at://did:plc:abc/app.bsky.feed.post/3mki3hqjyj33e",
+   "author": {
+    "handle": "druce.ai",
+    "displayName": "Druce"
+   },
+   "record": {
+    "text": "Reply: the same goes for chunk size, which interacts with the reranker window more than people expect. Reply: the same goes for chunk size, which interacts with the reranker window more than people expect. "
+   }
+  }
+ ]
+}

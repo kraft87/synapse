@@ -1,0 +1,16 @@
+description = "A Bluesky thread dumped by `bsky thread <uri-or-url> --json`, kept cold."
+destination = "archive"
+
+[match]
+command = '''(?:\bbsky|\$BSKY)["']?\s+thread\s+["']?(?P<web>https?://)?(?P<path>[^\s"']*?(?:/post/|app\.bsky\.feed\.post/)(?P<rkey>[a-z0-9]+)[^\s"']*)'''
+
+[fields]
+# An at:// URI has no page of its own: link to a search for the post instead.
+url = ["{web}{path}", "https://bsky.app/search?q={rkey}"]
+source_id = "thread:bsky:{rkey}"
+body = "{output}"
+author = [
+    "@{json.0.author.handle}",
+    "@{json.posts.0.author.handle}",
+    "@{json.thread.0.author.handle}",
+]

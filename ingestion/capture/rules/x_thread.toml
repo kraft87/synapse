@@ -1,0 +1,16 @@
+description = "An X (Twitter) thread dumped by `bird thread <url-or-id> --json`, kept cold."
+destination = "archive"
+
+[match]
+command = '''(?:^|[;&|]\s*|\s)bird\s+thread\s+["']?(?:\S*?/status/)?(?P<id>\d{8,})'''
+
+[fields]
+url = "https://x.com/i/status/{id}"
+source_id = "thread:x:{id}"
+body = "{output}"
+author = [
+    "@{json.0.author.username}",
+    "@{json.0.author.handle}",
+    "@{json.tweets.0.author.username}",
+    "@{json.thread.0.author.username}",
+]
