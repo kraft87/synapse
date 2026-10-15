@@ -31,6 +31,28 @@ def load_catalog(conn) -> list[tuple[str, str]]:
     return [(name, desc) for name, desc in cur.fetchall()]
 
 
+def load_scopes(conn) -> dict[str, str]:
+    """name -> scope ('global' or 'project:<p>') for ACTIVE skills."""
+    cur = conn.cursor()
+    cur.execute("SELECT name, scope FROM skills_lane.skill_registry WHERE status = 'active'")
+    return dict(cur.fetchall())
+
+
+def served_catalog(
+    catalog: list[tuple[str, str]], scopes: dict[str, str], project: str | None
+) -> list[tuple[str, str]]:
+    """The (name, description) pairs of the skills a session in `project` is served: the
+    global ones and its own project's `project:<p>` ones, the project compared
+    case-insensitively like the sync's SkillAccess (a label keeps its folder's case)."""
+    mine = f"project:{project.lower()}" if project else None
+
+    def served(name: str) -> bool:
+        scope = scopes.get(name, "global")
+        return scope == "global" or scope.lower() == mine
+
+    return [(n, d) for n, d in catalog if served(n)]
+
+
 def format_catalog(items) -> str:
     """Render a skill catalog for a judge prompt: one `- {name}: {desc}` line per entry,
     "(none)" when the catalog is empty."""

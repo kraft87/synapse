@@ -226,9 +226,7 @@ def test_one_analysis_call_per_session_feeds_derive_and_retune(monkeypatch):
     monkeypatch.setattr(N.L, "merge_candidate", merge)
     catalog = [("db-query", "Query the app Postgres with psql.")]
 
-    stats = N.judge_sessions(
-        None, [_session("s1"), _session("s2")], SM.format_catalog(catalog), dict(catalog), set()
-    )
+    stats = N.judge_sessions(None, [_session("s1"), _session("s2")], catalog, {}, set())
 
     # two sessions -> two analysis calls (was four: a scan and a judge each) + one cluster call
     assert len(prompts) == 3
@@ -262,9 +260,53 @@ def test_a_proposed_derive_is_left_to_the_draft_stage_and_keeps_its_bash_heads(m
     assert [e["bash"] for e in derived[0]] == [["widgetctl status"], ["widgetctl status"]]
 
 
+def test_a_session_is_judged_against_the_skills_its_project_is_served(monkeypatch):
+    seen: dict[str, str] = {}
+    analysis = {
+        "would_have_helped": [
+            {"skill": s, "why": "w", "description_covers": False, "missing_phrasing": "pgbouncer"}
+            for s in ("db-query", "widget-deploy")
+        ],
+        "gaps": [],
+    }
+
+    def judge(prompt):
+        session = "a" if "in the widgets repo" in prompt else "b"
+        seen[session] = prompt.split("SESSION:")[0]
+        return json.dumps(analysis)
+
+    merged: list[tuple[str, str]] = []
+
+    def merge(conn, kind, name, evidence, **kw):
+        merged.append((evidence[0]["session_id"], name))
+        return {"id": len(merged), "status": "observe", "score": 0.5, "merged": False}
+
+    monkeypatch.setattr(lane, "judge", judge)
+    monkeypatch.setattr(N.L, "merge_candidate", merge)
+    catalog = [("db-query", "Query Postgres."), ("widget-deploy", "Deploy the widgets.")]
+    scopes = {"db-query": "global", "widget-deploy": "project:Widgets"}
+    in_widgets = {  # the label's case differs from the scope's
+        **_session("session-a"),
+        "project": "widgets",
+        "user_msgs": ["in the widgets repo"],
+    }
+    elsewhere = {**_session("session-b"), "project": "Other", "user_msgs": ["somewhere else"]}
+
+    N.judge_sessions(None, [in_widgets, elsewhere], catalog, scopes, set())
+
+    assert "widget-deploy" in seen["a"] and "widget-deploy" not in seen["b"]
+    assert "db-query" in seen["a"] and "db-query" in seen["b"]
+    # the judge named a project skill for the session that is never served it: no widen
+    assert sorted(merged) == [
+        ("session-a", "db-query"),
+        ("session-a", "widget-deploy"),
+        ("session-b", "db-query"),
+    ]
+
+
 def test_an_unparseable_analysis_adds_nothing_and_is_counted(monkeypatch):
     monkeypatch.setattr(lane, "judge", lambda prompt: "Sorry, I cannot help with that.")
-    stats = N.judge_sessions(None, [_session("s1")], "(none)", {}, set())
+    stats = N.judge_sessions(None, [_session("s1")], [], {}, set())
     assert stats["sessions"] == 1 and stats["unparsed"] == 1
     assert stats["derive"]["gaps"] == 0 and stats["retune"]["under_trigger"] == 0
 

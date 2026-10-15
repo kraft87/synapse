@@ -70,7 +70,6 @@ COVERAGE_RATIO = 0.6  # registry-prescreen: fraction of head tokens one skill mu
 
 SIGNAL = "procedure_freq"
 DETECTOR = "procedure_miner"
-EXCLUDED_PROJECTS = ("transcribe_ai",)  # foreign skill environment (has its own catalog)
 
 # Generic dev-workflow stoplist: these fingerprints appear in most sessions and are not a
 # nameable procedure on their own (git/gh basics, venv activation, one-liners, cron ritual).
@@ -266,7 +265,6 @@ def content_fingerprints(content: str) -> list[tuple[str, str | None]]:
 # ----------------------------------------------------------------- corpus (SQL seam)
 def _fetch_rows(conn, window_days: float) -> list[tuple[str, int, str, str]]:
     """(session_id, position, date_iso, content) rows of the window's Claude Code episodes."""
-    excl = list(dict.fromkeys(EXCLUDED_PROJECTS + tuple(config.EXCLUDE_PROJECTS)))
     cur = conn.cursor()
     cur.execute(
         """SELECT session_id, sequence, created_at::date::text, content
@@ -274,7 +272,7 @@ def _fetch_rows(conn, window_days: float) -> list[tuple[str, int, str, str]]:
             WHERE platform = 'claude_code'
               AND created_at > now() - (%s || ' days')::interval
               AND (project IS NULL OR project <> ALL(%s))""",
-        (str(window_days), excl),
+        (str(window_days), list(config.EXCLUDE_PROJECTS)),
     )
     return [(str(s), int(q), d, c or "") for s, q, d, c in cur.fetchall()]
 

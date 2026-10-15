@@ -76,16 +76,27 @@ def sync_usage(conn, events):
 
 
 # --------------------------------------------------------------- 3+4+5 candidate gen
-def judge_sessions(conn, substantive, catalog_text, descriptions, seen_ids):
+def judge_sessions(conn, substantive, catalog, scopes, seen_ids):
     """The lane's per-session LLM pass. One analysis call per session (lane.LLM_WORKERS in
     flight at once) returns both its gaps and its would-have-helped skills; they feed DERIVE
-    and RETUNE. `unparsed` counts replies with no JSON object (their session adds nothing)."""
-    analyses = lane.run_parallel(lambda s: SM.analyze_session(s, catalog_text), substantive)
+    and RETUNE. `unparsed` counts replies with no JSON object (their session adds nothing).
+
+    A session is judged against the skills served in its project (global plus its own
+    `project:<p>`; SM.served_catalog): a skill its folder never receives is neither something
+    it should have fired nor a reason to call a gap covered."""
+    served = {
+        p: dict(SM.served_catalog(catalog, scopes, p))
+        for p in {s.get("project") for s in substantive}
+    }
+    analyses = lane.run_parallel(
+        lambda s: SM.analyze_session(s, SM.format_catalog(served[s.get("project")].items())),
+        substantive,
+    )
     return {
         "sessions": len(substantive),
         "unparsed": sum(1 for a in analyses if a is None),
         "derive": run_derive(conn, substantive, analyses, seen_ids),
-        "retune": run_retune(conn, substantive, analyses, seen_ids, descriptions),
+        "retune": run_retune(conn, substantive, analyses, seen_ids, served),
     }
 
 
@@ -126,7 +137,7 @@ def run_derive(conn, substantive, analyses, seen_ids):
     return {"gaps": len(gaps), "clusters": len(clusters), "proposed": n_proposed}
 
 
-def run_retune(conn, substantive, analyses, seen_ids, descriptions):
+def run_retune(conn, substantive, analyses, seen_ids, served):
     """Under-trigger judge -> retune/widen candidates, gated on a REAL description gap.
 
     A would_have_helped skill whose current description already covers the request was a
@@ -136,15 +147,18 @@ def run_retune(conn, substantive, analyses, seen_ids, descriptions):
     (matched-but-not-invoked telemetry), and items with no stated gap (incl. legacy judge
     output without description_covers / missing_phrasing) are dropped as `no_gap_stated`.
     `analyses` holds each session's analysis (SM.analyze_session; None = no usable reply);
-    `descriptions` is name -> current description (the catalog the judge saw)."""
+    `served` maps a project to name -> current description of the skills served there (the
+    catalog the judge saw for its sessions)."""
     stats = {"under_trigger": 0, "covered_not_fired": 0, "backstop_covered": 0, "no_gap_stated": 0}
     covered_by_skill: dict[str, int] = {}
     for s, v in zip(substantive, analyses, strict=True):
         if not v:
             continue
+        descriptions = served[s.get("project")]
         for m in v.get("would_have_helped") or []:
             sk = m.get("skill")
-            # a skill missing from the catalog has no description to widen
+            # a skill missing from the session's catalog (unknown, or not served in its
+            # project) has no description to widen
             if not sk or sk in s["fired"] or sk not in descriptions:
                 continue
             phrasing = s.get("first_user", "")[:160]
@@ -366,7 +380,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
         covered = replace(window, until_id=carry)
 
         catalog = SM.load_catalog(conn)
-        catalog_text = SM.format_catalog(catalog)
+        scopes = SM.load_scopes(conn)
         fires = DB.fire_events(conn, covered)
         seen: set[int] = set()
 
@@ -377,7 +391,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
         )
         print(f"substantive sessions to judge: {len(substantive)}")
         stage("usage", sync_usage, conn, fires)
-        stage("judge", judge_sessions, conn, substantive, catalog_text, dict(catalog), seen)
+        stage("judge", judge_sessions, conn, substantive, catalog, scopes, seen)
         if "judge" not in errors:
             lane.mark_judged(conn, "skills", substantive)
         stage("grounded", capture_grounded, conn, covered, fires, seen, catalog=catalog)
@@ -399,7 +413,6 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
                 conn,
                 run_started,
                 config={
-                    "excluded_projects": list(config.EXCLUDE_PROJECTS),
                     "propose_score": L.PROPOSE_SCORE,
                     "session_jaccard": L.SESSION_JACCARD,
                     "limit": limit,

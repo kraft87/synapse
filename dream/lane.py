@@ -49,7 +49,8 @@ from dream.skills import config
 from ingestion.llm_client import create_llm_client, stage_model
 from ingestion.schema_check import ColumnProbe
 
-#: A session view: {session, first_user, user_turns, user_msgs, tools, bash_heads, fired}.
+#: A session view: {session, project, first_user, user_turns, user_msgs, tools, bash_heads,
+#: fired}.
 View = dict[str, Any]
 
 PLATFORM = "claude_code"
@@ -148,15 +149,17 @@ def advance(conn: psycopg.Connection[Any], window: Window, to_id: int) -> None:
 
 # --------------------------------------------------------------------------- sessions
 def build_views(rows: Iterable[Sequence[Any]]) -> list[View]:
-    """Session views from (session_id, sequence, human_turn, content) rows ordered by
-    session and sequence. `content` carries the ingest markers ([user] / [tool:NAME] /
-    [result] / [assistant]); `human_turn` the full user text (up to 3000 chars)."""
+    """Session views from (session_id, sequence, human_turn, content, project) rows ordered
+    by session and sequence. `content` carries the ingest markers ([user] / [tool:NAME] /
+    [result] / [assistant]); `human_turn` the full user text (up to 3000 chars); the view's
+    `project` is the first label the session's episodes carry (None when untagged)."""
     sessions: dict[str, View] = {}
-    for sid, _seq, human, content in rows:
+    for sid, _seq, human, content, project in rows:
         s = sessions.get(str(sid))
         if s is None:
             s = sessions[str(sid)] = {
                 "session": str(sid),
+                "project": None,
                 "first_user": "",
                 "user_turns": 0,
                 "user_msgs": [],
@@ -164,6 +167,7 @@ def build_views(rows: Iterable[Sequence[Any]]) -> list[View]:
                 "bash_heads": [],
                 "fired": set(),
             }
+        s["project"] = s["project"] or project
         h = (human or "").strip()
         if h:
             s["user_turns"] += 1
@@ -197,7 +201,7 @@ def session_views(
 ) -> dict[str, View]:
     """Whole-session views of `session_ids`, from their turns stored up to `until_id`."""
     rows = conn.execute(
-        "SELECT session_id, sequence, human_turn, content FROM episodes "
+        "SELECT session_id, sequence, human_turn, content, project FROM episodes "
         "WHERE session_id = ANY(%s) AND id <= %s AND platform = %s "
         "AND (project IS NULL OR project <> ALL(%s)) ORDER BY session_id, sequence",
         (list(session_ids), until_id, PLATFORM, list(exclude_projects)),

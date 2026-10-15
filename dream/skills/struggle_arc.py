@@ -88,10 +88,6 @@ _NOISE = re.compile(
     re.I,
 )
 
-# transcribe_ai has its own skill environment; its sessions are never gaps in this catalog.
-EXCLUDED_PROJECTS = tuple(sorted({*config.EXCLUDE_PROJECTS, "transcribe_ai"}))
-
-
 # Topic gate: an arc window must show TOOL-USE evidence (a [tool:*] marker or a
 # file path). A correction arc with no tool work near it is conversation, not a procedure.
 _TOOL_MARK = re.compile(r"^\[tool:[\w-]+\]", re.M)
@@ -211,7 +207,7 @@ def _fetch_new_episodes(conn, window) -> list[dict]:
              WHERE platform = 'claude_code' AND id > %s AND id <= %s
                AND (project IS NULL OR project <> ALL(%s))
              ORDER BY session_id, sequence""",
-        (window.after_id, window.until_id, list(EXCLUDED_PROJECTS)),
+        (window.after_id, window.until_id, list(config.EXCLUDE_PROJECTS)),
     )
     return [
         {

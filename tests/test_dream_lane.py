@@ -195,6 +195,18 @@ def test_views_are_whole_sessions_up_to_the_bound(db):
     assert v["user_turns"] == 2 and v["tools"] == {"Bash": 1}
 
 
+def test_a_view_carries_the_sessions_project(db):
+    _seed(db)
+    db.execute(
+        "INSERT INTO episodes (session_id, sequence, platform, project, human_turn, content) "
+        "VALUES ('lanet-p', 1, 'claude_code', NULL, 'one', '[user] one'), "
+        "('lanet-p', 2, 'claude_code', 'Widgets', 'two', '[user] two'), "
+        "('lanet-q', 1, 'claude_code', NULL, 'one', '[user] one')"
+    )
+    views, _ = lane.sessions(db, _open(db), limit=10)
+    assert {v["session"]: v["project"] for v in views} == {"lanet-p": "Widgets", "lanet-q": None}
+
+
 def test_a_judged_session_waits_until_it_grows(db):
     _seed(db)
     _ep(db, "lanet-a", 1)

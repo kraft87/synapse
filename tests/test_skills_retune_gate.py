@@ -47,7 +47,7 @@ def _wire(monkeypatch, calls):
 def _run(sessions, verdict):
     """run_retune over `sessions`, each analysed as `verdict`."""
     seen: set[int] = set()
-    stats = N.run_retune(None, sessions, [verdict] * len(sessions), seen, _CATALOG)
+    stats = N.run_retune(None, sessions, [verdict] * len(sessions), seen, {None: _CATALOG})
     return stats, seen
 
 
