@@ -26,6 +26,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -329,8 +330,8 @@ class _StubServer:
     """A stand-in for /private-sessions/{id}: records calls, serves the flag back.
 
     By default it behaves like a server from before purge existed: PUT answers only
-    ``private``. ``stored_turns`` makes it report that count; ``purge`` ("ok" or "refuse")
-    makes it act on ``?purge=1`` the way the current route does."""
+    ``private``. ``stored_turns`` makes it report that count; ``purge`` ("ok", "refuse" or
+    "error") makes it act on ``?purge=1`` the way the current route does."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
@@ -371,6 +372,9 @@ class _StubServer:
                         # the flag is committed first, so it stays set
                         detail = "purge refused: needs full trust"
                         return self._send(403, {"status": "error", "detail": detail})
+                    if purging and outer.purge == "error":
+                        # the purge transaction failed after the flag was committed
+                        return self._send(500, {"status": "error", "detail": "purge failed"})
                     if purging and outer.purge == "ok":
                         payload["purged"] = {
                             "episodes_deleted": outer.stored_turns or 0,
@@ -466,17 +470,47 @@ def test_on_purge_against_a_server_that_ignores_it_never_claims_a_deletion(
     assert "private mode is ON" in captured.err
 
 
-def test_on_purge_refused_keeps_private_mode_on_and_says_nothing_was_deleted(
-    toggle, stub_server, capsys
-):
+def test_on_purge_refused_keeps_private_mode_on_and_claims_no_deletion(toggle, stub_server, capsys):
     stub_server.purge = "refuse"
     assert toggle.main(["on", "s-abc", "--purge"]) == 1
     captured = capsys.readouterr()
     assert "purge refused: needs full trust" in captured.err
-    assert "private mode is ON" in captured.err and "nothing was deleted" in captured.err
+    assert "private mode is ON" in captured.err and "nothing is claimed deleted" in captured.err
     assert "NOT off the record" not in captured.err  # the flag did land
     assert "s-abc" in stub_server.rows
     assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]  # the flag was read back
+
+
+def test_on_purge_server_error_still_reports_private_mode_on(toggle, stub_server, capsys):
+    """The route commits the flag before it purges, so a 5xx from the purge must not read as
+    "server flag not set / NOT off the record": the read-back says the flag landed."""
+    stub_server.purge = "error"
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "private mode is ON" in captured.err and "nothing is claimed deleted" in captured.err
+    assert "purge failed" in captured.err
+    assert "NOT off the record" not in captured.err and "purged" not in captured.out
+    assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]
+
+
+def test_on_purge_timeout_says_the_outcome_is_unknown(toggle, stub_server, monkeypatch, capsys):
+    """The purge runs in one long transaction; when the answer does not come in time it may
+    still finish. The flag is read back, and the output claims neither state of the turns."""
+    real = toggle.config.request_json
+
+    def slow_purge(method, path, *args, **kwargs):
+        if method == "PUT" and "purge=1" in path:
+            real(method, path.split("?")[0], *args, **kwargs)  # the flag lands server-side
+            raise urllib.error.URLError(TimeoutError("timed out"))
+        return real(method, path, *args, **kwargs)
+
+    monkeypatch.setattr(toggle.config, "request_json", slow_purge)
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "private mode is ON" in captured.err and "nothing is claimed deleted" in captured.err
+    assert "outcome is unknown" in captured.err and "on --purge" in captured.err
+    assert "NOT off the record" not in captured.err and "purged" not in captured.out
+    assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]
 
 
 def test_purge_only_belongs_to_on(toggle, stub_server, capsys):

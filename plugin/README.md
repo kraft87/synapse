@@ -228,8 +228,10 @@ are already memory and stay recallable; `on` prints how many (an older server do
 `on --purge` deletes them, with the facts, events and preferences derived from them, in one
 transaction. It is destructive, so it only runs when you ask for it. A device that may not
 delete those turns (a restricted one, for turns another device wrote) is refused: private mode
-is on, nothing was deleted, and the command exits nonzero saying so. A server that predates
-purge ignores the flag, and the command exits nonzero instead of claiming a deletion.
+is on, nothing was deleted, and the command exits nonzero saying so. The same goes for a purge
+that fails or times out on the server: the flag is committed first, so private mode is on
+(the command reads it back), the command exits nonzero and claims no deletion. A server that
+predates purge ignores the flag, and the command exits nonzero instead of claiming a deletion.
 
 `off` removes the marker and **keeps** the row: private turns already spoken stay
 uningestable, which is the only honest reading of "we were off the record". `--forget`

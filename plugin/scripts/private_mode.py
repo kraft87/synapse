@@ -25,9 +25,10 @@ recallable. The server reports how many (`stored_turns`) and `on` prints it; `--
 asks the server to delete them, with the facts, events and preferences derived from them,
 in one transaction. That is destructive, so it is only ever asked for by name, and the
 output claims a deletion only when the server answers with what it deleted. The server
-refuses it (403) to a device that may not delete those turns; the flag is set first and
-stays, so private mode is ON and nothing was deleted. A server that predates purge ignores
-the parameter, which `on` reports instead of passing over.
+refuses it (403) to a device that may not delete those turns, and the purge itself can fail
+or time out; the flag is committed first and stays, so whatever the purge did, private mode
+is ON (read back) and `on` claims no deletion. A server that predates purge ignores the
+parameter, which `on` reports instead of passing over.
 
 `on` therefore verifies BOTH landed (the server flag is read back, not assumed) and
 exits nonzero, loudly, if either did not. Only exit 0 means "off the record" is true.
@@ -104,26 +105,36 @@ def _on(session_id: str, purge: bool) -> int:
         _write_marker(session_id)
     except OSError as e:
         return _fail(f"could not write marker {_marker(session_id)}: {e}")
-    refused = ""
+    failed = ""
     try:
         try:
             reply = _server("PUT", session_id, purge=purge)
         except urllib.error.HTTPError as e:
-            if not (purge and e.code == 403):
+            if not purge:
                 raise
-            # The server sets the flag before it checks the purge, so private mode is on;
-            # only the deletion was refused.
-            reply, refused = {}, _refusal(e)
+            # The server commits the flag before it purges, so whatever went wrong with the
+            # purge (403, 5xx), the read-back below says whether private mode landed.
+            reply, failed = {}, _refusal(e)
+        except (urllib.error.URLError, TimeoutError) as e:
+            if not (purge and isinstance(getattr(e, "reason", e), TimeoutError)):
+                raise
+            reply, failed = (
+                {},
+                (
+                    "no answer in time, so the purge outcome is unknown (it may still finish "
+                    "on the server); run `on --purge` again to see"
+                ),
+            )
         if not _server_private(session_id):
             return _fail("server did not record the session as private (read-back said false)")
     except (urllib.error.URLError, OSError, ValueError) as e:
         return _fail(
             f"server flag not set ({type(e).__name__}: {str(e)[:160]}). Local marker is in place, but a later backfill could still ingest this session."
         )
-    if refused:
+    if failed:
         print(
-            f"private mode is ON for {session_id}, but --purge was refused and nothing was "
-            f"deleted: {refused}",
+            f"private mode is ON for {session_id}, but --purge failed and nothing is claimed "
+            f"deleted: {failed}",
             file=sys.stderr,
         )
         return 1
