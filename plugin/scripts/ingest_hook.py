@@ -47,7 +47,9 @@ that is `synapse-import`'s job.
 The sweep visits the least recently touched file first (its last failed
 attempt, else its mtime), so repeated capped sweeps make oldest-first progress
 and a file that keeps failing goes to the back of the queue instead of holding
-a slot.
+a slot. Main transcripts always go before sub-agent transcripts (each group
+oldest first), so a session's many sub-agent files cannot push its own main
+transcript out of the capped sweep.
 
 The cursor file also keeps one `_health` record of the upload streak. After
 WARN_AFTER_FAILS failed POSTs in a row, or WARN_AFTER_HOURS of failure, with
@@ -613,12 +615,30 @@ def _catchup_candidates(
     synapse_ingest_retry.sweep_candidates, shared with the Codex hook.
 
     ``subagents`` adds the sub-agent transcripts (<session>/subagents/**/agent-<id>.jsonl)
-    under the same rules; the caller asks for them only while the server captures."""
-    paths = glob.glob(os.path.join(projects_root, "*", "*.jsonl"))
+    under the same rules; the caller asks for them only while the server captures.
+    They come AFTER every main transcript, each group oldest first: a session's
+    sub-agent files stop being written before its main transcript's last turn, so
+    in one shared oldest-first list the hundreds of a workflow session's agent files
+    would all sort ahead of their own main transcript, and a capped sweep (only the
+    first CATCHUP_MAX_FILES are shipped) would starve it until it aged out of the
+    window with turns unshipped."""
+    candidates = _sweep(
+        glob.glob(os.path.join(projects_root, "*", "*.jsonl")), skip_path, state, now
+    )
     if subagents:
-        paths += glob.glob(
-            os.path.join(projects_root, "*", "*", "subagents", "**", "*.jsonl"), recursive=True
+        candidates += _sweep(
+            glob.glob(
+                os.path.join(projects_root, "*", "*", "subagents", "**", "*.jsonl"), recursive=True
+            ),
+            skip_path,
+            state,
+            now,
         )
+    return candidates
+
+
+def _sweep(paths: list[str], skip_path: str, state: dict[str, Any], now: float) -> list[str]:
+    """One group of transcripts through the shared sweep rules (oldest first)."""
     return retry.sweep_candidates(
         paths,
         state,

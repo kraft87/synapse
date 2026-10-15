@@ -631,3 +631,36 @@ def test_the_sweep_finds_workflow_subagent_transcripts(hook, tmp_path):
     assert hook._catchup_candidates(str(root), "", {}, time.time()) == [str(main)]
     got = hook._catchup_candidates(str(root), "", {}, time.time(), subagents=True)
     assert sorted(got) == sorted([str(main), str(side), str(direct)])
+
+
+def test_the_sweep_puts_main_transcripts_before_any_subagent_transcript(hook, tmp_path):
+    """A session's sub-agent files stop being written before its main transcript's last turn,
+    so in one shared oldest-first list its hundreds of agent files would all sort ahead of
+    it, and the capped sweep (CATCHUP_MAX_FILES a session start) would never reach it."""
+    root = tmp_path / "projects"
+    now = time.time()
+    main, side = _session(root)
+    sides = [side]
+    for i in range(hook.CATCHUP_MAX_FILES + 15):  # a workflow session's agents, never shipped
+        extra = side.parent / "workflows" / "wf_x" / f"agent-w{i:03d}.jsonl"
+        extra.parent.mkdir(parents=True, exist_ok=True)
+        _write_jsonl(extra, _subagent_records("sess1"))
+        sides.append(extra)
+    for i, p in enumerate(sides):  # all older than the main transcript, oldest first by index
+        os.utime(p, (now - 7200 + i, now - 7200 + i))
+    os.utime(main, (now - 3600, now - 3600))
+    older_main, _ = _session(root, sid="sess0")
+    os.utime(older_main, (now - 10_000, now - 10_000))  # a main older than every agent file
+
+    got = hook._catchup_candidates(str(root), "", {}, now, subagents=True)
+
+    assert len(sides) > hook.CATCHUP_MAX_FILES + 10
+    assert got.index(str(main)) < hook.CATCHUP_MAX_FILES
+    mains = {str(main), str(older_main)}
+    # every main transcript first, then the sub-agent files, each group oldest first
+    assert got[:2] == [str(older_main), str(main)]
+    assert set(got[:2]) == mains
+    assert [p for p in got[2:] if p not in mains][:3] == [str(p) for p in sides[:3]]
+    assert got[2:] == sorted(got[2:], key=os.path.getmtime)
+    # sub-agent files off: the main transcripts are all there is
+    assert hook._catchup_candidates(str(root), "", {}, now) == [str(older_main), str(main)]
