@@ -27,13 +27,13 @@ def test_pollers_get_time_to_finish_their_in_flight_items(name):
 
 
 @pytest.mark.parametrize(
-    "threads,with_workers,claims", [("3", True, 3), ("1", True, 1), ("4", False, 1)]
+    "threads,with_workers,limit", [("3", True, 6), ("1", True, 1), ("4", False, 1)]
 )
-def test_run_loop_claims_one_row_per_worker_thread(
-    tmp_path, monkeypatch, threads, with_workers, claims
+def test_run_loop_drains_two_waves_of_the_pool_per_call(
+    tmp_path, monkeypatch, threads, with_workers, limit
 ):
-    """A claim that only waits for a free thread is held for nothing, and is stranded
-    for 45 minutes if the worker is killed."""
+    """One drain call takes two waves of the thread pool (the serial worker, one item); the
+    drain itself claims a row only as a thread frees up (tests/test_poller.py)."""
 
     class _Db:
         def release_stale_claims(self) -> int:
@@ -44,16 +44,16 @@ def test_run_loop_claims_one_row_per_worker_thread(
     monkeypatch.setenv("SYNAPSE_DRAIN_ONLY", "1")
     monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", threads)
     p = Poller(db=_Db(), worker_factory=(lambda: (None, None)) if with_workers else None)  # type: ignore[arg-type,return-value]
-    claimed = []
+    limits = []
 
     def drain(batch_limit: int) -> int:
-        claimed.append(batch_limit)
+        limits.append(batch_limit)
         p.request_stop()
         return 0
 
     monkeypatch.setattr(p, "drain_extraction_queue", drain)
     p.run_loop(interval_seconds=3600)
-    assert claimed == [claims]
+    assert limits == [limit]
 
 
 def test_run_loop_touches_the_heartbeat(tmp_path, monkeypatch):

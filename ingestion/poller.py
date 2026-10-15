@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -180,28 +180,27 @@ class Poller:
         of pending items via ``FOR UPDATE SKIP LOCKED`` and the rows flip
         to ``status='processing'`` for the duration.
 
-        The claimed batch itself runs concurrently when a ``worker_factory``
-        was provided and SYNAPSE_DRAIN_CONCURRENCY > 1 (issue #13): per-item
-        work is ~all LLM network wait, so a thread per in-flight item is
-        ~batch_limit-fold throughput at the same RAM. Failure stays item-isolated —
-        one bad item marks failed without touching the rest of the batch.
+        With a ``worker_factory`` and SYNAPSE_DRAIN_CONCURRENCY > 1 (issue #13) items run on
+        a thread pool: per-item work is ~all LLM network wait, so a thread per in-flight
+        item is ~concurrency-fold throughput at the same RAM. ``batch_limit`` then bounds
+        how many items one call takes in total (so run_loop gets back to its other work),
+        while rows are claimed only as threads free up. Failure stays item-isolated — one
+        bad item marks failed without touching the rest.
 
         On UsageLimitError (Claude usage cap hit) the offending item and
-        every still-claimed item in the current batch are released back to
-        ``pending`` so another replica (or this one on the next cycle) can
-        retry once the cap resets.
+        every still-claimed item are released back to ``pending`` so another
+        replica (or this one on the next cycle) can retry once the cap resets.
         """
         if self._extraction is None:
             return 0
 
-        items = self._db.claim_pending_extractions(limit=batch_limit)
-        if not items:
-            return 0
-
         concurrency = _drain_concurrency() if self._worker_factory is not None else 1
-        if concurrency > 1 and len(items) > 1:
-            processed = self._drain_concurrent(items, concurrency)
+        if concurrency > 1:
+            processed = self._drain_concurrent(batch_limit, concurrency)
         else:
+            items = self._db.claim_pending_extractions(limit=batch_limit)
+            if not items:
+                return 0
             processed = self._drain_serial(items)
 
         if processed:
@@ -265,13 +264,16 @@ class Poller:
             self._worker_local.stack = stack
         return stack
 
-    def _drain_concurrent(self, items: list[dict[str, Any]], concurrency: int) -> int:
-        """Run the claimed batch through the persistent drain pool.
+    def _drain_concurrent(self, batch_limit: int, concurrency: int) -> int:
+        """Run up to ``batch_limit`` queue items through the persistent drain pool, keeping
+        every thread busy: a row is claimed only when a thread is free to start it, so one
+        slow item (they run minutes) neither idles the other threads nor holds claims it
+        is not working on.
 
         Per-item failure isolation: an ordinary failure marks THAT item failed and
-        never releases the rest of the batch. A UsageLimitError marks the batch's
-        quota_hit event so queued-but-unstarted items skip their LLM attempt; every
-        quota-hit item is released back to ``pending`` and UsageLimitError is
+        never releases the rest. A UsageLimitError marks the quota_hit event so no
+        further row is claimed and claimed-but-unstarted items skip their LLM attempt;
+        every quota-hit item is released back to ``pending`` and UsageLimitError is
         re-raised so run_loop backs off — the same contract as the serial path.
         """
         import logfire
@@ -282,12 +284,13 @@ class Poller:
             self._drain_pool = ThreadPoolExecutor(
                 max_workers=concurrency, thread_name_prefix="drain"
             )
+        pool = self._drain_pool
         quota_hit = threading.Event()
 
         def _one(item: dict[str, Any]) -> tuple[int, str]:
             queue_id = int(item["id"])
             if self._stop_requested.is_set():
-                return queue_id, "stopped"  # release below; exit at the batch boundary
+                return queue_id, "stopped"  # release below; exit once the in-flight items end
             if quota_hit.is_set():
                 return queue_id, "quota"  # don't burn an attempt on a known-dead window
             db, pipeline = self._thread_worker()
@@ -314,7 +317,20 @@ class Poller:
                     logger.exception("Could not mark queue_id=%d failed", queue_id)
                 return queue_id, "failed"
 
-        results = list(self._drain_pool.map(_one, items))
+        running: set[Future[tuple[int, str]]] = set()
+        results: list[tuple[int, str]] = []
+        claimed = 0
+        while True:
+            free = min(concurrency - len(running), batch_limit - claimed)
+            if free > 0 and not self._stop_requested.is_set() and not quota_hit.is_set():
+                items = self._db.claim_pending_extractions(limit=free)
+                claimed += len(items)
+                running.update(pool.submit(_one, item) for item in items)
+            if not running:
+                break
+            finished, running = wait(running, return_when=FIRST_COMPLETED)
+            results.extend(f.result() for f in finished)
+
         stopped_ids = [qid for qid, status in results if status == "stopped"]
         if stopped_ids:
             logger.info(
@@ -384,13 +400,15 @@ class Poller:
         last_full_cycle = 0.0
         last_stale_sweep = time.monotonic()  # just swept above; next sweep one interval out
         last_daily_sweep = 0.0  # first full cycle sweeps, then daily
-        # One claim per worker thread (the serial kill switch claims one). A claimed row
-        # stays 'processing' until its item ends, so a claim that only waits for a free
-        # thread is held for nothing: it makes the priority lane laggy (a worker doesn't
-        # re-check for new high-priority ingest until its batch drains), and when the worker
-        # is killed mid-item (a deploy, an OOM) every such row is stranded for the 45 min
-        # stale-claim threshold, not just the items that were running.
-        drain_batch_limit = _drain_concurrency() if self._worker_factory is not None else 1
+        # Rows are claimed only as a worker thread frees up (the serial kill switch claims
+        # one at a time): a claimed row stays 'processing' until its item ends, so one that
+        # merely waits for a thread would make the priority lane laggy and, when the worker
+        # is killed mid-item (a deploy, an OOM), be stranded for the 45 min stale-claim
+        # threshold along with the items that were running. The limit is how many items one
+        # drain call takes before run_loop gets back to its chunk/embed cycle and the
+        # priority check: two waves of the pool.
+        concurrency = _drain_concurrency() if self._worker_factory is not None else 1
+        drain_batch_limit = 2 * concurrency if concurrency > 1 else 1
         prev_drained = 0
         quota_backoff = 0  # seconds; grows while the Max quota window is exhausted, 0 when healthy
         while True:

@@ -1,10 +1,10 @@
-"""DB-backed tests for the drain worker's concurrent batch path (issue #13).
+"""DB-backed tests for the drain worker's concurrent path (issue #13).
 
-The claimed batch runs through a thread pool when a worker_factory is provided and
-SYNAPSE_DRAIN_CONCURRENCY > 1. These cover the care points from the issue: genuine
-in-batch concurrency, per-item failure isolation (one bad item never releases the
-rest), the UsageLimitError contract (quota items released to pending + re-raise so
-run_loop backs off), and the serial kill switch.
+Items run through a thread pool when a worker_factory is provided and
+SYNAPSE_DRAIN_CONCURRENCY > 1, a row claimed as each thread frees up. These cover the
+care points from the issue: genuine concurrency, per-item failure isolation (one bad item
+never releases the rest), the UsageLimitError contract (quota items released to pending +
+re-raise so run_loop backs off), and the serial kill switch.
 """
 
 from __future__ import annotations
@@ -142,13 +142,57 @@ def test_stop_request_releases_unstarted_serial_items(conn, db_url, monkeypatch)
     assert [st[i] for i in ids[1:]] == ["pending", "pending"]
 
 
-def test_stop_request_releases_unstarted_concurrent_items(conn, db_url, monkeypatch):
+def test_stop_request_claims_nothing_more_concurrently(conn, db_url, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "2")
-    _seed(conn, 4)
+    ids = _seed(conn, 6)
+    p_holder: list[Poller] = []
+    both_in_flight = threading.Barrier(2, timeout=15)
+
+    def behavior(item):
+        both_in_flight.wait()
+        p_holder[0].request_stop()  # the stop arrives while two items are in flight
+
+    p = _poller(db_url, behavior)
+    p_holder.append(p)
+    assert p.drain_extraction_queue(batch_limit=8) == 2
+    st = _statuses(conn)
+    assert [st[i] for i in ids[:2]] == ["done", "done"]  # in-flight items finish
+    assert {st[i] for i in ids[2:]} == {"pending"}  # nothing else was claimed
+
+
+def test_one_slow_item_does_not_idle_the_other_threads(conn, db_url, monkeypatch):
+    """The drain claims a row as each thread frees up. Claiming a whole batch and waiting
+    on it would leave the other thread idle behind the slow item (and time it out here)."""
+    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "2")
+    ids = _seed(conn, 4)
+    slow, quick = ids[0], ids[1:]
+    quick_done = threading.Semaphore(0)
+    peaks: list[int] = []
+
+    def behavior(item):
+        peaks.append(
+            conn.execute(
+                "SELECT count(*) FROM extraction_queue WHERE status = 'processing'"
+            ).fetchone()[0]
+        )
+        if int(item["id"]) == slow:
+            for _ in quick:
+                assert quick_done.acquire(timeout=15), "the other thread was idle"
+        else:
+            quick_done.release()
+
+    p = _poller(db_url, behavior)
+    assert p.drain_extraction_queue(batch_limit=8) == 4
+    assert set(_statuses(conn).values()) == {"done"}
+    assert max(peaks) <= 2  # never more claimed than there are threads
+
+
+def test_batch_limit_bounds_one_concurrent_drain(conn, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "2")
+    ids = _seed(conn, 6)
     p = _poller(db_url, lambda item: None)
-    p.request_stop()  # stop before dispatch: every item releases, none run
-    assert p.drain_extraction_queue(batch_limit=8) == 0
-    assert set(_statuses(conn).values()) == {"pending"}
+    assert p.drain_extraction_queue(batch_limit=4) == 4
+    assert [_statuses(conn)[i] for i in ids] == ["done"] * 4 + ["pending"] * 2
 
 
 def test_a_failed_item_is_retried_once_it_cools_off(conn, db_url, monkeypatch):
