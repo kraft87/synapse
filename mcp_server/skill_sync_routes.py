@@ -12,7 +12,9 @@ auth via the shared machine token (custom routes bypass FastMCP's auth middlewar
 PG work in a threadpool, fail-soft JSON.
 
 Routes (all POST):
-  /skills/list        {scope, held?}                 -> active skills (name, desc, mtime, file shas)
+  /skills/list        {scope, held?}                 -> active skills (name, desc, mtime, file shas,
+                                                        content_hash: the whole-skill hash, so a
+                                                        client compares it instead of the body)
                                                         + retired ones (name, hashes, retired_at)
                                                         + withdrawn ones among `held` (below)
                                                         + publish: may this caller push here
@@ -194,11 +196,21 @@ def whole_skill_hash(body: str, files) -> str:
     return h.hexdigest()
 
 
+def _files_by_skill(c, names: list[str]) -> dict[str, list[dict]]:
+    """{name: [{path, sha256}, ...] by path} for each of `names`, in one query."""
+    out: dict[str, list[dict]] = {n: [] for n in names}
+    rows = c.cursor(row_factory=dict_row).execute(  # whatever row factory `c` has
+        "SELECT skill_name, path, sha256 FROM skills_lane.skill_files "
+        "WHERE skill_name = ANY(%s) ORDER BY skill_name, path",
+        (names,),
+    )
+    for r in rows.fetchall():
+        out[r["skill_name"]].append({"path": r["path"], "sha256": r["sha256"]})
+    return out
+
+
 def _file_shas(c, name: str) -> list[dict]:
-    return c.execute(
-        "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
-        (name,),
-    ).fetchall()
+    return _files_by_skill(c, [name])[name]
 
 
 def _held_names(held) -> list[str] | None:
@@ -230,15 +242,19 @@ def _list_skills(db_url: str, scope: str, access: SkillAccess = FULL_ACCESS, hel
             if served
             else []
         )
+        files = _files_by_skill(c, [s["name"] for s in skills])
         listing = {
             "skills": [
                 {
                     "name": s["name"],
                     "scope": s["scope"],
+                    # body and description stay for a client that predates content_hash (the
+                    # plugin updates from the marketplace independently of the server)
                     "body": s["body"],
                     "description": s["description"],
                     "content_modified_at": _iso(s["content_modified_at"]),
-                    "files": _file_shas(c, s["name"]),
+                    "files": files[s["name"]],
+                    "content_hash": whole_skill_hash(s["body"], _pairs(files[s["name"]])),
                 }
                 for s in skills
             ],
@@ -264,24 +280,36 @@ def _shown_scope(scope: str, asked: str, access: SkillAccess) -> str:
     return scope if access.serves(scope) else ""
 
 
-def _past_hashes(c, name: str, files) -> list[str]:
-    """Whole-skill hashes of the skill's recent past registry bodies, with today's files:
-    a copy pulled before the latest edit is still a copy Synapse delivered. Only bodies
-    the registry itself held ('superseded' by the history trigger); a 'disk_overwrite'
-    row is a local edit a pull replaced, which Synapse never delivered."""
-    rows = c.execute(
-        "SELECT COALESCE(body,'') AS body FROM skills_lane.skill_history "
-        "WHERE name=%s AND op='superseded' ORDER BY recorded_at DESC LIMIT %s",
-        (name, _MAX_PAST_VERSIONS),
-    ).fetchall()
-    return list(dict.fromkeys(whole_skill_hash(r["body"], files) for r in rows))
+def _pairs(files: list[dict]) -> list[tuple[str, str]]:
+    return [(f["path"], f["sha256"]) for f in files]
 
 
-def _entry_hashes(c, name: str, body: str) -> tuple[str, list[str]]:
-    files = [(f["path"], f["sha256"]) for f in _file_shas(c, name)]
-    current = whole_skill_hash(body, files)
-    past = [h for h in _past_hashes(c, name, files) if h != current]
-    return current, [current, *past]
+def _past_bodies(c, names: list[str]) -> dict[str, list[str]]:
+    """{name: its recent past registry bodies, newest first} for each of `names`, in one
+    query. Only bodies the registry itself held ('superseded' by the history trigger); a
+    'disk_overwrite' row is a local edit a pull replaced, which Synapse never delivered."""
+    out: dict[str, list[str]] = {n: [] for n in names}
+    rows = c.cursor(row_factory=dict_row).execute(
+        "SELECT name, body FROM ("
+        "  SELECT name, COALESCE(body,'') AS body, "
+        "         row_number() OVER (PARTITION BY name ORDER BY recorded_at DESC) AS n "
+        "  FROM skills_lane.skill_history WHERE name = ANY(%s) AND op='superseded'"
+        ") h WHERE n <= %s ORDER BY name, n",
+        (names, _MAX_PAST_VERSIONS),
+    )
+    for r in rows.fetchall():
+        out[r["name"]].append(r["body"])
+    return out
+
+
+def _entry_hashes(body: str, files: list[dict], past_bodies: list[str]) -> tuple[str, list[str]]:
+    """The whole-skill hash of the skill as it is, and with it the hashes of its recent past
+    bodies under today's files: a copy pulled before the latest edit is still a copy Synapse
+    delivered."""
+    pairs = _pairs(files)
+    current = whole_skill_hash(body, pairs)
+    past = dict.fromkeys(whole_skill_hash(b, pairs) for b in past_bodies)
+    return current, [current, *(h for h in past if h != current)]
 
 
 def _retired_skills(c, asked: str, access: SkillAccess, held: list[str] | None) -> list[dict]:
@@ -295,16 +323,20 @@ def _retired_skills(c, asked: str, access: SkillAccess, held: list[str] | None) 
 
     Full trust is told every retirement, whatever scope it asks about. A restricted caller
     only of the skills it could have been served, and of the names it says it holds."""
-    rows = c.execute(
-        "SELECT name, scope, COALESCE(body,'') AS body, retired_at "
-        "FROM skills_lane.skill_registry "
-        "WHERE status='retired' AND retired_at IS NOT NULL ORDER BY name",
-    ).fetchall()
+    rows = [
+        r
+        for r in c.execute(
+            "SELECT name, scope, COALESCE(body,'') AS body, retired_at "
+            "FROM skills_lane.skill_registry "
+            "WHERE status='retired' AND retired_at IS NOT NULL ORDER BY name",
+        ).fetchall()
+        if access.serves(r["scope"]) or (held is not None and r["name"] in held)
+    ]
+    names = [r["name"] for r in rows]
+    files, past = _files_by_skill(c, names), _past_bodies(c, names)
     out = []
     for r in rows:
-        if not (access.serves(r["scope"]) or (held is not None and r["name"] in held)):
-            continue
-        current, hashes = _entry_hashes(c, r["name"], r["body"])
+        current, hashes = _entry_hashes(r["body"], files[r["name"]], past[r["name"]])
         out.append(
             {
                 "name": r["name"],
@@ -329,9 +361,11 @@ def _withdrawn_skills(c, asked: str, access: SkillAccess, names: list[str]) -> l
         "WHERE status='active' AND name = ANY(%s) ORDER BY name",
         (names,),
     ).fetchall()
+    found = [r["name"] for r in rows]
+    files, past = _files_by_skill(c, found), _past_bodies(c, found)
     out = []
     for r in rows:
-        current, hashes = _entry_hashes(c, r["name"], r["body"])
+        current, hashes = _entry_hashes(r["body"], files[r["name"]], past[r["name"]])
         out.append(
             {
                 "name": r["name"],
@@ -425,7 +459,7 @@ def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
         return None
     if edited is None or _utc(edited) <= row[1]:
         return row[1]
-    retired = whole_skill_hash(row[2], [(f[0], f[1]) for f in _file_shas(c, name)])
+    retired = whole_skill_hash(row[2], _pairs(_file_shas(c, name)))
     pushed = whole_skill_hash(
         p.get("body", ""), [(f["path"], f["sha256"]) for f in p.get("files", [])]
     )
