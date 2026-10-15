@@ -140,15 +140,12 @@ class EntityResolver:
         # vector search.
         if embeddings is None:
             embeddings = {}
-        unsettled: list[str] = []
         vector_needed: list[ExtractedEntity] = []
         if deduper is not None:
             for entity in entities:
                 kind, payload = deduper.classify(
                     entity.name, entity.summary, entity_type=entity.type
                 )
-                if kind != "exact":
-                    unsettled.append(entity.name)
                 if kind == "exact":
                     mapping[entity.name] = cast(str, payload)
                 elif kind == "candidates":
@@ -160,46 +157,47 @@ class EntityResolver:
                     vector_needed.append(entity)
         else:
             vector_needed = list(entities)
-            unsettled = [e.name for e in entities]
 
-        # One embedding request for everything the deduper did not settle exactly. A name
-        # with LSH candidates skips the vector search but may still be judged new.
-        to_embed = list(dict.fromkeys(n for n in unsettled if n not in embeddings))
+        # One embedding request for everything the deduper did not settle exactly (only
+        # exact hits are in ``mapping`` so far). A name with LSH candidates skips the
+        # vector search but may still be judged new.
+        to_embed = list(
+            dict.fromkeys(
+                e.name for e in entities if e.name not in mapping and e.name not in embeddings
+            )
+        )
         if to_embed:
             embeddings.update(
                 zip(to_embed, self._embedder.embed(to_embed, task="entity"), strict=True)
             )
 
         # Phase 1b: vector-similarity pass for the deduper misses.
-        if vector_needed:
-            for entity in vector_needed:
-                candidates = kg_client.find_similar_nodes(
-                    embeddings[entity.name], group_id, limit=5
-                )
-                if not candidates:
-                    mapping[entity.name] = _new_uuid()
-                    continue
-                # Vector score is cosine distance (0=identical).
-                best = min(candidates, key=lambda c: c["score"])
-                similarity = 1.0 - float(best["score"])
-                if similarity < self._threshold:
-                    mapping[entity.name] = _new_uuid()
-                elif similarity >= self._autoconfirm:
-                    # Trust the embedding, skip the LLM (near-identical names).
-                    mapping[entity.name] = cast(str, best["uuid"])
-                else:
-                    pending.append(
-                        (
-                            entity,
-                            [
-                                {
-                                    "uuid": cast(str, best["uuid"]),
-                                    "name": cast(str, best["name"]),
-                                    "summary": "",
-                                }
-                            ],
-                        )
+        for entity in vector_needed:
+            candidates = kg_client.find_similar_nodes(embeddings[entity.name], group_id, limit=5)
+            if not candidates:
+                mapping[entity.name] = _new_uuid()
+                continue
+            # Vector score is cosine distance (0=identical).
+            best = min(candidates, key=lambda c: c["score"])
+            similarity = 1.0 - float(best["score"])
+            if similarity < self._threshold:
+                mapping[entity.name] = _new_uuid()
+            elif similarity >= self._autoconfirm:
+                # Trust the embedding, skip the LLM (near-identical names).
+                mapping[entity.name] = cast(str, best["uuid"])
+            else:
+                pending.append(
+                    (
+                        entity,
+                        [
+                            {
+                                "uuid": cast(str, best["uuid"]),
+                                "name": cast(str, best["name"]),
+                                "summary": "",
+                            }
+                        ],
                     )
+                )
 
         # Phase 2: ONE batched confirm for everything that needs a decision.
         if pending:
