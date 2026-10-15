@@ -66,10 +66,16 @@ run_psql() {
 }
 
 # Every migration, in order. Zero-padded NNN_ prefixes make the glob's order the
-# numeric order.
+# numeric order; a .sql that doesn't follow the pattern would silently never run.
+shopt -s nullglob
 ALL_FILES=()
-for f in "$SCHEMA_DIR"/[0-9][0-9][0-9]_*.sql; do
-  ALL_FILES+=("$(basename "$f")")
+for f in "$SCHEMA_DIR"/*.sql; do
+  b="$(basename "$f")"
+  if ! [[ "$b" =~ ^[0-9]{3}_.+\.sql$ ]]; then
+    echo "ERROR: $b in $SCHEMA_DIR is not named NNN_name.sql, so it would never be applied." >&2
+    exit 1
+  fi
+  ALL_FILES+=("$b")
 done
 if (( ${#ALL_FILES[@]} == 0 )); then
   echo "ERROR: no NNN_*.sql files in $SCHEMA_DIR." >&2

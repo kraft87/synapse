@@ -123,3 +123,11 @@ def test_all_and_from_are_exclusive(scratch):
     r = _run(dsn, schema_dir, "--all", "--from", "2")
     assert r.returncode != 0
     assert "mutually exclusive" in r.stderr
+
+
+def test_a_misnamed_migration_is_an_error_not_a_silent_skip(scratch):
+    dsn, schema_dir = scratch
+    (schema_dir / "4_late.sql").write_text("INSERT INTO applied VALUES ('4');")
+    r = _run(dsn, schema_dir)
+    assert r.returncode != 0
+    assert "4_late.sql" in r.stderr
