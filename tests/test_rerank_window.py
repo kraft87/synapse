@@ -8,8 +8,10 @@ it a strict, no-regression change).
 
 from __future__ import annotations
 
-import mcp_server.recall as recall_mod
-from mcp_server.recall import _RERANK_DOC_CAP, Recall, _bm25_best_window, _bm25_tokenize
+from mcp_server.recall import Recall, _bm25_best_window, _bm25_tokenize
+from mcp_server.recall_config import RecallConfig
+
+_RERANK_DOC_CAP = RecallConfig().rerank_doc_cap
 
 
 def _mk(content: str) -> dict:
@@ -35,30 +37,19 @@ def test_window_locates_query_region_past_the_head():
 
 
 # --- _rerank_docs ----------------------------------------------------------
-def test_rerank_docs_short_items_head_only(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RERANK_WINDOW", True)
+def test_rerank_docs_short_items_head_only():
     r = Recall("", "")
     docs, owner = r._rerank_docs("q", [_mk("a" * 100), _mk("b" * 100)])
     assert owner == [0, 1]
     assert len(docs) == 2
 
 
-def test_rerank_docs_long_item_adds_window(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RERANK_WINDOW", True)
+def test_rerank_docs_long_item_adds_window():
     r = Recall("", "")
     long = "x " * (_RERANK_DOC_CAP)  # > cap chars
     docs, owner = r._rerank_docs("q", [_mk("short"), _mk(long)])
     assert owner == [0, 1, 1]  # short -> head; long -> head + window
     assert len(docs) == 3
-
-
-def test_rerank_docs_flag_off_head_only(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RERANK_WINDOW", False)
-    r = Recall("", "")
-    long = "x " * (_RERANK_DOC_CAP)
-    docs, owner = r._rerank_docs("q", [_mk(long)])
-    assert owner == [0]
-    assert len(docs) == 1
 
 
 # --- max-collapse in _rerank_pool_scored -----------------------------------
@@ -70,8 +61,7 @@ class _FakeEmb:
         return [(i, self._scores[i]) for i in range(len(docs))]
 
 
-def test_pool_scored_scores_episode_by_max_of_its_docs(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RERANK_WINDOW", True)
+def test_pool_scored_scores_episode_by_max_of_its_docs():
     r = Recall("", "")
     long = "x " * (_RERANK_DOC_CAP)
     pool = [_mk("short"), _mk(long)]
@@ -84,8 +74,7 @@ def test_pool_scored_scores_episode_by_max_of_its_docs(monkeypatch):
     assert len(scored) == 2  # collapsed back to one entry per pool item
 
 
-def test_pool_scored_degrades_to_rrf_on_rerank_error(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RERANK_WINDOW", True)
+def test_pool_scored_degrades_to_rrf_on_rerank_error():
     r = Recall("", "")
 
     class _Boom:

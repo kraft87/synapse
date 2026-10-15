@@ -15,8 +15,14 @@ import psycopg
 import pytest
 
 import ingestion.notes as notes_mod
+from ingestion import pg_pool
 from ingestion.db import Database
-from ingestion.db_notes import NOTES_HISTORY_PROBE, select_board_notes
+from ingestion.db_notes import (
+    NOTES_HISTORY_PROBE,
+    get_notes_by_ids,
+    search_live_notes,
+    select_board_notes,
+)
 from ingestion.notes import _OWNER, reconcile_note
 from tests.helpers.embed import GROUP, onehot
 
@@ -229,6 +235,28 @@ def test_get_notes_by_ids(conn, db_url):
     assert rows[0]["body"] == "Body one."
     assert set(rows[0]) == {"id", "hook", "body", "type", "project", "audience", "updated_at"}
     assert db.get_notes_by_ids([]) == []
+    db.close()
+    _wipe(conn)
+
+
+def test_recall_reads_notes_on_an_autocommit_borrow(conn, db_url):
+    """search_live_notes and get_notes_by_ids take a connection, so recall runs each as one
+    statement on a pooled autocommit borrow, scoped like the board."""
+    _wipe(conn)
+    db = Database(db_url)
+    usr = _insert(db, type="user", hook="User fact", slot=18)
+    pa = _insert(db, type="project", project="proj-a", hook="A fact", slot=19)
+    _insert(db, type="project", project="proj-b", hook="B fact", slot=20)
+    retired = _insert(db, type="user", hook="Retired fact", slot=18)
+    db.supersede_note(retired, usr)
+    with pg_pool.connection(db_url) as borrowed:
+        hits = search_live_notes(borrowed, _OWNER, "proj-a", onehot(19), limit=10)
+        assert hits[0]["id"] == pa  # nearest first
+        assert {h["id"] for h in hits} == {usr, pa}  # proj-b and the retired row are out
+        assert [h["id"] for h in search_live_notes(borrowed, _OWNER, None, onehot(19))] == [usr]
+        assert borrowed.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS
+        assert [r["id"] for r in get_notes_by_ids(borrowed, [pa, usr, 999999999])] == [usr, pa]
+        assert get_notes_by_ids(borrowed, []) == []
     db.close()
     _wipe(conn)
 

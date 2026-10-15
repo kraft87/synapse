@@ -22,11 +22,11 @@ import uuid
 
 import pytest
 
-import mcp_server.recall as recall_mod
 from ingestion.db import Database
 from mcp_server import server
 from mcp_server.board import _OWNER, build_board, record_board_metrics
 from mcp_server.recall import Recall
+from mcp_server.recall_config import RecallConfig
 
 pytestmark = pytest.mark.db
 
@@ -55,10 +55,10 @@ def _pool(n: int = 4) -> list[dict]:
     ]
 
 
-def _wired(db_url: str, scores: list[float]) -> Recall:
+def _wired(db_url: str, scores: list[float], floor: float = 0.0) -> Recall:
     """A Recall whose search/feedback legs are stubbed (same set as test_recall_floor's
     harness) but whose telemetry writer is REAL — the row lands in the test DB."""
-    r = Recall(db_url, "")
+    r = Recall(db_url, "", config=RecallConfig(recall_floor=floor))
     p = _pool()
     r._ensure_embedder = lambda: _FakeEmbedder()
     r._ensure_timeline = lambda: _FakeTimeline()
@@ -100,9 +100,8 @@ def _newest(conn, engine: Recall, kind: str, cols: str, after: int):
 
 
 def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry shape pin recall {uuid.uuid4().hex[:8]}"
-    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])  # real scores, above the floor
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59], floor=0.58)  # real scores, above the floor
     mark = _watermark(conn)
     out = engine.recall(q, source="mcp-tool", surface=full_surface)
     assert out["episodes"]
@@ -149,12 +148,11 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
 def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, full_surface):
     """No flag: a hook-injected self_session always drops the caller's own episodes from
     the overview, and the envelope records how many were dropped."""
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry self exclusion recall {uuid.uuid4().hex[:8]}"
     p = _pool()
     for i, ep in enumerate(p):
         ep["session_id"] = "MY-SESSION" if i < 2 else f"other-{i}"
-    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59], floor=0.58)
     engine._search_bm25_episodes = lambda q_, proj, limit, sid=None, allowed=None, own=None: [
         dict(e) for e in p
     ]
@@ -173,9 +171,8 @@ def test_recall_kind_self_excludes_calling_session(conn, db_url, monkeypatch, fu
 def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypatch, full_surface):
     """Facts sourced only from the calling session drop out of the facts bucket and the
     supersession extras, are not retrieval-bumped, and are counted in the envelope."""
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry self exclusion facts {uuid.uuid4().hex[:8]}"
-    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59], floor=0.58)
     kg = [
         {"fact": f"fact {k}", "_uuid": k, "_id": i, "_date": None}
         for i, k in enumerate(("own-1", "old-1", "own-2"), start=1)
@@ -230,9 +227,8 @@ def test_recall_without_self_session_never_looks_up_fact_provenance(db_url, full
 
 
 def test_episodes_kind_row_shape_records_abstention_shadow(conn, db_url, monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry shape pin episodes {uuid.uuid4().hex[:8]}"
-    engine = _wired(db_url, [0.31, 0.22, 0.11, 0.05])  # real scores, below the floor
+    engine = _wired(db_url, [0.31, 0.22, 0.11, 0.05], floor=0.58)  # real scores, below the floor
     monkeypatch.setattr(server, "_recall_engine", engine)
     mark = _watermark(conn)
     out = server.recall_full_turns(q)  # the MCP surface path for the drill-down
@@ -398,8 +394,7 @@ def test_board_kind_row_shape(conn, db_url, full_surface):
 def test_overlay_gets_the_served_passage_text(conn, db_url, monkeypatch, full_surface):
     """The episode-validity overlay is judged against what was served for each episode,
     so a chunk-cited successor only lands on a passage that states the retired claim."""
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
+    engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59], floor=0.58)
     seen: list[dict] = []
     engine._episode_supersessions = lambda ids, g, **k: seen.append({"ids": ids, **k}) or {}
     out = engine.recall("overlay text", source="mcp-tool", surface=full_surface)

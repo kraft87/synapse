@@ -21,11 +21,13 @@ from typing import Any, ClassVar
 import mcp_server.recall as recall_mod
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server.recall import Recall, _to_recall_item
+from mcp_server.recall_config import RecallConfig
 
 
 def _bare() -> Recall:
     r = object.__new__(Recall)
     r._db_url = "postgresql://stub"
+    r._config = RecallConfig()
     r._leg_executor = ThreadPoolExecutor(max_workers=2)
     return r
 

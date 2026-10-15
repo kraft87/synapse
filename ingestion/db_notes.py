@@ -23,7 +23,7 @@ class NoteStore(DatabaseConnection):
         """Live notes for one owner/group, nearest to ``embedding`` by cosine (over the
         HOOK — the embed target). Returns ``[{id, hook, body, type, project, updated_at,
         sim}]`` in DESCENDING similarity. The reconcile path's dedup/supersession decision
-        reads this."""
+        reads this; recall's notes leg reads ``search_live_notes`` (module level)."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
@@ -47,46 +47,6 @@ class NoteStore(DatabaseConnection):
             }
             for r in rows
         ]
-
-    def search_live_notes(
-        self,
-        owner_id: str,
-        project: str | None,
-        embedding: list[float],
-        limit: int = 24,
-        audience: str | None = None,
-    ) -> list[dict[str, Any]]:
-        """Live notes nearest to ``embedding`` (hook KNN), scoped like the board: global
-        types (user/feedback/reference) always in, project notes only for the caller's
-        project (``project = NULL`` matches global types only). No group filter — notes
-        span groups and the board doesn't filter either. recall()'s notes leg reads this;
-        ``find_live_notes`` (above) stays the reconcile path's owner/group-exact probe.
-
-        ``audience`` (schema 053) narrows to one tier — recall passes 'work-safe' for a
-        restricted surface, None for a full-trust one. Filtering here rather than after
-        the KNN keeps a restricted caller's serve at full width instead of spending its
-        _NOTES_FETCH budget on rows it can never see."""
-        vlit = _vector_literal(embedding)
-        clauses = [
-            "owner_id = %s",
-            "superseded_by IS NULL",
-            "embedding IS NOT NULL",
-            "(type IN ('user','feedback','reference') OR project = %s)",
-        ]
-        params: list[Any] = [vlit, owner_id, project]
-        if audience is not None:
-            clauses.append("audience = %s")
-            params.append(audience)
-        with self._conn() as conn:
-            rows = conn.execute(
-                f"SELECT id, hook, body, type, project, audience, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int; the WHERE clauses are literals with bound params
-                f"1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "
-                "FROM notes "
-                f"WHERE {' AND '.join(clauses)} "
-                f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
-                (*params, vlit, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]
 
     def insert_note(
         self,
@@ -192,26 +152,9 @@ class NoteStore(DatabaseConnection):
             )
 
     def get_notes_by_ids(self, ids: list[int], audience: str | None = None) -> list[dict[str, Any]]:
-        """Fetch note bodies by id — the on-demand half of the board (hook on the board,
-        body behind the id). Silently drops unknown ids.
-
-        ``audience`` applies the same tier filter the overview paths use. Ids are
-        guessable, so drill-down MUST NOT be a way around the board's filter: a
-        restricted caller asking for an id it was never served simply gets nothing."""
-        if not ids:
-            return []
-        clauses = ["id = ANY(%s)"]
-        params: list[Any] = [ids]
-        if audience is not None:
-            clauses.append("audience = %s")
-            params.append(audience)
+        """Note bodies by id (see the module-level ``get_notes_by_ids``)."""
         with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT id, hook, body, type, project, audience, updated_at FROM notes "  # nosec B608 — clause list is literal, values are bound
-                f"WHERE {' AND '.join(clauses)} ORDER BY id",
-                params,
-            ).fetchall()
-        return [dict(r) for r in rows]
+            return get_notes_by_ids(conn, ids, audience)
 
     def restricted_surface_projects(self) -> list[str]:
         """Every project any REGISTERED restricted surface may read (schema 053).
@@ -450,6 +393,78 @@ def select_board_notes(
             f"WHERE {' AND '.join(clauses)} "
             "ORDER BY CASE type WHEN 'feedback' THEN 0 WHEN 'user' THEN 1 "
             "WHEN 'project' THEN 2 ELSE 3 END, updated_at DESC",
+            params,
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def search_live_notes(
+    conn: psycopg.Connection[Any],
+    owner_id: str,
+    project: str | None,
+    embedding: list[float],
+    limit: int = 24,
+    audience: str | None = None,
+) -> list[dict[str, Any]]:
+    """Live notes nearest to ``embedding`` (hook KNN), scoped like the board: global
+    types (user/feedback/reference) always in, project notes only for the caller's
+    project (``project = NULL`` matches global types only). No group filter — notes
+    span groups and the board doesn't filter either. recall()'s notes leg reads this;
+    ``NoteStore.find_live_notes`` stays the reconcile path's owner/group-exact probe.
+
+    ``audience`` (schema 053) narrows to one tier — recall passes 'work-safe' for a
+    restricted surface, None for a full-trust one. Filtering here rather than after
+    the KNN keeps a restricted caller's serve at full width instead of spending its
+    notes_fetch budget on rows it can never see.
+
+    Takes the connection, like ``select_board_notes``, so recall can run it on a pooled
+    autocommit borrow (one statement, no BEGIN/COMMIT around it)."""
+    vlit = _vector_literal(embedding)
+    clauses = [
+        "owner_id = %s",
+        "superseded_by IS NULL",
+        "embedding IS NOT NULL",
+        "(type IN ('user','feedback','reference') OR project = %s)",
+    ]
+    params: list[Any] = [vlit, owner_id, project]
+    if audience is not None:
+        clauses.append("audience = %s")
+        params.append(audience)
+    with conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            f"SELECT id, hook, body, type, project, audience, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int; the WHERE clauses are literals with bound params
+            f"1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "
+            "FROM notes "
+            f"WHERE {' AND '.join(clauses)} "
+            f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
+            (*params, vlit, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_notes_by_ids(
+    conn: psycopg.Connection[Any], ids: list[int], audience: str | None = None
+) -> list[dict[str, Any]]:
+    """Fetch note bodies by id — the on-demand half of the board (hook on the board,
+    body behind the id). Silently drops unknown ids.
+
+    ``audience`` applies the same tier filter the overview paths use. Ids are
+    guessable, so drill-down MUST NOT be a way around the board's filter: a
+    restricted caller asking for an id it was never served simply gets nothing.
+
+    Takes the connection like ``select_board_notes``; fetch() runs it on a pooled
+    autocommit borrow."""
+    if not ids:
+        return []
+    clauses = ["id = ANY(%s)"]
+    params: list[Any] = [ids]
+    if audience is not None:
+        clauses.append("audience = %s")
+        params.append(audience)
+    with conn.cursor(row_factory=dict_row) as cur:
+        rows = cur.execute(
+            "SELECT id, hook, body, type, project, audience, updated_at FROM notes "  # nosec B608 — clause list is literal, values are bound
+            f"WHERE {' AND '.join(clauses)} ORDER BY id",
             params,
         ).fetchall()
     return [dict(r) for r in rows]

@@ -38,7 +38,7 @@ def vector_web_sql(dims: int) -> str:
 
 class RecallWebMixin:
     def _search_bm25_web(self, query: str, limit: int) -> list[dict[str, Any]]:
-        # Same no-alphanumeric-tokens short-circuit as _bm25_table.
+        # Same no-alphanumeric-tokens short-circuit as _search_bm25_episodes.
         if not any(c.isalnum() for c in query):
             return []
         try:
@@ -67,7 +67,7 @@ class RecallWebMixin:
         try:
             with self._pg() as pg:
                 rows = pg.execute(
-                    vector_web_sql(self._settings()._EMBED_DIMS),
+                    vector_web_sql(self._config.embed_dims),
                     (emb_literal, emb_literal, limit),
                 ).fetchall()
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
@@ -98,23 +98,23 @@ class RecallWebMixin:
 
     def _search_web_reranked(self, query: str, query_emb: list[float]) -> list[dict[str, Any]]:
         """Web bucket (2026-07-24): fuse BM25 + vector via RRF, cross-encoder rerank the pool,
-        DROP chunks below _WEB_FLOOR (off-topic collisions), dedupe by parent page, cap to
-        _WEB_LIMIT. May return [] when nothing clears the floor — that self-gates web on intent.
+        DROP chunks below ``web_floor`` (off-topic collisions), dedupe by parent page, cap to
+        ``web_limit``. May return [] when nothing clears the floor — that self-gates web on intent.
 
         Replaces the old vector-only leg: BM25 was written (_search_bm25_web) but never wired,
         and the raw bi-encoder ranking served ~2.6% precision (feedback). The rerank is the active
         ingredient (it reads content topicality, not surface tokens); fusion widens the candidate
         pool the reranker sees. Degrades safe: on reranker outage/disable (top score 0.0) it serves
         the fused RRF order deduped rather than blanking the bucket or hard-failing."""
-        settings = self._settings()
-        bm25 = self._search_bm25_web(query, settings._WEB_FETCH)
-        vec = self._search_vector_web(query_emb, settings._WEB_FETCH)
-        fused = _merge_rrf(bm25, vec, id_key="id")[: settings._WEB_RERANK_POOL]
+        cfg = self._config
+        bm25 = self._search_bm25_web(query, cfg.web_fetch)
+        vec = self._search_vector_web(query_emb, cfg.web_fetch)
+        fused = _merge_rrf(bm25, vec, id_key="id")[: cfg.web_rerank_pool]
         if not fused:
             return []
         scored = self._rerank_pool_scored(query, fused)
-        if settings._WEB_FLOOR > 0 and scored and scored[0][1] > 0.0:
-            ranked = [fused[i] for i, s in scored if s >= settings._WEB_FLOOR]
+        if cfg.web_floor > 0 and scored and scored[0][1] > 0.0:
+            ranked = [fused[i] for i, s in scored if s >= cfg.web_floor]
         else:  # floor disabled, or reranker degraded to RRF order (no score signal)
             ranked = [fused[i] for i, _ in scored] if scored else fused
-        return self._dedupe_by_artifact(ranked, settings._WEB_LIMIT)
+        return self._dedupe_by_artifact(ranked, cfg.web_limit)

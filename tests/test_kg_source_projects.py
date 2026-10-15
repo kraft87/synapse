@@ -34,8 +34,8 @@ from ingestion import schema_check
 from ingestion.kg_client import KGClient
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
-from mcp_server import recall_sources as recall_sources_mod
 from mcp_server.recall import Recall
+from mcp_server.recall_sources import KG_SCOPE_PROBE
 from mcp_server.recall_warnings import warn_sink
 from tests.helpers.db import DB_URL
 from tests.helpers.embed import GROUP, onehot
@@ -632,9 +632,29 @@ def test_restricted_kg_paths_serve_nothing_without_the_column(no_column, caplog)
         assert r._surface_supersessions(onehot(1), GROUP, allowed_projects=allowed) == []
         assert r._episode_supersessions([ids["w"]], GROUP, allowed_projects=allowed) == {}
     assert sink == [], "the pre-056 restricted skip added no response warning"
-    missing = [m for m in caplog.messages if "source_projects is missing" in m]
+    missing = [m for m in caplog.messages if "source_projects (schema 056" in m]
     assert len(missing) == 1, "one log warning, not one per call"
     assert all(rec.levelno <= logging.WARNING for rec in caplog.records)
+
+
+class _Applied:
+    """A connection on which the probe finds the column."""
+
+    def transaction(self):
+        return nullcontext()
+
+    def execute(self, sql):
+        return self
+
+    def fetchone(self):
+        return (1,)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_probe():
+    KG_SCOPE_PROBE.reset()
+    yield
+    KG_SCOPE_PROBE.reset()
 
 
 def test_a_column_lost_after_the_probe_cached_it_still_fails_closed(no_column, caplog):
@@ -642,13 +662,13 @@ def test_a_column_lost_after_the_probe_cached_it_still_fails_closed(no_column, c
     caught on the restricted path."""
     tx, _ids = no_column
     r = _engine_on(tx)
-    r._kg_scope_ok = True
+    assert KG_SCOPE_PROBE.ready(_Applied(), r._db_url)
     sink: list[str] = []
     with caplog.at_level(logging.WARNING), warn_sink(sink):
         out = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
     assert out == ([], [])
     assert sink == []
-    assert r._kg_scope_ok is False
+    assert KG_SCOPE_PROBE.cached(r._db_url) is False
 
 
 def test_full_trust_keeps_working_without_the_column(no_column):
@@ -687,9 +707,9 @@ def test_applying_056_under_a_running_engine_takes_effect_without_a_restart(
     engine starts serving restricted facts."""
     _seed_kg(kg)
     r = Recall(db_url, "")
-    r._kg_scope_missing()  # as if a probe had just found no column
+    KG_SCOPE_PROBE.missing(r._db_url)  # as if a probe had just found no column
     assert r._kg_scope_ready() is False  # inside the TTL: no re-probe yet
-    monkeypatch.setattr(recall_sources_mod, "_KG_SCOPE_REPROBE_S", 0.0)
+    monkeypatch.setattr(KG_SCOPE_PROBE, "reprobe_s", 0.0)
     assert r._kg_scope_ready() is True
     facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
     assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}

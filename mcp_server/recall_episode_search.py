@@ -17,9 +17,9 @@ from ingestion.surfaces import (
     own_surface_if_ready,
 )
 from mcp_server.kg_pg import _vec_literal
+from mcp_server.recall_config import RecallConfig
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_ranking import timed as _timed
-from mcp_server.recall_settings import RecallSettings
 from mcp_server.recall_warnings import config_hint as _config_hint
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import submit_with_context as _submit_ctx
@@ -47,7 +47,7 @@ class EpisodeLegs(NamedTuple):
     f_vec: Future[tuple[list[dict[str, Any]], float]] | None  # None: no query embedding
     query_emb: list[float] | None
     ms_embed: float
-    # The chunk candidate sources (SYNAPSE_RECALL_CHUNK_CANDIDATES): each is a ranked list
+    # The chunk candidate sources (RecallConfig.chunk_candidates): each is a ranked list
     # of episodes, like the legs above. None: the setting is off, or the source cannot run.
     f_chunk_bm25: Future[list[dict[str, Any]]] | None = None
     f_chunk_vec: Future[list[dict[str, Any]]] | None = None
@@ -66,12 +66,12 @@ class EpisodePool(NamedTuple):
 
 class RecallEpisodeSearchMixin:
     _db_url: str
+    _config: RecallConfig
     _leg_executor: ThreadPoolExecutor
 
     if TYPE_CHECKING:
 
         def _pg(self) -> AbstractContextManager[Any]: ...
-        def _settings(self) -> RecallSettings: ...
         def _ensure_embedder(self) -> Any: ...
         @staticmethod
         def _exclude_self(
@@ -93,31 +93,11 @@ class RecallEpisodeSearchMixin:
             logger.warning("own-surface probe skipped (%s)", e)
             return None
 
-    @staticmethod
-    def _ts_col(table: str) -> str:
-        """Timestamp column name varies by table."""
-        return "generated_at" if table == "synth_documents" else "created_at"
-
-    @staticmethod
-    def _extra_cols(table: str) -> str:
-        # Slim SELECT: only fields read by the ranking pipeline. Drill-down
-        # columns (source_ids, sequence ranges, synth_type) are dropped — caller
-        # never sees them, so don't waste DB→Python wire bytes.
-        # retrieval_count IS kept for episodes because _feedback_multiplier reads it.
-        # session_id IS kept for episodes because the passage serve-cap reads it to break
-        # self/recency domination (one session monopolising the served bucket). It is still
-        # dropped from the caller-facing item by _to_recall_item — internal ranking use only.
-        if table == "episodes":
-            return ", retrieval_count, session_id"
-        return ""
-
-    def _bm25_table(
+    def _search_bm25_episodes(
         self,
-        table: str,
         query: str,
         project: str | None,
         limit: int,
-        doc_type: str,
         session_id: str | None = None,
         allowed_projects: list[str] | None = None,
         own_surface: str | None = None,
@@ -128,14 +108,12 @@ class RecallEpisodeSearchMixin:
         # legs' sanitize-then-empty check.
         if not any(c.isalnum() for c in query):
             return []
-        ts = self._ts_col(table)
-        extra = self._extra_cols(table)
         where = ["id @@@ paradedb.match('content', %s)"]
         params: list[Any] = [query]
         if project:
             where.append("project = %s")
             params.append(project)
-        if session_id:  # episodes only — the session-scoped drill-down filter
+        if session_id:  # the session-scoped drill-down filter
             where.append("session_id = %s")
             params.append(session_id)
         scope = episode_scope_sql(allowed_projects, own_surface)
@@ -148,100 +126,28 @@ class RecallEpisodeSearchMixin:
             params.extend(scope[1])
         try:
             with self._pg() as pg:
+                # Slim SELECT: only what the ranking pipeline reads. retrieval_count feeds
+                # feedback_multiplier; session_id lets the passage serve-cap stop one session
+                # monopolising the bucket (_to_recall_item drops it from the served item).
                 rows = pg.execute(
                     f"""
-                    SELECT id, content, project,
-                           {ts} AS created_at{extra},
+                    SELECT id, content, project, created_at, retrieval_count, session_id,
                            paradedb.score(id) AS bm25_score
-                    FROM {table}
+                    FROM episodes
                     WHERE {" AND ".join(where)}
                     ORDER BY bm25_score DESC LIMIT %s
                     """,
                     (*params, limit),
                 ).fetchall()
-            return [
-                {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
-            ]
+            return [{**dict(r), "doc_type": "episode", "id": f"e:{r['id']}"} for r in rows]
         except Exception as e:
             if own_surface and OWN_SURFACE_PROBE.note_error(e, self._db_url):
                 # Schema 057 rolled back under a running engine: the pre-057 serve.
-                return self._bm25_table(
-                    table, query, project, limit, doc_type, session_id, allowed_projects
+                return self._search_bm25_episodes(
+                    query, project, limit, session_id, allowed_projects
                 )
-            logger.warning("BM25 %s search failed: %s", table, e)
-            _warn(f"BM25 {table} search failed ({_err_brief(e)}): lexical leg served nothing.")
-            return []
-
-    def _search_bm25_episodes(
-        self,
-        query: str,
-        project: str | None,
-        limit: int,
-        session_id: str | None = None,
-        allowed_projects: list[str] | None = None,
-        own_surface: str | None = None,
-    ) -> list[dict[str, Any]]:
-        return self._bm25_table(
-            "episodes", query, project, limit, "episode", session_id, allowed_projects, own_surface
-        )
-
-    def _vector_table(
-        self,
-        table: str,
-        emb_literal: str,
-        project: str | None,
-        limit: int,
-        doc_type: str,
-        session_id: str | None = None,
-        allowed_projects: list[str] | None = None,
-        own_surface: str | None = None,
-    ) -> list[dict[str, Any]]:
-        settings = self._settings()
-        ts = self._ts_col(table)
-        extra = self._extra_cols(table)
-        # Distance is computed over halfvec(N), NOT vector(N). The default embeddings are
-        # 2048-dim (voyage-4-large), which exceeds pgvector's 2000-dim limit for HNSW on
-        # the full `vector` type — so the HNSW indexes are built on `embedding::halfvec(N)`
-        # (half-precision, index limit 4000 dims), with N = _EMBED_DIMS as provisioned.
-        # The ORDER BY expression must match that index expression verbatim to be served
-        # from it; the alias form is NOT index-eligible.
-        # Half precision is loss-free for what's served: recall@10 vs exact scan = 1.000,
-        # recall@100 = 0.981 (and the reranker re-scores the pool). 878ms -> 23ms on episodes.
-        where = ["is_embedded = TRUE"]
-        params: list[Any] = [emb_literal]
-        if project:
-            where.append("project = %s")
-            params.append(project)
-        if session_id:  # episodes only — the session-scoped drill-down filter
-            where.append("session_id = %s")
-            params.append(session_id)
-        scope = episode_scope_sql(allowed_projects, own_surface)
-        if scope is not None:  # restricted surface (schema 053/057) — see _bm25_table
-            where.append(scope[0])
-            params.extend(scope[1])
-        try:
-            with self._pg() as pg:
-                rows = pg.execute(
-                    f"""
-                    SELECT id, content, project,
-                           {ts} AS created_at{extra},
-                           (embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS vec_distance
-                    FROM {table}
-                    WHERE {" AND ".join(where)}
-                    ORDER BY embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) ASC LIMIT %s
-                    """,
-                    (*params, emb_literal, limit),
-                ).fetchall()
-            return [
-                {**dict(r), "doc_type": doc_type, "id": f"{doc_type[0]}:{r['id']}"} for r in rows
-            ]
-        except Exception as e:
-            if own_surface and OWN_SURFACE_PROBE.note_error(e, self._db_url):
-                return self._vector_table(
-                    table, emb_literal, project, limit, doc_type, session_id, allowed_projects
-                )
-            logger.warning("Vector %s search failed: %s", table, e)
-            _warn(f"vector {table} search failed ({_err_brief(e)}): semantic leg served nothing.")
+            logger.warning("BM25 episodes search failed: %s", e)
+            _warn(f"BM25 episodes search failed ({_err_brief(e)}): lexical leg served nothing.")
             return []
 
     def _search_vector_episodes(
@@ -254,16 +160,48 @@ class RecallEpisodeSearchMixin:
         own_surface: str | None = None,
     ) -> list[dict[str, Any]]:
         emb_literal = _vec_literal(query_emb)
-        return self._vector_table(
-            "episodes",
-            emb_literal,
-            project,
-            limit,
-            "episode",
-            session_id,
-            allowed_projects,
-            own_surface,
-        )
+        dims = self._config.embed_dims
+        # Distance is computed over halfvec(N), NOT vector(N). The default embeddings are
+        # 2048-dim (voyage-4-large), which exceeds pgvector's 2000-dim limit for HNSW on
+        # the full `vector` type — so the HNSW indexes are built on `embedding::halfvec(N)`
+        # (half-precision, index limit 4000 dims), with N = embed_dims as provisioned.
+        # The ORDER BY expression must match that index expression verbatim to be served
+        # from it; the alias form is NOT index-eligible.
+        # Half precision is loss-free for what's served: recall@10 vs exact scan = 1.000,
+        # recall@100 = 0.981 (and the reranker re-scores the pool). 878ms -> 23ms on episodes.
+        where = ["is_embedded = TRUE"]
+        params: list[Any] = [emb_literal]
+        if project:
+            where.append("project = %s")
+            params.append(project)
+        if session_id:  # the session-scoped drill-down filter
+            where.append("session_id = %s")
+            params.append(session_id)
+        scope = episode_scope_sql(allowed_projects, own_surface)
+        if scope is not None:  # restricted surface (schema 053/057) — see _search_bm25_episodes
+            where.append(scope[0])
+            params.extend(scope[1])
+        try:
+            with self._pg() as pg:
+                rows = pg.execute(
+                    f"""
+                    SELECT id, content, project, created_at, retrieval_count, session_id,
+                           (embedding::halfvec({dims}) <=> %s::halfvec({dims})) AS vec_distance
+                    FROM episodes
+                    WHERE {" AND ".join(where)}
+                    ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) ASC LIMIT %s
+                    """,
+                    (*params, emb_literal, limit),
+                ).fetchall()
+            return [{**dict(r), "doc_type": "episode", "id": f"e:{r['id']}"} for r in rows]
+        except Exception as e:
+            if own_surface and OWN_SURFACE_PROBE.note_error(e, self._db_url):
+                return self._search_vector_episodes(
+                    query_emb, project, limit, session_id, allowed_projects
+                )
+            logger.warning("Vector episodes search failed: %s", e)
+            _warn(f"vector episodes search failed ({_err_brief(e)}): semantic leg served nothing.")
+            return []
 
     def _chunk_episodes(
         self,
@@ -306,7 +244,7 @@ class RecallEpisodeSearchMixin:
     ) -> list[dict[str, Any]]:
         """Episodes of the chunks whose text best matches ``query`` by keyword: a candidate
         source for episodes whose own text misses the words a neighbouring turn carries."""
-        if not any(c.isalnum() for c in query):  # see _bm25_table
+        if not any(c.isalnum() for c in query):  # see _search_bm25_episodes
             return []
         where = ["id @@@ paradedb.match('content', %s)"]
         params: list[Any] = [query]
@@ -338,7 +276,7 @@ class RecallEpisodeSearchMixin:
         """Episodes of the chunks nearest to the query embedding. Needs the optional chunks
         vector index; without it the source says so and serves nothing, because the
         alternative is an exact scan of every chunk on every recall."""
-        dims = self._settings()._EMBED_DIMS
+        dims = self._config.embed_dims
         emb_literal = _vec_literal(query_emb)
         where = ["is_embedded = TRUE"]
         params: list[Any] = []
@@ -403,11 +341,11 @@ class RecallEpisodeSearchMixin:
         project allowlist to BOTH legs: it filters the pool, not the served slice, so the
         allowlisted content still gets the full deep-fetch width. ``own_surface`` widens
         that filter to the rows the calling surface ingested itself (schema 057)."""
-        settings = self._settings()
-        fetch = settings._EPISODE_FETCH
+        cfg = self._config
+        fetch = cfg.episode_fetch
         # Chunk sources feed more candidates into the same pool. A session-scoped drill-down
         # greps one conversation, which the episode legs already cover.
-        chunks = settings._CHUNK_CANDIDATES and session_id is None
+        chunks = cfg.chunk_candidates and session_id is None
         f_bm25 = _submit_ctx(
             self._leg_executor,
             _timed,
@@ -479,5 +417,5 @@ class RecallEpisodeSearchMixin:
             kept = self._exclude_self(fused, self_session)
             n_self_excluded = len(fused) - len(kept)
             fused = kept
-        pool = fused[: self._settings()._EPISODE_RERANK_POOL]
+        pool = fused[: self._config.episode_rerank_pool]
         return EpisodePool(pool, len(bm25_eps), len(vec_eps), n_self_excluded, ms_bm25, ms_vec)

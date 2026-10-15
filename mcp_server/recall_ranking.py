@@ -43,15 +43,6 @@ def feedback_multiplier(retrieval_count: Any) -> float:
         return 1.0
 
 
-def rrf_fuse(ranked_lists: list[list[str]], k: int = 1) -> dict[str, float]:
-    """Fuse ranked identifier lists into RRF scores."""
-    scores: dict[str, float] = {}
-    for ranked in ranked_lists:
-        for rank, identifier in enumerate(ranked):
-            scores[identifier] = scores.get(identifier, 0.0) + 1.0 / (rank + k + 1)
-    return scores
-
-
 def merge_rrf(
     *ranked_lists: list[dict[str, Any]],
     id_key: str = "id",
@@ -99,14 +90,3 @@ def served_chars(out: dict[str, Any]) -> int:
             str(historical.get("superseded_by") or "")
         )
     return size
-
-
-def cutoff_k(scores: list[float], tau: float, min_k: int, max_k: int) -> int:
-    """Return the bounded count whose score is at least ``tau`` times the top score."""
-    if not scores:
-        return 0
-    top = scores[0]
-    if top <= 0:
-        return min(len(scores), max_k)
-    keep = sum(1 for score in scores if score >= tau * top)
-    return min(max(keep, min_k), max_k, len(scores))

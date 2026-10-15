@@ -87,7 +87,7 @@ def _events(rng: random.Random, n: int) -> list[dict[str, Any]]:
 
 
 def _db_ordered(notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The order list_board_notes serves: type rank, then newest-updated first."""
+    """The order select_board_notes serves: type rank, then newest-updated first."""
     rank = {"feedback": 0, "user": 1, "project": 2, "reference": 3}
     return sorted(notes, key=lambda n: (rank[n["type"]], -n["updated_at"].timestamp()))
 

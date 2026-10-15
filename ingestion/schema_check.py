@@ -30,6 +30,7 @@ import logging
 import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -180,8 +181,10 @@ class ColumnProbe:
 
     The probe runs on the CALLER's connection, inside a transaction block (a savepoint
     when one is already open), so a probe failure never poisons the caller's
-    transaction. A failure answers False without caching. State is plain dicts: threads
-    race only to write the same answer, and the worst case is one extra probe.
+    transaction. A failure answers False and is not retried for ``reprobe_s``. Probes are
+    serialised, and the probe time is recorded when a probe ENDS, so legs that race for the
+    first answer wait for it instead of reading the probe in flight as "probed a moment
+    ago, so absent".
     """
 
     def __init__(self, sql: str, what: str, reprobe_s: float = 60.0) -> None:
@@ -191,26 +194,30 @@ class ColumnProbe:
         self._ok: dict[str, bool] = {}
         self._probed_at: dict[str, float] = {}
         self._warned: set[str] = set()
+        self._lock = threading.Lock()
 
     def ready(self, conn: Any, key: str = "") -> bool:
         """True when the migration's columns exist on ``conn``'s database."""
         if self._ok.get(key):
             return True
-        last = self._probed_at.get(key)
-        if last is not None and time.monotonic() - last < self.reprobe_s:
-            return False
-        self._probed_at[key] = time.monotonic()
-        try:
-            with conn.transaction():
-                row = conn.execute(self._sql).fetchone()
-        except Exception as e:
-            logger.warning("%s probe failed (%s); treating it as not applied", self._what, e)
-            return False
-        if row is None:
-            self.missing(key)
-            return False
-        self._ok[key] = True
-        return True
+        with self._lock:
+            if self._ok.get(key):  # another thread's probe answered while this one waited
+                return True
+            last = self._probed_at.get(key)
+            if last is not None and time.monotonic() - last < self.reprobe_s:
+                return False
+            try:
+                with conn.transaction():
+                    row = conn.execute(self._sql).fetchone()
+            except Exception as e:
+                self._probed_at[key] = time.monotonic()
+                logger.warning("%s probe failed (%s); treating it as not applied", self._what, e)
+                return False
+            if row is None:
+                self.missing(key)
+                return False
+            self._ok[key] = True
+            return True
 
     def cached(self, key: str = "") -> bool | None:
         """The cached answer for ``key`` without touching the database: True (applied),

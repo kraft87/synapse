@@ -130,15 +130,14 @@ def run_arm(
     from mcp_server.recall_warnings import warn_sink
 
     query, project = golden["query"], golden["project"]
-    base = engine._settings()
-    engine._settings = lambda: dataclasses.replace(base, _CHUNK_CANDIDATES=chunks_on)
+    engine._config = dataclasses.replace(engine._config, chunk_candidates=chunks_on)
     notices: list[str] = []
     started = time.perf_counter()
     with warn_sink(notices):
         pool = engine._join_episode_pool(engine._start_episode_legs(query, project))
         pool_ms = (time.perf_counter() - started) * 1000.0
         scored = engine._rerank_pool_scored(query, pool.items)
-        ranked, _scores, _top, _n_echo = engine._rank_episodes(query, pool.items, scored, max(ks))
+        ranked, _top, _n_echo = engine._rank_episodes(query, pool.items, scored, max(ks))
     total_ms = (time.perf_counter() - started) * 1000.0
     pool_ids = [item["id"] for item in pool.items]
     ranked_ids = [item["id"] for item in ranked]

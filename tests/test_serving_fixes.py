@@ -8,7 +8,7 @@
      the freed slots from the next-ranked candidates. Cost-contained by a C-speed
      shingle pre-filter and a lazy scan that stops at the needed survivor count.
 
-Both ship ON; each has an env kill switch that restores the prior ordering exactly.
+Both are always on (their env kill switches were deleted once the behaviour was validated).
 """
 
 from __future__ import annotations
@@ -17,11 +17,14 @@ from datetime import UTC, datetime, timedelta
 
 import mcp_server.recall as recall_mod
 from mcp_server.recall import Recall
+from mcp_server.recall_config import RecallConfig
 
 
 def _bare() -> Recall:
-    # bypass __init__ (no DB/Voyage) — these helpers only touch the pool + module knobs
-    return object.__new__(Recall)
+    # bypass __init__ (no DB/Voyage) — these helpers only touch the pool + the config
+    r = object.__new__(Recall)
+    r._config = RecallConfig()
+    return r
 
 
 def _ago(days: float) -> datetime:
@@ -43,18 +46,6 @@ def test_newer_lower_score_outranks_older_higher_within_floor():
     scored = [(0, 0.80), (1, 0.70)]  # reranker order: old first
     out = r._apply_rerank_recency(scored, pool)
     assert [pool[i]["id"] for i, _ in out] == ["e:new", "e:old"]
-
-
-def test_recency_kill_switch_is_byte_identical(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RERANK_RECENCY", False)
-    r = _bare()
-    pool = [
-        {"id": "e:old", "content": "old", "created_at": _ago(120)},
-        {"id": "e:new", "content": "new", "created_at": _ago(0)},
-    ]
-    scored = [(0, 0.80), (1, 0.70)]
-    # disabled -> returns the incoming (raw rerank) order, unchanged
-    assert r._apply_rerank_recency(scored, pool) == scored
 
 
 def test_recency_floor_prevents_annihilation():
@@ -102,17 +93,10 @@ def test_echo_flags_verbatim_quote():
 
 
 def test_echo_short_query_untouched():
-    # below _ECHO_MIN_QUERY_LEN the heuristic is meaningless — never suppress
+    # below echo_min_query_len the heuristic is meaningless — never suppress
     r = _bare()
     items = [{"id": "e:0", "content": "postgres postgres postgres"}]
     assert r._filter_query_echo("postgres", items, need=1) == ([0], 0)
-
-
-def test_echo_kill_switch_disables(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_SUPPRESS_QUERY_ECHO", False)
-    r = _bare()
-    items = [{"id": "e:echo", "content": _ECHO_QUERY}]
-    assert r._filter_query_echo(_ECHO_QUERY, items, need=1) == ([0], 0)
 
 
 # --- Fix 2 cost containment: shingle pre-filter + lazy scan ----------------------
@@ -167,7 +151,6 @@ def test_echo_scan_stops_after_needed_survivors(monkeypatch):
 def test_echo_dropped_and_backfilled_via_select(monkeypatch):
     # recall's shared selection path: the rank-0 echo is dropped and the freed slot
     # backfills from the next-ranked candidates so the served count does not shrink.
-    monkeypatch.setattr(recall_mod, "_EPISODE_CUTOFF_TAU", 0.0)  # fixed-k path
     r = _bare()
     pool = [
         {"id": "e:echo", "content": _ECHO_QUERY},  # the query quoting itself
@@ -181,41 +164,24 @@ def test_echo_dropped_and_backfilled_via_select(monkeypatch):
     assert [d["id"] for d in out] == ["e:1", "e:2"]  # echo gone, backfilled to full count
 
 
-def test_echo_kill_switch_restores_prior_selection(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_EPISODE_CUTOFF_TAU", 0.0)
-    monkeypatch.setattr(recall_mod, "_SUPPRESS_QUERY_ECHO", False)
-    r = _bare()
-    pool = [
-        {"id": "e:echo", "content": _ECHO_QUERY},
-        {"id": "e:1", "content": "sized the pool at four workers"},
-        {"id": "e:2", "content": "hnsw ef_search set to two hundred"},
-    ]
-    r._rerank_pool_scored = lambda q, p: [(i, 1.0 - i * 0.01) for i in range(len(p))]
-    out, n_echo, _top = r._select_episodes(_ECHO_QUERY, pool, limit=2)
-    assert n_echo == 0
-    assert [d["id"] for d in out] == ["e:echo", "e:1"]  # prior behavior: echo served
-
-
 # --- defaults -------------------------------------------------------------------
 
 
-def test_serving_fix_defaults_on():
-    # both validated fixes ship ON; the env vars are kill switches, not opt-ins
-    assert recall_mod._RERANK_RECENCY is True
-    assert recall_mod._SUPPRESS_QUERY_ECHO is True
-    assert recall_mod._RERANK_RECENCY_FLOOR == 0.25
+def test_recency_floor_default(monkeypatch):
+    monkeypatch.delenv("SYNAPSE_RERANK_RECENCY_FLOOR", raising=False)
+    assert RecallConfig().rerank_recency_floor == 0.25
 
 
 # --- BM25 empty-query short-circuit ---------------------------------------------
 
 
-def test_bm25_table_short_circuits_no_alnum_query():
+def test_bm25_episodes_short_circuits_no_alnum_query():
     # A query with no alphanumeric content tokenizes to nothing — the leg must
     # return "no candidates" without touching Postgres. _bare() has no pg, so
     # reaching _pg would blow up the test.
     r = _bare()
-    assert r._bm25_table("episodes", "?!... ---", None, 10, "episode") == []
-    assert r._bm25_table("episodes", "", None, 10, "episode") == []
+    assert r._search_bm25_episodes("?!... ---", None, 10) == []
+    assert r._search_bm25_episodes("", None, 10) == []
 
 
 def test_bm25_web_short_circuits_no_alnum_query():

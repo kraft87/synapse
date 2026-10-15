@@ -37,12 +37,11 @@ class RecallPassagesMixin:
         hybrid->rerank cascade's ceiling at this bounded chunk count, and rerank-only avoids a live
         passage embed. Serves at most n chunks as one item per parent episode, skipping chunks that
         repeat another episode's chosen chunk; ``stats`` (if given) gets ``n_dup_passages`` and
-        ``n_chunks_cut`` (chunks left out of the rerank by the _RECALL_PASSAGE_CAND budget).
+        ``n_chunks_cut`` (chunks left out of the rerank by the ``recall_passage_cand`` budget).
 
         Without a rerank signal (SYNAPSE_RERANK_PROVIDER=none, or the call failed) the passages
         are picked by keyword overlap instead: the best-matching chunk of each top episode, in
         episode order. Returns [] only when no episode has text to chunk."""
-        settings = self._settings()
         q_tokens = _bm25_tokenize(query)
         eps: list[dict[str, Any]] = []
         episode_chunks: list[list[tuple[str, int, int]]] = []  # (text, char_start, char_end)
@@ -68,7 +67,7 @@ class RecallPassagesMixin:
         for e, chunks, kept in zip(
             eps,
             episode_chunks,
-            _share_chunk_budget(episode_chunks, q_tokens, settings._RECALL_PASSAGE_CAND),
+            _share_chunk_budget(episode_chunks, q_tokens, self._config.recall_passage_cand),
             strict=True,
         ):
             for j in kept:

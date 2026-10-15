@@ -1,14 +1,13 @@
-"""Abstention floor (SYNAPSE_RECALL_FLOOR / SYNAPSE_RECALL_FLOOR_ENFORCE).
+"""Abstention floor (SYNAPSE_RECALL_FLOOR, RecallConfig.recall_floor).
 
 Marker: when real rerank scores exist and the RAW pre-recency top score is strictly below
 the floor, the recall_metrics served_ids envelope gains {"would_abstain": true,
-"floor": <float>} — recorded regardless of enforcement.
+"floor": <float>}.
 
-Enforcement (ON by default as of 2026-07-23): recall() drops the EPISODE bucket when the raw
-top rerank score is in (0, floor) under working retrieval (query_emb present). Facts and
-timeline are unaffected. recall_episodes() (drill-down) never enforces — the caller asked for
-turns. The marker still fires either way, so telemetry and payload agree on WHEN a recall was
-below the floor.
+Enforcement: recall() drops the EPISODE bucket when the raw top rerank score is in
+(0, floor) under working retrieval (query_emb present). Facts are unaffected.
+recall_episodes() (drill-down) never enforces — the caller asked for turns, but it records
+the marker. Telemetry and payload agree on WHEN a recall was below the floor.
 
 Pure-logic tests — no DB, no Voyage: every search leg is stubbed (same style as the other
 recall tests) and _record_metrics captures the telemetry row instead of writing it.
@@ -18,8 +17,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-import mcp_server.recall as recall_mod
-from mcp_server.recall import Recall, _floor_shadow
+from mcp_server.recall import Recall
+from mcp_server.recall_config import RecallConfig
 
 # Poison DSN, not "": libpq reads its PG* env vars for an empty conninfo, so an
 # unstubbed leg would quietly connect on any host that has them set (that is exactly
@@ -57,13 +56,19 @@ def _pool(n: int = 4) -> list[dict]:
     ]
 
 
-def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | None = None):
+def _wired(
+    scores: list[float],
+    *,
+    embed_fail: bool = False,
+    pool: list[dict] | None = None,
+    floor: float = 0.0,
+):
     """A Recall with every network/DB leg stubbed; returns (recall, captured_metric_rows).
 
     ``scores`` are the raw rerank scores handed back for the pool, by pool index (extra
-    entries ignored when the pool is shorter).
+    entries ignored when the pool is shorter). ``floor`` is the abstention floor (0 = off).
     """
-    r = Recall(_NO_DB, "")
+    r = Recall(_NO_DB, "", config=RecallConfig(recall_floor=floor))
     p = _pool() if pool is None else pool
     r._ensure_embedder = lambda: _FakeEmbedder(fail=embed_fail)
     r._ensure_timeline = lambda: _FakeTimeline()
@@ -95,37 +100,36 @@ def _wired(scores: list[float], *, embed_fail: bool = False, pool: list[dict] | 
 # --- _floor_shadow unit ----------------------------------------------------------
 
 
-def test_floor_shadow_marks_below_floor(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+def _shadow(floor: float, rerank_top: float, *, emb_ok: bool = True) -> dict:
     env: dict = {"episodes": [], "n_echo_suppressed": 0}
-    _floor_shadow(env, 0.31, emb_ok=True)
+    Recall(_NO_DB, "", config=RecallConfig(recall_floor=floor))._floor_shadow(
+        env, rerank_top, emb_ok=emb_ok
+    )
+    return env
+
+
+def test_floor_shadow_marks_below_floor():
+    env = _shadow(0.58, 0.31)
     assert env["would_abstain"] is True
     assert env["floor"] == 0.58
 
 
-def test_floor_shadow_strict_less_than(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    env: dict = {}
-    _floor_shadow(env, 0.58, emb_ok=True)  # exactly at the floor — not below it
-    assert env == {}
+def test_floor_shadow_strict_less_than():
+    assert _shadow(0.58, 0.58) == {"episodes": [], "n_echo_suppressed": 0}  # exactly at the floor
 
 
-def test_floor_shadow_guards(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    env: dict = {}
-    _floor_shadow(env, 0.0, emb_ok=True)  # degraded/disabled/empty-pool sentinel
-    _floor_shadow(env, 0.31, emb_ok=False)  # embedding failure
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.0)
-    _floor_shadow(env, 0.31, emb_ok=True)  # floor disabled
-    assert env == {}
+def test_floor_shadow_guards():
+    clean = {"episodes": [], "n_echo_suppressed": 0}
+    assert _shadow(0.58, 0.0) == clean  # degraded/disabled/empty-pool sentinel
+    assert _shadow(0.58, 0.31, emb_ok=False) == clean  # embedding failure
+    assert _shadow(0.0, 0.31) == clean  # floor disabled
 
 
 # --- recall(): marker + payload invariance ---------------------------------------
 
 
-def test_recall_below_floor_drops_episodes_and_marks_envelope(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.31, 0.22, 0.11, 0.05])  # top 0.31 < floor
+def test_recall_below_floor_drops_episodes_and_marks_envelope():
+    r, captured = _wired([0.31, 0.22, 0.11, 0.05], floor=0.58)  # top 0.31 < floor
     out = r.recall("q")
     assert "episodes" not in out  # enforced: weak top -> episode bucket dropped
     (m,) = captured
@@ -135,13 +139,12 @@ def test_recall_below_floor_drops_episodes_and_marks_envelope(monkeypatch):
     assert m["served_ids"]["episodes"] == []  # telemetry agrees: nothing served
 
 
-def test_recall_no_passages_yields_empty_episode_bucket(monkeypatch):
+def test_recall_no_passages_yields_empty_episode_bucket():
     # Compaction-gate contract (2026-07-23), isolated from the floor: scores here are ABOVE
     # the floor, so enforcement does not fire — the ONLY reason the bucket is empty is that
     # passage compaction produced nothing. recall() does NOT fall back to full episodes;
     # the bucket is omitted (empty container). Drill-down still returns full turns.
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.91, 0.80, 0.60, 0.59])  # above floor -> floor does not fire
+    r, captured = _wired([0.91, 0.80, 0.60, 0.59], floor=0.58)  # above floor -> floor does not fire
     r._compact_to_passages = lambda q, eps, n, **_k: []  # but no passage is produced
     out = r.recall("q")
     assert "episodes" not in out  # empty container from the compaction gate, no fallback
@@ -149,9 +152,8 @@ def test_recall_no_passages_yields_empty_episode_bucket(monkeypatch):
     assert "would_abstain" not in captured[0]["served_ids"]  # above floor -> no marker
 
 
-def test_recall_floor_disabled_serves_episodes(monkeypatch):
+def test_recall_floor_disabled_serves_episodes():
     # Floor 0 disables both the marker AND enforcement: weak scores still serve episodes.
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.0)
     r, captured = _wired([0.31, 0.22, 0.11, 0.05])
     out = r.recall("q")
     assert out["episodes"]  # floor off -> no enforcement, episodes served
@@ -159,9 +161,8 @@ def test_recall_floor_disabled_serves_episodes(monkeypatch):
     assert "floor" not in captured[0]["served_ids"]
 
 
-def test_recall_above_floor_no_marker(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.91, 0.80, 0.60, 0.59])
+def test_recall_above_floor_no_marker():
+    r, captured = _wired([0.91, 0.80, 0.60, 0.59], floor=0.58)
     r.recall("q")
     (m,) = captured
     assert m["rerank_top_score"] == 0.91
@@ -169,34 +170,31 @@ def test_recall_above_floor_no_marker(monkeypatch):
     assert "floor" not in m["served_ids"]
 
 
-def test_recall_exactly_at_floor_no_marker(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.58, 0.40, 0.30, 0.20])
+def test_recall_exactly_at_floor_no_marker():
+    r, captured = _wired([0.58, 0.40, 0.30, 0.20], floor=0.58)
     r.recall("q")
     assert "would_abstain" not in captured[0]["served_ids"]
 
 
-def test_recall_marker_uses_raw_pre_recency_top(monkeypatch):
+def test_recall_marker_uses_raw_pre_recency_top():
     # Recency reweighting can reorder/deflate scores, but the floor compares the RAW top:
     # an old top-scored doc decays (14d half-life) yet the marker must NOT appear, because
     # the raw 0.60 clears the 0.58 floor. rerank_top_score records the same raw value.
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     old = (datetime.now(UTC) - timedelta(days=120)).isoformat()
     pool = _pool()
     for row in pool:
         row["created_at"] = old
-    r, captured = _wired([0.60, 0.20, 0.10, 0.05], pool=pool)
+    r, captured = _wired([0.60, 0.20, 0.10, 0.05], pool=pool, floor=0.58)
     r.recall("q")
     (m,) = captured
     assert m["rerank_top_score"] == 0.6
     assert "would_abstain" not in m["served_ids"]
 
 
-def test_recall_rerank_disabled_no_marker(monkeypatch):
+def test_recall_rerank_disabled_no_marker():
     # SYNAPSE_RERANK_PROVIDER=none path: _ensure_reranker() resolves to None and the real
     # _rerank_pool_scored returns the all-0.0 RRF-order sentinel — no scores, no marker.
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([])
+    r, captured = _wired([], floor=0.58)
     del r._rerank_pool_scored  # use the real method
     r._reranker = None  # what create_reranker() yields for provider "none"
     out = r.recall("q")
@@ -206,21 +204,19 @@ def test_recall_rerank_disabled_no_marker(monkeypatch):
     assert "would_abstain" not in m["served_ids"]
 
 
-def test_recall_degraded_rerank_no_marker(monkeypatch):
+def test_recall_degraded_rerank_no_marker():
     # Rerank outage degrades to all-0.0 scores — never mark a degraded call.
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.0, 0.0, 0.0, 0.0])
+    r, captured = _wired([0.0, 0.0, 0.0, 0.0], floor=0.58)
     r.recall("q")
     (m,) = captured
     assert m["rerank_top_score"] == 0.0
     assert "would_abstain" not in m["served_ids"]
 
 
-def test_recall_embed_failure_no_marker(monkeypatch):
+def test_recall_embed_failure_no_marker():
     # Embedding down -> BM25-only retrieval. Real rerank scores may exist, but a weak top
     # under crippled retrieval is not abstention evidence — guard on emb_ok.
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.31, 0.22, 0.11, 0.05], embed_fail=True)
+    r, captured = _wired([0.31, 0.22, 0.11, 0.05], embed_fail=True, floor=0.58)
     out = r.recall("q")
     assert out["episodes"]
     (m,) = captured
@@ -228,9 +224,8 @@ def test_recall_embed_failure_no_marker(monkeypatch):
     assert "would_abstain" not in m["served_ids"]
 
 
-def test_recall_empty_pool_no_marker_no_crash(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([], pool=[])
+def test_recall_empty_pool_no_marker_no_crash():
+    r, captured = _wired([], pool=[], floor=0.58)
     out = r.recall("q")
     assert "episodes" not in out
     (m,) = captured
@@ -241,9 +236,8 @@ def test_recall_empty_pool_no_marker_no_crash(monkeypatch):
 # --- recall_episodes(): rerank_top_score + marker ---------------------------------
 
 
-def test_recall_episodes_records_rerank_top_score(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.7712, 0.50, 0.40, 0.30])
+def test_recall_episodes_records_rerank_top_score():
+    r, captured = _wired([0.7712, 0.50, 0.40, 0.30], floor=0.58)
     out = r.recall_episodes("q")
     assert len(out["episodes"]) == 4
     (m,) = captured
@@ -252,9 +246,8 @@ def test_recall_episodes_records_rerank_top_score(monkeypatch):
     assert "would_abstain" not in m["served_ids"]
 
 
-def test_recall_episodes_below_floor_marks_envelope(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.31, 0.22, 0.11, 0.05])
+def test_recall_episodes_below_floor_marks_envelope():
+    r, captured = _wired([0.31, 0.22, 0.11, 0.05], floor=0.58)
     out = r.recall_episodes("q")
     assert len(out["episodes"]) == 4  # served in full — shadow only
     (m,) = captured
@@ -263,13 +256,11 @@ def test_recall_episodes_below_floor_marks_envelope(monkeypatch):
     assert m["served_ids"]["floor"] == 0.58
 
 
-def test_recall_episodes_payload_identical_with_and_without_floor(monkeypatch):
+def test_recall_episodes_payload_identical_with_and_without_floor():
     scores = [0.31, 0.22, 0.11, 0.05]
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r1, c1 = _wired(scores)
-    out_marked = r1.recall_episodes("q")  # floor still ON — the marked leg
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.0)  # floor off
-    r2, c2 = _wired(scores)
+    r1, c1 = _wired(scores, floor=0.58)
+    out_marked = r1.recall_episodes("q")  # floor ON — the marked leg
+    r2, c2 = _wired(scores, floor=0.0)  # floor off
     out_plain = r2.recall_episodes("q")
     assert out_marked == out_plain  # the full response object — byte-identical payload
     assert c1[0]["served_ids"]["would_abstain"] is True  # marked leg really ran with floor on
@@ -277,16 +268,14 @@ def test_recall_episodes_payload_identical_with_and_without_floor(monkeypatch):
     assert "floor" not in c2[0]["served_ids"]
 
 
-def test_recall_episodes_exactly_at_floor_no_marker(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([0.58, 0.40, 0.30, 0.20])
+def test_recall_episodes_exactly_at_floor_no_marker():
+    r, captured = _wired([0.58, 0.40, 0.30, 0.20], floor=0.58)
     r.recall_episodes("q")
     assert "would_abstain" not in captured[0]["served_ids"]
 
 
-def test_recall_episodes_empty_pool_no_marker_no_crash(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _wired([], pool=[])
+def test_recall_episodes_empty_pool_no_marker_no_crash():
+    r, captured = _wired([], pool=[], floor=0.58)
     out = r.recall_episodes("q")
     assert out["episodes"] == []
     (m,) = captured
@@ -294,42 +283,12 @@ def test_recall_episodes_empty_pool_no_marker_no_crash(monkeypatch):
     assert "would_abstain" not in m["served_ids"]
 
 
-# --- enforce env: read but inert ---------------------------------------------------
-
-
-def test_enforce_gates_episodes_below_floor(monkeypatch):
-    # Enforcement ON drops the episode bucket below the floor; OFF serves it. The shadow
-    # marker fires in BOTH cases (telemetry is independent of enforcement).
-    scores = [0.31, 0.22, 0.11, 0.05]
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR_ENFORCE", True)
-    r1, c1 = _wired(scores)
-    out_on = r1.recall("q")
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR_ENFORCE", False)
-    r2, c2 = _wired(scores)
-    out_off = r2.recall("q")
-    assert "episodes" not in out_on  # enforced -> dropped
-    assert out_off["episodes"]  # not enforced -> served
-    assert c1[0]["served_ids"]["would_abstain"] is True
-    assert c2[0]["served_ids"]["would_abstain"] is True  # marker unaffected by enforce
-
-
 # --- env parsing / defaults --------------------------------------------------------
 
 
-def test_env_defaults_and_parsing(monkeypatch):
-    import importlib
-
-    # Defaults: floor OFF (the threshold is reranker-specific and lives in .env); enforce ON.
-    assert recall_mod._RECALL_FLOOR == 0.0
-    assert recall_mod._RECALL_FLOOR_ENFORCE is True
+def test_floor_defaults_off_and_reads_the_env(monkeypatch):
+    # The threshold is reranker-specific and lives in .env, so the code default is off.
+    monkeypatch.delenv("SYNAPSE_RECALL_FLOOR", raising=False)
+    assert RecallConfig().recall_floor == 0.0
     monkeypatch.setenv("SYNAPSE_RECALL_FLOOR", "0.7")
-    monkeypatch.setenv("SYNAPSE_RECALL_FLOOR_ENFORCE", "0")
-    try:
-        mod = importlib.reload(recall_mod)
-        assert mod._RECALL_FLOOR == 0.7
-        assert mod._RECALL_FLOOR_ENFORCE is False
-    finally:
-        monkeypatch.delenv("SYNAPSE_RECALL_FLOOR")
-        monkeypatch.delenv("SYNAPSE_RECALL_FLOOR_ENFORCE")
-        importlib.reload(recall_mod)  # restore module state for the rest of the suite
+    assert RecallConfig().recall_floor == 0.7

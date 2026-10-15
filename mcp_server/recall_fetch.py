@@ -7,6 +7,7 @@ import time
 from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
+from ingestion.db_notes import get_notes_by_ids
 from ingestion.localtime import local_date
 from ingestion.surfaces import SurfaceTrust, episode_scope_sql
 from mcp_server.recall_presentation import fit_turns_to_budget as _fit_turns_to_budget
@@ -286,20 +287,14 @@ class RecallFetchMixin:
         self, parsed: list[int], audience: str | None = None
     ) -> list[dict[str, Any]]:
         """The notes leg of fetch(): board-note bodies by int id (the on-demand half of
-        the board — hook on the board, body behind the id). Uses a short-lived Database
-        like the other notes-store paths. Fail-soft like the episodes leg.
+        the board — hook on the board, body behind the id). Fail-soft like the episodes leg.
 
         ``audience`` applies the restricted surface's tier filter — same reason as the
         episodes leg: n:N ids are guessable, so the drill-down cannot be looser than the
         board that served them."""
-        from ingestion.db import Database
-
         try:
-            db = Database(self._db_url)
-            try:
-                rows = db.get_notes_by_ids(parsed, audience=audience)
-            finally:
-                db.close()
+            with self._pg() as conn:
+                rows = get_notes_by_ids(conn, parsed, audience=audience)
         except Exception as e:
             logger.warning("fetch notes leg failed: %s", e)
             return []

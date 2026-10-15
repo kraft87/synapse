@@ -84,8 +84,8 @@ def test_debug_true_attaches_envelope():
     assert "debug" in out
     d = out["debug"]
     assert isinstance(d["total_ms"], float)
-    # Timed legs: the six always-on legs plus timeline (enabled by default). The prefs
-    # leg was removed 2026-07-27 — it must never reappear in the waterfall.
+    # Timed legs: the embedding, the two episode legs, KG, web, rerank and notes. The prefs
+    # and timeline legs were removed from recall() — they must never reappear in the waterfall.
     assert set(d["legs_ms"]) == {
         "embed",
         "bm25",
@@ -116,18 +116,6 @@ def test_debug_false_omits_key_and_is_byte_identical():
     assert "debug" not in without
     # The served payload is identical apart from the debug envelope.
     assert {k: v for k, v in with_dbg.items() if k != "debug"} == without
-
-
-def test_disabled_legs_are_omitted_from_legs_ms(monkeypatch):
-    # A disabled timeline leg has no timed future, so its key is dropped — the
-    # console renders it as untimed/skipped rather than a spurious 0 ms bar.
-    monkeypatch.setattr(recall_module, "_NOTES_IN_RECALL", False)
-    r = Recall(_NO_DB, "")
-    _wire_stubs(r)
-    d = r.recall("q", debug=True)["debug"]
-    assert set(d["legs_ms"]) == {"embed", "bm25", "vector", "kg", "web", "rerank"}
-    assert "timeline" not in d["legs_ms"] and "prefs" not in d["legs_ms"]
-    assert "notes" not in d["legs_ms"]
 
 
 def test_notes_count_toward_the_served_size():

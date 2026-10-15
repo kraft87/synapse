@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
-import time
 from typing import Any
 
-import psycopg
 from psycopg.rows import tuple_row
 
+from ingestion.db_notes import search_live_notes
+from ingestion.schema_check import ColumnProbe
 from mcp_server.kg_pg import _vec_literal, scope_predicate, search_kg_postgres
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_warnings import error_brief as _err_brief
@@ -19,18 +18,13 @@ from mcp_server.recall_warnings import warn as _warn
 logger = logging.getLogger(__name__)
 
 # Restricted KG serving needs kg_relationships.source_projects (schema 056), and the code
-# ships before that migration is applied by hand. A positive probe is cached for the
-# process lifetime; a negative one is re-probed at most this often, so applying 056 under
-# a running server takes effect without a restart. Until then every restricted KG path
+# ships before that migration is applied by hand. Until it exists every restricted KG path
 # serves nothing, which is exactly the pre-056 posture.
-_KG_SCOPE_REPROBE_S = 60.0
-# One probe at a time: the KG-derived legs run concurrently, and a leg arriving while another
-# is mid-probe must wait for its answer, not read "probed a moment ago" as "column absent".
-_KG_SCOPE_LOCK = threading.Lock()
-_KG_SCOPE_PROBE_SQL = (
+KG_SCOPE_PROBE = ColumnProbe(
     "SELECT 1 FROM pg_attribute "
     "WHERE attrelid = to_regclass('kg_relationships') "
-    "  AND attname = 'source_projects' AND NOT attisdropped"
+    "  AND attname = 'source_projects' AND NOT attisdropped",
+    "kg_relationships.source_projects (schema 056, restricted KG serving)",
 )
 
 
@@ -51,7 +45,7 @@ def _self_only_sql(alias: str) -> str:
 def _link_close_sql(old: str, new: str, dims: int) -> str:
     """SQL predicate: successor ``new`` is about the same thing as the retired ``old``.
 
-    Distance bound at %s (_SUP_LINK_MAX_DIST). A missing embedding trusts the link."""
+    Distance bound at %s (sup_link_max_dist). A missing embedding trusts the link."""
     return (
         f"COALESCE({old}.fact_embedding::halfvec({dims}) <=> "
         f"{new}.fact_embedding::halfvec({dims}), 0) < %s"
@@ -59,53 +53,22 @@ def _link_close_sql(old: str, new: str, dims: int) -> str:
 
 
 class RecallSourcesMixin:
-    # Schema-056 probe state (per engine); probes serialise on _KG_SCOPE_LOCK.
-    _kg_scope_ok: bool = False
-    _kg_scope_probed_at: float | None = None
-    _kg_scope_warned: bool = False
-
     def _kg_scope_ready(self) -> bool:
         """True when restricted KG serving can run, i.e. schema 056 is applied.
 
         Fail-closed: a probe error or a missing column answers False, and the restricted
         caller is served no facts. Full-trust paths never call this. They do not read
-        the column, so its absence cannot break them."""
-        if self._kg_scope_ok:
-            return True
-        with _KG_SCOPE_LOCK:
-            if self._kg_scope_ok:
-                return True
-            last = self._kg_scope_probed_at
-            if last is not None and time.monotonic() - last < _KG_SCOPE_REPROBE_S:
-                return False
-            self._kg_scope_probed_at = time.monotonic()
-            try:
-                with self._pg() as pg:
-                    row = pg.execute(_KG_SCOPE_PROBE_SQL).fetchone()
-            except Exception as e:
-                logger.warning(
-                    "KG provenance probe failed (%s): restricted KG serving stays off", e
-                )
-                return False
-            if row is None:
-                self._kg_scope_missing()
-                return False
-            self._kg_scope_ok = True
-            return True
-
-    def _kg_scope_missing(self, err: BaseException | None = None) -> None:
-        """Note that source_projects is absent: restricted KG serving stays off until a
-        later probe finds it. One log warning per engine and never a response warning, so
-        a restricted serve before the migration looks exactly as it did before 056."""
-        self._kg_scope_ok = False
-        self._kg_scope_probed_at = time.monotonic()
-        if not self._kg_scope_warned:
-            self._kg_scope_warned = True
-            logger.warning(
-                "kg_relationships.source_projects is missing (schema 056 not applied%s): "
-                "restricted surfaces are served no KG facts until it is",
-                f": {err}" if err is not None else "",
-            )
+        the column, so its absence cannot break them. Applying 056 under a running server
+        takes effect without a restart (see ``ColumnProbe``)."""
+        cached = KG_SCOPE_PROBE.cached(self._db_url)
+        if cached is not None:
+            return cached
+        try:
+            with self._pg() as pg:
+                return KG_SCOPE_PROBE.ready(pg, self._db_url)
+        except Exception as e:
+            logger.warning("KG provenance probe failed (%s): restricted KG serving stays off", e)
+            return False
 
     def _kg_scope_blocked(self, allowed_projects: list[str] | None) -> bool:
         """True when a restricted KG read must return nothing without querying.
@@ -119,10 +82,7 @@ class RecallSourcesMixin:
     def _kg_scope_error(self, allowed_projects: list[str] | None, e: Exception) -> bool:
         """True when ``e`` is the restricted predicate hitting a missing column (056 rolled
         back, or dropped after the probe cached it). The caller then returns empty."""
-        if allowed_projects is not None and isinstance(e, psycopg.errors.UndefinedColumn):
-            self._kg_scope_missing(e)
-            return True
-        return False
+        return allowed_projects is not None and KG_SCOPE_PROBE.note_error(e, self._db_url)
 
     def _search_notes(
         self,
@@ -131,48 +91,42 @@ class RecallSourcesMixin:
         project: str | None,
         audience: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Notes bucket: hook-KNN top-_NOTES_FETCH live notes (global types + this
+        """Notes bucket: hook-KNN top-``notes_fetch`` live notes (global types + this
         project's), floored by the cross-encoder on "hook — body" text, top
-        _NOTES_LIMIT served. May return [] when nothing clears the floor — notes
+        ``notes_limit`` served. May return [] when nothing clears the floor — notes
         self-gate on relevance like web. Fail-soft: any error serves no bucket.
-        Uses a short-lived Database like the other notes-store paths.
 
         ``audience`` is the restricted surface's tier filter (schema 053) — 'work-safe'
         for a restricted caller, None for full trust. Fail-soft here means an EMPTY
         bucket, which is also the fail-closed answer; there is no path where the filter
-        is dropped and the leg still serves."""
-        settings = self._settings()
-        from ingestion.db import Database
-
+        is dropped and the leg serves."""
+        cfg = self._config
         try:
-            db = Database(self._db_url)
-            try:
-                rows = db.search_live_notes(
-                    settings._KG_OWNER,
+            with self._pg() as conn:
+                rows = search_live_notes(
+                    conn,
+                    cfg.kg_owner,
                     project,
                     query_emb,
-                    limit=settings._NOTES_FETCH,
+                    limit=cfg.notes_fetch,
                     audience=audience,
                 )
-            finally:
-                db.close()
         except Exception as e:
             logger.warning("notes leg fetch failed: %s", e)
             _warn(f"notes leg failed ({_err_brief(e)}): no notes served.")
             return []
         if not rows:
             return []
-        if settings._NOTES_FLOOR > 0:
+        if cfg.notes_floor > 0:
             docs = [
-                {"fact": f"{r['hook']} — {r['body']}"[: settings._RERANK_DOC_CAP], "_r": r}
-                for r in rows
+                {"fact": f"{r['hook']} — {r['body']}"[: cfg.rerank_doc_cap], "_r": r} for r in rows
             ]
-            rows = [d["_r"] for d in self._floor_by_rerank(query, docs, settings._NOTES_FLOOR)]
+            rows = [d["_r"] for d in self._floor_by_rerank(query, docs, cfg.notes_floor)]
         served = []
-        for r in rows[: settings._NOTES_LIMIT]:
+        for r in rows[: cfg.notes_limit]:
             body = r["body"]
-            if len(body) > settings._NOTES_BODY_CAP:
-                body = body[: settings._NOTES_BODY_CAP] + "…"
+            if len(body) > cfg.notes_body_cap:
+                body = body[: cfg.notes_body_cap] + "…"
             item: dict[str, Any] = {"id": f"n:{r['id']}", "hook": r["hook"], "note": body}
             if r.get("project"):
                 item["project"] = r["project"]
@@ -202,7 +156,7 @@ class RecallSourcesMixin:
         on every connection by ingestion/pg_pool. A failure degrades to an empty facts
         bucket rather than failing the whole recall.
         """
-        settings = self._settings()
+        cfg = self._config
         if self._kg_scope_blocked(allowed_projects):
             return [], []
         try:
@@ -220,7 +174,7 @@ class RecallSourcesMixin:
                         cur,
                         query,
                         query_emb,
-                        settings._KG_OWNER,
+                        cfg.kg_owner,
                         group_id,
                         session_focus,
                         fact_limit,
@@ -284,7 +238,7 @@ class RecallSourcesMixin:
         DISTINCT ON: when an edge's newest predecessor is out of scope, an older
         in-scope one can still be shown.
         """
-        settings = self._settings()
+        cfg = self._config
         if not active_edge_uuids or cap <= 0:
             return []
         if self._kg_scope_blocked(allowed_projects):
@@ -308,16 +262,16 @@ class RecallSourcesMixin:
                       AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                       AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
                       AND ((o.invalidated_by = a.uuid
-                            AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
+                            AND {_link_close_sql("o", "a", cfg.embed_dims)})
                            OR (o.invalidated_by IS NULL AND o.name = a.name))
                       AND o.fact IS NOT NULL AND a.fact IS NOT NULL{scope_sql}
                     ORDER BY a.uuid, o.t_invalid DESC
                     """,
                     (
-                        settings._KG_OWNER,
+                        cfg.kg_owner,
                         group_id,
                         active_edge_uuids,
-                        settings._SUP_LINK_MAX_DIST,
+                        cfg.sup_link_max_dist,
                         *scope_args,
                     ),
                 ).fetchall()
@@ -372,7 +326,7 @@ class RecallSourcesMixin:
 
         ``served_text`` (episode id -> the text actually served for it) keeps a successor
         only where that text states P's claim (``OVERLAY_MIN_SUPPORT``)."""
-        settings = self._settings()
+        cfg = self._config
         if not episode_ids:
             return {}
         if self._kg_scope_blocked(allowed_projects):
@@ -388,9 +342,9 @@ class RecallSourcesMixin:
         ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
         params: list[Any] = [
             *(json.dumps([i]) for i in episode_ids),
-            settings._KG_OWNER,
+            cfg.kg_owner,
             group_id,
-            settings._SUP_LINK_MAX_DIST,
+            cfg.sup_link_max_dist,
             *scope_args,
             cap if served_text is None else cap * 4,  # headroom for the support filter
         ]
@@ -401,7 +355,7 @@ class RecallSourcesMixin:
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                     f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
                     "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
-                    f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
+                    f"  AND {_link_close_sql('p', 'n', cfg.embed_dims)} "
                     f"{scope_sql}"
                     "LIMIT %s",
                     params,
@@ -453,7 +407,7 @@ class RecallSourcesMixin:
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
         and its served successor to pass the schema-056 provenance rule."""
-        settings = self._settings()
+        cfg = self._config
         if query_emb is None:
             return []
         if self._kg_scope_blocked(allowed_projects):
@@ -468,22 +422,22 @@ class RecallSourcesMixin:
             with self._pg() as conn:
                 rows = conn.execute(
                     "SELECT n.id, n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
-                    f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
+                    f"  (p.fact_embedding::halfvec({cfg.embed_dims}) <=> %s::halfvec({cfg.embed_dims})) AS d "
                     "FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
                     "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
                     "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
-                    f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
+                    f"  AND {_link_close_sql('p', 'n', cfg.embed_dims)} "
                     f"{scope_sql}"
-                    f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
+                    f"ORDER BY p.fact_embedding::halfvec({cfg.embed_dims}) <=> %s::halfvec({cfg.embed_dims}) LIMIT %s",
                     (
                         vec,
-                        settings._KG_OWNER,
+                        cfg.kg_owner,
                         group_id,
-                        settings._SUP_LINK_MAX_DIST,
+                        cfg.sup_link_max_dist,
                         *scope_args,
                         vec,
-                        settings._SUP_CANDIDATES,
+                        cfg.sup_candidates,
                     ),
                 ).fetchall()
         except Exception as e:
@@ -495,7 +449,7 @@ class RecallSourcesMixin:
         seen: set[str] = set()
         for r in rows:
             d = r.get("d")
-            if d is None or d > settings._SUP_MAX_DIST:
+            if d is None or d > cfg.sup_max_dist:
                 continue
             u, fact = r.get("uuid"), r.get("fact")
             if u and fact and u not in seen:

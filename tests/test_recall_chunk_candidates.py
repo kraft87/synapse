@@ -1,4 +1,4 @@
-"""Chunks as an extra candidate source for the episode pool (SYNAPSE_RECALL_CHUNK_CANDIDATES).
+"""Chunks as an extra candidate source for the episode pool (RecallConfig.chunk_candidates).
 
 A chunk is four consecutive turns of a session, embedded and keyword-indexed at ingest. With
 the setting on, the top chunks by keyword and by embedding name their episodes, which join the
@@ -18,11 +18,11 @@ from typing import Any
 
 import pytest
 
-import mcp_server.recall as recall_mod
 import mcp_server.recall_episode_search as search_mod
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import FULL_TRUST
 from mcp_server.recall import Recall
+from mcp_server.recall_config import RecallConfig
 from mcp_server.recall_warnings import warn_sink
 from tests.helpers.kg import DIM, _axis_list
 
@@ -38,8 +38,8 @@ class _Emb:
         return [_axis_list(0) for _ in texts]
 
 
-def _engine(db_url: str) -> Recall:
-    r = Recall(db_url, "")
+def _engine(db_url: str, chunk_candidates: bool = False) -> Recall:
+    r = Recall(db_url, "", config=RecallConfig(chunk_candidates=chunk_candidates))
     r._ensure_embedder = lambda: _Emb()  # type: ignore[method-assign]
     return r
 
@@ -145,11 +145,10 @@ def test_an_unindexed_vector_source_says_so_and_serves_nothing(corpus, db_url, m
     assert len(notices) == 1 and "chunks vector index" in notices[0]
 
 
-def test_chunk_episodes_join_the_pool_only_when_the_setting_is_on(corpus, db_url, monkeypatch):
+def test_chunk_episodes_join_the_pool_only_when_the_setting_is_on(corpus, db_url):
     # The turns say "deployment details"; only their chunk says "zebracorn".
     def pool(on: bool) -> list[str]:
-        monkeypatch.setattr(recall_mod, "_CHUNK_CANDIDATES", on)
-        r = _engine(db_url)
+        r = _engine(db_url, on)
         legs = r._start_episode_legs("zebracorn", "chunky")
         assert (legs.f_chunk_bm25 is not None) is on and (legs.f_chunk_vec is not None) is on
         return _ids(r._join_episode_pool(legs).items)
@@ -159,17 +158,15 @@ def test_chunk_episodes_join_the_pool_only_when_the_setting_is_on(corpus, db_url
     assert expected <= set(pool(True))
 
 
-def test_chunk_sources_stay_out_of_a_session_scoped_drill_down(corpus, db_url, monkeypatch):
-    monkeypatch.setattr(recall_mod, "_CHUNK_CANDIDATES", True)
-    r = _engine(db_url)
+def test_chunk_sources_stay_out_of_a_session_scoped_drill_down(corpus, db_url):
+    r = _engine(db_url, True)
     legs = r._start_episode_legs("zebracorn", None, session_id="some-session")
     assert legs.f_chunk_bm25 is None and legs.f_chunk_vec is None
     r._join_episode_pool(legs)
 
 
-def test_recall_with_chunk_candidates_still_serves_episodes_not_chunks(corpus, db_url, monkeypatch):
-    monkeypatch.setattr(recall_mod, "_CHUNK_CANDIDATES", True)
-    r = _engine(db_url)
+def test_recall_with_chunk_candidates_still_serves_episodes_not_chunks(corpus, db_url):
+    r = _engine(db_url, True)
     r._rerank_pool_scored = lambda q, pl: [(i, 0.9 - 0.01 * i) for i in range(len(pl))]  # type: ignore[method-assign]
     r._record_metrics = lambda m: None  # type: ignore[method-assign]
     out = r.recall_episodes("zebracorn", project="chunky", limit=5, trust=FULL_TRUST)

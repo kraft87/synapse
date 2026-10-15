@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from psycopg.types.json import Json as PgJson
 
 from ingestion import pg_pool
+from mcp_server.recall_config import RecallConfig
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +50,7 @@ class RecallMetricsMixin:
 
     _db_url: str
     _async_executor: Any
-    _kg_owner: str
+    _config: RecallConfig
 
     if TYPE_CHECKING:
 
@@ -84,7 +85,7 @@ class RecallMetricsMixin:
                     "UPDATE kg_relationships "
                     "SET retrieval_count = COALESCE(retrieval_count, 0) + 1 "
                     "WHERE owner_id = %s AND group_id = %s AND uuid = ANY(%s)",
-                    (self._kg_owner, group_id, edge_uuids),
+                    (self._config.kg_owner, group_id, edge_uuids),
                 )
         except Exception as error:
             logger.debug("Background fact-bump (PG) failed: %s", error)

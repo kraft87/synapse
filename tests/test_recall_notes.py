@@ -1,20 +1,23 @@
 """Notes leg (_search_notes): hook-KNN over the live notes store -> cross-encoder floor
-on "hook — body" text -> top _NOTES_LIMIT served as n:-id items. Pure-logic — the
-Database is stubbed at ingestion.db, the reranker on the instance. The floor self-gates
-like web/timeline (all-subfloor serves []); any DB failure serves [] (fail-soft)."""
+on "hook — body" text -> top notes_limit served as n:-id items. Pure-logic — the KNN
+query is stubbed at mcp_server.recall_sources, the reranker on the instance. The floor
+self-gates like web (all-subfloor serves []); any DB failure serves [] (fail-soft)."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from typing import ClassVar
 
-import ingestion.db as db_mod
-import mcp_server.recall as recall_mod
+import mcp_server.recall_sources as sources_mod
 from mcp_server.recall import Recall
+from mcp_server.recall_config import RecallConfig
 
 
-def _bare() -> Recall:
+def _bare(notes_floor: float = 0.60) -> Recall:
     r = object.__new__(Recall)
     r._db_url = "postgresql://stub"
+    r._config = RecallConfig(notes_floor=notes_floor)
+    r._pg = lambda: nullcontext(object())  # type: ignore[method-assign]
     return r
 
 
@@ -44,29 +47,24 @@ class _DB:
     fail = False
     last_kwargs: ClassVar[dict] = {}
 
-    def __init__(self, url):
-        if _DB.fail:
-            raise RuntimeError("db down")
 
-    def search_live_notes(self, owner_id, project, embedding, limit=24, audience=None):
-        _DB.last_kwargs = {
-            "owner_id": owner_id,
-            "project": project,
-            "limit": limit,
-            "audience": audience,
-        }
-        return list(_DB.rows)
-
-    def close(self):
-        pass
+def _search_live_notes(conn, owner_id, project, embedding, limit=24, audience=None):
+    if _DB.fail:
+        raise RuntimeError("db down")
+    _DB.last_kwargs = {
+        "owner_id": owner_id,
+        "project": project,
+        "limit": limit,
+        "audience": audience,
+    }
+    return list(_DB.rows)
 
 
 def _wire(monkeypatch, rows, scored, floor=0.60):
     _DB.rows = rows
     _DB.fail = False
-    monkeypatch.setattr(db_mod, "Database", _DB)
-    monkeypatch.setattr(recall_mod, "_NOTES_FLOOR", floor)
-    r = _bare()
+    monkeypatch.setattr(sources_mod, "search_live_notes", _search_live_notes)
+    r = _bare(notes_floor=floor)
     r._reranker = _RR(scored)
     return r
 
@@ -87,7 +85,7 @@ def test_notes_project_key_and_scope_passthrough(monkeypatch):
     out = r._search_notes("q", [0.0], "synapse")
     assert out[0]["project"] == "synapse"
     assert _DB.last_kwargs["project"] == "synapse"
-    assert _DB.last_kwargs["limit"] == recall_mod._NOTES_FETCH
+    assert _DB.last_kwargs["limit"] == r._config.notes_fetch
 
 
 def test_notes_all_subfloor_serves_nothing(monkeypatch):
@@ -100,14 +98,15 @@ def test_notes_limit_caps_served(monkeypatch):
     scored = [(i, 0.9 - i * 0.01) for i in range(6)]
     r = _wire(monkeypatch, rows, scored)
     out = r._search_notes("q", [0.0], None)
-    assert len(out) == recall_mod._NOTES_LIMIT
+    assert len(out) == r._config.notes_limit
 
 
 def test_notes_body_capped_full_via_fetch(monkeypatch):
-    long_body = "x" * (recall_mod._NOTES_BODY_CAP + 50)
-    r = _wire(monkeypatch, [_note(1, body=long_body)], [(0, 0.9)])
+    r = _wire(monkeypatch, [], [(0, 0.9)])
+    cap = r._config.notes_body_cap
+    _DB.rows = [_note(1, body="x" * (cap + 50))]
     out = r._search_notes("q", [0.0], None)
-    assert len(out[0]["note"]) == recall_mod._NOTES_BODY_CAP + 1  # cap + ellipsis
+    assert len(out[0]["note"]) == cap + 1  # cap + ellipsis
     assert out[0]["note"].endswith("…")
 
 
@@ -127,8 +126,7 @@ def test_notes_reranker_outage_degrades_to_knn_order(monkeypatch):
 
 def test_notes_floor_disabled_serves_knn_order(monkeypatch):
     rows = [_note(1), _note(2)]
-    r = _wire(monkeypatch, rows, [(0, 0.9), (1, 0.8)])
-    monkeypatch.setattr(recall_mod, "_NOTES_FLOOR", 0.0)
+    r = _wire(monkeypatch, rows, [(0, 0.9), (1, 0.8)], floor=0.0)
     out = r._search_notes("q", [0.0], None)
     assert [it["id"] for it in out] == ["n:1", "n:2"]
 

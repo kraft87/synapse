@@ -10,7 +10,6 @@ from ingestion.surfaces import SurfaceTrust
 from mcp_server.recall_presentation import fit_turns_to_budget as _fit_turns_to_budget
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
-from mcp_server.recall_settings import _EPISODE_LIMIT
 from mcp_server.recall_warnings import warn_sink as _warn_sink
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,7 @@ class RecallEpisodesMixin:
         self,
         query: str,
         project: str | None = None,
-        limit: int = _EPISODE_LIMIT,
+        limit: int = 5,
         source: str | None = None,
         self_session: str | None = None,
         session_id: str | None = None,
@@ -84,9 +83,7 @@ class RecallEpisodesMixin:
         st = self._resolve_trust(surface, trust)
         allowed = st.project_filter
         # Deep-fetch both legs (golds rank up to ~88 in a single leg), fuse, then
-        # rerank the WIDE pool and select what to serve (WIN1 — see _start_episode_legs).
-        # Fixed top-`limit` by default; adaptive score-cutoff when enabled (see
-        # _select_episodes / _EPISODE_CUTOFF_TAU).
+        # rerank the WIDE pool and serve the top `limit` (WIN1 — see RecallConfig).
         legs = self._start_episode_legs(
             query,
             project,
@@ -130,8 +127,8 @@ class RecallEpisodesMixin:
             served_ids["session_id"] = session_id  # session-scoped drill-down call
         if n_excerpted:  # tunes FULL_TURN_BUDGET: how often a call outgrows it
             served_ids["n_excerpted"] = n_excerpted
-        # Shadow abstention floor (telemetry only) — same RAW pre-recency score contract
-        # as recall(); the served episodes above are untouched.
+        # Abstention-floor marker (telemetry only) — same RAW pre-recency score contract
+        # as recall(); the served episodes above are untouched (this drill-down never enforces).
         self._floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)
         chars = _served_chars(out)
         self._record_metrics(

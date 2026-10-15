@@ -17,11 +17,16 @@ happens in, because that is what latency and relevance ride on:
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 from typing import Any
+
+import pytest
 
 import mcp_server.recall as recall_mod
 from ingestion.surfaces import FULL_TRUST
 from mcp_server.recall import Recall
+from mcp_server.recall_config import RecallConfig
+from mcp_server.recall_sources import KG_SCOPE_PROBE
 
 # Poison DSN: an unstubbed leg fails fast and everywhere instead of finding a local DB.
 _NO_DB = "postgresql://synapse@127.0.0.1:1/nonexistent"
@@ -31,6 +36,13 @@ _WAIT_S = 3.0
 class _Emb:
     def embed(self, texts, task="query"):
         return [[0.0] * 4 for _ in texts]
+
+
+@pytest.fixture(autouse=True)
+def _fresh_kg_scope_probe():
+    KG_SCOPE_PROBE.reset()
+    yield
+    KG_SCOPE_PROBE.reset()
 
 
 def _pool(n: int, session: str | None = None, start: int = 0) -> list[dict[str, Any]]:
@@ -52,9 +64,13 @@ def _fact(uuid: str, fact_id: int) -> dict[str, Any]:
     return {"fact": f"fact {uuid}", "_uuid": uuid, "_id": fact_id, "_date": None}
 
 
-def _engine(pool: list[dict[str, Any]] | None = None, scores: list[float] | None = None):
+def _engine(
+    pool: list[dict[str, Any]] | None = None,
+    scores: list[float] | None = None,
+    floor: float = 0.0,
+):
     """A Recall with every leg stubbed; returns (recall, captured telemetry rows)."""
-    r = Recall(_NO_DB, "")
+    r = Recall(_NO_DB, "", config=RecallConfig(recall_floor=floor))
     p = _pool(4) if pool is None else pool
     r._ensure_embedder = lambda: _Emb()
     r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None, own=None: list(p)
@@ -173,14 +189,14 @@ def test_self_session_facts_backfill_the_facts_bucket():
     r._search_kg = _kg
     r._self_session_facts = lambda uuids, session: {u for u in uuids if u.startswith("own-")}
     out = r.recall("where is the gizmo", trust=FULL_TRUST, self_session="me")
-    assert limits[0] > recall_mod._FACT_LIMIT  # asked for a few extra
-    assert len(out["facts"]) == recall_mod._FACT_LIMIT  # and the bucket is still full
+    assert limits[0] > r._config.fact_limit  # asked for a few extra
+    assert len(out["facts"]) == r._config.fact_limit  # and the bucket is still full
     assert not {"f:100", "f:101", "f:102"} & {f["id"] for f in out["facts"]}
     assert captured[0]["served_ids"]["n_self_facts_excluded"] == 3
 
     limits.clear()
     r.recall("where is the gizmo", trust=FULL_TRUST)  # no hook, no headroom
-    assert limits == [recall_mod._FACT_LIMIT]
+    assert limits == [r._config.fact_limit]
 
 
 def test_facts_and_successors_share_one_provenance_lookup():
@@ -203,11 +219,10 @@ def test_facts_and_successors_share_one_provenance_lookup():
 _ECHO_QUERY = "what is the exact configuration of the gizmo in the staging cluster"
 
 
-def test_a_query_echo_cannot_hold_the_abstention_floor_open(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
+def test_a_query_echo_cannot_hold_the_abstention_floor_open():
     pool = _pool(4)
     pool[0]["content"] = _ECHO_QUERY  # the prompt quoting itself
-    r, captured = _engine(pool, scores=[0.95, 0.40, 0.35, 0.30])
+    r, captured = _engine(pool, scores=[0.95, 0.40, 0.35, 0.30], floor=0.58)
     out = r.recall(_ECHO_QUERY, trust=FULL_TRUST)
     assert "episodes" not in out  # every survivor is weak: the bucket abstains
     served = captured[0]["served_ids"]
@@ -216,9 +231,8 @@ def test_a_query_echo_cannot_hold_the_abstention_floor_open(monkeypatch):
     assert served["would_abstain"] is True and served["n_echo_suppressed"] == 1
 
 
-def test_the_floor_is_unchanged_when_nothing_is_filtered(monkeypatch):
-    monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
-    r, captured = _engine(scores=[0.95, 0.40, 0.35, 0.30])
+def test_the_floor_is_unchanged_when_nothing_is_filtered():
+    r, captured = _engine(scores=[0.95, 0.40, 0.35, 0.30], floor=0.58)
     out = r.recall("where is the gizmo", trust=FULL_TRUST)
     assert out["episodes"]
     assert captured[0]["rerank_top_score"] == 0.95
@@ -341,6 +355,9 @@ def test_a_leg_arriving_mid_probe_waits_for_the_answer():
         def __exit__(self, *exc):
             return False
 
+        def transaction(self):
+            return nullcontext()
+
         def execute(self, sql):
             probes.append(1)
             inside_probe.set()
@@ -362,3 +379,11 @@ def test_a_leg_arriving_mid_probe_waits_for_the_answer():
     first.join(_WAIT_S)
     second.join(_WAIT_S)
     assert answers == [True, True] and len(probes) == 1
+
+
+def test_select_episodes_serves_the_top_limit_and_degrades_to_rrf_order():
+    pool = _pool(4)
+    r, _ = _engine(pool, scores=[0.0, 0.0, 0.0, 0.0])  # the rerank degraded: no real scores
+    served, n_echo, top = r._select_episodes("where is the gizmo", pool, limit=2)
+    assert [e["id"] for e in served] == ["e:0", "e:1"] and n_echo == 0 and top == 0.0
+    assert r._select_episodes("where is the gizmo", [], limit=2) == ([], 0, 0.0)

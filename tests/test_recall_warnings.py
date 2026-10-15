@@ -16,8 +16,6 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 
-import ingestion.db as db_mod
-import mcp_server.recall as recall_mod
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server.recall import Recall, _config_hint, _err_brief, _warn, _warn_sink
 
@@ -227,15 +225,10 @@ def test_kg_leg_failure_warns():
     assert "no facts served" in msg
 
 
-def test_notes_leg_failure_warns(monkeypatch):
-    class _DeadDB:
-        def __init__(self, url):
-            raise RuntimeError("db down")
-
-    monkeypatch.setattr(db_mod, "Database", _DeadDB)
-    monkeypatch.setattr(recall_mod, "_NOTES_IN_RECALL", True)
+def test_notes_leg_failure_warns():
     r = _wired()
-    del r._search_notes  # real notes leg, dead Database
+    del r._search_notes  # real notes leg, dead connection
+    r._pg = lambda: nullcontext(_DeadPG())
     msg = _joined(r.recall("anything"))
     assert "notes leg failed" in msg
     assert "no notes served" in msg

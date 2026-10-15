@@ -26,7 +26,6 @@ from typing import Any, ClassVar
 import httpx
 import pytest
 
-import mcp_server.recall as recall_mod
 from ingestion.embedding import (
     EmbeddingConfigError,
     EmbeddingHTTPError,
@@ -814,19 +813,6 @@ class TestRerankNoneRecallPath:
         scored = r._rerank_pool_scored("q", pool)
         # RRF (incoming) order preserved; 0.0 = fixed-k signal downstream
         assert scored == [(0, 0.0), (1, 0.0), (2, 0.0), (3, 0.0)]
-
-    def test_rerank_pool_preserves_pool_order(self):
-        r = Recall("", "")
-        r._reranker = None
-        pool = _pool(3)
-        assert r._rerank_pool("q", pool) == pool
-
-    def test_floor_facts_keeps_all(self, monkeypatch):
-        monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.40)
-        r = Recall("", "")
-        r._reranker = None
-        facts = [{"fact": f"f{i}"} for i in range(3)]
-        assert r._floor_facts("q", facts) == facts
 
     def test_passages_are_picked_without_a_reranker(self):
         # many chunks + no reranker -> passages chosen by keyword overlap, never an empty bucket.

@@ -16,7 +16,6 @@ from mcp_server.recall_presentation import parse_episode_ids as _parse_episode_i
 from mcp_server.recall_presentation import to_web_recall_item as _to_web_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
 from mcp_server.recall_ranking import timed as _timed
-from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import submit_with_context as _submit_ctx
 from mcp_server.recall_warnings import warn as _warn
@@ -51,7 +50,7 @@ class RecallOverviewMixin:
         entity-level precision. The summary layer was retired (task #63).
 
         write_feedback=False suppresses the retrieval_count bump on surfaced facts — used
-        by the auto-recall memory hook so automatic (non-agentic) recalls don't count as
+        by the HTTP route so non-agentic recalls (the dashboard console) don't count as
         served in the dashboard. That counter ranks nothing: only the episode counter,
         bumped by the drill-down tools, feeds ranking (``feedback_multiplier``).
 
@@ -59,9 +58,9 @@ class RecallOverviewMixin:
         on the recall_metrics row so per-origin metrics are filterable in SQL.
 
         The episode bucket serves compact passages (markdown chunks) of the top reranked episodes
-        instead of whole turns (Stage 2 — see _RECALL_PASSAGE_N). For raw full-episode drill-down,
-        use recall_episodes() (the recall tool's mode="turns"). Facts carry their t_valid "as-of"
-        date for currency weighting.
+        instead of whole turns (see RecallConfig.recall_passage_n). For raw full-episode
+        drill-down, use recall_episodes() (the recall_full_turns tool). Facts carry their t_valid
+        "as-of" date for currency weighting.
 
         ``debug`` (phase-2 dashboard console) attaches a ``debug`` key to the response SURFACING
         the SAME numbers already measured for the recall_metrics telemetry row — no extra
@@ -124,7 +123,7 @@ class RecallOverviewMixin:
         trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """recall()'s body, run with ``warnings`` bound as the active degradation sink."""
-        settings = self._settings()
+        cfg = self._config
         group_id = coerce_group(group_id) or "technical"
         t_start = time.perf_counter()
         ex = self._leg_executor
@@ -149,8 +148,8 @@ class RecallOverviewMixin:
         ms_embed = legs.ms_embed
 
         # Self-exclusion asks the KG for a few extra facts, so those the calling session
-        # sourced alone can drop out and the bucket still fills to _FACT_LIMIT.
-        fact_limit = settings._FACT_LIMIT + (_SELF_FACT_HEADROOM if self_session else 0)
+        # sourced alone can drop out and the bucket still fills to fact_limit.
+        fact_limit = cfg.fact_limit + (_SELF_FACT_HEADROOM if self_session else 0)
 
         # The remaining legs all need the embedding; fan them out concurrently (they
         # no-op when it's unavailable). Summaries were retired (task #63): the KG owns
@@ -205,7 +204,7 @@ class RecallOverviewMixin:
                 return []
             return self._search_notes(query, query_emb, project, audience=st.audience_filter)
 
-        f_notes = _submit_ctx(ex, _timed, _notes_leg) if settings._NOTES_IN_RECALL else None
+        f_notes = _submit_ctx(ex, _timed, _notes_leg)
 
         # Join the episode legs and start the cross-encoder rerank (Voyage HTTP, the largest
         # call) at once: it needs only this pool, so it runs while the web and KG legs and
@@ -231,7 +230,7 @@ class RecallOverviewMixin:
                 kg_results = [f for f in kg_results if f.get("_uuid") not in own_facts]
                 sup_candidates = [f for f in sup_candidates if f.get("_uuid") not in own_facts]
                 n_self_facts_excluded = len(own_facts)
-        facts_internal = kg_results[: settings._FACT_LIMIT]  # carry _uuid for bump + superseded
+        facts_internal = kg_results[: cfg.fact_limit]  # carry _uuid for bump + superseded
         # Bump retrieval_count on every surfaced edge: the dashboard's "served" count.
         # Nothing in ranking reads the fact counter. Fire-and-forget, never blocks the
         # response.
@@ -248,7 +247,7 @@ class RecallOverviewMixin:
                 functools.partial(self._fetch_superseded_pairs_pg, **kg_scope),
                 group_id,
                 surfaced_edge_uuids,
-                settings._SUPERSEDED_LIMIT,
+                cfg.superseded_limit,
             )
         )
         scored, ms_rerank = f_rerank.result()
@@ -257,15 +256,15 @@ class RecallOverviewMixin:
         # *definitive* claim out-ranks a newer *correction* when both make the pool), then
         # query-echo suppression, in _rank_episodes: the same ranking contract
         # recall_episodes() serves. The slices below backfill freed slots from next-ranked.
-        # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
+        # Passage mining reads the top recall_passage_src_k, so that bounds the lazy scan.
         # ``rerank_top`` is the RAW (pre-recency) top score among the episodes that survive
         # echo suppression, i.e. of what gets mined; ``rerank_top_all`` is the pool's own
         # top, recorded when the two differ so SYNAPSE_RECALL_FLOOR can be recalibrated.
-        ranked_eps, _scores, rerank_top, n_echo_suppressed = self._rank_episodes(
+        ranked_eps, rerank_top, n_echo_suppressed = self._rank_episodes(
             query,
             ep_pool,
             scored,
-            max(settings._RECALL_EPISODE_LIMIT, settings._RECALL_PASSAGE_SRC_K),
+            max(cfg.recall_episode_limit, cfg.recall_passage_src_k),
         )
         rerank_top_all = scored[0][1] if scored else 0.0
         # Stage 2: serve compact passages of the top reranked episodes instead of whole
@@ -281,41 +280,29 @@ class RecallOverviewMixin:
             ep_items = (
                 self._compact_to_passages(
                     query,
-                    ranked_eps[: settings._RECALL_PASSAGE_SRC_K],
-                    settings._RECALL_PASSAGE_N,
+                    ranked_eps[: cfg.recall_passage_src_k],
+                    cfg.recall_passage_n,
                     stats=passage_stats,
                 )
                 or None
             )
-        # Floor enforcement: when even the top episode passage is below the floor — a weak
+        # Abstention floor: when even the top episode passage is below the floor — a weak
         # match under WORKING retrieval (query_emb present, a real score in (0, floor)) —
         # drop the episode bucket. Complements the compaction gate above at a harder
-        # threshold and keeps low relevance cheap. Facts/timeline stay (their own
-        # relevance gates). The same condition is still shadow-marked in served_ids below.
-        # recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
-        if (
-            settings._RECALL_FLOOR_ENFORCE
-            and query_emb is not None
-            and 0.0 < rerank_top < settings._RECALL_FLOOR
-        ):
-            if settings._RECALL_FLOOR_KEEP_MIN > 0 and ep_items:
-                ep_items = ep_items[: settings._RECALL_FLOOR_KEEP_MIN] or None
-            else:
-                ep_items = None
-        # Web bucket: fused (BM25+vector) -> cross-encoder rerank -> _WEB_FLOOR -> dedupe, all done
+        # threshold and keeps low relevance cheap. Facts stay (they have their own gating);
+        # the same condition is marked in served_ids below. recall_episodes() (drill-down)
+        # does NOT enforce — the caller asked for turns.
+        if query_emb is not None and 0.0 < rerank_top < cfg.recall_floor:
+            ep_items = None
+        # Web bucket: fused (BM25+vector) -> cross-encoder rerank -> web_floor -> dedupe, all done
         # in _search_web_reranked. Floor self-gates on intent, so this is often empty.
         web_chunks, ms_web = f_web.result() if f_web is not None else ([], 0.0)
 
-        # Surface the edge's kg_relationships.id to the caller as "f:<id>" (below) so facts
-        # are citable in recall_feedback, same as episodes carry "e:N".
-        # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
-        # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
-        # default (adds one rerank of the served facts), so this is a no-op until enabled.
+        # Facts are cited in recall_feedback as "f:<kg_relationships.id>" (below), the way
+        # episodes carry "e:N".
         served_facts = facts_internal
-        if settings._RECALL_FACT_FLOOR > 0 and len(served_facts) > 1:
-            served_facts = self._floor_facts(query, served_facts)
-        # Supersession extras: the successors not already served, up to _SUP_LIMIT, added
-        # beyond _FACT_LIMIT. Go-forward coverage only; the stale fact itself is never served.
+        # Supersession extras: the successors not already served, up to sup_limit, added
+        # beyond fact_limit. Go-forward coverage only; the stale fact itself is never served.
         served_uuids = {f.get("_uuid") for f in served_facts if f.get("_uuid")}
         sup_extras = []
         for f in sup_candidates:
@@ -323,7 +310,7 @@ class RecallOverviewMixin:
                 continue
             served_uuids.add(f["_uuid"])
             sup_extras.append(f)
-            if len(sup_extras) >= _SUP_LIMIT:
+            if len(sup_extras) >= cfg.sup_limit:
                 break
         if sup_extras:
             served_facts = list(served_facts) + sup_extras
@@ -385,12 +372,11 @@ class RecallOverviewMixin:
             out["superseded_facts"] = superseded_facts  # {fact: old, superseded_by: current}
         note_items: list[dict[str, Any]] = []
         ms_notes = 0.0
-        if f_notes is not None:
-            try:
-                note_items, ms_notes = f_notes.result()
-            except Exception as e:
-                logger.warning("notes leg failed: %s", e)
-                _warn(f"notes leg failed ({_err_brief(e)}): no notes served.")
+        try:
+            note_items, ms_notes = f_notes.result()
+        except Exception as e:
+            logger.warning("notes leg failed: %s", e)
+            _warn(f"notes leg failed ({_err_brief(e)}): no notes served.")
         if note_items:
             out["notes"] = note_items
 
@@ -414,7 +400,7 @@ class RecallOverviewMixin:
             "n_echo_suppressed": n_echo_suppressed,
             # Passages skipped as repeats of another episode's chosen passage.
             "n_dup_passages": passage_stats.get("n_dup_passages", 0),
-            # Chunks the rerank never saw because the episodes overran _RECALL_PASSAGE_CAND.
+            # Chunks the rerank never saw because the episodes overran recall_passage_cand.
             "n_chunks_cut": passage_stats.get("n_chunks_cut", 0),
             # Trust verdict (schema 053): a restricted serve is narrower by design, so
             # the metrics have to say which regime produced these numbers.
@@ -430,9 +416,9 @@ class RecallOverviewMixin:
             served_ids["n_self_facts_excluded"] = n_self_facts_excluded
         if rerank_top_all != rerank_top:
             served_ids["rerank_top_all"] = round(float(rerank_top_all), 4)
-        # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
-        # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
-        # recency-adjusted ordering — so the marker and rerank_top_score always agree.
+        # Abstention-floor marker (telemetry): the floor fired and dropped the episode bucket.
+        # Compares the RAW pre-recency rerank_top recorded below — NOT the recency-adjusted
+        # ordering — so the marker and rerank_top_score always agree.
         self._floor_shadow(served_ids, float(rerank_top), emb_ok=query_emb is not None)
         chars = _served_chars(out)
         metrics: dict[str, Any] = {
@@ -467,9 +453,7 @@ class RecallOverviewMixin:
         }
         self._record_metrics(metrics)
         # Phase-2 dashboard debug envelope: surface the SAME numbers just recorded (no
-        # re-instrumentation). Only the timed legs are exposed; the timeline key is
-        # OMITTED when its leg is disabled (f_timeline is None), so the console renders
-        # it as untimed/skipped rather than a spurious 0ms. Byte-identical when off.
+        # re-instrumentation). Only the timed legs are exposed. Byte-identical when off.
         if debug:
             legs_ms: dict[str, Any] = {
                 "embed": metrics["ms_embed"],
@@ -478,9 +462,8 @@ class RecallOverviewMixin:
                 "kg": metrics["ms_kg"],
                 "web": metrics["ms_web"],
                 "rerank": metrics["ms_rerank"],
+                "notes": metrics["ms_notes"],
             }
-            if f_notes is not None:
-                legs_ms["notes"] = metrics["ms_notes"]
             out["debug"] = {
                 "total_ms": metrics["ms_total"],
                 "legs_ms": legs_ms,
