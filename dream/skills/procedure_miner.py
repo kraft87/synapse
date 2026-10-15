@@ -3,7 +3,7 @@
 """dream->skills v2 — WEEKLY procedure-fingerprint miner (deterministic detector).
 
 The other detectors judge transcripts with an LLM; this one counts. It normalizes shell
-commands ([tool:Bash] markers) and MCP tool calls from the chunk+episode union into
+commands ([tool:Bash] markers) and MCP tool calls from the last weeks' episodes into
 FINGERPRINTS, counts DISTINCT sessions per fingerprint, clusters fingerprints that
 repeatedly co-occur (same session, nearby in the episode stream), and only then spends a
 small LLM budget confirming the top clusters as coherent repeatable procedures. Confirmed
@@ -31,6 +31,11 @@ Exclusion rules (the rejected-procedure taxonomy, encoded):
     one-liners, crontab list ritual) are stoplisted — universal background noise.
   - clusters an existing skill already covers are skipped (deterministic registry
     prescreen + LLM covered_by), or routed to a retune when they clearly extend one.
+  - clusters already decided are skipped, so the LLM budget goes to new ones: one a ledger
+    candidate of any status already carries (matched on its sorted step set), or one the
+    LLM turned down or found covered in the last VERDICT_MEMO_DAYS (a memo in the cursor
+    config). A cluster stays in the window for weeks; without this the biggest ones took
+    every confirm slot, every week.
 
 Cadence is the CALLER's job: the nightly integration calls run() only when due() says the
 last pass is >= 7 days old (watermark lives in skill_scan_cursor.config['procedure_miner']).
@@ -40,23 +45,25 @@ run() is idempotent — evidence entries carry the session's date and the ledger
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import defaultdict
-from datetime import date
+from datetime import date, timedelta
 
 from dream import lane
 
 from . import config, skill_ledger, skill_measure
 
 # ------------------------------------------------------------------------- knobs
-WINDOW_DAYS = 35  # look-back for the chunk+episode union
+WINDOW_DAYS = 35  # look-back for the episodes mined
 MIN_SESSIONS = 4  # distinct-session floor for a cluster (design §8)
 MIN_STEPS = 2  # single-command procedures are script-covered — never propose them
 EDGE_MIN_SESSIONS = 2  # a fingerprint pair must co-occur in this many sessions to link
 PROXIMITY = 8  # max episode-sequence distance for two fingerprints to "co-occur"
 MAX_STEPS = 10  # steps kept per cluster (ranked by distinct-session count)
 MAX_CONFIRM = 8  # LLM confirm budget per run
+VERDICT_MEMO_DAYS = 56  # a cluster the LLM turned down is not put to it again for 8 weeks
 EVIDENCE_SESSION_CAP = 10  # evidence entries per candidate (one per distinct session)
 HIGH_SALIENCE_SESSIONS = 8  # >= this many distinct sessions -> salience 4 (else 3)
 COVERAGE_RATIO = 0.6  # registry-prescreen: fraction of head tokens one skill must mention
@@ -241,7 +248,7 @@ def split_atoms(bashtext: str) -> list[str]:
 
 
 def content_fingerprints(content: str) -> list[tuple[str, str | None]]:
-    """(fingerprint, example_atom) pairs from one episode/chunk content blob."""
+    """(fingerprint, example_atom) pairs from one episode's content."""
     out: list[tuple[str, str | None]] = []
     for m in _TOOL_MARKER.finditer(content or ""):
         tool, args = m.group(1), m.group(2)
@@ -258,12 +265,9 @@ def content_fingerprints(content: str) -> list[tuple[str, str | None]]:
 
 # ----------------------------------------------------------------- corpus (SQL seam)
 def _fetch_rows(conn, window_days: float) -> list[tuple[str, int, str, str]]:
-    """(session_id, position, date_iso, content) rows from the episode+chunk union.
-    Chunks are sliding windows OVER episodes — the union is deduped downstream by
-    counting DISTINCT sessions / positions, never raw occurrences."""
+    """(session_id, position, date_iso, content) rows of the window's Claude Code episodes."""
     excl = list(dict.fromkeys(EXCLUDED_PROJECTS + tuple(config.EXCLUDE_PROJECTS)))
     cur = conn.cursor()
-    rows: list[tuple[str, int, str, str]] = []
     cur.execute(
         """SELECT session_id, sequence, created_at::date::text, content
              FROM episodes
@@ -272,22 +276,13 @@ def _fetch_rows(conn, window_days: float) -> list[tuple[str, int, str, str]]:
               AND (project IS NULL OR project <> ALL(%s))""",
         (str(window_days), excl),
     )
-    rows += [(str(s), int(q), d, c or "") for s, q, d, c in cur.fetchall()]
-    cur.execute(
-        """SELECT session_id, start_sequence, created_at::date::text, content
-             FROM chunks
-            WHERE created_at > now() - (%s || ' days')::interval
-              AND (project IS NULL OR project <> ALL(%s))""",
-        (str(window_days), excl),
-    )
-    rows += [(str(s), int(q), d, c or "") for s, q, d, c in cur.fetchall()]
-    return rows
+    return [(str(s), int(q), d, c or "") for s, q, d, c in cur.fetchall()]
 
 
 def _occurrences(rows):
     """rows -> (session->fp->positions, session->earliest date, fp->example atoms).
-    Position = episode sequence (chunks use start_sequence — same coordinate space), so
-    a chunk re-serving an episode's command collapses into the same (session, fp, pos)."""
+    Position = episode sequence; frequency is counted in distinct sessions, never in raw
+    occurrences."""
     sess_fp_pos: dict[str, dict[str, set[int]]] = defaultdict(lambda: defaultdict(set))
     sess_date: dict[str, str] = {}
     examples: dict[str, list[str]] = defaultdict(list)
@@ -504,20 +499,54 @@ def due(conn, every_days: int = 7) -> bool:
     return (date.today() - date.fromisoformat(lr)).days >= every_days
 
 
-def _stamp_watermark(conn, scan_night: str) -> None:
-    """Merge (not replace) our watermark into skill_scan_cursor.config — the nightly owns
-    the rest of that JSONB and last_scan_at is never touched here."""
+def _load_memo(conn) -> dict[str, dict]:
+    """The verdict memo: {memo key: {"on": date, "verdict": "rejected"|"covered"}}."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT config->'procedure_miner'->'verdicts' FROM skills_lane.skill_scan_cursor WHERE id = 1"
+    )
+    row = cur.fetchone()
+    return dict(row[0]) if row and row[0] else {}
+
+
+def _stamp_watermark(conn, scan_night: str, memo: dict[str, dict]) -> None:
+    """Merge (not replace) our watermark and verdict memo into skill_scan_cursor.config — the
+    nightly owns the rest of that JSONB and last_scan_at is never touched here."""
     cur = conn.cursor()
     cur.execute(
         """UPDATE skills_lane.skill_scan_cursor
               SET config = COALESCE(config, '{}'::jsonb)
                          || jsonb_build_object('procedure_miner',
-                                               jsonb_build_object('last_run', %s::text)),
+                                               jsonb_build_object('last_run', %s::text,
+                                                                  'verdicts', %s::jsonb)),
                   updated_at = now()
             WHERE id = 1""",
-        (scan_night,),
+        (scan_night, json.dumps(memo)),
     )
     conn.commit()
+
+
+# ------------------------------------------------------------- clusters already decided
+def _signature(cluster: dict) -> str:
+    """A cluster's identity: its sorted step set, which is also the `signature` a candidate
+    made from it carries in the ledger."""
+    return " ".join(sorted(cluster["steps"]))
+
+
+def _memo_key(signature: str) -> str:
+    return hashlib.sha256(signature.encode()).hexdigest()[:16]
+
+
+def _in_ledger(conn, signatures: list[str]) -> set[str]:
+    """Those of `signatures` that a ledger candidate of any status already carries."""
+    if not signatures:
+        return set()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT signature FROM skills_lane.skill_gap_candidates WHERE signature = ANY(%s)",
+        (signatures,),
+    )
+    return {sig for (sig,) in cur.fetchall()}
 
 
 # -------------------------------------------------------------------------- run
@@ -531,6 +560,9 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) ->
     clusters = _cluster(_pairs(sess_fp_pos), fp_sessions, min_sessions)
     registry = dict(catalog)
     catalog_text = skill_measure.format_catalog(sorted(registry.items()))
+    cutoff = (date.fromisoformat(scan_night) - timedelta(days=VERDICT_MEMO_DAYS)).isoformat()
+    memo = {k: v for k, v in _load_memo(conn).items() if v.get("on", "") >= cutoff}
+    in_ledger = _in_ledger(conn, [_signature(c) for c in clusters])
 
     stats = {
         "scan_night": scan_night,
@@ -539,6 +571,7 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) ->
         "fingerprints": len(fp_sessions),
         "clusters": len(clusters),
         "covered": 0,
+        "known": 0,
         "llm_calls": 0,
         "rejected": 0,
         "derived": 0,
@@ -547,11 +580,14 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) ->
         "candidate_ids": [],
     }
 
-    # deterministic coverage prescreen — don't spend LLM budget on skill-covered clusters
+    # deterministic prescreen — don't spend LLM budget on skill-covered clusters, or on ones
+    # already decided: in the ledger, or put to the LLM within the memo window
     to_confirm = []
     for c in clusters:
         if _covered_by_registry(c["steps"], registry):
             stats["covered"] += 1
+        elif _signature(c) in in_ledger or _memo_key(_signature(c)) in memo:
+            stats["known"] += 1
         else:
             to_confirm.append(c)
 
@@ -560,10 +596,13 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) ->
         stats["llm_calls"] += 1
         if not verdict or not verdict.get("procedure"):
             stats["rejected"] += 1
+            if verdict:  # a reply that said no; an unparseable one is asked again next week
+                memo[_memo_key(_signature(c))] = {"on": scan_night, "verdict": "rejected"}
             continue
         covered = (verdict.get("covered_by") or "").strip()
         if covered and covered in registry:
             stats["covered"] += 1
+            memo[_memo_key(_signature(c))] = {"on": scan_night, "verdict": "covered"}
             continue
 
         n = len(c["sessions"])
@@ -583,7 +622,7 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) ->
         # STABLE signature on every derive: the sorted fingerprint set is the cluster's
         # identity key. Never emit a derive without one — the ledger resolver's signature
         # leg wildcard-merges empty-signature candidates (empty-vs-empty jaccard == 1.0).
-        signature = " ".join(sorted(c["steps"]))
+        signature = _signature(c)
 
         extends = (verdict.get("extends") or "").strip()
         if not extends and name in registry:
@@ -618,7 +657,7 @@ def run(conn, *, catalog, window_days=WINDOW_DAYS, min_sessions=MIN_SESSIONS) ->
             stats["derived"] += 1
         stats["candidate_ids"].append(res["id"])
 
-    _stamp_watermark(conn, scan_night)
+    _stamp_watermark(conn, scan_night, memo)
     return stats
 
 

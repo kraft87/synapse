@@ -87,15 +87,12 @@ def wire(monkeypatch, rows, confirm_raw=CONFIRM_OK):
     return calls
 
 
-def health_sweep_rows(n_sessions, dup_chunk_for=()):
-    """Synthetic corpus: each session runs the same 2-step procedure. Sessions listed in
-    dup_chunk_for also re-serve the same commands via an overlapping chunk row."""
+def health_sweep_rows(n_sessions):
+    """Synthetic corpus: each session runs the same 2-step procedure."""
     content = (
         '[tool:Bash] ssh nas "docker ps"\n[result] ok\n[tool:Bash] bash ~/scripts/health-report.sh'
     )
-    rows = [episode(f"s{i}", 3, content) for i in range(n_sessions)]
-    rows += [episode(sid, 2, content) for sid in dup_chunk_for]  # chunk overlapping seq 2-4
-    return rows
+    return [episode(f"s{i}", 3, content) for i in range(n_sessions)]
 
 
 # ---------------------------------------------------------------------- normalization
@@ -219,8 +216,8 @@ class TestExclusions:
 
 # ---------------------------------------------------------------- union + clustering
 class TestUnionAndClustering:
-    def test_chunk_episode_union_dedupes_sessions(self):
-        rows = health_sweep_rows(2, dup_chunk_for=("s0", "s1"))
+    def test_a_session_counts_once_however_often_it_repeats_the_commands(self):
+        rows = health_sweep_rows(2) + [(sid, 2, d, c) for sid, _seq, d, c in health_sweep_rows(2)]
         sess_fp_pos, _, _ = pm._occurrences(rows)
         fp_sessions = pm._fp_sessions(sess_fp_pos)
         assert fp_sessions["ssh:nas>docker:ps"] == {"s0", "s1"}  # 4 rows, 2 sessions
@@ -412,6 +409,69 @@ class TestRun:
         assert calls[0]["evidence"] == calls[1]["evidence"]
         assert calls[0]["name"] == calls[1]["name"]
 
+    def test_a_cluster_a_ledger_candidate_already_carries_is_not_confirmed_again(self, monkeypatch):
+        calls = wire(monkeypatch, health_sweep_rows(5))
+        monkeypatch.setattr(pm, "_in_ledger", lambda conn, sigs: {SWEEP_SIGNATURE})
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
+        assert stats["known"] == 1 and stats["llm_calls"] == 0
+        assert calls == []
+
+    def test_the_confirm_slots_go_to_clusters_nobody_has_decided_yet(self, monkeypatch):
+        rows = []
+        for i in range(12):  # procedure i is seen in 4 + i sessions: 11 is the biggest cluster
+            content = (
+                f"[tool:Bash] bash ~/scripts/proc{i}a.sh\n[tool:Bash] bash ~/scripts/proc{i}b.sh"
+            )
+            rows += [episode(f"s{j}", i * 100, content) for j in range(4 + i)]
+        calls = wire(monkeypatch, rows)
+        biggest = [f"script:proc{i}a.sh script:proc{i}b.sh" for i in range(4, 12)]
+        monkeypatch.setattr(pm, "_in_ledger", lambda conn, sigs: set(biggest))
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
+        assert stats["clusters"] == 12 and stats["known"] == 8
+        assert stats["llm_calls"] == 4  # the small, new ones; not the 8 big ones again
+        assert len(calls) == 4
+
+    def test_a_turned_down_cluster_is_not_asked_again_for_eight_weeks(self, monkeypatch):
+        no = json.dumps({"procedure": False})
+        wire(monkeypatch, health_sweep_rows(5), confirm_raw=no)
+        conn = FakeConn()
+        assert pm.run(conn, catalog=[], min_sessions=4)["rejected"] == 1
+        (stamp,) = [p for sql, p in conn.executed if "jsonb_build_object" in sql]
+        memo = json.loads(stamp[1])
+        assert list(memo.values()) == [{"on": TODAY, "verdict": "rejected"}]
+
+        monkeypatch.setattr(pm, "_load_memo", lambda conn: memo)
+        stats = pm.run(FakeConn(), catalog=[], min_sessions=4)
+        assert stats["known"] == 1 and stats["llm_calls"] == 0
+
+        # ...and asked again once the verdict is older than that, the stale entry dropped
+        stale = (date.today() - timedelta(days=pm.VERDICT_MEMO_DAYS + 1)).isoformat()
+        monkeypatch.setattr(
+            pm, "_load_memo", lambda conn: {k: {**v, "on": stale} for k, v in memo.items()}
+        )
+        conn = FakeConn()
+        assert pm.run(conn, catalog=[], min_sessions=4)["llm_calls"] == 1
+        (stamp,) = [p for sql, p in conn.executed if "jsonb_build_object" in sql]
+        assert [v["on"] for v in json.loads(stamp[1]).values()] == [TODAY]
+
+    def test_a_reply_with_no_verdict_is_not_remembered(self, monkeypatch):
+        wire(monkeypatch, health_sweep_rows(5), confirm_raw="Sorry, I cannot help with that.")
+        conn = FakeConn()
+        assert pm.run(conn, catalog=[], min_sessions=4)["rejected"] == 1
+        (stamp,) = [p for sql, p in conn.executed if "jsonb_build_object" in sql]
+        assert json.loads(stamp[1]) == {}  # unparseable is a failure, not an answer
+
+    def test_an_llm_covered_by_verdict_is_remembered_too(self, monkeypatch):
+        registry = {"ops-check": "Daily operations checklist for the homelab"}
+        raw = json.dumps(
+            {"procedure": True, "name": "x", "summary": "s", "covered_by": "ops-check"}
+        )
+        wire(monkeypatch, health_sweep_rows(5), confirm_raw=raw)
+        conn = FakeConn()
+        pm.run(conn, catalog=sorted(registry.items()), min_sessions=4)
+        (stamp,) = [p for sql, p in conn.executed if "jsonb_build_object" in sql]
+        assert [v["verdict"] for v in json.loads(stamp[1]).values()] == ["covered"]
+
     def test_watermark_stamped_via_config_merge(self, monkeypatch):
         wire(monkeypatch, health_sweep_rows(5))
         conn = FakeConn()
@@ -419,12 +479,12 @@ class TestRun:
         stamps = [
             (sql, params)
             for sql, params in conn.executed
-            if "skill_scan_cursor" in sql and "procedure_miner" in sql
+            if sql.lstrip().startswith("UPDATE") and "procedure_miner" in sql
         ]
         assert len(stamps) == 1
         sql, params = stamps[0]
         assert "||" in sql and "last_scan_at" not in sql  # merge config, never the scan watermark
-        assert params == (TODAY,)
+        assert params == (TODAY, "{}")
         assert conn.commits == 1
 
 
