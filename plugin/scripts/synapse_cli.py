@@ -9,6 +9,7 @@
     synapse update
     synapse skill retire NAME
     synapse skill scope NAME global|project:LABEL
+    synapse capture --dry-run|--backfill [--since 30d]
     synapse devices|private|import ...     (the synapse-devices/-private/-import tools)
     synapse version
 
@@ -660,7 +661,12 @@ def _skill_scope(args) -> int:
 
 # ---------------------------------------------------------------------- passthrough
 
-_PASSTHROUGH = {"devices": "device_admin", "private": "private_mode", "import": "import_history"}
+_PASSTHROUGH = {
+    "devices": "device_admin",
+    "private": "private_mode",
+    "import": "import_history",
+    "capture": "capture_cmd",
+}
 
 
 def _passthrough(module: str, rest: list[str]) -> int:

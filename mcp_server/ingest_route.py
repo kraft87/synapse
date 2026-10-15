@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
@@ -17,33 +18,106 @@ from mcp_server.http_helpers import err, unauthorized
 if TYPE_CHECKING:
     from ingestion.capture import ToolCall
     from ingestion.episode_writer import StoreStats
+    from ingestion.models import Episode
 
 logger = logging.getLogger(__name__)
 
 
-def _sidechain_calls(
-    records: list[Any],
-    record_format: str,
-    project_override: str | None,
-    project_by_cwd: dict[str, str],
-    surface_id: str | None,
-) -> list[ToolCall]:
-    """The tool calls of the sub-agent records among ``records`` when capture is on. The
-    conversation parser drops those records, so no stored turn carries them. Never raises."""
+@dataclass(frozen=True)
+class _Post:
+    """The body of a records POST (``/ingest`` and ``/capture/dry-run`` read the same one)."""
+
+    records: list[Any]
+    source: str
+    #: the client's label for the whole batch; else each turn is labelled from its own cwd
+    project: str | None
+    project_by_cwd: dict[str, str]
+    record_format: str
+    session_id: str | None
+
+    @classmethod
+    def read(cls, body: Any) -> _Post:
+        """Raises ValueError, with the 400's message, for a body that is not a records POST."""
+        records = body.get("records") if isinstance(body, dict) else None
+        if not isinstance(records, list):
+            raise ValueError("body must contain a 'records' list")
+        # A batch spanning several projects (a session that moved between repositories)
+        # carries each cwd's label instead.
+        raw_by_cwd = body.get("cwd_projects")
+        record_format = body.get("format") or "claude_code"
+        if record_format not in ("claude_code", "codex"):
+            raise ValueError(f"unknown format {record_format!r}")
+        return cls(
+            records=records,
+            source=body.get("source") or "hook",
+            # The client resolves the label (marker file, git toplevel, folder name); without
+            # one the parser labels from the transcript's cwd. Either way, never a path.
+            project=clean_label(body.get("project")),
+            project_by_cwd={
+                c: lb
+                for c, v in (raw_by_cwd.items() if isinstance(raw_by_cwd, dict) else ())
+                if isinstance(c, str) and (lb := clean_label(v))
+            },
+            record_format=record_format,
+            session_id=body.get("session_id"),
+        )
+
+    def parse(self, stamp: str | None, *, sidechain: bool) -> tuple[list[Episode], list[ToolCall]]:
+        """The turns of the records, each stamped with ``stamp`` (the surface the BEARER
+        resolves to, assigned unconditionally so nothing a parser might ever lift out of the
+        records can survive as one), and, with ``sidechain``, the tool calls of the sub-agent
+        records, which the conversation parser drops."""
+        if self.record_format == "codex":
+            from ingestion.codex_client import CodexRolloutParser
+
+            episodes = CodexRolloutParser().parse_records(
+                self.records,
+                self.source,
+                self.project,
+                session_id_hint=self.session_id,
+                with_records=True,
+            )
+        else:
+            from ingestion.jsonl_client import JSONLParser
+
+            episodes = JSONLParser().parse_records(
+                self.records,
+                self.source,
+                self.project,
+                project_by_cwd=self.project_by_cwd or None,
+                with_records=True,
+            )
+        for ep in episodes:
+            ep.surface_id = stamp
+        return episodes, self._sidechain_calls(stamp) if sidechain else []
+
+    def _sidechain_calls(self, stamp: str | None) -> list[ToolCall]:
+        """Never raises: a sub-agent record capture cannot read costs the capture only."""
+        from ingestion import capture
+        from ingestion.jsonl_client import JSONLParser
+
+        if self.record_format != "claude_code":
+            return []
+        try:
+            return capture.sidechain_tool_calls(
+                self.records,
+                lambda cwd: JSONLParser.project_of(cwd, self.project, self.project_by_cwd or None),
+                stamp,
+            )
+        except Exception:
+            logger.exception("web capture could not read the sub-agent records")
+            return []
+
+
+def _capture_enabled() -> bool:
+    """Whether the sub-agent records are worth reading. A bad switch is not this route's to
+    report: the episode writer logs it and counts it, and the turns are stored regardless."""
     from ingestion import capture
-    from ingestion.jsonl_client import JSONLParser
 
     try:
-        if record_format != "claude_code" or not capture.enabled():
-            return []
-        return capture.sidechain_tool_calls(
-            records,
-            lambda cwd: JSONLParser.project_of(cwd, project_override, project_by_cwd or None),
-            surface_id,
-        )
-    except Exception:
-        logger.exception("web capture could not read the sub-agent records")
-        return []
+        return capture.enabled()
+    except ValueError:
+        return False
 
 
 def register(
@@ -99,57 +173,18 @@ def register(
         except Exception:
             return err("invalid JSON body", 400)
 
-        records = body.get("records")
-        if not isinstance(records, list):
-            return err("body must contain a 'records' list", 400)
-        source_label = body.get("source") or "hook"
-        # The client resolves the label (marker file, git toplevel, folder name); without
-        # one the parser labels from the transcript's cwd. Either way, never a path.
-        project_override = clean_label(body.get("project"))
-        # A batch spanning several projects (a session that moved between repositories)
-        # carries each cwd's label instead; every turn is then labelled from its own cwd.
-        raw_by_cwd = body.get("cwd_projects")
-        project_by_cwd = {
-            c: lb
-            for c, v in (raw_by_cwd.items() if isinstance(raw_by_cwd, dict) else ())
-            if isinstance(c, str) and (lb := clean_label(v))
-        }
-        record_format = body.get("format") or "claude_code"
-        session_id_hint = body.get("session_id")
-        if record_format not in ("claude_code", "codex"):
-            return err(f"unknown format {record_format!r}", 400)
+        try:
+            post = _Post.read(body)
+        except ValueError as e:
+            return err(str(e), 400)
 
         def _work() -> StoreStats:
             from ingestion.db import Database
-            from ingestion.episode_writer import store_episodes
-            from ingestion.jsonl_client import JSONLParser
+            from ingestion.episode_writer import StoreStats, store_episodes
 
-            if record_format == "codex":
-                from ingestion.codex_client import CodexRolloutParser
-
-                episodes = CodexRolloutParser().parse_records(
-                    records,
-                    source_label,
-                    project_override,
-                    session_id_hint=session_id_hint,
-                    with_records=True,
-                )
-            else:
-                episodes = JSONLParser().parse_records(
-                    records,
-                    source_label,
-                    project_override,
-                    project_by_cwd=project_by_cwd or None,
-                    with_records=True,
-                )
-            # Resolved from the credential only. Assigned unconditionally so nothing a
-            # parser might ever lift out of the records can survive as a stamp.
+            # Resolved from the credential only.
             stamp = _request_trust(request).stamp_surface_id if _request_trust else None
-            for ep in episodes:
-                ep.surface_id = stamp
-            extra_calls = _sidechain_calls(
-                records, record_format, project_override, project_by_cwd, stamp
-            )
+            episodes, extra_calls = post.parse(stamp, sidechain=_capture_enabled())
             if not episodes and not extra_calls:
                 return StoreStats()
             db = Database(db_url())
@@ -169,5 +204,65 @@ def register(
             logger.exception("ingest failed")
             return err(str(exc)[:200], 500)
         return JSONResponse({"status": "ok", "ingested": stats.written, "captured": stats.captured})
+
+    @mcp.custom_route("/capture/dry-run", methods=["POST"])
+    async def capture_dry_run(request: Request) -> JSONResponse:
+        """What web capture WOULD store from a batch of transcript records. Writes nothing.
+
+        The body is ``/ingest``'s, behind the same client gate. The records go through the
+        detector, the capture rules, the private-session check, the duplicate check against
+        what is stored and the per-POST and per-day caps exactly as a live capture does
+        (``ingestion.capture.capture_calls(dry_run=True)``), and the reply groups the outcome
+        by tool (``ingestion.capture.report``). It answers whether or not
+        ``SYNAPSE_WEB_CAPTURE`` is on, and says which in ``enabled``: ``synapse capture
+        --backfill`` reads that before it posts anything for real; an empty ``records`` list
+        is the question alone.
+
+        It does not run the episode guards (a tombstoned, contaminated or scratch-workspace
+        turn, a replay) that keep a turn's research from being captured, and the caps and
+        duplicates it sees are per POST: a client posting a long history in batches counts a
+        page fetched twice in two batches twice.
+        """
+        if not _machine_authorized(request):
+            return unauthorized()
+
+        from starlette.concurrency import run_in_threadpool
+
+        from ingestion import capture
+
+        try:
+            capture.check_config()  # the switch and the rule files, named if invalid
+        except ValueError as e:
+            return err(f"web capture is misconfigured: {e}", 500)
+        try:
+            body = await request.json()
+        except Exception:
+            return err("invalid JSON body", 400)
+        try:
+            post = _Post.read(body)
+        except ValueError as e:
+            return err(str(e), 400)
+
+        def _work() -> dict[str, Any]:
+            from ingestion.db import Database
+            from ingestion.private_sessions import PrivateSessions
+
+            stamp = _request_trust(request).stamp_surface_id if _request_trust else None
+            episodes, extra_calls = post.parse(stamp, sidechain=True)
+            calls = [c for ep in episodes for c in capture.episode_tool_calls(ep)] + extra_calls
+            db = Database(db_url())
+            try:
+                result = capture.capture_calls(
+                    db, calls, is_private=PrivateSessions(db).is_private, dry_run=True
+                )
+            finally:
+                db.close()
+            return {"status": "ok", "enabled": capture.enabled(), **capture.report(result)}
+
+        try:
+            return JSONResponse(await run_in_threadpool(_work))
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.exception("capture dry run failed")
+            return err(str(exc)[:200], 500)
 
     return ingest_turns

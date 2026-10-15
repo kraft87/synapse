@@ -209,6 +209,13 @@ def test_ingest_reports_what_it_captured(db_url, conn, capture_on):
     assert [a[:2] for a in artifacts(conn)] == [("toolu_a", sid)]
 
 
+def test_ingest_of_records_that_make_no_turn_is_a_clean_no_op(db_url, conn, capture_on):
+    r = _client(db_url).post("/ingest", json={"records": []})
+    assert r.status_code == 200 and r.json() == {"status": "ok", "ingested": 0, "captured": 0}
+    r = _client(db_url).post("/ingest", json={"records": [{"type": "summary", "summary": "x"}]})
+    assert r.status_code == 200 and r.json() == {"status": "ok", "ingested": 0, "captured": 0}
+
+
 def test_ingest_captures_a_post_of_nothing_but_sub_agent_records(db_url, conn, capture_on):
     sid = f"r-{uuid.uuid4().hex}"
     side = [{**r, "isSidechain": True} for r in records("side", sid)[1:3]]
