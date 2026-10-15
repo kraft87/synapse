@@ -23,7 +23,8 @@ nothing else, so the dry run reports exactly what a live capture would do. Skip 
 * ``too_short`` the page body is under :data:`MIN_BODY_CHARS`; ``no_shape`` the output is
   neither a page nor a list of at least :data:`MIN_LIST_ITEMS` results.
 
-The store step adds ``private``, ``duplicate`` and the caps.
+The store step adds ``private``, ``deleted`` (a sub-agent's call in a session with a deleted
+turn), ``duplicate`` and the caps.
 """
 
 from __future__ import annotations

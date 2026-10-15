@@ -84,8 +84,9 @@ def capture_calls(
     """Capture the web research in ``calls``.
 
     A call from a private session is never captured (``is_private`` fails closed: a lookup
-    that raises skips the call). A call is stored once per ``tool_use_id`` and once per
-    (canonical URL, content hash); an archived source is kept once, at its longest."""
+    that raises skips the call), nor a sub-agent's from a session with a deleted turn. A call
+    is stored once per ``tool_use_id`` and once per (canonical URL, content hash); an
+    archived source is kept once, at its longest."""
     calls = list(calls)
     result = CaptureResult()
     if not calls:
@@ -97,12 +98,18 @@ def capture_calls(
     stored = 0
     unlinked = {c.span_id for c in calls if c.span_id and c.episode_id is None}
     episode_ids = {} if dry_run else db.episode_ids_by_span(unlinked)
+    # A sub-agent's call belongs to no stored turn, so a tombstone cannot refuse it by turn:
+    # a session with a deleted turn captures no more of them (the delete asked for that
+    # research gone, and the transcript on disk still carries it).
+    deleted = db.tombstoned_sessions(c.session_id for c in calls if c.span_id is None)
 
     with db.atomic() as conn:
 
         def capture(call: ToolCall) -> Capture | Skip:
             if is_private(call.session_id):
                 return Skip("private")
+            if call.span_id is None and call.session_id in deleted:
+                return Skip("deleted")
             decision = decide(call)
             if isinstance(decision, Skip):
                 return decision

@@ -89,7 +89,11 @@ if TYPE_CHECKING:
             allowed_projects: list[str] | None = None,
         ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]: ...
         def _search_web_reranked(
-            self, query: str, query_emb: list[float]
+            self,
+            query: str,
+            query_emb: list[float],
+            allowed_projects: list[str] | None = None,
+            own_surface: str | None = None,
         ) -> list[dict[str, Any]]: ...
         def _search_notes(
             self,

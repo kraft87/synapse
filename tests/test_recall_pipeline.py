@@ -75,7 +75,7 @@ def _engine(
     r._ensure_embedder = lambda: _Emb()
     r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None, own=None: list(p)
     r._search_vector_episodes = lambda emb, proj, limit, sid=None, allowed=None, own=None: []
-    r._search_web_reranked = lambda q, emb: []
+    r._search_web_reranked = lambda q, emb, **_k: []
     r._search_kg = lambda *a, **k: ([], [])
     r._search_notes = lambda q, emb, proj, audience=None: []
     r._fetch_superseded_pairs_pg = lambda gid, uuids, cap: []

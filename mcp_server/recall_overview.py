@@ -73,10 +73,12 @@ class RecallOverviewMixin(RecallEngine):
         registered ``trust='full'`` — including a missing one — is RESTRICTED: episodes
         are filtered to the surface's project allowlist (plus, for a credential-bound
         surface, the episodes it ingested itself: schema 057 ``surface_id``), notes to
-        ``audience='work-safe'``, no web chunks are served (web rows carry no project
-        provenance), and KG facts to those whose provenance is known and
-        lies wholly inside the allowlist (schema 056 ``source_projects``: every source
-        episode exists, has a project, and that project is allowed). The same rule
+        ``audience='work-safe'``, web chunks to the pages fetched in an allowed project or by
+        the surface itself (``metadata.project`` / ``surface_id``, stamped by server-side
+        capture; an older page carries neither and is not served), and KG facts to those
+        whose provenance is known and lies wholly inside the allowlist (schema 056
+        ``source_projects``: every source episode exists, has a project, and that project is
+        allowed). The same rule
         covers every KG-derived extra (superseded pairs, the supersession surface, the
         episode-validity overlay). An empty allowlist, or a database without schema 056,
         serves no facts at all. Bare calls with no surface therefore serve a narrow
@@ -175,11 +177,23 @@ class RecallOverviewMixin(RecallEngine):
                 **kg_scope,
             )
 
-        # Web rows carry no project provenance and the web SQL has no scope predicate, so a
-        # restricted caller (an unknown one included) is served no web bucket at all.
+        # Captured pages carry the project and surface of the turn that fetched them
+        # (ingestion.capture), so a restricted caller is served the ones its allowlisted
+        # projects and its own credential produced, like the episode legs; a caller with
+        # neither, an unknown one included, is served no web bucket at all.
+        web_scope: dict[str, Any] = (
+            {"allowed_projects": allowed, "own_surface": st.own_surface} if st.restricted else {}
+        )
+        web_off = st.restricted and not allowed and not st.own_surface
         f_web = (
-            _submit_ctx(ex, _timed, self._search_web_reranked, query, query_emb)
-            if query_emb is not None and not st.restricted
+            _submit_ctx(
+                ex,
+                _timed,
+                functools.partial(self._search_web_reranked, **web_scope),
+                query,
+                query_emb,
+            )
+            if query_emb is not None and not web_off
             else None
         )
         f_kg = _submit_ctx(ex, _timed, _kg_leg)

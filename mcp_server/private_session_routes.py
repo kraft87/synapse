@@ -24,7 +24,8 @@ and never on session-end cleanup.
 The flag covers the session FROM NOW ON. Turns ingested before it was set are already
 memory, so PUT reports how many are stored (``stored_turns``) and deletes them only when
 asked by name: ``?purge=1`` runs the dashboard's episode-delete cascade over every stored
-turn of the session, plus the preferences those turns gave birth to, in one transaction.
+turn of the session, plus the preferences those turns gave birth to and every web page or
+archived thread captured in the session (a sub-agent's included), in one transaction.
 That is wider than the dashboard's single-turn delete, which leaves preferences alone
 because a preference's ``source_ref`` names only its first turn: a privacy purge errs
 toward removing what the session said, and a preference the user states again elsewhere
@@ -61,7 +62,13 @@ _MAX_ID_LEN = 200
 
 #: The cascade counts a session purge reports. A chunk's "mixed" count is left out: a
 #: session's chunk windows only span that session's own turns.
-_PURGE_COUNTS = ("chunks_deleted", "facts_deleted", "facts_unlinked", "events_deleted")
+_PURGE_COUNTS = (
+    "chunks_deleted",
+    "facts_deleted",
+    "facts_unlinked",
+    "events_deleted",
+    "web_deleted",
+)
 
 
 class PurgeRefused(Exception):
@@ -130,7 +137,7 @@ def _purge_session(db_url: str, session_id: str, trust: SurfaceTrust) -> dict[st
                 "device, or a restricted one purging only turns it wrote itself; the "
                 "session is flagged private and nothing was deleted"
             )
-        counts = delete_episode_content(conn, turns)
+        counts = delete_episode_content(conn, turns, session_id)
         prefs = [
             r["id"]
             for r in conn.execute(

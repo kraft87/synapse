@@ -146,6 +146,21 @@ class EpisodeStore(DatabaseConnection):
             ).fetchone()
         return row is not None
 
+    def tombstoned_sessions(self, session_ids: Iterable[str]) -> set[str]:
+        """Those of ``session_ids`` with a deleted turn (``deleted_turns``). Always empty
+        until the tombstone migration is applied."""
+        wanted = sorted(set(session_ids))
+        if not wanted:
+            return set()
+        with self._conn() as conn:
+            if not DELETED_TURNS_PROBE.ready(conn, self._url):
+                return set()
+            rows = conn.execute(
+                "SELECT DISTINCT session_id FROM deleted_turns WHERE session_id = ANY(%s)",
+                (wanted,),
+            ).fetchall()
+        return {r["session_id"] for r in rows}
+
     def is_private_session(self, session_id: str) -> bool:
         """True if this session is flagged private (schema/050) — its turns must never
         become episodes, on ANY path (live /ingest, catch-up sweep, bulk backfill).

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from ingestion.surfaces import web_scope_sql
 from mcp_server.kg_pg import _vec_literal
 from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
@@ -14,14 +15,19 @@ from mcp_server.recall_warnings import warn as _warn
 logger = logging.getLogger(__name__)
 
 
-def vector_web_sql(dims: int) -> str:
-    """The web vector KNN, nearest first; placeholders: query vector (distance), query vector
-    (order), limit.
+def vector_web_sql(dims: int, scope: str | None = None) -> str:
+    """The web vector KNN, nearest first; placeholders: query vector (distance), the
+    ``scope`` predicate's own (``web_scope_sql``, on ``web_artifacts`` aliased ``a``), query
+    vector (order), limit.
 
     The ORDER BY is the verbatim ``embedding::halfvec(N)`` expression
     ``web_chunks_embedding_hnsw`` is built on (schema 014), so the index serves it; ordering
     by the full-precision ``vector`` column reads every embedded chunk. It sits in a LIMITed
-    subquery so the join to web_artifacts only touches the rows that survive."""
+    subquery so the join to web_artifacts only touches the rows that survive. A restricted
+    caller's ``scope`` filters inside that subquery, as the episode leg's does."""
+    scoped = (
+        f"AND web_artifact_id IN (SELECT a.id FROM web_artifacts a WHERE {scope})" if scope else ""
+    )
     return f"""
         SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
                c.content_ts AS created_at, a.url, a.title, a.tool_name, c.vec_distance
@@ -29,33 +35,45 @@ def vector_web_sql(dims: int) -> str:
             SELECT id, content, context_prefix, web_artifact_id, content_ts,
                    (embedding::halfvec({dims}) <=> %s::halfvec({dims})) AS vec_distance
             FROM web_chunks
-            WHERE is_embedded = TRUE
+            WHERE is_embedded = TRUE {scoped}
             ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) LIMIT %s
         ) c
         JOIN web_artifacts a ON a.id = c.web_artifact_id
         ORDER BY c.vec_distance
-        """
+        """  # nosec B608 — scope is web_scope_sql's fixed text and dims a validated int; the values are bound
 
 
 class RecallWebMixin(RecallEngine):
-    def _search_bm25_web(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def _search_bm25_web(
+        self,
+        query: str,
+        limit: int,
+        allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
+    ) -> list[dict[str, Any]]:
         # Same no-alphanumeric-tokens short-circuit as _search_bm25_episodes.
         if not any(c.isalnum() for c in query):
             return []
+        where = ["c.id @@@ paradedb.match('content', %s)"]
+        params: list[Any] = [query]
+        scope = web_scope_sql(allowed_projects, own_surface)
+        if scope is not None:  # restricted surface: only pages its own projects/device fetched
+            where.append(scope[0])
+            params.extend(scope[1])
         try:
             with self._pg() as pg:
                 rows = pg.execute(
-                    """
+                    f"""
                     SELECT c.id, c.content, c.context_prefix, c.web_artifact_id,
                            c.content_ts AS created_at,
                            a.url, a.title, a.tool_name,
                            paradedb.score(c.id) AS bm25_score
                     FROM web_chunks c
                     JOIN web_artifacts a ON a.id = c.web_artifact_id
-                    WHERE c.id @@@ paradedb.match('content', %s)
+                    WHERE {" AND ".join(where)}
                     ORDER BY bm25_score DESC LIMIT %s
-                    """,
-                    (query, limit),
+                    """,  # nosec B608 — where holds fixed predicates; the values are bound
+                    (*params, limit),
                 ).fetchall()
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
@@ -63,13 +81,20 @@ class RecallWebMixin(RecallEngine):
             _warn(f"BM25 web search failed ({_err_brief(e)}): web bucket is degraded.")
             return []
 
-    def _search_vector_web(self, query_emb: list[float], limit: int) -> list[dict[str, Any]]:
+    def _search_vector_web(
+        self,
+        query_emb: list[float],
+        limit: int,
+        allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
+    ) -> list[dict[str, Any]]:
         emb_literal = _vec_literal(query_emb)
+        scope = web_scope_sql(allowed_projects, own_surface)
         try:
             with self._pg() as pg:
                 rows = pg.execute(
-                    vector_web_sql(self._config.embed_dims),
-                    (emb_literal, emb_literal, limit),
+                    vector_web_sql(self._config.embed_dims, scope[0] if scope else None),
+                    (emb_literal, *(scope[1] if scope else ()), emb_literal, limit),
                 ).fetchall()
             return [{**dict(r), "doc_type": "web", "id": f"w:{r['id']}"} for r in rows]
         except Exception as e:
@@ -97,7 +122,13 @@ class RecallWebMixin(RecallEngine):
                 break
         return out
 
-    def _search_web_reranked(self, query: str, query_emb: list[float]) -> list[dict[str, Any]]:
+    def _search_web_reranked(
+        self,
+        query: str,
+        query_emb: list[float],
+        allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Web bucket (2026-07-24): fuse BM25 + vector via RRF, cross-encoder rerank the pool,
         DROP chunks below ``web_floor`` (off-topic collisions), dedupe by parent page, cap to
         ``web_limit``. May return [] when nothing clears the floor — that self-gates web on intent.
@@ -106,10 +137,19 @@ class RecallWebMixin(RecallEngine):
         and the raw bi-encoder ranking served ~2.6% precision (feedback). The rerank is the active
         ingredient (it reads content topicality, not surface tokens); fusion widens the candidate
         pool the reranker sees. Degrades safe: on reranker outage/disable (top score 0.0) it serves
-        the fused RRF order deduped rather than blanking the bucket or hard-failing."""
+        the fused RRF order deduped rather than blanking the bucket or hard-failing.
+
+        ``allowed_projects`` (None: full trust, every page) restricts both legs to the pages a
+        restricted surface may read: those fetched in its allowlisted projects, plus the ones
+        its own credential uploaded (``own_surface``); see ``ingestion.surfaces.web_scope_sql``."""
         cfg = self._config
-        bm25 = self._search_bm25_web(query, cfg.web_fetch)
-        vec = self._search_vector_web(query_emb, cfg.web_fetch)
+        scope: dict[str, Any] = (
+            {}
+            if allowed_projects is None
+            else {"allowed_projects": allowed_projects, "own_surface": own_surface}
+        )
+        bm25 = self._search_bm25_web(query, cfg.web_fetch, **scope)
+        vec = self._search_vector_web(query_emb, cfg.web_fetch, **scope)
         fused = _merge_rrf(bm25, vec, id_key="id")[: cfg.web_rerank_pool]
         if not fused:
             return []

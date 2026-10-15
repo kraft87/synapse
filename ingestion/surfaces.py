@@ -162,6 +162,27 @@ def episode_scope_sql(
     return "project = ANY(%s)", [allowed_projects]
 
 
+def web_scope_sql(
+    allowed_projects: list[str] | None, own_surface: str | None = None
+) -> tuple[str, list[Any]] | None:
+    """The restricted-surface row predicate for ``web_artifacts`` (aliased ``a``), or None.
+
+    :func:`episode_scope_sql` on the page's provenance: server-side capture stamps
+    ``metadata.project`` and ``metadata.surface_id`` from the turn that fetched the page
+    (``ingestion.capture.store``). A page with neither key (stored before capture knew the
+    turn) matches nothing, and neither does an empty allowlist or an unknown surface, so the
+    serve fails closed exactly as the episode legs do. ``None`` means full trust.
+    """
+    if allowed_projects is None:
+        return None
+    if own_surface:
+        return (
+            "(a.metadata->>'project' = ANY(%s) OR a.metadata->>'surface_id' = %s)",
+            [allowed_projects, own_surface],
+        )
+    return "a.metadata->>'project' = ANY(%s)", [allowed_projects]
+
+
 #: Schema 057 adds ``surface_id`` to episodes AND timeline_events. The code ships before
 #: the migration is applied by hand, so every read or write that would name the column
 #: asks this probe first and keeps the pre-057 statement until both columns exist.

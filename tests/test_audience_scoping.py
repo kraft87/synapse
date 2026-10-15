@@ -155,7 +155,7 @@ def _engine(db_url, monkeypatch, notes_rows=None):
     r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "text": e.get("content", "")} for e in eps
     ]
-    r._search_web_reranked = lambda q, emb: []
+    r._search_web_reranked = lambda q, emb, **_k: []
     r._search_kg = lambda *a, **k: ([], [])
     r._fetch_superseded_pairs_pg = lambda gid, uuids, cap, allowed_projects=None: []
     r._surface_supersessions = lambda *a, **k: []
@@ -227,10 +227,12 @@ def test_restricted_recall_scopes_the_kg_leg_to_the_allowlist(clean, db_url, mon
     assert "allowed_projects" not in full_calls[0]
 
 
-def test_restricted_recall_serves_no_web_bucket(clean, db_url, monkeypatch):
-    """Web rows carry no project provenance and the web SQL has no scope predicate, so a
-    restricted or unknown caller must not be served the bucket at all. Everything under
-    _search_web_reranked stays real here: stubbing the whole leg is what hid the leak."""
+def test_restricted_recall_serves_the_web_bucket_through_its_scope(clean, db_url, monkeypatch):
+    """Captured pages carry the project and surface of the turn that fetched them, so a
+    restricted caller's web legs run with its allowlist; one with no allowlist and no own
+    surface (an unknown caller) is served no web bucket and nothing even queries the table.
+    Everything under _search_web_reranked stays real here: stubbing the whole leg is what
+    hid the old leak."""
     chunk = {
         "id": "w:1",
         "content": "private research page",
@@ -238,23 +240,27 @@ def test_restricted_recall_serves_no_web_bucket(clean, db_url, monkeypatch):
         "url": "https://example.org/private",
         "title": "Personal medical lookup",
     }
-    legs: list[str] = []
+    scopes: list[dict] = []
 
     def _engine_with_web():
         r = _engine(db_url, monkeypatch)
         del r._search_web_reranked  # the real fuse -> rerank -> floor path
-        r._search_bm25_web = lambda q, n: legs.append("bm25") or [chunk]
-        r._search_vector_web = lambda emb, n: legs.append("vector") or []
+        r._search_bm25_web = lambda q, n, **scope: scopes.append(scope) or [chunk]
+        r._search_vector_web = lambda emb, n, **scope: []
         r._rerank_pool_scored = lambda q, pool: [(i, 0.9) for i in range(len(pool))]
         return r
 
-    for surface in (register_restricted(clean, ["alpha"]), "never-registered"):
-        assert "web" not in _engine_with_web().recall("research", surface=surface)
-    assert legs == []  # nothing even queried the table
+    assert "web" not in _engine_with_web().recall("research", surface="never-registered")
+    assert scopes == []  # nothing even queried the table
 
-    full = register_full(clean)
-    out = _engine_with_web().recall("research", surface=full)
+    out = _engine_with_web().recall("research", surface=register_restricted(clean, ["alpha"]))
     assert [w["id"] for w in out["web"]] == ["w:1"]
+    assert scopes == [{"allowed_projects": ["alpha"], "own_surface": None}]
+
+    scopes.clear()
+    out = _engine_with_web().recall("research", surface=register_full(clean))
+    assert [w["id"] for w in out["web"]] == ["w:1"]
+    assert scopes == [{}]  # full trust: the legs run unscoped, as they always did
 
 
 def test_unknown_surface_skips_every_kg_read(clean, db_url, monkeypatch):

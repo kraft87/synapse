@@ -172,7 +172,7 @@ def _engine(db_url):
     r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "text": e.get("content", "")} for e in eps
     ]
-    r._search_web_reranked = lambda q, emb: []
+    r._search_web_reranked = lambda q, emb, **_k: []
     r._search_kg = lambda *a, **k: ([], [])
     r._fetch_superseded_pairs_pg = lambda *a, **k: []
     r._surface_supersessions = lambda *a, **k: []

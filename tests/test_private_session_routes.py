@@ -193,6 +193,7 @@ def test_put_with_purge_deletes_the_turns_and_what_was_derived_from_them(derived
         "facts_deleted": 2,
         "facts_unlinked": 2,
         "events_deleted": 1,
+        "web_deleted": 0,
         "preferences_deleted": 1,
     }
 

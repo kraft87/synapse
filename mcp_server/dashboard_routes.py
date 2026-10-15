@@ -62,6 +62,7 @@ from ingestion.db_timeline import REPORTED_REFS_PROBE
 from ingestion.dedup import _normalize_name
 from ingestion.llm_schemas import EVENT_TYPES
 from ingestion.surfaces import OWN_SURFACE_PROBE
+from ingestion.web_artifacts import ARCHIVE_PROBE
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -1676,7 +1677,8 @@ def _set_flag(db_url: str, kind: str, item_id: str, note: str | None, flagged: b
 # blanket "delete every fact whose provenance mentions these episodes" would have taken
 # 1467 legitimate facts out with the 330 bad ones. See docs/dashboard-contract.md §Phase 7
 # for the full cascade table, including what is deliberately left alone (preferences,
-# notes, recall_metrics/recall_feedback, web_artifacts, kg_entities) and why.
+# notes, recall_metrics/recall_feedback, kg_entities) and why. The web research captured
+# from a deleted turn is not left alone: it is that turn's content.
 #
 # Note the NOTIFY trigger (schema 043) is AFTER INSERT only, so a delete does not push
 # anything down the SSE stream; the deleting client drops the row locally and other
@@ -1743,7 +1745,9 @@ def _repoint_event(
 
 
 def delete_episode_content(
-    conn: psycopg.Connection[dict[str, Any]], episode_ids: list[int]
+    conn: psycopg.Connection[dict[str, Any]],
+    episode_ids: list[int],
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """The episode-delete cascade: everything carrying the content of ``episode_ids``.
 
@@ -1754,9 +1758,13 @@ def delete_episode_content(
     re-ship, catch-up sweep or backfill of the transcript on disk cannot bring the turn
     back; ``ingestion.episode_writer`` checks it), the rows themselves (their own
     extraction_queue rows follow via the 001 FK), and any active flag on the facts, events
-    and episodes that went. Returns the counts plus the uuids of the deleted facts and the
-    ids of the deleted events, so a client can drop them from its lists. Shared by the
-    dashboard's single-turn delete and private mode's session purge
+    and episodes that went. The web research captured from these turns (``web_artifacts``
+    and the cold ``research_archive``, by ``parent_episode_id``) goes with them, and so do
+    the facts the web lane read out of those pages. ``session_id`` (a session purge) also
+    takes every capture of that session, which includes a sub-agent's: those belong to no
+    turn, so a single-turn delete leaves them. Returns the counts plus the uuids of the
+    deleted facts and the ids of the deleted events, so a client can drop them from its
+    lists. Shared by the dashboard's single-turn delete and private mode's session purge
     (``mcp_server/private_session_routes``).
 
     Set-based on purpose: the purge passes every turn of a session, and the provenance
@@ -1796,13 +1804,34 @@ def delete_episode_content(
         )
         conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
 
+    # --- captured web research -------------------------------------------------------
+    # A page's chunks (and their queue rows) follow it by FK. The facts the web lane read out
+    # of it name the page as their only source: they go, or are unlinked when a surviving
+    # episode backs them too, joining the sole/shared judgement below.
+    ids_arg = (episode_ids, session_id)
+    web_ids = [
+        r["id"]
+        for r in conn.execute(
+            "DELETE FROM web_artifacts WHERE parent_episode_id = ANY(%s::bigint[]) "
+            "OR session_id = %s RETURNING id",
+            ids_arg,
+        ).fetchall()
+    ]
+    archive_deleted = 0
+    if ARCHIVE_PROBE.ready(conn):  # the cold archive (optional migration)
+        archive_deleted = conn.execute(
+            "DELETE FROM research_archive WHERE parent_episode_id = ANY(%s::bigint[]) "
+            "OR session_id = %s",
+            ids_arg,
+        ).rowcount
+
     # --- KG facts (sole vs shared provenance) --------------------------------
     fact_rows = conn.execute(
         "SELECT uuid, episodes FROM kg_relationships r WHERE EXISTS ("
         "SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(r.episodes) = 'array' "
         "THEN r.episodes ELSE jsonb_build_array(r.episodes) END) AS v "
-        "WHERE v = ANY(%s::text[])) FOR UPDATE",
-        (id_texts,),
+        "WHERE v = ANY(%s::text[])) OR r.web_artifact_id = ANY(%s::bigint[]) FOR UPDATE",
+        (id_texts, web_ids),
     ).fetchall()
     sole: list[str] = []
     shared: list[tuple[str, list[Any]]] = []
@@ -1821,6 +1850,11 @@ def delete_episode_content(
         _clear_invalidated_by(conn, sole)
         conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
         retire_flags(conn, "fact", sole)
+    if web_ids:  # the facts that stay are backed by a surviving turn: no page to cite
+        conn.execute(
+            "UPDATE kg_relationships SET web_artifact_id = NULL WHERE web_artifact_id = ANY(%s)",
+            (web_ids,),
+        )
 
     # --- timeline events -----------------------------------------------------
     # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
@@ -1878,6 +1912,7 @@ def delete_episode_content(
         "facts_deleted": len(sole),
         "facts_unlinked": len(shared),
         "events_deleted": len(deleted_events),
+        "web_deleted": len(web_ids) + archive_deleted,
         "tombstoned": tombstoned,
         "deleted_fact_ids": sole,
         "deleted_event_ids": deleted_events,
