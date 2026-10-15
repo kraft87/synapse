@@ -143,6 +143,10 @@ def clean_tables(conn):
         TRUNCATE episodes, search_cache,
                  ingestion_state, extraction_queue RESTART IDENTITY CASCADE
     """)
+    # Delete tombstones (schema 123, optional) hang off no table, so CASCADE misses them, and
+    # a stale one would drop a later test's ingest of the same words as a deleted turn.
+    if conn.execute("SELECT to_regclass('deleted_turns')").fetchone()[0]:
+        conn.execute("TRUNCATE deleted_turns")
     yield
 
 

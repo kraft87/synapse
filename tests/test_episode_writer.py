@@ -30,10 +30,24 @@ def db(db_url):
 
 @pytest.fixture(autouse=True)
 def _clean(clean_tables, conn):
-    conn.execute("TRUNCATE deleted_turns, private_sessions RESTART IDENTITY")
+    conn.execute("TRUNCATE private_sessions RESTART IDENTITY")
     DELETED_TURNS_PROBE.reset()
     yield
     DELETED_TURNS_PROBE.reset()
+
+
+def _tombstones(conn) -> int | None:
+    """Rows in deleted_turns, or None on a database without it (schema 123 is optional)."""
+    if not conn.execute("SELECT to_regclass('deleted_turns')").fetchone()[0]:
+        return None
+    return conn.execute("SELECT count(*) FROM deleted_turns").fetchone()[0]
+
+
+@pytest.fixture()
+def tombstones(conn):
+    """For the tests whose point is the tombstone: skipped until schema 123 is applied."""
+    if _tombstones(conn) is None:
+        pytest.skip("schema 123 (deleted_turns) is not applied")
 
 
 def _ep(session: str, seq: int, tag: str, project: str | None = "proj", **kw) -> Episode:
@@ -241,7 +255,7 @@ def _delete(db_url, db, session: str, seq: int) -> dict:
     return summary
 
 
-def test_a_deleted_turn_does_not_come_back_on_a_reship(db, db_url, conn):
+def test_a_deleted_turn_does_not_come_back_on_a_reship(tombstones, db, db_url, conn):
     eps = [_ep("t-1", 1, "keep"), _ep("t-1", 2, "doomed")]
     store_episodes(db, eps)
     assert _delete(db_url, db, "t-1", 2)["tombstoned"] == 1
@@ -252,7 +266,7 @@ def test_a_deleted_turn_does_not_come_back_on_a_reship(db, db_url, conn):
     assert [r[2] for r in _episodes(conn)] == ["jsonl:keep"]
 
 
-def test_a_deleted_turn_does_not_come_back_in_a_replayed_session(db, db_url, conn):
+def test_a_deleted_turn_does_not_come_back_in_a_replayed_session(tombstones, db, db_url, conn):
     doomed = _ep("t-2", 1, "doomed", metadata={"cwd": "/work/app"})
     store_episodes(db, [doomed])
     _delete(db_url, db, "t-2", 1)
@@ -265,7 +279,7 @@ def test_a_deleted_turn_does_not_come_back_in_a_replayed_session(db, db_url, con
     assert store_episodes(db, [other]).written == 1
 
 
-def test_the_backfill_honours_a_tombstone(db, db_url, conn, tmp_path):
+def test_the_backfill_honours_a_tombstone(tombstones, db, db_url, conn, tmp_path):
     root = _transcript_dir(tmp_path, "t-3", ["one", "two"])
     assert backfill("claude-code", root, db)["episodes_written"] == 2
     eid = conn.execute("SELECT id FROM episodes ORDER BY sequence DESC LIMIT 1").fetchone()[0]
@@ -282,7 +296,7 @@ def test_without_the_tombstone_table_a_delete_still_works_and_nothing_is_checked
     eps = [_ep("t-4", 1, "a")]
     store_episodes(db, eps)
     assert _delete(db_url, db, "t-4", 1)["tombstoned"] == 0
-    assert conn.execute("SELECT count(*) FROM deleted_turns").fetchone()[0] == 0
+    assert not _tombstones(conn)  # no table, or nothing recorded in it
     assert store_episodes(db, eps).written == 1  # nothing recorded, so the turn returns
 
 
