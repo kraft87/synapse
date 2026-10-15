@@ -170,6 +170,7 @@ class CodexRolloutParser:
         source_label: str,
         project_override: str | None = None,
         session_id_hint: str | None = None,
+        with_records: bool = False,
     ) -> list[Episode]:
         """Shared seam for the disk sweep and the /ingest push, mirroring
         JSONLParser.parse_records: same records -> same span_ids, so both
@@ -178,6 +179,9 @@ class CodexRolloutParser:
         A pushed TAIL usually lacks the session_meta line, so push callers
         must supply ``session_id_hint`` (the hook knows it from the rollout
         filename); session_meta wins when present.
+
+        ``with_records`` keeps each turn's records on its Episode (``Episode.records``) for
+        the tool-call capture; a whole-file sweep leaves it off.
         """
         session_id = session_id_hint
         cwd: str | None = None
@@ -287,6 +291,7 @@ class CodexRolloutParser:
                         "originator": originator,
                     },
                     created_at=parse_iso(ts),
+                    records=group if with_records else [],
                 )
             )
 

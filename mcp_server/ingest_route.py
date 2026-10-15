@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 from starlette.requests import Request
@@ -14,7 +14,36 @@ from ingestion.project_label import clean_label
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
+if TYPE_CHECKING:
+    from ingestion.capture import ToolCall
+    from ingestion.episode_writer import StoreStats
+
 logger = logging.getLogger(__name__)
+
+
+def _sidechain_calls(
+    records: list[Any],
+    record_format: str,
+    project_override: str | None,
+    project_by_cwd: dict[str, str],
+    surface_id: str | None,
+) -> list[ToolCall]:
+    """The tool calls of the sub-agent records among ``records`` when capture is on. The
+    conversation parser drops those records, so no stored turn carries them. Never raises."""
+    from ingestion import capture
+    from ingestion.jsonl_client import JSONLParser
+
+    try:
+        if record_format != "claude_code" or not capture.enabled():
+            return []
+        return capture.sidechain_tool_calls(
+            records,
+            lambda cwd: JSONLParser.project_of(cwd, project_override, project_by_cwd or None),
+            surface_id,
+        )
+    except Exception:
+        logger.exception("web capture could not read the sub-agent records")
+        return []
 
 
 def register(
@@ -55,6 +84,10 @@ def register(
         Provenance (schema 057): each stored turn is stamped with the surface the BEARER
         resolves to, which is what lets a restricted device read its own uploads back.
         Nothing in the body can set or influence that stamp.
+
+        Web research in the records' tool calls (any tool: ``ingestion.capture`` recognises it
+        by shape) is captured too when ``SYNAPSE_WEB_CAPTURE=on``, from stored turns, re-shipped
+        turns and sub-agent records alike; the reply's ``captured`` counts the artifacts stored.
         """
         if not _machine_authorized(request):
             return unauthorized()
@@ -86,7 +119,7 @@ def register(
         if record_format not in ("claude_code", "codex"):
             return err(f"unknown format {record_format!r}", 400)
 
-        def _work() -> int:
+        def _work() -> StoreStats:
             from ingestion.db import Database
             from ingestion.episode_writer import store_episodes
             from ingestion.jsonl_client import JSONLParser
@@ -95,35 +128,46 @@ def register(
                 from ingestion.codex_client import CodexRolloutParser
 
                 episodes = CodexRolloutParser().parse_records(
-                    records, source_label, project_override, session_id_hint=session_id_hint
+                    records,
+                    source_label,
+                    project_override,
+                    session_id_hint=session_id_hint,
+                    with_records=True,
                 )
             else:
                 episodes = JSONLParser().parse_records(
-                    records, source_label, project_override, project_by_cwd=project_by_cwd or None
+                    records,
+                    source_label,
+                    project_override,
+                    project_by_cwd=project_by_cwd or None,
+                    with_records=True,
                 )
-            if not episodes:
-                return 0
             # Resolved from the credential only. Assigned unconditionally so nothing a
             # parser might ever lift out of the records can survive as a stamp.
             stamp = _request_trust(request).stamp_surface_id if _request_trust else None
             for ep in episodes:
                 ep.surface_id = stamp
+            extra_calls = _sidechain_calls(
+                records, record_format, project_override, project_by_cwd, stamp
+            )
+            if not episodes and not extra_calls:
+                return StoreStats()
             db = Database(db_url())
             try:
-                # Every guard, the span dedup, the append at max(sequence)+1 and the
-                # extraction enqueue live in ingestion.episode_writer, shared with the
-                # backfills; the POST is one transaction on one connection.
-                stats = store_episodes(db, episodes)
+                # Every guard, the span dedup, the append at max(sequence)+1, the extraction
+                # enqueue and the web capture live in ingestion.episode_writer, shared with
+                # the backfills; the POST is one transaction on one connection.
+                stats = store_episodes(db, episodes, extra_calls=extra_calls)
             finally:
                 db.close()
             stats.log_skipped()
-            return stats.written
+            return stats
 
         try:
-            n = await run_in_threadpool(_work)
+            stats = await run_in_threadpool(_work)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("ingest failed")
             return err(str(exc)[:200], 500)
-        return JSONResponse({"status": "ok", "ingested": n})
+        return JSONResponse({"status": "ok", "ingested": stats.written, "captured": stats.captured})
 
     return ingest_turns

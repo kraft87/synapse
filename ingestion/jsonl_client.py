@@ -156,6 +156,7 @@ class JSONLParser:
         project_override: str | None = None,
         *,
         project_by_cwd: dict[str, str] | None = None,
+        with_records: bool = False,
         _filtered: bool = False,
     ) -> list[Episode]:
         """Parse already-loaded transcript records into Episodes.
@@ -163,6 +164,10 @@ class JSONLParser:
         ``project_by_cwd`` (a client's labels for each cwd in a batch that spans several
         projects) labels each turn from its own cwd when no ``project_override`` applies;
         a cwd it doesn't name falls back to :func:`_cwd_to_project`.
+
+        ``with_records`` keeps each turn's records on its Episode (``Episode.records``) for
+        the tool-call capture; a whole-file sweep leaves it off rather than hold every
+        record of the run in memory.
 
         The seam shared by the disk sweep (``parse_file``) and the real-time
         ``/ingest`` push: both feed the SAME records through the SAME grouping
@@ -177,7 +182,9 @@ class JSONLParser:
         if not recs:
             return []
         groups = self._group_into_turns(recs)
-        return self._groups_to_episodes(groups, source_label, project_override, project_by_cwd)
+        return self._groups_to_episodes(
+            groups, source_label, project_override, project_by_cwd, with_records
+        )
 
     @classmethod
     def _load_records(cls, path: Path) -> list[dict[str, Any]]:
@@ -249,11 +256,24 @@ class JSONLParser:
         return groups
 
     @staticmethod
+    def project_of(
+        cwd: str | None, project_override: str | None, project_by_cwd: dict[str, str] | None
+    ) -> str | None:
+        """A turn's project: the client's label for the batch, else its label for this cwd,
+        else one derived from the cwd."""
+        return (
+            project_override
+            or ((project_by_cwd or {}).get(cwd) if cwd else None)
+            or _cwd_to_project(cwd)
+        )
+
+    @staticmethod
     def _groups_to_episodes(
         groups: list[list[dict[str, Any]]],
         source_path: str,
         project_override: str | None,
         project_by_cwd: dict[str, str] | None = None,
+        with_records: bool = False,
     ) -> list[Episode]:
         episodes: list[Episode] = []
         # Claude Code transcripts physically repeat records across compaction/resume
@@ -303,11 +323,7 @@ class JSONLParser:
             if not session_id or not turns.accept(turn, span_id):
                 continue
 
-            project = (
-                project_override
-                or ((project_by_cwd or {}).get(cwd) if cwd else None)
-                or _cwd_to_project(cwd)
-            )
+            project = JSONLParser.project_of(cwd, project_override, project_by_cwd)
 
             episodes.append(
                 Episode(
@@ -328,6 +344,7 @@ class JSONLParser:
                         "git_branch": git_branch,
                     },
                     created_at=parse_iso(ts),
+                    records=group if with_records else [],
                 )
             )
 

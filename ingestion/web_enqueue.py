@@ -12,6 +12,9 @@ Gates — the lane refuses substrate that would pollute the graph:
   - near-dup pages: when several artifacts share a content_hash (same article
     scraped from multiple URLs / sessions), only the lowest-id artifact's
     chunks are enqueued.
+  - opt-in: server-side capture (ingestion.capture) marks each artifact it stores with
+    metadata.kg_extract; generic captures are searchable, not extracted, and only a source
+    a rule trusts says true. An artifact with no mark predates capture and is extracted.
   - readiness: only chunks that finished the contextualize+embed lane
     (context_prefix IS NOT NULL AND is_embedded) — guarantees the contextual
     prefix exists before extraction reads the chunk, regardless of how the
@@ -83,6 +86,7 @@ SELECT c.id AS web_chunk_id,
 FROM web_chunks c
 JOIN web_artifacts a ON a.id = c.web_artifact_id
 WHERE a.kind IN ('web_scrape', 'research_brief')
+  AND COALESCE((a.metadata->>'kg_extract')::boolean, TRUE)
   AND c.context_prefix IS NOT NULL
   AND c.is_embedded
   AND NOT EXISTS (
@@ -132,7 +136,7 @@ def enqueue_web_chunks(
         rows = conn.execute(_CANDIDATES_SQL, (cutoff,)).fetchall()
 
     for row in rows:
-        # dict_row vs tuple-row tolerance (matches WebArtifactsIngester pattern)
+        # dict_row vs tuple-row tolerance
         if isinstance(row, dict):
             chunk_id, content = row["web_chunk_id"], row["content"]
             prefix, session_id = row["context_prefix"], row["session_id"]

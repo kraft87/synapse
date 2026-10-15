@@ -144,6 +144,10 @@ class Episode(BaseModel):
     # Provenance (schema 057): the credential-resolved surface that wrote this turn.
     # Set only by the server from the authenticated caller, never parsed from a payload.
     surface_id: str | None = None
+    # The transcript records this turn was parsed from (the parser's own objects, not copies),
+    # kept only when asked (``with_records``) so the tool calls of a stored turn can be read
+    # from them (``ingestion.capture``). Never stored or dumped.
+    records: list[dict[str, Any]] = Field(default_factory=list, exclude=True, repr=False)
 
     # Every ingest path builds an Episode, so this is the one place a credential in a
     # transcript is stopped before it is stored, chunked, extracted or served, and the

@@ -74,15 +74,22 @@ def web_tables(conn):
     yield
 
 
-def _mk_artifact(conn, *, tool_use_id: str, content_hash: str | None = None, kind="web_scrape"):
+def _mk_artifact(
+    conn,
+    *,
+    tool_use_id: str,
+    content_hash: str | None = None,
+    kind="web_scrape",
+    metadata: str | None = None,
+):
     row = conn.execute(
         """
         INSERT INTO web_artifacts (kind, tool_name, tool_use_id, url, content_hash,
-                                   content_markdown, synthesized, session_id, fetched_at)
-        VALUES (%s, 'test', %s, 'https://e.com/x', %s, %s, false, 'sess-1', %s)
+                                   content_markdown, synthesized, session_id, fetched_at, metadata)
+        VALUES (%s, 'test', %s, 'https://e.com/x', %s, %s, false, 'sess-1', %s, %s)
         RETURNING id
         """,
-        (kind, tool_use_id, content_hash, PROSE, datetime(2026, 6, 1, tzinfo=UTC)),
+        (kind, tool_use_id, content_hash, PROSE, datetime(2026, 6, 1, tzinfo=UTC), metadata),
     ).fetchone()
     return row["id"] if isinstance(row, dict) else row[0]
 
@@ -170,3 +177,23 @@ class TestEnqueue:
         cutoff = datetime(2026, 6, 5, tzinfo=UTC)
         assert enqueue_web_chunks(conn, since=cutoff).candidates == 0
         assert enqueue_web_chunks(conn).enqueued == 1
+
+    def test_only_artifacts_not_marked_against_extraction_are_enqueued(self, conn, web_tables):
+        # A generic capture says kg_extract=false; a trusted source says true; an older row
+        # has no mark and was always extracted.
+        for tid, meta in (
+            ("generic", '{"capture": "generic", "kg_extract": false}'),
+            ("trusted", '{"capture": "rule", "kg_extract": true}'),
+            ("legacy", None),
+        ):
+            _mk_chunk(conn, _mk_artifact(conn, tool_use_id=tid, metadata=meta), 0, PROSE)
+        assert enqueue_web_chunks(conn).enqueued == 2
+        queued = conn.execute(
+            "SELECT a.tool_use_id FROM extraction_queue q "
+            "JOIN web_chunks c ON c.id = q.web_chunk_id "
+            "JOIN web_artifacts a ON a.id = c.web_artifact_id ORDER BY a.id"
+        ).fetchall()
+        assert [r["tool_use_id"] if isinstance(r, dict) else r[0] for r in queued] == [
+            "trusted",
+            "legacy",
+        ]

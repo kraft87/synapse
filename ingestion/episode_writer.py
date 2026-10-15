@@ -26,6 +26,13 @@ call (the client's retry skips by span_id what did land, and nothing is stored w
 queue row). It holds each session's advisory lock from before the high-water read to the
 commit, the lock remember()'s ``append_episode`` takes, so a row appended meanwhile is
 neither overwritten at the sequence the call computed nor missing from the span index.
+
+Web research is captured from the tool calls of the turns that cleared those guards, and of
+turns already stored (a re-ship or a history import still captures what an earlier run
+missed), after the commit and in a transaction of its own (``ingestion.capture``, off
+unless ``SYNAPSE_WEB_CAPTURE=on``). A capture failure is logged and counted, never raised.
+Only turns parsed ``with_records`` (the ``POST /ingest`` push) carry tool calls; a disk
+sweep does not, and a history import captures by posting the transcripts.
 """
 
 from __future__ import annotations
@@ -34,6 +41,7 @@ import logging
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
+from ingestion import capture
 from ingestion.contamination import is_harness_call, is_transcript_contamination
 from ingestion.db import Database
 from ingestion.models import Episode, ExtractionItem
@@ -41,6 +49,10 @@ from ingestion.private_sessions import PrivateSessions
 from ingestion.scratch_projects import is_scratch_turn
 
 logger = logging.getLogger(__name__)
+
+
+#: StoreStats counters that are not turns the call refused.
+_NOT_SKIPS = frozenset({"written", "captured", "capture_errors"})
 
 
 @dataclass
@@ -56,6 +68,9 @@ class StoreStats:
     replays: int = 0
     #: no span_id, so no way to tell a re-ship from a new turn
     unkeyed: int = 0
+    #: web artifacts stored from the tool calls, and capture steps that failed (not turns)
+    captured: int = 0
+    capture_errors: int = 0
 
     def add(self, other: StoreStats) -> None:
         for f in fields(self):
@@ -63,24 +78,32 @@ class StoreStats:
 
     def log_skipped(self) -> None:
         """One line naming each kind of turn the call refused (nothing when none were)."""
-        skipped = {f.name: getattr(self, f.name) for f in fields(self) if f.name != "written"}
+        skipped = {f.name: getattr(self, f.name) for f in fields(self) if f.name not in _NOT_SKIPS}
         skipped = {name: n for name, n in skipped.items() if n}
         if skipped:
             logger.info("episode writer skipped turns: %s", skipped)
 
 
 def store_episodes(
-    db: Database, eps: Iterable[Episode], project_default: str | None = None
+    db: Database,
+    eps: Iterable[Episode],
+    project_default: str | None = None,
+    *,
+    extra_calls: Iterable[capture.ToolCall] = (),
 ) -> StoreStats:
     """Store ``eps`` (any number of sessions) through the guards in the module docstring.
 
-    ``project_default`` labels the turns the parser left without a project."""
+    ``project_default`` labels the turns the parser left without a project. ``extra_calls``
+    are tool calls that belong to no stored turn (a sub-agent's), captured like the rest."""
     stats = StoreStats()
     eps = sorted(eps, key=lambda e: e.sequence)
     private = PrivateSessions(db)  # per-call memo: one SELECT per session id
     # Per session, the stored span_ids and the high-water sequence, loaded on first sight.
     seen: dict[str, set[str]] = {}
     top_seq: dict[str, int] = {}
+    # The turns whose tool calls are captured once the call commits, with the episode id of
+    # the ones it just stored.
+    turns: list[tuple[Episode, int | None]] = []
     with db.atomic():
         db.lock_sessions(ep.session_id for ep in eps)
         for ep in eps:
@@ -93,7 +116,10 @@ def store_episodes(
                 stats.unkeyed += 1
                 continue
             if span_id in seen[ep.session_id]:
-                continue  # idempotent no-op; also a tail's truncated leading fragment
+                # An idempotent no-op (also a tail's truncated leading fragment), except that
+                # the research of a stored turn may not have been captured yet.
+                turns.append((ep, None))
+                continue
             if not ep.project and project_default:
                 ep = ep.model_copy(update={"project": project_default})
             if is_transcript_contamination(ep.content) or is_harness_call(ep.content):
@@ -119,6 +145,7 @@ def store_episodes(
             seen[ep.session_id].add(span_id)
             ep = ep.model_copy(update={"sequence": top_seq[ep.session_id]})
             episode_id = db.upsert_episode(ep)
+            turns.append((ep, episode_id))
             if ep.content.strip():
                 db.enqueue_extraction(
                     ExtractionItem(
@@ -129,4 +156,43 @@ def store_episodes(
                     )
                 )
             stats.written += 1
+    _capture_research(db, stats, turns, extra_calls, private, project_default)
     return stats
+
+
+def _capture_research(
+    db: Database,
+    stats: StoreStats,
+    turns: list[tuple[Episode, int | None]],
+    extra_calls: Iterable[capture.ToolCall],
+    private: PrivateSessions,
+    project_default: str | None,
+) -> None:
+    """Capture the web research in the tool calls of ``turns`` and ``extra_calls``. Runs
+    after the episodes committed and never raises: a failure costs the capture, not the
+    episodes (a re-ship captures what this call could not)."""
+    try:
+        if not capture.enabled():
+            return
+        calls = []
+        for ep, episode_id in turns:
+            for call in capture.episode_tool_calls(ep, project_default):
+                call.episode_id = episode_id
+                calls.append(call)
+        for call in extra_calls:
+            call.project = call.project or project_default
+            calls.append(call)
+        result = capture.capture_calls(db, calls, is_private=private.is_private)
+    except Exception:
+        logger.exception("web capture failed; the stored turns are not affected")
+        stats.capture_errors += 1
+        return
+    stats.captured += result.captured
+    stats.capture_errors += result.errors
+    if result.captured or result.errors:
+        logger.info(
+            "web capture: %d stored, %d failed, skipped %s",
+            result.captured,
+            result.errors,
+            dict(result.skipped),
+        )

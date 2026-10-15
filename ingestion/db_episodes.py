@@ -96,6 +96,17 @@ class EpisodeStore(DatabaseConnection):
             ).fetchone()
         return row is not None
 
+    def episode_ids_by_span(self, span_ids: Iterable[str]) -> dict[str, int]:
+        """The id of the episode stored under each of ``span_ids`` (absent ones omitted)."""
+        wanted = sorted(set(span_ids))
+        if not wanted:
+            return {}
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT span_id, id FROM episodes WHERE span_id = ANY(%s)", (wanted,)
+            ).fetchall()
+        return {r["span_id"]: r["id"] for r in rows}
+
     def content_dup_exists(self, project: str | None, content: str, cwd: str | None = None) -> bool:
         """True if an identical-content episode already exists in this project, or was
         stored from the same working directory under any label.
