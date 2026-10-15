@@ -11,6 +11,7 @@ from psycopg.rows import tuple_row
 from ingestion.db_notes import search_live_notes
 from ingestion.schema_check import ColumnProbe
 from mcp_server.kg_pg import _vec_literal, scope_predicate, search_kg_postgres
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import warn as _warn
@@ -52,7 +53,7 @@ def _link_close_sql(old: str, new: str, dims: int) -> str:
     )
 
 
-class RecallSourcesMixin:
+class RecallSourcesMixin(RecallEngine):
     def _kg_scope_ready(self) -> bool:
         """True when restricted KG serving can run, i.e. schema 056 is applied.
 

@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from mcp_server.kg_pg import _vec_literal
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import warn as _warn
@@ -36,7 +37,7 @@ def vector_web_sql(dims: int) -> str:
         """
 
 
-class RecallWebMixin:
+class RecallWebMixin(RecallEngine):
     def _search_bm25_web(self, query: str, limit: int) -> list[dict[str, Any]]:
         # Same no-alphanumeric-tokens short-circuit as _search_bm25_episodes.
         if not any(c.isalnum() for c in query):

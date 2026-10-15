@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from ingestion import embedding as _embedding
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_query import bm25_best_window as _bm25_best_window
 from mcp_server.recall_query import bm25_tokenize as _bm25_tokenize
 from mcp_server.recall_query import normalize_whitespace as _norm_ws
@@ -18,7 +19,7 @@ from mcp_server.recall_warnings import warn as _warn
 logger = logging.getLogger(__name__)
 
 
-class RecallRerankMixin:
+class RecallRerankMixin(RecallEngine):
     def _rerank_docs(self, query: str, pool: list[dict[str, Any]]) -> tuple[list[str], list[int]]:
         """Build the docs fed to the reranker + their pool owner index.
 

@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from ingestion.db_notes import get_notes_by_ids
 from ingestion.localtime import local_date
 from ingestion.surfaces import SurfaceTrust, episode_scope_sql
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_presentation import fit_turns_to_budget as _fit_turns_to_budget
 from mcp_server.recall_presentation import parse_fetch_ids as _parse_fetch_ids
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
@@ -24,20 +24,8 @@ _SESSION_PAGE_MAX = 25
 _SESSION_HEAD_CHARS = 500
 
 
-class RecallFetchMixin:
+class RecallFetchMixin(RecallEngine):
     """Read paths using the engine's connection, trust resolver, and metrics writer."""
-
-    _db_url: str
-
-    if TYPE_CHECKING:
-
-        def _pg(self) -> AbstractContextManager[Any]: ...
-        def _resolve_trust(
-            self, surface: str | None, trust: SurfaceTrust | None
-        ) -> SurfaceTrust: ...
-        def _record_metrics(self, metrics: dict[str, Any]) -> None: ...
-        def _increment_retrieval_counts(self, episode_ids: list[int]) -> None: ...
-        def _own_surface(self, st: SurfaceTrust) -> str | None: ...
 
     def fetch(
         self,

@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import logging
 import time
-from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any, NamedTuple
+from concurrent.futures import Future
+from typing import Any, NamedTuple
 
 from ingestion import embedding as _embedding
 from ingestion.schema_check import ColumnProbe
@@ -17,7 +16,7 @@ from ingestion.surfaces import (
     own_surface_if_ready,
 )
 from mcp_server.kg_pg import _vec_literal
-from mcp_server.recall_config import RecallConfig
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_ranking import timed as _timed
 from mcp_server.recall_warnings import config_hint as _config_hint
@@ -64,20 +63,7 @@ class EpisodePool(NamedTuple):
     ms_vector: float
 
 
-class RecallEpisodeSearchMixin:
-    _db_url: str
-    _config: RecallConfig
-    _leg_executor: ThreadPoolExecutor
-
-    if TYPE_CHECKING:
-
-        def _pg(self) -> AbstractContextManager[Any]: ...
-        def _ensure_embedder(self) -> Any: ...
-        @staticmethod
-        def _exclude_self(
-            ranked_eps: list[dict[str, Any]], self_session: str
-        ) -> list[dict[str, Any]]: ...
-
+class RecallEpisodeSearchMixin(RecallEngine):
     def _own_surface(self, st: SurfaceTrust) -> str | None:
         """The caller's own-surface widening (schema 057), or None.
 

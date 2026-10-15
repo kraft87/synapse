@@ -9,6 +9,7 @@ from typing import Any
 from ingestion import embedding as _embedding
 from ingestion.localtime import local_date
 from ingestion.web_chunker import CHUNK_OVERLAP, chunk_markdown
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_presentation import passage_role as _passage_role
 from mcp_server.recall_presentation import role_spans as _role_spans
 from mcp_server.recall_query import bm25_scores as _bm25_scores
@@ -20,7 +21,7 @@ from mcp_server.recall_warnings import warn as _warn
 logger = logging.getLogger(__name__)
 
 
-class RecallPassagesMixin:
+class RecallPassagesMixin(RecallEngine):
     def _compact_to_passages(
         self,
         query: str,

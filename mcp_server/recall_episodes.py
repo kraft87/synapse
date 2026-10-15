@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_presentation import fit_turns_to_budget as _fit_turns_to_budget
 from mcp_server.recall_presentation import to_recall_item as _to_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
@@ -15,7 +16,7 @@ from mcp_server.recall_warnings import warn_sink as _warn_sink
 logger = logging.getLogger(__name__)
 
 
-class RecallEpisodesMixin:
+class RecallEpisodesMixin(RecallEngine):
     def recall_episodes(
         self,
         query: str,

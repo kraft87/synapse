@@ -10,6 +10,7 @@ from typing import Any
 from ingestion import embedding as _embedding
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.recall_engine import RecallEngine
 from mcp_server.recall_presentation import apply_supersessions as _apply_supersessions
 from mcp_server.recall_presentation import fact_day as _fact_day
 from mcp_server.recall_presentation import parse_episode_ids as _parse_episode_ids
@@ -29,7 +30,7 @@ logger = logging.getLogger(__name__)
 _SELF_FACT_HEADROOM = 5
 
 
-class RecallOverviewMixin:
+class RecallOverviewMixin(RecallEngine):
     def recall(
         self,
         query: str,

@@ -28,6 +28,7 @@ from collections.abc import Callable
 from typing import Any
 
 import psycopg
+from fastmcp import FastMCP
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -420,7 +421,7 @@ def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[
 
 
 def register(
-    mcp: Any,
+    mcp: FastMCP,
     db_url: str,
     authorized: Callable[[Request], bool],
     get_recall: Callable[[], Any] | None = None,
@@ -445,7 +446,7 @@ def register(
         logger.info("board routes disabled (no DB_URL)")
         return
 
-    @mcp.custom_route("/context", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/context", methods=["GET"])
     async def board_context(request: Request) -> JSONResponse:
         """The rendered board for the plugin's SessionStart hook (follow-up PR): one
         bounded always-relevant index block, not query-blind recall injection."""

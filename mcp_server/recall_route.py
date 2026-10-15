@@ -71,7 +71,7 @@ def register(
         trust = _request_trust(request)
         told = _authenticated(request)
 
-        def _work() -> tuple[dict, str | None]:
+        def _work() -> tuple[dict[str, Any], str | None]:
             engine = _get_recall()
             result = engine.recall(
                 query=query,

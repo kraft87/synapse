@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import logging
-from contextlib import AbstractContextManager
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from psycopg.types.json import Json as PgJson
 
 from ingestion import pg_pool
-from mcp_server.recall_config import RecallConfig
+from mcp_server.recall_engine import RecallEngine
 
 logger = logging.getLogger(__name__)
 
@@ -45,16 +44,8 @@ _METRIC_COLS = (
 )
 
 
-class RecallMetricsMixin:
+class RecallMetricsMixin(RecallEngine):
     """Persistence methods mixed into the stateful recall engine."""
-
-    _db_url: str
-    _async_executor: Any
-    _config: RecallConfig
-
-    if TYPE_CHECKING:
-
-        def _pg(self) -> AbstractContextManager[Any]: ...
 
     def _increment_retrieval_counts(self, episode_ids: list[int]) -> None:
         """Bump served episodes' counters asynchronously: the UPDATE writes a new row version
