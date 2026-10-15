@@ -3145,6 +3145,10 @@ def test_delete_episode_repoints_a_retold_event_to_a_surviving_turn(clean, conn,
     )
     # The survivor already owns ep:<keep>, so a row moved onto it takes the next free suffix.
     own = _event(conn, fact="survivor's own", source_ref=f"ep:{keep}")
+    # The event is served on its owner turn's account (schema 057), so it takes the new one's.
+    conn.execute("UPDATE episodes SET surface_id = 'dev-a' WHERE id = %s", (second,))
+    conn.execute("UPDATE episodes SET surface_id = 'dev-b' WHERE id = %s", (keep,))
+    conn.execute("UPDATE timeline_events SET surface_id = 'dev-c' WHERE id = %s", (retold,))
 
     def stored(event_id):
         return tuple(
@@ -3157,10 +3161,22 @@ def test_delete_episode_repoints_a_retold_event_to_a_surviving_turn(clean, conn,
         body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
         assert body["events_deleted"] == 0 and body["deleted_event_ids"] == []
         assert stored(retold) == (f"ep:{second}", [f"ep:{second}", f"ep:{keep}"])
+        assert (
+            conn.execute(
+                "SELECT surface_id FROM timeline_events WHERE id = %s", (retold,)
+            ).fetchone()[0]
+            == "dev-a"
+        )
 
         client.request("DELETE", f"/dash/api/episodes/{second}", headers=_H)
         # The turn that is gone re-told nothing any more.
         assert stored(retold) == (f"ep:{keep}#2", [f"ep:{keep}"])
+        assert (
+            conn.execute(
+                "SELECT surface_id FROM timeline_events WHERE id = %s", (retold,)
+            ).fetchone()[0]
+            == "dev-b"
+        )
 
         body = client.request("DELETE", f"/dash/api/episodes/{keep}", headers=_H).json()
     assert sorted(body["deleted_event_ids"]) == sorted([retold, own])
