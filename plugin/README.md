@@ -173,7 +173,7 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
 - **`synapse import`** / **`! synapse-import`** — backfill your existing history (step 4).
-- **`synapse private on|off|status <session-id>`** — private mode (below).
+- **`synapse private on [--purge]|off [--forget]|status <session-id>`** — private mode (below).
 
 ## Retiring a skill
 
@@ -206,7 +206,7 @@ Scripts (run by full path; see [Memory-write spool](#memory-write-spool)):
 
 ## Private mode
 
-Take one session off the record — nothing from it becomes memory, ever:
+Take one session off the record — nothing it says from now on becomes memory:
 
 ```
 ! synapse-private on <session-id>
@@ -221,6 +221,14 @@ fails, so "off the record" is never claimed on a half-write:
 - a row in `private_sessions` on the server — the durable half. Your transcript stays on disk
   after the marker is gone, so this row is what stops a later catch-up sweep or
   `synapse-import` from ingesting the very turns the hook skipped.
+
+Private mode covers the session **from now on**. Turns it stored before you switched it on
+are already memory and stay recallable; `on` prints how many (an older server doesn't say).
+`on --purge` deletes them, with the facts, events and preferences derived from them, in one
+transaction. It is destructive, so it only runs when you ask for it. A device that may not
+delete those turns (a restricted one, for turns another device wrote) is refused: private mode
+is on, nothing was deleted, and the command exits nonzero saying so. A server that predates
+purge ignores the flag, and the command exits nonzero instead of claiming a deletion.
 
 `off` removes the marker and **keeps** the row: private turns already spoken stay
 uningestable, which is the only honest reading of "we were off the record". `--forget`

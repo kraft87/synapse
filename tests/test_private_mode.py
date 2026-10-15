@@ -29,6 +29,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -324,28 +325,58 @@ def test_predicate_fails_closed_on_lookup_error():
 
 
 class _StubServer:
-    """A stand-in for /private-sessions/{id}: records calls, serves the flag back."""
+    """A stand-in for /private-sessions/{id}: records calls, serves the flag back.
+
+    By default it behaves like a server from before purge existed: PUT answers only
+    ``private``. ``stored_turns`` makes it report that count; ``purge`` ("ok" or "refuse")
+    makes it act on ``?purge=1`` the way the current route does."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.queries: list[dict[str, list[str]]] = []
         self.rows: set[str] = set()
         self.lie_on_put = False  # simulate a write that silently doesn't land
+        self.stored_turns: int | None = None
+        self.purge: str | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
-            def _reply(self) -> None:
-                sid = self.path.rsplit("/", 1)[-1]
-                outer.calls.append((self.command, sid))
-                if self.command == "PUT" and not outer.lie_on_put:
-                    outer.rows.add(sid)
-                elif self.command == "DELETE":
-                    outer.rows.discard(sid)
-                body = json.dumps({"status": "ok", "private": sid in outer.rows}).encode()
-                self.send_response(200)
+            def _send(self, status: int, payload: dict) -> None:
+                body = json.dumps(payload).encode()
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _reply(self) -> None:
+                url = urlsplit(self.path)
+                sid = url.path.rsplit("/", 1)[-1]
+                query = parse_qs(url.query)
+                outer.calls.append((self.command, sid))
+                outer.queries.append(query)
+                if self.command == "PUT" and not outer.lie_on_put:
+                    outer.rows.add(sid)
+                elif self.command == "DELETE":
+                    outer.rows.discard(sid)
+                payload: dict = {"status": "ok", "private": sid in outer.rows}
+                if self.command == "PUT":
+                    if outer.stored_turns is not None:
+                        payload["stored_turns"] = outer.stored_turns
+                    purging = query.get("purge") == ["1"]
+                    if purging and outer.purge == "refuse":
+                        # the flag is committed first, so it stays set
+                        detail = "purge refused: needs full trust"
+                        return self._send(403, {"status": "error", "detail": detail})
+                    if purging and outer.purge == "ok":
+                        payload["purged"] = {
+                            "episodes_deleted": outer.stored_turns or 0,
+                            "facts_deleted": 4,
+                            "events_deleted": 1,
+                            "preferences_deleted": 2,
+                        }
+                        payload["stored_turns"] = 0
+                self._send(200, payload)
 
             do_PUT = do_GET = do_DELETE = _reply
 
@@ -383,6 +414,73 @@ def test_on_writes_marker_and_verifies_server(toggle, stub_server):
     # wrote it, then READ IT BACK — "off the record" is never claimed on an unverified write
     assert stub_server.calls == [("PUT", sid), ("GET", sid)]
     assert sid in stub_server.rows
+
+
+def test_on_says_how_many_earlier_turns_are_still_stored(toggle, stub_server, capsys):
+    """Private mode covers the session from now on; what was ingested before stays
+    recallable, so the count and the way to remove it are printed, and nothing is deleted."""
+    stub_server.stored_turns = 3
+    assert toggle.main(["on", "s-abc"]) == 0
+    out = capsys.readouterr().out
+    assert "3 turn(s) of this session were already stored" in out and "--purge" in out
+    assert "deleted" not in out and "purged" not in out
+    assert stub_server.queries[0] == {}  # no purge was asked for
+
+
+def test_on_is_quiet_about_earlier_turns_when_there_are_none_or_the_server_is_old(
+    toggle, stub_server, capsys
+):
+    stub_server.stored_turns = 0
+    assert toggle.main(["on", "s-abc"]) == 0
+    assert "already stored" not in capsys.readouterr().out
+    stub_server.stored_turns = None  # a server from before the count: nothing to claim
+    assert toggle.main(["on", "s-def"]) == 0
+    assert "already stored" not in capsys.readouterr().out
+
+
+def test_on_purge_asks_the_server_to_delete_and_reports_what_it_deleted(
+    toggle, stub_server, capsys
+):
+    stub_server.stored_turns = 3
+    stub_server.purge = "ok"
+    assert toggle.main(["on", "s-abc", "--purge"]) == 0
+    assert stub_server.queries[0] == {"purge": ["1"]}
+    out = capsys.readouterr().out
+    assert "purged 3 stored turn(s)" in out and "4 fact(s)" in out and "2 preference(s)" in out
+    assert "already stored" not in out
+    assert "s-abc" in stub_server.rows
+
+
+def test_on_purge_against_a_server_that_ignores_it_never_claims_a_deletion(
+    toggle, stub_server, capsys
+):
+    """An older server drops the unknown query parameter and answers a plain 200."""
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "purged" not in captured.out and "deleted" not in captured.out
+    assert "--purge did not run" in captured.err
+    assert "s-abc" in stub_server.rows  # private mode itself is on, and the output says so
+    assert "private mode is ON" in captured.err
+
+
+def test_on_purge_refused_keeps_private_mode_on_and_says_nothing_was_deleted(
+    toggle, stub_server, capsys
+):
+    stub_server.purge = "refuse"
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "purge refused: needs full trust" in captured.err
+    assert "private mode is ON" in captured.err and "nothing was deleted" in captured.err
+    assert "NOT off the record" not in captured.err  # the flag did land
+    assert "s-abc" in stub_server.rows
+    assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]  # the flag was read back
+
+
+def test_purge_only_belongs_to_on(toggle, stub_server, capsys):
+    assert toggle.main(["off", "s-abc", "--purge"]) == 2
+    assert toggle.main(["status", "s-abc", "--purge"]) == 2
+    assert "only applies to `on`" in capsys.readouterr().err
+    assert stub_server.calls == []
 
 
 def test_on_exits_nonzero_when_the_server_write_does_not_land(toggle, stub_server, capsys):
@@ -471,3 +569,35 @@ def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys):
     assert toggle.main(["off", "--forget", "s-abc"]) == 1
     assert "looks like a flag" in capsys.readouterr().err
     assert stub_server.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The Codex port of the toggle CLI follows the same --purge contract
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def codex_toggle(monkeypatch, tmp_path, stub_server) -> ModuleType:
+    _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("SYNAPSE_URL", stub_server.url)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delitem(sys.modules, "common", raising=False)
+    mod = _load(_REPO / "plugin-codex" / "scripts" / "private_mode.py", "codex_private_mode_test")
+    monkeypatch.delitem(sys.modules, "common", raising=False)
+    return mod
+
+
+def test_codex_on_reports_earlier_turns_and_purges_by_name(codex_toggle, stub_server, capsys):
+    stub_server.stored_turns = 2
+    stub_server.purge = "ok"
+    assert codex_toggle.main(["on", "s-abc"]) == 0
+    assert "2 turn(s) of this session were already stored" in capsys.readouterr().out
+    assert codex_toggle.main(["on", "s-abc", "--purge"]) == 0
+    assert "purged 2 stored turn(s)" in capsys.readouterr().out
+    assert stub_server.queries[-2] == {"purge": ["1"]}  # the PUT; the read-back GET follows
+
+
+def test_codex_on_purge_against_an_older_server_is_not_a_success(codex_toggle, stub_server, capsys):
+    assert codex_toggle.main(["on", "s-abc", "--purge"]) == 1
+    assert "--purge did not run" in capsys.readouterr().err
+    assert codex_toggle.main(["status", "s-abc", "--purge"]) == 2

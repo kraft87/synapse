@@ -2,7 +2,8 @@
 # mypy: ignore-errors
 """Private mode toggle for Codex sessions — port of plugin/scripts/private_mode.py.
 
-    private_mode.py on  <session_id>          # nothing from this session ever ingests
+    private_mode.py on  <session_id>          # nothing this session says ingests from now on
+    private_mode.py on  <session_id> --purge  # ALSO delete what it already stored
     private_mode.py off <session_id>          # stop skipping locally (row stays)
     private_mode.py off <session_id> --forget # ALSO delete the server row
     private_mode.py status <session_id>
@@ -17,6 +18,12 @@ server routes (Codex and Claude session ids share the private_sessions table):
      later catchup/backfill from ingesting what the hook skipped.
 
 `on` verifies BOTH landed and exits nonzero loudly if either did not.
+
+`on` covers the session from NOW ON; turns stored before it stay recallable. The server
+reports how many and `on` prints it; `--purge` asks it to delete them (see
+plugin/scripts/private_mode.py for the contract: only ever by name, a deletion is claimed
+only when the server says what it deleted, a refusal or an older server exits nonzero
+with private mode still ON).
 """
 
 from __future__ import annotations
@@ -49,8 +56,18 @@ def _remove_marker(session_id: str) -> bool:
     return not _marker(session_id).exists()
 
 
-def _server(method: str, session_id: str) -> dict:
-    return common.request_json(method, f"/private-sessions/{session_id}", timeout=15)
+def _server(method: str, session_id: str, *, purge: bool = False) -> dict:
+    # A purge deletes a whole session's cascade in one transaction: give it longer.
+    path = f"/private-sessions/{session_id}" + ("?purge=1" if purge else "")
+    return common.request_json(method, path, timeout=60 if purge else 15)
+
+
+def _refusal(e: urllib.error.HTTPError) -> str:
+    """The server's reason for an HTTP error (its envelope's ``detail``), else the status."""
+    try:
+        return str(json.loads(e.read()).get("detail") or "")[:300] or f"HTTP {e.code}"
+    except (OSError, ValueError, AttributeError):
+        return f"HTTP {e.code}"
 
 
 def _server_private(session_id: str) -> bool:
@@ -63,21 +80,65 @@ def _fail(msg: str) -> int:
     return 1
 
 
-def _on(session_id: str) -> int:
+def _on(session_id: str, purge: bool) -> int:
+    # Marker first: it is the half that works with no network, and it protects the very
+    # next turn. If the server write then fails we say so loudly rather than silently
+    # relying on a marker that expires in 12h.
     try:
         _write_marker(session_id)
     except OSError as e:
         return _fail(f"could not write marker {_marker(session_id)}: {e}")
+    refused = ""
     try:
-        _server("PUT", session_id)
+        try:
+            reply = _server("PUT", session_id, purge=purge)
+        except urllib.error.HTTPError as e:
+            if not (purge and e.code == 403):
+                raise
+            # The server sets the flag before it checks the purge, so private mode is on;
+            # only the deletion was refused.
+            reply, refused = {}, _refusal(e)
         if not _server_private(session_id):
             return _fail("server did not record the session as private (read-back said false)")
     except (urllib.error.URLError, OSError, ValueError) as e:
         return _fail(
-            f"server flag not set ({type(e).__name__}: {str(e)[:160]}). Local marker is in "
-            "place, but a later backfill could still ingest this session."
+            f"server flag not set ({type(e).__name__}: {str(e)[:160]}). Local marker is in place, but a later backfill could still ingest this session."
         )
+    if refused:
+        print(
+            f"private mode is ON for {session_id}, but --purge was refused and nothing was "
+            f"deleted: {refused}",
+            file=sys.stderr,
+        )
+        return 1
+    purged, stored = reply.get("purged"), reply.get("stored_turns")
+    if purge and not isinstance(purged, dict):
+        # An older server drops the unknown ?purge=1 and answers a plain 200.
+        print(
+            f"private mode is ON for {session_id}, but --purge did not run: this server "
+            "predates it, so turns stored before now are still stored. Update the server "
+            "and run it again.",
+            file=sys.stderr,
+        )
+        return 1
     print(f"private mode ON for {session_id}")
+    print(f"  marker: {_marker(session_id)}")
+    print("  server: private_sessions row written (permanent)")
+    if isinstance(purged, dict):
+        print(
+            f"  purged {purged.get('episodes_deleted', 0)} stored turn(s) of this session, and "
+            f"with them {purged.get('facts_deleted', 0)} fact(s), "
+            f"{purged.get('events_deleted', 0)} event(s), "
+            f"{purged.get('preferences_deleted', 0)} preference(s)"
+        )
+    if isinstance(stored, int) and stored > 0:
+        if isinstance(purged, dict):
+            print(f"  still stored: {stored} turn(s) written while the purge ran; run it again")
+        else:
+            print(
+                f"  note: {stored} turn(s) of this session were already stored and are still "
+                f"recallable; `synapse private on {session_id} --purge` deletes them"
+            )
     return 0
 
 
@@ -127,15 +188,23 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "--session-end":
         return _session_end()
     if len(argv) < 2 or argv[0] not in ("on", "off", "status"):
-        print("usage: private_mode.py on|off|status <session_id> [--forget]", file=sys.stderr)
+        print(
+            "usage: private_mode.py on <session_id> [--purge] | off <session_id> [--forget]"
+            " | status <session_id>",
+            file=sys.stderr,
+        )
         return 2
     action, session_id = argv[0], argv[1].strip()
+    purge = "--purge" in argv[2:]
+    if purge and action != "on":
+        print("--purge only applies to `on`", file=sys.stderr)
+        return 2
     if not session_id or "/" in session_id or session_id in (".", ".."):
         return _fail(f"invalid session id {session_id!r}")
     if session_id.startswith("-"):
         return _fail(f"session id {session_id!r} looks like a flag")
     if action == "on":
-        return _on(session_id)
+        return _on(session_id, purge)
     if action == "off":
         return _off(session_id, forget="--forget" in argv[2:])
     return _status(session_id)
