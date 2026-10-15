@@ -10,8 +10,8 @@ facts came from different batches, 112 of them created under 10 minutes apart an
 those sharing a source episode.
 
 The recheck calls no LLM and runs as late as it can: after 6b and its saturation rounds,
-inside Stage 7 once that stage's own LLM pre-pass (edge dates, writer-side contradictions)
-is done, right before anything is written. Each fact Stage 7 would create is looked up
+inside Stage 7 once that stage's own LLM pre-pass (edge dates) is done, right before
+anything is written. Each fact Stage 7 would create is looked up
 against its nearest live edges in the group. An edge whose text is the same after case and
 whitespace folding, or that is a twin under the same-batch rule (ingestion.extraction_twins:
 identical identifier signature, content words differing on one side only, cosine >=
@@ -28,7 +28,6 @@ restatement only adds provenance.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any
 
 from ingestion.extraction_twins import _TWIN_MIN_SIM, fact_tokens, lexical_twins
@@ -68,15 +67,14 @@ def recheck_restated(
     skip_indices: set[int],
     invalidate: dict[int, list[str]],
     reinforce: dict[int, list[str]],
-    also_retiring: Iterable[str] = (),
 ) -> int:
     """Stage 6c. Moves restated facts into ``skip_indices`` / ``reinforce`` in place.
 
     Only facts Stage 7 would create are looked up (not skipped, both endpoints resolved),
     in one query for the group. An edge any fact of this batch retires (a Stage 6 verdict in
-    ``invalidate``, or a writer-side one in ``also_retiring``) is never a match,
-    since absorbing a fact into it would leave the claim with no live edge; a fact judged
-    to contradict its own near-copy is a drop-in replacement and is written as one.
+    ``invalidate``) is never a match, since absorbing a fact into it would leave the claim
+    with no live edge; a fact judged to contradict its own near-copy is a drop-in
+    replacement and is written as one.
     Returns the number of facts moved."""
     todo = [
         i
@@ -85,7 +83,7 @@ def recheck_restated(
     ]
     if not todo:
         return 0
-    retiring = {u for uuids in invalidate.values() for u in uuids} | set(also_retiring)
+    retiring = {u for uuids in invalidate.values() for u in uuids}
     hits = kg.nearest_live_edges(
         [fact_embeddings[i] for i in todo],
         group_id,

@@ -66,7 +66,7 @@ def test_coerce_group(monkeypatch):
 
 
 def test_default_group_for_project_respects_switch(monkeypatch):
-    from ingestion.extractor import _default_group_for_project
+    from ingestion.extraction_policy import _default_group_for_project
 
     monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
     assert _default_group_for_project("jobs") == "personal"
@@ -79,7 +79,7 @@ def test_default_group_for_project_respects_switch(monkeypatch):
 
 
 def test_classify_entity_group_respects_switch(monkeypatch):
-    from ingestion.extractor import _classify_entity_group
+    from ingestion.extraction_policy import _classify_entity_group
 
     monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
     assert _classify_entity_group("dentist appointment", None, "technical") == "personal"
@@ -174,11 +174,10 @@ def test_process_item_routes_everything_technical_when_scope_off(monkeypatch):
 
 
 def test_gate_prompt_asks_for_domain_when_scope_on(monkeypatch):
-    from ingestion.timeline_gate import GATE_PROMPT, gate_prompt
+    from ingestion.timeline_gate import gate_prompt
 
     monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
     p = gate_prompt()
-    assert p == GATE_PROMPT
     assert 'domain: "personal"' in p
     assert '"domain": "personal"|"technical"' in p
 

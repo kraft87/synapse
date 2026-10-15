@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+
 from ingestion.edge_dates import EdgeDateExtractor, _has_temporal_markers
+from ingestion.llm_client import LLMUnavailableError
 
 
 def _mock_llm(text: str) -> MagicMock:
@@ -115,15 +118,115 @@ class TestExtractBatchPreFilter:
         llm.messages.create.assert_not_called()
 
 
-class TestExtractSinglePreFilter:
-    def test_non_temporal_skips_llm(self):
-        llm = _mock_llm('{"valid_at": null, "invalid_at": null}')
+class TestExtractBatchFailures:
+    """A response that never validates costs the batch its dates; an outage fails the item."""
+
+    def test_unparseable_response_falls_back_to_none_and_is_logged(self, caplog):
+        llm = _mock_llm("not json at all")
         ext = EdgeDateExtractor(llm)
-        assert ext.extract("config_loader.py defines EligibilityConfig class") == (None, None)
+        with caplog.at_level("WARNING", logger="ingestion.edge_dates"):
+            out = ext.extract_batch(["Alex joined Acme in 2020"])
+        assert out == [(None, None)]
+        assert "edge dates" in caplog.text
+
+    def test_transport_failure_propagates(self):
+        llm = _mock_llm("{}")
+        llm.messages.create.side_effect = LLMUnavailableError("claude CLI unreachable")
+        ext = EdgeDateExtractor(llm)
+        with pytest.raises(LLMUnavailableError):
+            ext.extract_batch(["Alex joined Acme in 2020"])
+
+
+class TestExtractBatchResults:
+    """Batched extract_batch collapses N per-fact ~30s claude-CLI subprocess
+    calls into ONE Haiku call. Each fact gets its OWN (valid_at, invalid_at)
+    back, indexed by position in the input list.
+    """
+
+    def _llm_with_results(self, results: list[dict]) -> object:
+        import json as _json
+
+        msg = MagicMock()
+        msg.content = [MagicMock(text=_json.dumps({"results": results}))]
+        llm = MagicMock()
+        llm.messages.create.return_value = msg
+        return llm
+
+    def test_one_call_for_many_facts(self):
+        llm = self._llm_with_results(
+            [
+                {"id": 0, "valid_at": "2026-05-10T00:00:00Z", "invalid_at": None},
+                {"id": 1, "valid_at": None, "invalid_at": "2026-04-01T00:00:00Z"},
+            ]
+        )
+        ext = EdgeDateExtractor(llm)
+        out = ext.extract_batch(
+            ["Alex joined Acme last week", "Old contract ended in April"],
+            reference_time="2026-05-17T00:00:00Z",
+        )
+        assert len(out) == 2
+        assert out[0] == ("2026-05-10T00:00:00Z", None)
+        assert out[1] == (None, "2026-04-01T00:00:00Z")
+        # ONE LLM call regardless of input length.
+        llm.messages.create.assert_called_once()
+
+    def test_empty_input_short_circuits(self):
+        llm = MagicMock()
+        ext = EdgeDateExtractor(llm)
+        assert ext.extract_batch([]) == []
         llm.messages.create.assert_not_called()
 
-    def test_temporal_calls_llm(self):
-        llm = _mock_llm('{"valid_at": "2021-06-01T00:00:00Z", "invalid_at": null}')
+    def test_blank_facts_skipped_index_preserved(self):
+        """Blank entries skip the LLM but keep the position so the caller
+        can map results back 1:1 with the input list."""
+        llm = self._llm_with_results(
+            [
+                {"id": 0, "valid_at": "2026-05-10T00:00:00Z", "invalid_at": None},
+                {"id": 2, "valid_at": "2026-05-12T00:00:00Z", "invalid_at": None},
+            ]
+        )
         ext = EdgeDateExtractor(llm)
-        assert ext.extract("Alex joined in 2021") == ("2021-06-01T00:00:00Z", None)
-        llm.messages.create.assert_called_once()
+        out = ext.extract_batch(["Alex joined Acme", "", "Alex promoted today"])
+        # Index alignment preserved — blank slot stays (None, None).
+        assert out[0] == ("2026-05-10T00:00:00Z", None)
+        assert out[1] == (None, None)
+        assert out[2] == ("2026-05-12T00:00:00Z", None)
+        # Only the 2 non-blank facts went to the LLM.
+        prompt = "\n".join(m["content"] for m in llm.messages.create.call_args.kwargs["messages"])
+        assert "Alex joined Acme" in prompt
+        assert "Alex promoted today" in prompt
+
+    def test_tolerates_trailing_prose(self):
+        msg = MagicMock()
+        msg.content = [
+            MagicMock(
+                text=(
+                    '{"results": [{"id": 0, "valid_at": "2026-05-10T00:00:00Z",'
+                    ' "invalid_at": null}]}\n\nHere is my reasoning...'
+                )
+            )
+        ]
+        llm = MagicMock()
+        llm.messages.create.return_value = msg
+
+        ext = EdgeDateExtractor(llm)
+        out = ext.extract_batch(["Alex joined Acme last week"])
+        assert out[0] == ("2026-05-10T00:00:00Z", None)
+
+    def test_missing_id_in_response_treated_as_none(self):
+        # LLM returns results only for ids 0 and 2, omits id 1.
+        llm = self._llm_with_results(
+            [
+                {"id": 0, "valid_at": "2026-05-10T00:00:00Z", "invalid_at": None},
+                {"id": 2, "valid_at": "2026-05-12T00:00:00Z", "invalid_at": None},
+            ]
+        )
+        ext = EdgeDateExtractor(llm)
+        # Temporal facts so all three pass the pre-filter and reach the LLM;
+        # the test exercises missing-id handling, not the pre-filter.
+        out = ext.extract_batch(
+            ["Alex joined in 2020", "She left last week", "Released on 2026-05-12"]
+        )
+        assert out[0] == ("2026-05-10T00:00:00Z", None)
+        assert out[1] == (None, None)
+        assert out[2] == ("2026-05-12T00:00:00Z", None)

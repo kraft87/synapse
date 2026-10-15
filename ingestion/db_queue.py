@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from datetime import datetime
 from typing import Any, cast
 
 from ingestion.db_connection import DatabaseConnection
@@ -8,25 +7,6 @@ from ingestion.models import ExtractionItem
 
 
 class ExtractionQueueStore(DatabaseConnection):
-    def get_watermark(self, source: str) -> datetime | None:
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT last_ingested_at FROM ingestion_state WHERE source = %s",
-                (source,),
-            ).fetchone()
-        return cast(datetime, row["last_ingested_at"]) if row else None
-
-    def set_watermark(self, source: str, ts: datetime) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                """
-                INSERT INTO ingestion_state (source, last_ingested_at)
-                VALUES (%s, %s)
-                ON CONFLICT (source) DO UPDATE SET last_ingested_at = EXCLUDED.last_ingested_at
-                """,
-                (source, ts),
-            )
-
     # ------------------------------------------------------------------
     # Extraction queue
     # ------------------------------------------------------------------
@@ -75,21 +55,6 @@ class ExtractionQueueStore(DatabaseConnection):
                     item.project,
                 ),
             )
-
-    def get_pending_extractions(self, limit: int = 50) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            result = conn.execute(
-                """
-                SELECT * FROM extraction_queue
-                WHERE status = 'pending'
-                -- priority lane: new ingest (0) drains before backfill (10);
-                -- then oldest-first. (summaries retired #113, so no doc-type tiebreak.)
-                ORDER BY priority ASC, enqueued_at ASC
-                LIMIT %s
-                """,
-                (limit,),
-            ).fetchall()
-        return cast(list[dict[str, Any]], result)
 
     #: A failed item is retried at most this many times before it stays failed. Bounded
     #: so a genuinely poisonous item (content the model will never parse) stops costing

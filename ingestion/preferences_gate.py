@@ -35,6 +35,7 @@ import logging
 import os
 from typing import Any
 
+from ingestion.extraction_policy import _default_group_for_project
 from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError, parse_with_retry
 
 logger = logging.getLogger(__name__)
@@ -202,14 +203,8 @@ def _candidate_text(candidates: list[dict[str, Any]], target_id: Any) -> str:
 
 
 def _group_for(project: str | None) -> str:
-    """Group routing derived from the project tag — same axis as the KG. Imported lazily
-    to avoid an import cycle (the extractor imports this gate)."""
-    try:
-        from ingestion.extractor import _default_group_for_project
-
-        return _default_group_for_project(project)
-    except Exception:
-        return "technical"
+    """Group routing derived from the project tag — same axis as the KG."""
+    return _default_group_for_project(project)
 
 
 class PreferencesGate:

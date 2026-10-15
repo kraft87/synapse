@@ -11,17 +11,11 @@ The ``SYNAPSE_KG_READ`` / ``SYNAPSE_KG_DUAL_WRITE`` env seams from PRs #128/#129
 are gone: with FalkorDB decommissioned there is nothing to dispatch to or fall
 back on. Read failures now RAISE instead of degrading — same retry semantics
 as writes.
-
-Orchestration preserved verbatim from the FalkorDB client: bi-temporal
-edge-date enrichment, the write-time contradiction safety net, and the batched
-self-invalidation pass for facts that arrive already bookended ("from 2020 to
-2022"). Only the storage calls underneath changed.
 """
 
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -113,141 +107,6 @@ class KGClient:
     # Edge operations
     # ------------------------------------------------------------------
 
-    def create_edge(
-        self,
-        source_uuid: str,
-        target_uuid: str,
-        relationship: str,
-        fact: str,
-        episode_ids: list[int],
-        group_id: str,
-        fact_embedding: list[float] | None = None,
-        *,
-        t_valid: str | None = None,
-        t_invalid: str | None = None,
-        detector: Any | None = None,
-        extracted_fact: Any | None = None,
-        edge_date_extractor: Any | None = None,
-        reference_time: str | None = None,
-    ) -> str:
-        """Create a relationship edge. Returns the new edge UUID.
-
-        Bi-temporal model (Phase 3):
-        - ``t_created`` (== ``created_at``) -- when the edge was written. Set
-          on every create. Never updated.
-        - ``t_valid``   (== ``valid_at``)   -- when the fact began being true.
-          Defaults to now() when the caller does not pass an explicit value;
-          callers extracting an LLM-supplied valid date should pass it via
-          ``t_valid``.
-        - ``t_invalid`` (== ``invalid_at``) -- when the fact stopped being
-          true. NULL on create; set later via ``invalidate_edge`` when a
-          contradiction is confirmed.
-        - ``t_expired`` -- soft-delete marker for facts the system decides
-          are no longer relevant even if not contradicted. NULL on create;
-          populated by future selective-forgetting work in the dream
-          pipeline.
-
-        When ``detector`` is supplied, the bi-temporal contradiction safety
-        net runs BEFORE the create: any live edge it confirms the new fact
-        contradicts has its ``t_invalid`` set in-place. The new edge is then
-        always written -- contradictions invalidate the *old* edge, never
-        block the new one.
-
-        ``edge_date_extractor`` (Phase 4) is an optional
-        ``EdgeDateExtractor`` that runs only when ``t_valid`` was NOT
-        supplied by the caller. It pulls ``valid_at`` and ``invalid_at``
-        from the fact text itself using the verbatim Graphiti
-        ``extract_edge_dates`` prompt. Failures (LLM error, malformed JSON,
-        empty result) fall through silently to the legacy "now()" default
-        so a write is never blocked by date extraction.
-        """
-        now = datetime.now(UTC).isoformat()
-        edge_uuid = str(uuid.uuid4())
-
-        # Phase 4 bi-temporal enrichment. When the caller pre-computed
-        # ``t_valid`` / ``t_invalid`` via a batched extractor (PR #38) we
-        # use those and skip the per-fact LLM call entirely. Otherwise fall
-        # back to the per-fact ``edge_date_extractor`` (best-effort: both
-        # fields fall back to None on failure and we then use now() for
-        # valid_at — legacy behavior preserved).
-        invalid_at_ts: str | None = t_invalid
-        if t_valid is None and edge_date_extractor is not None:
-            try:
-                v, i = edge_date_extractor.extract(fact, reference_time=reference_time)
-            except Exception:
-                v, i = (None, None)
-            if v:
-                t_valid = v
-            if i and invalid_at_ts is None:
-                invalid_at_ts = i
-
-        valid_at_ts = t_valid or now
-
-        # Bi-temporal safety net: invalidate confirmed-contradicted live
-        # edges BEFORE writing the new one. Detector failures never block
-        # the write -- the detector swallows exceptions and returns [].
-        if detector is not None and extracted_fact is not None:
-            contradicted_uuids = detector.detect_contradictions(
-                extracted_fact,
-                source_uuid,
-                target_uuid,
-                group_id,
-                fact_embedding=fact_embedding,
-            )
-            for old_uuid in contradicted_uuids:
-                # Record the superseder: edge_uuid is the new edge that contradicted old_uuid.
-                self.invalidate_edge(old_uuid, group_id, by_uuid=edge_uuid)
-
-        self._writer.create_edges(
-            [
-                {
-                    "src": source_uuid,
-                    "tgt": target_uuid,
-                    "edge_uuid": edge_uuid,
-                    "name": relationship,
-                    "fact": fact,
-                    "episodes": episode_ids,
-                    "created_at": now,
-                    "t_created": now,
-                    "valid_at": valid_at_ts,
-                    "t_valid": valid_at_ts,
-                    "emb": fact_embedding,
-                }
-            ],
-            group_id,
-        )
-
-        # Phase 4: if the edge-date extractor came back with an explicit
-        # invalid_at, mark the edge as already-invalidated. The fact was
-        # ALREADY contradicted at write time (e.g. "a person worked at X from
-        # 2020 to 2022") — preserve that lifecycle bookend immediately
-        # rather than wait for a future contradiction to flip it.
-        if invalid_at_ts:
-            self.invalidate_edge(edge_uuid, group_id, invalid_at=invalid_at_ts)
-
-        return edge_uuid
-
-    def invalidate_edge(
-        self,
-        edge_uuid: str,
-        group_id: str,
-        invalid_at: str | None = None,
-        by_uuid: str | None = None,
-    ) -> None:
-        """Set invalid_at on an edge (marks it as contradicted/superseded).
-
-        Bi-temporal (Phase 3): writes BOTH the legacy ``invalid_at`` AND the
-        canonical ``t_invalid`` so existing readers and the future t_*-only
-        readers both see the invalidation. Edges are NEVER deleted -- this
-        is the only mutation on the bi-temporal lifecycle (apart from the
-        future ``t_expired`` soft-delete marker).
-
-        ``by_uuid`` records the superseding edge (schema 028); set only by the
-        contradiction path, where the new edge that killed this one is known.
-        """
-        ts = invalid_at or datetime.now(UTC).isoformat()
-        self._writer.invalidate_edges([(edge_uuid, ts)], group_id, invalidated_by=by_uuid)
-
     def invalidate_edges_batch(
         self,
         items: list[tuple[str, str | None]],
@@ -275,7 +134,7 @@ class KGClient:
         self,
         rows: list[dict[str, Any]],
         group_id: str,
-    ) -> list[str]:
+    ) -> None:
         """Batch-create relationship edges in one writer round-trip.
 
         Each row must already contain:
@@ -288,28 +147,14 @@ class KGClient:
           - ``created_at`` / ``t_created`` (timestamps)
           - ``valid_at`` / ``t_valid`` (timestamps)
           - optional ``emb``: list[float] fact embedding
-          - optional ``t_invalid``: pre-known invalidation timestamp (e.g. fact
-            text said "from 2020 to 2022") — applied via a follow-up
-            ``invalidate_edges_batch`` so the bi-temporal lifecycle bookend
-            is recorded immediately.
           - optional ``web_artifact_id``: web-lane provenance (task #68).
 
-        Returns the list of edge UUIDs that were written, in input order.
+        Edges are never born invalid: ``t_invalid`` is set only by a later
+        fact superseding them (``invalidate_edges_batch``).
         """
         if not rows:
-            return []
+            return
         self._writer.create_edges(rows, group_id)
-
-        # Apply any pre-known invalidations in one more round-trip. This
-        # collapses the create_edge() per-fact "edge was already contradicted
-        # at write time" pattern into the batched path.
-        self_invalidations: list[tuple[str, str | None]] = [
-            (r["edge_uuid"], r.get("t_invalid")) for r in rows if r.get("t_invalid")
-        ]
-        if self_invalidations:
-            self.invalidate_edges_batch(self_invalidations, group_id)
-
-        return [r["edge_uuid"] for r in rows]
 
     def reinforce_edges(self, items: list[tuple[Any, ...]], group_id: str) -> None:
         """Capture dedup hits: bump ``mention_count`` + union source episodes on
@@ -399,9 +244,9 @@ class KGClient:
     ) -> list[dict[str, Any]]:
         """Return active edges between a specific source/target pair.
 
-        ContradictionDetector relies on this call returning ONLY live edges;
-        already-invalidated edges must NOT re-enter the candidate pool, or
-        we could re-contradict an edge that was already retired.
+        Live edges only: already-invalidated edges must NOT re-enter the
+        candidate pool, or Stage 6b could re-contradict an edge that was
+        already retired.
         """
         hits: list[dict[str, Any]] = self._reader.find_edges_by_pair(
             source_uuid, target_uuid, group_id

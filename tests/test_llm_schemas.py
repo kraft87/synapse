@@ -25,11 +25,7 @@ from ingestion.llm_schemas import (
     BatchEdgeDatesResult,
     BatchNodeDedupResult,
     BatchResolutionResult,
-    ContradictionVerdict,
-    EdgeDatesResult,
     ExtractionOutput,
-    NodeDedupVerdict,
-    ResolutionResult,
     TimelineGateEvents,
     first_json_object,
 )
@@ -63,12 +59,8 @@ def _strict_schema(model_cls):
 class TestStrictSchema:
     def test_every_object_is_closed_and_fully_required(self):
         for model in (
-            ResolutionResult,
             BatchResolutionResult,
-            ContradictionVerdict,
-            EdgeDatesResult,
             BatchEdgeDatesResult,
-            NodeDedupVerdict,
             BatchNodeDedupResult,
             TimelineGateEvents,
             ExtractionOutput,
@@ -88,21 +80,26 @@ class TestStrictSchema:
         assert "$ref" not in json.dumps(schema)
 
     def test_optional_fields_are_nullable_but_required(self):
-        schema = _strict_schema(EdgeDatesResult)
-        assert sorted(schema["required"]) == ["invalid_at", "valid_at"]
-        valid_at = schema["properties"]["valid_at"]
+        item = _strict_schema(BatchEdgeDatesResult)["properties"]["results"]["items"]
+        assert sorted(item["required"]) == ["id", "invalid_at", "valid_at"]
+        valid_at = item["properties"]["valid_at"]
         rendered = json.dumps(valid_at)
         assert "null" in rendered and "string" in rendered
 
     def test_index_lists_are_plain_integer_arrays(self):
         # The wire schema asks for the CLEAN shape; tolerance is python-side.
-        schema = _strict_schema(ResolutionResult)
-        assert schema["properties"]["duplicate_facts"]["items"] == {"type": "integer"}
+        item = _strict_schema(BatchResolutionResult)["properties"]["results"]["items"]
+        assert item["properties"]["duplicate_facts"]["items"] == {"type": "integer"}
+
+
+def _resolution_item(verdict: dict):
+    """The one item of a batched stage-6b response carrying ``verdict``."""
+    return BatchResolutionResult.model_validate({"results": [{"id": 0, **verdict}]}).results[0]
 
 
 class TestIndexCoercion:
     def test_wrapped_and_stringified_indices(self):
-        v = ResolutionResult.model_validate(
+        v = _resolution_item(
             {
                 "duplicate_facts": [1, "2", {"index": 3}, {"id": 4}, {"fact_index": 5}],
                 "contradicted_facts": [],
@@ -111,17 +108,14 @@ class TestIndexCoercion:
         assert v.duplicate_facts == [1, 2, 3, 4, 5]
 
     def test_junk_dropped_not_fatal(self):
-        v = ContradictionVerdict.model_validate(
-            {"contradicted_facts": [0, None, True, {"bogus": 1}, "x", [], "  7 "]}
-        )
+        v = _resolution_item({"contradicted_facts": [0, None, True, {"bogus": 1}, "x", [], "  7 "]})
         assert v.contradicted_facts == [0, 7]
 
     def test_non_list_collapses_to_empty(self):
-        v = ContradictionVerdict.model_validate({"contradicted_facts": "3"})
-        assert v.contradicted_facts == []
+        assert _resolution_item({"contradicted_facts": "3"}).contradicted_facts == []
 
     def test_missing_key_defaults_empty(self):
-        assert ResolutionResult.model_validate({}).duplicate_facts == []
+        assert _resolution_item({}).duplicate_facts == []
 
 
 class TestBatchTolerance:
@@ -147,11 +141,15 @@ class TestBatchTolerance:
 
 class TestEdgeDates:
     def test_empty_strings_normalize_to_none(self):
-        v = EdgeDatesResult.model_validate({"valid_at": "", "invalid_at": None})
+        v = BatchEdgeDatesResult.model_validate(
+            {"results": [{"id": 0, "valid_at": "", "invalid_at": None}]}
+        ).results[0]
         assert v.valid_at is None and v.invalid_at is None
 
     def test_junk_typed_dates_degrade_to_none(self):
-        v = EdgeDatesResult.model_validate({"valid_at": 20260101, "invalid_at": {"x": 1}})
+        v = BatchEdgeDatesResult.model_validate(
+            {"results": [{"id": 0, "valid_at": 20260101, "invalid_at": {"x": 1}}]}
+        ).results[0]
         assert v.valid_at is None and v.invalid_at is None
 
     def test_batch_items_keep_ids(self):
@@ -161,18 +159,6 @@ class TestEdgeDates:
         assert v.results[0].id == 3
         assert v.results[0].valid_at == "2026-01-01T00:00:00Z"
         assert v.results[0].invalid_at is None
-
-
-class TestNodeDedup:
-    def test_partial_response_parses_with_defaults(self):
-        # The legacy parser only ever read duplicate_candidate_id; a partial
-        # response must not fail the confirm.
-        v = NodeDedupVerdict.model_validate({"duplicate_candidate_id": 0})
-        assert v.duplicate_candidate_id == 0
-        assert v.id == 0 and v.name == ""
-
-    def test_missing_candidate_id_defaults_to_no_match(self):
-        assert NodeDedupVerdict.model_validate({}).duplicate_candidate_id == -1
 
 
 class TestTimelineGateEvents:
@@ -219,6 +205,32 @@ class TestTimelineGateEvents:
         )
         assert [e.event for e in v.events] == ["kept"]
 
+    def test_date_is_stripped_and_non_string_dates_are_none(self):
+        v = TimelineGateEvents.model_validate(
+            {
+                "events": [
+                    {"event": "attended the conference", "date": " 2026-06-20 "},
+                    {"event": "did a thing", "date": 20260620},
+                    {"event": "did another", "date": ""},
+                ]
+            }
+        )
+        assert [e.date for e in v.events] == ["2026-06-20", None, None]
+
+    def test_domain_is_kept_when_valid_and_none_otherwise(self):
+        # Invalid or missing -> None (unlabeled fails OPEN at read; a wrong default
+        # would hide the event from personal-scope serving).
+        v = TimelineGateEvents.model_validate(
+            {
+                "events": [
+                    {"event": "started a gym routine", "domain": "personal"},
+                    {"event": "did a thing", "domain": "work"},
+                    {"event": "did another"},
+                ]
+            }
+        )
+        assert [e.domain for e in v.events] == ["personal", None, None]
+
 
 class TestExtractionOutput:
     def test_bad_rows_skipped(self):
@@ -253,6 +265,6 @@ class TestJsonExtraction:
             first_json_object("nothing here")
 
     def test_prose_wrapped_model_validation_end_to_end(self):
-        raw = 'prefix {"contradicted_facts": [{"index": 2}]} suffix'
-        v = ContradictionVerdict.model_validate_json(first_json_object(raw))
-        assert v.contradicted_facts == [2]
+        raw = 'prefix {"results": [{"id": 0, "contradicted_facts": [{"index": 2}]}]} suffix'
+        v = BatchResolutionResult.model_validate_json(first_json_object(raw))
+        assert v.results[0].contradicted_facts == [2]

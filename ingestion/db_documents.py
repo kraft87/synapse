@@ -109,75 +109,6 @@ class DocumentStore(DatabaseConnection):
                 (embedding, chunk_id),
             )
 
-    # ------------------------------------------------------------------
-    # Synth documents (segment summaries + dream documents)
-    # ------------------------------------------------------------------
-
-    def upsert_synth_document(
-        self,
-        doc_type: str,
-        content: str,
-        constituent_hash: str,
-        session_id: str | None = None,
-        project: str | None = None,
-        start_sequence: int | None = None,
-        end_sequence: int | None = None,
-        source_ids: list[int] | None = None,
-    ) -> int | None:
-        """Insert a synth document; skip if constituent_hash already exists. Returns id or None."""
-        import orjson
-
-        sql = """
-            INSERT INTO synth_documents
-                (doc_type, session_id, project, start_sequence, end_sequence,
-                 source_ids, constituent_hash, content)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s)
-            ON CONFLICT (constituent_hash) DO NOTHING
-            RETURNING id
-        """
-        with self._conn() as conn:
-            row = conn.execute(
-                sql,
-                (
-                    doc_type,
-                    session_id,
-                    project,
-                    start_sequence,
-                    end_sequence,
-                    orjson.dumps(source_ids or []).decode(),
-                    constituent_hash,
-                    content,
-                ),
-            ).fetchone()
-        return cast(int | None, row["id"] if row else None)
-
-    def sessions_with_pending_segments(self, every_n: int = 25) -> list[str]:
-        """Return session IDs that have at least one un-summarized segment.
-
-        A session has pending work when its episode count divided by every_n
-        exceeds its existing summary count (one summary per complete window).
-        Replaces a per-session fan-out scan that issued ~2 queries against
-        every distinct session, even when no work was outstanding.
-        """
-        with self._conn() as conn:
-            rows = conn.execute(
-                """
-                WITH ep_counts AS (
-                    SELECT session_id, COUNT(*) AS n FROM episodes GROUP BY session_id
-                ),
-                sum_counts AS (
-                    SELECT session_id, COUNT(*) AS n FROM synth_documents
-                    WHERE doc_type = 'summary' GROUP BY session_id
-                )
-                SELECT e.session_id
-                FROM ep_counts e
-                LEFT JOIN sum_counts s USING (session_id)
-                WHERE (e.n / %s) > COALESCE(s.n, 0)
-                """,
-                (every_n,),
-            ).fetchall()
-        return [cast(str, r["session_id"]) for r in rows]
-
     def sessions_with_pending_chunks(self) -> list[str]:
         """Return session IDs that have a NEW complete chunk window available.
 
@@ -265,43 +196,9 @@ class DocumentStore(DatabaseConnection):
             ).fetchone()
         return dict(row) if row else None
 
-    def get_unsummarized_segments(
-        self, session_id: str, every_n: int = 25
-    ) -> list[tuple[int, int, list[int]]]:
-        """Return (start_seq, end_seq, episode_ids) for segments that need summaries.
-
-        A segment is N=every_n consecutive episodes. Returns segments not yet covered
-        by an existing synth_document summary.
-        """
-        with self._conn() as conn:
-            eps = conn.execute(
-                "SELECT id, sequence FROM episodes WHERE session_id = %s ORDER BY sequence ASC",
-                (session_id,),
-            ).fetchall()
-
-            if not eps:
-                return []
-
-            # Existing summary ranges for this session
-            covered = conn.execute(
-                """SELECT start_sequence, end_sequence FROM synth_documents
-                   WHERE session_id = %s AND doc_type = 'summary'""",
-                (session_id,),
-            ).fetchall()
-
-        covered_ranges = {(r["start_sequence"], r["end_sequence"]) for r in covered}
-
-        segments = []
-        for i in range(0, len(eps), every_n):
-            window = eps[i : i + every_n]
-            if len(window) < every_n:
-                break  # incomplete final segment — wait for more episodes
-            start = window[0]["sequence"]
-            end = window[-1]["sequence"]
-            if (start, end) not in covered_ranges:
-                segments.append((start, end, [e["id"] for e in window]))
-
-        return segments
+    # ------------------------------------------------------------------
+    # Synth documents (frozen legacy table; only the summary-item lookup is live)
+    # ------------------------------------------------------------------
 
     def get_synth_document_source_ids(
         self, session_id: str, content: str, doc_type: str = "summary"

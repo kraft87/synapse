@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import MagicMock
 
-from ingestion.extractor import LLMExtractor
+from ingestion.extraction_llm import LLMExtractor
 from ingestion.models import ExtractionResult
 
 

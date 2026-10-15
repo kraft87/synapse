@@ -12,14 +12,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from ingestion.extractor import (
-    _SEMANTIC_POOL_LIMIT,
-    DeterministicExtractor,
-    EntityResolver,
-    ExtractionPipeline,
-    LLMExtractor,
-    _cosine_similarity,
-)
+from ingestion.extraction_entities import DeterministicExtractor, EntityResolver
+from ingestion.extraction_llm import LLMExtractor
+from ingestion.extraction_policy import _SEMANTIC_POOL_LIMIT, _cosine_similarity
+from ingestion.extractor import ExtractionPipeline
 from ingestion.models import (
     CombinedExtraction,
     ExtractedEntity,
@@ -844,74 +840,6 @@ class TestEntityResolver:
 # ---------------------------------------------------------------------------
 
 
-class TestBuildResolutionPrompt:
-    """The prompt fed to Haiku in Stage 6b must:
-    - Use integer idx values, not raw UUIDs (token efficiency + hallucination guard)
-    - Separate pair-matched (likely-duplicate) candidates from semantic
-      (likely-contradiction) candidates into two labelled sections
-    - Number indices continuously across both sections so the LLM can refer
-      to either pool with one idx range
-    """
-
-    def test_prompt_uses_idx_not_uuids(self):
-        from ingestion.extractor import build_resolution_prompt
-
-        new_fact = "Synapse uses voyage-4-large for embeddings"
-        dup_pool = [{"uuid": "uuid-a", "fact": "Synapse uses OpenAI text-embedding-3-large"}]
-        contradiction_pool = [
-            {"uuid": "uuid-b", "fact": "Synapse uses pgvector for vector storage"}
-        ]
-        prompt, idx_to_uuid = build_resolution_prompt(new_fact, dup_pool, contradiction_pool)
-
-        # Idx-based references, never raw UUIDs
-        assert "uuid-a" not in prompt
-        assert "uuid-b" not in prompt
-        assert "[0]" in prompt
-        assert "[1]" in prompt
-        # Map round-trips
-        assert idx_to_uuid[0] == "uuid-a"
-        assert idx_to_uuid[1] == "uuid-b"
-
-    def test_prompt_has_two_labelled_sections(self):
-        from ingestion.extractor import build_resolution_prompt
-
-        prompt, _ = build_resolution_prompt(
-            "new fact",
-            [{"uuid": "a", "fact": "dup-fact"}],
-            [{"uuid": "b", "fact": "contra-fact"}],
-        )
-        # Section labels (case-insensitive substring match)
-        lower = prompt.lower()
-        assert "existing facts" in lower or "duplicate" in lower
-        assert "invalidation candidates" in lower or "contradiction" in lower
-        # The two facts appear under different labels
-        dup_section_idx = lower.find("dup-fact")
-        contra_section_idx = lower.find("contra-fact")
-        assert dup_section_idx >= 0 and contra_section_idx >= 0
-        assert dup_section_idx != contra_section_idx
-
-    def test_indices_are_continuous_across_pools(self):
-        """idx values must NOT restart at 0 between sections — Graphiti uses one continuous idx range."""
-        from ingestion.extractor import build_resolution_prompt
-
-        _, idx_map = build_resolution_prompt(
-            "x",
-            [{"uuid": "a", "fact": "f1"}, {"uuid": "b", "fact": "f2"}],
-            [{"uuid": "c", "fact": "f3"}],
-        )
-        assert set(idx_map.keys()) == {0, 1, 2}
-        assert idx_map[0] == "a"
-        assert idx_map[1] == "b"
-        assert idx_map[2] == "c"
-
-    def test_empty_pools_still_produce_a_prompt(self):
-        from ingestion.extractor import build_resolution_prompt
-
-        prompt, idx_map = build_resolution_prompt("new fact", [], [])
-        assert "new fact" in prompt
-        assert idx_map == {}
-
-
 class TestBatchResolutionPrompt:
     """Batched stage-6b prompt (one LLM call for many facts). Each fact has
     its OWN candidate lists with idx scoped per-fact — never across facts.
@@ -919,7 +847,7 @@ class TestBatchResolutionPrompt:
     """
 
     def test_per_fact_idx_scoping(self):
-        from ingestion.extractor import build_batch_resolution_prompt
+        from ingestion.extraction_policy import build_batch_resolution_prompt
 
         items = [
             {
@@ -948,7 +876,7 @@ class TestBatchResolutionPrompt:
         assert "Neo4j on 7474" in prompt
 
     def test_indices_continuous_within_one_fact(self):
-        from ingestion.extractor import build_batch_resolution_prompt
+        from ingestion.extraction_policy import build_batch_resolution_prompt
 
         items = [
             {
@@ -963,11 +891,11 @@ class TestBatchResolutionPrompt:
         ]
         _, per_item_maps = build_batch_resolution_prompt(items)
         # Existing pool idx 0,1 then candidate pool continues at 2 — same
-        # continuous scheme as build_resolution_prompt single-fact version.
+        # continuous scheme across both pools.
         assert per_item_maps[0] == {0: "p0", 1: "p1", 2: "c0"}
 
     def test_empty_pools_yields_empty_map_for_id(self):
-        from ingestion.extractor import build_batch_resolution_prompt
+        from ingestion.extraction_policy import build_batch_resolution_prompt
 
         items = [{"id": 7, "new_fact": "novel", "existing_pool": [], "candidate_pool": []}]
         prompt, per_item_maps = build_batch_resolution_prompt(items)
@@ -1109,19 +1037,48 @@ class TestStage6bBatchConfirm:
         assert 1 not in skip_indices
         assert 1 not in invalidate
 
-    def test_llm_exception_returns_empty_no_raise(self):
-        """An LLM transport failure must NOT raise: contradiction misses are
-        recoverable on next extraction; blocking writes is not."""
-        pipe, llm_client = self._pipeline_with_llm("{}")
-        llm_client.messages.create.side_effect = RuntimeError("upstream 500")
-        skip_indices, invalidate, reinforce, ok = pipe._stage6b_batch_confirm(
-            self._facts(1),
-            {0: ([{"uuid": "x", "fact": "y"}], [])},
-        )
+    def test_unparseable_answer_is_retried_once_then_fails_closed(self, caplog):
+        """A response that never validates costs the chunk its verdicts. It gets one
+        retry with the validation error quoted back; after that the facts are written
+        without verdicts, and the miss is logged so the rate is visible."""
+        pipe, llm_client = self._pipeline_with_llm("not json at all")
+        with caplog.at_level("WARNING", logger="ingestion.extraction_edges"):
+            skip_indices, invalidate, reinforce, ok = pipe._stage6b_batch_confirm(
+                self._facts(1),
+                {0: ([{"uuid": "x", "fact": "y"}], [])},
+            )
+        assert llm_client.messages.create.call_count == 2
         assert ok is False  # a failed call is not a verdict
         assert skip_indices == set()
         assert invalidate == {}
         assert reinforce == {}
+        assert "stage 6b" in caplog.text and "1 fact" in caplog.text
+
+    def test_unparseable_first_answer_is_recovered_by_the_retry(self):
+        import json as _json
+
+        good = _json.dumps(
+            {"results": [{"id": 0, "duplicate_facts": [], "contradicted_facts": [0]}]}
+        )
+        pipe, llm_client = self._pipeline_with_llm("not json at all")
+        llm_client.messages.create.side_effect = [
+            MagicMock(content=[MagicMock(text="not json at all")]),
+            MagicMock(content=[MagicMock(text=good)]),
+        ]
+        _, invalidate, _, ok = pipe._stage6b_batch_confirm(
+            self._facts(1), {0: ([], [{"uuid": "u", "fact": "old"}])}
+        )
+        assert ok is True
+        assert invalidate == {0: ["u"]}
+
+    def test_transport_failure_propagates(self):
+        """An outage is not a verdict and not a parse miss: the item fails and retries."""
+        from ingestion.llm_client import LLMUnavailableError
+
+        pipe, llm_client = self._pipeline_with_llm("{}")
+        llm_client.messages.create.side_effect = LLMUnavailableError("claude CLI unreachable")
+        with pytest.raises(LLMUnavailableError):
+            pipe._stage6b_batch_confirm(self._facts(1), {0: ([{"uuid": "x", "fact": "y"}], [])})
 
 
 class TestStage6bSaturationRounds:
@@ -1208,7 +1165,7 @@ class TestStage6bSaturationRounds:
     def test_rounds_stop_when_retrieval_runs_dry(self):
         import json as _json
 
-        from ingestion.extractor import _SATURATION_MAX_ROUNDS
+        from ingestion.extraction_policy import _SATURATION_MAX_ROUNDS
 
         round1_pool = self._edges("s", 8)
         tail = self._edges("n", 6)
@@ -1246,7 +1203,7 @@ class TestStage6aDedup:
     """
 
     def test_dedup_pair_then_semantic(self):
-        from ingestion.extractor import dedupe_pools
+        from ingestion.extraction_policy import dedupe_pools
 
         pair = [{"uuid": "A", "fact": "shared"}, {"uuid": "B", "fact": "pair-only"}]
         semantic = [
@@ -1288,7 +1245,6 @@ class TestPerStageModels:
         pipe = self._pipeline()
         assert pipe._timeline_gate._model == "stage-timeline"
         assert pipe._contradiction_model == "stage-contradiction"
-        assert pipe._contradiction_detector._model == "stage-contradiction"
         # Untouched stages keep the code default.
         assert pipe._llm._model == "claude-haiku-4-5"
         assert pipe._preferences_gate._model == "claude-haiku-4-5"
@@ -1505,13 +1461,13 @@ class TestCanonicalAliases:
         return [ExtractedEntity(name=n, type="Person", summary=f"summary of {n}") for n in names]
 
     def test_alias_entity_renamed(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         out = _apply_canonical_aliases(self._ents("the user"), [])
         assert [e.name for e in out] == ["User"]
 
     def test_alias_collapses_into_existing_canonical(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         ents = [
             ExtractedEntity(name="User", type="Person", summary="short"),
@@ -1525,7 +1481,7 @@ class TestCanonicalAliases:
         assert out[0].summary == "much longer summary wins here"
 
     def test_fact_endpoints_repointed(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         facts = [
             ExtractedFact(
@@ -1537,7 +1493,7 @@ class TestCanonicalAliases:
         assert facts[0].target == "Synapse"
 
     def test_self_loop_dropped_after_rewrite(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         facts = [
             ExtractedFact(
@@ -1558,7 +1514,7 @@ class TestCanonicalAliases:
         """SYNAPSE_OWNER_NAME + SYNAPSE_OWNER_ALIASES: a deployment's full-name
         spelling resolves onto its configured hub, not a hardcoded one."""
         from ingestion import dedup
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         monkeypatch.setenv("SYNAPSE_OWNER_NAME", "Sam")
         monkeypatch.setenv("SYNAPSE_OWNER_ALIASES", "Sam Smith, sammy")
@@ -1567,20 +1523,20 @@ class TestCanonicalAliases:
         assert [e.name for e in out] == ["Sam"]
 
     def test_assistant_cluster_untouched(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         ents = self._ents("Claude", "neuron", "Neuron")
         out = _apply_canonical_aliases(ents, [])
         assert sorted(e.name for e in out) == ["Claude", "Neuron", "neuron"]
 
     def test_normalization_catches_case_and_whitespace(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         out = _apply_canonical_aliases(self._ents("  THE USER "), [])
         assert [e.name for e in out] == ["User"]
 
     def test_non_alias_names_pass_through(self):
-        from ingestion.extractor import _apply_canonical_aliases
+        from ingestion.extraction_policy import _apply_canonical_aliases
 
         ents = self._ents("FalkorDB", "Postgres")
         out = _apply_canonical_aliases(ents, [])
@@ -1640,6 +1596,6 @@ class TestDeduperCache:
             "Shared Register Probe", "uuid-shared-probe", summary="s"
         )
         assert (
-            pipe_b._deduper_for("technical").find_or_none("shared register probe")
+            pipe_b._deduper_for("technical").exact_match("shared register probe")
             == "uuid-shared-probe"
         )

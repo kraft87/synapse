@@ -2,9 +2,7 @@
 
 The storage layer underneath is covered by test_kg_pg_write.py /
 test_kg_pg_read.py (DB-backed); this file covers the module-level rrf_merge
-fusion plus the batch-path orchestration (self-invalidation of pre-bookended
-facts). create_edge's detector/edge-date orchestration is covered in
-test_contradiction.py::TestCreateEdgeBiTemporal.
+fusion plus the batch-path orchestration.
 """
 
 from __future__ import annotations
@@ -73,29 +71,16 @@ class TestCreateEdgesBatch:
             uuid, src="s", tgt="t", fact=f"fact {uuid}", episodes=[1], drop=("emb",), **over
         )
 
-    def test_returns_uuids_in_input_order(self):
+    def test_rows_go_to_the_writer_in_one_call(self):
         client, writer = _client_with_mock_writer()
         rows = [self._row("r-1"), self._row("r-2")]
-        assert client.create_edges_batch(rows, "technical") == ["r-1", "r-2"]
+        client.create_edges_batch(rows, "technical")
         writer.create_edges.assert_called_once_with(rows, "technical")
         writer.invalidate_edges.assert_not_called()
 
-    def test_pre_bookended_facts_self_invalidate(self):
-        """Rows carrying t_invalid (fact text said "from 2020 to 2022") are
-        created and then immediately invalidated with the extracted date."""
-        client, writer = _client_with_mock_writer()
-        rows = [
-            self._row("r-1"),
-            self._row("r-2", t_invalid="2022-01-01T00:00:00+00:00"),
-        ]
-        client.create_edges_batch(rows, "technical")
-        (items, group) = writer.invalidate_edges.call_args.args
-        assert group == "technical"
-        assert items == [("r-2", "2022-01-01T00:00:00+00:00")]
-
     def test_empty_rows_short_circuits(self):
         client, writer = _client_with_mock_writer()
-        assert client.create_edges_batch([], "technical") == []
+        client.create_edges_batch([], "technical")
         writer.create_edges.assert_not_called()
 
     def test_invalidate_edges_batch_fills_now_for_none(self):

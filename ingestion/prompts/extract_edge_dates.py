@@ -1,7 +1,8 @@
-"""Verbatim port of Graphiti's single-fact temporal-bounds extractor.
+"""Port of Graphiti's temporal-bounds extractor, batched.
 
 Upstream: ``graphiti_core/prompts/extract_edges.py`` (the
-``extract_timestamps`` function — single fact, single REFERENCE TIME).
+``extract_timestamps`` function — one fact, one REFERENCE TIME;
+``build_batch_prompt`` renders many facts in one call).
 
 See ``NOTICE.md`` for Apache 2.0 attribution.
 """
@@ -20,47 +21,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .models import EdgeDates, Message
-
-
-def build_prompt(context: dict[str, Any]) -> list[dict[str, str]]:
-    """Render the temporal-bounds extraction prompt.
-
-    Required context keys:
-      - ``fact`` (str)            — natural-language fact text
-      - ``reference_time`` (str)  — ISO 8601 (typically the episode timestamp);
-        used to resolve relative expressions like "last week".
-    """
-    messages = [
-        Message(
-            role="system",
-            content="You extract temporal bounds from facts. NEVER hallucinate dates.",
-        ),
-        Message(
-            role="user",
-            content=f"""Given a FACT and its REFERENCE TIME, determine when the fact became true
-(valid_at) and when it stopped being true (invalid_at).
-
-Rules:
-- Resolve relative expressions ("last week", "2 years ago", "yesterday") using REFERENCE TIME.
-- If the fact is ongoing (present tense), set valid_at to REFERENCE TIME.
-- If a change or end is expressed, set invalid_at to the relevant time.
-- Leave both null if no time is stated or resolvable.
-- If only a date is mentioned (no time), assume 00:00:00.
-- Use ISO 8601 with Z suffix (e.g., 2025-04-30T00:00:00Z).
-- Do NOT hallucinate or infer dates from unrelated events.
-
-<FACT>
-{context["fact"]}
-</FACT>
-
-<REFERENCE TIME>
-{context["reference_time"]}
-</REFERENCE TIME>
-""",
-        ),
-    ]
-    return [m.model_dump() for m in messages]
+from .models import Message
 
 
 def build_batch_prompt(items: list[dict[str, Any]], reference_time: str) -> list[dict[str, str]]:
@@ -70,9 +31,9 @@ def build_batch_prompt(items: list[dict[str, Any]], reference_time: str) -> list
 
         {"id": 0, "fact": "Synapse switched from Neo4j to FalkorDB"}
 
-    Rules mirror the single-fact ``build_prompt`` verbatim so the LLM
-    judgement is identical — only the input/output shape changes from one
-    fact per call to many. Returns ``[{"role", "content"}]`` dicts.
+    Rules mirror Graphiti's ``extract_timestamps`` verbatim; only the
+    input/output shape changes from one fact per call to many. Returns
+    ``[{"role", "content"}]`` dicts.
     """
     import json as _json
 
@@ -113,9 +74,4 @@ with exactly one object per fact id.
     return [m.model_dump() for m in messages]
 
 
-# Re-export the response model so callers can do
-# `from .extract_edge_dates import build_prompt, EdgeDatesResponse`.
-EdgeDatesResponse = EdgeDates
-
-
-__all__ = ["EdgeDatesResponse", "build_batch_prompt", "build_prompt"]
+__all__ = ["build_batch_prompt"]

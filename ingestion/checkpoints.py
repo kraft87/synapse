@@ -4,9 +4,7 @@
 high-water mark in the ``ingestion_state`` table through an injected raw
 psycopg connection. The get/set pair (same table, same tz-normalization to
 UTC, same dict-row/tuple-row defensiveness) lives here once; both classes
-delegate. Distinct from ``Database.get_watermark``/``set_watermark`` in
-``ingestion/db.py``, which owns its own pooled connection — different layer,
-deliberately not unified.
+delegate.
 """
 
 from __future__ import annotations

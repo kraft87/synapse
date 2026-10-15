@@ -11,9 +11,7 @@ See ``NOTICE.md`` in this directory for Apache 2.0 attribution.
 from __future__ import annotations
 
 __all__ = [
-    "dedupe_edges",
     "dedupe_nodes",
     "extract_edge_dates",
-    "invalidate_edges",
     "models",
 ]

@@ -18,35 +18,11 @@ from ingestion.extraction_edges import ExtractionEdgesMixin
 from ingestion.extraction_entities import DeterministicExtractor, EntityResolver
 from ingestion.extraction_llm import LLMExtractor
 from ingestion.extraction_nodes import ExtractionNodesMixin, PendingNodes
-from ingestion.extraction_policy import _BATCH_CONTRADICTION_PROMPT as _BATCH_CONTRADICTION_PROMPT
-from ingestion.extraction_policy import _CONTRADICTION_PROMPT as _CONTRADICTION_PROMPT
-from ingestion.extraction_policy import _ERROR_RE as _ERROR_RE
-from ingestion.extraction_policy import _FILE_PATH_RE as _FILE_PATH_RE
-from ingestion.extraction_policy import _KNOWN_TOOLS as _KNOWN_TOOLS
-from ingestion.extraction_policy import _OWNER as _OWNER
-from ingestion.extraction_policy import _OWNER_POSSESSIVE as _OWNER_POSSESSIVE
-from ingestion.extraction_policy import _PERSONAL_NAME_PATTERN as _PERSONAL_NAME_PATTERN
-from ingestion.extraction_policy import _PERSONAL_PROJECTS as _PERSONAL_PROJECTS
-from ingestion.extraction_policy import _SATURATION_MAX_ROUNDS as _SATURATION_MAX_ROUNDS
-from ingestion.extraction_policy import _SATURATION_MIN as _SATURATION_MIN
-from ingestion.extraction_policy import _SEMANTIC_POOL_LIMIT as _SEMANTIC_POOL_LIMIT
-from ingestion.extraction_policy import _TECHNICAL_NAME_PATTERN as _TECHNICAL_NAME_PATTERN
-from ingestion.extraction_policy import _URL_RE as _URL_RE
 from ingestion.extraction_policy import (
-    _apply_canonical_aliases as _apply_canonical_aliases,
+    _apply_canonical_aliases,
+    _classify_entity_group,
+    _default_group_for_project,
 )
-from ingestion.extraction_policy import (
-    _classify_entity_group as _classify_entity_group,
-)
-from ingestion.extraction_policy import _cosine_similarity as _cosine_similarity
-from ingestion.extraction_policy import (
-    _default_group_for_project as _default_group_for_project,
-)
-from ingestion.extraction_policy import (
-    build_batch_resolution_prompt as build_batch_resolution_prompt,
-)
-from ingestion.extraction_policy import build_resolution_prompt as build_resolution_prompt
-from ingestion.extraction_policy import dedupe_pools as dedupe_pools
 from ingestion.extraction_recheck import recheck_restated
 from ingestion.extraction_twins import collapse_batch_twins
 from ingestion.localtime import local_date, local_iso
@@ -65,7 +41,6 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         kg_client: Any,
         llm_model: str | None = None,
     ) -> None:
-        from ingestion.contradiction import ContradictionDetector
         from ingestion.edge_dates import EdgeDateExtractor
         from ingestion.llm_client import DEFAULT_MODEL, stage_model
 
@@ -81,23 +56,9 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         self._contradiction_model = stage_model("CONTRADICTION", base)
         self._kg = kg_client
         self._embedder = embedder
-        # Phase 3: writer-side bi-temporal contradiction safety net. Runs
-        # immediately before create_edge writes, layered on top of Stage 6's
-        # extractor-level contradiction prompt -- catches edges written via
-        # paths that bypass Stage 6 (dream pipeline, manual writes, future
-        # ingestion sources) AND any same-pair contradictions Stage 6's
-        # broader retrieval missed.
-        self._contradiction_detector = ContradictionDetector(
-            kg_client=kg_client,
-            embedder=embedder,
-            llm_client=llm_client,
-            model=self._contradiction_model,
-        )
-        # Phase 4: LLM-driven temporal-bounds extractor (Graphiti verbatim
-        # `extract_timestamps`). Reads valid_at / invalid_at out of the
-        # fact text itself when the caller doesn't pre-supply t_valid.
-        # Best-effort: failures fall back to now() inside create_edge so
-        # the write path is never blocked by date extraction.
+        # LLM-driven temporal-bounds extractor (Graphiti's `extract_timestamps`):
+        # reads valid_at out of the fact text. A response that never validates
+        # falls back to the segment time; an outage fails the item.
         self._edge_date_extractor = EdgeDateExtractor(
             llm_client=llm_client,
             model=stage_model("EDGE_DATES", base),
@@ -456,8 +417,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
 
             # Stage 6b: ONE batched LLM call for every fact with candidates,
             # instead of N serial ~30s claude-CLI subprocesses. Mirrors PR #83's
-            # stage-4 batch treatment; per-fact _stage6b_llm_confirm is retained
-            # for callers that need single-fact confirmation (e.g. dream writes).
+            # stage-4 batch treatment.
             with logfire.span(
                 "stage6b_batch_confirm cands={cands}",
                 cands=len(candidates_map),
@@ -467,6 +427,9 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                 )
                 span.set_attribute("skipped", len(skip_indices))
                 span.set_attribute("invalidated", sum(len(v) for v in invalidate.values()))
+                # False: the response never validated and these facts go in with no
+                # duplicate or contradiction verdicts (the warning names the count).
+                span.set_attribute("llm_ok", llm_ok)
 
             # Saturation continuation: facts that contradicted most of their
             # pool get fresh retrieval rounds so a sweeping supersession can
@@ -485,7 +448,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # LLM calls. 6c rechecks the facts about to be created against the live graph
             # as it is NOW (an edge written since 6a pooled, or one the judge missed); then
             # only the new entities a fact still being created links are written.
-            def recheck_then_write_new_nodes(writer_retires: list[list[str]]) -> None:
+            def recheck_then_write_new_nodes() -> None:
                 with logfire.span("stage6c_recheck") as recheck_span:
                     restated = recheck_restated(
                         facts,
@@ -496,7 +459,6 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                         skip_indices,
                         invalidate,
                         reinforce,
-                        also_retiring=[u for uuids in writer_retires for u in uuids],
                     )
                     recheck_span.set_attribute("restated", restated)
                 if restated:

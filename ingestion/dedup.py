@@ -1,13 +1,13 @@
 """Write-time entity deduplication for KG ingestion.
 
-Ports Graphiti's 4-strategy node dedup (``graphiti_core/utils/maintenance/
+Ports Graphiti's node dedup (``graphiti_core/utils/maintenance/
 dedup_helpers.py`` + ``node_operations.resolve_extracted_nodes``) into a
 single ``NodeDeduper`` class scoped to one KG group at a time.
 
-The strategies, tried in order, return the first match:
+``NodeDeduper.classify`` runs the strategies that need no LLM, in order, and
+returns on the first that settles the name:
 
-1. **Exact normalized name** — Cypher lookup against ``Entity.normalized_name``
-   (must be indexed; see ``scripts/migrate_normalized_name.py``).
+1. **Exact normalized name** — indexed lookup of ``kg_entities.normalized_name``.
 2. **Entropy gate** — names with low Shannon entropy or fewer than
    ``_MIN_NAME_LENGTH`` characters short-circuit *out* of fuzzy matching.
    Two distinct "api" entities should stay distinct; the LSH+Jaccard
@@ -15,15 +15,10 @@ The strategies, tried in order, return the first match:
 3. **MinHash/LSH Jaccard** — character-3-gram MinHash signatures (64-perm,
    packed numpy banding — see ``_PackedLSH``) produce a candidate set,
    then Jaccard is recomputed exactly on the shingles. Default threshold 0.7.
-4. **LLM confirm** — top-K (default 3) LSH candidates that survive the
-   entropy filter are sent to Haiku 4.5 with a "are these the same
-   entity? yes/no/uncertain" prompt, one pair per call. Returns the
-   canonical UUID for the first ``yes``.
 
-If no strategy matches, ``find_or_none`` returns ``None`` and the caller
-should INSERT the entity as new. If any strategy matches, the caller
-should treat the entity as a duplicate and route edges to the returned
-UUID instead — and may merge the candidate's summary (longer wins).
+The LLM "same entity?" confirm (strategy 4) is not here: the resolver
+(``extraction_entities.EntityResolver``) gathers the LSH candidates of every
+entity in a chunk and confirms them all in one batched call.
 
 Why this layer matters: the retired FalkorDB-era cleanup CLI
 (``dream/entity_dedup.py``, deleted in #67 PR 3) used to catch ~1,603
@@ -45,8 +40,7 @@ import os
 import re
 import threading
 import time
-from collections import defaultdict
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ingestion.kg_client import KGClient
@@ -86,11 +80,6 @@ _LSH_ROWS = 4
 
 # Number of top LSH candidates passed to the LLM confirm pass.
 _LLM_CONFIRM_TOP_K = 3
-
-# Default Haiku model for the LLM confirm step. Background-work standard,
-# per PR #11 and the project conventions (~10x cheaper than Sonnet, fine
-# for binary yes/no on short pairs). Overridable via SYNAPSE_DEDUP_MODEL.
-_DEFAULT_LLM_MODEL = "claude-haiku-4-5"
 
 # --- Canonical identity aliases (task #49, config-driven per issue #41) -----
 # The extractor keeps minting fresh identity nodes ('User' / a full-name
@@ -270,14 +259,6 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return intersection / union if union else 0.0
 
 
-# --- Optional LLM confirm ---------------------------------------------------
-# Phase 4: the legacy "yes/no/uncertain" mini-prompt has been retired in
-# favor of Graphiti's verbatim NodeDuplicate prompt. The prompt body lives
-# in `ingestion/prompts/dedupe_nodes.py`; the response shape (Graphiti's
-# `NodeDuplicate`) is enforced via pydantic-ai structured outputs — see
-# ``ingestion.llm_schemas.NodeDedupVerdict``.
-
-
 # ---------------------------------------------------------------------------
 # NodeDeduper
 # ---------------------------------------------------------------------------
@@ -340,33 +321,26 @@ class NodeDeduper:
     group shares one process-wide ``_GroupIndex``, built lazily on first
     fuzzy lookup and rebuilt on TTL expiry by whichever caller trips it.
     ``register`` updates the shared index when the caller decides to
-    INSERT (i.e. find_or_none returned None) so later calls from ANY
-    worker thread see the freshly-written node.
+    INSERT so later calls from ANY worker thread see the freshly-written node.
 
     Public surface:
-        - ``find_or_none(name, summary)`` → existing UUID or None
+        - ``classify(name, summary, entity_type)`` → exact hit, LSH candidates or none
         - ``exact_match(name)`` → existing UUID or None, exact-name only (pre-INSERT guard)
         - ``register(name, uuid)`` — call after INSERT so the index stays warm
         - ``merge_summary(existing_summary, new_summary)`` → str (longer wins)
-        - ``summary_of(uuid)`` / ``type_map`` — read-through index accessors
+        - ``type_map`` — read-through index accessor
     """
 
     def __init__(
         self,
         kg_client: KGClient,
         group_id: str,
-        llm_client: Any | None = None,
         *,
-        llm_model: str | None = None,
         lsh_threshold: float = _LSH_JACCARD_THRESHOLD,
         top_k: int = _LLM_CONFIRM_TOP_K,
     ) -> None:
-        from ingestion.llm_client import stage_model
-
         self._kg = kg_client
         self._group_id = group_id
-        self._llm = llm_client
-        self._llm_model = llm_model or stage_model("DEDUP", _DEFAULT_LLM_MODEL)
         self._lsh_threshold = lsh_threshold
         self._top_k = top_k
 
@@ -384,9 +358,8 @@ class NodeDeduper:
             in-run ``register``); the caller should merge, no LLM needed.
           - ``("candidates", [(uuid, name, summary, jaccard), ...])`` — the
             top-K LSH candidates above the Jaccard floor that need an LLM
-            "same entity?" decision. Caller decides how to confirm (one pair
-            at a time via :meth:`find_or_none`, or batched across many
-            entities by the resolver).
+            "same entity?" decision, which the resolver batches across the
+            chunk's entities.
           - ``("none", None)`` — no exact hit, entropy-gated, or no LSH
             candidate; the caller should treat the name as new (or fall
             through to its own vector search).
@@ -444,71 +417,6 @@ class NodeDeduper:
         ]
         return ("candidates", enriched)
 
-    def find_or_none(self, name: str, summary: str | None = None) -> str | None:
-        """Run the 4 strategies in order and return a canonical UUID or None.
-
-        The contract: if this returns a non-None UUID, the caller MUST NOT
-        INSERT a new node — instead, route incoming edges to the returned
-        UUID and (if appropriate) update the existing node's summary via
-        ``merge_summary``.
-
-        Strategies 1-3 live in :meth:`classify`; this method adds the
-        per-pair LLM confirm (strategy 4). The resolver uses ``classify``
-        directly so it can batch the confirm across many entities; this
-        single-pair path remains for standalone callers and tests.
-        """
-        kind, payload = self.classify(name, summary)
-        if kind == "exact":
-            return cast("str", payload)
-        if kind == "none":
-            return None
-
-        candidates = cast("list[tuple[str, str, str, float]]", payload)
-
-        # If no LLM available, fall back to "Jaccard alone above threshold
-        # is enough." This is the no-LLM path — still useful in tests and
-        # for the bench-mark case where Haiku is unavailable.
-        if self._llm is None:
-            cand_uuid, cand_name, _cand_summary, jacc = candidates[0]
-            if jacc >= self._lsh_threshold:
-                logger.debug(
-                    "dedup: LSH match (no LLM) %r ~ %r jacc=%.2f → %s",
-                    name,
-                    cand_name or "?",
-                    jacc,
-                    cand_uuid[:8],
-                )
-                return cand_uuid
-            return None
-
-        # Send top-K to Haiku one pair at a time. First "yes" wins.
-        for cand_uuid, cand_name, cand_summary, jacc in candidates:
-            try:
-                verdict = self._llm_confirm(name, summary or "", cand_name, cand_summary)
-            except Exception as exc:
-                logger.warning(
-                    "dedup: LLM confirm failed for %r vs %r: %s",
-                    name,
-                    cand_name or "?",
-                    exc,
-                )
-                # On LLM failure, mirror the existing extractor's policy:
-                # trust the strong-Jaccard signal rather than crash the run.
-                if jacc >= self._lsh_threshold:
-                    return cand_uuid
-                continue
-            if verdict == "yes":
-                logger.debug(
-                    "dedup: LLM confirmed %r ~ %r jacc=%.2f → %s",
-                    name,
-                    cand_name or "?",
-                    jacc,
-                    cand_uuid[:8],
-                )
-                return cand_uuid
-            # "no" or "uncertain" → keep trying the next LSH candidate.
-        return None
-
     def exact_match(self, name: str) -> str | None:
         """Strategy 1 alone: the uuid of an entity with ``name``'s normalized name, or None.
 
@@ -520,7 +428,7 @@ class NodeDeduper:
     def register(self, name: str, node_uuid: str, summary: str = "") -> None:
         """Add a freshly-inserted node to the shared in-memory index.
 
-        Call after a successful INSERT so that subsequent ``find_or_none``
+        Call after a successful INSERT so that subsequent ``classify``
         calls — from this or any other worker thread in the process — dedupe
         against this node. Hydrates the index if it isn't built yet.
         """
@@ -725,95 +633,12 @@ class NodeDeduper:
         scored.sort(key=lambda kv: kv[1], reverse=True)
         return scored
 
-    def _llm_confirm(
-        self,
-        new_name: str,
-        new_summary: str,
-        existing_name: str,
-        existing_summary: str,
-    ) -> str:
-        """Return 'yes', 'no', or 'uncertain' from a single Haiku call.
-
-        Phase 4: routes through Graphiti's verbatim node-dedup prompt
-        (``ingestion.prompts.dedupe_nodes``) with a single-element
-        ``existing_nodes`` list whose ``candidate_id`` is 0. We then map the
-        structured response back onto the legacy ``yes/no/uncertain`` API so
-        the surrounding LSH top-K loop and the existing tests keep working:
-
-        - ``duplicate_candidate_id == 0``  → ``yes`` (the one candidate matches)
-        - ``duplicate_candidate_id == -1`` → ``no``  (Graphiti's "no match")
-        - anything else / parse failure    → ``uncertain``
-
-        The legacy stub asked the model "yes/no/uncertain"; the Graphiti
-        prompt also explicitly allows the model to return -1 ("no match or
-        unsure") — that's our `uncertain` path. The semantic is preserved.
-        """
-        assert self._llm is not None  # narrowed by find_or_none
-        # Both summaries are truncated at 600 chars to match the legacy
-        # stub's budget; long auto-generated summaries would otherwise blow
-        # past Haiku's context.
-        new_summary_trim = (new_summary or "")[:600]
-        existing_summary_trim = (existing_summary or "")[:600]
-
-        from .prompts.dedupe_nodes import build_prompt
-
-        messages = build_prompt(
-            {
-                "previous_episodes": [],
-                "episode_content": "",
-                "extracted_node": {
-                    "name": new_name,
-                    "summary": new_summary_trim,
-                },
-                "entity_type_description": "Entity",
-                "existing_nodes": [
-                    {
-                        "candidate_id": 0,
-                        "name": existing_name,
-                        "entity_types": ["Entity"],
-                        "summary": existing_summary_trim,
-                    }
-                ],
-            }
-        )
-
-        from ingestion.llm_client import MalformedResponseError, structured_call
-        from ingestion.llm_schemas import NodeDedupVerdict
-
-        try:
-            verdict = structured_call(
-                self._llm,
-                output_model=NodeDedupVerdict,
-                messages=messages,
-                model=self._llm_model,
-                max_tokens=200,
-            )
-        except MalformedResponseError as exc:
-            # Legacy yes/no/uncertain plain-text shape (the test fixtures
-            # still produce this; keep the tolerant mapping so we don't
-            # break them). Anything else unparseable is a miss.
-            text = (exc.raw_response or "").strip().lower()
-            if text.startswith("yes"):
-                return "yes"
-            if text.startswith("no"):
-                return "no"
-            return "uncertain"
-
-        cid = verdict.duplicate_candidate_id
-        if cid == 0:
-            return "yes"
-        if cid == -1:
-            return "no"
-        # Any other id is treated as a parse miss — the only candidate we
-        # sent has candidate_id=0, so a non-zero non-(-1) answer is noise.
-        return "uncertain"
-
 
 class _NullLSH:
-    """Sentinel for "numpy unavailable / graph load failed."
+    """Sentinel for "numpy unavailable".
 
-    ``find_or_none`` treats this as "no LSH candidates ever" so the
-    pipeline degrades gracefully to exact-name-only matching.
+    ``classify`` treats this as "no LSH candidates ever" so the pipeline
+    degrades gracefully to exact-name-only matching.
     """
 
     def __contains__(self, key: str) -> bool:  # pragma: no cover - trivial
@@ -942,28 +767,6 @@ class _PackedLSH:
         return key in self._known
 
 
-# ---------------------------------------------------------------------------
-# Internal collection helper — used by ingestion.extractor to group existing
-# candidates by normalized name for ambiguous-match disambiguation.
-# ---------------------------------------------------------------------------
-
-
-def index_by_normalized_name(rows: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """Bucket existing-node rows by ``_normalize_name(row['name'])``.
-
-    Used by callers that want to detect the "two candidates share the same
-    normalized name" ambiguity case without re-issuing a Cypher query.
-    Returns {normalized_name: [uuid, ...]}.
-    """
-    bucket: dict[str, list[str]] = defaultdict(list)
-    for row in rows:
-        normalized = _normalize_name(str(row.get("name", "")))
-        if not normalized:
-            continue
-        bucket[normalized].append(str(row.get("uuid", "")))
-    return dict(bucket)
-
-
 __all__ = [
     "NodeDeduper",
     "_jaccard",
@@ -972,5 +775,4 @@ __all__ = [
     "_normalize_name",
     "_shingles",
     "has_high_entropy",
-    "index_by_normalized_name",
 ]

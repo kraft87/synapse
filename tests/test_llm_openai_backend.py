@@ -814,17 +814,19 @@ class TestStructuredCall:
         assert "invoke_agent strict_verdict" in [s.name for s in exporter.get_finished_spans()]
 
     def test_wrapped_indices_coerced_over_http(self):
-        from ingestion.llm_schemas import ContradictionVerdict
+        from ingestion.llm_schemas import BatchResolutionResult
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
-                json=_completion_body('{"contradicted_facts": [{"index": 2}, "3", null]}'),
+                json=_completion_body(
+                    '{"results": [{"id": 0, "contradicted_facts": [{"index": 2}, "3", null]}]}'
+                ),
             )
 
         client = _client_with(handler)
-        result = structured_call(client, output_model=ContradictionVerdict, base_prompt="judge")
-        assert result.contradicted_facts == [2, 3]
+        result = structured_call(client, output_model=BatchResolutionResult, base_prompt="judge")
+        assert result.results[0].contradicted_facts == [2, 3]
 
     def test_default_model_sentinel_resolves_to_configured(self):
         seen: dict[str, Any] = {}

@@ -24,8 +24,6 @@ logging.basicConfig(
 #     stage6b_batch_confirm
 #       claude_agent_sdk.messages.create  <-- per-LLM call latency, tokens, model
 #     stage7_write_edges
-#       create_edge (n times)
-#         contradiction_detector  <-- only fires when similarity gate passes
 #
 # Each poller / drain replica registers under its own service so traces
 # fan out per-worker in the UI.

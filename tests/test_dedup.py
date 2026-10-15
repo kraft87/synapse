@@ -1,8 +1,9 @@
 """Tests for the write-time entity deduplicator.
 
-The deduper runs four strategies in order: exact normalized-name short-
-circuit, entropy gate, MinHash/LSH Jaccard, LLM confirm. These tests
-cover each strategy independently and the summary-merge helper.
+The deduper runs three LLM-free strategies in order: exact normalized-name
+short-circuit, entropy gate, MinHash/LSH Jaccard (the LLM confirm over its
+candidates is the resolver's batched call). These tests cover each strategy
+independently and the summary-merge helper.
 
 The graph client is mocked — ``NodeDeduper`` only touches it through
 ``entity_uuid_by_normalized_name`` (exact-name pass) and ``load_entities``
@@ -24,7 +25,6 @@ from ingestion.dedup import (
     _shingles,
     has_high_entropy,
 )
-from tests.helpers.llm import mock_llm_client
 
 # ---------------------------------------------------------------------------
 # Mock-KG helper
@@ -157,26 +157,25 @@ class TestExactNameMatch:
 
         # Two entities with names "FalkorDB" and "falkordb " (trailing space)
         # dedup to the same UUID via Strategy 1.
-        first = deduper.find_or_none("FalkorDB", summary="graph db")
-        second = deduper.find_or_none("falkordb ", summary="other summary")
-
-        assert first == "uuid-existing"
-        assert second == "uuid-existing"
+        assert deduper.classify("FalkorDB", "graph db") == ("exact", "uuid-existing")
+        assert deduper.classify("falkordb ", "other summary") == ("exact", "uuid-existing")
+        assert deduper.exact_match("FalkorDB") == "uuid-existing"
 
     def test_no_match_returns_none(self):
         graph = _FakeGraph(exact_match={})
         client = _FakeKGClient(graph)
         deduper = NodeDeduper(client, group_id="technical")
-        assert deduper.find_or_none("BrandNewName") is None
+        assert deduper.exact_match("BrandNewName") is None
+        assert deduper.classify("BrandNewName") == ("none", None)
 
     def test_register_then_in_memory_hit(self):
         graph = _FakeGraph(exact_match={})
         client = _FakeKGClient(graph)
         deduper = NodeDeduper(client, group_id="technical")
         deduper.register("Synapse", "uuid-syn", summary="memory layer")
-        # Next call to find_or_none on the same normalized name resolves
-        # via the in-memory map, not Cypher.
-        assert deduper.find_or_none("synapse") == "uuid-syn"
+        # Next call on the same normalized name resolves via the in-memory
+        # map, not the database.
+        assert deduper.exact_match("synapse") == "uuid-syn"
 
 
 # ---------------------------------------------------------------------------
@@ -198,8 +197,8 @@ class TestEntropyGateSkipsFuzzy:
         deduper = NodeDeduper(client, group_id="technical")
 
         # "api" has length < 6 AND token_count < 2 → fails has_high_entropy.
-        # No exact match → must return None.
-        assert deduper.find_or_none("api", summary="second api meaning") is None
+        # No exact match → no candidates either.
+        assert deduper.classify("api", "second api meaning") == ("none", None)
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +207,7 @@ class TestEntropyGateSkipsFuzzy:
 
 
 class TestMinHashJaccardMatch:
-    def test_minhash_match_with_no_llm(self):
+    def test_minhash_candidate_for_a_near_name(self):
         # "synapse-poller" and "synapse poller" share enough 3-gram
         # shingles to clear the LSH+Jaccard threshold of 0.7.
         graph = _FakeGraph(
@@ -216,11 +215,11 @@ class TestMinHashJaccardMatch:
             exact_match={},
         )
         client = _FakeKGClient(graph)
-        # No LLM → deduper falls back to "Jaccard alone is enough."
-        deduper = NodeDeduper(client, group_id="technical", llm_client=None)
+        deduper = NodeDeduper(client, group_id="technical")
 
-        result = deduper.find_or_none("synapse poller", summary="...")
-        assert result == "uuid-poller"
+        kind, payload = deduper.classify("synapse poller", "...")
+        assert kind == "candidates"
+        assert payload[0][0] == "uuid-poller"
 
     def test_minhash_below_threshold_no_match(self):
         graph = _FakeGraph(
@@ -228,9 +227,9 @@ class TestMinHashJaccardMatch:
             exact_match={},
         )
         client = _FakeKGClient(graph)
-        deduper = NodeDeduper(client, group_id="technical", llm_client=None)
+        deduper = NodeDeduper(client, group_id="technical")
         # Very different name shouldn't hit the LSH threshold.
-        assert deduper.find_or_none("totally-unrelated-grandstream-router") is None
+        assert deduper.classify("totally-unrelated-grandstream-router") == ("none", None)
 
 
 class TestTypeGate:
@@ -256,7 +255,7 @@ class TestTypeGate:
             exact_match={},
             type_map={"Database": "Database", "Service": "Service"},
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
         # new entity is a Service; the only fuzzy candidate is a Database (not allowlisted) -> dropped
         kind, _payload = deduper.classify("synapse poller", "...", entity_type="Service")
         assert kind == "none"
@@ -268,7 +267,7 @@ class TestTypeGate:
             exact_match={},
             type_map={"Service": "Service"},
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
         kind, payload = deduper.classify("synapse poller", "...", entity_type="Service")
         assert kind == "candidates"
         assert payload[0][0] == "uuid-poller"
@@ -281,53 +280,9 @@ class TestTypeGate:
             exact_match={},
             type_map={"Database": "Database"},
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
         kind, _payload = deduper.classify("synapse poller", "...")
         assert kind == "candidates"
-
-
-# ---------------------------------------------------------------------------
-# Strategy 4 — LLM confirm
-# ---------------------------------------------------------------------------
-
-
-class TestLLMConfirm:
-    def test_llm_confirm_yes_returns_canonical_uuid(self):
-        graph = _FakeGraph(
-            entities=[("uuid-poller", "synapse-poller", "watches sessions")],
-            exact_match={},
-        )
-        client = _FakeKGClient(graph)
-        llm = mock_llm_client("yes")
-        deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
-
-        result = deduper.find_or_none("synapse poller", summary="...")
-        assert result == "uuid-poller"
-        assert llm.messages.create.called
-
-    def test_llm_confirm_no_returns_none(self):
-        graph = _FakeGraph(
-            entities=[("uuid-poller", "synapse-poller", "watches sessions")],
-            exact_match={},
-        )
-        client = _FakeKGClient(graph)
-        llm = mock_llm_client("no")
-        deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
-
-        result = deduper.find_or_none("synapse poller", summary="...")
-        assert result is None
-
-    def test_llm_uncertain_returns_none(self):
-        graph = _FakeGraph(
-            entities=[("uuid-poller", "synapse-poller", "watches sessions")],
-            exact_match={},
-        )
-        client = _FakeKGClient(graph)
-        llm = mock_llm_client("uncertain")
-        deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
-        # "uncertain" answers don't accept the merge — return None so the
-        # caller writes a new node and the nightly pipeline can re-evaluate.
-        assert deduper.find_or_none("synapse poller", summary="...") is None
 
 
 # ---------------------------------------------------------------------------
@@ -361,8 +316,8 @@ class TestSummaryMerge:
 class TestClassify:
     """``classify`` runs strategies 1-3 (no LLM) and tags the outcome.
 
-    The batch resolver calls this instead of ``find_or_none`` so it can
-    gather every entity needing a decision and confirm them in one LLM call.
+    The batch resolver calls this so it can gather every entity needing a
+    decision and confirm them in one LLM call.
     """
 
     def test_exact_hit_returns_exact(self):

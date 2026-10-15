@@ -7,7 +7,7 @@ import pytest
 
 from ingestion.llm_client import MalformedResponseError
 from ingestion.llm_schemas import TimelineGateEvents
-from ingestion.timeline_gate import TimelineGate, _parse_gate
+from ingestion.timeline_gate import TimelineGate, gate_prompt
 
 
 def _gate_events(events):
@@ -18,7 +18,7 @@ def _gate_events(events):
 def test_gate_prompt_ports_framing_and_date_anchoring():
     """v2 disciplines from the Mastra study: the framing preamble (only-record +
     authoritative user, question != happening) and in-text date anchoring."""
-    from ingestion.timeline_gate import GATE_PROMPT
+    GATE_PROMPT = gate_prompt()
 
     # Framing preamble.
     assert "ONLY record" in GATE_PROMPT
@@ -31,72 +31,6 @@ def test_gate_prompt_ports_framing_and_date_anchoring():
     assert "QUOTED MATERIAL" in GATE_PROMPT
     assert "THEIR event" in GATE_PROMPT
     assert "still about the user" in GATE_PROMPT
-
-
-def test_parse_gate_null_is_skip():
-    assert _parse_gate('{"events": []}') == []
-    assert _parse_gate('{"event": null}') == []  # legacy single-event shape
-
-
-def test_parse_gate_event_and_salience():
-    d = _parse_gate(
-        'noise {"events": [{"event": "fixed the dating bug", "salience": 2, '
-        '"event_type": "action"}]} trailing'
-    )
-    assert d == [
-        {
-            "event": "fixed the dating bug",
-            "salience": 2,
-            "event_type": "action",
-            "domain": None,
-            "date": None,
-        }
-    ]
-
-
-def test_parse_gate_accepts_date():
-    d = _parse_gate(
-        '{"events": [{"event": "attended the conference", "salience": 1, '
-        '"event_type": "action", "date": " 2026-06-20 "}]}'
-    )
-    assert d[0]["date"] == "2026-06-20"
-
-
-def test_parse_gate_ignores_nonstring_or_empty_date():
-    assert _parse_gate('{"event": "did a thing", "date": 20260620}')[0]["date"] is None
-    assert _parse_gate('{"event": "did a thing", "date": ""}')[0]["date"] is None
-    assert _parse_gate('{"event": "did a thing"}')[0]["date"] is None
-
-
-def test_parse_gate_domain_field():
-    ok = _parse_gate('{"event": "started a new gym routine", "domain": "personal"}')
-    assert ok[0]["domain"] == "personal"
-    # Invalid or missing -> None (unlabeled fails OPEN at read; a wrong default
-    # would hide the event from personal-scope serving).
-    assert _parse_gate('{"event": "did a thing", "domain": "work"}')[0]["domain"] is None
-    assert _parse_gate('{"event": "did a thing"}')[0]["domain"] is None
-
-
-def test_parse_gate_bad_event_type_nulls():
-    d = _parse_gate('{"event": "did a thing", "salience": 1, "event_type": "vibe"}')
-    assert d[0]["event_type"] is None
-
-
-def test_parse_gate_bad_salience_clamps_to_med():
-    d = _parse_gate('{"event": "ran the benchmark", "salience": 9}')
-    assert d[0]["salience"] == 1
-
-
-def test_parse_gate_caps_at_three_events():
-    import json as _json
-
-    raw = _json.dumps({"events": [{"event": f"did thing {i}", "salience": 1} for i in range(5)]})
-    assert len(_parse_gate(raw)) == 3
-
-
-def test_parse_gate_malformed_raises():
-    with pytest.raises(MalformedResponseError):
-        _parse_gate("no json here at all")
 
 
 class _Boom:

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from ingestion.kg_client import rrf_merge
-from ingestion.llm_client import LLM_TRANSPORT_ERRORS
+from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError
 from ingestion.models import (
     ExtractedFact,
 )
@@ -21,7 +21,6 @@ from ingestion.extraction_policy import (
     _SATURATION_MIN,
     _SEMANTIC_POOL_LIMIT,
     build_batch_resolution_prompt,
-    build_resolution_prompt,
     dedupe_pools,
 )
 
@@ -45,7 +44,6 @@ class ExtractionEdgesMixin:
     _llm: LLMExtractor
     _contradiction_model: str
     _edge_date_extractor: Any
-    _contradiction_detector: Any
 
     def _stage6a_embedding_filter(
         self,
@@ -106,77 +104,25 @@ class ExtractionEdgesMixin:
 
         return per_fact_pools
 
-    def _stage6b_llm_confirm(
-        self,
-        fact: ExtractedFact,
-        pair_pool: list[dict[str, Any]],
-        semantic_pool: list[dict[str, Any]],
-    ) -> tuple[bool, list[str]]:
-        """Ask LLM which candidates the new fact duplicates and/or contradicts.
-
-        Pools are passed separately so the prompt can render them under
-        distinct labels (`EXISTING FACTS` vs `INVALIDATION CANDIDATES`),
-        giving the LLM the structural prior — same-endpoint → likely
-        duplicate, semantic-neighbour → likely contradiction.
-
-        Returns (skip_write, contradicted_uuids).
-        skip_write=True when a pure-duplicate idx is present in the response.
-        contradicted_uuids lists every edge to invalidate; an idx in both
-        duplicate_facts and contradicted_facts is treated as a drop-in
-        replacement (skip nothing, invalidate the old).
-        """
-        from ingestion.llm_client import structured_call
-        from ingestion.llm_schemas import ResolutionResult
-
-        prompt, idx_to_uuid = build_resolution_prompt(fact.fact, pair_pool, semantic_pool)
-        if not idx_to_uuid:
-            return False, []
-        try:
-            # Triple classification on short fact pairs — Haiku is sufficient
-            # and ~10x cheaper than Sonnet.
-            resolution = structured_call(
-                self._llm._client,
-                output_model=ResolutionResult,
-                base_prompt=prompt,
-                model=self._contradiction_model,
-                max_tokens=300,
-            )
-            dup_idx = [i for i in resolution.duplicate_facts if i in idx_to_uuid]
-            contradicted_idx = [i for i in resolution.contradicted_facts if i in idx_to_uuid]
-        except LLM_TRANSPORT_ERRORS:
-            raise  # never answered: fail the item, don't record a non-decision
-        except Exception:
-            return False, []
-        dup_uuids = [idx_to_uuid[i] for i in dup_idx]
-        contradicted = [idx_to_uuid[i] for i in contradicted_idx]
-
-        # Skip the new write when ANY duplicate is purely-restated (in dup
-        # list but not also contradicted) — the existing edge already covers
-        # this information. Still emit any contradictions so they get
-        # invalidated regardless.
-        pure_duplicates = [u for u in dup_uuids if u not in contradicted]
-        return bool(pure_duplicates), contradicted
-
     def _stage6b_batch_confirm(
         self,
         facts: list[ExtractedFact],
         candidates_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
     ) -> tuple[set[int], dict[int, list[str]], dict[int, list[str]], bool]:
-        """Batched version of _stage6b_llm_confirm.
+        """Judge every (fact, pools) entry with at least one candidate in ONE LLM call.
 
-        Collects every (fact, pools) entry with at least one candidate and
-        issues ONE LLM call instead of N ~30s claude-CLI subprocesses. On
-        any parse/transport failure, fails closed: returns empty skip set
-        and empty invalidate dict (same conservative behaviour as the
-        per-fact version's bare except — a missed contradiction is
-        recoverable; blocking the new write is not).
+        A response that never validates gets one retry (the validation error quoted
+        back to the model), then fails closed: empty skip set and empty invalidate
+        dict, logged. A missed contradiction is recoverable; blocking the new write
+        is not. A transport failure is not a response at all and propagates, so the
+        queue retries the item.
 
         Returns (skip_indices, invalidate, reinforce, ok): skip_indices = new
         facts to skip (pure duplicates), invalidate = {new_idx: [contradicted
         edge uuids]}, reinforce = {new_idx: [matched existing edge uuids]} for
         the skipped duplicates — the dedup-hit signal Stage 7 uses to bump
         mention_count + union episodes instead of dropping the re-assertion.
-        ok=False means the LLM call/parse failed (fail-closed empties), so no
+        ok=False means the response never validated (fail-closed empties), so no
         saturation round runs on the result.
         """
         if not candidates_map:
@@ -203,10 +149,15 @@ class ExtractionEdgesMixin:
                 base_prompt=prompt,
                 model=self._contradiction_model,
                 max_tokens=300 * max(1, len(items)),
+                max_attempts=2,
             )
-        except LLM_TRANSPORT_ERRORS:
-            raise  # never answered: fail the item, don't record a non-decision
-        except Exception:
+        except MalformedResponseError as exc:
+            logger.warning(
+                "stage 6b: no usable verdicts for %d fact(s) after a retry; writing them "
+                "without duplicate or contradiction checks: %s",
+                len(items),
+                exc,
+            )
             return set(), {}, {}, False
 
         # Index coercion (digit strings, {"index": N} wrappers — seen on
@@ -259,7 +210,7 @@ class ExtractionEdgesMixin:
         edge on a rank-9+ "duplicate" would be trusting a weaker signal.
 
         Mutates ``invalidate`` in place. Returns the number of extra edges
-        marked for invalidation (for span attributes). Never raises.
+        marked for invalidation (for span attributes). Raises only transport errors.
         """
         seen: dict[int, set[str]] = {}
         active: list[int] = []
@@ -318,9 +269,10 @@ class ExtractionEdgesMixin:
                 active = next_active
                 if not active:
                     break
+        except LLM_TRANSPORT_ERRORS:
+            raise  # never answered: fail the item, don't write with a partial verdict set
         except Exception as exc:
-            # Same posture as the writer-side detector: a missed
-            # contradiction is recoverable, blocking the write path is not.
+            # A missed contradiction is recoverable, blocking the write path is not.
             logger.warning("stage6b saturation rounds failed group=%s: %s", group_id, exc)
         return extra
 
@@ -337,7 +289,7 @@ class ExtractionEdgesMixin:
         default_valid_at: str | None = None,
         reference_time: str | None = None,
         reinforce: dict[int, list[str]] | None = None,
-        before_write: Callable[[list[list[str]]], None] | None = None,
+        before_write: Callable[[], None] | None = None,
     ) -> None:
         """Write fact edges, skipping duplicates and invalidating contradictions.
 
@@ -346,74 +298,41 @@ class ExtractionEdgesMixin:
         replacement case), we skip the redundant write but still mark the
         superseded edge as invalid.
 
-        ``before_write`` runs after the LLM pre-pass (edge dates, writer-side
-        contradictions, which it receives) and before the first write. It may add to
-        ``skip_indices`` and ``reinforce`` and remap ``uuid_map``; everything below reads
-        them after it. The extractor runs Stage 6c and the new-entity writes there, so an
-        edge another worker writes while this batch waits on those LLM calls is still seen.
+        ``before_write`` runs after the LLM pre-pass (edge dates) and before the first
+        write. It may add to ``skip_indices`` and ``reinforce`` and remap ``uuid_map``;
+        everything below reads them after it. The extractor runs Stage 6c and the
+        new-entity writes there, so an edge another worker writes while this batch waits
+        on the date call is still seen.
         """
         # Pre-extract (valid_at, invalid_at) for ALL facts in ONE LLM call
-        # (PR #89). Previously create_edge fired EdgeDateExtractor.extract
-        # once per fact — at ~30s/call on N=26 facts that was ~13 min of
-        # serial LLM work per summary. Batching collapses it to one call.
-        # On failure the helper returns (None, None) per fact; create_edge
-        # then falls back to now() for valid_at exactly as before.
+        # (PR #89): one call per summary instead of one per fact at ~30s each.
+        # A fact the call returns no date for gets the default valid-time below.
         eligible_facts: list[str] = []
-        eligible_srcs: list[str] = []
-        eligible_tgts: list[str] = []
-        eligible_embs: list[list[float] | None] = []
         for idx, fact in enumerate(facts):
-            if idx in skip_indices:
-                eligible_facts.append("")
-                eligible_srcs.append("")
-                eligible_tgts.append("")
-                eligible_embs.append(None)
-                continue
-            src_uuid = uuid_map.get(fact.source)
-            tgt_uuid = uuid_map.get(fact.target)
-            ok = bool(src_uuid and tgt_uuid)
-            eligible_facts.append(fact.fact if ok else "")
-            eligible_srcs.append(src_uuid.removeprefix("new:") if (ok and src_uuid) else "")
-            eligible_tgts.append(tgt_uuid.removeprefix("new:") if (ok and tgt_uuid) else "")
-            eligible_embs.append(
-                fact_embeddings[idx]
-                if (ok and fact_embeddings and idx < len(fact_embeddings))
-                else None
+            ok = idx not in skip_indices and bool(
+                uuid_map.get(fact.source) and uuid_map.get(fact.target)
             )
+            eligible_facts.append(fact.fact if ok else "")
         batched_dates = self._edge_date_extractor.extract_batch(
             eligible_facts, reference_time=reference_time
         )
-
-        # Batched contradiction detection (one LLM call covering every fact
-        # whose (src, tgt) pair already has a live edge above the similarity
-        # threshold). Replaces the per-fact detector firing inside
-        # create_edge: stage7 wall p95 was 110s, max 186s — variance was
-        # the detector firing serially when contradictions exist. Batching
-        # collapses N detector LLM calls to ONE.
-        batched_contradictions = self._contradiction_detector.detect_contradictions_batch(
-            facts, eligible_srcs, eligible_tgts, group_id, fact_embeddings=eligible_embs
-        )
         if before_write is not None:
-            before_write(batched_contradictions)
+            before_write()
 
         # Assemble the FULL invalidation list before writing edges so we
         # dispatch ONE UNWIND-batched MATCH+SET round-trip instead of N.
-        # Three sources contribute, in the same ordering the previous
-        # per-fact code used:
-        #   1. ``invalidate`` (dedup invalidations from Stage 6) — independent
-        #      of whether the new edge gets written; always applied.
-        #   2. ``batched_contradictions[idx]`` — old live edges the new fact
-        #      supersedes. Applied BEFORE the new CREATE (preserves the
-        #      semantic ordering from the per-fact create_edge detector path).
-        # The edge-date extractor's ``invalid_at`` is deliberately NOT a third
-        # source (2026-10-09). It used to be applied at birth, so a fact whose text
+        # ``invalidate`` (the Stage 6b verdicts: old live edges the new fact
+        # supersedes) is independent of whether the new edge gets written;
+        # always applied, before the new CREATE.
+        # The edge-date extractor's ``invalid_at`` is deliberately NOT a source
+        # (2026-10-09). It used to be applied at birth, so a fact whose text
         # expressed an end ("User told the assistant on 2026-08-29 to stop X", "the
         # outage ran Aug-Sep") was written already-retired and dropped out of the
         # live index on the spot: 616 such edges in prod, with no successor link,
         # invisible to every recall leg. A fact that records a dated happening or a
         # bounded past state is a TRUE statement for as long as the graph exists;
         # ``t_invalid`` means "superseded by a later fact", and only supersession
-        # (Stage 6b, the writer-side detector) sets it. Currency for the reader
+        # (Stage 6b) sets it. Currency for the reader
         # rides ``t_valid`` + the schema-058 fields instead.
         # Pre-generate the new edge uuid for each fact that WILL be created (same guards as the
         # create_rows loop below), so a contradiction can record WHICH new edge supersedes the old
@@ -455,17 +374,15 @@ class ExtractionEdgesMixin:
                 return dups[0] if dups else None
             return new_uuid_by_idx.get(idx)
 
-        # 1. Stage 6 verdicts ({new fact idx: [old edge uuids]}) — previously flattened
-        #    and written with NO superseder, which is why corrections found at
-        #    extraction never reached recall's successor lookup.
-        # 2. Writer-side safety-net verdicts (batched_contradictions[idx]) — same shape.
+        # Stage 6 verdicts ({new fact idx: [old edge uuids]}) were once flattened
+        # and written with NO superseder, which is why corrections found at
+        # extraction never reached recall's successor lookup.
         by_superseder: dict[str, list[tuple[str, str | None]]] = {}
         orphan_invalidations: list[tuple[str, str | None]] = []
         seen_old: set[tuple[str, str | None]] = set()
         for idx in range(len(facts)):
-            # A fact skipped by 6b reached the detector with blank endpoints, so its
-            # list is empty; one 6c absorbed keeps its verdicts, linked to the absorbing edge.
-            olds: list[str] = list(invalidate.get(idx, [])) + batched_contradictions[idx]
+            # A fact 6c absorbed keeps its verdicts, linked to the absorbing edge.
+            olds = invalidate.get(idx, [])
             if not olds:
                 continue
             sup = _superseder(idx)
@@ -485,11 +402,8 @@ class ExtractionEdgesMixin:
             self._kg.invalidate_edges_batch(orphan_invalidations, group_id)
 
         # Build CREATE rows for every eligible fact in one pass, then dispatch
-        # one batched MATCH+CREATE round-trip (two if some facts lack
-        # embeddings — see create_edges_batch). Replaces N per-fact create_edge
-        # calls, each of which fired its own MATCH+CREATE Cypher hop. Stage 7
-        # wall on a 16-fact item was ~30s dominated by graph round-trips;
-        # this collapses them.
+        # one batched INSERT (see create_edges_batch) instead of a round-trip per
+        # fact.
         # Evidence metadata (schema 058): support time = when the chunk was SAID
         # (segment timestamp), never the extracted valid-from — "User ran a marathon
         # in 2019", said today, is supported today and valid from 2019. Only a

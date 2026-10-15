@@ -1,16 +1,9 @@
 """LLM-driven temporal-bounds extractor for newly-written edges.
 
-Wraps the verbatim Graphiti prompt at
-``ingestion.prompts.extract_edge_dates`` with the structured-response
-schema and error handling needed at write time. Used by
-``KGClient.create_edge`` to populate ``t_valid`` / ``t_invalid`` from
-fact text when the caller hasn't supplied them already.
-
-Why this lives outside ``contradiction.py``: the contradiction detector and
-edge-date extractor share the bi-temporal write path but are otherwise
-independent — different prompts, different failure modes, different
-inputs. Keeping them in separate modules makes the dependency graph
-obvious and prevents one regression from masking another.
+Wraps the Graphiti-derived prompt at ``ingestion.prompts.extract_edge_dates``
+with the structured-response schema and error handling needed at write time.
+Stage 7 of the extraction pipeline calls it once per fact batch to read
+``valid_at`` / ``invalid_at`` out of the fact text.
 """
 
 from __future__ import annotations
@@ -20,6 +13,10 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
+from ingestion.llm_client import MalformedResponseError, structured_call
+from ingestion.llm_schemas import BatchEdgeDatesResult
+from ingestion.prompts.extract_edge_dates import build_batch_prompt
+
 logger = logging.getLogger(__name__)
 
 # Temporal-marker pre-filter. The date extractor is the single most
@@ -28,11 +25,10 @@ logger = logging.getLogger(__name__)
 # facts ("config_loader.py defines EligibilityConfig class") for which the
 # LLM just echoes valid_at=REFERENCE_TIME, invalid_at=null.
 #
-# Safety: ``extract_batch`` defaults reference_time to now(), and the
-# extractor's fallback for a (None, None) result is ALSO now()
-# (``valid_at_ts = t_valid_pre or now``). So for an ongoing/present-tense
-# fact the LLM's answer (valid_at=now, invalid_at=null) is bit-identical to
-# skipping the call and letting the now() fallback fill in. Only facts whose
+# Safety: ``extract_batch`` defaults reference_time to now(), and Stage 7's
+# fallback for a (None, None) result is the segment time or now(). So for an
+# ongoing/present-tense fact the LLM's answer is the same as skipping the
+# call and letting the fallback fill in. Only facts whose
 # TEXT carries a resolvable date / offset / validity-flip can produce a
 # different answer — those still go to the LLM.
 #
@@ -75,9 +71,8 @@ def _has_temporal_markers(fact: str) -> bool:
     return bool(_TEMPORAL_RE.search(fact))
 
 
-# Response shapes (mirroring ``ingestion.prompts.models.EdgeDates``) are
-# enforced via pydantic-ai structured outputs — see
-# ``ingestion.llm_schemas.EdgeDatesResult`` / ``BatchEdgeDatesResult``.
+# The response shape is enforced via pydantic-ai structured outputs — see
+# ``ingestion.llm_schemas.BatchEdgeDatesResult``.
 
 _DEFAULT_MODEL = "claude-haiku-4-5"
 
@@ -85,54 +80,14 @@ _DEFAULT_MODEL = "claude-haiku-4-5"
 class EdgeDateExtractor:
     """LLM-backed bi-temporal date extractor for fact edges.
 
-    Stateless; safe to share one instance across all writes. Never raises —
-    on any failure ``extract`` returns ``(None, None)`` so the caller falls
-    back to ``datetime.now(UTC)`` for ``t_valid``.
+    Stateless; safe to share one instance across all writes. A response that
+    does not validate costs the batch its dates (the caller falls back to the
+    segment time); an outage propagates, so the queue retries the item.
     """
 
     def __init__(self, llm_client: Any, *, model: str = _DEFAULT_MODEL) -> None:
         self._llm = llm_client
         self._model = model
-
-    def extract(
-        self, fact: str, reference_time: str | None = None
-    ) -> tuple[str | None, str | None]:
-        """Return ``(valid_at, invalid_at)`` as ISO 8601 strings or ``None``.
-
-        ``reference_time`` defaults to ``datetime.now(UTC).isoformat()`` so
-        relative expressions ("last week") resolve against the moment of the
-        write. Callers that have a per-episode timestamp (the typical
-        extractor path) should pass it through verbatim.
-        """
-        if not fact or not fact.strip():
-            return (None, None)
-        if self._llm is None:
-            return (None, None)
-        # Non-temporal facts resolve to the caller's now() fallback anyway —
-        # skip the LLM. See _TEMPORAL_RE.
-        if not _has_temporal_markers(fact):
-            return (None, None)
-        ref = reference_time or datetime.now(UTC).isoformat()
-        try:
-            from ingestion.llm_client import structured_call
-            from ingestion.llm_schemas import EdgeDatesResult
-
-            from .prompts.extract_edge_dates import build_prompt
-
-            messages = build_prompt({"fact": fact, "reference_time": ref})
-            # Empty strings normalize to None inside the model — some LLM
-            # responses come back with "" instead of null even with the schema.
-            dates = structured_call(
-                self._llm,
-                output_model=EdgeDatesResult,
-                messages=messages,
-                model=self._model,
-                max_tokens=200,
-            )
-            return (dates.valid_at, dates.invalid_at)
-        except Exception as exc:
-            logger.debug("EdgeDateExtractor failed for fact=%r: %s", (fact or "")[:80], exc)
-            return (None, None)
 
     def extract_batch(
         self, facts: list[str], reference_time: str | None = None
@@ -140,10 +95,10 @@ class EdgeDateExtractor:
         """Extract (valid_at, invalid_at) for many facts in ONE LLM call.
 
         Returns a list parallel to ``facts`` — index i in the return matches
-        ``facts[i]``. Facts missing in the LLM response (or any parse failure
-        of the whole batch) fall back to ``(None, None)``, matching the
-        single-fact ``extract``'s conservative posture so a date-extraction
-        miss never blocks an edge write.
+        ``facts[i]``. Facts missing in the LLM response (or a response that
+        never validates) fall back to ``(None, None)``, so a date-extraction
+        miss never blocks an edge write. A transport failure raises: writing
+        the batch would stamp every fact with the segment time for good.
 
         Empty/blank fact strings are skipped without an LLM call and return
         ``(None, None)``; the index alignment with the input list is
@@ -166,13 +121,8 @@ class EdgeDateExtractor:
             return out
 
         ref = reference_time or datetime.now(UTC).isoformat()
+        messages = build_batch_prompt(items, ref)
         try:
-            from ingestion.llm_client import structured_call
-            from ingestion.llm_schemas import BatchEdgeDatesResult
-
-            from .prompts.extract_edge_dates import build_batch_prompt
-
-            messages = build_batch_prompt(items, ref)
             batch = structured_call(
                 self._llm,
                 output_model=BatchEdgeDatesResult,
@@ -182,8 +132,12 @@ class EdgeDateExtractor:
                 # wrapping JSON. 80 tokens/fact is generous.
                 max_tokens=max(200, 80 * len(items)),
             )
-        except Exception as exc:
-            logger.debug("EdgeDateExtractor.extract_batch failed (n=%d): %s", len(items), exc)
+        except MalformedResponseError as exc:
+            logger.warning(
+                "edge dates: no usable response for %d fact(s); they take the segment time: %s",
+                len(items),
+                exc,
+            )
             return out
 
         for r in batch.results:

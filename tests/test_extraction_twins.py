@@ -235,10 +235,6 @@ class TestPipelineWiring:
         pipe._edge_date_extractor.extract_batch.side_effect = lambda facts, reference_time=None: [
             (None, None) for _ in facts
         ]
-        pipe._contradiction_detector = MagicMock()
-        pipe._contradiction_detector.detect_contradictions_batch.side_effect = (
-            lambda facts, *a, **k: [[] for _ in facts]
-        )
         return pipe
 
     def test_twin_written_once_with_batch_provenance(self):

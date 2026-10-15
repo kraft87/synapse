@@ -36,10 +36,6 @@ def pipe(conn, monkeypatch, db_url):
     p._edge_date_extractor.extract_batch.side_effect = lambda facts, reference_time=None: [
         (None, None) for _ in facts
     ]
-    p._contradiction_detector = MagicMock()
-    p._contradiction_detector.detect_contradictions_batch.side_effect = lambda facts, *a, **k: [
-        [] for _ in facts
-    ]
     return p
 
 

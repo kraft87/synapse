@@ -1,7 +1,7 @@
 """Two extractor defects seen on prod, reproduced end to end through process_item.
 
 Real test DB and the real Stage 4-7 code; the LLM stages (extraction, the 6b judge, edge
-dates, the writer-side contradiction check) are stubbed and embeddings are one-hot, so
+dates) are stubbed and embeddings are one-hot, so
 texts that share a slot are identical vectors.
 
 1. Restatement race. Overlapping chunk windows share a turn, so two batches extract the
@@ -93,10 +93,6 @@ def _pipeline(
     pipe._edge_date_extractor = MagicMock()
     pipe._edge_date_extractor.extract_batch.side_effect = lambda fs, reference_time=None: [
         (None, None) for _ in fs
-    ]
-    pipe._contradiction_detector = MagicMock()
-    pipe._contradiction_detector.detect_contradictions_batch.side_effect = lambda fs, *a, **k: [
-        [] for _ in fs
     ]
     return pipe
 

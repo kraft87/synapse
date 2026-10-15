@@ -192,67 +192,6 @@ _SATURATION_MIN = 4
 _FULLTEXT_MIN_SIM = 0.70
 _SATURATION_MAX_ROUNDS = 8
 
-_CONTRADICTION_PROMPT = """\
-You are a knowledge graph deduplication assistant. Decide which existing facts the NEW FACT duplicates and which it contradicts. A single existing fact CAN be both — e.g. "X uses A" supersedes "X uses A (v1)" (duplicate predicate, but the new one updates/replaces).
-
-NEW FACT: "{new_fact}"
-
-EXISTING FACTS share the same source/target entity pair as the new fact — strongest prior for duplicate detection:
-{existing_section}
-
-INVALIDATION CANDIDATES were retrieved by hybrid (BM25 + vector) similarity — strongest prior for contradiction/supersession detection:
-{candidates_section}
-
-Indices are continuous across both sections. Refer to facts by their `idx`, not by any other identifier.
-
-Rules:
-- duplicate_facts: idx values whose information is restated by the NEW FACT (same relationship, same meaning, may differ only by phrasing).
-- contradicted_facts: idx values whose claim is incompatible with or superseded by the NEW FACT. This INCLUDES drop-in replacements ("X uses A" → "X uses B") even when the target entity differs.
-- A status change of the SAME thing IS a contradiction ("PR 12 is open" → "PR 12 is merged"). NOT a contradiction: a different fact about a related thing (another ticket, PR, file, step or person in the same project or thread), or added detail or later progress that leaves the old claim still true. Sharing an identifier or a topic is not enough.
-- An idx MAY appear in BOTH lists when the new fact restates the old predicate while correcting/superseding the value.
-- Both lists may be empty if the NEW FACT is genuinely novel.
-"""
-
-# Response shape enforced via pydantic-ai structured outputs — see
-# ``ingestion.llm_schemas.ResolutionResult``.
-
-
-def build_resolution_prompt(
-    new_fact: str,
-    existing_pool: list[dict[str, Any]],
-    candidate_pool: list[dict[str, Any]],
-) -> tuple[str, dict[int, str]]:
-    """Render the dual-section prompt with continuous idx numbering.
-
-    Returns (prompt_text, idx_to_uuid_map). The map lets the caller translate
-    the LLM's idx-based response back to edge UUIDs without including the
-    UUIDs in the prompt itself — saves tokens and prevents the LLM from
-    hallucinating UUID characters.
-    """
-    idx_to_uuid: dict[int, str] = {}
-    existing_lines: list[str] = []
-    candidate_lines: list[str] = []
-
-    i = 0
-    for item in existing_pool:
-        idx_to_uuid[i] = item["uuid"]
-        existing_lines.append(f"[{i}] {item['fact']}")
-        i += 1
-    for item in candidate_pool:
-        idx_to_uuid[i] = item["uuid"]
-        candidate_lines.append(f"[{i}] {item['fact']}")
-        i += 1
-
-    existing_section = "\n".join(existing_lines) if existing_lines else "(none)"
-    candidates_section = "\n".join(candidate_lines) if candidate_lines else "(none)"
-    prompt = _CONTRADICTION_PROMPT.format(
-        new_fact=new_fact,
-        existing_section=existing_section,
-        candidates_section=candidates_section,
-    )
-    return prompt, idx_to_uuid
-
-
 _BATCH_CONTRADICTION_PROMPT = """\
 You are a knowledge graph deduplication assistant. For EACH new fact below, decide which of ITS OWN existing/candidate facts it duplicates and which it contradicts. Each new fact has a unique `id` and its OWN indexed candidate lists. An idx ONLY refers to facts under the same fact `id`.
 

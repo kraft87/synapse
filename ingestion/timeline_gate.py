@@ -22,7 +22,6 @@ swallowed so KG extraction never breaks on the timeline's account.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -134,11 +133,6 @@ def gate_prompt() -> str:
     return _GATE_PROMPT_BASE + (_OUTPUT_RULE % "")
 
 
-#: Back-compat alias: the full prompt with the domain rule. ``gate_prompt()`` is
-#: what the gate calls, because the switch is read at call time.
-GATE_PROMPT = _GATE_PROMPT_BASE + _DOMAIN_RULE + (_OUTPUT_RULE % _DOMAIN_FIELD)
-
-
 _MAX_EVENTS_PER_TURN = 3
 
 # ---------------------------------------------------------------------------
@@ -182,27 +176,6 @@ def _parse_verdict(text: str) -> str:
     if t.startswith("DISTINCT"):
         return "DISTINCT"
     raise MalformedResponseError("expected SAME or DISTINCT", text[:100])
-
-
-def _parse_gate(text: str) -> list[dict[str, Any]]:
-    """Parse a raw gate response into validated event dicts (capped).
-
-    All tolerance (legacy single-event shape, salience clamping, unknown
-    event_type/domain → None, non-string dates → None, junk items dropped)
-    lives in ``ingestion.llm_schemas.TimelineGateEvents``; a non-list
-    ``events`` value raises ``MalformedResponseError`` so the retry loop can
-    correct it. Kept as the text-path parser and the single source of the
-    model → dict conversion."""
-    start, end = text.find("{"), text.rfind("}")
-    if start < 0 or end <= start:
-        raise MalformedResponseError("no JSON object in response", text[:200])
-    try:
-        parsed = TimelineGateEvents.model_validate(json.loads(text[start : end + 1]))
-    except json.JSONDecodeError as exc:
-        raise MalformedResponseError(f"JSON decode error: {exc}", text[:200]) from exc
-    except ValueError as exc:  # pydantic ValidationError included
-        raise MalformedResponseError(str(exc)[:200], text[:200]) from exc
-    return _events_to_dicts(parsed)
 
 
 def _events_to_dicts(parsed: Any) -> list[dict[str, Any]]:

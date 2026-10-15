@@ -174,10 +174,6 @@ def _pipe(nearest: list[list[dict]] | None = None, judge=None) -> ExtractionPipe
     pipe._edge_date_extractor.extract_batch.side_effect = lambda facts, reference_time=None: [
         (None, None) for _ in facts
     ]
-    pipe._contradiction_detector = MagicMock()
-    pipe._contradiction_detector.detect_contradictions_batch.side_effect = lambda facts, *a, **k: [
-        [] for _ in facts
-    ]
     return pipe
 
 
@@ -215,28 +211,13 @@ class TestStage7Wiring:
             [("e-old-san", SEG)], "g", invalidated_by="e-live"
         )
 
-    def test_writer_side_verdict_of_a_restated_fact_still_retires_linked(self):
+    def test_judge_verdict_against_the_near_copy_writes_a_replacement(self):
         facts = [_fact("The build cache lives on the NAS", "Cache", "NAS")]
         uuid_map = {"Cache": "u-c", "NAS": "u-n"}
-        pipe = _pipe(nearest=[[_edge("e-live", "The build cache lives on the NAS")]])
-        pipe._contradiction_detector.detect_contradictions_batch.side_effect = lambda fs, *a, **k: [
-            ["e-old-san"]
-        ]
-
-        pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
-
-        assert _created(pipe) == []
-        pipe._kg.invalidate_edges_batch.assert_called_once_with(
-            [("e-old-san", SEG)], "g", invalidated_by="e-live"
+        pipe = _pipe(
+            nearest=[[_edge("e-live", "The build cache lives on the NAS")]],
+            judge=lambda fs, cands: (set(), {0: ["e-live"]}, {}, True),
         )
-
-    def test_writer_side_verdict_against_the_near_copy_writes_a_replacement(self):
-        facts = [_fact("The build cache lives on the NAS", "Cache", "NAS")]
-        uuid_map = {"Cache": "u-c", "NAS": "u-n"}
-        pipe = _pipe(nearest=[[_edge("e-live", "The build cache lives on the NAS")]])
-        pipe._contradiction_detector.detect_contradictions_batch.side_effect = lambda fs, *a, **k: [
-            ["e-live"]
-        ]
 
         pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
 

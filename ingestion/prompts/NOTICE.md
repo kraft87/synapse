@@ -18,10 +18,8 @@ Graphiti repo at https://github.com/getzep/graphiti):
 | Synapse file                                | Upstream Graphiti file                          |
 |---------------------------------------------|--------------------------------------------------|
 | `ingestion/prompts/dedupe_nodes.py`         | `graphiti_core/prompts/dedupe_nodes.py`          |
-| `ingestion/prompts/dedupe_edges.py`         | `graphiti_core/prompts/dedupe_edges.py`          |
-| `ingestion/prompts/invalidate_edges.py`     | `graphiti_core/prompts/dedupe_edges.py` (`resolve_edge` — Graphiti folds invalidation and dedup into one prompt with two output lists; Synapse splits them so the writer-side detector can call invalidation alone) |
-| `ingestion/prompts/extract_edge_dates.py`   | `graphiti_core/prompts/extract_edges.py` (`extract_timestamps` — Graphiti's name for the single-fact temporal-bounds extractor) |
-| `ingestion/prompts/models.py`               | `graphiti_core/prompts/models.py` (`Message` type) and the per-prompt `BaseModel` classes from each upstream file |
+| `ingestion/prompts/extract_edge_dates.py`   | `graphiti_core/prompts/extract_edges.py` (`extract_timestamps` — Graphiti's name for the temporal-bounds extractor) |
+| `ingestion/prompts/models.py`               | `graphiti_core/prompts/models.py` (`Message` type) |
 
 Additionally, parts of the extraction rule set in `ingestion/extractor.py`
 (entity-name/skip-class discipline, direct-edge preference, output-discipline

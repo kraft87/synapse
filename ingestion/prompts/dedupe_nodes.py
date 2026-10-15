@@ -1,8 +1,8 @@
-"""Verbatim port of Graphiti's node-dedup prompt.
+"""Port of Graphiti's node-dedup prompt, batched.
 
 Upstream: ``graphiti_core/prompts/dedupe_nodes.py`` (the ``node`` function —
-single new-entity vs candidate-list shape, which matches Synapse's per-pair
-``NodeDeduper._llm_confirm`` flow).
+one new entity vs its candidate list; ``build_batch_prompt`` renders many of
+those in one call).
 
 See ``NOTICE.md`` for Apache 2.0 attribution.
 """
@@ -27,92 +27,12 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .models import Message, NodeDuplicate
+from .models import Message
 
 
 def _to_prompt_json(data: Any) -> str:
     """Verbatim port of Graphiti's ``to_prompt_json`` (prompt_helpers.py)."""
     return json.dumps(data, ensure_ascii=False, indent=None)
-
-
-def build_prompt(context: dict[str, Any]) -> list[dict[str, str]]:
-    """Render the single-pair node-dedup prompt.
-
-    Required context keys:
-      - ``previous_episodes`` (list) — prior conversation/episode snippets
-      - ``episode_content`` (str)    — the current episode body
-      - ``extracted_node`` (dict)    — {name, summary, ...} for the new entity
-      - ``entity_type_description`` (str) — short description of the entity type
-      - ``existing_nodes`` (list[dict]) — candidate matches, each carrying a
-        ``candidate_id`` integer and a ``name`` (Graphiti's required shape).
-
-    Returns plain ``[{"role": ..., "content": ...}]`` dicts so callers can pass
-    them directly to ``llm_client.messages.create(messages=...)``.
-    """
-    messages = [
-        Message(
-            role="system",
-            content=(
-                "You are an entity deduplication assistant. "
-                "NEVER fabricate entity names or mark distinct entities as duplicates."
-            ),
-        ),
-        Message(
-            role="user",
-            content=f"""
-<PREVIOUS MESSAGES>
-{_to_prompt_json(context["previous_episodes"])}
-</PREVIOUS MESSAGES>
-
-<CURRENT MESSAGE>
-{context["episode_content"]}
-</CURRENT MESSAGE>
-
-<NEW ENTITY>
-{_to_prompt_json(context["extracted_node"])}
-</NEW ENTITY>
-
-<ENTITY TYPE DESCRIPTION>
-{_to_prompt_json(context["entity_type_description"])}
-</ENTITY TYPE DESCRIPTION>
-
-<EXISTING ENTITIES>
-{_to_prompt_json(context["existing_nodes"])}
-</EXISTING ENTITIES>
-
-Entities should only be considered duplicates if they refer to the *same real-world object or concept*.
-Semantic Equivalence: if a descriptive label in EXISTING ENTITIES clearly refers to a named entity in context, treat them as duplicates.
-
-NEVER mark entities as duplicates if:
-- They are related but distinct.
-- They have similar names or purposes but refer to separate instances or concepts.
-
-Task:
-1. Compare the NEW ENTITY against each EXISTING ENTITY (identified by `candidate_id`).
-2. If it refers to the same real-world object or concept, return the `candidate_id` of that match.
-3. Return `duplicate_candidate_id = -1` when there is no match or you are unsure.
-
-<EXAMPLE>
-NEW ENTITY: "Sam" (Person)
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "Sam", "entity_types": ["Person"], "summary": "Sam enjoys hiking and photography"}}]
-Result: duplicate_candidate_id = 0 (same person referenced in conversation)
-
-NEW ENTITY: "NYC"
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "New York City", "entity_types": ["Location"]}}, {{"candidate_id": 1, "name": "New York Knicks", "entity_types": ["Organization"]}}]
-Result: duplicate_candidate_id = 0 (same location, abbreviated name)
-
-NEW ENTITY: "Java" (programming language)
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "Java", "entity_types": ["Location"], "summary": "An island in Indonesia"}}]
-Result: duplicate_candidate_id = -1 (same name but distinct real-world things)
-
-NEW ENTITY: "Marco's car"
-EXISTING ENTITIES: [{{"candidate_id": 0, "name": "Marco's vehicle", "entity_types": ["Entity"], "summary": "Marco drives a red sedan."}}]
-Result: duplicate_candidate_id = 0 (synonym — "car" and "vehicle" refer to the same thing, same possessor)
-</EXAMPLE>
-""",
-        ),
-    ]
-    return [m.model_dump() for m in messages]
 
 
 def build_batch_prompt(items: list[dict[str, Any]]) -> list[dict[str, str]]:
@@ -128,8 +48,8 @@ def build_batch_prompt(items: list[dict[str, Any]]) -> list[dict[str, str]]:
     preserving versus confirming each (entity, candidate) pair separately —
     it just collapses N ~30s claude-CLI subprocess calls into one.
 
-    The dedup rules mirror the single-pair :func:`build_prompt` (Graphiti's
-    ``dedupe_nodes.node``) verbatim. Returns ``[{"role", "content"}]`` dicts.
+    The dedup rules mirror Graphiti's ``dedupe_nodes.node`` verbatim. Returns
+    ``[{"role", "content"}]`` dicts.
     """
     messages = [
         Message(
@@ -178,39 +98,4 @@ with exactly one object per new entity `id`.
     return [m.model_dump() for m in messages]
 
 
-# Structured-response schema for ``build_batch_prompt`` — object-wrapped array
-# (object root is the safest shape for the SDK's structured-output mode).
-BATCH_NODE_DEDUP_SCHEMA: dict[str, Any] = {
-    "type": "json",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "results": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "integer"},
-                        "duplicate_candidate_id": {"type": "integer"},
-                    },
-                    "required": ["id", "duplicate_candidate_id"],
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["results"],
-        "additionalProperties": False,
-    },
-}
-
-
-# Re-export the response model so callers only need a single import.
-NodeDedupResponse = NodeDuplicate
-
-
-__all__ = [
-    "BATCH_NODE_DEDUP_SCHEMA",
-    "NodeDedupResponse",
-    "build_batch_prompt",
-    "build_prompt",
-]
+__all__ = ["build_batch_prompt"]

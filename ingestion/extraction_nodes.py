@@ -196,11 +196,7 @@ class ExtractionNodesMixin:
         from ingestion.dedup import NodeDeduper
 
         if group_id not in self._dedupers:
-            self._dedupers[group_id] = NodeDeduper(
-                kg_client=self._kg,
-                group_id=group_id,
-                llm_client=self._llm._client,
-            )
+            self._dedupers[group_id] = NodeDeduper(kg_client=self._kg, group_id=group_id)
         return self._dedupers[group_id]
 
     # ------------------------------------------------------------------

@@ -1,7 +1,7 @@
 """Stage 7 supersession lineage + evidence metadata (schema 028 links, schema 058 fields).
 
-Pure-logic: the KG client is a MagicMock, the edge-date extractor and the writer-side
-contradiction detector are stubbed. What is pinned:
+Pure-logic: the KG client is a MagicMock and the edge-date extractor is stubbed. What is
+pinned:
 
 * Every old edge a new fact retires carries ``invalidated_by`` -> the edge that replaced it.
   Stage 6 verdicts used to be flattened and written with NO superseder, so a correction
@@ -31,10 +31,6 @@ def _pipe(n_facts: int, dates: list[tuple[str | None, str | None]] | None = None
     pipe._kg = MagicMock()
     pipe._edge_date_extractor = MagicMock()
     pipe._edge_date_extractor.extract_batch.return_value = dates or [(None, None)] * n_facts
-    pipe._contradiction_detector = MagicMock()
-    pipe._contradiction_detector.detect_contradictions_batch.return_value = [
-        [] for _ in range(n_facts)
-    ]
     return pipe
 
 
@@ -107,19 +103,24 @@ class TestSupersederLink:
         assert _created(pipe) == []
         assert _invalidations(pipe) == [([("old-1", SEG)], None)]
 
-    def test_safety_net_contradictions_share_the_link_and_date(self):
+    def test_every_retired_edge_shares_the_link_and_the_facts_own_date(self):
         facts = [_fact(0)]
         pipe = _pipe(1, dates=[("2026-03-15T00:00:00Z", None)])
-        pipe._contradiction_detector.detect_contradictions_batch.return_value = [["old-pair"]]
         pipe._stage7_write_edges(
-            facts, _uuid_map(facts), [1], "g", set(), {0: ["old-sem"]}, default_valid_at=SEG
+            facts,
+            _uuid_map(facts),
+            [1],
+            "g",
+            set(),
+            {0: ["old-sem", "old-pair"]},
+            default_valid_at=SEG,
         )
         rows = _created(pipe)
         inv = _invalidations(pipe)
         assert len(inv) == 1
         items, sup = inv[0]
         assert sup == rows[0]["edge_uuid"]
-        # the fact's own in-text date wins over the segment timestamp, for both verdict sources
+        # the fact's own in-text date wins over the segment timestamp
         assert set(items) == {
             ("old-sem", "2026-03-15T00:00:00Z"),
             ("old-pair", "2026-03-15T00:00:00Z"),

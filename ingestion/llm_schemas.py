@@ -94,14 +94,6 @@ def _drop_invalid_items[M: BaseModel](item_model: type[M], val: Any) -> list[M]:
 # ---------------------------------------------------------------------------
 
 
-class ResolutionResult(BaseModel):
-    """Single-fact stage-6b verdict: which existing facts the new fact
-    duplicates and/or contradicts (idx values into the prompt's pools)."""
-
-    duplicate_facts: IndexList = []
-    contradicted_facts: IndexList = []
-
-
 class BatchResolutionItem(BaseModel):
     """Per-fact entry in the batched stage-6b response."""
 
@@ -122,31 +114,6 @@ class BatchResolutionResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Writer-side contradiction detector (contradiction.py)
-# ---------------------------------------------------------------------------
-
-
-class ContradictionVerdict(BaseModel):
-    """Contradiction-only verdict for a single fact pair."""
-
-    contradicted_facts: IndexList = []
-
-
-class BatchContradictionItem(BaseModel):
-    id: int
-    contradicted_facts: IndexList = []
-
-
-class BatchContradictionResult(BaseModel):
-    results: list[BatchContradictionItem] = []
-
-    @field_validator("results", mode="before")
-    @classmethod
-    def _tolerant_items(cls, v: Any) -> list[BatchContradictionItem]:
-        return _drop_invalid_items(BatchContradictionItem, v)
-
-
-# ---------------------------------------------------------------------------
 # Edge dates (edge_dates.py)
 # ---------------------------------------------------------------------------
 
@@ -157,18 +124,6 @@ def _clean_date(v: Any) -> str | None:
     if isinstance(v, str) and v:
         return v
     return None
-
-
-class EdgeDatesResult(BaseModel):
-    """Temporal bounds for one fact — ISO 8601 strings or null."""
-
-    valid_at: str | None = None
-    invalid_at: str | None = None
-
-    @field_validator("valid_at", "invalid_at", mode="before")
-    @classmethod
-    def _empty_to_none(cls, v: Any) -> str | None:
-        return _clean_date(v)
 
 
 class BatchEdgeDatesItem(BaseModel):
@@ -192,18 +147,8 @@ class BatchEdgeDatesResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Node dedup (dedup.py single-pair + extractor.py batch confirm)
+# Node dedup (extraction_entities.py batch confirm)
 # ---------------------------------------------------------------------------
-
-
-class NodeDedupVerdict(BaseModel):
-    """Node-dedup verdict. Defaults keep partial responses
-    parseable (the legacy parser only ever read ``duplicate_candidate_id``);
-    the strict wire schema still requires every key."""
-
-    id: int = 0
-    name: str = ""
-    duplicate_candidate_id: int = -1
 
 
 class BatchNodeDedupItem(BaseModel):
@@ -385,22 +330,16 @@ def first_json_object(raw: str) -> str:
 
 
 __all__ = [
-    "BatchContradictionItem",
-    "BatchContradictionResult",
     "BatchEdgeDatesItem",
     "BatchEdgeDatesResult",
     "BatchNodeDedupItem",
     "BatchNodeDedupResult",
     "BatchResolutionItem",
     "BatchResolutionResult",
-    "ContradictionVerdict",
-    "EdgeDatesResult",
     "ExtractionEntityRow",
     "ExtractionFactRow",
     "ExtractionOutput",
     "IndexList",
-    "NodeDedupVerdict",
-    "ResolutionResult",
     "TimelineGateEvent",
     "TimelineGateEvents",
     "first_json_object",
