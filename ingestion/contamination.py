@@ -64,7 +64,7 @@ def is_transcript_contamination(content: str | None) -> bool:
 # exactly that). What is listed is code that is not importable from here: scripts and the
 # dream lanes, which import this package, not the other way round.
 _HARNESS_PREFIXES = (
-    # scripts/ab_*.py fact-quality judge
+    # the deleted scripts/ab_*.py fact-quality judge (kept for re-swept old transcripts)
     "Below are candidate facts extracted for a long-term knowledge graph",
     # scripts/retype_untyped_entities.py / retype_pilot.py entity-typing prompt.
     # The BIGGEST self-ingestion leak (24,462 stranded episodes, 2026-06-18): these

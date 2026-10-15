@@ -154,7 +154,7 @@ Env or `settings.json` only:
 | `SYNAPSE_DATA_DIR` | Where the ingest cursors, the retry bookkeeping and the memory-write spool live (default `~/.local/share/synapse-skills`). |
 | `CLAUDE_PROJECTS_DIR` | Transcript root for the ingest hook's catch-up sweep and `synapse import` (default `~/.claude/projects`). |
 | `SYNAPSE_HOME` | The client's config directory (default `~/.synapse`): `config.json`, the installed client, and the hook logs. |
-| `SYNAPSE_INGEST_URL` | Legacy full-endpoint override, still honored. |
+| `SYNAPSE_INGEST_URL` / `SYNAPSE_MCP_URL` | Legacy full-endpoint overrides for `/ingest` and `/mcp`, still honored (else both derive from `SYNAPSE_URL`). |
 
 The six switches above (`SYNAPSE_TIMELINE_REPOS` through `SYNAPSE_PROMPT_TIMESTAMP`) are also `synapse config` keys, so they can be set without editing the environment. The sweep window (3 days, 20 files per start, 300 s grace for a live session) is a constant shared by the Claude and Codex hooks, not a knob. Every client hook logs to `~/.synapse/logs/<name>.log` (`ingest-hook`, `codex-hook`, `remember-spool`, `mcp_headers`), each capped at 64 KB; the `SYNAPSE_INGEST_*`, `SYNAPSE_SPOOL_*` and `SYNAPSE_CODEX_CATCHUP*` variables of earlier releases are no longer read.
 

@@ -6,7 +6,7 @@ turn completes, passing JSON on stdin ({session_id, transcript_path, cwd,
 hook_event_name, turn_id, ...}) where transcript_path is the session's
 rollout .jsonl. We ship the not-yet-shipped tail of that file to Synapse's
 `/ingest` endpoint with format="codex", where CodexRolloutParser — the same
-parser the disk sweep (ingestion.codex_backfill) uses — turns it into
+parser the disk sweep (ingestion.backfill --source codex) uses — turns it into
 episodes, so push and sweep converge idempotently on span_id.
 
 Design constraints, inherited from the Claude Code hook:
@@ -36,7 +36,7 @@ rollout modified within the catch-up window, plus every pending one
 regardless of age, least recently touched first, at most one capped batch per session
 start. Pending entries are exempt from the cursor TTL. A rollout older than the window that the hook never attempted
 (history from before install) is left alone; `python -m
-ingestion.codex_backfill` is the tool for that.
+ingestion.backfill --source codex` is the tool for that.
 
 After 3 failed POSTs in a row, or 24 hours of failure, with no success since,
 session start prints one line, shown to the user and to the model: "Synapse
