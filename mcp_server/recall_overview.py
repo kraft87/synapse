@@ -44,7 +44,7 @@ class RecallOverviewMixin(RecallEngine):
         surface: str | None = None,
         trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
-        """Overview retrieval: reranked episodes + KG facts (+ entities, web).
+        """Overview retrieval: reranked episodes + KG facts (+ notes, web).
 
         Best for session start and 'what's the state of X?' queries. Serves a wide-pool
         reranked episode leg (the broad/needle workhorse) plus knowledge-graph facts for

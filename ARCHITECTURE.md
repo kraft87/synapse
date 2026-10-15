@@ -4,7 +4,7 @@ Synapse is a persistent episodic memory layer for AI assistants. It captures Cla
 
 **The core problem it solves**: Claude Code sessions have no memory across restarts. Every new session starts cold. Synapse bridges that gap by indexing everything that happened in past sessions and making it retrievable via hybrid search that fuses reranked episodes with knowledge-graph facts. (Recall makes two Voyage API round-trips — query-embed and cross-encoder rerank — so it is not instant: roughly 1.5s warm, rising to a few seconds on a cold first call after the server has been idle. Measured on the homelab prod instance.)
 
-**One-paragraph mental model**: A Claude Code `Stop` hook pushes the tail of each session transcript to an HTTP `/ingest` endpoint. Episodes land in Postgres, get grouped into overlapping chunks, and the chunks are the substrate the knowledge-graph extractor mines for entities and facts (written to a knowledge graph in Postgres). At recall time, the MCP server runs a reranked episode leg (BM25 + vector), a KG fact leg, a web-research leg, and a bitemporal history leg in parallel, and returns a compact structured result. There is **no Logfire polling, no summary layer, and no served chunk bucket** — all three were retired during 2026.
+**One-paragraph mental model**: A Claude Code `Stop` hook pushes the not-yet-shipped part of each session transcript to an HTTP `/ingest` endpoint. Episodes land in Postgres, get grouped into overlapping chunks, and the chunks are the substrate the knowledge-graph extractor mines for entities and facts (written to a knowledge graph in Postgres). At recall time, the MCP server runs a reranked episode leg (BM25 + vector), a KG fact leg, a notes leg and a web-research leg in parallel (plus the bitemporal history of the facts it serves), and returns a compact structured result. There is **no Logfire polling, no summary layer, and no served chunk bucket** — all three were retired during 2026.
 
 > **Status note (2026-06-05):** This document was reconciled against the live code after a large architectural drift. The headline changes from the previous version: (1) ingestion moved from Logfire SQL-API polling to a Stop-hook `/ingest` push; (2) KG facts are extracted from **chunks**, not summaries; (3) the **summary/synth-document layer is retired**; (4) the **chunk bucket is no longer served** by `recall()` — episodes are served via a deep-fetch + cross-encoder rerank; (5) a **web-research ingestion subsystem** was added; (6) halfvec HNSW vector indexes shipped; (7) edges are **bitemporal** (`t_created`/`t_valid`/`t_invalid`); (8) the Docker migration is done — all services run in Docker on the server host.
 >
@@ -37,7 +37,7 @@ Synapse is a persistent episodic memory layer for AI assistants. It captures Cla
 
 ```mermaid
 graph TD
-    CC[Claude Code / Cursor\nactive session] -->|Stop hook: transcript TAIL| ING[POST /ingest\nFastMCP custom route]
+    CC[Claude Code / Cursor\nactive session] -->|Stop hook: records past the cursor| ING[POST /ingest\nFastMCP custom route]
 
     ING -->|dedup by span_id\nappend at max seq+1| EP[episodes\nPG table]
     ING -->|enqueue content_type=episode| EQ[extraction_queue]
@@ -58,11 +58,11 @@ graph TD
 
 **Data flow summary**:
 
-1. A Claude Code `Stop` hook (`scripts/synapse_ingest_hook.py`) fires on every turn and POSTs a bounded **tail** of the raw session JSONL to `http://<server-host>:8765/ingest`. It runs detached and never blocks the turn. (Any other agent frontend that drives the real `claude` CLI ingests the same way.)
+1. A Claude Code `Stop` hook (`plugin/scripts/ingest_hook.py`; Codex has its own, `plugin-codex/hooks/synapse_stop_hook.py`) fires on every turn and POSTs the part of the raw session JSONL past a durable per-file cursor to `http://<server-host>:8765/ingest`. It runs detached and never blocks the turn. (Any other agent frontend that drives the real `claude` CLI ingests the same way.)
 2. `/ingest` parses the tail, drops transcript contamination, **dedups by `span_id`**, and appends genuinely-new turns as episodes at `max(sequence)+1`, enqueuing each for KG extraction.
 3. The **poller** (a maintenance loop, *not* an ingester) rebuilds sliding-window chunks, embeds pending episodes/chunks via Voyage AI, and drains the extraction queue.
 4. KG extraction runs on **chunks** (3–5 turn windows): Haiku extracts entities + facts, resolves entities against the Postgres KG, dedups/contradicts against existing facts, and writes bitemporal relationship edges (`kg_relationships`).
-5. When a new session calls `synapse:recall`, the MCP server runs four legs in parallel (episodes, KG facts, web, bitemporal history) and returns a compact ranked result.
+5. When a new session calls `synapse:recall`, the MCP server runs its legs in parallel (episodes, KG facts, notes, web, with the bitemporal history of the served facts) and returns a compact ranked result.
 
 **Where things run**: All Synapse services (poller, MCP server, dream) run in Docker on the **server host** alongside Postgres. Claude Code runs on the **client machine** and reaches the MCP server over the network at `http://<server-host>:8765/mcp` with a machine **bearer token**. The hosted claude.ai connector reaches the same server at a public hostname (e.g. `synapse.example.net`, via a Cloudflare tunnel) and authenticates via **GitHub OAuth** — handled by the server's own `fastmcp` **MultiAuth**, which replaced the former hand-rolled OAuth proxy (#166). Prod compose + `.env` live at a dedicated deploy path on the server host (e.g. `/opt/synapse`).
 
@@ -84,7 +84,7 @@ graph TD
 | MCP server | **standalone `fastmcp` 3.4.2**, HTTP (stateless), port 8765 | `/mcp` (tools + `skill://` resources), `/ingest` + `/recall` custom routes; **MultiAuth** (machine bearer + GitHub OAuth) |
 | Ingestion trigger | Claude Code `Stop` hook → HTTP push | **replaced Logfire polling** (now removed) |
 | Data models | Pydantic v2 | |
-| Postgres driver | psycopg3 (`dict_row`), thread-local in recall | |
+| Postgres driver | psycopg3 (`dict_row`); the server borrows from one shared pool (`ingestion/pg_pool`) | |
 | JSON | orjson | |
 | Telemetry | Logfire **emit only** | all Logfire *read/poll* paths removed (#108); spans still emitted to the configured Logfire project |
 | Auth | `fastmcp` MultiAuth: `StaticTokenVerifier` (bearer) + `GitHubProvider` OAuth | machines send one bearer on every endpoint; claude.ai does GitHub OAuth on `/mcp`; **replaced the hand-rolled OAuth proxy** (#166) |
@@ -151,7 +151,7 @@ Web-research tool results (WebFetch, Exa, Firecrawl, WebSearch) are captured as 
 
 ### 3.4 Knowledge graph (Postgres)
 
-`kg_entities` rows and bitemporal `kg_relationships` fact edges (migrated out of FalkorDB in #67). The KG is the relational/multi-hop specialist served as side buckets (`facts`, `entities`), never the primary retrieval path. See [§10](#10-postgres-graph-model).
+`kg_entities` rows and bitemporal `kg_relationships` fact edges (migrated out of FalkorDB in #67). The KG is the relational/multi-hop specialist served as a side bucket (`facts`), never the primary retrieval path. See [§10](#10-postgres-graph-model).
 
 ### 3.5 Timeline events — the episodic date log
 
@@ -166,7 +166,7 @@ Idempotency rides on `UNIQUE(source, source_ref)`. Three write-time quality mech
 - **Domain scoping** (schema 038): the gate labels each event `personal` (the user's own life) or `technical` (engineering/work); git events are technical by construction; NULL = unlabeled and fails open. An explicit `group_id="personal"` on the read side filters the timeline to life events. Measured motivation: for a reworded personal query, cross-domain junk sat *closer* in embedding space (0.704) than the true personal events (0.748+), so no relevance floor can do this job — only a domain label can. The default/technical scope stays unfiltered so callers that never set `group_id` lose nothing. With `SYNAPSE_PERSONAL_SCOPE=0` the gate is never asked for a domain and every event is stored `technical`.
 - **Quoted-material suppression**: happenings narrated inside pasted third-party content (someone else's email, a meeting/interview/legal transcript, an article with first-person narration) are never emitted as the user's events — the gate distinguishes content the user *asserted* from content the user *quoted*. The user's own work on the material, and third-party statements *about* the user, stay eligible. Probed on labeled cases before shipping: third-party leaks 2/8 → 0/8 with no legit-event loss.
 
-**Serving** (`mcp_server/timeline.py`): topical queries fuse BM25 + vector (RRF) then re-sort survivors chronologically — the timeline's value is order, never relevance-score presentation; pure-time queries are a range scan with family-collapse (same-project low-salience runs become one line with count + first/last anchors, so computed durations stay auditable). Served as its own bucket in `recall()` (one cheap parallel leg, every query) and via the `recall_timeline` MCP tool.
+**Serving**: `recall()` does not retrieve timeline events and there is no `recall_timeline` tool (both removed 2026-08-07: 39 helpful against 92 noise citations lifetime; the store, its gate and the board block stayed). The events are read by the board's **Last 7 days** block (`GET /context`; `timeline_routes._recent_events`, a pure time-window read of the newest salient events under a per-project-day cap, a day being the user's local day, each line carrying its `t:N` id) and by the dashboard's Timeline page and search.
 
 ### 3.6 Retired: summaries & dream documents
 
@@ -176,11 +176,11 @@ Idempotency rides on `UNIQUE(source, source_ref)`. Three write-time quality mech
 
 ## 4. Ingestion Pipeline
 
-Episodes enter Synapse through exactly one live path: a Claude Code `Stop` hook that POSTs a transcript tail to `/ingest`. **There is no Logfire polling** — `ingestion/logfire_client.py` no longer exists, and Logfire is used only to *emit* telemetry.
+Episodes enter Synapse through `/ingest`: a `Stop` hook (Claude Code's or Codex's) POSTs the transcript records it has not shipped yet. **There is no Logfire polling** — `ingestion/logfire_client.py` no longer exists, and Logfire is used only to *emit* telemetry.
 
 ```mermaid
 flowchart TD
-    HK[Stop hook\nsynapse_ingest_hook.py] -->|bounded TAIL of raw JSONL| ING[POST /ingest\nmcp_server/server.py]
+    HK[Stop hook\nplugin/scripts/ingest_hook.py] -->|raw JSONL past the cursor| ING[POST /ingest\nmcp_server/ingest_route.py]
     ING --> PARSE[JSONLParser\nsame parser as disk sweep]
     PARSE --> CONTAM{transcript\ncontamination?}
     CONTAM -- yes --> DROP[drop]
@@ -244,7 +244,9 @@ onto canonical names (`--dry-run` first; the alias file stays outside the reposi
 
 ### 4.2 The Stop hook
 
-`scripts/synapse_ingest_hook.py` fires on every turn. It ships a **bounded tail** (default `SYNAPSE_INGEST_TAIL=400` raw records), trimmed to start at a real turn boundary; if the window holds no boundary (one mega-turn) it falls back to the full file. It POSTs detached (`start_new_session=True`) and always `sys.exit(0)` — **it never blocks or fails a turn**. A disk-sweep backstop re-ingests anything a failed POST drops. Shipping a tail (not the full transcript) plus enqueue-gating on new `(session, span_id)` fixed an earlier O(turns²) re-extraction loop (#61, #105, #106).
+`plugin/scripts/ingest_hook.py` fires on every turn; the Codex analog, `plugin-codex/hooks/synapse_stop_hook.py`, shares its retry bookkeeping (`synapse_ingest_retry.py`). It ships the transcript records past a **durable per-file cursor** (`DATA_DIR/ingest_cursors.json`): the byte offset of the start of the last shipped turn, never EOF, because Claude Code may write a turn's final message after Stop fires, so the last turn is re-shipped once. The cursor advances only after a successful POST, so a failed POST self-heals: the next Stop hook, or the SessionStart `--catchup` sweep, re-ships from the same offset and the server skips every turn it already stores (a cursor past EOF means the file was truncated and resets to 0). The POST runs detached (`start_new_session=True`) and the hook always exits 0 — **it never blocks or fails a turn**.
+
+The catch-up sweep ships any transcript modified within the catch-up window (3 days) whose cursor lags its size, plus every file whose last upload failed (marked `pending` in the cursor file) however old, so an outage longer than the window loses nothing; history from before the plugin was installed is `synapse-import`'s job. After repeated failures the SessionStart parent prints one "uploads have been failing since …" line. Enqueue-gating on new `(session, span_id)` fixed an earlier O(turns²) re-extraction loop (#61, #105, #106).
 
 **Private mode** short-circuits the hook before any POST: `private_mode.py on <session_id>` writes a marker file at `~/.synapse/private/<session_id>`, and `_ship` skips the whole transcript while that marker is live — on the Stop path and the catch-up sweep alike. Markers expire after 12h (ignored *and* deleted) and are removed by a `SessionEnd` hook, because a session id is never reused and an orphaned marker would otherwise be permanent. The check is fail-safe in one direction: a marker directory that exists but can't be read counts as private, since silently capturing a session the user believes is off the record is the unacceptable failure and a deferred turn is not (the cursor doesn't advance). The marker is only the fast local half — the durable half is the `private_sessions` row the same CLI writes over `PUT /private-sessions/{session_id}`, which is what §4.1 enforces.
 
@@ -375,68 +377,88 @@ Contradictions **invalidate the old edge** (an `UPDATE` setting `invalid_at`/`t_
 
 ## 6. Recall Pipeline
 
-`recall()` fans out over a persistent `ThreadPoolExecutor`: wave 1 runs the episode pool, KG, web, and timeline ([§3.5](#35-timeline-events--the-episodic-date-log)) legs concurrently (the last is a single cheap DB read reusing the query embedding); wave 2 runs the cross-encoder rerank and the bitemporal history fetch. Returns a **compact, conditionally-populated** result.
+`recall()` fans out over a persistent leg executor (8 workers). Every leg borrows its own connection from the shared `ingestion/pg_pool` pool or makes its own Voyage call, so concurrent psycopg use is safe. The BM25 episode leg starts first so its fetch overlaps the query-embedding call; the embedding then releases the vector episode leg, the KG facts leg, the supersession surface, the notes leg and the web leg, all concurrently. The cross-encoder rerank starts the moment the episode pool is joined and runs while the other legs and the fact bookkeeping are still in flight. Returns a **compact, conditionally-populated** result. Interactive recall builds its Voyage clients with `interactive=True`: any retryable error, a 429 included, gets short backoffs and is given up on within about 5 s, so recall falls back to BM25-only legs and RRF order (each with a `warnings` entry) instead of hanging; the poller and dream keep the 3-minute patience.
 
 ```mermaid
 flowchart TD
-    Q[query] --> EMB[embed query\nvoyage-4-large input_type=query]
-    EMB --> W1{Wave 1 — parallel}
-    W1 --> EP[episode pool:\nBM25 + halfvec HNSW vector\nfetch 100/leg → RRF]
-    W1 --> WEB[web: vector over web_chunks]
-    W1 --> KG[KG: vector + BM25 + 1-hop\nRRF, _FACT_LIMIT=12]
-    EP --> W2{Wave 2 — parallel}
-    W2 --> RR[Voyage rerank-3-lite\npool 100 → top 5]
-    W2 --> HIST[bitemporal history pairs]
-    RR --> OUT[structured result]
+    Q[query] --> BM[episode BM25\nfetch 100, starts first]
+    Q --> EMB[embed query\nvoyage-4-large input_type=query]
+    EMB --> VEC[episode vector\nhalfvec HNSW, fetch 100]
+    EMB --> CHK[chunk sources\nBM25 + vector, default off]
+    EMB --> KG[KG facts: vector + BM25 + 1-hop\nRRF k=60, top 12]
+    EMB --> SUP[supersession surface]
+    EMB --> NOTES[notes: hook KNN\n+ rerank floor]
+    EMB --> WEB[web: BM25 + vector RRF\n+ rerank floor]
+    BM --> POOL[RRF pool, own session out,\ncut to 100]
+    VEC --> POOL
+    CHK --> POOL
+    POOL --> RR[Voyage rerank-3-lite\n+ recency, echo suppression]
+    RR --> PASS[passage mining:\nsecond rerank, top 6 passages]
+    KG --> HIST[superseded pairs]
+    PASS --> OUT[structured result]
     KG --> OUT
-    WEB --> OUT
+    SUP --> OUT
     HIST --> OUT
+    NOTES --> OUT
+    WEB --> OUT
 ```
 
 ### 6.1 Return shape
 
 ```python
 out = {"query": query, "facts": facts}   # always present (facts may be []); each {fact, id, date, ongoing?, supported?}
-if episodes_served: out["episodes"]    = [...]   # reranked passages, cap 5 (see role note)
-if entities_bucket: out["entities"]    = [...]   # {name, summary}, cap 3
-if web_chunks:      out["web"]         = [...]   # {context|excerpt, url?, title?, date?}, cap 3
-if timeline:        out["timeline"]    = [...]   # dated events (§3.5), cap 8
-if superseded:      out["superseded_facts"] = [...]  # {fact: old, superseded_by: current}, cap 2 — old carries the 028 link to current, or no link and the same predicate
+if ep_items:        out["episodes"] = [...]   # reranked passages, one item per parent episode, cap 6 passages (see role note)
+if note_items:      out["notes"]    = [...]   # {id, hook, note, project?}, cap 3
+if web_chunks:      out["web"]      = [...]   # {id, context|excerpt, url?, title?, date?}, cap 3
+if superseded:      out["superseded_facts"] = [...]  # {fact: old, superseded_by: current}, cap 2: the displaced version of each served fact
+if warnings:        out["warnings"] = [...]   # a leg degraded; absent on a healthy call
 return out
 ```
 
+Every served item carries an `id` that `recall_feedback` takes: `e:N` episode, `n:N` note, `f:N` fact, `w:N` web. Facts are served as `f:<kg_relationships.id>` (a bigint, the same id the KG tables key on), and `superseded_facts` entries use the same form; the older `f:<uuid>` form is still accepted everywhere ids are parsed, so feedback on a pre-change serve keeps resolving. Only `e:` and `n:` ids are `fetch()`-able. The retired buckets (`entities`, `timeline`, `chunks`, `summaries`, `communities`) are not returned.
+
 Served episode passages carry a **`role` provenance label** (`"user"` / `"assistant"` / `"mixed"`): episode content is assembled from role-marked parts, but passage compaction slices it into chunks and a mid-block chunk loses its marker — without the label, a reader cannot tell a human-stated fact from the agent's own past output (which may be speculation). The label is recovered deterministically from chunk char-offsets against the parent turn's marker layout; unattributable slices omit the key (fail-open, advisory only). Rank-side provenance *weighting* was deliberately rejected: serve-time rerank score surgery is the historically dead lever here, and most technical needle answers live in assistant halves — a blanket penalty would trade one failure class for a worse one.
 
-Served facts carry `date` = `t_valid` (when the fact became true *as stored*: an in-text date, else the conversation it came from — not the last time anyone confirmed it), `ongoing: true` when the edge is flagged as a claim that can lapse silently, and `supported` = the date the user themself last asserted it (absent = never user-confirmed, or pre-058). The reader contract that rides the server instructions and the `recall` description: a fact supports exactly what it states — one mention is not frequency, identity, or current activity; a fact about a profile or document describes the document; an ongoing fact with no recent `supported` is a lead to ask about, not current truth; anything written in the user's voice uses only what they said. `tests/fixtures/reader_contract.json` holds synthetic cases (licensed vs forbidden readings) that double as an eval set.
+Served facts carry `date` = `t_valid` (when the fact became true *as stored*: an in-text date, else the conversation it came from — not the last time anyone confirmed it), `ongoing: true` when the edge is flagged as a claim that can lapse silently, and `supported` = the date the user themself last asserted it (absent = never user-confirmed, or pre-058). Both dates are the user's local day (`SYNAPSE_TIMEZONE`); a value at exactly 00:00:00 UTC is a date-only value and keeps its own date. The reader contract that rides the server instructions and the `recall` description: a fact supports exactly what it states — one mention is not frequency, identity, or current activity; a fact about a profile or document describes the document; an ongoing fact with no recent `supported` is a lead to ask about, not current truth; anything written in the user's voice uses only what they said. `tests/fixtures/reader_contract.json` holds synthetic cases (licensed vs forbidden readings) that double as an eval set.
 
-`chunks`, `summaries`, and the `communities` bucket are **not** returned (chunks/summaries retired in #63; communities retired with the #67 KG cutover, never measured as contributing). Keys are present only when their bucket is non-empty (`query` and `facts` always present).
+`recall_metrics.served_ids` records which ids were served per bucket (`{"episodes": ["e:12"], "facts": ["f:41"], "notes": [...], "web": [...]}`, plus `trust`, the echo, duplicate-passage and `n_chunks_cut` counters, and the abstention markers of §6.2); rows written before facts moved to `f:<bigint>` hold the raw edge uuids. `est_tokens` counts everything served including notes, never `warnings`.
 
 ### 6.2 Episode leg (the workhorse)
 
 Two sub-legs deep-fetch 100 candidates each, fuse, then a cross-encoder reranks:
 
 - **BM25** (ParadeDB): `WHERE id @@@ paradedb.match('content', %s) ORDER BY paradedb.score(id) DESC`.
-- **Vector** (halfvec HNSW, #104): `ORDER BY embedding::halfvec(2048) <=> %s::halfvec(2048)` — the cast must match the index expression *verbatim* to be served by HNSW. `SET hnsw.ef_search = 200` per connection (default 40 under-recalls a 100-deep fetch). This took episode vector search from ~878ms to ~15–23ms (38x) at recall@10 = 1.000 vs exact scan.
-- **Fusion** (`_merge_rrf`): RRF `k=60` × recency decay (half-life 30 days) × feedback boost (`min(2.0, 1 + log1p(retrieval_count)·0.3)`).
-- **Rerank (WIN1)**: the fused 100-pool goes to Voyage `rerank-3-lite` by default (WIN1 measured on `rerank-2.5`); top `_RECALL_EPISODE_LIMIT = 5` served in pure rerank order. The reranker is the active ingredient — deeper RRF alone can't lift a rank-40 gold; the cross-encoder can. Degrades gracefully to RRF order on reranker error (recall never hard-fails). Lifted answerability 90.5%→95.2%, exact-gold hit +7pts, served tokens −20%.
+- **Vector** (halfvec HNSW): `ORDER BY embedding::halfvec(2048) <=> %s::halfvec(2048)` — the cast must match the index expression *verbatim* to be served by HNSW. `SET hnsw.ef_search = 200` on every pooled connection (default 40 under-recalls a 100-deep fetch). This took episode vector search from ~878ms to ~15–23ms (38x) at recall@10 = 1.000 vs exact scan.
+- **Fusion** (`merge_rrf`): RRF `k=60` × recency decay (half-life 30 days) × feedback boost (`min(2.0, 1 + log1p(retrieval_count)·0.3)`). The counter behind the boost is the episode's own, bumped asynchronously by `fetch`, `fetch_session` and `recall_full_turns`; the fact counter feeds only the dashboard.
+- **Self exclusion**: the calling session's own turns (`self_session`, injected by the client's PreToolUse hook) are dropped before the pool is cut to 100, so their slots backfill with real history; its self-only facts are dropped from the 12 + 5 candidates the KG leg is asked for, so the bucket stays full.
+- **Chunk candidates** (`SYNAPSE_RECALL_CHUNK_CANDIDATES=1`, default off): the top 10 chunks by keyword (BM25 over `chunks`) and by embedding (the optional chunks HNSW index, migration 067) name their episodes, which join the RRF pool through the same project and surface predicates as the episode legs. Chunks are never served, only their episodes; without the index the vector half says so in `warnings` and serves nothing while the keyword half works. `scripts/ab_chunk_candidates.py` runs the on/off A/B over a goldens JSONL (`query`, gold `e:` ids, optional `project`); the losing side gets deleted.
+- **Rerank (WIN1)**: the fused 100-pool goes to Voyage `rerank-3-lite` by default (WIN1 measured on `rerank-2.5`). The reranker is the active ingredient — deeper RRF alone can't lift a rank-40 gold; the cross-encoder can. Lifted answerability 90.5%→95.2%, exact-gold hit +7pts, served tokens −20%. The cross-encoder is recency-blind, so its scores are multiplied by a recency decay afterwards (14-day half-life, floored at `SYNAPSE_RERANK_RECENCY_FLOOR`), and an episode that merely quotes the query back (a long verbatim run of the prompt) is dropped, with the next-ranked backfilling. `recall()` and `recall_full_turns` share this ranking contract (`_rank_episodes`).
+- **Passages**: `recall()` does not serve whole turns. The top 20 reranked episodes are split into markdown chunks (`ingestion/web_chunker`), the chunks (80 at most; past that budget it is shared across the episodes, BM25-best chunks first, round-robin by episode rank) go through a second rerank, and the top `SYNAPSE_RECALL_PASSAGE_N` = 6 are served, one item per parent episode, skipping a chunk that repeats another episode's chosen one and capping how many may share a session. About 1/4 the tokens of whole turns at near-baseline answer survival.
+- **Abstention floor**: `SYNAPSE_RECALL_FLOOR` (0 = off). When the raw (pre-recency) top rerank score among the episodes that survive echo suppression is strictly below it, `recall()` serves no episode bucket instead of the least-bad ones, and `served_ids` gains `would_abstain` / `floor`; `rerank_top_all` records the pool's own top when it differs. Enforcement is always on; `recall_full_turns` records the marker but never withholds (the caller asked for turns).
+- **Degradation**: with `SYNAPSE_RERANK_PROVIDER=none`, or a failed rerank, the pool stays in RRF order and passages are picked by BM25 keyword overlap, one best chunk per top episode; a failed rerank adds a `warnings` entry saying so. Recall never hard-fails on the rerank leg.
 
-### 6.3 KG fact leg (`_search_kg`)
+### 6.3 KG fact leg (`mcp_server/kg_pg.py`)
 
-Three candidate lists over Postgres (`kg_relationships`), all filtering `t_invalid IS NULL`, fused by a separate RRF (`k=1`, no recency/feedback):
-1. **Fact-embedding vector** over `kg_relationships.fact_embedding` (halfvec HNSW, partial on `t_invalid IS NULL`).
+Three candidate lists over Postgres (`kg_relationships`), all filtering `t_invalid IS NULL`, fused by a separate RRF (`k=60`, `_RRF_K`; no recency or feedback factor):
+1. **Fact-embedding vector** over `kg_relationships.fact_embedding` (halfvec HNSW, partial on `t_invalid IS NULL`), over-fetched on the bare partial-index predicate and then filtered to the owner and group.
 2. **BM25 fulltext** (ParadeDB) over fact text.
-3. **1-hop join** from seed entities via `src_uuid`/`tgt_uuid`.
+3. **1-hop traversal** from seed entities: one `LATERAL` statement for all seeds takes each seed's newest 8 live edges, either direction (the optional `kg_rel_src_live` / `kg_rel_tgt_live` indexes of migration 065 serve it; the rows are the same without them).
 
-Seed entities come from a pgvector KNN over `kg_entities.embedding` (halfvec HNSW, fetch 25), degree-gated (drop orphans), capped at 8, with a `session_focus` bonus (0.3 subtracted from distance when a seed's name/uuid is in the caller-supplied focus set). `_FACT_LIMIT = 12` (#100 — doubled exact-fact keyword recall 0.119→0.214 at zero graph bloat). Returns `(facts, seed_entities)`; seeds feed the `entities` bucket.
+Seed entities come from a pgvector KNN over `kg_entities.embedding` (halfvec HNSW, fetch 25), gated to entities with at least one live edge (an `EXISTS` probe per side), capped at 8, with a `session_focus` bonus (0.3 subtracted from distance when a seed's name/uuid is in the caller-supplied focus set). The whole leg is four statements however many seeds there are. Same-text twin facts serve once. `_FACT_LIMIT = 12` (#100 — doubled exact-fact keyword recall 0.119→0.214 at zero graph bloat). A restricted caller (§7.5) is served only facts whose cached `source_projects` set (schema 056) is non-empty and inside its allowlist, through an exact allowlist KNN; an empty allowlist, or a database without 056, serves no facts. A KG-leg failure degrades to an empty `facts` bucket with a `warnings` entry.
 
-### 6.4 Web & history legs
+**Supersession.** Two extras ride beside the leg. The *supersession surface* answers a query that matches a now-invalid fact with its current successor (the `invalidated_by` link, accepted only within `SYNAPSE_SUPERSEDE_LINK_MAX_DIST` of the fact it retired), up to 3 facts beyond the 12, gated by `SYNAPSE_SUPERSEDE_MAX_DIST`. The *episode-validity overlay* attaches the current fact to a served passage that states a claim the KG has since superseded. `superseded_facts` carries the `{previously, now}` pair for each served fact that was itself superseded.
 
-- **Web**: vector-only over `web_chunks` (BM25-over-web caused cross-domain token collisions), joined to `web_artifacts` for url/title, deduped to one chunk per parent page. Cap 3.
+### 6.4 Notes, web & history legs
+
+- **Notes**: the hook-embedding KNN over live notes (global types plus the caller's project; `work-safe` notes only for a restricted caller) fetches 24, a cross-encoder floor on `hook — body` text (`SYNAPSE_RECALL_NOTES_FLOOR`) keeps the relevant ones, and the top 3 are served with the body capped at 700 characters (`fetch("n:N")` returns the full note). A note already on the board may be served again. The leg self-gates: an all-subfloor result serves no bucket.
+- **Web**: BM25 and vector over `web_chunks` fused by RRF (50 per leg, pool 60), reranked, cut by `SYNAPSE_RECALL_WEB_FLOOR` with no keep-one backstop (the bucket may serve nothing, which gates web on intent), deduped to one chunk per parent page, joined to `web_artifacts` for url and title. Cap 3. A restricted caller is served only pages fetched in an allowlisted project or by its own credential; an unknown or root-token caller gets no web bucket.
 - **History**: bitemporal `{previously, now}` pairs for facts whose edges were surfaced — the supersession story flat vector search can't tell. Cap 2.
+
+The floors are properties of the reranker, not of recall: scores are not comparable across models, so every `examples/env` preset pins `SYNAPSE_RECALL_FLOOR`, `SYNAPSE_RECALL_WEB_FLOOR` and `SYNAPSE_RECALL_NOTES_FLOOR` (0.60 for the Voyage and OpenRouter presets, calibrated on `rerank-2.5-lite`, whose scores run 0.02–0.04 below `rerank-3-lite`; 0 for the bundled local reranker).
 
 ### 6.5 Parallelism
 
-Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage rerank HTTP + KG history) runs concurrently. PG connections are thread-local. A separate single-worker executor handles fire-and-forget `retrieval_count` writes. This took `recall()` from ~2.85s to ~1.3s (#60, #103, #104).
+Legs fan out on the 8-worker leg executor as above; a separate single-worker executor handles fire-and-forget `retrieval_count` and `recall_metrics` writes. Postgres connections come from the shared `ingestion/pg_pool` pool (autocommit, dict rows, `hnsw.ef_search = 200` set on each), borrowed per leg. This took `recall()` from ~2.85s to ~1.3s (#60, #103, #104).
 
 ---
 
@@ -470,7 +492,7 @@ Removed from the surface (git history keeps the code): `list_projects` (the boar
 
 ### 7.3 Lazy init & connection resilience
 
-The `Recall` engine and its Postgres/Voyage clients initialize lazily on first call. `_ensure_pg()` probes live connections with `SELECT 1` before trusting `conn.closed=False`, so half-open TCP connections (PG restart, network blip) are detected and reconnected transparently.
+The `Recall` engine and its Voyage clients initialize lazily on first call. The engine holds no Postgres connection of its own: every recall leg, `fetch` and the notes lookups borrow an autocommit dict-row connection from the server's one pool (`ingestion/pg_pool`, 2–16 connections, held open from startup to shutdown by the server lifespan) and hand it back. The pool checks a connection when it hands it out, so a half-open TCP connection (PG restart, network blip) is replaced transparently. Every borrow starts with `hnsw.ef_search = 200`, so nothing that borrows issues a session-level `SET`.
 
 ### 7.4 Auth
 
@@ -589,7 +611,7 @@ Web-research tool results are captured so prior research is recallable, mirrorin
 - **`web_chunks`** (schema 012) — 1:N embedded slices (`voyage-4-large`, 2048), `ON DELETE CASCADE` from the artifact. BM25-indexed; halfvec HNSW (schema 014).
 - **`web_chunk_context`** (schema 013) — a `context_prefix` column: a 50–100 token Haiku-generated context blurb prepended before embedding (Contextual Retrieval) to lift recall. `''` = trivial doc, NULL = not yet contextualized; filled by `scripts/contextualize_web_chunks.py`.
 
-`recall()` serves the `web` bucket vector-only from `web_chunks`, joined to artifacts, deduped per page.
+`recall()` serves the `web` bucket from `web_chunks` ([§6.4](#64-notes-web--history-legs)): BM25 and vector fused, reranked and floored, joined to artifacts, deduped per page.
 
 **How it's fed — external cron, not in-process.** Web capture is **not** a compose service, and nothing in the `/ingest` hook or poller calls it. A **cron on the client machine** (a scheduled client-side job, every ~5 minutes) walks the session JSONLs and runs the pipeline end-to-end: parse web tool_results → `web_artifacts` (idempotent by `tool_use_id` + a per-file mtime checkpoint in `ingestion_state`, `source='web:<path>'`) → chunk (`web_chunker.py`) → contextualize (Haiku prefix via `scripts/contextualize_web_chunks.py`) → embed. So the subsystem is effectively **live with a ~5-minute lag**, not captured inside the turn. Current state (2026-06-05): **1,336 artifacts / 3,898 chunks, all embedded and contextualized, spanning 2026-05-14 → present.** Making capture truly in-process (within the `/ingest` turn) is the one remaining piece.
 
@@ -597,7 +619,7 @@ Web-research tool results are captured so prior research is recallable, mirrorin
 
 ## 9. Database Schema
 
-Migrations are numbered SQL files applied manually (no runner — small project; `scripts/apply_schema.sh` is the single source of truth for order). Thirty-eight migrations to date:
+Migrations are numbered SQL files applied with `scripts/apply_schema.sh` (no runner — small project; the script is the single source of truth for order: every `schema/NNN_*.sql` ascending, then it stamps `synapse_meta.schema_version`). 001–076 exist; 010 was removed from the apply list. Migrations marked *optional* carry `-- schema-check: optional`: the code probes for what they add and keeps its previous behaviour until they are applied, so the image can land before the hand-applied file. A file numbered below a database's stamp is applied with `scripts/apply_schema.sh --from NNN`.
 
 - **001–009** — base: `episodes`, `extraction_queue`, `ingestion_state` (001); `span_id` (002); voyage dims 3072→2048 (003); session embeddings, now deprecated (004); ParadeDB BM25 (005); `retrieval_count` (006); drop old `session_summaries` (007); `chunks` (008); `synth_documents` (009, now legacy).
 - **010 `memory_proposals`** — was the dream stage-3 auto-memory-proposal sink; stage 3 was deleted 2026-07-24 and 047 drops the table (010 removed from the apply list).
@@ -618,15 +640,49 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **028–029 episode-validity overlay** — `kg_relationships.invalidated_by` provenance link (028) + partial GIN on superseded episode ids (029), powering the `superseded_by` annotation on served episodes.
 - **030–032 config lane** — mirrored config-file store, scope column, scan cursor.
 - **033 `timeline_events`** — the episodic date log ([§3.5](#35-timeline-events--the-episodic-date-log)).
-- **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot. The same table carries the `schema_version` stamp `apply_schema.sh` writes after a full run — every service checks it at startup (`ingestion/schema_check.py`) and refuses to boot when the database is behind the code's schema, pointing at the upgrade command instead of failing mid-request (`SYNAPSE_SCHEMA_CHECK=0` skips). Two exceptions only warn: a database *ahead* of the build (migrations are additive), and one behind only by migrations whose header carries `-- schema-check: optional`, the marker for a migration whose code probes for it and keeps its pre-migration behaviour until it is applied (056 is the first), so the image can land before the hand-applied migration without a crash loop.
+- **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot. The same table carries the `schema_version` stamp `apply_schema.sh` writes after a full run — every service checks it at startup (`ingestion/schema_check.py`) and refuses to boot when the database is behind the code's schema, pointing at the upgrade command instead of failing mid-request (`SYNAPSE_SCHEMA_CHECK=0` skips). Two exceptions only warn: a database *ahead* of the build (migrations are additive), and one behind only by migrations whose header carries `-- schema-check: optional`, the marker for a migration whose code probes for it and keeps its pre-migration behaviour until it is applied (056 was the first; 062–076 all carry it), so the image can land before the hand-applied migration without a crash loop.
 - **035 `preferences`** — standing user-preference store. Fed by the ingestion preferences gate and read by `/preferences/top` (the SessionStart block) and the dashboard. It was ALSO a `recall()` bucket until 2026-07-27, when the leg was removed: measured on `recall_feedback` since all six buckets became citable, prefs served 380 rows for 6 helpful citations (1.6% of served, 11.1% of the rated subset) against episodes 39.0% / facts 16.8% / timeline 8.2% — ~2.68 items of context cost on nearly every recall for nothing.
 - **036 content-md5 index** — `episodes (md5(content))`, the cross-session replay guard ([§4.1](#4-ingestion-pipeline)).
 - **037 `timeline_events.reported_count`** — non-destructive confirm-merge counter ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **038 `timeline_events.domain`** — `personal`/`technical` scoping label ([§3.5](#35-timeline-events--the-episodic-date-log)).
+- **039 `recall_metrics.served_ids`** — which ids each recall served, per bucket (`e:` episodes, `f:` facts, `n:` notes, `w:` web), for the episode-validity overlay and retrieval-quality debugging ([§6.1](#61-return-shape)); also the timeline/preferences telemetry columns the writer used to fill.
 - **040 `dedup_gate_shadow`** — was the shadow log for a Stage-6 embedding-similarity gate meant to skip the 6b LLM confirm on clear-cut pairs. Measured over its shadow run (2026-07 to 2026-10), a 0.95 merge threshold would have swallowed ~1.6% of genuine corrections (similarity barely registers digits: a changed dose, version or PR number reads as a duplicate), and it could never skip the batched call (BM25-only candidates carry no score, so they are always gray). The gate was deleted 2026-10-09 and 059 drops the table.
+- **041 `notes`** — the explicit-memory store behind the always-injected board: a ~120-char `hook` (the board line, also the embed target for dedup KNN) and a self-contained `body`. The live set is `superseded_by IS NULL`; a contradiction supersedes (lineage), a restatement updates in place.
+- **042 `dashboard_flags` / `dashboard_audit`** — the dashboard's only writable state: a soft, reversible "look at this" mark on any memory item, and the append-only history of flag toggles and proposal decisions.
+- **043 dashboard notify** — `AFTER INSERT` triggers on `episodes`, `kg_relationships` and `timeline_events` that `pg_notify('dash_feed', …)` for the dashboard's SSE live feed.
+- **044 `dream_runs`** — one bookkeeping row per nightly run: per-lane outcome, counts and samples ([§11](#11-nightly-maintenance--dream-pipeline)).
+- **045 skills v2 foundation** — richer candidates (a verbatim quote, `scan_night` recurrence), retune directions, and a `skill_usage` data repair.
+- **046 `recall_feedback`** — labeled retrieval-quality reports from agents (`helpful` / `noise` / `missing` ids and a free-text note): offline data for eval goldens and reranker tuning.
+- **047 drop `memory_proposals`** — see 010.
+- **048 `recall_feedback.found_via`** — where the missing information was eventually found, which tells a serving miss from an ingest gap.
+- **049 `recall_metrics` notes telemetry** — `n_notes` and `ms_notes` for the notes leg.
+- **050 `private_sessions`** — the durable off-the-record list behind private mode, enforced at the `/ingest` chokepoint and by the backfill ([§4.1](#41-the-ingest-endpoint)).
+- **051 `notes_curation`** — the audit log and re-judging memo of the notes lane ([§11](#11-nightly-maintenance--dream-pipeline)).
+- **052 `remember_intents`** — idempotency ledger for spooled `remember()` writes ([§7.2](#72-custom-http-routes-ingest-recall)).
+- **053 audience scoping** — `surfaces` (a machine's trust tier and project allowlist) and `notes.audience` ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)).
+- **054 credential-bound trust** — a surface is a credential, not a hostname: per-device tokens bound to a surface row (§7.5).
+- **055 `skill_proposal_base_hash`** — the registry body a proposal was drafted against, so an accept refuses to revert an edit made since.
+- **056 `kg_relationships.source_projects`** — the cached provenance set that lets a restricted caller be served facts (§7.5). Optional.
+- **057 `episodes.surface_id`** (and `timeline_events.surface_id`) — a provenance stamp so a restricted surface can read back what it ingested itself (§7.5). Optional.
 - **058 `kg_relationships` evidence currency** — `ongoing`, `last_supported_at`, `last_supported_by` ([§5.4](#54-bitemporal-edges)). No backfill: attribution is not recoverable from stored edges.
 - **059 drop `dedup_gate_shadow`** — see 040. Marked `-- schema-check: optional`: nothing reads the table, so the image can land before the drop is applied.
 - **060 `skill_registry.retired_at`** — when a skill was retired, so a retirement holds against stale publishes ([§7.6](#76-skills-serving)). Rows already retired are backfilled from `updated_at`. Marked optional: the routes probe for the column and keep their pre-060 behaviour until it exists.
+- **061 `episodes (project, created_at)`** — the board banner's project list walks the distinct projects through it. Optional.
+- **062 `extraction_queue.chunk_id`** — a chunk's queue row names the chunk and stores no text: the worker reads the chunk by primary key, the enqueue dedup is an `ON CONFLICT` on the unique index, and deleting the chunk deletes the row. Also an `episode_id` index for the delete cascade. Build the indexes `CONCURRENTLY` on a populated queue (steps in the file header). Until applied, a chunk item keeps its text in the row.
+- **063 unembedded-episodes index** — a partial index for the poller's "which episodes still lack a vector" question, so the usual answer (nothing) stops costing a scan. `CONCURRENTLY`; the query is the same without it.
+- **064 `timeline_events.reported_refs`** — the append-only list of re-telling turns' `ep:<id>` refs for confirm-merge ([§3.5](#35-timeline-events--the-episodic-date-log)): a retried merge finds its own ref and changes nothing, and a delete re-points the event at a surviving re-telling turn instead of deleting it. `reported_count` is no longer written but stays (the previous image still bumps it) until a later migration drops it. Until applied, a merge only moves `t_valid` and a delete takes a re-told event with its owner turn.
+- **065 live-edge hop indexes** — `kg_rel_src_live` / `kg_rel_tgt_live`: partial btrees on `(owner_id, group_id, src_uuid | tgt_uuid, t_valid DESC) WHERE t_invalid IS NULL` that hand the KG leg's hop its 8 newest edges per seed without reading a supernode whole ([§6.3](#63-kg-fact-leg-mcp_serverkg_pgpy)). `CONCURRENTLY`; a failed build leaves an INVALID index, so drop it and re-run the file. The recall query returns the same rows without them.
+- **066 drop the episode retrieval-count index** — drops `idx_episodes_retrieval_count` (`CONCURRENTLY`; nothing reads it) and sets `episodes` to `fillfactor 90`, so the `retrieval_count` bump `fetch`, `fetch_session` and `recall_full_turns` make can be a HOT update. Safe for the previous image.
+- **067 chunks vector index** — `chunks_embedding_hnsw`, a halfvec HNSW over `chunks.embedding`, needed only before turning on `SYNAPSE_RECALL_CHUNK_CANDIDATES` ([§6.2](#62-episode-leg-the-workhorse)). Build it out-of-band and `CONCURRENTLY`, exactly as the file header says: a plain build blocks chunk inserts, and the parallel build needs more `/dev/shm` than the container has. Without it the setting's vector half says so in `warnings`.
+- **068 dream lane cursors** — `dream_lane_cursors` (the last `episodes.id` each lane covered) and `dream_session_memo` (sessions a lane judged, at how many user turns) ([§11](#11-nightly-maintenance--dream-pipeline)). Until applied, a window starts from the lane's legacy `last_scan_at` and a long session is re-sent in full every night.
+- **069 skill candidate open identity** — a retune's identity key `(kind, name, direction)` is unique among the OPEN candidates only, so a sighting after an accept or a retirement opens a fresh candidate instead of folding into the closed row. Apply it soon after the image: until then a re-sighting of a closed retune's key is dropped with a warning. Do not roll the image back past it (the previous image's `ON CONFLICT` clause cannot infer the new index).
+- **070 skill draft attempts** — `draft_attempts`, `last_draft_at` and `last_draft_error` on the candidate ledger, so a failing draft backs off (1, 2, 4… days, at most 16) and says why in `skill_review show`. Until applied every failing draft is retried nightly.
+- **071 `notes_history`** — the text a note had before `remember()` rewrote it in place: an operator's undo copy (`SELECT * FROM notes_history WHERE note_id = N`), never read at run time. Until applied the rewrite leaves no record.
+- **072 KG dashboard reads** — backfills `t_created` / `entity_subtype` from the FalkorDB-era `created_at` / `entity_type` mirrors where only the legacy column was ever written, and builds `kg_rel_t_created_idx` for the feed. On a populated table don't run the file whole: run its UPDATEs, then build the index `CONCURRENTLY` by hand, as its header says. Apply soon after the image: until the UPDATEs have run, a legacy-only fact is absent from the feed.
+- **073 `deleted_turns`** — tombstones (`span_id`, `content_md5`, project/cwd) for turns deleted from memory, checked at the `/ingest` chokepoint so a re-shipped transcript does not bring a deleted turn back. Rows are permanent by design. Until applied, a delete leaves no tombstone and ingest checks nothing.
+- **074 GIN on `kg_relationships.episodes`** — for the "facts that cite episode N" lookup (056's relabel trigger, the dashboard drill-down and episode delete). `CONCURRENTLY`; the lookups are correct without it, only slower.
+- **075 drop redundant indexes** — the dead `search_cache` table and the btrees another index already covers (`episodes_session_idx`, `episodes_project_idx` — only once 061's index is valid — `kg_rel_src`, `kg_rel_owner`, `kg_entities_owner`). `CONCURRENTLY`; safe for the previous image.
+- **076 `research_archive`** — the cold archive of the verbatim results a capture rule sends to `destination = 'archive'` (X and Bluesky threads, YouTube transcripts): never chunked, embedded, extracted or served. Gives a table an out-of-repo cron may already have created the `session_id` / `parent_episode_id` provenance a delete needs. Until applied, archive-rule captures are skipped (`archive_unavailable`) instead of failing.
 
 Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` exists but is dormant (`memory_proposals` was dropped by 047).
 
@@ -634,7 +690,7 @@ Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|proce
 
 ## 10. Postgres Graph Model
 
-The graph is **two Postgres tables** (`kg_entities`, `kg_relationships`, schema 017), not a separate database. FalkorDB was decommissioned in #67 after the cutover measured quality-equal on the relational golden set (delta −0.017, CI spans zero; `scripts/ab_kg_pg_quality.py`) and removed a moving part. Scope is selected by `group_id` (**`technical`** default, **`personal`**); `owner_id` (default `'default'`) is the forward-compatible multi-tenant seam, so a write can never land unscoped. A work-only deployment can retire the second scope with `SYNAPSE_PERSONAL_SCOPE=0` ([§13](#13-configuration)): writes all route to `technical`, and a read that asks for `personal` is answered from it.
+The graph is **two Postgres tables** (`kg_entities`, `kg_relationships`, schema 017), not a separate database. FalkorDB was decommissioned in #67 after the cutover measured quality-equal on the relational golden set (delta −0.017, CI spans zero) and removed a moving part. Scope is selected by `group_id` (**`technical`** default, **`personal`**); `owner_id` (default `'default'`) is the forward-compatible multi-tenant seam, so a write can never land unscoped. A work-only deployment can retire the second scope with `SYNAPSE_PERSONAL_SCOPE=0` ([§13](#13-configuration)): writes all route to `technical`, and a read that asks for `personal` is answered from it.
 
 **`kg_entities`**:
 ```sql
@@ -677,21 +733,25 @@ kg_relationships (
 
 ## 11. Nightly Maintenance & Dream Pipeline
 
-> **Honest status:** the `dream` container's daily `run_once()` now runs the **dream→skills lane** (`dream/skills/`, gated on `SKILLS_LANE_ENABLED=1`): mine episodes → judge → candidate ledger + drafts → consolidate-overlap nominations, reading its catalog from `skills_lane.skill_registry` (no disk). The lane moved here from the plugin so the server owns it (the plugin is now a thin client that publishes skills to the registry + reviews proposals). The legacy memory-proposal stages are gone entirely (stage 3 and its `--stage` plumbing were deleted 2026-07-24; the substrate — `doc_type='summary'` — and the auto-memory-file sink were both already retired). The lane import is lazy + guarded so a lane error can't crash the loop.
+> **Status:** the `dream` container's daily `run_once()` (`python -m dream --schedule`, 02:03 UTC) runs four lanes in order: **dream→skills**, **dream→config**, **dream→notes**, then a telemetry retention prune (`recall_metrics` rows older than 180 days). Every lane switch is a **kill switch**: the lanes are ON by default and `=0` turns one off (`SKILLS_LANE_ENABLED`, `CONFIG_LANE_ENABLED`, `SYNAPSE_NOTES_LANE`). A run the container missed (down at 02:03, or redeployed mid-run) starts as a catch-up, and a session-level advisory lock keeps a manual `python -m dream` from racing the scheduled run. A lane error cannot crash the loop: each lane's stages are isolated and reported, a lane that cannot reach its model stops with its cursor where it was, and one row per run lands in `dream_runs` (schema 044) with the per-lane counts, samples and errors the dashboard's Dream report reads. The legacy memory-proposal stages are gone entirely (stage 3 and its `--stage` plumbing were deleted 2026-07-24; the substrate — `doc_type='summary'` — and the auto-memory-file sink were both already retired).
+
+**Shared plumbing** (`dream/lane.py`). A run covers the episodes with `after_id < id <= until_id`; `episodes.id` follows insertion order, where `created_at` is the conversation's event time, so a turn uploaded late (a catch-up retry, an offline laptop, an import) is still mined. Each lane keeps its own cursor in `dream_lane_cursors` (migration 068, optional) and advances it only past the sessions it got to, so a capped run's overflow rolls to the next night; `SKILLS_LANE_LIMIT` and `CONFIG_LANE_LIMIT` (30) cap the **sessions a lane judges per run**, oldest last touch first. The judges' unit is the whole session, and a judged session waits until it has 3 more user turns (`dream_session_memo`) before it is judged again. Without 068 a window starts from the lane's legacy `last_scan_at` and nothing is skipped as already judged. Every lane LLM call goes through `ingestion.llm_client` (the `claude-code` or `openai` provider; `SYNAPSE_SKILLS_JUDGE_MODEL` / `SYNAPSE_SKILLS_DRAFT_MODEL`, default Opus): a failure to reach the model raises instead of reading as "found nothing".
+
+**dream→skills lane** (`dream/skills/`) reads its catalog from `skills_lane.skill_registry` (no disk) and runs these stages: usage sync (`[tool:Skill]` markers → `skill_usage`); judge (one analysis call per session: gaps for DERIVE, would-have-helped skills for RETUNE); grounded signals (dismissals, explicit "make a skill" asks); the detectors (struggle arcs, post-fire outcomes, the weekly procedure miner); drafts (a complete `SKILL.md` + `base_body_hash` for every proposed row, backing off 1, 2, 4… days after a failed draft once migration 070 is applied); decay of stale `observe` candidates; effect measurement of accepted retunes; and a throttled Discord digest. **Propose-only**: nothing writes `skill_registry` until a review accept does. The lane moved here from the plugin so the server owns it; the plugin is a thin client that publishes skills to the registry and reviews proposals.
+
+**dream→config lane** (`dream/config/`) mines the same session window for **behavioral corrections** — moments the user corrected how the agent writes, works or behaves, not task content — into `config_lane.config_proposals`. A correction must recur in 2 distinct sessions before it reaches review, proposals target a dedicated `rules/learned.md` (`CONFIG_LEARNED_FILE`) so dream never rewrites a hand-kept file, and a rule the user already has is not proposed: that is every line of a mirrored config file (the plugin's SessionStart hook pushes the opted-in config files to `/config/publish` when `SYNAPSE_CONFIG_SYNC=1`; the dashboard lists the same mirror) or a live feedback note. Propose-only.
 
 **dream→notes curation lane** (`dream/notes/`, kill switch `SYNAPSE_NOTES_LANE=0`, ON by default) — the notes store's missing outflow. `remember()` was the only thing that ever wrote a note, so paraphrase duplicates, notes a later correction had already replaced, and project-specific content typed as global `feedback` all accumulated on a board that is injected into every session. The lane runs three stages nightly: (A) candidate pairs from a pure-SQL self-join of live notes on the cosine similarity of their **stored hook embeddings** (no new embedding calls; floor 0.60, permissive because a correction often shares little wording with what it corrects); (B) a pair judge that merges DUPLICATEs (older `updated_at` loses) and retires the note a CORRECTION replaces; (C) a scope judge that re-types a global note to `project` when its content is specific to one named codebase.
 
 Unlike the skills and config lanes it **auto-applies** — no proposals, no review queue, no review command, by explicit user decision (curation should happen silently as a self-improvement step, not as a second inbox). The safety model is structural instead: every write is reversible and non-destructive (`superseded_by` keeps the row and the lineage; retype changes only `type`/`project`), every judgement is made in **both orders** with consensus required and disagreement collapsing to the safe verdict, both prompts carry an explicit under-report bias, per-night caps bound the blast radius (40 pairs / 10 scopes / 10 applied ops), a retype applies only for a project slug that already exists in the store, and every verdict — applied or not — is written to `notes_curation` (schema 051), which doubles as the memo that stops re-judging and the staleness cursor (`judged_at` vs `notes.updated_at`).
 
-The real KG-hygiene and web-capture work runs as **independent entry points** (scheduled externally — a client-machine cron for the web-capture lane, plus server-host systemd timers), not orchestrated by `dream/__main__`:
+The real KG-hygiene and web-capture work runs as **independent entry points**, not orchestrated by `dream/__main__`:
 
 - **Semantic identity merge** (#48, [§5.3](#53-entity-resolution)) — exact-name and moderate (name-gated) pairs auto-merge on the write path; the lexically-different semantic lane is detection-only, surfaced for human review (the #49 gap). The former standalone `dream/entity_dedup` pass was removed in #67.
 - **Communities** — **legacy/retired.** `Community` clusters (Raghavan label propagation) and `HAS_MEMBER` edges lived in FalkorDB; the bucket was retired with the #67 KG cutover (never measured as contributing), so there is no runnable module and no Postgres target.
-- **Cursor ingest** — the live path is `ingestion/cursor_sqlite_client.py` (`CursorSQLiteParser`) + `cursor_sqlite_backfill.py`, emitting real `Episode` rows (`platform="cursor"`). (The old `dream/cursor_parser.py` was **deleted** — it had no caller.)
+- **Cursor ingest** — there is no live Cursor path. Cursor chat history is imported by hand: `python -m ingestion.backfill --source cursor <dir>` parses the `*.vscdb` files with `CursorSQLiteParser` (`ingestion/cursor_sqlite_client.py`) into `Episode` rows (`platform="cursor"`) through the same writer `/ingest` uses.
 
-**Stage 2's one live side-effect** (only if explicitly invoked, which the schedule never does): `_refresh_entity_summaries` rewrites the top-20 dense `Entity.summary` per group from connected facts. Worth knowing it exists; it is dormant in practice.
-
-**Logfire**: all *read* paths were removed (#108) when Logfire ingestion was ripped out — the old Stage-1 Logfire reviewer is gone, episodes now arrive via `/ingest`. Logfire **emit** (telemetry spans) is retained; the `dream` and `mcp-server` containers still set `LOGFIRE_TOKEN` (spans land in the configured Logfire project).
+**Logfire**: all *read* paths were removed (#108) when Logfire ingestion was ripped out — episodes arrive via `/ingest`. Logfire **emit** (telemetry spans) is retained: the poller, the MCP server and `dream` each configure it (`dream` opens one span per lane) and send to the project named by `LOGFIRE_TOKEN`; with no token nothing is sent.
 
 ---
 
@@ -796,22 +856,21 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `OIDC_USER_CLAIMS` | `preferred_username,email` | ordered claims read for the user's identity |
 | `SYNAPSE_MACHINE_ROLE` | `personal` | **plugin side**, not the server: this machine's declared role at enrollment, `personal` (full trust) or `work` (restricted). An *unstated* role resolves to restricted server-side ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)) |
 
-### Recall tuning (`mcp_server/recall.py`)
+### Recall tuning (`mcp_server/recall_config.py`)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SYNAPSE_RECALL_PASSAGE_N` | `6` | passages served per `recall()` from the second-pass passage rerank |
-| `SYNAPSE_RERANK_WINDOW` | `1` | relevance-windowed truncation of long episodes before rerank (`0` = full episodes) |
-| `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall(mode="turns")`: serve turns scoring ≥ tau×top_score |
-| `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |
-| `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
-| `SYNAPSE_RECALL_FLOOR` | `0` (off) | abstention floor on the raw (pre-recency) rerank top score: strictly below it, recall serves no episodes for that call instead of the least-bad ones, and `recall_metrics.served_ids` gains `would_abstain`/`floor` markers. The threshold belongs to the reranker (scores are not comparable across models), so each `examples/env` preset sets it: `0.60` for the default `rerank-3-lite` (`0.58` if you roll back to `rerank-2.5-lite`), `0` for the bundled local reranker |
-| `SYNAPSE_RECALL_FLOOR_ENFORCE` | `1` | `0` keeps the telemetry markers but never withholds episodes |
-| `SYNAPSE_RECALL_FLOOR_KEEP_MIN` | `0` | when the floor fires, serve this many top passages instead of none |
+| `SYNAPSE_RERANK_RECENCY_FLOOR` | `0.25` | lower bound of the recency multiplier applied to rerank scores (14-day half-life): a ~3-month-old episode keeps a quarter of its score instead of ~0.01x, so a query that asks for old content still gets it |
+| `SYNAPSE_RECALL_FLOOR` | `0` (off) | abstention floor on the raw (pre-recency) rerank top score of the episodes that survive echo suppression: strictly below it, `recall()` serves no episodes for that call instead of the least-bad ones, and `recall_metrics.served_ids` gains `would_abstain`/`floor` markers (`rerank_top_all` records the pool's own top when it differs; `recall_full_turns` records the marker but never withholds). Always enforced when set. The threshold belongs to the reranker (scores are not comparable across models), so each `examples/env` preset sets it: `0.60` for the default `rerank-3-lite` (`0.58` if you roll back to `rerank-2.5-lite`), `0` for the bundled local reranker |
+| `SYNAPSE_RECALL_WEB_FLOOR` | `0.60` | cross-encoder floor on the web bucket, with no keep-one backstop: the bucket may serve nothing, which gates web on intent. Reranker-specific like `SYNAPSE_RECALL_FLOOR` (`0` = off; the local preset) |
+| `SYNAPSE_RECALL_NOTES_FLOOR` | `0.60` | the same floor for the notes bucket |
+| `SYNAPSE_RECALL_CHUNK_CANDIDATES` | `0` | `1` adds the top 10 chunks by keyword and by embedding as a candidate source for the episode pool ([§6.2](#62-episode-leg-the-workhorse)); chunks are never served. The vector half needs the optional chunks index (migration 067). `scripts/ab_chunk_candidates.py` runs the on/off A/B over a goldens file; the losing side gets deleted |
 | `SYNAPSE_SUPERSEDE_MAX_DIST` | `0.45` | cosine-distance gate for surfacing successor facts of superseded edges |
+| `SYNAPSE_SUPERSEDE_LINK_MAX_DIST` | `0.35` | a successor link is believed only when the successor is within this distance of the fact it retired; recalibrate with the embedder |
 | `SYNAPSE_TIMELINE_GROUP_SCOPE` | `1` | `group_id="personal"` filters timeline serving to personal-domain events (`0` = never filter) |
 | `SYNAPSE_SCHEMA_CHECK` | `1` | boot-time guard: refuse to start when the database schema is behind the code (`0` = skip) |
-| `SYNAPSE_<STAGE>_MODEL` | unset | per-stage LLM override (stages: `EXTRACTOR`, `TIMELINE`, `PREFERENCES`, `DEDUP`, `CONTRADICTION`, `EDGE_DATES`, `DREAM`, `QUERY_GRAPH`, `SKILLS`); falls back to `SYNAPSE_LLM_MODEL`, then the stage default — see `.env.example` |
+| `SYNAPSE_<STAGE>_MODEL` | unset | per-stage LLM override (stages: `EXTRACTOR`, `TIMELINE`, `PREFERENCES`, `DEDUP`, `CONTRADICTION`, `EDGE_DATES`, `NOTES_CONFIRM`, `NOTES_CURATE`, `SKILLS_JUDGE`, `SKILLS_DRAFT`, `CONTEXTUALIZE`); falls back to `SYNAPSE_LLM_MODEL`, then the stage default — see `.env.example` |
 | `SYNAPSE_KG_OWNER_ID` | `default` | `owner_id` scope for all KG reads/writes (multi-tenant seam) |
 | `SYNAPSE_PERSONAL_SCOPE` | `1` | keep the `personal`/`technical` split in the KG and on timeline events. `0` routes every extracted entity, fact and event to the single `technical` graph and domain, drops the domain question from the timeline gate prompt, and answers `group_id="personal"` from the technical graph. For work-only deployments. Existing rows are not moved |
 
@@ -819,8 +878,6 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYNAPSE_INGEST_TAIL` | `400` | Stop-hook tail size (raw records) |
-| `SYNAPSE_INGEST_CATCHUP_DAYS` | `3` | client-side: the SessionStart catch-up sweep ships lagging transcripts modified this recently, plus any transcript whose upload failed, however old. Never-attempted older files (pre-install history) are `synapse-import`'s job |
 | `SYNAPSE_DRAIN_ONLY` | unset | `1` → replica is a pure extraction worker (no chunk/embed cycle) |
 | `SYNAPSE_RERANK_MODEL` | `rerank-3-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5-lite` to roll back); for `http` the served model id |
 | `SYNAPSE_DEDUP_TYPE_GATE` | `1` | entity-type compatibility gate in fact dedup (`0` = off) |
@@ -833,74 +890,88 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SKILLS_LANE_ENABLED` | unset | `1` → nightly dream→skills lane runs (§11) |
-| `SKILLS_LANE_LIMIT` | `30` | sessions scanned per skills-lane run |
-| `CONFIG_LANE_ENABLED` | `1` | nightly config lane (`0` = off) |
-| `CONFIG_LANE_LIMIT` | `30` | sessions scanned per config-lane run |
+| `SKILLS_LANE_ENABLED` | `1` | kill switch for the nightly dream→skills lane ([§11](#11-nightly-maintenance--dream-pipeline)); `0` = off |
+| `SKILLS_LANE_LIMIT` | `30` | sessions the skills lane judges per run, oldest first; the rest roll to the next night |
+| `CONFIG_LANE_ENABLED` | `1` | kill switch for the nightly config lane (`0` = off) |
+| `CONFIG_LANE_LIMIT` | `30` | sessions the config lane judges per run (same cursor rule) |
 | `CONFIG_LEARNED_FILE` | `rules/learned.md` | target file (relative to the config mirror) for learned behavioral rules |
-| `CONFIG_PROPOSE_SESSIONS` | `2` | distinct sessions a correction must recur in before a proposal is drafted |
-| `SYNAPSE_DATA_DIR` | `~/.local/share/synapse-skills` | lane state / proposal drafts / logs |
-| `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | transcript root for dev-only disk scans (the nightly reads episodes from Postgres) |
-| `SKILLS_JUDGE_MODEL` | `claude-opus-4-8` | judge model for skills-lane candidate scoring |
-| `SKILLS_JUDGE_BACKEND` | `claude` | judge backend (the `claude` CLI) |
-| `SKILL_MEASURE_MODEL` | `opus` | model for the skill-gap measurement pass |
-| `SKILL_DERIVE_DRAFT_MODEL` | `claude-opus-4-8` | model for drafting new skill proposals |
-| `SKILLS_DISCORD_WEBHOOK` | empty | optional webhook for lane notifications |
-| `SKILLS_EXCLUDE_PROJECTS` | empty | comma-separated project ids the lanes skip |
-| `SYNAPSE_NOTES_LANE` | `1` | nightly dream→notes curation lane (`0` = off) |
-| `NOTES_LANE_SIM_FLOOR` | `0.60` | hook-embedding cosine floor for note-pair candidacy |
-| `NOTES_LANE_MAX_JUDGE` | `40` | note pairs judged per run |
-| `NOTES_LANE_MAX_RETYPE_JUDGE` | `10` | global notes scope-judged per run |
-| `NOTES_LANE_MAX_APPLY` | `10` | operations APPLIED per run, across merges and retypes |
+| `SYNAPSE_NOTES_LANE` | `1` | kill switch for the nightly dream→notes curation lane (`0` = off) |
+| `SYNAPSE_SKILLS_JUDGE_MODEL` / `SYNAPSE_SKILLS_DRAFT_MODEL` | `claude-opus-4-8` | judge model of the skills and config lanes, and drafter model of the skills lane (`stage_model`) |
 | `SYNAPSE_NOTES_CURATE_MODEL` | `SYNAPSE_LLM_MODEL` | judge model for the notes curation lane (`stage_model("NOTES_CURATE")`) |
+| `SKILLS_DISCORD_WEBHOOK` | empty | optional webhook for the skills lane's digest |
+| `SKILLS_EXCLUDE_PROJECTS` | empty | comma-separated project ids the lanes skip |
+| `SYNAPSE_DATA_DIR` | `~/.local/share/synapse-skills` | **plugin side**: local client state (ingest cursors, the remember spool) |
+| `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | **plugin side**: transcript root for the ingest hook's catch-up sweep |
 | `SYNAPSE_ENV_FILE` | `/app/.env` | .env fallback path inside the dream container |
 
 ---
 
 ## 14. File Structure
 
+Directory-level on purpose: per-file comments are kept to modules whose role is not obvious from the name, because a long annotated tree rots.
+
 ```
 synapse/
-├── ingestion/
-│   ├── __main__.py            # poller bootstrap (run_loop)
-│   ├── poller.py              # maintenance loop: chunk rebuild, embed, drain
+├── ingestion/                 # everything that turns transcripts into memory (shared by the poller and the server)
+│   ├── __main__.py            # poller bootstrap
+│   ├── poller.py              # two threads: maintenance (chunks, embed, sweeps, web pages) and extraction (drains the queue)
+│   ├── episode_writer.py      # the one place a parsed turn becomes a stored episode (guards, dedup, tombstones)
+│   ├── jsonl_client.py        # transcript parsers → Episodes: Claude Code (jsonl_client), Codex, Cursor (SQLite),
+│   │                          #   claude.ai and ChatGPT exports (codex_client, cursor_sqlite_client, claude_ai_client, chatgpt_export)
+│   ├── backfill.py            # manual import CLI over those parsers (python -m ingestion.backfill --source ...)
 │   ├── chunks.py              # sliding-window chunk construction (window=4 step=3)
-│   ├── db.py                  # PG CRUD: episodes, chunks, queue, claim, span index
-│   ├── embedding.py           # VoyageEmbeddingModel (embed + rerank-3-lite)
-│   ├── extractor.py           # ExtractionPipeline + stages 2-7
+│   ├── db.py + db_*.py        # PG CRUD facade: episodes, queue, notes, preferences, timeline, documents
+│   ├── pg_pool.py             # the server's one connection pool; every route and recall leg borrows from it
+│   ├── embedding.py           # Voyage / OpenAI-compatible embed + rerank clients (interactive vs batch retry policy)
+│   ├── extractor.py           # ExtractionPipeline; extraction_*.py are its stages (entities, nodes, edges, twins, recheck)
 │   ├── edge_dates.py          # EdgeDateExtractor + temporal prefilter
-│   ├── kg_client.py           # Postgres KG client (KGClient): nodes/edges/indexes, bitemporal writes, candidate-find
-│   ├── kg_pg_read.py / kg_pg_write.py  # the KG read/write SQL behind kg_client
-│   ├── llm_client.py          # claude-agent-sdk wrapper (ClaudeCLIClient + agent_call)
-│   ├── cursor_sqlite_client.py / cursor_sqlite_backfill.py  # LIVE Cursor ingest
-│   └── models.py              # Pydantic domain models
+│   ├── kg_client.py           # Postgres KG client: nodes/edges, bitemporal writes, candidate-find
+│   ├── llm_client.py          # LLM surface (create_llm_client, structured_call, agent_call, stage_model); llm_claude_cli.py,
+│   │                          #   llm_openai.py are the two backends, llm_common.py the shared errors and retry policy
+│   ├── timeline_gate.py       # per-turn gate → timeline events;  preferences_gate.py: → standing preferences
+│   ├── capture/               # server-side web capture out of the records /ingest receives (rules in capture/rules/*.toml)
+│   ├── web_artifacts.py       # web-research store (+ web_extractors, web_chunker, web_context, web_enqueue)
+│   ├── surfaces.py            # credential-bound surface trust and the audience rules
+│   ├── schema_check.py        # boot-time schema-version guard + the ColumnProbe the optional migrations use
+│   └── settings.py            # env-then-.env resolution for every process
 │
 ├── mcp_server/
-│   ├── server.py              # fastmcp: recall/fetch/remember/recall_timeline/recall_feedback (+hidden issue_machine_token) + /ingest + /recall routes + MultiAuth
-│   ├── recall.py              # Recall engine: episode leg + KG leg + web + history, rerank, fusion
+│   ├── server.py              # fastmcp app: instructions, MultiAuth, tool and route registration
+│   ├── retrieval_tools.py     # recall / recall_full_turns / fetch / fetch_session
+│   ├── remember_tool.py       # remember;  feedback_tools.py: recall_feedback;  hidden_tools.py: issue_machine_token
+│   ├── recall.py              # Recall engine, assembled from the recall_*.py mixins (episode_search, rerank, passages,
+│   │                          #   sources, web, overview = recall(), episodes = recall_full_turns, fetch); settings in recall_config.py
 │   ├── kg_pg.py               # recall-side KG search (vector + BM25 + 1-hop over kg_*)
-│   ├── device_routes.py       # /device/code + /device/token — RFC 8628 device login (proxies GitHub), allowlist-gated
-│   ├── install_routes.py      # GET /install — serves install_script.py with this server's client inside
-│   ├── skill_sync_routes.py   # machine-token-gated /skills/* HTTP routes (DSN-free skill sync + review)
-│   ├── config_sync_routes.py  # machine-token-gated /config/* HTTP routes (config-lane mirror for dream)
-│   ├── remember_routes.py     # machine-token-gated /remember/spool — replays a memory write the MCP tool couldn't make, idempotent on the client's intent id
-│   └── skills_provider.py     # PgSkillsProvider — serves skill:// resources from skills_lane
+│   ├── board.py               # the always-injected note board (GET /context)
+│   ├── ingest_route.py        # POST /ingest
+│   ├── recall_route.py        # POST /recall
+│   ├── auth_tokens.py         # root + per-device bearer verifier;  caller_trust.py / http_auth.py: the gates
+│   ├── device_routes.py       # /device/code + /device/token (RFC 8628 login), allowlist-gated
+│   ├── install_routes.py      # GET /install: install_script.py with this server's client inside
+│   ├── skill_sync_routes.py   # machine-token-gated /skills/* routes (DSN-free sync);  skill_review_routes.py: proposal review
+│   ├── config_sync_routes.py  # /config/* routes: the mirror of a machine's config files the dashboard lists and the config lane reads
+│   ├── remember_routes.py     # /remember/spool: replays a write the MCP tool could not make, idempotent on the client's intent id
+│   ├── skills_provider.py     # PgSkillsProvider: skill:// resources from skills_lane
+│   └── dash/                  # operator dashboard API (/dash/api/*), serving the React bundle built from web/
 │
 ├── dream/
-│   └── __main__.py            # nightly orchestrator — runs the skills + config lanes
+│   ├── __main__.py            # nightly orchestrator: skills, config and notes lanes, then the retention prune
+│   ├── lane.py                # shared window/cursor/session plumbing and the lanes' LLM calls
+│   ├── skills/  config/  notes/   # the three lanes
+│   └── evidence.py            # the evidence union the skills and config ledgers share
 │
-├── scripts/
-│   ├── synapse_ingest_hook.py # the Stop hook (tail shipper)
-│   ├── contextualize_web_chunks.py
-│   └── ... (eval/benchmark harnesses, gitignored goldens)
-│
-├── plugin/                    # the Claude Code plugin (hooks, commands, dream→skills lane) + the `synapse` CLI
-│                              #   (synapse_cli.py, harness.py, synapse_home.py, mcp_headers.py, synapse_run.py)
+├── plugin/                    # the Claude Code plugin (hooks, commands) + the `synapse` CLI
+│   └── scripts/               #   ingest_hook.py is the Stop hook; synapse_cli.py, synapse_login.py, harness.py, synapse_run.py ...
 ├── plugin-codex/              # the Codex hooks + installer (reuses plugin/scripts by relative path)
-│   └── README.md
+├── web/                       # the dashboard SPA (React, built by `npm run build` into web/dist, served by mcp_server/dash/static.py)
+├── schema/                    # numbered SQL migrations, 001-076 (010 was removed); scripts/apply_schema.sh applies them in order
+├── scripts/                   # apply_schema.sh and one-off operator tools (backfills, relabel, redaction, chunk-candidate A/B, board bench)
+├── examples/env/              # per-backend .env presets (voyage, openrouter, local)
+├── tests/
+├── docs/                      # install, auth, tools, features, dashboard contract, specs
 ├── .claude-plugin/marketplace.json  # makes the repo a self-hosted plugin marketplace
-├── schema/                    # 001-034 numbered SQL migrations
-├── compose.yml                # postgres / poller / mcp-server / dream services (server host)
+├── compose.yml                # postgres / poller / mcp-server / dream (+ opt-in local-inference) services
+├── HANDOFF.md                 # operator log: what changed and what to apply, newest first
 ├── README.md
 └── ARCHITECTURE.md
 ```
@@ -923,7 +994,7 @@ The poller backs off exponentially (capped 30min) on `UsageLimitError`, releasin
 
 ### Connection resilience
 
-`_ensure_pg()` probes with `SELECT 1`; half-open connections after a PG restart reconnect transparently. With the graph folded into Postgres (#67), there is one data store to watch, not two.
+The pool (`ingestion/pg_pool`) checks a connection when it hands it out; half-open connections after a PG restart are replaced transparently. With the graph folded into Postgres (#67), there is one data store to watch, not two.
 
 ---
 
@@ -943,7 +1014,7 @@ The field's most under-benchmarked lever. Synapse has the primitives — recency
 
 ### 16.4 FalkorDB → Postgres — DONE (#67)
 
-Shipped. The graph was folded into Postgres (`kg_entities` / `kg_relationships`) and FalkorDB decommissioned. The cutover measured quality-equal on the relational golden set (delta −0.017, CI spans zero; `scripts/ab_kg_pg_quality.py`) and fixed FalkorDB's silently-dead BM25 leg (AND/phrase semantics returned 0 rows on real multi-word queries). One data store now, not two; the `SYNAPSE_KG_READ` rollback seam is gone, and a KG-leg failure degrades to an empty `facts` bucket rather than failing the recall.
+Shipped. The graph was folded into Postgres (`kg_entities` / `kg_relationships`) and FalkorDB decommissioned. The cutover measured quality-equal on the relational golden set (delta −0.017, CI spans zero) and fixed FalkorDB's silently-dead BM25 leg (AND/phrase semantics returned 0 rows on real multi-word queries). One data store now, not two; the `SYNAPSE_KG_READ` rollback seam is gone, and a KG-leg failure degrades to an empty `facts` bucket rather than failing the recall.
 
 ### 16.5 Smaller items
 
