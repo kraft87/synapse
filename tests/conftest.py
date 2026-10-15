@@ -5,9 +5,7 @@ from urllib.parse import urlsplit
 import psycopg
 import pytest
 
-DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from tests.helpers.db import DB_URL
 
 
 def _refuse_production(url: str) -> None:
@@ -34,70 +32,16 @@ _refuse_production(DB_URL)
 # Pin it to the test database so a missing monkeypatch cannot reach prod.
 os.environ["SYNAPSE_DB_URL"] = DB_URL
 
-# Files whose tests touch the shared Postgres test DB. The collection hook below
-# auto-tags every test in these files with `xdist_group="db"`, which pins them
-# onto a single xdist worker so TRUNCATE/INSERT operations don't race across
-# parallel workers. Pure-Python test files are left untagged and fan out freely.
-_DB_FILES = {
-    "test_db.py",
-    "test_poller.py",
-    "test_schema.py",
-    "test_mcp_server.py",
-    "test_web_artifacts.py",
-    "test_web_enqueue.py",
-    "test_contradiction.py",
-    "test_extractor.py",
-    "test_extraction_twins_db.py",
-    "test_extraction_races_db.py",
-    "test_kg_pg_write.py",
-    "test_kg_pg_read.py",
-    "test_skills_provider.py",
-    "test_skills_lane_v2.py",
-    "test_skill_accept_applies.py",
-    "test_skill_retire.py",
-    "test_supersede_leg.py",
-    "test_self_session_facts.py",
-    "test_config_lane.py",
-    "test_config_proposer_db.py",
-    "test_config_review_routes.py",
-    "test_timeline_routes.py",
-    "test_preferences_routes.py",
-    "test_recall_metrics.py",
-    "test_notes_store.py",
-    "test_notes_curation.py",
-    "test_remember_notes.py",
-    "test_remember_routes.py",
-    "test_board.py",
-    "test_dashboard_routes.py",
-    "test_telemetry_kinds.py",
-    "test_import_notes.py",
-    "test_tool_surface.py",
-    "test_restamp_inherited_dates.py",
-    "test_recall_feedback.py",
-    "test_private_session_routes.py",
-    "test_audience_scoping.py",
-    "test_kg_source_projects.py",
-    "test_surface_routes.py",
-    "test_credential_trust.py",
-    "test_serving_notice.py",
-    "test_root_surface_lane.py",
-    "test_own_surface_episodes.py",
-    "test_config_scope.py",
-    "test_local_tz_dates.py",
-    "test_pg_pool.py",
-    "test_project_identity_db.py",
-    "test_relabel_projects_db.py",
-    "test_skill_trust_scoping.py",
-    "test_episode_writer.py",
-    "test_apply_schema.py",
-}
+# A test that reaches the shared Postgres test DB runs in the serial `db` passes, where
+# TRUNCATE/INSERT cannot race across xdist workers; every other test fans out freely.
+# Tests get the marker from the DB fixtures they use. A module that talks to the database
+# directly says so with ``pytestmark = pytest.mark.db`` (DSN: tests/helpers/db.py).
+_DB_FIXTURES = frozenset({"conn", "db_url", "clean_tables", "full_surface"})
 
 
 def pytest_collection_modifyitems(config, items):
     for item in items:
-        file_name = os.path.basename(str(item.fspath))
-        if file_name in _DB_FILES:
-            item.add_marker(pytest.mark.xdist_group(name="db"))
+        if _DB_FIXTURES.intersection(item.fixturenames):
             item.add_marker(pytest.mark.db)
 
 

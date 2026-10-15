@@ -4,14 +4,12 @@ Covers the /dash/api/* contract (catalog, feed merge + keyset cursor + type-filt
 behavior, episode detail, derived facts/events, session ordering, entity dossier,
 search per-type + total_by_type, flag toggle + audit + feed reflection) and the
 unauthenticated static bundle routes (503 without a build, 200 + traversal rejection
-with a monkeypatched dist dir). Skips cleanly when no test DB is reachable (mirrors
-test_board.py). ALL fixture data is synthetic — this repo is public.
+with a monkeypatched dist dir). ALL fixture data is synthetic — this repo is public.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
@@ -19,22 +17,12 @@ from urllib.parse import quote
 import psycopg
 import pytest
 from psycopg.types.json import Json
+from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import mcp_server.dashboard_routes as dr
+from mcp_server.dashboard_routes import register
 
-# Skip the whole module if the shared Postgres test DB isn't up — these tests are DB-only.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from starlette.testclient import TestClient  # noqa: E402
-
-import mcp_server.dashboard_routes as dr  # noqa: E402
-from mcp_server.dashboard_routes import register  # noqa: E402
+pytestmark = pytest.mark.db
 
 _TOKEN = "test-dash-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}

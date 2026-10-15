@@ -9,31 +9,21 @@ Two things only a database can prove:
     whole design rests on: the marker file only covers the live hook, so a catch-up sweep,
     a backfill, or any other client posting the same transcript must still land nothing.
 
-Skips cleanly when no test DB is reachable (the pure-logic coverage — marker handling,
-predicate, toggle CLI — lives in test_private_mode.py).
+The pure-logic coverage (marker handling, predicate, toggle CLI) lives in
+test_private_mode.py.
 """
 
 from __future__ import annotations
 
-import os
 from types import SimpleNamespace
 
-import psycopg
 import pytest
 from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
+from mcp_server.private_session_routes import register
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust  # noqa: E402
-from mcp_server.private_session_routes import register  # noqa: E402
+pytestmark = pytest.mark.db
 
 _TOKEN = "test-machine-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}

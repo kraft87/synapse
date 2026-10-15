@@ -9,30 +9,17 @@ to full.
 
 Enrollment, approval, minting and the no-self-approve property live in
 test_credential_trust.py, next to the schema-054 machinery they cover.
-
-Skips cleanly when no test DB is reachable, mirroring test_private_session_routes.py.
 """
 
 from __future__ import annotations
 
-import os
-
-import psycopg
 import pytest
 from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.surfaces import lookup_surface
+from mcp_server.surface_routes import register
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.surfaces import lookup_surface  # noqa: E402
-from mcp_server.surface_routes import register  # noqa: E402
+pytestmark = pytest.mark.db
 
 _TOKEN = "test-surface-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}

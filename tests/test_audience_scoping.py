@@ -24,38 +24,29 @@ fetch_session's predicates in test_fetch_session.py — both next to the code th
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 
-import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import ingestion.notes as notes_mod  # noqa: E402
-from ingestion.db import Database  # noqa: E402
-from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-from ingestion.surfaces import (  # noqa: E402
+import ingestion.notes as notes_mod
+from ingestion.db import Database
+from ingestion.notes import _OWNER, reconcile_note
+from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     derive_audience,
     lookup_surface,
     restricted_project_union,
 )
-from mcp_server import server  # noqa: E402
-from mcp_server.recall import Recall  # noqa: E402
-from tests.helpers.surfaces import (  # noqa: E402
+from mcp_server import server
+from mcp_server.recall import Recall
+from tests.helpers.db import DB_URL as _DB_URL
+from tests.helpers.surfaces import (
     clear_surfaces,
     register_full,
     register_restricted,
 )
+
+pytestmark = pytest.mark.db
 
 
 @pytest.fixture()

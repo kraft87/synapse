@@ -2,30 +2,18 @@
 
 Covers the reconciliation round-trip the gate relies on (insert / cosine KNN / reassert /
 supersede) and the session-start route serialization + ordering. Mirrors the timeline
-route tests. Skips cleanly when no test DB is reachable (the pure-logic decision + parser
-coverage lives in test_preferences_gate.py)."""
+route tests. (The pure-logic decision + parser coverage lives in test_preferences_gate.py.)"""
 
 from __future__ import annotations
-
-import os
 
 import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.db import Database
+from mcp_server.preferences_routes import _OWNER, _top_preferences
+from tests.helpers.embed import GROUP, onehot
 
-# Skip the whole module if the shared Postgres test DB isn't up — these tests are DB-only.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.db import Database  # noqa: E402
-from mcp_server.preferences_routes import _OWNER, _top_preferences  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
+pytestmark = pytest.mark.db
 
 
 def _wipe(conn):

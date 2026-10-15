@@ -18,31 +18,21 @@ cover the replacement, organised around the properties that make it worth the ch
 
 from __future__ import annotations
 
-import os
-
-import psycopg
 import pytest
 from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.surfaces import (  # noqa: E402
+from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     issue_dash_token,
     mint_surface,
     resolve_caller,
     token_hash,
 )
-from mcp_server.surface_routes import register  # noqa: E402
-from tests.helpers.surfaces import clear_surfaces, register_device  # noqa: E402
+from mcp_server.surface_routes import register
+from tests.helpers.db import DB_URL as _DB_URL
+from tests.helpers.surfaces import clear_surfaces, register_device
+
+pytestmark = pytest.mark.db
 
 _ROOT = "test-root-token"
 _ADMIN = "admin-device-token"

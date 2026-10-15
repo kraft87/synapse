@@ -70,15 +70,6 @@ PROSE = (
 
 @pytest.fixture()
 def web_tables(conn):
-    present = conn.execute("SELECT to_regclass('public.web_chunks')").fetchone()
-    if not (present[0] if not isinstance(present, dict) else present["to_regclass"]):
-        pytest.skip("web tables not present in test DB (migrations 011-013 unapplied)")
-    col = conn.execute(
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_name = 'extraction_queue' AND column_name = 'web_chunk_id'"
-    ).fetchone()
-    if not col:
-        pytest.skip("extraction_queue.web_chunk_id missing (migration 018 unapplied)")
     conn.execute("TRUNCATE web_artifacts, web_chunks, extraction_queue RESTART IDENTITY CASCADE")
     yield
 

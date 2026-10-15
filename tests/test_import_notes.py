@@ -12,10 +12,8 @@ Two halves, mirroring test_notes_store.py:
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 
-import psycopg
 import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
@@ -30,18 +28,6 @@ from ingestion.db import Database  # noqa: E402
 from ingestion.embedding import EmbeddingConfigError, embed_dims  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
 from tests.helpers.embed import onehot  # noqa: E402
-
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-    _DB_UP = True
-except Exception:  # pragma: no cover - environment dependent
-    _DB_UP = False
-
-needs_db = pytest.mark.skipif(not _DB_UP, reason="no test DB reachable")
 
 _DIMS = embed_dims()
 
@@ -237,7 +223,7 @@ def _write(d: Path, filename: str, text: str) -> Path:
     return p
 
 
-@needs_db
+@pytest.mark.db
 def test_dry_run_writes_zero_rows(conn, db_url, tmp_path):
     _wipe(conn)
     _write(tmp_path, "feedback_no_tables.md", "Never use tables in replies. Ever.\n")
@@ -248,7 +234,7 @@ def test_dry_run_writes_zero_rows(conn, db_url, tmp_path):
     _wipe(conn)
 
 
-@needs_db
+@pytest.mark.db
 def test_apply_creates_rows_with_source_ref(conn, db_url, tmp_path, monkeypatch):
     _wipe(conn)
     _no_network(monkeypatch)
@@ -277,7 +263,7 @@ def test_apply_creates_rows_with_source_ref(conn, db_url, tmp_path, monkeypatch)
     _wipe(conn)
 
 
-@needs_db
+@pytest.mark.db
 def test_rerun_same_dir_all_skips(conn, db_url, tmp_path, monkeypatch):
     _wipe(conn)
     _no_network(monkeypatch)
@@ -291,7 +277,7 @@ def test_rerun_same_dir_all_skips(conn, db_url, tmp_path, monkeypatch):
     _wipe(conn)
 
 
-@needs_db
+@pytest.mark.db
 def test_edited_file_updates_in_place(conn, db_url, tmp_path, monkeypatch):
     _wipe(conn)
     _no_network(monkeypatch)
@@ -315,7 +301,7 @@ def test_edited_file_updates_in_place(conn, db_url, tmp_path, monkeypatch):
     _wipe(conn)
 
 
-@needs_db
+@pytest.mark.db
 def test_superseded_source_ref_skip_and_reconcile(conn, db_url, tmp_path, monkeypatch):
     """Newest row for the source_ref is retired: unchanged content stays skipped
     (never resurrect); changed content reconciles into a NEW live row instead of
@@ -372,7 +358,7 @@ def test_superseded_source_ref_skip_and_reconcile(conn, db_url, tmp_path, monkey
     _wipe(conn)
 
 
-@needs_db
+@pytest.mark.db
 def test_high_sim_collision_routes_through_reconcile(conn, db_url, tmp_path, monkeypatch):
     """A seed whose hook collides (cosine ~1.0, same type) with an existing
     remember-written note must UPDATE that note via reconcile_note — not blind-insert

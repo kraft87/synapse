@@ -4,29 +4,18 @@ Covers both lanes' selection rules: facts restamp only non-midnight (not
 evidence-dated) edges disagreeing >1 day with the recomputed episode max,
 syncing t_valid AND valid_at; timeline restamps only non-noon (not
 LLM-resolved) chat events; dry-run mutates nothing; re-runs are idempotent.
-Skips cleanly when no test DB is reachable.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import uuid
 from pathlib import Path
 
-import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
+pytestmark = pytest.mark.db
 
 _REPO = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(

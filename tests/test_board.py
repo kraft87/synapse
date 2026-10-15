@@ -2,35 +2,22 @@
 
 Covers the render contract (banner, grouping/order, line format, project scoping,
 superseded exclusion), the hard cap (line overflow drop order + token cap), the
-timeline section, the machine-token route gate, and kind='board' telemetry. Skips
-cleanly when no test DB is reachable (mirrors test_notes_store.py)."""
+timeline section, the machine-token route gate, and kind='board' telemetry."""
 
 from __future__ import annotations
 
-import os
 import re
 
-import psycopg
 import pytest
+from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.db import Database
+from ingestion.surfaces import FULL_TRUST
+from mcp_server.board import _OWNER, build_board, record_board_metrics, register
+from tests.helpers.embed import GROUP
+from tests.helpers.surfaces import register_full, register_restricted
 
-# Skip the whole module if the shared Postgres test DB isn't up — these tests are DB-only.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from starlette.testclient import TestClient  # noqa: E402
-
-from ingestion.db import Database  # noqa: E402
-from ingestion.surfaces import FULL_TRUST  # noqa: E402
-from mcp_server.board import _OWNER, build_board, record_board_metrics, register  # noqa: E402
-from tests.helpers.embed import GROUP  # noqa: E402
-from tests.helpers.surfaces import register_full, register_restricted  # noqa: E402
+pytestmark = pytest.mark.db
 
 
 def _board(db_url, project):

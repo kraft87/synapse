@@ -12,28 +12,18 @@ semantics, the telemetry row, and the input-validation error dicts.
 from __future__ import annotations
 
 import asyncio
-import os
 from types import SimpleNamespace
 
-import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import ingestion.notes as notes_mod
+from ingestion.db import Database
+from ingestion.notes import _OWNER
+from mcp_server import server
+from mcp_server.recall import Recall
+from tests.helpers.embed import GROUP, onehot
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import ingestion.notes as notes_mod  # noqa: E402
-from ingestion.db import Database  # noqa: E402
-from ingestion.notes import _OWNER  # noqa: E402
-from mcp_server import server  # noqa: E402
-from mcp_server.recall import Recall  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
+pytestmark = pytest.mark.db
 
 # GROUP ("technical") is where _group_for(None) routes project-less notes.
 

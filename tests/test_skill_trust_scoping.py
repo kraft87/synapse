@@ -37,7 +37,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
 
-import psycopg
 import pytest
 from psycopg.types.json import Json
 
@@ -59,14 +58,7 @@ from mcp_server.skill_sync_routes import (
 )
 from mcp_server.skills_provider import PgSkillsProvider
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    psycopg.connect(_DB_URL, connect_timeout=2).close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
+pytestmark = pytest.mark.db
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
