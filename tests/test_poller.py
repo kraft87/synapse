@@ -1,15 +1,16 @@
-"""DB-backed tests for the drain worker's concurrent path (issue #13).
+"""DB-backed tests for the extraction drain (issue #13) and the maintenance stages.
 
-Items run through a thread pool when a worker_factory is provided and
-SYNAPSE_DRAIN_CONCURRENCY > 1, a row claimed as each thread frees up. These cover the
-care points from the issue: genuine concurrency, per-item failure isolation (one bad item
-never releases the rest), the UsageLimitError contract (quota items released to pending +
-re-raise so run_loop backs off), and the serial kill switch.
+Items run through a thread pool of SYNAPSE_DRAIN_CONCURRENCY threads, a row claimed as each
+thread frees up. These cover the care points from the issue: genuine concurrency, per-item
+failure isolation (one bad item never releases the rest), the UsageLimitError contract
+(quota items released to pending + re-raise so the extraction loop backs off), and the
+serial kill switch. The two threads together are in tests/test_poller_threads.py.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ import pytest
 from ingestion.db import Database
 from ingestion.llm_client import UsageLimitError
 from ingestion.models import Episode
-from ingestion.poller import Poller
+from ingestion.poller import Maintenance, Poller
 
 
 def _seed(conn, n: int) -> list[int]:
@@ -48,17 +49,11 @@ class FakePipeline:
         self._behavior(item)
 
 
-def _poller(db_url: str, behavior, factory_calls: list[int] | None = None) -> Poller:
+def _poller(db_url: str, behavior) -> Poller:
     def factory():
-        if factory_calls is not None:
-            factory_calls.append(1)
         return Database(db_url), FakePipeline(behavior)
 
-    return Poller(
-        db=Database(db_url),
-        extraction_pipeline=FakePipeline(behavior),
-        worker_factory=factory,
-    )
+    return Poller(db=Database(db_url), worker_factory=factory)
 
 
 def test_batch_runs_concurrently_and_marks_done(conn, db_url, monkeypatch):
@@ -112,17 +107,28 @@ def test_usage_limit_releases_quota_items_and_raises(conn, db_url, monkeypatch):
     assert set(st.values()) <= {"done", "pending"}
 
 
-def test_concurrency_1_stays_serial(conn, db_url, monkeypatch):
+def test_concurrency_1_runs_one_item_at_a_time(conn, db_url, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "1")
     _seed(conn, 3)
-    factory_calls: list[int] = []
-    p = _poller(db_url, lambda item: None, factory_calls)
+    lock = threading.Lock()
+    running = peak = 0
+
+    def behavior(item):
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.05)
+        with lock:
+            running -= 1
+
+    p = _poller(db_url, behavior)
     assert p.drain_extraction_queue(batch_limit=8) == 3
-    assert factory_calls == []  # serial path never builds per-thread workers
+    assert peak == 1
     assert set(_statuses(conn).values()) == {"done"}
 
 
-def test_stop_request_releases_unstarted_serial_items(conn, db_url, monkeypatch):
+def test_stop_request_at_concurrency_1_claims_nothing_more(conn, db_url, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", "1")
     ids = _seed(conn, 3)
     stop_after = ids[0]
@@ -232,6 +238,28 @@ def test_a_failed_item_is_retried_once_it_cools_off(conn, db_url, monkeypatch):
     assert _statuses(conn)[qid] == "done"
 
 
+def test_one_replica_holds_the_maintenance_lock(db_url):
+    """The lock is the session's: a second replica gets it once the first's connection ends.
+    (A distinct application_name keeps both off the test pool, whose connections go back to
+    it with their session locks still held.)"""
+    sep = "&" if "?" in db_url else "?"
+    first, second = (Database(f"{db_url}{sep}application_name=maint_lock_{n}") for n in "ab")
+    try:
+        assert first.try_maintenance_lock()
+        assert not second.try_maintenance_lock()
+        assert first.try_maintenance_lock()  # the holder asks again every cycle
+        first.close()
+        for _ in range(100):  # the server drops the closed session's locks a beat later
+            if second.try_maintenance_lock():
+                break
+            time.sleep(0.05)
+        else:
+            pytest.fail("the lock was never handed over")
+    finally:
+        first.close()
+        second.close()
+
+
 def test_orphan_sweep_goes_through_the_pipeline_kg_client():
     calls: list[int] = []
 
@@ -243,9 +271,8 @@ def test_orphan_sweep_goes_through_the_pipeline_kg_client():
     class _Pipe:
         _kg = _KG()
 
-    assert Poller(db=None, extraction_pipeline=_Pipe()).sweep_orphan_entities() == 3  # type: ignore[arg-type]
+    assert Maintenance(db=None, pipeline=_Pipe()).sweep_orphan_entities() == 3  # type: ignore[arg-type]
     assert calls == [24]
-    assert Poller(db=None).sweep_orphan_entities() == 0  # type: ignore[arg-type]
 
 
 # --- embed_pending ---------------------------------------------------------------------
@@ -274,17 +301,17 @@ class _Backlog:
         self.stored.append((table, [i for i, _ in pairs]))
 
 
-def _embedding_poller(backlog: _Backlog) -> Poller:
+def _embedding_maintenance(backlog: _Backlog) -> Maintenance:
     embedder = SimpleNamespace(embed=lambda texts, task: [[0.5] for _ in texts])
-    return Poller(
+    return Maintenance(
         db=backlog,  # type: ignore[arg-type]
-        extraction_pipeline=SimpleNamespace(_embedder=embedder),  # type: ignore[arg-type]
+        pipeline=SimpleNamespace(_embedder=embedder),  # type: ignore[arg-type]
     )
 
 
 def test_embed_pending_works_through_the_whole_backlog_in_one_cycle():
     backlog = _Backlog(episodes=7, chunks=3)
-    assert _embedding_poller(backlog).embed_pending(batch_size=3) == 10
+    assert _embedding_maintenance(backlog).embed_pending(batch_size=3) == 10
     # newest first, one statement per batch, episodes before chunks
     assert backlog.stored == [
         ("episodes", [7, 6, 5]),
@@ -296,13 +323,13 @@ def test_embed_pending_works_through_the_whole_backlog_in_one_cycle():
 
 def test_embed_pending_stops_at_its_time_budget():
     backlog = _Backlog(episodes=7, chunks=0)
-    assert _embedding_poller(backlog).embed_pending(batch_size=3, budget_s=0) == 0
+    assert _embedding_maintenance(backlog).embed_pending(batch_size=3, budget_s=0) == 0
     assert backlog.stored == []
 
 
 def test_embed_pending_with_nothing_pending_does_nothing():
     backlog = _Backlog(episodes=0, chunks=0)
-    assert _embedding_poller(backlog).embed_pending() == 0
+    assert _embedding_maintenance(backlog).embed_pending() == 0
     assert backlog.stored == []
 
 
@@ -330,7 +357,7 @@ def test_the_daily_queue_sweep_empties_text_finished_a_week_ago():
             asked.append(days)
             return 5
 
-    assert Poller(db=_Db()).sweep_finished_queue_text() == 5  # type: ignore[arg-type]
+    assert Maintenance(db=_Db(), pipeline=None).sweep_finished_queue_text() == 5  # type: ignore[arg-type]
     assert asked == [7]
 
 
@@ -348,7 +375,7 @@ def test_rebuild_enqueues_each_chunk_by_id_and_a_flushed_tail_behind_live_ingest
                 created_at=last - timedelta(minutes=5 - seq),
             )
         )
-    assert Poller(db=db).rebuild_pending_chunks(sessions={"rb-1"}) == 2
+    assert Maintenance(db=db, pipeline=None).rebuild_pending_chunks(sessions={"rb-1"}) == 2  # type: ignore[arg-type]
 
     rows = conn.execute(
         "SELECT c.start_sequence, c.end_sequence, q.priority, q.content "

@@ -1,82 +1,35 @@
 """compose.yml carries the contracts the code and the operator rely on."""
 
-import signal
 from pathlib import Path
 
 import pytest
 import yaml
 
 from ingestion import poller as poller_mod
-from ingestion.poller import Poller
 
 _SERVICES = yaml.safe_load((Path(__file__).resolve().parent.parent / "compose.yml").read_text())[
     "services"
 ]
 
 
-@pytest.mark.parametrize("name", ["poller", "poller-drain"])
-def test_poller_healthcheck_reads_the_file_run_loop_touches(name):
-    test = _SERVICES[name]["healthcheck"]["test"]
-    assert poller_mod._HEARTBEAT.name in " ".join(test)
+def test_poller_healthcheck_reads_the_files_the_threads_touch():
+    """Both threads must be alive for the check to pass: it names each one's heartbeat."""
+    test = " ".join(_SERVICES["poller"]["healthcheck"]["test"])
+    assert poller_mod._EXTRACTION_HEARTBEAT.name in test
+    assert poller_mod._MAINTENANCE_HEARTBEAT.name in test
 
 
-@pytest.mark.parametrize("name", ["poller", "poller-drain"])
-def test_pollers_get_time_to_finish_their_in_flight_items(name):
+def test_pollers_get_time_to_finish_their_in_flight_items():
     """An item takes minutes; a stop that kills sooner strands its claim for 45 minutes."""
-    assert _SERVICES[name]["stop_grace_period"] == "5m"
+    assert _SERVICES["poller"]["stop_grace_period"] == "5m"
 
 
-@pytest.mark.parametrize(
-    "threads,with_workers,limit", [("3", True, 6), ("1", True, 1), ("4", False, 1)]
-)
-def test_run_loop_drains_two_waves_of_the_pool_per_call(
-    tmp_path, monkeypatch, threads, with_workers, limit
-):
-    """One drain call takes two waves of the thread pool (the serial worker, one item); the
-    drain itself claims a row only as a thread frees up (tests/test_poller.py)."""
-
-    class _Db:
-        def release_stale_claims(self) -> int:
-            return 0
-
-    monkeypatch.setattr(poller_mod, "_HEARTBEAT", tmp_path / "poller.alive")
-    monkeypatch.setattr(signal, "signal", lambda *_: None)
-    monkeypatch.setenv("SYNAPSE_DRAIN_ONLY", "1")
-    monkeypatch.setenv("SYNAPSE_DRAIN_CONCURRENCY", threads)
-    p = Poller(db=_Db(), worker_factory=(lambda: (None, None)) if with_workers else None)  # type: ignore[arg-type,return-value]
-    limits = []
-
-    def drain(batch_limit: int) -> int:
-        limits.append(batch_limit)
-        p.request_stop()
-        return 0
-
-    monkeypatch.setattr(p, "drain_extraction_queue", drain)
-    p.run_loop(interval_seconds=3600)
-    assert limits == [limit]
-
-
-def test_run_loop_touches_the_heartbeat(tmp_path, monkeypatch):
-    class _Db:
-        def release_stale_claims(self) -> int:
-            return 0
-
-    beat = tmp_path / "poller.alive"
-    monkeypatch.setattr(poller_mod, "_HEARTBEAT", beat)
-    monkeypatch.setattr(signal, "signal", lambda *_: None)  # not the test runner's handlers
-    monkeypatch.setenv("SYNAPSE_DRAIN_ONLY", "1")
-    p = Poller(db=_Db())  # type: ignore[arg-type]
-
-    beat_when_drained = []
-
-    def drain(batch_limit: int) -> int:
-        beat_when_drained.append(beat.exists())
-        p.request_stop()
-        return 0
-
-    monkeypatch.setattr(p, "drain_extraction_queue", drain)
-    p.run_loop(interval_seconds=3600)
-    assert beat_when_drained == [True]
+def test_no_service_is_a_drain_only_poller():
+    """The poller does both jobs; SYNAPSE_DRAIN_ONLY is honoured only for a compose that
+    has not been re-applied, never set by this one."""
+    assert "poller-drain" not in _SERVICES
+    for service in _SERVICES.values():
+        assert not any("SYNAPSE_DRAIN_ONLY" in str(e) for e in service.get("environment", []))
 
 
 @pytest.mark.parametrize(

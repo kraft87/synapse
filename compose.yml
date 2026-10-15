@@ -96,38 +96,35 @@ services:
 
   # --- App layer --------------------------------------------------------
 
-  poller: &poller
+  poller:
     <<: *synapse-app
     # container_name removed so this service can be scaled via
-    # `docker compose up -d --scale poller=N`. Replicas claim disjoint
-    # slices of extraction_queue via SELECT ... FOR UPDATE SKIP LOCKED.
+    # `docker compose up -d --scale poller=N`. Every replica runs the extraction thread
+    # and claims disjoint slices of extraction_queue via SELECT ... FOR UPDATE SKIP
+    # LOCKED; one of them, whichever takes the advisory lock, also runs the maintenance
+    # thread (chunks, embeddings, sweeps). SYNAPSE_DRAIN_CONCURRENCY sets the items one
+    # replica extracts at once (default 4); raise it for a burst instead of adding replicas.
     command: python -m ingestion
     environment:
       - LOGFIRE_SERVICE_NAME=synapse-poller
-    # On SIGTERM run_loop lets the items in flight finish (~3-4 min each) before it exits.
-    # Docker's default 10 s kills them first, and their claims then wait out the 45 min
-    # stale-claim sweep and re-run every LLM call. (Watchtower stops containers with its
-    # own timeout, WATCHTOWER_TIMEOUT where watchtower runs: set it to match.)
+    # On SIGTERM both threads stop: the items in flight finish (~3-4 min each) before the
+    # process exits. Docker's default 10 s kills them first, and their claims then wait out
+    # the 45 min stale-claim sweep and re-run every LLM call. (Watchtower stops containers
+    # with its own timeout, WATCHTOWER_TIMEOUT where watchtower runs: set it to match.)
     stop_grace_period: 5m
     healthcheck:
-      # run_loop touches /tmp/poller.alive at the top of every iteration
-      # (ingestion/poller.py). The window is the longest honest iteration: a
-      # drain (45 min is the stale-claim limit) plus the 30 min quota backoff.
-      test: ["CMD-SHELL", "test -n \"$$(find /tmp/poller.alive -mmin -120)\""]
+      # Each thread touches its own file at the top of every iteration
+      # (ingestion/poller.py), so a stalled thread fails the check while the other runs.
+      # The window is the longest honest iteration: a drain (45 min is the stale-claim
+      # limit) plus the 30 min quota backoff.
+      test:
+        - CMD-SHELL
+        - >-
+          test -n "$$(find /tmp/poller.alive -mmin -120)"
+          && test -n "$$(find /tmp/poller.maintenance.alive -mmin -120)"
       interval: 60s
       timeout: 10s
       retries: 3
-
-  poller-drain:
-    # Scaled-out extraction-queue worker: the poller with SYNAPSE_DRAIN_ONLY=1,
-    # which skips summarize / embed (the master `poller` service owns those)
-    # and runs ONLY drain_extraction_queue against the shared queue via FOR
-    # UPDATE SKIP LOCKED claims. Scale via
-    # `docker compose up -d --scale poller-drain=N`.
-    <<: *poller
-    environment:
-      - SYNAPSE_DRAIN_ONLY=1
-      - LOGFIRE_SERVICE_NAME=synapse-poller-drain
 
   mcp-server:
     <<: *synapse-app

@@ -268,7 +268,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # (same-batch twin, 6b/6c duplicate, unresolved endpoint), which used to
         # leave a third of the fresh entities edge-less: so NEW entities are held
         # back here and written per group right before Stage 7 writes edges, only
-        # for the facts it creates. Poller.sweep_orphan_entities stays as the daily safety net
+        # for the facts it creates. Maintenance.sweep_orphan_entities stays as the daily safety net
         # (edges deleted with their episode, a crash between the two writes).
         referenced_uuids: set[str] = set()
         for fact in llm_result.facts:

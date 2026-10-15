@@ -14,8 +14,8 @@ class Settings(BaseSettings):
     # Postgres
     db_url: str = Field(alias="SYNAPSE_DB_URL")
 
-    # Maintenance loop cadence (summaries + embed). Episodes arrive via the
-    # /ingest push hook, not a poll, so this only paces post-ingest work.
+    # Maintenance thread cadence (chunk rebuild, embed, stale-claim sweep). Episodes
+    # arrive via the /ingest push hook, not a poll, so this only paces post-ingest work.
     poll_interval_seconds: int = Field(default=300, alias="POLL_INTERVAL_SECONDS")
 
     # Voyage AI API key (for embeddings)

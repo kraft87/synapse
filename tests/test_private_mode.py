@@ -245,6 +245,9 @@ class _StubDB:
     def atomic(self):
         yield
 
+    def lock_sessions(self, session_ids) -> None:
+        pass
+
     def get_session_span_index(self, session_id: str) -> tuple[set[str], int]:
         return set(), 0
 

@@ -156,6 +156,20 @@ class ExtractionQueueStore(DatabaseConnection):
             ).fetchall()
         return len(result)
 
+    def try_maintenance_lock(self) -> bool:
+        """Try for the session-level advisory lock that makes one poller replica the one
+        that runs maintenance (chunk rebuild, embedding, the sweeps). It is held until this
+        object's connection ends, so a replica that dies hands it over. Trying on the session
+        that already holds it succeeds, so asking every cycle answers for the current
+        connection: a holder that dropped and reconnected gets the lock back only if no
+        other replica took it meanwhile. It needs the connection to be this object's own,
+        so not a pooled one (the poller opens no pool)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT pg_try_advisory_lock(hashtext('poller.maintenance')) AS held"
+            ).fetchone()
+        return bool(row and row["held"])
+
     def release_stale_claims(self, older_than_minutes: int = 45) -> int:
         """Reset GENUINELY-STALE ``status='processing'`` rows back to ``pending``.
 

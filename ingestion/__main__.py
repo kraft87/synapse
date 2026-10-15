@@ -25,8 +25,7 @@ logging.basicConfig(
 #       claude_agent_sdk.messages.create  <-- per-LLM call latency, tokens, model
 #     stage7_write_edges
 #
-# Each poller / drain replica registers under its own service so traces
-# fan out per-worker in the UI.
+# A poller replica's two threads (extraction, maintenance) report under one service.
 logfire.configure(
     service_name=os.environ.get("LOGFIRE_SERVICE_NAME", "synapse-poller"),
     send_to_logfire="if-token-present",
