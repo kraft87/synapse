@@ -235,6 +235,9 @@ def test_error_result_is_not_retried(cli):
         "You've hit your weekly limit · resets Mon 9am (UTC)",
         "You've hit your Opus limit · resets 5pm (UTC)",
         "Your org is out of usage · add funds to continue",
+        # An individual account whose extra-usage credits ran out / whose overage is rejected.
+        "You're out of extra usage · resets 5pm (UTC)",
+        "You've hit your limit · resets 5pm (UTC)",
     ],
 )
 def test_quota_notice_error_result_raises_usage_limit(cli, notice):

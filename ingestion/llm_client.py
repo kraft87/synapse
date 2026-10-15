@@ -189,7 +189,9 @@ _CLI_TIMEOUT_S = 300.0
 # Matched case-insensitively — but only against what can be a CLI quota
 # notice, never against a completion (see ``_is_usage_limit_result``). The CLI
 # builds its notice as "You've hit your <session|weekly|Opus|Sonnet|...> limit
-# · resets 5pm" and "Your org is out of usage · add funds to continue"; its
+# · resets 5pm" (also "You've hit your limit" when overage is rejected),
+# "You're out of extra usage · resets 5pm" (an individual account whose extra-usage
+# credits ran out) and "Your org is out of usage · add funds to continue"; its
 # warnings ("You've used 90% ...", "You're close to ...") are not exhaustion.
 _USAGE_LIMIT_PATTERNS = (
     "usage limit reached",
@@ -197,6 +199,7 @@ _USAGE_LIMIT_PATTERNS = (
     "rate_limit_error",
     "credit balance is too low",
     "out of usage",
+    "out of extra usage",
     "quota exceeded",
     "you've hit your",
 )
