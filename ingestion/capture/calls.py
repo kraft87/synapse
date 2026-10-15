@@ -119,6 +119,23 @@ def _codex_input(payload: dict[str, Any]) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _codex_output(output: Any) -> tuple[str, bool]:
+    """(text, is_error) of a Codex tool output. An MCP tool's arrives as the JSON of its
+    ``CallToolResult`` (``{"content": [{"type": "text", "text": ...}], "isError": ...}``);
+    its text blocks are the result, as they are in a Claude Code transcript. Anything else
+    is the text as it is."""
+    text = result_text(output)
+    if text.lstrip().startswith("{"):
+        try:
+            obj = json.loads(text)
+        except json.JSONDecodeError:
+            return text, False
+        blocks = obj.get("content") if isinstance(obj, dict) else None
+        if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+            return result_text(blocks), bool(obj.get("isError"))
+    return text, False
+
+
 def _codex_calls(records: list[dict[str, Any]]) -> Iterator[ToolCall]:
     pending: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for rec in records:
@@ -132,14 +149,15 @@ def _codex_calls(records: list[dict[str, Any]]) -> Iterator[ToolCall]:
             pending[call_id] = (rec, payload)
         elif ptype in _CODEX_OUTPUTS and call_id in pending:
             use_rec, use = pending.pop(call_id)
+            text, is_error = _codex_output(payload.get("output"))
             yield ToolCall(
                 tool_use_id=call_id,
                 tool_name="shell"
                 if use.get("type") == "local_shell_call"
                 else str(use.get("name") or ""),
                 tool_input=_codex_input(use),
-                result_text=result_text(payload.get("output")),
-                is_error=False,
+                result_text=text,
+                is_error=is_error,
                 session_id="",
                 project=None,
                 timestamp=parse_iso(use_rec.get("timestamp")),

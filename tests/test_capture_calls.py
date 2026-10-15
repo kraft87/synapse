@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from ingestion.capture import episode_tool_calls, sidechain_tool_calls
@@ -150,6 +151,54 @@ def test_codex_function_and_shell_calls_pair_by_call_id():
     assert calls[1].tool_input == {"command": ["curl", "https://example.com"]}
     assert calls[1].result_text == "out"
     assert (calls[0].session_id, calls[0].project) == ("C1", "proj")
+
+
+def _codex_turn(*items: dict) -> list[dict]:
+    def rec(payload: dict) -> dict:
+        return {"timestamp": "2026-09-01T12:00:00Z", "type": "response_item", "payload": payload}
+
+    user = {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]}
+    done = {
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "a"}],
+    }
+    return [rec(p) for p in (user, *items, done)]
+
+
+def test_a_codex_mcp_result_is_read_from_its_call_tool_result_envelope():
+    page = "# A Real Article\n\n" + "The measured latency was low. " * 20
+    envelope = json.dumps({"content": [{"type": "text", "text": page}], "isError": False})
+    failed = json.dumps({"content": [{"type": "text", "text": "boom"}], "isError": True})
+    records = _codex_turn(
+        {"type": "function_call", "name": "mcp__acme__fetch", "call_id": "c1",
+         "arguments": '{"url": "https://example.com/a"}'},
+        {"type": "function_call_output", "call_id": "c1", "output": envelope},
+        {"type": "function_call", "name": "mcp__acme__fetch", "call_id": "c2",
+         "arguments": '{"url": "https://example.com/b"}'},
+        {"type": "function_call_output", "call_id": "c2", "output": failed},
+        {"type": "function_call", "name": "exec", "call_id": "c3", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c3", "output": '{"output": "x"}'},
+    )  # fmt: skip
+    (ep,) = CodexRolloutParser().parse_records(
+        records, "hook", "proj", session_id_hint="C1", with_records=True
+    )
+    ok, bad, other = episode_tool_calls(ep)
+    assert (ok.result_text, ok.is_error) == (page, False)
+    assert (bad.result_text, bad.is_error) == ("boom", True)
+    assert other.result_text == '{"output": "x"}'  # not an MCP result: as it is
+
+
+def test_codex_native_web_search_leaves_no_call_to_capture():
+    """The rollout keeps the query of a native web_search_call and none of its results."""
+    records = _codex_turn(
+        {"type": "web_search_call", "status": "completed",
+         "action": {"type": "search", "query": "synapse memory"}},
+    )  # fmt: skip
+    (ep,) = CodexRolloutParser().parse_records(
+        records, "hook", "proj", session_id_hint="C1", with_records=True
+    )
+    assert episode_tool_calls(ep) == []
 
 
 def test_a_parse_keeps_no_records_unless_asked():

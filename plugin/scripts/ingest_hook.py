@@ -59,6 +59,12 @@ token. That failure bookkeeping lives in synapse_ingest_retry.py, which the
 Codex Stop hook (plugin-codex/hooks/synapse_stop_hook.py) shares, so both
 hosts retry and warn the same way.
 
+A tool result Claude Code saved to a file because it was too large (the transcript keeps
+only "Output too large ... Full output saved to: <path>") is read back into the shipped
+record when the call looks like web research, so the server can capture it
+(persisted_outputs.py: capped per result and per POST, only files that exist under the
+projects directory).
+
 Design constraints:
   * NEVER block or fail the turn. Claude waits for Stop hooks to exit, so the
     actual HTTP work is done in a DETACHED child (start_new_session) and the
@@ -141,6 +147,7 @@ from collections.abc import Callable  # noqa: E402
 from typing import Any  # noqa: E402
 
 import config  # noqa: E402
+import persisted_outputs  # noqa: E402
 import synapse_ingest_retry as retry  # noqa: E402
 import synapse_project  # noqa: E402
 from synapse_filelock import lock_exclusive  # noqa: E402
@@ -380,13 +387,15 @@ def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
     return {c: lb for c in cwds if (lb := synapse_project.project_label(c))}
 
 
-def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
-    """POST a batch of raw transcript records to /ingest; returns the (truncated)
-    response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
-    bulk history import (import_history.py), so all resolve URL/token identically
-    through config.py, and all send the batch's project label (_cwd_labels).
-    Raises on transport/HTTP errors — callers decide how to fail-soft."""
-    payload: dict[str, Any] = {"records": records, "source": source}
+def _payload(records: list[dict[str, Any]], source: str) -> dict[str, Any]:
+    """The /ingest body for a batch of raw transcript records: the records themselves (the
+    results of large tool outputs read in from their files, persisted_outputs) and the
+    batch's project label (_cwd_labels). Shared with `synapse capture`, whose dry run posts
+    the same body to /capture/dry-run."""
+    payload: dict[str, Any] = {
+        "records": persisted_outputs.inline(records, config.PROJECTS_DIR),
+        "source": source,
+    }
     by_cwd = _cwd_labels(records)
     if len(set(by_cwd.values())) == 1:
         payload["project"] = next(iter(by_cwd.values()))
@@ -394,7 +403,16 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
         # A session that moved between repositories: each turn is labelled from its own
         # cwd (an older server ignores this and labels each turn from the cwd's basename).
         payload["cwd_projects"] = by_cwd
-    body = json.dumps(payload).encode()
+    return payload
+
+
+def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
+    """POST a batch of raw transcript records to /ingest; returns the (truncated)
+    response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
+    bulk history import (import_history.py), so all resolve URL/token identically
+    through config.py, and all send the batch's project label (_cwd_labels).
+    Raises on transport/HTTP errors — callers decide how to fail-soft."""
+    body = json.dumps(_payload(records, source)).encode()
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
     # soft, so without it every ingest is silently dropped.

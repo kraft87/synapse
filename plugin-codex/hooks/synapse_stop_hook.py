@@ -50,6 +50,14 @@ copied: plugin/scripts/synapse_ingest_retry.py, imported from this checkout
 both hosts retry and warn by the same rules. Each keeps its own cursor file
 and cursor semantics.
 
+Web research: the server captures it from these same records (ingestion.capture, when it
+has SYNAPSE_WEB_CAPTURE=on), so the hook ships nothing extra. A rollout carries every
+function, custom-tool and shell call with its output inline (Codex truncates a long output
+itself: there is no saved file to read back, unlike Claude Code's persisted tool outputs,
+plugin/scripts/persisted_outputs.py), and an MCP tool's output as its CallToolResult JSON,
+which the server unwraps. The gap: Codex's native web_search_call records the query and
+never the results, so native web search cannot be captured; an MCP search tool can.
+
 Log: ~/.synapse/logs/codex-hook.log (one line per upload or failure).
 
 Env:
