@@ -676,6 +676,60 @@ def test_store_token_never_creates_a_settings_token_slot(settings):
     assert _read_home()["token"] == _DEVICE
 
 
+def test_write_user_config_changes_only_its_key_and_leaves_no_temp_file():
+    _write_settings({"SYNAPSE_URL": _URL, "other": "kept"}, theme="dark")
+    cfg = _load_config()
+    cfg.write_user_config("SYNAPSE_URL", _FOREIGN)
+    assert json.loads(_settings_path().read_text(encoding="utf-8")) == {
+        "pluginConfigs": {
+            "synapse@some-marketplace": {"options": {"SYNAPSE_URL": _FOREIGN, "other": "kept"}}
+        },
+        "theme": "dark",
+    }
+    assert cfg._FILE_OPTIONS["SYNAPSE_URL"] == _FOREIGN
+    assert [p.name for p in _settings_path().parent.iterdir()] == ["settings.json"]
+
+
+def test_write_user_config_refuses_a_settings_file_it_cannot_parse():
+    """The user's Claude Code settings must never be replaced by a file holding only the
+    keys this code knows about."""
+    _settings_path().parent.mkdir(parents=True, exist_ok=True)
+    _settings_path().write_text("{oops", encoding="utf-8")
+    cfg = _load_config()
+    with pytest.raises(RuntimeError, match="isn't valid JSON"):
+        cfg.write_user_config("SYNAPSE_URL", _URL)
+    assert _settings_path().read_text(encoding="utf-8") == "{oops"
+
+
+def test_a_crash_while_writing_settings_leaves_the_previous_file(monkeypatch):
+    _write_settings({"SYNAPSE_URL": _URL})
+    before = _settings_path().read_bytes()
+    cfg = _load_config()
+
+    def crash(src, dst):
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(cfg.synapse_home.os, "replace", crash)
+    with pytest.raises(OSError, match="disk went away"):
+        cfg.write_user_config("SYNAPSE_URL", _FOREIGN)
+    assert _settings_path().read_bytes() == before
+    assert [p.name for p in _settings_path().parent.iterdir()] == ["settings.json"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_settings_written_through_a_symlink_keep_the_link(tmp_path):
+    """A dotfiles repo often owns settings.json; replacing the link would orphan it."""
+    real = tmp_path / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    _settings_path().parent.mkdir(parents=True, exist_ok=True)
+    _settings_path().symlink_to(real)
+    _load_config().write_user_config("SYNAPSE_URL", _URL)
+    assert _settings_path().is_symlink()
+    assert json.loads(real.read_text(encoding="utf-8"))["theme"] == "dark"
+    assert "SYNAPSE_URL" in real.read_text(encoding="utf-8")
+
+
 def test_store_token_with_a_record_removes_the_legacy_device_json():
     """Otherwise the old record would resurface the moment config.json lost its own."""
     _write_legacy_record(_record(_OTHER, surface="dev-old"))

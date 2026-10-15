@@ -155,19 +155,14 @@ def write_user_config(key: str, value: str) -> None:
     store: the MCP entry interpolates `${user_config.<key>}` from here. Used for the server
     URL (the one value the Claude harness must hold itself) and to keep a legacy plaintext
     token slot in step with config.json. Touches only
-    pluginConfigs['synapse@<marketplace>'].options[key]; every other setting is preserved."""
+    pluginConfigs['synapse@<marketplace>'].options[key]; every other setting is preserved.
+    Raises RuntimeError when settings.json isn't valid JSON, OSError when it can't be written."""
     settings = CONFIG_DIR / "settings.json"
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    plugin_configs = data.setdefault("pluginConfigs", {})
+    data = synapse_home.settings_for_update(settings)
     pc_key = _plugin_block(data) or "synapse@synapse"
-    plugin_configs.setdefault(pc_key, {}).setdefault("options", {})[key] = value
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    options = data.setdefault("pluginConfigs", {}).setdefault(pc_key, {}).setdefault("options", {})
+    options[key] = value
+    synapse_home.atomic_write_json(settings, data)
     # Refresh the in-process cache so a same-run read (and any later import) sees the new value.
     _FILE_OPTIONS[key] = value
 
@@ -193,25 +188,6 @@ def plugin_block_options() -> dict:
     key = _plugin_block(data) if isinstance(data, dict) else ""
     opts = ((data.get("pluginConfigs") or {}).get(key) or {}).get("options") if key else None
     return dict(opts) if isinstance(opts, dict) else {}
-
-
-def _drop_user_option(key: str) -> None:
-    """Remove ``key`` from every synapse@* options block in the user settings.json; an
-    unreadable file is left alone."""
-    settings = CONFIG_DIR / "settings.json"
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    touched = False
-    for cfg_key, cfg in (data.get("pluginConfigs") or {}).items() if isinstance(data, dict) else ():
-        opts = cfg.get("options") if isinstance(cfg, dict) else None
-        if str(cfg_key).split("@", 1)[0] == "synapse" and isinstance(opts, dict) and key in opts:
-            del opts[key]
-            touched = True
-    if touched:
-        settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    _FILE_OPTIONS.pop(key, None)
 
 
 # Legacy: pre-consolidation `synapse login` stashed the token here. Read-only fallback so a
@@ -314,7 +290,8 @@ def store_token(token: str, record: dict | None = None, server: str = "") -> Non
         if plugin_url and _origin(plugin_url) == _origin(server):
             write_user_config(_TOKEN_KEY, token)
         else:
-            _drop_user_option(_TOKEN_KEY)
+            synapse_home.drop_plugin_options(CONFIG_DIR / "settings.json", [_TOKEN_KEY])
+            _FILE_OPTIONS.pop(_TOKEN_KEY, None)
 
 
 def token_sha256(token: str) -> str:

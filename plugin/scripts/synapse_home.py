@@ -71,15 +71,15 @@ def load(path: Path | None = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save(data: dict, path: Path | None = None) -> None:
-    """Write ``data`` atomically, owner-only. Raises OSError: callers decide whether a
-    failed write is fatal (the CLI) or ignorable (hook bookkeeping)."""
-    path = path or config_file()
-    created = not path.parent.exists()
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write ``data`` to ``path`` as JSON through a fresh temp file renamed over it, so a
+    crash leaves the previous file, never half of one. The new file is owner-only (a
+    config.json holds a credential), and a symlinked ``path`` (a dotfiles repo) keeps its
+    link: the file it points at is the one replaced. Creates the parent directory. Raises
+    OSError."""
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    if created and os.name != "nt":
-        os.chmod(path.parent, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -91,6 +91,17 @@ def save(data: dict, path: Path | None = None) -> None:
         except OSError:
             pass
         raise
+
+
+def save(data: dict, path: Path | None = None) -> None:
+    """Write ``data`` atomically, owner-only. Raises OSError: callers decide whether a
+    failed write is fatal (the CLI) or ignorable (hook bookkeeping)."""
+    path = path or config_file()
+    created = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if created and os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    atomic_write_json(path, data)
 
 
 def update(changes: dict, path: Path | None = None) -> dict:
@@ -151,3 +162,33 @@ def plugin_options(settings_files) -> dict:
             if str(cfg_key).split("@", 1)[0] == "synapse" and isinstance(opts, dict):
                 merged.update({k: v for k, v in opts.items() if v not in (None, "")})
     return merged
+
+
+def settings_for_update(path: Path) -> dict:
+    """The Claude settings.json at ``path`` to edit and write back: ``{}`` when it doesn't
+    exist yet. Raises RuntimeError when it exists but isn't a readable JSON object, so a
+    rewrite never replaces the user's settings with only the keys this code knows about."""
+    if not path.exists():
+        return {}
+    data = load(path)
+    if not data and path.read_bytes().strip() not in (b"", b"{}"):
+        raise RuntimeError(f"{path} isn't valid JSON; fix it and run this again")
+    return data
+
+
+def drop_plugin_options(path: Path, names) -> None:
+    """Remove ``names`` from every pluginConfigs."synapse@<any>" options block of the
+    settings.json at ``path``. An unreadable file is left alone. Raises OSError."""
+    data = load(path)
+    configs = data.get("pluginConfigs")
+    touched = False
+    for cfg_key, cfg in configs.items() if isinstance(configs, dict) else ():
+        opts = cfg.get("options") if isinstance(cfg, dict) else None
+        if str(cfg_key).split("@", 1)[0] != "synapse" or not isinstance(opts, dict):
+            continue
+        for name in names:
+            if name in opts:
+                del opts[name]
+                touched = True
+    if touched:
+        atomic_write_json(path, data)

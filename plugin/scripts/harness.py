@@ -91,26 +91,6 @@ def _read_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _settings_for_update(path: Path) -> dict:
-    """settings.json to edit and write back: ``{}`` when it doesn't exist yet. Raises
-    RuntimeError when it exists but isn't a readable JSON object, so a rewrite never
-    replaces the user's settings with only the keys this code knows about."""
-    if not path.exists():
-        return {}
-    data = _read_json(path)
-    if not data and path.read_bytes().strip() not in (b"", b"{}"):
-        raise RuntimeError(f"{path} isn't valid JSON; fix it and run this again")
-    return data
-
-
-def _write_json(path: Path, data: dict) -> None:
-    """Write via a temp file and a rename, so a crash never leaves half a settings.json."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.synapse-tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
-
-
 def _plugin_secret(name: str) -> str:
     """A value the old install dialog stored as sensitive: Claude Code keeps those in
     ~/.claude/.credentials.json (Linux, Windows) under pluginSecrets, or in the macOS
@@ -162,19 +142,7 @@ def adopt_legacy() -> list[str]:
 def drop_options(names) -> None:
     """Remove ``names`` from every synapse@* options block in the user settings.json.
     Leaves an unreadable file alone."""
-    path = _user_settings()
-    data = _read_json(path)
-    touched = False
-    for cfg_key, cfg in (data.get("pluginConfigs") or {}).items():
-        opts = cfg.get("options") if isinstance(cfg, dict) else None
-        if str(cfg_key).split("@", 1)[0] != "synapse" or not isinstance(opts, dict):
-            continue
-        for name in names:
-            if name in opts:
-                del opts[name]
-                touched = True
-    if touched:
-        _write_json(path, data)
+    synapse_home.drop_plugin_options(_user_settings(), names)
 
 
 # --------------------------------------------------------------------------- Claude Code
@@ -302,7 +270,7 @@ def _version_tuple(version: str) -> tuple:
 
 def _settings_bootstrap(url: str) -> None:
     path = _user_settings()
-    data = _settings_for_update(path)
+    data = synapse_home.settings_for_update(path)
     data.setdefault("extraKnownMarketplaces", {}).setdefault(
         "synapse", {"source": {"source": "github", "repo": MARKETPLACE_REPO}}
     )
@@ -311,7 +279,7 @@ def _settings_bootstrap(url: str) -> None:
     enabled[key] = True
     configs = data.setdefault("pluginConfigs", {})
     configs.setdefault(key, {}).setdefault("options", {})["SYNAPSE_URL"] = url
-    _write_json(path, data)
+    synapse_home.atomic_write_json(path, data)
 
 
 def update_claude(runner=subprocess.run) -> str | None:
