@@ -17,7 +17,7 @@ import { openEpisode, openSession } from '../hash';
 import { relTime, monoHead, localMinute } from '../tokens';
 import { ErrorBox, EmptyState } from '../components/ui';
 import { useAsync } from '../hooks';
-import { defaultRun, runDuration, runState } from '../dream';
+import { defaultRun, laneCounts, runDuration, runState } from '../dream';
 import { decisionProblem } from '../proposals';
 
 const TABS = [
@@ -410,7 +410,7 @@ function DreamTab() {
         </select>
         <span style={{ ...mono, fontSize: '11.5px', color: 'var(--txt3)' }}>
           {runDuration(run)} · {run.errors.length} error{run.errors.length === 1 ? '' : 's'}
-          {run.ok === false ? ' · failed' : ''}
+          {run.ok === false && runState(run) !== 'interrupted' ? ' · failed' : ''}
         </span>
       </div>
 
@@ -430,6 +430,17 @@ function DreamTab() {
           );
         })}
       </div>
+
+      {/* the counts the lanes keep besides the five above */}
+      {laneCounts(run.counts).length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '16px' }}>
+          {laneCounts(run.counts).map(([k, v]) => (
+            <span key={k} style={{ ...mono, fontSize: '11px', padding: '2px 8px', borderRadius: '4px', background: 'var(--bg2)', border: '1px solid var(--line)', color: 'var(--txt2)' }}>
+              {k} <span style={{ color: 'var(--txt)' }}>{v.toLocaleString()}</span>
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* sample panel for the selected card */}
       <div style={{ border: '1px solid var(--line)', borderRadius: '10px', background: 'var(--bg1)', padding: '14px 16px' }}>

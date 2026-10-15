@@ -15,7 +15,7 @@ import { useStore } from '../state';
 import { LEG_COLOR, LEG_ORDER, cssValue, srcColor, relTime, mono } from '../tokens';
 import { UPlotChart } from '../components/UPlotChart';
 import { useAsync } from '../hooks';
-import { runDuration } from '../dream';
+import { countLine, runDuration } from '../dream';
 
 type Tab = 'recall' | 'ingestion' | 'corpus';
 
@@ -276,7 +276,7 @@ function DreamRunPanel({ run }: { run: DreamRun | null }) {
     lines.push(`duration  ${runDuration(run)}`);
     lines.push(`ok        ${run.ok == null ? '—' : run.ok}`);
     if (stg) lines.push(`stages    ${stg}`);
-    for (const [k, v] of Object.entries(run.counts)) lines.push(`${(k + '            ').slice(0, 24)}${v}`);
+    for (const [k, v] of Object.entries(run.counts)) lines.push(countLine(k, v));
     if (run.errors.length) lines.push(`errors    ${run.errors.join(' | ')}`);
   }
   return (
