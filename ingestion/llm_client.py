@@ -187,18 +187,21 @@ _CLI_TIMEOUT_S = 300.0
 
 # Substrings that indicate the Max-subscription session is over its window.
 # Matched case-insensitively — but only against what can be a CLI quota
-# notice, never against a completion (see ``_is_usage_limit_result``).
+# notice, never against a completion (see ``_is_usage_limit_result``). The CLI
+# builds its notice as "You've hit your <session|weekly|Opus|Sonnet|...> limit
+# · resets 5pm" and "Your org is out of usage · add funds to continue"; its
+# warnings ("You've used 90% ...", "You're close to ...") are not exhaustion.
 _USAGE_LIMIT_PATTERNS = (
     "usage limit reached",
     "your limit will reset at",
     "rate_limit_error",
     "credit balance is too low",
-    "out of usage credits",
+    "out of usage",
     "quota exceeded",
-    "you've hit your limit",
+    "you've hit your",
 )
 
-# A quota notice is one short line ("You've hit your limit · resets 5pm");
+# A quota notice is one short line ("You've hit your session limit · resets 5pm");
 # a reply longer than this is a completion, whatever it mentions.
 _USAGE_NOTICE_MAX_CHARS = 300
 
@@ -380,7 +383,9 @@ def _cli_options(model: str) -> ClaudeAgentOptions:
         # No built-in tools. allowed_tools=[] only removes auto-approval: without
         # this the CLI still ships its ~23 tool definitions (about 10K prompt
         # tokens on every call, measured) and Read/Grep stay callable while the
-        # model reads untrusted transcripts and scraped pages.
+        # model reads untrusted transcripts and scraped pages. (The feature-flagged
+        # Monitor / PushNotification / RemoteTrigger survive it; the env below
+        # removes those.)
         tools=[],
         # Nothing can use a second turn once there are no tools.
         max_turns=1,
@@ -393,9 +398,15 @@ def _cli_options(model: str) -> ClaudeAgentOptions:
         # episodes purged 2026-06-12. Hooks, CLAUDE.md, and output styles
         # are all interactive-session concerns; extraction wants none.
         setting_sources=[],
-        # Each call is a new process with a unique prompt, so the CLI's
-        # prompt-cache write (1.25-2x the input price) is never read back.
-        env={"DISABLE_PROMPT_CACHING": "1"},
+        env={
+            # Each call is a new process with a unique prompt, so the CLI's
+            # prompt-cache write (1.25-2x the input price) is never read back.
+            "DISABLE_PROMPT_CACHING": "1",
+            # No session-title request to Haiku (it carries the whole prompt, so
+            # every call would bill its input twice) and no feature-flagged
+            # tools (~2K tokens): background traffic a one-shot call never needs.
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+        },
         extra_args={
             # The CLI otherwise saves every prompt, turn text included, as a
             # session transcript under ~/.claude/projects: disk churn, and a

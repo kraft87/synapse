@@ -128,9 +128,16 @@ def test_cli_spawns_without_mcp_servers_or_session_transcripts():
     assert "--setting-sources=" in cmd
 
 
-def test_cli_spawns_with_prompt_caching_off():
-    """Every call is a fresh process with a unique prompt, so a cache write is never read."""
-    assert llm_mod._cli_options("claude-haiku-4-5").env == {"DISABLE_PROMPT_CACHING": "1"}
+def test_cli_spawns_with_prompt_caching_off_and_no_background_requests():
+    """Every call is a fresh process with a unique prompt, so a cache write is never read.
+    Nonessential traffic is off too: without it the CLI sends a second request (a
+    session-title call to Haiku carrying the whole prompt, doubling input tokens) and
+    still ships the feature-flagged Monitor / PushNotification / RemoteTrigger tools
+    that ``--tools ""`` does not remove (measured against CLI 2.1.126)."""
+    assert llm_mod._cli_options("claude-haiku-4-5").env == {
+        "DISABLE_PROMPT_CACHING": "1",
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
 
 
 def test_cli_spawns_with_the_thinking_cap():
@@ -220,8 +227,18 @@ def test_error_result_is_not_retried(cli):
 # ---------------------------------------------------------------------------
 
 
-def test_quota_notice_error_result_raises_usage_limit(cli):
-    prompts = cli([_FakeResult("You've hit your limit · resets 5pm (UTC)", is_error=True)])
+@pytest.mark.parametrize(
+    "notice",
+    [
+        # The CLI builds "You've hit your ${scope}limit" (session / weekly / Opus / Sonnet / ...).
+        "You've hit your session limit · resets 5pm (UTC)",
+        "You've hit your weekly limit · resets Mon 9am (UTC)",
+        "You've hit your Opus limit · resets 5pm (UTC)",
+        "Your org is out of usage · add funds to continue",
+    ],
+)
+def test_quota_notice_error_result_raises_usage_limit(cli, notice):
+    prompts = cli([_FakeResult(notice, is_error=True)])
     with pytest.raises(UsageLimitError):
         asyncio.run(agent_call("hi"))
     assert len(prompts) == 1
@@ -258,11 +275,16 @@ class TestUsageLimitDetector:
         assert _is_usage_limit("Your limit will reset at 5pm")
         assert _is_usage_limit("rate_limit_error from API")
         assert _is_usage_limit("Out of usage credits")
-        assert _is_usage_limit("You've hit your limit")
+        assert _is_usage_limit("You've hit your session limit · resets 5pm (UTC)")
+        assert _is_usage_limit("You've hit your weekly limit")
+        assert _is_usage_limit("Your org is out of usage · add funds to continue")
 
     def test_does_not_false_positive_on_unrelated_text(self):
         assert not _is_usage_limit("here is your extraction result")
         assert not _is_usage_limit("entity: rate")  # 'rate' alone, not the phrase
+        # The CLI's warning prefixes are not exhaustion.
+        assert not _is_usage_limit("You've used 90% of your weekly limit")
+        assert not _is_usage_limit("You're close to your usage limit")
         assert not _is_usage_limit("")
         assert not _is_usage_limit(None)
 
