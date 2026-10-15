@@ -501,6 +501,11 @@ def test_decay_retires_observe_but_never_proposed(lane):
 # -------------------------------------------------------------- digest throttle
 
 
+def _counts(result):
+    """The digest's proposal counts, without the served-description size it also reports."""
+    return {k: result[k] for k in ("proposed", "new")}
+
+
 def test_digest_caps_at_five_and_pings_only_on_new(lane, capsys):
     # the shared test DB may hold other proposed rows; run this window empty of them
     lane.execute(
@@ -525,7 +530,7 @@ def test_digest_caps_at_five_and_pings_only_on_new(lane, capsys):
         )
     r1 = N.discord_digest(lane, no_discord=True)
     out1 = capsys.readouterr().out
-    assert r1 == {"proposed": 7, "new": 7}
+    assert _counts(r1) == {"proposed": 7, "new": 7}
     assert out1.count("- `retune`") == 5  # capped at DIGEST_CAP
     assert "+2 more pending (skill_review list)" in out1
     assert "sal 5" in out1.splitlines()[1]  # ranked salience DESC first
@@ -533,7 +538,7 @@ def test_digest_caps_at_five_and_pings_only_on_new(lane, capsys):
     # same pending set again -> no ping, no re-wall
     r2 = N.discord_digest(lane, no_discord=True)
     out2 = capsys.readouterr().out
-    assert r2 == {"proposed": 7, "new": 0}
+    assert _counts(r2) == {"proposed": 7, "new": 0}
     assert "- `retune`" not in out2
 
     # one genuinely new proposal -> pings again
@@ -554,6 +559,43 @@ def test_digest_caps_at_five_and_pings_only_on_new(lane, capsys):
     )
     r3 = N.discord_digest(lane, no_discord=True)
     assert r3["proposed"] == 8 and r3["new"] == 1
+
+
+def test_digest_reports_the_size_of_the_global_descriptions(lane, capsys):
+    def size():
+        r = N.discord_digest(lane, no_discord=True)
+        return r["global_skills"], r["global_description_chars"]
+
+    try:
+        n0, chars0 = size()
+        lane.execute(
+            "INSERT INTO skills_lane.skill_registry (name, scope, body, description, status) "
+            "VALUES ('v2t-big', 'global', 'b', %s, 'active'), "
+            "('v2t-proj', 'project:v2t', 'b', %s, 'active'), "
+            "('v2t-gone', 'global', 'b', %s, 'retired')",
+            ("d" * 300, "p" * 50, "r" * 70),
+        )
+        assert size() == (n0 + 1, chars0 + 300)  # project and retired skills are not counted
+        _mc(
+            lane,
+            "retune",
+            "v2t-digest-size",
+            [
+                {
+                    "session_id": "v2t-sess-z",
+                    "class": "judge",
+                    "signal": "post_fire_deviation",
+                    "quote": "synthetic",
+                }
+            ],
+            direction="fix",
+            target_skills=["v2t-digest-size"],
+        )
+        capsys.readouterr()
+        N.discord_digest(lane, no_discord=True)
+        assert f"{n0 + 1} skills, {chars0 + 300} chars" in capsys.readouterr().out
+    finally:
+        lane.execute("DELETE FROM skills_lane.skill_registry WHERE name LIKE 'v2t-%'")
 
 
 def test_a_failed_discord_post_raises_and_the_batch_pings_again_next_run(lane, monkeypatch, capsys):
@@ -588,9 +630,9 @@ def test_a_failed_discord_post_raises_and_the_batch_pings_again_next_run(lane, m
     with pytest.raises(urllib.error.URLError):  # the stage fails, so the run is recorded not ok
         N.discord_digest(lane, no_discord=False)
     assert "v2t-digest-hook" in capsys.readouterr().out  # the digest is still in the log
-    assert N.discord_digest(lane, no_discord=False) == {"proposed": 1, "new": 1}  # pings again
+    assert _counts(N.discord_digest(lane, no_discord=False)) == {"proposed": 1, "new": 1}  # again
     assert [p["content"].count("v2t-digest-hook") for p in posts] == [1, 1]
-    assert N.discord_digest(lane, no_discord=False) == {"proposed": 1, "new": 0}  # delivered
+    assert _counts(N.discord_digest(lane, no_discord=False)) == {"proposed": 1, "new": 0}
     assert len(posts) == 2
 
 

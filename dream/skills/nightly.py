@@ -259,6 +259,14 @@ def discord_digest(conn, no_discord):
     never clobbers); it is written only once the digest was delivered, and a failed Discord
     POST raises."""
     cur = conn.cursor()
+    # Claude Code puts every served skill's description in each session's context: the total of
+    # the global ones, which every session pays for, shows whether widens are inflating it.
+    cur.execute(
+        "SELECT count(*), COALESCE(sum(length(description)), 0) FROM skills_lane.skill_registry "
+        "WHERE status='active' AND scope='global'"
+    )
+    n_skills, chars = cur.fetchone()
+    size = {"global_skills": n_skills, "global_description_chars": int(chars)}
     cur.execute(
         """SELECT id, kind, name, score, grounded_sessions, judge_sessions, salience, source_detector
              FROM skills_lane.skill_gap_candidates WHERE status='proposed'
@@ -266,7 +274,7 @@ def discord_digest(conn, no_discord):
     )
     rows = cur.fetchall()
     if not rows:
-        return {"proposed": 0, "new": 0}
+        return {"proposed": 0, "new": 0, **size}
     ids = [r[0] for r in rows]
     prev = set((L.get_cursor(conn).get("config") or {}).get("digest_ids") or [])
     new = [i for i in ids if i not in prev]
@@ -279,12 +287,15 @@ def discord_digest(conn, no_discord):
         lines.append(f"- `{kind}` **{name}** (score {score:.1f}, {js} judge{g}{s}{v})")
     if len(rows) > DIGEST_CAP:
         lines.append(f"+{len(rows) - DIGEST_CAP} more pending (skill_review list)")
-    lines.append("\nReview: `/skill-review` (or skill_review.py list) · accept/reject <id>")
+    lines.append(
+        f"\nGlobal skill descriptions: {n_skills} skills, {int(chars)} chars in every session"
+    )
+    lines.append("Review: `/skill-review` (or skill_review.py list) · accept/reject <id>")
     msg = "\n".join(lines)
 
     if not new:
         print(f"(digest: {len(rows)} pending, none new since last digest — not pinging)")
-        return {"proposed": len(rows), "new": 0}
+        return {"proposed": len(rows), "new": 0, **size}
     # Notifier: POST to a Discord webhook if configured; otherwise just print (default).
     if not no_discord and config.DISCORD_WEBHOOK:
         try:
@@ -307,7 +318,7 @@ def discord_digest(conn, no_discord):
         (json.dumps({"digest_ids": ids}),),
     )
     conn.commit()
-    return {"proposed": len(rows), "new": len(new)}
+    return {"proposed": len(rows), "new": len(new), **size}
 
 
 #: The stages that consume the run's episode window: when one fails, the cursor holds.

@@ -53,7 +53,9 @@ PHRASINGS THE DESCRIPTION MISSES (from real sessions):
 
 Rewrite the description so it ALSO covers those phrasings. Keep everything it already
 covers and its voice; add the missing trigger vocabulary compactly; do not describe new
-capabilities. One line, at most {max_chars} characters, no line breaks.
+capabilities. Every session carries every skill's description in its context, so spend few
+characters: tighten the existing wording where you need room. One line, at most {max_chars}
+characters (it is {current_chars} now), no line breaks.
 
 Output ONLY a JSON object, no prose: {{"description": "..."}}"""
 
@@ -111,7 +113,8 @@ def draft_widen(name: str, current: str, evidence) -> str:
             name=name,
             description=old,
             phrasings="\n".join(f"- {p}" for p in phrasings),
-            max_chars=D.MAX_DESCRIPTION,
+            max_chars=D.widen_limit(old),
+            current_chars=len(old),
         )
     )
     obj = _extract_json(raw or "") or {}

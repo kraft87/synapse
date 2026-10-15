@@ -27,6 +27,8 @@ MIN_SHRINK = 0.4
 MAX_GROWTH = 3
 GROWTH_SLACK = 2000
 MAX_DESCRIPTION = 1024  # Claude Code's skill description cap
+WIDEN_CAP = 400  # a widen keeps a description under this length unless it already was longer
+WIDEN_MAX_GROWTH = 160  # and adds at most this many characters
 
 
 class DraftProblem(ValueError):
@@ -189,6 +191,15 @@ def only_description_changed(old: str, new: str) -> bool:
     return skill_description(old) != skill_description(new)
 
 
+def widen_limit(old_description: str) -> int:
+    """The longest a widened description may be. Claude Code lists every served skill's
+    description in every session's context, so each widen is paid for by every session on every
+    machine: it adds at most WIDEN_MAX_GROWTH characters, may not take a description past
+    WIDEN_CAP, and one that is already longer may not grow (the drafter is asked to compress)."""
+    n = len(old_description)
+    return min(n + WIDEN_MAX_GROWTH, max(n, WIDEN_CAP))
+
+
 def widen_draft(old: str, new_description: str) -> str:
     """The widen draft: `old` with only its description replaced, verified. Raises
     DraftProblem when the splice can't be made, didn't round-trip, or touched anything else."""
@@ -199,6 +210,13 @@ def widen_draft(old: str, new_description: str) -> str:
         raise DraftProblem(
             f"the new description is {len(new_description)} chars, over Claude Code's "
             f"{MAX_DESCRIPTION}"
+        )
+    was = skill_description(old)
+    if len(new_description) > widen_limit(was):
+        raise DraftProblem(
+            f"the new description is {len(new_description)} chars; a widen of this "
+            f"{len(was)}-char description may be at most {widen_limit(was)}, because every "
+            "session carries the descriptions in its context"
         )
     draft = replace_description(old, new_description)
     if draft is None:

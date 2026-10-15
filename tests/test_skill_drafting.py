@@ -121,6 +121,30 @@ def test_a_refused_widen_says_why():
         D.widen_draft(_BODY, "x" * 1025)
 
 
+def test_a_widen_adds_a_bounded_number_of_characters():
+    # every session carries every skill's description: a widen can't just keep growing it
+    old = D.skill_description(_BODY)
+    assert D.widen_limit(old) == len(old) + D.WIDEN_MAX_GROWTH  # a short one: +160
+    assert D.widen_limit("x" * 300) == D.WIDEN_CAP  # nearing the cap: not past it
+    assert D.widen_limit("x" * 700) == 700  # already long: no growth at all
+    ok = old + " Also snapshot the db."
+    assert D.skill_description(D.widen_draft(_BODY, ok)) == ok
+    with pytest.raises(D.DraftProblem, match=r"may be at most 2\d\d"):
+        D.widen_draft(_BODY, old + " " + "snapshot " * 20)
+    long_desc = "Run " + "the nightly backup of the demo database " * 17
+    long_body = _BODY.replace(old, long_desc.strip())
+    with pytest.raises(D.DraftProblem, match="may be at most"):
+        D.widen_draft(long_body, long_desc.strip() + " plus a snapshot")
+
+
+def test_the_widen_prompt_states_the_limit_and_the_current_size(monkeypatch):
+    calls = _stub_llm(monkeypatch, json.dumps({"description": "Back up or snapshot the db."}))
+    old = D.skill_description(_BODY)
+    DR.draft_widen("demo-backup", _BODY, _WIDEN_EV)
+    prompt = " ".join(calls[0].split())
+    assert f"at most {D.widen_limit(old)} characters (it is {len(old)} now)" in prompt
+
+
 def test_only_description_changed_rejects_any_other_edit():
     edited = _BODY.replace("description: Run", "description: Snapshot or run").replace(
         "1. Dump", "1. Carefully dump"
