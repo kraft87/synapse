@@ -36,9 +36,18 @@ def test_validator_accepts_all_bucket_id_forms():
                 "n:45",  # note
                 "t:9",  # timeline
                 "w:7",  # web
-                "f:0b3c1d2e-4f56-7890-abcd-ef0123456789",  # fact (KG edge uuid)
+                "f:456",  # fact (kg_relationships.id)
             ],
         )
+        is None
+    )
+
+
+def test_validator_still_accepts_the_uuid_fact_ids_served_before_short_ids():
+    # recall() served "f:<edge uuid>" until facts moved to "f:<kg_relationships.id>"; a
+    # rating drafted from an older transcript must still file.
+    assert (
+        _feedback_ids_error("helpful", ["f:0b3c1d2e-4f56-7890-abcd-ef0123456789", "f:12345678"])
         is None
     )
 
@@ -75,7 +84,6 @@ def test_web_item_id_is_single_prefixed_and_ratable():
         ["n:"],  # empty numeric part
         ["e:1\n"],  # fullmatch, not match — trailing newline rejected
         [123],  # non-string entries rejected, not coerced
-        ["f:1"],  # fact id is a uuid, not an int
         ["f:short"],  # non-hex / too-short uuid rejected
         ["t:abc"],  # timeline id must be numeric
         ["g:1"],  # unknown numeric kind

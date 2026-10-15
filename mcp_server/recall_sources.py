@@ -299,7 +299,7 @@ class RecallSourcesMixin:
                 rows = conn.execute(
                     f"""
                     SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
-                           o.uuid AS old_uid, o.fact AS old_fact
+                           o.id AS old_id, o.fact AS old_fact
                     FROM kg_relationships a
                     JOIN kg_relationships o
                       ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
@@ -332,13 +332,13 @@ class RecallSourcesMixin:
             r = by_uid.get(uid)
             if r is None:
                 continue
-            # id is the invalidated (old) edge's uuid, "f:<uuid>" like a regular fact.
+            # id is the invalidated (old) edge's id, "f:<id>" like a regular fact.
             # Collision-free: the facts bucket serves the CURRENT edge (a.uuid), never
             # the superseded predecessor (o.uuid, enforced <> a.uuid above). Lets the
             # stale pair be cited in recall_feedback.
             out.append(
                 {
-                    "id": f"f:{r['old_uid']}",
+                    "id": f"f:{r['old_id']}",
                     "fact": r["old_fact"],
                     "superseded_by": r["now_fact"],
                 }
@@ -448,7 +448,7 @@ class RecallSourcesMixin:
         first, distance-gated (_SUP_MAX_DIST) so only on-topic superseded facts pull their
         correction in. The caller drops those it already serves and caps the rest. Go-forward
         coverage only (no link => skipped); never returns the stale fact itself. Shape matches
-        the KG fact leg ({fact, _uuid, _date, _ongoing, _supported}) so it flows through fact
+        the KG fact leg ({fact, _uuid, _id, _date, _ongoing, _supported}) so it flows through fact
         serving. Fail-open — a lookup error just yields no extras.
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
@@ -467,7 +467,7 @@ class RecallSourcesMixin:
         try:
             with self._pg() as conn:
                 rows = conn.execute(
-                    "SELECT n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
+                    "SELECT n.id, n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
                     f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
                     "FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
@@ -503,6 +503,7 @@ class RecallSourcesMixin:
                     {
                         "fact": fact,
                         "_uuid": u,
+                        "_id": r["id"],
                         "_date": r.get("t_valid"),
                         "_ongoing": r.get("ongoing"),
                         "_supported": r.get("last_supported_at"),

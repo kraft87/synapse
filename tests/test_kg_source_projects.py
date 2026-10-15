@@ -330,6 +330,13 @@ def _seed_kg(conn) -> dict[str, int]:
 _ALL = {"v-ok", "v-mixed", "v-web", "b-ok", "b-personal", "b-two", "h-ok", "h-gone"}
 
 
+def _served_uuids(conn, facts: list[dict[str, Any]]) -> set[str]:
+    """The edge uuids behind served facts (``{"id": "f:<kg_relationships.id>"}``)."""
+    ids = [int(f["id"].removeprefix("f:")) for f in facts]
+    rows = conn.execute("SELECT uuid FROM kg_relationships WHERE id = ANY(%s)", (ids,)).fetchall()
+    return {r[0] for r in rows}
+
+
 def _uuids(facts: list[dict[str, Any]]) -> set[str]:
     return {f["_uuid"] for f in facts}
 
@@ -355,6 +362,9 @@ def test_full_trust_kg_leg_still_serves_everything(kg, db_url):
     facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), GROUP, [], 20)
     assert _uuids(facts) == _ALL
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
+    # Every fact carries kg_relationships.id, the number it is served and rated under.
+    ids = {r[0]: r[1] for r in kg.execute("SELECT uuid, id FROM kg_relationships WHERE uuid <> ''")}
+    assert {f["_uuid"]: f["_id"] for f in facts} == {u: ids[u] for u in _ALL}
 
 
 def test_identical_fact_text_serves_once(kg, db_url):
@@ -447,9 +457,9 @@ def test_superseded_pairs_need_both_sides_in_scope(kg, db_url):
     r = Recall(db_url, "")
     uuids = ["n-ok", "n-2", "n-3"]
     scoped = r._fetch_superseded_pairs_pg(GROUP, uuids, 10, allowed_projects=[WORK])
-    assert [x["id"] for x in scoped] == ["f:o-ok"]
+    assert _served_uuids(kg, scoped) == {"o-ok"}
     full = r._fetch_superseded_pairs_pg(GROUP, uuids, 10)
-    assert [x["id"] for x in full] == ["f:o-ok", "f:o-2", "f:o-3"]
+    assert [next(iter(_served_uuids(kg, [x]))) for x in full] == ["o-ok", "o-2", "o-3"]
 
 
 def test_supersession_surface_needs_both_edges_in_scope(kg, db_url):
@@ -498,12 +508,11 @@ def test_restricted_recall_serves_only_fully_covered_facts(kg, db_url):
     full = register_full(kg)
 
     out = _recall_engine(db_url).recall("widget", surface=restricted)
-    served = {f["id"].removeprefix("f:") for f in out["facts"]}
-    assert served == {"v-ok", "b-ok", "h-ok"}
+    assert _served_uuids(kg, out["facts"]) == {"v-ok", "b-ok", "h-ok"}
     assert "warnings" not in out
 
     out_full = _recall_engine(db_url).recall("widget", surface=full)
-    assert {f["id"].removeprefix("f:") for f in out_full["facts"]} == _ALL
+    assert _served_uuids(kg, out_full["facts"]) == _ALL
 
 
 def test_restricted_recall_scopes_the_supersession_extras(kg, db_url):
@@ -525,7 +534,7 @@ def test_restricted_recall_scopes_the_supersession_extras(kg, db_url):
 
     out = _recall_engine(db_url).recall("widget", surface=restricted)
     assert out.get("episodes"), "the work turn is served, so the overlay runs"
-    assert "succ-work" in {f["id"].removeprefix("f:") for f in out["facts"]}
+    assert "succ-work" in _served_uuids(kg, out["facts"])
     assert "current personal answer" not in str(out)
 
     out_full = _recall_engine(db_url).recall("widget", surface=full)
@@ -664,7 +673,11 @@ def test_recall_without_the_column_matches_the_pre_056_restricted_serve(no_colum
     assert "warnings" not in out
 
     out_full = _engine_on(tx).recall("widget", trust=FULL_TRUST)
-    assert {f["id"].removeprefix("f:") for f in out_full["facts"]} >= _ALL
+    # Read on the transaction that hides the column: the committed connection would wait
+    # on its table lock.
+    ids = [int(f["id"].removeprefix("f:")) for f in out_full["facts"]]
+    rows = tx.execute("SELECT uuid FROM kg_relationships WHERE id = ANY(%s)", (ids,)).fetchall()
+    assert {r["uuid"] for r in rows} >= _ALL
 
 
 def test_applying_056_under_a_running_engine_takes_effect_without_a_restart(

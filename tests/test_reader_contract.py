@@ -68,7 +68,7 @@ def _wired(kg_facts: list[dict]) -> Recall:
 
 def _internal(served: dict, uid: str) -> dict:
     """Fixture 'served' shape -> the KG leg's internal row."""
-    row = {"fact": served["fact"], "_uuid": uid, "_date": served.get("date")}
+    row = {"fact": served["fact"], "_uuid": uid, "_id": 7, "_date": served.get("date")}
     row["_ongoing"] = served.get("ongoing")
     row["_supported"] = served.get("supported")
     return row
@@ -86,7 +86,7 @@ def test_served_fact_carries_its_currency_signals(case):
     r = _wired([_internal(case["served"], "u-1")])
     out = r.recall(query="q", project=None, session_focus=[], group_id="technical", trust=_FULL)
     (fact,) = out["facts"]
-    assert fact["id"] == "f:u-1"
+    assert fact["id"] == "f:7"
     assert fact["fact"] == case["served"]["fact"]
     assert fact.get("date") == case["served"].get("date")
     # `ongoing` appears only when true; `supported` only when the user ever asserted it
@@ -97,10 +97,17 @@ def test_served_fact_carries_its_currency_signals(case):
 
 def test_pre_058_facts_serve_exactly_as_before():
     r = _wired(
-        [{"fact": "User uses Postgres", "_uuid": "u-2", "_date": "2026-06-10T00:00:00+00:00"}]
+        [
+            {
+                "fact": "User uses Postgres",
+                "_uuid": "u-2",
+                "_id": 8,
+                "_date": "2026-06-10T00:00:00+00:00",
+            }
+        ]
     )
     out = r.recall(query="q", project=None, session_focus=[], group_id="technical", trust=_FULL)
-    assert out["facts"] == [{"fact": "User uses Postgres", "id": "f:u-2", "date": "2026-06-10"}]
+    assert out["facts"] == [{"fact": "User uses Postgres", "id": "f:8", "date": "2026-06-10"}]
 
 
 def test_contract_is_on_the_always_loaded_surfaces():
@@ -119,3 +126,44 @@ def test_contract_is_on_the_always_loaded_surfaces():
         "describes that document",
     ):
         assert needle in doc, needle
+
+
+@pytest.mark.parametrize(
+    ("stored", "served"),
+    [
+        # an instant: the user's day, not the UTC one (Toronto is behind UTC in October)
+        ("2026-10-11T00:30:00+00:00", "2026-10-10"),
+        ("2026-10-11T16:30:00+00:00", "2026-10-11"),
+        # a date the extractor read with no time of day, stored at UTC midnight before date-only
+        # values moved to noon: it keeps its own date instead of landing on the day before
+        ("2026-01-31T00:00:00+00:00", "2026-01-31"),
+        # the same date stored at noon UTC, as dates are written now
+        ("2026-01-31T12:00:00+00:00", "2026-01-31"),
+    ],
+)
+def test_a_fact_is_served_under_the_users_day(stored, served, monkeypatch):
+    from datetime import datetime
+
+    from mcp_server.recall_presentation import fact_day
+
+    monkeypatch.setenv("SYNAPSE_TIMEZONE", "America/Toronto")
+    assert fact_day(stored) == served
+    assert fact_day(datetime.fromisoformat(stored)) == served
+
+
+def test_recall_serves_fact_dates_in_the_users_zone(monkeypatch):
+    monkeypatch.setenv("SYNAPSE_TIMEZONE", "America/Toronto")
+    r = _wired(
+        [
+            {
+                "fact": "User rode the bike",
+                "_uuid": "u-3",
+                "_id": 9,
+                "_date": "2026-10-11T00:30:00+00:00",
+                "_supported": "2026-10-11T01:00:00+00:00",
+            },
+        ]
+    )
+    out = r.recall(query="q", project=None, session_focus=[], group_id="technical", trust=_FULL)
+    (fact,) = out["facts"]
+    assert (fact["date"], fact["supported"]) == ("2026-10-10", "2026-10-10")

@@ -35,6 +35,11 @@ def _mix(i: int, j: int, wi: float) -> str:
     return "[" + ",".join(map(str, v)) + "]"
 
 
+def _edge_id(conn, uuid_: str) -> int:
+    """kg_relationships.id of the edge seeded under ``uuid_``: what a fact is served as."""
+    return conn.execute("SELECT id FROM kg_relationships WHERE uuid = %s", (uuid_,)).fetchone()[0]
+
+
 def _seed(conn) -> None:
     conn.execute("TRUNCATE kg_relationships RESTART IDENTITY CASCADE")
     conn.execute(
@@ -57,6 +62,7 @@ def test_query_matching_invalid_fact_surfaces_successor(conn, db_url):
     out = r._surface_supersessions(_axis_list(1), GROUP)
     assert len(out) == 1
     assert out[0]["_uuid"] == "n-1"
+    assert out[0]["_id"] == _edge_id(conn, "n-1")
     assert out[0]["fact"] == "Synapse uses Postgres now"  # the CURRENT fact, not the stale one
     assert str(out[0]["_date"]).startswith("2026-06-10")  # successor's t_valid
 
@@ -94,7 +100,7 @@ def test_superseded_pair_needs_a_link_or_the_same_predicate(conn, db_url):
     r = Recall(db_url, "")
     out = r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)
     # DISTINCT ON keeps the most recently retired genuine predecessor: the linked one.
-    assert [x["id"] for x in out] == ["f:linked"]
+    assert [x["id"] for x in out] == [f"f:{_edge_id(conn, 'linked')}"]
     assert out[0]["superseded_by"] == "User corrected the assistant on 10-08"
 
 
@@ -109,7 +115,8 @@ def test_same_predicate_without_a_link_still_pairs(conn, db_url):
     _seed_pairs(conn)
     conn.execute("DELETE FROM kg_relationships WHERE uuid = 'linked'")
     r = Recall(db_url, "")
-    assert [x["id"] for x in r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)] == ["f:same-name"]
+    pairs = r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)
+    assert [x["id"] for x in pairs] == [f"f:{_edge_id(conn, 'same-name')}"]
 
 
 def _seed_far_link(conn) -> dict[str, int]:
@@ -152,7 +159,7 @@ def test_close_successor_link_still_overlays_its_episode(conn, db_url):
     r = Recall(db_url, "")
     assert r._episode_supersessions([eid], GROUP) == {eid: ["Synapse uses Postgres now"]}
     pairs = r._fetch_superseded_pairs_pg(GROUP, ["n-1"], 10)
-    assert [x["id"] for x in pairs] == ["f:p-1"]
+    assert [x["id"] for x in pairs] == [f"f:{_edge_id(conn, 'p-1')}"]
 
 
 def test_overlay_never_serves_a_retired_successor(conn, db_url):

@@ -17,7 +17,9 @@ from mcp_server.http_helpers import err, unauthorized
 logger = logging.getLogger(__name__)
 
 
-_FEEDBACK_ID_RE = re.compile(r"^(?:[entw]:\d+|f:[0-9a-fA-F-]{8,})$")
+# Facts are served as "f:<kg_relationships.id>"; the "f:<uuid>" form recall() served before
+# that stays valid so ratings drafted from an older transcript still file.
+_FEEDBACK_ID_RE = re.compile(r"^(?:[entwf]:\d+|f:[0-9a-fA-F-]{8,})$")
 
 
 def register(
@@ -29,17 +31,17 @@ def register(
         """Validation error for recall_feedback's helpful/noise lists, or None if valid.
 
         Accepts None or a list of served-id strings — "e:N" episode, "n:N" note,
-        "f:<uuid>" fact, "t:N" timeline, "w:N" web — exactly as recall() serves them.
-        Anything else is rejected."""
+        "f:N" fact (or an older "f:<uuid>"), "t:N" timeline, "w:N" web — exactly as
+        recall() serves them. Anything else is rejected."""
         if ids is None:
             return None
         if not isinstance(ids, list):
-            return f"{field} must be a list of served ids like ['e:123', 'f:<uuid>']"
+            return f"{field} must be a list of served ids like ['e:123', 'f:456']"
         bad = [i for i in ids if not (isinstance(i, str) and _FEEDBACK_ID_RE.fullmatch(i))]
         if bad:
             return (
                 f"{field} contains invalid ids {bad!r} — expected recall-served ids: "
-                '"e:N" episode, "n:N" note, "f:<uuid>" fact, "t:N" timeline, "w:N" web'
+                '"e:N" episode, "n:N" note, "f:N" fact, "t:N" timeline, "w:N" web'
             )
         return None
 
@@ -119,7 +121,7 @@ def register(
         serving miss, the highest-value signal) vs "filesystem" / "live_system" /
         "web" / "user" (memory never had it) vs "nowhere" (still unresolved).
 
-        Rate any served id verbatim — "e:N" episodes, "f:<uuid>" facts (and
+        Rate any served id verbatim — "e:N" episodes, "f:N" facts (and
         superseded_facts), "t:N" timeline, "w:N" web — plus
         "n:N" note ids from the session-start board or fetch(): WHEN a board
         note shaped your answer (or misled it), rate it too. A comment-only
@@ -133,7 +135,7 @@ def register(
 
         Args:
             query: The recall query being rated, verbatim.
-            helpful: Served ids that were load-bearing ("e:123", "f:<uuid>", "w:7").
+            helpful: Served ids that were load-bearing ("e:123", "f:456", "w:7").
             noise: Served ids that were irrelevant or distracting.
             missing: The specific content you needed but were not served — omit
                 entirely unless you can name it AND believe memory holds it.

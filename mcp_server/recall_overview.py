@@ -11,6 +11,7 @@ from ingestion import embedding as _embedding
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.recall_presentation import apply_supersessions as _apply_supersessions
+from mcp_server.recall_presentation import fact_day as _fact_day
 from mcp_server.recall_presentation import parse_episode_ids as _parse_episode_ids
 from mcp_server.recall_presentation import to_web_recall_item as _to_web_recall_item
 from mcp_server.recall_ranking import served_chars as _served_chars
@@ -50,8 +51,9 @@ class RecallOverviewMixin:
         entity-level precision. The summary layer was retired (task #63).
 
         write_feedback=False suppresses the retrieval_count bump on surfaced facts — used
-        by the auto-recall memory hook so automatic (non-agentic) recalls don't pollute the
-        frequency-feedback signal that ranks future results. History fetch is unaffected.
+        by the auto-recall memory hook so automatic (non-agentic) recalls don't count as
+        served in the dashboard. That counter ranks nothing: only the episode counter,
+        bumped by the drill-down tools, feeds ranking (``feedback_multiplier``).
 
         ``source`` tags the call origin (e.g. "mcp-tool", "http", "recall-hook:session")
         on the recall_metrics row so per-origin metrics are filterable in SQL.
@@ -230,8 +232,9 @@ class RecallOverviewMixin:
                 sup_candidates = [f for f in sup_candidates if f.get("_uuid") not in own_facts]
                 n_self_facts_excluded = len(own_facts)
         facts_internal = kg_results[: settings._FACT_LIMIT]  # carry _uuid for bump + superseded
-        # Feedback loop: bump retrieval_count on every surfaced edge so frequent hits
-        # float higher next time. Already fire-and-forget — never blocks the response.
+        # Bump retrieval_count on every surfaced edge: the dashboard's "served" count.
+        # Nothing in ranking reads the fact counter. Fire-and-forget, never blocks the
+        # response.
         surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
         if surfaced_edge_uuids and write_feedback:
             self._increment_fact_retrieval_counts(surfaced_edge_uuids, group_id)
@@ -303,7 +306,7 @@ class RecallOverviewMixin:
         # in _search_web_reranked. Floor self-gates on intent, so this is often empty.
         web_chunks, ms_web = f_web.result() if f_web is not None else ([], 0.0)
 
-        # Surface the internal _uuid to the caller as a "f:<uuid>" id (below) so facts
+        # Surface the edge's kg_relationships.id to the caller as "f:<id>" (below) so facts
         # are citable in recall_feedback, same as episodes carry "e:N".
         # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
@@ -334,14 +337,14 @@ class RecallOverviewMixin:
         facts: list[dict[str, Any]] = []
         for f in served_facts:
             item: dict[str, Any] = {"fact": f["fact"]}
-            if (uid := f.get("_uuid")) is not None:
-                item["id"] = f"f:{uid}"  # KG edge uuid — cite in recall_feedback (not fetch())
+            if (fact_id := f.get("_id")) is not None:
+                item["id"] = f"f:{fact_id}"  # KG edge id — cite in recall_feedback (not fetch())
             if (d := f.get("_date")) is not None:
-                item["date"] = str(d)[:10]
+                item["date"] = _fact_day(d)
             if f.get("_ongoing"):
                 item["ongoing"] = True
             if (sup := f.get("_supported")) is not None:
-                item["supported"] = str(sup)[:10]
+                item["supported"] = _fact_day(sup)
             facts.append(item)
 
         # Episode-validity overlay: if a served episode/passage asserted a claim the KG has since
@@ -405,7 +408,7 @@ class RecallOverviewMixin:
         # because passages share a parent id.
         served_ids: dict[str, Any] = {
             "episodes": list(dict.fromkeys(it["id"] for it in (ep_items or []) if it.get("id"))),
-            "facts": [f["_uuid"] for f in served_facts if f.get("_uuid")],
+            "facts": [f"f:{f['_id']}" for f in served_facts if f.get("_id") is not None],
             "web": [c["id"] for c in web_chunks if c.get("id")],
             "notes": [it["id"] for it in note_items if it.get("id")],
             "n_echo_suppressed": n_echo_suppressed,

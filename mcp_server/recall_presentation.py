@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from datetime import UTC, datetime, time
 from typing import Any
 
 from ingestion.localtime import local_date
@@ -13,6 +14,26 @@ _ROLE_MARKER_RE = re.compile(
 )
 _USER_MARKERS = {"user", "attachments"}
 _FETCH_MAX = 20
+
+
+def fact_day(ts: Any) -> str:
+    """The calendar day a fact's ``t_valid`` / ``last_supported_at`` is served under.
+
+    An instant is the user's day (``local_date``): a fact said at 20:30 EDT is today's, not
+    tomorrow's. A value at exactly 00:00:00 UTC is a date the extractor read with no time of
+    day (written that way before date-only values were stored at noon UTC, and until
+    scripts/restamp_date_only_dates.py has run), so it keeps its own date: moved into the
+    user's zone it would show the day before."""
+    if isinstance(ts, str) and len(ts) > 10:
+        try:
+            ts = datetime.fromisoformat(ts)
+        except ValueError:
+            return ts[:10]
+    if isinstance(ts, datetime):
+        utc = ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
+        if utc.time() == time(0):
+            return utc.date().isoformat()
+    return local_date(ts)
 
 
 def to_web_recall_item(row: dict[str, Any]) -> dict[str, Any]:

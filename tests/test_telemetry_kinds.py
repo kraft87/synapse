@@ -176,11 +176,14 @@ def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypat
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     q = f"telemetry self exclusion facts {uuid.uuid4().hex[:8]}"
     engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
-    kg = [{"fact": f"fact {k}", "_uuid": k, "_date": None} for k in ("own-1", "old-1", "own-2")]
+    kg = [
+        {"fact": f"fact {k}", "_uuid": k, "_id": i, "_date": None}
+        for i, k in enumerate(("own-1", "old-1", "own-2"), start=1)
+    ]
     engine._search_kg = lambda *a, **k: ([dict(f) for f in kg], [])
     engine._surface_supersessions = lambda *a, **k: [
-        {"fact": "successor own-3", "_uuid": "own-3", "_date": None},
-        {"fact": "successor old-2", "_uuid": "old-2", "_date": None},
+        {"fact": "successor own-3", "_uuid": "own-3", "_id": 4, "_date": None},
+        {"fact": "successor old-2", "_uuid": "old-2", "_id": 5, "_date": None},
     ]
     asked: list[tuple[list[str], str]] = []
 
@@ -193,27 +196,30 @@ def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypat
     engine._increment_fact_retrieval_counts = lambda uuids, gid: bumped.append(list(uuids))
     mark = _watermark(conn)
     out = engine.recall(q, source="mcp-tool", surface=full_surface, self_session="MY-SESSION")
-    assert [f["id"] for f in out["facts"]] == ["f:old-1", "f:old-2"]
+    assert [f["id"] for f in out["facts"]] == ["f:2", "f:5"]
     assert bumped == [["old-1"]]
     assert all(session == "MY-SESSION" for _, session in asked)
 
     row = _newest(conn, engine, "recall", "served_ids", mark)
     assert row is not None
     (served,) = row
-    assert served["facts"] == ["old-1", "old-2"]
+    assert served["facts"] == ["f:2", "f:5"]  # as served, so ratings join on them
     assert served["n_self_facts_excluded"] == 3
 
 
 def test_recall_without_self_session_never_looks_up_fact_provenance(db_url, full_surface):
     engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
-    engine._search_kg = lambda *a, **k: ([{"fact": "f", "_uuid": "own-1", "_date": None}], [])
+    engine._search_kg = lambda *a, **k: (
+        [{"fact": "f", "_uuid": "own-1", "_id": 9, "_date": None}],
+        [],
+    )
 
     def _never(*a, **k):
         raise AssertionError("no self_session, no lookup")
 
     engine._self_session_facts = _never
     out = engine.recall("no hook here", source="mcp-tool", surface=full_surface)
-    assert [f["id"] for f in out["facts"]] == ["f:own-1"]
+    assert [f["id"] for f in out["facts"]] == ["f:9"]
 
 
 # ---------------------------------------------------------------------------

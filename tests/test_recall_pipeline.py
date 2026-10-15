@@ -48,8 +48,8 @@ def _pool(n: int, session: str | None = None, start: int = 0) -> list[dict[str, 
     ]
 
 
-def _fact(uuid: str) -> dict[str, Any]:
-    return {"fact": f"fact {uuid}", "_uuid": uuid, "_date": None}
+def _fact(uuid: str, fact_id: int) -> dict[str, Any]:
+    return {"fact": f"fact {uuid}", "_uuid": uuid, "_id": fact_id, "_date": None}
 
 
 def _engine(pool: list[dict[str, Any]] | None = None, scores: list[float] | None = None):
@@ -126,12 +126,12 @@ def test_supersession_surface_runs_beside_the_kg_leg():
 
 def test_supersession_successors_are_deduped_against_served_facts_and_capped():
     r, _ = _engine()
-    r._search_kg = lambda *a, **k: ([_fact("served-1")], [])
+    r._search_kg = lambda *a, **k: ([_fact("served-1", 1)], [])
     r._surface_supersessions = lambda *a, **k: [
-        _fact(u) for u in ("served-1", "n-1", "n-2", "n-3", "n-4")
+        _fact(u, i) for i, u in enumerate(("served-1", "n-1", "n-2", "n-3", "n-4"), start=1)
     ]
     out = r.recall("where is the gizmo", trust=FULL_TRUST)
-    assert [f["id"] for f in out["facts"]] == ["f:served-1", "f:n-1", "f:n-2", "f:n-3"]
+    assert [f["id"] for f in out["facts"]] == ["f:1", "f:2", "f:3", "f:4"]
 
 
 # --- recall-11: self-session turns and facts leave before the cut --------------------
@@ -161,7 +161,10 @@ def test_self_session_turns_leave_the_pool_before_the_rerank():
 def test_self_session_facts_backfill_the_facts_bucket():
     r, captured = _engine()
     limits: list[int] = []
-    facts = [{"fact": f"fact {i}", "_uuid": f"own-{i}" if i < 3 else f"u{i}"} for i in range(20)]
+    facts = [
+        {"fact": f"fact {i}", "_uuid": f"own-{i}" if i < 3 else f"u{i}", "_id": 100 + i}
+        for i in range(20)
+    ]
 
     def _kg(q, emb, gid, focus, fact_limit, **kw):
         limits.append(fact_limit)
@@ -172,7 +175,7 @@ def test_self_session_facts_backfill_the_facts_bucket():
     out = r.recall("where is the gizmo", trust=FULL_TRUST, self_session="me")
     assert limits[0] > recall_mod._FACT_LIMIT  # asked for a few extra
     assert len(out["facts"]) == recall_mod._FACT_LIMIT  # and the bucket is still full
-    assert not any(f["id"].startswith("f:own-") for f in out["facts"])
+    assert not {"f:100", "f:101", "f:102"} & {f["id"] for f in out["facts"]}
     assert captured[0]["served_ids"]["n_self_facts_excluded"] == 3
 
     limits.clear()

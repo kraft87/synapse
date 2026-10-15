@@ -82,7 +82,7 @@ def register(
         current truth. A fact supports only what it states; one about a profile or
         document describes that document.
 
-        Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact incl.
+        Every served item carries an `id` (e:N episode, n:N note, f:N fact incl.
         superseded_facts pairs, t:N timeline, w:N web); copy it into recall_feedback
         to rate it. Only e:/n: ids are fetch()-able.
 
