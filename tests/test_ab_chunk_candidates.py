@@ -49,7 +49,14 @@ def test_a_query_is_scored_on_its_pool_and_its_ranking():
 
 
 def _row(query: str, **scores: float) -> dict[str, Any]:
-    return {"query": query, "scores": scores, "pool_ms": 10.0, "total_ms": 20.0, "notices": []}
+    return {
+        "query": query,
+        "scores": scores,
+        "pool_ms": 10.0,
+        "total_ms": 20.0,
+        "notices": [],
+        "degraded": False,
+    }
 
 
 def test_movers_are_the_queries_whose_score_changed():
@@ -75,6 +82,49 @@ def test_the_report_carries_the_deltas_and_the_notices():
     assert "chunk vector source skipped" in text
 
 
+def test_the_report_labels_the_notices_of_both_arms_and_counts_degraded_reranks():
+    rows = {
+        "off": [
+            {
+                **_row("a", pool_recall=0.0, mrr=0.0, **{"hit@5": 0.0}),
+                "notices": ["rerank failed (voyage: 429): serving RRF fusion order"],
+                "degraded": True,
+            }
+        ],
+        "on": [_row("a", pool_recall=1.0, mrr=0.5, **{"hit@5": 1.0})],
+    }
+    text = "\n".join(script.report(rows, n_skipped=0, ks=(5,)))
+    assert "notices from the 'off' arm" in text
+    assert "rerank failed (voyage: 429)" in text
+    assert "notices from the 'on' arm" not in text  # that arm had none
+    assert "queries with a degraded rerank (RRF order, score 0.0): off 1, on 0" in text
+
+
+def test_the_engine_is_built_with_batch_patience():
+    seen: dict[str, Any] = {}
+
+    def fake_embedder(*_a, **kw):
+        seen["embedder"] = kw
+        return _Emb()
+
+    def fake_reranker(*_a, **kw):
+        seen["reranker"] = kw
+        return None
+
+    import ingestion.embedding as embedding
+
+    original = embedding.create_embedder, embedding.create_reranker
+    embedding.create_embedder, embedding.create_reranker = fake_embedder, fake_reranker
+    try:
+        engine = script.build_engine(_NO_DB, "key")
+    finally:
+        embedding.create_embedder, embedding.create_reranker = original
+    # Offline measurement: a Voyage 429 is ridden out, not silently turned into RRF order.
+    assert seen["embedder"]["interactive"] is False
+    assert seen["reranker"]["interactive"] is False
+    assert engine._ensure_reranker() is None
+
+
 class _Emb:
     def embed(self, texts, task="query"):
         return [[0.0] * 4 for _ in texts]
@@ -92,7 +142,7 @@ def _ep(n: int) -> dict[str, Any]:
     }
 
 
-def test_only_the_on_arm_reaches_the_chunk_sources():
+def _engine(rerank: Any, chunk_hits: list[dict[str, Any]]) -> Recall:
     r = Recall(_NO_DB, "")
     r._ensure_embedder = lambda: _Emb()  # type: ignore[method-assign]
     r._search_bm25_episodes = lambda q, proj, limit, sid=None, allowed=None, own=None: [  # type: ignore[method-assign]
@@ -100,9 +150,23 @@ def test_only_the_on_arm_reaches_the_chunk_sources():
         _ep(2),
     ]
     r._search_vector_episodes = lambda emb, proj, limit, sid=None, allowed=None, own=None: []  # type: ignore[method-assign]
-    r._search_chunks_bm25 = lambda q, proj, allowed=None, own=None: [_ep(3)]  # type: ignore[method-assign]
+    r._search_chunks_bm25 = lambda q, proj, allowed=None, own=None: chunk_hits  # type: ignore[method-assign]
     r._search_chunks_vector = lambda emb, proj, allowed=None, own=None: []  # type: ignore[method-assign]
-    r._rerank_pool_scored = lambda q, pool: [(i, 0.9 - 0.1 * i) for i in range(len(pool))]  # type: ignore[method-assign]
+    r._rerank_pool_scored = rerank  # type: ignore[method-assign]
+    return r
+
+
+def _graded(q: str, pool: list[dict[str, Any]]) -> list[tuple[int, float]]:
+    return [(i, 0.9 - 0.1 * i) for i in range(len(pool))]
+
+
+def _degraded(q: str, pool: list[dict[str, Any]]) -> list[tuple[int, float]]:
+    """What _rerank_pool_scored returns when the reranker errors: RRF order, every score 0.0."""
+    return [(i, 0.0) for i in range(len(pool))]
+
+
+def test_only_the_on_arm_reaches_the_chunk_sources():
+    r = _engine(_graded, [_ep(3)])
     golden = {"query": "where is the gizmo", "gold": ["e:3"], "project": None}
 
     off = script.run_arm(r, golden, False, (5, 10))
@@ -114,3 +178,22 @@ def test_only_the_on_arm_reaches_the_chunk_sources():
     assert 0.0 < on["scores"]["mrr"] <= 1.0
     assert off_again["scores"] == off["scores"]  # the setting is per run, not left switched on
     assert on["pool_ms"] <= on["total_ms"]
+    assert not off["degraded"] and not on["degraded"]
+
+
+def test_an_arm_whose_rerank_degraded_is_flagged():
+    golden = {"query": "where is the gizmo", "gold": ["e:1"], "project": None}
+    assert script.run_arm(_engine(_degraded, []), golden, False, (5,))["degraded"] is True
+    assert script.run_arm(_engine(_graded, []), golden, False, (5,))["degraded"] is False
+
+
+def test_the_script_exits_nonzero_when_any_rerank_degraded(tmp_path, monkeypatch, capsys):
+    goldens = tmp_path / "goldens.jsonl"
+    goldens.write_text('{"query": "where is the gizmo", "gold": ["e:1"]}\n')
+    argv = [str(goldens), "--db-url", _NO_DB, "--k", "5"]
+
+    monkeypatch.setattr(script, "build_engine", lambda *_a: _engine(_graded, []))
+    assert script.main(argv) == 0
+    monkeypatch.setattr(script, "build_engine", lambda *_a: _engine(_degraded, []))
+    assert script.main(argv) == 1
+    assert "degraded rerank (RRF order, score 0.0): off 1, on 1" in capsys.readouterr().out

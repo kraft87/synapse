@@ -15,7 +15,10 @@ candidates put a gold turn into the pool and whether it ends up ranked higher:
 and which queries gained or lost a gold turn in the pool or in the top k. Nothing is
 written: no recall_metrics row, no retrieval-count bump. It calls the real Voyage embedder
 and reranker (VOYAGE_API_KEY, or the SYNAPSE_EMBED_* / SYNAPSE_RERANK_* provider settings
-the server uses) and the database, so it costs a rerank call per query per arm.
+the server uses) and the database, so it costs a rerank call per query per arm. Both clients
+keep the batch patience (a Voyage 429 is ridden out, not failed fast as in recall), and a
+query whose rerank still failed (RRF order, every score 0.0) is counted per arm and makes
+the script exit 1: that arm's numbers say nothing about the rerank.
 
 Goldens: one JSON object per line,
 
@@ -147,6 +150,8 @@ def run_arm(
         "pool_ms": pool_ms,
         "total_ms": total_ms,
         "notices": notices,
+        # The reranker erroring (or off) serves the pool in RRF order with every score 0.0.
+        "degraded": bool(scored) and max(score for _, score in scored) == 0.0,
     }
 
 
@@ -162,11 +167,35 @@ def report(rows: dict[str, list[dict[str, Any]]], n_skipped: int, ks: tuple[int,
         gained, lost = movers(rows["off"], rows["on"], key)
         lines += ["", f"gained {what} with chunks on: {len(gained)}", *(f"  {q}" for q in gained)]
         lines += [f"lost {what} with chunks on: {len(lost)}", *(f"  {q}" for q in lost)]
-    notices = sorted({n for row in rows["on"] for n in row["notices"]})
-    if notices:
-        lines += ["", "notices from the 'on' arm (a source that did not run is not measured):"]
-        lines += [f"  {n}" for n in notices]
+    for arm in _ARMS:
+        notices = sorted({n for row in rows[arm] for n in row["notices"]})
+        if notices:
+            lines += [
+                "",
+                f"notices from the '{arm}' arm (a source that did not run is not measured):",
+            ]
+            lines += [f"  {n}" for n in notices]
+    degraded = {arm: sum(row["degraded"] for row in rows[arm]) for arm in _ARMS}
+    lines += [
+        "",
+        "queries with a degraded rerank (RRF order, score 0.0): "
+        + ", ".join(f"{arm} {n}" for arm, n in degraded.items()),
+    ]
     return lines
+
+
+def build_engine(db_url: str, voyage_key: str) -> Any:
+    """A Recall engine whose embedder and reranker keep the batch patience: this is offline
+    measurement, so a Voyage 429 is ridden out instead of failing fast into RRF order."""
+    from ingestion import embedding
+    from mcp_server.recall import Recall
+
+    engine = Recall(db_url, voyage_key)
+    engine._embedder = embedding.create_embedder(
+        voyage_api_key=voyage_key, db_url=db_url, interactive=False
+    )
+    engine._reranker = embedding.create_reranker(voyage_api_key=voyage_key, interactive=False)
+    return engine
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -188,9 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("no usable goldens (each line needs a query and gold episode ids)")
     ks = tuple(sorted(set(args.k)))
 
-    from mcp_server.recall import Recall
-
-    engine = Recall(args.db_url, os.environ.get("VOYAGE_API_KEY", ""))
+    engine = build_engine(args.db_url, os.environ.get("VOYAGE_API_KEY", ""))
     rows: dict[str, list[dict[str, Any]]] = {arm: [] for arm in _ARMS}
     for index, golden in enumerate(goldens):
         for arm in _ARMS if index % 2 == 0 else reversed(_ARMS):
@@ -198,7 +225,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\n".join(report(rows, n_skipped, ks)))
     if args.json:
         args.json.write_text(json.dumps(rows, indent=2))
-    return 0
+    # A degraded rerank means the arm's ranking is the RRF order, not the cross-encoder's.
+    return 1 if any(row["degraded"] for arm_rows in rows.values() for row in arm_rows) else 0
 
 
 if __name__ == "__main__":
