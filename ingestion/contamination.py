@@ -19,6 +19,8 @@ agent's actual transcript-processing calls:
 
 from __future__ import annotations
 
+import functools
+
 # Distinctive transcribe_ai agent-prompt phrases. Lowercased substring match.
 # Kept deliberately LONG/complete: short fragments ("legal discovery proceedings",
 # "speech segments") also appear in dev conversations that quote the prompt while
@@ -56,13 +58,12 @@ def is_transcript_contamination(content: str | None) -> bool:
 # user turn: harness calls are single-turn sessions whose content starts
 # "[user] <prompt>". Dev conversations that merely QUOTE these prompts start
 # with prose or [context] blocks and keep flowing in.
+#
+# The prompts under ingestion/ are not listed here: ``_prompt_heads`` reads them, so editing
+# one cannot leave this list guarding text that no longer exists (the Stage 3 prefix did
+# exactly that). What is listed is code that is not importable from here: scripts and the
+# dream lanes, which import this package, not the other way round.
 _HARNESS_PREFIXES = (
-    # ingestion/extraction_llm.py::_EXTRACTION_PROMPT
-    "Given the session summary and pre-identified entities below",
-    # ingestion/extraction_llm.py::_WEB_EXTRACTION_PROMPT
-    "The text below is an excerpt from ",
-    # ingestion/extractor.py::_CONTRADICTION_PROMPT + _BATCH_CONTRADICTION_PROMPT
-    "You are a knowledge graph deduplication assistant.",
     # scripts/ab_*.py fact-quality judge
     "Below are candidate facts extracted for a long-term knowledge graph",
     # scripts/retype_untyped_entities.py / retype_pilot.py entity-typing prompt.
@@ -73,8 +74,7 @@ _HARNESS_PREFIXES = (
     "You are retyping an entity in a personal knowledge graph",
     # scripts/survey_cross_graph_leaks.py / typing-pass audit prompt (205 stranded)
     "You are auditing entities in a personal knowledge graph",
-    # KG fact-dedup prompt — distinct wording from the "knowledge graph deduplication
-    # assistant" above (60 stranded)
+    # KG fact-dedup prompt of the pre-batch pipeline (60 stranded)
     "You are a fact deduplication assistant",
     # dream/ lane prompts (skill_measure, skill_derive, skill_draft, struggle_arc, post_fire,
     # procedure_miner, config/nightly). They go through llm_client, which never loads the Stop
@@ -94,6 +94,40 @@ _HARNESS_PREFIXES = (
 _JUDGE_MARKER = "REFERENCE ANSWER (ground truth):"
 
 
+#: How much of a prompt's opening identifies it.
+_HEAD_CHARS = 60
+
+
+@functools.cache
+def _prompt_heads() -> tuple[str, ...]:
+    """The opening of each of Synapse's own prompts, read from the prompts.
+
+    The CLI path prepends a call's system message to its prompt, so a prompt built from
+    messages is identified by its system message. The head stops at the first format field,
+    so a template and its rendering share it. Imported here, not at the top: these modules
+    import this one's package at start-up."""
+    from ingestion.extraction_llm import _EXTRACTION_PROMPT, _WEB_EXTRACTION_PROMPT
+    from ingestion.extraction_policy import _BATCH_CONTRADICTION_PROMPT
+    from ingestion.notes import PAIR_PROMPT
+    from ingestion.preferences_gate import CONFIRM_PROMPT, GATE_PROMPT
+    from ingestion.prompts import dedupe_nodes, extract_edge_dates
+    from ingestion.timeline_gate import TIMELINE_DEDUP_PROMPT, gate_prompt
+
+    texts = (
+        _EXTRACTION_PROMPT,
+        _WEB_EXTRACTION_PROMPT,
+        _BATCH_CONTRADICTION_PROMPT,
+        PAIR_PROMPT,
+        GATE_PROMPT,
+        CONFIRM_PROMPT,
+        gate_prompt(),
+        TIMELINE_DEDUP_PROMPT,
+        dedupe_nodes.build_batch_prompt([])[0]["content"],
+        extract_edge_dates.build_batch_prompt([], "")[0]["content"],
+    )
+    return tuple(t.split("{", 1)[0][:_HEAD_CHARS] for t in texts)
+
+
 def is_harness_call(content: str | None) -> bool:
     """True if `content` is one of Synapse's own LLM-call payloads (drop at ingest)."""
     if not content or not content.startswith("[user] "):
@@ -101,4 +135,4 @@ def is_harness_call(content: str | None) -> bool:
     text = content[len("[user] ") :]
     if text.startswith("QUESTION: "):
         return _JUDGE_MARKER in text[:2000]
-    return text.startswith(_HARNESS_PREFIXES)
+    return text.startswith(_HARNESS_PREFIXES + _prompt_heads())

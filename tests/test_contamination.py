@@ -3,6 +3,8 @@ the operator's dev conversations about the legal-transcription domain."""
 
 from __future__ import annotations
 
+import re
+
 from ingestion.contamination import is_harness_call, is_transcript_contamination
 
 
@@ -63,21 +65,53 @@ def test_flags_recall_benchmark_judge_call():
 
 def test_flags_extraction_and_judge_calls():
     assert is_harness_call(
-        "[user] Given the session summary and pre-identified entities below, extract any "
-        "additional entities and the relationships between all entities.\n\n[assistant] {}"
-    )
-    assert is_harness_call(
-        "[user] The text below is an excerpt from a research brief. Extract entities...\n\n"
-        "[assistant] {}"
-    )
-    assert is_harness_call(
-        "[user] You are a knowledge graph deduplication assistant. Decide which existing "
-        "facts the NEW FACT duplicates...\n\n[assistant] {}"
-    )
-    assert is_harness_call(
         "[user] Below are candidate facts extracted for a long-term knowledge graph. "
         "Rate EACH:\n1. ...\n\n[assistant] [1, 0]"
     )
+
+
+def _prompt_constants() -> dict[str, str]:
+    """Every module-level prompt template under ingestion/, found rather than listed, so a
+    prompt added tomorrow is covered by this test without anyone remembering to add it."""
+    import importlib
+    import pkgutil
+
+    import ingestion
+
+    found: dict[str, str] = {}
+    for mod_info in pkgutil.iter_modules(ingestion.__path__):
+        if mod_info.name == "__main__":
+            continue
+        mod = importlib.import_module(f"ingestion.{mod_info.name}")
+        for name, value in vars(mod).items():
+            if isinstance(value, str) and re.fullmatch(r"_?[A-Z_]*PROMPT[A-Z_]*", name):
+                found[f"{mod_info.name}.{name}"] = value
+    return found
+
+
+def test_every_prompt_in_ingestion_is_a_harness_call():
+    """The guard reads the prompts themselves, so editing one cannot disarm it: Stage 3's
+    opening was reworded once and the literal prefix kept matching the old text."""
+    prompts = _prompt_constants()
+    # The module layout is what this test discovers; a rename must not make it vacuous.
+    assert {"extraction_llm._EXTRACTION_PROMPT", "timeline_gate.TIMELINE_DEDUP_PROMPT"} <= set(
+        prompts
+    )
+    for name, template in prompts.items():
+        assert is_harness_call("[user] " + template), name
+
+
+def test_prompts_built_from_messages_are_harness_calls_too():
+    """The edge-date and node-dedup prompts lead with a system message, which the CLI
+    path prepends to the user turn."""
+    from ingestion.prompts import dedupe_nodes, extract_edge_dates
+
+    for messages in (
+        dedupe_nodes.build_batch_prompt([]),
+        extract_edge_dates.build_batch_prompt([], "2026-01-01T00:00:00Z"),
+    ):
+        flattened = "\n\n".join(m["content"] for m in messages)
+        assert is_harness_call("[user] " + flattened)
 
 
 def test_flags_entity_pipeline_calls():
