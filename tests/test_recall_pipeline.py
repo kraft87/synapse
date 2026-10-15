@@ -292,6 +292,17 @@ def test_recall_full_turns_serves_ordinary_turns_whole():
     assert "n_excerpted" not in captured[0]["served_ids"]
 
 
+def test_fetch_reports_fact_ids_as_skipped_in_either_form():
+    """Facts are rateable, not fetchable: "f:<id>" and the older "f:<uuid>" are told apart
+    from nothing else, and both come back under skipped."""
+    from mcp_server.recall_presentation import parse_fetch_ids
+
+    old_style = "f:0b3c1d2e-4f56-7890-abcd-ef0123456789"
+    episodes, notes, skipped, _normalized = parse_fetch_ids(["e:5", "f:41", old_style, "n:2"])
+    assert (episodes, notes) == ([5], [2])
+    assert skipped == ["f:41", old_style]
+
+
 # --- recall-19: interactive recall does not ride out a Voyage 429 --------------------
 
 

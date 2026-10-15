@@ -40,7 +40,7 @@ def fact_day(ts: Any) -> str:
         try:
             ts = datetime.fromisoformat(ts)
         except ValueError:
-            return ts[:10]
+            return str(ts)[:10]
     if isinstance(ts, datetime):
         utc = ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts.astimezone(UTC)
         if utc.time() == time(0):
