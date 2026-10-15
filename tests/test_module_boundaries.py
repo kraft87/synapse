@@ -17,6 +17,7 @@ _PATTERNS = (
     "mcp_server/remember_tool.py",
     "mcp_server/feedback_tools.py",
     "mcp_server/ingest_route.py",
+    "mcp_server/dash/*.py",
 )
 _MODULES = sorted({path for pattern in _PATTERNS for path in _ROOT.glob(pattern)})
 

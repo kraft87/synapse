@@ -1,4 +1,4 @@
-"""DB-backed tests for the operator dashboard routes (mcp_server/dashboard_routes.py).
+"""DB-backed tests for the operator dashboard routes (the mcp_server/dash package).
 
 Covers the /dash/api/* contract (catalog, feed merge + keyset cursor + type-filter
 behavior, episode detail, derived facts/events, session ordering, entity dossier,
@@ -19,8 +19,8 @@ import pytest
 from psycopg.types.json import Json
 from starlette.testclient import TestClient
 
-import mcp_server.dashboard_routes as dr
-from mcp_server.dashboard_routes import register
+from mcp_server.dash import curation, feed, kg, register, review, static, stream
+from mcp_server.dash.common import _episode_id_from_ref
 
 pytestmark = pytest.mark.db
 
@@ -579,12 +579,12 @@ def test_episode_derived_containment_and_ep_ref(clean, conn, db_url):
 
 
 def test_episode_id_from_ref_reads_the_kth_event_form():
-    assert dr._episode_id_from_ref("ep:12") == 12
-    assert dr._episode_id_from_ref("ep:12#3") == 12
-    assert dr._episode_id_from_ref("ep:12#") is None
-    assert dr._episode_id_from_ref("ep:x#2") is None
-    assert dr._episode_id_from_ref("deadbeef") is None
-    assert dr._episode_id_from_ref(None) is None
+    assert _episode_id_from_ref("ep:12") == 12
+    assert _episode_id_from_ref("ep:12#3") == 12
+    assert _episode_id_from_ref("ep:12#") is None
+    assert _episode_id_from_ref("ep:x#2") is None
+    assert _episode_id_from_ref("deadbeef") is None
+    assert _episode_id_from_ref(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -617,7 +617,7 @@ def test_session_ordering_and_highlight_echo(clean, conn, db_url):
 def test_session_cap_windows_around_the_highlight(clean, conn, db_url, monkeypatch):
     """A session longer than the cap is cut to a window around the highlighted turn,
     so the drawer can always show the turn it was opened for."""
-    monkeypatch.setattr(dr, "_SESSION_CAP", 4)
+    monkeypatch.setattr(feed, "_SESSION_CAP", 4)
     ids = {seq: _episode(conn, session="long", seq=seq, created_at=_t(seq)) for seq in range(1, 11)}
     with _client(db_url) as client:
         hl = client.get(f"/dash/api/session/long?highlight={ids[8]}", headers=_H).json()
@@ -717,7 +717,7 @@ def test_entity_dossier(clean, conn, db_url):
 def test_entity_dossier_pages_facts_live_first(clean, conn, db_url, monkeypatch):
     """The header counts every fact, so the list pages to match: live facts first (newest
     first), superseded ones after, `facts_offset` walks the rest."""
-    monkeypatch.setattr(dr, "_ENTITY_FACTS_PAGE", 3)
+    monkeypatch.setattr(kg, "_ENTITY_FACTS_PAGE", 3)
     _entity(conn, "hub", name="Hub")
     _entity(conn, "o", name="Other")
     # Five facts. The two superseded ones are the NEWEST by t_valid, and one live fact has no
@@ -976,7 +976,7 @@ def test_flag_concurrent_requests_settle_without_error(clean, conn, db_url):
 
     def hit(_):
         gate.wait()
-        return dr._set_flag(db_url, "episode", str(eid), None, True)
+        return curation._set_flag(db_url, "episode", str(eid), None, True)
 
     with ThreadPoolExecutor(n) as pool:
         assert list(pool.map(hit, range(n))) == [True] * n
@@ -1289,7 +1289,7 @@ def test_proposals_list_keeps_old_proposed_rows_behind_a_decided_backlog(
 ):
     """The per-lane cap must not hide a still-'proposed' row behind newer decided ones:
     proposed rows come first inside each lane's window, and ?status= is applied in SQL."""
-    monkeypatch.setattr(dr, "_PROPOSALS_LANE_CAP", 3)
+    monkeypatch.setattr(review, "_PROPOSALS_LANE_CAP", 3)
     old_skill = _skill_proposal(conn, name="old-skill", status="proposed", created_at=_t(1))
     old_cfg = _config_proposal(conn, file_key="old.md", status="proposed", created_at=_t(1))
     for i in range(4):  # newer decided rows that would fill each lane's window
@@ -1578,7 +1578,7 @@ def test_dash_notify_trigger_fires_on_insert(clean, conn, db_url):
 
 def test_feed_event_buffer_replay_and_reset():
     """Pure-unit: the ring buffer's resume() replay/reset logic — no DB, no HTTP."""
-    from mcp_server.dashboard_routes import _FeedEventBuffer
+    from mcp_server.dash.stream import _FeedEventBuffer
 
     buf = _FeedEventBuffer(capacity=3)
     ids = [buf.append({"type": "episode", "id": str(i)}) for i in (1, 2, 3)]
@@ -1610,7 +1610,7 @@ async def test_stream_manager_hydrates_notify_into_buffer(clean, conn, db_url):
     starts the worker, an insert fires NOTIFY, the worker hydrates the row into the ring
     buffer as a full FeedItem. Deterministic — waits for the worker's `listening` event
     before inserting, so the NOTIFY is never raced against worker startup."""
-    from mcp_server.dashboard_routes import _StreamManager
+    from mcp_server.dash.stream import _StreamManager
 
     mgr = _StreamManager(db_url)
     mgr.subscribe()
@@ -1640,9 +1640,9 @@ async def test_stream_manager_relistens_after_the_connection_drops(
     """A dropped LISTEN connection (Postgres restart, network blip) must not leave the
     feed silently stale while clients stay subscribed: the worker reconnects, marks the
     gap with a `reset` event in the ring (clients refetch page 1), and delivers again."""
-    from mcp_server.dashboard_routes import _StreamManager
+    from mcp_server.dash.stream import _StreamManager
 
-    monkeypatch.setattr(dr, "_STREAM_RECONNECT_MIN_S", 0.05)
+    monkeypatch.setattr(stream, "_STREAM_RECONNECT_MIN_S", 0.05)
     mgr = _StreamManager(db_url)
     mgr.subscribe()
     try:
@@ -1696,7 +1696,7 @@ def test_processing_status_counts_pending_processing_and_failed(clean, conn, db_
     vanish from it, and failed rows never showed. queue_depth/active stay for compatibility."""
     for status in ("pending", "pending", "processing", "failed", "done"):
         _queue(conn, status=status, enqueued_at=_t(0))
-    assert dr._processing_status(db_url) == {
+    assert stream._processing_status(db_url) == {
         "queue_depth": 2,
         "processing": 1,
         "failed": 1,
@@ -1708,7 +1708,7 @@ async def test_stream_first_frames_are_ready_then_a_fresh_status(clean, conn, db
     """A connection opens with `ready` (the stream is positioned and LISTENing: the client
     refetches page 1 now) and then a status snapshot computed for THIS connection, not the
     zeros the manager starts with or the previous run's leftovers."""
-    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+    from mcp_server.dash.stream import _event_stream, _StreamManager
 
     _queue(conn, status="pending", enqueued_at=_t(0))
     _queue(conn, status="processing", enqueued_at=_t(0))
@@ -1741,7 +1741,7 @@ async def test_stream_delivers_a_row_committed_right_after_ready(clean, conn, db
     """`ready` means the lazily-started worker is LISTENing: a row committed the moment the
     client sees it (the client's page-1 fetch follows it) is delivered, not lost to the
     worker's startup the way a first-subscriber NOTIFY used to be."""
-    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+    from mcp_server.dash.stream import _event_stream, _StreamManager
 
     mgr = _StreamManager(db_url)
     stream = _event_stream(mgr, _never_disconnected, None)
@@ -1757,12 +1757,12 @@ async def test_stream_delivers_a_row_committed_right_after_ready(clean, conn, db
 
 async def test_stream_status_is_dropped_when_the_refresh_fails(clean, db_url, monkeypatch):
     """A count that can no longer be read is withdrawn (no status frames), not served stale."""
-    from mcp_server.dashboard_routes import _StreamManager
+    from mcp_server.dash.stream import _StreamManager
 
     def boom(_url):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(dr, "_processing_status", boom)
+    monkeypatch.setattr(stream, "_processing_status", boom)
     mgr = _StreamManager(db_url)
     mgr.status = {"queue_depth": 9, "active": False}
     mgr.subscribe()
@@ -1774,7 +1774,7 @@ async def test_stream_status_is_dropped_when_the_refresh_fails(clean, db_url, mo
 
 
 async def test_stream_replays_buffered_events_after_ready(clean, db_url):
-    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+    from mcp_server.dash.stream import _event_stream, _StreamManager
 
     mgr = _StreamManager(db_url)
     for i in (1, 2, 3):
@@ -1796,7 +1796,7 @@ async def test_stream_replays_buffered_events_after_ready(clean, db_url):
 async def test_stream_resets_a_connection_the_ring_buffer_outran(clean, db_url):
     """A reader blocked on a yield while the ring evicts events it has not sent must be told
     (`reset`: refetch page 1), the same as a resume across the gap, not skipped silently."""
-    from mcp_server.dashboard_routes import _event_stream, _FeedEventBuffer, _StreamManager
+    from mcp_server.dash.stream import _event_stream, _FeedEventBuffer, _StreamManager
 
     mgr = _StreamManager(db_url)
     mgr.buffer = _FeedEventBuffer(capacity=3)
@@ -1829,7 +1829,7 @@ def test_sse_frame_format():
     ring buffer (test_stream_manager_hydrates_notify_into_buffer), the buffer replay/reset
     logic (test_feed_event_buffer_replay_and_reset), the auth gate (test_stream_requires_token),
     and the frame format (here)."""
-    from mcp_server.dashboard_routes import _sse_frame
+    from mcp_server.dash.stream import _sse_frame
 
     ep = _sse_frame("new_episode", '{"type":"episode","id":"42"}', 7)
     assert ep == 'event: new_episode\nid: 7\ndata: {"type":"episode","id":"42"}\n\n'
@@ -1846,7 +1846,7 @@ def test_sse_frame_format():
 
 def test_parse_window_caps_and_defaults():
     """Pure-function window parsing: unit suffixes, 1h floor, 30d cap, safe fallback."""
-    from mcp_server.dashboard_routes import _parse_window
+    from mcp_server.dash.metrics import _parse_window
 
     assert _parse_window(None, 7 * 86400) == 7 * 86400
     assert _parse_window("48h", 7 * 86400) == 48 * 3600
@@ -2158,8 +2158,13 @@ def test_metrics_require_machine_token(clean, conn, db_url):
 # ---------------------------------------------------------------------------
 
 
+def test_the_bundle_is_served_from_the_repo_web_dist():
+    """The package moved a directory down from the module that first computed this path."""
+    assert static._DIST_DIR == Path(__file__).resolve().parents[1] / "web" / "dist"
+
+
 def test_static_503_without_bundle(tmp_path, monkeypatch, db_url):
-    monkeypatch.setattr(dr, "_DIST_DIR", tmp_path / "missing")
+    monkeypatch.setattr(static, "_DIST_DIR", tmp_path / "missing")
     with _client(db_url) as client:
         r = client.get("/dash")  # no auth header — static routes are open
         assert r.status_code == 503 and r.json()["detail"] == "bundle not built"
@@ -2173,7 +2178,7 @@ def test_static_serves_bundle_and_rejects_traversal(tmp_path, monkeypatch, db_ur
     (dist / "app.js").write_text("console.log('dash')")
     (dist / "secret.txt").write_text("not an asset")  # sits in dist root, not assets/
     (dist / "assets" / "font.woff2").write_bytes(b"woff2-bytes")
-    monkeypatch.setattr(dr, "_DIST_DIR", dist)
+    monkeypatch.setattr(static, "_DIST_DIR", dist)
 
     with _client(db_url) as client:
         idx = client.get("/dash")
@@ -2889,7 +2894,7 @@ def test_graph_neighborhood_edge_cap_prunes_orphans(clean, conn, db_url):
     _rel(conn, "ec-x1", src="ec-n0", tgt="ec-n1", retrieval_count=99)
     _rel(conn, "ec-x2", src="ec-n2", tgt="ec-n3", retrieval_count=98)
 
-    out = dr._graph_neighborhood(db_url, "ec-hub", 1, None, 150, edge_cap=3)
+    out = kg._graph_neighborhood(db_url, "ec-hub", 1, None, 150, edge_cap=3)
     assert out is not None and out["truncated"] is True
     # Seed-adjacent edges beat the higher-retrieval leaf-leaf edges; within the
     # adjacent set, retrieval_count orders the cut.

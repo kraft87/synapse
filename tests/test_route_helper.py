@@ -168,6 +168,8 @@ _UNUSED_DSN = "postgresql://unused.invalid/none"
 
 #: (method, path) of every route that takes a JSON object body.
 _BODY_ROUTES = [
+    ("POST", "/dash/api/flag"),
+    ("POST", "/dash/api/proposals/skill:1/decision"),
     ("POST", "/timeline/events"),
     ("POST", "/remember/spool"),
     ("POST", "/surfaces/mint"),
@@ -181,6 +183,7 @@ _BODY_ROUTES = [
 
 def _everything(gate: _Gate) -> TestClient:
     from mcp_server import (
+        dash,
         feedback_tools,
         ingest_route,
         recall_route,
@@ -190,6 +193,7 @@ def _everything(gate: _Gate) -> TestClient:
     )
 
     mcp = FastMCP("test-route-all")
+    dash.register(mcp, _UNUSED_DSN, gate)
     timeline_routes.register(mcp, _UNUSED_DSN, gate, "")
     remember_routes.register(mcp, _UNUSED_DSN, gate, remember_fn=lambda **kw: None)
     surface_routes.register(mcp, _UNUSED_DSN, gate)
@@ -215,3 +219,24 @@ def test_every_body_route_answers_a_bad_body_with_the_envelope(method, path):
                 400,
                 {"status": "error", "detail": detail},
             ), (path, content)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("GET", "/dash/api/episode/abc", None),
+        ("GET", "/dash/api/episode/abc/derived", None),
+        ("GET", "/dash/api/graph/neighborhood", None),
+        ("GET", "/dash/api/behavior/file", None),
+        ("GET", "/dash/api/proposals/nope", None),
+        ("POST", "/dash/api/proposals/nope/decision", {"action": "approve"}),
+        ("DELETE", "/dash/api/episodes/abc", None),
+        ("GET", "/dash/api/timeline?type=nonsense", None),
+    ],
+)
+def test_a_dashboard_route_asks_the_gate_once_even_when_it_refuses_the_request(method, path, body):
+    gate = _Gate()
+    with _everything(gate) as client:
+        r = client.request(method, path, json=body, headers=_H)
+    assert r.status_code == 400, (path, r.text)
+    assert gate.calls == 1, path

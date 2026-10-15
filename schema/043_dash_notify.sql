@@ -15,7 +15,7 @@
 -- ingest path and means the WIRE shape a client sees is produced by ONE code path (the feed
 -- hydration), not duplicated in SQL here.
 --
---   type      id column (JSON)      hydration source (mcp_server/dashboard_routes.py)
+--   type      id column (JSON)      hydration source (mcp_server/dash/feed.py)
 --   episode         episodes.id (int)         _EP_SELECT  -> _episode_item
 --   fact            kg_relationships.uuid (text)  _FACT_SELECT -> _fact_item
 --   timeline_event  timeline_events.id (int)  _TL_SELECT  -> _timeline_item

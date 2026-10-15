@@ -50,7 +50,7 @@ from starlette.requests import Request
 
 from ingestion import pg_pool
 from ingestion.surfaces import OWN_SURFACE_PROBE, SurfaceTrust
-from mcp_server.dashboard_routes import delete_episode_content, retire_flags
+from mcp_server.dash.curation import delete_episode_content, retire_flags
 from mcp_server.http_helpers import RouteError, route
 
 logger = logging.getLogger(__name__)

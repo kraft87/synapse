@@ -90,7 +90,7 @@ def register(
     # cosmetic: /dash/api serves the whole corpus unfiltered and can flag/edit, so leaving it on the
     # root token would let anything holding the enrollment credential read the unfiltered corpus
     # that audience scoping withholds from restricted devices. No-op w/o DB_URL, like the siblings.
-    from mcp_server.dashboard_routes import register as _register_dashboard_routes
+    from mcp_server.dash import register as _register_dashboard_routes
 
     _register_dashboard_routes(mcp, DB_URL, _admin_authorized)
 

@@ -1,5 +1,5 @@
 // The Feed's ordering and merge rules, pure so they can be unit-tested. The order is the
-// server's keyset order (mcp_server/dashboard_routes.py _feed): timestamp descending, then
+// server's keyset order (mcp_server/dash/feed.py _feed): timestamp descending, then
 // the id as text descending, whatever the type. Live rows and refetched pages are folded in by
 // that order, so what a live Feed shows is what a reload would show.
 import type { FeedItem } from './api';

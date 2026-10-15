@@ -146,7 +146,7 @@ def test_research_of_a_stored_turn_in_a_session_made_private_since_is_not_captur
 
 
 def test_a_deleted_turn_is_not_captured_when_it_is_shipped_again(db, db_url, conn, capture_on):
-    from mcp_server.dashboard_routes import _delete_episode
+    from mcp_server.dash.curation import _delete_episode
 
     if not conn.execute("SELECT to_regclass('deleted_turns')").fetchone()[0]:
         pytest.skip("schema 123 (deleted_turns) is not applied")

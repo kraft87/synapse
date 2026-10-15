@@ -18,7 +18,7 @@ from ingestion.db import Database
 from ingestion.db_episodes import DELETED_TURNS_PROBE
 from ingestion.episode_writer import store_episodes
 from ingestion.models import Episode
-from mcp_server.dashboard_routes import _delete_episode
+from mcp_server.dash.curation import _delete_episode
 
 
 @pytest.fixture(scope="module")

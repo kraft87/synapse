@@ -251,7 +251,7 @@ def test_deleting_a_source_episode_makes_the_fact_unknown(kg):
 def test_dashboard_episode_delete_unlinks_and_recomputes(kg, db_url):
     """The dashboard's hard-delete rewrites a shared fact's episodes to the survivors
     before deleting the turn; the trigger recomputes from what is left."""
-    from mcp_server.dashboard_routes import _delete_episode
+    from mcp_server.dash.curation import _delete_episode
 
     w, p = _ep(kg, WORK), _ep(kg, PERSONAL)
     _fact(kg, "shared", "f", f"[{w}, {p}]")
