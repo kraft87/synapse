@@ -7,8 +7,8 @@ nothing. The most load-bearing assertion in this file is now a NEGATIVE one — 
 hook re-grows a surface injection — because a client that starts sending one again
 would look harmless while quietly reviving a spoofable trust input.
 
-Both the Claude Code hook and its Codex port are covered here; they are separate files
-that must not drift.
+Both the Claude Code hook and its Codex port are covered here; the port calls the Claude
+hook's inject(), so they cannot drift on which tools get which field.
 """
 
 from __future__ import annotations
@@ -176,8 +176,9 @@ def test_hook_matchers_cover_exactly_the_injected_tools():
     expected = "(" + "|".join(_INJECTED_TOOLS) + ")$"
     assert matcher.endswith(expected)
     assert expected in codex_install
-    for hook in (_CC_HOOK, _CODEX_HOOK):
-        assert expected in hook.read_text()
+    assert expected in _CC_HOOK.read_text()
+    # The Codex hook's in-script guard IS the Claude one: it calls the same inject().
+    assert "from self_session_inject import inject" in _CODEX_HOOK.read_text()
 
 
 def test_no_client_hook_still_references_a_surface_param():

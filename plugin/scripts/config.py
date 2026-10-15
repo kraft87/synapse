@@ -15,7 +15,7 @@ Every setting resolves env var -> ~/.synapse/config.json (synapse_home.py, writt
 (CLAUDE_PLUGIN_OPTION_*, then settings.json) -> default. Env vars (all optional):
   CLAUDE_SKILLS_DIR     skills library to maintain   (default ~/.claude/skills)
   CLAUDE_PROJECTS_DIR   transcript root              (default ~/.claude/projects)
-  SYNAPSE_DATA_DIR      local state / proposal drafts (default ~/.local/share/synapse-skills)
+  SYNAPSE_DATA_DIR      local state: cursors, the remember spool (default ~/.local/share/synapse-skills)
   SYNAPSE_HOME          config.json + the installed client (default ~/.synapse)
   SYNAPSE_URL           base URL of the server       (default http://localhost:8765)
   SYNAPSE_INGEST_TOKEN  bearer token. Prefer config.json (`synapse login` writes it
@@ -81,7 +81,6 @@ def _path(env: str, default: str) -> Path:
 SKILLS_DIR = _path("CLAUDE_SKILLS_DIR", "~/.claude/skills")
 PROJECTS_DIR = _path("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
 DATA_DIR = _path("SYNAPSE_DATA_DIR", "~/.local/share/synapse-skills")
-PROPOSALS_DIR = DATA_DIR / "proposals"
 
 # Private mode: one marker file per off-the-record session (name = session id). The Stop
 # hook stats this directory before every POST, so it lives outside DATA_DIR on a short,
@@ -617,8 +616,3 @@ def act(endpoint: str, cid: int, action: str, *, expect: str, **extra) -> dict |
         print(r.get("detail") or "not found")
         return None
     return r
-
-
-def ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)
