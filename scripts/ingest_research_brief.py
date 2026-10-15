@@ -4,8 +4,10 @@ Ingest a research brief as a first-class web_artifact (task #68, Phase 2).
 
 A brief (run-research output, or any deliberately-written markdown doc) is the
 highest-quality extraction substrate in the web lane: multi-source, synthesized,
-zero chrome. Inserting it as kind='research_brief' lets it ride the existing
-chunk → embed → contextualize → KG-extract pipeline with no further code.
+zero chrome. This script only inserts the kind='research_brief' row. Chunking,
+contextualizing and embedding it is the out-of-repo web-capture cron's job (see
+ingestion/web_artifacts.py); once its chunks are contextualized and embedded,
+ingestion.web_enqueue queues them for KG extraction like a scrape's.
 
 Idempotent via tool_use_id = 'brief:<slug>:<YYYY-MM-DD>' (UNIQUE).
 

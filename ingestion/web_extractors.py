@@ -18,6 +18,8 @@ Persisted-output redirects ("Output too large (N KB). Full output saved to:
 /path/to/tool-results/<id>.{txt,json}") are detected; if the file exists,
 content is loaded from disk and re-parsed. Without this, ~10-15% of the
 largest tool_results would be lost to ~2KB previews.
+
+Called by ingestion.web_artifacts, which an out-of-repo cron drives.
 """
 
 from __future__ import annotations
@@ -89,28 +91,36 @@ ExtractResult = Annotated[
 
 # ---------- Constants ----------
 
-WEB_TOOLS_SCRAPE = {
-    "WebFetch",
-    "mcp__claude_ai_firecrawl__firecrawl_scrape",
-    "mcp__claude_ai_Exa_search__crawling_exa",
-}
+# Web tools by their own id. An MCP tool's full name is mcp__<server>__<tool>, and the
+# server segment is whatever the user named the server: claude_ai_firecrawl for the
+# claude.ai connector, firecrawl or Exa_search for a locally configured one. Matching
+# and dispatch go by ``tool_id``, so the same tool is captured under any server name.
+WEB_TOOLS_SCRAPE = {"WebFetch", "firecrawl_scrape", "crawling_exa"}
 
 WEB_TOOLS_SEARCH = {
     "WebSearch",
-    "mcp__claude_ai_firecrawl__firecrawl_search",
-    "mcp__claude_ai_Exa_search__web_search_exa",
-    "mcp__claude_ai_Exa_search__web_search_advanced_exa",
-    "mcp__claude_ai_Exa_search__deep_search_exa",
-    "mcp__claude_ai_Exa_search__people_search_exa",
-    "mcp__claude_ai_Exa_search__company_research_exa",
+    "firecrawl_search",
+    "web_search_exa",
+    "web_search_advanced_exa",
+    "deep_search_exa",
+    "people_search_exa",
+    "company_research_exa",
 }
 
-WEB_TOOLS_RESEARCH = {
-    "mcp__claude_ai_Exa_search__deep_researcher_start",
-    "mcp__claude_ai_Exa_search__deep_researcher_check",
-}
+WEB_TOOLS_RESEARCH = {"deep_researcher_start", "deep_researcher_check"}
 
 WEB_TOOLS_ALL = WEB_TOOLS_SCRAPE | WEB_TOOLS_SEARCH | WEB_TOOLS_RESEARCH
+
+
+def tool_id(tool_name: str) -> str:
+    """``mcp__<server>__<tool>`` -> ``<tool>``; built-in names (WebFetch) pass through."""
+    if tool_name.startswith("mcp__"):
+        return tool_name.rsplit("__", 1)[-1]
+    return tool_name
+
+
+def is_web_tool(tool_name: str) -> bool:
+    return tool_id(tool_name) in WEB_TOOLS_ALL
 
 
 # ---------- Helpers ----------
@@ -402,6 +412,9 @@ def parse_firecrawl_search(tool_input: dict[str, Any], result_text: str) -> Extr
     if text.startswith("{"):
         try:
             obj = json.loads(text)
+            # Current Firecrawl servers wrap the lists: {"success": true, "data": {"web": [...]}}.
+            if isinstance(obj.get("data"), dict):
+                obj = obj["data"]
             for key in ("web", "results", "data"):
                 arr = obj.get(key)
                 if isinstance(arr, list):
@@ -448,14 +461,6 @@ def _parse_exa_block(block: str) -> SearchResultItem | None:
         key = m.group("key").lower().rstrip("s")  # Highlights -> highlight
         if key == "highlight":
             key = "snippet"
-        elif key == "published":
-            key = "published"
-        elif key == "url":
-            key = "url"
-        elif key == "title":
-            key = "title"
-        elif key == "author":
-            key = "author"
         fields[key] = m.group("val").strip()
     if not fields.get("url"):
         return None
@@ -628,21 +633,17 @@ def parse_deep_researcher_check(tool_input: dict[str, Any], result_text: str) ->
 _DISPATCH = {
     "WebFetch": parse_webfetch,
     "WebSearch": parse_websearch,
-    "mcp__claude_ai_firecrawl__firecrawl_scrape": parse_firecrawl_scrape,
-    "mcp__claude_ai_firecrawl__firecrawl_search": parse_firecrawl_search,
-    "mcp__claude_ai_Exa_search__crawling_exa": parse_crawling_exa,
-    "mcp__claude_ai_Exa_search__web_search_advanced_exa": parse_exa_advanced,
-    "mcp__claude_ai_Exa_search__deep_search_exa": parse_deep_search,
-    "mcp__claude_ai_Exa_search__deep_researcher_start": parse_deep_researcher_start,
-    "mcp__claude_ai_Exa_search__deep_researcher_check": parse_deep_researcher_check,
+    "firecrawl_scrape": parse_firecrawl_scrape,
+    "firecrawl_search": parse_firecrawl_search,
+    "crawling_exa": parse_crawling_exa,
+    "web_search_advanced_exa": parse_exa_advanced,
+    "deep_search_exa": parse_deep_search,
+    "deep_researcher_start": parse_deep_researcher_start,
+    "deep_researcher_check": parse_deep_researcher_check,
 }
 
 # Exa text-block-format tools share a parser, dispatched by name
-_EXA_TEXT_BLOCK_TOOLS = {
-    "mcp__claude_ai_Exa_search__web_search_exa",
-    "mcp__claude_ai_Exa_search__people_search_exa",
-    "mcp__claude_ai_Exa_search__company_research_exa",
-}
+_EXA_TEXT_BLOCK_TOOLS = {"web_search_exa", "people_search_exa", "company_research_exa"}
 
 
 def extract(
@@ -662,15 +663,17 @@ def extract(
         if loaded:
             effective_text = loaded
 
-    if tool_name in _EXA_TEXT_BLOCK_TOOLS:
+    key = tool_id(tool_name)
+    if key in _EXA_TEXT_BLOCK_TOOLS:
         out = parse_exa_text_blocks(tool_name, tool_input or {}, effective_text or "")
-    elif tool_name in _DISPATCH:
-        out = _DISPATCH[tool_name](tool_input or {}, effective_text or "")
+    elif key in _DISPATCH:
+        out = _DISPATCH[key](tool_input or {}, effective_text or "")
     else:
         return ExtractError(
             tool_name=tool_name, reason="unknown_tool", raw_chars=len(result_text or "")
         )
 
+    out.tool_name = tool_name  # the name it was called under, whatever the server
     if persisted_path and hasattr(out, "persisted_output_path"):
         out.persisted_output_path = persisted_path
     return out

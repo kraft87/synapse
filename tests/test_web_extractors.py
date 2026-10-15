@@ -16,6 +16,7 @@ from ingestion.web_extractors import (
     _parse_datetime,
     _strip_firecrawl_boilerplate,
     extract,
+    is_web_tool,
     parse_crawling_exa,
     parse_deep_researcher_check,
     parse_deep_researcher_start,
@@ -428,3 +429,58 @@ class TestCoverageSmoke:
                 f"{tool} happy sample produced ExtractError: {out!r}\n"
                 f"input={s['input']}\nresult preview: {s['result_text'][:200]}"
             )
+
+
+class TestServerNamePrefixes:
+    """An MCP tool is named mcp__<server>__<tool>, and the server part is whatever the
+    user called it: the claude.ai connector or a locally configured server."""
+
+    @pytest.mark.parametrize(
+        "connector,local",
+        [
+            ("mcp__claude_ai_firecrawl__firecrawl_scrape", "mcp__firecrawl__firecrawl_scrape"),
+            ("mcp__claude_ai_firecrawl__firecrawl_search", "mcp__firecrawl__firecrawl_search"),
+            ("mcp__claude_ai_Exa_search__web_search_exa", "mcp__Exa_search__web_search_exa"),
+            ("mcp__claude_ai_Exa_search__crawling_exa", "mcp__exa__crawling_exa"),
+            ("mcp__claude_ai_Exa_search__deep_search_exa", "mcp__Exa_search__deep_search_exa"),
+        ],
+    )
+    def test_local_server_parses_like_the_connector(self, connector, local):
+        slug = connector.removeprefix("mcp__claude_ai_").replace("__", "_")
+        for s in _load(slug)["happy_samples"]:
+            via_connector = extract(connector, s["input"], s["result_text"])
+            via_local = extract(local, s["input"], s["result_text"])
+            assert not isinstance(via_local, ExtractError)
+            assert via_local.tool_name == local
+            assert via_local.model_dump(exclude={"tool_name"}) == via_connector.model_dump(
+                exclude={"tool_name"}
+            )
+
+    def test_is_web_tool_ignores_the_server_name(self):
+        assert is_web_tool("mcp__firecrawl__firecrawl_scrape")
+        assert is_web_tool("mcp__claude_ai_Exa_search__web_search_exa")
+        assert is_web_tool("WebFetch")
+        assert not is_web_tool("mcp__Synapse__recall")
+        assert not is_web_tool("Bash")
+
+    def test_firecrawl_search_reads_the_wrapped_shape(self):
+        """Firecrawl's current search result nests the lists under data (seen 2026-10-14)."""
+        text = json.dumps(
+            {
+                "success": True,
+                "data": {
+                    "web": [
+                        {
+                            "url": "https://blog.voyageai.com/2026/01/15/voyage-4/",
+                            "title": "The Voyage 4 model family",
+                            "description": "2048, 1024, 512 and 256 dims",
+                            "position": 1,
+                        }
+                    ]
+                },
+                "creditsUsed": 2,
+            }
+        )
+        out = extract("mcp__firecrawl__firecrawl_search", {"query": "voyage-4"}, text)
+        assert isinstance(out, SearchResultSet)
+        assert [it.url for it in out.items] == ["https://blog.voyageai.com/2026/01/15/voyage-4/"]

@@ -13,9 +13,14 @@ This implementation batches all chunks of one doc into a single Haiku call
 to amortize the document tokens. ~$3 total for the full 311-doc corpus
 (311 calls, doc tokens not paid 4000x3898 times).
 
-After contextualizing, chunks must be re-embedded (is_embedded=false flips
-to true after embedding completes). Run scripts/backfill_web_chunks.py
---embed-only afterwards.
+After contextualizing, chunks must be re-embedded: every row this writes gets
+is_embedded = false, and the out-of-repo web-capture cron that runs this
+script (see ingestion/web_artifacts.py) embeds those rows.
+
+The LLM is whatever SYNAPSE_LLM_PROVIDER selects (create_llm_client), on the
+CONTEXTUALIZE stage model (SYNAPSE_CONTEXTUALIZE_MODEL, else SYNAPSE_LLM_MODEL,
+else Haiku). A run stops at the first LLM outage or quota exhaustion rather
+than burning retries on every remaining artifact.
 
 Usage:
     uv run python scripts/contextualize_web_chunks.py [--limit N] [--reset]
@@ -28,14 +33,22 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import psycopg
 from pydantic import BaseModel, Field, ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ingestion.llm_client import ClaudeCLIClient
+from ingestion.llm_client import (
+    LLM_TRANSPORT_ERRORS,
+    MalformedResponseError,
+    create_llm_client,
+    parse_with_retry,
+    stage_model,
+)
 
 
 class _ContextItem(BaseModel):
@@ -158,12 +171,27 @@ def parse_contexts(text: str, expected_n: int) -> tuple[list[str] | None, str | 
     return [indexed.get(i, "") for i in range(expected_n)], None
 
 
+def _contexts_parser(expected_n: int) -> Callable[[str], list[str]]:
+    """parse_contexts as a parse_with_retry parser: a failure raises with the reason,
+    which parse_with_retry quotes back to the model on the next attempt."""
+
+    def parse(text: str) -> list[str]:
+        contexts, reason = parse_contexts(text, expected_n)
+        if contexts is None:
+            raise MalformedResponseError(reason or "unparseable response", raw_response=text)
+        return contexts
+
+    return parse
+
+
 def contextualize_artifact(
-    conn: psycopg.Connection, llm: ClaudeCLIClient, artifact_id: int, content: str
+    conn: psycopg.Connection, llm: Any, artifact_id: int, content: str, model: str
 ) -> tuple[int, str | None]:
     """Generate context_prefix for every chunk of one artifact.
 
-    Returns (chunks_updated, error_or_None).
+    Returns (chunks_updated, error_or_None). An unusable reply after the retries
+    is this artifact's error; LLM_TRANSPORT_ERRORS (outage, quota) propagate so
+    the caller stops the run.
     """
     chunks = conn.execute(
         "SELECT id, idx, content FROM web_chunks WHERE web_artifact_id = %s ORDER BY idx",
@@ -195,38 +223,20 @@ def contextualize_artifact(
         chunks_section = "\n\n".join(f"[{i}]\n{c[2]}" for i, c in enumerate(batch))
         prompt = PROMPT.format(document=doc, n_chunks=len(batch), chunks_section=chunks_section)
 
-        # Structured-output occasionally returns malformed shapes (schema echo,
-        # truncated JSON). Retry up to twice with the prior failed response +
-        # validation reason fed back, so the LLM can self-correct.
-        batch_contexts: list[str] | None = None
-        last_text = ""
-        last_err: str | None = None
-        current_prompt = prompt
-        for _ in range(3):
-            try:
-                resp = llm.messages.create(
-                    messages=[{"role": "user", "content": current_prompt}],
-                    max_tokens=min(8192, 250 * len(batch) + 500),
-                    response_format=_CONTEXTS_SCHEMA,
-                )
-                last_text = resp.content[0].text if resp.content else ""
-            except Exception as e:
-                last_err = f"llm: {e}"
-                continue
-            batch_contexts, reason = parse_contexts(last_text, len(batch))
-            if batch_contexts is not None:
-                break
-            last_err = reason
-            current_prompt = (
-                f"{prompt}\n\n"
-                f"Your previous response failed validation: {reason}\n\n"
-                f"Previous response (truncated):\n{last_text[:1500]}\n\n"
-                f"Return ONLY a JSON object matching the schema — no schema echo, "
-                f'no markdown. Shape: {{"contexts": [{{"idx": <int>, "context": <string>}}, ...]}}'
+        # Replies occasionally come back malformed (schema echo, truncated JSON,
+        # dropped chunks): up to three attempts, each failure's reason fed back.
+        try:
+            batch_contexts = parse_with_retry(
+                llm,
+                base_prompt=prompt,
+                parser=_contexts_parser(len(batch)),
+                model=model,
+                max_tokens=min(8192, 250 * len(batch) + 500),
+                response_format=_CONTEXTS_SCHEMA,
+                max_attempts=3,
             )
-
-        if batch_contexts is None:
-            return 0, f"batch {batch_start} after retries: {last_err}; last_text={last_text[:200]}"
+        except MalformedResponseError as e:
+            return 0, f"batch {batch_start} after retries: {e}; last_text={e.raw_response[:200]}"
         contexts.extend(batch_contexts)
 
     with conn.cursor() as cur:
@@ -249,7 +259,8 @@ def main() -> int:
     args = parser.parse_args()
 
     db_url = load_env()
-    llm = ClaudeCLIClient(model="claude-haiku-4-5")
+    llm = create_llm_client()
+    model = stage_model("CONTEXTUALIZE")
 
     with psycopg.connect(db_url, autocommit=False) as conn:
         if args.reset:
@@ -268,14 +279,18 @@ def main() -> int:
         else:
             rows = conn.execute(
                 """
-                SELECT DISTINCT a.id, a.content_markdown
+                SELECT a.id, a.content_markdown
                 FROM web_artifacts a
-                JOIN web_chunks c ON c.web_artifact_id = a.id
                 WHERE a.kind IN ('web_scrape', 'research_brief')
                   AND a.content_markdown IS NOT NULL
-                  AND c.context_prefix IS NULL
+                  AND EXISTS (
+                      SELECT 1 FROM web_chunks c
+                      WHERE c.web_artifact_id = a.id AND c.context_prefix IS NULL
+                  )
                 ORDER BY a.id
-                """
+                LIMIT %s
+                """,
+                (args.limit,),
             ).fetchall()
         if args.limit:
             rows = rows[: args.limit]
@@ -286,7 +301,16 @@ def main() -> int:
         errors = 0
         total_chunks = 0
         for i, (aid, content) in enumerate(rows, 1):
-            n, err = contextualize_artifact(conn, llm, aid, content)
+            try:
+                n, err = contextualize_artifact(conn, llm, aid, content, model)
+            except LLM_TRANSPORT_ERRORS as e:
+                # An outage or an exhausted quota fails every remaining artifact the
+                # same way: stop, keeping what is committed, and say so.
+                print(
+                    f"  [{i}/{len(rows)}] artifact={aid} LLM unavailable, stopping: {e}",
+                    file=sys.stderr,
+                )
+                return 1
             if err:
                 errors += 1
                 print(f"  [{i}/{len(rows)}] artifact={aid} ERROR: {err}", file=sys.stderr)
@@ -305,7 +329,7 @@ def main() -> int:
             f"\nContextualized {ok} artifacts ({total_chunks} chunks) in {time.time() - t0:.1f}s. "
             f"{errors} errors."
         )
-        print("Next step: rerun `scripts/backfill_web_chunks.py --embed-only` to re-embed.")
+        print("Next step: the web-capture cron's embed pass re-embeds the updated chunks.")
 
     return 0
 

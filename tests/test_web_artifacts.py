@@ -215,6 +215,32 @@ class TestIterWebEvents:
         )
         assert list(iter_web_events(jsonl)) == []
 
+    def test_walks_a_locally_configured_mcp_server(self, tmp_path: Path):
+        """The same Firecrawl tool under a local server name, not the claude.ai connector's."""
+        jsonl = tmp_path / "session.jsonl"
+        lines = []
+        for role, block, ts in (
+            (
+                "assistant",
+                {
+                    "type": "tool_use",
+                    "id": "toolu_local",
+                    "name": "mcp__firecrawl__firecrawl_scrape",
+                    "input": {"url": "https://e.com/x"},
+                },
+                "2026-05-14T01:00:00Z",
+            ),
+            (
+                "user",
+                {"type": "tool_result", "tool_use_id": "toolu_local", "content": "# Page"},
+                "2026-05-14T01:00:01Z",
+            ),
+        ):
+            lines.append(_jsonl_record(role, [block], session_id="S", ts=ts))
+        jsonl.write_text("\n".join(lines) + "\n")
+        (event,) = iter_web_events(jsonl)
+        assert event.tool_name == "mcp__firecrawl__firecrawl_scrape"
+
     def test_tool_result_without_matching_use_is_skipped(self, tmp_path: Path):
         jsonl = tmp_path / "session.jsonl"
         jsonl.write_text(
@@ -378,3 +404,88 @@ class TestWriterIdempotency:
         s2 = ing.ingest_one(jsonl)
         assert s2.files_scanned == 0
         assert s2.files_skipped_unchanged == 1
+
+
+def _search_pair(tool_use_id: str, query: str, snippet: str = "s") -> str:
+    """One WebSearch tool_use/tool_result pair as two JSONL lines."""
+    links = json.dumps([{"title": "A", "url": "https://a.example", "snippet": snippet}])
+    return (
+        _jsonl_record(
+            "assistant",
+            [{"type": "tool_use", "id": tool_use_id, "name": "WebSearch", "input": {"query": query}}],
+            "S",
+            "2026-05-14T02:00:00Z",
+        )
+        + "\n"
+        + _jsonl_record(
+            "user",
+            [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "content": f'Web search results for query: "{query}"\n\nLinks: {links}',
+                }
+            ],
+            "S",
+            "2026-05-14T02:00:01Z",
+        )
+        + "\n"
+    )
+
+
+def _stored_ids(conn) -> list[str]:
+    rows = conn.execute("SELECT tool_use_id FROM web_artifacts ORDER BY id").fetchall()
+    conn.commit()
+    return [r[0] for r in rows]
+
+
+class TestWriterFailures:
+    def test_one_bad_row_keeps_the_others_and_leaves_the_file_unchecked(
+        self, tmp_path: Path, test_conn, clean_web_artifacts, monkeypatch
+    ):
+        """A failed insert used to roll back every earlier row of the file, which the
+        stats still counted, and then checkpoint the file so it was never re-read."""
+        import ingestion.web_artifacts as wa
+
+        real_build = wa._build_row
+
+        def build(event, parsed):
+            row = real_build(event, parsed)
+            if row is not None and event.tool_use_id == "toolu_bad":
+                row["kind"] = "not_a_kind"  # violates the CHECK constraint server-side
+            return row
+
+        monkeypatch.setattr(wa, "_build_row", build)
+        jsonl = tmp_path / "s.jsonl"
+        jsonl.write_text(
+            _search_pair("toolu_first", "one")
+            + _search_pair("toolu_bad", "two")
+            + _search_pair("toolu_last", "three")
+        )
+        ing = WebArtifactsIngester(test_conn)
+        stats = ing.ingest_one(jsonl)
+        assert stats.inserted == 2
+        assert stats.db_errors == 1
+        assert _stored_ids(test_conn) == ["toolu_first", "toolu_last"]
+
+        # Not checkpointed: the next pass reads the file again and gets the row in.
+        monkeypatch.setattr(wa, "_build_row", real_build)
+        again = ing.ingest_one(jsonl)
+        assert again.files_scanned == 1
+        assert again.inserted == 1
+        assert _stored_ids(test_conn) == ["toolu_first", "toolu_last", "toolu_bad"]
+        assert ing.ingest_one(jsonl).files_skipped_unchanged == 1
+
+    def test_nul_bytes_are_stripped_not_fatal(self, tmp_path: Path, test_conn, clean_web_artifacts):
+        jsonl = tmp_path / "s.jsonl"
+        jsonl.write_text(
+            _search_pair("toolu_first", "one") + _search_pair("toolu_nul", "q\x00two", "s\x00nip")
+        )
+        stats = WebArtifactsIngester(test_conn).ingest_one(jsonl)
+        assert stats.db_errors == 0
+        assert _stored_ids(test_conn) == ["toolu_first", "toolu_nul"]
+        query, items = test_conn.execute(
+            "SELECT query, items FROM web_artifacts WHERE tool_use_id = 'toolu_nul'"
+        ).fetchone()
+        assert query == "qtwo"
+        assert items[0]["snippet"] == "snip"

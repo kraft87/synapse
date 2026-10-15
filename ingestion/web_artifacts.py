@@ -12,31 +12,40 @@ same JSONL produce no duplicates and no errors.
 A checkpoint per JSONL is recorded in ``ingestion_state`` with
 ``source = 'web:<absolute path>'`` so re-runs skip files whose mtime has not
 advanced since last successful pass.
+
+Nothing in this repo runs the web-capture lane (this module, web_extractors,
+web_chunker, web_enqueue, research_capture, scripts/contextualize_web_chunks.py):
+a cron on the client machine, outside the repo, walks the session JSONLs and
+drives it end to end (ARCHITECTURE §8).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 
 from ingestion.checkpoints import checkpoint_get, checkpoint_set
+from ingestion.textsafe import strip_nul
 from ingestion.web_extractors import (
-    WEB_TOOLS_ALL,
     ExtractError,
     ExtractResult,
     ResearchJobRef,
     SearchResultSet,
     WebScrape,
     extract,
+    is_web_tool,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------- URL canonicalization ----------
 
@@ -150,7 +159,7 @@ def iter_web_events(jsonl_path: Path) -> Iterator[WebToolEvent]:
                 btype = block.get("type")
                 if btype == "tool_use":
                     name = block.get("name")
-                    if name not in WEB_TOOLS_ALL:
+                    if not isinstance(name, str) or not is_web_tool(name):
                         continue
                     tu_id = block.get("id")
                     if not tu_id:
@@ -205,14 +214,15 @@ def _build_row(event: WebToolEvent, parsed: ExtractResult) -> dict[str, Any] | N
 
     if isinstance(parsed, WebScrape):
         url_canonical = canonicalize_url(parsed.url) if parsed.url else None
-        content_hash = _sha256_hex(parsed.content_markdown) if parsed.content_markdown else None
+        markdown = strip_nul(parsed.content_markdown)
+        content_hash = _sha256_hex(markdown) if markdown else None
         base.update(
             {
                 "url": parsed.url or None,
                 "url_canonical": url_canonical,
                 "content_hash": content_hash,
                 "title": parsed.title,
-                "content_markdown": parsed.content_markdown,
+                "content_markdown": markdown,
                 "synthesized": parsed.synthesized,
                 "prompt": parsed.prompt,
                 "author": parsed.author,
@@ -220,8 +230,9 @@ def _build_row(event: WebToolEvent, parsed: ExtractResult) -> dict[str, Any] | N
             }
         )
     elif isinstance(parsed, SearchResultSet):
-        # Serialize items as a JSON array; preserve typed shape from extractor.
-        items_json = [it.model_dump(mode="json") for it in parsed.items]
+        # Serialize items as a JSON array; preserve typed shape from extractor. NULs go
+        # before json.dumps: escaped as \u0000 they still fail the jsonb cast.
+        items_json = strip_nul([it.model_dump(mode="json") for it in parsed.items])
         base.update(
             {
                 "query": parsed.query,
@@ -238,7 +249,8 @@ def _build_row(event: WebToolEvent, parsed: ExtractResult) -> dict[str, Any] | N
             }
         )
 
-    return base
+    # Postgres text rejects NUL bytes; one in a scraped page would fail the insert.
+    return cast(dict[str, Any], strip_nul(base))
 
 
 # ---------- Writer ----------
@@ -331,14 +343,14 @@ class WebArtifactsIngester:
         checkpoint_set(self._conn, source, ts)
 
     def _insert(self, row: dict[str, Any]) -> bool:
-        """Return True if a new row was inserted, False on conflict."""
-        try:
+        """Return True if a new row was inserted, False on conflict.
+
+        Runs in its own savepoint: a failed insert rolls back this row only, never
+        the rows already inserted from the same file (committed at the file's end).
+        """
+        with self._conn.transaction():
             cur = self._conn.execute(_INSERT_SQL, _fill_defaults(row))
-            r = cur.fetchone()
-            return r is not None
-        except psycopg.Error:
-            self._conn.rollback()
-            raise
+            return cur.fetchone() is not None
 
     def ingest_one(self, jsonl_path: Path, stats: IngestStats | None = None) -> IngestStats:
         stats = stats or IngestStats()
@@ -353,7 +365,7 @@ class WebArtifactsIngester:
             return stats
         stats.files_scanned += 1
 
-        rows_in_file = 0
+        failed_in_file = 0
         for event in iter_web_events(jsonl_path):
             stats.events_seen += 1
             parsed = extract(event.tool_name, event.tool_input, event.result_text)
@@ -363,19 +375,26 @@ class WebArtifactsIngester:
                 continue
             try:
                 inserted = self._insert(row)
-            except psycopg.Error:
+            except psycopg.Error as e:
                 stats.db_errors += 1
+                failed_in_file += 1
+                logger.warning(
+                    "web_artifacts: insert failed for %s in %s: %s", event.tool_use_id, jsonl_path, e
+                )
                 continue
             if inserted:
                 stats.inserted += 1
-                rows_in_file += 1
                 stats.by_kind[row["kind"]] = stats.by_kind.get(row["kind"], 0) + 1
                 stats.by_tool[event.tool_name] = stats.by_tool.get(event.tool_name, 0) + 1
             else:
                 stats.skipped_duplicate += 1
 
-        # Commit + checkpoint per file so partial runs are durable.
-        self._checkpoint_set(source_key, mtime)
+        # Commit per file so partial runs are durable. A file with a failed insert is
+        # left unchecked: a finished session's mtime never changes, so its checkpoint
+        # would hide the missing rows for good, and a re-read only adds what is missing
+        # (tool_use_id dedup).
+        if not failed_in_file:
+            self._checkpoint_set(source_key, mtime)
         self._conn.commit()
         return stats
 

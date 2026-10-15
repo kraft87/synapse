@@ -21,13 +21,16 @@ The queued `content` is `context_prefix + chunk` when a non-empty prefix
 exists: the prefix situates the chunk in its parent doc, which measurably
 helps extraction the same way it helps retrieval (Anthropic contextual
 retrieval, schema 013).
+
+Nothing in this repo calls enqueue_web_chunks: the web-capture lane is driven
+by a cron outside the repo (see ingestion/web_artifacts.py).
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -159,14 +162,8 @@ def enqueue_web_chunks(
     return stats
 
 
-# Gate helpers exposed for the retro-clean script (Phase 3 of the spec):
-# chunks already in the DB that fail the gates today.
-@dataclass
-class GateReport:
-    chunk_id: int
-    reasons: list[str] = field(default_factory=list)
-
-
+# Gate check exposed for the retro-clean script (Phase 3 of the spec): chunks
+# already in the DB that fail the gates today.
 def gate_failures(content: str) -> list[str]:
     """Which gates this content fails (empty list = clean)."""
     reasons = []

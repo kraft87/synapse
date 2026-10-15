@@ -7,6 +7,9 @@ transcript layer (same JSONL scan as the web lane, including subagent
 transcripts under <session>/subagents/), never by prompting an agent to copy
 files. The LLM can't forget, truncate, or reformat what it never touches.
 
+Nothing in this repo calls it: the same out-of-repo client cron that drives the
+web lane (see ingestion/web_artifacts.py) runs ResearchArchiveCapture.
+
 Strict isolation, on purpose (oracle + Gemini review):
   * own table `research_archive` — no FKs, nothing else reads or writes it
   * NEVER chunked, embedded, or KG-extracted; invisible to recall()
