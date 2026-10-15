@@ -281,8 +281,7 @@ _INSTRUCTIONS = (
     "recall_full_turns searches raw turns, long ones as excerpts — the retry when an "
     "overview recall comes back thin. WHEN the user states a "
     "durable fact or correction, or you are about to say 'noted', call remember "
-    "FIRST, then reply. AFTER a recall whose results you used, recall_feedback "
-    "reports which served ids helped, which were noise, and what was missing. "
+    "FIRST, then reply. "
     "Absence from results means unknown, not false. A served fact supports exactly "
     "what it states: one mention of an activity is not evidence of frequency, "
     "currency, or identity, and a fact about a document describes the document. "
@@ -299,8 +298,9 @@ mcp = FastMCP(
     lifespan=lambda _server: pg_pool.held_open(DB_URL),
 )
 
-# Serve skills_lane skills as skill:// MCP resources (PG-backed). Clients materialize
-# them into ~/.claude/skills via sync_skills. Guarded on DB_URL so dev/stdio boots open.
+# Also serve the skills as native fastmcp skill:// resources, for any generic fastmcp client
+# (the first-party plugins sync through the /skills/* routes instead). Both read paths apply
+# the one SkillAccess trust rule. Guarded on DB_URL so dev/stdio boots open.
 if DB_URL:
     from mcp_server.skills_provider import PgSkillsProvider
 

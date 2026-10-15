@@ -83,8 +83,8 @@ def register(
         document describes that document.
 
         Every served item carries an `id` (e:N episode, n:N note, f:N fact incl.
-        superseded_facts pairs, t:N timeline, w:N web); copy it into recall_feedback
-        to rate it. Only e:/n: ids are fetch()-able.
+        superseded_facts pairs, w:N web); recall_feedback takes them to rate an item.
+        Only e:/n: ids are fetch()-able.
 
         A `warnings` list means a leg degraded or this connection is served (almost)
         nothing: a config problem, not empty memory.
@@ -140,7 +140,7 @@ def register(
         notes; this serves whole turns and nothing else, ranked by relevance +
         recency (keyword + semantic search + rerank over the full archive). `limit`
         sizes the response: 1-2 turns for a pinpoint quote, the default 5 to
-        reconstruct a discussion (weak trailing matches drop automatically). A call
+        reconstruct a discussion. A call
         serves up to ~40K characters of turn text: a turn that would pass that comes
         back as its opening plus the stretch that best matches the query, with
         `full_chars` giving its real length; fetch its e:N id for the rest.

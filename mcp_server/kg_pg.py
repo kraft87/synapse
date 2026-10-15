@@ -1,20 +1,18 @@
-"""Postgres read-port of the KG retrieval leg (mcp_server/recall.py::_search_kg).
+"""Postgres KG retrieval leg (recall's ``_search_kg``).
 
 Queries the ``kg_entities`` / ``kg_relationships`` tables (schema/017) that the
-extraction pipeline writes (the canonical KG store since #67 PR 3), scoped by ``owner_id`` + ``group_id``.
-Returns the same ``(facts, seed_entities)`` shape ``recall._search_kg`` returns, so
-it can be wired into recall behind a shadow-read flag and, eventually, become the
-source of truth.
+extraction pipeline writes, scoped by ``owner_id`` + ``group_id``. Returns
+``(facts, seed_entities)``.
 
-Retrieval mirrors ``_search_kg`` exactly:
+Retrieval:
   1. fact-embedding vector KNN over live edges (partial HNSW: t_invalid IS NULL)
   2. fact BM25 over edge text (ParadeDB)
-  3. entity-seed vector KNN + live-degree gate + session-focus bonus -> top 8 seeds
+  3. entity-seed vector KNN + live-edge gate + session-focus bonus -> top 8 seeds
   4. 1-hop traversal from the seeds (per-seed LIMIT 8, one statement for all of them)
   5. RRF fuse [vec, bm25, hop], take top ``limit``
 
-The caller's cursor MUST have these session GUCs set (see parity_kg_read.py):
-  - ``hnsw.ef_search = 200``               (matches FalkorDB's efRuntime)
+The caller's cursor MUST have these session GUCs set (recall_sources._search_kg does):
+  - ``hnsw.ef_search = 200``               (set on every pooled connection)
   - ``enable_seqscan = off``               } pgvector won't use the HNSW index when
   - ``max_parallel_workers_per_gather = 0``} an equality filter is also present --
 the planner picks a bitmap/parallel-seq-scan on the owner_id btree and sorts 47K
@@ -42,7 +40,7 @@ from ingestion.embedding import embed_dims
 # (and its HNSW index expressions) verbatim. Default 2048 (Voyage prod, unchanged).
 _EMBED_DIMS = embed_dims()
 
-# RRF constant matches recall._rrf_fuse / bench_pg_kg (k=60, 1-indexed rank).
+# RRF constant (k=60, 1-indexed rank), the same as recall_ranking.merge_rrf.
 _RRF_K = 60
 # Fact-vector over-fetch pool: how many global-nearest live facts to pull before
 # applying the owner/group filter. Headroom for multi-tenant filtering; for a single
@@ -153,8 +151,7 @@ def search_kg_postgres(
         vec_uuids.append(u)
 
     # 2 — BM25 full-text over fact text (ParadeDB). Sanitized by bm25_query_text so
-    # identifiers/error strings survive. t_invalid filtered in the WHERE (before LIMIT),
-    # matching the FalkorDB fulltext leg.
+    # identifiers/error strings survive. t_invalid filtered in the WHERE (before LIMIT).
     safe = bm25_query_text(query)
     bm25_uuids: list[str] = []
     if safe:
@@ -183,7 +180,7 @@ def search_kg_postgres(
     # (embedding IS NOT NULL -> stays on kg_entities_hnsw), over-fetch _OVERFETCH, then
     # filter the tenant scope on that small candidate set (single owner: ~97% survive,
     # 25 found trivially). 1248ms -> 26ms verified via EXPLAIN ANALYZE.
-    # A seed must have at least one live edge (matches FalkorDB), asked as two EXISTS
+    # A seed must have at least one live edge, asked as two EXISTS
     # (src side, tgt side) over all 25 seeds in this ONE query: each probe stops at the
     # first live edge, where a live-degree COUNT read every edge of every seed (the User
     # supernode has thousands), and a correlated (src OR tgt) predicate could not use the

@@ -102,50 +102,36 @@ def register(
         session_id: str | None = None,
         project: str | None = None,
     ) -> dict:
-        """Report retrieval quality after a recall() whose results you used: which
-        served ids helped, which were noise, plus free-text comment on the serving.
+        """Rate a recall() whose results you used: which served ids helped, which were
+        noise, and what was missing.
 
-        AFTER acting on a recall's results, call this ONCE with that recall's
-        query string. `helpful` = served ids that were load-bearing; `noise` =
-        served ids that were irrelevant or distracting. Everything else goes in
-        `comment`, free text: too much dumped at once, load-bearing hit buried,
-        wrong granularity or ordering, a misleading passage, an improvement idea.
+        Call it ONCE per recall, with that recall's query verbatim. `helpful` = served
+        ids that were load-bearing; `noise` = served ids that were irrelevant or
+        distracting. Rate ids exactly as served: "e:N" episodes, "f:N" facts (and
+        superseded_facts), "w:N" web, "t:N" board timeline events, plus "n:N"
+        note ids from the session-start board or fetch(): WHEN a board note shaped
+        your answer (or misled it), rate it too. Everything else goes in `comment`,
+        free text: too much volume, a buried hit, wrong ordering, a misleading passage.
 
-        `missing` is the exception, not a per-report field — most recalls lack
-        nothing; then OMIT it (never file "nothing missing"). Set it only when
-        you can name the specific content you needed AND have concrete reason to
-        believe memory holds it (a past session covered it, or the user said it
-        was stored). Never-discussed content is not a miss; weak results belong
-        in `comment`. A `missing` without `found_via` is unusable, so always pair
-        them: "full_turns" / "fetch" / "another_recall" (memory HAD it — a
-        serving miss, the highest-value signal) vs "filesystem" / "live_system" /
-        "web" / "user" (memory never had it) vs "nowhere" (still unresolved).
+        `missing` is the exception, not a per-report field: most recalls lack nothing,
+        then OMIT it. Set it only when you can name the specific content you needed AND
+        have concrete reason to believe memory holds it. Always pair it with
+        `found_via`: "full_turns" / "fetch" / "another_recall" (memory HAD it, a serving
+        miss, the highest-value signal), "filesystem" / "live_system" / "web" / "user"
+        (memory never had it), or "nowhere" (still unresolved).
 
-        Rate any served id verbatim — "e:N" episodes, "f:N" facts (and
-        superseded_facts), "t:N" timeline, "w:N" web — plus
-        "n:N" note ids from the session-start board or fetch(): WHEN a board
-        note shaped your answer (or misled it), rate it too. A comment-only
-        report is still valuable when the serving itself was the problem.
-
-        This is offline labeled data (eval goldens, reranker tuning); it never
-        changes live ranking, so honest negatives are safe and wanted. Do NOT
-        file more than one report per recall query, do NOT rate results you
-        never used, and do NOT invent ids — report only ids actually served to
-        you by recall, the board, or fetch.
+        This is offline labeled data (eval goldens, reranker tuning); it never changes
+        live ranking, so honest negatives are safe. Do NOT rate results you never used
+        or invent ids: report only ids served to you by recall, the board, or fetch.
 
         Args:
             query: The recall query being rated, verbatim.
             helpful: Served ids that were load-bearing ("e:123", "f:456", "w:7").
             noise: Served ids that were irrelevant or distracting.
-            missing: The specific content you needed but were not served — omit
-                entirely unless you can name it AND believe memory holds it.
-                Always pair with `found_via`.
-            found_via: Where the missing info turned up ("full_turns"/"fetch"/
-                "another_recall" = memory had it; "filesystem"/"live_system"/
-                "web"/"user" = it never did; "nowhere" = unresolved). Set it
-                whenever `missing` is set.
-            comment: Free text for anything the other fields can't say — serving
-                volume, ordering, presentation, misleading results, improvement ideas.
+            missing: The specific content you needed but were not served; set only
+                with `found_via`.
+            found_via: Where the missing info turned up (see above).
+            comment: Free text for anything the other fields can't say.
             session_id: Optional session id for grouping reports.
             project: Optional project slug the recall was scoped to.
         """

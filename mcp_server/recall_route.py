@@ -29,13 +29,10 @@ def register(
 ) -> Any:
     @mcp.custom_route("/recall", methods=["POST"])
     async def recall_http(request: Request) -> JSONResponse:
-        """Plain-HTTP recall for non-MCP callers — the auto-recall memory hook.
+        """Plain-HTTP recall for non-MCP callers (the dashboard's Recall console, scripts).
 
-        A shell/Python hook (UserPromptSubmit) has no MCP client: command hooks talk
-        stdout/exit-code only and can't invoke an MCP tool. This route gives them the
-        same recall() over plain HTTP, reusing the warm process-singleton engine
-        (loaded embedder + pooled PG connections + warm HNSW cache) so a per-turn hook
-        stays fast instead of cold-starting the pipeline each call.
+        Gives a caller with no MCP client the same recall() over plain HTTP, reusing the warm
+        process-singleton engine (loaded embedder + pooled PG connections + warm HNSW cache).
 
         Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
                "source"?: str, "debug"?: bool}.
@@ -44,10 +41,9 @@ def register(
         (restricted, empty allowlist). A ``surface`` body field is ignored. Holding a
         credential is not the same as being trusted — the token says "a Synapse client",
         the surface row says what that client may read.
-        write_feedback defaults FALSE here: automatic recalls must not bump the
-        retrieval-count feedback signal (bench-grade discipline) — and the phase-2
-        dashboard debug console relies on this default staying false so its diagnostic
-        recalls never pollute the feedback signal. ``debug`` attaches the per-leg timing /
+        write_feedback defaults FALSE here: HTTP recalls are not agent-served, so they
+        must not bump the served counters, and the dashboard's debug console relies on
+        this default so its diagnostic recalls never pollute them. ``debug`` attaches the per-leg timing /
         pool-size / rerank envelope the engine already measures (see recall(debug=...)).
         Fail-soft like /ingest — never raises past the JSONResponse boundary.
         An authenticated caller whose verdict serves (almost) nothing gets the reason
