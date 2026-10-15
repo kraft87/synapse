@@ -684,7 +684,7 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any] | N
 
 # kg_entities.degree is a one-off backfill (schema 017) that nothing maintains: stale for
 # older entities, 0 for every one extraction wrote since. Reads count live edges instead.
-# One scalar subquery per side keeps each count on kg_rel_src / kg_rel_tgt (an src-OR-tgt
+# One scalar subquery per side keeps each count on kg_rel_pair / kg_rel_tgt (an src-OR-tgt
 # predicate can use neither). `e` is the kg_entities alias of the surrounding query.
 _LIVE_DEGREE_SQL = (
     "((SELECT count(*) FROM kg_relationships r WHERE r.owner_id = e.owner_id "
@@ -713,7 +713,7 @@ def _entity(
 
         flags = _flag_set(conn)
         # An entity's edges live in its own (owner_id, group_id): extraction and dedup run
-        # per group. Naming both lets kg_rel_src / kg_rel_tgt serve the src-OR-tgt reads.
+        # per group. Naming both lets kg_rel_pair / kg_rel_tgt serve the src-OR-tgt reads.
         scope = {"u": uuid, "o": ent["owner_id"], "g": ent["group_id"]}
         touching = "r.owner_id = %(o)s AND r.group_id = %(g)s AND (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s)"
 
@@ -910,7 +910,7 @@ def _graph_neighborhood(
         seed_uuid = seed["uuid"]
 
         # Edges stay within the seed's (owner_id, group_id) — extraction and dedup run per
-        # group — and naming both lets kg_rel_src / kg_rel_tgt / kg_rel_pair serve every
+        # group — and naming both lets kg_rel_pair / kg_rel_tgt serve every
         # scan below. Plus the shared as-of edge-visibility fragment (empty when unset).
         edge_scope = "owner_id = %s AND group_id = %s"
         edge_params: list[Any] = [seed["owner_id"], seed["group_id"]]
