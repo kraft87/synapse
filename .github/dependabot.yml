@@ -11,9 +11,7 @@ updates:
         patterns: ["*"]
 
   - package-ecosystem: "docker"
-    directories:
-      - "/"
-      - "/docker"
+    directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"

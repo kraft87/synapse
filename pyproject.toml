@@ -96,6 +96,10 @@ known-first-party = ["synapse"]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
+# The one list of what is type-checked: CI and pre-commit both run a bare `uv run mypy`.
+# `exclude` only prunes directory walks, so the two mcp_server modules named here are
+# still checked; the other mcp_server modules are followed as imports, not reported.
+files = ["ingestion", "mcp_server/__init__.py", "mcp_server/recall.py", "dream"]
 exclude = ["tests/", "mcp_server/", "dream/__main__.py", "plugin/"]
 
 [tool.uv.sources]
