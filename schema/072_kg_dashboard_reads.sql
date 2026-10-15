@@ -1,5 +1,5 @@
 -- schema-check: optional
--- 120_kg_dashboard_reads.sql
+-- 072_kg_dashboard_reads.sql
 -- The dashboard reads the KG's own columns, t_created and entity_subtype, instead of
 -- the FalkorDB-era mirrors (created_at, entity_type) that 017 and 020 kept for a cycle.
 --

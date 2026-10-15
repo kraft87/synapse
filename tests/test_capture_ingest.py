@@ -149,7 +149,7 @@ def test_a_deleted_turn_is_not_captured_when_it_is_shipped_again(db, db_url, con
     from mcp_server.dash.curation import _delete_episode
 
     if not conn.execute("SELECT to_regclass('deleted_turns')").fetchone()[0]:
-        pytest.skip("schema 123 (deleted_turns) is not applied")
+        pytest.skip("the deleted_turns migration is not applied")
     recs = records("a", "s-4")
     store_episodes(db, parse(recs))
     conn.execute("TRUNCATE web_artifacts CASCADE")

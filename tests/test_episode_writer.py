@@ -37,7 +37,7 @@ def _clean(clean_tables, conn):
 
 
 def _tombstones(conn) -> int | None:
-    """Rows in deleted_turns, or None on a database without it (schema 123 is optional)."""
+    """Rows in deleted_turns, or None on a database without it (that migration is optional)."""
     if not conn.execute("SELECT to_regclass('deleted_turns')").fetchone()[0]:
         return None
     return conn.execute("SELECT count(*) FROM deleted_turns").fetchone()[0]
@@ -45,9 +45,9 @@ def _tombstones(conn) -> int | None:
 
 @pytest.fixture()
 def tombstones(conn):
-    """For the tests whose point is the tombstone: skipped until schema 123 is applied."""
+    """For the tests whose point is the tombstone: skipped until the deleted_turns migration is applied."""
     if _tombstones(conn) is None:
-        pytest.skip("schema 123 (deleted_turns) is not applied")
+        pytest.skip("the deleted_turns migration is not applied")
 
 
 def _ep(session: str, seq: int, tag: str, project: str | None = "proj", **kw) -> Episode:
