@@ -34,6 +34,7 @@ import json
 import os
 import stat
 import sys
+import urllib.request
 from pathlib import Path
 from types import ModuleType
 
@@ -197,7 +198,7 @@ def _capture_requests(monkeypatch, cfg: ModuleType) -> list[tuple[str, str | Non
         seen.append((req.full_url, req.get_header("Authorization")))
         return _Resp(b"{}")
 
-    monkeypatch.setattr(cfg.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     return seen
 
 
@@ -255,6 +256,38 @@ def test_a_failed_save_leaves_the_previous_file_and_no_temp_file():
         home.save({"token": "new", "broken": object()})
     assert home.load() == {"token": "old"}
     assert [p.name for p in _config_json().parent.iterdir()] == ["config.json"]
+
+
+def test_log_appends_timestamped_lines_under_the_synapse_home():
+    """Hook logs used to default to /tmp, which Windows doesn't have (the work laptop
+    logged nothing) and POSIX shares between users."""
+    home = _load_home()
+    home.log("ingest-hook", "OK s.jsonl")
+    home.log("ingest-hook", "ERR boom")
+    lines = (Path(os.environ["SYNAPSE_HOME"]) / "logs" / "ingest-hook.log").read_text().splitlines()
+    assert [line.split(" ", 1)[1] for line in lines] == ["OK s.jsonl", "ERR boom"]
+    assert lines[0].split(" ", 1)[0].startswith("20")  # ISO timestamp
+
+
+def test_log_restarts_a_file_past_64kb():
+    home = _load_home()
+    path = Path(os.environ["SYNAPSE_HOME"]) / "logs" / "spool.log"
+    path.parent.mkdir(parents=True)
+    path.write_text("x" * (64 * 1024 + 1), encoding="utf-8")
+    home.log("spool", "fresh")
+    assert path.read_text().endswith("fresh\n") and len(path.read_text()) < 200
+
+
+def test_log_never_raises(tmp_path, monkeypatch):
+    """The Synapse home can't be created (it is a file) or the message can't be encoded:
+    a hook must not die over its log."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("not a directory")
+    monkeypatch.setenv("SYNAPSE_HOME", str(blocker))
+    home = _load_home()
+    home.log("x", "msg")
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path / "ok"))
+    home.log("x", "lone surrogate \ud800")
 
 
 def test_update_merges_changes_and_a_none_value_deletes_the_key():
@@ -674,6 +707,60 @@ def test_store_token_never_creates_a_settings_token_slot(settings):
     else:
         assert _settings_path().read_bytes() == before
     assert _read_home()["token"] == _DEVICE
+
+
+def test_write_user_config_changes_only_its_key_and_leaves_no_temp_file():
+    _write_settings({"SYNAPSE_URL": _URL, "other": "kept"}, theme="dark")
+    cfg = _load_config()
+    cfg.write_user_config("SYNAPSE_URL", _FOREIGN)
+    assert json.loads(_settings_path().read_text(encoding="utf-8")) == {
+        "pluginConfigs": {
+            "synapse@some-marketplace": {"options": {"SYNAPSE_URL": _FOREIGN, "other": "kept"}}
+        },
+        "theme": "dark",
+    }
+    assert cfg._FILE_OPTIONS["SYNAPSE_URL"] == _FOREIGN
+    assert [p.name for p in _settings_path().parent.iterdir()] == ["settings.json"]
+
+
+def test_write_user_config_refuses_a_settings_file_it_cannot_parse():
+    """The user's Claude Code settings must never be replaced by a file holding only the
+    keys this code knows about."""
+    _settings_path().parent.mkdir(parents=True, exist_ok=True)
+    _settings_path().write_text("{oops", encoding="utf-8")
+    cfg = _load_config()
+    with pytest.raises(RuntimeError, match="isn't valid JSON"):
+        cfg.write_user_config("SYNAPSE_URL", _URL)
+    assert _settings_path().read_text(encoding="utf-8") == "{oops"
+
+
+def test_a_crash_while_writing_settings_leaves_the_previous_file(monkeypatch):
+    _write_settings({"SYNAPSE_URL": _URL})
+    before = _settings_path().read_bytes()
+    cfg = _load_config()
+
+    def crash(src, dst):
+        raise OSError("disk went away")
+
+    monkeypatch.setattr(cfg.synapse_home.os, "replace", crash)
+    with pytest.raises(OSError, match="disk went away"):
+        cfg.write_user_config("SYNAPSE_URL", _FOREIGN)
+    assert _settings_path().read_bytes() == before
+    assert [p.name for p in _settings_path().parent.iterdir()] == ["settings.json"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_settings_written_through_a_symlink_keep_the_link(tmp_path):
+    """A dotfiles repo often owns settings.json; replacing the link would orphan it."""
+    real = tmp_path / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    real.write_text(json.dumps({"theme": "dark"}), encoding="utf-8")
+    _settings_path().parent.mkdir(parents=True, exist_ok=True)
+    _settings_path().symlink_to(real)
+    _load_config().write_user_config("SYNAPSE_URL", _URL)
+    assert _settings_path().is_symlink()
+    assert json.loads(real.read_text(encoding="utf-8"))["theme"] == "dark"
+    assert "SYNAPSE_URL" in real.read_text(encoding="utf-8")
 
 
 def test_store_token_with_a_record_removes_the_legacy_device_json():

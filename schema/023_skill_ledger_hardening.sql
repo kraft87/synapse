@@ -14,5 +14,6 @@
 --  lane is single-user / tiny, so the MVCC/idempotency win doesn't justify the join cost yet.)
 
 ALTER TABLE skills_lane.skill_gap_candidates
+    DROP CONSTRAINT IF EXISTS grounded_required_to_apply,
     ADD CONSTRAINT grounded_required_to_apply
     CHECK (status NOT IN ('accepted', 'promoted') OR grounded_weight > 0);

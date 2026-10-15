@@ -9,30 +9,17 @@ to full.
 
 Enrollment, approval, minting and the no-self-approve property live in
 test_credential_trust.py, next to the schema-054 machinery they cover.
-
-Skips cleanly when no test DB is reachable, mirroring test_private_session_routes.py.
 """
 
 from __future__ import annotations
 
-import os
-
-import psycopg
 import pytest
 from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.surfaces import lookup_surface
+from mcp_server.surface_routes import register
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.surfaces import lookup_surface  # noqa: E402
-from mcp_server.surface_routes import register  # noqa: E402
+pytestmark = pytest.mark.db
 
 _TOKEN = "test-surface-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}
@@ -40,16 +27,16 @@ _SID = "route-test-host"
 
 
 def _client(db_url):
-    """Both gates satisfied by the one test token. The gates' ASYMMETRY (root enrolls,
-    only a full-trust device approves) is what test_credential_trust.py exists for;
-    conflating them here would just make these registration tests noisier."""
+    """The admin gate satisfied by the one test token. Who may clear it (only a
+    full-trust device, never root) is what test_credential_trust.py exists for; these
+    registration tests only need a gate that admits one credential."""
     from fastmcp import FastMCP
 
-    def authorized(request):
+    def admin(request):
         return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
 
     test_mcp = FastMCP("test-surfaces")
-    register(test_mcp, db_url, authorized, authorized)
+    register(test_mcp, db_url, admin)
     return TestClient(test_mcp.http_app())
 
 
@@ -157,7 +144,8 @@ def test_delete_revokes_back_to_the_unregistered_default(clean, db_url):
         client.put(f"/surfaces/{_SID}", json={"trust": "full"}, headers=_H)
         assert lookup_surface(db_url, _SID).trust == "full"
         r = client.delete(f"/surfaces/{_SID}", headers=_H)
-        assert r.status_code == 200 and r.json()["revoked"] == 1
+        assert r.status_code == 200
+        assert r.json() == {"status": "ok", "surface_id": _SID, "revoked": 1}
         # Idempotent: revoking an already-revoked (or absent) row is a no-op.
         assert client.delete(f"/surfaces/{_SID}", headers=_H).json()["revoked"] == 0
 

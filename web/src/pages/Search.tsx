@@ -1,14 +1,16 @@
 // Search — the omnibox target. Lexical BM25 over episodes/facts/entities/events
 // (README §Search) — deliberately "not recall()". Type tabs with counts, result
 // cards that deep-link (entity → dossier, others → episode overlay).
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
-  cascadeSummary, deleteEpisode, deleteFact, factDeleteSummary, fetchSearch, onDeleted,
+  cascadeSummary, deleteEpisode, deleteFact, factDeleteSummary, fetchSearch, onDeleted, wasDeleted,
   type SearchHit, type SearchResult, type SearchTab,
 } from '../api';
 import { useStore } from '../state';
 import { openEntity, openEpisode, openSession } from '../hash';
-import { relTime, typeColor } from '../tokens';
+import { appendUnique } from '../paging';
+import { typeColor } from '../tokens';
+import { hasTarget, isSuperseded, metaLine } from '../searchHits';
 import { DeleteButton } from '../components/ui';
 
 const TABS: { key: SearchTab; label: string }[] = [
@@ -24,13 +26,7 @@ const LIMIT = 20;
 const DELETABLE: SearchTab[] = ['episodes', 'facts'];
 const NOTICE_MS = 8000;
 
-function metaLine(h: SearchHit): string {
-  if (h.type === 'entities') return [h.meta.entity_type, h.meta.degree != null ? h.meta.degree + ' edges' : ''].filter(Boolean).join(' · ');
-  // Events: show when the event happened (t_valid), not when the row was
-  // ingested — backfills stamp thousands of events with one ingested_at.
-  const ts = h.type === 'events' ? (h.meta.t_valid ?? h.meta.ts) : h.meta.ts;
-  return [h.meta.project, h.meta.source, relTime(ts)].filter(Boolean).join(' · ');
-}
+const hitKey = (h: SearchHit): string => h.type + ':' + h.id;
 function openHit(h: SearchHit) {
   if (h.type === 'entities') return openEntity(h.id);
   if (h.type === 'episodes') return openEpisode(h.id);
@@ -44,27 +40,47 @@ export function Search() {
   const [tab, setTab] = useState<SearchTab>('episodes');
   const [res, setRes] = useState<SearchResult | null>(null);
   const [hits, setHits] = useState<SearchHit[]>([]);
+  const hitsRef = useRef<SearchHit[]>([]);
+  hitsRef.current = hits;
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(false);
   // Delete feedback: the cascade summary (or a failure), shown briefly under the tabs.
   const [notice, setNotice] = useState<{ text: string; bad: boolean } | null>(null);
+  // Bumped when the query, tab or a filter changes: a response (first page or load more) from
+  // an older selection is dropped on arrival, so the hits and counts always match the tabs.
+  const epoch = useRef(0);
 
-  const run = (offset: number) => {
-    if (offset === 0) setLoading(true);
+  const run = (offset: number, mine: number) => {
+    if (offset === 0) setLoading(true); else setLoadingMore(true);
     setError(false);
     fetchSearch({ q: searchQuery, type: tab, offset, limit: LIMIT, project, group_id: group, source })
-      .then((r) => { setRes(r); setHits((prev) => (offset === 0 ? r.hits : prev.concat(r.hits))); })
-      .catch(() => setError(true))
-      .finally(() => setLoading(false));
+      .then((r) => {
+        if (mine !== epoch.current) return;
+        setRes((prev) => ({ ...r, total_by_type: r.total_by_type ?? prev?.total_by_type }));
+        setHits((prev) => (offset === 0 ? r.hits : appendUnique(prev, r.hits, hitKey)));
+      })
+      .catch(() => { if (mine === epoch.current) setError(true); })
+      .finally(() => { if (mine === epoch.current) { setLoading(false); setLoadingMore(false); } });
   };
 
-  useEffect(() => { setHits([]); run(0); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [searchQuery, tab, project, group, source]);
+  useEffect(() => {
+    setHits([]); setLoadingMore(false);
+    run(0, ++epoch.current);
+    /* eslint-disable-next-line react-hooks/exhaustive-deps */
+  }, [searchQuery, tab, project, group, source]);
 
   // A delete can also fire from the episode overlay opened off one of these hits, so the
-  // list drops the row on the shared event rather than only in its own success handler.
-  useEffect(() => onDeleted(({ kind, id }) => {
-    setHits((prev) => prev.filter((h) => !(h.type === kind && h.id === id)));
-    setRes((prev) => prev && { ...prev, total_by_type: { ...prev.total_by_type, [kind]: Math.max(0, prev.total_by_type[kind] - 1) } });
+  // list drops the row on the shared event rather than only in its own success handler, and
+  // with it the facts and events the episode's cascade took. The tab's count falls by the
+  // hits that were shown and went.
+  useEffect(() => onDeleted((d) => {
+    const gone = hitsRef.current.filter((h) => wasDeleted(d, h.type, h.id));
+    if (!gone.length) return;
+    const goneKeys = new Set(gone.map(hitKey));
+    const type = gone[0].type; // the hits are one tab's
+    setHits((prev) => prev.filter((h) => !goneKeys.has(hitKey(h))));
+    setRes((prev) => prev?.total_by_type ? { ...prev, total_by_type: { ...prev.total_by_type, [type]: Math.max(0, prev.total_by_type[type] - gone.length) } } : prev);
   }), []);
 
   useEffect(() => {
@@ -119,7 +135,7 @@ export function Search() {
             inside a button is invalid, so the shell is a div and the snippet carries the
             open-hit click — the FeedCard pattern. */}
         {hits.map((h) => (
-          <div key={h.type + ':' + h.id} className="result"
+          <div key={hitKey(h)} className="result"
             style={{ textAlign: 'left', border: '1px solid var(--line)', background: 'var(--bg1)', borderRadius: '9px', padding: '10px 13px' }}>
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap', marginBottom: '5px' }}>
               <span style={{ fontFamily: 'var(--font-data)', fontSize: '10px', padding: '2px 7px', borderRadius: '4px', border: '1px solid var(--line2)', color: typeColor[h.type] || 'var(--txt2)' }}>{singular[h.type]}</span>
@@ -131,10 +147,13 @@ export function Search() {
                   onError={() => setNotice({ text: 'delete failed — the ' + singular[h.type] + ' is still in memory.', bad: true })}
                 />
               )}
-              <button className="linkbtn" onClick={() => openHit(h)} title={'open ' + singular[h.type]}
-                style={{ border: 'none', background: 'none', padding: '2px 4px', cursor: 'pointer', fontFamily: 'var(--font-data)', fontSize: '10.5px', color: 'var(--txt3)' }}>↗</button>
+              {hasTarget(h) && (
+                <button className="linkbtn" onClick={() => openHit(h)} title={'open ' + singular[h.type]}
+                  style={{ border: 'none', background: 'none', padding: '2px 4px', cursor: 'pointer', fontFamily: 'var(--font-data)', fontSize: '10.5px', color: 'var(--txt3)' }}>↗</button>
+              )}
             </div>
-            <div onClick={() => openHit(h)} style={{ fontSize: '13.5px', lineHeight: 1.5, color: 'var(--txt)', cursor: 'pointer' }}>{h.snippet}</div>
+            <div onClick={hasTarget(h) ? () => openHit(h) : undefined}
+              style={{ fontSize: '13.5px', lineHeight: 1.5, color: 'var(--txt)', cursor: hasTarget(h) ? 'pointer' : 'default', ...(isSuperseded(h) ? { textDecoration: 'line-through', opacity: 0.6 } : {}) }}>{h.snippet}</div>
           </div>
         ))}
       </div>
@@ -142,8 +161,8 @@ export function Search() {
       {hits.length > 0 && (
         <div style={{ textAlign: 'center', marginTop: '16px' }}>
           {canPage ? (
-            <button className="softbtn" onClick={() => run(hits.length)}
-              style={{ borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>load more</button>
+            <button className="softbtn" onClick={() => run(hits.length, epoch.current)} disabled={loadingMore}
+              style={{ borderRadius: '7px', padding: '7px 16px', fontSize: '12.5px', fontFamily: 'var(--font-data)' }}>{loadingMore ? 'loading…' : 'load more'}</button>
           ) : (
             <span style={{ fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt3)' }}>{hits.length} of {total} · end of results</span>
           )}

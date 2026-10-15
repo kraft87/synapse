@@ -1,6 +1,14 @@
 -- Migrate episodes embedding column from VECTOR(3072) to VECTOR(2048) for voyage-4-large.
 -- All existing rows have is_embedded=FALSE so no embedding data is lost.
-ALTER TABLE episodes ALTER COLUMN embedding TYPE VECTOR(2048);
+-- Only when the width differs: ALTER COLUMN TYPE rewrites the table and rebuilds every
+-- index on it (the HNSW one for minutes, under ACCESS EXCLUSIVE), even to the same type.
+DO $$
+BEGIN
+    IF (SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+        WHERE attrelid = 'episodes'::regclass AND attname = 'embedding') <> 'vector(2048)' THEN
+        ALTER TABLE episodes ALTER COLUMN embedding TYPE VECTOR(2048);
+    END IF;
+END $$;
 
 -- Drop old index if it exists.
 DROP INDEX IF EXISTS episodes_embedding_idx;

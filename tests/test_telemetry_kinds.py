@@ -18,28 +18,17 @@ test's engine can never win the assertion.
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 
-import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import mcp_server.recall as recall_mod
+from ingestion.db import Database
+from mcp_server import server
+from mcp_server.board import _OWNER, build_board, record_board_metrics
+from mcp_server.recall import Recall
 
-# Skip the whole module if the shared Postgres test DB isn't up — these tests are DB-only.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import mcp_server.recall as recall_mod  # noqa: E402
-from ingestion.db import Database  # noqa: E402
-from mcp_server import server  # noqa: E402
-from mcp_server.board import _OWNER, build_board, record_board_metrics  # noqa: E402
-from mcp_server.recall import Recall  # noqa: E402
+pytestmark = pytest.mark.db
 
 
 class _FakeEmbedder:

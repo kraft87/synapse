@@ -1,31 +1,28 @@
 // Episode detail overlay (#/episode/:id). Turn cards + the derived-from block —
 // both-directions provenance for verifying extraction (spec §IA).
 import type React from 'react';
-import { useState } from 'react';
-import { cascadeSummary, deleteEpisode, fetchDerived, fetchEpisode, type Derived } from '../api';
+import { useRef, useState } from 'react';
+import { cascadeSummary, deleteEpisode } from '../api';
 import { closeOverlay } from '../hash';
 import { srcColor } from '../tokens';
 import { DerivedBlock } from '../components/FeedCard';
 import { DeleteButton, Spinner } from '../components/ui';
-import { useAsync } from '../hooks';
+import { useEpisode, useModal } from '../hooks';
 
 const chip = (bg: string, color: string, border?: string): React.CSSProperties => ({
   fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 7px', borderRadius: '4px', background: bg, color, border: border || 'none',
 });
 
 export function EpisodeModal({ id }: { id: string }) {
-  const { data, error } = useAsync(() => Promise.all([
-    fetchEpisode(id),
-    fetchDerived(id).catch(() => ({ facts: [], timeline_events: [] } as Derived)),
-  ]).then(([e, d]) => ({ ep: e, derived: d })), [id]);
+  const { ep, derived, error } = useEpisode(id);
   // After a successful delete the episode no longer exists, so the overlay stops showing
   // it and shows the cascade summary instead — closing straight away would hide the one
   // line that says what else went (mixed chunks, unlinked facts). Dismiss closes.
   const [deleted, setDeleted] = useState<string | null>(null);
   const [delErr, setDelErr] = useState(false);
-  const ep = data?.ep ?? null;
-  const derived = data?.derived ?? null;
   const err = error != null;
+  const panel = useRef<HTMLDivElement>(null);
+  useModal(panel);
 
   const turns = ep ? [
     ep.human_turn && { role: 'user', text: ep.human_turn, user: true },
@@ -35,9 +32,9 @@ export function EpisodeModal({ id }: { id: string }) {
 
   return (
     <div onClick={closeOverlay} style={{ position: 'fixed', inset: 0, background: 'var(--scrim)', zIndex: 60, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '24px', backdropFilter: 'blur(2px)' }}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '14px', maxWidth: '720px', width: '100%', maxHeight: '80vh', overflowY: 'auto', padding: '20px 22px', boxSizing: 'border-box' }}>
+      <div ref={panel} role="dialog" aria-modal="true" aria-labelledby="overlay-title" onClick={(e) => e.stopPropagation()} style={{ background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '14px', maxWidth: '720px', width: '100%', maxHeight: '80vh', overflowY: 'auto', padding: '20px 22px', boxSizing: 'border-box' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-          <span style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)' }}>ep-{id}</span>
+          <span id="overlay-title" style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)' }}>ep-{id}</span>
           {ep?.project && <span style={chip('var(--acc-bg)', 'var(--acc)')}>{ep.project}</span>}
           {ep?.source && <span style={chip('transparent', srcColor(ep.source), '1px solid ' + srcColor(ep.source))}>{ep.source}</span>}
           <span style={{ flex: 1 }} />
@@ -48,7 +45,7 @@ export function EpisodeModal({ id }: { id: string }) {
               onError={() => setDelErr(true)}
             />
           )}
-          <button className="iconbtn" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
+          <button className="iconbtn" aria-label="close" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
         </div>
 
         {delErr && <div style={{ color: 'var(--err)', fontSize: '13px', fontFamily: 'var(--font-data)', marginTop: '14px' }}>delete failed — the episode is still in memory.</div>}

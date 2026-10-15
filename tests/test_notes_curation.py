@@ -14,27 +14,17 @@ tests use. The pure half lives in tests/test_notes_lane.py.
 from __future__ import annotations
 
 import math
-import os
 
-import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import dream.notes.nightly as lane
+from dream.notes.nightly import run_lane
+from ingestion.db import Database
+from ingestion.embedding import embed_dims
+from ingestion.notes import _OWNER
+from tests.helpers.embed import GROUP
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import dream.notes.nightly as lane  # noqa: E402
-from dream.notes.nightly import run_lane  # noqa: E402
-from ingestion.db import Database  # noqa: E402
-from ingestion.embedding import embed_dims  # noqa: E402
-from ingestion.notes import _OWNER  # noqa: E402
-from tests.helpers.embed import GROUP  # noqa: E402
+pytestmark = pytest.mark.db
 
 _DIMS = embed_dims()
 

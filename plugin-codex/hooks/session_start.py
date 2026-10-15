@@ -19,12 +19,20 @@ hook entry as a separate process; one fetch pass is cheaper):
                       synced skills exist before Codex scans ~/.agents/skills and
                       the project's <root>/.agents/skills
 
+The board fetch, the preferences fetch and the skills sync run side by side under one
+budget (_BUDGET, inside the hook's 20 s timeout): run one after another, a blackholed
+server used up the whole timeout, Codex killed the hook, and even the local lines below
+were lost. Whatever has not arrived when the budget ends is left out, and the local lines
+(the token notice and the upload warning) always print. For a /clear or a compaction
+(``source``) only the board, the preferences and the local lines run: the sync and the
+sweep ran when the session started.
+
 Output is Codex's JSON envelope: {"hookSpecificOutput": {"hookEventName":
 "SessionStart", "additionalContext": ...}} — Codex does not read plain stdout.
 The upload warning also goes out as the top-level ``systemMessage``, which
 Codex surfaces to the user as a warning.
-Disable pieces with SYNAPSE_BOARD=0 / SYNAPSE_PREFS_BLOCK=0 /
-SYNAPSE_CODEX_CATCHUP=0 / SYNAPSE_SKILLS_SYNC=0. Fail-open everywhere: a broken board must never
+Disable pieces with SYNAPSE_BOARD=0 / SYNAPSE_PREFS_BLOCK=0 (or `synapse config board off` /
+`prefs_block off`) / SYNAPSE_SKILLS_SYNC=0. Fail-open everywhere: a broken board must never
 break a session start.
 """
 
@@ -35,6 +43,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
+from collections.abc import Callable
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 # The project resolver is the Claude plugin's, so both plugins label a folder the same
@@ -48,6 +59,8 @@ from common import _cfg, get_json, token_override_notice
 _SCRIPTS = sys.path[0]
 _STOP_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "synapse_stop_hook.py")
 
+_BUDGET = 15.0  # seconds the fetches and the sync share; the hook's own timeout is 20
+_SKILLS_SYNC_TIMEOUT = 12.0
 _MAX_PREF_LINES = 7
 _PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
 
@@ -99,8 +112,6 @@ def _upload_warning() -> str | None:
 def _spawn_catchup(skip_path: str = "") -> None:
     """Detached sweep; ``skip_path`` is this session's own rollout, which its
     Stop hook owns."""
-    if _cfg("SYNAPSE_CODEX_CATCHUP", "1") == "0":
-        return
     try:
         subprocess.Popen(
             [sys.executable, _STOP_HOOK, "--catchup", skip_path],
@@ -116,21 +127,41 @@ def _spawn_catchup(skip_path: str = "") -> None:
 def _sync_skills(cwd: str | None = None) -> None:
     if _cfg("SYNAPSE_SKILLS_SYNC", "0") in ("", "0"):
         return
-    # Bounded: the hook block's timeout is 20s and the board fetch still has to fit. A kill
-    # mid-pull is safe — the engine's next pass re-mirrors the skill and a push can never
-    # shrink the server's file set.
+    # Bounded: it shares the hook's budget with the fetches. A kill mid-pull is safe — the
+    # engine's next pass re-mirrors the skill and a push can never shrink the server's
+    # file set.
     try:
-        budget = float(_cfg("SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT", "12"))
         subprocess.run(
             [sys.executable, os.path.join(_SCRIPTS, "skills_sync.py")]
             + (["--cwd", cwd] if cwd else []),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=budget,
+            timeout=_SKILLS_SYNC_TIMEOUT,
         )
     except Exception:
         pass
+
+
+def _concurrently(jobs: dict[str, Callable[[], object]]) -> dict[str, object]:
+    """Run each job in its own thread and wait for them all, but no longer than _BUDGET
+    in total. Returns the results of the jobs that finished in time; a job that is still
+    running is left behind (daemon threads do not hold the process open)."""
+    results: dict[str, object] = {}
+
+    def run(name: str, job: Callable[[], object]) -> None:
+        try:
+            results[name] = job()
+        except Exception:
+            pass  # fail-open: the jobs catch their own errors; this is the backstop
+
+    threads = [threading.Thread(target=run, args=item, daemon=True) for item in jobs.items()]
+    deadline = time.monotonic() + _BUDGET
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(max(0.0, deadline - time.monotonic()))
+    return dict(results)
 
 
 def main() -> None:
@@ -138,19 +169,28 @@ def main() -> None:
         payload = json.loads(sys.stdin.read() or "{}")
     except Exception:
         payload = {}
+    # A /clear or a compaction opens a new context window, not a new session.
+    resumed = payload.get("source") in ("clear", "compact")
     # Read before the sweep starts, so the line reflects the streak as it stood;
     # a sweep that succeeds ends the streak.
     warning = _upload_warning()
-    _spawn_catchup(str(payload.get("transcript_path") or ""))
-    _sync_skills(str(payload.get("cwd") or os.getcwd()))
+    if not resumed:
+        _spawn_catchup(str(payload.get("transcript_path") or ""))
+    cwd = str(payload.get("cwd") or os.getcwd())
     project = synapse_project.project_label(payload.get("cwd")) or synapse_project.project_label(
         os.getcwd()
     )
+    jobs = {"prefs": _prefs_text, "board": lambda: _board_text(project)}
+    if not resumed:
+        jobs["skills"] = lambda: _sync_skills(cwd)
+    fetched = _concurrently(jobs)
     # The credential notice is local and leads: an env token silently overridden by the
     # device token is exactly the split this line exists to surface. The upload warning,
     # also local, follows it.
     parts = [
-        t for t in (token_override_notice(), warning, _prefs_text(), _board_text(project)) if t
+        t
+        for t in (token_override_notice(), warning, fetched.get("prefs"), fetched.get("board"))
+        if t
     ]
     if not parts:
         return

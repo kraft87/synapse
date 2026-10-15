@@ -15,7 +15,7 @@
     ],
     "SessionStart": [
       {
-        "matcher": "*",
+        "matcher": "startup|resume",
         "hooks": [
           {
             "type": "command",
@@ -34,7 +34,12 @@
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
             "commandWindows": "python3 \"$env:CLAUDE_PLUGIN_ROOT/scripts/git_feeder.py\"",
             "timeout": 30
-          },
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/board_block.py\"",

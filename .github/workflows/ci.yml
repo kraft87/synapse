@@ -1,8 +1,10 @@
 name: CI
 
 on:
+  # Branches are tested through their pull request; a push trigger on them as well
+  # would run every commit twice.
   push:
-    branches: [main, "claude/**", "feat/**"]
+    branches: [main]
     paths-ignore:
       - "**.md"
   # No paths-ignore on pull_request: branch protection requires every job below,
@@ -10,6 +12,12 @@ on:
   # only be force-merged. The push trigger keeps its filter (no image rebuild
   # for a README change).
   pull_request:
+
+# A newer push to a PR cancels the superseded run. main is never cancelled: runs queue,
+# so `latest` only ever moves forward.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   ruff:
@@ -34,13 +42,18 @@ jobs:
         with:
           python-version: "3.12"
           activate-environment: "true"
-          enable-cache: false  # use the persistent local UV_CACHE_DIR instead
-      # mypy's incremental store is the persistent MYPY_CACHE_DIR volume now
-      # (no actions/cache round-trip to GitHub's cache service).
+      # mypy's incremental store: a warm cache re-checks only what changed.
+      - uses: actions/cache@v4
+        with:
+          path: .mypy_cache
+          key: mypy-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: mypy-${{ hashFiles('uv.lock') }}-
       - name: Install dependencies
         run: uv sync --frozen
+      # What gets checked is pyproject.toml's [tool.mypy] files list, which pre-commit
+      # runs as well.
       - name: Mypy
-        run: uv run mypy ingestion/ mcp_server/__init__.py mcp_server/recall.py --ignore-missing-imports
+        run: uv run mypy
 
   bandit:
     name: Bandit
@@ -67,23 +80,29 @@ jobs:
           node-version: "22"
           cache: npm
           cache-dependency-path: web/package-lock.json
+      # Unit tests for the pure helpers (node --test, no extra dependencies), then
       # tsc --noEmit + esbuild (web/package.json's "build"). A broken bundle fails
       # here and, via the push job's needs, can never ship in an image.
-      - name: Install and build
+      - name: Install, test and build
         working-directory: web
         run: |
           npm ci
+          npm test
           npm run build
 
   test:
     name: Pytest
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     # A ParadeDB service container gives each run its own Postgres. `services:` publish to
     # the job's localhost, so it's reachable at 127.0.0.1:5432. A per-run ephemeral database
     # still gives isolation; the whole service is torn down with the job.
     services:
       paradedb:
-        image: paradedb/paradedb:latest
+        # The same image, by digest, as compose.yml's postgres (tests/test_ci_config.py
+        # keeps them equal), so a green run says something about production's PostgreSQL
+        # and pg_search. `env` is not available in a service's image, hence the copy.
+        image: paradedb/paradedb:latest-pg17@sha256:0defbfb50d530e6e875ab584528f1e235662225127c09e7a8d5651e59dabe341
         env:
           POSTGRES_USER: synapse
           POSTGRES_PASSWORD: synapse
@@ -100,13 +119,14 @@ jobs:
       PGUSER: synapse
       PGPASSWORD: synapse
       CI_DB: ci_${{ github.run_id }}_${{ github.run_attempt }}
+      # The pooled DB pass runs beside the plain one, on its own copy of the database.
+      CI_DB_POOL: ci_${{ github.run_id }}_${{ github.run_attempt }}_pool
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
           activate-environment: "true"
-          enable-cache: false  # use the persistent local UV_CACHE_DIR instead
       - name: Install psql client
         run: command -v psql >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client)
       # Schema comes from scripts/apply_schema.sh — the same script the shipped
@@ -119,62 +139,81 @@ jobs:
           psql -h "$PGHOST" -U "$PGUSER" -d postgres -c "DROP DATABASE IF EXISTS \"$CI_DB\" WITH (FORCE)"
           psql -h "$PGHOST" -U "$PGUSER" -d postgres -c "CREATE DATABASE \"$CI_DB\""
           scripts/apply_schema.sh "postgresql://$PGUSER:$PGPASSWORD@$PGHOST:5432/$CI_DB"
+          # Every migration must also survive a re-run: upgrades and `make schema` rely on it.
+          scripts/apply_schema.sh --all "postgresql://$PGUSER:$PGPASSWORD@$PGHOST:5432/$CI_DB"
+          psql -h "$PGHOST" -U "$PGUSER" -d postgres -c "CREATE DATABASE \"$CI_DB_POOL\" TEMPLATE \"$CI_DB\""
           wait $UV_PID
-      - name: Run tests (parallel non-DB, serial DB)
+      - name: Run tests (parallel non-DB, then the DB passes side by side)
         env:
           SYNAPSE_TEST_URL: postgresql://synapse:synapse@localhost:5432/ci_${{ github.run_id }}_${{ github.run_attempt }}
           SYNAPSE_DB_URL: postgresql://synapse:synapse@localhost:5432/ci_${{ github.run_id }}_${{ github.run_attempt }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            EXTRA='and not slow'
-          else
-            EXTRA=''
-          fi
-          # Non-DB tests fan out across all cores
-          uv run pytest tests/ -n auto --dist loadfile --maxfail=5 \
-            -m "not db and not integration $EXTRA"
-          # DB tests run serially to avoid TRUNCATE/INSERT races on the shared schema
-          uv run pytest tests/ -p no:xdist --maxfail=5 \
-            -m "db and not integration $EXTRA"
-          # ...and again through one session-wide connection pool, the way the server
-          # runs (ingestion/pg_pool); the run above covers the no-pool path.
-          SYNAPSE_TEST_POOL=1 uv run pytest tests/ -p no:xdist --maxfail=5 \
-            -m "db and not integration $EXTRA"
+          # Tests that touch no database fan out across all cores
+          uv run pytest tests/ -n auto --dist loadfile --maxfail=5 -m "not db"
+          # DB tests are serial within a pass (TRUNCATE/INSERT would race across workers),
+          # but the two passes use separate databases and run at the same time: the plain
+          # one, and one through a session-wide connection pool, the way the server runs
+          # (ingestion/pg_pool).
+          uv run pytest tests/ -p no:xdist --maxfail=5 -m db > db.log 2>&1 &
+          PLAIN=$!
+          POOL_URL="postgresql://synapse:synapse@localhost:5432/$CI_DB_POOL"
+          SYNAPSE_TEST_POOL=1 SYNAPSE_TEST_URL="$POOL_URL" SYNAPSE_DB_URL="$POOL_URL" \
+            uv run pytest tests/ -p no:xdist --maxfail=5 -m db > db-pool.log 2>&1 &
+          POOLED=$!
+          FAILED=0
+          wait $PLAIN || FAILED=1
+          wait $POOLED || FAILED=1
+          echo "::group::DB tests"; cat db.log; echo "::endgroup::"
+          echo "::group::DB tests, pooled"; cat db-pool.log; echo "::endgroup::"
+          exit $FAILED
       - name: Drop ephemeral test DB
         if: always()
-        run: psql -h "$PGHOST" -U "$PGUSER" -d postgres -c "DROP DATABASE IF EXISTS \"$CI_DB\" WITH (FORCE)" || true
+        run: |
+          for db in "$CI_DB" "$CI_DB_POOL"; do
+            psql -h "$PGHOST" -U "$PGUSER" -d postgres -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" || true
+          done
 
-  # Build the images IN PARALLEL with the quality gates (no `needs`), but push:false —
-  # this only warms the layer cache. The expensive compile/install work overlaps the
-  # ~test-duration gate instead of starting after it. Nothing reaches GHCR here; the
-  # deploy job below is the gate that actually pushes, only once every check is green.
+  # The image builds on every run, in parallel with the quality gates (no `needs`), so a
+  # broken Dockerfile, lockfile or web bundle fails the PR instead of the merge. On main it
+  # also pushes :<sha>; the push job below only moves `latest` onto it once every gate is
+  # green, which is a manifest copy rather than a second build.
   #
   # The image builds self-contained (the Dockerfile needs no external base), with a
   # GHA layer cache so warm builds reuse the apt/uv/CLI layers. Fresh clones build
   # the same way with `docker compose up -d --build`.
   build:
-    name: Build images
-    if: github.repository == 'kraft87/synapse' && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    name: Build image
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: write
+    env:
+      # Forks have no GHCR push rights under this owner; PRs never publish.
+      PUBLISH: ${{ github.repository == 'kraft87/synapse' && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
     steps:
       - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
-      - name: Build synapse (cache warm, no push)
+      - uses: docker/login-action@v4
+        if: env.PUBLISH == 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build synapse
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: false
+          push: ${{ env.PUBLISH == 'true' }}
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
           cache-from: type=gha,scope=synapse
           cache-to: type=gha,mode=max,scope=synapse
           provenance: false
 
   push:
-    name: Push image
-    # Publishes the app image to GHCR on every green main build. Deployment is
-    # pull-based: hosts running this stack watch ghcr.io/<repo>:latest and update
-    # themselves (e.g. Watchtower), so CI never reaches into any host.
+    name: Publish latest
+    # Deployment is pull-based: hosts running this stack watch ghcr.io/<repo>:latest and
+    # update themselves (e.g. Watchtower), so CI never reaches into any host. `latest`
+    # moves only when every check is green.
     needs: [ruff, mypy, bandit, web, test, build]
     # Repository guard: forks have no GHCR push rights under this owner.
     if: github.repository == 'kraft87/synapse' && github.ref == 'refs/heads/main' && github.event_name == 'push'
@@ -183,22 +222,14 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      # The build job already produced every layer; cache-from resolves them, so
-      # this step is push-only in practice.
-      - name: Push synapse
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:latest
+      - name: Point latest at this commit's image
+        run: |
+          docker buildx imagetools create \
+            -t ghcr.io/${{ github.repository }}:latest \
             ghcr.io/${{ github.repository }}:${{ github.sha }}
-          cache-from: type=gha,scope=synapse
-          provenance: false

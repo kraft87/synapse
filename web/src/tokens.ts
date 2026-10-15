@@ -75,8 +75,7 @@ export const typeLabel: Record<string, string> = {
 // per-leg stack (README leg token table). CSS vars so themes switch automatically.
 export const LEG_COLOR: Record<string, string> = {
   embed: 'var(--leg-embed)', bm25: 'var(--leg-bm25)', vector: 'var(--leg-vector)',
-  kg: 'var(--leg-kg)', timeline: 'var(--leg-timeline)', prefs: 'var(--leg-prefs)',
-  web: 'var(--leg-web)', rerank: 'var(--leg-rerank)',
+  kg: 'var(--leg-kg)', notes: 'var(--leg-notes)', web: 'var(--leg-web)', rerank: 'var(--leg-rerank)',
 };
 
 // Resolve a CSS custom-property reference to its concrete value so it can be painted onto a
@@ -89,29 +88,76 @@ export function cssValue(ref: string): string {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || ref;
 }
 // Fixed render order (spec §5): embed, then the parallel band, then rerank last.
-export const LEG_ORDER = ['embed', 'bm25', 'vector', 'kg', 'timeline', 'prefs', 'web', 'rerank'] as const;
+export const LEG_ORDER = ['embed', 'bm25', 'vector', 'kg', 'notes', 'web', 'rerank'] as const;
 // Recall-item relevance score → color ramp (spec §5b Served bucket).
 export const scoreColor = (score?: number): string =>
   score == null ? 'var(--txt3)' : score > 0.8 ? 'var(--acc)' : score > 0.6 ? 'var(--txt2)' : 'var(--txt3)';
 
-export function relTime(ts?: string): string {
+// How long ago, in whole units rounded DOWN: 23.6 h is "23h ago" (24h would claim a day that
+// has not passed), and anything under a minute reads "1m ago".
+export function relTime(ts?: string, now: number = Date.now()): string {
   if (!ts) return '';
   const then = new Date(ts).getTime();
   if (Number.isNaN(then)) return '';
-  const dh = (Date.now() - then) / 3600e3;
+  const dh = (now - then) / 3600e3;
   if (dh < 0) return 'now';
-  if (dh < 1) return Math.max(1, Math.round(dh * 60)) + 'm ago';
-  if (dh < 24) return Math.round(dh) + 'h ago';
-  return Math.round(dh / 24) + 'd ago';
+  if (dh < 1) return Math.max(1, Math.floor(dh * 60)) + 'm ago';
+  if (dh < 24) return Math.floor(dh) + 'h ago';
+  return Math.floor(dh / 24) + 'd ago';
 }
 
-// A tool-call trace is detected heuristically from stored episode content — the
-// contract delegates display derivation to the client.
-const TOOL_RE = /(^|\n)\s*(Read|Edit|Write|MultiEdit|Bash|Grep|Glob|LS|NotebookEdit|Task|WebFetch|WebSearch|Tool)\b/;
+// ---- calendar days, in the viewer's zone ----
+// An instant's calendar day is the viewer's, not the one its UTC string spells: said at 20:30
+// EDT on the 30th, an event is stored as 00:30Z on the 1st, and slicing the string files it a
+// day (a month, at month end) late. Every date the dashboard shows or buckets goes through
+// these; the zone is the browser's, and the tests pass one.
+export const browserTz = (): string => Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+const zoneFmt = new Map<string, Intl.DateTimeFormat>();
+function zoneParts(iso: string, tz: string): Record<string, string> | null {
+  const t = new Date(iso);
+  if (Number.isNaN(t.getTime())) return null;
+  let fmt = zoneFmt.get(tz);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+    });
+    zoneFmt.set(tz, fmt);
+  }
+  return Object.fromEntries(fmt.formatToParts(t).map((p) => [p.type, p.value]));
+}
+// YYYY-MM-DD ('' for a missing or unparseable instant).
+export function localDay(iso?: string | null, tz: string = browserTz()): string {
+  const p = iso ? zoneParts(iso, tz) : null;
+  return p ? `${p.year}-${p.month}-${p.day}` : '';
+}
+export const localMonth = (iso?: string | null, tz?: string): string => localDay(iso, tz).slice(0, 7);
+// YYYY-MM-DD HH:MM, 24-hour.
+export function localMinute(iso?: string | null, tz: string = browserTz()): string {
+  const p = iso ? zoneParts(iso, tz) : null;
+  return p ? `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}` : '';
+}
+
+// A tool-call trace is detected from stored episode content — the contract delegates display
+// derivation to the client. Every client writes the trace as its own lines: `[tool:<name>] <input>`
+// for a call and `[result] <output>` for what came back (ingestion/jsonl_client.py,
+// codex_client.py, cursor_sqlite_client.py). Prose that merely starts with "Read" or "Task" is not one.
+const TOOL_RE = /(^|\n)\[(tool:[^\]\n]+|result)\] /;
+// A turn pair as one readable block ("user: …" / "assistant: …"); either side may be empty.
+export const turnBody = (t: { human_turn?: string; assistant_turn?: string }): string =>
+  [t.human_turn && 'user: ' + t.human_turn, t.assistant_turn && 'assistant: ' + t.assistant_turn].filter(Boolean).join('\n\n');
+
+// "12 turns", or "seq 3–502 of 520 turns" when the drawer holds only the server's window of a longer session.
+export function turnsLabel(episodes: { sequence: number }[], total: number): string {
+  if (episodes.length === 0 || episodes.length >= total) return total + (total === 1 ? ' turn' : ' turns');
+  const seqs = episodes.map((e) => e.sequence);
+  return `seq ${Math.min(...seqs)}–${Math.max(...seqs)} of ${total} turns`;
+}
+
 export const hasToolTrace = (content?: string): boolean => !!content && TOOL_RE.test(content);
 
 // Build a human validity string from bitemporal fields.
 export function validityLine(t_valid?: string, t_invalid?: string | null): string {
-  const v = t_valid ? 'valid since ' + t_valid.slice(0, 10) : 'valid';
-  return t_invalid ? v + ' · superseded ' + t_invalid.slice(0, 10) : v;
+  const v = t_valid ? 'valid since ' + localDay(t_valid) : 'valid';
+  return t_invalid ? v + ' · superseded ' + localDay(t_invalid) : v;
 }

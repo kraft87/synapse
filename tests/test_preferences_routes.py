@@ -2,30 +2,18 @@
 
 Covers the reconciliation round-trip the gate relies on (insert / cosine KNN / reassert /
 supersede) and the session-start route serialization + ordering. Mirrors the timeline
-route tests. Skips cleanly when no test DB is reachable (the pure-logic decision + parser
-coverage lives in test_preferences_gate.py)."""
+route tests. (The pure-logic decision + parser coverage lives in test_preferences_gate.py.)"""
 
 from __future__ import annotations
-
-import os
 
 import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.db import Database
+from mcp_server.preferences_routes import _OWNER, _top_preferences
+from tests.helpers.embed import GROUP, onehot
 
-# Skip the whole module if the shared Postgres test DB isn't up — these tests are DB-only.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.db import Database  # noqa: E402
-from mcp_server.preferences_routes import _OWNER, _top_preferences  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
+pytestmark = pytest.mark.db
 
 
 def _wipe(conn):
@@ -171,3 +159,23 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     assert top["since"] and len(top["since"]) == 10  # YYYY-MM-DD
     db.close()
     _wipe(conn)
+
+
+def test_a_missing_preferences_table_is_an_error_not_an_empty_block(conn, db_url):
+    """Schema 035 is not optional (the boot guard refuses to start without it), so the
+    route does not dress its absence up as "no preferences": the database's error comes
+    back as a 500 naming the relation."""
+    from fastmcp import FastMCP
+    from starlette.testclient import TestClient
+
+    from ingestion.surfaces import FULL_TRUST
+    from mcp_server.preferences_routes import register
+    from tests.helpers.schemaless import schemaless_dsn
+
+    with schemaless_dsn(conn, db_url) as dsn:
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            _top_preferences(dsn, 8)
+        m = FastMCP("test-prefs-missing")
+        register(m, dsn, lambda r: True, lambda r: FULL_TRUST)
+        r = TestClient(m.http_app()).get("/preferences/top")
+    assert r.status_code == 500 and "preferences" in r.json()["detail"]

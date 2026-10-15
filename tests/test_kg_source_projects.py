@@ -18,7 +18,6 @@ Sections:
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import subprocess
 import uuid
@@ -680,12 +679,6 @@ def test_applying_056_under_a_running_engine_takes_effect_without_a_restart(
     assert r._kg_scope_ready() is True
     facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
     assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}
-
-
-def test_schema_056_is_registered_for_apply_schema():
-    script = (Path(__file__).resolve().parent.parent / "scripts" / "apply_schema.sh").read_text()
-    assert "056_kg_source_projects.sql" in script
-    assert os.path.exists(_SCHEMA_056)
 
 
 def test_schema_056_does_not_block_boot_before_it_is_applied():

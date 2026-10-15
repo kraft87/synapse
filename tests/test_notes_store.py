@@ -2,33 +2,21 @@
 
 Two halves, mirroring the preferences split:
   * DB-backed accessor tests (insert / cosine KNN / update / supersede / board listing /
-    source_ref probe) against the shared Postgres test DB — skip cleanly when it's down.
+    source_ref probe) against the shared Postgres test DB.
   * reconcile_note unit tests with the DB, embedder, and LLM all stubbed — thresholds,
     kill switch, and fail-open behavior, no network and no real model calls."""
 
 from __future__ import annotations
 
-import os
-
 import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import ingestion.notes as notes_mod
+from ingestion.db import Database
+from ingestion.notes import _OWNER, reconcile_note
+from tests.helpers.embed import GROUP, onehot
 
-# Skip the whole module if the shared Postgres test DB isn't up — the accessor tests
-# are DB-only and the reconcile tests ride along (this file is pinned to the db worker).
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import ingestion.notes as notes_mod  # noqa: E402
-from ingestion.db import Database  # noqa: E402
-from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
+pytestmark = pytest.mark.db
 
 
 def _wipe(conn):

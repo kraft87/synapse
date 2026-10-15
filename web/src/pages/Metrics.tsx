@@ -15,13 +15,16 @@ import { useStore } from '../state';
 import { LEG_COLOR, LEG_ORDER, cssValue, srcColor, relTime, mono } from '../tokens';
 import { UPlotChart } from '../components/UPlotChart';
 import { useAsync } from '../hooks';
+import { runDuration } from '../dream';
 
 type Tab = 'recall' | 'ingestion' | 'corpus';
 
 // ---- shared shells ----
+// minWidth 0: a panel is a grid item, and without it one long nowrap line (a failure's error
+// text) sets the track's minimum and stretches the page past the screen.
 const panel = (extra?: CSSProperties): CSSProperties => ({
   background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '10px',
-  padding: '14px 16px', ...extra,
+  padding: '14px 16px', minWidth: 0, ...extra,
 });
 const panelHead: CSSProperties = {
   fontSize: '12px', fontFamily: mono, color: 'var(--txt3)', textTransform: 'uppercase',
@@ -77,19 +80,6 @@ function RecallTab() {
   const { theme } = useStore();
   const { data, loading, error } = useAsync<MetricsRecall>(() => fetchMetricsRecall('7d'), []);
 
-  const cards = useMemo(() => {
-    const s = data?.series || [];
-    const totalCalls = s.reduce((a, p) => a + p.calls, 0);
-    const wavg = (sel: (p: MetricsRecall['series'][number]) => number | null) => {
-      let num = 0, den = 0;
-      for (const p of s) { const v = sel(p); if (v != null) { num += v * p.calls; den += p.calls; } }
-      return den ? num / den : null;
-    };
-    return {
-      p50: wavg((p) => p.p50), p95: wavg((p) => p.p95), calls: totalCalls, tokens: wavg((p) => p.tokens_p50),
-    };
-  }, [data]);
-
   // stacked per-leg latency chart: cumulative sums, drawn largest-first so bars stack.
   const chart = useMemo(() => {
     const s = data?.series || [];
@@ -125,13 +115,14 @@ function RecallTab() {
   if (loading) return (<><StatGridSkel /><div style={panel({ marginBottom: '14px' })}><ChartSkel /></div></>);
 
   const fmt = (v: number | null, unit = '') => (v == null ? '—' : Math.round(v) + unit);
+  const sum = data?.summary ?? { calls: 0, p50: null, p95: null, tokens_p50: null };
   return (
     <>
       <div className="statgrid" style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: '10px', marginBottom: '14px' }}>
-        <StatCard label="p50 total" value={fmt(cards.p50, ' ms')} sub="median over window" />
-        <StatCard label="p95 total" value={fmt(cards.p95, ' ms')} sub="tail latency" />
-        <StatCard label="calls" value={cards.calls.toLocaleString()} sub="in window (7d)" />
-        <StatCard label="tokens / call" value={cards.tokens == null ? '—' : Math.round(cards.tokens).toLocaleString()} sub="median served" />
+        <StatCard label="p50 total" value={fmt(sum.p50, ' ms')} sub="median over window" />
+        <StatCard label="p95 total" value={fmt(sum.p95, ' ms')} sub="tail latency" />
+        <StatCard label="calls" value={sum.calls.toLocaleString()} sub="in window (7d)" />
+        <StatCard label="tokens / call" value={sum.tokens_p50 == null ? '—' : Math.round(sum.tokens_p50).toLocaleString()} sub="median served" />
       </div>
 
       <section style={panel({ marginBottom: '14px' })}>
@@ -239,7 +230,7 @@ function IngestionTab() {
         <StatCard label="queue depth" value={String(data.queue_depth)} sub={`${data.queue.processing} processing`} valueColor={data.queue_depth > 90 ? 'var(--warn)' : 'var(--txt)'} />
         <StatCard label="throughput" value={compTotal.toLocaleString()} sub="completed / 48h" />
         <StatCard label="failures" value={String(data.queue.failed)} sub="status=failed" valueColor={data.queue.failed > 0 ? 'var(--err)' : 'var(--txt)'} />
-        <StatCard label="last run" value={ld?.duration_s != null ? Math.round(ld.duration_s) + ' s' : '—'} sub={ld ? relTime(ld.started_at) : 'no runs yet'} />
+        <StatCard label="last run" value={ld ? runDuration(ld) : '—'} sub={ld ? relTime(ld.started_at) : 'no runs yet'} />
       </div>
 
       <section style={panel({ marginBottom: '14px' })}>
@@ -257,15 +248,15 @@ function IngestionTab() {
         </div>
       </section>
 
-      <div className="duo" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
+      <div className="duo" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: '14px' }}>
         <section style={panel()}>
           <div style={panelHead}>recent failures</div>
           {data.failures.length > 0 ? (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '7px' }}>
               {data.failures.slice(0, 8).map((f) => (
-                <div key={f.id} style={{ display: 'flex', gap: '10px', alignItems: 'baseline' }}>
+                <div key={f.id} style={{ display: 'flex', gap: '10px', alignItems: 'baseline', minWidth: 0 }}>
                   <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)', minWidth: '54px' }}>#{f.episode_id ?? f.id}</span>
-                  <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--err)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.error || 'unknown error'}</span>
+                  <span title={f.error || undefined} style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--err)', flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.error || 'unknown error'}</span>
                 </div>
               ))}
             </div>
@@ -282,7 +273,7 @@ function DreamRunPanel({ run }: { run: DreamRun | null }) {
   if (run) {
     const stg = Object.entries(run.stages).map(([k, v]) => `${k}:${v?.ok === false ? 'ERR' : 'ok'}`).join('  ');
     lines.push(`started   ${run.started_at?.replace('T', ' ').slice(0, 19)} UTC`);
-    lines.push(`duration  ${run.duration_s != null ? run.duration_s + ' s' : '(in flight)'}`);
+    lines.push(`duration  ${runDuration(run)}`);
     lines.push(`ok        ${run.ok == null ? '—' : run.ok}`);
     if (stg) lines.push(`stages    ${stg}`);
     for (const [k, v] of Object.entries(run.counts)) lines.push(`${(k + '            ').slice(0, 24)}${v}`);
@@ -313,7 +304,7 @@ function DreamRunPanel({ run }: { run: DreamRun | null }) {
 function CorpusTab() {
   const { data, loading, error } = useAsync<MetricsCorpus>(() => fetchMetricsCorpus(), []);
   if (error) return <ErrorChip msg={`corpus metrics failed: ${error}`} />;
-  if (loading) return (<><div style={panel({ marginBottom: '14px' })}><ChartSkel h={220} /></div><div className="duo" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}><ChartSkel h={160} /><ChartSkel h={160} /></div></>);
+  if (loading) return (<><div style={panel({ marginBottom: '14px' })}><ChartSkel h={220} /></div><div className="duo" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: '14px' }}><ChartSkel h={160} /><ChartSkel h={160} /></div></>);
   if (!data || data.tables.length === 0) return <Empty>not enough data in window</Empty>;
 
   const projTotal = Math.max(1, data.by_project.reduce((a, r) => a + r.n, 0));
@@ -321,30 +312,32 @@ function CorpusTab() {
   const grid = '160px 96px 1fr 96px';
   return (
     <>
-      <section className="scrollx" style={panel({ padding: 0, overflow: 'hidden', marginBottom: '14px' })}>
-        <div style={{ display: 'grid', gridTemplateColumns: grid, gap: '12px', padding: '9px 16px', borderBottom: '1px solid var(--line)', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
-          <div>table</div><div style={{ textAlign: 'right' }}>rows</div><div>growth · 30d</div><div style={{ textAlign: 'right' }}>+30d</div>
+      <section className="scrollx" style={panel({ padding: 0, marginBottom: '14px' })}>
+        <div style={{ minWidth: '520px' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: grid, gap: '12px', padding: '9px 16px', borderBottom: '1px solid var(--line)', fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.06em' }}>
+            <div>table</div><div style={{ textAlign: 'right' }}>rows</div><div>growth · 30d</div><div style={{ textAlign: 'right' }}>+30d</div>
+          </div>
+          {data.tables.map((t) => {
+            const max = Math.max(1, ...t.spark_30d);
+            return (
+              <div key={t.name} className="corpus-row" style={{ display: 'grid', gridTemplateColumns: grid, gap: '12px', padding: '10px 16px', borderBottom: '1px solid var(--line)', alignItems: 'center' }}>
+                <div style={{ fontFamily: mono, fontSize: '12.5px', color: 'var(--txt)' }}>{t.name}</div>
+                <div style={{ fontFamily: mono, fontSize: '12.5px', color: 'var(--txt)', textAlign: 'right' }} title={t.rows_estimated ? 'estimated (pg_class.reltuples)' : 'exact count'}>
+                  {t.rows.toLocaleString()}{t.rows_estimated ? <span style={{ color: 'var(--txt3)' }}> ~</span> : ''}
+                </div>
+                <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', height: '26px' }}>
+                  {t.spark_30d.length ? t.spark_30d.map((v, i) => (
+                    <div key={i} title={String(v)} style={{ flex: 1, height: Math.max(2, (v / max) * 100) + '%', background: 'var(--acc)', opacity: 0.55, borderRadius: '1px' }} />
+                  )) : <span style={{ fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)' }}>no time column</span>}
+                </div>
+                <div style={{ fontFamily: mono, fontSize: '12px', color: t.delta_30d > 0 ? 'var(--ok)' : 'var(--txt3)', textAlign: 'right' }}>+{t.delta_30d.toLocaleString()}</div>
+              </div>
+            );
+          })}
         </div>
-        {data.tables.map((t) => {
-          const max = Math.max(1, ...t.spark_30d);
-          return (
-            <div key={t.name} className="corpus-row" style={{ display: 'grid', gridTemplateColumns: grid, gap: '12px', padding: '10px 16px', borderBottom: '1px solid var(--line)', alignItems: 'center' }}>
-              <div style={{ fontFamily: mono, fontSize: '12.5px', color: 'var(--txt)' }}>{t.name}</div>
-              <div style={{ fontFamily: mono, fontSize: '12.5px', color: 'var(--txt)', textAlign: 'right' }} title={t.rows_estimated ? 'estimated (pg_class.reltuples)' : 'exact count'}>
-                {t.rows.toLocaleString()}{t.rows_estimated ? <span style={{ color: 'var(--txt3)' }}> ~</span> : ''}
-              </div>
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '2px', height: '26px' }}>
-                {t.spark_30d.length ? t.spark_30d.map((v, i) => (
-                  <div key={i} title={String(v)} style={{ flex: 1, height: Math.max(2, (v / max) * 100) + '%', background: 'var(--acc)', opacity: 0.55, borderRadius: '1px' }} />
-                )) : <span style={{ fontFamily: mono, fontSize: '10.5px', color: 'var(--txt3)' }}>no time column</span>}
-              </div>
-              <div style={{ fontFamily: mono, fontSize: '12px', color: t.delta_30d > 0 ? 'var(--ok)' : 'var(--txt3)', textAlign: 'right' }}>+{t.delta_30d.toLocaleString()}</div>
-            </div>
-          );
-        })}
       </section>
 
-      <div className="duo" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
+      <div className="duo" style={{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1fr)', gap: '14px' }}>
         <section style={panel()}>
           <div style={{ ...panelHead, marginBottom: '12px' }}>episodes by project</div>
           <Proportions rows={data.by_project} total={projTotal} />

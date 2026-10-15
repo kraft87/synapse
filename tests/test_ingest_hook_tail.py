@@ -1,13 +1,10 @@
-"""The Stop hook ships a bounded TAIL, not the whole transcript.
+"""The Stop hook's turn boundary and its endpoint resolution.
 
-``_select_tail`` must (a) start the slice at a real turn boundary so a leading
-fragment of an already-ingested turn is never POSTed, and (b) fall back to the
-full file when the tail window holds no boundary (a single mega-turn longer than
-the window) so that turn still lands complete. Both copies of the hook are
-covered: the repo-root ``scripts/synapse_ingest_hook.py`` and the plugin's
-``plugin/scripts/ingest_hook.py``.
+``_is_turn_start`` decides where a POST may begin, so a leading fragment of an
+already-ingested turn is never shipped; slash-command and system-reminder user
+records must not count as boundaries.
 
-The plugin copy also resolves its endpoint through the plugin config layer
+The hook also resolves its endpoint through the plugin config layer
 (``plugin/scripts/config.py``) — regression-tested here so it can never again
 silently fall back to localhost when the user configured ``SYNAPSE_URL``
 through the ``/plugin install`` prompt (persisted in settings.json).
@@ -24,10 +21,7 @@ import sys
 from pathlib import Path
 from types import ModuleType
 
-import pytest
-
 _REPO = Path(__file__).resolve().parents[1]
-_ROOT_HOOK = _REPO / "scripts" / "synapse_ingest_hook.py"
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
 
 # Every env var the plugin config layer consults for the endpoint/token, so the
@@ -72,73 +66,10 @@ def _isolated_plugin_env(monkeypatch, tmp_path, options: dict | None = None) -> 
         monkeypatch.delenv(var, raising=False)
 
 
-def _records() -> list[dict]:
-    sid = "s-tail-1"
-
-    def u(uid: str, text: str) -> dict:
-        return {"type": "user", "uuid": uid, "sessionId": sid, "message": {"content": text}}
-
-    def a(uid: str, text: str) -> dict:
-        return {
-            "type": "assistant",
-            "uuid": uid,
-            "sessionId": sid,
-            "message": {"content": [{"type": "text", "text": text}]},
-        }
-
-    # 3 turns, 6 records: u1 a1 | u2 a2 | u3 a3
-    return [
-        u("u1", "q1"),
-        a("a1", "r1"),
-        u("u2", "q2"),
-        a("a2", "r2"),
-        u("u3", "q3"),
-        a("a3", "r3"),
-    ]
-
-
-def _lines(recs: list[dict]) -> list[bytes]:
-    return [json.dumps(r).encode() for r in recs]
-
-
-@pytest.mark.parametrize("hook_path", [_ROOT_HOOK, _PLUGIN_HOOK], ids=["root", "plugin"])
-def test_tail_starts_at_turn_boundary(hook_path, monkeypatch):
-    mod = _load_hook(hook_path)
-    monkeypatch.setattr(mod, "TAIL_RECORDS", 3)
-    records, mode = mod._select_tail(_lines(_records()))
-    # last 3 raw records are [a2, u3, a3]; trimmed to the first turn-start (u3)
-    assert mode == "tail"
-    assert [r["uuid"] for r in records] == ["u3", "a3"]
-
-
-@pytest.mark.parametrize("hook_path", [_ROOT_HOOK, _PLUGIN_HOOK], ids=["root", "plugin"])
-def test_tail_drops_leading_fragment(hook_path, monkeypatch):
-    """When the window cuts mid-turn, the dangling tail of the prior turn is dropped
-    (it was already ingested); the slice begins at the next user turn."""
-    mod = _load_hook(hook_path)
-    monkeypatch.setattr(mod, "TAIL_RECORDS", 5)
-    records, mode = mod._select_tail(_lines(_records()))
-    # last 5 = [a1, u2, a2, u3, a3]; first turn-start is u2 → drop a1
-    assert mode == "tail"
-    assert [r["uuid"] for r in records] == ["u2", "a2", "u3", "a3"]
-
-
-@pytest.mark.parametrize("hook_path", [_ROOT_HOOK, _PLUGIN_HOOK], ids=["root", "plugin"])
-def test_full_fallback_when_no_boundary_in_window(hook_path, monkeypatch):
-    """A window with no turn boundary (one mega-turn) falls back to the full file."""
-    mod = _load_hook(hook_path)
-    monkeypatch.setattr(mod, "TAIL_RECORDS", 1)
-    records, mode = mod._select_tail(_lines(_records()))
-    # last 1 record = a3 (an assistant record, not a turn-start) → ship everything
-    assert mode == "full-fallback"
-    assert len(records) == 6
-
-
-@pytest.mark.parametrize("hook_path", [_ROOT_HOOK, _PLUGIN_HOOK], ids=["root", "plugin"])
-def test_machinery_user_record_is_not_a_boundary(hook_path):
+def test_machinery_user_record_is_not_a_boundary():
     """Slash-command / system-reminder user records must not count as turn starts —
     starting a slice there would split a turn at machinery noise."""
-    mod = _load_hook(hook_path)
+    mod = _load_hook(_PLUGIN_HOOK)
     assert mod._is_turn_start({"type": "user", "message": {"content": "real question"}})
     assert not mod._is_turn_start(
         {"type": "user", "message": {"content": "<command-name>/compact</command-name>"}}

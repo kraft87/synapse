@@ -11,10 +11,10 @@ that re-scans disk later — the SessionStart catch-up sweep, ``ingestion.backfi
 manual re-import months from now — would ingest those turns even though the hook
 skipped them at the time. Marker = fast local skip; table = durable guarantee.
 
-Wired exactly like ``ingestion.contamination``: one predicate applied at the same
-chokepoints where a parsed turn becomes an episode (``mcp_server.server.ingest_turns``
-and ``ingestion.backfill``). Dropping there means chunks, KG extraction, dream, and the
-timeline never see the turn — nothing downstream needs to know private mode exists.
+Wired exactly like ``ingestion.contamination``: one predicate applied at the chokepoint
+where a parsed turn becomes an episode (``ingestion.episode_writer``, which ``POST /ingest``
+and every backfill store through). Dropping there means chunks, KG extraction, dream, and
+the timeline never see the turn — nothing downstream needs to know private mode exists.
 """
 
 from __future__ import annotations

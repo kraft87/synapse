@@ -8,7 +8,7 @@ session's context. Not query-scoped, so it avoids the relevance-mismatch problem
 query-blind recall injection unwired (#171); preferences are few and apply to every turn.
 
 Reads the machine-token-gated ``/preferences/top`` route (thin client, no DSN). Disable
-with SYNAPSE_PREFS_BLOCK=0. Fail-open: any error prints nothing and exits 0 — session
+with `synapse config prefs_block off` (or SYNAPSE_PREFS_BLOCK=0). Fail-open: any error prints nothing and exits 0 — session
 start never breaks.
 """
 

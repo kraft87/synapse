@@ -10,9 +10,11 @@ stops gating the custom routes, or lets the root token clear the admin gate).
 from __future__ import annotations
 
 import importlib
-import os
+from types import SimpleNamespace
 
 import pytest
+
+from tests.helpers.db import DB_URL
 
 _AUTH_KEYS = (
     "SYNAPSE_MACHINE_TOKEN",
@@ -42,8 +44,13 @@ def _reload(monkeypatch, env):
 
 
 class _Req:
+    """The slice of a Starlette request the gates read: headers, scope and state. The
+    scope carries no ``user``: no auth middleware ran, so the gates look the bearer up."""
+
     def __init__(self, headers):
         self.headers = headers
+        self.scope: dict = {}
+        self.state = SimpleNamespace()
 
 
 def test_open_mode_has_no_auth(monkeypatch):
@@ -213,7 +220,7 @@ def test_identity_claims_track_the_active_leg(monkeypatch):
     # derivation stays inert and a call with no device credential resolves to no surface.
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "tok"})
     assert s._IDENTITY_CLAIMS == ()
-    assert s._caller_surface() is None
+    assert s._caller_trust().surface_id is None
 
 
 def test_machine_authorized_constant_time_check(monkeypatch):
@@ -245,23 +252,6 @@ def test_oauth_storage_none_without_db_or_key(monkeypatch):
 # Credential-bound trust (schema 054): two gates, and root cannot clear the second
 # ---------------------------------------------------------------------------
 
-_TEST_DB = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-
-def _db_reachable() -> bool:
-    try:
-        import psycopg
-
-        psycopg.connect(_TEST_DB, connect_timeout=2).close()
-        return True
-    except Exception:  # pragma: no cover - environment dependent
-        return False
-
-
-_needs_db = pytest.mark.skipif(not _db_reachable(), reason="no test DB reachable")
-
 
 @pytest.fixture()
 def credentialed(monkeypatch):
@@ -272,19 +262,19 @@ def credentialed(monkeypatch):
 
     from tests.helpers.surfaces import clear_surfaces, register_device
 
-    conn = psycopg.connect(_TEST_DB, autocommit=True)
+    conn = psycopg.connect(DB_URL, autocommit=True)
     clear_surfaces(conn)
     register_device(conn, "full-device", trust="full", surface_id="dev-full")
     register_device(conn, "work-device", trust="restricted", projects=["w"], surface_id="dev-work")
     register_device(conn, "revoked-device", trust="full", surface_id="dev-gone", status="revoked")
-    monkeypatch.setenv("SYNAPSE_DB_URL", _TEST_DB)
+    monkeypatch.setenv("SYNAPSE_DB_URL", DB_URL)
     s = _reload(monkeypatch, {"SYNAPSE_MACHINE_TOKEN": "root-tok"})
     yield s
     clear_surfaces(conn)
     conn.close()
 
 
-@_needs_db
+@pytest.mark.db
 @pytest.mark.parametrize(
     "token,client_ok,admin_ok",
     [
@@ -303,7 +293,7 @@ def test_the_two_gates_admit_exactly_the_right_credentials(
     assert credentialed._admin_authorized(req) is admin_ok
 
 
-@_needs_db
+@pytest.mark.db
 def test_the_admin_gate_excludes_the_root_token(credentialed):
     """Spelled out because it is load-bearing: every machine that ever ran the plugin
     has held the root token, so a credential that widespread must not be able to mint
@@ -312,7 +302,7 @@ def test_the_admin_gate_excludes_the_root_token(credentialed):
     assert credentialed._admin_authorized(_Req({})) is False
 
 
-@_needs_db
+@pytest.mark.db
 def test_request_trust_reads_the_credential_and_nothing_else(credentialed):
     """The plain-HTTP lane takes no `surface` at all. A device bearer is its own surface;
     the root token, a missing bearer and an unknown bearer are all UNKNOWN."""
@@ -335,7 +325,7 @@ def test_request_trust_reads_the_credential_and_nothing_else(credentialed):
     )
 
 
-@_needs_db
+@pytest.mark.db
 async def test_the_verifier_admits_root_with_no_database_at_all(monkeypatch):
     """Root is verified by constant-time compare and NOTHING else. The services on the
     Docker host authenticate with it to reach /ingest, so a PG blip must not take out
@@ -349,11 +339,11 @@ async def test_the_verifier_admits_root_with_no_database_at_all(monkeypatch):
     assert await v.verify_token("some-device-token") is None
 
 
-@_needs_db
+@pytest.mark.db
 async def test_the_verifier_stamps_a_device_with_its_resolved_row(credentialed):
     from mcp_server.auth_tokens import SynapseTokenVerifier
 
-    v = SynapseTokenVerifier("root-tok", _TEST_DB, ["user"])
+    v = SynapseTokenVerifier("root-tok", DB_URL, ["user"])
     tok = await v.verify_token("work-device")
     assert tok is not None
     assert tok.claims == {
@@ -366,7 +356,7 @@ async def test_the_verifier_stamps_a_device_with_its_resolved_row(credentialed):
     assert await v.verify_token("never-issued") is None
 
 
-@_needs_db
+@pytest.mark.db
 def test_a_device_token_cannot_fetch_the_root_credential(credentialed, monkeypatch):
     """Device tokens are leaves. Handing one the shared, un-revocable root credential
     would collapse the two back into one and make revocation meaningless."""

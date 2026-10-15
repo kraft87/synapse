@@ -2,30 +2,59 @@
 // All facts (valid + superseded struck), paginated mentions, provenance that
 // opens the episode overlay. "view in graph" is disabled until the Graph phase.
 import type React from 'react';
-import { useEffect, useState } from 'react';
-import { fetchEntity, type Entity } from '../api';
+import { useEffect, useRef, useState } from 'react';
+import { fetchEntity, onDeleted, type Entity, type EntityFact } from '../api';
 import { closeOverlay, openEpisode } from '../hash';
+import { appendUnique } from '../paging';
 import { etColor, validityLine } from '../tokens';
 import { Dot, FlagButton, Spinner } from '../components/ui';
 import { useStore } from '../state';
-import { useAsync } from '../hooks';
+import { useAsync, useModal } from '../hooks';
 
 const provBtn: React.CSSProperties = { border: 'none', background: 'none', padding: 0, color: 'var(--acc)', cursor: 'pointer', fontFamily: 'inherit', fontSize: 'inherit', textDecoration: 'underline', textUnderlineOffset: '2px' };
 
 export function EntityDossier({ id }: { id: string }) {
   const store = useStore();
-  const { data, error } = useAsync(() => fetchEntity(id, 0), [id]);
+  const { data, error, reload } = useAsync(() => fetchEntity(id, 0), [id]);
   const err = error != null;
+  const panel = useRef<HTMLDivElement>(null);
+  useModal(panel);
   const [mentions, setMentions] = useState<Entity['mentions']['items']>([]);
-  const [offset, setOffset] = useState(0);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreFailed, setMoreFailed] = useState(false);
+  const [facts, setFacts] = useState<EntityFact[]>([]);
+  const [loadingFacts, setLoadingFacts] = useState(false);
+  const [factsFailed, setFactsFailed] = useState(false);
 
-  // seed the paginated mentions list from the base fetch; "load more" appends past this.
+  // A delete made while the dossier is open (the episode overlay stacks over it) can take
+  // facts and mentions with it: refetch rather than patch three lists.
+  useEffect(() => onDeleted(reload), [reload]);
+
+  // seed the paginated lists from the base fetch; "load more" appends past this.
   useEffect(() => {
-    if (data) { setMentions(data.mentions.items); setOffset(data.mentions.items.length); }
+    if (data) { setMentions(data.mentions.items); setFacts(data.facts); }
   }, [data]);
 
+  // One page at a time, from the end of the list; a page can repeat rows the list holds
+  // (offsets move under a live corpus). A late page for another entity cannot land here:
+  // Overlays remounts the dossier per entity.
   const loadMoreMentions = () => {
-    fetchEntity(id, offset).then((d) => { setMentions((prev) => prev.concat(d.mentions.items)); setOffset((o) => o + d.mentions.items.length); }).catch(() => {});
+    if (loadingMore) return;
+    setLoadingMore(true); setMoreFailed(false);
+    fetchEntity(id, mentions.length)
+      .then((d) => setMentions((prev) => appendUnique(prev, d.mentions.items, (m) => String(m.episode_id))))
+      .catch(() => setMoreFailed(true))
+      .finally(() => setLoadingMore(false));
+  };
+
+  // Same for facts (live ones first, so what is still to load is the superseded tail).
+  const loadMoreFacts = () => {
+    if (loadingFacts) return;
+    setLoadingFacts(true); setFactsFailed(false);
+    fetchEntity(id, 0, facts.length)
+      .then((d) => setFacts((prev) => appendUnique(prev, d.facts, (f) => f.uuid)))
+      .catch(() => setFactsFailed(true))
+      .finally(() => setLoadingFacts(false));
   };
 
   const e = data?.entity;
@@ -34,10 +63,10 @@ export function EntityDossier({ id }: { id: string }) {
 
   return (
     <div onClick={closeOverlay} style={{ position: 'fixed', inset: 0, background: 'var(--scrim)', zIndex: 60, display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '24px', backdropFilter: 'blur(2px)', overflowY: 'auto' }}>
-      <div onClick={(ev) => ev.stopPropagation()} style={{ background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '14px', maxWidth: '760px', width: '100%', padding: '22px 24px', boxSizing: 'border-box', margin: 'auto' }}>
+      <div ref={panel} role="dialog" aria-modal="true" aria-labelledby="overlay-title" onClick={(ev) => ev.stopPropagation()} style={{ background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '14px', maxWidth: '760px', width: '100%', padding: '22px 24px', boxSizing: 'border-box', margin: 'auto' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
           <Dot color={color} size={12} />
-          <span style={{ fontFamily: 'var(--font-data)', fontSize: '18px', fontWeight: 500 }}>{e?.name || '…'}</span>
+          <span id="overlay-title" style={{ fontFamily: 'var(--font-data)', fontSize: '18px', fontWeight: 500 }}>{e?.name || '…'}</span>
           {e?.entity_type && <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 8px', borderRadius: '4px', border: '1px solid ' + color, color }}>{e.entity_type}</span>}
           <span style={{ flex: 1 }} />
           <button
@@ -52,7 +81,7 @@ export function EntityDossier({ id }: { id: string }) {
             }}
             style={{ border: '1px solid var(--acc)', background: 'var(--acc-bg)', color: 'var(--acc)', borderRadius: '6px', padding: '5px 12px', fontSize: '12px', fontFamily: 'var(--font-data)', cursor: e ? 'pointer' : 'not-allowed', opacity: e ? 1 : 0.55 }}
           >view in graph</button>
-          <button className="iconbtn" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
+          <button className="iconbtn" aria-label="close" onClick={closeOverlay} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '6px', width: 26, height: 26, fontSize: '14px', lineHeight: 1 }}>×</button>
         </div>
 
         {err && <div style={{ color: 'var(--err)', fontSize: '13px', fontFamily: 'var(--font-data)', marginTop: '14px' }}>couldn't load entity.</div>}
@@ -67,7 +96,7 @@ export function EntityDossier({ id }: { id: string }) {
 
             <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: '8px' }}>facts · valid + superseded</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '16px' }}>
-              {data.facts.map((f) => {
+              {facts.map((f) => {
                 const dead = f.t_invalid != null;
                 return (
                   <div key={f.uuid} style={{ border: '1px solid var(--line)', borderRadius: '8px', padding: '8px 11px', opacity: dead ? 0.55 : 1 }}>
@@ -83,18 +112,26 @@ export function EntityDossier({ id }: { id: string }) {
                 );
               })}
             </div>
+            {facts.length < data.stats.facts && (
+              <div style={{ textAlign: 'center', margin: '-6px 0 16px' }}>
+                <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', marginBottom: '6px' }}>showing {facts.length} of {data.stats.facts} facts</div>
+                {factsFailed && <div style={{ color: 'var(--err)', fontSize: '12px', fontFamily: 'var(--font-data)', marginBottom: '6px' }}>couldn't load more facts.</div>}
+                <button className="softbtn" onClick={loadMoreFacts} disabled={loadingFacts} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>{loadingFacts ? 'loading…' : 'load more facts'}</button>
+              </div>
+            )}
 
             <div style={{ fontFamily: 'var(--font-data)', fontSize: '11px', color: 'var(--txt3)', textTransform: 'uppercase', letterSpacing: '.07em', marginBottom: '8px' }}>mentions · {total} episodes</div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '5px' }}>
-              {mentions.map((m, i) => (
-                <button key={i} className="result" onClick={() => openEpisode(m.episode_id)} style={{ textAlign: 'left', border: '1px solid var(--line)', background: 'var(--bg2)', borderRadius: '7px', padding: '7px 11px', cursor: 'pointer', fontSize: '12.5px', lineHeight: 1.4, color: 'var(--txt2)' }}>
+              {mentions.map((m) => (
+                <button key={m.episode_id} className="result" onClick={() => openEpisode(m.episode_id)} style={{ textAlign: 'left', border: '1px solid var(--line)', background: 'var(--bg2)', borderRadius: '7px', padding: '7px 11px', cursor: 'pointer', fontSize: '12.5px', lineHeight: 1.4, color: 'var(--txt2)' }}>
                   <span style={{ fontFamily: 'var(--font-data)', fontSize: '10.5px', color: 'var(--acc)' }}>ep-{m.episode_id}</span> · {m.gist}
                 </button>
               ))}
             </div>
             {mentions.length < total && (
               <div style={{ textAlign: 'center', marginTop: '10px' }}>
-                <button className="softbtn" onClick={loadMoreMentions} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>load more mentions</button>
+                {moreFailed && <div style={{ color: 'var(--err)', fontSize: '12px', fontFamily: 'var(--font-data)', marginBottom: '6px' }}>couldn't load more mentions.</div>}
+                <button className="softbtn" onClick={loadMoreMentions} disabled={loadingMore} style={{ borderRadius: '6px', padding: '5px 12px', fontSize: '11.5px', fontFamily: 'var(--font-data)' }}>{loadingMore ? 'loading…' : 'load more mentions'}</button>
               </div>
             )}
           </>

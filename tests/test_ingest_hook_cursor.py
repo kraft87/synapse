@@ -3,8 +3,8 @@
 ``_plan_from_cursor`` must (a) split POSTs only at turn boundaries so a chunk
 never ends mid-turn (that would mint a bogus span_id for a turn a later chunk
 completes), (b) park the cursor at the START of the last turn — never EOF — so
-a turn still growing at Stop time is re-shipped and lands as a span_id no-op
-once complete, and (c) hold the cursor still when the window has no boundary.
+a turn still growing at Stop time is re-shipped once complete, and (c) hold the
+cursor still when the window has no boundary.
 
 The cursor store must advance monotonically (concurrent Stop/sweep children
 can't rewind each other), reset on truncation, and only record the
@@ -12,9 +12,8 @@ everything-shipped ``size`` on the final chunk so a crash mid-backlog can't
 fake the skip condition. ``_catchup_candidates`` picks exactly the transcripts
 a dead session or an unreachable server left behind.
 
-Cursor logic lives only in the plugin hook (``plugin/scripts/ingest_hook.py``);
-the repo-root hook keeps the legacy tail behavior. Loaded by path like
-test_ingest_hook_tail.py — the hook runs under the CLI's bare Python.
+Cursor logic lives in the plugin hook (``plugin/scripts/ingest_hook.py``), loaded by
+path like test_ingest_hook_tail.py — the hook runs under the CLI's bare Python.
 """
 
 from __future__ import annotations
@@ -49,7 +48,6 @@ def hook(monkeypatch, tmp_path) -> ModuleType:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "hook.log"))
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
@@ -280,6 +278,76 @@ def test_ship_stop_mode_seeds_cursor_from_tail(hook, tmp_path, monkeypatch):
     assert hook._load_state()[str(path)]["offset"] == offsets[4]
 
 
+def _spy_reads(hook, monkeypatch) -> list[int]:
+    """Record the start offset of every transcript read `_ship` makes."""
+    starts: list[int] = []
+    real = hook._read_offset_records
+
+    def spy(path, start=0):
+        starts.append(start)
+        return real(path, start)
+
+    monkeypatch.setattr(hook, "_read_offset_records", spy)
+    return starts
+
+
+def test_ship_does_not_open_an_unchanged_transcript(hook, tmp_path, monkeypatch):
+    path = tmp_path / "s.jsonl"
+    _write_jsonl(path, _turns3())
+    monkeypatch.setattr(hook, "_post_records", lambda recs, source="hook": "ok")
+    hook._ship(str(path), mode="catchup")
+    starts = _spy_reads(hook, monkeypatch)
+    assert hook._ship(str(path), mode="stop") == (0, 0)
+    assert starts == []  # the size check is a stat, not a parse of the whole file
+
+
+def test_ship_reads_only_from_the_cursor(hook, tmp_path, monkeypatch):
+    """Every Stop used to json.loads the whole transcript to find its few new records
+    (O(turns^2) over a session). The cursor is a line start, so the read begins there."""
+    path = tmp_path / "s.jsonl"
+    recs = [_u("u1", "old"), _a("a1", "old"), _u("u2", "old"), _a("a2", "old"), _u("u3"), _a("a3")]
+    offsets = _write_jsonl(path, recs)
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(
+        hook, "_post_records", lambda recs, source="hook": posted.append(recs) or "ok"
+    )
+    hook._ship(str(path), mode="catchup")
+    assert hook._load_state()[str(path)]["offset"] == offsets[4]  # cursor at u3
+
+    with open(path, "ab") as f:
+        f.write(json.dumps(_u("u4")).encode() + b"\n")
+        f.write(json.dumps(_a("a4")).encode() + b"\n")
+    starts = _spy_reads(hook, monkeypatch)
+    posted.clear()
+    assert hook._ship(str(path), mode="stop") == (1, 4)
+    assert starts == [offsets[4]]
+    # the last turn re-ships with the new one (the transcript may lag a Stop)
+    assert [r["uuid"] for r in posted[0]] == ["u3", "a3", "u4", "a4"]
+
+
+def test_ship_cursor_inside_a_line_means_the_file_was_rewritten(hook, tmp_path, monkeypatch):
+    """A cursor that is within the file but not at a line start belongs to a transcript
+    replaced by a longer one: reship it from the top rather than parse a line's tail."""
+    path = tmp_path / "s.jsonl"
+    _write_jsonl(path, _turns3())
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(
+        hook, "_post_records", lambda recs, source="hook": posted.append(recs) or "ok"
+    )
+    hook._ship(str(path), mode="catchup")
+    cursor = hook._load_state()[str(path)]["offset"]
+    # a different transcript, longer than the old one, with a line spanning the cursor
+    fresh = [_u(f"n{i}", "x" * 60) if i % 2 == 0 else _a(f"n{i}", "y" * 60) for i in range(10)]
+    offsets = _write_jsonl(path, fresh)
+    assert all(o != cursor for o in offsets) and cursor < path.stat().st_size
+    posted.clear()
+
+    posts, shipped = hook._ship(str(path), mode="stop")
+    assert posts == 1 and shipped == 10
+    assert [r["uuid"] for r in posted[0]] == [r["uuid"] for r in fresh]
+    assert hook._load_state()[str(path)]["offset"] == offsets[8]
+
+
 # ---------------------------------------------------------------------------
 # Catch-up candidate selection
 # ---------------------------------------------------------------------------
@@ -344,5 +412,5 @@ def test_post_records_sends_a_real_user_agent(hook, monkeypatch):
 
     monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
     hook._post_records([_u("u1")])
-    assert seen.get("user-agent") == hook.config._UA
+    assert seen.get("user-agent") == hook.config.USER_AGENT
     assert not seen["user-agent"].startswith("Python-urllib")

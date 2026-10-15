@@ -8,13 +8,15 @@ Two auth postures, by design (mirrors the contract's Namespace & auth section):
   * The static routes (/dash, /dash/app.js, /dash/assets/*) are UNAUTHENTICATED — the
     bundle is public code carrying no memory, so gating it buys nothing and would break
     the paste-once login screen (which needs to load before it has a token).
-  * Every /dash/api/* route is machine-token gated through the same ``authorized`` seam
-    the other route modules use (custom routes bypass FastMCP's auth middleware by
-    design — issue #3704 — so each handler checks explicitly). 401 body is the contract's
-    {"status":"error","detail":"unauthorized"}.
+  * Every /dash/api/* route rides the ADMIN gate (``http_auth.admin_authorized``: an
+    approved full-trust device token, such as the one the dashboard login mints; the
+    root token is refused), passed in as ``authorized``. Custom routes bypass FastMCP's
+    auth enforcement by design (issue #3704), so each handler checks explicitly. 401
+    body is the contract's {"status":"error","detail":"unauthorized"}.
 
-Shape rules shared by every api route: PG work runs in a threadpool on ONE short-lived
-psycopg connection per request, and the boundary is fail-soft — an exception becomes a
+Shape rules shared by every api route: PG work runs in a threadpool on ONE connection
+borrowed from the server's pool (ingestion/pg_pool) per request, and the boundary is
+fail-soft — an exception becomes a
 500 JSON and is logged, never raised past the JSONResponse. Reads are owner-agnostic
 (an operator sees the whole store); the only group_id/project/source scoping is the
 per-endpoint filtering the contract spells out.
@@ -34,10 +36,11 @@ import logging
 import re
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 from psycopg.rows import dict_row
@@ -53,6 +56,10 @@ from starlette.responses import (
 )
 
 from ingestion import pg_pool
+from ingestion.db_connection import bm25_query_text
+from ingestion.db_episodes import DELETED_TURNS_PROBE
+from ingestion.dedup import _normalize_name
+from ingestion.llm_schemas import _EVENT_TYPES
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -81,9 +88,12 @@ _MENTIONS_PAGE = 20
 _SESSION_CAP = 500
 _RECALL_HISTORY_DEFAULT = 50
 _RECALL_HISTORY_MAX = 200
-_ENTITY_FACTS_CAP = 200  # bound the dossier payload; the example has ~15
+_ENTITY_FACTS_PAGE = 200  # dossier facts per page; the example has ~15
 _DERIVED_CAP = 200
 _GIST_MAX = 200
+# Episode text read for a gist: _gist keeps the first non-empty line, so the head of
+# the content is enough, and a 100 KB turn never leaves Postgres to make 200 chars.
+_GIST_SOURCE_MAX = 2000
 _SNIPPET_MAX = 240
 _CATALOG_TTL_S = 300  # ~5 min in-process cache
 
@@ -97,12 +107,16 @@ _STREAM_EVENT_NAMES = {
     "episode": "new_episode",
     "fact": "new_fact",
     "timeline_event": "new_timeline_event",
+    "reset": "reset",  # the LISTEN worker's reconnect marker, not a feed item
 }
 _STREAM_CHANNEL = "dash_feed"  # matches schema/043_dash_notify.sql
 _STREAM_BUFFER_CAP = 512  # ring-buffer slots (contract: 512-event replay window)
 _STREAM_POLL_S = 0.25  # per-connection buffer poll cadence (new-event latency ceiling)
 _STREAM_STATUS_S = 1.0  # processing_status emit cadence (contract: ~1/s)
 _STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the stream
+_STREAM_READY_S = 2.0  # a new connection waits at most this long for LISTEN + a first status
+_STREAM_RECONNECT_MIN_S = 1.0  # LISTEN reconnect backoff: first retry delay ...
+_STREAM_RECONNECT_MAX_S = 30.0  # ... doubling up to this
 
 # Proposals (phase 2b): per-lane row cap for the unified list, and the review-relevant
 # statuses. 'observe' (pre-graduation) and skills' 'retired' (decayed) are NOT proposals
@@ -113,7 +127,6 @@ _STREAM_HEARTBEAT_S = 15.0  # comment heartbeat so idle proxies don't kill the s
 _PROPOSALS_LANE_CAP = 200
 _SKILL_REVIEW_STATUSES = ("proposed", "accepted", "promoted", "rejected")
 _CONFIG_REVIEW_STATUSES = ("proposed", "accepted", "applied", "rejected")
-_PROVENANCE_CAP = 40  # bound the best-effort session→episode resolution
 
 # Phase 5 (Timeline / Preferences / Dream report / Behavior files).
 _TIMELINE_LIMIT_DEFAULT = 50
@@ -201,20 +214,42 @@ def _provenance(episodes: Any) -> int | None:
     return None
 
 
+_EP_REF_RE = re.compile(r"ep:(\d+)(?:#\d+)?")
+
+
 def _episode_id_from_ref(source_ref: Any) -> int | None:
-    """Resolve a timeline event's 'ep:<id>' source_ref to an episode id, else None
-    (git-sourced refs are SHAs, which resolve to null)."""
-    if isinstance(source_ref, str) and source_ref.startswith("ep:"):
-        rest = source_ref[3:].strip()
-        if rest.isdigit():
-            return int(rest)
+    """Resolve a timeline event's source_ref to an episode id, else None. A turn's first
+    event carries 'ep:<id>' and its k-th 'ep:<id>#<k>' (ingestion/timeline_gate.py);
+    git-sourced refs are SHAs, which resolve to null."""
+    if isinstance(source_ref, str):
+        m = _EP_REF_RE.fullmatch(source_ref.strip())
+        if m:
+            return int(m.group(1))
     return None
 
 
-def _bm25_sanitize(q: str) -> str:
-    """Alnum/space-only, mirroring recall/kg_pg: keeps identifiers/error strings while
-    stripping the ParadeDB query-language metacharacters that would raise a parse error."""
-    return "".join(c if (c.isalnum() or c.isspace()) else " " for c in q).strip()
+def _label_filter(col: str, value: str) -> tuple[str, list[Any]]:
+    """WHERE fragment for a project/source filter. 'untagged' is the catalog's bucket for
+    NULL and '' (a literal 'untagged' label lands in it too); a real label is a plain
+    equality, so the column's index can serve it. ``col`` is a fixed identifier from
+    this module, never user input."""
+    if value == "untagged":
+        return f"({col} IS NULL OR {col} = '' OR {col} = 'untagged')", []
+    return f"{col} = %s", [value]
+
+
+def _domain_filter(group_id: str) -> tuple[str, list[Any]]:
+    """WHERE fragment for the group filter on timeline_events. ``domain`` is NULL for an
+    unlabelled event (legacy rows, a gate parse miss, a pushed non-git event) and schema 038
+    makes a NULL FAIL OPEN at read, so it stays visible under either group."""
+    return "(domain = %s OR domain IS NULL)", [group_id]
+
+
+def _like_contains(q: str) -> str:
+    """ILIKE pattern for "name contains q" with q taken literally: '%' and '_' in user text
+    are not wildcards. Backslash is Postgres's default LIKE escape, so it is escaped too."""
+    escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def _encode_cursor(ts_iso: str, type_: str, id_str: str) -> str:
@@ -306,9 +341,14 @@ def _catalog(db_url: str) -> dict[str, Any]:
 # a "WHERE <pk> = %s". The mappers emit the final item minus `flagged` (added after the
 # per-request flag set is loaded) and minus the internal `_ts`/`_idstr` merge-sort keys.
 
-_EP_SELECT = "SELECT id, created_at, project, source, session_id, sequence, content FROM episodes"
+_EP_SELECT = (
+    "SELECT id, created_at, project, source, session_id, sequence, "
+    f"left(content, {_GIST_SOURCE_MAX}) AS content FROM episodes"
+)
+# A fact's feed time is t_created, its write time (schema 017); the FalkorDB-era
+# created_at mirror is not read.
 _FACT_SELECT = (
-    "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
+    "SELECT r.uuid, r.t_created, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
     "       se.name AS src_name, te.name AS tgt_name "
     "FROM kg_relationships r "
     "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
@@ -336,7 +376,7 @@ def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
     return {
         "type": "fact",
         "id": r["uuid"],
-        "ts": _iso(r["created_at"]),
+        "ts": _iso(r["t_created"]),
         "group_id": r["group_id"],
         "gist": _gist(r["fact"]),
         "data": {
@@ -351,7 +391,7 @@ def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
 
 
 def _timeline_item(r: dict[str, Any]) -> dict[str, Any]:
-    sal = {0: 0.3, 1: 0.6, 2: 0.9}.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6)
+    sal = _SAL_MAP.get(int(r["salience"]) if r["salience"] is not None else 1, 0.6)
     return {
         "type": "timeline_event",
         "id": str(r["id"]),
@@ -398,12 +438,11 @@ def _feed(
         # --- episodes (ts = created_at). Filters: project, source. No group_id column. ---
         ep_where = ["1=1"]
         ep_params: list[Any] = []
-        if project is not None:
-            ep_where.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            ep_params.append(project)
-        if source is not None:
-            ep_where.append("COALESCE(NULLIF(source, ''), 'untagged') = %s")
-            ep_params.append(source)
+        for col, value in (("project", project), ("source", source)):
+            if value is not None:
+                clause, args = _label_filter(col, value)
+                ep_where.append(clause)
+                ep_params += args
         if cts is not None:
             ep_where.append(
                 "(created_at < %s::timestamptz OR (created_at = %s::timestamptz AND id::text < %s))"
@@ -420,26 +459,26 @@ def _feed(
             item["_idstr"] = str(r["id"])
             candidates.append(item)
 
-        # --- facts (ts = created_at). Filter: group_id. No project/source column. ---
-        # Columns are r.-qualified: the entity joins below also expose created_at/group_id.
-        f_where = ["r.created_at IS NOT NULL"]
+        # --- facts (ts = t_created). Filter: group_id. No project/source column. ---
+        # Columns are r.-qualified: the entity joins below also expose t_created/group_id.
+        # The row-wise keyset and ORDER BY match kg_rel_t_created_idx (a later optional
+        # migration); without that index the same query sorts.
+        f_where = ["r.t_created IS NOT NULL"]
         f_params: list[Any] = []
         if group_id is not None:
             f_where.append("r.group_id = %s")
             f_params.append(group_id)
         if cts is not None:
-            f_where.append(
-                "(r.created_at < %s::timestamptz OR (r.created_at = %s::timestamptz AND r.uuid < %s))"
-            )
-            f_params += [cts, cts, cid]
+            f_where.append("(r.t_created, r.uuid) < (%s::timestamptz, %s)")
+            f_params += [cts, cid]
         fact_rows = conn.execute(
             f"{_FACT_SELECT} WHERE {' AND '.join(f_where)} "
-            "ORDER BY r.created_at DESC, r.uuid DESC LIMIT %s",
+            "ORDER BY r.t_created DESC, r.uuid DESC LIMIT %s",
             (*f_params, limit),
         ).fetchall()
         for r in fact_rows:
             item = _fact_item(r)
-            item["_ts"] = r["created_at"]
+            item["_ts"] = r["t_created"]
             item["_idstr"] = str(r["uuid"])
             candidates.append(item)
 
@@ -447,14 +486,16 @@ def _feed(
         t_where = ["1=1"]
         t_params: list[Any] = []
         if project is not None:
-            t_where.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            t_params.append(project)
+            clause, args = _label_filter("project", project)
+            t_where.append(clause)
+            t_params += args
         if group_id is not None:
             # 038 added `domain` (technical/personal) as the timeline's group scope; the
             # contract's feed-filter line names only project for timeline, but the domain
             # column IS a group_id-equivalent, so the group filter applies here too.
-            t_where.append("domain = %s")
-            t_params.append(group_id)
+            clause, args = _domain_filter(group_id)
+            t_where.append(clause)
+            t_params += args
         if cts is not None:
             t_where.append(
                 "(ingested_at < %s::timestamptz OR (ingested_at = %s::timestamptz AND id::text < %s))"
@@ -538,10 +579,11 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
             "ORDER BY t_valid DESC NULLS LAST, uuid LIMIT %s",
             (episode_id, str(episode_id), _DERIVED_CAP),
         ).fetchall()
+        # A turn's events carry 'ep:<id>', then 'ep:<id>#<k>' (ingestion/timeline_gate.py).
         events = conn.execute(
             "SELECT id, fact, t_valid, salience FROM timeline_events "
-            "WHERE source_ref = %s ORDER BY t_valid DESC LIMIT %s",
-            (f"ep:{episode_id}", _DERIVED_CAP),
+            "WHERE source_ref = %s OR source_ref LIKE %s ORDER BY t_valid DESC LIMIT %s",
+            (f"ep:{episode_id}", f"ep:{episode_id}#%", _DERIVED_CAP),
         ).fetchall()
         return {
             "facts": [
@@ -571,18 +613,59 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
-    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            "SELECT id, sequence, created_at, project, source, human_turn, assistant_turn, content "
-            "FROM episodes WHERE session_id = %s ORDER BY sequence LIMIT %s",
-            (session_id, _SESSION_CAP),
+_SESSION_COLS = "id, sequence, created_at, project, source, human_turn, assistant_turn"
+
+
+def _session_rows(
+    conn: psycopg.Connection[dict[str, Any]], session_id: str, highlight: Any
+) -> list[dict[str, Any]]:
+    """Up to _SESSION_CAP turns of the session, in sequence order: the first ones, or,
+    when ``highlight`` is a turn of this session, a window around it (about half before,
+    sliding toward whichever side has the turns) so the drawer can show the turn it was
+    opened for however long the session is."""
+    cap = _SESSION_CAP
+    hl = None
+    if isinstance(highlight, int):
+        hl = conn.execute(
+            "SELECT sequence FROM episodes WHERE id = %s AND session_id = %s",
+            (highlight, session_id),
+        ).fetchone()
+    if hl is None:
+        return conn.execute(
+            f"SELECT {_SESSION_COLS} FROM episodes "  # nosec B608 - fixed column list
+            "WHERE session_id = %s ORDER BY sequence LIMIT %s",
+            (session_id, cap),
         ).fetchall()
-        first = rows[0] if rows else None
+    after = conn.execute(
+        f"SELECT {_SESSION_COLS} FROM episodes "  # nosec B608 - fixed column list
+        "WHERE session_id = %s AND sequence >= %s ORDER BY sequence LIMIT %s",
+        (session_id, hl["sequence"], cap),
+    ).fetchall()
+    before = conn.execute(
+        f"SELECT {_SESSION_COLS} FROM episodes "  # nosec B608 - fixed column list
+        "WHERE session_id = %s AND sequence < %s ORDER BY sequence DESC LIMIT %s",
+        (session_id, hl["sequence"], cap - min(len(after), cap - cap // 2)),
+    ).fetchall()
+    return before[::-1] + after[: cap - len(before)]
+
+
+def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any] | None:
+    """The session drawer's payload, or None when no turn is stored under the id (the route
+    turns that into the 404). ``total`` counts the whole session: ``episodes`` is only the
+    window of it that _SESSION_CAP allows."""
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        rows = _session_rows(conn, session_id, highlight)
+        if not rows:
+            return None
+        first = rows[0]
+        total = conn.execute(
+            "SELECT count(*) AS n FROM episodes WHERE session_id = %s", (session_id,)
+        ).fetchone()
         return {
             "session_id": session_id,
-            "project": first["project"] if first else None,
-            "source": first["source"] if first else None,
+            "project": first["project"],
+            "source": first["source"],
+            "total": total["n"] if total else len(rows),
             "highlight": highlight,
             "episodes": [
                 {
@@ -591,11 +674,22 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
                     "created_at": _iso(r["created_at"]),
                     "human_turn": r["human_turn"],
                     "assistant_turn": r["assistant_turn"],
-                    "content": r["content"],
                 }
                 for r in rows
             ],
         }
+
+
+# kg_entities.degree is a one-off backfill (schema 017) that nothing maintains: stale for
+# older entities, 0 for every one extraction wrote since. Reads count live edges instead.
+# One scalar subquery per side keeps each count on kg_rel_src / kg_rel_tgt (an src-OR-tgt
+# predicate can use neither). `e` is the kg_entities alias of the surrounding query.
+_LIVE_DEGREE_SQL = (
+    "((SELECT count(*) FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+    "AND r.group_id = e.group_id AND r.src_uuid = e.uuid AND r.t_invalid IS NULL) "
+    "+ (SELECT count(*) FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+    "AND r.group_id = e.group_id AND r.tgt_uuid = e.uuid AND r.t_invalid IS NULL))"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -603,10 +697,12 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | None:
+def _entity(
+    db_url: str, uuid: str, mentions_offset: int, facts_offset: int = 0
+) -> dict[str, Any] | None:
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         ent = conn.execute(
-            "SELECT uuid, name, entity_type, summary, degree, created_at "
+            "SELECT uuid, owner_id, group_id, name, entity_subtype, summary, t_created "
             "FROM kg_entities WHERE uuid = %s",
             (uuid,),
         ).fetchone()
@@ -614,9 +710,14 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             return None
 
         flags = _flag_set(conn)
+        # An entity's edges live in its own (owner_id, group_id): extraction and dedup run
+        # per group. Naming both lets kg_rel_src / kg_rel_tgt serve the src-OR-tgt reads.
+        scope = {"u": uuid, "o": ent["owner_id"], "g": ent["group_id"]}
+        touching = "r.owner_id = %(o)s AND r.group_id = %(g)s AND (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s)"
 
-        # Facts = live + superseded edges touching the uuid; the "other" endpoint's name
-        # comes from a join on whichever side isn't this entity.
+        # Facts = live + superseded edges touching the uuid, live first so a page cut never
+        # hides a current fact behind superseded ones; the "other" endpoint's name comes from
+        # a join on whichever side isn't this entity. Paged: stats.facts is the total.
         fact_rows = conn.execute(
             "SELECT r.uuid, r.name, r.fact, r.t_valid, r.t_invalid, r.episodes, "
             "       CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END AS other_uuid, "
@@ -624,9 +725,10 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             "FROM kg_relationships r "
             "LEFT JOIN kg_entities oe "
             "  ON oe.uuid = CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END "
-            "WHERE r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s "
-            "ORDER BY r.t_valid DESC NULLS LAST, r.uuid LIMIT %(lim)s",
-            {"u": uuid, "lim": _ENTITY_FACTS_CAP},
+            f"WHERE {touching} "
+            "ORDER BY (r.t_invalid IS NOT NULL), r.t_valid DESC NULLS LAST, r.uuid "
+            "OFFSET %(off)s LIMIT %(lim)s",
+            {**scope, "off": facts_offset, "lim": _ENTITY_FACTS_PAGE},
         ).fetchall()
 
         stats = (
@@ -634,8 +736,8 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 "SELECT count(*) FILTER (WHERE t_invalid IS NULL) AS edges, "
                 "       count(*) AS facts, "
                 "       COALESCE(sum(retrieval_count), 0) AS served "
-                "FROM kg_relationships WHERE src_uuid = %(u)s OR tgt_uuid = %(u)s",
-                {"u": uuid},
+                f"FROM kg_relationships r WHERE {touching}",
+                scope,
             ).fetchone()
             or {}
         )
@@ -643,37 +745,39 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
         # Mentions = distinct episode ids across the touching edges' `episodes` arrays,
         # resolved to real episodes, newest first, paged. Non-numeric elements are skipped.
         # The CASE guard coerces NULL / non-array episodes to '[]' so the lateral never
-        # errors on a malformed row (it would raise at execution, before any WHERE).
-        _mentions_from = (
-            "kg_relationships r "
+        # errors on a malformed row (it would raise at execution, before any WHERE). The
+        # ids are deduplicated before the episodes join, so no episode text is sorted.
+        mentioned = (
+            "SELECT elem.v::bigint FROM kg_relationships r "
             "CROSS JOIN LATERAL jsonb_array_elements_text("
             "  CASE WHEN jsonb_typeof(r.episodes) = 'array' THEN r.episodes ELSE '[]'::jsonb END"
             ") AS elem(v) "
-            "JOIN episodes e ON e.id = elem.v::bigint "
-            "WHERE (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s) AND elem.v ~ '^[0-9]+$'"
+            f"WHERE {touching} AND elem.v ~ '^[0-9]+$'"
         )
         total_row = (
             conn.execute(
-                f"SELECT count(*) AS total FROM (SELECT DISTINCT e.id FROM {_mentions_from}) m",
-                {"u": uuid},
+                f"SELECT count(*) AS total FROM episodes e WHERE e.id IN ({mentioned})",
+                scope,
             ).fetchone()
             or {}
         )
         mention_rows = conn.execute(
-            "SELECT e.id, e.created_at, e.content FROM ("
-            f"  SELECT DISTINCT e.id, e.created_at, e.content FROM {_mentions_from}"
-            ") e ORDER BY e.created_at DESC, e.id DESC OFFSET %(off)s LIMIT %(lim)s",
-            {"u": uuid, "off": mentions_offset, "lim": _MENTIONS_PAGE},
+            f"SELECT e.id, e.created_at, left(e.content, {_GIST_SOURCE_MAX}) AS content "
+            f"FROM episodes e WHERE e.id IN ({mentioned}) "
+            "ORDER BY e.created_at DESC, e.id DESC OFFSET %(off)s LIMIT %(lim)s",
+            {**scope, "off": mentions_offset, "lim": _MENTIONS_PAGE},
         ).fetchall()
 
         return {
             "entity": {
                 "uuid": ent["uuid"],
                 "name": ent["name"],
-                "entity_type": ent["entity_type"],
+                # The wire keeps the name entity_type; the value is the taxonomy subtype
+                # (schema 020), not the FalkorDB-era raw entity_type column.
+                "entity_type": ent["entity_subtype"],
                 "summary": ent["summary"],
-                "degree": ent["degree"],
-                "created_at": _iso(ent["created_at"]),
+                "degree": int(stats.get("edges") or 0),
+                "created_at": _iso(ent["t_created"]),
             },
             "stats": {
                 "edges": int(stats.get("edges") or 0),
@@ -714,13 +818,6 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
 # ---------------------------------------------------------------------------
 
 
-def _normalize_seed_name(name: str) -> str:
-    """Mirror ingestion.dedup._normalize_name for the exact-name seed lookup:
-    lowercase, collapse internal whitespace, strip bookend whitespace/punctuation."""
-    collapsed = " ".join(name.lower().split())
-    return collapsed.strip(" \t\n\r\f\v.,;:!?\"'()[]{}<>")
-
-
 def _parse_as_of(raw: str | None) -> datetime | None:
     """Parse the as-of ISO timestamp, or None (unset / unparseable → no time filter)."""
     if not raw:
@@ -733,20 +830,21 @@ def _parse_as_of(raw: str | None) -> datetime | None:
 
 def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
     """Typeahead over entity names — shares the search endpoint's entity leg SQL
-    (name ILIKE, degree DESC). Global (no group scope): the graph is seeded explicitly."""
+    (name ILIKE, live degree DESC). Global (no group scope): the graph is seeded explicitly."""
     if not q:
         return []
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         rows = conn.execute(
-            "SELECT uuid, name, entity_type, entity_supertype, degree FROM kg_entities "
-            "WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT %s",
-            (f"%{q}%", limit),
+            "SELECT e.uuid, e.name, e.entity_subtype, e.entity_supertype, "  # nosec B608
+            f"       {_LIVE_DEGREE_SQL} AS degree FROM kg_entities e "
+            "WHERE e.name ILIKE %s ORDER BY degree DESC, e.name LIMIT %s",
+            (_like_contains(q), limit),
         ).fetchall()
         return [
             {
                 "uuid": r["uuid"],
                 "name": r["name"],
-                "entity_type": r["entity_type"],
+                "entity_type": r["entity_subtype"],
                 "supertype": r["entity_supertype"],
                 "degree": r["degree"],
             }
@@ -756,23 +854,24 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
 
 def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
     """Resolve a seed given a uuid OR a name: exact uuid → exact normalized_name →
-    best ILIKE match (highest degree). None when nothing matches."""
-    cols = "uuid, name, entity_type, degree, summary"
-    row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
+    best ILIKE match (highest live degree). None when nothing matches."""
+    cols = "e.uuid, e.owner_id, e.group_id"
+    row = conn.execute(f"SELECT {cols} FROM kg_entities e WHERE e.uuid = %s", (entity,)).fetchone()  # nosec B608
     if row:
         return row
-    norm = _normalize_seed_name(entity)
+    norm = _normalize_name(entity)
     if norm:
         row = conn.execute(
-            f"SELECT {cols} FROM kg_entities WHERE normalized_name = %s "
-            "ORDER BY degree DESC LIMIT 1",
+            f"SELECT {cols} FROM kg_entities e WHERE e.normalized_name = %s "  # nosec B608
+            f"ORDER BY {_LIVE_DEGREE_SQL} DESC LIMIT 1",
             (norm,),
         ).fetchone()
         if row:
             return row
     return conn.execute(
-        f"SELECT {cols} FROM kg_entities WHERE name ILIKE %s ORDER BY degree DESC, name LIMIT 1",
-        (f"%{entity}%",),
+        f"SELECT {cols} FROM kg_entities e WHERE e.name ILIKE %s "  # nosec B608
+        f"ORDER BY {_LIVE_DEGREE_SQL} DESC, e.name LIMIT 1",
+        (_like_contains(entity),),
     ).fetchone()
 
 
@@ -808,7 +907,11 @@ def _graph_neighborhood(
             return None
         seed_uuid = seed["uuid"]
 
-        # Shared as-of edge-visibility fragment (empty when unset).
+        # Edges stay within the seed's (owner_id, group_id) — extraction and dedup run per
+        # group — and naming both lets kg_rel_src / kg_rel_tgt / kg_rel_pair serve every
+        # scan below. Plus the shared as-of edge-visibility fragment (empty when unset).
+        edge_scope = "owner_id = %s AND group_id = %s"
+        edge_params: list[Any] = [seed["owner_id"], seed["group_id"]]
         as_of_sql, as_of_params = "", []
         if as_of is not None:
             as_of_sql = " AND (t_valid IS NULL OR t_valid <= %s)"
@@ -822,8 +925,9 @@ def _graph_neighborhood(
                 break
             rows = conn.execute(
                 "SELECT src_uuid, tgt_uuid FROM kg_relationships "
-                f"WHERE (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} LIMIT %s",
-                (frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+                f"WHERE {edge_scope} AND (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} "
+                "LIMIT %s",
+                (*edge_params, frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
             ).fetchall()
             nxt: list[str] = []
             for r in rows:
@@ -836,8 +940,8 @@ def _graph_neighborhood(
         # Materialize real entity rows for the reached uuids (edge endpoints without an
         # entity row are dropped — edges aren't FKs, so a dangling endpoint has no node).
         ent_rows = conn.execute(
-            "SELECT uuid, name, entity_type, entity_supertype, degree, summary "
-            "FROM kg_entities WHERE uuid = ANY(%s)",
+            "SELECT e.uuid, e.name, e.entity_subtype, e.entity_supertype, e.summary, "  # nosec B608
+            f"       {_LIVE_DEGREE_SQL} AS degree FROM kg_entities e WHERE e.uuid = ANY(%s)",
             (list(visited),),
         ).fetchall()
 
@@ -852,8 +956,9 @@ def _graph_neighborhood(
         edge_rows = conn.execute(
             "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "
             "       retrieval_count FROM kg_relationships "
-            f"WHERE src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
-            (kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+            f"WHERE {edge_scope} AND src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} "
+            "LIMIT %s",
+            (*edge_params, kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
         ).fetchall()
 
         # Edge cap (see _GRAPH_EDGE_CAP): keep seed-adjacent edges first, then the
@@ -880,7 +985,7 @@ def _graph_neighborhood(
                 {
                     "uuid": r["uuid"],
                     "name": r["name"],
-                    "entity_type": r["entity_type"],
+                    "entity_type": r["entity_subtype"],
                     # canonical coarse layer (020) — the client colors by this
                     "supertype": r["entity_supertype"],
                     "degree": r["degree"],
@@ -924,8 +1029,9 @@ def _search(
 ) -> dict[str, Any]:
     """BM25 (ParadeDB @@@) for episodes/facts/events, ILIKE-on-name for entities.
 
-    total_by_type is always computed for all four tabs; `hits` only for the requested
-    type. Snippet is the first 240 chars of the matched text — paradedb.snippet() with
+    total_by_type is computed for all four tabs on a query's first page (offset 0) and left
+    out of later pages, which the client pages with the totals it already holds; `hits`
+    only for the requested type. Snippet is the first 240 chars of the matched text — paradedb.snippet() with
     real term highlighting is a later upgrade.
     """
     empty = {
@@ -936,67 +1042,72 @@ def _search(
     }
     if not q:
         return empty
-    safe = _bm25_sanitize(q)
-    like = f"%{q}%"
+    safe = bm25_query_text(q)
+    like = _like_contains(q)
 
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         # --- per-type filter fragments (applied to both count and hit queries) ---
-        ep_filt, ep_p = [], []
-        if project is not None:
-            ep_filt.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            ep_p.append(project)
-        if source is not None:
-            ep_filt.append("COALESCE(NULLIF(source, ''), 'untagged') = %s")
-            ep_p.append(source)
+        ep_filt: list[str] = []
+        ep_p: list[Any] = []
+        for col, value in (("project", project), ("source", source)):
+            if value is not None:
+                clause, args = _label_filter(col, value)
+                ep_filt.append(clause)
+                ep_p += args
         ep_and = "".join(f" AND {c}" for c in ep_filt)
 
         f_and, f_p = "", []
         if group_id is not None:
             f_and, f_p = " AND group_id = %s", [group_id]
 
-        ev_filt, ev_p = [], []
+        ev_filt: list[str] = []
+        ev_p: list[Any] = []
         if project is not None:
-            ev_filt.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
-            ev_p.append(project)
+            clause, args = _label_filter("project", project)
+            ev_filt.append(clause)
+            ev_p += args
         if group_id is not None:
-            ev_filt.append("domain = %s")
-            ev_p.append(group_id)
+            clause, args = _domain_filter(group_id)
+            ev_filt.append(clause)
+            ev_p += args
         ev_and = "".join(f" AND {c}" for c in ev_filt)
 
         en_and, en_p = "", []
         if group_id is not None:
             en_and, en_p = " AND group_id = %s", [group_id]
 
-        # --- total_by_type: all four counts, every call ---
-        total: dict[str, int] = dict.fromkeys(_SEARCH_TYPES, 0)
-        if safe:
-            total["episodes"] = _count(
+        # --- total_by_type: all four counts, first page only ---
+        total: dict[str, int] | None = None
+        if offset == 0:
+            total = dict.fromkeys(_SEARCH_TYPES, 0)
+            if safe:
+                total["episodes"] = _count(
+                    conn,
+                    f"SELECT count(*) AS c FROM episodes WHERE id @@@ paradedb.match('content', %s){ep_and}",
+                    (safe, *ep_p),
+                )
+                total["facts"] = _count(
+                    conn,
+                    f"SELECT count(*) AS c FROM kg_relationships WHERE id @@@ paradedb.match('fact', %s){f_and}",
+                    (safe, *f_p),
+                )
+                total["events"] = _count(
+                    conn,
+                    f"SELECT count(*) AS c FROM timeline_events WHERE id @@@ paradedb.match('fact', %s){ev_and}",
+                    (safe, *ev_p),
+                )
+            total["entities"] = _count(
                 conn,
-                f"SELECT count(*) AS c FROM episodes WHERE id @@@ paradedb.match('content', %s){ep_and}",
-                (safe, *ep_p),
+                f"SELECT count(*) AS c FROM kg_entities WHERE name ILIKE %s{en_and}",
+                (like, *en_p),
             )
-            total["facts"] = _count(
-                conn,
-                f"SELECT count(*) AS c FROM kg_relationships WHERE id @@@ paradedb.match('fact', %s){f_and}",
-                (safe, *f_p),
-            )
-            total["events"] = _count(
-                conn,
-                f"SELECT count(*) AS c FROM timeline_events WHERE id @@@ paradedb.match('fact', %s){ev_and}",
-                (safe, *ev_p),
-            )
-        total["entities"] = _count(
-            conn,
-            f"SELECT count(*) AS c FROM kg_entities WHERE name ILIKE %s{en_and}",
-            (like, *en_p),
-        )
 
         # --- hits for the requested type only ---
         hits: list[dict[str, Any]] = []
         if type_ == "episodes" and safe:
             for r in conn.execute(
-                "SELECT id, content, project, source, created_at, session_id, "
-                "       paradedb.score(id) AS sc FROM episodes "
+                f"SELECT id, left(content, {_SNIPPET_MAX}) AS snippet, project, source, "
+                "       created_at, session_id, paradedb.score(id) AS sc FROM episodes "
                 f"WHERE id @@@ paradedb.match('content', %s){ep_and} "
                 "ORDER BY sc DESC, id DESC OFFSET %s LIMIT %s",
                 (safe, *ep_p, offset, limit),
@@ -1005,7 +1116,7 @@ def _search(
                     {
                         "type": "episodes",
                         "id": str(r["id"]),
-                        "snippet": (r["content"] or "")[:_SNIPPET_MAX],
+                        "snippet": r["snippet"] or "",
                         "meta": {
                             "project": r["project"],
                             "source": r["source"],
@@ -1016,7 +1127,7 @@ def _search(
                 )
         elif type_ == "facts" and safe:
             for r in conn.execute(
-                "SELECT uuid, fact, group_id, t_valid, t_invalid, created_at, episodes, "
+                "SELECT uuid, fact, group_id, t_valid, t_invalid, t_created, episodes, "
                 "       paradedb.score(id) AS sc FROM kg_relationships "
                 f"WHERE id @@@ paradedb.match('fact', %s){f_and} "
                 "ORDER BY sc DESC, uuid DESC OFFSET %s LIMIT %s",
@@ -1034,7 +1145,7 @@ def _search(
                             "group_id": r["group_id"],
                             "t_valid": _iso(r["t_valid"]),
                             "t_invalid": _iso(r["t_invalid"]),
-                            "ts": _iso(r["created_at"]),
+                            "ts": _iso(r["t_created"]),
                             "episode_id": _provenance(r["episodes"]),
                         },
                     }
@@ -1058,14 +1169,17 @@ def _search(
                             "source": r["source"],
                             "ts": _iso(r["ingested_at"]),
                             "episode_id": _episode_id_from_ref(r["source_ref"]),
+                            # the only provenance a git-sourced event has (a SHA)
+                            "source_ref": r["source_ref"],
                         },
                     }
                 )
         elif type_ == "entities":
             for r in conn.execute(
-                "SELECT uuid, name, entity_type, summary, degree FROM kg_entities "
-                f"WHERE name ILIKE %s{en_and} "
-                "ORDER BY degree DESC, name OFFSET %s LIMIT %s",
+                "SELECT e.uuid, e.name, e.entity_subtype, e.summary, "  # nosec B608
+                f"       {_LIVE_DEGREE_SQL} AS degree FROM kg_entities e "
+                f"WHERE e.name ILIKE %s{en_and} "
+                "ORDER BY degree DESC, e.name OFFSET %s LIMIT %s",
                 (like, *en_p, offset, limit),
             ).fetchall():
                 hits.append(
@@ -1075,13 +1189,14 @@ def _search(
                         "snippet": ((r["summary"] or r["name"]) or "")[:_SNIPPET_MAX],
                         "meta": {
                             "name": r["name"],
-                            "entity_type": r["entity_type"],
+                            "entity_type": r["entity_subtype"],
                             "degree": r["degree"],
                         },
                     }
                 )
 
-        return {"hits": hits, "total_by_type": total, "offset": offset, "limit": limit}
+        page = {"hits": hits, "offset": offset, "limit": limit}
+        return page if total is None else {**page, "total_by_type": total}
 
 
 # ---------------------------------------------------------------------------
@@ -1140,9 +1255,10 @@ def _recall_history(db_url: str, limit: int) -> dict[str, Any]:
 _METRICS_WINDOW_MAX_S = 30 * 86400  # window is capped at 30d (contract)
 _RECALL_WINDOW_DEFAULT_S = 7 * 86400  # /metrics/recall default 7d
 _INGEST_WINDOW_DEFAULT_S = 48 * 3600  # /metrics/ingestion default 48h
-# Recall legs timed by the engine (recall_metrics ms_* columns). timeline/prefs are only
-# populated when those legs are enabled — a bucket with none stays absent for that leg.
-_RECALL_LEGS = ("embed", "bm25", "vector", "kg", "web", "rerank", "timeline", "prefs")
+# Recall legs timed by the engine (recall_metrics ms_* columns). notes is only populated
+# when the notes leg ran — a bucket with none stays absent for that leg. The retired
+# timeline/prefs legs (ms_timeline/ms_prefs) are no longer reported.
+_RECALL_LEGS = ("embed", "bm25", "vector", "kg", "web", "rerank", "notes")
 _SLOWEST_CAP = 10
 _SCORE_BINS = 10
 _INGEST_FAILURES_CAP = 20
@@ -1152,8 +1268,8 @@ _CORPUS_ESTIMATE_FLOOR = 50000
 # (table, time_column|None) — the corpus tables to report + which column drives spark_30d.
 _CORPUS_TABLES: tuple[tuple[str, str | None], ...] = (
     ("episodes", "created_at"),
-    ("kg_entities", "created_at"),
-    ("kg_relationships", "created_at"),
+    ("kg_entities", "t_created"),
+    ("kg_relationships", "t_created"),
     ("timeline_events", "ingested_at"),
     ("preferences", "ingested_at"),
     ("notes", "created_at"),
@@ -1188,9 +1304,10 @@ def _r1(v: Any) -> float | None:
 
 def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
     """Hourly recall latency percentiles + per-leg p50 + slowest queries + rerank-score
-    histogram, over recall_metrics (kind='recall') within the window. percentile_cont is a
-    true continuous percentile; NULL leg timings are ignored by the aggregate (a disabled
-    leg simply doesn't contribute)."""
+    histogram, over recall_metrics (kind='recall') within the window, plus `summary`: the
+    window's own p50/p95/tokens (percentiles do not average across hourly buckets).
+    percentile_cont is a true continuous percentile; NULL leg timings are ignored by the
+    aggregate (a disabled leg simply doesn't contribute)."""
     leg_select = ", ".join(
         f"percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_{leg}::double precision) AS leg_{leg}"
         for leg in _RECALL_LEGS
@@ -1221,6 +1338,24 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
                     "legs_p50": legs,
                 }
             )
+
+        summary_row = (
+            conn.execute(
+                "SELECT count(*) AS calls, "
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY ms_total::double precision) AS p50, "
+                "  percentile_cont(0.95) WITHIN GROUP (ORDER BY ms_total::double precision) AS p95, "
+                "  percentile_cont(0.5) WITHIN GROUP (ORDER BY est_tokens::double precision) AS tok "
+                "FROM recall_metrics WHERE kind = 'recall' AND created_at >= now() - %s::interval",
+                (f"{window_s} seconds",),
+            ).fetchone()
+            or {}
+        )
+        summary = {
+            "calls": int(summary_row.get("calls") or 0),
+            "p50": _r1(summary_row.get("p50")),
+            "p95": _r1(summary_row.get("p95")),
+            "tokens_p50": int(summary_row["tok"]) if summary_row.get("tok") is not None else None,
+        }
 
         slow_rows = conn.execute(
             "SELECT query, ms_total, created_at FROM recall_metrics "
@@ -1254,13 +1389,14 @@ def _metrics_recall(db_url: str, window_s: int) -> dict[str, Any]:
             {"lo": round(i / _SCORE_BINS, 2), "hi": round((i + 1) / _SCORE_BINS, 2), "n": n}
             for i, n in enumerate(counts_by_bin)
         ]
-        return {"series": series, "slowest": slowest, "score_hist": score_hist}
+        return {"summary": summary, "series": series, "slowest": slowest, "score_hist": score_hist}
 
 
 def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
     """Extraction-queue health. queue_depth is a LIVE snapshot (pending/processing/failed
     right now); throughput series are enqueue/hour (enqueued_at) + completions/hour
-    (processed_at) — the ONLY honest series the columns support. There is no historical
+    (processed_at of the rows that finished 'done'; a failed row stamps processed_at too and
+    is no completion) — the ONLY honest series the columns support. There is no historical
     depth series because a row's status is overwritten in place (contract §Phase 4)."""
     interval = f"{window_s} seconds"
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
@@ -1268,7 +1404,9 @@ def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
             "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, "
             "  count(*) FILTER (WHERE status = 'processing') AS processing, "
             "  count(*) FILTER (WHERE status = 'failed') AS failed "
-            "FROM extraction_queue"
+            # Finished rows are kept (with their content) and outnumber these by far;
+            # naming the live statuses lets extraction_queue_status_idx skip them.
+            "FROM extraction_queue WHERE status IN ('pending', 'processing', 'failed')"
         ).fetchone() or {"pending": 0, "processing": 0, "failed": 0}
 
         enq = conn.execute(
@@ -1278,21 +1416,23 @@ def _metrics_ingestion(db_url: str, window_s: int) -> dict[str, Any]:
         ).fetchall()
         comp = conn.execute(
             "SELECT date_trunc('hour', processed_at) AS t, count(*) AS n FROM extraction_queue "
-            "WHERE processed_at IS NOT NULL AND processed_at >= now() - %s::interval "
+            "WHERE status = 'done' AND processed_at >= now() - %s::interval "
             "GROUP BY 1 ORDER BY 1",
             (interval,),
         ).fetchall()
         fails = conn.execute(
             "SELECT id, episode_id, error, enqueued_at, processed_at, attempts "
             "FROM extraction_queue WHERE status = 'failed' "
+            "AND COALESCE(processed_at, enqueued_at) >= now() - %s::interval "
             "ORDER BY COALESCE(processed_at, enqueued_at) DESC, id DESC LIMIT %s",
-            (_INGEST_FAILURES_CAP,),
+            (interval, _INGEST_FAILURES_CAP),
         ).fetchall()
 
         last = conn.execute(
             "SELECT id, started_at, finished_at, stages, counts, samples, errors, ok, "
             "  EXTRACT(EPOCH FROM (finished_at - started_at)) AS duration_s "
-            "FROM dream_runs ORDER BY started_at DESC, id DESC LIMIT 1"
+            # A run that never finished (crashed mid-way) must not hide the last real one.
+            "FROM dream_runs ORDER BY (finished_at IS NULL), started_at DESC, id DESC LIMIT 1"
         ).fetchone()
 
         return {
@@ -1403,35 +1543,59 @@ def _metrics_corpus(db_url: str) -> dict[str, Any]:
 # Flags
 # ---------------------------------------------------------------------------
 
-# Per-kind resolver for the best-effort gist shown on the flags list. The flags list is
-# operator-sized (a handful of rows), so a small lookup per row is cheap.
-_GIST_SOURCES = {
-    "episode": ("episodes", "content", "id"),
-    "fact": ("kg_relationships", "fact", "uuid"),
-    "timeline_event": ("timeline_events", "fact", "id"),
-    "preference": ("preferences", "pref", "id"),
-    "note": ("notes", "hook", "id"),
+# Per-kind resolver for the best-effort gist, source episode and (notes only) full body
+# shown on the flags list. The flags list is operator-sized (a handful of rows), so a small
+# lookup per row is cheap.
+# kind -> (table, text column, id column, column naming the row's source episode, body column)
+_FLAG_SOURCES = {
+    "episode": ("episodes", "content", "id", None, None),
+    "fact": ("kg_relationships", "fact", "uuid", "episodes", None),
+    "timeline_event": ("timeline_events", "fact", "id", "source_ref", None),
+    "preference": ("preferences", "pref", "id", "source_ref", None),
+    "note": ("notes", "hook", "id", "source_ref", "body"),
 }
 
 
-def _resolve_flag_gist(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str) -> str:
-    spec = _GIST_SOURCES.get(kind)
+def _resolve_flag_item(
+    conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str
+) -> tuple[str, int | None, str | None]:
+    """A flagged row's gist, the episode the Flags tab can open for it, and its body.
+
+    The episode is the episode itself, a fact's first provenance episode, or the
+    ``ep:<id>`` turn a timeline event, preference or note was born from; None when the
+    row or its episode is gone, or the ref names something that isn't a turn (a git SHA).
+    The body is a note's full text (the Flags tab shows it inline beside the hook), None
+    for every other kind."""
+    spec = _FLAG_SOURCES.get(kind)
     if not spec:
-        return ""
-    table, text_col, id_col = spec
+        return "", None, None
+    table, text_col, id_col, ref_col, body_col = spec
     # id_col is a fixed identifier from the trusted map above, never user input; item_id
     # is bound as a parameter. Numeric-keyed tables get a digit guard so a bad id can't
     # raise a cast error inside the read.
     if id_col == "id" and not str(item_id).isdigit():
-        return ""
+        return "", None, None
+    ref_sql = f", {ref_col} AS ref" if ref_col else ""
+    body_sql = f", {body_col} AS body" if body_col else ""
     try:
         row = conn.execute(
-            f"SELECT {text_col} AS t FROM {table} WHERE {id_col} = %s LIMIT 1",  # nosec B608
+            f"SELECT {text_col} AS t{ref_sql}{body_sql} FROM {table} WHERE {id_col} = %s LIMIT 1",  # nosec B608
             (item_id,),
         ).fetchone()
     except Exception:  # pragma: no cover - defensive, e.g. a missing table
-        return ""
-    return _gist(row["t"]) if row else ""
+        return "", None, None
+    if row is None:
+        return "", None, None
+    if kind == "episode":
+        return _gist(row["t"]), int(item_id), None
+    ref = row["ref"]
+    episode_id = _provenance(ref) if isinstance(ref, list) else _episode_id_from_ref(ref)
+    if (
+        episode_id is not None
+        and conn.execute("SELECT 1 FROM episodes WHERE id = %s", (episode_id,)).fetchone() is None
+    ):
+        episode_id = None
+    return _gist(row["t"]), episode_id, row.get("body")
 
 
 def _flags_list(db_url: str) -> dict[str, Any]:
@@ -1440,50 +1604,60 @@ def _flags_list(db_url: str) -> dict[str, Any]:
             "SELECT id, kind, item_id, note, created_at FROM dashboard_flags "
             "WHERE removed_at IS NULL ORDER BY created_at DESC, id DESC"
         ).fetchall()
-        return {
-            "flags": [
+        flags = []
+        for r in rows:
+            gist, episode_id, body = _resolve_flag_item(conn, r["kind"], r["item_id"])
+            flags.append(
                 {
                     "id": r["id"],
                     "kind": r["kind"],
                     "item_id": r["item_id"],
                     "note": r["note"],
                     "created_at": _iso(r["created_at"]),
-                    "gist": _resolve_flag_gist(conn, r["kind"], r["item_id"]),
+                    "gist": gist,
+                    "episode_id": episode_id,
+                    "body": body,
                 }
-                for r in rows
-            ]
-        }
+            )
+        return {"flags": flags}
 
 
-def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool:
-    """Insert a flag if none is active, else retire the active one. Returns the new
-    flagged state and appends a dashboard_audit row either way."""
-    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        active = conn.execute(
-            "SELECT id FROM dashboard_flags "
-            "WHERE kind = %s AND item_id = %s AND removed_at IS NULL",
-            (kind, item_id),
-        ).fetchone()
-        if active is not None:
-            conn.execute(
-                "UPDATE dashboard_flags SET removed_at = now() WHERE id = %s", (active["id"],)
-            )
-            conn.execute(
-                "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
-                "VALUES ('unflag', %s, %s, %s)",
-                (kind, item_id, Json({"note": note}) if note else None),
-            )
-            return False
-        conn.execute(
-            "INSERT INTO dashboard_flags (kind, item_id, note) VALUES (%s, %s, %s)",
-            (kind, item_id, note),
-        )
-        conn.execute(
-            "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
-            "VALUES ('flag', %s, %s, %s)",
-            (kind, item_id, Json({"note": note}) if note else None),
-        )
-        return True
+def _set_flag(db_url: str, kind: str, item_id: str, note: str | None, flagged: bool | None) -> bool:
+    """Put a flag in the state the operator asked for and return the state it ends in.
+
+    ``flagged`` True / False is idempotent (a repeat changes nothing and appends no audit
+    row), so a stale button or list can't invert the intent; None toggles, for older
+    clients. Each branch is one statement against the partial-unique index, so concurrent
+    requests settle instead of colliding on it. A change appends a dashboard_audit row."""
+    detail = Json({"note": note}) if note else None
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
+        with conn.transaction():
+            if flagged is not True:
+                retired = conn.execute(
+                    "UPDATE dashboard_flags SET removed_at = now() "
+                    "WHERE kind = %s AND item_id = %s AND removed_at IS NULL RETURNING id",
+                    (kind, item_id),
+                ).fetchone()
+                if retired is not None:
+                    conn.execute(
+                        "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
+                        "VALUES ('unflag', %s, %s, %s)",
+                        (kind, item_id, detail),
+                    )
+                if retired is not None or flagged is False:
+                    return False
+            created = conn.execute(
+                "INSERT INTO dashboard_flags (kind, item_id, note) VALUES (%s, %s, %s) "
+                "ON CONFLICT (kind, item_id) WHERE removed_at IS NULL DO NOTHING RETURNING id",
+                (kind, item_id, note),
+            ).fetchone()
+            if created is not None:
+                conn.execute(
+                    "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
+                    "VALUES ('flag', %s, %s, %s)",
+                    (kind, item_id, detail),
+                )
+            return True
 
 
 # ---------------------------------------------------------------------------
@@ -1507,8 +1681,8 @@ def _flag_toggle(db_url: str, kind: str, item_id: str, note: str | None) -> bool
 # clients see it gone on their next full fetch.
 
 
-def _is_episode_ref(elem: Any, episode_id: int) -> bool:
-    """True when a provenance-array element names ``episode_id``.
+def _is_episode_ref(elem: Any, episode_ids: set[int]) -> bool:
+    """True when a provenance-array element names one of ``episode_ids``.
 
     Matches the JSON number and (defensively) the numeric-string form — the extractor's
     array element type isn't guaranteed, which is why every read path here checks both.
@@ -1516,21 +1690,20 @@ def _is_episode_ref(elem: Any, episode_id: int) -> bool:
     if isinstance(elem, bool):
         return False
     if isinstance(elem, int):
-        return elem == episode_id
+        return elem in episode_ids
     if isinstance(elem, str):
-        return elem.strip().isdigit() and int(elem) == episode_id
+        return elem.strip().isdigit() and int(elem) in episode_ids
     return False
 
 
-def _other_episode_refs(raw: Any, episode_id: int) -> list[Any]:
-    """The provenance elements that are NOT ``episode_id`` (order preserved).
+def _other_episode_refs(raw: Any, episode_ids: set[int]) -> list[Any]:
+    """The provenance elements that are NOT in ``episode_ids`` (order preserved).
 
     Empty ⇒ SOLE provenance (delete the row). Non-empty ⇒ SHARED (unlink and keep). A
-    malformed / non-array ``episodes`` value counts as sole: it names nothing that would
-    survive."""
+    malformed / non-array value counts as sole: it names nothing that would survive."""
     if not isinstance(raw, list):
         return []
-    return [e for e in raw if not _is_episode_ref(e, episode_id)]
+    return [e for e in raw if not _is_episode_ref(e, episode_ids)]
 
 
 def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[str]) -> int:
@@ -1545,6 +1718,131 @@ def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
+def delete_episode_content(
+    conn: psycopg.Connection[dict[str, Any]], episode_ids: list[int]
+) -> dict[str, Any]:
+    """The episode-delete cascade: everything carrying the content of ``episode_ids``.
+
+    Runs on ``conn`` inside the CALLER's transaction, with the episode rows already locked:
+    chunks citing any of them and those chunks' extraction_queue rows (keyed by session and
+    text, so the 001 FK misses them), their sole-provenance facts (shared ones are
+    unlinked), their chat timeline events, a tombstone per turn (``deleted_turns``, so a
+    re-ship, catch-up sweep or backfill of the transcript on disk cannot bring the turn
+    back; ``ingestion.episode_writer`` checks it), the rows themselves (their own
+    extraction_queue rows follow via the 001 FK), and any active flag on the facts, events
+    and episodes that went. Returns the counts plus the uuids of the deleted facts and the
+    ids of the deleted events, so a client can drop them from its lists. Shared by the
+    dashboard's single-turn delete and private mode's session purge
+    (``mcp_server/private_session_routes``).
+
+    Set-based on purpose: the purge passes every turn of a session, and the provenance
+    arrays have no usable index (029's GIN is partial), so each lookup is one pass over
+    the table. "Sole" and "shared" are judged against the whole set, so a fact citing two
+    deleted turns and one surviving turn is unlinked once, not once per turn."""
+    ids = set(episode_ids)
+    id_texts = [str(i) for i in episode_ids]
+    # --- chunks -------------------------------------------------------------
+    # A chunk's `content` is the verbatim concatenation of its 3-5 episode window
+    # (schema 008), so there is no way to excise one turn from it: every chunk
+    # citing one of these episodes goes. Chunks whose window ALSO named surviving
+    # episodes are counted separately — that's real collateral the UI has to admit to.
+    # jsonb_array_elements_text renders the number 12 and the string "12" alike, which is
+    # both forms _is_episode_ref accepts; a non-array value is read as a one-element array.
+    chunk_rows = conn.execute(
+        "SELECT id, episode_ids FROM chunks c WHERE EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(c.episode_ids) = 'array' "
+        "THEN c.episode_ids ELSE jsonb_build_array(c.episode_ids) END) AS v "
+        "WHERE v = ANY(%s::text[])) FOR UPDATE",
+        (id_texts,),
+    ).fetchall()
+    chunk_ids = [r["id"] for r in chunk_rows]
+    chunks_mixed = sum(1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], ids))
+    if chunk_ids:
+        # The poller enqueues each chunk for extraction keyed by (session_id, content),
+        # with no episode_id, so the episode FK never reaches those rows: a pending one
+        # would re-extract the deleted text into facts with no provenance, and a done one
+        # still stores it verbatim. Every status goes, before the chunk text is gone.
+        conn.execute(
+            "DELETE FROM extraction_queue q USING chunks c "
+            "WHERE c.id = ANY(%s) AND q.content_type = 'chunk' "
+            "AND q.session_id = c.session_id AND q.content = c.content",
+            (chunk_ids,),
+        )
+        conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
+
+    # --- KG facts (sole vs shared provenance) --------------------------------
+    fact_rows = conn.execute(
+        "SELECT uuid, episodes FROM kg_relationships r WHERE EXISTS ("
+        "SELECT 1 FROM jsonb_array_elements_text(CASE WHEN jsonb_typeof(r.episodes) = 'array' "
+        "THEN r.episodes ELSE jsonb_build_array(r.episodes) END) AS v "
+        "WHERE v = ANY(%s::text[])) FOR UPDATE",
+        (id_texts,),
+    ).fetchall()
+    sole: list[str] = []
+    shared: list[tuple[str, list[Any]]] = []
+    for r in fact_rows:
+        others = _other_episode_refs(r["episodes"], ids)
+        if others:
+            shared.append((r["uuid"], others))
+        else:
+            sole.append(r["uuid"])
+    for uuid, others in shared:
+        conn.execute(
+            "UPDATE kg_relationships SET episodes = %s WHERE uuid = %s",
+            (Json(others), uuid),
+        )
+    if sole:
+        _clear_invalidated_by(conn, sole)
+        conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
+        retire_flags(conn, "fact", sole)
+
+    # --- timeline events -----------------------------------------------------
+    # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
+    # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
+    # makes the first telling's turn the row's owner, so the rule resolves to delete;
+    # keeping them would go on serving the deleted turn from recall()'s timeline leg.
+    # That includes a row a later turn re-told: schema 037's dedup merge only bumps
+    # reported_count and records no list of re-telling turns, so there is no telling
+    # whether one survives, and a kept row would still carry the deleted turn's text.
+    deleted_events = [
+        r["id"]
+        for r in conn.execute(
+            "DELETE FROM timeline_events WHERE source_ref = ANY(%s) OR source_ref LIKE ANY(%s) "
+            "RETURNING id",
+            ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids]),
+        ).fetchall()
+    ]
+    if deleted_events:
+        retire_flags(conn, "timeline_event", [str(i) for i in deleted_events])
+
+    # --- tombstones, while the rows still say what the turns were ------------------------
+    # Without the table (its migration is optional) there is nothing to record and the
+    # turn can return; the probe logs that once.
+    tombstoned = 0
+    if DELETED_TURNS_PROBE.ready(conn):
+        tombstoned = conn.execute(
+            "INSERT INTO deleted_turns (span_id, session_id, content_md5, project, cwd) "
+            "SELECT span_id, session_id, md5(content), project, metadata->>'cwd' "
+            "FROM episodes WHERE id = ANY(%s)",
+            (episode_ids,),
+        ).rowcount
+
+    # --- the episodes themselves (their extraction_queue rows follow via the 001 FK) ----
+    conn.execute("DELETE FROM episodes WHERE id = ANY(%s)", (episode_ids,))
+
+    retire_flags(conn, "episode", id_texts)
+    return {
+        "chunks_deleted": len(chunk_ids),
+        "chunks_mixed_deleted": chunks_mixed,
+        "facts_deleted": len(sole),
+        "facts_unlinked": len(shared),
+        "events_deleted": len(deleted_events),
+        "tombstoned": tombstoned,
+        "deleted_fact_ids": sole,
+        "deleted_event_ids": deleted_events,
+    }
+
+
 def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
     """Hard-delete an episode and everything carrying ITS content, in one transaction.
 
@@ -1557,74 +1855,10 @@ def _delete_episode(db_url: str, episode_id: int) -> dict[str, Any] | None:
             ).fetchone()
             if row is None:
                 return None
-
-            # --- chunks -------------------------------------------------------------
-            # A chunk's `content` is the verbatim concatenation of its 3-5 episode window
-            # (schema 008), so there is no way to excise one turn from it: every chunk
-            # citing this episode goes. Chunks whose window ALSO named surviving episodes
-            # are counted separately — that's real collateral the UI has to admit to.
-            chunk_rows = conn.execute(
-                "SELECT id, episode_ids FROM chunks "
-                "WHERE episode_ids @> to_jsonb(%s::bigint) "
-                "   OR episode_ids @> to_jsonb(%s::text) "
-                "FOR UPDATE",
-                (episode_id, str(episode_id)),
-            ).fetchall()
-            chunk_ids = [r["id"] for r in chunk_rows]
-            chunks_mixed = sum(
-                1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], episode_id)
-            )
-            if chunk_ids:
-                conn.execute("DELETE FROM chunks WHERE id = ANY(%s)", (chunk_ids,))
-
-            # --- KG facts (sole vs shared provenance) --------------------------------
-            fact_rows = conn.execute(
-                "SELECT uuid, episodes FROM kg_relationships "
-                "WHERE episodes @> to_jsonb(%s::bigint) "
-                "   OR episodes @> to_jsonb(%s::text) "
-                "FOR UPDATE",
-                (episode_id, str(episode_id)),
-            ).fetchall()
-            sole: list[str] = []
-            shared: list[tuple[str, list[Any]]] = []
-            for r in fact_rows:
-                others = _other_episode_refs(r["episodes"], episode_id)
-                if others:
-                    shared.append((r["uuid"], others))
-                else:
-                    sole.append(r["uuid"])
-            for uuid, others in shared:
-                conn.execute(
-                    "UPDATE kg_relationships SET episodes = %s WHERE uuid = %s",
-                    (Json(others), uuid),
-                )
-            if sole:
-                _clear_invalidated_by(conn, sole)
-                conn.execute("DELETE FROM kg_relationships WHERE uuid = ANY(%s)", (sole,))
-
-            # --- timeline events -----------------------------------------------------
-            # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
-            # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
-            # makes them sole-provenance by construction, so the rule resolves to delete;
-            # keeping them would go on serving the deleted turn from recall()'s timeline leg.
-            ev = conn.execute(
-                "DELETE FROM timeline_events WHERE source_ref = %s OR source_ref LIKE %s",
-                (f"ep:{episode_id}", f"ep:{episode_id}#%"),
-            )
-            events_deleted = ev.rowcount if ev.rowcount and ev.rowcount > 0 else 0
-
-            # --- the episode itself (extraction_queue rows follow via the 001 FK) -----
-            conn.execute("DELETE FROM episodes WHERE id = %s", (episode_id,))
-
             summary = {
                 "episode_id": episode_id,
-                "chunks_deleted": len(chunk_ids),
-                "chunks_mixed_deleted": chunks_mixed,
-                "facts_deleted": len(sole),
-                "facts_unlinked": len(shared),
-                "events_deleted": events_deleted,
+                **delete_episode_content(conn, [episode_id]),
             }
-            _retire_flag(conn, "episode", str(episode_id))
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
                 "VALUES ('delete_episode', 'episode', %s, %s)",
@@ -1650,7 +1884,7 @@ def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
                 "deleted": True,
                 "supersession_links_cleared": links_cleared,
             }
-            _retire_flag(conn, "fact", uuid)
+            retire_flags(conn, "fact", [uuid])
             conn.execute(
                 "INSERT INTO dashboard_audit (action, kind, item_id, detail) "
                 "VALUES ('delete_fact', 'fact', %s, %s)",
@@ -1659,14 +1893,14 @@ def _delete_fact(db_url: str, uuid: str) -> dict[str, Any] | None:
             return result
 
 
-def _retire_flag(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: str) -> None:
-    """Retire the active flag (if any) on an item we just deleted, so the Flags list can't
+def retire_flags(conn: psycopg.Connection[dict[str, Any]], kind: str, item_ids: list[str]) -> None:
+    """Retire the active flag (if any) on items we just deleted, so the Flags list can't
     point at a row that no longer exists. The dashboard_audit trail is NOT touched — it is
     append-only and deliberately outlives the content."""
     conn.execute(
         "UPDATE dashboard_flags SET removed_at = now() "
-        "WHERE kind = %s AND item_id = %s AND removed_at IS NULL",
-        (kind, item_id),
+        "WHERE kind = %s AND item_id = ANY(%s) AND removed_at IS NULL",
+        (kind, item_ids),
     )
 
 
@@ -1711,15 +1945,16 @@ def _age_days(created: Any) -> int:
     return max(0, int((now - created).total_seconds() // 86400))
 
 
-def _provenance_episodes(conn: psycopg.Connection[dict[str, Any]], evidence: Any) -> list[int]:
-    """Best-effort episode ids behind a proposal, from its evidence entries. Two sources:
-    an explicit episode ref on an entry (``episode_id`` / an ``ep:<id>`` ``source_ref``),
-    and — since lane evidence is keyed by session, not episode — the episodes of each
-    distinct evidence ``session_id`` (bounded). Empty list when nothing resolves."""
+def _proposal_provenance(evidence: Any) -> tuple[list[int], list[str]]:
+    """What a proposal's evidence points at: the episodes it names outright (an
+    ``episode_id`` or an ``ep:<id>`` ``source_ref`` on an entry), and the distinct
+    ``session_id``s in first-seen order. Lane evidence is keyed by session, not turn, so
+    a session is as precise as it gets; guessing turns from it would show arbitrary
+    ones, and the starting turns of the earliest sessions at that."""
     if not isinstance(evidence, list):
-        return []
+        return [], []
     explicit: set[int] = set()
-    sessions: set[str] = set()
+    sessions: dict[str, None] = {}
     for e in evidence:
         if not isinstance(e, dict):
             continue
@@ -1735,23 +1970,20 @@ def _provenance_episodes(conn: psycopg.Connection[dict[str, Any]], evidence: Any
             explicit.add(rid)
         sid = e.get("session_id")
         if isinstance(sid, str) and sid:
-            sessions.add(sid)
-    ids = set(explicit)
-    if sessions:
-        rows = conn.execute(
-            "SELECT id FROM episodes WHERE session_id = ANY(%s) ORDER BY id LIMIT %s",
-            (list(sessions), _PROVENANCE_CAP),
-        ).fetchall()
-        ids.update(int(r["id"]) for r in rows)
-    return sorted(ids)
+            sessions[sid] = None
+    return sorted(explicit), list(sessions)
 
 
 def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dict[str, Any]:
-    """Lane-merged proposal list + the nav-badge pending_count. Bounded per lane (newest
-    first), then merged and re-sorted by created_at. ``status``/``kind`` narrow the view;
-    ``pending_count`` is always both lanes' 'proposed' rows, independent of the view."""
+    """Lane-merged proposal list + the nav-badge pending_count. Each lane is bounded
+    (still-'proposed' rows first, then newest first, so a backlog of decided rows can't
+    push an unreviewed candidate out of the window), then merged and re-sorted by
+    created_at. ``status``/``kind`` narrow the view; ``pending_count`` is always both
+    lanes' 'proposed' rows, independent of the view."""
     want_skill = kind in (None, "skill")
     want_config = kind in (None, "config-edit")
+    skill_statuses = [s for s in _SKILL_REVIEW_STATUSES if status in (None, s)]
+    config_statuses = [s for s in _CONFIG_REVIEW_STATUSES if status in (None, s)]
 
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         out: list[dict[str, Any]] = []
@@ -1759,11 +1991,9 @@ def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dic
             for r in conn.execute(
                 "SELECT id, name, summary, status, created_at "
                 "FROM skills_lane.skill_gap_candidates WHERE status = ANY(%s) "
-                "ORDER BY created_at DESC, id DESC LIMIT %s",
-                (list(_SKILL_REVIEW_STATUSES), _PROPOSALS_LANE_CAP),
+                "ORDER BY (status = 'proposed') DESC, created_at DESC, id DESC LIMIT %s",
+                (skill_statuses, _PROPOSALS_LANE_CAP),
             ).fetchall():
-                if status and r["status"] != status:
-                    continue
                 out.append(
                     {
                         "id": f"skill:{r['id']}",
@@ -1779,11 +2009,9 @@ def _proposals_unified(db_url: str, status: str | None, kind: str | None) -> dic
             for r in conn.execute(
                 "SELECT id, file_key, summary, status, created_at "
                 "FROM config_lane.config_proposals WHERE status = ANY(%s) "
-                "ORDER BY created_at DESC, id DESC LIMIT %s",
-                (list(_CONFIG_REVIEW_STATUSES), _PROPOSALS_LANE_CAP),
+                "ORDER BY (status = 'proposed') DESC, created_at DESC, id DESC LIMIT %s",
+                (config_statuses, _PROPOSALS_LANE_CAP),
             ).fetchall():
-                if status and r["status"] != status:
-                    continue
                 out.append(
                     {
                         "id": f"config:{r['id']}",
@@ -1827,8 +2055,8 @@ def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
         rr_sql = "SELECT reject_reason FROM config_lane.config_proposals WHERE id=%s"
 
     full_id = f"{lane}:{n}"
+    provenance_episodes, provenance_sessions = _proposal_provenance(evidence)
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        provenance = _provenance_episodes(conn, evidence)
         audit_rows = conn.execute(
             "SELECT ts, action, detail FROM dashboard_audit WHERE item_id = %s ORDER BY ts, id",
             (full_id,),
@@ -1854,7 +2082,8 @@ def _proposal_detail(db_url: str, lane: str, n: int) -> dict[str, Any] | None:
         "name": name,
         "status": status,
         "evidence": evidence,
-        "provenance_episodes": provenance,
+        "provenance_episodes": provenance_episodes,
+        "provenance_sessions": provenance_sessions,
         "payload": payload,
         "audit_log": audit_log,
     }
@@ -1865,8 +2094,28 @@ def _proposal_decision(
 ) -> dict[str, Any] | None:
     """Delegate to the lane's _proposal_act (approve→accept, reject→reject-with-reason),
     then append a dashboard_audit row. Returns the lane result, or None if the row is gone.
-    A lane refusal (skills accept: no draft yet, stale draft, name taken) changed nothing,
-    so it is returned as-is and leaves no audit row."""
+    Only a 'proposed' row takes a decision: the lanes' reject and config-accept updates are
+    unconditional, so a stale pane or a double click would otherwise overwrite an applied,
+    promoted or already-decided row. A refusal (not proposed; skills accept: no draft yet,
+    stale draft, name taken) changed nothing, so it is returned as-is and leaves no audit
+    row. The status read and the lane's update are separate statements, so two decisions
+    landing in the same instant can both pass; the lanes own closing that window."""
+    table = (
+        "skills_lane.skill_gap_candidates" if lane == "skill" else "config_lane.config_proposals"
+    )
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        current = conn.execute(
+            f"SELECT status FROM {table} WHERE id = %s",  # nosec B608 — table is one of two literals
+            (n,),
+        ).fetchone()
+    if current is None:
+        return None
+    if current["status"] != "proposed":
+        return {
+            "status": "refused",
+            "detail": f"proposal is '{current['status']}', not 'proposed'",
+        }
+
     lane_action = "accept" if action == "approve" else "reject"
     if lane == "skill":
         result = _skill_proposal_act(db_url, n, lane_action, note, _skill_routing_eval_stub)
@@ -1899,11 +2148,12 @@ def _proposal_decision(
 #
 # Read-only surfaces over the episodic timeline (033), the preference log (035), the
 # dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as
-# the rest of /dash/api: one short-lived connection per call, bounded, fail-soft. Honesty
+# the rest of /dash/api: one pooled connection per call, bounded, fail-soft. Honesty
 # notes (mirrored into docs/dashboard-contract.md §"Phase 5"):
-#   * timeline_events.event_type is sparsely populated (schema 033 deferred it) — a `type`
-#     chip filter narrows to rows with that exact event_type; UNTYPED events show only when
-#     no chip is active (the default view is the full stream).
+#   * timeline_events.event_type is decision|action|finding|milestone or NULL (untyped, the
+#     sparse legacy majority) — a `type` chip filter narrows to rows with that exact
+#     event_type and any other value is a 400; UNTYPED events show only when no chip is
+#     active (the default view is the full stream).
 #   * config_lane.config_registry stores the CURRENT file content only (content + hash +
 #     updated_at) — there is NO version history table, so /behavior/file returns no history
 #     and the client's change-history timeline stays hidden. Not fabricated this phase.
@@ -1926,9 +2176,10 @@ def _timeline(
     db_url: str, before: str | None, limit: int, type_: str | None, group_id: str | None
 ) -> dict[str, Any]:
     """t_valid-DESC keyset page of timeline events. `type` filters event_type (sparse —
-    see honesty note); `group_id` maps to the `domain` column (schema 038). Each event
-    carries the coarse `salience` plus the 0.3/0.6/0.9 `sal` readout the type ramp reads,
-    the resolved `ep:N` episode id, and its flag state."""
+    see honesty note); `group_id` maps to the `domain` column (schema 038), an unlabelled
+    event passing either group. Each event carries the coarse `salience` plus the
+    0.3/0.6/0.9 `sal` readout the type ramp reads, the resolved `ep:N` episode id, and its
+    flag state."""
     cur = _parse_before(before)
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         where = ["1=1"]
@@ -1937,8 +2188,9 @@ def _timeline(
             where.append("event_type = %s")
             params.append(type_)
         if group_id is not None:
-            where.append("domain = %s")
-            params.append(group_id)
+            clause, args = _domain_filter(group_id)
+            where.append(clause)
+            params += args
         if cur is not None:
             ts, cid = cur
             if cid is not None:
@@ -1976,6 +2228,38 @@ def _timeline(
             last = rows[-1]
             next_before = f"{_iso(last['t_valid'])}|{last['id']}"
         return {"events": events, "next_before": next_before}
+
+
+def _timeline_months(
+    db_url: str, type_: str | None, group_id: str | None, tz: str
+) -> dict[str, Any]:
+    """Every month that has events under the Events tab's filters, newest first, bucketed
+    in the viewer's zone `tz` (an event said at 20:30 on the 30th belongs to that month,
+    not to the next one its UTC stamp falls in). `before` is the first instant after the
+    month, the cursor that makes /timeline start at the month's last event."""
+    where = ["1=1"]
+    params: list[Any] = [tz]
+    if type_ is not None:
+        where.append("event_type = %s")
+        params.append(type_)
+    if group_id is not None:
+        clause, args = _domain_filter(group_id)
+        where.append(clause)
+        params += args
+    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            "SELECT to_char(m, 'YYYY-MM') AS month, n, "
+            "       (m + interval '1 month') AT TIME ZONE %s AS before "
+            "FROM (SELECT date_trunc('month', t_valid AT TIME ZONE %s) AS m, count(*) AS n "
+            f"      FROM timeline_events WHERE {' AND '.join(where)} GROUP BY 1) AS s "  # nosec B608
+            "ORDER BY m DESC",
+            (tz, *params),
+        ).fetchall()
+        return {
+            "months": [
+                {"month": r["month"], "n": r["n"], "before": _iso(r["before"])} for r in rows
+            ]
+        }
 
 
 def _preferences(db_url: str, sort: str) -> dict[str, Any]:
@@ -2119,25 +2403,6 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
     }
 
 
-def _behavior_linkgraph(db_url: str) -> dict[str, Any]:
-    """Adjacency over every registry file's [[wikilinks]]. Nodes are keyed by logical
-    file_key (deduped across surfaces); edges are file_key → wikilink target. A target need
-    not be a node (many point at memory notes, which are not mirrored files) — the client
-    resolves what it can and renders the rest as inert leaves."""
-    with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        rows = conn.execute(
-            "SELECT scope, file_key, content FROM config_lane.config_registry"
-        ).fetchall()
-    nodes: dict[str, dict[str, Any]] = {}
-    edges: list[dict[str, str]] = []
-    for r in rows:
-        fk = r["file_key"]
-        nodes.setdefault(fk, {"file_key": fk, "scope": r["scope"], "group": _behavior_group(fk)})
-        for target in _wikilinks(r["content"]):
-            edges.append({"source": fk, "target": target})
-    return {"nodes": list(nodes.values()), "edges": edges}
-
-
 # ---------------------------------------------------------------------------
 # Phase 3 — SSE live stream (LISTEN/NOTIFY + ring buffer)
 # ---------------------------------------------------------------------------
@@ -2148,7 +2413,8 @@ def _behavior_linkgraph(db_url: str) -> dict[str, Any]:
 # the last disconnects) hydrates each notification into a full FeedItem — via the SAME
 # per-type SELECT + mapper the /feed endpoint uses — and appends it to a 512-slot ring
 # buffer keyed by a monotonically increasing integer event id. The /dash/api/stream route
-# replays from the buffer on resume (Last-Event-ID) and streams live thereafter.
+# opens each connection with `ready` (the client refetches page 1 on it), replays from the
+# buffer on resume (Last-Event-ID) and streams live thereafter.
 
 
 def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | None:
@@ -2178,21 +2444,26 @@ def _hydrate_feed_item(db_url: str, type_: Any, id_: Any) -> dict[str, Any] | No
 
 
 def _processing_status(db_url: str) -> dict[str, Any]:
-    """Extraction-queue health for the header live badge: {queue_depth, active}. ONE cheap
+    """Extraction-queue health for the header live badge: pending (queue_depth, the name the
+    wire has always used), processing, failed and active (anything processing). ONE cheap
     indexed count (extraction_queue_status_idx) — the status refresher runs it once/second,
     shared across all connected SSE clients, never per-connection."""
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         row = (
             conn.execute(
-                "SELECT count(*) FILTER (WHERE status = 'pending') AS queue_depth, "
-                "       count(*) FILTER (WHERE status = 'processing') AS processing "
-                "FROM extraction_queue WHERE status IN ('pending', 'processing')"
+                "SELECT count(*) FILTER (WHERE status = 'pending') AS pending, "
+                "       count(*) FILTER (WHERE status = 'processing') AS processing, "
+                "       count(*) FILTER (WHERE status = 'failed') AS failed "
+                "FROM extraction_queue WHERE status IN ('pending', 'processing', 'failed')"
             ).fetchone()
             or {}
         )
+        processing = int(row.get("processing") or 0)
         return {
-            "queue_depth": int(row.get("queue_depth") or 0),
-            "active": int(row.get("processing") or 0) > 0,
+            "queue_depth": int(row.get("pending") or 0),
+            "processing": processing,
+            "failed": int(row.get("failed") or 0),
+            "active": processing > 0,
         }
 
 
@@ -2250,10 +2521,14 @@ class _StreamManager:
     def __init__(self, db_url: str) -> None:
         self._db_url = db_url
         self.buffer = _FeedEventBuffer()
-        self.status: dict[str, Any] = {"queue_depth": 0, "active": False}
+        # The shared processing_status snapshot; None while there is none to serve (no
+        # subscriber yet, or the last refresh failed), so a stale count is never sent.
+        self.status: dict[str, Any] | None = None
         # Set once the LISTEN is actually issued — lets a caller (and the tests) know a
         # NOTIFY inserted from now on will be delivered, not raced against worker startup.
         self.listening = asyncio.Event()
+        # Set once the status loop has made its first refresh attempt (success or not).
+        self.status_ready = asyncio.Event()
         self._subscribers = 0
         self._tasks: list[asyncio.Task[Any]] = []
 
@@ -2274,43 +2549,76 @@ class _StreamManager:
                 t.cancel()
             self._tasks = []
             self.listening.clear()
+            self.status = None  # the next first subscriber must not be handed this run's count
+            self.status_ready.clear()
+
+    async def wait_ready(self) -> None:
+        """Block until the LISTEN is issued and the first status snapshot is in, so what a
+        new connection sends first is current. Gives up after _STREAM_READY_S when the DB is
+        unreachable: the connection streams anyway, and the worker's gap marker resyncs the
+        client once the DB is back."""
+        try:
+            async with asyncio.timeout(_STREAM_READY_S):
+                await self.listening.wait()
+                await self.status_ready.wait()
+        except TimeoutError:
+            logger.warning("dash stream: not ready after %.0fs; streaming anyway", _STREAM_READY_S)
 
     async def _listen_loop(self) -> None:
         """One dedicated async connection LISTENing on the dash_feed channel; hydrates each
         notification off the event loop (a thread executor) and appends it to the ring
         buffer. run_in_executor (not starlette's run_in_threadpool) keeps this background
-        task off anyio's request-scoped context."""
+        task off anyio's request-scoped context.
+
+        A dropped connection (a Postgres restart, a network blip) is retried with backoff
+        for as long as the task lives, i.e. while a client is subscribed. Notifications sent
+        during the gap are lost, so each reconnect appends a `reset` event: connected clients
+        refetch page 1 instead of sitting on a feed that silently went stale."""
         loop = asyncio.get_running_loop()
-        aconn = None
-        try:
-            aconn = await psycopg.AsyncConnection.connect(self._db_url, autocommit=True)
-            await aconn.execute(f"LISTEN {_STREAM_CHANNEL}")
-            self.listening.set()
-            async for notify in aconn.notifies():
-                try:
-                    payload = json.loads(notify.payload)
-                    item = await loop.run_in_executor(
-                        None,
-                        _hydrate_feed_item,
-                        self._db_url,
-                        payload.get("type"),
-                        payload.get("id"),
-                    )
-                    if item is not None:
-                        self.buffer.append(item)
-                except Exception as e:  # one bad notification must not kill the stream
-                    logger.warning("dash stream: hydrate failed: %s", e)
-        except asyncio.CancelledError:
-            pass  # intended shutdown when the last subscriber leaves
-        except Exception as e:  # pragma: no cover - defensive (connect/LISTEN failure)
-            logger.warning("dash stream: listen loop error: %s", e)
-        finally:
-            self.listening.clear()
-            if aconn is not None:
-                try:
-                    await aconn.close()
-                except Exception:  # pragma: no cover - best-effort close during cancel
-                    pass
+        delay = _STREAM_RECONNECT_MIN_S
+        gap = False
+        while True:
+            aconn = None
+            try:
+                aconn = await psycopg.AsyncConnection.connect(self._db_url, autocommit=True)
+                await aconn.execute(f"LISTEN {_STREAM_CHANNEL}")
+                delay = _STREAM_RECONNECT_MIN_S
+                if gap:
+                    self.buffer.append({"type": "reset"})
+                    gap = False
+                self.listening.set()
+                async for notify in aconn.notifies():
+                    try:
+                        payload = json.loads(notify.payload)
+                        item = await loop.run_in_executor(
+                            None,
+                            _hydrate_feed_item,
+                            self._db_url,
+                            payload.get("type"),
+                            payload.get("id"),
+                        )
+                        if item is not None:
+                            self.buffer.append(item)
+                    except Exception as e:  # one bad notification must not kill the stream
+                        logger.warning("dash stream: hydrate failed: %s", e)
+                logger.warning("dash stream: listen connection closed; reconnecting")
+            except asyncio.CancelledError:
+                return  # intended shutdown when the last subscriber leaves
+            except Exception as e:
+                logger.warning("dash stream: listen connection lost, retrying: %s", e)
+            finally:
+                self.listening.clear()
+                if aconn is not None:
+                    try:
+                        await aconn.close()
+                    except Exception:  # pragma: no cover - best-effort close during cancel
+                        pass
+            gap = True
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            delay = min(delay * 2, _STREAM_RECONNECT_MAX_S)
 
     async def _status_loop(self) -> None:
         """Refresh the shared processing_status snapshot once/second (one query total, not
@@ -2320,8 +2628,10 @@ class _StreamManager:
             while True:
                 try:
                     self.status = await loop.run_in_executor(None, _processing_status, self._db_url)
-                except Exception as e:  # pragma: no cover - defensive
+                except Exception as e:
+                    self.status = None  # withdraw the count rather than serve it stale
                     logger.warning("dash stream: status refresh failed: %s", e)
+                self.status_ready.set()
                 await asyncio.sleep(_STREAM_STATUS_S)
         except asyncio.CancelledError:
             pass
@@ -2336,6 +2646,61 @@ def _sse_frame(event: str, data: str, event_id: int | None = None) -> str:
         lines.append(f"id: {event_id}")
     lines.append(f"data: {data}")
     return "\n".join(lines) + "\n\n"
+
+
+async def _event_stream(
+    manager: _StreamManager,
+    is_disconnected: Callable[[], Awaitable[bool]],
+    last_id: int | None,
+) -> AsyncIterator[str]:
+    """One SSE connection's frames: `ready`, the resume replay, then live feed events, a
+    processing_status snapshot ~1/s and a heartbeat comment every 15s.
+
+    `ready` is sent once the LISTEN is up and this connection's position is fixed: every row
+    committed from then on is delivered, so the client refetches page 1 on it and holds
+    everything older. That fetch is what closes the gaps (rows written while the client was
+    away, before the worker was listening, or between its first /feed and the connect); the
+    replay is only the shortcut for rows still in the ring, so a Last-Event-ID the ring can
+    no longer resume simply gets no replay."""
+    manager.subscribe()
+    try:
+        await manager.wait_ready()
+        buf = manager.buffer
+        sent = buf.head
+        replay: list[tuple[int, dict[str, Any]]] = []
+        if last_id is not None:
+            mode, events = buf.resume(last_id)
+            if mode == "replay":
+                sent, replay = last_id, events
+        yield _sse_frame("ready", "{}")
+        for eid, item in replay:
+            yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
+            sent = eid
+        last_status = 0.0  # the first pass sends the status at once
+        last_hb = time.monotonic()
+        while True:
+            if await is_disconnected():
+                break
+            oldest = buf.oldest()
+            if oldest is not None and sent < oldest - 1:
+                # The ring outran this connection (a slow reader through a burst): the
+                # evicted events are gone, so the client refetches rather than skip them.
+                sent = buf.head  # before the yield: events appended while we're suspended are new
+                yield _sse_frame("reset", "{}")
+                continue
+            for eid, item in buf.since(sent):
+                yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
+                sent = eid
+            now = time.monotonic()
+            if now - last_status >= _STREAM_STATUS_S and manager.status is not None:
+                yield _sse_frame("processing_status", json.dumps(manager.status))
+                last_status = now
+            if now - last_hb >= _STREAM_HEARTBEAT_S:
+                yield ": heartbeat\n\n"
+                last_hb = now
+            await asyncio.sleep(_STREAM_POLL_S)
+    finally:
+        manager.unsubscribe()
 
 
 # ---------------------------------------------------------------------------
@@ -2368,8 +2733,8 @@ def _serve_static_file(name: str) -> Response:
 
 
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
-    """Mount /dash (static bundle) + /dash/api/* (machine-token gated). No-op w/o DB_URL,
-    matching the sibling route modules."""
+    """Mount /dash (static bundle) + /dash/api/* (gated by ``authorized``, which the server
+    wires to the admin gate). No-op w/o DB_URL, matching the sibling route modules."""
     if not db_url:
         logger.info("dashboard routes disabled (no DB_URL)")
         return
@@ -2468,7 +2833,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         )
         return FileResponse(path, media_type=media, headers=headers)
 
-    # ---- api (machine-token gated) ----
+    # ---- api (admin gated) ----
 
     @mcp.custom_route("/dash/api/catalog", methods=["GET"])  # type: ignore[misc]
     async def dash_catalog(request: Request) -> JSONResponse:
@@ -2488,60 +2853,21 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[misc]
     async def dash_stream(request: Request) -> Response:
-        """SSE live feed (Phase 3). Machine-token gated like every /dash/api/* route — the
+        """SSE live feed (Phase 3). Admin-gated like every /dash/api/* route — the
         client uses fetch + a ReadableStream parser (not EventSource) so it CAN send the
-        Authorization header. On connect: if Last-Event-ID (header or ?last_event_id=) is
-        still inside the ring buffer, replay from it; if it aged out or is ahead of us, emit
-        a `reset` event (client refetches page 1). Then stream live feed events
-        (new_episode|new_fact|new_timeline_event, data = the FeedItem JSON) plus a
-        processing_status snapshot ~1/s and a heartbeat comment every 15s."""
+        Authorization header. Frames: `ready` first (the client refetches page 1 on it), then
+        the Last-Event-ID (header or ?last_event_id=) replay while that id is still inside the
+        ring buffer, then live feed events (new_episode|new_fact|new_timeline_event, data =
+        the FeedItem JSON), `reset` when the ring outran this connection or the LISTEN worker
+        lost its connection (refetch page 1 again), a processing_status snapshot ~1/s and a
+        heartbeat comment every 15s."""
         if not authorized(request):
             return _unauthorized()
         raw = request.headers.get("last-event-id") or request.query_params.get("last_event_id")
         last_id = int(raw) if (raw and raw.lstrip("-").isdigit()) else None
 
-        async def gen() -> Any:
-            stream_manager.subscribe()
-            try:
-                buf = stream_manager.buffer
-                if last_id is not None:
-                    mode, events = buf.resume(last_id)
-                    if mode == "reset":
-                        yield _sse_frame("reset", "{}")
-                        sent = buf.head
-                    else:
-                        sent = last_id
-                        for eid, item in events:
-                            yield _sse_frame(
-                                _STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid
-                            )
-                            sent = eid
-                else:
-                    # Fresh connect: the client already has page 1 from /feed, so start live
-                    # from the current head — only genuinely new events stream.
-                    sent = buf.head
-                # Push status immediately so the header live badge is correct on connect.
-                yield _sse_frame("processing_status", json.dumps(stream_manager.status))
-                last_status = last_hb = time.monotonic()
-                while True:
-                    if await request.is_disconnected():
-                        break
-                    for eid, item in buf.since(sent):
-                        yield _sse_frame(_STREAM_EVENT_NAMES[item["type"]], json.dumps(item), eid)
-                        sent = eid
-                    now = time.monotonic()
-                    if now - last_status >= _STREAM_STATUS_S:
-                        yield _sse_frame("processing_status", json.dumps(stream_manager.status))
-                        last_status = now
-                    if now - last_hb >= _STREAM_HEARTBEAT_S:
-                        yield ": heartbeat\n\n"
-                        last_hb = now
-                    await asyncio.sleep(_STREAM_POLL_S)
-            finally:
-                stream_manager.unsubscribe()
-
         return StreamingResponse(
-            gen(),
+            _event_stream(stream_manager, request.is_disconnected, last_id),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -2580,7 +2906,12 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         if raw_hl is not None:
             highlight = int(raw_hl) if raw_hl.isdigit() else raw_hl
         session_id = request.path_params["id"]
-        return await _api(request, lambda: _session(db_url, session_id, highlight))
+        return await _api(
+            request,
+            lambda: _session(db_url, session_id, highlight),
+            not_found="session not found",
+            label="session",
+        )
 
     @mcp.custom_route("/dash/api/entity/{uuid}", methods=["GET"])  # type: ignore[misc]
     async def dash_entity(request: Request) -> JSONResponse:
@@ -2588,9 +2919,10 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             return _unauthorized()
         uuid = request.path_params["uuid"]
         m_off = _offset(request.query_params.get("mentions_offset"))
+        f_off = _offset(request.query_params.get("facts_offset"))
         return await _api(
             request,
-            lambda: _entity(db_url, uuid, m_off),
+            lambda: _entity(db_url, uuid, m_off, f_off),
             not_found="entity not found",
             label="entity",
         )
@@ -2673,12 +3005,32 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
 
     @mcp.custom_route("/dash/api/timeline", methods=["GET"])  # type: ignore[misc]
     async def dash_timeline(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _unauthorized()
         qp = request.query_params
         limit = _limit(qp.get("limit"), _TIMELINE_LIMIT_DEFAULT, _TIMELINE_LIMIT_MAX)
         before = qp.get("before") or None
         type_ = qp.get("type") or None
         group_id = qp.get("group_id") or None
+        if type_ is not None and type_ not in _EVENT_TYPES:
+            return _err(f"unknown type {type_!r}", 400)
         return await _api(request, lambda: _timeline(db_url, before, limit, type_, group_id))
+
+    @mcp.custom_route("/dash/api/timeline/months", methods=["GET"])  # type: ignore[misc]
+    async def dash_timeline_months(request: Request) -> JSONResponse:
+        if not authorized(request):
+            return _unauthorized()
+        qp = request.query_params
+        type_ = qp.get("type") or None
+        group_id = qp.get("group_id") or None
+        tz = qp.get("tz") or ""
+        if type_ is not None and type_ not in _EVENT_TYPES:
+            return _err(f"unknown type {type_!r}", 400)
+        try:
+            ZoneInfo(tz)
+        except (ZoneInfoNotFoundError, ValueError):
+            return _err("missing or unknown 'tz' (an IANA zone name)", 400)
+        return await _api(request, lambda: _timeline_months(db_url, type_, group_id, tz))
 
     @mcp.custom_route("/dash/api/preferences", methods=["GET"])  # type: ignore[misc]
     async def dash_preferences(request: Request) -> JSONResponse:
@@ -2713,10 +3065,6 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             label="behavior file",
         )
 
-    @mcp.custom_route("/dash/api/behavior/linkgraph", methods=["GET"])  # type: ignore[misc]
-    async def dash_behavior_linkgraph(request: Request) -> JSONResponse:
-        return await _api(request, lambda: _behavior_linkgraph(db_url))
-
     @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
     async def dash_flags(request: Request) -> JSONResponse:
         return await _api(request, lambda: _flags_list(db_url))
@@ -2732,14 +3080,17 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         kind = body.get("kind")
         item_id = body.get("id")
         note = body.get("note")
+        want = body.get("flagged")
         if kind not in _FLAG_KINDS:
             return _err(f"invalid kind {kind!r}", 400)
         if not item_id or not isinstance(item_id, str):
             return _err("missing 'id' (item_id string)", 400)
         if note is not None and not isinstance(note, str):
             return _err("'note' must be a string", 400)
+        if want is not None and not isinstance(want, bool):
+            return _err("'flagged' must be a boolean", 400)
         try:
-            flagged = await run_in_threadpool(_flag_toggle, db_url, kind, item_id, note)
+            flagged = await run_in_threadpool(_set_flag, db_url, kind, item_id, note, want)
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("dashboard flag failed: %s", e)
             return _err(str(e)[:200], 500)

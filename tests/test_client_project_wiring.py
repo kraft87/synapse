@@ -7,7 +7,7 @@ the worktree's folder name, and a Windows cwd parsed on the server as the whole 
 Each hook now asks the one resolver (marker file, else git toplevel with worktrees
 folded into their main checkout, else the folder name) and sends or uses its answer:
 
-  * ingest_hook._records_project / _post_records: the distinct record cwds resolve to
+  * ingest_hook._post_records: the distinct record cwds resolve to
     one label -> ``project`` in the /ingest body; none or several -> no key at all
   * Codex Stop hook: _rollout_cwd (payload cwd, else the newest session_meta or
     turn_context in the shipped records, else the rollout's first line), and _ship
@@ -35,7 +35,6 @@ import os
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import urllib.parse
 import uuid
@@ -45,6 +44,8 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
+
+from tests.helpers.http import LoopbackServer
 
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
@@ -82,7 +83,6 @@ _ENV_VARS = (
     *(f"CLAUDE_PLUGIN_OPTION_{k}" for k in _SETTINGS),
     "CLAUDE_PROJECT_DIR",
     "CLAUDE_PROJECTS_DIR",
-    "SYNAPSE_CODEX_CATCHUP",
     "SYNAPSE_CODEX_SKILLS_DIR",
 )
 # Modules the scripts import by bare name that resolve config at import time.
@@ -206,9 +206,7 @@ def _isolated(monkeypatch, tmp_path) -> Iterator[None]:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("CLAUDE_SKILLS_DIR", str(home / ".claude" / "skills"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "ingest-hook.log"))
     monkeypatch.setenv("SYNAPSE_CODEX_CURSORS", str(tmp_path / "state" / "codex_cursors.json"))
-    monkeypatch.setenv("SYNAPSE_CODEX_HOOK_LOG", str(tmp_path / "codex-hook.log"))
     monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(tmp_path / "private"))
     monkeypatch.setenv("SYNAPSE_SURFACE", "test-project-wiring-host")
     for var in _ENV_VARS:
@@ -279,15 +277,11 @@ def server() -> Iterator[SimpleNamespace]:
         def log_message(self, *args) -> None:
             pass
 
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-    thread.start()
+    server = LoopbackServer(Handler)
     try:
-        yield SimpleNamespace(url=f"http://127.0.0.1:{httpd.server_address[1]}", seen=seen)
+        yield SimpleNamespace(url=server.url, seen=seen)
     finally:
-        httpd.shutdown()
-        httpd.server_close()
-        thread.join(timeout=5)
+        server.close()
 
 
 def _proc_env(url: str, **extra: str) -> dict[str, str]:
@@ -305,6 +299,12 @@ def _proc_env(url: str, **extra: str) -> dict[str, str]:
         **extra,
     )
     return env
+
+
+def _hook_log(name: str) -> str:
+    """What a hook process wrote to its log (shown when its assertion fails)."""
+    path = Path(os.environ["SYNAPSE_HOME"]) / "logs" / f"{name}.log"
+    return path.read_text(errors="replace") if path.exists() else "(no log)"
 
 
 def _run(args: list[str], url: str, cwd: Path, stdin: str = "", **extra: str):
@@ -384,31 +384,6 @@ def ingest() -> ModuleType:
     return _load(_INGEST_HOOK, "ingest_hook_project_wiring_test")
 
 
-@pytest.mark.parametrize(
-    ("cwds", "expected"),
-    [
-        pytest.param(["sub"], "MyRepo", id="repo-subfolder"),
-        pytest.param(["wt_sub"], "MyRepo", id="linked-worktree-subfolder"),
-        pytest.param(["root", "sub", "wt", "wt_sub"], "MyRepo", id="checkout-and-worktree-one"),
-        pytest.param(["none", "sub", "none"], "MyRepo", id="records-without-cwd-ignored"),
-        pytest.param(["marked"], "alpha", id="marker-file"),
-        pytest.param(["win"], "Acme", id="windows-path"),
-        pytest.param(["none"], None, id="no-cwd"),
-        pytest.param(["sub", "other"], None, id="two-repositories"),
-        pytest.param(["win", "sub"], None, id="windows-and-local-differ"),
-    ],
-)
-def test_records_project_resolves_the_records_cwds(ingest, layout, cwds, expected):
-    assert ingest._records_project(_turns(layout, cwds)) == expected
-
-
-def test_records_project_skips_falsy_and_unlabelable_cwds(ingest, layout):
-    records = _turns(layout, ["sub"])
-    records += [{"type": "user", "cwd": ""}, {"type": "user", "cwd": "C:\\"}, "not-a-record"]
-    assert ingest._records_project(records) == "MyRepo"
-    assert ingest._records_project([{"type": "user", "cwd": "C:\\"}]) is None
-
-
 def test_post_records_survives_a_malformed_cwd(ingest, layout, monkeypatch):
     bodies = _capture_bodies(monkeypatch, ingest, b'{"status":"ok"}')
     records = [*_turns(layout, ["sub"]), {"type": "user", "uuid": "x", "cwd": ["not", "a path"]}]
@@ -417,14 +392,28 @@ def test_post_records_survives_a_malformed_cwd(ingest, layout, monkeypatch):
     assert bodies[0]["project"] == "MyRepo"  # the malformed cwd is ignored, not fatal
 
 
+def test_post_records_skips_falsy_and_unlabelable_cwds(ingest, layout, monkeypatch):
+    bodies = _capture_bodies(monkeypatch, ingest, b'{"status":"ok"}')
+    records = _turns(layout, ["sub"])
+    records += [{"type": "user", "cwd": ""}, {"type": "user", "cwd": "C:\\"}, "not-a-record"]
+    ingest._post_records(records)
+    ingest._post_records([{"type": "user", "cwd": "C:\\"}])
+    assert bodies[0]["project"] == "MyRepo"
+    assert "project" not in bodies[1] and "cwd_projects" not in bodies[1]
+
+
 @pytest.mark.parametrize(
     ("cwds", "expected"),
     [
         pytest.param(["sub"], "MyRepo", id="repo-subfolder"),
         pytest.param(["wt_sub"], "MyRepo", id="linked-worktree"),
+        pytest.param(["root", "sub", "wt", "wt_sub"], "MyRepo", id="checkout-and-worktree-one"),
+        pytest.param(["none", "sub", "none"], "MyRepo", id="records-without-cwd-ignored"),
+        pytest.param(["marked"], "alpha", id="marker-file"),
         pytest.param(["win"], "Acme", id="windows-path"),
         pytest.param(["none"], None, id="no-cwd"),
         pytest.param(["sub", "other"], None, id="two-repositories"),
+        pytest.param(["win", "sub"], None, id="windows-and-local-differ"),
     ],
 )
 def test_post_records_body_carries_the_resolved_project(
@@ -472,7 +461,7 @@ def test_ingest_hook_process_ships_the_project(layout, server, tmp_path, where, 
     _run([str(_INGEST_HOOK), "--ship", str(transcript)], server.url, tmp_path)
 
     posts = [r for r in server.seen if r.path == "/ingest"]
-    assert len(posts) == 1, (tmp_path / "ingest-hook.log").read_text(errors="replace")
+    assert len(posts) == 1, _hook_log("ingest-hook")
     body = posts[0].body
     assert [r["uuid"] for r in body["records"]] == ["u1", "a1", "u2", "a2"]
     assert body["source"] == "hook"
@@ -689,7 +678,7 @@ def test_codex_stop_hook_process_ships_the_project(layout, server, tmp_path, mod
     _run([str(_STOP_HOOK), "--ship", json.dumps(payload)], server.url, tmp_path)
 
     posts = [r for r in server.seen if r.path == "/ingest"]
-    assert len(posts) == 1, (tmp_path / "codex-hook.log").read_text(errors="replace")
+    assert len(posts) == 1, _hook_log("codex-hook")
     body = posts[0].body
     assert body["project"] == expected
     assert body["format"] == "codex"
@@ -798,7 +787,7 @@ def test_codex_session_start_process_sends_the_resolved_project(layout, server, 
         tmp_path,
         json.dumps({"cwd": str(layout.wt_sub)}),
         SYNAPSE_PREFS_BLOCK="0",
-        SYNAPSE_CODEX_CATCHUP="0",
+        HOME=str(tmp_path),  # the sweep it spawns finds no rollouts
         SYNAPSE_SKILLS_SYNC="0",
     )
     gets = [r for r in server.seen if r.path == "/context"]

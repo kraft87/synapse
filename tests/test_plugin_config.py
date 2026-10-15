@@ -92,6 +92,16 @@ def test_unconfigured_defaults_to_localhost(monkeypatch, tmp_path):
     assert cfg.INGEST_TOKEN == ""
 
 
+def test_user_agent_carries_the_clients_real_version(monkeypatch, tmp_path):
+    """Frozen at "synapse-plugin/0.9" for months, so the server could not tell which clients
+    still call a legacy route. The version is the manifest's, the one /install ships."""
+    manifest = _CONFIG_PY.parents[1] / ".claude-plugin" / "plugin.json"
+    version = json.loads(manifest.read_text(encoding="utf-8"))["version"]
+    cfg = _fresh_config(monkeypatch, tmp_path)
+    assert cfg.USER_AGENT == f"synapse-plugin/{version}"
+    assert cfg.synapse_home.client_version() == version
+
+
 def test_config_sync_defaults_off(monkeypatch, tmp_path):
     """Privacy default: the user's global CLAUDE.md + rules must NOT leave the box
     unless they opt in."""

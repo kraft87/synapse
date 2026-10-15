@@ -104,7 +104,7 @@ def cmd_revoke(args: list[str]) -> int:
     r = config.request_json("DELETE", f"/surfaces/{args[0]}")
     if r.get("status") != "ok":
         return _die(r.get("detail") or "revoke failed")
-    n = r.get("revoked", r.get("deleted", 0))
+    n = r.get("revoked", 0)
     print(f"revoked {args[0]} ({n} row(s)) — its token stops working on the next request")
     return 0
 

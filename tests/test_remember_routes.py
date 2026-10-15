@@ -9,35 +9,23 @@ Two things only a database can prove:
     after a confirm, so a flush that dies in the confirm window re-posts; that retry must
     resolve to the recorded note instead of minting a second one.
 
-Same shape as test_private_session_routes.py: skips cleanly when no test DB is reachable,
-LLM and embedder stubbed so nothing leaves the process. The local spool half is covered in
+Same shape as test_private_session_routes.py: LLM and embedder stubbed so nothing leaves the process. The local spool half is covered in
 test_remember_spool.py.
 """
 
 from __future__ import annotations
 
-import os
-
-import psycopg
 import pytest
 from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import ingestion.notes as notes_mod
+from ingestion.notes import _OWNER
+from mcp_server import server
+from mcp_server.recall import Recall
+from mcp_server.remember_routes import register
+from tests.helpers.embed import onehot
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import ingestion.notes as notes_mod  # noqa: E402
-from ingestion.notes import _OWNER  # noqa: E402
-from mcp_server import server  # noqa: E402
-from mcp_server.recall import Recall  # noqa: E402
-from mcp_server.remember_routes import register  # noqa: E402
-from tests.helpers.embed import onehot  # noqa: E402
+pytestmark = pytest.mark.db
 
 _TOKEN = "test-machine-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}

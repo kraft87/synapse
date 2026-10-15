@@ -20,8 +20,8 @@ a beekeeper. The failure is that the WORKSPACE is not a memory source. The proje
 the only signal that is cheap, exact, and decided by the operator rather than inferred.
 
 Wired exactly like ``ingestion.contamination`` and ``ingestion.private_sessions``: one
-predicate applied at the chokepoints where a parsed turn becomes an episode
-(``mcp_server.server.ingest_turns``, ``ingestion.backfill``, ``ingestion.codex_backfill``).
+predicate applied at the chokepoint where a parsed turn becomes an episode
+(``ingestion.episode_writer``, which ``POST /ingest`` and every backfill store through).
 Dropping there means chunks, KG extraction, dream, and the timeline never see the turn.
 
 Matching is EXACT on the normalized project name, never a substring: a substring rule on

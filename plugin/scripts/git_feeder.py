@@ -11,8 +11,9 @@ One naked event per commit ("committed to <project>: <subject>", author-dated),
 POSTed to the machine-token-gated ``/timeline/events`` route. The SERVER embeds and upserts — this script holds no DSN and no Voyage key,
 same thin-client seam as ingest_hook / skills_sync / config_sync.
 
-OFF until repos are configured: set ``SYNAPSE_TIMELINE_REPOS`` (env or plugin option)
-to a comma/space-separated list of local checkout paths. Each session start re-reads
+OFF until repos are configured: `synapse config timeline_repos "<path>,<path>"` (or
+``SYNAPSE_TIMELINE_REPOS`` in the environment) takes a comma/space-separated list of local
+checkout paths. Each session start re-reads
 a bounded window (``SYNAPSE_TIMELINE_SINCE_DAYS``, default 30) — re-pushes are free
 because the server filters existing (source, source_ref) pairs before embedding, so
 idempotency needs no local cursor state. For a first-time full-history backfill, run

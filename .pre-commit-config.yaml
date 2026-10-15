@@ -6,26 +6,17 @@ repos:
         args: [--fix]
       - id: ruff-format
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.14.1
+  # The project's own mypy, run with no arguments: what it checks is pyproject.toml's
+  # [tool.mypy] files list, the same one CI runs, so the two cannot disagree (a mirrored
+  # mypy pinned here would drift from uv.lock).
+  - repo: local
     hooks:
       - id: mypy
-        additional_dependencies:
-          - psycopg[binary]>=3.2
-          - pgvector>=0.3
-          - pydantic>=2.10
-          - pydantic-settings>=2.7
-          - pydantic-ai-slim[openai]>=2.13
-          - voyageai>=0.3
-        args: [--ignore-missing-imports]
-        # mcp_server/server.py + skill_sync_routes.py: FastMCP @custom_route decorators
-        #   are inherently untyped; these are route-handler modules, not the typed core.
-        # dream/: pre-existing untyped pipeline scripts, type later if needed.
-        # scripts/: utility/bench scripts, not shipped with the package.
-        # oauth-proxy/: standalone FastAPI shim, untyped route decorators
-        #   (same rationale as mcp_server/server.py); not part of the core
-        #   typed surface and not checked by the CI mypy job either.
-        exclude: ^(tests/|mcp_server/(server|skills_provider|skill_sync_routes|config_sync_routes)\.py$|dream/|scripts/|oauth-proxy/)
+        name: mypy
+        entry: uv run mypy
+        language: system
+        types: [python]
+        pass_filenames: false
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

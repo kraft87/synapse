@@ -11,7 +11,7 @@ Search strategy:
 
 KG legs serve from Postgres (kg_entities / kg_relationships, task #67).
 The cutover was judged quality-EQUAL to FalkorDB on the relational golden set
-(delta -0.017, CI spans zero; scripts/ab_kg_pg_quality.py) and fixed FalkorDB's
+(delta -0.017, CI spans zero; the #67 cutover A/B) and fixed FalkorDB's
 silently-dead BM25 leg (AND/phrase semantics returned 0 results on real
 multi-word queries). FalkorDB itself was decommissioned in #67 PR 3, so the
 ``SYNAPSE_KG_READ`` rollback seam is gone; a KG-leg failure degrades to an

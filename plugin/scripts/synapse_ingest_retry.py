@@ -1,4 +1,4 @@
-"""Failed-upload bookkeeping shared by both transcript shippers.
+"""Failed-upload bookkeeping and the private-mode check shared by both transcript shippers.
 
 Two hooks ship a session transcript to /ingest past a per-file byte cursor:
 ``ingest_hook.py`` here (Claude Code) and ``plugin-codex/hooks/synapse_stop_hook.py``
@@ -21,6 +21,10 @@ when an upload fails:
 
 Reasons come from a short fixed vocabulary and are scrubbed of the bearer token before
 they are stored or printed.
+
+``is_private`` is the other half they share: whether a session's private-mode marker is
+live, with the same expiry and the same fail-safe on both hosts. The sweep window, its
+file cap and the active-write grace are constants here too, one set for both.
 
 Dependency-free and config-free: the caller passes in the cursor path, token, window and
 TTL, so this loads under either host's bare python3. Named with the ``synapse_`` prefix
@@ -48,6 +52,10 @@ from synapse_filelock import lock_exclusive
 HEALTH_KEY = "_health"
 WARN_AFTER_FAILS = 3  # failed POSTs in a row with no success since → warn at session start
 WARN_AFTER_HOURS = 24.0  # ...or a first failure this old with no success since
+CATCHUP_DAYS = 3.0  # the sweep takes lagging files modified this recently (failed ones, any age)
+CATCHUP_MAX_FILES = 20  # files per sweep; the rest defer to the next session start, logged
+ACTIVE_GRACE = 300.0  # skip files written this recently: a live session's Stop hook owns them
+PRIVATE_TTL_HOURS = 12.0  # a private-mode marker older than this is stale (see is_private)
 
 State = dict[str, Any]
 
@@ -64,6 +72,45 @@ def load_state(cursor_path: str | os.PathLike[str]) -> State:
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
+
+
+def is_private(
+    session_id: str, private_dir: str | os.PathLike[str], log: Callable[[str], None]
+) -> bool:
+    """True if ``session_id`` is in private mode: ship NOTHING for it.
+
+    Private mode is a marker file at ``private_dir``/<session_id>, written by
+    private_mode.py (which also sets the durable server-side flag). This local check is
+    the fast half: it keeps the turns from ever leaving the machine, and it works while
+    the server is unreachable.
+
+    Two deliberate behaviours:
+      * STALE markers (older than PRIVATE_TTL_HOURS) are ignored AND deleted. A marker
+        outlives its session (a crashed SessionEnd hook leaves one behind, and session
+        ids are never reused), so an orphan would otherwise sit there forever. The
+        server-side row is the durable record; the marker is a live flag.
+      * An UNREADABLE marker dir counts as PRIVATE. If we can't prove a session is not
+        private, silently capturing it is the unacceptable failure; a deferred turn is
+        not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
+    """
+    if not session_id:
+        return False
+    marker = os.path.join(str(private_dir), session_id)
+    try:
+        age = time.time() - os.stat(marker).st_mtime
+    except FileNotFoundError:
+        return False  # no marker (or no private dir at all): the normal case
+    except OSError as e:
+        log(f"PRIVATE unreadable {session_id}: {type(e).__name__}, skipping ingestion")
+        return True
+    if age > PRIVATE_TTL_HOURS * 3600:
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        log(f"PRIVATE stale marker removed {session_id} (age {int(age)}s)")
+        return False
+    return True
 
 
 def needs_retry(ent: Any) -> bool:

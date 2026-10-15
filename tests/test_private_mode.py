@@ -6,7 +6,7 @@ Three legs, tested here without a database or a live server:
     stops every POST for that session, a stale marker is ignored AND deleted, and an
     unreadable marker directory counts as private (fail-safe direction: silently
     capturing a believed-private session is the unacceptable failure);
-  * the SERVER chokepoint (``ingestion.private_sessions`` + ``ingestion.backfill``) —
+  * the SERVER chokepoint (``ingestion.private_sessions`` + ``ingestion.episode_writer``) —
     the predicate that drops private turns wherever a parsed turn becomes an episode,
     which is what covers the paths that bypass the hook entirely;
   * the TOGGLE CLI (``plugin/scripts/private_mode.py``) round-tripped against a stubbed
@@ -22,18 +22,22 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
-import threading
 import time
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.error
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import ModuleType
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from tests.helpers.http import LoopbackServer
+
 _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
-_ROOT_HOOK = _REPO / "scripts" / "synapse_ingest_hook.py"
 _TOGGLE = _REPO / "plugin" / "scripts" / "private_mode.py"
 
 _PLUGIN_ENV_VARS = (
@@ -54,7 +58,6 @@ def _isolate(monkeypatch, tmp_path) -> Path:
     private_dir = tmp_path / "private"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "hook.log"))
     monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(private_dir))
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
@@ -218,27 +221,6 @@ def test_no_marker_ships_normally(hook, tmp_path, monkeypatch):
     assert len(posted) == 1
 
 
-def test_root_hook_copy_honours_the_marker(monkeypatch, tmp_path):
-    """The repo-root Stop hook (the pre-plugin deployment path) ships the same
-    transcripts, so it carries the same check — otherwise private mode would be
-    silently local-only on those installs."""
-    _isolate(monkeypatch, tmp_path)
-    mod = _load(_ROOT_HOOK, "root_hook_private_test")
-    sid = "s-private"
-    path = _transcript(tmp_path, sid)
-    marker = _mark(Path(os.environ["SYNAPSE_PRIVATE_DIR"]), sid)
-
-    def _boom(*a, **k):
-        raise AssertionError("posted a private session")
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _boom)
-    assert mod._is_private(sid) is True
-    mod._ship(str(path))  # would raise via _boom if it POSTed
-
-    os.utime(marker, (time.time() - 13 * 3600,) * 2)
-    assert mod._is_private(sid) is False and not marker.exists()
-
-
 # ---------------------------------------------------------------------------
 # Server chokepoint: the predicate + its backfill wiring
 # ---------------------------------------------------------------------------
@@ -258,11 +240,21 @@ class _StubDB:
         self.lookups.append(session_id)
         return session_id in self.private
 
-    # backfill leg
-    def get_session_episodes(self, session_id: str) -> list[dict]:
-        return []
+    # episode-writer leg: nothing is stored yet, nothing is a replay or tombstoned
+    @contextmanager
+    def atomic(self):
+        yield
+
+    def get_session_span_index(self, session_id: str) -> tuple[set[str], int]:
+        return set(), 0
 
     def span_id_exists(self, span_id: str) -> bool:
+        return False
+
+    def content_dup_exists(self, project: str | None, content: str, cwd: str | None = None) -> bool:
+        return False
+
+    def is_tombstoned(self, span_id, project, content, cwd) -> bool:
         return False
 
     def upsert_episode(self, ep: object) -> int:
@@ -299,21 +291,21 @@ def test_predicate_drops_private_and_memoizes():
 
 def test_backfill_drops_a_private_session():
     """The disk sweep is the path the marker file can't cover (the transcript outlives
-    the marker), so the row has to stop it here."""
-    from ingestion.backfill import _write_session_episodes, write_backfill_session
+    the marker), so the row has to stop it here: every backfill stores through the
+    episode writer."""
+    from ingestion.episode_writer import store_episodes
 
     db = _StubDB(private={"s-private"})
-    eps = [_episode("s-private", 1), _episode("s-private", 2)]
-    assert _write_session_episodes(db, "s-private", eps, "demo") == 0
-    assert write_backfill_session(db, "s-private", eps) == 0
+    stats = store_episodes(db, [_episode("s-private", 1), _episode("s-private", 2)], "demo")
+    assert stats.written == 0 and stats.private == 2
     assert db.written == [] and db.enqueued == []
 
 
 def test_backfill_still_writes_a_normal_session():
-    from ingestion.backfill import _write_session_episodes
+    from ingestion.episode_writer import store_episodes
 
     db = _StubDB(private={"s-private"})
-    assert _write_session_episodes(db, "s-public", [_episode("s-public", 1)], "demo") == 1
+    assert store_episodes(db, [_episode("s-public", 1)], "demo").written == 1
     assert len(db.written) == 1
 
 
@@ -336,42 +328,74 @@ def test_predicate_fails_closed_on_lookup_error():
 
 
 class _StubServer:
-    """A stand-in for /private-sessions/{id}: records calls, serves the flag back."""
+    """A stand-in for /private-sessions/{id}: records calls, serves the flag back.
+
+    By default it behaves like a server from before purge existed: PUT answers only
+    ``private``. ``stored_turns`` makes it report that count; ``purge`` ("ok", "refuse" or
+    "error") makes it act on ``?purge=1`` the way the current route does."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.queries: list[dict[str, list[str]]] = []
+        self.agents: list[str] = []
         self.rows: set[str] = set()
         self.lie_on_put = False  # simulate a write that silently doesn't land
+        self.stored_turns: int | None = None
+        self.purge: str | None = None
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
-            def _reply(self) -> None:
-                sid = self.path.rsplit("/", 1)[-1]
-                outer.calls.append((self.command, sid))
-                if self.command == "PUT" and not outer.lie_on_put:
-                    outer.rows.add(sid)
-                elif self.command == "DELETE":
-                    outer.rows.discard(sid)
-                body = json.dumps({"status": "ok", "private": sid in outer.rows}).encode()
-                self.send_response(200)
+            def _send(self, status: int, payload: dict) -> None:
+                body = json.dumps(payload).encode()
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+
+            def _reply(self) -> None:
+                url = urlsplit(self.path)
+                sid = url.path.rsplit("/", 1)[-1]
+                query = parse_qs(url.query)
+                outer.calls.append((self.command, sid))
+                outer.queries.append(query)
+                outer.agents.append(self.headers.get("User-Agent", ""))
+                if self.command == "PUT" and not outer.lie_on_put:
+                    outer.rows.add(sid)
+                elif self.command == "DELETE":
+                    outer.rows.discard(sid)
+                payload: dict = {"status": "ok", "private": sid in outer.rows}
+                if self.command == "PUT":
+                    if outer.stored_turns is not None:
+                        payload["stored_turns"] = outer.stored_turns
+                    purging = query.get("purge") == ["1"]
+                    if purging and outer.purge == "refuse":
+                        # the flag is committed first, so it stays set
+                        detail = "purge refused: needs full trust"
+                        return self._send(403, {"status": "error", "detail": detail})
+                    if purging and outer.purge == "error":
+                        # the purge transaction failed after the flag was committed
+                        return self._send(500, {"status": "error", "detail": "purge failed"})
+                    if purging and outer.purge == "ok":
+                        payload["purged"] = {
+                            "episodes_deleted": outer.stored_turns or 0,
+                            "facts_deleted": 4,
+                            "events_deleted": 1,
+                            "preferences_deleted": 2,
+                        }
+                        payload["stored_turns"] = 0
+                self._send(200, payload)
 
             do_PUT = do_GET = do_DELETE = _reply
 
             def log_message(self, *args) -> None:  # keep pytest output clean
                 pass
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._httpd.server_port}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
+        self._server = LoopbackServer(Handler)
+        self.url = self._server.url
 
     def close(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+        self._server.close()
 
 
 @pytest.fixture()
@@ -395,6 +419,116 @@ def test_on_writes_marker_and_verifies_server(toggle, stub_server):
     # wrote it, then READ IT BACK — "off the record" is never claimed on an unverified write
     assert stub_server.calls == [("PUT", sid), ("GET", sid)]
     assert sid in stub_server.rows
+
+
+def test_on_says_how_many_earlier_turns_are_still_stored(toggle, stub_server, capsys):
+    """Private mode covers the session from now on; what was ingested before stays
+    recallable, so the count and the way to remove it are printed, and nothing is deleted."""
+    stub_server.stored_turns = 3
+    assert toggle.main(["on", "s-abc"]) == 0
+    out = capsys.readouterr().out
+    assert "3 turn(s) of this session were already stored" in out and "--purge" in out
+    assert "deleted" not in out and "purged" not in out
+    assert stub_server.queries[0] == {}  # no purge was asked for
+
+
+def test_on_is_quiet_about_earlier_turns_when_there_are_none_or_the_server_is_old(
+    toggle, stub_server, capsys
+):
+    stub_server.stored_turns = 0
+    assert toggle.main(["on", "s-abc"]) == 0
+    assert "already stored" not in capsys.readouterr().out
+    stub_server.stored_turns = None  # a server from before the count: nothing to claim
+    assert toggle.main(["on", "s-def"]) == 0
+    assert "already stored" not in capsys.readouterr().out
+
+
+def test_on_purge_asks_the_server_to_delete_and_reports_what_it_deleted(
+    toggle, stub_server, capsys
+):
+    stub_server.stored_turns = 3
+    stub_server.purge = "ok"
+    assert toggle.main(["on", "s-abc", "--purge"]) == 0
+    assert stub_server.queries[0] == {"purge": ["1"]}
+    out = capsys.readouterr().out
+    assert "purged 3 stored turn(s)" in out and "4 fact(s)" in out and "2 preference(s)" in out
+    assert "already stored" not in out
+    assert "s-abc" in stub_server.rows
+
+
+def test_on_purge_against_a_server_that_ignores_it_never_claims_a_deletion(
+    toggle, stub_server, capsys
+):
+    """An older server drops the unknown query parameter and answers a plain 200."""
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "purged" not in captured.out and "deleted" not in captured.out
+    assert "--purge did not run" in captured.err
+    assert "s-abc" in stub_server.rows  # private mode itself is on, and the output says so
+    assert "private mode is ON" in captured.err
+
+
+def test_on_purge_refused_keeps_private_mode_on_and_claims_no_deletion(toggle, stub_server, capsys):
+    stub_server.purge = "refuse"
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "purge refused: needs full trust" in captured.err
+    assert "private mode is ON" in captured.err and "nothing is claimed deleted" in captured.err
+    assert "NOT off the record" not in captured.err  # the flag did land
+    assert "s-abc" in stub_server.rows
+    assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]  # the flag was read back
+
+
+def test_on_purge_server_error_still_reports_private_mode_on(toggle, stub_server, capsys):
+    """The route commits the flag before it purges, so a 5xx from the purge must not read as
+    "server flag not set / NOT off the record": the read-back says the flag landed."""
+    stub_server.purge = "error"
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "private mode is ON" in captured.err and "nothing is claimed deleted" in captured.err
+    assert "purge failed" in captured.err
+    assert "NOT off the record" not in captured.err and "purged" not in captured.out
+    assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        # urlopen raises the bare form when the request went out and the reply never came
+        # (http.client.getresponse() runs outside do_open's URLError wrapper)...
+        TimeoutError("timed out"),
+        # ...and the wrapped form only when connect or send timed out.
+        urllib.error.URLError(TimeoutError("timed out")),
+    ],
+    ids=["bare", "wrapped"],
+)
+def test_on_purge_timeout_says_the_outcome_is_unknown(
+    toggle, stub_server, monkeypatch, capsys, timeout
+):
+    """The purge runs in one long transaction; when the answer does not come in time it may
+    still finish. The flag is read back, and the output claims neither state of the turns."""
+    real = toggle.config.request_json
+
+    def slow_purge(method, path, *args, **kwargs):
+        if method == "PUT" and "purge=1" in path:
+            real(method, path.split("?")[0], *args, **kwargs)  # the flag lands server-side
+            raise timeout
+        return real(method, path, *args, **kwargs)
+
+    monkeypatch.setattr(toggle.config, "request_json", slow_purge)
+    assert toggle.main(["on", "s-abc", "--purge"]) == 1
+    captured = capsys.readouterr()
+    assert "private mode is ON" in captured.err and "nothing is claimed deleted" in captured.err
+    assert "outcome is unknown" in captured.err and "on --purge" in captured.err
+    assert "NOT off the record" not in captured.err and "purged" not in captured.out
+    assert [c[0] for c in stub_server.calls] == ["PUT", "GET"]
+
+
+def test_purge_only_belongs_to_on(toggle, stub_server, capsys):
+    assert toggle.main(["off", "s-abc", "--purge"]) == 2
+    assert toggle.main(["status", "s-abc", "--purge"]) == 2
+    assert "only applies to `on`" in capsys.readouterr().err
+    assert stub_server.calls == []
 
 
 def test_on_exits_nonzero_when_the_server_write_does_not_land(toggle, stub_server, capsys):
@@ -483,3 +617,96 @@ def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys):
     assert toggle.main(["off", "--forget", "s-abc"]) == 1
     assert "looks like a flag" in capsys.readouterr().err
     assert stub_server.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The Codex entry point is the shared script, not a copy of it
+# ---------------------------------------------------------------------------
+
+_CODEX_TOGGLE = _REPO / "plugin-codex" / "scripts" / "private_mode.py"
+
+
+def _codex(tmp_path, stub_server, *args: str) -> subprocess.CompletedProcess:
+    """plugin-codex/scripts/private_mode.py as Codex runs it: a subprocess in the session's
+    directory, with the server URL only in the user-level Claude settings."""
+    cfg_dir = tmp_path / "claude"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "settings.json").write_text(
+        json.dumps(
+            {"pluginConfigs": {"synapse@synapse": {"options": {"SYNAPSE_URL": stub_server.url}}}}
+        )
+    )
+    project = tmp_path / "project"
+    (project / ".claude").mkdir(parents=True, exist_ok=True)
+    # A repository's own settings are not Codex's: they must not redirect the toggle.
+    (project / ".claude" / "settings.json").write_text(
+        json.dumps(
+            {
+                "pluginConfigs": {
+                    "synapse@synapse": {"options": {"SYNAPSE_URL": "http://127.0.0.1:9"}}
+                }
+            }
+        )
+    )
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("SYNAPSE_", "CLAUDE_PLUGIN_OPTION_"))
+    }
+    env |= {
+        "HOME": str(tmp_path),
+        "CLAUDE_CONFIG_DIR": str(cfg_dir),
+        "SYNAPSE_HOME": str(tmp_path / "synapse-home"),
+        "SYNAPSE_DATA_DIR": str(tmp_path / "data"),
+        "SYNAPSE_PRIVATE_DIR": str(tmp_path / "private"),
+    }
+    return subprocess.run(
+        [sys.executable, str(_CODEX_TOGGLE), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=project,
+        check=False,
+    )
+
+
+def test_codex_toggle_runs_the_shared_script_as_codex(stub_server, tmp_path):
+    stub_server.stored_turns = 2
+    done = _codex(tmp_path, stub_server, "on", "s-abc")
+    assert done.returncode == 0, done.stderr
+    assert "2 turn(s) of this session were already stored" in done.stdout
+    assert (tmp_path / "private" / "s-abc").exists()
+    assert "s-abc" in stub_server.rows
+    assert stub_server.agents and all(
+        a.startswith("synapse-codex-plugin/") for a in stub_server.agents
+    )
+
+
+def test_codex_toggle_purges_by_name_and_refuses_a_flag_for_an_id(stub_server, tmp_path):
+    stub_server.stored_turns = 2
+    stub_server.purge = "ok"
+    done = _codex(tmp_path, stub_server, "on", "s-abc", "--purge")
+    assert done.returncode == 0, done.stderr
+    assert "purged 2 stored turn(s)" in done.stdout
+    assert stub_server.queries[-2] == {"purge": ["1"]}  # the PUT; the read-back GET follows
+    assert _codex(tmp_path, stub_server, "status", "s-abc", "--purge").returncode == 2
+
+
+def test_codex_toggle_against_an_older_server_does_not_claim_a_purge(stub_server, tmp_path):
+    done = _codex(tmp_path, stub_server, "on", "s-abc", "--purge")
+    assert done.returncode == 1
+    assert "--purge did not run" in done.stderr
+
+
+def test_codex_session_end_drops_the_marker(stub_server, tmp_path):
+    assert _codex(tmp_path, stub_server, "on", "s-end").returncode == 0
+    done = subprocess.run(
+        [sys.executable, str(_CODEX_TOGGLE), "--session-end"],
+        input=json.dumps({"session_id": "s-end"}),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SYNAPSE_PRIVATE_DIR": str(tmp_path / "private")},
+        check=False,
+    )
+    assert done.returncode == 0
+    assert not (tmp_path / "private" / "s-end").exists()

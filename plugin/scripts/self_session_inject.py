@@ -38,29 +38,31 @@ _SYNAPSE_TOOL = re.compile(
 )
 
 
+def inject(payload: dict) -> dict | None:
+    """The tool input with the calling session's id added, or None when the hook should
+    say nothing (not a synapse tool, no session id, or the field is already set). The
+    Codex hook (plugin-codex/hooks/pre_tool_use.py) shares this."""
+    tool_name = payload.get("tool_name") or ""
+    if not _SYNAPSE_TOOL.match(tool_name):
+        return None
+    session_id = payload.get("session_id")
+    tool_input = payload.get("tool_input") or {}
+    if not session_id or not isinstance(tool_input, dict):
+        return None
+    # recall carries the caller id as self_session (serving-side self-exclusion);
+    # recall_feedback's existing session_id param groups reports so noise can be
+    # classified by session later (all 96 historical rows were NULL — unmeasurable).
+    base = tool_name.rsplit("__", 1)[-1]
+    field = "session_id" if base in ("recall_feedback", "remember") else "self_session"
+    if tool_input.get(field):  # already set (retry/nested call) — don't overwrite
+        return None
+    return {**tool_input, field: session_id}
+
+
 def main() -> None:
     try:
-        payload = json.load(sys.stdin)
-        tool_name = payload.get("tool_name") or ""
-        if not _SYNAPSE_TOOL.match(tool_name):
-            return
-        session_id = payload.get("session_id")
-        tool_input = payload.get("tool_input") or {}
-        if not isinstance(tool_input, dict):
-            return
-        base = tool_name.rsplit("__", 1)[-1]
-        changed = False
-
-        # recall carries the caller id as self_session (serving-side self-exclusion);
-        # recall_feedback's existing session_id param groups reports so noise can be
-        # classified by session later (all 96 historical rows were NULL — unmeasurable).
-        if session_id:
-            field = "session_id" if base in ("recall_feedback", "remember") else "self_session"
-            if not tool_input.get(field):  # already set (retry/nested call) — don't overwrite
-                tool_input[field] = session_id
-                changed = True
-
-        if not changed:
+        tool_input = inject(json.load(sys.stdin))
+        if tool_input is None:
             return
         print(
             json.dumps(

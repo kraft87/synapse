@@ -1,13 +1,10 @@
 // Offline fixture dataset for `#mock` mode — obviously synthetic, no real data
 // (this repo is public). Enough to render every phase-1 screen without a server.
-export const MOCK =
-  typeof location !== 'undefined' &&
-  (location.hash.includes('mock') || (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('synapse.mock') === '1'));
-if (MOCK && typeof sessionStorage !== 'undefined') sessionStorage.setItem('synapse.mock', '1');
+// Loaded on demand by api.ts when MOCK (mode.ts) is set; a normal page never fetches it.
 
 const now = Date.now();
 const iso = (hAgo: number) => new Date(now - hAgo * 3600e3).toISOString();
-const trace = 'user: wire service A to library B\n\nRead   src/service_a.py\nEdit   src/service_a.py:42\nBash   pytest tests/ — 3 passed';
+const trace = '[user] wire service A to library B\n\n[tool:Read] src/service_a.py\n[tool:Edit] src/service_a.py:42\n[tool:Bash] pytest tests/\n\n[result] ===== 3 passed in 0.41s =====\n\n[assistant] Done — added the dependency and a smoke test.';
 
 const FIX: Record<string, unknown> = {
   catalog: {
@@ -27,7 +24,7 @@ const FIX: Record<string, unknown> = {
   'episode/1': { id: 1, session_id: 'sess-1', sequence: 3, project: 'service-a', source: 'claude-code', platform: 'cli', model: 'example-model', created_at: iso(0.4), flagged: false, human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency and a smoke test.', content: trace },
   'episode/2': { id: 2, session_id: 'sess-2', sequence: 1, project: 'service-b', source: 'cursor', platform: 'ide', model: 'example-model', created_at: iso(30), flagged: false, human_turn: 'Refactor the widget cache.', assistant_turn: 'Extracted a WidgetCache class; hit rate unchanged.', content: 'user: refactor the widget cache\n\nassistant: extracted a WidgetCache class.' },
   derived: { facts: [{ uuid: 'ent-edge-1', fact: 'service A depends on library B', group_id: 'technical', t_valid: iso(24), t_invalid: null }], timeline_events: [{ id: 10, fact: 'service A shipped v2', t_valid: iso(48), salience: 2 }] },
-  session: { session_id: 'sess-1', project: 'service-a', source: 'claude-code', highlight: 1, episodes: [{ id: 0, sequence: 1, created_at: iso(1), human_turn: 'Set up the project.', assistant_turn: 'Scaffolded service A.', content: '' }, { id: 1, sequence: 3, created_at: iso(0.4), human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency.', content: trace }] },
+  session: { session_id: 'sess-1', project: 'service-a', source: 'claude-code', total: 2, highlight: 1, episodes: [{ id: 0, sequence: 1, created_at: iso(1), human_turn: 'Set up the project.', assistant_turn: 'Scaffolded service A.' }, { id: 1, sequence: 3, created_at: iso(0.4), human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency.' }] },
   entity: {
     entity: { uuid: 'ent-1', name: 'service A', entity_type: 'Project', summary: 'Example service used to demonstrate the dossier surface.', degree: 4, created_at: iso(200) },
     stats: { edges: 4, served: 42, facts: 3 },
@@ -37,7 +34,11 @@ const FIX: Record<string, unknown> = {
     ],
     mentions: { items: [{ episode_id: 1, created_at: iso(0.4), gist: 'wired service A to library B' }, { episode_id: 2, created_at: iso(30), gist: 'refactored the widget cache' }], offset: 0, limit: 20, total: 2 },
   },
-  flags: { flags: [{ id: 1, kind: 'timeline_event', item_id: '10', note: null, created_at: iso(2), gist: 'example event: service A shipped v2' }] },
+  flags: { flags: [
+    { id: 1, kind: 'timeline_event', item_id: '10', note: null, created_at: iso(2), gist: 'example event: service A shipped v2', episode_id: 1, body: null },
+    { id: 2, kind: 'fact', item_id: 'ent-edge-1', note: null, created_at: iso(3), gist: 'example fact: service A depends on library B', episode_id: null, body: null },
+    { id: 3, kind: 'note', item_id: '4', note: null, created_at: iso(5), gist: 'example note: prefers small reviewable commits', episode_id: null, body: 'Keep each commit to one concern.\nSplit refactors from behaviour changes so a revert stays cheap.' },
+  ] },
   proposals: {
     pending_count: 2,
     proposals: [
@@ -53,35 +54,35 @@ const FIX: Record<string, unknown> = {
       { session_id: 'sess-1', class: 'grounded', signal: 'explicit_request', why: 'operator asked for a reusable recall-latency playbook' },
       { session_id: 'sess-2', class: 'grounded', signal: 'user_correction', why: 'repeated the same waterfall read-through by hand' },
     ],
-    provenance_episodes: [1, 2],
+    provenance_episodes: [1, 2], provenance_sessions: ['sess-1', 'sess-2'],
     payload: { type: 'markdown', content: '# latency-triage\n\nWhen recall p95 regresses, read the waterfall leg-by-leg. Dominant leg → known remedy:\n\n- **rerank** → cap candidate pool (`RERANK_POOL_CAP`)\n- **kg** → depth-limit the neighborhood expand\n- **vector** → check `pgvector` index / cache hit rate\n- **bm25** → review tokenizer + stopwords\n\n```\nrecall --debug "<query>" | jq .legs\n```' },
     audit_log: [],
   },
   'proposals/config:1': {
     id: 'config:1', kind: 'config-edit', name: 'CLAUDE.md', status: 'proposed',
     evidence: [{ session_id: 'sess-3', signal: 'correction', why: 'operator restated "prefer raw SQL over the ORM" five times' }],
-    provenance_episodes: [2],
+    provenance_episodes: [], provenance_sessions: ['sess-3'],
     payload: { type: 'diff', content: '--- a/CLAUDE.md\n+++ b/CLAUDE.md\n@@ -12,3 +12,4 @@\n ## Conventions\n Keep functions small.\n+Prefer raw SQL over the ORM for hot-path reads.\n Log every migration.' },
     audit_log: [],
   },
   'proposals/skill:2': {
     id: 'skill:2', kind: 'skill', name: 'graph-inspect', status: 'accepted',
     evidence: [{ session_id: 'sess-4', class: 'grounded', signal: 'accept', why: 'operator accepted the merge' }],
-    provenance_episodes: [],
+    provenance_episodes: [], provenance_sessions: ['sess-4'],
     payload: { type: 'markdown', content: '# graph-inspect\n\nMerged from **graph-explore** + **kg-inspect** — one skill for reading the KG.' },
     audit_log: [{ ts: iso(48), action: 'proposal_approve', note: 'clear overlap; merge is right' }],
   },
   'proposals/config:2': {
     id: 'config:2', kind: 'config-edit', name: 'rules/testing.md', status: 'rejected',
     evidence: [{ session_id: 'sess-5', signal: 'correction', why: 'proposed a hard coverage gate' }],
-    provenance_episodes: [],
+    provenance_episodes: [], provenance_sessions: ['sess-5'],
     payload: { type: 'diff', content: '--- a/rules/testing.md\n+++ b/rules/testing.md\n@@ -1 +1,2 @@\n # Testing\n+Every PR must hit 90% line coverage.' },
     audit_log: [{ ts: iso(96), action: 'proposal_reject', note: 'too rigid — coverage is a lagging signal' }],
   },
 };
 
 // ---- metrics fixtures (phase 4) — obviously synthetic ----
-const LEGS = ['embed', 'bm25', 'vector', 'kg', 'timeline', 'prefs', 'web', 'rerank'];
+const LEGS = ['embed', 'bm25', 'vector', 'kg', 'notes', 'web', 'rerank'];
 const metricsSeries = Array.from({ length: 24 }, (_, i) => {
   const legs: Record<string, number> = {};
   for (const l of LEGS) legs[l] = Math.round((4 + Math.random() * 40) * (l === 'rerank' ? 3 : l === 'kg' ? 2 : 1));
@@ -90,6 +91,7 @@ const metricsSeries = Array.from({ length: 24 }, (_, i) => {
 });
 const FIX_METRICS = {
   recall: {
+    summary: { calls: metricsSeries.reduce((a, p) => a + p.calls, 0), p50: 213, p95: 412, tokens_p50: 1560 },
     series: metricsSeries,
     slowest: [
       { query: 'everything I know about the lisbon trip planning and who is coming', ms_total: 612, created_at: iso(3) },
@@ -143,12 +145,18 @@ const day = (d: string) => new Date(d + 'T12:00:00Z').toISOString();
 const FIX_P5 = {
   timeline: {
     events: [
-      { id: 3, t_valid: day('2026-07-03'), fact: 'Rerank latency regression fixed — candidate pool capped at 96.', source: 'chat', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
-      { id: 2, t_valid: day('2026-07-03'), fact: 'SSE Last-Event-ID resume shipped.', source: 'git:example', project: 'synapse', salience: 2, sal: 0.9, event_type: 'work', episode_id: 88412, flagged: false },
-      { id: 1, t_valid: day('2026-07-01'), fact: 'Embedding cache moved into Postgres (pgvector table).', source: 'git:example', project: 'synapse', salience: 1, sal: 0.6, event_type: 'work', episode_id: 88101, flagged: false },
-      { id: 0, t_valid: day('2026-06-30'), fact: 'Took a proper rest day.', source: 'chat', project: null, salience: 1, sal: 0.6, event_type: 'health', episode_id: null, flagged: true },
+      { id: 3, t_valid: day('2026-07-03'), fact: 'Rerank latency regression fixed — candidate pool capped at 96.', source: 'chat', project: 'synapse', salience: 2, sal: 0.9, event_type: 'decision', episode_id: 88412, flagged: false },
+      { id: 2, t_valid: day('2026-07-03'), fact: 'SSE Last-Event-ID resume shipped.', source: 'git:example', project: 'synapse', salience: 2, sal: 0.9, event_type: 'milestone', episode_id: 88412, flagged: false },
+      { id: 1, t_valid: day('2026-07-01'), fact: 'Embedding cache moved into Postgres (pgvector table).', source: 'git:example', project: 'synapse', salience: 1, sal: 0.6, event_type: 'action', episode_id: 88101, flagged: false },
+      { id: 0, t_valid: day('2026-06-30'), fact: 'Took a proper rest day.', source: 'chat', project: null, salience: 1, sal: 0.6, event_type: 'finding', episode_id: null, flagged: true },
     ],
     next_before: null,
+  },
+  months: {
+    months: [
+      { month: '2026-07', n: 3, before: '2026-08-01T00:00:00+00:00' },
+      { month: '2026-06', n: 1, before: '2026-07-01T00:00:00+00:00' },
+    ],
   },
   preferences: {
     preferences: [
@@ -256,19 +264,13 @@ export function mockRecall<T>(query: string): Promise<T> {
       { id: 'e:1', content: 'Wired service A to library B; added a shared asyncpg pool (min 2 / max 10) and a smoke test.', project: 'service-a', date: '2026-07-01', role: 'assistant', score: 0.91 },
       { id: 'e:2', content: 'Refactored the widget cache into a WidgetCache class; hit rate unchanged.', project: 'service-b', date: '2026-06-15', score: 0.71 },
     ],
-    entities: [
-      { name: 'service A', summary: 'Example project used to demonstrate the recall debug surface.', score: 0.81 },
-    ],
-    timeline: [
-      { date: '2026-06-30', fact: 'service A shipped v2', type: 'milestone', salience: 2, score: 0.74 },
-    ],
-    preferences: [
-      { pref: 'prefers boring, well-understood infra over clever abstractions', polarity: 'like', since: '2026-03-02', asserted: 7, score: 0.62 },
+    notes: [
+      { id: 'n:7', hook: 'prefers boring, well-understood infra over clever abstractions', note: 'Stated in the service A design review; applies to new dependencies too.' },
     ],
     web: [],
     debug: {
       total_ms: 341,
-      legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, timeline: 33, prefs: 9 },
+      legs_ms: { embed: 12, bm25: 48, vector: 96, kg: 141, web: 4, rerank: 168, notes: 33 },
       pool_sizes: { bm25: 100, vector: 100, fused: 100, kg_candidates: 12 },
       rerank: { model: 'rerank-3-lite', top_score: 0.91 },
       est_tokens: 1874,
@@ -287,6 +289,7 @@ export async function mockApi<T>(path: string): Promise<T> {
   else if (p === 'metrics/ingestion') out = FIX_METRICS.ingestion;
   else if (p === 'metrics/corpus') out = FIX_METRICS.corpus;
   else if (p === 'timeline') out = FIX_P5.timeline;
+  else if (p === 'timeline/months') out = FIX_P5.months;
   else if (p === 'preferences') out = FIX_P5.preferences;
   else if (p === 'dream/report') out = FIX_P5.dreamReport;
   else if (p === 'behavior/files') out = FIX_P5.behaviorFiles;
@@ -312,7 +315,7 @@ export async function mockApi<T>(path: string): Promise<T> {
   return out as T;
 }
 
-export const mockFlag = (_kind: string, _id: string) => ({ status: 'ok', flagged: true });
+export const mockFlag = (_kind: string, _id: string, flagged: boolean) => ({ status: 'ok', flagged });
 
 // ---- delete (phase 7) ----
 // Fixed non-zero counts so #mock exercises the interesting readout: a mixed chunk (text of
@@ -327,6 +330,8 @@ export function mockDeleteEpisode<T>(id: string): Promise<T> {
     facts_deleted: 2,
     facts_unlinked: 1,
     events_deleted: 1,
+    deleted_fact_ids: [],
+    deleted_event_ids: [],
   } as T);
 }
 

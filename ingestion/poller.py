@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ingestion.db import Database
@@ -34,6 +36,11 @@ def _drain_concurrency() -> int:
     except ValueError:
         return 1
 
+
+# run_loop touches this at the top of every iteration; the poller services' compose
+# healthcheck reads its age. Its window (compose.yml) must outlast the longest honest
+# iteration: one drain (45 min is the stale-claim limit) plus the 30 min quota backoff.
+_HEARTBEAT = Path(tempfile.gettempdir()) / "poller.alive"
 
 # Daily, on the master replica's full cycle: entities with no edges are deleted once a day
 # old (KGPostgresWriter.delete_orphan_entities). Drain-only replicas never sweep.
@@ -390,6 +397,7 @@ class Poller:
             if self._stop_requested.is_set():
                 logger.info("Maintenance loop stopped cleanly")
                 return
+            _HEARTBEAT.touch()
             drained = 0
             now_mono = time.monotonic()
             if not drain_only:

@@ -2,8 +2,6 @@
 Tests for Phase 2b extraction pipeline.
 
 Unit tests run without any external services.
-Integration tests (marked @pytest.mark.integration) require a live FalkorDB
-and are skipped in CI.
 """
 
 from __future__ import annotations
@@ -552,32 +550,6 @@ class TestBannedNameInValidator:
         assert len(ce.facts) == 1
         assert ce.facts[0].relationship == "PAYS"
         assert len(ce.dropped_facts) == 2
-
-    def test_filter_can_be_disabled(self, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_BANNED_NAME_FILTER", "0")
-        ce = CombinedExtraction(
-            entities=[
-                ExtractedEntity(name="$10,000 premium", type="Amount"),
-                ExtractedEntity(name="Synapse", type="Project"),
-            ],
-            facts=[
-                ExtractedFact(
-                    source="Synapse",
-                    target="$10,000 premium",
-                    relationship="COSTS",
-                    fact="Synapse costs a $10,000 premium",
-                )
-            ],
-        )
-        assert len(ce.entities) == 2
-        assert len(ce.facts) == 1
-
-    def test_flag_is_read_per_call_not_at_import(self, monkeypatch):
-        # The A/B harness flips the flag between arms inside one process.
-        monkeypatch.setenv("SYNAPSE_BANNED_NAME_FILTER", "0")
-        assert len(CombinedExtraction(entities=[_entity("6 PM", "Time")], facts=[]).entities) == 1
-        monkeypatch.setenv("SYNAPSE_BANNED_NAME_FILTER", "1")
-        assert CombinedExtraction(entities=[_entity("6 PM", "Time")], facts=[]).entities == []
 
 
 # ---------------------------------------------------------------------------

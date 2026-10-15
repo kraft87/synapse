@@ -25,6 +25,8 @@ import re
 from collections import Counter
 from datetime import datetime
 
+import psycopg
+
 from . import config
 
 _MARKER = re.compile(r"^\[tool:([\w-]+)\]\s*(.*)$")
@@ -39,14 +41,7 @@ def _dsn() -> str:
 
 
 def _connect(dsn: str):
-    try:
-        import psycopg
-
-        return psycopg.connect(dsn, connect_timeout=8)
-    except ImportError:
-        import psycopg2
-
-        return psycopg2.connect(dsn, connect_timeout=8)
+    return psycopg.connect(dsn, connect_timeout=8)
 
 
 def db_session_views(

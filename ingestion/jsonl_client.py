@@ -16,7 +16,6 @@ with the same shape produced by the Logfire ingestion path.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +23,7 @@ import orjson
 
 from ingestion.models import Episode
 from ingestion.project_label import label_from_path
+from ingestion.turns import TurnSequence, parse_iso
 
 logger = logging.getLogger(__name__)
 
@@ -84,11 +84,6 @@ def _tool_input_detail(inp: Any) -> str:
         or inp.get("url")
         or (str(inp)[:120] if inp else "")
     )
-
-
-def _strip_nulls(text: str) -> str:
-    """Postgres TEXT columns reject NUL bytes — strip them defensively."""
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _tool_result_text(raw: Any) -> str:
@@ -261,33 +256,25 @@ class JSONLParser:
         project_by_cwd: dict[str, str] | None = None,
     ) -> list[Episode]:
         episodes: list[Episode] = []
-        prev_assistant: str | None = None
-        seq = 0
         # Claude Code transcripts physically repeat records across compaction/resume
         # (one file can carry the same uuid up to ~5x). The span_id is a group's last
         # uuid, so a repeated turn yields duplicate span_ids — which collide on the
         # episodes partial-unique span_id index and 500 the /ingest push mid-batch
-        # (dropping the session's tail). A repeated uuid IS the same turn, so keep only
-        # its first occurrence. Lives at the shared seam, so push and sweep stay identical.
-        seen_span_ids: set[str] = set()
+        # (dropping the session's tail). TurnSequence keeps only the first occurrence
+        # of a repeated uuid. Lives at the shared seam, so push and sweep stay identical.
+        turns = TurnSequence()
 
         for group in groups:
             if not group:
                 continue
-            seq += 1
+            turn = turns.begin()
 
-            content_parts: list[str] = []
-            human_turn: str | None = None
-            assistant_turn: str | None = None
             model: str | None = None
             session_id: str | None = None
             cwd: str | None = None
             last_uuid: str | None = None
             ts: str | None = None
             git_branch: str | None = None
-
-            if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
 
             for rec in group:
                 session_id = session_id or rec.get("sessionId")
@@ -303,32 +290,18 @@ class JSONLParser:
                 if rtype == "user":
                     if text and text.startswith(_HOOK_FEEDBACK_PREFIX):
                         text = None
-                    if text and human_turn is None and len(text) > 0:
-                        human_turn = text[:3000]
-                        content_parts.append(f"[user] {human_turn}")
+                    turn.user(text)
                     for tr in tresults:
-                        content_parts.append(tr)
+                        turn.line(tr)
                 else:  # assistant
                     for tu in tuses:
-                        content_parts.append(tu)
-                    if text:
-                        assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:3000]}")
-
-            # A hook bounce with no reply leaves only the [context] prefix: nothing to store.
-            if not session_id or not content_parts[1 if prev_assistant else 0 :]:
-                continue
+                        turn.line(tu)
+                    turn.assistant_text(text)
 
             span_id = f"jsonl:{last_uuid}" if last_uuid else None
-            if span_id is not None:
-                if span_id in seen_span_ids:
-                    continue  # repeated turn (compaction re-dump) — already emitted
-                seen_span_ids.add(span_id)
-
-            try:
-                created_at = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
-            except (ValueError, TypeError):
-                created_at = None
+            # A hook bounce with no reply leaves only the [context] prefix: nothing to store.
+            if not session_id or not turns.accept(turn, span_id):
+                continue
 
             project = (
                 project_override
@@ -339,13 +312,13 @@ class JSONLParser:
             episodes.append(
                 Episode(
                     session_id=session_id,
-                    sequence=seq,
+                    sequence=turn.sequence,
                     project=project,
                     platform="claude_code",
                     model=model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=turn.human,
+                    assistant_turn=turn.assistant,
+                    content=turn.content,
                     span_id=span_id,
                     source="jsonl",
                     metadata={
@@ -354,9 +327,8 @@ class JSONLParser:
                         "cwd": cwd,
                         "git_branch": git_branch,
                     },
-                    created_at=created_at,
+                    created_at=parse_iso(ts),
                 )
             )
-            prev_assistant = assistant_turn
 
         return episodes

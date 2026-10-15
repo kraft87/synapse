@@ -25,6 +25,7 @@ import {
 import { useStore } from '../state';
 import { superColor, cssValue, validityLine, mono } from '../tokens';
 import { openEpisode } from '../hash';
+import { asOfDateFor, asOfLabel, AS_OF_TODAY } from '../asOf';
 
 const NODE_CAP = 150;
 // First render shows a readable subset; the "+N more" cluster chip pages the rest in.
@@ -39,15 +40,6 @@ function ensureRegistered() {
   try { cytoscape.use(coseBilkent); } catch { /* already registered */ }
   registered = true;
 }
-
-// ---- as-of slider (0..24 → months back; 24 = today/null) ----
-function asOfDateFor(idx: number): Date | null {
-  if (idx >= 24) return null;
-  const d = new Date();
-  d.setMonth(d.getMonth() - (24 - idx));
-  return d;
-}
-const asOfLabel = (idx: number): string => (idx >= 24 ? 'today' : (asOfDateFor(idx) as Date).toISOString().slice(0, 10));
 
 // ---- concrete-color palette (cytoscape draws to canvas, so var(--x) can't resolve) ----
 function buildPalette() {
@@ -80,7 +72,8 @@ function stylesheet(pal: Palette, sizeRef: { current: number }): cytoscape.Style
     } as unknown as cytoscape.Css.Node },
     { selector: 'node.cluster', style: {
       'background-color': pal.bg3, 'border-width': 1, 'border-color': pal.line2, shape: 'round-rectangle',
-      color: pal.acc, 'text-halign': 'center', 'text-margin-x': 0, width: 'label', height: 20,
+      color: pal.acc, 'text-halign': 'center', 'text-margin-x': 0,
+      width: (e: cytoscape.NodeSingular) => Math.max(48, String(e.data('name')).length * 6.5 + 20), height: 20,
       padding: 6, 'font-size': 10.5,
     } as unknown as cytoscape.Css.Node },
     { selector: 'node:selected', style: { 'border-width': 2, 'border-color': pal.acc } },
@@ -125,13 +118,18 @@ export function Graph() {
   const pageMoreRef = useRef<() => void>(() => {});
   const asOfReqRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const suggestTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suggestSeq = useRef(0);        // bumped to supersede a pending or in-flight typeahead
+  // Bumped by every new seed (a replace). An expand or as-of merge belongs to the seed it
+  // started under: when a newer seed has been asked for, its result is dropped, as is the
+  // result of an older seed, so the latest seed wins and nothing old merges into its graph.
+  const seedGen = useRef(0);
 
   const [model, setModel] = useState<GraphModel>({ nodes: [], edges: [] });
   const [renderCap, setRenderCap] = useState(INITIAL_RENDER_CAP);
   const [seedText, setSeedText] = useState('');
   const [seedUuid, setSeedUuid] = useState<string | null>(null);
   const [depth, setDepth] = useState<1 | 2>(1);
-  const [asOfIdx, setAsOfIdx] = useState(24);
+  const [asOfIdx, setAsOfIdx] = useState(AS_OF_TODAY);
   const [selId, setSelId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [notFound, setNotFound] = useState(false);
@@ -145,18 +143,22 @@ export function Graph() {
   const loadNeighborhood = useCallback((
     query: string, opts: { depth?: 1 | 2; as_of?: string | null; replace: boolean },
   ) => {
+    const mine = opts.replace ? ++seedGen.current : seedGen.current;
     setLoading(true); setNotFound(false);
     fetchGraphNeighborhood({ entity: query, depth: opts.depth ?? depth, as_of: opts.as_of ?? null, limit: NODE_CAP })
       .then((nb) => {
-        setSeedUuid(nb.seed);
-        setTruncated(nb.truncated);
+        if (mine !== seedGen.current) return;
         if (opts.replace) {
+          setSeedUuid(nb.seed);
+          setTruncated(nb.truncated);
           pendingLayoutRef.current = { mode: 'full', added: nb.nodes.map((n) => n.uuid) };
           setModel({ nodes: nb.nodes, edges: nb.edges });
           setSelId(nb.seed);
           const s = nb.nodes.find((n) => n.uuid === nb.seed);
           if (s) setSeedText(s.name);
         } else {
+          // The seed stays the seed; the graph is capped if any of its loads was.
+          setTruncated((t) => t || nb.truncated);
           setModel((prev) => {
             const nByU = new Map(prev.nodes.map((n) => [n.uuid, n]));
             const added: string[] = [];
@@ -169,18 +171,19 @@ export function Graph() {
         }
       })
       .catch((err) => {
-        if (err instanceof AuthError) return;
+        if (err instanceof AuthError || mine !== seedGen.current) return;
         if (String(err?.message || '').includes('404')) { if (opts.replace) { setNotFound(true); setModel({ nodes: [], edges: [] }); setSelId(null); } }
         else setToast('neighborhood query failed — showing last graph');
       })
-      .finally(() => setLoading(false));
+      .finally(() => { if (mine === seedGen.current) setLoading(false); });
   }, [depth]);
 
-  const runSeed = useCallback((query: string) => {
+  // A new seed starts over; `d` is the depth to load it at (the toggle reloads the current seed).
+  const runSeed = useCallback((query: string, d: 1 | 2 = depth) => {
     if (!query.trim()) return;
     setRenderCap(INITIAL_RENDER_CAP);
-    setSuggest([]); setSuggestIdx(-1);
-    loadNeighborhood(query.trim(), { replace: true });
+    closeSuggest();
+    loadNeighborhood(query.trim(), { replace: true, depth: d });
   }, [loadNeighborhood]);
 
   const expand = useCallback((uuid: string) => { loadNeighborhood(uuid, { replace: false, depth: 1 }); }, [loadNeighborhood]);
@@ -197,7 +200,6 @@ export function Graph() {
       autounselectify: true, // selection is driven by our selId, not cytoscape's tap toggle
       boxSelectionEnabled: false,
       minZoom: 0.2, maxZoom: 3,
-      wheelSensitivity: 0.25,
     });
     cyRef.current = cy;
     cy.on('tap', 'node', (ev) => {
@@ -218,16 +220,16 @@ export function Graph() {
     return () => { cy.destroy(); cyRef.current = null; };
   }, []);
 
-  // ---- consume the dossier "view in graph" handoff on mount ----
+  // ---- consume the dossier "view in graph" handoff, whenever it is set (also while the
+  // Graph is already the open page) ----
   useEffect(() => {
-    if (store.graphSeed) {
-      const { uuid, name } = store.graphSeed;
-      setSeedText(name);
-      store.clearGraphSeed();
-      loadNeighborhood(uuid, { replace: true });
-    }
+    if (!store.graphSeed) return;
+    const { uuid, name } = store.graphSeed;
+    setSeedText(name);
+    store.clearGraphSeed();
+    runSeed(uuid);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [store.graphSeed]);
 
   // ---- reconcile the model into cytoscape (diff → keep positions → layout) ----
   useEffect(() => {
@@ -340,15 +342,26 @@ export function Graph() {
   };
 
   // ---- toolbar typeahead ----
+  function supersedeSuggest() {
+    suggestSeq.current += 1;
+    if (suggestTimer.current) clearTimeout(suggestTimer.current);
+  }
+  function closeSuggest() {
+    supersedeSuggest();
+    setSuggest([]); setSuggestIdx(-1);
+  }
   const onSeedInput = (val: string) => {
     setSeedText(val); setNotFound(false);
-    if (suggestTimer.current) clearTimeout(suggestTimer.current);
-    if (!val.trim()) { setSuggest([]); setSuggestIdx(-1); return; }
+    if (!val.trim()) { closeSuggest(); return; }
+    supersedeSuggest();
+    const mine = suggestSeq.current;
     suggestTimer.current = setTimeout(() => {
-      fetchGraphEntities(val.trim(), 8).then((r) => { setSuggest(r); setSuggestIdx(-1); }).catch(() => setSuggest([]));
+      fetchGraphEntities(val.trim(), 8)
+        .then((r) => { if (mine === suggestSeq.current) { setSuggest(r); setSuggestIdx(-1); } })
+        .catch(() => { if (mine === suggestSeq.current) setSuggest([]); });
     }, 180);
   };
-  const chooseSuggest = (e: GraphEntity) => { setSeedText(e.name); setSuggest([]); setSuggestIdx(-1); runSeed(e.uuid); };
+  const chooseSuggest = (e: GraphEntity) => { setSeedText(e.name); runSeed(e.uuid); };
   const onSeedKey = (ev: React.KeyboardEvent) => {
     if (suggest.length && (ev.key === 'ArrowDown' || ev.key === 'ArrowUp')) {
       ev.preventDefault();
@@ -356,7 +369,12 @@ export function Graph() {
     } else if (ev.key === 'Enter') {
       if (suggestIdx >= 0 && suggest[suggestIdx]) chooseSuggest(suggest[suggestIdx]);
       else runSeed(seedText);
-    } else if (ev.key === 'Escape') { setSuggest([]); setSuggestIdx(-1); }
+    } else if (ev.key === 'Escape') closeSuggest();
+  };
+  const changeDepth = (d: 1 | 2) => {
+    if (d === depth) return;
+    setDepth(d);
+    if (seedUuid) runSeed(seedUuid, d);
   };
 
   // ---- inspector data ----
@@ -381,7 +399,7 @@ export function Graph() {
           <input
             className="field" value={seedText} spellCheck={false} placeholder="seed entity…"
             onChange={(e) => onSeedInput(e.target.value)} onKeyDown={onSeedKey}
-            onBlur={() => setTimeout(() => setSuggest([]), 120)}
+            onBlur={() => setTimeout(closeSuggest, 120)}
             style={{ width: '100%', boxSizing: 'border-box', background: 'var(--bg1)', border: '1px solid var(--line2)', borderRadius: '7px', padding: '7px 10px', fontFamily: mono, fontSize: '12.5px', color: 'var(--txt)', outline: 'none' }}
           />
           {suggest.length > 0 && (
@@ -402,14 +420,14 @@ export function Graph() {
         </div>
         <button className="chipbtn" onClick={() => runSeed(seedText)} style={{ border: '1px solid var(--acc)', background: 'var(--acc-bg)', color: 'var(--acc)', borderRadius: '7px', padding: '7px 13px', fontSize: '12.5px', fontFamily: mono, cursor: 'pointer' }}>seed</button>
         <div style={{ display: 'flex', border: '1px solid var(--line2)', borderRadius: '7px', overflow: 'hidden' }}>
-          <button onClick={() => setDepth(1)} style={depthBtn(1)}>depth 1</button>
-          <button onClick={() => setDepth(2)} style={{ ...depthBtn(2), borderLeft: '1px solid var(--line2)' }}>depth 2</button>
+          <button aria-pressed={depth === 1} onClick={() => changeDepth(1)} style={depthBtn(1)}>depth 1</button>
+          <button aria-pressed={depth === 2} onClick={() => changeDepth(2)} style={{ ...depthBtn(2), borderLeft: '1px solid var(--line2)' }}>depth 2</button>
         </div>
         <button className="gbtn" onClick={relayout} style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--txt2)', borderRadius: '7px', padding: '7px 13px', fontSize: '12.5px', fontFamily: mono, cursor: 'pointer' }}>re-run layout</button>
         <div style={{ flex: 1 }} />
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
           <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)' }}>as-of</span>
-          <input type="range" min={0} max={24} value={asOfIdx} onChange={(e) => setAsOfIdx(Number(e.target.value))} style={{ width: '180px', accentColor: 'var(--acc)' }} />
+          <input type="range" aria-label="as-of date" aria-valuetext={asOfLabel(asOfIdx)} min={0} max={AS_OF_TODAY} value={asOfIdx} onChange={(e) => setAsOfIdx(Number(e.target.value))} style={{ width: '180px', accentColor: 'var(--acc)' }} />
           <span style={{ fontFamily: mono, fontSize: '12px', color: 'var(--acc)', minWidth: '86px' }}>{asOfLabel(asOfIdx)}</span>
         </div>
       </div>
@@ -418,7 +436,7 @@ export function Graph() {
       {/* body */}
       <div style={{ display: 'flex', gap: '12px', flex: 1, minHeight: 0, flexWrap: 'wrap' }}>
         {/* canvas */}
-        <div style={{ flex: 2, minWidth: '380px', position: 'relative', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '12px', overflow: 'hidden', minHeight: '540px' }}>
+        <div style={{ flex: 2, minWidth: 'min(380px, 100%)', position: 'relative', background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '12px', overflow: 'hidden', minHeight: '540px' }}>
           <div ref={containerRef} style={{ position: 'absolute', inset: 0 }} />
           {loading && (
             <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', pointerEvents: 'none' }}>

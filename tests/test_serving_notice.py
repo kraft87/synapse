@@ -20,7 +20,6 @@ The properties pinned here:
 from __future__ import annotations
 
 import importlib
-import os
 
 import pytest
 
@@ -32,6 +31,7 @@ from mcp_server.recall_warnings import (
     serving_notice,
     with_notice,
 )
+from tests.helpers.db import DB_URL
 
 _ALL_NOTICES = (NO_CREDENTIAL_NOTICE, RESTRICTED_EMPTY_NOTICE, SIGN_IN_NOTICE)
 
@@ -121,23 +121,7 @@ def test_notice_text_names_no_ids_or_credentials(notice):
 # End to end through the real server wiring
 # ---------------------------------------------------------------------------
 
-_TEST_DB = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
 _ROOT = "root-tok"
-
-
-def _db_reachable() -> bool:
-    try:
-        import psycopg
-
-        psycopg.connect(_TEST_DB, connect_timeout=2).close()
-        return True
-    except Exception:  # pragma: no cover - environment dependent
-        return False
-
-
-_needs_db = pytest.mark.skipif(not _db_reachable(), reason="no test DB reachable")
 
 _AUTH_KEYS = (
     "SYNAPSE_MACHINE_TOKEN",
@@ -196,7 +180,7 @@ def _reload(monkeypatch, machine_token: str):
     for k in _AUTH_KEYS:
         monkeypatch.setenv(k, "")
     monkeypatch.setenv("SYNAPSE_MACHINE_TOKEN", machine_token)
-    monkeypatch.setenv("SYNAPSE_DB_URL", _TEST_DB)
+    monkeypatch.setenv("SYNAPSE_DB_URL", DB_URL)
     import mcp_server.server as s
 
     s = importlib.reload(s)
@@ -232,7 +216,7 @@ def server(monkeypatch, devices):
 def _device_claims(conn, token: str) -> dict:
     from ingestion.surfaces import resolve_caller, token_hash
 
-    st = resolve_caller(_TEST_DB, token_hash_hex=token_hash(token))
+    st = resolve_caller(DB_URL, token_hash_hex=token_hash(token))
     return {
         "kind": "device",
         "surface_id": st.surface_id,
@@ -250,7 +234,7 @@ def _call_all_tools(s) -> list[dict]:
     ]
 
 
-@_needs_db
+@pytest.mark.db
 @pytest.mark.parametrize(
     "token,expected",
     [
@@ -274,7 +258,7 @@ def test_mcp_read_tools_explain_a_serve_nothing_verdict(server, conn, monkeypatc
             assert out["warnings"] == [expected], out
 
 
-@_needs_db
+@pytest.mark.db
 def test_mcp_notice_precedes_leg_degradation_warnings(server, monkeypatch):
     leg = "embedding failed (voyage: Unauthorized): vector legs skipped, results are BM25-only."
     monkeypatch.setattr(server, "_recall_engine", _StubEngine(leg_warning=leg))
@@ -285,7 +269,7 @@ def test_mcp_notice_precedes_leg_degradation_warnings(server, monkeypatch):
     assert server.recall_full_turns("widget")["warnings"] == [NO_CREDENTIAL_NOTICE, leg]
 
 
-@_needs_db
+@pytest.mark.db
 def test_mcp_oauth_sign_in_without_a_grant_gets_the_sign_in_remedy(server, monkeypatch):
     monkeypatch.setattr(server, "_IDENTITY_CLAIMS", ("preferred_username",))
     monkeypatch.setattr(
@@ -294,7 +278,7 @@ def test_mcp_oauth_sign_in_without_a_grant_gets_the_sign_in_remedy(server, monke
     assert server.recall("widget")["warnings"] == [SIGN_IN_NOTICE]
 
 
-@_needs_db
+@pytest.mark.db
 def test_mcp_without_a_verified_credential_stays_silent(server, monkeypatch):
     """No token context at all (open server, stdio): nothing authenticated, so nothing to
     fix with a credential, and the response keeps its pre-notice shape."""
@@ -313,7 +297,7 @@ def _h(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-@_needs_db
+@pytest.mark.db
 @pytest.mark.parametrize(
     "token,expected",
     [
@@ -351,7 +335,7 @@ def _assert_board(server, token, expected):
         assert "episodes across" in lines[2]
 
 
-@_needs_db
+@pytest.mark.db
 @pytest.mark.parametrize(
     "token,expected",
     [
@@ -367,20 +351,20 @@ def test_board_puts_the_notice_at_the_top(server, token, expected):
     _assert_board(server, token, expected)
 
 
-@_needs_db
+@pytest.mark.db
 def test_board_keeps_the_restricted_notice_before_057(server):
     """Without schema 057 an empty-allowlist device is served nothing, so it keeps the
     notice, exactly as before 057."""
     from ingestion.surfaces import OWN_SURFACE_PROBE
 
-    OWN_SURFACE_PROBE.missing(_TEST_DB)  # as if the probe had just found no column
+    OWN_SURFACE_PROBE.missing(DB_URL)  # as if the probe had just found no column
     try:
         _assert_board(server, "empty-dev-tok", RESTRICTED_EMPTY_NOTICE)
     finally:
         OWN_SURFACE_PROBE.reset()
 
 
-@_needs_db
+@pytest.mark.db
 def test_unauthenticated_requests_are_refused_before_any_notice(server):
     """No oracle: a request without a valid credential never reaches a verdict."""
     with _client(server) as c:
@@ -391,7 +375,7 @@ def test_unauthenticated_requests_are_refused_before_any_notice(server):
             assert r.status_code == 401 and "warnings" not in r.json()
 
 
-@_needs_db
+@pytest.mark.db
 def test_open_server_serves_its_empty_answer_without_a_notice(monkeypatch, devices):
     """An open server authenticates nobody, so every caller is unknown and no credential
     would change that. The notice would be wrong advice there; the startup banner owns

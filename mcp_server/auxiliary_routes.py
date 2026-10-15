@@ -53,10 +53,11 @@ def register(
     # Private mode — the plugin's toggle CLI flips a session's "off the record" flag here
     # (schema 050). The flag is what ingest_turns/backfill check, so a session marked private
     # can never be ingested by ANY path, including one that bypasses the plugin's hook.
-    # Same machine-token seam. No-op w/o DB.
+    # Same machine-token seam, except that deleting what the session already stored
+    # (?purge=1) needs full trust or the session's own stamps. No-op w/o DB.
     from mcp_server.private_session_routes import register as _register_private_routes
 
-    _register_private_routes(mcp, DB_URL, _machine_authorized)
+    _register_private_routes(mcp, DB_URL, _machine_authorized, _request_trust)
 
     # Surface enrollment + registration — audience scoping's operator seam (schema 053/054).
     # Which DEVICES get the full corpus and which get only work-safe notes + an allowlisted
@@ -66,7 +67,7 @@ def register(
     # AFTER _idp is built, since enrollment needs it. Doing nothing is already the safe state.
     from mcp_server.surface_routes import register as _register_surface_routes
 
-    _register_surface_routes(mcp, DB_URL, _machine_authorized, _admin_authorized, idp=_idp)
+    _register_surface_routes(mcp, DB_URL, _admin_authorized, idp=_idp)
 
     # Board read route — GET /context?project=X serves the rendered explicit-memory board
     # for the plugin's SessionStart hook (the ONLY serve path — see the Tools comment).
@@ -87,8 +88,8 @@ def register(
     # contract docs/dashboard-contract.md). Static routes are unauthenticated (public bundle, no
     # data); every api route rides the ADMIN gate, not the client one. That move is required, not
     # cosmetic: /dash/api serves the whole corpus unfiltered and can flag/edit, so leaving it on the
-    # root token would let anything holding the enrollment credential read everything the TOFU gate
-    # was meant to withhold. No-op w/o DB_URL, like the siblings.
+    # root token would let anything holding the enrollment credential read the unfiltered corpus
+    # that audience scoping withholds from restricted devices. No-op w/o DB_URL, like the siblings.
     from mcp_server.dashboard_routes import register as _register_dashboard_routes
 
     _register_dashboard_routes(mcp, DB_URL, _admin_authorized)

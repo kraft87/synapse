@@ -14,22 +14,13 @@ went to every caller. Now:
 from __future__ import annotations
 
 import json
-import os
 import uuid
 
-import psycopg
 import pytest
 
 from mcp_server import caller_trust as ct
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    psycopg.connect(_DB_URL, connect_timeout=2).close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
+pytestmark = pytest.mark.db
 
 _ROOT = "root-test-token"
 

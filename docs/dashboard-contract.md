@@ -11,11 +11,17 @@ either side. Design source of truth: the handoff bundle (prototype + spec), not 
   `GET /dash/app.js`, `GET /dash/assets/{file}` (self-hosted IBM Plex woff2; whitelist
   served from the build's `assets/` dir — no path traversal). Static routes are
   UNAUTHENTICATED (the code is public; no data in the bundle).
-- Every `/dash/api/*` route requires `Authorization: Bearer <SYNAPSE_MACHINE_TOKEN>`
-  via the existing `_machine_authorized` seam. 401 → `{"status":"error","detail":"unauthorized"}`.
-  The client keeps the token in `localStorage` (paste-once login screen; also accepts
-  `#token=...` in the URL fragment on first load, then strips it). Fragment, not query
-  param — fragments never reach server logs.
+- Every `/dash/api/*` route requires `Authorization: Bearer <token>` through the ADMIN
+  gate (`http_auth.admin_authorized`): an approved, full-trust device token. The root
+  `SYNAPSE_MACHINE_TOKEN` is refused, because every machine that ran the plugin holds it.
+  The dashboard login (`/dash/oauth/start`, `mcp_server/web_login_routes`) mints a
+  full-trust device token for an allowlisted identity and hands it back as `#token=...`
+  in the URL fragment; the client stores it in `localStorage` and strips the fragment.
+  The login screen also takes a pasted full-trust device token as a fallback, and asks the
+  unauthenticated `GET /dash/oauth/available` (`{"available": bool}`: is an identity provider
+  configured?) before it offers "sign in", so a bearer-only deployment shows no dead button.
+  Fragment, not query param — fragments never reach server logs.
+  401 → `{"status":"error","detail":"unauthorized"}`.
 - Spec §7 names endpoints bare (`/feed`, `/search`); they are namespaced under
   `/dash/api/` here to avoid colliding with existing routes (`/timeline/*`,
   `/preferences/top`, `/recall`, `/context`).
@@ -40,9 +46,20 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
 - `cursor`: opaque string from a previous response (`next_cursor`); absent = newest.
 - `limit` ≤ 100. Filters apply where the column exists (episodes: project+source;
   facts: group_id; timeline: project + group_id via its `domain` column, schema 038) —
-  a filter a type lacks does not exclude that type.
-- Feed timestamps: episode `created_at`, fact `created_at`, timeline `ingested_at`
-  (the feed shows when memory was WRITTEN; the event's own date is `t_valid` in data).
+  a filter a type lacks does not exclude that type. A timeline event with no domain
+  (`NULL`: legacy rows, a gate parse miss, a pushed non-git event) fails open, as 038
+  specifies: it passes either group filter (here, in search and in `/timeline`, and in the
+  client's live filter). Facts keep the strict match.
+- Feed timestamps: episode `created_at`, fact `t_created`, timeline `ingested_at`.
+  Facts and timeline events are ordered by when they were WRITTEN (the event's own date is
+  `t_valid` in data); an episode is ordered by its CONVERSATION time, so a backfilled or
+  late-synced episode sits at its own time, not at the top. The live client inserts each
+  streamed item by the same order (ts descending, then id as text descending), so a live
+  feed lists what a reload would.
+  The KG is read through its own columns (`t_created`, `entity_subtype`), never the
+  FalkorDB-era `created_at` / `entity_type` mirrors.
+- The `project` / `source` filter value `untagged` matches NULL, `''` and a literal
+  `untagged` label; any other value is an exact match.
 
 ```json
 {"items": [
@@ -61,7 +78,8 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
 ```
 `sal` maps salience 0/1/2 → 0.3/0.6/0.9 (timeline items only). Fact/timeline items are
 fully inline (no expand fetch); episode expansion fetches `/dash/api/episode/:id`.
-`data.episode_id` on timeline items is the resolved `ep:N` source_ref or null.
+`data.episode_id` on timeline items is the episode named by an `ep:N` or `ep:N#k` source_ref
+(a turn's k-th event, ingestion/timeline_gate.py), or null.
 
 ### GET /dash/api/episode/{id}
 ```json
@@ -76,17 +94,23 @@ fully inline (no expand fetch); episode expansion fetches `/dash/api/episode/:id
 {"facts": [{"uuid": "…", "fact": "…", "group_id": "…", "t_valid": "…", "t_invalid": null}],
  "timeline_events": [{"id": 8841, "fact": "…", "t_valid": "…", "salience": 2}]}
 ```
-Facts whose `episodes` jsonb array contains the id; events with `source_ref = 'ep:<id>'`.
+Facts whose `episodes` jsonb array contains the id; events with `source_ref` `ep:<id>` or
+`ep:<id>#<k>`.
 
 ### GET /dash/api/session/{id}?highlight=<episode_id>
 ```json
-{"session_id": "…", "project": "…", "source": "…", "highlight": 227168,
+{"session_id": "…", "project": "…", "source": "…", "total": 520, "highlight": 227168,
  "episodes": [{"id": 1, "sequence": 1, "created_at": "…",
-                "human_turn": "…", "assistant_turn": "…", "content": "…"}]}
+                "human_turn": "…", "assistant_turn": "…"}]}
 ```
 Ordered by sequence, cap 500 rows. `highlight` echoes the query param (client scrolls to it).
+A session longer than the cap returns a window around the highlighted turn (about half
+before it, sliding to stay full at either end); without a highlight in the session, the
+first 500. `total` counts every stored turn of the session, so the drawer can say "of N" when
+`episodes` is a window. A session with no stored turns is `404 {"detail":"session not found"}`.
+No `content`: the drawer renders the two turn fields (`/episode/{id}` has it).
 
-### GET /dash/api/entity/{uuid}?mentions_offset=0
+### GET /dash/api/entity/{uuid}?mentions_offset=0&facts_offset=0
 ```json
 {"entity": {"uuid": "…", "name": "…", "entity_type": "…", "summary": "…",
              "degree": 12, "created_at": "…"},
@@ -97,34 +121,55 @@ Ordered by sequence, cap 500 rows. `highlight` echoes the query param (client sc
  "mentions": {"items": [{"episode_id": 227001, "created_at": "…", "gist": "…"}],
                "offset": 0, "limit": 20, "total": 63}}
 ```
-Facts = live + superseded edges touching the uuid (superseded have `t_invalid` set).
+Facts = live + superseded edges touching the uuid (superseded have `t_invalid` set), read
+within the entity's own `(owner_id, group_id)`, live first (newest `t_valid` first, undated
+last), then superseded. One page of 200 per request; `facts_offset` walks the rest and
+`stats.facts` is the total the client pages against. `entity.degree` is the live-edge count
+(equal to `stats.edges`), not the `kg_entities.degree` column. `entity_type` is the taxonomy subtype
+(`entity_subtype`, schema 020); `created_at` is the entity's `t_created`.
 `served` = sum of edge `retrieval_count`. Mentions = distinct provenance episodes, newest
 first, paged. (Timeline/preference cross-links: reserved for a later phase.)
 
 ### GET /dash/api/search?q&type=episodes|facts|entities|events&offset=0&limit=20&project&group_id&source
-ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE. NOT recall().
+ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE, as a literal
+substring (`%`, `_` and `\` in `q` are text, not wildcards). NOT recall().
 ```json
 {"hits": [{"type": "episodes", "id": "227168", "snippet": "…",
             "meta": {"project": "…", "source": "…", "ts": "…", "session_id": "…"}}],
  "total_by_type": {"episodes": 41, "facts": 7, "entities": 2, "events": 12},
  "offset": 0, "limit": 20}
 ```
-`total_by_type` is always computed for all four types (tab counts); `hits` only for the
-requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`.
-Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
-resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link.
+`total_by_type` is computed for all four types (tab counts) on a query's first page
+(`offset=0`) and omitted from later pages (the client keeps the totals it has); `hits` only
+for the requested `type`. `limit` ≤ 50. Entity hits: `meta: {name, entity_type, degree}`
+(`entity_type` = `entity_subtype`; `degree` = live edges, which also orders the hits).
+Fact hits' `meta.ts` is the edge's `t_created`; `meta.t_invalid` is set on a superseded
+fact. Fact/event hits carry `meta.episode_id` (fact → first provenance episode, event →
+resolved `ep:N` source_ref; null when unresolvable) so the client can deep-link; event
+hits also carry `meta.source_ref` (a git-sourced event's only provenance, a commit SHA).
 
 ### GET /dash/api/flags · POST /dash/api/flag
 Flag kinds: `episode | fact | timeline_event | preference | note`.
 `item_id`: episode/timeline/preference/note → numeric id as string; fact → edge uuid.
 ```json
-POST body: {"kind": "fact", "id": "<item_id>", "note": "optional"}
+POST body: {"kind": "fact", "id": "<item_id>", "flagged": true, "note": "optional"}
 POST resp: {"status": "ok", "flagged": true}
 GET  resp: {"flags": [{"id": 3, "kind": "fact", "item_id": "…", "note": null,
-                        "created_at": "…", "gist": "<resolved item text, best effort>"}]}
+                        "created_at": "…", "gist": "<resolved item text, best effort>",
+                        "episode_id": 227168, "body": null}]}
 ```
-POST toggles: no active row → insert; active row → set `removed_at`. Every toggle appends
-a `dashboard_audit` row. Flag state on feed/entity payloads comes from the active set.
+`flagged` (optional boolean) is the state the operator wants: `true` always ends flagged and
+`false` always ends unflagged, idempotently (a repeat changes nothing and writes no audit
+row), and the response carries the state it ended in. Without `flagged` the POST toggles (no
+active row → insert; active row → set `removed_at`), the shape older clients send. A
+non-boolean `flagged` is a 400. Every change appends a `dashboard_audit` row. Flag state on
+feed/entity payloads comes from the active set.
+
+`episode_id` on a flag row is the episode the Flags tab opens for it: the episode itself, a
+fact's first provenance episode, or the `ep:<id>` turn a timeline event, preference or note
+was born from. `null` when the ref names no turn (a git SHA) or the episode is gone.
+`body` is a note's full text (the Flags tab shows hook and body inline); `null` for every
+other kind.
 
 ## Phase 2 endpoints (Recall console)
 
@@ -133,8 +178,9 @@ Phase 2 adds the Recall debugging page. It reuses the existing `POST /recall` ro
 
 ### POST /recall — `debug` flag
 
-`POST /recall` already accepts `{query, group_id?, write_feedback?, source?}` (machine-token
-gated, same bearer as `/dash/api/*`). Phase 2 adds two body fields:
+`POST /recall` already accepts `{query, group_id?, write_feedback?, source?}` (client
+gate; the dashboard sends the same bearer it uses for `/dash/api/*`). Phase 2 adds two
+body fields:
 
 - `project?` (string) — scopes the episode legs, same as the MCP `recall(project=…)` arg.
 - `debug?` (bool, default false) — when true the response gains a `debug` envelope.
@@ -158,9 +204,17 @@ The `debug` envelope surfaces the SAME numbers the engine already measures for t
 ```
 
 `legs_ms` carries only legs the engine timed. `embed / bm25 / vector / kg / web / rerank`
-are always present; `timeline` is no longer emitted (the inline timeline leg was
-removed from `recall()` on 2026-08-07) and the waterfall renders an omitted leg as
-untimed/skipped. Absent `debug` key ⇒ `debug` was not requested. The waterfall
+are always present; `notes` is present when the notes leg ran (`SYNAPSE_RECALL_NOTES`, on by
+default); `timeline` is no longer emitted (the inline timeline leg was removed from
+`recall()` on 2026-08-07) and the waterfall renders an omitted leg as untimed/skipped. The
+Served tab shows what the payload carries: `episodes`, `facts`, `notes` (`{id, hook, note}`),
+`web` and `superseded_facts`; the entity, community, timeline and preference buckets are
+retired and never drawn.
+
+The console sends the scope `recall()` honors: it searches exactly one group, so a header
+group of `all` goes out as `technical` (stated beside the query bar), and `untagged` is not a
+project `recall()` can match (its episode legs compare `project` literally), so it goes out
+as no project, also stated. Absent `debug` key ⇒ `debug` was not requested. The waterfall
 UI models the parallel band schematically (all parallel legs start at embed-end, rerank at the
 max parallel end) from these durations; the payload carries durations, not start offsets.
 
@@ -196,7 +250,7 @@ never sees it. `fetch` and `fetch_session` gain the key on the same terms, and t
 ### GET /dash/api/recall/history?limit=50
 
 Recent `recall()` calls from the `recall_metrics` log (`kind = 'recall'`), newest first.
-`limit` ≤ 200 (default 50). Machine-token gated like every `/dash/api/*` route.
+`limit` ≤ 200 (default 50). Admin-gated like every `/dash/api/*` route.
 Deviation from spec §8 (which routed history through the phase-4 `/metrics/recall` aggregate):
 a dedicated slim endpoint ships now and can be superseded by the aggregate later.
 
@@ -229,11 +283,13 @@ Unified, lane-merged list + the nav-badge count.
  "pending_count": 2}
 ```
 - `name`: skill candidate name / config `file_key`. `gist`: the lane `summary` (capped 200).
-- Rows capped 200 **per lane**, newest first, then merged and re-sorted by `created_at`.
+- Rows capped 200 **per lane**: still-`proposed` rows first, then newest first (so a backlog of
+  decided rows never pushes an unreviewed candidate out of the window), then merged and
+  re-sorted by `created_at`.
 - Statuses shown: skills `{proposed, accepted, promoted, rejected}`, config
   `{proposed, accepted, applied, rejected}`. `observe` (pre-graduation) and skills'
   `retired` (decayed) are NOT proposals and are excluded.
-- `status` filters to one status; `kind` (`skill`|`config-edit`) to one lane. `status=all` == unset.
+- `status` filters to one status (in SQL, before the cap); `kind` (`skill`|`config-edit`) to one lane. `status=all` == unset.
 - `pending_count` = `status='proposed'` across BOTH lanes, **independent** of the view
   filters — the header Review badge reads it (accent pill, dark text; hidden at 0).
 
@@ -243,14 +299,16 @@ Normalized detail over the lane's `_proposal_detail`.
 {"id": "skill:12", "kind": "skill", "name": "latency-triage", "status": "proposed",
  "evidence": [{"session_id": "…", "class": "grounded", "signal": "explicit_request", "why": "…"}],
  "provenance_episodes": [227168, 227201],
+ "provenance_sessions": ["…"],
  "payload": {"type": "markdown", "content": "# latency-triage\n…"},
  "audit_log": [{"ts": "…", "action": "proposal_approve", "note": "…"}]}
 ```
 - `evidence` (`str | list`): the lane's raw evidence list (both lanes store a list).
-- `provenance_episodes`: best-effort episode ids behind the evidence — explicit
-  `episode_id` / `ep:<id>` refs on entries, plus the episodes of each distinct evidence
-  `session_id` (bounded 40). `[]` when nothing resolves (lane evidence is keyed by
-  session, not episode, so this is genuinely best-effort).
+- `provenance_episodes`: the episode ids the evidence names outright — an `episode_id` or
+  `ep:<id>` ref on an entry. `[]` when none does (lane evidence is keyed by session, not
+  turn, so most proposals have none).
+- `provenance_sessions`: every distinct evidence `session_id`, first-seen order, uncapped.
+  The client links each to the session drawer instead of guessing turns.
 - `payload.type`: `markdown` (skills SKILL.md draft from `proposal_body`; falls back to
   `summary`) or `diff` (config unified `diff`).
 - `audit_log`: `dashboard_audit` rows for this id, oldest first; plus the lane's own
@@ -261,6 +319,12 @@ Normalized detail over the lane's `_proposal_detail`.
 ```json
 body: {"action": "approve" | "reject", "note": "…"}
 ```
+- A decision applies only to a `proposed` row. Any other status (an applied config, a
+  promoted or already-rejected skill, a double click) returns
+  `{"status": "refused", "detail": "proposal is '<status>', not 'proposed'"}`, changes
+  nothing and writes no audit row; the Review page reloads to show the real status. The
+  check is a read before the lane's update, so two decisions landing in the same instant can
+  still both pass; closing that is the lanes' job.
 - `approve` → the lane's `_proposal_act(..., "accept", ...)`, delegating the lane's own accept:
   - **skills**: applies the proposal. The drafted `proposal_body` is written to
     `skills_lane.skill_registry` through the same upsert `/skills/publish` uses (the two-way
@@ -304,7 +368,7 @@ server-side LISTEN worker hydrates each notification into a full FeedItem and fa
 to connected clients over `GET /dash/api/stream`.
 
 ### GET /dash/api/stream
-Machine-token gated like every `/dash/api/*` route, `Content-Type: text/event-stream`.
+Admin-gated like every `/dash/api/*` route, `Content-Type: text/event-stream`.
 
 **Auth is why the client uses `fetch`, not `EventSource`.** `EventSource` cannot set the
 `Authorization` header, and this route requires the same `Bearer` token as the rest of the
@@ -313,38 +377,71 @@ API. So the client reads the stream with `fetch` + a `ReadableStream` line parse
 usual 401 `{"status":"error","detail":"unauthorized"}` (a plain JSON body, not a stream).
 
 **Events**
+- `ready` — `data` is `{}`, no `id:`. The first frame of every connection, sent once the
+  LISTEN worker is up and this connection's position is fixed: every row committed from then
+  on is delivered. The client refetches page 1 on it (see *Resync* below).
 - `new_episode` | `new_fact` | `new_timeline_event` — `data` is the FeedItem JSON, the SAME
   shape `/dash/api/feed` items carry (produced by the same hydration code path). Each carries
   an `id:` — a monotonically increasing integer event id.
-- `processing_status` — `data` is `{"queue_depth": N, "active": bool}` from `extraction_queue`
-  (pending count + whether anything is processing). Emitted on connect and then ~1/s. It has
-  **no `id:`** (only feed events advance Last-Event-ID). The refresh is a single shared query
-  throttled to ~1/s across ALL connected clients — never a per-connection query.
+- `processing_status` — `data` is `{"queue_depth": N, "processing": N, "failed": N,
+  "active": bool}` from `extraction_queue`: `queue_depth` is the pending count (the name the
+  wire has always used), `processing` the claimed rows, `failed` the rows with status
+  `failed`, `active` whether anything is processing. The first frame of a connection is
+  computed fresh for it (the connection waits up to 2 s for it, and for the LISTEN), then ~1/s.
+  It has **no `id:`** (only feed events advance Last-Event-ID). The refresh is a single shared
+  query throttled to ~1/s across ALL connected clients — never a per-connection query. The
+  snapshot is dropped when the last client leaves, and withdrawn (no frames) when a refresh
+  fails, so a count nothing is refreshing is never sent.
+- `reset` — `data` is `{}`, no `id:`. Events were lost: the ring buffer outran a slow
+  connection (the live loop checks it against the oldest buffered id), or the LISTEN worker
+  lost its connection and reconnected. The client refetches page 1.
 - Heartbeat — a `: heartbeat` SSE comment every 15s so idle proxies don't kill the stream.
+
+**Resync (`ready`).** Nothing in the stream can prove a client saw every row: the LISTEN
+worker only runs while a client is connected (rows written between two connections are never
+notified), and a client's first `/feed` can predate the LISTEN. So on every `ready` the client
+refetches page 1 (`GET /feed`) and merges it under the rows it holds; because the fetch
+starts after `ready`, no row falls between the snapshot and the stream. The merge inserts
+unseen rows in feed order and keeps the rest of the list; if page 1 shares no row with the
+list (more than a page was written meanwhile) it replaces the list and takes the page's
+cursor, so no hole is left between page 1 and the old tail.
 
 **Resume / reset (Last-Event-ID).** The server keeps the last 512 feed events in an
 in-process ring buffer. On connect the client may present its last seen event id via the
 `Last-Event-ID` request header (or `?last_event_id=`):
-- still inside the buffer → the server **replays** every event after it, then streams live;
+- still inside the buffer → the server **replays** every event after it (after `ready`), then
+  streams live;
 - aged out of the buffer, or ahead of the server (buffer was reset, e.g. a server restart) →
-  the server sends a `reset` event (`data: {}`, no id) and the client **refetches page 1**
-  (`GET /feed`) to resync, then resumes live;
-- absent → the client already has page 1 from its initial `/feed` fetch, so the server
-  streams live only (from the current buffer head).
+  no replay: the client's page-1 refetch on `ready` covers it;
+- absent → streams live only (from the current buffer head).
 
-**Client reconnect (spec §2).** The reader reconnects manually with 1s→30s exponential
-backoff, resending `Last-Event-ID`. A transient loss turns the header live dot amber
-("reconnecting") and keeps the stale items on screen. After >5 consecutive failed
-reconnects the client gives up on the stream and falls back to the original 30s `/feed`
-polling automatically. New items that pass the CURRENT filter cluster prepend with the
-slidein animation; items filtered out client-side are dropped (they reappear correctly on
-the next full reload). `MOCK` mode has no server and stays on polling.
+If the LISTEN connection itself drops (a Postgres restart or network blip), the worker
+reconnects with 1s→30s backoff while any client is subscribed, and appends a `reset` event
+to the ring once it is listening again (this one carries an `id` and `data: {"type":"reset"}`);
+notifications sent during the gap are not replayed, so clients refetch page 1.
+
+**Client link (spec §2).** The stream is owned by the app shell, not by the Feed page: it is
+open on every page while signed in, and the header's queue badge reads it everywhere. The
+reader reconnects manually with 1s→30s exponential backoff, resending `Last-Event-ID`; a
+connection counts as healthy only once `ready` arrives. The header shows one of four states:
+`connecting`; `queue N` with `· M running` and `· K failed` (warn colour when K > 0) while the
+stream is live (the count is withdrawn if no status frame arrives for 10 s); `reconnecting`
+after a transient loss (stale rows stay on screen); `polling` after >5 consecutive failed
+reconnects, when the Feed refetches page 1 every 30s. While polling the shell retries the
+stream every 2 minutes, and at once on the window `online` event or when the tab becomes
+visible; a retry that connects returns the link to live and the Feed resyncs. New items that
+pass the CURRENT filter cluster are inserted in feed order (animated only when they land at
+the top; an item older than the last loaded row is left for paging while more pages exist);
+items filtered out client-side are dropped (they reappear correctly on the next full reload).
+A Feed response that belongs to a previous filter selection is discarded, so the list and its
+cursor always match the filters in the header. `MOCK` mode has no server and stays on polling.
 
 **Zero cost when idle.** The LISTEN worker (one dedicated psycopg connection) starts lazily
 on the first subscriber and stops when the last disconnects; with no client connected there
 is no LISTEN connection and NOTIFY is discarded by Postgres.
 
 **Deviations from spec §7.**
+- `ready` is an addition to the spec's event names (the resync point described above).
 - Timeline FeedItems now carry a top-level `group_id` (mirroring the `domain` column, schema
   038) so the live client can apply the group filter uniformly across all three feed types.
   Additive — episodes/facts are unchanged; `/feed` timeline items gain the same field.
@@ -358,7 +455,7 @@ is no LISTEN connection and NOTIFY is discarded by Postgres.
 ## Phase 4 endpoints (Metrics ops page)
 
 Three read-only aggregate endpoints backing the Metrics page's Recall / Ingestion / Corpus
-tabs. Machine-token gated, threadpool, bounded — same posture as every `/dash/api/*` route.
+tabs. Admin-gated, threadpool, bounded — same posture as every `/dash/api/*` route.
 
 **Honesty notes (read before consuming a series):**
 - **Estimated corpus counts.** A table's headline `rows` uses `pg_class.reltuples` (a fast
@@ -368,8 +465,8 @@ tabs. Machine-token gated, threadpool, bounded — same posture as every `/dash/
 - **No ingestion depth history.** `extraction_queue` overwrites a row's `status` in place, so
   historical queue depth is NOT reconstructable and is never fabricated. `queue_depth` is a
   LIVE snapshot only. The only honest throughput series the columns support are
-  **enqueued/hour** (`enqueued_at`) and **completed/hour** (`processed_at` — the single
-  completion timestamp; set when a row goes done/failed).
+  **enqueued/hour** (`enqueued_at`) and **completed/hour** (`processed_at` of the rows whose
+  `status` is `done`; a failed row stamps `processed_at` too and is no completion).
 
 ### GET /dash/api/metrics/recall?window=7d&bucket=1h
 Percentiles over `recall_metrics` where `kind='recall'`, hour-bucketed, within the window.
@@ -378,16 +475,20 @@ Percentiles over `recall_metrics` where `kind='recall'`, hour-bucketed, within t
 `percentile_cont` (continuous); NULL leg timings are ignored by the aggregate, so a disabled
 leg simply doesn't contribute to that bucket's `legs_p50`.
 ```json
-{"series": [
+{"summary": {"calls": 412, "p50": 213.0, "p95": 3225.0, "tokens_p50": 1520},
+ "series": [
    {"t": "2026-07-01T12:00:00+00:00", "p50": 218.0, "p95": 389.0, "calls": 12,
     "tokens_p50": 1540,
     "legs_p50": {"embed": 12.0, "bm25": 48.0, "vector": 96.0, "kg": 141.0,
-                 "web": 4.0, "rerank": 168.0, "timeline": 33.0, "prefs": 9.0}}],
+                 "web": 4.0, "rerank": 168.0, "notes": 33.0}}],
  "slowest": [{"query": "…", "ms_total": 612.0, "created_at": "…"}],
  "score_hist": [{"lo": 0.0, "hi": 0.1, "n": 0}, {"lo": 0.9, "hi": 1.0, "n": 41}]}
 ```
+- `summary`: the window's own p50 / p95 / median tokens over all its calls (the page's tiles).
+  Percentiles of hourly percentiles are not window percentiles, so the tiles never derive
+  from `series`; `p50`, `p95` and `tokens_p50` are null for an empty window.
 - `series` ordered oldest→newest; a leg key is present in `legs_p50` only when that leg was
-  timed in the bucket. `p50/p95/tokens_p50` are null for a bucket with no non-null values.
+  timed in the bucket (`ms_timeline` / `ms_prefs` rows from the retired legs are not reported). `p50/p95/tokens_p50` are null for a bucket with no non-null values.
 - `slowest`: top 10 recalls by `ms_total` desc within the window.
 - `score_hist`: 10 fixed bins over `rerank_top_score` in [0,1] (`width_bucket`); a 1.0 score
   folds into the top bin, sub-0 into the bottom bin.
@@ -412,9 +513,12 @@ Extraction-queue health. `window` parsing identical to `/metrics/recall` (defaul
 - `queue_depth` = live pending count (headline). `queue` breaks out pending/processing/failed.
 - `throughput.*_per_hour`: hour-bucketed, oldest→newest, over the window. These are the two
   honest series (see honesty note); there is deliberately no depth history.
-- `failures`: up to 20 most-recent `status='failed'` rows.
-- `last_dream`: the latest `dream_runs` row (schema 044), or `null` when the table is empty
-  ("no runs recorded yet"). `duration_s` = finished−started; `null` while a run is in flight.
+- `failures`: up to 20 most-recent `status='failed'` rows whose `processed_at` (else
+  `enqueued_at`) falls inside the window; `queue.failed` is the all-time live count.
+- `last_dream`: the latest FINISHED `dream_runs` row (schema 044) — a run that crashed
+  leaves `finished_at` NULL and does not pin it — else the latest unfinished one, or `null`
+  when the table is empty ("no runs recorded yet"). `duration_s` = finished−started; `null`
+  while a run is in flight.
   `counts`/`samples`/`stages` carry only what the nightly lanes cheaply report today
   (`proposals_raised` + the config lane's session/correction/proposal counts); the fuller
   set (facts_extracted, superseded, dedup_merges, timeline_events) is honestly absent until a
@@ -432,7 +536,8 @@ are the expensive part).
 ```
 - `tables`: episodes, kg_entities, kg_relationships, timeline_events, preferences, notes,
   chunks (each only if the table exists). `spark_30d` = 30 daily counts (oldest→newest) off
-  the table's own time column (`created_at`, or `ingested_at` for timeline/preferences);
+  the table's own time column (`created_at`; `t_created` for the KG tables; `ingested_at`
+  for timeline/preferences);
   `[]` when the table has no time column. `delta_30d` = sum of `spark_30d`.
 - `rows_estimated` — see the honesty note. `by_project`/`by_source` are exact, top 12,
   `untagged` for NULL/empty.
@@ -441,14 +546,15 @@ are the expensive part).
 
 Read-only surfaces over the episodic timeline (schema 033), the preference log (035), the
 dream-run bookkeeping (044), and the config-lane file mirror (030/031). Same posture as every
-`/dash/api/*` route: machine-token gated, threadpool, one short-lived connection, bounded,
-fail-soft. No new migration — these read existing tables.
+`/dash/api/*` route: admin-gated, threadpool, one pooled connection, bounded, fail-soft. No new migration — these read existing tables.
 
 **Honesty notes (read before consuming a payload):**
 - **`timeline_events.event_type` is sparse.** Schema 033 deferred typed events, so most rows
-  have `event_type = NULL`. A `type` chip filter narrows to rows with that exact `event_type`;
-  **untyped events show only in the unfiltered view** (the default). This is why the type
-  filter is single-select and the default Events view is the whole stream.
+  have `event_type = NULL`; the rest are `decision | action | finding | milestone` (every
+  writer emits only those, ingestion/llm_schemas.py `_EVENT_TYPES`). A `type` chip filter
+  narrows to rows with that exact `event_type`; **untyped events show only in the unfiltered
+  view** (the default). This is why the type filter is single-select and the default Events
+  view is the whole stream.
 - **No behavior-file history.** `config_lane.config_registry` keeps only the CURRENT version of
   a file (`content` + `content_hash` + `updated_at`); there is NO versions table. So
   `/behavior/file` returns no history and the client's change-history timeline stays hidden —
@@ -460,17 +566,34 @@ fail-soft. No new migration — these read existing tables.
 {"events": [
   {"id": 8841, "t_valid": "2026-07-03T…", "fact": "rerank pool capped at 96",
    "source": "chat", "project": "synapse", "salience": 2, "sal": 0.9,
-   "event_type": "work", "episode_id": 88412, "flagged": false}],
+   "event_type": "decision", "episode_id": 88412, "flagged": false}],
  "next_before": "2026-07-03T…|8841"}
 ```
 - `limit` ≤ 200 (default 50). `sal` maps salience `0/1/2 → 0.3/0.6/0.9` (the feed mapping); the
   salience type ramp reads `sal`. `episode_id` is the resolved `ep:N` `source_ref` (git SHAs → null).
-- `type` filters `event_type` (see honesty note). `group_id` filters the `domain` column (schema 038).
+- `type` filters `event_type` (see honesty note); any value outside the four types is a **400**
+  (`unknown type`), so a drifting client shows up instead of listing nothing. `group_id`
+  filters the `domain` column (schema 038); an unlabelled (`NULL`) event passes either group.
 - `before` is the keyset cursor: a **bare ISO timestamp** (the jump-to-date case → strict
   `t_valid < ts`) OR a compound **`ts|id`** (a prior `next_before` → the full `(t_valid, id)`
   keyset, so ties on `t_valid` never drop or duplicate a row). `next_before` is set whenever a
   full page (`len == limit`) is returned — the next fetch drains the stream (empty page, no
   cursor), exactly like `/feed`.
+
+### GET /dash/api/timeline/months?tz&type&group_id
+The Events tab's jump-to-date options: every month that has events under the same `type` /
+`group_id` filters, newest first, bucketed in the viewer's zone.
+```json
+{"months": [{"month": "2026-09", "n": 41, "before": "2026-10-01T04:00:00+00:00"}]}
+```
+- `tz` (required) is an IANA zone name, the browser's; a missing or unknown one is a **400**, as
+  is an unknown `type`. An event said at 20:30 on Sep 30 in Toronto is stored as 00:30Z on Oct 1
+  and counts under `2026-09`.
+- `before` is the first instant after the month: pass it to `/timeline` as `before` and the page
+  starts at that month's last event and runs back through older months.
+- **Client date rule.** The client shows and buckets every date as the viewer's calendar day in
+  the browser's zone (card dates, month sections, validity lines, preference `since`, the Dream
+  run picker), never by slicing the UTC string.
 
 ### GET /dash/api/preferences?sort=recency|assert_count
 The full standing-preference log (the Preferences tab). LIVE rows first, then superseded
@@ -498,6 +621,9 @@ shape as `/metrics/ingestion`'s `last_dream`. `limit` ≤ 100. Empty table → `
    "samples": {"proposals": [{"id": "config:4", "kind": "config-edit", "name": "rules/x.md"}]},
    "errors": []}]}
 ```
+- The page opens on the newest run that has a `finished_at`; an unfinished run stays in the
+  picker, labelled "in flight" (started within 6 h) or "abandoned" (older: it crashed). A
+  duration under two minutes shows in seconds.
 - The 5 stat cards read `counts.{facts_extracted, superseded, dedup_merges, timeline_events,
   proposals_raised}`; an **absent** count renders "—" (the dream lanes propose, they do not
   extract facts, so most of these are honestly absent today — see the Phase 4 honesty note).
@@ -532,27 +658,17 @@ One mirrored file's content + meta + parsed `[[wikilinks]]`. Reuses the `_fetch_
 - `links` = unique `[[target]]` values in first-seen order (an `|alias` suffix is dropped).
   **No history** (honesty note) — the response carries no versions.
 
-### GET /dash/api/behavior/linkgraph
-Adjacency over every registry file's `[[wikilinks]]`.
-```json
-{"nodes": [{"file_key": "CLAUDE.md", "scope": "global", "group": "CLAUDE.md"}],
- "edges": [{"source": "CLAUDE.md", "target": "rules/voice.md"}]}
-```
-- Nodes are keyed by logical `file_key` (deduped across surfaces). Edges are
-  `file_key → wikilink target`; a target need not be a node (many point at memory notes, which
-  are not mirrored files) — the client resolves what it can (exact `file_key`, or basename
-  without extension) and renders the rest as inert leaves.
 ## Phase 6 endpoints (Graph explorer)
 
-Two read-only endpoints backing the KG explorer page (README §3, spec §4). Machine-token
-gated, threadpool, bounded — same posture as every `/dash/api/*` route. No migration:
+Two read-only endpoints backing the KG explorer page (README §3, spec §4). Admin-gated,
+threadpool, bounded — same posture as every `/dash/api/*` route. No migration:
 they read `kg_entities` / `kg_relationships` (schema 017 + 020 supertype + 028/029
 supersession) directly. `src_uuid`/`tgt_uuid` are NOT FKs — edges match endpoints by
 uuid; an edge to a uuid with no `kg_entities` row is simply dropped (no phantom node).
 
 ### GET /dash/api/graph/entities?q&limit=10
-Seed typeahead — shares the search endpoint's entity leg SQL (`name ILIKE '%q%'`, `degree
-DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
+Seed typeahead — shares the search endpoint's entity leg SQL (`name ILIKE '%q%'` with `q`
+taken literally, live `degree DESC`). `limit` ≤ 25 (default 10). Global (no group scope — the graph is seeded explicitly).
 Empty `q` → `[]`. Returns a bare array:
 ```json
 [{"uuid": "…", "name": "Synapse", "entity_type": "Project", "degree": 10}]
@@ -573,10 +689,13 @@ orphaned, and sets `truncated`.
 ```
 - **Seed resolution:** exact `uuid` → exact `normalized_name` (input lowercased +
   whitespace-collapsed + bookend-punctuation-stripped, mirroring `ingestion.dedup`) → best
-  `name ILIKE` match by `degree DESC`. No match → **404** `entity not found`. Missing/empty
+  `name ILIKE` substring match (`q` taken literally) by live `degree DESC`. No match → **404** `entity not found`. Missing/empty
   `entity` → **400**.
 - **`supertype`** (nodes + typeahead) is the canonical coarse layer (`kg_entities.entity_supertype`,
   schema 020) — the client colors by it; `entity_type` stays the fine-grained label.
+- **`degree`** (nodes, typeahead, search) is the entity's count of live edges, read from
+  `kg_relationships` per request. `kg_entities.degree` is a one-off backfill (schema 017) that
+  nothing maintains, so no dashboard read uses it.
 - **Truncation:** when the reachable set exceeds `limit`, keep the highest-degree nodes (the
   seed is always kept) and set `truncated: true`. Edges are returned only when BOTH endpoints
   survive truncation. Ranking is best-effort over the scanned candidates (per-level BFS scans
@@ -586,8 +705,10 @@ orphaned, and sets `truncated`.
   (`t_invalid ≤ as_of`) — the client renders those dashed (spec §4). When unset, return live
   + superseded and let the client scrub client-side; the client re-queries with `as_of` only
   when a neighborhood was `truncated`. Edges with `t_valid IS NULL` are always visible.
-- Bounded end to end: `kg_rel_src`/`kg_rel_tgt` make per-node expansion cheap; no unbounded
-  scan touches the ~75K-edge table. `node.color` is by `entity_type` (client `etColor`,
+- Bounded end to end: every edge scan names the seed's `(owner_id, group_id)` (an entity's
+  edges live in its own group), so `kg_rel_src`/`kg_rel_tgt`/`kg_rel_pair` make per-node
+  expansion cheap; no unbounded scan touches the ~75K-edge table. Node `entity_type` is
+  `entity_subtype`. `node.color` is by `entity_type` (client `etColor`,
   matching the dossier/search surfaces); the legend shows the six supertype colors.
 
 ## Schema (migrations 042, 044)
@@ -614,7 +735,7 @@ read-only plus the `dashboard_flags` soft-flag (schema 042 explicitly called its
 "deliberately NOT a delete"); phase 7 adds the real thing, because a flag does not
 satisfy "get this out of my memory". Both routes are **hard deletes** (no tombstone, no
 soft-delete column) and each runs in ONE transaction — a partial cascade is never
-committed. Machine-token gated like every `/dash/api/*` route.
+committed. Admin-gated like every `/dash/api/*` route.
 
 Route naming note: these are `/dash/api/episodes/{id}` and `/dash/api/facts/{id}`
 (**plural**), while the phase-1 read routes are `/dash/api/episode/{id}` (singular) and a
@@ -626,8 +747,12 @@ Deletes the episode row and everything that carries ITS CONTENT. Non-numeric id 
 no such episode → 404 `episode not found`.
 ```json
 {"episode_id": 227168, "chunks_deleted": 3, "chunks_mixed_deleted": 1,
- "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1}
+ "facts_deleted": 2, "facts_unlinked": 1, "events_deleted": 1,
+ "deleted_fact_ids": ["<edge-uuid>", "<edge-uuid>"], "deleted_event_ids": [8841]}
 ```
+`deleted_fact_ids` / `deleted_event_ids` name the rows the cascade removed (not the unlinked
+or kept ones), so a client can drop them from its lists. The audit row's `detail` is this
+same object.
 
 **Cascade semantics (the sole-vs-shared rule).** Provenance that names ONLY the deleted
 episode is deleted; provenance SHARED with surviving episodes is unlinked, not deleted.
@@ -655,14 +780,22 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
     NULLed so no edge cites a uuid that no longer exists.
 - **timeline events** (`timeline_events.source_ref` = `ep:<id>` or `ep:<id>#<k>` — the
   multi-event-per-turn form written by `ingestion/timeline_gate.py`) → DELETED
-  (`events_deleted`). `UNIQUE (source, source_ref)` makes a chat event sole-provenance by
-  construction, so the sole-vs-shared rule resolves to "delete"; leaving them would keep
-  serving the deleted turn's content out of `recall()`'s timeline leg.
-- **extraction_queue** rows (`episode_id` FK, `ON DELETE CASCADE`, schema 001) carry a
-  verbatim copy of `episodes.content`, so they must go — the existing FK already does it.
-  Not counted in the response (the operator never sees the queue as memory).
-- **dashboard_flags**: an ACTIVE flag on the deleted item is retired (`removed_at`) so the
-  Flags list can't point at a row that no longer exists. `dashboard_audit` gains a
+  (`events_deleted`). `UNIQUE (source, source_ref)` makes the first telling's turn the
+  owner, so the sole-vs-shared rule resolves to "delete"; leaving them would keep serving
+  the deleted turn's content out of `recall()`'s timeline leg. That includes an event a later
+  turn re-told: the dedup merge (schema 037) only bumps `reported_count` and records no
+  list of re-telling turns, so the cascade cannot tell whether one survives, and a kept row
+  would still carry the deleted turn's text. The private-session purge deletes them the same
+  way.
+- **extraction_queue** rows. Those with an `episode_id` (FK, `ON DELETE CASCADE`, schema
+  001) carry a verbatim copy of `episodes.content`, and the FK takes them. Chunk rows
+  (`content_type = 'chunk'`) are keyed by `(session_id, content)` with no `episode_id`, so
+  the FK misses them: the cascade deletes the ones matching each deleted chunk, in every
+  status. A pending one would otherwise re-extract the deleted text into facts with no
+  provenance, and a done one still stores it. Not counted in the response (the operator
+  never sees the queue as memory).
+- **dashboard_flags**: an ACTIVE flag on a deleted episode, fact or timeline event is
+  retired (`removed_at`) so the Flags list can't point at a row that no longer exists. `dashboard_audit` gains a
   `delete_episode` row carrying the cascade summary as `detail` (append-only; the audit
   log deliberately OUTLIVES the content — it records that a delete happened, not what was
   deleted).
@@ -688,6 +821,19 @@ match would have destroyed 1467 legitimate facts to remove 330 bad ones.
   facts can leave a zero-degree orphan entity; that is graph hygiene for a sweeper, not
   for this route.
 
+**One cascade, two callers.** The cascade above is `dashboard_routes.delete_episode_content`.
+Private mode's session purge (`PUT /private-sessions/{id}?purge=1`,
+`mcp_server/private_session_routes`) runs it over every stored turn of a session in one
+transaction and, unlike this route, also deletes the preferences those turns gave birth to
+(a privacy purge errs toward removal). The cascade is set-based, so a fact citing several
+purged turns is counted once. The purge sits behind the client gate, not the admin gate,
+so it checks trust itself: a full-trust device may purge any session; a restricted device
+only a session whose every stored turn carries its own provenance stamp (schema 057);
+the root token and every other caller get 403, with the privacy flag still set and
+nothing deleted. It writes one `dashboard_audit` row with
+`action = 'purge_private_session'`, `kind = 'session'`, `item_id` = the session id, and
+the summed counts plus the caller's `surface_id` as `detail`.
+
 ### DELETE /dash/api/facts/{id}
 Deletes ONE KG edge by uuid — no cascade, no provenance arithmetic (a fact is the leaf).
 No such uuid → 404 `fact not found`.
@@ -699,17 +845,16 @@ No such uuid → 404 `fact not found`.
   dangling-pointer cleanup the episode cascade does for its sole-provenance deletes.
 - Retires an active `dashboard_flags` row for the uuid; appends a `delete_fact`
   `dashboard_audit` row.
-- The entity endpoints are NOT touched: `kg_entities.degree` is a denormalized counter
-  that the KG backfill recomputes; this route does not try to keep it in sync (it is
-  already stale by design on the dual-write path — schema 017).
+- The entity endpoints are NOT touched: `degree` is counted live from `kg_relationships`
+  on every read (the `kg_entities.degree` column is an unmaintained backfill value).
 
 ## Shipped surface
 
 All spec §8 phases are shipped; no reserved paths remain. `POST /recall`'s `debug: true`
 flag + `/dash/api/recall/history` (phase 2); `/dash/api/proposals*` (phase 2b);
 `/dash/api/stream` SSE (phase 3); `/dash/api/metrics/{recall,ingestion,corpus}` (phase 4);
-`/dash/api/timeline`, `/dash/api/preferences`, `/dash/api/dream/report`,
-`/dash/api/behavior/{files,file,linkgraph}` (phase 5);
+`/dash/api/timeline{,/months}`, `/dash/api/preferences`, `/dash/api/dream/report`,
+`/dash/api/behavior/{files,file}` (phase 5);
 `/dash/api/graph/{entities,neighborhood}` (phase 6);
 `DELETE /dash/api/episodes/{id}` + `DELETE /dash/api/facts/{id}` (phase 7) — all
 documented above.

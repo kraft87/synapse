@@ -35,7 +35,6 @@ import os
 import sys
 import time
 import urllib.error
-import webbrowser
 from collections.abc import Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -195,6 +194,8 @@ def enroll(
         print("Waiting for approval...", file=sys.stderr)
     if open_browser:
         try:  # convenience only: the flow works fine without a local browser
+            import webbrowser  # deferred: board_block imports this module at every session start
+
             webbrowser.open(complete or verify)
         except Exception:
             pass

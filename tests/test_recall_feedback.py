@@ -9,26 +9,11 @@ All data is synthetic — no real queries or session ids.
 
 from __future__ import annotations
 
-import os
-
-import psycopg
 import pytest
 
 from mcp_server import server
 from mcp_server.server import _feedback_ids_error
-
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-    _DB_OK = True
-except Exception:  # pragma: no cover - environment dependent
-    _DB_OK = False
-
-_needs_db = pytest.mark.skipif(not _DB_OK, reason="no test DB reachable")
+from tests.helpers.db import DB_URL as _DB_URL
 
 # ---------------------------------------------------------------------------
 # Validator — pure unit
@@ -139,7 +124,7 @@ def _test_db(monkeypatch, conn):
     conn.execute("DELETE FROM recall_feedback")
 
 
-@_needs_db
+@pytest.mark.db
 def test_tool_round_trip_inserts_labeled_row(conn, _test_db):
     out = server.recall_feedback(
         query="synthetic: how does the widget frobnicate",
@@ -170,7 +155,7 @@ def test_tool_round_trip_inserts_labeled_row(conn, _test_db):
     assert created_at is not None
 
 
-@_needs_db
+@pytest.mark.db
 def test_tool_defaults_store_empty_lists_and_nulls(conn, _test_db):
     out = server.recall_feedback(query="synthetic: bare minimum report")
     assert out["status"] == "ok"
@@ -182,7 +167,7 @@ def test_tool_defaults_store_empty_lists_and_nulls(conn, _test_db):
     assert row == ([], [], None, None, None, None, None)
 
 
-@_needs_db
+@pytest.mark.db
 def test_http_worker_shares_tool_validation_and_insert(conn, _test_db):
     """The /feedback route delegates to _file_recall_feedback — same rejection,
     same insert, so the seams cannot drift."""
@@ -199,7 +184,7 @@ def test_http_worker_shares_tool_validation_and_insert(conn, _test_db):
     ).fetchone()[0] == ["e:7"]
 
 
-@_needs_db
+@pytest.mark.db
 def test_tool_round_trip_via_mcp_client(conn, _test_db):
     """Through the real FastMCP pipeline (middleware included), like the
     tool-surface tests drive it."""

@@ -25,38 +25,20 @@ Fail-open: on any error, no output — the call proceeds unmodified.
 from __future__ import annotations
 
 import json
-import re
+import os
 import sys
 
-# `fetch` is absent: it has no session dimension, and the surface lane it used to
-# receive was removed with schema 054.
-_SYNAPSE_TOOL = re.compile(
-    r"^mcp__.*__(recall|recall_full_turns|recall_feedback|fetch_session|remember)$"
+# The matching and the field logic are the Claude hook's. Dependency-free, so no config.
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugin", "scripts")
 )
+from self_session_inject import inject
 
 
 def main() -> None:
     try:
-        payload = json.load(sys.stdin)
-        tool_name = payload.get("tool_name") or ""
-        # In-script guard mirrors the config matcher so a broader-than-intended
-        # matcher can never auto-allow or rewrite an unrelated tool.
-        if not _SYNAPSE_TOOL.match(tool_name):
-            return
-        session_id = payload.get("session_id")
-        tool_input = payload.get("tool_input") or {}
-        if not isinstance(tool_input, dict):
-            return
-        base = tool_name.rsplit("__", 1)[-1]
-        changed = False
-
-        if session_id:
-            field = "session_id" if base in ("recall_feedback", "remember") else "self_session"
-            if not tool_input.get(field):  # already set (retry or nested call)
-                tool_input[field] = session_id
-                changed = True
-
-        if not changed:
+        tool_input = inject(json.load(sys.stdin))
+        if tool_input is None:
             return
         print(
             json.dumps(

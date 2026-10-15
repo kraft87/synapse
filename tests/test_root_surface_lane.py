@@ -20,35 +20,24 @@ OAuth identities are covered in test_audience_scoping.py and stay unchanged.
 from __future__ import annotations
 
 import asyncio
-import os
 
-import psycopg
 import pytest
+from fastmcp import FastMCP
+from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from fastmcp import FastMCP  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
-
-from ingestion.db import Database  # noqa: E402
-from ingestion.notes import _OWNER  # noqa: E402
-from ingestion.surfaces import UNKNOWN_SURFACE  # noqa: E402
-from mcp_server import board, recall_route, remember_routes, server  # noqa: E402
-from mcp_server.auth_tokens import SynapseTokenVerifier  # noqa: E402
-from tests.helpers.surfaces import (  # noqa: E402
+from ingestion.db import Database
+from ingestion.notes import _OWNER
+from ingestion.surfaces import UNKNOWN_SURFACE
+from mcp_server import board, recall_route, remember_routes, server
+from mcp_server.auth_tokens import SynapseTokenVerifier
+from tests.helpers.surfaces import (
     clear_surfaces,
     register_device,
     register_full,
     register_restricted,
 )
+
+pytestmark = pytest.mark.db
 
 _ROOT = "root-tok"
 _FULL_DEVICE = "full-device-tok"

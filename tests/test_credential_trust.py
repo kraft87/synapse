@@ -18,31 +18,21 @@ cover the replacement, organised around the properties that make it worth the ch
 
 from __future__ import annotations
 
-import os
-
-import psycopg
 import pytest
 from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from ingestion.surfaces import (  # noqa: E402
+from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     issue_dash_token,
     mint_surface,
     resolve_caller,
     token_hash,
 )
-from mcp_server.surface_routes import register  # noqa: E402
-from tests.helpers.surfaces import clear_surfaces, register_device  # noqa: E402
+from mcp_server.surface_routes import register
+from tests.helpers.db import DB_URL as _DB_URL
+from tests.helpers.surfaces import clear_surfaces, register_device
+
+pytestmark = pytest.mark.db
 
 _ROOT = "test-root-token"
 _ADMIN = "admin-device-token"
@@ -80,22 +70,19 @@ class _FakeIdP:
 
 
 def _client(db_url, *, admin_token: str | None = _ADMIN, idp: object | None = None):
-    """A surfaces-routes app with the real gates wired the way the server wires them.
+    """A surfaces-routes app with the admin gate wired the way the server wires it.
 
-    ``authorized`` = any bearer at all; ``admin`` = one specific full-trust device token.
-    Keeping them separate is the point of the file: a test that cleared both gates with
-    one credential would prove nothing about the property under test.
+    ``admin`` = one specific full-trust device token; any other bearer (the root token
+    included) is refused. A test that let every credential clear it would prove nothing
+    about the property under test.
     """
     from fastmcp import FastMCP
-
-    def authorized(request):
-        return bool(_bearer(request))
 
     def admin(request):
         return admin_token is not None and _bearer(request) == admin_token
 
     test_mcp = FastMCP("test-credential-trust")
-    register(test_mcp, db_url, authorized, admin, idp=idp)
+    register(test_mcp, db_url, admin, idp=idp)
     return TestClient(test_mcp.http_app())
 
 
@@ -276,6 +263,17 @@ def test_each_enrollment_gets_its_own_credential(clean, db_url):
 # ---------------------------------------------------------------------------
 
 
+def test_the_admin_gate_has_no_fallback():
+    """The routes that create and list credentials take the admin gate and nothing else.
+    They used to fall back to the client gate when none was passed, which the root token
+    clears: fail-open on exactly the routes that must not be."""
+    import inspect
+
+    params = inspect.signature(register).parameters
+    assert "authorized" not in params
+    assert params["admin"].default is inspect.Parameter.empty
+
+
 def test_mint_issues_a_ready_scoped_token(clean, db_url):
     register_device(clean, _ADMIN, trust="full", surface_id="dev-admin")
     with _client(db_url) as client:
@@ -419,6 +417,29 @@ def test_last_seen_is_stamped_on_use(clean):
     assert _last_seen(clean, "dev-seen") is None
     resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
     assert _last_seen(clean, "dev-seen") is not None
+
+
+def test_last_seen_is_not_rewritten_inside_its_window(clean, monkeypatch):
+    """Every device request resolves its bearer; only the first in a window may write.
+    The window is read with the row, so a fresh stamp costs no UPDATE round trip."""
+    from ingestion import surfaces
+
+    writes: list[str] = []
+    real_touch = surfaces._touch_last_seen
+    monkeypatch.setattr(
+        surfaces, "_touch_last_seen", lambda conn, th: (writes.append(th), real_touch(conn, th))
+    )
+    register_device(clean, "tok", trust="full", surface_id="dev-seen")
+    resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
+    resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
+    assert writes == [token_hash("tok")]
+    clean.execute(
+        "UPDATE surfaces SET last_seen_at = now() - interval '6 minutes' "
+        "WHERE surface_id = 'dev-seen'"
+    )
+    before = _last_seen(clean, "dev-seen")
+    resolve_caller(_DB_URL, token_hash_hex=token_hash("tok"))
+    assert len(writes) == 2 and _last_seen(clean, "dev-seen") > before
 
 
 def _last_seen(conn, sid):

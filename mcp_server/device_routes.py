@@ -8,8 +8,10 @@ browser, no loopback redirect, no redirect URIs at all.
 
 Two unauthenticated bootstrap routes (custom routes bypass FastMCP's auth middleware by
 design — these are the pre-token handshake). Security rests entirely on the IdP: the
-machine token is handed back ONLY after the IdP confirms the device was approved AND the
-approving user's identity is in the allowlist (the same gate as the web/MCP leg).
+token is handed back ONLY after the IdP confirms the device was approved AND the
+approving user's identity is in the allowlist (the same gate as the web/MCP leg). That
+token is the ROOT machine token, the enrollment credential: it may ingest and enroll a
+device, is served nothing, and cannot clear the admin gate (``mcp_server/http_auth``).
 Stateless — the device_code lives on the client and is replayed on each poll; we keep no
 server-side state.
 
