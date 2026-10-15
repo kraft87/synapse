@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Iterable
 from typing import Any, cast
 
 import orjson
@@ -55,6 +56,9 @@ RETURNING id
 #: Each lost pass means another writer committed a higher sequence, so a second pass
 #: nearly always wins; this only bounds a session under a continuous write storm.
 _APPEND_ATTEMPTS = 5
+#: Serializes the writers of one session's sequence numbers: append_episode, and a
+#: store_episodes call from before its span-index read to its commit.
+_SESSION_LOCK = "SELECT pg_advisory_xact_lock(hashtext(%s))"
 _APPEND = _APPEND_SQL.format(extra_col="", extra_val="")
 _APPEND_STAMPED = _APPEND_SQL.format(extra_col=", surface_id", extra_val=", %(surface_id)s")
 
@@ -233,6 +237,18 @@ class EpisodeStore(DatabaseConnection):
         max_seq = max((int(r["sequence"]) for r in rows), default=0)
         return span_ids, max_seq
 
+    def lock_sessions(self, session_ids: Iterable[str]) -> None:
+        """Take the advisory lock :meth:`append_episode` takes for each session, in sorted
+        order (two calls over overlapping sessions cannot deadlock), to the end of the
+        enclosing :meth:`atomic` block. Whoever reads a session's high-water mark and then
+        writes past it calls this first: the read is then not stale when the write lands, so
+        the upsert never rewrites a row another writer (remember()) appended in between."""
+        if not self._atomic:
+            raise RuntimeError("lock_sessions holds its locks to the end of an atomic() block")
+        with self._conn() as conn:
+            for session_id in sorted(set(session_ids)):
+                conn.execute(_SESSION_LOCK, (session_id,))
+
     def append_episode(self, ep: Episode) -> int:
         """Insert ``ep`` at the next free sequence of its session (``ep.sequence`` is
         ignored) and return the new row's id. For writers that are not the transcript
@@ -252,7 +268,7 @@ class EpisodeStore(DatabaseConnection):
             "surface_id": ep.surface_id,
         }
         with self._conn() as conn:
-            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (ep.session_id,))
+            conn.execute(_SESSION_LOCK, (ep.session_id,))
             # Schema 057 names the provenance column; before it is applied the stamp is
             # dropped, as in upsert_episode.
             sql = _APPEND_STAMPED if own_surface_columns_ready(conn, self._url) else _APPEND

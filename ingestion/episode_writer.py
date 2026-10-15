@@ -23,7 +23,9 @@ Guards, in order, for each turn:
 A new turn is appended at ``max(sequence) + 1`` and queued for extraction. The whole call is
 one transaction on one connection, so a failure at any turn rolls back every write of the
 call (the client's retry skips by span_id what did land, and nothing is stored without its
-queue row).
+queue row). It holds each session's advisory lock from before the high-water read to the
+commit, the lock remember()'s ``append_episode`` takes, so a row appended meanwhile is
+neither overwritten at the sequence the call computed nor missing from the span index.
 """
 
 from __future__ import annotations
@@ -74,12 +76,14 @@ def store_episodes(
 
     ``project_default`` labels the turns the parser left without a project."""
     stats = StoreStats()
+    eps = sorted(eps, key=lambda e: e.sequence)
     private = PrivateSessions(db)  # per-call memo: one SELECT per session id
     # Per session, the stored span_ids and the high-water sequence, loaded on first sight.
     seen: dict[str, set[str]] = {}
     top_seq: dict[str, int] = {}
     with db.atomic():
-        for ep in sorted(eps, key=lambda e: e.sequence):
+        db.lock_sessions(ep.session_id for ep in eps)
+        for ep in eps:
             if ep.session_id not in seen:
                 seen[ep.session_id], top_seq[ep.session_id] = db.get_session_span_index(
                     ep.session_id

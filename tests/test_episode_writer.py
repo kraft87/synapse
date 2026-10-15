@@ -91,6 +91,67 @@ def test_a_reshipped_turn_is_a_no_op(db, conn):
     assert len(_episodes(conn)) == 2 and len(_queued(conn)) == 2
 
 
+def test_a_remember_row_appended_mid_call_is_not_overwritten(db, db_url, conn):
+    """remember() appends from its own connection while the writer sits between reading the
+    session's high-water mark and upserting past it. The writer holds the session's advisory
+    lock from before that read, so the append waits for the commit and takes the next
+    sequence; unlocked, the upsert's ON CONFLICT rewrote the remembered row with the turn."""
+    import threading
+    import time
+
+    for seq in (1, 2, 3):
+        db.upsert_episode(_ep("w-race", seq, f"old-{seq}"))
+    real_index = db.get_session_span_index
+    appended = threading.Thread(target=lambda: _remember("w-race", db_url))
+    first = []
+
+    def index_then_append(session_id):
+        index = real_index(session_id)
+        if not first:
+            first.append(1)
+            appended.start()
+            for _ in range(100):  # until the append is parked on the lock, or has committed
+                parked = conn.execute(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event = 'advisory'"
+                ).fetchone()[0]
+                if parked or not appended.is_alive():
+                    break
+                time.sleep(0.05)
+        return index
+
+    db.get_session_span_index = index_then_append  # type: ignore[method-assign]
+    try:
+        assert store_episodes(db, [_ep("w-race", 1, "new")]).written == 1
+    finally:
+        del db.get_session_span_index
+    appended.join(timeout=10)
+    assert not appended.is_alive()
+    rows = conn.execute(
+        "SELECT sequence, source, content FROM episodes WHERE session_id = 'w-race' "
+        "AND sequence > 3 ORDER BY sequence"
+    ).fetchall()
+    assert [(r[0], r[1]) for r in rows] == [(4, None), (5, "manual")]
+    assert rows[0][2].startswith("[user] question new") and rows[1][2] == "remembered"
+
+
+def test_session_locks_outside_an_atomic_block_are_refused(db):
+    """Outside atomic() the commit on exit would release the lock before the caller's read."""
+    with pytest.raises(RuntimeError, match="atomic"):
+        db.lock_sessions(["w-lock"])
+
+
+def _remember(session_id: str, db_url: str) -> None:
+    """remember()'s archive write, from a connection of its own."""
+    other = Database(db_url)
+    try:
+        other.append_episode(
+            Episode(session_id=session_id, sequence=0, content="remembered", source="manual")
+        )
+    finally:
+        other.close()
+
+
 def test_a_missing_private_sessions_table_does_not_undo_the_calls_earlier_writes(db, db_url, conn):
     """is_private_session tolerates a database without schema 050; inside an atomic block
     that tolerance must not roll back what the block already wrote."""
