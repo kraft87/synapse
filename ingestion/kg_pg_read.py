@@ -25,7 +25,7 @@ the caller (``_SEMANTIC_POOL_LIMIT``), rank-only RRF (k=1) does the weighting,
 and stage 6b's LLM confirm gates every candidate. The old RediSearch leg's
 ``min_score=0.6`` floor never transferred (different score scale) — and that
 leg returned ZERO results on all multi-word queries in prod (AND/phrase
-semantics — see ab_kg_pg_quality.py), so this leg is strictly additive to the
+semantics — measured in the #67 cutover A/B), so this leg is strictly additive to the
 candidate pool.
 
 Vector KNN uses the same planner discipline as ``mcp_server/kg_pg.py``: over-fetch

@@ -15,6 +15,6 @@ logs:
 test:
 	uv run pytest -x -q
 
-## schema: apply all numbered migrations in schema/ to $$SYNAPSE_DB_URL
+## schema: apply the migrations newer than $$SYNAPSE_DB_URL's schema stamp (a fresh database gets all)
 schema:
 	scripts/apply_schema.sh "$$SYNAPSE_DB_URL"

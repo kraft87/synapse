@@ -2,8 +2,6 @@
 Tests for Phase 2b extraction pipeline.
 
 Unit tests run without any external services.
-Integration tests (marked @pytest.mark.integration) require a live FalkorDB
-and are skipped in CI.
 """
 
 from __future__ import annotations
