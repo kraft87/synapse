@@ -34,7 +34,6 @@ import pytest
 
 _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
-_ROOT_HOOK = _REPO / "scripts" / "synapse_ingest_hook.py"
 _TOGGLE = _REPO / "plugin" / "scripts" / "private_mode.py"
 
 _PLUGIN_ENV_VARS = (
@@ -217,27 +216,6 @@ def test_no_marker_ships_normally(hook, tmp_path, monkeypatch):
     )
     assert hook._ship(str(path), mode="stop")[1] == 4
     assert len(posted) == 1
-
-
-def test_root_hook_copy_honours_the_marker(monkeypatch, tmp_path):
-    """The repo-root Stop hook (the pre-plugin deployment path) ships the same
-    transcripts, so it carries the same check — otherwise private mode would be
-    silently local-only on those installs."""
-    _isolate(monkeypatch, tmp_path)
-    mod = _load(_ROOT_HOOK, "root_hook_private_test")
-    sid = "s-private"
-    path = _transcript(tmp_path, sid)
-    marker = _mark(Path(os.environ["SYNAPSE_PRIVATE_DIR"]), sid)
-
-    def _boom(*a, **k):
-        raise AssertionError("posted a private session")
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", _boom)
-    assert mod._is_private(sid) is True
-    mod._ship(str(path))  # would raise via _boom if it POSTed
-
-    os.utime(marker, (time.time() - 13 * 3600,) * 2)
-    assert mod._is_private(sid) is False and not marker.exists()
 
 
 # ---------------------------------------------------------------------------

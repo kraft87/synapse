@@ -7,7 +7,7 @@ the worktree's folder name, and a Windows cwd parsed on the server as the whole 
 Each hook now asks the one resolver (marker file, else git toplevel with worktrees
 folded into their main checkout, else the folder name) and sends or uses its answer:
 
-  * ingest_hook._records_project / _post_records: the distinct record cwds resolve to
+  * ingest_hook._post_records: the distinct record cwds resolve to
     one label -> ``project`` in the /ingest body; none or several -> no key at all
   * Codex Stop hook: _rollout_cwd (payload cwd, else the newest session_meta or
     turn_context in the shipped records, else the rollout's first line), and _ship
@@ -384,31 +384,6 @@ def ingest() -> ModuleType:
     return _load(_INGEST_HOOK, "ingest_hook_project_wiring_test")
 
 
-@pytest.mark.parametrize(
-    ("cwds", "expected"),
-    [
-        pytest.param(["sub"], "MyRepo", id="repo-subfolder"),
-        pytest.param(["wt_sub"], "MyRepo", id="linked-worktree-subfolder"),
-        pytest.param(["root", "sub", "wt", "wt_sub"], "MyRepo", id="checkout-and-worktree-one"),
-        pytest.param(["none", "sub", "none"], "MyRepo", id="records-without-cwd-ignored"),
-        pytest.param(["marked"], "alpha", id="marker-file"),
-        pytest.param(["win"], "Acme", id="windows-path"),
-        pytest.param(["none"], None, id="no-cwd"),
-        pytest.param(["sub", "other"], None, id="two-repositories"),
-        pytest.param(["win", "sub"], None, id="windows-and-local-differ"),
-    ],
-)
-def test_records_project_resolves_the_records_cwds(ingest, layout, cwds, expected):
-    assert ingest._records_project(_turns(layout, cwds)) == expected
-
-
-def test_records_project_skips_falsy_and_unlabelable_cwds(ingest, layout):
-    records = _turns(layout, ["sub"])
-    records += [{"type": "user", "cwd": ""}, {"type": "user", "cwd": "C:\\"}, "not-a-record"]
-    assert ingest._records_project(records) == "MyRepo"
-    assert ingest._records_project([{"type": "user", "cwd": "C:\\"}]) is None
-
-
 def test_post_records_survives_a_malformed_cwd(ingest, layout, monkeypatch):
     bodies = _capture_bodies(monkeypatch, ingest, b'{"status":"ok"}')
     records = [*_turns(layout, ["sub"]), {"type": "user", "uuid": "x", "cwd": ["not", "a path"]}]
@@ -417,14 +392,28 @@ def test_post_records_survives_a_malformed_cwd(ingest, layout, monkeypatch):
     assert bodies[0]["project"] == "MyRepo"  # the malformed cwd is ignored, not fatal
 
 
+def test_post_records_skips_falsy_and_unlabelable_cwds(ingest, layout, monkeypatch):
+    bodies = _capture_bodies(monkeypatch, ingest, b'{"status":"ok"}')
+    records = _turns(layout, ["sub"])
+    records += [{"type": "user", "cwd": ""}, {"type": "user", "cwd": "C:\\"}, "not-a-record"]
+    ingest._post_records(records)
+    ingest._post_records([{"type": "user", "cwd": "C:\\"}])
+    assert bodies[0]["project"] == "MyRepo"
+    assert "project" not in bodies[1] and "cwd_projects" not in bodies[1]
+
+
 @pytest.mark.parametrize(
     ("cwds", "expected"),
     [
         pytest.param(["sub"], "MyRepo", id="repo-subfolder"),
         pytest.param(["wt_sub"], "MyRepo", id="linked-worktree"),
+        pytest.param(["root", "sub", "wt", "wt_sub"], "MyRepo", id="checkout-and-worktree-one"),
+        pytest.param(["none", "sub", "none"], "MyRepo", id="records-without-cwd-ignored"),
+        pytest.param(["marked"], "alpha", id="marker-file"),
         pytest.param(["win"], "Acme", id="windows-path"),
         pytest.param(["none"], None, id="no-cwd"),
         pytest.param(["sub", "other"], None, id="two-repositories"),
+        pytest.param(["win", "sub"], None, id="windows-and-local-differ"),
     ],
 )
 def test_post_records_body_carries_the_resolved_project(

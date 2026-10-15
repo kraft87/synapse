@@ -45,7 +45,7 @@ and a file that keeps failing goes to the back of the queue instead of holding
 a slot.
 
 The cursor file also keeps one `_health` record of the upload streak. After
-_WARN_AFTER_FAILS failed POSTs in a row, or _WARN_AFTER_HOURS of failure, with
+WARN_AFTER_FAILS failed POSTs in a row, or WARN_AFTER_HOURS of failure, with
 no success since, the SessionStart parent prints one line, shown to the user
 and to the model: "Synapse uploads have been failing since <date> (<reason>);
 transcripts will be retried automatically." Reasons come from a short fixed
@@ -114,9 +114,6 @@ ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
 CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
-_HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
-_WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
-_WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
 _PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
@@ -173,22 +170,6 @@ def _parse_lines(lines: list[bytes]) -> list[dict[str, Any]]:
         if isinstance(rec, dict):
             out.append(rec)
     return out
-
-
-def _select_tail(raw_lines: list[bytes]) -> tuple[list[dict[str, Any]], str]:
-    """Pick the records for a first-encounter seed: a turn-boundary-aligned tail,
-    or the full file when the tail window holds no boundary (one mega-turn).
-    Returns (records, mode). Pure (no I/O) so it's unit-testable.
-
-    Kept for the Stop path's cursor seeding: a long-lived pre-cursor session was
-    already shipped turn-by-turn by earlier hook fires, so re-parsing the whole
-    file wholesale on the first cursored run would be pure churn.
-    """
-    tail = _parse_lines(raw_lines[-TAIL_RECORDS:])
-    start = next((i for i, r in enumerate(tail) if _is_turn_start(r)), None)
-    if start is not None:
-        return tail[start:], "tail"
-    return _parse_lines(raw_lines), "full-fallback"
 
 
 # ---------------------------------------------------------------------------
@@ -268,9 +249,6 @@ def _load_state() -> dict[str, Any]:
     return retry.load_state(CURSOR_PATH)
 
 
-_needs_retry = retry.needs_retry  # attempted and not completed: swept at any age, never pruned
-
-
 def _update_state(path: str, apply: Callable[[dict[str, Any], float], None]) -> None:
     """Locked load → `apply(state, now)` → prune → atomic rewrite of the cursor
     file. Pruning drops deleted transcripts and ones idle past _CURSOR_TTL_DAYS,
@@ -315,23 +293,12 @@ def _record_failure(path: str, reason: str, offset: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _scrub(text: str) -> str:
-    return retry.scrub(text, INGEST_TOKEN)
-
-
-_short_reason = retry.short_reason  # fixed vocabulary, never message text
-
-
-def _failure_warning(state: dict[str, Any], now: float) -> str | None:
-    return retry.failure_warning(state, now, INGEST_TOKEN)
-
-
 def _emit_failure_warning() -> None:
     """Print the sustained-failure line at SessionStart: `systemMessage` shows it
     to the user, `additionalContext` to the model. Reads local state only (no
     network), prints nothing while uploads are healthy, and never raises."""
     try:
-        line = _failure_warning(_load_state(), time.time())
+        line = retry.failure_warning(_load_state(), time.time(), INGEST_TOKEN)
         if line:
             print(
                 json.dumps(
@@ -400,18 +367,11 @@ def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
     return {c: lb for c in cwds if (lb := synapse_project.project_label(c))}
 
 
-def _records_project(records: list[dict[str, Any]]) -> str | None:
-    """The batch's one project label, or None when no record carries a cwd or the cwds
-    resolve to different projects (then the body carries ``cwd_projects`` instead)."""
-    labels = set(_cwd_labels(records).values())
-    return labels.pop() if len(labels) == 1 else None
-
-
 def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     """POST a batch of raw transcript records to /ingest; returns the (truncated)
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
     bulk history import (import_history.py), so all resolve URL/token identically
-    through config.py, and all send the batch's project label (_records_project).
+    through config.py, and all send the batch's project label (_cwd_labels).
     Raises on transport/HTTP errors — callers decide how to fail-soft."""
     payload: dict[str, Any] = {"records": records, "source": source}
     by_cwd = _cwd_labels(records)
@@ -501,7 +461,7 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
             # it ages out of the catch-up window.
             _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
             try:
-                _record_failure(transcript_path, _short_reason(e), chunk_start)
+                _record_failure(transcript_path, retry.short_reason(e), chunk_start)
             except Exception as e2:
                 _log(f"ERR {mode} record-failure: {type(e2).__name__}: {str(e2)[:160]}")
             break
@@ -536,7 +496,7 @@ def _catchup_candidates(
     """Transcripts worth sweeping: not the live session, not mid-write
     (ACTIVE_GRACE — an active session's own Stop hooks own it), with bytes past
     their cursor, and either modified within CATCHUP_DAYS or owed a retry (a
-    failed or half-finished upload, _needs_retry) however old.
+    failed or half-finished upload, retry.needs_retry) however old.
 
     A file older than the window that the hook never attempted is NOT a
     candidate: that is history from before the plugin was installed (or from

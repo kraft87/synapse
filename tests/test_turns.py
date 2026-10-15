@@ -321,12 +321,9 @@ def _prefixes_in(path: Path) -> tuple[str, ...]:
     raise AssertionError(f"{path} defines no _MACHINERY_PREFIXES")
 
 
-@pytest.mark.parametrize(
-    "hook",
-    ["scripts/synapse_ingest_hook.py", "plugin/scripts/ingest_hook.py"],
-)
-def test_claude_code_hooks_mirror_the_server_machinery_prefixes(hook):
-    assert _prefixes_in(_REPO / hook) == jsonl_client._MACHINERY_PREFIXES
+def test_claude_code_hook_mirrors_the_server_machinery_prefixes():
+    hook = _REPO / "plugin" / "scripts" / "ingest_hook.py"
+    assert _prefixes_in(hook) == jsonl_client._MACHINERY_PREFIXES
 
 
 def test_codex_hook_mirrors_the_server_machinery_prefixes():
