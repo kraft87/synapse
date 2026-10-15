@@ -386,8 +386,14 @@ def test_board_kind_row_shape(conn, db_url, full_surface):
     assert ms_total is not None and ms_total >= 0
     assert chars == len(board["text"]) and chars > 0
     assert est_tokens == chars // 4
-    # Note ids in served ("n:N") form — joinable against recall_feedback's id lists.
-    assert served == {"notes": [f"n:{nid}"], "n_notes": 1, "overflow": 0, "trust": "full"}
+    # Note and event ids in served ("n:N", "t:N") form — joinable against recall_feedback's id lists.
+    assert served == {
+        "notes": [f"n:{nid}"],
+        "events": [],
+        "n_notes": 1,
+        "overflow": 0,
+        "trust": "full",
+    }
 
 
 def test_overlay_gets_the_served_passage_text(conn, db_url, monkeypatch, full_surface):

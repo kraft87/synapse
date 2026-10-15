@@ -1838,7 +1838,9 @@ def delete_episode_content(
     deleted_events = []
     for r in owned:
         survivors = [
-            ep for ref in r["reported_refs"] if (ep := _episode_id_from_ref(ref)) not in ids
+            ep
+            for ref in r["reported_refs"]
+            if (ep := _episode_id_from_ref(ref)) is not None and ep not in ids
         ]
         if not any(_repoint_event(conn, r["id"], ep) for ep in survivors):
             deleted_events.append(r["id"])
