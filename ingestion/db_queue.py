@@ -163,10 +163,14 @@ class ExtractionQueueStore(DatabaseConnection):
         that already holds it succeeds, so asking every cycle answers for the current
         connection: a holder that dropped and reconnected gets the lock back only if no
         other replica took it meanwhile. It needs the connection to be this object's own,
-        so not a pooled one (the poller opens no pool)."""
+        so not a pooled one (the poller opens no pool). The two-key form keeps it out of the
+        single-key space the episode writer locks per session (hashtext(session_id)): a
+        session id that hashed to a one-key lock would be blocked for as long as the leader
+        lives."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT pg_try_advisory_lock(hashtext('poller.maintenance')) AS held"
+                "SELECT pg_try_advisory_lock(hashtext('synapse.poller'), hashtext('maintenance')) "
+                "AS held"
             ).fetchone()
         return bool(row and row["held"])
 

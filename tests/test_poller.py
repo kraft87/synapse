@@ -14,6 +14,7 @@ import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 
 from ingestion.db import Database
@@ -258,6 +259,24 @@ def test_one_replica_holds_the_maintenance_lock(db_url):
     finally:
         first.close()
         second.close()
+
+
+def test_the_maintenance_lock_does_not_share_a_keyspace_with_session_locks(db_url):
+    """The episode writer takes pg_advisory_xact_lock(hashtext(session_id)); the maintenance
+    lock lives as long as the leader's connection, so a session id hashing to its key must
+    not block that session's writes."""
+    sep = "&" if "?" in db_url else "?"
+    leader = Database(f"{db_url}{sep}application_name=maint_lock_keyspace")
+    try:
+        assert leader.try_maintenance_lock()
+        with psycopg.connect(db_url) as conn:
+            # 'poller.maintenance' is the session id the old single-key lock collided with
+            row = conn.execute(
+                "SELECT pg_try_advisory_xact_lock(hashtext('poller.maintenance'))"
+            ).fetchone()
+        assert row is not None and row[0]
+    finally:
+        leader.close()
 
 
 def test_orphan_sweep_goes_through_the_pipeline_kg_client():
