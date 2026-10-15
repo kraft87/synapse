@@ -278,7 +278,11 @@ restart" is the whole upgrade. `--all` re-applies every file (each is safe to re
 repeats their backfills too, so it is slow on a big database) and `--from NNN` starts at a
 number; a database that has tables but no stamp (it predates migration 034) is refused until
 you pass one of them. The `postgres` service now has `shm_size: 1g`; re-apply `compose.yml`
-(`docker compose up -d --remove-orphans`) to pick that and any other compose change up.
+(`docker compose up -d --remove-orphans`) to pick that and any other compose change up. This
+recreates the postgres container, so Postgres restarts: run `docker compose stop -t 120
+postgres` first so it shuts down cleanly (Docker's default is 10 s, and an unclean stop can
+corrupt the BM25 index). If BM25 recall degrades afterwards, run
+`REINDEX INDEX CONCURRENTLY episodes_search_idx` (ARCHITECTURE.md §15).
 
 Every service verifies at boot that the database schema matches the code (the script
 stamps the applied version; a mismatch refuses to start with instructions rather than
@@ -290,7 +294,9 @@ transaction: do not use `psql -1`, and if a build fails drop the INVALID index i
 run the file again.
 
 **The optional migrations** of the current release, all safe to apply after the image is
-running (HANDOFF.md has the order and what each needs by hand):
+running (HANDOFF.md has the order and what each needs by hand). `apply_schema.sh` runs each
+file whole, so on a populated database do the two hand steps below (`062`, `072`) BEFORE
+running it; it then finds their statements already applied.
 
 - `062` `extraction_queue.chunk_id` and its indexes (on a populated queue build the
   `episode_id` index `CONCURRENTLY` first; the command is in the file header);
@@ -305,7 +311,8 @@ running (HANDOFF.md has the order and what each needs by hand):
   `CONCURRENTLY`. Apply `074` before any project relabel.
 - `072` backfills `t_created` / `entity_subtype` for the dashboard. On a populated table run
   its three `UPDATE`s, then build `kg_rel_t_created_idx` `CONCURRENTLY` by hand with the
-  command in the file header, instead of running the file whole.
+  command in the file header, instead of running the file whole. Do this, and the `062`
+  index above, before `apply_schema.sh`.
 
 Two one-off scripts accompany this release, both idempotent and counts-only (run each with
 `--dry-run` first): `python scripts/backfill_normalized_name.py` (entities with a NULL
