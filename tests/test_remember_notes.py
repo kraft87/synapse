@@ -185,6 +185,17 @@ def test_credentials_are_redacted_in_note_episode_and_extraction(env):
         assert key not in text and "[REDACTED:openai]" in text
 
 
+def test_the_write_time_judge_runs_on_its_own_model(env, monkeypatch):
+    """remember() keeps SYNAPSE_NOTES_CONFIRM_MODEL (a caller waits on it); the nightly
+    lane's SYNAPSE_NOTES_CURATE_MODEL does not reach it."""
+    monkeypatch.setenv("SYNAPSE_NOTES_CONFIRM_MODEL", "claude-haiku-4-5")
+    monkeypatch.setenv("SYNAPSE_NOTES_CURATE_MODEL", "claude-sonnet-4-6")
+    _seed_note(env, slot=1)
+    env.emb.mapping["User prefers light mode"] = 1
+    _remember(hook="User prefers light mode", body="New body.", type="user")
+    assert [c["model"] for c in env.llm_calls] == ["claude-haiku-4-5"]
+
+
 def test_high_sim_same_type_duplicate_updates(env):
     old = _seed_note(env, slot=1)
     env.emb.mapping["User prefers light mode"] = 1  # sim 1.0 to the seeded note

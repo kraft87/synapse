@@ -123,7 +123,9 @@ def parse_pair_verdict(text: str) -> dict[str, Any]:
 
 
 def judge_model() -> str:
-    """Independently overridable via SYNAPSE_NOTES_CURATE_MODEL (stage_model precedence)."""
+    """The nightly lane's judge: independently overridable via SYNAPSE_NOTES_CURATE_MODEL
+    (stage_model precedence). remember() judges on its own SYNAPSE_NOTES_CONFIRM_MODEL,
+    since a caller waits on that one."""
     return stage_model("NOTES_CURATE")
 
 
@@ -137,15 +139,22 @@ def fmt_note(note: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def judge_pair(llm: Any, first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
-    """One judgement of the pair in ONE ordering (NOTE 1 = first, NOTE 2 = second)."""
+def judge_pair(
+    llm: Any, first: dict[str, Any], second: dict[str, Any], model: str | None = None
+) -> dict[str, Any]:
+    """One judgement of the pair in ONE ordering (NOTE 1 = first, NOTE 2 = second), on
+    ``model`` (default: the lane's :func:`judge_model`)."""
     f, s = fmt_note(first), fmt_note(second)
     prompt = PAIR_PROMPT.format(
         t1=f["type"], p1=f["project"], u1=f["updated"], h1=f["hook"], b1=f["body"],
         t2=s["type"], p2=s["project"], u2=s["updated"], h2=s["hook"], b2=s["body"],
     )  # fmt: skip
     return parse_with_retry(
-        llm, base_prompt=prompt, parser=parse_pair_verdict, model=judge_model(), max_tokens=64
+        llm,
+        base_prompt=prompt,
+        parser=parse_pair_verdict,
+        model=model or judge_model(),
+        max_tokens=64,
     )
 
 
@@ -156,7 +165,7 @@ def _write_action(llm: Any, existing: dict[str, Any], new: dict[str, Any]) -> st
     if existing["hook"] == new["hook"] and (existing.get("body") or "") == new["body"]:
         return "update"  # an exact restatement (a replayed spool write) needs no judge
     try:
-        verdict = judge_pair(llm, existing, new)
+        verdict = judge_pair(llm, existing, new, model=stage_model("NOTES_CONFIRM"))
     except Exception as e:
         logger.warning("notes judge failed (%s); inserting as a new note", e)
         return "insert"
