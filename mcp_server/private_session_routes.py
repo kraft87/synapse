@@ -46,14 +46,12 @@ from typing import Any
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.surfaces import OWN_SURFACE_PROBE, SurfaceTrust
 from mcp_server.dashboard_routes import delete_episode_content, retire_flags
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import RouteError, route
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +69,11 @@ _PURGE_COUNTS = (
 )
 
 
-class PurgeRefused(Exception):
+class PurgeRefused(RouteError):
     """The caller's trust does not cover deleting this session's turns (the route's 403)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail, 403)
 
 
 def _mark_private(db_url: str, session_id: str, purge_as: SurfaceTrust | None) -> dict[str, Any]:
@@ -194,67 +195,43 @@ def register(
         return
 
     def _session_id(request: Request) -> str:
-        return (request.path_params.get("session_id") or "").strip()
-
-    async def _run(request: Request, work: Callable[[str], Any]) -> JSONResponse | Any:
-        """Auth + session-id validation + threadpool, shared by the three verbs.
-
-        Returns a JSONResponse on any failure, or the raw work() result on success —
-        callers wrap that in their own envelope."""
-        if not authorized(request):
-            return unauthorized()
-        session_id = _session_id(request)
+        session_id = (request.path_params.get("session_id") or "").strip()
         if not session_id or len(session_id) > _MAX_ID_LEN:
-            return err("session_id required", 400)
-        try:
-            return await run_in_threadpool(work, session_id)
-        except PurgeRefused as e:
-            return err(str(e), 403)
-        except Exception as e:
-            logger.warning("private-session route failed: %s", e)
-            return err(str(e)[:200], 500)
+            raise RouteError("session_id required")
+        return session_id
 
     @mcp.custom_route("/private-sessions/{session_id}", methods=["PUT"])  # type: ignore[misc]
-    async def private_session_put(request: Request) -> JSONResponse:
+    @route(authorized)
+    def private_session_put(request: Request) -> dict[str, Any]:
         """Take a session off the record from now on. Idempotent; the row is permanent by
         design. ``?purge=1`` also deletes the turns it already stored, for a caller whose
         trust covers them (module docstring)."""
         purge = request.query_params.get("purge", "0")
         if purge not in ("0", "1"):
-            return err("purge must be 0 or 1", 400)
-        out = await _run(
-            request,
-            lambda sid: _mark_private(
-                db_url, sid, resolve_trust(request) if purge == "1" else None
-            ),
-        )
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse(
-            {"status": "ok", "session_id": _session_id(request), "private": True, **out}
-        )
+            raise RouteError("purge must be 0 or 1")
+        session_id = _session_id(request)
+        out = _mark_private(db_url, session_id, resolve_trust(request) if purge == "1" else None)
+        return {"status": "ok", "session_id": session_id, "private": True, **out}
 
     @mcp.custom_route("/private-sessions/{session_id}", methods=["DELETE"])  # type: ignore[misc]
-    async def private_session_delete(request: Request) -> JSONResponse:
+    @route(authorized)
+    def private_session_delete(request: Request) -> dict[str, Any]:
         """Un-private a session. Re-exposes its on-disk transcript to future backfills."""
-        out = await _run(request, lambda sid: _unmark_private(db_url, sid))
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse(
-            {
-                "status": "ok",
-                "session_id": _session_id(request),
-                "private": False,
-                "deleted": int(out),
-            }
-        )
+        session_id = _session_id(request)
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "private": False,
+            "deleted": int(_unmark_private(db_url, session_id)),
+        }
 
     @mcp.custom_route("/private-sessions/{session_id}", methods=["GET"])  # type: ignore[misc]
-    async def private_session_get(request: Request) -> JSONResponse:
+    @route(authorized)
+    def private_session_get(request: Request) -> dict[str, Any]:
         """Read back the flag — how the CLI verifies its write actually landed."""
-        out = await _run(request, lambda sid: _is_private(db_url, sid))
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse(
-            {"status": "ok", "session_id": _session_id(request), "private": bool(out)}
-        )
+        session_id = _session_id(request)
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "private": bool(_is_private(db_url, session_id)),
+        }

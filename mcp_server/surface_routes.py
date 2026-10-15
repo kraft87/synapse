@@ -71,7 +71,7 @@ from ingestion.surfaces import (
     revoke_surface,
     upsert_surface,
 )
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import RouteError, route
 
 logger = logging.getLogger(__name__)
 
@@ -106,34 +106,19 @@ def register(
         return
 
     def _surface_id(request: Request) -> str:
-        return (request.path_params.get("surface_id") or "").strip()
+        surface_id = (request.path_params.get("surface_id") or "").strip()
+        if not surface_id or len(surface_id) > _MAX_ID_LEN:
+            raise RouteError("surface_id required")
+        return surface_id
 
-    async def _run(
-        request: Request, work: Callable[[], Any], gate: Callable[[Request], bool] | None
-    ) -> JSONResponse | Any:
-        """Auth + threadpool, shared by every verb. Returns a JSONResponse on any
-        failure, or the raw work() result on success. ``gate=None`` means the caller has
-        already authenticated by another means (the enroll route's identity check)."""
-        if gate is not None and not gate(request):
-            return unauthorized()
+    def _validated(work: Callable[..., Any], *args: Any) -> Any:
+        """``work(*args)``, its own validation failure (a ValueError) answered as the 400."""
         try:
-            return await run_in_threadpool(work)
+            return work(*args)
         except ValueError as e:
-            return err(str(e)[:200], 400)
-        except Exception as e:  # pragma: no cover - defensive
-            logger.warning("surface route failed: %s", e)
-            return err(str(e)[:200], 500)
+            raise RouteError(str(e)[:200]) from e
 
-    async def _body(request: Request) -> dict[str, Any] | JSONResponse:
-        try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON", 400)
-        if not isinstance(body, dict):
-            return err("body must be a JSON object", 400)
-        return body
-
-    def _projects(body: dict[str, Any]) -> list[str] | None | JSONResponse:
+    def _projects(body: dict[str, Any]) -> list[str] | None:
         """The allowlist the caller stated, or None for "unstated".
 
         The distinction is load-bearing: unstated lets a restricted surface inherit the
@@ -144,21 +129,19 @@ def register(
             return None
         projects = body["allowed_projects"]
         if not isinstance(projects, list):
-            return err("allowed_projects must be a list", 400)
+            raise RouteError("allowed_projects must be a list")
         if len(projects) > _MAX_PROJECTS:
-            return err(f"allowed_projects capped at {_MAX_PROJECTS}", 400)
+            raise RouteError(f"allowed_projects capped at {_MAX_PROJECTS}")
         return [str(p) for p in projects]
 
-    def _grant(body: dict[str, Any]) -> tuple[str | None, list[str] | None] | JSONResponse:
-        projects = _projects(body)
-        if isinstance(projects, JSONResponse):
-            return projects
-        return (str(body.get("trust") or "") or None), projects
+    def _grant(body: dict[str, Any]) -> tuple[str | None, list[str] | None]:
+        return (str(body.get("trust") or "") or None), _projects(body)
 
     # -- enrollment ---------------------------------------------------------
 
     @mcp.custom_route("/surfaces/enroll", methods=["POST"])  # type: ignore[misc]
-    async def surfaces_enroll(request: Request) -> JSONResponse:
+    @route(None, body=True)  # the gate is the identity check below, not a token
+    async def surfaces_enroll(request: Request, body: dict[str, Any]) -> JSONResponse:
         """Join this Synapse: prove an allowlisted identity, get this device's token.
 
         Body ``{"device_code": "...", "label": "<hostname>", "trust": "full"|"restricted",
@@ -173,22 +156,16 @@ def register(
         create new credentials.
         """
         if idp is None:
-            return err(
+            raise RouteError(
                 "enrollment needs an identity provider (GitHub or OIDC); run "
                 "'docker compose exec mcp-server synapse-admin bootstrap \"<label>\"' "
                 "on the server instead",
                 503,
             )
-        body = await _body(request)
-        if isinstance(body, JSONResponse):
-            return body
         device_code = str(body.get("device_code") or "")
         if not device_code:
-            return err("device_code required — start with POST /device/code", 400)
-        grant = _grant(body)
-        if isinstance(grant, JSONResponse):
-            return grant
-        trust, projects = grant
+            raise RouteError("device_code required — start with POST /device/code")
+        trust, projects = _grant(body)
         label = str(body.get("label") or "")[:_MAX_LABEL_LEN]
 
         # Identity first, always. Nothing below this point runs for a caller the IdP
@@ -197,7 +174,7 @@ def register(
             tok = await idp.device_poll(device_code)
         except Exception as e:
             logger.warning("enroll: %s device poll failed: %s", idp.label, e)
-            return err(f"{idp.label} device poll failed", 502)
+            raise RouteError(f"{idp.label} device poll failed", 502) from e
         access = tok.get("access_token")
         if not access:
             reason = tok.get("error", "authorization_pending")
@@ -211,14 +188,12 @@ def register(
             identity = await idp.fetch_identity(access)
         except Exception as e:
             logger.warning("enroll: %s identity lookup failed: %s", idp.label, e)
-            return err(f"{idp.label} identity lookup failed", 502)
+            raise RouteError(f"{idp.label} identity lookup failed", 502) from e
         if not identity or identity not in idp.allowed:
             logger.warning("enroll: %s user %r not in allowlist", idp.label, identity)
-            return err(f"{idp.label} user {identity!r} not in allowlist", 403)
+            raise RouteError(f"{idp.label} user {identity!r} not in allowlist", 403)
 
-        out = await _run(request, lambda: enroll_surface(db_url, label, trust, projects), None)
-        if isinstance(out, JSONResponse):
-            return out
+        out = await run_in_threadpool(_validated, enroll_surface, db_url, label, trust, projects)
         logger.info(
             "device enrolled by %s user %r: %s trust=%s",
             idp.label,
@@ -237,73 +212,51 @@ def register(
         )
 
     @mcp.custom_route("/surfaces/mint", methods=["POST"])  # type: ignore[misc]
-    async def surfaces_mint(request: Request) -> JSONResponse:
+    @route(admin, body=True)
+    def surfaces_mint(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """Create a device token for a machine that will never run a browser flow —
         a headless box, a service, a container. ADMIN gate: it needs a machine that is
         already trusted, since there is no identity in the request to anchor on.
 
         Body ``{"label": "...", "trust": ..., "allowed_projects": [...]}``.
         """
-        body = await _body(request)
-        if isinstance(body, JSONResponse):
-            return body
-        grant = _grant(body)
-        if isinstance(grant, JSONResponse):
-            return grant
-        trust, projects = grant
+        trust, projects = _grant(body)
         label = str(body.get("label") or "")[:_MAX_LABEL_LEN]
-        out = await _run(request, lambda: mint_surface(db_url, label, trust, projects), admin)
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse({"status": "ok", "surface": out["surface"], "token": out["token"]})
+        out = _validated(mint_surface, db_url, label, trust, projects)
+        return {"status": "ok", "surface": out["surface"], "token": out["token"]}
 
     # -- operator views -----------------------------------------------------
 
     @mcp.custom_route("/surfaces", methods=["GET"])  # type: ignore[misc]
-    async def surfaces_list(request: Request) -> JSONResponse:
+    @route(admin)
+    def surfaces_list(request: Request) -> dict[str, Any]:
         """Every surface — "who can see what", in one read. ADMIN gated: the listing is
         the map of what each credential reaches."""
-        out = await _run(request, lambda: list_surfaces(db_url), admin)
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse({"status": "ok", "surfaces": out})
+        return {"status": "ok", "surfaces": list_surfaces(db_url)}
 
     @mcp.custom_route("/surfaces/{surface_id}", methods=["PUT"])  # type: ignore[misc]
-    async def surfaces_put(request: Request) -> JSONResponse:
+    @route(admin, body=True)
+    def surfaces_put(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """Register or re-register one credential-less surface (``oauth:<login>``, or a
         legacy hostname row). Idempotent; replaces trust + allowlist wholesale, because
         a partial update of a security allowlist is how a stale grant survives a
         demotion. Rejects device rows — those go through enroll/mint/revoke."""
         surface_id = _surface_id(request)
-        if not surface_id or len(surface_id) > _MAX_ID_LEN:
-            return err("surface_id required", 400)
-        body = await _body(request)
-        if isinstance(body, JSONResponse):
-            return body
-        grant = _grant(body)
-        if isinstance(grant, JSONResponse):
-            return grant
-        trust, projects = grant
+        trust, projects = _grant(body)
         # Default to restricted when the caller omits `trust`: the schema default and
         # the no-row default both say restricted, so the route must not be the one
         # place where a missing field means "full".
-        out = await _run(
-            request,
-            lambda: upsert_surface(db_url, surface_id, trust or "restricted", projects or []),
-            admin,
-        )
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse({"status": "ok", "surface": out})
+        out = _validated(upsert_surface, db_url, surface_id, trust or "restricted", projects or [])
+        return {"status": "ok", "surface": out}
 
     @mcp.custom_route("/surfaces/{surface_id}", methods=["DELETE"])  # type: ignore[misc]
-    async def surfaces_delete(request: Request) -> JSONResponse:
+    @route(admin)
+    def surfaces_delete(request: Request) -> dict[str, Any]:
         """Revoke a surface: its token stops authenticating on the very next request
         and its trust resets to the floor. The row stays as the audit trail."""
         surface_id = _surface_id(request)
-        if not surface_id or len(surface_id) > _MAX_ID_LEN:
-            return err("surface_id required", 400)
-        out = await _run(request, lambda: revoke_surface(db_url, surface_id), admin)
-        if isinstance(out, JSONResponse):
-            return out
-        return JSONResponse({"status": "ok", "surface_id": surface_id, "revoked": int(out)})
+        return {
+            "status": "ok",
+            "surface_id": surface_id,
+            "revoked": int(revoke_surface(db_url, surface_id)),
+        }

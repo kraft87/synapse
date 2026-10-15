@@ -2,22 +2,18 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
 from typing import Any
 
 import logfire
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust, own_surface_served
 from mcp_server.caller_trust import note_ignored_surface
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import RouteError, route
 from mcp_server.recall_warnings import serving_notice, with_notice
-
-logger = logging.getLogger(__name__)
 
 
 def register(
@@ -28,7 +24,8 @@ def register(
     _authenticated: Callable[[Request], bool],
 ) -> Any:
     @mcp.custom_route("/recall", methods=["POST"])
-    async def recall_http(request: Request) -> JSONResponse:
+    @route(_machine_authorized, body=True)
+    def recall_http(request: Request, body: dict[str, Any]) -> Any:
         """Plain-HTTP recall for non-MCP callers (the dashboard's Recall console, scripts).
 
         Gives a caller with no MCP client the same recall() over plain HTTP, reusing the warm
@@ -49,19 +46,9 @@ def register(
         An authenticated caller whose verdict serves (almost) nothing gets the reason
         first in ``warnings`` (recall_warnings.serving_notice), same as the MCP tools.
         """
-        if not _machine_authorized(request):
-            return unauthorized()
-
-        from starlette.concurrency import run_in_threadpool
-
-        try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON body", 400)
-
         query = (body.get("query") or "").strip()
         if not query:
-            return err("missing 'query'", 400)
+            raise RouteError("missing 'query'")
         project = body.get("project") or None
         group_id = coerce_group(body.get("group_id")) or "technical"
         write_feedback = bool(body.get("write_feedback", False))
@@ -71,7 +58,7 @@ def register(
         trust = _request_trust(request)
         told = _authenticated(request)
 
-        def _work() -> tuple[dict[str, Any], str | None]:
+        with logfire.span("http.recall {query!r}", query=query[:80], group_id=group_id):
             engine = _get_recall()
             result = engine.recall(
                 query=query,
@@ -82,17 +69,10 @@ def register(
                 debug=debug,
                 trust=trust,
             )
-            if not told:
-                return result, None
-            own = own_surface_served(getattr(engine, "_db_url", ""), trust)
-            return result, serving_notice(trust, own)
-
-        try:
-            with logfire.span("http.recall {query!r}", query=query[:80], group_id=group_id):
-                out, notice = await run_in_threadpool(_work)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("http recall failed")
-            return err(str(exc)[:200], 500)
-        return JSONResponse(with_notice(out, notice))
+            notice = None
+            if told:
+                own = own_surface_served(getattr(engine, "_db_url", ""), trust)
+                notice = serving_notice(trust, own)
+        return with_notice(result, notice)
 
     return recall_http

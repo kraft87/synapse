@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Callable
 from typing import Any
@@ -12,10 +11,7 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from mcp_server.http_helpers import err, unauthorized
-
-logger = logging.getLogger(__name__)
-
+from mcp_server.http_helpers import route
 
 # Facts are served as "f:<kg_relationships.id>"; the "f:<uuid>" form recall() served before
 # that stays valid so ratings drafted from an older transcript still file.
@@ -141,7 +137,8 @@ def register(
             )
 
     @mcp.custom_route("/feedback", methods=["POST"])
-    async def feedback_http(request: Request) -> JSONResponse:
+    @route(_machine_authorized, body=True)
+    def feedback_http(request: Request, body: dict[str, Any]) -> JSONResponse:
         """Plain-HTTP recall_feedback for non-MCP callers — the /recall sibling.
 
         Hooks and the dashboard talk to /recall over plain HTTP (no MCP client), so
@@ -153,18 +150,8 @@ def register(
                "found_via"?: str, "comment"?: str, "session_id"?: str, "project"?: str}.
         "note" is accepted as a legacy alias for "comment" (pre-1.0.1 callers).
         """
-        if not _machine_authorized(request):
-            return unauthorized()
-
-        from starlette.concurrency import run_in_threadpool
-
-        try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON body", 400)
-
-        def _work() -> dict:
-            return _file_recall_feedback(
+        with logfire.span("http.feedback"):
+            out = _file_recall_feedback(
                 query=body.get("query") or "",
                 helpful=body.get("helpful"),
                 noise=body.get("noise"),
@@ -174,13 +161,6 @@ def register(
                 session_id=body.get("session_id"),
                 project=body.get("project"),
             )
-
-        try:
-            with logfire.span("http.feedback"):
-                out = await run_in_threadpool(_work)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("http feedback failed")
-            return err(str(exc)[:200], 500)
         return JSONResponse(out, status_code=200 if out.get("status") == "ok" else 400)
 
     return _feedback_ids_error, _file_recall_feedback, recall_feedback, feedback_http

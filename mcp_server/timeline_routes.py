@@ -21,9 +21,7 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.db_connection import _vector_literal
@@ -37,7 +35,7 @@ from ingestion.surfaces import (
     episode_scope_sql,
     own_surface_if_ready,
 )
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import RouteError, route
 
 logger = logging.getLogger(__name__)
 
@@ -218,25 +216,20 @@ def register(
         return
 
     @mcp.custom_route("/timeline/events", methods=["POST"])  # type: ignore[misc]
-    async def timeline_events(request: Request) -> JSONResponse:
-        if not authorized(request):
-            return unauthorized()
-        try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON body", 400)
+    @route(authorized, body=True)
+    def timeline_events(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         events = body.get("events")
         if not isinstance(events, list) or not events:
-            return err("body must contain a non-empty 'events' list", 400)
+            raise RouteError("body must contain a non-empty 'events' list")
         if len(events) > _MAX_BATCH:
-            return err(f"max {_MAX_BATCH} events per call", 400)
+            raise RouteError(f"max {_MAX_BATCH} events per call")
         cleaned: list[dict[str, Any]] = []
         for i, e in enumerate(events):
             if not isinstance(e, dict):
-                return err(f"events[{i}] not an object", 400)
+                raise RouteError(f"events[{i}] not an object")
             missing = [k for k in ("t_valid", "fact", "source", "source_ref") if not e.get(k)]
             if missing:
-                return err(f"events[{i}] missing {missing}", 400)
+                raise RouteError(f"events[{i}] missing {missing}")
             sal = e.get("salience", 1)
             et = e.get("event_type")
             cleaned.append(
@@ -251,16 +244,6 @@ def register(
                 }
             )
 
-        try:
-            st = (
-                await run_in_threadpool(resolve_trust, request)
-                if resolve_trust
-                else UNKNOWN_SURFACE
-            )
-            inserted, skipped = await run_in_threadpool(
-                _ingest_events, db_url, voyage_api_key, cleaned, st.stamp_surface_id
-            )
-        except Exception as e:
-            logger.warning("timeline ingest failed: %s", e)
-            return err(str(e)[:200], 500)
-        return JSONResponse({"status": "ok", "inserted": inserted, "skipped": skipped})
+        st = resolve_trust(request) if resolve_trust else UNKNOWN_SURFACE
+        inserted, skipped = _ingest_events(db_url, voyage_api_key, cleaned, st.stamp_surface_id)
+        return {"status": "ok", "inserted": inserted, "skipped": skipped}

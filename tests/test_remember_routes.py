@@ -302,7 +302,7 @@ def test_a_write_refused_by_remember_is_a_400(env, db_url):
 def test_invalid_json_body(env, db_url):
     with _client(db_url) as client:
         r = client.post(_ROUTE, content=b"not json", headers=_H)
-    assert r.status_code == 400 and r.json()["detail"] == "invalid JSON"
+    assert r.status_code == 400 and r.json()["detail"] == "invalid JSON body"
 
 
 def test_route_is_a_no_op_without_a_db_url(env):

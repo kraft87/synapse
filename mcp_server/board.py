@@ -29,9 +29,7 @@ from typing import Any
 
 import psycopg
 from fastmcp import FastMCP
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.db_notes import select_board_notes
@@ -45,7 +43,7 @@ from ingestion.surfaces import (
     own_surface_served,
 )
 from mcp_server.caller_trust import note_ignored_surface
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import route
 from mcp_server.recall_warnings import serving_notice
 from mcp_server.timeline_routes import _recent_events
 
@@ -447,11 +445,10 @@ def register(
         return
 
     @mcp.custom_route("/context", methods=["GET"])
-    async def board_context(request: Request) -> JSONResponse:
+    @route(authorized)
+    def board_context(request: Request) -> dict[str, Any]:
         """The rendered board for the plugin's SessionStart hook (follow-up PR): one
         bounded always-relevant index block, not query-blind recall injection."""
-        if not authorized(request):
-            return unauthorized()
         project = request.query_params.get("project") or None
         note_ignored_surface(request.query_params.get("surface"), "http.context")
         trust = resolve_trust(request) if resolve_trust is not None else UNKNOWN_SURFACE
@@ -459,16 +456,11 @@ def register(
         told = resolve_trust is not None and authenticated is not None and authenticated(request)
         notice = None
         if told:
-            own = await run_in_threadpool(own_surface_served, db_url, trust)
-            notice = serving_notice(trust, own)
+            notice = serving_notice(trust, own_surface_served(db_url, trust))
         t0 = time.perf_counter()
-        try:
-            board = await run_in_threadpool(build_board, db_url, project, None, trust, notice)
-        except Exception as e:
-            logger.warning("board build failed: %s", e)
-            return err(str(e)[:200], 500)
+        board = build_board(db_url, project, None, trust, notice)
         if get_recall is not None:
             record_board_metrics(get_recall(), "http", (time.perf_counter() - t0) * 1000.0, board)
         board.pop("note_ids", None)
         board.pop("event_ids", None)
-        return JSONResponse(board)
+        return board

@@ -47,12 +47,11 @@ from typing import Any
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server.caller_trust import note_ignored_surface
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import RouteError, route
 
 logger = logging.getLogger(__name__)
 
@@ -103,19 +102,20 @@ def _complete(db_url: str, intent_id: str, result: dict[str, Any]) -> None:
         )
 
 
-def _validate(body: dict[str, Any]) -> str | None:
-    """Reject a payload the route cannot faithfully replay. None means valid."""
+def _validate(body: dict[str, Any]) -> None:
+    """Reject a payload the route cannot faithfully replay (the 400)."""
     intent_id = str(body.get("intent_id") or "").strip()
     if not intent_id:
-        return "intent_id required — it is the idempotency key for the replay"
+        raise RouteError("intent_id required — it is the idempotency key for the replay")
     if len(intent_id) > _MAX_INTENT_ID:
-        return f"intent_id too long (max {_MAX_INTENT_ID})"
+        raise RouteError(f"intent_id too long (max {_MAX_INTENT_ID})")
     has_pair = bool(str(body.get("hook") or "").strip()) and bool(
         str(body.get("body") or "").strip()
     )
     if not has_pair and not str(body.get("content") or "").strip():
-        return "provide hook + body (preferred) or content (legacy) — same forms as remember()"
-    return None
+        raise RouteError(
+            "provide hook + body (preferred) or content (legacy) — same forms as remember()"
+        )
 
 
 def register(
@@ -133,48 +133,32 @@ def register(
         return
 
     @mcp.custom_route("/remember/spool", methods=["POST"])  # type: ignore[misc]
-    async def remember_spool(request: Request) -> JSONResponse:
+    @route(authorized, body=True)
+    async def remember_spool(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """Replay one spooled remember() intent. Idempotent on the client's intent_id.
 
-        Not wrapped in ``guarded_json``: that helper runs its work in a threadpool, and the
-        write here is the async ``remember`` coroutine (which manages its own thread hop for
-        the blocking DB/LLM legs). Same auth + error envelope, hand-rolled."""
-        if not authorized(request):
-            return unauthorized()
-        try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON", 400)
-        if not isinstance(body, dict):
-            return err("invalid JSON", 400)
-
+        An ``async def`` handler: the write is the async ``remember`` coroutine (which
+        manages its own thread hop for the blocking DB/LLM legs), so the route offloads only
+        the intent bookkeeping."""
         # Cheap liveness+auth probe for the plugin's SessionStart step: it must be able to
         # tell "server reachable and my token works" from "spool locally" WITHOUT writing.
         if body.get("probe"):
-            return JSONResponse({"status": "ok", "probe": True})
+            return {"status": "ok", "probe": True}
 
-        detail = _validate(body)
-        if detail:
-            return err(detail, 400)
+        _validate(body)
         intent_id = str(body["intent_id"]).strip()
 
-        try:
-            prior = await run_in_threadpool(_claim, db_url, intent_id, body.get("hook"))
-        except Exception as e:
-            logger.warning("remember spool claim failed: %s", e)
-            return err(str(e)[:200], 500)
+        prior = await run_in_threadpool(_claim, db_url, intent_id, body.get("hook"))
 
         if prior is not None and prior.get("status") == "done":
-            return JSONResponse(
-                {
-                    "status": "ok",
-                    "intent_id": intent_id,
-                    "outcome": "duplicate",
-                    "note_id": prior.get("note_id"),
-                    "episode_id": prior.get("episode_id"),
-                    "prior_outcome": prior.get("outcome"),
-                }
-            )
+            return {
+                "status": "ok",
+                "intent_id": intent_id,
+                "outcome": "duplicate",
+                "note_id": prior.get("note_id"),
+                "episode_id": prior.get("episode_id"),
+                "prior_outcome": prior.get("outcome"),
+            }
 
         note_ignored_surface(body.get("surface"), "http.remember_spool")
         kwargs: dict[str, Any] = {
@@ -198,17 +182,13 @@ def register(
             kwargs["archived_episode_id"] = prior["episode_id"]
         kwargs["on_archived"] = lambda episode_id: _record_episode(db_url, intent_id, episode_id)
 
-        try:
-            result = await remember_fn(**kwargs)
-        except Exception as e:
-            logger.warning("remember spool write failed: %s", e)
-            return err(str(e)[:200], 500)
+        result = await remember_fn(**kwargs)
 
         if not isinstance(result, dict) or result.get("status") != "ok":
             # A rejected payload (bad type, blank body) is the client's problem, not a
             # transport failure: 400 so the flush drops the line instead of retrying forever.
             reason = (result or {}).get("detail") if isinstance(result, dict) else "write refused"
-            return err(str(reason)[:200], 400)
+            raise RouteError(str(reason)[:200])
 
         try:
             await run_in_threadpool(_complete, db_url, intent_id, result)
@@ -217,4 +197,4 @@ def register(
             # the still-'pending' claim) re-run the convergent write. Log and report success.
             logger.warning("remember spool complete-mark failed for %s: %s", intent_id, e)
 
-        return JSONResponse({"status": "ok", "intent_id": intent_id, **result})
+        return {"status": "ok", "intent_id": intent_id, **result}

@@ -24,14 +24,12 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.localtime import local_date
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import route
 
 logger = logging.getLogger(__name__)
 
@@ -83,24 +81,14 @@ def register(
         return
 
     @mcp.custom_route("/preferences/top", methods=["GET"])  # type: ignore[misc]
-    async def preferences_top(request: Request) -> JSONResponse:
+    @route(authorized)
+    def preferences_top(request: Request) -> dict[str, Any]:
         """Top standing user preferences for the plugin's session-start block. Bounded
         and time-agnostic by design — a small factual block, not query-blind recall."""
-        if not authorized(request):
-            return unauthorized()
         try:
             limit = min(int(request.query_params.get("limit", "8")), _MAX_LIMIT)
         except (TypeError, ValueError):
             limit = 8
         limit = max(limit, 1)
-        try:
-            st = (
-                await run_in_threadpool(resolve_trust, request)
-                if resolve_trust
-                else UNKNOWN_SURFACE
-            )
-            items = await run_in_threadpool(_top_preferences, db_url, limit, st.project_filter)
-        except Exception as e:
-            logger.warning("preferences top failed: %s", e)
-            return err(str(e)[:200], 500)
-        return JSONResponse({"status": "ok", "items": items})
+        st = resolve_trust(request) if resolve_trust else UNKNOWN_SURFACE
+        return {"status": "ok", "items": _top_preferences(db_url, limit, st.project_filter)}

@@ -9,15 +9,13 @@ from typing import TYPE_CHECKING, Any
 
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse
 
 from ingestion.project_label import clean_label
 from ingestion.surfaces import SurfaceTrust
-from mcp_server.http_helpers import err, unauthorized
+from mcp_server.http_helpers import RouteError, route
 
 if TYPE_CHECKING:
     from ingestion.capture import ToolCall
-    from ingestion.episode_writer import StoreStats
     from ingestion.models import Episode
 
 logger = logging.getLogger(__name__)
@@ -36,17 +34,17 @@ class _Post:
     session_id: str | None
 
     @classmethod
-    def read(cls, body: Any) -> _Post:
-        """Raises ValueError, with the 400's message, for a body that is not a records POST."""
-        records = body.get("records") if isinstance(body, dict) else None
+    def read(cls, body: dict[str, Any]) -> _Post:
+        """Raises RouteError (the 400) for a body that is not a records POST."""
+        records = body.get("records")
         if not isinstance(records, list):
-            raise ValueError("body must contain a 'records' list")
+            raise RouteError("body must contain a 'records' list")
         # A batch spanning several projects (a session that moved between repositories)
         # carries each cwd's label instead.
         raw_by_cwd = body.get("cwd_projects")
         record_format = body.get("format") or "claude_code"
         if record_format not in ("claude_code", "codex"):
-            raise ValueError(f"unknown format {record_format!r}")
+            raise RouteError(f"unknown format {record_format!r}")
         return cls(
             records=records,
             source=body.get("source") or "hook",
@@ -132,7 +130,8 @@ def register(
     or for the root token / an unknown credential, episodes are stamped NULL."""
 
     @mcp.custom_route("/ingest", methods=["POST"])
-    async def ingest_turns(request: Request) -> JSONResponse:
+    @route(_machine_authorized, body=True)
+    def ingest_turns(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """Direct-push ingest endpoint — replaces the Logfire poll for Claude Code.
 
         A Claude Code ``Stop`` hook POSTs a bounded TAIL of the session transcript
@@ -165,30 +164,15 @@ def register(
         turns and sub-agent records alike; the reply's ``captured`` counts the artifacts stored
         and ``capture`` says whether the switch is on (an older server has neither key).
         """
-        if not _machine_authorized(request):
-            return unauthorized()
+        from ingestion.db import Database
+        from ingestion.episode_writer import StoreStats, store_episodes
 
-        from starlette.concurrency import run_in_threadpool
-
-        try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON body", 400)
-
-        try:
-            post = _Post.read(body)
-        except ValueError as e:
-            return err(str(e), 400)
-
-        def _work() -> StoreStats:
-            from ingestion.db import Database
-            from ingestion.episode_writer import StoreStats, store_episodes
-
-            # Resolved from the credential only.
-            stamp = _request_trust(request).stamp_surface_id if _request_trust else None
-            episodes, extra_calls = post.parse(stamp, sidechain=_capture_enabled())
-            if not episodes and not extra_calls:
-                return StoreStats()
+        post = _Post.read(body)
+        # Resolved from the credential only.
+        stamp = _request_trust(request).stamp_surface_id if _request_trust else None
+        episodes, extra_calls = post.parse(stamp, sidechain=_capture_enabled())
+        stats = StoreStats()
+        if episodes or extra_calls:
             db = Database(db_url())
             try:
                 # Every guard, the span dedup, the append at max(sequence)+1, the extraction
@@ -198,26 +182,18 @@ def register(
             finally:
                 db.close()
             stats.log_skipped()
-            return stats
-
-        try:
-            stats = await run_in_threadpool(_work)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("ingest failed")
-            return err(str(exc)[:200], 500)
-        return JSONResponse(
-            {
-                "status": "ok",
-                "ingested": stats.written,
-                "captured": stats.captured,
-                # Whether capture is on: the client ships sub-agent transcripts and the large
-                # tool outputs it saved to files only to a server that will use them.
-                "capture": _capture_enabled(),
-            }
-        )
+        return {
+            "status": "ok",
+            "ingested": stats.written,
+            "captured": stats.captured,
+            # Whether capture is on: the client ships sub-agent transcripts and the large
+            # tool outputs it saved to files only to a server that will use them.
+            "capture": _capture_enabled(),
+        }
 
     @mcp.custom_route("/capture/dry-run", methods=["POST"])
-    async def capture_dry_run(request: Request) -> JSONResponse:
+    @route(_machine_authorized, body=True)
+    def capture_dry_run(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         """What web capture WOULD store from a batch of transcript records. Writes nothing.
 
         The body is ``/ingest``'s, behind the same client gate. The records go through the
@@ -234,46 +210,25 @@ def register(
         duplicates it sees are per POST: a client posting a long history in batches counts a
         page fetched twice in two batches twice.
         """
-        if not _machine_authorized(request):
-            return unauthorized()
-
-        from starlette.concurrency import run_in_threadpool
-
         from ingestion import capture
+        from ingestion.db import Database
+        from ingestion.private_sessions import PrivateSessions
 
         try:
             capture.check_config()  # the switch and the rule files, named if invalid
         except ValueError as e:
-            return err(f"web capture is misconfigured: {e}", 500)
+            raise RouteError(f"web capture is misconfigured: {e}", 500) from e
+        post = _Post.read(body)
+        stamp = _request_trust(request).stamp_surface_id if _request_trust else None
+        episodes, extra_calls = post.parse(stamp, sidechain=True)
+        calls = [c for ep in episodes for c in capture.episode_tool_calls(ep)] + extra_calls
+        db = Database(db_url())
         try:
-            body = await request.json()
-        except Exception:
-            return err("invalid JSON body", 400)
-        try:
-            post = _Post.read(body)
-        except ValueError as e:
-            return err(str(e), 400)
-
-        def _work() -> dict[str, Any]:
-            from ingestion.db import Database
-            from ingestion.private_sessions import PrivateSessions
-
-            stamp = _request_trust(request).stamp_surface_id if _request_trust else None
-            episodes, extra_calls = post.parse(stamp, sidechain=True)
-            calls = [c for ep in episodes for c in capture.episode_tool_calls(ep)] + extra_calls
-            db = Database(db_url())
-            try:
-                result = capture.capture_calls(
-                    db, calls, is_private=PrivateSessions(db).is_private, dry_run=True
-                )
-            finally:
-                db.close()
-            return {"status": "ok", "enabled": capture.enabled(), **capture.report(result)}
-
-        try:
-            return JSONResponse(await run_in_threadpool(_work))
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.exception("capture dry run failed")
-            return err(str(exc)[:200], 500)
+            result = capture.capture_calls(
+                db, calls, is_private=PrivateSessions(db).is_private, dry_run=True
+            )
+        finally:
+            db.close()
+        return {"status": "ok", "enabled": capture.enabled(), **capture.report(result)}
 
     return ingest_turns

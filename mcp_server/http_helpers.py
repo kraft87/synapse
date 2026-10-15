@@ -3,10 +3,10 @@
 # already in the mypy pre-commit exclude via mcp_server/*).
 """Shared plain-HTTP route helpers for the machine-token custom routes.
 
-Consolidates the error-envelope + auth/JSON/threadpool boilerplate that the DSN-free
-route modules (server, skill_sync, config_sync, timeline, preferences, board, dashboard)
-each hand-rolled. The contract's error body is ``{"status": "error", "detail": ...}`` at
-some status; ``unauthorized()`` is the 401 special case.
+One place for the error-envelope + auth/JSON/threadpool boilerplate the route modules used
+to hand-roll. The contract's error body is ``{"status": "error", "detail": ...}`` at some
+status; ``unauthorized()`` is the 401 special case, ``route`` is the decorator that applies
+all of it, and ``guarded_json`` is the skill/config sync routes' lenient-body variant.
 
 Import discipline: this module imports ONLY starlette + stdlib, never any other mcp_server
 module, so it can be imported from all of them without a cycle.
@@ -14,6 +14,8 @@ module, so it can be imported from all of them without a cycle.
 
 from __future__ import annotations
 
+import functools
+import inspect
 import logging
 import re
 from collections.abc import Callable
@@ -21,7 +23,7 @@ from typing import Any
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,70 @@ def _iso(dt: Any) -> str | None:
     return dt.isoformat() if dt is not None else None
 
 
+class RouteError(Exception):
+    """Raised inside a ``route`` handler to answer the error envelope: ``detail`` at
+    ``status`` (400 unless the handler says otherwise), for a request it refuses."""
+
+    def __init__(self, detail: str, status: int = 400) -> None:
+        super().__init__(detail)
+        self.detail = detail
+        self.status = status
+
+
+def route(
+    gate: Callable[[Request], bool] | None,
+    *,
+    body: bool = False,
+    not_found: str | None = None,
+    label: str | None = None,
+) -> Callable[[Callable[..., Any]], Callable[[Request], Any]]:
+    """Decorator for a ``custom_route`` handler: the gate, the body and the error envelope.
+
+    The wrapper checks ``gate(request)`` once (401; ``None`` for a route that authenticates
+    by other means), parses a JSON object body when ``body`` is set (400 for invalid JSON or
+    anything but an object) and calls ``fn(request)`` / ``fn(request, body)``. A plain
+    function runs in the threadpool, so it may block on the database and resolve a caller's
+    trust; an ``async def`` runs on the event loop and offloads its own blocking calls.
+
+    What ``fn`` returns goes out as the 200 JSON body, except a ready ``Response`` (a
+    streamed or non-200 answer) which passes through, and ``None`` when ``not_found`` is
+    set, which is the 404 with that detail. ``RouteError`` is the handler's own refusal;
+    any other exception is logged under ``label`` (the handler's name unless given) and
+    answered as a 500 carrying the first 200 characters of its message."""
+
+    def decorate(fn: Callable[..., Any]) -> Callable[[Request], Any]:
+        offload = not inspect.iscoroutinefunction(fn)
+        name = label or fn.__name__
+
+        @functools.wraps(fn)
+        async def handler(request: Request) -> Response:
+            if gate is not None and not gate(request):
+                return unauthorized()
+            args: tuple[Any, ...] = (request,)
+            if body:
+                try:
+                    payload = await request.json()
+                except Exception:
+                    return err("invalid JSON body", 400)
+                if not isinstance(payload, dict):
+                    return err("body must be a JSON object", 400)
+                args = (request, payload)
+            try:
+                out = await (run_in_threadpool(fn, *args) if offload else fn(*args))
+            except RouteError as e:
+                return err(e.detail, e.status)
+            except Exception as e:
+                logger.exception("%s failed", name)
+                return err(str(e)[:200], 500)
+            if out is None and not_found is not None:
+                return err(not_found, 404)
+            return out if isinstance(out, Response) else JSONResponse(out)
+
+        return handler
+
+    return decorate
+
+
 async def guarded_json(
     request: Request,
     authorized: Callable[[Request], bool],
@@ -58,18 +124,19 @@ async def guarded_json(
     *,
     label: str = "route",
 ) -> JSONResponse:
-    """Auth-gate + JSON-parse + threadpool boundary shared by the skill/config sync routes.
+    """The skill/config sync routes' form of ``route``: gate (401), parse the JSON body
+    (400 on failure) and run ``work(body)`` in a threadpool (500 + logged on exception).
 
-    Gate on ``authorized(request)`` (401), parse the JSON body (400 on failure), run
-    ``work(body)`` in a threadpool (500 + logged on exception), else return ``JSONResponse(out)``.
-    ``label`` names the route in the 500 log line (e.g. 'skill route' / 'config route').
-    ``work`` may return a ready ``JSONResponse`` (e.g. a 403) and it is passed through."""
+    Unlike ``route(body=True)`` the body may be any JSON value: those routes' ``work`` answers
+    a malformed body in its own words (a 200 ``status: error`` the CLIs print). ``label``
+    names the route in the 500 log line (e.g. 'skill route' / 'config route'). ``work`` may
+    return a ready ``JSONResponse`` (e.g. a 403) and it is passed through."""
     if not authorized(request):
         return unauthorized()
     try:
         body = await request.json()
     except Exception:
-        return err("invalid JSON", 400)
+        return err("invalid JSON body", 400)
     try:
         out = await run_in_threadpool(work, body)
     except Exception as exc:  # pragma: no cover - defensive
