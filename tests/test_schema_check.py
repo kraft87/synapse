@@ -133,11 +133,13 @@ def test_check_exits_on_unparseable_stamp(tmp_path, monkeypatch):
         check_schema_version("postgresql://x", schema_dir=d)
 
 
-def test_check_exits_when_stamp_is_missing(tmp_path, monkeypatch):
+def test_check_exits_when_stamp_is_missing(tmp_path, monkeypatch, caplog):
     d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
     monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: None)
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit), caplog.at_level("CRITICAL"):
         check_schema_version("postgresql://x", schema_dir=d)
+    # apply_schema.sh refuses an unstamped database without an explicit start
+    assert "scripts/apply_schema.sh --all" in caplog.text
 
 
 def test_kill_switch_skips_check(tmp_path, monkeypatch):

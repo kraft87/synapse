@@ -1,7 +1,7 @@
 """Boot-time schema-version guard.
 
 ``scripts/apply_schema.sh`` stamps ``synapse_meta.schema_version`` (table
-from migration 034) after a full run; every long-lived service (poller,
+from migration 034) after each run; every long-lived service (poller,
 MCP server, dream) calls :func:`check_schema_version` at startup. A
 database that is missing the stamp or behind the code's schema fails FAST
 with upgrade instructions, instead of surfacing as confusing runtime
@@ -154,13 +154,16 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
         if applied is None
         else f"is at schema {applied}"
     )
+    # Without a stamp the script cannot tell which files the database already has.
+    command = "scripts/apply_schema.sh" + (" --all" if applied is None else "")
     logger.critical(
         "Database %s but this build expects schema %s. "
-        "Run scripts/apply_schema.sh against your database to upgrade it "
+        "Run %s against your database to upgrade it "
         "(see README > Upgrading), then restart. "
         "To skip this check: SYNAPSE_SCHEMA_CHECK=0.",
         state,
         expected,
+        command,
     )
     sys.exit(1)
 
