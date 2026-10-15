@@ -13,11 +13,9 @@ from ingestion.web_extractors import (
     ResearchJobRef,
     SearchResultSet,
     WebScrape,
-    _parse_datetime,
-    _strip_firecrawl_boilerplate,
-    extract,
-    is_web_tool,
+    error_reason,
     parse_crawling_exa,
+    parse_datetime,
     parse_deep_researcher_check,
     parse_deep_researcher_start,
     parse_deep_search,
@@ -27,6 +25,9 @@ from ingestion.web_extractors import (
     parse_firecrawl_search,
     parse_webfetch,
     parse_websearch,
+    refine,
+    strip_boilerplate,
+    tool_id,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "web_extractors"
@@ -41,27 +42,27 @@ def _load(slug: str) -> dict:
 
 class TestParseDatetime:
     def test_iso_z(self):
-        dt = _parse_datetime("2026-04-23T03:00:00.000Z")
+        dt = parse_datetime("2026-04-23T03:00:00.000Z")
         assert dt is not None and dt.year == 2026 and dt.month == 4
 
     def test_date_only(self):
-        dt = _parse_datetime("2012-04-14")
+        dt = parse_datetime("2012-04-14")
         assert dt is not None and dt.year == 2012
 
     def test_na_returns_none(self):
-        assert _parse_datetime("N/A") is None
-        assert _parse_datetime("") is None
-        assert _parse_datetime(None) is None
+        assert parse_datetime("N/A") is None
+        assert parse_datetime("") is None
+        assert parse_datetime(None) is None
 
 
-# ---------- Firecrawl boilerplate stripper ----------
+# ---------- Boilerplate stripper ----------
 
 
-class TestFirecrawlBoilerplate:
+class TestBoilerplate:
     def test_strips_github_skip_to_content(self):
         md = "[Skip to content](https://example.com#start)\n\nReal content here"
-        assert "[Skip to content]" not in _strip_firecrawl_boilerplate(md)
-        assert "Real content here" in _strip_firecrawl_boilerplate(md)
+        assert "[Skip to content]" not in strip_boilerplate(md)
+        assert "Real content here" in strip_boilerplate(md)
 
     def test_strips_signed_in_chatter(self):
         # Real firecrawl-on-GitHub output: each "Reload" is a markdown link with a URL.
@@ -71,7 +72,7 @@ class TestFirecrawlBoilerplate:
             "You switched accounts on another tab or window. [Reload](https://github.com/x) to refresh your session."
             "Dismiss alert\n\nReal content"
         )
-        out = _strip_firecrawl_boilerplate(md)
+        out = strip_boilerplate(md)
         assert "You signed in" not in out
         assert "Dismiss alert" not in out
         assert "Real content" in out
@@ -140,8 +141,8 @@ class TestFirecrawlScrape:
             assert len(out.content_markdown) > 20
         for s in f["error_samples"]:
             out = parse_firecrawl_scrape(s["input"], s["result_text"])
-            # "Error: result (...) exceeds maximum allowed tokens" — persisted output
-            # is detected at the dispatcher level; raw parser sees the error preamble.
+            # "Error: result (...) exceeds maximum allowed tokens": the raw parser sees
+            # the error preamble.
             assert isinstance(out, ExtractError | WebScrape)
 
 
@@ -151,8 +152,8 @@ class TestFirecrawlScrape:
 class TestCrawlingExa:
     def test_real_fixtures(self):
         # Errors here include MCP-validation failures (ExtractError) AND
-        # persisted-output redirects (treated as content; dispatch loads from
-        # disk). Test per-sample.
+        # persisted-output redirects (treated as content: the capture skips those
+        # before parsing). Test per-sample.
         f = _load("Exa_search_crawling_exa")
         for s in f["happy_samples"]:
             out = parse_crawling_exa(s["input"], s["result_text"])
@@ -165,7 +166,7 @@ class TestCrawlingExa:
             if "MCP error" in text[:200] or "validation failed" in text[:200]:
                 assert isinstance(out, ExtractError)
             elif "<persisted-output>" in text[:200]:
-                assert isinstance(out, WebScrape)  # raw parser; dispatch loads file
+                assert isinstance(out, WebScrape)  # raw parser
             else:
                 # Some other format — at minimum doesn't crash
                 assert out is not None
@@ -348,17 +349,15 @@ class TestDeepResearcher:
         assert out.synthesized is True
 
 
-# ---------- Dispatch + persisted output ----------
+# ---------- Dispatch ----------
 
 
 class TestDispatch:
-    def test_unknown_tool_returns_error(self):
-        out = extract("NotARealTool", {}, "some content")
-        assert isinstance(out, ExtractError)
-        assert out.reason == "unknown_tool"
+    def test_unknown_operation_has_no_refinement(self):
+        assert refine("NotARealTool", {}, "some content") is None
 
     def test_dispatch_picks_correct_parser(self):
-        out = extract(
+        out = refine(
             "WebSearch",
             {"query": "q"},
             'Web search results for query: "q"\n\nLinks: [{"title":"A","url":"https://a"}]',
@@ -366,32 +365,26 @@ class TestDispatch:
         assert isinstance(out, SearchResultSet)
         assert out.items[0].url == "https://a"
 
-    def test_persisted_output_detection_records_path(self, tmp_path):
-        # Build a fake persisted file with a real Exa-style result
-        persisted = tmp_path / "tool-results" / "abc.txt"
-        persisted.parent.mkdir(parents=True, exist_ok=True)
-        persisted.write_text(
-            "Title: From disk\nURL: https://disk.example\nPublished: 2026-01-01\nAuthor: N/A\nHighlights:\nfrom-disk body\n"
-        )
+    def test_a_persisted_output_redirect_is_not_read_from_disk(self, tmp_path):
+        """The path names a file on the client machine; the server must never open it."""
+        persisted = tmp_path / "abc.txt"
+        persisted.write_text("Title: From disk\nURL: https://disk.example\nHighlights:\nbody\n")
         preamble = (
-            f"<persisted-output>\nOutput too large (61.4KB). Full output saved to: {persisted}\n\n"
-            'Preview (first 2KB):\n[\n  {\n    "type": "text"\n  }\n]'
+            f"<persisted-output>\nOutput too large (61.4KB). Full output saved to: {persisted}\n"
         )
-        out = extract("mcp__claude_ai_Exa_search__web_search_exa", {"query": "q"}, preamble)
+        out = refine("mcp__claude_ai_Exa_search__web_search_exa", {"query": "q"}, preamble)
         assert isinstance(out, SearchResultSet)
-        assert out.persisted_output_path == str(persisted)
-        assert any(it.url == "https://disk.example" for it in out.items)
+        assert out.items == []
 
-    def test_persisted_output_missing_file_falls_back_to_preview(self, tmp_path):
-        preamble = (
-            f"<persisted-output>\nOutput too large. Full output saved to: {tmp_path}/missing.txt\n\n"
-            "Preview (first 2KB):\nTitle: Inline\nURL: https://inline.example\nPublished: N/A\nAuthor: N/A\nHighlights:\nstub\n"
-        )
-        out = extract("mcp__claude_ai_Exa_search__web_search_exa", {"query": "q"}, preamble)
-        # Even if the file's missing, we should fall back to parsing the preview
-        # and record the attempted path.
-        assert isinstance(out, SearchResultSet)
-        assert out.persisted_output_path is not None
+
+class TestErrorReason:
+    def test_short_wall_pages_are_errors(self):
+        assert error_reason("Just a moment...\nChecking your browser") == "blocked_page"
+        assert error_reason("Please sign in to continue to the docs.") == "blocked_page"
+
+    def test_a_long_page_mentioning_captcha_is_content(self):
+        page = "# Bot detection\n\nA CAPTCHA tells humans and bots apart. " + "More text. " * 400
+        assert error_reason(page) is None
 
 
 # ---------- End-to-end coverage smoke test ----------
@@ -424,7 +417,7 @@ class TestCoverageSmoke:
     def test_all_happy_fixtures_dispatch_cleanly(self, slug, tool):
         f = _load(slug)
         for s in f["happy_samples"]:
-            out = extract(tool, s["input"], s["result_text"])
+            out = refine(tool, s["input"], s["result_text"])
             assert not isinstance(out, ExtractError), (
                 f"{tool} happy sample produced ExtractError: {out!r}\n"
                 f"input={s['input']}\nresult preview: {s['result_text'][:200]}"
@@ -448,20 +441,19 @@ class TestServerNamePrefixes:
     def test_local_server_parses_like_the_connector(self, connector, local):
         slug = connector.removeprefix("mcp__claude_ai_").replace("__", "_")
         for s in _load(slug)["happy_samples"]:
-            via_connector = extract(connector, s["input"], s["result_text"])
-            via_local = extract(local, s["input"], s["result_text"])
+            via_connector = refine(connector, s["input"], s["result_text"])
+            via_local = refine(local, s["input"], s["result_text"])
             assert not isinstance(via_local, ExtractError)
             assert via_local.tool_name == local
             assert via_local.model_dump(exclude={"tool_name"}) == via_connector.model_dump(
                 exclude={"tool_name"}
             )
 
-    def test_is_web_tool_ignores_the_server_name(self):
-        assert is_web_tool("mcp__firecrawl__firecrawl_scrape")
-        assert is_web_tool("mcp__claude_ai_Exa_search__web_search_exa")
-        assert is_web_tool("WebFetch")
-        assert not is_web_tool("mcp__Synapse__recall")
-        assert not is_web_tool("Bash")
+    def test_tool_id_ignores_the_server_name(self):
+        assert tool_id("mcp__firecrawl__firecrawl_scrape") == "firecrawl_scrape"
+        assert tool_id("mcp__claude_ai_Exa_search__web_search_exa") == "web_search_exa"
+        assert tool_id("server__crawling_exa") == "crawling_exa"
+        assert tool_id("WebFetch") == "WebFetch"
 
     def test_firecrawl_search_reads_the_wrapped_shape(self):
         """Firecrawl's current search result nests the lists under data (seen 2026-10-14)."""
@@ -481,6 +473,6 @@ class TestServerNamePrefixes:
                 "creditsUsed": 2,
             }
         )
-        out = extract("mcp__firecrawl__firecrawl_search", {"query": "voyage-4"}, text)
+        out = refine("mcp__firecrawl__firecrawl_search", {"query": "voyage-4"}, text)
         assert isinstance(out, SearchResultSet)
         assert [it.url for it in out.items] == ["https://blog.voyageai.com/2026/01/15/voyage-4/"]

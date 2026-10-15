@@ -1,51 +1,29 @@
 """
-Write web_extractor outputs into Postgres web_artifacts.
+Write captured web research into Postgres web_artifacts.
 
-The writer is the persistence half of the web-capture pipeline; the parser
-half lives in ``ingestion.web_extractors``. Together they walk a JSONL,
-locate tool_use/tool_result pairs for web tools, and produce one
-``web_artifacts`` row per pair.
+The persistence half of the web-capture pipeline; the parser half lives in
+``ingestion.web_extractors`` and the decision of what to capture in ``ingestion.capture``,
+which calls this module for every call it stores. One ``web_artifacts`` row per
+tool_use/tool_result pair.
 
-Idempotency is by ``tool_use_id`` (UNIQUE in the schema). Re-runs over the
-same JSONL produce no duplicates and no errors.
-
-A checkpoint per JSONL is recorded in ``ingestion_state`` with
-``source = 'web:<absolute path>'`` so re-runs skip files whose mtime has not
-advanced since last successful pass.
-
-Nothing in this repo runs the web-capture lane (this module, web_extractors,
-web_chunker, web_enqueue, research_capture, scripts/contextualize_web_chunks.py):
-a cron on the client machine, outside the repo, walks the session JSONLs and
-drives it end to end (ARCHITECTURE §8).
+Idempotency is by ``tool_use_id`` (UNIQUE in the schema): shipping the same records again
+inserts nothing and raises nothing. A page or result list that was already stored (same
+canonical URL and content hash) from another call is not stored twice either.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import logging
-from collections.abc import Iterable, Iterator
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
-from pathlib import Path
-from typing import Any, cast
+from datetime import datetime
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import psycopg
 
-from ingestion.checkpoints import checkpoint_get, checkpoint_set
+from ingestion.secret_redact import redact_secrets
 from ingestion.textsafe import strip_nul
-from ingestion.web_extractors import (
-    ExtractError,
-    ExtractResult,
-    ResearchJobRef,
-    SearchResultSet,
-    WebScrape,
-    extract,
-    is_web_tool,
-)
-
-logger = logging.getLogger(__name__)
+from ingestion.web_extractors import ExtractResult, ResearchJobRef, SearchResultSet, WebScrape
 
 # ---------- URL canonicalization ----------
 
@@ -76,181 +54,83 @@ def _sha256_hex(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8", errors="ignore")).hexdigest()
 
 
-# ---------- Walking JSONLs ----------
-
-
-@dataclass
-class WebToolEvent:
-    """One tool_use/tool_result pair extracted from a JSONL."""
-
-    tool_use_id: str
-    tool_name: str
-    tool_input: dict[str, Any] | None
-    result_text: str
-    timestamp: datetime | None
-    session_id: str | None
-    jsonl_path: str
-
-
-def _coerce_text(content: Any) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for c in content:
-            if isinstance(c, dict):
-                t = c.get("text") or c.get("content")
-                if isinstance(t, str):
-                    parts.append(t)
-                elif isinstance(t, list):
-                    parts.append(_coerce_text(t))
-            elif isinstance(c, str):
-                parts.append(c)
-        return "\n".join(parts)
-    if isinstance(content, dict):
-        return _coerce_text(content.get("content"))
-    return str(content)
-
-
-def _parse_ts(s: str | None) -> datetime | None:
-    if not s:
-        return None
-    try:
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
-        return datetime.fromisoformat(s)
-    except (ValueError, TypeError):
-        return None
-
-
-def iter_web_events(jsonl_path: Path) -> Iterator[WebToolEvent]:
-    """Yield matched tool_use/tool_result pairs for web tools in one JSONL.
-
-    Tool calls without a matched result (mid-stream or interrupted) are
-    skipped.
-    """
-    pending: dict[str, dict[str, Any]] = {}
-    session_id: str | None = None
-    try:
-        fh = jsonl_path.open("r", encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    with fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if session_id is None:
-                session_id = rec.get("sessionId") or rec.get("session_id")
-            ts = _parse_ts(rec.get("timestamp"))
-            msg = rec.get("message") or {}
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                btype = block.get("type")
-                if btype == "tool_use":
-                    name = block.get("name")
-                    if not isinstance(name, str) or not is_web_tool(name):
-                        continue
-                    tu_id = block.get("id")
-                    if not tu_id:
-                        continue
-                    pending[tu_id] = {
-                        "name": name,
-                        "input": block.get("input"),
-                        "ts": ts,
-                    }
-                elif btype == "tool_result":
-                    tu_id_raw = block.get("tool_use_id")
-                    if not isinstance(tu_id_raw, str):
-                        continue
-                    tu = pending.pop(tu_id_raw, None)
-                    if not tu:
-                        continue
-                    yield WebToolEvent(
-                        tool_use_id=tu_id_raw,
-                        tool_name=tu["name"],
-                        tool_input=tu["input"] if isinstance(tu["input"], dict) else None,
-                        result_text=_coerce_text(block.get("content")),
-                        timestamp=tu["ts"] or ts,
-                        session_id=session_id,
-                        jsonl_path=str(jsonl_path),
-                    )
+def _clean(value: Any) -> Any:
+    """NUL bytes out (Postgres text rejects them; escaped as \\u0000 they still fail the jsonb
+    cast) and credentials redacted, in every string of any nesting."""
+    if isinstance(value, str):
+        return redact_secrets(strip_nul(value))
+    if isinstance(value, dict):
+        return {k: _clean(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clean(v) for v in value]
+    return value
 
 
 # ---------- Row construction ----------
 
 
-def _build_row(event: WebToolEvent, parsed: ExtractResult) -> dict[str, Any] | None:
-    """Translate a (event, parsed extractor output) into a web_artifacts row.
-
-    Returns None if `parsed` is an ExtractError or otherwise non-storeable
-    (caller increments the appropriate counter).
-    """
-    if isinstance(parsed, ExtractError):
-        return None
-
-    fetched_at = event.timestamp or datetime.now(UTC)
-
+def build_row(
+    parsed: ExtractResult,
+    *,
+    tool_name: str,
+    tool_use_id: str,
+    session_id: str,
+    fetched_at: datetime,
+    parent_episode_id: int | None,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    """Translate a parsed capture into a web_artifacts row. Credentials are redacted from
+    every text field, so what is stored, hashed and served never carries one."""
     base: dict[str, Any] = {
         "kind": parsed.kind,
-        "tool_name": event.tool_name,
-        "tool_use_id": event.tool_use_id,
-        "session_id": event.session_id,
-        "jsonl_path": event.jsonl_path,
+        "tool_name": tool_name,
+        "tool_use_id": tool_use_id,
+        "session_id": session_id,
+        "parent_episode_id": parent_episode_id,
         "fetched_at": fetched_at,
         "raw_chars": getattr(parsed, "raw_chars", None) or 0,
-        "persisted_output_path": getattr(parsed, "persisted_output_path", None),
     }
 
     if isinstance(parsed, WebScrape):
-        url_canonical = canonicalize_url(parsed.url) if parsed.url else None
-        markdown = strip_nul(parsed.content_markdown)
-        content_hash = _sha256_hex(markdown) if markdown else None
+        url = _clean(parsed.url) if parsed.url else None
+        markdown = _clean(parsed.content_markdown)
         base.update(
             {
-                "url": parsed.url or None,
-                "url_canonical": url_canonical,
-                "content_hash": content_hash,
-                "title": parsed.title,
+                "url": url,
+                "url_canonical": canonicalize_url(url) if url else None,
+                "content_hash": _sha256_hex(markdown) if markdown else None,
+                "title": _clean(parsed.title),
                 "content_markdown": markdown,
                 "synthesized": parsed.synthesized,
-                "prompt": parsed.prompt,
-                "author": parsed.author,
+                "prompt": _clean(parsed.prompt),
+                "author": _clean(parsed.author),
                 "published_at": parsed.published_at,
             }
         )
     elif isinstance(parsed, SearchResultSet):
-        # Serialize items as a JSON array; preserve typed shape from extractor. NULs go
-        # before json.dumps: escaped as \u0000 they still fail the jsonb cast.
-        items_json = strip_nul([it.model_dump(mode="json") for it in parsed.items])
+        items = _clean([it.model_dump(mode="json") for it in parsed.items])
+        query = _clean(parsed.query)
+        urls = sorted(canonicalize_url(it["url"]) or it["url"] for it in items)
         base.update(
             {
-                "query": parsed.query,
-                "items": json.dumps(items_json),
-                "item_count": len(parsed.items),
+                "query": query,
+                "items": json.dumps(items),
+                "item_count": len(items),
+                # The same results for the same query are one stored copy.
+                "content_hash": _sha256_hex(json.dumps([query, urls])),
             }
         )
     elif isinstance(parsed, ResearchJobRef):
         base.update(
             {
-                "research_id": parsed.research_id,
-                "research_instructions": parsed.instructions,
+                "research_id": _clean(parsed.research_id),
+                "research_instructions": _clean(parsed.instructions),
                 "research_model": parsed.model,
             }
         )
 
-    # Postgres text rejects NUL bytes; one in a scraped page would fail the insert.
-    return cast(dict[str, Any], strip_nul(base))
+    base["metadata"] = json.dumps(_clean(metadata))
+    return base
 
 
 # ---------- Writer ----------
@@ -263,16 +143,16 @@ INSERT INTO web_artifacts (
     synthesized, prompt, author, published_at,
     query, items, item_count,
     research_id, research_instructions, research_model,
-    session_id, parent_episode_id, jsonl_path,
-    persisted_output_path, raw_chars, fetched_at, metadata
+    session_id, parent_episode_id,
+    raw_chars, fetched_at, metadata
 ) VALUES (
     %(kind)s, %(tool_name)s, %(tool_use_id)s,
     %(url)s, %(url_canonical)s, %(content_hash)s, %(title)s, %(content_markdown)s,
     %(synthesized)s, %(prompt)s, %(author)s, %(published_at)s,
     %(query)s, %(items)s, %(item_count)s,
     %(research_id)s, %(research_instructions)s, %(research_model)s,
-    %(session_id)s, %(parent_episode_id)s, %(jsonl_path)s,
-    %(persisted_output_path)s, %(raw_chars)s, %(fetched_at)s, %(metadata)s
+    %(session_id)s, %(parent_episode_id)s,
+    %(raw_chars)s, %(fetched_at)s, %(metadata)s
 )
 ON CONFLICT (tool_use_id) DO NOTHING
 RETURNING id
@@ -299,110 +179,45 @@ _ALL_COLS = (
     "research_model",
     "session_id",
     "parent_episode_id",
-    "jsonl_path",
-    "persisted_output_path",
     "raw_chars",
     "fetched_at",
     "metadata",
 )
 
 
-def _fill_defaults(row: dict[str, Any]) -> dict[str, Any]:
-    """Ensure every column key is present (psycopg params barf otherwise)."""
-    return {col: row.get(col) for col in _ALL_COLS}
+def insert_artifact(conn: psycopg.Connection[Any], row: dict[str, Any]) -> bool:
+    """Insert ``row``; True if it landed, False when its tool_use_id is already stored.
+
+    A failed insert aborts the caller's transaction: run it in a savepoint to carry on."""
+    params = {col: row.get(col) for col in _ALL_COLS}  # psycopg params barf on a missing key
+    return conn.execute(_INSERT_SQL, params).fetchone() is not None
 
 
-@dataclass
-class IngestStats:
-    files_scanned: int = 0
-    files_skipped_unchanged: int = 0
-    events_seen: int = 0
-    inserted: int = 0
-    skipped_duplicate: int = 0
-    extract_errors: int = 0
-    db_errors: int = 0
-    by_kind: dict[str, int] = field(default_factory=dict)
-    by_tool: dict[str, int] = field(default_factory=dict)
-
-
-class WebArtifactsIngester:
-    """Walk JSONLs, extract web tool_results, write to web_artifacts.
-
-    Usage:
-        ing = WebArtifactsIngester(conn)
-        stats = ing.ingest_paths([Path("...jsonl"), ...])
-    """
-
-    def __init__(self, conn: psycopg.Connection[Any]) -> None:
-        self._conn = conn
-
-    def _checkpoint_get(self, source: str) -> datetime | None:
-        return checkpoint_get(self._conn, source)
-
-    def _checkpoint_set(self, source: str, ts: datetime) -> None:
-        checkpoint_set(self._conn, source, ts)
-
-    def _insert(self, row: dict[str, Any]) -> bool:
-        """Return True if a new row was inserted, False on conflict.
-
-        Runs in its own savepoint: a failed insert rolls back this row only, never
-        the rows already inserted from the same file (committed at the file's end).
+def artifact_stored(
+    conn: psycopg.Connection[Any],
+    tool_use_id: str,
+    url_canonical: str | None,
+    content_hash: str | None,
+) -> bool:
+    """True if this call was already captured, or the same content under the same URL
+    (a result list has no URL: the same results for the same query) was captured from
+    another call."""
+    row = conn.execute(
         """
-        with self._conn.transaction():
-            cur = self._conn.execute(_INSERT_SQL, _fill_defaults(row))
-            return cur.fetchone() is not None
+        SELECT 1 FROM web_artifacts
+        WHERE tool_use_id = %s
+           OR (content_hash = %s AND url_canonical IS NOT DISTINCT FROM %s)
+        LIMIT 1
+        """,
+        (tool_use_id, content_hash, url_canonical),
+    ).fetchone()
+    return row is not None
 
-    def ingest_one(self, jsonl_path: Path, stats: IngestStats | None = None) -> IngestStats:
-        stats = stats or IngestStats()
-        source_key = f"web:{jsonl_path}"
-        try:
-            mtime = datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=UTC)
-        except OSError:
-            return stats
-        last = self._checkpoint_get(source_key)
-        if last and mtime <= last:
-            stats.files_skipped_unchanged += 1
-            return stats
-        stats.files_scanned += 1
 
-        failed_in_file = 0
-        for event in iter_web_events(jsonl_path):
-            stats.events_seen += 1
-            parsed = extract(event.tool_name, event.tool_input, event.result_text)
-            row = _build_row(event, parsed)
-            if row is None:
-                stats.extract_errors += 1
-                continue
-            try:
-                inserted = self._insert(row)
-            except psycopg.Error as e:
-                stats.db_errors += 1
-                failed_in_file += 1
-                logger.warning(
-                    "web_artifacts: insert failed for %s in %s: %s",
-                    event.tool_use_id,
-                    jsonl_path,
-                    e,
-                )
-                continue
-            if inserted:
-                stats.inserted += 1
-                stats.by_kind[row["kind"]] = stats.by_kind.get(row["kind"], 0) + 1
-                stats.by_tool[event.tool_name] = stats.by_tool.get(event.tool_name, 0) + 1
-            else:
-                stats.skipped_duplicate += 1
-
-        # Commit per file so partial runs are durable. A file with a failed insert is
-        # left unchecked: a finished session's mtime never changes, so its checkpoint
-        # would hide the missing rows for good, and a re-read only adds what is missing
-        # (tool_use_id dedup).
-        if not failed_in_file:
-            self._checkpoint_set(source_key, mtime)
-        self._conn.commit()
-        return stats
-
-    def ingest_paths(self, paths: Iterable[Path]) -> IngestStats:
-        stats = IngestStats()
-        for p in paths:
-            self.ingest_one(p, stats)
-        return stats
+def count_fetched_between(conn: psycopg.Connection[Any], start: datetime, end: datetime) -> int:
+    """Artifacts fetched in [start, end)."""
+    row = conn.execute(
+        "SELECT count(*) AS n FROM web_artifacts WHERE fetched_at >= %s AND fetched_at < %s",
+        (start, end),
+    ).fetchone()
+    return int(row["n"]) if row else 0

@@ -220,7 +220,7 @@ def _coerce_result_text(content: Any) -> str:
 class ResearchArchiveCapture:
     """Walks transcript JSONLs and cold-archives matched tool results.
 
-    Mirrors WebArtifactsIngester's per-file mtime checkpoint (source key
+    Keeps a per-file mtime checkpoint (source key
     prefix 'research-archive:') so 5-minute cron re-runs are cheap no-ops.
     """
 

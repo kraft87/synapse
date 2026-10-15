@@ -1,10 +1,8 @@
 """Shared ingestion_state checkpoint helpers.
 
-`WebArtifactsIngester` and `ResearchArchiveCapture` each track a per-source
-high-water mark in the ``ingestion_state`` table through an injected raw
-psycopg connection. The get/set pair (same table, same tz-normalization to
-UTC, same dict-row/tuple-row defensiveness) lives here once; both classes
-delegate.
+`ResearchArchiveCapture` tracks a per-source high-water mark in the ``ingestion_state``
+table through an injected raw psycopg connection. The get/set pair (same table, same
+tz-normalization to UTC, same dict-row/tuple-row defensiveness) lives here once.
 """
 
 from __future__ import annotations

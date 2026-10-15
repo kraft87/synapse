@@ -1,8 +1,13 @@
 """
-Parsers for web-research tool_results in Claude Code JSONLs.
+Operation-specific parsers for web-research tool_results.
 
 Each tool's tool_result has a distinct shape (text-block-format, JSON, markdown).
-This module produces a normalized typed output regardless of source.
+This module produces a normalized typed output regardless of source. They are
+refinements: ``ingestion.capture`` detects web research by shape and calls ``refine`` for
+the operations listed in ``_DISPATCH``, for their better title / author / date / item
+fields. An operation is matched by its own name whatever the connector is called
+(``*__crawling_exa``, ``*__firecrawl_scrape``, ``WebFetch``), so a renamed server loses
+nothing.
 
 Three output shapes:
   - WebScrape: single-page content with URL + body. `synthesized=True` for WebFetch
@@ -14,12 +19,10 @@ Three output shapes:
 redirect-detection, captcha pages, etc.) so callers can count them rather than
 treating them as missing data.
 
-Persisted-output redirects ("Output too large (N KB). Full output saved to:
-/path/to/tool-results/<id>.{txt,json}") are detected; if the file exists,
-content is loaded from disk and re-parsed. Without this, ~10-15% of the
-largest tool_results would be lost to ~2KB previews.
-
-Called by ingestion.web_artifacts, which an out-of-repo cron drives.
+Parsers read only the text they are given. A persisted-output redirect ("Output too large
+(N KB). Full output saved to: <path>") names a file on the client machine; the server cannot
+read it, so the Stop hook inlines it before shipping the record (or the capture skips the
+call).
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
@@ -50,7 +52,6 @@ class SearchResultSet(BaseModel):
     query: str | None = None
     items: list[SearchResultItem] = Field(default_factory=list)
     raw_chars: int = 0
-    persisted_output_path: str | None = None
 
 
 class WebScrape(BaseModel):
@@ -64,7 +65,6 @@ class WebScrape(BaseModel):
     published_at: datetime | None = None
     author: str | None = None
     raw_chars: int = 0
-    persisted_output_path: str | None = None
 
 
 class ResearchJobRef(BaseModel):
@@ -89,92 +89,18 @@ ExtractResult = Annotated[
 ]
 
 
-# ---------- Constants ----------
-
-# Web tools by their own id. An MCP tool's full name is mcp__<server>__<tool>, and the
-# server segment is whatever the user named the server: claude_ai_firecrawl for the
-# claude.ai connector, firecrawl or Exa_search for a locally configured one. Matching
-# and dispatch go by ``tool_id``, so the same tool is captured under any server name.
-WEB_TOOLS_SCRAPE = {"WebFetch", "firecrawl_scrape", "crawling_exa"}
-
-WEB_TOOLS_SEARCH = {
-    "WebSearch",
-    "firecrawl_search",
-    "web_search_exa",
-    "web_search_advanced_exa",
-    "deep_search_exa",
-    "people_search_exa",
-    "company_research_exa",
-}
-
-WEB_TOOLS_RESEARCH = {"deep_researcher_start", "deep_researcher_check"}
-
-WEB_TOOLS_ALL = WEB_TOOLS_SCRAPE | WEB_TOOLS_SEARCH | WEB_TOOLS_RESEARCH
+# ---------- Operation names ----------
 
 
 def tool_id(tool_name: str) -> str:
-    """``mcp__<server>__<tool>`` -> ``<tool>``; built-in names (WebFetch) pass through."""
-    if tool_name.startswith("mcp__"):
-        return tool_name.rsplit("__", 1)[-1]
-    return tool_name
-
-
-def is_web_tool(tool_name: str) -> bool:
-    return tool_id(tool_name) in WEB_TOOLS_ALL
+    """The operation a tool name calls, whatever the connector prefix: ``mcp__<server>__<tool>``
+    (the server is whatever the user named it: ``claude_ai_firecrawl`` for the claude.ai
+    connector, ``firecrawl`` or ``Exa_search`` for a local one) and ``<server>__<tool>``
+    both give ``<tool>``; built-in names (WebFetch) pass through."""
+    return tool_name.rsplit("__", 1)[-1]
 
 
 # ---------- Helpers ----------
-
-_PERSISTED_HEADER_RE = re.compile(
-    r"(?:<persisted-output>|Error: result \([\d,]+(?: characters)?[^)]*\))",
-    re.IGNORECASE,
-)
-_PERSISTED_PATH_RE = re.compile(
-    r"(?:saved to:?|saved to)\s*(/[^\s\"'<>]+\.(?:json|txt))",
-    re.IGNORECASE,
-)
-
-
-def _detect_persisted_output(text: str) -> str | None:
-    """Return the on-disk path for a persisted-output response, or None."""
-    if not text:
-        return None
-    if not _PERSISTED_HEADER_RE.search(text[:500]):
-        return None
-    m = _PERSISTED_PATH_RE.search(text[:2000])
-    return m.group(1) if m else None
-
-
-def _load_persisted(path: str) -> str | None:
-    """Load a persisted-output file. Handles .txt and .json (array-of-text-blocks)."""
-    p = Path(path)
-    if not p.exists():
-        return None
-    try:
-        raw = p.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return None
-    if path.endswith(".json"):
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                parts = []
-                for item in data:
-                    if isinstance(item, dict):
-                        t = item.get("text") or item.get("content")
-                        if isinstance(t, str):
-                            parts.append(t)
-                        elif isinstance(t, list):
-                            for sub in t:
-                                if isinstance(sub, dict) and isinstance(sub.get("text"), str):
-                                    parts.append(sub["text"])
-                    elif isinstance(item, str):
-                        parts.append(item)
-                return "\n".join(parts)
-        except json.JSONDecodeError:
-            pass
-    return raw
-
 
 _ERROR_PRELUDES = (
     "MCP error -32602",
@@ -189,21 +115,36 @@ _ERROR_PRELUDES = (
 )
 
 
-def _is_pure_error(text: str) -> str | None:
-    """Return a brief reason if `text` is clearly a tool-error response, else None."""
+# A page that is a wall rather than content: captcha, login, rate limit, script shell. Real
+# pages are longer than these, so the phrases only count in a short body.
+_BLOCK_PAGE_RE = re.compile(
+    r"captcha|verify (?:that )?you(?: are|'re) (?:a )?human|are you a robot|just a moment"
+    r"|attention required|enable javascript|access denied|403 forbidden|404 not found"
+    r"|page not found|(?:sign|log) ?in to (?:continue|view|access)|please (?:sign|log) ?in"
+    r"|login required|unusual traffic|too many requests|rate limit exceeded",
+    re.IGNORECASE,
+)
+_BLOCK_PAGE_MAX_CHARS = 3000
+
+
+def error_reason(text: str) -> str | None:
+    """Return a brief reason if `text` is clearly a tool-error, redirect, captcha or login
+    response rather than page content, else None."""
     if not text:
         return "empty"
     head = text[:400]
     for pre in _ERROR_PRELUDES:
         if pre in head:
             return pre.rstrip(":").lower().replace(" ", "_")
+    if len(text) < _BLOCK_PAGE_MAX_CHARS and _BLOCK_PAGE_RE.search(text[:600]):
+        return "blocked_page"
     return None
 
 
 def _error_guard(tool_name: str, result_text: str) -> ExtractError | None:
     """Shared pure-error guard for the text-format parsers. Returns an
     ``ExtractError`` when `result_text` is a tool-error response, else None."""
-    err = _is_pure_error(result_text)
+    err = error_reason(result_text)
     if err:
         return ExtractError(
             tool_name=tool_name,
@@ -214,7 +155,7 @@ def _error_guard(tool_name: str, result_text: str) -> ExtractError | None:
     return None
 
 
-def _parse_datetime(s: str | None) -> datetime | None:
+def parse_datetime(s: str | None) -> datetime | None:
     if not s or not isinstance(s, str):
         return None
     s = s.strip()
@@ -253,7 +194,7 @@ def parse_webfetch(tool_input: dict[str, Any], result_text: str) -> ExtractResul
             detail=result_text[:400],
             raw_chars=raw_chars,
         )
-    err = _is_pure_error(result_text)
+    err = error_reason(result_text)
     if err:
         return ExtractError(
             tool_name="WebFetch", reason=err, detail=result_text[:400], raw_chars=raw_chars
@@ -272,7 +213,7 @@ def parse_webfetch(tool_input: dict[str, Any], result_text: str) -> ExtractResul
 
 # ---------- firecrawl_scrape ----------
 
-_FIRECRAWL_BOILERPLATE = [
+_BOILERPLATE = [
     re.compile(r"^\s*\[Skip to content\]\([^)]+\)\s*", re.MULTILINE),
     # Whole "You signed in / out / switched accounts ... Dismiss alert" run —
     # match lazily across the multi-Reload block.
@@ -285,8 +226,8 @@ _FIRECRAWL_BOILERPLATE = [
 ]
 
 
-def _strip_firecrawl_boilerplate(md: str) -> str:
-    for pat in _FIRECRAWL_BOILERPLATE:
+def strip_boilerplate(md: str) -> str:
+    for pat in _BOILERPLATE:
         md = pat.sub("", md)
     return re.sub(r"\n{3,}", "\n\n", md).strip()
 
@@ -309,7 +250,7 @@ def parse_firecrawl_scrape(tool_input: dict[str, Any], result_text: str) -> Extr
                     url = obj.get("url") or url
         except json.JSONDecodeError:
             pass
-    md = _strip_firecrawl_boilerplate(md)
+    md = strip_boilerplate(md)
     return WebScrape(
         tool_name="mcp__claude_ai_firecrawl__firecrawl_scrape",
         url=url,
@@ -341,7 +282,7 @@ def parse_crawling_exa(tool_input: dict[str, Any], result_text: str) -> ExtractR
         title = m.group("title").strip()
         url = m.group("url").strip()
         author = (m.group("author") or "").strip() or None
-        published = _parse_datetime(m.group("published"))
+        published = parse_datetime(m.group("published"))
     # Fall back to input urls
     if not url:
         inp_url = (tool_input or {}).get("urls") or (tool_input or {}).get("url")
@@ -426,7 +367,7 @@ def parse_firecrawl_search(tool_input: dict[str, Any], result_text: str) -> Extr
                                 url=it["url"],
                                 title=it.get("title"),
                                 snippet=it.get("description") or it.get("snippet"),
-                                published_at=_parse_datetime(
+                                published_at=parse_datetime(
                                     it.get("publishedDate") or it.get("date")
                                 ),
                                 author=it.get("author"),
@@ -468,7 +409,7 @@ def _parse_exa_block(block: str) -> SearchResultItem | None:
         url=fields["url"],
         title=fields.get("title"),
         snippet=fields.get("snippet"),
-        published_at=_parse_datetime(fields.get("published")),
+        published_at=parse_datetime(fields.get("published")),
         author=fields.get("author") if fields.get("author") not in (None, "", "N/A") else None,
     )
 
@@ -521,7 +462,7 @@ def parse_exa_advanced(tool_input: dict[str, Any], result_text: str) -> ExtractR
                         url=url,
                         title=it.get("title"),
                         snippet=(it.get("text") or it.get("highlights") or "")[:500] or None,
-                        published_at=_parse_datetime(it.get("publishedDate")),
+                        published_at=parse_datetime(it.get("publishedDate")),
                         author=it.get("author") or None,
                         position=i + 1,
                     )
@@ -646,34 +587,20 @@ _DISPATCH = {
 _EXA_TEXT_BLOCK_TOOLS = {"web_search_exa", "people_search_exa", "company_research_exa"}
 
 
-def extract(
+def refine(
     tool_name: str,
     tool_input: dict[str, Any] | None,
     result_text: str,
-) -> ExtractResult:
-    """
-    Parse a (tool_name, tool_input, result_text) triple into a typed shape.
-    If `result_text` is a persisted-output redirect, the on-disk file is loaded
-    and re-parsed; the path is recorded on the returned object.
-    """
-    persisted_path = _detect_persisted_output(result_text or "")
-    effective_text = result_text
-    if persisted_path:
-        loaded = _load_persisted(persisted_path)
-        if loaded:
-            effective_text = loaded
-
+) -> ExtractResult | None:
+    """Parse a (tool_name, tool_input, result_text) triple with the parser registered for
+    the operation, or None when this operation has none (the generic shape detector in
+    ``ingestion.capture`` takes it)."""
     key = tool_id(tool_name)
     if key in _EXA_TEXT_BLOCK_TOOLS:
-        out = parse_exa_text_blocks(tool_name, tool_input or {}, effective_text or "")
+        out = parse_exa_text_blocks(tool_name, tool_input or {}, result_text or "")
     elif key in _DISPATCH:
-        out = _DISPATCH[key](tool_input or {}, effective_text or "")
+        out = _DISPATCH[key](tool_input or {}, result_text or "")
     else:
-        return ExtractError(
-            tool_name=tool_name, reason="unknown_tool", raw_chars=len(result_text or "")
-        )
-
+        return None
     out.tool_name = tool_name  # the name it was called under, whatever the server
-    if persisted_path and hasattr(out, "persisted_output_path"):
-        out.persisted_output_path = persisted_path
     return out
