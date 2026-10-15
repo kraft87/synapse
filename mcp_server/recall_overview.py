@@ -71,7 +71,8 @@ class RecallOverviewMixin:
         registered ``trust='full'`` — including a missing one — is RESTRICTED: episodes
         are filtered to the surface's project allowlist (plus, for a credential-bound
         surface, the episodes it ingested itself: schema 057 ``surface_id``), notes to
-        ``audience='work-safe'``, and KG facts to those whose provenance is known and
+        ``audience='work-safe'``, no web chunks are served (web rows carry no project
+        provenance), and KG facts to those whose provenance is known and
         lies wholly inside the allowlist (schema 056 ``source_projects``: every source
         episode exists, has a project, and that project is allowed). The same rule
         covers every KG-derived extra (superseded pairs, the supersession surface, the

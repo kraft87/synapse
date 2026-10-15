@@ -286,8 +286,11 @@ _RECALL_FACT_FLOOR = float(os.getenv("SYNAPSE_RECALL_FACT_FLOOR", "0") or "0")
 # confidently-wrong answers: when nothing clears relevance, recall serves the least-bad six
 # and the model runs with them. Before ENFORCING a floor, log when one WOULD have fired so
 # the threshold is picked from real data: when real rerank scores exist and the RAW
-# pre-recency-reweight top score (the same value recall_metrics.rerank_top_score records)
-# is strictly below _RECALL_FLOOR, the served_ids telemetry envelope gains
+# pre-recency-reweight top score (the same value recall_metrics.rerank_top_score records,
+# taken over the episodes that survive echo suppression, so a high-scoring echo of the
+# prompt cannot hold the floor open; the value above that is served_ids.rerank_top_all,
+# recorded when it differs, for recalibrating after this change) is strictly below
+# _RECALL_FLOOR, the served_ids telemetry envelope gains
 # {"would_abstain": true, "floor": <float>} — see _floor_shadow(). The marker is recorded
 # regardless of enforcement. The threshold is a property of the RERANKER in use, not of
 # recall: rerank scores are not comparable across models, and a floor calibrated on one
