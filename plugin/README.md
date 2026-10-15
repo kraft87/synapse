@@ -96,6 +96,8 @@ Settings live in `~/.synapse/config.json`, owned by no harness:
 synapse config                         # list
 synapse config skills_sync on          # two-way skill sync at session start
 synapse config config_sync on          # mirror CLAUDE.md + rules/*.md for the dream lane
+synapse config timeline_repos ~/code/app  # git checkouts that feed the board's last-week block
+synapse config recall_nudge off        # also board, prefs_block, prompt_timestamp (default on)
 synapse config url https://...         # same server, new address; also rewires the harnesses
 ```
 
@@ -134,9 +136,8 @@ work through [the troubleshooting list](../docs/install.md#troubleshooting).
 
 A failed upload is not lost. The hook records it, and every session start's catch-up sweep
 retries it, however long the outage lasted: a down server, a revoked token, a proxy answering
-`403`. The sweep picks up any lagging transcript modified in the last
-`SYNAPSE_INGEST_CATCHUP_DAYS` (default 3) plus every transcript whose upload failed, at any
-age, `SYNAPSE_INGEST_CATCHUP_MAX` (default 20) files per session start. When uploads keep
+`403`. The sweep picks up any lagging transcript modified in the last 3 days plus every
+transcript whose upload failed, at any age, 20 files per session start. When uploads keep
 failing, session start shows one line saying so:
 
 ```

@@ -37,7 +37,7 @@ Failed uploads are retried however old they are. A POST that fails (server
 down, 401/403 from a revoked token or a proxy/WAF, timeout) marks the file's
 cursor entry `pending`, with the time and a short reason; the next successful
 POST for that file clears it. The sweep takes every lagging file modified
-within SYNAPSE_INGEST_CATCHUP_DAYS, plus every pending or half-shipped file
+within the catch-up window (3 days), plus every pending or half-shipped file
 regardless of age, and pending entries are exempt from the cursor TTL. An
 outage longer than the window therefore no longer loses the history it
 covered. A file the hook never attempted that is older than the window

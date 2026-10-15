@@ -12,8 +12,8 @@ the Claude Code plugin (`../plugin/`) for the per-session surface:
 | recall/remember MCP | plugin manifest | `[mcp_servers.synapse]` + headers helper (installer) |
 | per-prompt recall nudge | UserPromptSubmit | `hooks/user_prompt_submit.py` |
 | self-session injection | PreToolUse | `hooks/pre_tool_use.py` |
-| recall-feedback nudge | PostToolUse | `hooks/post_tool_use.py` |
-| private mode | marker + server row | `scripts/private_mode.py` (+ SessionEnd cleanup) |
+| recall-feedback nudge (off by default) | PostToolUse | `hooks/post_tool_use.py` |
+| private mode | marker + server row | `scripts/private_mode.py` (runs the Claude script; + SessionEnd cleanup) |
 | skills sync (opt-in) | SessionStart `skills_sync.py` | `scripts/skills_sync.py`, run by `hooks/session_start.py` |
 
 Skills sync shares the Claude plugin's engine and its opt-in (`skills_sync` in
@@ -30,10 +30,9 @@ either folder reaches the other at its next session start.
 A failed upload is not lost. When a POST fails (server down, a revoked token, a
 proxy answering `403`), the Stop hook marks that rollout in its cursor file, and
 every session start's catch-up sweep retries it, however long the outage
-lasted. The sweep takes any lagging rollout modified in the last
-`SYNAPSE_CODEX_CATCHUP_DAYS` (default 3) plus every rollout whose upload failed,
-at any age, oldest first, `SYNAPSE_CODEX_CATCHUP_MAX` (default 20) per session
-start. When uploads keep failing (3 in a row, or a day with no success), session
+lasted. The sweep takes any lagging rollout modified in the last 3 days plus every
+rollout whose upload failed, at any age, oldest first, 20 per session start (the same
+window and cap as the Claude plugin's). When uploads keep failing (3 in a row, or a day with no success), session
 start shows one line, as a Codex warning and in the model's context:
 
 ```
@@ -129,9 +128,7 @@ at 64 KB, like the MCP helper's log); there is no setting for it.
 | `SYNAPSE_HOME` | `~/.synapse` | config.json, the installed client and its shims |
 | `SYNAPSE_PRIVATE_DIR` | `~/.synapse/private` | private-mode markers |
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
-| `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window for lagging rollouts; failed uploads are retried at any age |
-| `SYNAPSE_CODEX_CATCHUP_MAX` | `20` | rollouts per sweep; the rest wait for the next session start |
 | `SYNAPSE_SKILLS_SYNC` | `skills_sync` in `~/.synapse/config.json` (off) | `1` enables skills sync |
 | `SYNAPSE_CODEX_SKILLS_DIR` | `~/.agents/skills` | folder the sync scans |
-| `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT` | `12` | seconds SessionStart waits for the sync |
-| `SYNAPSE_BOARD` / `SYNAPSE_PREFS_BLOCK` / `SYNAPSE_RECALL_NUDGE` / `SYNAPSE_RECALL_FEEDBACK_NUDGE` / `SYNAPSE_CODEX_CATCHUP` | `1` | kill switches |
+| `SYNAPSE_BOARD` / `SYNAPSE_PREFS_BLOCK` / `SYNAPSE_RECALL_NUDGE` / `SYNAPSE_PROMPT_TIMESTAMP` | `1` | `0` turns the session-start board, the preferences block, the per-prompt recall reminder and the per-prompt timestamp line off; `synapse config board off` (etc.) sets them in `~/.synapse/config.json` |
+| `SYNAPSE_RECALL_FEEDBACK_NUDGE` | `0` | `1` asks the model for `recall_feedback` after each recall (off since 2026-08-26, as on Claude; for dev boxes that tune retrieval); `synapse config recall_feedback_nudge on` |

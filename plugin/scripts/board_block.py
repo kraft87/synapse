@@ -24,7 +24,7 @@ say so and where to remove it, to the user (systemMessage) and the model. That l
 local, needs no server, and is printed even with the board disabled or the server down,
 since a silent override is the bug it exists to prevent.
 
-Disable the board with SYNAPSE_BOARD=0. Fail-open: any error prints nothing beyond that
+Disable the board with `synapse config board off` (or SYNAPSE_BOARD=0). Fail-open: any error prints nothing beyond that
 notice and exits 0 — a broken board must never break a session start.
 """
 
