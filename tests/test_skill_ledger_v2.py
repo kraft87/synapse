@@ -227,10 +227,15 @@ def test_a_signatureless_derive_matches_only_the_row_of_its_own_name():
     assert got is not None and got[0] == 1
 
 
-def test_shared_session_without_signatures_still_merges():
+def test_a_row_without_a_signature_is_matched_only_by_its_name():
     from dream.skills.skill_ledger import _resolve_id
 
-    # legacy rows carry no signature_key; session overlap alone still resolves there
+    # a row with no signature_key (an explicit "make this a skill" request, a legacy row) has
+    # no topic to compare: a shared session alone must not let a later sighting merge into it
+    # (and overwrite its summary), only a sighting of the same name is that row
     cur = _FakeCur([_row(1, "s1", "")])
-    got = _resolve_id(cur, "derive", "media-admin", None, None, "media preferences", {"s1"})
+    assert (
+        _resolve_id(cur, "derive", "media-admin", None, None, "media preferences", {"s1"}) is None
+    )
+    got = _resolve_id(cur, "derive", "row-1", None, None, "media preferences", {"s1"})
     assert got is not None and got[0] == 1

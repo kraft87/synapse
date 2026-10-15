@@ -329,6 +329,40 @@ def test_an_explicit_request_is_its_own_candidate_and_leaves_the_sessions_gap_al
     assert (n, weight) == (1, 3.0)
 
 
+def test_a_sighting_joins_its_gap_not_the_explicit_request_made_in_the_same_session(lane):
+    sig = "synthetic restic nas backup rclone"
+    gap = _mc(lane, "derive", "v2t-rev-nas-backup", _gap("v2t-sess-s0"), signature=sig)
+    # the user asks for a skill in another session; capture_grounded stores it as its own row
+    request = _mc(
+        lane,
+        "derive",
+        "explicit:v2t-sess-s1",
+        [{"session_id": "v2t-sess-s1", "class": "grounded", "signal": "explicit_request"}],
+        summary="make this a skill",
+    )
+    cols = "summary, signature_key, evidence, grounded_weight, status"
+    before = _row(lane, request["id"], cols)
+    # struggle_arc then sights the same procedure in that session: it belongs to the gap row
+    # (same signature), not to the request row that only shares the session
+    sighting = _mc(
+        lane,
+        "derive",
+        "v2t-rev-struggle",
+        [
+            {
+                "session_id": "v2t-sess-s1",
+                "class": "judge",
+                "signal": "struggle_arc",
+                "date": "2026-07-18",
+            }
+        ],
+        signature=sig,
+        summary="backing up the nas",
+    )
+    assert sighting["id"] == gap["id"] and sighting["merged"] is True
+    assert _row(lane, request["id"], cols) == before
+
+
 def test_only_a_dismissal_of_a_registered_skill_becomes_a_narrow_candidate(lane, monkeypatch):
     monkeypatch.setattr(N.DB, "explicit_skill_requests", lambda conn, window: [])
     fires = [
@@ -407,7 +441,9 @@ def test_a_sighting_after_a_retirement_opens_a_fresh_candidate(lane):
     assert _row(lane, r1["id"], "status") == ("retired",)
 
 
-def test_before_the_open_identity_migration_a_sighting_after_an_accept_is_reported(lane):
+def test_before_the_open_identity_migration_a_sighting_of_a_closed_retune_is_dropped_loudly(
+    lane, caplog
+):
     old_index = (
         "CREATE UNIQUE INDEX skill_gap_named_idx ON skills_lane.skill_gap_candidates "
         "(kind, name, COALESCE(direction, '-')) WHERE kind IN ('retune', 'consolidate')"
@@ -419,7 +455,16 @@ def test_before_the_open_identity_migration_a_sighting_after_an_accept_is_report
         _promote(lane, r1["id"])
         r2 = _retune(lane, "v2t-sess-t2")  # the closed row still occupies the key
         assert r2["id"] == r1["id"] and r2["merged"] is False and r2["status"] == "promoted"
-        assert _row(lane, r1["id"], "jsonb_array_length(evidence)") == (2,)
+        assert _row(lane, r1["id"], "jsonb_array_length(evidence)") == (2,)  # nothing recorded
+        assert "sighting of" in caplog.text and "open-identity migration" in caplog.text
+        # the same for a retired row, which used to be reopened
+        caplog.clear()
+        lane.execute(
+            "UPDATE skills_lane.skill_gap_candidates SET status='retired' WHERE id=%s", (r1["id"],)
+        )
+        r3 = _retune(lane, "v2t-sess-t3")
+        assert r3["id"] == r1["id"] and r3["status"] == "retired" and r3["merged"] is False
+        assert "open-identity migration" in caplog.text
     finally:
         lane.execute(OPEN_IDENTITY_MIGRATION.read_text())
 

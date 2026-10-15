@@ -1,10 +1,10 @@
 # mypy: ignore-errors
 """skills_lane ledger writer — the dream->skills "writer contract" from schema/022.
 
-Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name;
-retune = (name,direction)), evidence accumulation (dedup by
-(session, signal, class, work date), recompute weights from the FULL evidence every
-merge — never incrementally), the 0.5x judge discount (the score column does it),
+Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name, except that
+a side without a signature matches by name only; retune = (name,direction)),
+evidence accumulation (dedup by (session, signal, class, work date), recompute weights from
+the FULL evidence every merge — never incrementally), the 0.5x judge discount (the score column does it),
 observe->proposed classification (v2 gates: retune proposes on one quote-carrying
 instance; derive on recurrence across distinct days, high salience, or the legacy
 score), and decay of unseen 'observe' candidates ('proposed' rows wait for human
@@ -19,11 +19,14 @@ Evidence entry shape (all fields beyond class/signal optional, backward compatib
 from __future__ import annotations
 
 import json
+import logging
 import re
 
 from ingestion.schema_check import ColumnProbe
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 # identity / classification knobs (Oracle-reviewed defaults)
 SESSION_JACCARD = 0.4  # derive identity: evidence-session overlap (ground truth, primary)
@@ -212,7 +215,7 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         # Match skill_gap_named_idx's unique key among the open states (the open-identity
         # migration): a promoted or retired row is history, so a new sighting opens a fresh
         # candidate. On a database still on the old index (unique across every status) the
-        # INSERT then conflicts with the closed row; merge_candidate reports that row untouched.
+        # INSERT then conflicts with the closed row, and merge_candidate drops the sighting.
         cur.execute(
             "SELECT id, evidence, trigger_phrasings, "
             "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
@@ -233,24 +236,23 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
     )
     rows = cur.fetchall()
     new_toks = set((sigkey or "").split())
-    if not new_toks:
-        # No signature to compare (an explicit "make this a skill" request): a shared session
-        # alone says nothing about the topic, and would rewrite another gap's candidate. Only
-        # the row of the same name is this one.
-        for cid, ev, _rk, phr, row_name in rows:
+    best, best_score = None, 0.0
+    for cid, ev, rk, phr, row_name in rows:
+        old_toks = set((rk or "").split())
+        if not new_toks or not old_toks:
+            # One side has no signature to compare (an explicit "make this a skill" request, a
+            # legacy row): a shared session alone says nothing about the topic, and would
+            # rewrite the other gap's candidate. Only the row of the same name is this one.
             if row_name == name:
                 return cid, ev or [], phr or [], False
-        return None
-    best, best_score = None, 0.0
-    for cid, ev, rk, phr, _row_name in rows:
+            continue
         old_sessions = _ev_sessions(ev or [])
-        old_toks = set((rk or "").split())
         sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
-        tj = _jaccard(new_toks, old_toks) if old_toks else 0.0
+        tj = _jaccard(new_toks, old_toks)
         # Signature disagreement vetoes session-overlap identity: one long session
         # routinely contains several distinct gaps, so a shared session alone is not
         # identity when both sides carry signatures that don't resemble each other.
-        session_match = sj >= SESSION_JACCARD and not (old_toks and tj < SIGNATURE_VETO_FLOOR)
+        session_match = sj >= SESSION_JACCARD and tj >= SIGNATURE_VETO_FLOOR
         if session_match or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
@@ -296,13 +298,14 @@ def merge_candidate(
     """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
 
     A retune's (name, direction) is one row among the OPEN candidates (observe / proposed /
-    rejected; the open-identity migration). A sighting of a skill whose earlier row is promoted or retired
-    therefore opens a fresh candidate holding only the new evidence; the closed row is
-    history. A re-sighted rejected row:
+    rejected; the open-identity migration). A sighting of a skill whose earlier row is
+    promoted or retired therefore opens a fresh candidate holding only the new evidence; the
+    closed row is history. A re-sighted rejected row:
       - inside its 30d cooldown: skipped silently, no write;
       - past the cooldown: evidence merges and the row REOPENS to 'observe'.
-    Before that migration the closed row still occupies the key: the INSERT does nothing and the
-    row is reported untouched.
+    Before that migration the old index still covers promoted and retired rows: the INSERT does
+    nothing, the sighting's evidence is dropped (a retired row is not reopened) and the closed
+    row is reported untouched, with a warning. Apply the migration soon after deploying.
 
     salience persists as max(existing, new) — a candidate's pain rating only ratchets up.
     source_detector / proposed_patch: latest non-null wins (a fresh patch draft supersedes)."""
@@ -415,6 +418,15 @@ def merge_candidate(
             (kind, name, direction),
         )
         r = cur.fetchone()
+        if r and r[1] in ("promoted", "retired"):
+            logger.warning(
+                "%s sighting of %s/%s dropped: a %s row holds its key; apply the open-identity "
+                "migration (skill_gap_named_idx)",
+                kind,
+                name,
+                direction,
+                r[1],
+            )
         return {
             "id": r[0] if r else None,
             "status": r[1] if r else None,

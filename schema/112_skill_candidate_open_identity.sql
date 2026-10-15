@@ -10,15 +10,21 @@
 -- consolidate kind left with its nightly pass, so it leaves the index too.
 --
 -- Deploy order: the application ships BEFORE this file is applied. Until it is, the old index
--- still occupies the key of a closed row: the writer's INSERT then does nothing and
--- skill_ledger.merge_candidate reports the closed row untouched (the pre-migration
--- behaviour, minus the evidence merge). Its ON CONFLICT clause infers either index. The
--- marker on the first line lets the boot-time schema guard (ingestion/schema_check.py) start
--- a build on a database behind only by this file.
+-- still occupies the key of a promoted or retired row: a re-sighting of that retune hits ON
+-- CONFLICT DO NOTHING, its evidence is dropped (a promoted row used to take the sighting, a
+-- retired one was reopened), and skill_ledger.merge_candidate reports the closed row
+-- untouched, with a warning. Apply this file soon after the new image is running. Its ON
+-- CONFLICT clause infers either index. The marker on the first line lets the boot-time schema
+-- guard (ingestion/schema_check.py) start a build on a database behind only by this file.
 --
--- Apply it after the new image is running: an older image's INSERT names the old index
--- predicate, which cannot infer this one, so it would fail on every NEW retune key (merges
--- into existing rows still work).
+-- Do not roll the image back past this file. Postgres picks the ON CONFLICT arbiter index when
+-- it plans the statement, and an older image's clause (WHERE kind IN ('retune',
+-- 'consolidate')) cannot infer this index, so once this file is applied that image's
+-- candidate INSERT fails for every new candidate of any kind, derive included: the judge,
+-- grounded and struggle_arc stages fail every night. No index can serve that clause and still
+-- allow a closed and an open row on one key. A rollback needs DROP INDEX
+-- skills_lane.skill_gap_named_idx, retiring or deleting the duplicate (kind, name, direction)
+-- retune rows, and recreating the index from schema/022.
 --
 -- Dropping and creating the index in one transaction leaves no window without the guard.
 -- A re-run recreates the same index.
