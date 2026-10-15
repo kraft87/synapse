@@ -7,7 +7,8 @@ server's /config/publish route (machine-token gated), tagged with this surface +
   * 'global'         — CLAUDE.md + rules/**/*.md under ~/.claude (CONFIG_DIR)
   * 'project:<name>' — CLAUDE.md, .claude/CLAUDE.md, .claude/rules/**/*.md under $CLAUDE_PROJECT_DIR
 SYNAPSE_CONFIG_PATHS adds extra globs (under CONFIG_DIR, global scope). file_key = path relative to
-that scope's root. The server stores it so the dream pipeline can read it and propose edits later.
+that scope's root. The server stores it as the mirror the dashboard lists; the nightly config lane
+mines transcripts for corrections and does not read it.
 
 OFF by default — these files often carry personal instructions, so mirroring them off-box is
 opt-in: set SYNAPSE_CONFIG_SYNC=1 to enable. DSN-free: HTTP only. Fail-open: never blocks or

@@ -50,8 +50,3 @@ def db_url() -> str:
 def secret(key: str) -> str:
     """Resolve an API key (VOYAGE_API_KEY, ...): env then .env fallback."""
     return os.environ.get(key) or _from_env_file(key) or ""
-
-
-def ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)

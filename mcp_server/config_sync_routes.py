@@ -6,8 +6,9 @@
 
 Same shape as skill_sync_routes: machine-token-gated custom routes (they bypass FastMCP's auth
 middleware by design), PG work in a threadpool, fail-soft JSON. The plugin's SessionStart hook
-PUSHES each surface's opted-in config files here so the dream pipeline (server-side) can read them
-and propose edits. The plugin needs only a base URL + bearer — never database access.
+PUSHES each surface's opted-in config files here; the server keeps them as the mirror the dashboard
+lists (/config/list, /config/read). The nightly config lane mines transcripts for corrections and
+does not read the mirror. The plugin needs only a base URL + bearer — never database access.
 
 A "surface" is a machine/install. file_key is the file's path relative to the config root, stable
 across machines.

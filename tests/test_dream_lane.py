@@ -353,7 +353,6 @@ def _memo(conn, sid, lane_name="skills"):
 
 def test_a_failing_stage_does_not_skip_the_later_ones(db, db_url, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
-    monkeypatch.setenv("SYNAPSE_SKILLS_DETECTORS", "")  # the retired kill switch is ignored
     ran: list[str] = []
     _stub_skills_stages(monkeypatch, ran, fail="drafts")
     _seed(db, "skills")

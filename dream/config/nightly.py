@@ -10,7 +10,7 @@ ledger -> gate observe->proposed at N distinct sessions.
 
 PROPOSE-ONLY: writes config_proposals (the review CLI + apply phase land edits on disk). Proposals
 target a dedicated `rules/learned.md` (global) so dream's contributions never rewrite a hand-kept
-file. Gated CONFIG_LANE_ENABLED; ships inert.
+file. ON by default; CONFIG_LANE_ENABLED=0 (read by dream/__main__) turns it off.
 """
 
 from __future__ import annotations
