@@ -114,12 +114,10 @@ class ExtractionNodesMixin:
             # Auto-type: roll the extracted subtype up to a canonical supertype via the
             # taxonomy map (already loaded on the deduper). Unknown subtype -> 'other'
             # (queryable as the to-map backlog); no map -> None (backfill fills later).
-            supertype = None
             type_map = deduper.type_map if deduper is not None else {}
-            if type_map:
-                supertype = type_map.get(entity.type, "other")
 
             if is_new:
+                supertype = type_map.get(entity.type, "other") if type_map else None
                 self._kg.insert_node(
                     node_uuid=clean_uuid,
                     name=entity.name,
@@ -133,10 +131,13 @@ class ExtractionNodesMixin:
                 inserted.append((entity.name, clean_uuid))
             else:
                 # A mention of an entity that already has its identity: it keeps its name,
-                # embedding and subtype. The longer summary survives (the freshly
+                # embedding and subtype, and its supertype follows that stored subtype,
+                # never the mention's own type. The longer summary survives (the freshly
                 # extracted one is often shorter than the canonical one), decided in SQL
                 # against the stored text: another replica may have extended it since.
-                self._kg.update_node(clean_uuid, summary=entity.summary, supertype=supertype)
+                self._kg.update_node(
+                    clean_uuid, summary=entity.summary, refresh_supertype=bool(type_map)
+                )
         return inserted
 
     def _stage5_write_new_nodes(

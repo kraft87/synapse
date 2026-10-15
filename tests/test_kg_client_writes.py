@@ -129,6 +129,16 @@ class TestUpdateNode:
         )
         return kg_writer
 
+    @pytest.fixture()
+    def taxonomy(self, conn):
+        conn.execute("INSERT INTO kg_supertypes (name) VALUES ('Data store'), ('Tool')")
+        conn.execute(
+            "INSERT INTO kg_entity_types (subtype, supertype) VALUES "
+            "('Database', 'Data store'), ('Software', 'Tool')"
+        )
+        yield
+        conn.execute("TRUNCATE kg_entity_types, kg_supertypes CASCADE")
+
     def _row(self, conn):
         return conn.execute(
             "SELECT name, normalized_name, entity_subtype, entity_supertype, summary, "
@@ -152,15 +162,29 @@ class TestUpdateNode:
         entity.update_node("e-pg", summary="")
         assert self._row(conn)[4] == "relational database"
 
-    def test_supertype_is_set_when_known_and_kept_when_not(self, entity, conn):
-        entity.update_node("e-pg", summary="", supertype="Tool")
-        assert self._row(conn)[3] == "Tool"
+    def test_supertype_follows_the_stored_subtype_when_the_taxonomy_is_loaded(
+        self, entity, taxonomy, conn
+    ):
+        entity.update_node("e-pg", summary="", refresh_supertype=True)
+        assert self._row(conn)[3] == "Data store"  # from its own subtype 'Database'
+        conn.execute("UPDATE kg_entities SET entity_supertype = 'Tool' WHERE uuid = 'e-pg'")
         entity.update_node("e-pg", summary="")  # taxonomy map not loaded: nothing to say
         assert self._row(conn)[3] == "Tool"
 
-    def test_a_mention_that_adds_nothing_writes_nothing(self, entity, conn):
+    def test_a_subtype_the_taxonomy_lacks_rolls_up_to_other(self, entity, taxonomy, conn):
+        conn.execute("UPDATE kg_entities SET entity_subtype = 'Gadget' WHERE uuid = 'e-pg'")
+        entity.update_node("e-pg", summary="", refresh_supertype=True)
+        assert self._row(conn)[3] == "other"
+
+    def test_a_row_without_a_subtype_keeps_its_supertype(self, entity, taxonomy, conn):
+        conn.execute("UPDATE kg_entities SET entity_subtype = NULL WHERE uuid = 'e-pg'")
+        entity.update_node("e-pg", summary="", refresh_supertype=True)
+        assert self._row(conn)[3] == "Database"
+
+    def test_a_mention_that_adds_nothing_writes_nothing(self, entity, taxonomy, conn):
+        entity.update_node("e-pg", summary="", refresh_supertype=True)  # settles 'Data store'
         before = self._row(conn)[6]
-        entity.update_node("e-pg", summary="database", supertype="Database")
+        entity.update_node("e-pg", summary="database", refresh_supertype=True)
         assert self._row(conn)[6] == before  # same row version: no write, no new HNSW tuple
 
     def test_unknown_uuid_is_a_zero_row_update(self, entity):

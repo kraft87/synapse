@@ -240,9 +240,9 @@ def _inserted(pipe) -> list[tuple[str, str]]:
     return [(c.kwargs["name"], c.kwargs["node_uuid"]) for c in pipe._kg.insert_node.call_args_list]
 
 
-def _updated(pipe) -> list[tuple[str, str, str | None]]:
+def _updated(pipe) -> list[tuple[str, str, bool]]:
     return [
-        (c.args[0], c.kwargs["summary"], c.kwargs["supertype"])
+        (c.args[0], c.kwargs["summary"], c.kwargs["refresh_supertype"])
         for c in pipe._kg.update_node.call_args_list
     ]
 
@@ -298,7 +298,7 @@ class TestNewEntityDeferral:
 
         # the other worker's entity keeps its identity: this mention only offers its summary
         assert _inserted(pipe) == [("NAS", "n")]
-        assert _updated(pipe) == [("e-cache-other-worker", "Cache summary", None)]
+        assert _updated(pipe) == [("e-cache-other-worker", "Cache summary", False)]
         deduper.register.assert_called_once_with("NAS", "n")
         assert uuid_map["Cache"] == "e-cache-other-worker"
         (row,) = _created(pipe)
@@ -354,7 +354,7 @@ class TestStage5MatchedEntities:
             {"Postgres": EMB},
         )
         pipe._kg.insert_node.assert_not_called()
-        assert _updated(pipe) == [("u-pg", "the SQL database", None)]
+        assert _updated(pipe) == [("u-pg", "the SQL database", False)]
 
     def test_a_new_entity_is_inserted_with_its_embedding(self):
         pipe = self._pipe()
@@ -381,4 +381,15 @@ class TestStage5MatchedEntities:
         pipe._stage5_write_nodes([entity], {"Postgres": "u-pg"}, None, "g", {}, deduper=unloaded)
         pipe._stage5_write_nodes([entity], {"Postgres": "u-pg"}, None, "g", {}, deduper=loaded)
         # an unloaded map must not blank the stored supertype (it used to write NULL)
-        assert [c[2] for c in _updated(pipe)] == [None, "Tool"]
+        assert [c[2] for c in _updated(pipe)] == [False, True]
+
+    def test_a_matched_mention_never_hands_its_own_supertype_to_the_row(self):
+        """The stored row decides its supertype (from its own subtype, in SQL); the mention's
+        type only says whether the taxonomy is loaded."""
+        pipe = self._pipe()
+        entity = ExtractedEntity(name="Postgres", type="Software", summary="")
+        deduper = MagicMock(type_map={"Database": "Data store"})
+        pipe._stage5_write_nodes([entity], {"Postgres": "u-pg"}, None, "g", {}, deduper=deduper)
+        (call,) = pipe._kg.update_node.call_args_list
+        assert "supertype" not in call.kwargs
+        assert call.kwargs["refresh_supertype"] is True

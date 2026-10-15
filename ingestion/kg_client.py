@@ -481,26 +481,39 @@ class KGClient:
         self._run(_do)
         return node_uuid
 
-    def update_node(self, node_uuid: str, summary: str = "", supertype: str | None = None) -> None:
+    def update_node(
+        self, node_uuid: str, summary: str = "", refresh_supertype: bool = False
+    ) -> None:
         """What a mention that matched an existing entity may change on it: the summary,
         when the mention's is longer, and the supertype, when the taxonomy map is loaded
-        (``supertype`` not None; the map is fluid, so it propagates). The name,
-        normalized_name, embedding and subtype are whatever the entity was first written
-        with: a fuzzy match from "Postgres" must not rename "PostgreSQL", and every
-        rewrite of the 8 KB embedding costs a new HNSW tuple. A mention that adds nothing
-        writes nothing."""
+        (``refresh_supertype``; the map is fluid, so it propagates). The supertype is
+        rolled up from the entity's OWN stored subtype, never from the mention's type: a
+        mention that types "PostgreSQL" as "Tool" must not leave a Database row under
+        another supertype. The name, normalized_name, embedding and subtype are whatever
+        the entity was first written with: a fuzzy match from "Postgres" must not rename
+        "PostgreSQL", and every rewrite of the 8 KB embedding costs a new HNSW tuple. A
+        mention that adds nothing writes nothing."""
         new_summary = strip_nul(summary or "").strip()
 
         def _do(conn: psycopg.Connection[Any]) -> None:
+            # Unknown subtype -> 'other', as at insert; a row with no subtype (legacy) is left.
             conn.execute(
-                "UPDATE kg_entities SET "
-                "  summary = CASE WHEN length(%(s)s::text) > length(COALESCE(summary, '')) "
-                "                 THEN %(s)s ELSE summary END, "
-                "  entity_supertype = COALESCE(%(st)s, entity_supertype) "
-                "WHERE uuid = %(u)s AND owner_id = %(o)s "
-                "  AND (length(%(s)s::text) > length(COALESCE(summary, '')) "
-                "       OR entity_supertype IS DISTINCT FROM COALESCE(%(st)s, entity_supertype))",
-                {"s": new_summary, "st": supertype, "u": node_uuid, "o": OWNER},
+                "WITH cur AS ( "
+                "  SELECT uuid, "
+                "         CASE WHEN %(r)s AND entity_subtype IS NOT NULL "
+                "              THEN COALESCE((SELECT t.supertype FROM kg_entity_types t "
+                "                             WHERE t.subtype = kg_entities.entity_subtype), 'other') "
+                "              ELSE entity_supertype END AS st "
+                "  FROM kg_entities WHERE uuid = %(u)s AND owner_id = %(o)s) "
+                "UPDATE kg_entities k SET "
+                "  summary = CASE WHEN length(%(s)s::text) > length(COALESCE(k.summary, '')) "
+                "                 THEN %(s)s ELSE k.summary END, "
+                "  entity_supertype = cur.st "
+                "FROM cur "
+                "WHERE k.uuid = cur.uuid AND k.owner_id = %(o)s "
+                "  AND (length(%(s)s::text) > length(COALESCE(k.summary, '')) "
+                "       OR k.entity_supertype IS DISTINCT FROM cur.st)",
+                {"s": new_summary, "r": refresh_supertype, "u": node_uuid, "o": OWNER},
             )
 
         self._run(_do)
