@@ -12,6 +12,7 @@ from starlette.testclient import TestClient
 from ingestion.capture.ruleset import load_rules
 from ingestion.db import Database
 from ingestion.episode_writer import store_episodes
+from tests.helpers.db import research_archive_exists, truncate_research_archive
 from tests.test_capture_ingest import PAGE, parse, records
 
 pytestmark = pytest.mark.db
@@ -22,10 +23,12 @@ def _clean(clean_tables, conn, monkeypatch):
     monkeypatch.delenv("SYNAPSE_WEB_CAPTURE", raising=False)
     monkeypatch.delenv("SYNAPSE_CAPTURE_DIR", raising=False)
     load_rules.cache_clear()
-    tables = "web_artifacts, research_archive, private_sessions"
+    tables = "web_artifacts, private_sessions"
     conn.execute(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")  # nosec B608 - fixed names
+    truncate_research_archive(conn)
     yield
     conn.execute(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")  # nosec B608 - fixed names
+    truncate_research_archive(conn)
     load_rules.cache_clear()
 
 
@@ -44,10 +47,13 @@ def _dry_run(db_url, recs, **body):
 
 
 def _stored(conn) -> tuple[int, int, int]:
-    return tuple(  # type: ignore[return-value]
-        conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]  # nosec B608 - fixed names
-        for t in ("episodes", "web_artifacts", "research_archive")
-    )
+    """Rows in episodes, web_artifacts and the cold archive (0 where that is not applied)."""
+
+    def count(table: str) -> int:
+        return conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]  # nosec B608 - fixed
+
+    archived = count("research_archive") if research_archive_exists(conn) else 0
+    return (count("episodes"), count("web_artifacts"), archived)
 
 
 def test_it_reports_by_tool_what_a_live_capture_would_store_and_stores_nothing(db_url, conn):
@@ -135,6 +141,7 @@ def test_it_reads_sub_agent_records_and_codex_rollouts(db_url):
     assert codex["tools"]["mcp__acme__read"]["captured"] == 1
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_an_archive_rule_is_reported_with_its_destination(db_url):
     thread = '[{"author": {"username": "u"}, "text": "' + "A point worth keeping. " * 20 + '"}]'
     recs = records(

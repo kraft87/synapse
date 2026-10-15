@@ -16,6 +16,7 @@ from ingestion.db import Database
 from ingestion.db_episodes import DELETED_TURNS_PROBE
 from ingestion.episode_writer import store_episodes
 from ingestion.jsonl_client import JSONLParser
+from tests.helpers.db import truncate_research_archive
 
 PAGE = "# A Real Article\n\n" + "The measured latency was low and the design held up well. " * 12
 
@@ -29,14 +30,12 @@ def db(db_url):
 
 @pytest.fixture(autouse=True)
 def _clean(clean_tables, conn):
-    conn.execute(
-        "TRUNCATE web_artifacts, research_archive, private_sessions RESTART IDENTITY CASCADE"
-    )
+    conn.execute("TRUNCATE web_artifacts, private_sessions RESTART IDENTITY CASCADE")
+    truncate_research_archive(conn)
     DELETED_TURNS_PROBE.reset()
     yield
-    conn.execute(
-        "TRUNCATE web_artifacts, research_archive, private_sessions RESTART IDENTITY CASCADE"
-    )
+    conn.execute("TRUNCATE web_artifacts, private_sessions RESTART IDENTITY CASCADE")
+    truncate_research_archive(conn)
     DELETED_TURNS_PROBE.reset()
 
 
@@ -269,6 +268,7 @@ def test_ingest_stamps_the_research_with_the_callers_surface(db_url, conn, captu
     assert artifacts(conn)[0][3]["surface_id"] == "dev-1"
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_a_shell_command_is_captured_only_by_its_rule_into_the_archive(db, conn, capture_on):
     thread = (
         '[{"author": {"username": "steipete"}, "text": "' + "A point worth keeping. " * 20 + '"}]'

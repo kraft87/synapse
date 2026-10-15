@@ -19,6 +19,7 @@ from ingestion.episode_writer import store_episodes
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.dash.curation import _delete_episode
 from mcp_server.private_session_routes import _purge_session
+from tests.helpers.db import truncate_research_archive
 from tests.test_capture_ingest import parse, records
 
 pytestmark = pytest.mark.db
@@ -39,11 +40,13 @@ def db(db_url):
 @pytest.fixture(autouse=True)
 def _clean(clean_tables, conn, monkeypatch):
     monkeypatch.setenv("SYNAPSE_WEB_CAPTURE", "on")
-    tables = "web_artifacts, research_archive, private_sessions, kg_relationships, kg_entities"
+    tables = "web_artifacts, private_sessions, kg_relationships, kg_entities"
     conn.execute(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")  # nosec B608 - fixed names
+    truncate_research_archive(conn)
     DELETED_TURNS_PROBE.reset()
     yield
     conn.execute(f"TRUNCATE {tables} RESTART IDENTITY CASCADE")  # nosec B608 - fixed names
+    truncate_research_archive(conn)
     DELETED_TURNS_PROBE.reset()
 
 
@@ -66,6 +69,7 @@ def _archive(conn, session: str, parent: int | None) -> None:
     )
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_deleting_a_turn_deletes_what_was_captured_from_it(db, db_url, conn):
     store_episodes(db, parse(records("a", "s-1") + records("b", "s-1", url=_URL["b"])))
     assert _titles(conn) == ["toolu_a", "toolu_b"]
@@ -106,6 +110,7 @@ def test_facts_read_out_of_a_deleted_page_go_unless_a_surviving_turn_backs_them(
     assert facts == {"w-backed": None, "w-unrelated": None}
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_a_session_purge_also_takes_the_sub_agents_captures(db, db_url, conn):
     store_episodes(db, parse(records("a", "s-3")))
     store_episodes(db, parse(records("keep", "s-keep", url=_URL["keep"])))

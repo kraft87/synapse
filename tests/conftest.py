@@ -5,7 +5,7 @@ from urllib.parse import urlsplit
 import psycopg
 import pytest
 
-from tests.helpers.db import DB_URL
+from tests.helpers.db import DB_URL, research_archive_ready
 
 
 def _refuse_production(url: str) -> None:
@@ -92,6 +92,14 @@ def clean_tables(conn):
     if conn.execute("SELECT to_regclass('deleted_turns')").fetchone()[0]:
         conn.execute("TRUNCATE deleted_turns")
     yield
+
+
+@pytest.fixture()
+def research_archive(conn):
+    """For the tests whose point is the cold research archive: skipped on a database
+    without it (migration 076 is optional; the image lands before it is applied by hand)."""
+    if not research_archive_ready(conn):
+        pytest.skip("the research_archive migration (076) is not applied")
 
 
 @pytest.fixture()

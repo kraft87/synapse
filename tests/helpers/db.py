@@ -22,6 +22,28 @@ DB_URL = os.environ.get(
 )
 
 
+def research_archive_exists(conn: psycopg.Connection[Any]) -> bool:
+    """Whether the cold archive's table is here. ``schema/076_research_archive.sql`` is an
+    optional migration: an image can land before it is applied by hand."""
+    return conn.execute("SELECT to_regclass('research_archive')").fetchone()[0] is not None
+
+
+def research_archive_ready(conn: psycopg.Connection[Any]) -> bool:
+    """Whether the archive is usable as the code under test sees it: the table with the
+    provenance column ``ARCHIVE_PROBE`` checks. A table a cron made on the fly, before 076
+    added that column, is not."""
+    from ingestion.web_artifacts import ARCHIVE_PROBE
+
+    return ARCHIVE_PROBE.ready(conn, f"tests:{conn.info.dsn}")
+
+
+def truncate_research_archive(conn: psycopg.Connection[Any]) -> None:
+    """Empty the cold archive, on a database that has one (the same guard conftest puts
+    around the optional ``deleted_turns``). Nothing references it, so it needs no CASCADE."""
+    if research_archive_exists(conn):
+        conn.execute("TRUNCATE research_archive RESTART IDENTITY")
+
+
 def decide_behind_a_writer(db_url: str, write_sql: str, params: tuple, decide: Callable[[], Any]):
     """Run ``decide()`` on a worker thread while a second connection holds an uncommitted
     ``write_sql`` on the row it decides, commit that write once the worker is parked on the

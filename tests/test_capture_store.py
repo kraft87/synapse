@@ -13,6 +13,7 @@ from ingestion.capture.detect import Skip
 from ingestion.capture.ruleset import load_rules
 from ingestion.db import Database
 from ingestion.schema_check import ColumnProbe
+from tests.helpers.db import research_archive_ready, truncate_research_archive
 
 PAGE = "# A Real Article\n\n" + "The measured latency was low and the design held up well. " * 12
 RESULTS = json.dumps(
@@ -32,15 +33,11 @@ def db(db_url):
 
 @pytest.fixture(autouse=True)
 def _clean(conn):
-    conn.execute(
-        "TRUNCATE web_artifacts, research_archive, episodes, private_sessions "
-        "RESTART IDENTITY CASCADE"
-    )
+    conn.execute("TRUNCATE web_artifacts, episodes, private_sessions RESTART IDENTITY CASCADE")
+    truncate_research_archive(conn)
     yield
-    conn.execute(
-        "TRUNCATE web_artifacts, research_archive, episodes, private_sessions "
-        "RESTART IDENTITY CASCADE"
-    )
+    conn.execute("TRUNCATE web_artifacts, episodes, private_sessions RESTART IDENTITY CASCADE")
+    truncate_research_archive(conn)
 
 
 def fetch(tid: str, url: str = "https://example.com/p", text: str = PAGE, **kw) -> ToolCall:
@@ -269,6 +266,7 @@ def archive_rows(conn) -> list[tuple]:
     ).fetchall()
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_an_archive_rule_stores_the_thread_verbatim_with_its_provenance(db, conn):
     result = run(db, [thread("toolu_t", episode_id=77)])
     assert result.captured == 1 and result.errors == 0
@@ -288,6 +286,7 @@ def test_an_archive_rule_stores_the_thread_verbatim_with_its_provenance(db, conn
     assert conn.execute("SELECT content FROM research_archive").fetchone()[0] == THREAD
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_archived_text_has_its_credentials_redacted(db, conn):
     secret = "ghp_" + "a1B2c3D4e5F6g7H8i9J0" * 2
     run(db, [thread("toolu_t", text=THREAD + f" token={secret} " + "pad " * 80)])
@@ -295,6 +294,7 @@ def test_archived_text_has_its_credentials_redacted(db, conn):
     assert secret not in content
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_the_longer_capture_of_a_source_wins_and_a_re_ship_is_a_duplicate(db, conn):
     assert reasons(run(db, [thread("a")])) == ["captured"]
     assert reasons(run(db, [thread("a")])) == ["duplicate"]  # the same records shipped again
@@ -308,6 +308,7 @@ def test_the_longer_capture_of_a_source_wins_and_a_re_ship_is_a_duplicate(db, co
     assert len(archive_rows(conn)) == 2
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_in_one_post_the_same_source_is_kept_once_at_its_longest(db, conn):
     longer = THREAD + " A reply that arrived later. " * 5
     result = run(db, [thread("a"), thread("b", text=longer), thread("c")])
@@ -315,6 +316,7 @@ def test_in_one_post_the_same_source_is_kept_once_at_its_longest(db, conn):
     assert [r[7] for r in archive_rows(conn)] == [len(longer.strip())]
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_a_dry_run_reports_the_archive_and_writes_nothing(db, conn):
     calls = [thread("a")]
     dry = run(db, calls, dry_run=True)
@@ -324,6 +326,7 @@ def test_a_dry_run_reports_the_archive_and_writes_nothing(db, conn):
     assert reasons(run(db, calls, dry_run=True)) == ["duplicate"]
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_a_private_session_is_never_archived(db, conn):
     result = run(db, [thread("a")], is_private=lambda s: True)
     assert reasons(result) == ["private"] and archive_rows(conn) == []
@@ -334,9 +337,14 @@ def test_without_the_migration_archive_captures_are_skipped_not_failed(db, conn,
     monkeypatch.setattr(store_mod, "ARCHIVE_PROBE", absent)
     result = run(db, [thread("a"), fetch("b")])
     assert reasons(result) == ["archive_unavailable", "captured"]
-    assert result.errors == 0 and archive_rows(conn) == []
+    assert result.errors == 0
+    if research_archive_ready(
+        conn
+    ):  # without the table (or its provenance columns) nothing to read
+        assert archive_rows(conn) == []
 
 
+@pytest.mark.usefixtures("research_archive")
 def test_archive_captures_count_against_the_post_cap(db, conn, monkeypatch):
     monkeypatch.setattr(store_mod, "MAX_CAPTURES_PER_POST", 1)
     result = run(db, [thread("a"), thread("b", post="1790000000000000002"), fetch("c")])
