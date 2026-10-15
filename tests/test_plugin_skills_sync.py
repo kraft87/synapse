@@ -72,3 +72,65 @@ def test_real_project_dir_still_syncs_project_scope(monkeypatch, tmp_path):
     module.main()
 
     assert published == ["project:repo"]
+
+
+class _Server:
+    """A /skills/* stub: the listing it serves, a body for /skills/fetch, and every call."""
+
+    def __init__(self, skills: list[dict], fetched: dict | None = None) -> None:
+        self.skills = skills
+        self.fetched = fetched or {}
+        self.calls: list[str] = []
+
+    def post_json(self, path, payload, timeout=30.0):
+        self.calls.append(path)
+        if path == "/skills/list":
+            return {"skills": self.skills, "publish": True}
+        if path == "/skills/fetch":
+            return self.fetched
+        return {"status": "ok"}
+
+
+def test_listing_content_hash_is_compared_without_the_body(monkeypatch, tmp_path):
+    """The server names each skill's whole-skill hash, so the listing needs no body: an
+    identical copy settles on the hash alone."""
+    module = _load_sync(monkeypatch, tmp_path, tmp_path)
+    skills_dir = tmp_path / ".claude" / "skills"
+    _write_skill(skills_dir, "alpha")
+    body = (skills_dir / "alpha" / "SKILL.md").read_text()
+    server = _Server([{"name": "alpha", "content_hash": module._whole_hash(body, []), "files": []}])
+
+    assert module._sync("global", skills_dir, client=server) == (0, 0, 0)
+    assert server.calls == ["/skills/list"]
+
+
+def test_listing_without_content_hash_still_compares_the_body(monkeypatch, tmp_path):
+    """A server from before the field: the hash is computed from the body it sends."""
+    module = _load_sync(monkeypatch, tmp_path, tmp_path)
+    skills_dir = tmp_path / ".claude" / "skills"
+    _write_skill(skills_dir, "alpha")
+    body = (skills_dir / "alpha" / "SKILL.md").read_text()
+    server = _Server([{"name": "alpha", "body": body, "files": []}])
+
+    assert module._sync("global", skills_dir, client=server) == (0, 0, 0)
+    assert server.calls == ["/skills/list"]
+
+
+def test_a_different_content_hash_pulls_and_remembers_that_hash(monkeypatch, tmp_path):
+    module = _load_sync(monkeypatch, tmp_path, tmp_path)
+    skills_dir = tmp_path / ".claude" / "skills"
+    _write_skill(skills_dir, "alpha")
+    newer = "2999-01-01T00:00:00+00:00"
+    theirs = module._whole_hash("---\ndescription: alpha\n---\nedited elsewhere\n", [])
+    server = _Server(
+        [{"name": "alpha", "content_hash": theirs, "files": [], "content_modified_at": newer}],
+        fetched={
+            "found": True,
+            "body": "---\ndescription: alpha\n---\nedited elsewhere\n",
+            "files": [],
+        },
+    )
+
+    assert module._sync("global", skills_dir, client=server) == (1, 0, 0)
+    assert "/skills/fetch" in server.calls
+    assert theirs in module._load_ledger(skills_dir)["alpha"]
