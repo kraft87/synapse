@@ -214,9 +214,10 @@ def own_surface_served(db_url: str, trust: SurfaceTrust | None) -> bool:
 # Case-insensitive allowlists
 # ---------------------------------------------------------------------------
 
-#: A valid, whole-table btree index on episodes that leads with ``project`` (schema 001's
-#: ``episodes_project_idx``, or 061's ``(project, created_at)``). The variant walk below is
-#: a skip scan over it; without one it would read the whole table per step, so until one
+#: A valid, whole-table btree index on episodes that leads with ``project`` (061's
+#: ``(project, created_at)``, or schema 001's ``episodes_project_idx`` until the
+#: redundant-index migration drops it in favour of 061's). The variant walk below is a
+#: skip scan over it; without one it would read the whole table per step, so until one
 #: exists an allowlist matches exactly as written (the pre-0.21 behaviour).
 PROJECT_INDEX_PROBE = ColumnProbe(
     "SELECT 1 FROM pg_index i "

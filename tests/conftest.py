@@ -141,8 +141,7 @@ def conn(db_url):
 def clean_tables(conn):
     """Truncate all data tables before each test. Opt-in via parameter, not autouse."""
     conn.execute("""
-        TRUNCATE episodes, search_cache,
-                 ingestion_state, extraction_queue RESTART IDENTITY CASCADE
+        TRUNCATE episodes, ingestion_state, extraction_queue RESTART IDENTITY CASCADE
     """)
     # Delete tombstones (schema 123, optional) hang off no table, so CASCADE misses them, and
     # a stale one would drop a later test's ingest of the same words as a deleted turn.
