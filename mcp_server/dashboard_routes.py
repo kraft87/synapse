@@ -60,7 +60,7 @@ from ingestion.db_connection import bm25_query_text
 from ingestion.db_episodes import DELETED_TURNS_PROBE
 from ingestion.db_timeline import REPORTED_REFS_PROBE
 from ingestion.dedup import _normalize_name
-from ingestion.llm_schemas import _EVENT_TYPES
+from ingestion.llm_schemas import EVENT_TYPES
 from ingestion.surfaces import OWN_SURFACE_PROBE
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
@@ -3030,7 +3030,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         before = qp.get("before") or None
         type_ = qp.get("type") or None
         group_id = qp.get("group_id") or None
-        if type_ is not None and type_ not in _EVENT_TYPES:
+        if type_ is not None and type_ not in EVENT_TYPES:
             return _err(f"unknown type {type_!r}", 400)
         return await _api(request, lambda: _timeline(db_url, before, limit, type_, group_id))
 
@@ -3042,7 +3042,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         type_ = qp.get("type") or None
         group_id = qp.get("group_id") or None
         tz = qp.get("tz") or ""
-        if type_ is not None and type_ not in _EVENT_TYPES:
+        if type_ is not None and type_ not in EVENT_TYPES:
             return _err(f"unknown type {type_!r}", 400)
         try:
             ZoneInfo(tz)

@@ -7,7 +7,11 @@ and per-field storage (project / salience / t_valid land as sent).
 
 from __future__ import annotations
 
-from mcp_server.timeline_routes import _ingest_events
+import pytest
+from starlette.testclient import TestClient
+
+from ingestion.llm_schemas import EVENT_TYPES
+from mcp_server.timeline_routes import _ingest_events, register
 
 SRC = "test-evt"
 
@@ -62,6 +66,23 @@ def test_fields_stored(conn, db_url):
     assert event_type == "milestone"
     # keyless path: no embedding, no model recorded (a re-embed pass fills later)
     assert embedding is None and embed_model is None
+    _wipe(conn)
+
+
+@pytest.mark.parametrize("event_type", [*EVENT_TYPES, "chore", None])
+def test_route_keeps_the_gate_s_event_types_and_nulls_the_rest(conn, db_url, event_type):
+    from fastmcp import FastMCP
+
+    _wipe(conn)
+    mcp = FastMCP("test-timeline")
+    register(mcp, db_url, lambda request: True, "")
+    with TestClient(mcp.http_app()) as client:
+        r = client.post("/timeline/events", json={"events": [_ev("sha5", et=event_type)]})
+    assert r.status_code == 200
+    stored = conn.execute(
+        "SELECT event_type FROM timeline_events WHERE source = %s", (SRC,)
+    ).fetchone()[0]
+    assert stored == (event_type if event_type in EVENT_TYPES else None)
     _wipe(conn)
 
 

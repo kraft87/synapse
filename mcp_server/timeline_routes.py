@@ -28,6 +28,7 @@ from starlette.responses import JSONResponse
 from ingestion import pg_pool
 from ingestion.db_connection import _vector_literal
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
+from ingestion.llm_schemas import EVENT_TYPES
 from ingestion.localtime import local_date, user_tz
 from ingestion.scope import coerce_group
 from ingestion.surfaces import (
@@ -246,9 +247,7 @@ def register(
                     "source_ref": str(e["source_ref"]),
                     "project": e.get("project"),
                     "salience": sal if isinstance(sal, int) and 0 <= sal <= 2 else 1,
-                    "event_type": et
-                    if et in ("decision", "action", "finding", "milestone")
-                    else None,
+                    "event_type": et if et in EVENT_TYPES else None,
                 }
             )
 

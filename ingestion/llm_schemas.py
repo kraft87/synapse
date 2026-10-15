@@ -168,7 +168,7 @@ class BatchNodeDedupResult(BaseModel):
 # Timeline gate (timeline_gate.py)
 # ---------------------------------------------------------------------------
 
-_EVENT_TYPES = ("decision", "action", "finding", "milestone")
+EVENT_TYPES = ("decision", "action", "finding", "milestone")
 _DOMAINS = ("personal", "technical")
 
 
@@ -196,7 +196,7 @@ class TimelineGateEvent(BaseModel):
     @field_validator("event_type", mode="before")
     @classmethod
     def _known_type(cls, v: Any) -> str | None:
-        return v if v in _EVENT_TYPES else None
+        return v if v in EVENT_TYPES else None
 
     @field_validator("domain", mode="before")
     @classmethod
