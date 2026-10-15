@@ -149,13 +149,16 @@ class NoteStore(DatabaseConnection):
         The wording it replaces is copied to ``notes_history`` in the same transaction
         (once that optional table exists), unless the text did not change. ``source_ref``
         moves to the episode that carries the new wording; ``None`` keeps the stored one.
+        Without the history table it is the only pointer left to the old wording, so it
+        stays where it is.
 
         ``audience=None`` PRESERVES the stored tier. A restatement must never silently
         re-classify a note: the only thing that moves an existing note between audiences
         is an explicit override (COALESCE keeps the current value otherwise)."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
-            if NOTES_HISTORY_PROBE.ready(conn, self._url):
+            history = NOTES_HISTORY_PROBE.ready(conn, self._url)
+            if history:
                 conn.execute(
                     "INSERT INTO notes_history (note_id, hook, body, source_ref) "
                     "SELECT id, hook, body, source_ref FROM notes "
@@ -173,7 +176,7 @@ class NoteStore(DatabaseConnection):
                     body,
                     vlit,
                     embed_model if embedding is not None else None,
-                    source_ref,
+                    source_ref if history else None,
                     audience,
                     note_id,
                 ),

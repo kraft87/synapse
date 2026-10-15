@@ -131,17 +131,25 @@ def test_update_keeps_the_replaced_wording_in_history(conn, db_url):
 
 
 def test_update_without_the_history_table_still_rewrites(conn, db_url):
-    """Optional migration: before notes_history exists the update is the old plain one."""
+    """Optional migration: before notes_history exists the text is rewritten in place, and
+    source_ref stays on the episode that carries the wording that was just replaced."""
     _wipe(conn)
     db = Database(db_url)
-    nid = _insert(db, hook="Old hook", body="Old body.", slot=3)
+    nid = _insert(db, hook="Old hook", body="Old body.", slot=3, source_ref="ep:1")
     conn.execute("ALTER TABLE notes_history RENAME TO notes_history_away")
     try:
         NOTES_HISTORY_PROBE.reset()
-        db.update_note(nid, hook="New hook", body="New body.", embedding=None, embed_model=None)
-        assert (
-            conn.execute("SELECT hook FROM notes WHERE id = %s", (nid,)).fetchone()[0] == "New hook"
+        db.update_note(
+            nid,
+            hook="New hook",
+            body="New body.",
+            embedding=None,
+            embed_model=None,
+            source_ref="ep:2",
         )
+        assert conn.execute(
+            "SELECT hook, source_ref FROM notes WHERE id = %s", (nid,)
+        ).fetchone() == ("New hook", "ep:1")
     finally:
         conn.execute("ALTER TABLE notes_history_away RENAME TO notes_history")
         NOTES_HISTORY_PROBE.reset()
