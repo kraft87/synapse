@@ -368,14 +368,14 @@ def _graph_neighborhood(
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount the entity dossier and the graph explorer (admin gated)."""
 
-    @mcp.custom_route("/dash/api/entity/{uuid}", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/entity/{uuid}", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="entity not found")
     def dash_entity(request: Request) -> dict[str, Any] | None:
         m_off = _offset(request.query_params.get("mentions_offset"))
         f_off = _offset(request.query_params.get("facts_offset"))
         return _entity(db_url, request.path_params["uuid"], m_off, f_off)
 
-    @mcp.custom_route("/dash/api/graph/entities", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/graph/entities", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_graph_entities(request: Request) -> list[dict[str, Any]]:
         q = (request.query_params.get("q") or "").strip()
@@ -384,7 +384,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         )
         return _graph_entities(db_url, q, limit)
 
-    @mcp.custom_route("/dash/api/graph/neighborhood", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/graph/neighborhood", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="entity not found")
     def dash_graph_neighborhood(request: Request) -> dict[str, Any] | None:
         qp = request.query_params

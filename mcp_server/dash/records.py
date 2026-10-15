@@ -298,7 +298,7 @@ def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> di
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount timeline, preferences, the dream report and behavior files (admin gated)."""
 
-    @mcp.custom_route("/dash/api/timeline", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/timeline", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_timeline(request: Request) -> dict[str, Any]:
         qp = request.query_params
@@ -310,7 +310,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             raise RouteError(f"unknown type {type_!r}")
         return _timeline(db_url, before, limit, type_, group_id)
 
-    @mcp.custom_route("/dash/api/timeline/months", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/timeline/months", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_timeline_months(request: Request) -> dict[str, Any]:
         qp = request.query_params
@@ -325,23 +325,23 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             raise RouteError("missing or unknown 'tz' (an IANA zone name)") from e
         return _timeline_months(db_url, type_, group_id, tz)
 
-    @mcp.custom_route("/dash/api/preferences", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/preferences", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_preferences(request: Request) -> dict[str, Any]:
         return _preferences(db_url, request.query_params.get("sort") or "recency")
 
-    @mcp.custom_route("/dash/api/dream/report", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/dream/report", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_dream_report(request: Request) -> dict[str, Any]:
         limit = _limit(request.query_params.get("limit"), _DREAM_REPORT_DEFAULT, _DREAM_REPORT_MAX)
         return _dream_report(db_url, limit)
 
-    @mcp.custom_route("/dash/api/behavior/files", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/behavior/files", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_behavior_files(request: Request) -> dict[str, Any]:
         return _behavior_files(db_url)
 
-    @mcp.custom_route("/dash/api/behavior/file", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/behavior/file", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="file not found")
     def dash_behavior_file(request: Request) -> dict[str, Any] | None:
         qp = request.query_params

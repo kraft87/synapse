@@ -59,19 +59,19 @@ def register(mcp: Any) -> None:
 
     # The server has no other browser-facing root — a bare vhost hit (Caddy proxies
     # the whole port) 404'd. Send humans to the dashboard; machine paths unaffected.
-    @mcp.custom_route("/", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/", methods=["GET"])  # type: ignore[untyped-decorator]
     async def root_redirect(request: Request) -> Response:
         return RedirectResponse("/dash", status_code=302)
 
-    @mcp.custom_route("/dash", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash", methods=["GET"])  # type: ignore[untyped-decorator]
     async def dash_index(request: Request) -> Response:
         return _serve_static_file("index.html")
 
-    @mcp.custom_route("/dash/app.js", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/app.js", methods=["GET"])  # type: ignore[untyped-decorator]
     async def dash_appjs(request: Request) -> Response:
         return _serve_static_file("app.js")
 
-    @mcp.custom_route("/dash/assets/{name}", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/assets/{name}", methods=["GET"])  # type: ignore[untyped-decorator]
     async def dash_assets(request: Request) -> Response:
         name = request.path_params["name"]
         assets_dir = _DIST_DIR / "assets"

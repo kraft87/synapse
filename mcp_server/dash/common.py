@@ -145,7 +145,7 @@ def _episode_id(request: Request) -> int:
     return int(raw)
 
 
-class _TtlCache:
+class _TtlCache[T]:
     """One computed value kept for ``ttl`` seconds (monotonic) in this process. Owned by a
     ``register()`` call, not a module global, so a fresh register() in tests starts empty and
     one test's inserts never serve stale counts to another's."""
@@ -153,9 +153,9 @@ class _TtlCache:
     def __init__(self, ttl: float) -> None:
         self._ttl = ttl
         self._ts = 0.0
-        self._data: Any = None
+        self._data: T | None = None
 
-    def get(self, work: Callable[[], Any]) -> Any:
+    def get(self, work: Callable[[], T]) -> T:
         now = time.monotonic()
         if self._data is not None and now - self._ts < self._ttl:
             return self._data

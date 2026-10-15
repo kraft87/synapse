@@ -8,8 +8,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PATTERNS = (
     "ingestion/db*.py",
     "ingestion/extract*.py",
+    "ingestion/llm_*.py",
     "mcp_server/recall*.py",
     "mcp_server/server*.py",
+    "mcp_server/skill_review_routes.py",
     "mcp_server/caller_trust.py",
     "mcp_server/http_auth.py",
     "mcp_server/auxiliary_routes.py",

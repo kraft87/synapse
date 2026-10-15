@@ -353,7 +353,7 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     # register() in tests gets an isolated manager (own buffer/worker).
     stream_manager = _StreamManager(db_url)
 
-    @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     async def dash_stream(request: Request) -> StreamingResponse:
         """SSE live feed (Phase 3). Admin-gated like every /dash/api/* route — the

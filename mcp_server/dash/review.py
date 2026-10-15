@@ -249,7 +249,7 @@ def _proposal_ref(request: Request) -> tuple[str, int]:
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount the unified proposal list, detail and decision (admin gated)."""
 
-    @mcp.custom_route("/dash/api/proposals", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/proposals", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_proposals(request: Request) -> dict[str, Any]:
         qp = request.query_params
@@ -261,13 +261,13 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
             kind = None
         return _proposals_unified(db_url, status, kind)
 
-    @mcp.custom_route("/dash/api/proposals/{id}", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/proposals/{id}", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="proposal not found")
     def dash_proposal_detail(request: Request) -> dict[str, Any] | None:
         lane, n = _proposal_ref(request)
         return _proposal_detail(db_url, lane, n)
 
-    @mcp.custom_route("/dash/api/proposals/{id}/decision", methods=["POST"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/proposals/{id}/decision", methods=["POST"])  # type: ignore[untyped-decorator]
     @route(authorized, body=True, not_found="proposal not found")
     def dash_proposal_decision(
         request: Request, body: dict[str, Any]

@@ -404,14 +404,14 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any] | N
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount catalog, feed, episode detail and session (admin gated)."""
     # Contract: the catalog is cached ~5 min in-process.
-    catalog_cache = _TtlCache(_CATALOG_TTL_S)
+    catalog_cache = _TtlCache[dict[str, Any]](_CATALOG_TTL_S)
 
-    @mcp.custom_route("/dash/api/catalog", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/catalog", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_catalog(request: Request) -> dict[str, Any]:
         return catalog_cache.get(lambda: _catalog(db_url))
 
-    @mcp.custom_route("/dash/api/feed", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/feed", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_feed(request: Request) -> dict[str, Any]:
         qp = request.query_params
@@ -422,17 +422,17 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         source = qp.get("source") or None
         return _feed(db_url, cursor, limit, project, group_id, source)
 
-    @mcp.custom_route("/dash/api/episode/{id}", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/episode/{id}", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="episode not found")
     def dash_episode(request: Request) -> dict[str, Any] | None:
         return _episode(db_url, _episode_id(request))
 
-    @mcp.custom_route("/dash/api/episode/{id}/derived", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/episode/{id}/derived", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_episode_derived(request: Request) -> dict[str, Any]:
         return _episode_derived(db_url, _episode_id(request))
 
-    @mcp.custom_route("/dash/api/session/{id}", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/session/{id}", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="session not found")
     def dash_session(request: Request) -> dict[str, Any] | None:
         raw_hl = request.query_params.get("highlight")

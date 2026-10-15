@@ -455,12 +455,12 @@ def retire_flags(conn: psycopg.Connection[dict[str, Any]], kind: str, item_ids: 
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount the flag routes and the two delete routes (admin gated)."""
 
-    @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/flags", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_flags(request: Request) -> dict[str, Any]:
         return _flags_list(db_url)
 
-    @mcp.custom_route("/dash/api/flag", methods=["POST"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/flag", methods=["POST"])  # type: ignore[untyped-decorator]
     @route(authorized, body=True)
     def dash_flag(request: Request, body: dict[str, Any]) -> dict[str, Any]:
         kind = body.get("kind")
@@ -480,12 +480,12 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
     # Plural collection paths, unlike the singular phase-1 read routes — the DELETE verb
     # acts on the collection member. Contract §Phase 7 has the cascade table.
 
-    @mcp.custom_route("/dash/api/episodes/{id}", methods=["DELETE"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/episodes/{id}", methods=["DELETE"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="episode not found")
     def dash_delete_episode(request: Request) -> dict[str, Any] | None:
         return _delete_episode(db_url, _episode_id(request))
 
-    @mcp.custom_route("/dash/api/facts/{id}", methods=["DELETE"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/facts/{id}", methods=["DELETE"])  # type: ignore[untyped-decorator]
     @route(authorized, not_found="fact not found")
     def dash_delete_fact(request: Request) -> dict[str, Any] | None:
         uuid = request.path_params["id"]

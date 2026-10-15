@@ -354,9 +354,9 @@ def _metrics_corpus(db_url: str) -> dict[str, Any]:
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount recall history and the three metrics aggregates (admin gated)."""
     # Contract: corpus metrics are cached 1h in-process.
-    corpus_cache = _TtlCache(_CORPUS_TTL_S)
+    corpus_cache = _TtlCache[dict[str, Any]](_CORPUS_TTL_S)
 
-    @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/recall/history", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_recall_history(request: Request) -> dict[str, Any]:
         limit = _limit(
@@ -364,19 +364,19 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         )
         return _recall_history(db_url, limit)
 
-    @mcp.custom_route("/dash/api/metrics/recall", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/metrics/recall", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_metrics_recall(request: Request) -> dict[str, Any]:
         window_s = _parse_window(request.query_params.get("window"), _RECALL_WINDOW_DEFAULT_S)
         return _metrics_recall(db_url, window_s)
 
-    @mcp.custom_route("/dash/api/metrics/ingestion", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/metrics/ingestion", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_metrics_ingestion(request: Request) -> dict[str, Any]:
         window_s = _parse_window(request.query_params.get("window"), _INGEST_WINDOW_DEFAULT_S)
         return _metrics_ingestion(db_url, window_s)
 
-    @mcp.custom_route("/dash/api/metrics/corpus", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/metrics/corpus", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_metrics_corpus(request: Request) -> dict[str, Any]:
         return corpus_cache.get(lambda: _metrics_corpus(db_url))

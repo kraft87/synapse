@@ -214,7 +214,7 @@ def _search(
 def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> None:
     """Mount search (admin gated)."""
 
-    @mcp.custom_route("/dash/api/search", methods=["GET"])  # type: ignore[misc]
+    @mcp.custom_route("/dash/api/search", methods=["GET"])  # type: ignore[untyped-decorator]
     @route(authorized)
     def dash_search(request: Request) -> dict[str, Any]:
         qp = request.query_params
