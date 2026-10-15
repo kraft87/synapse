@@ -13,8 +13,11 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
   4. detectors      — struggle_arc, post_fire, and the weekly procedure_miner (each its own stage)
   5. draft          — every proposed derive/retune without a body (or with a stale retune
                       draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
-  6. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
-                      throttled Discord digest (top 5, pings only on NEW proposals)
+  6. decay, effects, digest
+                    — retire stale 'observe' candidates (proposed rows wait for review);
+                      measure what retunes accepted 7-30 days ago did to their skill's fires,
+                      dismissals and deviations; throttled Discord digest (top 5, pings only
+                      on NEW proposals)
 Incremental over an episode-id window (dream/lane.py): every stage covers the same episodes,
 and the cursor advances only past the sessions the run got to (at most `limit` are judged a
 night, oldest first; the rest roll to the next night). --backfill starts 30 days back.
@@ -54,8 +57,8 @@ BASH_HEADS_KEPT = 8  # shell commands kept per session on a derive's evidence, f
 
 # -------------------------------------------------------------------- 1. usage sync
 def sync_usage(conn, events):
-    """Record the window's skill fire events in skill_usage and roll them up into the
-    registry. The events (DB.fire_events) feed the dismissal and post-fire stages too."""
+    """Record the window's skill fire events in skill_usage. The events (DB.fire_events) feed
+    the dismissal and post-fire stages too, which add their verdicts to the same rows."""
     cur = conn.cursor()
     for e in events:
         cur.execute(
@@ -64,13 +67,6 @@ def sync_usage(conn, events):
                ON CONFLICT (skill, session_id, fired_at) DO UPDATE SET dismissed=EXCLUDED.dismissed""",
             (e["skill"], e["fired_at"], e["session_id"], e["via"], e["dismissed"]),
         )
-    # rollup into registry
-    cur.execute(
-        """UPDATE skills_lane.skill_registry r SET
-             fire_count = u.cnt, last_fired = u.last, updated_at = now()
-           FROM (SELECT skill, count(*) cnt, max(fired_at) last FROM skills_lane.skill_usage GROUP BY skill) u
-           WHERE r.name = u.skill"""
-    )
     conn.commit()
     return {"fire_events": len(events), "dismissals": sum(1 for e in events if e["dismissed"])}
 
@@ -250,6 +246,59 @@ def capture_grounded(conn, window, fires, seen_ids, *, catalog):
     return {"dismissals": len(dis), "explicit_requests": len(reqs)}
 
 
+# ------------------------------------------------------------- 5. effect of accepted retunes
+EFFECT_MIN_DAYS = 7  # a retune is measured from this long after its accept...
+EFFECT_MAX_DAYS = 30  # ...until this long after it
+
+# One row per accepted retune: the target skill's fires, dismissals, judged fires (post_fire
+# kept a verdict) and deviations (partial / failed), before the accept and since it. The span
+# before is as long as the span since.
+_EFFECTS_SQL = """
+SELECT c.name, c.direction, extract(day FROM now() - c.updated_at)::int,
+       count(u.id) FILTER (WHERE u.fired_at < c.updated_at),
+       count(u.id) FILTER (WHERE u.fired_at < c.updated_at AND u.dismissed),
+       count(u.id) FILTER (WHERE u.fired_at < c.updated_at
+                             AND u.outcome IN ('worked', 'partial', 'failed')),
+       count(u.id) FILTER (WHERE u.fired_at < c.updated_at AND u.outcome IN ('partial', 'failed')),
+       count(u.id) FILTER (WHERE u.fired_at >= c.updated_at),
+       count(u.id) FILTER (WHERE u.fired_at >= c.updated_at AND u.dismissed),
+       count(u.id) FILTER (WHERE u.fired_at >= c.updated_at
+                             AND u.outcome IN ('worked', 'partial', 'failed')),
+       count(u.id) FILTER (WHERE u.fired_at >= c.updated_at AND u.outcome IN ('partial', 'failed'))
+  FROM skills_lane.skill_gap_candidates c
+  LEFT JOIN skills_lane.skill_usage u
+         ON u.skill = COALESCE(c.target_skills[1], c.name)
+        AND u.fired_at >= c.updated_at - (now() - c.updated_at)
+ WHERE c.kind = 'retune' AND c.status = 'promoted'
+   AND c.updated_at <= now() - make_interval(days => %s)
+   AND c.updated_at > now() - make_interval(days => %s)
+ GROUP BY c.id ORDER BY c.updated_at DESC"""
+
+
+def skill_effects(conn):
+    """What each accepted retune did to its skill, in SQL only: for the retunes promoted
+    EFFECT_MIN_DAYS..EFFECT_MAX_DAYS ago (a promoted row's updated_at is its accept), the
+    skill's fires, dismissals and judged deviations (post_fire's verdicts) over the span since
+    the accept against the span of the same length before it. Information for the digest, not a
+    gate: a handful of fires says little, and fires from before post_fire kept its verdicts
+    show as "-"."""
+
+    def frac(n, d):
+        return f"{n}/{d}" if d else "-"
+
+    lines = []
+    for name, direction, days, *counts in conn.execute(
+        _EFFECTS_SQL, (EFFECT_MIN_DAYS, EFFECT_MAX_DAYS)
+    ).fetchall():
+        (bf, bd, bj, bx), (af, ad, aj, ax) = counts[:4], counts[4:]
+        lines.append(
+            f"{name} ({direction}, {days}d ago): fires {bf} -> {af}"
+            f" · dismissed {frac(bd, bf)} -> {frac(ad, af)}"
+            f" · deviated {frac(bx, bj)} -> {frac(ax, aj)}"
+        )
+    return {"measured": len(lines), "lines": lines}
+
+
 def _tools_from_bash(bash_heads):
     return sorted({h.split()[0] for h in bash_heads if h and h.split()})[:8]
 
@@ -265,13 +314,13 @@ def run_procedure_miner(conn, catalog):
 DIGEST_CAP = 5  # proposals shown per digest — flood control, the rest is a "+N pending" footer
 
 
-def discord_digest(conn, no_discord):
+def discord_digest(conn, no_discord, effects=()):
     """Throttled review digest. Shows the top-DIGEST_CAP proposals (salience DESC, then
     score), and PINGS only when there are proposals not covered by the previous digest —
     a nightly re-wall of the same pending list is how review queues rot. The seen-ids
     watermark lives in skill_scan_cursor.config['digest_ids'] (update_cursor merges,
     never clobbers); it is written only once the digest was delivered, and a failed Discord
-    POST raises."""
+    POST raises. `effects` are skill_effects' lines, shown under the proposals."""
     cur = conn.cursor()
     # Claude Code puts every served skill's description in each session's context: the total of
     # the global ones, which every session pays for, shows whether widens are inflating it.
@@ -301,6 +350,9 @@ def discord_digest(conn, no_discord):
         lines.append(f"- `{kind}` **{name}** (score {score:.1f}, {js} judge{g}{s}{v})")
     if len(rows) > DIGEST_CAP:
         lines.append(f"+{len(rows) - DIGEST_CAP} more pending (skill_review list)")
+    if effects:
+        lines.append("\nAccepted changes (the span since the accept, against the span before it):")
+        lines.extend(f"- {e}" for e in effects[:DIGEST_CAP])
     lines.append(
         f"\nGlobal skill descriptions: {n_skills} skills, {int(chars)} chars in every session"
     )
@@ -400,7 +452,10 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
         stage("procedure_miner", run_procedure_miner, conn, catalog)
         stage("drafts", skill_draft.draft_pending, conn)
         stage("decay", L.decay_stale, conn)
-        stage("digest", discord_digest, conn, no_discord)
+        stage("effects", skill_effects, conn)
+        stage(
+            "digest", discord_digest, conn, no_discord, stages.get("effects", {}).get("lines", ())
+        )
 
         held = [name for name in WINDOW_STAGES if name in errors]
         if held:

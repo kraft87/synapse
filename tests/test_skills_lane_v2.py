@@ -16,6 +16,7 @@ Covers:
 
 from __future__ import annotations
 
+import itertools
 import json
 import urllib.error
 from datetime import UTC, datetime, timedelta
@@ -498,6 +499,70 @@ def test_decay_retires_observe_but_never_proposed(lane):
     assert _row(lane, prop["id"])[0] == "proposed"  # waits for human review
 
 
+# --------------------------------------------- what an accepted retune did to its skill
+_usage_ids = itertools.count(1)
+
+
+def _usage(conn, skill, days_ago, *, dismissed=False, outcome=None):
+    conn.execute(
+        "INSERT INTO skills_lane.skill_usage (skill, fired_at, session_id, via, dismissed, outcome) "
+        "VALUES (%s, now() - make_interval(days => %s), %s, 'tool', %s, %s)",
+        (skill, days_ago, f"v2t-eff-{next(_usage_ids)}", dismissed, outcome),
+    )
+
+
+def _promoted(conn, name, days_ago, kind="retune"):
+    conn.execute(
+        "INSERT INTO skills_lane.skill_gap_candidates "
+        "(kind, name, direction, target_skills, status, grounded_weight, updated_at) "
+        "VALUES (%s, %s, 'fix', %s, 'promoted', 3.0, now() - make_interval(days => %s))",
+        (kind, name, [name], days_ago),
+    )
+
+
+def test_the_post_fire_verdict_is_kept_on_the_usage_row(lane):
+    import dream.skills.post_fire as PF
+
+    fired_at = datetime(2026, 7, 18, 12, tzinfo=UTC)
+    fire = {"skill": "v2t-kept", "session_id": "v2t-sess-o", "fired_at": fired_at}
+    lane.execute(
+        "INSERT INTO skills_lane.skill_usage (skill, fired_at, session_id, via, dismissed) "
+        "VALUES ('v2t-kept', %s, 'v2t-sess-o', 'tool', false)",
+        (fired_at,),
+    )
+    for verdict, stored in (("deviation", "partial"), ("clean", "worked"), ("fight", "failed")):
+        PF._record_outcome(lane, fire, verdict)
+        assert lane.execute(
+            "SELECT outcome FROM skills_lane.skill_usage WHERE skill='v2t-kept'"
+        ).fetchone() == (stored,)
+
+
+def test_skill_effects_compares_the_span_since_the_accept_with_the_span_before(lane):
+    # accepted 14 days ago: 14 days before it against the 14 since
+    _promoted(lane, "v2t-eff-skill", 14)
+    for ago, kw in ((20, {}), (18, {"dismissed": True}), (16, {"dismissed": True}), (29, {})):
+        _usage(lane, "v2t-eff-skill", ago, **kw)  # before; 29 is outside the 14-day span
+    for ago, kw in (
+        (10, {"outcome": "worked"}),
+        (8, {"outcome": "partial"}),
+        (3, {"outcome": "worked"}),
+        (1, {"outcome": "unknown"}),
+    ):
+        _usage(lane, "v2t-eff-skill", ago, **kw)
+    _usage(lane, "v2t-other-skill", 5)  # another skill's fires are not counted
+    # too fresh to say, too old to attribute, and not a retune: all left out
+    _promoted(lane, "v2t-eff-fresh", 3)
+    _promoted(lane, "v2t-eff-old", 40)
+    _promoted(lane, "v2t-eff-derive", 14, kind="derive")
+
+    r = N.skill_effects(lane)
+
+    assert r["measured"] == 1
+    assert r["lines"] == [
+        "v2t-eff-skill (fix, 14d ago): fires 3 -> 4 · dismissed 2/3 -> 0/4 · deviated - -> 1/3"
+    ]
+
+
 # -------------------------------------------------------------- digest throttle
 
 
@@ -596,6 +661,31 @@ def test_digest_reports_the_size_of_the_global_descriptions(lane, capsys):
         assert f"{n0 + 1} skills, {chars0 + 300} chars" in capsys.readouterr().out
     finally:
         lane.execute("DELETE FROM skills_lane.skill_registry WHERE name LIKE 'v2t-%'")
+
+
+def test_digest_shows_what_the_accepted_changes_did(lane, capsys):
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='observe' WHERE status='proposed'"
+    )
+    _mc(
+        lane,
+        "retune",
+        "v2t-digest-effects",
+        [
+            {
+                "session_id": "v2t-sess-ef",
+                "class": "judge",
+                "signal": "post_fire_deviation",
+                "quote": "synthetic",
+            }
+        ],
+        direction="fix",
+        target_skills=["v2t-digest-effects"],
+    )
+    line = "v2t-x (fix, 14d ago): fires 3 -> 4 · dismissed 2/3 -> 0/4 · deviated - -> 1/3"
+    N.discord_digest(lane, no_discord=True, effects=[line])
+    out = capsys.readouterr().out
+    assert "Accepted changes" in out and f"- {line}" in out
 
 
 def test_a_failed_discord_post_raises_and_the_batch_pings_again_next_run(lane, monkeypatch, capsys):

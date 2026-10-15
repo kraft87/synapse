@@ -121,7 +121,15 @@ def _stub_merge(calls):
 
 
 def _wire(
-    monkeypatch, *, fires, episodes, verdict_json, calls, doc=("desc", "body"), registered=None
+    monkeypatch,
+    *,
+    fires,
+    episodes,
+    verdict_json,
+    calls,
+    doc=("desc", "body"),
+    registered=None,
+    outcomes=None,
 ):
     """Stub the fetchers, the judge and the ledger. Returns (prompts, run): run() judges
     `fires` against a catalog of the `registered` skills (default: every fired skill)."""
@@ -137,6 +145,11 @@ def _wire(
 
     monkeypatch.setattr(PF.lane, "judge", judge)
     monkeypatch.setattr(PF.L, "merge_candidate", _stub_merge(calls))
+    monkeypatch.setattr(
+        PF,
+        "_record_outcome",
+        lambda conn, fire, outcome: outcomes is None or outcomes.append((fire["skill"], outcome)),
+    )
 
     def run():
         return PF.run(None, fires=fires, catalog=[(n, "") for n in sorted(registered)])
@@ -206,6 +219,44 @@ def test_deviation_emits_retune_call_shape(monkeypatch):
     assert "environment-dependent failures" in prompts[0]
     # the fire episode itself is NOT in the post-fire window
     assert "[seq 2]" not in prompts[0] and "[seq 3]" in prompts[0]
+
+
+def test_every_judged_outcome_is_kept_on_the_fire(monkeypatch):
+    for outcome in PF.OUTCOMES:
+        outcomes = []
+        _, run = _wire(
+            monkeypatch,
+            fires=[_fire()],
+            episodes=_SESSION,
+            verdict_json=json.dumps(dict(_DEVIATION_VERDICT, outcome=outcome)),
+            calls=[],
+            outcomes=outcomes,
+        )
+        run()
+        assert outcomes == [("widget-deploy", outcome)]
+
+
+def test_a_fire_that_was_not_judged_keeps_no_outcome(monkeypatch):
+    outcomes = []
+    _, run = _wire(  # the judge's reply has no JSON
+        monkeypatch,
+        fires=[_fire()],
+        episodes=_SESSION,
+        verdict_json="not json",
+        calls=[],
+        outcomes=outcomes,
+    )
+    run()
+    _, run = _wire(  # the fire is the session's last episode: nothing followed it
+        monkeypatch,
+        fires=[_fire()],
+        episodes={"s1": [_ep(1, content=_FIRE)]},
+        verdict_json=json.dumps(_DEVIATION_VERDICT),
+        calls=[],
+        outcomes=outcomes,
+    )
+    run()
+    assert outcomes == []
 
 
 def test_fight_emits_candidate_clean_does_not(monkeypatch):

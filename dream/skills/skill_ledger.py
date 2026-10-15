@@ -53,9 +53,7 @@ _GROUNDED_W = {
     "explicit_request": 3.0,
     "accept": 3.0,
     "reject": -3.0,
-    "post_change_fired": 2.0,
     "dismissal": 1.0,
-    "user_correction": 1.0,
 }
 _JUDGE_W = {"gap_scan": 1.0, "under_trigger": 1.0}
 

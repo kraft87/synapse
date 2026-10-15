@@ -44,6 +44,15 @@ FIRE_CAP = 20  # fires judged per run (one judge call each)
 BODY_CHARS = 4000  # skill-body cap in the judge prompt
 
 OUTCOMES = ("clean", "deviation", "fight", "unassessable")
+#: The verdict as skill_usage.outcome stores it (schema 022: worked | failed | partial |
+#: unknown); skill_effects reads the deviation rate from it. A fire that was not judged
+#: (over the cap, no position, a judge failure) keeps outcome NULL.
+USAGE_OUTCOME = {
+    "clean": "worked",
+    "deviation": "partial",
+    "fight": "failed",
+    "unassessable": "unknown",
+}
 
 _BASE_DIR_MARKER = "base directory for this skill"
 
@@ -202,11 +211,21 @@ def _patch_text(patch) -> str | None:
     return None
 
 
+def _record_outcome(conn, fire: dict, outcome: str) -> None:
+    """Keep the verdict on the fire's skill_usage row (sync_usage wrote it this run)."""
+    conn.execute(
+        "UPDATE skills_lane.skill_usage SET outcome = %s "
+        "WHERE skill = %s AND session_id = %s AND fired_at = %s",
+        (USAGE_OUTCOME[outcome], fire["skill"], fire["session_id"], fire["fired_at"]),
+    )
+
+
 # ------------------------------------------------------------------ entry
 def run(conn, *, fires, catalog) -> dict:
     """Judge the window's skill `fires` (fire_events dicts) of skills in `catalog` ((name,
     description) of the active skills), newest first and at most FIRE_CAP of them;
-    deviations/fights become retune candidates. Returns the per-outcome tally."""
+    deviations/fights become retune candidates, and every judged outcome is kept on the fire's
+    skill_usage row. Returns the per-outcome tally."""
     stats = {
         "fires": 0,
         "clean": 0,
@@ -269,6 +288,7 @@ def run(conn, *, fires, catalog) -> dict:
         if outcome not in OUTCOMES:
             outcome = "unassessable"
         stats[outcome] += 1
+        _record_outcome(conn, fire, outcome)
         if outcome not in ("deviation", "fight"):
             continue
 
