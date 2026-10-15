@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # mypy: ignore-errors
-"""Private mode toggle — take a Claude Code session off the record.
+"""Private mode toggle — take a Claude Code or Codex session off the record.
 
     private_mode.py on  <session_id>          # nothing this session says ingests from now on
     private_mode.py on  <session_id> --purge  # ALSO delete what it already stored (see below)
@@ -8,6 +8,9 @@
     private_mode.py off <session_id> --forget # ALSO delete the server row (see below)
     private_mode.py status <session_id>
     private_mode.py --session-end             # SessionEnd hook: reads the payload on stdin
+
+Codex runs this same file (plugin-codex/scripts/private_mode.py is a shim): the marker dir
+and the private_sessions table are shared, and session ids do not collide.
 
 Two writes, both required, because they cover different failure modes:
 
