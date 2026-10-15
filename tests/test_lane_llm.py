@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -44,7 +45,7 @@ class _FakeClient:
         self.calls.append(kw)
         if self.error:
             raise self.error
-        return llm._Response(self.reply)
+        return SimpleNamespace(content=[SimpleNamespace(text=self.reply)])
 
 
 @pytest.fixture()
