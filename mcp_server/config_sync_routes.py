@@ -157,13 +157,15 @@ def _own_ready(conn, db_url: str, own_surface: str | None) -> bool:
 
 
 def _proposals_list(db_url: str, own_surface: str | None = None) -> dict:
-    """The rule edits awaiting review — only 'proposed' (the dream gate graduated them past observe).
+    """The rule edits awaiting action: 'proposed' (the dream gate graduated them past observe)
+    awaiting a decision, and 'accepted' (approved, on the dashboard or by an accept whose disk
+    write failed) awaiting the write that marks them applied.
 
     ``own_surface`` limits the list to that surface's own proposals (_OWN_PROPOSAL), the
     restricted caller's view. None is the unfiltered (full-trust / dashboard) view."""
     sql = (
-        "SELECT id, kind, file_key, scope, summary, evidence, updated_at "
-        "FROM config_lane.config_proposals WHERE status='proposed'"
+        "SELECT id, kind, file_key, scope, diff, summary, evidence, status "
+        "FROM config_lane.config_proposals WHERE status IN ('proposed', 'accepted')"
     )
     if own_surface:
         sql += _OWN_PROPOSAL
@@ -181,6 +183,8 @@ def _proposals_list(db_url: str, own_surface: str | None = None) -> dict:
                 "kind": r["kind"],
                 "file_key": r["file_key"],
                 "scope": r["scope"],
+                "status": r["status"],
+                "rule": r["diff"] or r["summary"],
                 "summary": r["summary"],
                 "sessions": len({e.get("session_id") for e in ev if e.get("session_id")}),
                 "evidence_count": len(ev),
@@ -227,7 +231,11 @@ def _proposal_act(
     """Walk a proposal through the gate. accept records the human yes (and can override the blast
     radius via scope); apply marks it written-to-disk (the client did the actual write); reject drops
     it. The two-step accept->apply mirrors skills' accept->promote: 'accepted' = approved, 'applied' =
-    on disk, so a failed disk write leaves it recoverable at 'accepted'."""
+    on disk, so a failed disk write leaves it recoverable at 'accepted'.
+
+    A decision is final: an applied or rejected proposal refuses accept and reject (a late click
+    must not un-reject a rule or restart its cooling window). Accepting an accepted one is how the
+    CLI finishes a dashboard approval, so it is allowed."""
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         cur = conn.cursor()
         row = conn.execute(
@@ -237,6 +245,8 @@ def _proposal_act(
         ).fetchone()
         if not row:
             return {"found": False}
+        if action in ("accept", "reject") and row["status"] in ("rejected", "applied"):
+            return {"status": "refused", "detail": f"proposal is already '{row['status']}'"}
 
         if action == "accept":
             new_scope = scope if scope in ("local", "general") else row["scope"]
