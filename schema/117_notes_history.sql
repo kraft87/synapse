@@ -1,10 +1,11 @@
 -- schema-check: optional
--- 117: notes_history -- the text a note had before remember() rewrote it in place.
+-- notes_history -- the text a note had before remember() rewrote it in place.
 --
 -- A restatement that the write-time judge calls a duplicate refreshes the existing note's
 -- hook and body (the id, and so every board reference to it, stays). Without a record the
--- old wording was gone for good: only the archived manual episode still held it, and
--- source_ref pointed at that episode only until the next restatement moved it on.
+-- old wording was gone for good: only the archived manual episode still held it (source_ref
+-- points there); update_note now moves source_ref to the new episode only when it writes a
+-- history row.
 --
 -- update_note copies the row's hook, body and source_ref here in the same transaction as the
 -- overwrite, and only when the text actually changes. Nothing reads the table at run time; it
