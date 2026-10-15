@@ -68,6 +68,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import synapse_project
+from synapse_filelock import lock_exclusive
 
 
 def _skill_description(text: str) -> str:
@@ -279,8 +280,15 @@ def _ledger_path(target_dir: Path, kind: str = "delivered") -> Path:
     with the server (pulled, pushed, or seen identical; clients before 0.22 also counted
     a push a newer server refused). "pulled": only the versions a pull wrote here, so
     exactly what Synapse put in this folder, never the folder's own content."""
-    key = hashlib.sha256(str(target_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return config.synapse_home.home() / "skills" / f"{kind}-{key}.json"
+    return config.synapse_home.home() / "skills" / f"{kind}-{_folder_key(target_dir)}.json"
+
+
+def _lock_path(target_dir: Path) -> Path:
+    return config.synapse_home.home() / "skills" / f"sync-{_folder_key(target_dir)}.lock"
+
+
+def _folder_key(target_dir: Path) -> str:
+    return hashlib.sha256(str(target_dir.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
 def _load_ledger(target_dir: Path, kind: str = "delivered") -> dict:
@@ -423,6 +431,24 @@ def _sync(
     scope: str, target_dir: Path, client=config, *, git_exclude: bool = False
 ) -> tuple[int, int, int]:
     """One two-way pass over ``target_dir``. Returns (pulled, pushed, removed).
+
+    Sessions starting together (or a compaction beside a start) would run two passes over
+    one folder, through the same pull temp file and ledgers, so a pass takes a lock per
+    folder and a second one skips: (0, 0, 0), the next session start syncs it."""
+    lock = _lock_path(target_dir)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as lf:
+        try:
+            lock_exclusive(lf, blocking=False)
+        except OSError:
+            return 0, 0, 0
+        return _sync_folder(scope, target_dir, client, git_exclude=git_exclude)
+
+
+def _sync_folder(
+    scope: str, target_dir: Path, client, *, git_exclude: bool
+) -> tuple[int, int, int]:
+    """The pass ``_sync`` runs under the folder's lock.
 
     ``git_exclude`` (project folders): add each skill folder this pass pulls to its
     repository's .git/info/exclude. A skill folder the repository tracks is its own: git

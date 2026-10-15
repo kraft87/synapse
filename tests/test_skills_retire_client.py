@@ -759,7 +759,7 @@ def test_the_codex_run_returns_pulled_pushed_removed(engine, tmp_path):
     server.put("theirs", _V2)
     server.retire("retired-one", _hash(engine, _V1))
 
-    assert codex.run(server, folder, tmp_path / "lock") == (1, 1, 1)
+    assert codex.run(server, folder) == (1, 1, 1)
 
     assert sorted(p.name for p in folder.iterdir()) == ["mine", "theirs"]
     assert [p["name"] for p in server.published()] == ["mine"]

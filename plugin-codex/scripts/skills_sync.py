@@ -23,9 +23,10 @@ outside both folders and never enter the sync.
 
 Opt-in through ``skills_sync`` in ~/.synapse/config.json (``synapse login`` asks;
 ``SYNAPSE_SKILLS_SYNC=1`` in the environment works too), the same setting the Claude
-plugin reads, so a machine running both plugins configures once. A non-blocking lock
-serialises overlapping session starts; a second caller skips instead of double-syncing. Fail-open: any error
-exits 0 with nothing printed, and session start is never blocked.
+plugin reads, so a machine running both plugins configures once. The engine's per-folder
+lock serialises overlapping syncs of one folder; a second caller skips instead of
+double-syncing. Fail-open: any error exits 0 with nothing printed, and session start is
+never blocked.
 """
 
 from __future__ import annotations
@@ -42,7 +43,6 @@ _CLAUDE_SCRIPTS = Path(__file__).resolve().parents[2] / "plugin" / "scripts"
 
 SKILLS_SYNC = _cfg("SYNAPSE_SKILLS_SYNC", "0") not in ("", "0")
 SKILLS_DIR = Path(os.path.expanduser(_cfg("SYNAPSE_CODEX_SKILLS_DIR", "~/.agents/skills")))
-LOCK_PATH = Path(os.path.expanduser("~/.synapse/codex_skills_sync.lock"))
 
 
 def _load(name: str, path: Path):
@@ -80,25 +80,16 @@ def project_pass(cwd: str | None, user_dir: Path) -> tuple[str, Path] | None:
     return f"project:{label}", folder
 
 
-def run(
-    client, target_dir: Path, lock_path: Path, project: tuple[str, Path] | None = None
-) -> tuple[int, int, int] | None:
+def run(client, target_dir: Path, project: tuple[str, Path] | None = None) -> tuple[int, int, int]:
     """Sync ``target_dir`` against the global scope, then the project folder when one is
-    given (``project_pass``). None when another sync holds the lock."""
-    lock = _load("synapse_filelock", _CLAUDE_SCRIPTS / "synapse_filelock.py")
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lf:
-        try:
-            lock.lock_exclusive(lf, blocking=False)
-        except OSError:
-            return None
-        engine = _engine()
-        result = engine._sync("global", target_dir, client=client)
-        if project is not None:
-            scope, folder = project
-            more = engine._sync(scope, folder, client=client, git_exclude=True)
-            result = tuple(a + b for a, b in zip(result, more, strict=True))
-        return result
+    given (``project_pass``)."""
+    engine = _engine()
+    result = engine._sync("global", target_dir, client=client)
+    if project is not None:
+        scope, folder = project
+        more = engine._sync(scope, folder, client=client, git_exclude=True)
+        result = tuple(a + b for a, b in zip(result, more, strict=True))
+    return result
 
 
 def _cwd_arg(argv: list[str]) -> str | None:
@@ -111,7 +102,7 @@ def main() -> int:
     try:
         import common
 
-        result = run(common, SKILLS_DIR, LOCK_PATH, project_pass(_cwd_arg(sys.argv), SKILLS_DIR))
+        result = run(common, SKILLS_DIR, project_pass(_cwd_arg(sys.argv), SKILLS_DIR))
     except Exception:
         return 0
     if result and any(result):

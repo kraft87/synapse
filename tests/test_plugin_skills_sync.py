@@ -134,3 +134,26 @@ def test_a_different_content_hash_pulls_and_remembers_that_hash(monkeypatch, tmp
     assert module._sync("global", skills_dir, client=server) == (1, 0, 0)
     assert "/skills/fetch" in server.calls
     assert theirs in module._load_ledger(skills_dir)["alpha"]
+
+
+def test_a_folder_being_synced_is_skipped_by_a_second_sync(monkeypatch, tmp_path):
+    """Two session starts (or a compaction beside one) used to run two two-way syncs over
+    one folder, sharing the pull temp file and the ledgers. Now the second skips."""
+    module = _load_sync(monkeypatch, tmp_path, tmp_path)
+    skills_dir = tmp_path / ".claude" / "skills"
+    _write_skill(skills_dir, "alpha")
+    server = _Server([])
+    lock_path = module._lock_path(skills_dir)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(lock_path, "w") as held:
+        module.lock_exclusive(held, blocking=False)
+        assert module._sync("global", skills_dir, client=server) == (0, 0, 0)
+        assert server.calls == []  # not even the listing
+
+        # the lock is per folder: another folder syncs while this one is held
+        other = tmp_path / "other" / "skills"
+        _write_skill(other, "beta")
+        assert module._sync("global", other, client=server) == (0, 1, 0)
+
+    assert module._sync("global", skills_dir, client=server) == (0, 1, 0)  # released
