@@ -6,7 +6,7 @@ Run under the synapse venv (needs psycopg + voyageai):
     ~/services/synapse/.venv/bin/python ~/scripts/skill_ledger.py --selftest
 
 Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name;
-retune/consolidate = (name,direction)/target), evidence accumulation (dedup by
+retune = (name,direction)), evidence accumulation (dedup by
 (session, signal, class, work date), recompute weights from the FULL evidence every
 merge — never incrementally), the 0.5x judge discount (the score column does it),
 observe->proposed classification (v2 gates: retune proposes on one quote-carrying
@@ -47,7 +47,7 @@ _GROUNDED_W = {
     "dismissal": 1.0,
     "user_correction": 1.0,
 }
-_JUDGE_W = {"gap_scan": 1.0, "under_trigger": 1.0, "overlap": 1.0}
+_JUDGE_W = {"gap_scan": 1.0, "under_trigger": 1.0}
 
 _STOP = {
     "the",
@@ -184,7 +184,7 @@ def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
 def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions):
     """Return (id, evidence, cooling) of the matching candidate, or None. `cooling` is True
     when the row is rejected inside its 30d suppression window (rejected_until)."""
-    if kind in ("retune", "consolidate"):
+    if kind == "retune":
         # Match the skill_gap_named_idx unique key EXACTLY — no status filter. A row in a
         # terminal state (promoted/rejected/retired) still occupies (kind, name, direction);
         # filtering it out here sent merge_candidate down the INSERT path straight into a
@@ -226,13 +226,11 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
 
 
 def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
-    """v2 observe -> proposed gates (design 00: §3). The legacy score bar stays for every
-    kind (compat with existing rows/config); the new per-kind gates are ADDITIVE looseners:
+    """v2 observe -> proposed gates (design 00: §3). The legacy score bar stays for both
+    kinds (compat with existing rows/config); the new per-kind gates are ADDITIVE looseners:
       - retune: ONE strong instance — an evidence entry carrying a verbatim quote (the
         deviation/correction moment). Cheap to review, high prior.
       - derive: recurrence (distinct evidence dates) OR high detector salience.
-      - consolidate: legacy score path only (overlap nominations carry no quotes; one
-        cosine sighting is not review-worthy on its own).
     Junk is controlled downstream (candidate decay + human review), not at this gate."""
     if score is not None and score >= PROPOSE_SCORE:
         return True
@@ -264,8 +262,8 @@ def merge_candidate(
 ) -> dict:
     """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
 
-    Re-sighting a row in a terminal state (retune/consolidate share one unique key per
-    (kind, name, direction) regardless of status):
+    Re-sighting a row in a terminal state (retunes share one unique key per
+    (name, direction) regardless of status):
       - rejected inside its 30d cooldown: skipped silently, no write;
       - rejected past cooldown / retired: evidence merges and the row REOPENS to 'observe';
       - accepted / promoted: evidence merges (the sighting is recorded) but status never
@@ -343,7 +341,7 @@ def merge_candidate(
                   salience, source_detector, proposed_patch)
                VALUES (%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::halfvec,%s::jsonb,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (kind, name, COALESCE(direction, '-'))
-                 WHERE kind IN ('retune', 'consolidate') DO NOTHING
+                 WHERE kind = 'retune' DO NOTHING
                RETURNING id, status, score, salience""",
             (
                 kind,

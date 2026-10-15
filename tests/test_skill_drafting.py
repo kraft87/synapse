@@ -236,9 +236,8 @@ def test_draft_derive_and_unusable_reply(monkeypatch):
     assert DR.draft(row, None) is None
 
 
-def test_consolidate_and_missing_registry_body_are_never_drafted(monkeypatch):
+def test_missing_registry_body_is_never_drafted(monkeypatch):
     calls = _stub_llm(monkeypatch, _BODY)
-    assert DR.draft({"id": 5, "kind": "consolidate", "name": "a+b"}, None) is None
     row = {"id": 6, "kind": "retune", "direction": "fix", "name": "gone", "target_skills": []}
     assert DR.draft(row, None) is None
     assert calls == []

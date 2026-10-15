@@ -100,7 +100,7 @@ def _episode(conn, session, project, cwd):
 
 
 def _accept(db_url, cid, **kw):
-    return _proposal_act(db_url, cid, "accept", None, lambda *_: "routing-eval: stub", **kw)
+    return _proposal_act(db_url, cid, "accept", None, **kw)
 
 
 def _registry(conn, name):
@@ -130,7 +130,6 @@ def test_accept_writes_registry_records_history_and_promotes(acc, db_url):
 
     assert r["status"] == "promoted" and r["applied"] is True
     assert (r["skill"], r["scope"], r["created"]) == ("acc-backup", "global", False)
-    assert r["routing_eval"] == "routing-eval: stub"
     body, scope, desc, cmod, status = _registry(acc, "acc-backup")
     assert body == V2 and scope == "global" and status == "active"
     assert desc == "Back up the demo database."  # parsed from frontmatter, like a publish
@@ -267,34 +266,29 @@ def test_legacy_row_without_a_body_is_refused_cleanly(acc, db_url):
 
     assert r["status"] == "refused" and r["reason"] == "no_draft"
     assert r["detail"].startswith("no draft yet; re-drafts on the next nightly run")
-    assert "routing_eval" not in r  # no advisory LLM call for a guaranteed refusal
     assert _registry(acc, "acc-backup")[0] == V1 and _cand(acc, cid)[0] == "proposed"
     # the reviewer can still apply it by supplying the body
     assert _accept(db_url, cid, body=V2)["status"] == "promoted"
 
 
-def test_promote_is_a_noop(acc, db_url):
+def test_a_second_accept_is_refused_and_promote_is_gone(acc, db_url):
     _publish(db_url, "acc-backup", V1)
     cid = _candidate(acc, body=V2, base=body_hash(V1))
-    r = _proposal_act(db_url, cid, "promote", None, None)
-    assert r["status"] == "refused" and "no separate promote step" in r["detail"]
-
-    _accept(db_url, cid)
-    r = _proposal_act(db_url, cid, "promote", None, None)
-    assert r["status"] == "promoted" and r["noop"] is True
-    assert "applied at accept" in r["detail"]
+    assert _accept(db_url, cid)["status"] == "promoted"
     assert _registry(acc, "acc-backup")[0] == V2
 
     again = _accept(db_url, cid)
     assert again["status"] == "refused" and again["reason"] == "already_applied"
+    assert _proposal_act(db_url, cid, "promote", None)["status"] == "error"
 
 
-def test_consolidate_accept_still_only_records(acc, db_url):
+def test_a_leftover_consolidate_row_can_be_rejected_but_not_accepted(acc, db_url):
     cid = _candidate(
         acc, kind="consolidate", name="acc-a+acc-b", direction=None, target=("acc-a", "acc-b")
     )
-    assert _accept(db_url, cid)["status"] == "accepted"
-    assert _proposal_act(db_url, cid, "promote", None, None)["status"] == "promoted"
+    r = _accept(db_url, cid, body=V2)
+    assert r["status"] == "refused" and r["reason"] == "bad_kind"
+    assert _proposal_act(db_url, cid, "reject", "not a thing")["status"] == "rejected"
 
 
 def test_detail_reports_target_scope_and_registry_body(acc, db_url):
@@ -408,9 +402,6 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
     widen = _candidate(acc, direction="widen", body=None, evidence=ev)
     fix = _candidate(acc, direction="fix", body=V1 + "old draft\n", base="0" * 64)  # stale
     derive = _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
-    merge = _candidate(
-        acc, kind="consolidate", name="acc-a+acc-b", direction=None, target=("acc-a", "acc-b")
-    )
 
     def fake_llm(prompt):
         if '{"description"' in prompt:
@@ -436,7 +427,6 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
     )
     assert row(fix) == (V2, body_hash(V1))
     assert row(derive) == (_NEW, None)
-    assert row(merge) == (None, None)
     # drafted and current: a second pass leaves them alone
     monkeypatch.setattr(lane, "draft", lambda prompt: pytest.fail("re-drafted"))
     ours = {widen, fix, derive}

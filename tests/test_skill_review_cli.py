@@ -3,7 +3,7 @@
 No DB, no network: config.post_json is stubbed with canned server replies. Guards what the
 reviewer sees and sends: show renders a unified diff against the registry body (the full
 body for a new skill), accept forwards --body-file/--scope/--force and syncs this machine
-right away when it is the destination, refusals exit non-zero, promote is a no-op.
+right away when it is the destination, refusals exit non-zero.
 All skills are synthetic.
 """
 
@@ -187,14 +187,3 @@ def test_accept_refusal_exits_nonzero_with_the_reason(server):
     with pytest.raises(SystemExit) as e:
         skill_review.cmd_accept(7, None, None, False)
     assert "refusing [7]: no draft yet" in str(e.value.code)
-
-
-def test_promote_is_a_noop(server, capsys):
-    server.replies["/skills/proposals/act"] = {
-        "status": "promoted",
-        "noop": True,
-        "detail": "[7] demo-backup was applied at accept; nothing to promote",
-    }
-    skill_review.cmd_promote(7)
-    assert server.sent == [("/skills/proposals/act", {"id": 7, "action": "promote"})]
-    assert "applied at accept" in capsys.readouterr().out

@@ -14,7 +14,6 @@ body the draft was made from; accept refuses when the registry has moved on):
   retune / extend|fix|narrow
                             the current registry body with proposed_patch (or the evidence)
                             applied: frontmatter name unchanged, body non-empty, size sane
-  consolidate               never drafted (a merge is done by hand)
 
 A draft that fails its checks is not stored: the row stays body-less, the review CLI says
 "no draft yet", and the next nightly tries again.
@@ -169,8 +168,8 @@ def draft(row: dict, registry_body: str | None) -> tuple[str, str | None] | None
     if row["kind"] == "derive":
         body = draft_derive(row)
         return (body, None) if body else None
-    if row["kind"] != "retune" or not registry_body:
-        return None  # consolidate, or a retune of a skill the registry doesn't carry
+    if not registry_body:
+        return None  # a retune of a skill the registry doesn't carry
     if row.get("direction") == "widen":
         body = draft_widen(target_skill(row), registry_body, row.get("evidence"))
     else:

@@ -27,7 +27,7 @@ Routes (all POST):
   /skills/proposals   {id?}                          -> list proposed candidates, or one's detail
                                                         (detail: + where accept would apply it)
   /skills/proposals/act {id, action, reason?, body?, scope?, force?}
-                                                     -> accept (applies) | reject | promote (no-op)
+                                                     -> accept (applies) | reject
 
 Who is served what (schema 053/054 trust, the board's rule applied to skills): a full-trust
 device reads and writes every scope. A restricted device is served only ``project:<p>``
@@ -381,10 +381,9 @@ def _upsert_registry(
     """THE registry write for a skill's SKILL.md — /skills/publish and the review accept both
     go through it, so an accepted proposal lands exactly like a client publish.
 
-    Nulls the description embedding when the description changed so the server lane
-    re-embeds it (overlap detection). The skill_history trigger fires automatically on a body
-    change, so a superseded body stays recoverable. A write is the skill's newest edit, so
-    it ends any retirement (callers refuse the writes that must not)."""
+    The skill_history trigger fires automatically on a body change, so a superseded body stays
+    recoverable. A write is the skill's newest edit, so it ends any retirement (callers refuse
+    the writes that must not)."""
     cur.execute(
         """INSERT INTO skills_lane.skill_registry
                (name, scope, body, description, status, content_modified_at)
@@ -392,9 +391,6 @@ def _upsert_registry(
            ON CONFLICT (name) DO UPDATE SET
              scope=EXCLUDED.scope, body=EXCLUDED.body, description=EXCLUDED.description,
              status='active', content_modified_at=EXCLUDED.content_modified_at,
-             description_embedding = CASE
-               WHEN skills_lane.skill_registry.description IS DISTINCT FROM EXCLUDED.description
-               THEN NULL ELSE skills_lane.skill_registry.description_embedding END,
              updated_at=now()""",
         (name, scope, body, description, content_modified_at),
     )
@@ -702,7 +698,9 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
         issue("no_draft", _NO_DRAFT)
     if scope_override is not None and not _SCOPE_RE.match(scope_override):
         issue("bad_scope", f"scope must be 'global' or 'project:<name>', got {scope_override!r}")
-    if kind == "derive":
+    if kind not in ("derive", "retune"):  # a leftover 'consolidate' row: nothing applies it
+        issue("bad_kind", f"{kind} candidates can't be applied; reject it")
+    elif kind == "derive":
         if not valid_skill_name(skill):
             issue(
                 "bad_name", f"no usable skill name (frontmatter name or candidate {row['name']!r})"
@@ -774,15 +772,10 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
         if not r:
             return {"found": False}
         d = dict(r)
-        if r["kind"] != "consolidate":  # consolidate is never applied (merge by hand)
-            plan = _plan_apply(c, r, r["proposal_body"] or "", None)
-            d["apply_to"] = {
-                "skill": plan["skill"],
-                "scope": plan["scope"],
-                "exists": plan["exists"],
-            }
-            d["registry_body"] = plan["registry_body"]
-            d["apply_issues"] = plan["issues"]
+        plan = _plan_apply(c, r, r["proposal_body"] or "", None)
+        d["apply_to"] = {"skill": plan["skill"], "scope": plan["scope"], "exists": plan["exists"]}
+        d["registry_body"] = plan["registry_body"]
+        d["apply_issues"] = plan["issues"]
     d["found"] = True
     return d
 
@@ -859,7 +852,6 @@ def _proposal_act(
     cid: int,
     action: str,
     reason: str | None,
-    llm: Callable,
     *,
     body: str | None = None,
     scope: str | None = None,
@@ -877,35 +869,9 @@ def _proposal_act(
         if not row:
             return {"found": False}
 
-        if action == "accept" and row["kind"] != "consolidate":
-            note = ""
-            drafted = (body if body is not None else row["proposal_body"] or "").strip()
-            if row["kind"] == "retune" and row["status"] != "promoted" and drafted:
-                note = llm(c, cid, row["name"])  # advisory routing-eval, never blocks
+        if action == "accept":
             c.commit()  # close the read; the apply runs in its own locked transaction
-            res = _apply_accept(c, cid, body, scope, force)
-            if note and res.get("status") == "promoted":
-                res["routing_eval"] = note
-            return res
-
-        if action == "accept":  # consolidate: a merge is done by hand, accept only records it
-            ev = row["evidence"] or []
-            ev.append({"session_id": None, "class": "grounded", "signal": "accept"})
-            _js, gs, _jw, gw = _rollup(ev)
-            cur.execute(
-                "UPDATE skills_lane.skill_gap_candidates SET status='accepted', evidence=%s::jsonb, "
-                "grounded_sessions=%s, grounded_weight=%s, updated_at=now() WHERE id=%s",
-                (Json(ev), gs, gw, cid),
-            )
-            c.commit()
-            return {
-                "status": "accepted",
-                "id": cid,
-                "name": row["name"],
-                "proposal_path": row["proposal_path"],
-                "proposal_body": row["proposal_body"],
-                "routing_eval": "",
-            }
+            return _apply_accept(c, cid, body, scope, force)
 
         if action == "reject":
             ev = row["evidence"] or []
@@ -920,92 +886,7 @@ def _proposal_act(
             c.commit()
             return {"status": "rejected", "id": cid, "reason": reason or "user_rejected"}
 
-        if action == "promote":
-            # Kept for older clients: accept now applies, so promote has nothing left to do
-            # except confirm a hand-merged consolidate (the one kind accept doesn't apply).
-            if row["status"] == "promoted":
-                return {
-                    "status": "promoted",
-                    "noop": True,
-                    "id": cid,
-                    "name": row["name"],
-                    "detail": f"[{cid}] {row['name']} was applied at accept; nothing to promote",
-                }
-            if row["status"] == "accepted" and row["kind"] == "consolidate":
-                cur.execute(
-                    "UPDATE skills_lane.skill_gap_candidates SET status='promoted', "
-                    "updated_at=now() WHERE id=%s",
-                    (cid,),
-                )
-                c.commit()
-                return {"status": "promoted", "id": cid, "name": row["name"]}
-            if row["status"] == "accepted":
-                detail = (
-                    f"[{cid}] was accepted before accept applied changes; "
-                    f"run `accept {cid}` to apply it now"
-                )
-            else:
-                detail = (
-                    f"candidate is '{row['status']}'; `accept {cid}` applies the change, "
-                    "there is no separate promote step"
-                )
-            return {"status": "refused", "id": cid, "detail": detail}
-
     return {"status": "error", "detail": f"unknown action {action!r}"}
-
-
-def _routing_eval(c, cid: int, name: str) -> str:
-    """Advisory: would the under-trigger phrasings route to `name` under current descriptions?
-    Best-effort single LLM pass; any failure degrades to a skip note (never blocks accept)."""
-    try:
-        import json as _json
-
-        from ingestion.llm_client import create_llm_client
-
-        cur = c.cursor()
-        ev = cur.execute(
-            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
-        ).fetchone()[0]
-        phrasings = [
-            e.get("phrasing", "")
-            for e in ev
-            if e.get("signal") == "under_trigger" and e.get("phrasing")
-        ]
-        if not phrasings:
-            return "routing-eval: no phrasings to eval"
-        catalog = "\n".join(
-            f"- {n}: {d}"
-            for n, d in cur.execute(
-                "SELECT name, description FROM skills_lane.skill_registry ORDER BY name"
-            ).fetchall()
-        )
-        prompt = (
-            f"Skill catalog:\n{catalog}\n\nFor each user phrasing, name the ONE skill whose "
-            f"description best matches, or 'none'. We expect '{name}' to be the match.\n"
-            + "\n".join(f"- {p}" for p in phrasings[:8])
-            + '\n\nOutput JSON only: {"matches":["skill-or-none", ...]} in phrasing order.'
-        )
-
-        def _gen() -> str:
-            from ingestion.llm_client import stage_model
-
-            resp = create_llm_client().messages.create(
-                model=stage_model("SKILLS", "claude-opus-4-8"),
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return str(resp.content[0].text)
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            raw = pool.submit(_gen).result(timeout=120)
-        s, e = raw.find("{"), raw.rfind("}")
-        matches = _json.loads(raw[s : e + 1]).get("matches", []) if s >= 0 else []
-        hit = sum(1 for m in matches if m == name)
-        return f"routing-eval: {hit}/{len(matches)} missed phrasings already map to '{name}'"
-    except Exception as ex:  # pragma: no cover - advisory only
-        return f"routing-eval skipped: {ex}"
 
 
 # -------------------------------------------------------------------- register
@@ -1098,7 +979,6 @@ def register(
                 int(b["id"]),
                 b["action"],
                 b.get("reason"),
-                _routing_eval,
                 body=body,
                 scope=scope,
                 force=bool(b.get("force")),

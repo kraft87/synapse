@@ -285,7 +285,6 @@ def test_skills_lane_carries_overflow_and_bounds_every_stage(db, db_url, monkeyp
         fire_reads.append(window)
         return real_fire_events(conn, window)
 
-    monkeypatch.setattr(N, "consolidate_pass", lambda conn, ids: {})
     monkeypatch.setattr(N.SM, "analyze_session", lambda s, cat: scanned.append(s["session"]))
     monkeypatch.setattr(N.DB, "fire_events", fire_events)
     monkeypatch.setattr(
@@ -332,7 +331,6 @@ def _stub_skills_stages(monkeypatch, ran, *, fail=None):
         return run
 
     judge = stage("judge")
-    monkeypatch.setattr(N, "consolidate_pass", stage("consolidate"))
     monkeypatch.setattr(N, "sync_usage", stage("usage"))
     monkeypatch.setattr(N, "capture_grounded", stage("grounded"))
     monkeypatch.setattr(N.SM, "analyze_session", lambda s, cat: judge() and None)

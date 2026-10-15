@@ -251,7 +251,7 @@ def _candidate(conn, body: str, base: str) -> int:
 
 
 def _accept(db_url, cid: int, **kw) -> dict:
-    return _proposal_act(db_url, cid, "accept", None, lambda *_: "routing-eval: stub", **kw)
+    return _proposal_act(db_url, cid, "accept", None, **kw)
 
 
 def test_accepting_onto_a_retired_skill_needs_force(ret, db_url):

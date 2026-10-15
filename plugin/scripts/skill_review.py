@@ -8,7 +8,6 @@
     skill_review.py accept <id> [--body-file PATH] [--scope SCOPE] [--force]
                                             # APPLIES it: registry write + status=promoted
     skill_review.py reject <id> [reason]    # grounded reject -> rejected + 30d cooldown
-    skill_review.py promote <id>            # no-op kept for compatibility: accept applied it
 
 accept/reject are the grounded signals (the LLM judge can only nominate). accept writes the
 drafted SKILL.md — or --body-file, a version you edited — into the server's skill registry in
@@ -21,7 +20,7 @@ evidence came from one project. --scope overrides either.
 
 accept refuses, and says why, when there is no draft yet, when the registry body changed
 since the draft was made, or when a new skill's name is already taken (--force overrides the
-last two). For RETUNE accepts a server-side routing-eval runs first (advisory, never blocks).
+last two).
 
 Talks to the server's /skills/proposals* HTTP routes (machine-token gated); needs no DB access.
 """
@@ -38,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import synapse_project
 
-_KIND_BADGE = {"retune": "RETUNE", "consolidate": "MERGE", "derive": "DERIVE"}
+_KIND_BADGE = {"retune": "RETUNE", "derive": "DERIVE"}
 _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-file to accept"
 
 
@@ -53,7 +52,7 @@ def cmd_list() -> None:
         sal = f"  sal={r['salience']}" if r.get("salience") is not None else ""
         det = f"  via={r['source_detector']}" if r.get("source_detector") else ""
         draft = ""
-        if r["kind"] != "consolidate" and "has_draft" in r:
+        if "has_draft" in r:
             draft = "  [draft ready]" if r["has_draft"] else "  [no draft yet]"
         print(
             f"[{r['id']}] [{badge}{d}] {r['name']}  score={r['score']:.1f} "
@@ -107,12 +106,8 @@ def cmd_show(cid: int) -> None:
     if patch:
         print(f"\n--- proposed patch ---\n{patch[:1500]}")
 
-    target = r.get("apply_to")
+    target = r["apply_to"]
     body = r.get("proposal_body")
-    if not target:  # consolidate: merged by hand, never applied
-        if body:
-            print(f"\n--- drafted SKILL.md ---\n{body}")
-        return
     what = "updates the existing skill" if target["exists"] else "creates a new skill"
     print(f"\naccept applies to: '{target['skill']}' ({target['scope']}) — {what}")
     for issue in r.get("apply_issues") or []:
@@ -180,8 +175,6 @@ def cmd_accept(cid: int, body_file: str | None, scope: str | None, force: bool) 
     if force:
         extra["force"] = True
     r = config.post_json("/skills/proposals/act", {"id": cid, "action": "accept", **extra})
-    if r.get("routing_eval"):
-        print(r["routing_eval"])
     status = r.get("status")
     if status == "promoted":
         verb = "created" if r.get("created") else "updated"
@@ -192,12 +185,6 @@ def cmd_accept(cid: int, body_file: str | None, scope: str | None, force: bool) 
         if r.get("forced"):
             print(f"  --force overrode: {', '.join(r['forced'])}")
         _deliver(r["scope"])
-        return
-    if status == "accepted":  # consolidate: the one kind accept records but doesn't apply
-        print(
-            f"accepted [{cid}]. Merge proposals aren't applied automatically: merge the skills "
-            f"by hand, then `skill_review.py promote {cid}` to record it."
-        )
         return
     if status == "refused":
         sys.exit(f"refusing [{cid}]: {r.get('detail')}")
@@ -211,21 +198,11 @@ def cmd_reject(cid: int, reason: str | None) -> None:
     print(f"rejected [{cid}] ({r.get('reason')}); suppressed 30d.")
 
 
-def cmd_promote(cid: int) -> None:
-    """Kept so old habits and scripts don't break: accept now applies the change, so this
-    only reports that (or records a hand-merged consolidate)."""
-    r = config.post_json("/skills/proposals/act", {"id": cid, "action": "promote"})
-    if r.get("status") == "promoted":
-        print(r.get("detail") or f"promoted [{cid}] {r.get('name')}.")
-        return
-    print(r.get("detail") or "not found")
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
-    for c in ("show", "accept", "reject", "promote"):
+    for c in ("show", "accept", "reject"):
         p = sub.add_parser(c)
         p.add_argument("id", type=int)
         if c == "reject":
@@ -247,8 +224,6 @@ def main() -> None:
         cmd_accept(args.id, args.body_file, args.scope, args.force)
     elif args.cmd == "reject":
         cmd_reject(args.id, args.reason)
-    elif args.cmd == "promote":
-        cmd_promote(args.id)
 
 
 if __name__ == "__main__":

@@ -4,18 +4,16 @@
 
 Sequences the whole lane against the skills_lane ledger, reading its catalog from the
 skill_registry table (the client's skills_sync owns the disk<->registry publish):
-  1. consolidate    — embed any active skills missing a description embedding; overlap ->
-                      consolidate candidates (no disk access, no auto-merge)
-  2. sync_usage     — episode [tool:Skill] markers -> skill_usage (+ dismissal); rollup into registry
-  3. judge          — ONE analysis call per session returns its gaps and its would-have-helped
+  1. sync_usage     — episode [tool:Skill] markers -> skill_usage (+ dismissal)
+  2. judge          — ONE analysis call per session returns its gaps and its would-have-helped
                       skills (a few calls in flight at once):
-                      DERIVE: gaps -> cluster -> ledger (judge evidence); draft SKILL.md for proposed
+                      DERIVE: gaps -> cluster -> ledger (judge evidence)
                       RETUNE: under-trigger judge -> ledger retune/widen (judge evidence)
-  4. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
-  5. detectors      — struggle_arc, post_fire, and the weekly procedure_miner (each its own stage)
-  6. draft          — every proposed derive/retune without a body (or with a stale retune
+  3. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
+  4. detectors      — struggle_arc, post_fire, and the weekly procedure_miner (each its own stage)
+  5. draft          — every proposed derive/retune without a body (or with a stale retune
                       draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
-  7. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
+  6. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
                       throttled Discord digest (top 5, pings only on NEW proposals)
 Incremental over an episode-id window (dream/lane.py): every stage covers the same episodes,
 and the cursor advances only past the sessions the run got to (at most `limit` are judged a
@@ -54,71 +52,9 @@ SM = SD.skill_measure
 logger = logging.getLogger(__name__)
 
 PROPOSALS_DIR = config.PROPOSALS_DIR
-OVERLAP_COS = 0.90  # description-embedding cosine above this = consolidate candidate
-OVERLAP_TOP_K = 5  # cap consolidate nominations per run (avoid flooding the review queue)
 
 
-def _cosine(a, b):
-    import math
-
-    dot = sum(x * y for x, y in zip(a, b, strict=False))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    return dot / (na * nb) if na and nb else 0.0
-
-
-# ------------------------------------------------- 1. consolidate pass (registry-based)
-def consolidate_pass(conn, seen_ids):
-    """Server-side: embed any active-skill descriptions that lack an embedding (Voyage), then
-    nominate near-duplicate skill pairs as consolidate candidates for human review. Reads the
-    skill_registry (published by the client's skills_sync); no disk access, no auto-merge."""
-    cur = conn.cursor()
-
-    # (1) backfill description embeddings for active skills missing one.
-    cur.execute(
-        "SELECT name, description FROM skills_lane.skill_registry "
-        "WHERE status='active' AND description IS NOT NULL AND description <> '' "
-        "AND description_embedding IS NULL"
-    )
-    missing = cur.fetchall()
-    if missing:
-        vecs = L.embed([d for _, d in missing], "document")
-        for (name, _), v in zip(missing, vecs, strict=False):
-            cur.execute(
-                "UPDATE skills_lane.skill_registry SET description_embedding=%s::halfvec, "
-                "updated_at=now() WHERE name=%s",
-                (L.vec_literal(v), name),
-            )
-        conn.commit()
-
-    # (2) overlap detection -> consolidate candidates (top-K most-similar pairs above threshold).
-    cur.execute(
-        "SELECT name, description_embedding FROM skills_lane.skill_registry "
-        "WHERE status='active' AND description_embedding IS NOT NULL"
-    )
-    rows = [(n, [float(x) for x in str(e).strip("[]").split(",")]) for n, e in cur.fetchall()]
-    cand = []
-    for i in range(len(rows)):
-        for j in range(i + 1, len(rows)):
-            c = _cosine(rows[i][1], rows[j][1])
-            if c >= OVERLAP_COS:
-                cand.append((c, *sorted([rows[i][0], rows[j][0]])))
-    cand.sort(reverse=True)
-    for c, a, b in cand[:OVERLAP_TOP_K]:
-        res = L.merge_candidate(
-            conn,
-            "consolidate",
-            f"{a}+{b}",
-            [{"session_id": None, "class": "judge", "signal": "overlap"}],
-            target_skills=[a, b],
-            summary=f"{a} and {b} have near-duplicate trigger descriptions (cos={c:.2f}); review for merge.",
-            do_embed=False,
-        )
-        seen_ids.add(res["id"])
-    return {"embedded": len(missing), "overlap_pairs": len(cand[:OVERLAP_TOP_K])}
-
-
-# -------------------------------------------------------------------- 2. usage sync
+# -------------------------------------------------------------------- 1. usage sync
 def sync_usage(conn, events):
     """Record the window's skill fire events in skill_usage and roll them up into the
     registry. The events (DB.fire_events) feed the dismissal and post-fire stages too."""
@@ -438,7 +374,6 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
             f"draft={stage_model(lane.DRAFT_STAGE, lane.OPUS)}"
         )
         print(f"substantive sessions to judge: {len(substantive)}")
-        stage("consolidate", consolidate_pass, conn, seen)
         stage("usage", sync_usage, conn, fires)
         stage("judge", judge_sessions, conn, substantive, catalog_text, dict(catalog), seen)
         if "judge" not in errors:

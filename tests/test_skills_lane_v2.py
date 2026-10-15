@@ -218,24 +218,6 @@ def test_extend_and_fix_directions_accepted(lane):
         assert _row(lane, r["id"])[0] == "observe"
 
 
-def test_consolidate_does_not_propose_on_quote(lane):
-    r = _mc(
-        lane,
-        "consolidate",
-        "v2t-a+v2t-b",
-        [
-            {
-                "session_id": None,
-                "class": "judge",
-                "signal": "overlap",
-                "quote": "synthetic near-duplicate description",
-            }
-        ],
-        target_skills=["v2t-a", "v2t-b"],
-    )
-    assert r["status"] == "observe"
-
-
 def test_empty_keys_never_wildcard_merge(lane):
     anchor = _mc(
         lane,

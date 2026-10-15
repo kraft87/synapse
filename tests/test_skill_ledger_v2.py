@@ -125,14 +125,8 @@ def test_retune_blank_quote_does_not_count():
     assert not _passes_gate("retune", ev, 0.5, None)
 
 
-def test_consolidate_stays_observe_even_with_quote():
-    # overlap nominations carry no review-worthy moment; consolidate keeps the score path only
-    assert not _passes_gate("consolidate", [_ev(quote="synthetic overlap moment")], 0.5, None)
-    assert not _passes_gate("consolidate", [_ev(date="2026-07-17"), _ev(date="2026-07-18")], 0.5, 5)
-
-
 def test_derive_quote_alone_is_not_a_gate():
-    # the one-strong-instance gate is retune/consolidate only
+    # the one-strong-instance gate is retune only
     assert not _passes_gate("derive", [_ev(quote="synthetic")], 0.5, None)
 
 
@@ -163,7 +157,7 @@ def test_derive_proposes_on_salience():
 
 
 def test_legacy_score_gate_still_applies_to_all_kinds():
-    for kind in ("derive", "retune", "consolidate"):
+    for kind in ("derive", "retune"):
         assert _passes_gate(kind, [_ev()], PROPOSE_SCORE, None)
 
 

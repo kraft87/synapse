@@ -1683,15 +1683,6 @@ def _retire_flag(conn: psycopg.Connection[dict[str, Any]], kind: str, item_id: s
 # See docs/dashboard-contract.md §"Phase 2b".
 
 
-def _skill_routing_eval_stub(_conn: Any, _cid: int, _name: str) -> str:
-    """The skills lane's accept path takes an advisory ``llm`` callable that runs a
-    routing-eval on RETUNE candidates — an Anthropic API call that only annotates the
-    accept result. The dashboard passes THIS stub in place of the real ``_routing_eval``:
-    accept still applies the proposal and records the grounded 'accept' signal, but no LLM
-    call is made from the request path. Running the eval stays with the skills review CLI."""
-    return "routing-eval: skipped (dashboard decision path — advisory eval runs in the skills CLI)"
-
-
 def _parse_proposal_id(pid: str) -> tuple[str, int] | None:
     """'skill:<n>' | 'config:<n>' -> ('skill'|'config', n); None if malformed."""
     lane, _, rest = pid.partition(":")
@@ -1869,7 +1860,7 @@ def _proposal_decision(
     so it is returned as-is and leaves no audit row."""
     lane_action = "accept" if action == "approve" else "reject"
     if lane == "skill":
-        result = _skill_proposal_act(db_url, n, lane_action, note, _skill_routing_eval_stub)
+        result = _skill_proposal_act(db_url, n, lane_action, note)
     else:
         # config accept takes an optional scope override; the dashboard never re-scopes,
         # so pass None (the lane keeps the proposal's stored blast radius).
