@@ -31,7 +31,12 @@ def recency_multiplier(created_at: Any, half_life_days: float = 30) -> float:
 
 
 def feedback_multiplier(retrieval_count: Any) -> float:
-    """Boost frequently retrieved items, capped at 2x."""
+    """Boost frequently retrieved items, capped at 2x.
+
+    Only episodes carry a count that reaches here, and it counts turns drilled into whole
+    (fetch, fetch_session, recall_full_turns), not turns an overview recall() showed. Its
+    quality value is untested: the multiplier only decides which of the fused candidates
+    enter the rerank, and the cross-encoder then reorders them."""
     try:
         return min(2.0, 1.0 + math.log1p(int(retrieval_count or 0)) * 0.3)
     except Exception:

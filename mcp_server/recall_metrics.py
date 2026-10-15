@@ -56,14 +56,18 @@ class RecallMetricsMixin:
         def _pg(self) -> AbstractContextManager[Any]: ...
 
     def _increment_retrieval_counts(self, episode_ids: list[int]) -> None:
-        if not episode_ids:
-            return
+        """Bump served episodes' counters asynchronously: the UPDATE writes a new row version
+        and index entries on a table with HNSW, BM25 and GIN indexes, which no caller should
+        wait for. The count is the boost ``merge_rrf`` gives frequently drilled-into turns."""
+        if episode_ids:
+            self._async_executor.submit(self._do_increment_episodes, list(episode_ids))
+
+    def _do_increment_episodes(self, episode_ids: list[int]) -> None:
         try:
-            placeholders = ",".join(["%s"] * len(episode_ids))
             with self._pg() as connection:
                 connection.execute(
-                    f"UPDATE episodes SET retrieval_count = retrieval_count + 1 WHERE id IN ({placeholders})",
-                    episode_ids,
+                    "UPDATE episodes SET retrieval_count = retrieval_count + 1 WHERE id = ANY(%s)",
+                    (episode_ids,),
                 )
         except Exception as error:
             logger.warning("Failed to increment retrieval counts: %s", error)

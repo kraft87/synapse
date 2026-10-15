@@ -114,10 +114,10 @@ class RecallFetchMixin:
           * anchorless: ``offset``/``limit`` paging over the whole session,
             heads only (cap _SESSION_PAGE_MAX/page) — skim, then fetch() ids.
 
-        Pure indexed read (episodes_session_idx + the (session_id, sequence)
-        unique pair): no embedding, no rerank. An unknown session returns an
-        explicit ``error`` — never a silent empty — so the caller knows to fall
-        back to the on-disk transcript rather than concluding "nothing there".
+        Pure indexed read (the (session_id, sequence) unique pair): no embedding, no
+        rerank. An unknown session returns an explicit ``error`` — never a silent
+        empty — so the caller knows to fall back to the on-disk transcript rather than
+        concluding "nothing there".
 
         ``surface`` applies the restricted project allowlist (schema 053, widened to the
         surface's own ingested turns by 057) to every read below, including the metadata
