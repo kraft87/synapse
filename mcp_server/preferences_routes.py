@@ -29,6 +29,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
+from ingestion.localtime import local_date
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server.http_helpers import err, unauthorized
 
@@ -52,7 +53,7 @@ def _top_preferences(
     recording where it came from, so that ref cannot prove which device the text is
     from."""
     sql = (
-        "SELECT pref, polarity, assert_count, left(first_seen::text, 10) AS since "
+        "SELECT pref, polarity, assert_count, first_seen AS since "
         "FROM preferences WHERE owner_id = %s AND t_invalid IS NULL"
     )
     params: list[Any] = [_OWNER]
@@ -63,7 +64,10 @@ def _top_preferences(
     params.append(limit)
     with pg_pool.connection(db_url) as conn:
         rows = conn.execute(sql, params).fetchall()
-    return [{"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": r[3]} for r in rows]
+    return [
+        {"pref": r[0], "polarity": r[1], "assert_count": r[2], "since": local_date(r[3])}
+        for r in rows
+    ]
 
 
 def register(

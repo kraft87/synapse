@@ -180,3 +180,27 @@ def test_a_missing_preferences_table_is_an_error_not_an_empty_block(conn, db_url
         register(m, dsn, lambda r: True, lambda r: FULL_TRUST)
         r = TestClient(m.http_app()).get("/preferences/top")
     assert r.status_code == 500 and "preferences" in r.json()["detail"]
+
+
+def test_a_preference_is_dated_by_the_users_day(conn, db_url, monkeypatch):
+    """first_seen 01:30 UTC on the 11th is 21:30 on the 10th in Toronto."""
+    monkeypatch.setenv("SYNAPSE_TIMEZONE", "America/Toronto")
+    _wipe(conn)
+    db = Database(db_url)
+    pref_id = db.insert_preference(
+        owner_id=_OWNER,
+        group_id=GROUP,
+        project=None,
+        pref="User likes evening deploys",
+        polarity="like",
+        embedding=onehot(9),
+        embed_model="test",
+        source_ref="ep:9",
+    )
+    db.close()
+    conn.execute(
+        "UPDATE preferences SET first_seen = '2026-10-11T01:30:00+00:00' WHERE id = %s", (pref_id,)
+    )
+    (item,) = _top_preferences(db_url, limit=8)
+    assert item["since"] == "2026-10-10"
+    _wipe(conn)

@@ -400,6 +400,48 @@ def test_timeline_section_present_and_absent(conn, db_url):
     assert "## Last 7 days" not in _board(db_url, None)["text"]
 
 
+def test_timeline_days_are_the_users_days_not_utc_ones(conn, db_url, monkeypatch):
+    """An event told at 21:30 EDT on the 10th is stored on the 11th in UTC. It is shown
+    under the 10th and shares that day's per-project cap with the other events of the
+    10th, instead of opening a day of its own."""
+    from mcp_server.timeline_routes import _PER_PROJECT_DAY, _recent_events
+
+    monkeypatch.setenv("SYNAPSE_TIMEZONE", "America/Toronto")
+    _wipe(conn)
+    # Local 10:00, 16:00, 21:30 and 22:00 on 2026-10-10: two UTC days, one local day.
+    for i, t_valid in enumerate(
+        (
+            "2026-10-10T14:00:00+00:00",
+            "2026-10-10T20:00:00+00:00",
+            "2026-10-11T01:30:00+00:00",
+            "2026-10-11T02:00:00+00:00",
+        )
+    ):
+        conn.execute(
+            "INSERT INTO timeline_events (t_valid, fact, source, source_ref, project, salience) "
+            "VALUES (%s, %s, 'test', %s, 'alpha', 2)",
+            (t_valid, f"Event {i}", f"tb:day{i}"),
+        )
+    events = _recent_events(db_url, days=36500, min_salience=2, limit=10, project=None)
+    assert {e["date"] for e in events} == {"2026-10-10"}
+    assert len(events) == _PER_PROJECT_DAY
+
+
+def test_timeline_days_fall_back_to_utc_for_an_unknown_zone(conn, db_url, monkeypatch):
+    """A SYNAPSE_TIMEZONE that is not an IANA zone is UTC everywhere else; the day query
+    must not turn that into an error."""
+    from mcp_server.timeline_routes import _recent_events
+
+    monkeypatch.setenv("SYNAPSE_TIMEZONE", "Mars/Olympus_Mons")
+    _wipe(conn)
+    conn.execute(
+        "INSERT INTO timeline_events (t_valid, fact, source, source_ref, project, salience) "
+        "VALUES ('2026-10-11T01:30:00+00:00', 'Late event', 'test', 'tb:utc', 'alpha', 2)"
+    )
+    (event,) = _recent_events(db_url, days=36500, min_salience=2, limit=10, project=None)
+    assert event["date"] == "2026-10-11"
+
+
 # ---------------------------------------------------------------------------
 # /context route + telemetry
 # ---------------------------------------------------------------------------

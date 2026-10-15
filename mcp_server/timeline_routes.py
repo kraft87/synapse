@@ -28,6 +28,7 @@ from starlette.responses import JSONResponse
 from ingestion import pg_pool
 from ingestion.db_connection import _vector_literal
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
+from ingestion.localtime import local_date, user_tz
 from ingestion.scope import coerce_group
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
@@ -162,17 +163,21 @@ def _recent_events(
     ``own_surface`` (schema 057) also admits events whose source turn the calling
     surface ingested itself; the gate copies that stamp onto the event at write time.
     """
+    # A day is the user's day (ingestion.localtime): the session runs in UTC, so a plain
+    # t_valid::date puts every event told after 20:00 EDT under tomorrow, and into
+    # tomorrow's per-project cap. SQL gets the zone's name; a zone that failed to load
+    # (user_tz falls back to UTC, which has no name) is "UTC" here too.
+    zone = getattr(user_tz(), "key", "UTC")
     with pg_pool.connection(db_url) as conn:
         q = (
-            "SELECT id, date, fact, project, salience, event_type FROM ("
-            "  SELECT id, left(t_valid::text, 10) AS date, fact, project, salience, "
-            "         event_type, t_valid, row_number() OVER ("
-            "           PARTITION BY project, t_valid::date "
+            "SELECT id, t_valid, fact, project, salience, event_type FROM ("
+            "  SELECT id, fact, project, salience, event_type, t_valid, row_number() OVER ("
+            "           PARTITION BY project, (t_valid AT TIME ZONE %s)::date "
             "           ORDER BY salience DESC, t_valid DESC) AS day_rank "
             "  FROM timeline_events "
             "  WHERE t_valid > now() - make_interval(days => %s) AND salience >= %s "
         )
-        params: list[Any] = [days, min_salience]
+        params: list[Any] = [zone, days, min_salience]
         if project:
             q += "AND project = %s "
             params.append(project)
@@ -187,7 +192,7 @@ def _recent_events(
         return [
             {
                 "id": r[0],
-                "date": r[1],
+                "date": local_date(r[1]),
                 "fact": r[2],
                 "project": r[3],
                 "salience": r[4],
