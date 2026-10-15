@@ -34,7 +34,7 @@ def kg_tables(conn, db_url):
         "summary, embedding) VALUES "
         "('e-syn', 'default', %(g)s, 'Synapse', 'synapse', 'memory layer', %(v0)s), "
         "('e-fdb', 'default', %(g)s, 'FalkorDB', 'falkordb', 'graph db', %(v1)s), "
-        # pre-migration node: normalized_name missing, name needs lower(trim())
+        # an entity from before the column: normalized_name is NULL
         "('e-old', 'default', %(g)s, '  Voyage AI ', NULL, NULL, NULL), "
         # other tenant / other group: must never surface
         "('e-other-owner', 'tenant2', %(g)s, 'Synapse', 'synapse', NULL, %(v0)s), "
@@ -107,11 +107,13 @@ class TestEntityReads:
         assert "e-other-owner" not in uuids
         assert "e-other-group" not in uuids
 
-    def test_normalized_name_exact_and_fallback(self, kg_tables):
+    def test_normalized_name_lookup_reads_only_the_indexed_column(self, kg_tables):
         assert kg_tables.entity_uuid_by_normalized_name("synapse", GROUP) == "e-syn"
-        # pre-migration node: lower(trim(name)) fallback path
-        assert kg_tables.entity_uuid_by_normalized_name("voyage ai", GROUP) == "e-old"
         assert kg_tables.entity_uuid_by_normalized_name("nonexistent", GROUP) is None
+        # A row with NULL there (an entity from before the column) is not found by its
+        # name: no lower(trim(name)) scan of the group backs the lookup up.
+        # scripts/backfill_normalized_name.py fills such rows.
+        assert kg_tables.entity_uuid_by_normalized_name("voyage ai", GROUP) is None
 
     def test_load_entities_scoped_tuples(self, kg_tables):
         rows = kg_tables.load_entities(GROUP)

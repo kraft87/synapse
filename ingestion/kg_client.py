@@ -183,25 +183,14 @@ class KGClient:
         return self._run(_q)
 
     def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
-        """Exact normalized-name lookup (NodeDeduper short-circuit).
-
-        Falls back to a lower(trim(name)) equality check for pre-migration
-        rows that lack the indexed property.
-        """
+        """Exact normalized-name lookup (NodeDeduper short-circuit), on the indexed column
+        only. An entity with NULL there is not found by name; every write stores it, and
+        ``scripts/backfill_normalized_name.py`` fills older rows."""
 
         def _q(conn: psycopg.Connection[Any]) -> str | None:
             row = conn.execute(
                 "SELECT uuid FROM kg_entities "
                 "WHERE owner_id = %s AND group_id = %s AND normalized_name = %s LIMIT 1",
-                (OWNER, group_id, normalized),
-            ).fetchone()
-            if row:
-                return str(row[0])
-            # Pre-migration nodes without the property: compute on the fly (rare;
-            # mirrors the FalkorDB fallback).
-            row = conn.execute(
-                "SELECT uuid FROM kg_entities "
-                "WHERE owner_id = %s AND group_id = %s AND lower(trim(name)) = %s LIMIT 1",
                 (OWNER, group_id, normalized),
             ).fetchone()
             return str(row[0]) if row else None
