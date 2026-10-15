@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.error
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -74,7 +75,16 @@ def main() -> None:
                 continue  # one unreadable file must not hold back the rest
         if files:
             # The server skips a file whose hash it already holds, so re-pushing is cheap.
-            config.post_json("/config/publish", {"surface": config.SURFACE, "files": files})
+            try:
+                config.post_json("/config/publish", {"surface": config.SURFACE, "files": files})
+            except urllib.error.HTTPError as e:
+                if e.code != 500:
+                    raise
+                # A server older than the batch form reads one file per body and 500s on this
+                # one (no file_key). The plugin updates from GitHub, possibly ahead of the
+                # image; delete this fallback once no such server is left.
+                for f in files:
+                    config.post_json("/config/publish", {"surface": config.SURFACE, **f})
     except Exception:
         return  # fail-open: server/token/permission issues never break session start
 

@@ -107,6 +107,26 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     return len(a & b) / len(a | b) if (a or b) else 0.0
 
 
+# not/never/dont are stop words, so "Run the tests" and "Do not run the tests" have identical
+# tokens; the polarity is read from the raw words instead.
+_NEGATION = re.compile(r"\b(?:not|never|no|avoid|stop|dont)\b|n['\u2019]t\b")
+
+
+class _Rule(NamedTuple):
+    tokens: set[str]
+    negated: bool
+
+
+def _rule(text: str) -> _Rule:
+    return _Rule(_sig_tokens(text), bool(_NEGATION.search((text or "").lower())))
+
+
+def _same_rule(a: _Rule, b: _Rule) -> bool:
+    """Whether two rules say the same thing: one polarity (a rule and its reversal share every
+    token) and rule-token jaccard at or above IDENTITY_JACCARD."""
+    return a.negated == b.negated and _jaccard(a.tokens, b.tokens) >= IDENTITY_JACCARD
+
+
 def _distinct_sessions(evidence: list[dict]) -> int:
     return len({e.get("session_id") for e in evidence if e.get("session_id")})
 
@@ -122,12 +142,13 @@ def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
     return out
 
 
-def _best_match(rule_tokens: set[str], candidates: list[dict]) -> dict | None:
-    """The active candidate whose rule is the same as rule_tokens (jaccard >= threshold), or None."""
+def _best_match(rule: _Rule, candidates: list[dict]) -> dict | None:
+    """The candidate whose summary is the same rule as `rule` (closest by jaccard), or None."""
     best, best_j = None, 0.0
     for c in candidates:
-        j = _jaccard(rule_tokens, _sig_tokens(c["summary"]))
-        if j >= IDENTITY_JACCARD and j > best_j:
+        other = _rule(c["summary"])
+        j = _jaccard(rule.tokens, other.tokens)
+        if _same_rule(rule, other) and j > best_j:
             best, best_j = c, j
     return best
 
@@ -177,7 +198,7 @@ def _upsert_correction(cur, c: dict) -> Upsert:
     history: a sighting then opens a fresh observe row. Only observe and proposed rows are still
     moving; the sighting of an accepted, applied or cooling rejected rule is added to its
     evidence and nothing else changes (updated_at dates a rejection, so it stays)."""
-    toks = _sig_tokens(c["rule"])
+    rule = _rule(c["rule"])
     ev_new = [
         {"session_id": c["session_id"], "ts": datetime.now(UTC).isoformat(), "quote": c["quote"]}
     ]
@@ -188,7 +209,7 @@ def _upsert_correction(cur, c: dict) -> Upsert:
         (LEARNED_FILE, REJECT_COOLING_DAYS),
     )
     match = _best_match(
-        toks,
+        rule,
         [{"id": r[0], "summary": r[1], "evidence": r[2], "status": r[3]} for r in cur.fetchall()],
     )
     if match:
@@ -241,18 +262,22 @@ def _expire_observed(cur) -> int:
     return cur.rowcount
 
 
-def _known_rules(cur) -> list[set[str]]:
-    """The rules the user already has, as token sets: every line of every mirrored config file
-    (the lane's own learned file apart: a correction that matches an applied rule there is a
-    recurrence, which the ledger counts) and the hook of every live feedback note. A correction
-    that restates one is not a new rule. One-word lines (headings) are too thin to match on."""
+def _known_rules(cur) -> list[_Rule]:
+    """The rules the user already has: every line of every mirrored config file (the lane's own
+    learned file apart: a correction that matches an applied rule there is a recurrence, which
+    the ledger counts) and the hook of every live feedback note. A correction that restates one
+    is not a new rule. Headings, labels and lines under three tokens name a topic and state no
+    rule, so they are too thin to match on."""
     cur.execute(
         "SELECT content FROM config_lane.config_registry WHERE file_key <> %s", (LEARNED_FILE,)
     )
     lines = [ln for (content,) in cur.fetchall() for ln in content.splitlines()]
+    lines = [
+        ln for ln in lines if not ln.lstrip().startswith("#") and not ln.rstrip().endswith(":")
+    ]
     cur.execute("SELECT hook FROM notes WHERE type='feedback' AND superseded_by IS NULL")
     lines += [hook for (hook,) in cur.fetchall()]
-    return [t for t in map(_sig_tokens, lines) if len(t) >= 2]
+    return [r for r in map(_rule, lines) if len(r.tokens) >= 3]
 
 
 # --------------------------------------------------------------------------- orchestrator
@@ -285,8 +310,8 @@ def run_lane(limit: int = 30, backfill: bool = False) -> dict:
                 continue
             for c in corrections:
                 found += 1
-                toks = _sig_tokens(c["rule"])
-                if any(_jaccard(toks, k) >= IDENTITY_JACCARD for k in known):
+                rule = _rule(c["rule"])
+                if any(_same_rule(rule, k) for k in known):
                     already_known += 1
                     print(f"  [known] {c['rule'][:70]}")
                     continue

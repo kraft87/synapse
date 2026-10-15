@@ -470,7 +470,8 @@ def test_config_lane_reports_what_each_correction_did(db, db_url, monkeypatch):
     db.execute(
         "INSERT INTO config_lane.config_registry "
         "  (surface_id, scope, file_key, abs_path, content, content_hash) "
-        "VALUES ('lanet', 'global', 'CLAUDE.md', '', '- Run the tests before committing', 'h')"
+        "VALUES ('lanet', 'global', 'CLAUDE.md', '', "
+        "'## Commit messages\n- Run the tests before committing', 'h')"
     )
     db.execute(
         "INSERT INTO config_lane.config_proposals (kind, file_key, diff, summary, evidence, status) "
@@ -482,6 +483,11 @@ def test_config_lane_reports_what_each_correction_did(db, db_url, monkeypatch):
         "lanet-c2": [("Do not use em-dashes in prose", "again"), ("Keep answers short", "short")],
         "lanet-c3": None,
         "lanet-c4": [("Run the tests before committing", "tests")],
+        # not known: a reversal of a line of the user's config, and a rule under a heading
+        "lanet-c5": [
+            ("Do not run the tests before committing", "no tests"),
+            ("Keep commit messages short", "short"),
+        ],
     }
 
     def scan(s):
@@ -501,8 +507,8 @@ def test_config_lane_reports_what_each_correction_did(db, db_url, monkeypatch):
         db.execute("DELETE FROM config_lane.config_registry WHERE surface_id = 'lanet'")
 
     assert res == {
-        "sessions": 4,
-        "found": 4,
+        "sessions": 5,
+        "found": 6,
         "proposed": 1,  # the em-dashes rule: observe on c1, graduated by c2
         "recurred": 1,  # "Keep answers short", applied, corrected again in c2
         "already_known": 1,  # c4 restates a line of the mirrored CLAUDE.md
@@ -512,7 +518,12 @@ def test_config_lane_reports_what_each_correction_did(db, db_url, monkeypatch):
     statuses = dict(
         db.execute("SELECT summary, status FROM config_lane.config_proposals").fetchall()
     )
-    assert statuses == {"Avoid em-dashes in prose": "proposed", "Keep answers short": "applied"}
+    assert statuses == {
+        "Avoid em-dashes in prose": "proposed",
+        "Keep answers short": "applied",
+        "Do not run the tests before committing": "observe",
+        "Keep commit messages short": "observe",
+    }
     db.execute("TRUNCATE config_lane.config_proposals RESTART IDENTITY")
 
 

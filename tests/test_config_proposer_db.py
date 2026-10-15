@@ -17,7 +17,8 @@ from dream.config.nightly import (
     REJECT_COOLING_DAYS,
     _expire_observed,
     _known_rules,
-    _sig_tokens,
+    _rule,
+    _same_rule,
     _upsert_correction,
 )
 
@@ -151,7 +152,11 @@ def test_known_rules_cover_mirrored_lines_and_live_feedback_notes(conn, cur):
 
     clean()
     for key, body in (
-        ("CLAUDE.md", "# Style\n- Never use em-dashes in prose\n\nRun the tests before committing"),
+        (
+            "CLAUDE.md",
+            "# Style\n- Never use em-dashes in prose\n\nRun the tests before committing\n"
+            "## Commit messages\nCode style:\n- Commit messages\n- Code style",
+        ),
         (LEARNED_FILE, "- Prefer tabs over spaces"),  # the lane's own file: recurrence, not known
     ):
         conn.execute(
@@ -172,7 +177,16 @@ def test_known_rules_cover_mirrored_lines_and_live_feedback_notes(conn, cur):
     finally:
         clean()
 
-    assert _sig_tokens("Never use em-dashes in prose") in known
-    assert _sig_tokens("Answer in one paragraph unless asked") in known
-    assert _sig_tokens("Prefer tabs over spaces") not in known  # learned.md itself
-    assert _sig_tokens("Old advice nobody follows") not in known  # a retired note
+    def is_known(rule):
+        return any(_same_rule(_rule(rule), k) for k in known)
+
+    assert is_known("Never use em-dashes in prose")
+    assert is_known("Answer in one paragraph unless asked")
+    assert not is_known("Prefer tabs over spaces")  # learned.md itself
+    assert not is_known("Old advice nobody follows")  # a retired note
+    # headings, labels and two-word lines are topics, not rules: they restate nothing
+    assert not is_known("Keep commit messages short")
+    assert not is_known("Match the code style of the file")
+    # a user overriding a line of their own config is the rule the lane is here to surface
+    assert is_known("Run the tests before committing")
+    assert not is_known("Do not run the tests before committing")
