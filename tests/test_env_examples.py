@@ -125,19 +125,30 @@ def test_local_sample_keeps_the_two_values_that_make_it_work():
     assert local.get("SYNAPSE_EMBED_DIMS") == "768"
 
 
+_RERANKER_FLOORS = (
+    "SYNAPSE_RECALL_FLOOR",
+    "SYNAPSE_RECALL_WEB_FLOOR",
+    "SYNAPSE_RECALL_NOTES_FLOOR",
+)
+
+
 @pytest.mark.parametrize("sample", _samples(), ids=lambda p: p.name)
-def test_every_sample_pins_the_recall_floor_for_its_reranker(sample: Path):
-    """The abstention floor is a property of the reranker, so the code default is off and
-    each preset carries the value calibrated for the reranker it configures. A preset that
-    forgets it silently runs without abstention; one that inherits another reranker's
-    threshold blanks most of its results (39-56% on the LME A/B set, 2026-09-10)."""
-    got = _assigned(sample).get("SYNAPSE_RECALL_FLOOR")
-    assert got is not None, f"{sample.name} does not set SYNAPSE_RECALL_FLOOR"
-    floor = float(got)
-    if _assigned(sample).get("SYNAPSE_RERANK_MODEL", "").startswith("BAAI/"):
-        assert floor == 0.0, "no calibrated floor exists for the bundled local reranker"
-    else:
-        assert 0.0 < floor < 1.0
+def test_every_sample_pins_the_reranker_floors_for_its_reranker(sample: Path):
+    """The abstention, web and notes floors are properties of the reranker, so each preset
+    carries the values calibrated for the reranker it configures. A preset that forgets
+    them silently runs on the code defaults (no abstention, 0.60 web and notes gates); one
+    that inherits another reranker's thresholds blanks most of its results (39-56% of
+    episode buckets on the LME A/B set, 2026-09-10)."""
+    assigned = _assigned(sample)
+    local = assigned.get("SYNAPSE_RERANK_MODEL", "").startswith("BAAI/")
+    for name in _RERANKER_FLOORS:
+        got = assigned.get(name)
+        assert got is not None, f"{sample.name} does not set {name}"
+        floor = float(got)
+        if local:
+            assert floor == 0.0, "no calibrated floor exists for the bundled local reranker"
+        else:
+            assert 0.0 < floor < 1.0
 
 
 @pytest.mark.parametrize("sample", [*_samples(), ENV_EXAMPLE], ids=lambda p: p.name)
