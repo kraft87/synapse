@@ -544,3 +544,33 @@ class TestBlankFinishedQueueText:
             self._row(conn, "done", 30)
         assert db.blank_finished_queue_text(older_than_days=7, batch=2) == 5
         assert db.blank_finished_queue_text(older_than_days=7, batch=2) == 0
+
+
+def test_a_database_without_the_chunk_id_column_still_queues_and_claims_chunks(conn, db_url):
+    """The image lands before the migration is applied by hand: the real probe must find
+    the column absent and the queue must keep working as it always did."""
+    import uuid
+
+    schema = f"nocid_{uuid.uuid4().hex[:8]}"
+    conn.execute(f"CREATE SCHEMA {schema}")
+    try:
+        conn.execute(
+            f"CREATE TABLE {schema}.extraction_queue "
+            "(LIKE public.extraction_queue INCLUDING DEFAULTS)"
+        )
+        conn.execute(f"ALTER TABLE {schema}.extraction_queue DROP COLUMN chunk_id")
+        sep = "&" if "?" in db_url else "?"
+        scoped = Database(f"{db_url}{sep}options=-csearch_path%3D{schema},public")
+        item = ExtractionItem(
+            session_id="nocid", chunk_id=5, content="the window", content_type="chunk"
+        )
+        scoped.enqueue_extraction(item)
+        scoped.enqueue_extraction(item)  # deduped on its text, as before the column
+        assert conn.execute(
+            f"SELECT content, content_type FROM {schema}.extraction_queue"
+        ).fetchall() == [("the window", "chunk")]
+        (row,) = scoped.claim_pending_extractions(limit=10)
+        assert "chunk_id" not in row and row["content"] == "the window"
+        scoped.close()
+    finally:
+        conn.execute(f"DROP SCHEMA {schema} CASCADE")
