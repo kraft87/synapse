@@ -16,10 +16,10 @@
 #            first-boot init hook connects.
 #     (none) applies only the files numbered ABOVE synapse_meta.schema_version, the
 #            stamp this script writes (a fresh database gets every file). An
-#            upgrade is therefore one command and never rebuilds what is already
-#            there (003 alone would rewrite the episodes table).
-#     --all  applies every file regardless of the stamp. Every file is idempotent,
-#            so this is safe on a current database; it is also slow on a large one.
+#            upgrade is therefore one command that doesn't repeat what was applied.
+#     --all  applies every file regardless of the stamp. Every file is safe to
+#            re-run, but it repeats their backfills too (056's), so expect it to
+#            take a while on a large database.
 #     --from NNN  applies the files numbered NNN and above. Needed once for a
 #            database that has tables but no stamp (it predates migration 034),
 #            and to catch up a migration numbered below the stamp.
