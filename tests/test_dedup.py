@@ -252,8 +252,7 @@ class TestTypeGate:
         assert not _type_compatible("Service", "Database")  # the false-merge case the gate prevents
         assert not _type_compatible("Person", "Tool")
 
-    def test_gate_drops_cross_category_fuzzy_candidate(self, monkeypatch):
-        monkeypatch.setattr("ingestion.dedup._TYPE_GATE_ON", True)
+    def test_gate_drops_cross_category_fuzzy_candidate(self):
         graph = _FakeGraph(
             entities=[("uuid-poller", "synapse-poller", "the database", "Database")],
             exact_match={},
@@ -264,8 +263,7 @@ class TestTypeGate:
         kind, _payload = deduper.classify("synapse poller", "...", entity_type="Service")
         assert kind == "none"
 
-    def test_gate_keeps_same_category_candidate(self, monkeypatch):
-        monkeypatch.setattr("ingestion.dedup._TYPE_GATE_ON", True)
+    def test_gate_keeps_same_category_candidate(self):
         graph = _FakeGraph(
             entities=[("uuid-poller", "synapse-poller", "a service", "Service")],
             exact_match={},
@@ -276,9 +274,8 @@ class TestTypeGate:
         assert kind == "candidates"
         assert payload[0][0] == "uuid-poller"
 
-    def test_gate_untyped_new_entity_is_not_filtered(self, monkeypatch):
+    def test_gate_untyped_new_entity_is_not_filtered(self):
         # no entity_type -> gate no-ops -> current behavior preserved (candidate survives)
-        monkeypatch.setattr("ingestion.dedup._TYPE_GATE_ON", True)
         graph = _FakeGraph(
             entities=[("uuid-poller", "synapse-poller", "the database", "Database")],
             exact_match={},

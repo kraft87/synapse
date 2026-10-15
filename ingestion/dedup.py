@@ -119,9 +119,7 @@ def _build_canonical_aliases() -> dict[str, str]:
 # and always merges identical names regardless of type, so this only ever filters fuzzy
 # candidates; and it only DROPS when BOTH sides are non-permissive, different, and not
 # allowlisted — so an untyped/unknown/Concept side, or the LLM typing the same thing two
-# ways, never blocks a real merge (it degrades to current behavior). Default ON;
-# SYNAPSE_DEDUP_TYPE_GATE=0 disables for instant rollback.
-_TYPE_GATE_ON = os.getenv("SYNAPSE_DEDUP_TYPE_GATE", "1") not in ("0", "false", "")
+# ways, never blocks a real merge (it degrades to current behavior).
 # Permissive supertypes never block a merge (abstract/catch-all/untyped).
 _TYPE_PERMISSIVE = frozenset({None, "", "other", "Concept"})
 # Cross-supertype pairs that MAY still merge (genuinely fungible at the boundary).
@@ -393,7 +391,7 @@ class NodeDeduper:
         # is confidently typed; _type_compatible lets untyped/Concept/allowlisted pairs
         # through. Exact-name (Strategy 1) already returned above, so identical names are
         # never gated.
-        if _TYPE_GATE_ON and entity_type and idx.type_map:
+        if entity_type and idx.type_map:
             new_super = idx.type_map.get(entity_type)
             if new_super not in _TYPE_PERMISSIVE:
                 candidates = [
@@ -437,12 +435,11 @@ class NodeDeduper:
         with idx.lock:
             idx.uuid_by_normalized_name.setdefault(normalized, node_uuid)
             idx.name_by_uuid[node_uuid] = name
-            if not isinstance(idx.lsh, _NullLSH):
-                try:
-                    # insert() no-ops on already-known keys and empty shingles.
-                    idx.lsh.insert(node_uuid, _shingles(_normalize_for_fuzzy(name)))
-                except Exception as exc:
-                    logger.debug("dedup: register %s failed to update LSH: %s", node_uuid[:8], exc)
+            try:
+                # insert() no-ops on already-known keys and empty shingles.
+                idx.lsh.insert(node_uuid, _shingles(_normalize_for_fuzzy(name)))
+            except Exception as exc:
+                logger.debug("dedup: register %s failed to update LSH: %s", node_uuid[:8], exc)
 
     @property
     def type_map(self) -> dict[str, str]:
@@ -517,20 +514,12 @@ class NodeDeduper:
         """
         build_start = time.monotonic()
 
-        try:
-            lsh = _PackedLSH()
-        except ImportError as exc:
-            # No numpy → skip fuzzy strategy. Exact-name short-circuit
-            # still works.
-            logger.warning("dedup: numpy unavailable (%s); skipping LSH", exc)
-            return _GroupIndex(_NullLSH())
-
         rows = self._kg.load_entities(self._group_id)
+        lsh = _PackedLSH()
         idx = _GroupIndex(lsh)
 
         # Taxonomy map for the type-compatibility gate (empty if unseeded -> gate no-ops).
-        if _TYPE_GATE_ON:
-            idx.type_map = self._kg.load_type_map()
+        idx.type_map = self._kg.load_type_map()
 
         for node_uuid, name, supertype in rows:
             idx.supertype_by_uuid[node_uuid] = supertype
@@ -568,8 +557,6 @@ class NodeDeduper:
         ``_lsh_threshold`` — those that slipped through as approximate
         LSH hits but don't meet the true similarity floor.
         """
-        if isinstance(idx.lsh, _NullLSH):
-            return []
         query_shingles = _shingles(normalized)
         if not query_shingles:
             return []
@@ -593,23 +580,6 @@ class NodeDeduper:
                 scored.append((key, score))
         scored.sort(key=lambda kv: kv[1], reverse=True)
         return scored
-
-
-class _NullLSH:
-    """Sentinel for "numpy unavailable".
-
-    ``classify`` treats this as "no LSH candidates ever" so the pipeline
-    degrades gracefully to exact-name-only matching.
-    """
-
-    def __contains__(self, key: str) -> bool:  # pragma: no cover - trivial
-        return False
-
-    def insert(self, key: str, shingles: set[str]) -> None:  # pragma: no cover - trivial
-        return None
-
-    def query(self, shingles: set[str]) -> list[str]:  # pragma: no cover - trivial
-        return []
 
 
 class _PackedLSH:
