@@ -19,3 +19,15 @@ updates:
     groups:
       docker:
         patterns: ["*"]
+
+  # uv.lock pins claude-agent-sdk, and with it the bundled Claude Code CLI the image
+  # runs, so SDK and CLI bumps arrive as PRs instead of by accident.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]

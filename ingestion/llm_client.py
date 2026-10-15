@@ -77,7 +77,6 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -342,19 +341,6 @@ def _is_transient(exc: BaseException) -> bool:
     return isinstance(exc, _TRANSIENT_ERRORS)
 
 
-def _find_cli_path() -> str:
-    """Locate the latest installed Claude Code CLI version."""
-    versions_dir = Path.home() / ".local/share/claude/versions"
-    if versions_dir.exists():
-        versions = sorted(versions_dir.iterdir(), key=lambda p: p.name, reverse=True)
-        if versions:
-            return str(versions[0])
-    return "claude"  # fallback to PATH
-
-
-_CLI_PATH = _find_cli_path()
-
-
 # ---------------------------------------------------------------------------
 # Async API
 # ---------------------------------------------------------------------------
@@ -397,7 +383,6 @@ async def agent_call(
             allowed_tools=[],
             max_turns=max_turns,
             model=model,
-            cli_path=_CLI_PATH,
             output_format=output_format,
             max_thinking_tokens=_MAX_THINKING_TOKENS,
             # Never load filesystem settings into the spawned CLI. On a host
