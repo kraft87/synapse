@@ -29,7 +29,9 @@ Cursor semantics:
 
 SessionStart runs `--catchup`: a detached sweep over the projects dir that ships
 any recently-modified transcript whose cursor lags its size — sessions that died
-without a Stop hook, or turns dropped while the server was unreachable.
+without a Stop hook, or turns dropped while the server was unreachable. After a /clear
+or an auto-compaction (SessionStart fires for those too) it only repeats the upload
+warning below, which the fresh context window needs again; the sweep has already run.
 
 Failed uploads are retried however old they are. A POST that fails (server
 down, 401/403 from a revoked token or a proxy/WAF, timeout) marks the file's
@@ -587,6 +589,8 @@ def main() -> None:
         # Say so when uploads keep failing. Before the sweep runs, so the line
         # reflects the streak as it stood; a sweep that succeeds ends the streak.
         _emit_failure_warning()
+        if payload.get("source") in ("clear", "compact"):
+            return  # a fresh context window, not a new session: the sweep ran at its start
         root = (
             _projects_root_from(transcript_path)
             if transcript_path

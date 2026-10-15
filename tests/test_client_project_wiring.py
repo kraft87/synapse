@@ -82,7 +82,6 @@ _ENV_VARS = (
     *(f"CLAUDE_PLUGIN_OPTION_{k}" for k in _SETTINGS),
     "CLAUDE_PROJECT_DIR",
     "CLAUDE_PROJECTS_DIR",
-    "SYNAPSE_CODEX_CATCHUP",
     "SYNAPSE_CODEX_SKILLS_DIR",
 )
 # Modules the scripts import by bare name that resolve config at import time.
@@ -791,7 +790,7 @@ def test_codex_session_start_process_sends_the_resolved_project(layout, server, 
         tmp_path,
         json.dumps({"cwd": str(layout.wt_sub)}),
         SYNAPSE_PREFS_BLOCK="0",
-        SYNAPSE_CODEX_CATCHUP="0",
+        HOME=str(tmp_path),  # the sweep it spawns finds no rollouts
         SYNAPSE_SKILLS_SYNC="0",
     )
     gets = [r for r in server.seen if r.path == "/context"]

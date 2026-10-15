@@ -1,7 +1,7 @@
 """Codex catch-up retries failed uploads however old they are, and says so when they keep failing.
 
 The Codex mirror of test_ingest_hook_retry.py. The Codex Stop hook's sweep used to look only
-at rollouts modified within SYNAPSE_CODEX_CATCHUP_DAYS, so an outage longer than that window
+at rollouts modified within its catch-up window, so an outage longer than that window
 (server down, a revoked token, a proxy answering 403) silently lost every rollout that aged
 out before uploads recovered. The hook now shares the Claude plugin's failure bookkeeping
 (plugin/scripts/synapse_ingest_retry.py): a failed POST leaves a ``pending`` marker on the
@@ -631,7 +631,6 @@ def test_session_start_end_to_end(env, tmp_path):
         "SYNAPSE_URL": "http://127.0.0.1:9",
         "SYNAPSE_BOARD": "0",
         "SYNAPSE_PREFS_BLOCK": "0",
-        "SYNAPSE_CODEX_CATCHUP": "0",
         "SYNAPSE_SKILLS_SYNC": "0",
     }
     proc = subprocess.run(

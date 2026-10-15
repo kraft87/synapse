@@ -167,8 +167,7 @@ def test_session_start_runs_sync_under_budget(tmp_path, monkeypatch):
     hook._sync_skills()
     assert seen == {}
     monkeypatch.setenv("SYNAPSE_SKILLS_SYNC", "1")
-    monkeypatch.setenv("SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT", "3")
     hook._sync_skills()
     assert seen["cmd"][-1].endswith("skills_sync.py")
-    assert seen["timeout"] == 3.0
+    assert seen["timeout"] == 12.0
     assert json.dumps(seen["cmd"])  # plain argv, no shell

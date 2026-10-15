@@ -146,3 +146,30 @@ def test_the_codex_stop_hook_spawns_before_importing_the_client(tmp_path):
     assert loaded == []
     (argv,) = spawned
     assert argv[2] == "--ship" and json.loads(argv[3]) == payload
+
+
+def _session_start_groups() -> dict[str, list[str]]:
+    """matcher -> the script (and argument) of each SessionStart hook under it."""
+    config = json.loads((_REPO / "plugin" / "hooks" / "hooks.json").read_text(encoding="utf-8"))
+    return {
+        group["matcher"]: [
+            h["command"].split("/scripts/", 1)[1].rstrip('"').replace('" ', " ")
+            for h in group["hooks"]
+        ]
+        for group in config["hooks"]["SessionStart"]
+    }
+
+
+def test_session_start_sync_work_runs_only_when_a_session_starts():
+    """SessionStart also fires for /clear and auto-compaction. The sync and feeder hooks
+    are idempotent re-uploads that find nothing new there; the board, the preferences, the
+    upload warning and the spool notice are context a fresh window has lost."""
+    groups = _session_start_groups()
+    assert sorted(groups) == ["*", "startup|resume"]
+    assert groups["startup|resume"] == ["skills_sync.py", "config_sync.py", "git_feeder.py"]
+    assert groups["*"] == [
+        "board_block.py",
+        "preferences_block.py",
+        "ingest_hook.py --catchup",
+        "remember_spool.py session-start",
+    ]

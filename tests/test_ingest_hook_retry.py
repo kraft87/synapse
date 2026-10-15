@@ -388,6 +388,33 @@ def test_catchup_hook_prints_warning_for_user_and_model(hook, tmp_path, monkeypa
     assert spawned and spawned[0][:2] == ["--catchup-run", str(root)]
 
 
+@pytest.mark.parametrize("source", ["clear", "compact"])
+def test_catchup_hook_warns_but_does_not_sweep_on_a_clear_or_compaction(
+    hook, tmp_path, monkeypatch, capsys, source
+):
+    """SessionStart fires again for /clear and auto-compaction: a fresh context window needs
+    the warning again, but the sweep ran when the session started."""
+    _, proj = _projects(tmp_path)
+    path = _mk(proj, "s.jsonl", age_s=3600, now=time.time())
+    monkeypatch.setattr(hook, "_post_records", _fail(_http_error(401, "Unauthorized")))
+    for _ in range(hook.retry.WARN_AFTER_FAILS):
+        hook._ship(path, mode="stop")
+
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(hook, "_spawn_detached", spawned.append)
+    monkeypatch.setattr(sys, "argv", ["ingest_hook.py", "--catchup"])
+    payload = {"transcript_path": path, "source": source}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    hook.main()
+    assert "have been failing" in capsys.readouterr().out
+    assert spawned == []
+
+    payload["source"] = "resume"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    hook.main()
+    assert spawned and spawned[0][0] == "--catchup-run"
+
+
 def test_catchup_hook_is_silent_when_healthy(hook, tmp_path, monkeypatch, capsys):
     _, proj = _projects(tmp_path)
     path = _mk(proj, "s.jsonl", age_s=3600, now=time.time())
