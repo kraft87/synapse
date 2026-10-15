@@ -141,25 +141,33 @@ Then, in order:
    in the poller container should stop growing. Rollback is the previous image tag.
 7. **Migrations, by hand, outside a transaction** (never `psql -1`; a failed `CONCURRENTLY`
    build leaves an INVALID index: drop it and run the file again). `scripts/apply_schema.sh`
-   with no flag applies everything above the stamp in order; apply a file alone with
-   `psql "$DSN" -v ON_ERROR_STOP=1 -f schema/NNN_*.sql`. All are idempotent.
+   with no flag applies everything above the stamp in order, and runs each file WHOLE, so two
+   files that take a write lock on a populated table must be handled by hand BEFORE it (a, b).
+   Apply a file alone with `psql "$DSN" -v ON_ERROR_STOP=1 -f schema/NNN_*.sql`. All are
+   idempotent.
+   a. `072_kg_dashboard_reads`: run its three `UPDATE`s (`kg_relationships.t_created`,
+      `kg_entities.t_created`, `kg_entities.entity_subtype`; safe on the old image), then
+      `CREATE INDEX CONCURRENTLY IF NOT EXISTS kg_rel_t_created_idx ON kg_relationships
+      (t_created DESC, uuid DESC) WHERE t_created IS NOT NULL;`. Run as a whole file the plain
+      `CREATE INDEX` locks writes on `kg_relationships`. Soon after the deploy: until the
+      `UPDATE`s run, legacy-only facts are missing from the dashboard feed and legacy-only
+      entities show no type.
+   b. `062_extraction_queue_chunk_id`: on a populated queue first build
+      `extraction_queue_episode_idx` `CONCURRENTLY` (the command is in the file); as a whole
+      file the plain form briefly blocks enqueues.
+   c. Decide on `067` (below) now: the script builds it too.
+   d. Then `scripts/apply_schema.sh`. 062 and 072 are now no-ops for the statements above.
+   What the files do:
    - `074_kg_episodes_gin`: `CONCURRENTLY`; apply it before the pending project relabel (it
      removes the per-episode full scan in the 056 trigger).
-   - `072_kg_dashboard_reads`: do not run it whole on prod (its plain `CREATE INDEX` locks
-     writes on `kg_relationships`). Run its two `UPDATE`s (safe on the old image), then
-     `CREATE INDEX CONCURRENTLY IF NOT EXISTS kg_rel_t_created_idx ON kg_relationships
-     (t_created DESC, uuid DESC) WHERE t_created IS NOT NULL;`, then the file (a no-op). Soon
-     after the deploy: until the `UPDATE`s run, legacy-only facts are missing from the
-     dashboard feed and legacy-only entities show no type.
-   - `062_extraction_queue_chunk_id`: on a populated queue first build `extraction_queue_episode_idx`
-     `CONCURRENTLY` (the command is in the file); the plain form briefly blocks enqueues.
    - `063_episodes_unembedded_index`, `065_kg_live_hop_indexes`: `CONCURRENTLY`, no lock.
    - `066_drop_episode_retrieval_index`: drops `idx_episodes_retrieval_count` and sets
      `fillfactor 90`. Destructive but nothing reads the index, so the old image is unaffected;
      only newly written pages get the slack.
    - `067_chunks_vector_index`: an HNSW build (minutes; `maintenance_work_mem` 512MB, no parallel
-     workers). It is needed only before turning on `SYNAPSE_RECALL_CHUNK_CANDIDATES`; skip it
-     by applying the others as single files if you do not plan the A/B soon.
+     workers). It is needed only before turning on `SYNAPSE_RECALL_CHUNK_CANDIDATES`; to skip
+     it until you plan the A/B, apply 062-066 as single files, run
+     `scripts/apply_schema.sh --from 068`, and apply 067 alone later.
    - `068_dream_lane_cursors`: additive. The first run after it seeds each lane's cursor from
      its `last_scan_at`.
    - `069_skill_candidate_open_identity`: only after the new image is running, and soon after
@@ -176,16 +184,20 @@ Then, in order:
    The schema stamp ends at 076. The `legacy` columns, `kg_entities.degree`, `reported_count`
    and the retired `recall_metrics` columns are NOT dropped: the old image still names them.
 8. **Compose, once, on the server:** `docker compose up -d --remove-orphans`. Watchtower
-   updates images, not `compose.yml`. This removes `poller-drain`, recreates the poller with
-   the two-heartbeat healthcheck and `stop_grace_period: 5m`, gives Postgres `shm_size: 1g`,
-   binds Postgres and local-inference to `127.0.0.1` and drops
+   updates images, not `compose.yml`. This RECREATES the postgres container (`shm_size` and
+   the port binding changed), so Postgres restarts: do it in a quiet moment, ideally
+   `docker compose stop -t 120 postgres` first so it shuts down cleanly (Docker's default is
+   10 s, and an unclean stop can corrupt `episodes_search_idx`; if BM25 recall degrades
+   afterwards, `REINDEX INDEX CONCURRENTLY episodes_search_idx`, ARCHITECTURE.md §15). It also
+   removes `poller-drain`, recreates the poller with the two-heartbeat healthcheck and
+   `stop_grace_period: 5m`, binds Postgres and local-inference to `127.0.0.1` and drops
    `CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS` from `dream`. Anything that reaches Postgres through
    the published port from another machine (remote psql, scripts, tunnels) stops working:
    uncomment the override line in the `postgres` ports block first, or tunnel over ssh. Do the
    recreate together with the image (an old image never writes `/tmp/poller.maintenance.alive`,
    so the new healthcheck would show unhealthy; nothing acts on it). Then set
    `SYNAPSE_DRAIN_CONCURRENCY=8` in `.env` to keep today's peak (the poller plus poller-drain
-   ran 4 + 4; the default 4 is gentler) and `docker compose up -d poller`.
+   ran 4 + 4; the default 4 is gentler) and `docker compose up -d --no-deps poller`.
 9. **Web capture, in this order:** update a client to plugin 0.24.0, run `synapse capture
    --dry-run --since 30d` and read what it would store, set `SYNAPSE_WEB_CAPTURE=on` in
    `.env` and recreate `mcp-server`, then remove the client-side cron's crontab line (after
