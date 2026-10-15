@@ -452,6 +452,53 @@ def test_append_episode_serializes_a_burst_on_one_session(env):
     assert {r[1] for r in rows} == {f"memory {i}" for i in range(24)}
 
 
+def test_append_episode_waits_out_an_ingest_row_it_collides_with(env):
+    """The Stop-hook ingest holds the session's next sequence in an uncommitted
+    transaction when the append computes the same one. The append must take the one after
+    it once the ingest commits, not fail the remember() with a unique violation."""
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    import psycopg
+
+    from ingestion.models import Episode
+
+    def _append():
+        db = Database(env.db._url)
+        try:
+            return db.append_episode(
+                Episode(session_id="s8", sequence=0, content="memory", source="manual")
+            )
+        finally:
+            db.close()
+
+    with psycopg.connect(env.db._url) as ingest:  # autocommit off: the row stays pending
+        ingest.execute(
+            "INSERT INTO episodes (session_id, sequence, content, source) "
+            "VALUES ('s8', 1, 'turn', 'live')"
+        )
+        with ThreadPoolExecutor(1) as pool:
+            fut = pool.submit(_append)
+            for _ in range(100):  # until the append is parked behind the pending row
+                waiting = env.conn.execute(
+                    "SELECT count(*) FROM pg_stat_activity "
+                    "WHERE datname = current_database() AND wait_event = 'transactionid'"
+                ).fetchone()[0]
+                if waiting:
+                    break
+                time.sleep(0.05)
+            else:
+                ingest.rollback()  # release the append so the pool can shut down
+                pytest.fail("the append never collided with the pending ingest row")
+            ingest.commit()
+            episode_id = fut.result(timeout=10)
+    rows = env.conn.execute(
+        "SELECT id, sequence, source FROM episodes WHERE session_id = 's8' ORDER BY sequence"
+    ).fetchall()
+    assert [(r[1], r[2]) for r in rows] == [(1, "live"), (2, "manual")]
+    assert rows[1][0] == episode_id
+
+
 def test_device_caller_with_a_session_is_archived_but_not_queued(env):
     """Its Stop hook ingests the session, so the statement is extracted from the turn."""
     out = _remember_as(_DEVICE, session_id="s3")

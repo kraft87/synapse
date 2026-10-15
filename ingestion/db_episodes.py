@@ -34,14 +34,19 @@ RETURNING id
 """
 
 #: append_episode: the next sequence is read in the INSERT itself, with the same 057 split
-#: as the upsert above.
+#: as the upsert above. DO NOTHING (no row back) is a writer that holds this sequence in a
+#: transaction that has now committed; the caller reads the maximum again.
 _APPEND_SQL = """
 INSERT INTO episodes (session_id, sequence, project, content, source, metadata{extra_col})
 SELECT %(session_id)s, coalesce(max(sequence), 0) + 1, %(project)s, %(content)s, %(source)s,
        '{{}}'::jsonb{extra_val}
 FROM episodes WHERE session_id = %(session_id)s
+ON CONFLICT (session_id, sequence) DO NOTHING
 RETURNING id
 """
+#: Each lost pass means another writer committed a higher sequence, so a second pass
+#: nearly always wins; this only bounds a session under a continuous write storm.
+_APPEND_ATTEMPTS = 5
 _APPEND = _APPEND_SQL.format(extra_col="", extra_val="")
 _APPEND_STAMPED = _APPEND_SQL.format(extra_col=", surface_id", extra_val=", %(surface_id)s")
 
@@ -190,7 +195,9 @@ class EpisodeStore(DatabaseConnection):
         Unlike :meth:`upsert_episode` this never rewrites a row. The sequence is
         ``max + 1`` read in the same statement as the insert, under a per-session advisory
         lock, so two appends to one session (parallel remember() calls) take consecutive
-        sequences instead of one replacing the other."""
+        sequences instead of one replacing the other. A transcript ingest that has not
+        committed yet can hold the same sequence: the insert waits for it, finds the
+        sequence taken and runs again against the new maximum."""
         params = {
             "session_id": ep.session_id,
             "project": ep.project,
@@ -203,9 +210,11 @@ class EpisodeStore(DatabaseConnection):
             # Schema 057 names the provenance column; before it is applied the stamp is
             # dropped, as in upsert_episode.
             sql = _APPEND_STAMPED if own_surface_columns_ready(conn, self._url) else _APPEND
-            row = conn.execute(sql, params).fetchone()
-        assert row is not None, "INSERT RETURNING id returned nothing"
-        return cast(int, row["id"])
+            for _ in range(_APPEND_ATTEMPTS):
+                row = conn.execute(sql, params).fetchone()
+                if row is not None:
+                    return cast(int, row["id"])
+        raise RuntimeError(f"no free sequence in session {ep.session_id!r} after retries")
 
     def get_episodes_valid_at(self, episode_ids: list[int]) -> str | None:
         """Representative valid-time for a set of source episodes = MAX(created_at),
