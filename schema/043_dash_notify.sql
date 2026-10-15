@@ -21,8 +21,12 @@
 --   timeline_event  timeline_events.id (int)  _TL_SELECT  -> _timeline_item
 --
 -- Cost when no client is connected: the server starts LISTEN lazily (only while an SSE
--- client is attached), so with zero listeners the NOTIFY is discarded by Postgres almost
--- for free — the trigger is a single json_build_object + pg_notify per inserted row.
+-- client is attached), so with zero listeners the NOTIFY is discarded by Postgres and the
+-- trigger body is a single json_build_object + pg_notify per inserted row. The commit
+-- path is not free, though: a transaction that issued a NOTIFY takes a database-wide lock
+-- while it commits (PreCommit_Notify), so notifying commits serialize. At one user's
+-- volume that is negligible; if pg_locks or wait events ever show contention on the notify
+-- lock, replace the triggers with a poll of max(id) while an SSE client is attached.
 --
 -- Idempotent: CREATE OR REPLACE the function, DROP ... IF EXISTS then CREATE each trigger,
 -- so a re-run against an already-migrated database is a clean no-op-equivalent.
