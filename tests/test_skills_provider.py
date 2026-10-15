@@ -1,6 +1,6 @@
 """PgSkillsProvider — serves skills_lane skills as skill:// MCP resources from PG.
 
-DB-backed: tagged into the `db` xdist group via conftest's _DB_FILES. Seeds one throwaway
+DB-backed (conftest tags it `db` from the fixtures it uses). Seeds one throwaway
 skill (+ a bundled file), exercises the provider methods directly (no HTTP/MCP client), and
 asserts the exact wire shape fastmcp's client `sync_skills`/`download_skill` depends on:
 the SKILL.md resource, the _manifest JSON (incl. the SKILL.md entry, sha256:-prefixed
