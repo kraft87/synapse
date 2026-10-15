@@ -38,7 +38,8 @@ STAGES
   C. Retype — live global notes (user/feedback) judged for project specificity; a
      PROJECT verdict applies only if the slug already exists in the store.
 
-Kill switch: ``SYNAPSE_NOTES_LANE=0``. ENABLED BY DEFAULT.
+Kill switch: ``SYNAPSE_NOTES_LANE=0``, read by dream/__main__ (it does not run the lane).
+ENABLED BY DEFAULT.
 """
 
 from __future__ import annotations
@@ -130,11 +131,6 @@ Output ONLY JSON, no prose. One of:
 
 
 # --------------------------------------------------------------------------- config
-def _enabled() -> bool:
-    """Kill switch, not an enable gate: the lane ships ON."""
-    return os.environ.get("SYNAPSE_NOTES_LANE", "1") != "0"
-
-
 def _env_num(name: str, default: float, *, cast: type[int] | type[float]) -> Any:
     raw = os.environ.get(name, "").strip()
     if not raw:
@@ -323,10 +319,6 @@ def run_lane(
     }
     samples: list[str] = []
     errors: list[str] = []
-    if not _enabled():
-        logger.info("dream→notes lane disabled (SYNAPSE_NOTES_LANE=0)")
-        return {"enabled": False, "counts": counts, "samples": samples, "errors": errors}
-
     floor = float(sim_floor if sim_floor is not None else _env_num("NOTES_LANE_SIM_FLOOR", DEFAULT_SIM_FLOOR, cast=float))  # fmt: skip
     cap_judge = int(max_judge if max_judge is not None else _env_num("NOTES_LANE_MAX_JUDGE", DEFAULT_MAX_JUDGE, cast=int))  # fmt: skip
     cap_retype = int(max_retype_judge if max_retype_judge is not None else _env_num("NOTES_LANE_MAX_RETYPE_JUDGE", DEFAULT_MAX_RETYPE_JUDGE, cast=int))  # fmt: skip
@@ -453,7 +445,7 @@ def run_lane(
         cap_apply,
         len(errors),
     )
-    return {"enabled": True, "counts": counts, "samples": samples, "errors": errors}
+    return {"counts": counts, "samples": samples, "errors": errors}
 
 
 if __name__ == "__main__":  # pragma: no cover - manual runs

@@ -244,20 +244,6 @@ def _stub_llm(monkeypatch, pair_verdicts=(), scope_verdicts=(), fail_pairs=False
     return calls
 
 
-def test_kill_switch_returns_zeroed_counts_without_touching_anything(monkeypatch):
-    monkeypatch.setenv("SYNAPSE_NOTES_LANE", "0")
-    db = _FakeDB(pairs=[(_note(1), _note(2, days=1), 0.99)])
-    res = run_lane(db=db, llm=object())
-    assert res["enabled"] is False
-    assert res["counts"] == {
-        "pairs_judged": 0,
-        "retype_judged": 0,
-        "applied_supersede": 0,
-        "applied_retype": 0,
-    }
-    assert db.curation == [] and db.superseded == []
-
-
 def test_pair_merge_records_audit_and_sample(monkeypatch):
     _stub_llm(monkeypatch, pair_verdicts=[_DUP, _DUP])
     db = _FakeDB(pairs=[(_note(1), _note(2, days=1), 0.94)])
