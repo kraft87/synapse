@@ -41,6 +41,23 @@ ON CONFLICT (session_id, sequence) DO UPDATE SET
 RETURNING id
 """
 
+#: append_episode: the next sequence is read in the INSERT itself, with the same 057 split
+#: as the upsert above. DO NOTHING (no row back) is a writer that holds this sequence in a
+#: transaction that has now committed; the caller reads the maximum again.
+_APPEND_SQL = """
+INSERT INTO episodes (session_id, sequence, project, content, source, metadata{extra_col})
+SELECT %(session_id)s, coalesce(max(sequence), 0) + 1, %(project)s, %(content)s, %(source)s,
+       '{{}}'::jsonb{extra_val}
+FROM episodes WHERE session_id = %(session_id)s
+ON CONFLICT (session_id, sequence) DO NOTHING
+RETURNING id
+"""
+#: Each lost pass means another writer committed a higher sequence, so a second pass
+#: nearly always wins; this only bounds a session under a continuous write storm.
+_APPEND_ATTEMPTS = 5
+_APPEND = _APPEND_SQL.format(extra_col="", extra_val="")
+_APPEND_STAMPED = _APPEND_SQL.format(extra_col=", surface_id", extra_val=", %(surface_id)s")
+
 #: The pre-057 statement: what runs until the provenance column exists.
 _UPSERT = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(extra_col="", extra_val="", extra_set="")
 
@@ -203,6 +220,35 @@ class EpisodeStore(DatabaseConnection):
         span_ids: set[str] = {r["span_id"] for r in rows if r["span_id"]}
         max_seq = max((int(r["sequence"]) for r in rows), default=0)
         return span_ids, max_seq
+
+    def append_episode(self, ep: Episode) -> int:
+        """Insert ``ep`` at the next free sequence of its session (``ep.sequence`` is
+        ignored) and return the new row's id. For writers that are not the transcript
+        parser, such as remember()'s archive.
+
+        Unlike :meth:`upsert_episode` this never rewrites a row. The sequence is
+        ``max + 1`` read in the same statement as the insert, under a per-session advisory
+        lock, so two appends to one session (parallel remember() calls) take consecutive
+        sequences instead of one replacing the other. A transcript ingest that has not
+        committed yet can hold the same sequence: the insert waits for it, finds the
+        sequence taken and runs again against the new maximum."""
+        params = {
+            "session_id": ep.session_id,
+            "project": ep.project,
+            "content": strip_nul(ep.content),
+            "source": ep.source,
+            "surface_id": ep.surface_id,
+        }
+        with self._conn() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (ep.session_id,))
+            # Schema 057 names the provenance column; before it is applied the stamp is
+            # dropped, as in upsert_episode.
+            sql = _APPEND_STAMPED if own_surface_columns_ready(conn, self._url) else _APPEND
+            for _ in range(_APPEND_ATTEMPTS):
+                row = conn.execute(sql, params).fetchone()
+                if row is not None:
+                    return cast(int, row["id"])
+        raise RuntimeError(f"no free sequence in session {ep.session_id!r} after retries")
 
     def get_episodes_valid_at(self, episode_ids: list[int]) -> str | None:
         """Representative valid-time for a set of source episodes = MAX(created_at),

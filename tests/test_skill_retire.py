@@ -142,6 +142,81 @@ def test_a_hand_retired_row_is_not_enforced_until_retire_stamps_it(ret, db_url):
 # ------------------------------------------------------------------ list
 
 
+def test_list_gives_every_active_skill_its_whole_skill_hash(ret, db_url):
+    _publish(db_url, files=[_file("scripts/dump.sh", SCRIPT), _file("a.txt", b"a")])
+    _publish(db_url, name="ret-plain", body=_skill("ret-plain", "Run."))
+
+    listing = _list_skills(db_url, "global")
+
+    by_name = {s["name"]: s for s in listing["skills"] if s["name"].startswith("ret-")}
+    shas = [
+        ("scripts/dump.sh", hashlib.sha256(SCRIPT).hexdigest()),
+        ("a.txt", hashlib.sha256(b"a").hexdigest()),
+    ]
+    assert by_name["ret-backup"]["content_hash"] == whole_skill_hash(V1, shas)
+    assert by_name["ret-plain"]["content_hash"] == whole_skill_hash(_skill("ret-plain", "Run."), [])
+    # a client from before content_hash still reads the body and the file shas
+    assert by_name["ret-backup"]["body"] == V1 and len(by_name["ret-backup"]["files"]) == 2
+
+
+class _Counting:
+    """A connection or cursor that records every statement run through it."""
+
+    def __init__(self, inner, counts):
+        self._inner, self._counts = inner, counts
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def cursor(self, *args, **kwargs):
+        return _Counting(self._inner.cursor(*args, **kwargs), self._counts)
+
+    def execute(self, sql, *args, **kwargs):
+        self._counts.append(sql)
+        result = self._inner.execute(sql, *args, **kwargs)
+        return self if result is self._inner else result  # a cursor's execute returns itself
+
+
+def _statements_of_a_listing(db_url, monkeypatch, held) -> int:
+    from contextlib import contextmanager
+
+    from ingestion import pg_pool
+
+    counts: list[str] = []
+    real = pg_pool.connection
+
+    @contextmanager
+    def counting(*a, **k):
+        with real(*a, **k) as c:
+            yield _Counting(c, counts)
+
+    monkeypatch.setattr(pg_pool, "connection", counting)
+    _list_skills(db_url, "global", held=held)
+    return len(counts)
+
+
+def test_list_runs_the_same_number_of_statements_however_many_skills_there_are(
+    ret, db_url, monkeypatch
+):
+    def add(i):
+        name = f"ret-many-{i}"
+        _publish(db_url, name=name, body=_skill(name, "Run."), files=[_file("x", b"x")])
+        _publish(db_url, name=name, body=_skill(name, "Run it twice."), files=[_file("x", b"x")])
+        if i % 2:
+            _retire_skill(db_url, name)
+        return name
+
+    few = [add(i) for i in range(2)]
+    n_few = _statements_of_a_listing(db_url, monkeypatch, held=few)
+    many = few + [add(i) for i in range(2, 12)]
+    n_many = _statements_of_a_listing(db_url, monkeypatch, held=many)
+
+    assert n_few == n_many <= 10  # one read of each kind, not one per skill
+    got = _list_skills(db_url, "global", held=many)
+    assert len([r for r in got["retired"] if r["name"].startswith("ret-many")]) == 6
+    assert all(len(r["content_hashes"]) == 2 for r in got["retired"] if r["name"] in many)
+
+
 def test_list_reports_retired_skills_apart_from_the_active_ones(ret, db_url):
     _publish(db_url, files=[_file("scripts/dump.sh", SCRIPT), _file("a.txt", b"a")])
     _publish(db_url, name="ret-live", body=_skill("ret-live", "Run."), files=[_file("x", b"x")])
@@ -251,7 +326,7 @@ def _candidate(conn, body: str, base: str) -> int:
 
 
 def _accept(db_url, cid: int, **kw) -> dict:
-    return _proposal_act(db_url, cid, "accept", None, lambda *_: "routing-eval: stub", **kw)
+    return _proposal_act(db_url, cid, "accept", None, **kw)
 
 
 def test_accepting_onto_a_retired_skill_needs_force(ret, db_url):

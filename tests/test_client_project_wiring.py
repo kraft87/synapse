@@ -36,6 +36,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import uuid
 from collections.abc import Iterator
@@ -947,3 +948,122 @@ def test_git_feeder_process_files_worktree_commits_under_the_checkout(layout, se
     assert len(posts) == 1
     assert {e["project"] for e in posts[0].body["events"]} == {"MyRepo"}
     assert {e["source"] for e in posts[0].body["events"]} == {f"git:{layout.worktree.name}"}
+
+
+def test_config_sync_pushes_every_file_in_one_request(monkeypatch, layout, tmp_path):
+    proj = Path(_where(layout, "root"))
+    (proj / "CLAUDE.md").write_text("project rules")
+    config_dir = tmp_path / "claude"
+    (config_dir / "rules").mkdir(parents=True)
+    (config_dir / "CLAUDE.md").write_text("global rules")
+    (config_dir / "rules" / "voice.md").write_text("terse")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
+    mod = _load(_CONFIG_SYNC, "config_sync_batch_test")
+    sent: list[tuple[str, dict]] = []
+    monkeypatch.setattr(mod.config, "CONFIG_SYNC", True)
+    monkeypatch.setattr(mod.config, "CONFIG_DIR", config_dir)
+    monkeypatch.setattr(mod.config, "post_json", lambda path, body: sent.append((path, body)) or {})
+
+    mod.main()
+
+    assert [path for path, _ in sent] == ["/config/publish"]  # one round trip, not one per file
+    body = sent[0][1]
+    assert body["surface"] == mod.config.SURFACE
+    got = {(f["scope"], f["file_key"]): f["content"] for f in body["files"]}
+    assert got[("global", "CLAUDE.md")] == "global rules"
+    assert got[("global", "rules/voice.md")] == "terse"
+    assert got[("project:MyRepo", "CLAUDE.md")] == "project rules"
+    assert all(f["abs_path"] and f["modified_at"] for f in body["files"])
+
+
+def _config_sync_tree(monkeypatch, layout, tmp_path, name):
+    """config_sync loaded over a global CLAUDE.md, a global rules/voice.md and a project CLAUDE.md."""
+    proj = Path(_where(layout, "root"))
+    (proj / "CLAUDE.md").write_text("project rules")
+    config_dir = tmp_path / "claude"
+    (config_dir / "rules").mkdir(parents=True)
+    (config_dir / "CLAUDE.md").write_text("global rules")
+    (config_dir / "rules" / "voice.md").write_text("terse")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(proj))
+    mod = _load(_CONFIG_SYNC, name)
+    monkeypatch.setattr(mod.config, "CONFIG_SYNC", True)
+    monkeypatch.setattr(mod.config, "CONFIG_DIR", config_dir)
+    return mod
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("http://synapse.test/config/publish", code, "x", {}, None)
+
+
+def test_config_sync_falls_back_to_one_file_per_request_on_an_older_server(
+    monkeypatch, layout, tmp_path
+):
+    """A server from before the batch form reads file_key off the body, so it answers a
+    {surface, files} body with a 500; the plugin updates from GitHub, possibly ahead of the image."""
+    mod = _config_sync_tree(monkeypatch, layout, tmp_path, "config_sync_old_server_test")
+    sent: list[dict] = []
+
+    def post(path, body):
+        sent.append(body)
+        if "files" in body:
+            raise _http_error(500)
+        return {}
+
+    monkeypatch.setattr(mod.config, "post_json", post)
+
+    mod.main()
+
+    batch, singles = sent[0], sent[1:]
+    assert "files" in batch
+    assert singles == [{"surface": mod.config.SURFACE, **f} for f in batch["files"]]
+    got = {(b["scope"], b["file_key"]): b["content"] for b in singles}
+    assert got[("global", "CLAUDE.md")] == "global rules"
+    assert got[("global", "rules/voice.md")] == "terse"
+    assert got[("project:MyRepo", "CLAUDE.md")] == "project rules"
+
+
+def test_config_sync_does_not_fan_out_on_an_auth_failure(monkeypatch, layout, tmp_path):
+    mod = _config_sync_tree(monkeypatch, layout, tmp_path, "config_sync_unauthorized_test")
+    sent: list[dict] = []
+
+    def post(path, body):
+        sent.append(body)
+        raise _http_error(401)
+
+    monkeypatch.setattr(mod.config, "post_json", post)
+
+    mod.main()  # fail-open: the hook never raises
+
+    assert len(sent) == 1  # only the batch; a refused token is not retried file by file
+
+
+def test_config_sync_skips_a_file_it_cannot_read_and_sends_the_rest(monkeypatch, layout, tmp_path):
+    mod = _config_sync_tree(monkeypatch, layout, tmp_path, "config_sync_unreadable_test")
+    sent: list[dict] = []
+    monkeypatch.setattr(mod.config, "post_json", lambda path, body: sent.append(body) or {})
+    real = mod._file
+
+    def flaky(scope, file_key, p):
+        if file_key == "rules/voice.md":
+            raise PermissionError(13, "denied")
+        return real(scope, file_key, p)
+
+    monkeypatch.setattr(mod, "_file", flaky)
+
+    mod.main()
+
+    assert len(sent) == 1
+    keys = {(f["scope"], f["file_key"]) for f in sent[0]["files"]}
+    assert ("global", "rules/voice.md") not in keys
+    assert {("global", "CLAUDE.md"), ("project:MyRepo", "CLAUDE.md")} <= keys
+
+
+def test_config_sync_posts_nothing_when_there_is_nothing_to_mirror(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    mod = _load(_CONFIG_SYNC, "config_sync_empty_test")
+    sent: list = []
+    monkeypatch.setattr(mod.config, "CONFIG_SYNC", True)
+    monkeypatch.setattr(mod.config, "CONFIG_DIR", tmp_path / "empty")
+    monkeypatch.setattr(mod.config, "post_json", lambda *a: sent.append(a) or {})
+    mod.main()
+    assert sent == []

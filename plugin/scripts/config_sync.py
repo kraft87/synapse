@@ -2,12 +2,14 @@
 # mypy: ignore-errors
 """SessionStart hook — mirror this machine's config files into Synapse (config lane).
 
-PUSH-ONLY (V1 scaffolding). Auto-discovers the well-known config files and publishes each to the
-server's /config/publish route (machine-token gated), tagged with this surface + a scope:
+PUSH-ONLY (V1 scaffolding). Auto-discovers the well-known config files and publishes them all in
+one request to the server's /config/publish route (machine-token gated), tagged with this surface
++ a scope:
   * 'global'         — CLAUDE.md + rules/**/*.md under ~/.claude (CONFIG_DIR)
   * 'project:<name>' — CLAUDE.md, .claude/CLAUDE.md, .claude/rules/**/*.md under $CLAUDE_PROJECT_DIR
 SYNAPSE_CONFIG_PATHS adds extra globs (under CONFIG_DIR, global scope). file_key = path relative to
-that scope's root. The server stores it so the dream pipeline can read it and propose edits later.
+that scope's root. The server stores it as the mirror the dashboard lists; the nightly config lane
+mines transcripts for corrections and skips the ones that restate a line of it.
 
 OFF by default — these files often carry personal instructions, so mirroring them off-box is
 opt-in: set SYNAPSE_CONFIG_SYNC=1 to enable. DSN-free: HTTP only. Fail-open: never blocks or
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sys
+import urllib.error
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,26 +53,38 @@ def _targets() -> list[tuple[str, str, Path]]:
     return out
 
 
-def _publish(scope: str, file_key: str, p: Path) -> None:
-    config.post_json(
-        "/config/publish",
-        {
-            "surface": config.SURFACE,
-            "scope": scope,
-            "file_key": file_key,
-            "abs_path": str(p),
-            "content": p.read_text(encoding="utf-8", errors="ignore"),
-            "modified_at": datetime.fromtimestamp(p.stat().st_mtime, tz=UTC).isoformat(),
-        },
-    )
+def _file(scope: str, file_key: str, p: Path) -> dict:
+    return {
+        "scope": scope,
+        "file_key": file_key,
+        "abs_path": str(p),
+        "content": p.read_text(encoding="utf-8", errors="ignore"),
+        "modified_at": datetime.fromtimestamp(p.stat().st_mtime, tz=UTC).isoformat(),
+    }
 
 
 def main() -> None:
     if not config.CONFIG_SYNC:
         return
     try:
+        files = []
         for scope, file_key, p in _targets():
-            _publish(scope, file_key, p)
+            try:
+                files.append(_file(scope, file_key, p))
+            except OSError:
+                continue  # one unreadable file must not hold back the rest
+        if files:
+            # The server skips a file whose hash it already holds, so re-pushing is cheap.
+            try:
+                config.post_json("/config/publish", {"surface": config.SURFACE, "files": files})
+            except urllib.error.HTTPError as e:
+                if e.code != 500:
+                    raise
+                # A server older than the batch form reads one file per body and 500s on this
+                # one (no file_key). The plugin updates from GitHub, possibly ahead of the
+                # image; delete this fallback once no such server is left.
+                for f in files:
+                    config.post_json("/config/publish", {"surface": config.SURFACE, **f})
     except Exception:
         return  # fail-open: server/token/permission issues never break session start
 

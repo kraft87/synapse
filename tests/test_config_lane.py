@@ -1,78 +1,70 @@
-"""DB-backed tests for the config-lane ingest routes (mcp_server/config_sync_routes).
+"""DB-backed tests for the config-lane mirror route (mcp_server/config_sync_routes._publish_config).
 
-Covers the mirror contract the plugin push depends on: publish upserts a (surface, file_key) row,
-a re-push of unchanged content is a no-op (changed=False), a real edit updates content + hash,
-list/fetch return what was published, and two surfaces keep separate rows for the same file_key.
+Covers the mirror contract the plugin push depends on: publish upserts a (surface, scope,
+file_key) row, a re-push of unchanged content is a no-op, a real edit updates content + hash, a
+batch lands in one call, and two surfaces keep separate rows for the same file_key.
 """
 
 from __future__ import annotations
 
-from mcp_server.config_sync_routes import _fetch_config, _list_configs, _publish_config
+import pytest
+
+from mcp_server.config_sync_routes import _publish_config
 
 
-def _pub(db_url, surface, key, content, path="/home/u/.claude/x"):
-    return _publish_config(
-        db_url,
-        {"surface": surface, "file_key": key, "abs_path": path, "content": content},
-    )
-
-
-def test_publish_then_fetch(conn, db_url):
+@pytest.fixture()
+def mirror(conn, db_url):
     conn.execute("TRUNCATE config_lane.config_registry")
-    r = _pub(db_url, "boxA", "rules/voice.md", "be terse", path="/home/u/.claude/rules/voice.md")
-    assert r["changed"] is True
-    got = _fetch_config(db_url, "boxA", "rules/voice.md")
-    assert got["found"] and got["content"] == "be terse"
-    assert got["abs_path"] == "/home/u/.claude/rules/voice.md"
-    assert got["content_hash"] == r["content_hash"]
+
+    def pub(surface, key, content, scope="global", path="/home/u/.claude/x"):
+        file = {"scope": scope, "file_key": key, "abs_path": path, "content": content}
+        return _publish_config(db_url, surface, [file])
+
+    def read(surface, key, scope="global"):
+        return conn.execute(
+            "SELECT content, abs_path, content_hash FROM config_lane.config_registry "
+            "WHERE surface_id = %s AND scope = %s AND file_key = %s",
+            (surface, scope, key),
+        ).fetchone()
+
+    return pub, read
 
 
-def test_unchanged_republish_is_noop(conn, db_url):
-    conn.execute("TRUNCATE config_lane.config_registry")
-    _pub(db_url, "boxA", "CLAUDE.md", "same body")
-    again = _pub(db_url, "boxA", "CLAUDE.md", "same body")
-    assert again["changed"] is False  # identical content -> nothing written
-    edit = _pub(db_url, "boxA", "CLAUDE.md", "new body")
-    assert edit["changed"] is True
-    assert _fetch_config(db_url, "boxA", "CLAUDE.md")["content"] == "new body"
+def test_publish_stores_content_path_and_hash(mirror):
+    pub, read = mirror
+    r = pub("boxA", "rules/voice.md", "be terse", path="/home/u/.claude/rules/voice.md")
+    assert r == {"status": "ok", "changed": 1}
+    content, path, digest = read("boxA", "rules/voice.md")
+    assert (content, path) == ("be terse", "/home/u/.claude/rules/voice.md")
+    assert len(digest) == 64
 
 
-def test_list_scoped_to_surface(conn, db_url):
-    conn.execute("TRUNCATE config_lane.config_registry")
-    _pub(db_url, "boxA", "CLAUDE.md", "A body")
-    _pub(db_url, "boxA", "rules/voice.md", "A voice")
-    _pub(db_url, "boxB", "CLAUDE.md", "B body")  # same file_key, different surface = separate row
-    a = {f["file_key"] for f in _list_configs(db_url, "boxA")["files"]}
-    assert a == {"CLAUDE.md", "rules/voice.md"}
-    b = _list_configs(db_url, "boxB")["files"]
-    assert [f["file_key"] for f in b] == ["CLAUDE.md"]
-    assert (
-        _fetch_config(db_url, "boxB", "CLAUDE.md")["content"] == "B body"
-    )  # not clobbered by boxA
+def test_unchanged_republish_is_noop(mirror):
+    pub, read = mirror
+    pub("boxA", "CLAUDE.md", "same body")
+    assert pub("boxA", "CLAUDE.md", "same body")["changed"] == 0  # identical -> nothing written
+    assert pub("boxA", "CLAUDE.md", "new body")["changed"] == 1
+    assert read("boxA", "CLAUDE.md")[0] == "new body"
 
 
-def test_fetch_missing(conn, db_url):
-    conn.execute("TRUNCATE config_lane.config_registry")
-    assert _fetch_config(db_url, "boxA", "nope.md") == {"found": False}
+def test_one_batch_publishes_every_file_and_counts_the_changed(mirror, db_url):
+    pub, read = mirror
+    pub("boxA", "CLAUDE.md", "global body")
+    files = [
+        {"scope": "global", "file_key": "CLAUDE.md", "content": "global body"},  # unchanged
+        {"scope": "global", "file_key": "rules/voice.md", "content": "voice"},
+        {"scope": "project:repo", "file_key": "CLAUDE.md", "content": "project body"},
+    ]
+    assert _publish_config(db_url, "boxA", files) == {"status": "ok", "changed": 2}
+    assert read("boxA", "rules/voice.md")[0] == "voice"
+    # the same file_key under global vs project scope are distinct rows on one surface
+    assert read("boxA", "CLAUDE.md")[0] == "global body"
+    assert read("boxA", "CLAUDE.md", "project:repo")[0] == "project body"
 
 
-def test_scope_separates_same_file_key(conn, db_url):
-    # The same file_key (CLAUDE.md) under global vs project scope are distinct rows on one surface.
-    conn.execute("TRUNCATE config_lane.config_registry")
-    _publish_config(
-        db_url,
-        {"surface": "boxA", "scope": "global", "file_key": "CLAUDE.md", "content": "global body"},
-    )
-    _publish_config(
-        db_url,
-        {
-            "surface": "boxA",
-            "scope": "project:repo",
-            "file_key": "CLAUDE.md",
-            "content": "project body",
-        },
-    )
-    assert _fetch_config(db_url, "boxA", "CLAUDE.md", "global")["content"] == "global body"
-    assert _fetch_config(db_url, "boxA", "CLAUDE.md", "project:repo")["content"] == "project body"
-    scopes = {(f["scope"], f["file_key"]) for f in _list_configs(db_url, "boxA")["files"]}
-    assert scopes == {("global", "CLAUDE.md"), ("project:repo", "CLAUDE.md")}
+def test_surfaces_keep_separate_rows_for_the_same_file(mirror):
+    pub, read = mirror
+    pub("boxA", "CLAUDE.md", "A body")
+    pub("boxB", "CLAUDE.md", "B body")
+    assert read("boxA", "CLAUDE.md")[0] == "A body"  # not clobbered by boxB
+    assert read("boxB", "CLAUDE.md")[0] == "B body"

@@ -89,7 +89,7 @@ def _propose_audience(note: dict[str, Any], work_projects: set[str]) -> str:
 
 def _live_notes(db: Database) -> list[dict[str, Any]]:
     """Every live note, oldest first — including project notes for EVERY project, which
-    list_board_notes deliberately won't serve (it scopes to one project at a time)."""
+    select_board_notes deliberately won't serve (it scopes to one project at a time)."""
     with db._conn() as conn:
         rows = conn.execute(
             "SELECT id, hook, type, project, audience FROM notes "

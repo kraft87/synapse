@@ -3,11 +3,13 @@
 """dream->skills v2 detector: POST-FIRE OUTCOMES (nightly; entry: run()).
 
 Every skill fire is a free experiment: the aftermath says whether the skill's procedure
-actually held. This detector watermarks on skill_usage.fired_at (NEW fires only — the
-caller owns cursor state), reads the aftermath window that FOLLOWED each fire (up to ~10
-episodes, stopping before the session's NEXT skill fire — later corrections belong to
-that fire, not this one) alongside the skill's own registry description/body, and judges
-the outcome:
+actually held. This detector takes the fires the lane found in its episode window (the
+caller owns cursor state, so each fire is judged on one run), reads the aftermath window
+that FOLLOWED each fire (up to ~10 episodes, stopping before the session's NEXT skill fire —
+later corrections belong to that fire, not this one) alongside the skill's own registry
+description/body, and judges the outcome. At most FIRE_CAP fires are judged per run, newest
+first; the rest are counted as over_cap (a --backfill window or a held cursor can hold that
+many; the nightly report carries the count as skills_fires_over_cap):
 
   clean        — the procedure held; nothing to do
   deviation    — a step was wrong, missing, or mis-scoped and the user corrected it
@@ -29,6 +31,8 @@ Two data-quality rules learned the hard way (2026-07-18 audit):
 
 from __future__ import annotations
 
+from dream import lane
+
 from . import skill_db_source as DB
 from . import skill_ledger as L
 from . import skill_measure as SM
@@ -36,9 +40,19 @@ from .skill_measure import _clamp_salience, _excerpt, _extract_json
 from .struggle_arc import NEGATIVE_LIST
 
 WINDOW_EPISODES = 10  # aftermath the judge reads
+FIRE_CAP = 20  # fires judged per run (one judge call each)
 BODY_CHARS = 4000  # skill-body cap in the judge prompt
 
 OUTCOMES = ("clean", "deviation", "fight", "unassessable")
+#: The verdict as skill_usage.outcome stores it (schema 022: worked | failed | partial |
+#: unknown); skill_effects reads the deviation rate from it. A fire that was not judged
+#: (over the cap, no position, a judge failure) keeps outcome NULL.
+USAGE_OUTCOME = {
+    "clean": "worked",
+    "deviation": "partial",
+    "fight": "failed",
+    "unassessable": "unknown",
+}
 
 _BASE_DIR_MARKER = "base directory for this skill"
 
@@ -89,7 +103,7 @@ def _mentions_fire(content: str, skill: str) -> bool:
     for line in (content or "").splitlines():
         m = DB._SKILL_MARK.match(line)
         if m:
-            nm = DB._SKILL_NAME.search(m.group(1))
+            nm = lane.SKILL_NAME.search(m.group(1))
             if nm and nm.group(1) == skill:
                 return True
         low = line.lower()
@@ -140,33 +154,6 @@ def resolve_fire_position(episodes: list[dict], skill: str, fired_at) -> int | N
 
 
 # ------------------------------------------------------------------ DB fetches
-def _fetch_fires(conn, since) -> list[dict]:
-    cur = conn.cursor()
-    if since is not None:
-        cur.execute(
-            "SELECT skill, session_id, fired_at FROM skills_lane.skill_usage "
-            "WHERE fired_at > %s ORDER BY fired_at",
-            (since,),
-        )
-    else:
-        cur.execute(
-            "SELECT skill, session_id, fired_at FROM skills_lane.skill_usage ORDER BY fired_at"
-        )
-    return [
-        {"skill": s, "session_id": str(sid) if sid else None, "fired_at": ts}
-        for s, sid, ts in cur.fetchall()
-    ]
-
-
-def _registered_skills(conn) -> set[str]:
-    """Names of the skills in the registry (not retired). A fire of anything else, such
-    as a skill built into the agent or shipped by a third-party plugin, has no registry
-    row to retune, so judging it can only produce a proposal nobody can apply."""
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM skills_lane.skill_registry WHERE status <> 'retired'")
-    return {name for (name,) in cur.fetchall()}
-
-
 def _fetch_session_episodes(conn, session_id: str) -> list[dict]:
     cur = conn.cursor()
     cur.execute(
@@ -203,15 +190,7 @@ def _load_skill_doc(conn, name: str) -> tuple[str, str]:
 
 
 # ------------------------------------------------------------------ judge
-def _judge_call(prompt: str, model: str | None = None) -> str:
-    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
-    Kept as a named seam so tests can stub the LLM out."""
-    return SM.run_judge(prompt, model)
-
-
-def judge_fire(
-    skill: str, desc: str, body: str, window: list[dict], model: str | None = None
-) -> dict | None:
+def judge_fire(skill: str, desc: str, body: str, window: list[dict]) -> dict | None:
     prompt = _JUDGE_PROMPT.format(
         negative_list=NEGATIVE_LIST,
         name=skill,
@@ -219,12 +198,7 @@ def judge_fire(
         body=body or "(no body in registry)",
         window=_excerpt(window),
     )
-    try:
-        raw = _judge_call(prompt, model)
-    except Exception as e:
-        print(f"  post-fire judge failed for {skill}: {e}")
-        return None
-    return _extract_json(raw)
+    return _extract_json(lane.judge(prompt))
 
 
 def _patch_text(patch) -> str | None:
@@ -237,10 +211,21 @@ def _patch_text(patch) -> str | None:
     return None
 
 
+def _record_outcome(conn, fire: dict, outcome: str) -> None:
+    """Keep the verdict on the fire's skill_usage row (sync_usage wrote it this run)."""
+    conn.execute(
+        "UPDATE skills_lane.skill_usage SET outcome = %s "
+        "WHERE skill = %s AND session_id = %s AND fired_at = %s",
+        (USAGE_OUTCOME[outcome], fire["skill"], fire["session_id"], fire["fired_at"]),
+    )
+
+
 # ------------------------------------------------------------------ entry
-def run(conn, *, since, model: str | None = None) -> dict:
-    """Judge every skill fire recorded after `since`; deviations/fights become retune
-    candidates. Returns the per-outcome tally."""
+def run(conn, *, fires, catalog) -> dict:
+    """Judge the window's skill `fires` (fire_events dicts) of skills in `catalog` ((name,
+    description) of the active skills), newest first and at most FIRE_CAP of them;
+    deviations/fights become retune candidates, and every judged outcome is kept on the fire's
+    skill_usage row. Returns the per-outcome tally."""
     stats = {
         "fires": 0,
         "clean": 0,
@@ -252,23 +237,24 @@ def run(conn, *, since, model: str | None = None) -> dict:
         "candidates": 0,
         "judge_failures": 0,
         "unregistered": 0,
+        "over_cap": 0,
     }
-    fires = _fetch_fires(conn, since)
     stats["fires"] = len(fires)
-    if not fires:
+    # Only skills the lane owns can be retuned. The other detectors already gate on the
+    # registry (struggle_arc: name in skill_names; procedure_miner: extends in registry);
+    # without this, a fire of a built-in skill became an unappliable retune proposal.
+    registered = {name for name, _ in catalog}
+    owned = sorted(
+        (f for f in fires if f["skill"] in registered), key=lambda f: f["fired_at"], reverse=True
+    )
+    stats["unregistered"] = len(fires) - len(owned)
+    stats["over_cap"] = max(0, len(owned) - FIRE_CAP)
+    if not owned:
         return stats
 
     scan_night = SM.scan_night()
-    registered = _registered_skills(conn)
     sessions: dict[str, list[dict]] = {}
-    for fire in fires:
-        # Only skills the lane owns can be retuned. The other detectors already gate on
-        # the registry (struggle_arc: name in skill_names; procedure_miner: extends in
-        # registry); without this, a fire of a built-in skill became an unappliable
-        # retune proposal.
-        if fire["skill"] not in registered:
-            stats["unregistered"] += 1
-            continue
+    for fire in owned[:FIRE_CAP]:
         sid = fire["session_id"]
         if not sid:
             stats["unassessable"] += 1
@@ -293,7 +279,7 @@ def run(conn, *, since, model: str | None = None) -> dict:
             continue
 
         desc, body = _load_skill_doc(conn, fire["skill"])
-        verdict = judge_fire(fire["skill"], desc, body, window, model)
+        verdict = judge_fire(fire["skill"], desc, body, window)
         if verdict is None:
             stats["judge_failures"] += 1
             stats["unassessable"] += 1
@@ -302,6 +288,7 @@ def run(conn, *, since, model: str | None = None) -> dict:
         if outcome not in OUTCOMES:
             outcome = "unassessable"
         stats[outcome] += 1
+        _record_outcome(conn, fire, outcome)
         if outcome not in ("deviation", "fight"):
             continue
 

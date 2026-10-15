@@ -1917,15 +1917,6 @@ def retire_flags(conn: psycopg.Connection[dict[str, Any]], kind: str, item_ids: 
 # See docs/dashboard-contract.md §"Phase 2b".
 
 
-def _skill_routing_eval_stub(_conn: Any, _cid: int, _name: str) -> str:
-    """The skills lane's accept path takes an advisory ``llm`` callable that runs a
-    routing-eval on RETUNE candidates — an Anthropic API call that only annotates the
-    accept result. The dashboard passes THIS stub in place of the real ``_routing_eval``:
-    accept still applies the proposal and records the grounded 'accept' signal, but no LLM
-    call is made from the request path. Running the eval stays with the skills review CLI."""
-    return "routing-eval: skipped (dashboard decision path — advisory eval runs in the skills CLI)"
-
-
 def _parse_proposal_id(pid: str) -> tuple[str, int] | None:
     """'skill:<n>' | 'config:<n>' -> ('skill'|'config', n); None if malformed."""
     lane, _, rest = pid.partition(":")
@@ -2118,7 +2109,7 @@ def _proposal_decision(
 
     lane_action = "accept" if action == "approve" else "reject"
     if lane == "skill":
-        result = _skill_proposal_act(db_url, n, lane_action, note, _skill_routing_eval_stub)
+        result = _skill_proposal_act(db_url, n, lane_action, note)
     else:
         # config accept takes an optional scope override; the dashboard never re-scopes,
         # so pass None (the lane keeps the proposal's stored blast radius).
@@ -2364,10 +2355,9 @@ def _behavior_files(db_url: str) -> dict[str, Any]:
 
 
 def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> dict[str, Any] | None:
-    """One mirrored file's content + meta + parsed [[wikilinks]]. Mirrors config_sync_routes'
-    _fetch_config; when `surface` is omitted, the most-recently-updated surface for that
-    (scope, file_key) is served. No history — the registry keeps only the current version
-    (contract §Phase 5)."""
+    """One mirrored file's content + meta + parsed [[wikilinks]]. When `surface` is omitted,
+    the most-recently-updated surface for that (scope, file_key) is served. No history — the
+    registry keeps only the current version (contract §Phase 5)."""
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         cols = (
             "surface_id, scope, file_key, abs_path, content, content_hash, modified_at, updated_at"

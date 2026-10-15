@@ -7,23 +7,22 @@ The v1 gap scan asks "what procedure has no skill?" — this asks the sharper qu
 ("didn't work", "same error", "you sure") clustered in one session. Two stages, so the
 LLM only ever reads the worst few windows:
 
-  A. lexical prescreen (SQL + pure python, cheap): score correction markers per NEW
-     episode (hard markers weigh 2, soft markers 1 and only count mid-session — a fresh
-     request containing "wrong" is not a correction), drop transcript machinery
-     (task notifications, session-continuation summaries — they quote error text and
-     false-positive hard), group survivors into arcs by (session, sequence proximity),
-     keep the top `limit` arcs by score.
+  A. lexical prescreen (SQL + pure python, cheap): score correction markers per episode
+     in the lane's window (hard markers weigh 2, soft markers 1 and only count
+     mid-session — a fresh request containing "wrong" is not a correction), drop
+     transcript machinery (task notifications, session-continuation summaries — they
+     quote error text and false-positive hard), group survivors into arcs by (session,
+     sequence proximity), keep the top `limit` arcs by score.
   B. windowed LLM judge (arc +/- 3 episodes): genuine struggle? skill-worthy per the
      negative capture list? UPDATE-FIRST — the judge sees the full active skill catalog
      IN THE PROMPT (no embedding routing — at catalog scale that misroutes) and must
      prefer patching an existing skill (retune + proposed_patch) over minting a new one
      (derive). Verdicts land in the ledger via skill_ledger.merge_candidate with
-     signal='struggle_arc' evidence carrying a short verbatim quote + scan_night.
+     signal='struggle_arc' evidence carrying a short verbatim quote + the arc's date.
 
-Topic gate, two halves: an optional project ALLOWLIST (STRUGGLE_INCLUDE_PROJECTS env)
-keeps personal/medical/untagged sessions out of Stage A entirely, and an arc window with
-no tool-use evidence (no [tool:*] marker, no file path) never reaches the judge —
-correction phrasing without tool work is conversation, not a procedure. Derives always
+Topic gate: an arc window with no tool-use evidence (no [tool:*] marker, no file path)
+never reaches the judge — correction phrasing without tool work is conversation, not a
+procedure. Derives always
 carry a signature (judge topic key, synthesized fallback): the ledger's identity resolver
 jaccard-matches signature tokens and would wildcard-merge signatureless derives.
 
@@ -34,8 +33,9 @@ rest of the lane: nothing here touches disk skills or sets status past the ledge
 
 from __future__ import annotations
 
-import os
 import re
+
+from dream import lane
 
 from . import config
 from . import skill_db_source as DB
@@ -88,21 +88,7 @@ _NOISE = re.compile(
     re.I,
 )
 
-# transcribe_ai has its own skill environment; its sessions are never gaps in this catalog.
-EXCLUDED_PROJECTS = tuple(sorted({*config.EXCLUDE_PROJECTS, "transcribe_ai"}))
-
-
-# Topic gate half 1: an optional PROJECT ALLOWLIST (comma-separated env). When set, Stage A
-# scans ONLY those projects — personal / medical / untagged-personal sessions never reach the
-# prescreen (correction phrasing like "that's not the case" false-positives hard there).
-# Integration sets this in the dream container env; unset = exclusion-based filtering only.
-def _include_projects() -> tuple[str, ...]:
-    return tuple(
-        p.strip() for p in os.environ.get("STRUGGLE_INCLUDE_PROJECTS", "").split(",") if p.strip()
-    )
-
-
-# Topic gate half 2: an arc window must show TOOL-USE evidence (a [tool:*] marker or a
+# Topic gate: an arc window must show TOOL-USE evidence (a [tool:*] marker or a
 # file path). A correction arc with no tool work near it is conversation, not a procedure.
 _TOOL_MARK = re.compile(r"^\[tool:[\w-]+\]", re.M)
 _PATHISH = re.compile(r"(?:^|\s)(?:/|~/)[\w.\-]+/[\w.\-/]+", re.M)
@@ -211,28 +197,17 @@ def group_arcs(flagged: list[dict], gap: int = ARC_GAP) -> list[dict]:
     return arcs
 
 
-def _fetch_new_episodes(conn, since) -> list[dict]:
-    """Episodes newer than `since` (None -> 30d), claude_code only, foreign skill
-    environments excluded. With STRUGGLE_INCLUDE_PROJECTS set, only allowlisted
-    projects are scanned (untagged episodes drop too). Only prescreen fields."""
+def _fetch_new_episodes(conn, window) -> list[dict]:
+    """The episodes in the lane's `window`, claude_code only, foreign skill environments
+    excluded. Only prescreen fields."""
     cur = conn.cursor()
-    where_time = (
-        "created_at > %s" if since is not None else "created_at > now() - interval '30 days'"
-    )
-    params: list = [] if since is None else [since]
-    include = _include_projects()
-    if include:
-        where_project = "project = ANY(%s)"
-        params.append(list(include))
-    else:
-        where_project = "(project IS NULL OR project <> ALL(%s))"
-        params.append(list(EXCLUDED_PROJECTS))
     cur.execute(
-        f"""SELECT session_id, sequence, created_at, human_turn, LEFT(content, 400)
+        """SELECT session_id, sequence, created_at, human_turn, LEFT(content, 400)
               FROM episodes
-             WHERE platform = 'claude_code' AND {where_time} AND {where_project}
+             WHERE platform = 'claude_code' AND id > %s AND id <= %s
+               AND (project IS NULL OR project <> ALL(%s))
              ORDER BY session_id, sequence""",
-        tuple(params),
+        (window.after_id, window.until_id, list(config.EXCLUDE_PROJECTS)),
     )
     return [
         {
@@ -261,29 +236,14 @@ def _fetch_window(conn, session_id: str, lo: int, hi: int) -> list[dict]:
     ]
 
 
-def _load_catalog(conn) -> list[tuple[str, str]]:
-    """(name, description) for ACTIVE skills, name-ordered — the lane's shared load_catalog."""
-    return SM.load_catalog(conn)
-
-
-def _judge_call(prompt: str, model: str | None = None) -> str:
-    """Thin delegator to the lane's shared judge dispatch (skill_measure.run_judge).
-    Kept as a named seam so tests can stub the LLM out."""
-    return SM.run_judge(prompt, model)
-
-
-def judge_arc(window: list[dict], catalog_text: str, model: str | None = None) -> dict | None:
+def judge_arc(window: list[dict], catalog_text: str) -> dict | None:
     """One judge call for one arc window. Lenient JSON extraction, no retry — matches
-    skill_derive's parsing conventions."""
+    skill_derive's parsing conventions. None when the reply has no JSON object; raises when
+    the model cannot be reached (lane.judge)."""
     prompt = _JUDGE_PROMPT.format(
         catalog=catalog_text or "(none)", negative_list=NEGATIVE_LIST, window=_excerpt(window)
     )
-    try:
-        raw = _judge_call(prompt, model)
-    except Exception as e:
-        print(f"  struggle judge failed: {e}")
-        return None
-    return _extract_json(raw)
+    return _extract_json(lane.judge(prompt))
 
 
 # ------------------------------------------------------------------ emission
@@ -358,16 +318,17 @@ def _window_tools(window: list[dict]) -> list[str]:
     tools: set[str] = set()
     for ep in window:
         for line in (ep.get("content") or "").splitlines():
-            m = DB._MARKER.match(line)
+            m = lane.TOOL_MARKER.match(line)
             if m:
                 tools.add(m.group(1))
     return sorted(tools)[:8]
 
 
 # ------------------------------------------------------------------ entry
-def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
-    """One nightly pass: prescreen episodes newer than `since`, judge the top `limit`
-    arcs, merge verdicts into the ledger. The caller owns cursor state."""
+def run(conn, *, window, catalog, limit: int = 10) -> dict:
+    """One nightly pass: prescreen the episodes in the lane's `window`, judge the top
+    `limit` arcs against `catalog` ((name, description) of the active skills), merge
+    verdicts into the ledger. The caller owns cursor state."""
     stats = {
         "scanned": 0,
         "flagged": 0,
@@ -379,7 +340,7 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
         "retunes": 0,
         "derives": 0,
     }
-    episodes = _fetch_new_episodes(conn, since)
+    episodes = _fetch_new_episodes(conn, window)
     stats["scanned"] = len(episodes)
 
     flagged = []
@@ -406,22 +367,21 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
     if not arcs:
         return stats
 
-    catalog = _load_catalog(conn)
     catalog_text = SM.format_catalog(catalog)
     skill_names = {n for n, _ in catalog}
 
     for arc in arcs:
-        window = _fetch_window(
+        arc_window = _fetch_window(
             conn,
             arc["session_id"],
             max(0, arc["seq_min"] - WINDOW_PAD),
             arc["seq_max"] + WINDOW_PAD,
         )
-        if not has_tool_evidence(window):
+        if not has_tool_evidence(arc_window):
             # topic gate half 2: correction phrasing with zero tool work = conversation
             stats["skipped_no_tools"] += 1
             continue
-        verdict = judge_arc(window, catalog_text, model)
+        verdict = judge_arc(arc_window, catalog_text)
         if verdict is None:
             stats["judge_failures"] += 1
             continue
@@ -429,7 +389,7 @@ def run(conn, *, since, limit: int = 10, model: str | None = None) -> dict:
         if not (verdict.get("struggle") and verdict.get("skill_worthy")):
             stats["skipped"] += 1
             continue
-        res, kind = _emit(conn, arc, window, verdict, skill_names)
+        res, kind = _emit(conn, arc, arc_window, verdict, skill_names)
         stats[kind + "s"] += 1
         print(f"  struggle arc -> {kind} cand#{res['id']} ({res['status']})")
     return stats

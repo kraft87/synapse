@@ -13,10 +13,10 @@ import json
 
 import pytest
 
-import dream.skills.skill_derive as SD
 import dream.skills.skill_doc as D
 import dream.skills.skill_draft as DR
-from dream.skills.skill_measure import skill_description
+from dream import lane
+from dream.skills.skill_doc import skill_description
 
 _BODY = (
     "---\n"
@@ -49,7 +49,7 @@ def _stub_llm(monkeypatch, reply):
         calls.append(prompt)
         return reply(prompt) if callable(reply) else reply
 
-    monkeypatch.setattr(SD, "_draft_call", fake)
+    monkeypatch.setattr(lane, "draft", fake)
     return calls
 
 
@@ -112,7 +112,37 @@ def test_widen_draft_handles_block_scalar_descriptions():
     ],
 )
 def test_widen_draft_refuses_unsafe_descriptions(new_value):
-    assert D.widen_draft(_BODY, new_value) is None
+    with pytest.raises(D.DraftProblem):
+        D.widen_draft(_BODY, new_value)
+
+
+def test_a_refused_widen_says_why():
+    with pytest.raises(D.DraftProblem, match=r"1025 chars, over Claude Code's 1024"):
+        D.widen_draft(_BODY, "x" * 1025)
+
+
+def test_a_widen_adds_a_bounded_number_of_characters():
+    # every session carries every skill's description: a widen can't just keep growing it
+    old = D.skill_description(_BODY)
+    assert D.widen_limit(old) == len(old) + D.WIDEN_MAX_GROWTH  # a short one: +160
+    assert D.widen_limit("x" * 300) == D.WIDEN_CAP  # nearing the cap: not past it
+    assert D.widen_limit("x" * 700) == 700  # already long: no growth at all
+    ok = old + " Also snapshot the db."
+    assert D.skill_description(D.widen_draft(_BODY, ok)) == ok
+    with pytest.raises(D.DraftProblem, match=r"may be at most 2\d\d"):
+        D.widen_draft(_BODY, old + " " + "snapshot " * 20)
+    long_desc = "Run " + "the nightly backup of the demo database " * 17
+    long_body = _BODY.replace(old, long_desc.strip())
+    with pytest.raises(D.DraftProblem, match="may be at most"):
+        D.widen_draft(long_body, long_desc.strip() + " plus a snapshot")
+
+
+def test_the_widen_prompt_states_the_limit_and_the_current_size(monkeypatch):
+    calls = _stub_llm(monkeypatch, json.dumps({"description": "Back up or snapshot the db."}))
+    old = D.skill_description(_BODY)
+    DR.draft_widen("demo-backup", _BODY, _WIDEN_EV)
+    prompt = " ".join(calls[0].split())
+    assert f"at most {D.widen_limit(old)} characters (it is {len(old)} now)" in prompt
 
 
 def test_only_description_changed_rejects_any_other_edit():
@@ -175,12 +205,14 @@ def test_draft_widen_rewrites_only_the_description(monkeypatch):
 )
 def test_draft_widen_falls_back_to_no_draft(monkeypatch, reply):
     _stub_llm(monkeypatch, reply)
-    assert DR.draft_widen("demo-backup", _BODY, _WIDEN_EV) is None
+    with pytest.raises(D.DraftProblem):
+        DR.draft_widen("demo-backup", _BODY, _WIDEN_EV)
 
 
 def test_draft_widen_needs_a_stated_gap(monkeypatch):
     calls = _stub_llm(monkeypatch, json.dumps({"description": "whatever"}))
-    assert DR.draft_widen("demo-backup", _BODY, [{"signal": "dismissal"}]) is None
+    with pytest.raises(D.DraftProblem, match="no missing phrasing"):
+        DR.draft_widen("demo-backup", _BODY, [{"signal": "dismissal"}])
     assert calls == []  # no gap, no LLM call
 
 
@@ -203,7 +235,8 @@ def test_draft_revision_applies_patch_and_checks_result(monkeypatch):
 
     # a revision that renames the skill is not offered
     _stub_llm(monkeypatch, revised.replace("name: demo-backup", "name: renamed"))
-    assert DR.draft(row, _BODY) is None
+    with pytest.raises(D.DraftProblem, match="frontmatter name changed"):
+        DR.draft(row, _BODY)
 
 
 def test_draft_revision_falls_back_to_evidence_without_a_patch(monkeypatch):
@@ -233,14 +266,32 @@ def test_draft_derive_and_unusable_reply(monkeypatch):
     }
     assert DR.draft(row, None) == (_BODY, None)
     _stub_llm(monkeypatch, "Sorry, I can't help with that.")
-    assert DR.draft(row, None) is None
+    with pytest.raises(D.DraftProblem, match="frontmatter name missing"):
+        DR.draft(row, None)
 
 
-def test_consolidate_and_missing_registry_body_are_never_drafted(monkeypatch):
+def test_draft_derive_shows_the_model_the_shell_commands_in_the_evidence(monkeypatch):
     calls = _stub_llm(monkeypatch, _BODY)
-    assert DR.draft({"id": 5, "kind": "consolidate", "name": "a+b"}, None) is None
+    row = {
+        "id": 4,
+        "kind": "derive",
+        "name": "demo-backup",
+        "summary": "back up the demo db",
+        "evidence": [
+            {"session_id": "s-1", "bash": ["pg_dump demo", "aws s3 cp dump.sql s3://bucket"]},
+            {"session_id": "s-2", "bash": ["pg_dump demo"]},
+        ],
+    }
+    assert DR.draft(row, None) == (_BODY, None)
+    assert "pg_dump demo | aws s3 cp dump.sql s3://bucket" in calls[0]
+    assert "(none captured)" not in calls[0]
+
+
+def test_missing_registry_body_is_never_drafted(monkeypatch):
+    calls = _stub_llm(monkeypatch, _BODY)
     row = {"id": 6, "kind": "retune", "direction": "fix", "name": "gone", "target_skills": []}
-    assert DR.draft(row, None) is None
+    with pytest.raises(D.DraftProblem, match="'gone' is not in the skill registry"):
+        DR.draft(row, None)
     assert calls == []
 
 

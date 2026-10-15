@@ -148,7 +148,6 @@ services:
     container_name: ${COMPOSE_PROJECT_NAME:-synapse}-dream
     command: python -m dream --schedule
     environment:
-      - CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1
       - LOGFIRE_SERVICE_NAME=synapse-dream
 
   # --- Optional local inference (zero external accounts) -----------------

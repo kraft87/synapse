@@ -7,11 +7,15 @@ deduped by session, and the distinct-session propose gate.
 
 from __future__ import annotations
 
+import pytest
+
 from dream.config.nightly import (
     PROPOSE_SESSIONS,
     _best_match,
     _distinct_sessions,
     _jaccard,
+    _rule,
+    _same_rule,
     _sig_tokens,
     _union_evidence,
 )
@@ -45,9 +49,39 @@ def test_best_match_finds_same_rule_only():
         {"summary": "Filter out RBC job postings"},
     ]
     # a re-phrasing of the same correction matches (shared em/dashes/prose); a distinct rule doesn't
-    m = _best_match(_sig_tokens("Avoid em-dashes in prose"), cands)
+    m = _best_match(_rule("Avoid em-dashes in prose"), cands)
     assert m is not None and "em-dashes" in m["summary"]
-    assert _best_match(_sig_tokens("always run the test suite first"), cands) is None
+    assert _best_match(_rule("always run the test suite first"), cands) is None
+
+
+def test_a_rule_and_its_reversal_are_not_the_same_rule():
+    # not/never/dont are stop words, so the tokens alone say these are identical
+    assert (
+        _jaccard(
+            _sig_tokens("Run the tests before committing"),
+            _sig_tokens("Do not run the tests before committing"),
+        )
+        == 1.0
+    )
+    assert not _same_rule(
+        _rule("Run the tests before committing"), _rule("Do not run the tests before committing")
+    )
+    cands = [{"summary": "Run the tests before committing"}]
+    assert _best_match(_rule("Don't run the tests before committing"), cands) is None
+    assert _best_match(_rule("Run the tests before you commit"), cands) is not None
+
+
+@pytest.mark.parametrize(
+    "a, b",
+    [
+        ("Never use em-dashes in prose", "Avoid em-dashes in prose"),
+        ("Do not use em-dashes in prose", "Don\u2019t use em-dashes in prose"),
+        ("Do not push without asking", "Never push without asking"),
+        ("Keep answers short", "Keep your answers short"),
+    ],
+)
+def test_phrasings_of_one_polarity_are_the_same_rule(a, b):
+    assert _same_rule(_rule(a), _rule(b))
 
 
 def test_propose_gate_is_distinct_sessions():

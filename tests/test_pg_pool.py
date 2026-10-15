@@ -334,6 +334,6 @@ def test_the_pooled_run_really_borrows():
     pool = pg_pool._POOLS[_DB_URL]
     before = pool.get_stats().get("requests_num", 0)
     db = Database(_DB_URL)
-    db.list_board_notes("default", None)
+    db.known_project_slugs()
     resolve_caller(_DB_URL, token_hash_hex="0" * 64)
     assert pool.get_stats().get("requests_num", 0) >= before + 2

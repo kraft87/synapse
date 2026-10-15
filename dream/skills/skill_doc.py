@@ -2,21 +2,21 @@
 """SKILL.md helpers shared by the nightly drafter and the review accept path.
 
 Pure functions, no DB and no LLM:
-  * frontmatter reads (`name`; `description` is skill_measure.skill_description, the same
-    reader the lane catalog and the client sync use),
+  * frontmatter reads (`name`, and `description`: skill_description, the reader the lane
+    and the publish/accept routes share),
   * body_hash: the pin that ties a drafted proposal to the registry body it was drafted
     against, so accept can refuse a draft whose skill changed underneath it,
   * the description-only splice a retune/widen draft is built from, and the deterministic
     check that nothing but the description moved,
   * sanity checks for a drafted revision (extend/fix/narrow) and a drafted new skill.
+
+A draft that can't be offered raises DraftProblem with the reason a reviewer reads.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
-
-from .skill_measure import skill_description
 
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _KEY_RE = r"^(\s*){key}:\s*(.*?)\s*$"
@@ -27,6 +27,39 @@ MIN_SHRINK = 0.4
 MAX_GROWTH = 3
 GROWTH_SLACK = 2000
 MAX_DESCRIPTION = 1024  # Claude Code's skill description cap
+WIDEN_CAP = 400  # a widen keeps a description under this length unless it already was longer
+WIDEN_MAX_GROWTH = 160  # and adds at most this many characters
+
+
+class DraftProblem(ValueError):
+    """A drafted SKILL.md that can't be offered; the message says why. The nightly pass
+    stores it on the candidate, and the review shows it."""
+
+
+def skill_description(text: str) -> str:
+    """Parse the frontmatter `description`, handling YAML block scalars (`>` / `|`),
+    plain, and quoted forms. The naive `^description:\\s*(.+)$` grabbed just ">" for
+    multi-line block-scalar descriptions — which silently fed the judge garbage."""
+    m = re.search(r"^---\s*\n(.*?)\n---", text, re.DOTALL)
+    if not m:
+        return ""
+    lines = m.group(1).split("\n")
+    for i, line in enumerate(lines):
+        dm = re.match(r"^(\s*)description:\s*(.*)$", line)
+        if not dm:
+            continue
+        base_indent, val = len(dm.group(1)), dm.group(2).strip()
+        if val[:1] in ("|", ">"):  # block scalar — collect more-indented following lines
+            collected = []
+            for nxt in lines[i + 1 :]:
+                if not nxt.strip():
+                    continue
+                if len(nxt) - len(nxt.lstrip()) <= base_indent:
+                    break  # dedent = next key
+                collected.append(nxt.strip())
+            return " ".join(collected).strip()
+        return val.strip("\"'")
+    return ""
 
 
 def body_hash(body: str | None) -> str | None:
@@ -158,17 +191,43 @@ def only_description_changed(old: str, new: str) -> bool:
     return skill_description(old) != skill_description(new)
 
 
-def widen_draft(old: str, new_description: str) -> str | None:
-    """The widen draft: `old` with only its description replaced, verified. None when the
-    splice can't be made, didn't round-trip, or touched anything else."""
+def widen_limit(old_description: str) -> int:
+    """The longest a widened description may be. Claude Code lists every served skill's
+    description in every session's context, so each widen is paid for by every session on every
+    machine: it adds at most WIDEN_MAX_GROWTH characters, may not take a description past
+    WIDEN_CAP, and one that is already longer may not grow (the drafter is asked to compress)."""
+    n = len(old_description)
+    return min(n + WIDEN_MAX_GROWTH, max(n, WIDEN_CAP))
+
+
+def widen_draft(old: str, new_description: str) -> str:
+    """The widen draft: `old` with only its description replaced, verified. Raises
+    DraftProblem when the splice can't be made, didn't round-trip, or touched anything else."""
     new_description = (new_description or "").strip()
-    if not new_description or len(new_description) > MAX_DESCRIPTION:
-        return None
+    if not new_description:
+        raise DraftProblem("the model returned an empty description")
+    if len(new_description) > MAX_DESCRIPTION:
+        raise DraftProblem(
+            f"the new description is {len(new_description)} chars, over Claude Code's "
+            f"{MAX_DESCRIPTION}"
+        )
+    was = skill_description(old)
+    if len(new_description) > widen_limit(was):
+        raise DraftProblem(
+            f"the new description is {len(new_description)} chars; a widen of this "
+            f"{len(was)}-char description may be at most {widen_limit(was)}, because every "
+            "session carries the descriptions in its context"
+        )
     draft = replace_description(old, new_description)
-    if draft is None or not only_description_changed(old, draft):
-        return None
+    if draft is None:
+        raise DraftProblem(
+            "the new description can't be written in the skill's YAML style "
+            "(its quotes or special characters)"
+        )
+    if not only_description_changed(old, draft):
+        raise DraftProblem("splicing the description in changed more than the description")
     if skill_description(draft) != new_description:
-        return None
+        raise DraftProblem("the new description did not read back as written")
     return draft
 
 

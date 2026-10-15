@@ -68,7 +68,7 @@ def _client(db_url, resolve_trust=None):
 @pytest.fixture()
 def env(monkeypatch, conn, db_url):
     """Clean tables + a fully stubbed server (test DSN, fresh recall engine, slot embedder,
-    LLM confirm collapsed to 'same'). No network anywhere."""
+    LLM judge answering DUPLICATE). No network anywhere."""
     conn.execute("TRUNCATE episodes, extraction_queue RESTART IDENTITY CASCADE")
     conn.execute("DELETE FROM notes")
     conn.execute("DELETE FROM remember_intents")
@@ -77,7 +77,9 @@ def env(monkeypatch, conn, db_url):
     monkeypatch.setattr(server, "_recall_engine", Recall(db_url, ""))
     emb = _SlotEmb()  # ONE instance: a fresh one per call would re-slot every hook to 1
     monkeypatch.setattr(server, "_notes_deps", lambda: (emb, object()))
-    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
+    monkeypatch.setattr(
+        notes_mod, "parse_with_retry", lambda *a, **k: {"verdict": "DUPLICATE", "keep": None}
+    )
     yield conn
     conn.execute("DELETE FROM remember_intents")
 
@@ -208,6 +210,52 @@ def test_a_pending_claim_is_re_run_not_abandoned(env, db_url):
     assert env.execute(
         "SELECT status FROM remember_intents WHERE intent_id = 'i-crashed'"
     ).fetchone()[0] == ("done")
+
+
+def test_a_crashed_write_is_re_run_on_the_episode_it_archived(env, db_url, monkeypatch):
+    """The first attempt archives the text and dies before the note is reconciled. The
+    ledger row already names the episode, so the re-run reconciles on it instead of
+    archiving and extracting the text a second time, even with no session_id to key on."""
+    real_deps = server._notes_deps
+
+    def _down():
+        raise RuntimeError("embedder down")
+
+    monkeypatch.setattr(server, "_notes_deps", _down)
+    with _client(db_url) as client:
+        r = client.post(_ROUTE, json=_payload("i-half"), headers=_H)
+        assert r.status_code == 500
+        (episode_id,) = env.execute(
+            "SELECT episode_id FROM remember_intents WHERE intent_id = 'i-half'"
+        ).fetchone()
+        assert episode_id is not None
+        assert env.execute("SELECT count(*) FROM notes").fetchone()[0] == 0
+
+        monkeypatch.setattr(server, "_notes_deps", real_deps)
+        out = client.post(_ROUTE, json=_payload("i-half"), headers=_H).json()
+
+    assert out["status"] == "ok" and out["outcome"] == "created"
+    assert out["episode_id"] == episode_id
+    assert env.execute("SELECT count(*) FROM episodes").fetchone()[0] == 1
+    assert env.execute("SELECT count(*) FROM extraction_queue").fetchone()[0] == 1
+    assert env.execute("SELECT source_ref FROM notes").fetchone()[0] == f"ep:{episode_id}"
+
+
+def test_a_replayed_write_converges_on_its_note_without_the_llm(env, db_url, monkeypatch):
+    """A crash AFTER the note landed: the re-run finds the identical text and updates it
+    in place, so an LLM outage cannot fork a second note."""
+    with _client(db_url) as client:
+        first = client.post(_ROUTE, json=_payload("i-once"), headers=_H).json()
+        env.execute("UPDATE remember_intents SET status = 'pending' WHERE intent_id = 'i-once'")
+
+        def _down(*a, **k):
+            raise RuntimeError("LLM down")
+
+        monkeypatch.setattr(notes_mod, "parse_with_retry", _down)
+        again = client.post(_ROUTE, json=_payload("i-once"), headers=_H).json()
+    assert again["outcome"] == "updated" and again["note_id"] == first["note_id"]
+    assert env.execute("SELECT count(*) FROM notes").fetchone()[0] == 1
+    assert env.execute("SELECT count(*) FROM episodes").fetchone()[0] == 1
 
 
 def test_distinct_intents_both_land(env, db_url):

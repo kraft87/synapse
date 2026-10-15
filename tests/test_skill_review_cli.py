@@ -3,7 +3,7 @@
 No DB, no network: config.post_json is stubbed with canned server replies. Guards what the
 reviewer sees and sends: show renders a unified diff against the registry body (the full
 body for a new skill), accept forwards --body-file/--scope/--force and syncs this machine
-right away when it is the destination, refusals exit non-zero, promote is a no-op.
+right away when it is the destination, refusals exit non-zero.
 All skills are synthetic.
 """
 
@@ -111,6 +111,25 @@ def test_show_without_a_draft_and_with_warnings(server, capsys):
     assert "--- registry/" not in out
 
 
+@pytest.mark.parametrize(
+    "attempts, said",
+    [(2, "failed (2 attempts, retried"), (1, "failed (1 attempt, retried"), (None, "(1 attempt,")],
+)
+def test_show_says_why_the_nightly_draft_failed(server, capsys, attempts, said):
+    reason = "the model's reply had no description"
+    server.replies["/skills/proposals"] = _detail(
+        proposal_body=None,
+        apply_issues=[{"code": "no_draft", "detail": "no draft yet", "force": False}],
+        draft_attempts=attempts,
+        last_draft_error=reason,
+    )
+    skill_review.cmd_show(7)
+    out = capsys.readouterr().out
+    assert said in out and reason in out
+    assert "accept --body-file, or reject" in out
+    assert "re-drafts on the next nightly run" not in out
+
+
 def test_accept_forwards_body_file_scope_and_force(server, tmp_path, capsys):
     f = tmp_path / "SKILL.md"
     f.write_text(V2, encoding="utf-8")
@@ -187,14 +206,3 @@ def test_accept_refusal_exits_nonzero_with_the_reason(server):
     with pytest.raises(SystemExit) as e:
         skill_review.cmd_accept(7, None, None, False)
     assert "refusing [7]: no draft yet" in str(e.value.code)
-
-
-def test_promote_is_a_noop(server, capsys):
-    server.replies["/skills/proposals/act"] = {
-        "status": "promoted",
-        "noop": True,
-        "detail": "[7] demo-backup was applied at accept; nothing to promote",
-    }
-    skill_review.cmd_promote(7)
-    assert server.sent == [("/skills/proposals/act", {"id": 7, "action": "promote"})]
-    assert "applied at accept" in capsys.readouterr().out

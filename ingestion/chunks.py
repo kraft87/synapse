@@ -63,10 +63,13 @@ def rebuild_chunks(
         end_seq = window[-1]["sequence"]
         if (start_seq, end_seq) in existing:
             continue
-        content = "\n\n---\n\n".join(ep["content"] for ep in window if ep.get("content"))
+        # A remember() archive episode is already a note, and the turn that prompted it is
+        # in the window anyway: chunking it would extract the same statement again.
+        turns = [ep for ep in window if ep.get("source") != "manual"]
+        content = "\n\n---\n\n".join(ep["content"] for ep in turns if ep.get("content"))
         if not content.strip():
             continue
-        episode_ids = [ep["id"] for ep in window]
+        episode_ids = [ep["id"] for ep in turns]
         db.upsert_chunk(
             session_id=session_id,
             start_sequence=start_seq,
