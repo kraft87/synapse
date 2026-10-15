@@ -4,10 +4,10 @@ Ingest a research brief as a first-class web_artifact (task #68, Phase 2).
 
 A brief (run-research output, or any deliberately-written markdown doc) is the
 highest-quality extraction substrate in the web lane: multi-source, synthesized,
-zero chrome. This script only inserts the kind='research_brief' row. Chunking,
-contextualizing and embedding it is the out-of-repo web-capture cron's job (see
-ingestion/web_artifacts.py); once its chunks are contextualized and embedded,
-ingestion.web_enqueue queues them for KG extraction like a scrape's.
+zero chrome. This script only inserts the kind='research_brief' row. The poller's
+maintenance thread chunks, contextualizes and embeds it; the row is marked
+kg_extract=true, so once its chunks are embedded ingestion.web_enqueue queues them for KG
+extraction.
 
 Idempotent via tool_use_id = 'brief:<slug>:<YYYY-MM-DD>' (UNIQUE).
 
@@ -78,10 +78,10 @@ def main() -> int:
             """
             INSERT INTO web_artifacts
                 (kind, tool_name, tool_use_id, url, url_canonical, content_hash,
-                 title, content_markdown, synthesized, fetched_at, raw_chars)
+                 title, content_markdown, synthesized, fetched_at, raw_chars, metadata)
             VALUES
                 ('research_brief', 'run-research', %s, %s, %s, %s,
-                 %s, %s, true, %s, %s)
+                 %s, %s, true, %s, %s, '{"capture": "research_brief", "kg_extract": true}')
             ON CONFLICT (tool_use_id) DO NOTHING
             RETURNING id
             """,

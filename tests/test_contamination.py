@@ -101,6 +101,17 @@ def test_every_prompt_in_ingestion_is_a_harness_call():
         assert is_harness_call("[user] " + template), name
 
 
+def test_the_web_context_prompt_is_a_harness_call_once_rendered():
+    from ingestion.web_context import PROMPT
+
+    rendered = PROMPT.format(
+        document="# Page\n\nbody", n_chunks=2, chunks_section="[0]\na\n\n[1]\nb"
+    )
+    assert is_harness_call("[user] " + rendered)
+    # a dev conversation that pastes a <document> is not one
+    assert not is_harness_call("[user] <document>\nmy notes\n</document>\nwhat do you think?")
+
+
 def test_prompts_built_from_messages_are_harness_calls_too():
     """The edge-date and node-dedup prompts lead with a system message, which the CLI
     path prepends to the user turn."""

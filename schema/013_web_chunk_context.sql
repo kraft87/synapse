@@ -6,7 +6,7 @@
 -- query, retrieval recall improves materially per Anthropic's measurements
 -- (49% recall-failure reduction alone, 67% with rerank).
 --
--- Filled by scripts/contextualize_web_chunks.py via a Haiku call per parent
+-- Filled by the poller (ingestion/web_context.py) via a Haiku call per parent
 -- artifact (all chunks contextualized in one prompt to amortize doc tokens).
 -- Empty string means "trivial doc" (single-chunk page, no context needed).
 -- NULL means "not yet contextualized".

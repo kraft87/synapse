@@ -301,10 +301,11 @@ class _Backlog:
     """Stands in for Database: the unembedded rows, handed out newest first like the real
     query, and gone once ``set_embeddings`` stores them."""
 
-    def __init__(self, episodes: int, chunks: int) -> None:
+    def __init__(self, episodes: int, chunks: int, web_chunks: int = 0) -> None:
         self.rows = {
             "episodes": [{"id": i, "content": f"ep {i}"} for i in range(episodes, 0, -1)],
             "chunks": [{"id": i, "content": f"chunk {i}"} for i in range(chunks, 0, -1)],
+            "web_chunks": [{"id": i, "content": f"web {i}"} for i in range(web_chunks, 0, -1)],
         }
         self.stored: list[tuple[str, list[int]]] = []
 
@@ -313,6 +314,9 @@ class _Backlog:
 
     def get_unembedded_chunks(self, limit):
         return list(self.rows["chunks"][:limit])
+
+    def get_unembedded_web_chunks(self, limit):
+        return list(self.rows["web_chunks"][:limit])
 
     def set_embeddings(self, table, pairs):
         done = {i for i, _ in pairs}
@@ -329,14 +333,16 @@ def _embedding_maintenance(backlog: _Backlog) -> Maintenance:
 
 
 def test_embed_pending_works_through_the_whole_backlog_in_one_cycle():
-    backlog = _Backlog(episodes=7, chunks=3)
-    assert _embedding_maintenance(backlog).embed_pending(batch_size=3) == 10
-    # newest first, one statement per batch, episodes before chunks
+    backlog = _Backlog(episodes=7, chunks=3, web_chunks=4)
+    assert _embedding_maintenance(backlog).embed_pending(batch_size=3) == 14
+    # newest first, one statement per batch, episodes, then chunks, then web chunks
     assert backlog.stored == [
         ("episodes", [7, 6, 5]),
         ("episodes", [4, 3, 2]),
         ("episodes", [1]),
         ("chunks", [3, 2, 1]),
+        ("web_chunks", [4, 3, 2]),
+        ("web_chunks", [1]),
     ]
 
 
@@ -347,7 +353,7 @@ def test_embed_pending_stops_at_its_time_budget():
 
 
 def test_embed_pending_with_nothing_pending_does_nothing():
-    backlog = _Backlog(episodes=0, chunks=0)
+    backlog = _Backlog(episodes=0, chunks=0, web_chunks=0)
     assert _embedding_maintenance(backlog).embed_pending() == 0
     assert backlog.stored == []
 

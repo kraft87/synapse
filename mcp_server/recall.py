@@ -4,7 +4,7 @@ What recall() serves:
   1. Episodes  — passages of the best-matching user-turn exchanges, from a wide-pool rerank
   2. KG facts  — relationship edges (kg_relationships), with their superseded predecessors
   3. Notes     — the curated notes store, by hook similarity (a rerank floor gates the bucket)
-  4. Web       — captured web chunks (out-of-repo cron), gated the same way
+  4. Web       — captured web chunks (ingestion.capture), gated the same way
 
 Search strategy:
   - BM25 (ParadeDB) + ANN cosine over episodes, fused with RRF

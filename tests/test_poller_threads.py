@@ -89,6 +89,18 @@ class _Stack:
     def get_unembedded_chunks(self, limit: int) -> list[dict]:
         return []
 
+    def get_unembedded_web_chunks(self, limit: int) -> list[dict]:
+        return []
+
+    def artifacts_without_chunks(self, limit: int) -> list[dict]:
+        return []
+
+    def artifacts_to_contextualize(self, limit: int) -> list[dict]:
+        return []
+
+    def enqueue_web_extraction(self) -> int:
+        return 0
+
     def set_embeddings(self, table: str, pairs: list) -> None:
         with self._lock:
             self.backlog -= len(pairs)

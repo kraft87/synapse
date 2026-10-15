@@ -80,7 +80,7 @@ def _mk_artifact(
     tool_use_id: str,
     content_hash: str | None = None,
     kind="web_scrape",
-    metadata: str | None = None,
+    metadata: str | None = '{"capture": "rule", "kg_extract": true}',
 ):
     row = conn.execute(
         """
@@ -170,30 +170,20 @@ class TestEnqueue:
         _mk_chunk(conn, aid, 0, PROSE)
         assert enqueue_web_chunks(conn).enqueued == 1
 
-    def test_since_excludes_older_artifacts(self, conn, web_tables):
-        # fixture artifacts are fetched_at 2026-06-01
-        aid = _mk_artifact(conn, tool_use_id="t1")
-        _mk_chunk(conn, aid, 0, PROSE)
-        cutoff = datetime(2026, 6, 5, tzinfo=UTC)
-        assert enqueue_web_chunks(conn, since=cutoff).candidates == 0
-        assert enqueue_web_chunks(conn).enqueued == 1
-
-    def test_only_artifacts_not_marked_against_extraction_are_enqueued(self, conn, web_tables):
-        # A generic capture says kg_extract=false; a trusted source says true; an older row
-        # has no mark and was always extracted.
+    def test_only_artifacts_marked_for_extraction_are_enqueued(self, conn, web_tables):
+        # A generic capture says kg_extract=false and a trusted source true; a row with no mark
+        # (the backlog from before capture) is not extracted, so the poller's stage does not
+        # spend on old pages the day it ships.
         for tid, meta in (
             ("generic", '{"capture": "generic", "kg_extract": false}'),
             ("trusted", '{"capture": "rule", "kg_extract": true}'),
             ("legacy", None),
         ):
             _mk_chunk(conn, _mk_artifact(conn, tool_use_id=tid, metadata=meta), 0, PROSE)
-        assert enqueue_web_chunks(conn).enqueued == 2
+        assert enqueue_web_chunks(conn).enqueued == 1
         queued = conn.execute(
             "SELECT a.tool_use_id FROM extraction_queue q "
             "JOIN web_chunks c ON c.id = q.web_chunk_id "
             "JOIN web_artifacts a ON a.id = c.web_artifact_id ORDER BY a.id"
         ).fetchall()
-        assert [r["tool_use_id"] if isinstance(r, dict) else r[0] for r in queued] == [
-            "trusted",
-            "legacy",
-        ]
+        assert [r["tool_use_id"] if isinstance(r, dict) else r[0] for r in queued] == ["trusted"]

@@ -109,7 +109,7 @@ class RecallConfig:
         default_factory=_env_float("SYNAPSE_SUPERSEDE_LINK_MAX_DIST", 0.35)
     )
 
-    # --- Web (fed by the out-of-repo capture cron) ------------------------------------------
+    # --- Web (fed by server-side capture) ------------------------------------------
     # Fused BM25 + vector pool, cross-encoder rerank, then an absolute floor with NO keep-one
     # backstop: the bucket may serve zero, which self-gates web on intent. 0.60 was calibrated
     # on rerank-2.5-lite (all 41 noise ids scored <= 0.559, the one helpful id 0.914; n_helpful

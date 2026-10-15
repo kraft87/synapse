@@ -1,4 +1,4 @@
-"""RecallWebMixin operations: the web bucket, fed by the out-of-repo capture cron."""
+"""RecallWebMixin operations: the web bucket, fed by server-side capture (ingestion.capture)."""
 
 from __future__ import annotations
 

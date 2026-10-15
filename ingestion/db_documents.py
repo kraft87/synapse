@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal, cast
 
 import orjson
 
 from ingestion.db_connection import DatabaseConnection
+from ingestion.web_chunker import Chunk
 
 
 def _episode_ids(raw: Any) -> list[int]:
@@ -67,7 +69,9 @@ class DocumentStore(DatabaseConnection):
         return cast(list[dict[str, Any]], result)
 
     def set_embeddings(
-        self, table: Literal["episodes", "chunks"], rows: list[tuple[int, list[float]]]
+        self,
+        table: Literal["episodes", "chunks", "web_chunks"],
+        rows: list[tuple[int, list[float]]],
     ) -> None:
         """Store ``(id, vector)`` pairs on ``table`` in one statement and one commit."""
         if not rows:
@@ -76,7 +80,7 @@ class DocumentStore(DatabaseConnection):
         vectors = ["[" + ",".join(map(str, v)) + "]" for _, v in rows]
         with self._conn() as conn:
             conn.execute(
-                f"UPDATE {table} t SET embedding = v.e::vector, is_embedded = TRUE "  # nosec B608 — table is one of two literals
+                f"UPDATE {table} t SET embedding = v.e::vector, is_embedded = TRUE "  # nosec B608 — table is one of three literals
                 "FROM unnest(%s::bigint[], %s::text[]) AS v(id, e) WHERE t.id = v.id",
                 (ids, vectors),
             )
@@ -224,3 +228,103 @@ class DocumentStore(DatabaseConnection):
                 (web_chunk_id,),
             ).fetchone()
         return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Web chunks: captured pages (web_artifacts) -> chunks -> context -> vectors
+    # ------------------------------------------------------------------
+
+    def artifacts_without_chunks(self, limit: int) -> list[dict[str, Any]]:
+        """Captured pages not chunked yet, oldest first (id, content_markdown, fetched_at)."""
+        with self._conn() as conn:
+            result = conn.execute(
+                """
+                SELECT a.id, a.content_markdown, a.fetched_at
+                FROM web_artifacts a
+                WHERE a.kind IN ('web_scrape', 'research_brief')
+                  AND a.content_markdown IS NOT NULL AND a.content_markdown <> ''
+                  AND NOT EXISTS (SELECT 1 FROM web_chunks c WHERE c.web_artifact_id = a.id)
+                ORDER BY a.id LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return cast(list[dict[str, Any]], result)
+
+    def insert_web_chunks(self, artifact_id: int, fetched_at: datetime, chunks: list[Chunk]) -> int:
+        """Store a page's chunks (unembedded, no context prefix yet); a chunk already stored
+        under the same (artifact, idx) is left alone. ``content_ts`` is the page's fetch time."""
+        if not chunks:
+            return 0
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO web_chunks "
+                "(web_artifact_id, idx, content, char_start, char_end, content_ts) "
+                "VALUES (%s, %s, %s, %s, %s, %s) "
+                "ON CONFLICT (web_artifact_id, idx) DO NOTHING",
+                [
+                    (artifact_id, c.idx, c.content, c.char_start, c.char_end, fetched_at)
+                    for c in chunks
+                ],
+            )
+        return len(chunks)
+
+    def artifacts_to_contextualize(self, limit: int) -> list[dict[str, Any]]:
+        """Pages with a chunk that has no context prefix yet, oldest first (id, content_markdown)."""
+        with self._conn() as conn:
+            result = conn.execute(
+                """
+                SELECT a.id, a.content_markdown
+                FROM web_artifacts a
+                WHERE a.kind IN ('web_scrape', 'research_brief')
+                  AND a.content_markdown IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM web_chunks c
+                      WHERE c.web_artifact_id = a.id AND c.context_prefix IS NULL
+                  )
+                ORDER BY a.id LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return cast(list[dict[str, Any]], result)
+
+    def get_web_chunks(self, artifact_id: int) -> list[dict[str, Any]]:
+        """A page's chunks in order (id, idx, content)."""
+        with self._conn() as conn:
+            result = conn.execute(
+                "SELECT id, idx, content FROM web_chunks WHERE web_artifact_id = %s ORDER BY idx",
+                (artifact_id,),
+            ).fetchall()
+        return cast(list[dict[str, Any]], result)
+
+    def set_web_chunk_contexts(self, rows: list[tuple[int, str]]) -> None:
+        """Store ``(chunk id, context prefix)`` pairs ('' is "no context") and mark the chunks
+        for (re-)embedding: a vector is of the prefix and the chunk together."""
+        if not rows:
+            return
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE web_chunks c SET context_prefix = v.prefix, is_embedded = FALSE "
+                "FROM unnest(%s::bigint[], %s::text[]) AS v(id, prefix) WHERE c.id = v.id",
+                ([i for i, _ in rows], [p for _, p in rows]),
+            )
+
+    def get_unembedded_web_chunks(self, limit: int) -> list[dict[str, Any]]:
+        """Web chunks ready for a vector, newest first: ``content`` is the context prefix
+        and the chunk. A chunk still waiting for its prefix is not ready."""
+        with self._conn() as conn:
+            result = conn.execute(
+                "SELECT id, "
+                "CASE WHEN context_prefix = '' THEN content "
+                "ELSE context_prefix || E'\\n\\n' || content END AS content "
+                "FROM web_chunks WHERE NOT is_embedded AND context_prefix IS NOT NULL "
+                "ORDER BY id DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+        return cast(list[dict[str, Any]], result)
+
+    def enqueue_web_extraction(self) -> int:
+        """Queue the embedded chunks of pages marked for KG extraction (see
+        ``ingestion.web_enqueue``). Returns the number queued."""
+        from ingestion.web_enqueue import enqueue_web_chunks
+
+        with self._conn() as conn:
+            return enqueue_web_chunks(conn).enqueued

@@ -1,8 +1,10 @@
 """The poller process: the work after ingest, on two threads.
 
 Episodes arrive via the ``/ingest`` push hook (``mcp_server.server``), not a Logfire poll.
-The MAINTENANCE thread builds chunks, embeds, and runs the sweeps; the EXTRACTION thread
-drains the extraction queue to populate the Postgres KG (facts are extracted from chunks).
+The MAINTENANCE thread builds chunks, embeds, and runs the sweeps, and carries captured web
+pages (``ingestion.capture``) through chunking, context prefixes and embedding to recall; the
+EXTRACTION thread drains the extraction queue to populate the Postgres KG (facts are extracted
+from chunks).
 Neither waits for the other: a backlog of extraction batches never delays embedding, and a
 quota backoff pauses only extraction."""
 
@@ -22,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from ingestion.db import Database
 from ingestion.models import ExtractionItem
+from ingestion.web_chunker import chunk_markdown
+from ingestion.web_context import contextualize_pending
 
 if TYPE_CHECKING:
     from ingestion.extractor import ExtractionPipeline
@@ -55,6 +59,8 @@ _ORPHAN_MIN_AGE_H = 24
 # extraction_queue.priority of catch-up work; new ingest is 0 (lower drains first).
 _CATCH_UP_PRIORITY = 10
 _QUEUE_TEXT_KEEP_DAYS = 7
+# Captured pages one cycle chunks.
+_WEB_PAGES_PER_CYCLE = 200
 
 
 class Maintenance:
@@ -65,6 +71,7 @@ class Maintenance:
     def __init__(self, db: Database, pipeline: ExtractionPipeline) -> None:
         self._db = db
         self._pipeline = pipeline
+        self._llm: Any = None  # built on first use: only the web context step needs one
 
     def sweep_orphan_entities(self) -> int:
         """Delete KG entities no edge references (see KGClient.delete_orphan_entities)."""
@@ -90,8 +97,9 @@ class Maintenance:
         return released
 
     def embed_pending(self, batch_size: int = 500, budget_s: float = 60.0) -> int:
-        """Embed unembedded episodes, then chunks, until nothing is pending or ``budget_s``
-        is spent. Returns the number embedded.
+        """Embed unembedded episodes, then chunks, then web chunks (once they have their
+        context prefix), until nothing is pending or ``budget_s`` is spent. Returns the
+        number embedded.
 
         The embedder packs requests by tokens, so ``batch_size`` only bounds the rows one
         UPDATE carries. Looping, rather than one small batch per cycle, is what lets a
@@ -102,10 +110,14 @@ class Maintenance:
         deadline = time.monotonic() + budget_s
         total = 0
         sources: tuple[
-            tuple[Literal["episodes", "chunks"], Callable[[int], list[dict[str, Any]]]], ...
+            tuple[
+                Literal["episodes", "chunks", "web_chunks"], Callable[[int], list[dict[str, Any]]]
+            ],
+            ...,
         ] = (
             ("episodes", self._db.get_unembedded_episodes),
             ("chunks", self._db.get_unembedded_chunks),
+            ("web_chunks", self._db.get_unembedded_web_chunks),
         )
         for table, fetch in sources:
             while time.monotonic() < deadline and (rows := fetch(batch_size)):
@@ -169,6 +181,37 @@ class Maintenance:
             )
         return total
 
+    def chunk_web_artifacts(self) -> int:
+        """Chunk the captured web pages that have no chunks yet. Returns the chunks built.
+
+        A page enters recall here, in its own good time: chunks, then
+        :meth:`contextualize_web_chunks`, then :meth:`embed_pending`. (Pages come from
+        ``ingestion.capture``; result lists have no body and are not chunked.)"""
+        built = 0
+        for page in self._db.artifacts_without_chunks(_WEB_PAGES_PER_CYCLE):
+            chunks = chunk_markdown(page["content_markdown"])
+            built += self._db.insert_web_chunks(page["id"], page["fetched_at"], chunks)
+        if built:
+            logger.info("Built %d web chunk(s)", built)
+        return built
+
+    def contextualize_web_chunks(self) -> int:
+        """Give the new web chunks their context prefix (``ingestion.web_context``), a few
+        pages a cycle. Returns the chunks done."""
+        from ingestion.llm_client import create_llm_client, stage_model
+
+        if not self._db.artifacts_to_contextualize(1):
+            return 0
+        if self._llm is None:
+            self._llm = create_llm_client()
+        return contextualize_pending(self._db, self._llm, stage_model("CONTEXTUALIZE"))
+
+    def enqueue_web_extraction(self) -> int:
+        """Queue the embedded chunks of pages marked for KG extraction (a capture rule that
+        trusts its source says ``kg_extract``; generic captures are searchable only).
+        Returns the number queued."""
+        return self._db.enqueue_web_extraction()
+
     def run(self, stop: threading.Event, interval_seconds: int) -> None:
         """Run a cycle every ``interval_seconds`` until ``stop`` is set.
 
@@ -200,7 +243,10 @@ class Maintenance:
         backlog grows unbounded). (2026-05-18.)"""
         stages: list[tuple[str, Callable[[], int]]] = [
             ("Chunk rebuild", self.rebuild_pending_chunks),
+            ("Web chunking", self.chunk_web_artifacts),
+            ("Web context", self.contextualize_web_chunks),
             ("Embed pending", self.embed_pending),
+            ("Web extraction enqueue", self.enqueue_web_extraction),
             ("Stale-claim sweep", self.release_stale_claims),
         ]
         if daily:

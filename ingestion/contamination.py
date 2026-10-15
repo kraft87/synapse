@@ -112,6 +112,7 @@ def _prompt_heads() -> tuple[str, ...]:
     from ingestion.preferences_gate import CONFIRM_PROMPT, GATE_PROMPT
     from ingestion.prompts import dedupe_nodes, extract_edge_dates
     from ingestion.timeline_gate import TIMELINE_DEDUP_PROMPT, gate_prompt
+    from ingestion.web_context import PROMPT as CONTEXTUALIZE_PROMPT
 
     texts = (
         _EXTRACTION_PROMPT,
@@ -122,6 +123,7 @@ def _prompt_heads() -> tuple[str, ...]:
         CONFIRM_PROMPT,
         gate_prompt(),
         TIMELINE_DEDUP_PROMPT,
+        CONTEXTUALIZE_PROMPT,
         dedupe_nodes.build_batch_prompt([])[0]["content"],
         extract_edge_dates.build_batch_prompt([], "")[0]["content"],
     )
