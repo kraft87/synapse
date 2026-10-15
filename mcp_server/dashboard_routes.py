@@ -2071,10 +2071,9 @@ def _behavior_files(db_url: str) -> dict[str, Any]:
 
 
 def _behavior_file(db_url: str, key: str, scope: str, surface: str | None) -> dict[str, Any] | None:
-    """One mirrored file's content + meta + parsed [[wikilinks]]. Mirrors config_sync_routes'
-    _fetch_config; when `surface` is omitted, the most-recently-updated surface for that
-    (scope, file_key) is served. No history — the registry keeps only the current version
-    (contract §Phase 5)."""
+    """One mirrored file's content + meta + parsed [[wikilinks]]. When `surface` is omitted,
+    the most-recently-updated surface for that (scope, file_key) is served. No history — the
+    registry keeps only the current version (contract §Phase 5)."""
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         cols = (
             "surface_id, scope, file_key, abs_path, content, content_hash, modified_at, updated_at"
