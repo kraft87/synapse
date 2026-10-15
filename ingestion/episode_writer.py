@@ -120,7 +120,6 @@ def store_episodes(
                     ExtractionItem(
                         episode_id=episode_id,
                         session_id=ep.session_id,
-                        content=ep.content,
                         content_type="episode",
                         project=ep.project,
                     )

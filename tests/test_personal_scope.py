@@ -112,8 +112,7 @@ def _pipeline():
     embedder = MagicMock()
     embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
     db = MagicMock()
-    db.get_session_episodes.return_value = []
-    db.get_synth_document_source_ids.return_value = []
+    db.get_chunk_episode_ids.return_value = [1]
     kg = MagicMock()
     kg.find_similar_nodes.return_value = []
     return ExtractionPipeline(db=db, llm_client=MagicMock(), embedder=embedder, kg_client=kg)
@@ -143,7 +142,7 @@ def _run_item(pipe, project: str):
 
     pipe.process_item(
         {
-            "content_type": "summary",
+            "content_type": "chunk",
             "content": "booked the dentist appointment",
             "project": project,
             "session_id": "s1",

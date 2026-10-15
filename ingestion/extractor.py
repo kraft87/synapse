@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 from ingestion.models import (
     ExtractedEntity,
     ExtractedFact,
-    ExtractionResult,
 )
 from ingestion.scope import active_groups
 
@@ -101,56 +99,62 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         a sign of borderline content the regex misclassified).
         """
         content_type: str = item["content_type"]
-        content: str = item["content"]
         project: str | None = item.get("project")
         session_id: str | None = item.get("session_id")
         default_group = _default_group_for_project(project)
         web_provenance: dict[str, Any] | None = None
 
-        # Segment date (conversation time, NOT ingest wall-clock) = the source
-        # episodes' latest created_at. Resolved up-front, BEFORE Stage 3, so the
-        # extraction prompt can anchor in-text date mentions against it; reused below
-        # as the edge backlink and the default fact valid-time. Drill-back: the turn's
-        # own id for episodes, else the segment's source episodes.
+        # What the item extracts is read from the row it names: the queue stores no text
+        # for an episode, a remember() note or (once the chunk_id migration is applied) a
+        # chunk, so a turn deleted since it was queued is gone here too. Drill-back: the
+        # turn's own id for an episode or note, the window's source episodes for a chunk.
         episode_ids: list[int] = []
+        content: str = item["content"]
         if item.get("episode_id"):
             episode_ids = [item["episode_id"]]
-        elif content_type == "summary" and session_id:
-            # Summaries -> the synth_document's source_ids so edges trace back to the
-            # episodes they were derived from.
-            episode_ids = self._db.get_synth_document_source_ids(session_id, content)
-        elif content_type == "chunk" and session_id:
-            # Chunks -> the window the chunk was built from (task #63). A database error
-            # fails the item (the queue retries it): swallowing it wrote edges with no
-            # provenance and t_valid=now.
-            episode_ids = self._db.get_chunk_episode_ids(session_id, content)
-        # Episodes emit no facts and skip Stage 3, so their segment date is never
-        # consumed — skip the lookup for them to keep the per-turn hot path lean.
-        segment_valid_at = (
-            self._db.get_episodes_valid_at(episode_ids)
-            if (episode_ids and content_type != "episode")
-            else None
-        )
+            episode_text = self._db.get_episode_content(item["episode_id"])
+            if episode_text is None:
+                logger.info(
+                    "queue item %s: its episode is gone; nothing to extract", item.get("id")
+                )
+                return
+            content = episode_text
+        elif content_type == "chunk":
+            # A database error fails the item (the queue retries it): swallowing it wrote
+            # edges with no provenance and t_valid=now.
+            if item.get("chunk_id"):
+                chunk = self._db.get_chunk(item["chunk_id"])
+                if chunk is not None:
+                    content, episode_ids = chunk["content"], chunk["episode_ids"]
+            elif session_id:
+                # A row enqueued before the chunk_id column carries the chunk's text.
+                episode_ids = self._db.get_chunk_episode_ids(session_id, content)
+            if not episode_ids:
+                # Deleted with its episodes, or rebuilt: its facts would have no provenance.
+                logger.info("queue item %s: its chunk is gone; nothing to extract", item.get("id"))
+                return
+        item = {**item, "content": content}
+
+        # Per-turn gates ride the episode item (a chunk spans turns and would blur an
+        # event's date or a preference's author). They emit no KG facts, so there is
+        # nothing else to do for the turn.
+        if content_type == "episode":
+            self._timeline_gate.process(item)
+            self._preferences_gate.process(item)
+            return
+
+        # Segment date (conversation time, NOT ingest wall-clock) = the source episodes'
+        # latest created_at. Resolved BEFORE Stage 3, so the extraction prompt can anchor
+        # in-text date mentions against it; reused below as the default fact valid-time.
+        segment_valid_at = self._db.get_episodes_valid_at(episode_ids) if episode_ids else None
         # The user's calendar day, not the UTC one: a turn at 20:30 EDT is stored as
         # 00:30 UTC the next day.
         session_date = local_date(segment_valid_at) if segment_valid_at else None
 
-        # Stage 2: deterministic extraction
-        if content_type == "episode":
-            episodes = [{"content": content, "metadata": json.loads(item.get("metadata") or "{}")}]
-            det_entities = self._stage2_deterministic(episodes)
-            llm_result = ExtractionResult(entities=[], facts=[])
-            # Timeline chat gate rides the per-turn item (chunks span turns and
-            # would blur the event's date). Fail-soft; never blocks KG work.
-            self._timeline_gate.process(item)
-            # Preferences gate rides the same per-turn item (a preference is stated in
-            # one turn, not spread across a window). Fail-soft; never blocks KG work.
-            self._preferences_gate.process(item)
-        elif content_type == "chunk":
-            # Chunk = a 3-5 turn window (task #63). Deterministic entities come
-            # from the chunk's OWN text — not a full-session fetch per chunk —
-            # then full LLM extraction runs on the window. Edge backlink to the
-            # source episodes is resolved below via get_chunk_episode_ids.
+        # Stage 2: deterministic extraction, from the item's OWN text — not a full-session
+        # fetch per item — then full LLM extraction on it.
+        if content_type in ("chunk", "manual"):
+            # Chunk = a 3-5 turn window (task #63); manual = one remember() note.
             det_entities = self._stage2_deterministic([{"content": content, "metadata": {}}])
             llm_result = self._stage3_llm(content, det_entities, session_date)
         elif content_type == "web_chunk":
@@ -170,12 +174,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             det_entities = self._stage2_deterministic([{"content": content, "metadata": {}}])
             llm_result = self._llm.extract_web(content, det_entities, web_provenance)
         else:
-            # summary or manual — full pipeline
-            episodes_raw: list[dict[str, Any]] = []
-            if session_id:
-                episodes_raw = self._db.get_session_episodes(session_id)
-            det_entities = self._stage2_deterministic(episodes_raw)
-            llm_result = self._stage3_llm(content, det_entities, session_date)
+            raise ValueError(f"queue item {item.get('id')}: unknown content_type {content_type!r}")
 
         all_entities = det_entities + [
             e for e in llm_result.entities if e.name not in {x.name for x in det_entities}

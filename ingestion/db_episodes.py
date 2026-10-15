@@ -194,10 +194,22 @@ class EpisodeStore(DatabaseConnection):
             result = conn.execute("SELECT * FROM episodes WHERE id = %s", (episode_id,)).fetchone()
         return cast(dict[str, Any] | None, result)
 
+    def get_episode_content(self, episode_id: int) -> str | None:
+        """The text of one turn, or None when it is gone (deleted since it was queued)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT content FROM episodes WHERE id = %s", (episode_id,)
+            ).fetchone()
+        return None if row is None else cast(str, row["content"])
+
     def get_session_episodes(self, session_id: str) -> list[dict[str, Any]]:
+        """A session's turns in order, with the columns chunking reads. Not ``SELECT *``:
+        the vector alone is ~20KB of text per row, and a live session is read again every
+        few turns."""
         with self._conn() as conn:
             result = conn.execute(
-                "SELECT * FROM episodes WHERE session_id = %s ORDER BY sequence ASC",
+                "SELECT id, sequence, content, project, source, created_at FROM episodes "
+                "WHERE session_id = %s ORDER BY sequence ASC",
                 (session_id,),
             ).fetchall()
         return cast(list[dict[str, Any]], result)

@@ -317,8 +317,8 @@ def test_db_episode_after_8pm_edt_gets_local_session_date(db_url, clean_tables):
         pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=[], facts=[]))
         pipe.process_item(
             {
-                "content_type": "summary",
-                "content": "Got my first ride in finally.",
+                "content_type": "manual",
+                "content": "",
                 "project": None,
                 "session_id": "tz-repro",
                 "episode_id": ep_id,

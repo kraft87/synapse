@@ -1353,8 +1353,8 @@ class TestProcessItemOrphanPrefilter:
         embedder = MagicMock()
         embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
         db = MagicMock()
-        db.get_session_episodes.return_value = []
-        db.get_synth_document_source_ids.return_value = []
+        db.get_chunk_episode_ids.return_value = [11, 12]
+        db.get_episode_content.return_value = "ran a/b.py against https://x.test"
         return ExtractionPipeline(
             db=db,
             llm_client=MagicMock(),
@@ -1395,7 +1395,7 @@ class TestProcessItemOrphanPrefilter:
 
         pipe.process_item(
             {
-                "content_type": "summary",
+                "content_type": "chunk",
                 "content": "irrelevant",
                 "project": "synapse",
                 "session_id": "s1",
@@ -1405,28 +1405,113 @@ class TestProcessItemOrphanPrefilter:
         assert "noise/path.py" not in seen
         assert {"FalkorDB", "Synapse"} <= seen
 
-    def test_episode_with_no_facts_resolves_nothing(self):
-        # Episodes produce no LLM facts -> referenced set empty -> Stage 4 is
-        # never entered (previously it resolved every det entity then dropped
-        # them all as orphans).
-        pipe = self._pipeline()
-        pipe._stage2_deterministic = MagicMock(
-            return_value=[_entity("a/b.py"), _entity("https://x.test")]
-        )
-        pipe._stage4_resolve = MagicMock(return_value={})
-        pipe._stage5_write_nodes = MagicMock()
 
+# ---------------------------------------------------------------------------
+# process_item — what each kind of queue item extracts
+# ---------------------------------------------------------------------------
+
+
+class TestProcessItemSources:
+    """An item names its source row; the queue holds no text for an episode, a
+    remember() note or a chunk (once the chunk_id migration is applied). An episode runs
+    only the per-turn gates; a note and a chunk run Stage 2 on their OWN text."""
+
+    def _pipeline(self, **db_attrs):
+        db = MagicMock()
+        for name, value in db_attrs.items():
+            getattr(db, name).return_value = value
+        pipe = ExtractionPipeline(
+            db=db,
+            llm_client=MagicMock(),
+            embedder=MagicMock(),
+            kg_client=_mock_falkordb(similar_nodes=[]),
+        )
+        pipe._timeline_gate = MagicMock()
+        pipe._preferences_gate = MagicMock()
+        pipe._stage2_deterministic = MagicMock(return_value=[])
+        pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=[], facts=[]))
+        return pipe, db
+
+    def test_an_episode_item_runs_only_the_gates_on_the_episodes_text(self):
+        pipe, db = self._pipeline(get_episode_content="the turn's own text")
+        pipe.process_item(
+            {"id": 1, "content_type": "episode", "content": "", "episode_id": 7, "project": "p"}
+        )
+        db.get_episode_content.assert_called_once_with(7)
+        for gate in (pipe._timeline_gate, pipe._preferences_gate):
+            (item,) = (c.args[0] for c in gate.process.call_args_list)
+            assert item["content"] == "the turn's own text" and item["episode_id"] == 7
+        pipe._stage2_deterministic.assert_not_called()
+        pipe._stage3_llm.assert_not_called()
+
+    def test_an_episode_deleted_since_it_was_queued_is_finished_without_work(self):
+        pipe, _ = self._pipeline(get_episode_content=None)
+        pipe.process_item({"id": 1, "content_type": "episode", "content": "", "episode_id": 7})
+        pipe._timeline_gate.process.assert_not_called()
+        pipe._preferences_gate.process.assert_not_called()
+
+    def test_a_manual_note_extracts_its_own_text_not_the_whole_session(self):
+        pipe, db = self._pipeline(
+            get_episode_content="note text", get_episodes_valid_at="2026-09-01T10:00:00+00:00"
+        )
         pipe.process_item(
             {
-                "content_type": "episode",
-                "content": "ran a/b.py against https://x.test",
-                "project": "synapse",
-                "metadata": "{}",
+                "id": 2,
+                "content_type": "manual",
+                "content": "",
+                "episode_id": 9,
+                "session_id": "s1",
+                "project": "p",
             }
         )
+        pipe._stage2_deterministic.assert_called_once_with(
+            [{"content": "note text", "metadata": {}}]
+        )
+        assert pipe._stage3_llm.call_args.args[0] == "note text"
+        db.get_session_episodes.assert_not_called()
+        db.get_episodes_valid_at.assert_called_once_with([9])  # provenance: the note's episode
 
-        pipe._stage4_resolve.assert_not_called()
-        pipe._stage5_write_nodes.assert_not_called()
+    def test_a_chunk_item_reads_its_text_and_provenance_by_key(self):
+        pipe, db = self._pipeline(
+            get_chunk={"content": "window text", "episode_ids": [3, 4]},
+            get_episodes_valid_at="2026-09-01T10:00:00+00:00",
+        )
+        pipe.process_item(
+            {"id": 3, "content_type": "chunk", "content": "", "chunk_id": 5, "session_id": "s1"}
+        )
+        db.get_chunk.assert_called_once_with(5)
+        db.get_chunk_episode_ids.assert_not_called()
+        assert pipe._stage3_llm.call_args.args[0] == "window text"
+        db.get_episodes_valid_at.assert_called_once_with([3, 4])
+
+    def test_a_chunk_deleted_since_it_was_queued_is_finished_without_work(self):
+        pipe, _ = self._pipeline(get_chunk=None)
+        pipe.process_item(
+            {"id": 3, "content_type": "chunk", "content": "", "chunk_id": 5, "session_id": "s1"}
+        )
+        pipe._stage3_llm.assert_not_called()
+
+    def test_a_chunk_row_from_before_the_chunk_id_column_is_found_by_its_text(self):
+        pipe, db = self._pipeline(get_chunk_episode_ids=[3, 4])
+        pipe.process_item(
+            {"id": 3, "content_type": "chunk", "content": "old text", "session_id": "s1"}
+        )
+        db.get_chunk_episode_ids.assert_called_once_with("s1", "old text")
+        assert pipe._stage3_llm.call_args.args[0] == "old text"
+
+    def test_a_legacy_chunk_that_was_rebuilt_is_finished_without_work(self):
+        # Its text matches no chunk any more: extracting it would write facts with no
+        # source episodes and t_valid=now.
+        pipe, _ = self._pipeline(get_chunk_episode_ids=[])
+        pipe.process_item(
+            {"id": 3, "content_type": "chunk", "content": "old text", "session_id": "s1"}
+        )
+        pipe._stage3_llm.assert_not_called()
+
+    def test_an_unknown_content_type_is_an_error_not_a_silent_skip(self):
+        pipe, _ = self._pipeline()
+        with pytest.raises(ValueError, match="unknown content_type"):
+            pipe.process_item({"id": 4, "content_type": "summary", "content": "x"})
 
 
 # ---------------------------------------------------------------------------

@@ -157,11 +157,19 @@ class Episode(BaseModel):
 
 
 class ExtractionItem(BaseModel):
-    episode_id: int | None = None  # set for episode-type items
-    session_id: str | None = None  # set for summary-type items
-    content: str
-    content_type: str = "episode"  # episode | summary | manual
+    """What ``enqueue_extraction`` queues. An item names its source row instead of copying
+    it: ``episode_id`` for an episode or a remember() note, ``chunk_id`` for a chunk. The
+    worker reads the text from that row, so a deleted turn leaves no text in the queue.
+    ``content`` is only for a chunk on a database without the chunk_id column, where the
+    row is keyed by its text."""
+
+    episode_id: int | None = None  # episode and manual items
+    chunk_id: int | None = None  # chunk items
+    session_id: str | None = None
+    content: str = ""
+    content_type: str = "episode"  # episode | manual | chunk
     project: str | None = None
+    priority: int = 0  # lower drains first (extraction_queue.priority); catch-up work sorts last
 
 
 class ExtractedEntity(BaseModel):

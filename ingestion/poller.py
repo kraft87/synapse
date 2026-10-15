@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from ingestion.db import Database
 from ingestion.models import ExtractionItem
@@ -43,9 +43,13 @@ def _drain_concurrency() -> int:
 _HEARTBEAT = Path(tempfile.gettempdir()) / "poller.alive"
 
 # Daily, on the master replica's full cycle: entities with no edges are deleted once a day
-# old (KGClient.delete_orphan_entities). Drain-only replicas never sweep.
-_ORPHAN_SWEEP_INTERVAL_S = 24 * 3600
+# old (KGClient.delete_orphan_entities), and the text of finished queue rows is emptied.
+# Drain-only replicas never sweep.
+_DAILY_SWEEP_INTERVAL_S = 24 * 3600
 _ORPHAN_MIN_AGE_H = 24
+# extraction_queue.priority of catch-up work; new ingest is 0 (lower drains first).
+_CATCH_UP_PRIORITY = 10
+_QUEUE_TEXT_KEEP_DAYS = 7
 
 
 class Poller:
@@ -80,46 +84,40 @@ class Poller:
             return 0
         return int(self._extraction._kg.delete_orphan_entities(_ORPHAN_MIN_AGE_H))
 
-    def embed_pending(self, batch_size: int = 96) -> int:
-        """Embed unembedded episodes and chunks.
+    def sweep_finished_queue_text(self) -> int:
+        """Empty the text of extraction-queue rows finished a week ago (see
+        ``blank_finished_queue_text``)."""
+        return self._db.blank_finished_queue_text(_QUEUE_TEXT_KEEP_DAYS)
 
-        Returns total items embedded.
+    def embed_pending(self, batch_size: int = 500, budget_s: float = 60.0) -> int:
+        """Embed unembedded episodes, then chunks, until nothing is pending or ``budget_s``
+        is spent. Returns the number embedded.
+
+        The embedder packs requests by tokens, so ``batch_size`` only bounds the rows one
+        UPDATE carries. Looping, rather than one small batch per cycle, is what lets a
+        history import (tens of thousands of turns) get its vectors in hours instead of
+        weeks, while live turns (newest first) never wait behind it.
         """
         if self._extraction is None:
             return 0
 
         embedder = self._extraction._embedder
+        deadline = time.monotonic() + budget_s
         total = 0
-
-        episodes = self._db.get_unembedded_episodes(limit=batch_size)
-        if episodes:
-            texts = [e["content"] for e in episodes]
-            embeddings = embedder.embed(texts, task="document")
-            for ep, emb in zip(episodes, embeddings, strict=True):
-                self._db.set_episode_embedding(ep["id"], emb)
-            total += len(episodes)
-            logger.info("Embedded %d episodes", len(episodes))
-
-        # Chunks are ~4x longer than episodes — use smaller batch to stay under token limit
-        chunk_batch = max(1, batch_size // 4)
-        chunks = self._db.get_unembedded_chunks(limit=chunk_batch)
-        if chunks:
-            texts = [c["content"] for c in chunks]
-            embeddings = embedder.embed(texts, task="document")
-            for chunk, emb in zip(chunks, embeddings, strict=True):
-                self._db.set_chunk_embedding(chunk["id"], emb)
-            total += len(chunks)
-            logger.info("Embedded %d chunks", len(chunks))
-
-        synth_docs = self._db.get_unembedded_synth_docs(limit=chunk_batch)
-        if synth_docs:
-            texts = [d["content"] for d in synth_docs]
-            embeddings = embedder.embed(texts, task="document")
-            for doc, emb in zip(synth_docs, embeddings, strict=True):
-                self._db.set_synth_doc_embedding(doc["id"], emb)
-            total += len(synth_docs)
-            logger.info("Embedded %d synth documents", len(synth_docs))
-
+        sources: tuple[
+            tuple[Literal["episodes", "chunks"], Callable[[int], list[dict[str, Any]]]], ...
+        ] = (
+            ("episodes", self._db.get_unembedded_episodes),
+            ("chunks", self._db.get_unembedded_chunks),
+        )
+        for table, fetch in sources:
+            while time.monotonic() < deadline and (rows := fetch(batch_size)):
+                embeddings = embedder.embed([r["content"] for r in rows], task="document")
+                self._db.set_embeddings(
+                    table, [(r["id"], e) for r, e in zip(rows, embeddings, strict=True)]
+                )
+                total += len(rows)
+                logger.info("Embedded %d %s", len(rows), table)
         return total
 
     def rebuild_pending_chunks(self, sessions: set[str] | None = None) -> int:
@@ -148,9 +146,13 @@ class Poller:
             self._db.enqueue_extraction(
                 ExtractionItem(
                     session_id=chunk["session_id"],
+                    chunk_id=chunk["chunk_id"],
                     content=chunk["content"],
                     content_type="chunk",
                     project=chunk["project"],
+                    # A flushed tail is catch-up work (the first pass after it shipped
+                    # covers every old session at once): behind live ingest, like a backfill.
+                    priority=_CATCH_UP_PRIORITY if chunk["tail"] else 0,
                 )
             )
             enqueued += 1
@@ -381,16 +383,14 @@ class Poller:
             logger.info("Released %d stale 'processing' claims back to pending", released)
         last_full_cycle = 0.0
         last_stale_sweep = time.monotonic()  # just swept above; next sweep one interval out
-        last_orphan_sweep = 0.0  # first full cycle sweeps, then daily
-        # Small batches on purpose: a worker holds claimed rows in 'processing' for the
-        # whole batch (~per-item time each, serial), so a LARGE batch (a) makes the priority
-        # lane laggy — a worker won't re-check for new high-priority ingest until its batch
-        # drains — and (b) keeps legit in-progress rows 'processing' long enough that the
-        # stale-claim sweep would wrongly release them. 8 items x ~3-4 min ~= a ~30 min batch:
-        # new ingest preempts within one batch, and the 45 min stale threshold stays safe.
-        # In-worker concurrency (issue #13) only shortens the batch wall-clock — both
-        # properties get strictly safer, so the limit stays sized for the serial worst case.
-        drain_batch_limit = 8
+        last_daily_sweep = 0.0  # first full cycle sweeps, then daily
+        # One claim per worker thread (the serial kill switch claims one). A claimed row
+        # stays 'processing' until its item ends, so a claim that only waits for a free
+        # thread is held for nothing: it makes the priority lane laggy (a worker doesn't
+        # re-check for new high-priority ingest until its batch drains), and when the worker
+        # is killed mid-item (a deploy, an OOM) every such row is stranded for the 45 min
+        # stale-claim threshold, not just the items that were running.
+        drain_batch_limit = _drain_concurrency() if self._worker_factory is not None else 1
         prev_drained = 0
         quota_backoff = 0  # seconds; grows while the Max quota window is exhausted, 0 when healthy
         while True:
@@ -423,14 +423,20 @@ class Poller:
                         self.embed_pending()
                     except Exception as e:
                         logger.error("Embed pending failed: %s", e, exc_info=True)
-                    if now_mono - last_orphan_sweep >= _ORPHAN_SWEEP_INTERVAL_S:
+                    if now_mono - last_daily_sweep >= _DAILY_SWEEP_INTERVAL_S:
                         try:
                             n_orphans = self.sweep_orphan_entities()
                             if n_orphans:
                                 logger.info("Deleted %d orphan KG entities", n_orphans)
                         except Exception as e:
                             logger.error("Orphan entity sweep failed: %s", e, exc_info=True)
-                        last_orphan_sweep = now_mono
+                        try:
+                            n_blanked = self.sweep_finished_queue_text()
+                            if n_blanked:
+                                logger.info("Emptied the text of %d finished queue rows", n_blanked)
+                        except Exception as e:
+                            logger.error("Queue text sweep failed: %s", e, exc_info=True)
+                        last_daily_sweep = now_mono
                     last_full_cycle = now_mono
             try:
                 drained = self.drain_extraction_queue(batch_limit=drain_batch_limit)

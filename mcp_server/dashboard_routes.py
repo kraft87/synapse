@@ -1724,8 +1724,8 @@ def delete_episode_content(
     """The episode-delete cascade: everything carrying the content of ``episode_ids``.
 
     Runs on ``conn`` inside the CALLER's transaction, with the episode rows already locked:
-    chunks citing any of them and those chunks' extraction_queue rows (keyed by session and
-    text, so the 001 FK misses them), their sole-provenance facts (shared ones are
+    chunks citing any of them and those chunks' extraction_queue rows (by chunk_id, else by
+    session and text, so the 001 FK misses them), their sole-provenance facts (shared ones are
     unlinked), their chat timeline events, a tombstone per turn (``deleted_turns``, so a
     re-ship, catch-up sweep or backfill of the transcript on disk cannot bring the turn
     back; ``ingestion.episode_writer`` checks it), the rows themselves (their own
@@ -1758,10 +1758,12 @@ def delete_episode_content(
     chunk_ids = [r["id"] for r in chunk_rows]
     chunks_mixed = sum(1 for r in chunk_rows if _other_episode_refs(r["episode_ids"], ids))
     if chunk_ids:
-        # The poller enqueues each chunk for extraction keyed by (session_id, content),
-        # with no episode_id, so the episode FK never reaches those rows: a pending one
-        # would re-extract the deleted text into facts with no provenance, and a done one
-        # still stores it verbatim. Every status goes, before the chunk text is gone.
+        # A chunk's queue row follows it by chunk_id (cascade) once that migration is
+        # applied. Rows without one, from before it or from a database without it, are
+        # keyed by (session_id, content) with no episode_id, so no FK reaches them: a
+        # pending one would re-extract the deleted text into facts with no provenance, and
+        # a done one still stores it verbatim. Every status goes, before the chunk text is
+        # gone.
         conn.execute(
             "DELETE FROM extraction_queue q USING chunks c "
             "WHERE c.id = ANY(%s) AND q.content_type = 'chunk' "

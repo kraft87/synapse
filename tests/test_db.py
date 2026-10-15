@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from ingestion.db import Database
+from ingestion.db_queue import CHUNK_ID_PROBE
 from ingestion.models import Episode, ExtractionItem
 
 
@@ -290,16 +291,19 @@ class TestExtractionQueue:
         pending = _pending(db, 10)
         assert any(p["episode_id"] == ep_id for p in pending)
 
-    def test_enqueue_summary(self, db):
-        item = ExtractionItem(
-            session_id="eq-sum-1",
-            content="Summary text for extraction",
-            content_type="summary",
-            project="synapse",
-        )
-        db.enqueue_extraction(item)
-        pending = _pending(db, 10)
-        assert any(p["session_id"] == "eq-sum-1" for p in pending)
+    def test_an_episode_item_stores_no_text(self, db):
+        ep_id = db.upsert_episode(Episode(session_id="eq-notext", sequence=1, content="the turn"))
+        db.enqueue_extraction(ExtractionItem(episode_id=ep_id, content_type="episode"))
+        (row,) = [p for p in _pending(db, 100) if p["episode_id"] == ep_id]
+        assert row["content"] == ""
+
+    def test_an_item_that_names_no_source_is_refused(self, db):
+        with pytest.raises(ValueError, match="needs an episode_id"):
+            db.enqueue_extraction(
+                ExtractionItem(session_id="eq-sum-1", content="text", content_type="summary")
+            )
+        with pytest.raises(ValueError, match="chunk_id or its content"):
+            db.enqueue_extraction(ExtractionItem(session_id="eq-c", content_type="chunk"))
 
     def test_no_duplicate_enqueue(self, db):
         ep_id = db.upsert_episode(Episode(session_id="eq-dedup", sequence=1, content="no dups"))
@@ -382,3 +386,161 @@ class TestExtractionQueue:
             ).fetchone()
         assert row["status"] == "failed"
         assert "Connection refused" in row["error"]
+
+
+class TestPendingChunks:
+    """Which sessions the poller re-reads to chunk: a new complete window, or a quiet tail."""
+
+    @pytest.fixture(autouse=True)
+    def _no_chunks(self, conn):
+        conn.execute("DELETE FROM chunks WHERE session_id LIKE 'pc-%'")
+        yield
+        conn.execute("DELETE FROM chunks WHERE session_id LIKE 'pc-%'")
+
+    def _session(self, db, sid: str, n: int, *, idle: bool, manual_last: bool = False) -> None:
+        last = datetime.now(UTC) - (timedelta(hours=3) if idle else timedelta(minutes=1))
+        for seq in range(1, n + 1):
+            db.upsert_episode(
+                Episode(
+                    session_id=sid,
+                    sequence=seq,
+                    content=f"turn {seq}",
+                    source="manual" if manual_last and seq == n else "hook",
+                    created_at=last - timedelta(minutes=n - seq),
+                )
+            )
+
+    def _chunk(self, db, sid: str, start: int, end: int) -> int | None:
+        return db.upsert_chunk(sid, start, end, [start, end], f"{start}-{end}", None)
+
+    def test_upsert_chunk_returns_the_id_and_none_for_an_existing_window(self, db):
+        first = self._chunk(db, "pc-id", 1, 4)
+        assert isinstance(first, int)
+        assert self._chunk(db, "pc-id", 1, 4) is None
+
+    def test_a_live_session_waits_for_a_full_window(self, db):
+        self._session(db, "pc-live-3", 3, idle=False)
+        self._session(db, "pc-live-4", 4, idle=False)
+        self._session(db, "pc-live-tail", 5, idle=False)
+        self._chunk(db, "pc-live-tail", 1, 4)
+        pending = db.sessions_with_pending_chunks()
+        assert "pc-live-4" in pending
+        assert "pc-live-3" not in pending and "pc-live-tail" not in pending
+
+    def test_an_idle_session_is_pending_until_its_tail_is_chunked(self, db):
+        self._session(db, "pc-idle-short", 2, idle=True)
+        self._session(db, "pc-idle-tail", 5, idle=True)
+        self._chunk(db, "pc-idle-tail", 1, 4)
+        assert {"pc-idle-short", "pc-idle-tail"} <= set(db.sessions_with_pending_chunks())
+        self._chunk(db, "pc-idle-short", 1, 2)
+        self._chunk(db, "pc-idle-tail", 4, 5)
+        pending = db.sessions_with_pending_chunks()
+        assert "pc-idle-short" not in pending and "pc-idle-tail" not in pending
+
+    def test_a_remember_archive_does_not_keep_an_idle_session_pending(self, db):
+        self._session(db, "pc-idle-manual", 5, idle=True, manual_last=True)
+        self._chunk(db, "pc-idle-manual", 1, 4)
+        assert "pc-idle-manual" not in db.sessions_with_pending_chunks()
+
+    def test_the_session_read_leaves_out_the_vector_and_the_duplicated_text(self, db):
+        self._session(db, "pc-cols", 1, idle=False)
+        (row,) = db.get_session_episodes("pc-cols")
+        assert set(row) == {"id", "sequence", "content", "project", "source", "created_at"}
+
+
+class TestChunkQueueItems:
+    """A chunk's queue row names the chunk (schema: extraction_queue.chunk_id) and stores
+    no text; before that migration it keeps the text and is found by it."""
+
+    @pytest.fixture(autouse=True)
+    def _chunks(self, conn):
+        conn.execute("DELETE FROM chunks WHERE session_id LIKE 'cq-%'")
+        CHUNK_ID_PROBE.reset()
+        yield
+        conn.execute("DELETE FROM chunks WHERE session_id LIKE 'cq-%'")
+        CHUNK_ID_PROBE.reset()
+
+    def _chunk(self, db, sid: str = "cq-1", text: str = "one\n\n---\n\ntwo") -> int:
+        chunk_id = db.upsert_chunk(sid, 1, 4, [1, 2], text, "synapse")
+        assert chunk_id is not None
+        return chunk_id
+
+    def _rows(self, conn, sid: str):
+        return conn.execute(
+            "SELECT chunk_id, content, status FROM extraction_queue WHERE session_id = %s", (sid,)
+        ).fetchall()
+
+    def test_the_row_names_the_chunk_and_stores_no_text(self, db, conn):
+        chunk_id = self._chunk(db)
+        item = ExtractionItem(
+            session_id="cq-1", chunk_id=chunk_id, content="one", content_type="chunk"
+        )
+        db.enqueue_extraction(item)
+        db.enqueue_extraction(item)  # a double run is a no-op
+        assert self._rows(conn, "cq-1") == [(chunk_id, "", "pending")]
+
+    def test_a_finished_chunk_is_not_queued_again(self, db, conn):
+        chunk_id = self._chunk(db)
+        item = ExtractionItem(session_id="cq-1", chunk_id=chunk_id, content_type="chunk")
+        db.enqueue_extraction(item)
+        (queue_id,) = [r["id"] for r in db.claim_pending_extractions(limit=10)]
+        db.mark_extraction_done(queue_id)
+        db.enqueue_extraction(item)
+        assert [r[2] for r in self._rows(conn, "cq-1")] == ["done"]
+
+    def test_deleting_the_chunk_deletes_its_queue_row(self, db, conn):
+        chunk_id = self._chunk(db)
+        db.enqueue_extraction(
+            ExtractionItem(session_id="cq-1", chunk_id=chunk_id, content_type="chunk")
+        )
+        conn.execute("DELETE FROM chunks WHERE id = %s", (chunk_id,))
+        assert self._rows(conn, "cq-1") == []
+
+    def test_a_claimed_row_carries_its_chunk_id(self, db):
+        chunk_id = self._chunk(db)
+        db.enqueue_extraction(
+            ExtractionItem(session_id="cq-1", chunk_id=chunk_id, content_type="chunk")
+        )
+        (row,) = db.claim_pending_extractions(limit=10)
+        assert row["chunk_id"] == chunk_id and row["content"] == ""
+        assert db.get_chunk(chunk_id) == {"content": "one\n\n---\n\ntwo", "episode_ids": [1, 2]}
+
+    def test_without_the_column_the_row_keeps_the_text_and_dedups_on_it(self, db, conn):
+        CHUNK_ID_PROBE.missing(db._url)  # the migration is not applied here yet
+        item = ExtractionItem(
+            session_id="cq-2", chunk_id=7, content="the window", content_type="chunk"
+        )
+        db.enqueue_extraction(item)
+        db.enqueue_extraction(item)
+        assert self._rows(conn, "cq-2") == [(None, "the window", "pending")]
+
+    def test_a_chunk_gone_reads_as_none(self, db):
+        assert db.get_chunk(2_000_000_000) is None
+
+
+class TestBlankFinishedQueueText:
+    def _row(self, conn, status: str, age_days: int, content: str = "some turn text") -> int:
+        (qid,) = conn.execute(
+            "INSERT INTO extraction_queue (session_id, content, content_type, status, processed_at) "
+            "VALUES ('bq', %s, 'chunk', %s, now() - make_interval(days => %s)) RETURNING id",
+            (content, status, age_days),
+        ).fetchone()
+        return qid
+
+    def test_only_old_finished_rows_lose_their_text(self, db, conn, clean_tables):
+        old_done = self._row(conn, "done", 10)
+        fresh_done = self._row(conn, "done", 1)
+        old_failed = self._row(conn, "failed", 10)
+        pending = self._row(conn, "pending", 10)
+        assert db.blank_finished_queue_text(older_than_days=7, batch=2) == 1
+        text = dict(conn.execute("SELECT id, content FROM extraction_queue").fetchall())
+        assert text[old_done] == ""
+        assert text[fresh_done] == text[old_failed] == text[pending] == "some turn text"
+        # the row itself stays: the dashboard's series and web_enqueue read it
+        assert conn.execute("SELECT count(*) FROM extraction_queue").fetchone()[0] == 4
+
+    def test_it_works_through_more_rows_than_one_batch(self, db, conn, clean_tables):
+        for _ in range(5):
+            self._row(conn, "done", 30)
+        assert db.blank_finished_queue_text(older_than_days=7, batch=2) == 5
+        assert db.blank_finished_queue_text(older_than_days=7, batch=2) == 0

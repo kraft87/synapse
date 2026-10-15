@@ -4,6 +4,17 @@ from typing import Any, cast
 
 from ingestion.db_connection import DatabaseConnection
 from ingestion.models import ExtractionItem
+from ingestion.schema_check import ColumnProbe
+
+#: ``extraction_queue.chunk_id`` (an optional migration): until it exists a chunk item
+#: keeps its text in the row and is found by it, which is how every chunk item was keyed
+#: before the column.
+CHUNK_ID_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('extraction_queue') AND attname = 'chunk_id' "
+    "AND NOT attisdropped",
+    "extraction_queue.chunk_id",
+)
 
 
 class ExtractionQueueStore(DatabaseConnection):
@@ -12,28 +23,38 @@ class ExtractionQueueStore(DatabaseConnection):
     # ------------------------------------------------------------------
 
     def enqueue_extraction(self, item: ExtractionItem) -> None:
-        """Enqueue an item for KG extraction. Idempotent — ignores duplicates."""
-        # Each path dedups on a different predicate against still-live rows
-        # (status pending/processing); the exists-check + INSERT are otherwise
-        # identical, so compute (where, params) per path and share the rest.
-        if item.episode_id is not None:
-            # Deduplicate by episode_id (pending or processing only)
-            where = "episode_id = %s"
-            params: tuple[Any, ...] = (item.episode_id,)
-        elif item.content_type == "chunk":
-            # Chunks: MANY per session (unlike a single summary), so dedup by
-            # exact content, not (session_id, content_type) — the latter would
-            # collapse every chunk of a session into one queue row. Enqueued
-            # once at birth (ingestion.chunks.rebuild_chunks on_new), this guards
-            # only against a double-run re-enqueuing a still-pending chunk.
-            where = "session_id = %s AND content_type = 'chunk' AND content = %s"
-            params = (item.session_id, item.content)
-        else:
-            # Summary or manual — deduplicate by session_id + content_type
-            where = "session_id = %s AND content_type = %s"
-            params = (item.session_id, item.content_type)
+        """Enqueue an item for KG extraction. Idempotent — ignores duplicates.
 
+        An item names its source (``ExtractionItem``) and the row stores no text for it:
+        the worker reads the episode or chunk, so deleting the source takes the work with
+        it. The exception is a chunk on a database without ``chunk_id`` (see
+        ``CHUNK_ID_PROBE``), which keeps its text and dedups on it."""
+        if item.episode_id is None and item.content_type != "chunk":
+            raise ValueError(f"a {item.content_type!r} extraction item needs an episode_id")
         with self._conn() as conn:
+            if item.episode_id is not None:
+                # Deduplicate by episode_id (pending or processing only)
+                where = "episode_id = %s"
+                params: tuple[Any, ...] = (item.episode_id,)
+                text = ""
+            elif item.chunk_id is not None and CHUNK_ID_PROBE.ready(conn, self._url):
+                # Once at birth (ingestion.chunks.rebuild_chunks on_new); the unique index
+                # makes a double run a no-op whatever the first row's status.
+                conn.execute(
+                    "INSERT INTO extraction_queue (chunk_id, session_id, content, content_type, "
+                    "project, priority) VALUES (%s, %s, '', 'chunk', %s, %s) "
+                    "ON CONFLICT (chunk_id) WHERE chunk_id IS NOT NULL DO NOTHING",
+                    (item.chunk_id, item.session_id, item.project, item.priority),
+                )
+                return
+            elif item.content:
+                # Before the migration: MANY chunks per session, so dedup by exact text
+                # against the live rows (a double run re-enqueuing a pending chunk).
+                where = "session_id = %s AND content_type = 'chunk' AND content = %s"
+                params = (item.session_id, item.content)
+                text = item.content
+            else:
+                raise ValueError("a chunk extraction item needs a chunk_id or its content")
             exists = conn.execute(
                 "SELECT id FROM extraction_queue "  # nosec B608 — where is built from static literals, not user input
                 f"WHERE {where} AND status IN ('pending', 'processing')",
@@ -44,15 +65,16 @@ class ExtractionQueueStore(DatabaseConnection):
             conn.execute(
                 """
                 INSERT INTO extraction_queue
-                    (episode_id, session_id, content, content_type, project)
-                VALUES (%s, %s, %s, %s, %s)
+                    (episode_id, session_id, content, content_type, project, priority)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 """,
                 (
                     item.episode_id,
                     item.session_id,
-                    item.content,
+                    text,
                     item.content_type,
                     item.project,
+                    item.priority,
                 ),
             )
 
@@ -140,10 +162,9 @@ class ExtractionQueueStore(DatabaseConnection):
         A claim is stale if it was taken more than ``older_than_minutes`` ago
         (``claimed_at`` older than the threshold) or predates the claimed_at
         migration (``claimed_at IS NULL``). The default 45 min sits safely above
-        the worst-case batch processing time (drain_batch_limit items x per-item
-        time, all sharing one batch claimed_at), so this recovers orphans left by
-        a crashed or scaled-down worker WITHOUT clobbering rows a live peer is
-        still working through its batch.
+        the worst-case time of one item (a worker claims no more rows than it has
+        threads), so this recovers orphans left by a crashed or scaled-down worker
+        WITHOUT clobbering rows a live peer is still working on.
 
         Run at startup AND periodically from the maintenance loop. Safe across
         concurrent peers — Postgres serializes the UPDATEs and each row converges
@@ -184,3 +205,27 @@ class ExtractionQueueStore(DatabaseConnection):
                 """,
                 (error, queue_id),
             )
+
+    def blank_finished_queue_text(self, older_than_days: int = 7, batch: int = 2000) -> int:
+        """Empty the ``content`` of finished rows older than ``older_than_days``; returns
+        how many it emptied.
+
+        The queue used to copy every turn and chunk it queued and kept the copy for good
+        (as much text again as the corpus). Nothing reads a finished row's text. The rows
+        stay (the dashboard's enqueue and completion series, and web_enqueue's anti-join,
+        read them), only the text goes, in batches so one statement never rewrites
+        gigabytes of TOAST at once. Rows that name their source store no text from the start.
+        """
+        total = 0
+        while True:
+            with self._conn() as conn:
+                n = conn.execute(
+                    "UPDATE extraction_queue SET content = '' WHERE id IN ("
+                    "  SELECT id FROM extraction_queue "
+                    "  WHERE status = 'done' AND content <> '' "
+                    "    AND processed_at < now() - make_interval(days => %s) LIMIT %s)",
+                    (older_than_days, batch),
+                ).rowcount
+            total += n
+            if n < batch:
+                return total

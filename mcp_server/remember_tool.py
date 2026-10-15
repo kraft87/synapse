@@ -226,7 +226,6 @@ def register(
                             ExtractionItem(
                                 episode_id=episode_id,
                                 session_id=sid,
-                                content=ep_content,
                                 content_type="manual",
                                 project=project,
                             )

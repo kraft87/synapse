@@ -171,8 +171,9 @@ def test_credentials_are_redacted_in_note_episode_and_extraction(env):
         "SELECT content FROM episodes WHERE id = %s", (out["episode_id"],)
     ).fetchone()
     (queued,) = env.conn.execute("SELECT content FROM extraction_queue").fetchone()
-    for text in (hook, body, ep_content, queued):
+    for text in (hook, body, ep_content):
         assert key not in text and "[REDACTED:openai]" in text
+    assert queued == ""  # the extraction reads the (redacted) archive episode, not a copy
 
 
 def test_the_write_time_judge_runs_on_its_own_model(env, monkeypatch):

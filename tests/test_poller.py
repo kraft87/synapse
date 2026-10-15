@@ -10,11 +10,14 @@ run_loop backs off), and the serial kill switch.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from ingestion.db import Database
 from ingestion.llm_client import UsageLimitError
+from ingestion.models import Episode
 from ingestion.poller import Poller
 
 
@@ -199,3 +202,113 @@ def test_orphan_sweep_goes_through_the_pipeline_kg_client():
     assert Poller(db=None, extraction_pipeline=_Pipe()).sweep_orphan_entities() == 3  # type: ignore[arg-type]
     assert calls == [24]
     assert Poller(db=None).sweep_orphan_entities() == 0  # type: ignore[arg-type]
+
+
+# --- embed_pending ---------------------------------------------------------------------
+
+
+class _Backlog:
+    """Stands in for Database: the unembedded rows, handed out newest first like the real
+    query, and gone once ``set_embeddings`` stores them."""
+
+    def __init__(self, episodes: int, chunks: int) -> None:
+        self.rows = {
+            "episodes": [{"id": i, "content": f"ep {i}"} for i in range(episodes, 0, -1)],
+            "chunks": [{"id": i, "content": f"chunk {i}"} for i in range(chunks, 0, -1)],
+        }
+        self.stored: list[tuple[str, list[int]]] = []
+
+    def get_unembedded_episodes(self, limit):
+        return list(self.rows["episodes"][:limit])
+
+    def get_unembedded_chunks(self, limit):
+        return list(self.rows["chunks"][:limit])
+
+    def set_embeddings(self, table, pairs):
+        done = {i for i, _ in pairs}
+        self.rows[table] = [r for r in self.rows[table] if r["id"] not in done]
+        self.stored.append((table, [i for i, _ in pairs]))
+
+
+def _embedding_poller(backlog: _Backlog) -> Poller:
+    embedder = SimpleNamespace(embed=lambda texts, task: [[0.5] for _ in texts])
+    return Poller(
+        db=backlog,  # type: ignore[arg-type]
+        extraction_pipeline=SimpleNamespace(_embedder=embedder),  # type: ignore[arg-type]
+    )
+
+
+def test_embed_pending_works_through_the_whole_backlog_in_one_cycle():
+    backlog = _Backlog(episodes=7, chunks=3)
+    assert _embedding_poller(backlog).embed_pending(batch_size=3) == 10
+    # newest first, one statement per batch, episodes before chunks
+    assert backlog.stored == [
+        ("episodes", [7, 6, 5]),
+        ("episodes", [4, 3, 2]),
+        ("episodes", [1]),
+        ("chunks", [3, 2, 1]),
+    ]
+
+
+def test_embed_pending_stops_at_its_time_budget():
+    backlog = _Backlog(episodes=7, chunks=0)
+    assert _embedding_poller(backlog).embed_pending(batch_size=3, budget_s=0) == 0
+    assert backlog.stored == []
+
+
+def test_embed_pending_with_nothing_pending_does_nothing():
+    backlog = _Backlog(episodes=0, chunks=0)
+    assert _embedding_poller(backlog).embed_pending() == 0
+    assert backlog.stored == []
+
+
+def test_embeddings_are_stored_in_one_statement_and_newest_turns_come_first(conn, db_url):
+    conn.execute("TRUNCATE episodes RESTART IDENTITY CASCADE")
+    db = Database(db_url)
+    for seq in range(1, 4):
+        db.upsert_episode(Episode(session_id="emb", sequence=seq, content=f"turn {seq}"))
+    assert [r["id"] for r in db.get_unembedded_episodes(limit=2)] == [3, 2]
+    vec = [0.25] * 2048
+    db.set_embeddings("episodes", [(3, vec), (2, vec)])
+    assert [r["id"] for r in db.get_unembedded_episodes(limit=10)] == [1]
+    stored = conn.execute(
+        "SELECT id, is_embedded, vector_dims(embedding) FROM episodes ORDER BY id"
+    ).fetchall()
+    assert stored == [(1, False, None), (2, True, 2048), (3, True, 2048)]
+    db.set_embeddings("episodes", [])  # nothing to store is not an error
+
+
+def test_the_daily_queue_sweep_empties_text_finished_a_week_ago():
+    asked: list[int] = []
+
+    class _Db:
+        def blank_finished_queue_text(self, days):
+            asked.append(days)
+            return 5
+
+    assert Poller(db=_Db()).sweep_finished_queue_text() == 5  # type: ignore[arg-type]
+    assert asked == [7]
+
+
+def test_rebuild_enqueues_each_chunk_by_id_and_a_flushed_tail_behind_live_ingest(conn, db_url):
+    conn.execute("TRUNCATE episodes, extraction_queue RESTART IDENTITY CASCADE")
+    conn.execute("DELETE FROM chunks WHERE session_id = 'rb-1'")
+    db = Database(db_url)
+    last = datetime.now(UTC) - timedelta(hours=3)  # the session went quiet
+    for seq in range(1, 6):
+        db.upsert_episode(
+            Episode(
+                session_id="rb-1",
+                sequence=seq,
+                content=f"turn {seq}",
+                created_at=last - timedelta(minutes=5 - seq),
+            )
+        )
+    assert Poller(db=db).rebuild_pending_chunks(sessions={"rb-1"}) == 2
+
+    rows = conn.execute(
+        "SELECT c.start_sequence, c.end_sequence, q.priority, q.content "
+        "FROM extraction_queue q JOIN chunks c ON c.id = q.chunk_id ORDER BY c.start_sequence"
+    ).fetchall()
+    assert rows == [(1, 4, 0, ""), (4, 5, 10, "")]  # the full window is live; the tail waits
+    conn.execute("DELETE FROM chunks WHERE session_id = 'rb-1'")

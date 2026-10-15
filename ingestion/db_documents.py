@@ -1,10 +1,19 @@
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import orjson
 
 from ingestion.db_connection import DatabaseConnection
+
+
+def _episode_ids(raw: Any) -> list[int]:
+    """A chunk's ``episode_ids`` JSONB as ints ([] when NULL)."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = orjson.loads(raw)
+    return [int(x) for x in raw]
 
 
 class DocumentStore(DatabaseConnection):
@@ -45,19 +54,31 @@ class DocumentStore(DatabaseConnection):
         assert row is not None, "INSERT RETURNING id returned nothing"
         return cast(int, row["id"])
 
-    def get_unembedded_episodes(self, limit: int = 96) -> list[dict[str, Any]]:
+    def get_unembedded_episodes(self, limit: int) -> list[dict[str, Any]]:
+        """Episodes still without a vector, newest first: a turn that arrives during a
+        history import is searchable before the import's backlog is (``ORDER BY id`` is
+        also what the partial ``is_embedded = FALSE`` index serves)."""
         with self._conn() as conn:
             result = conn.execute(
-                "SELECT id, content FROM episodes WHERE is_embedded = FALSE LIMIT %s",
+                "SELECT id, content FROM episodes WHERE is_embedded = FALSE "
+                "ORDER BY id DESC LIMIT %s",
                 (limit,),
             ).fetchall()
         return cast(list[dict[str, Any]], result)
 
-    def set_episode_embedding(self, episode_id: int, embedding: list[float]) -> None:
+    def set_embeddings(
+        self, table: Literal["episodes", "chunks"], rows: list[tuple[int, list[float]]]
+    ) -> None:
+        """Store ``(id, vector)`` pairs on ``table`` in one statement and one commit."""
+        if not rows:
+            return
+        ids = [i for i, _ in rows]
+        vectors = ["[" + ",".join(map(str, v)) + "]" for _, v in rows]
         with self._conn() as conn:
             conn.execute(
-                "UPDATE episodes SET embedding = %s::vector, is_embedded = TRUE WHERE id = %s",
-                (embedding, episode_id),
+                f"UPDATE {table} t SET embedding = v.e::vector, is_embedded = TRUE "  # nosec B608 — table is one of two literals
+                "FROM unnest(%s::bigint[], %s::text[]) AS v(id, e) WHERE t.id = v.id",
+                (ids, vectors),
             )
 
     # ------------------------------------------------------------------
@@ -72,17 +93,17 @@ class DocumentStore(DatabaseConnection):
         episode_ids: list[int],
         content: str,
         project: str | None,
-    ) -> None:
-        """Insert a chunk; skip if this (session, start, end) range already exists."""
-        import orjson
-
+    ) -> int | None:
+        """Insert a chunk and return its id; None if this (session, start, end) range
+        already exists (another worker wrote it first)."""
         with self._conn() as conn:
-            conn.execute(
+            row = conn.execute(
                 """
                 INSERT INTO chunks
                     (session_id, start_sequence, end_sequence, episode_ids, content, project)
                 VALUES (%s, %s, %s, %s::jsonb, %s, %s)
                 ON CONFLICT (session_id, start_sequence, end_sequence) DO NOTHING
+                RETURNING id
                 """,
                 (
                     session_id,
@@ -92,40 +113,39 @@ class DocumentStore(DatabaseConnection):
                     content,
                     project,
                 ),
-            )
+            ).fetchone()
+        return None if row is None else cast(int, row["id"])
 
-    def get_unembedded_chunks(self, limit: int = 96) -> list[dict[str, Any]]:
+    def get_unembedded_chunks(self, limit: int) -> list[dict[str, Any]]:
         with self._conn() as conn:
             result = conn.execute(
-                "SELECT id, content FROM chunks WHERE is_embedded = FALSE LIMIT %s",
+                "SELECT id, content FROM chunks WHERE is_embedded = FALSE "
+                "ORDER BY id DESC LIMIT %s",
                 (limit,),
             ).fetchall()
         return cast(list[dict[str, Any]], result)
 
-    def set_chunk_embedding(self, chunk_id: int, embedding: list[float]) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE chunks SET embedding = %s::vector, is_embedded = TRUE WHERE id = %s",
-                (embedding, chunk_id),
-            )
-
     def sessions_with_pending_chunks(self) -> list[str]:
-        """Return session IDs that have a NEW complete chunk window available.
+        """Return session IDs that have a NEW chunk window available.
 
-        Pending when either (a) the session has no chunks yet but >= 4 episodes
-        (enough for one window), or (b) its max episode sequence is at least 3
-        past its chunks' max ``end_sequence`` — i.e. enough new episodes arrived
-        to form the next complete window (window=4, step=3, so each new window
-        needs ``step`` more episodes). The 4/3 mirror ``ingestion.chunks``; kept
-        inline so this stays one pre-filter query. A session with only a 1-2
-        episode incomplete tail is NOT flagged (avoids a no-op rebuild every
-        cycle). Mirrors ``sessions_with_pending_segments``.
+        Pending when (a) the session has no chunks yet but >= 4 episodes (enough for one
+        window), (b) its max episode sequence is at least 3 past its chunks' max
+        ``end_sequence`` — i.e. enough new episodes arrived to form the next complete
+        window (window=4, step=3, so each new window needs ``step`` more episodes), or
+        (c) the session has been idle for 2 hours and holds a turn past its chunks' max
+        ``end_sequence``: its tail is chunked as it stands
+        (``ingestion.chunks.rebuild_chunks``). A remember() archive (``source='manual'``)
+        is no reason for (c): chunks leave it out. The 4/3/2h mirror ``ingestion.chunks``;
+        kept inline so this stays one pre-filter query. A live session with only a 1-2
+        episode incomplete tail is NOT flagged (avoids a no-op rebuild every cycle).
         """
         with self._conn() as conn:
             rows = conn.execute(
                 """
                 WITH ep AS (
-                    SELECT session_id, COUNT(*) AS c, MAX(sequence) AS m
+                    SELECT session_id, COUNT(*) AS c, MAX(sequence) AS m,
+                           MAX(sequence) FILTER (WHERE source IS DISTINCT FROM 'manual') AS t,
+                           MAX(created_at) AS last_at
                     FROM episodes GROUP BY session_id
                 ),
                 ch AS (
@@ -137,6 +157,7 @@ class DocumentStore(DatabaseConnection):
                 LEFT JOIN ch c USING (session_id)
                 WHERE (c.m IS NULL AND e.c >= 4)
                    OR (c.m IS NOT NULL AND e.m >= c.m + 3)
+                   OR (e.last_at < now() - interval '2 hours' AND e.t > COALESCE(c.m, 0))
                 """
             ).fetchall()
         return [cast(str, r["session_id"]) for r in rows]
@@ -154,12 +175,25 @@ class DocumentStore(DatabaseConnection):
             ).fetchall()
         return {(int(r["start_sequence"]), int(r["end_sequence"])) for r in rows}
 
+    def get_chunk(self, chunk_id: int) -> dict[str, Any] | None:
+        """``{content, episode_ids}`` of a chunk, by key (what a ``chunk_id`` queue item
+        extracts, and the episodes its edges trace back to). None when the chunk is gone
+        (deleted with its episodes, or rebuilt)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT content, episode_ids FROM chunks WHERE id = %s", (chunk_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        return {"content": row["content"], "episode_ids": _episode_ids(row["episode_ids"])}
+
     def get_chunk_episode_ids(self, session_id: str, content: str) -> list[int]:
         """Return the episode_ids of the chunk with this exact content (for edge backlink).
 
-        Chunk extraction (task #63) enqueues a chunk's text for KG extraction; when its
-        facts are written the edges must trace back to the episodes the chunk was built
-        from. Chunk content is the episodes joined verbatim, so (session_id, content) is a
+        For a queue item that has no ``chunk_id`` (one enqueued before that column
+        existed): chunk extraction (task #63) enqueued a chunk's text, and when its facts
+        are written the edges must trace back to the episodes the chunk was built from.
+        Chunk content is the episodes joined verbatim, so (session_id, content) is a
         stable key. Returns [] if no match (chunk since rebuilt/removed).
         """
         with self._conn() as conn:
@@ -167,12 +201,7 @@ class DocumentStore(DatabaseConnection):
                 "SELECT episode_ids FROM chunks WHERE session_id = %s AND content = %s LIMIT 1",
                 (session_id, content),
             ).fetchone()
-        if not row or row["episode_ids"] is None:
-            return []
-        raw = row["episode_ids"]
-        if isinstance(raw, str):
-            raw = orjson.loads(raw)
-        return [int(x) for x in raw]
+        return _episode_ids(row["episode_ids"]) if row else []
 
     def get_web_chunk_provenance(self, web_chunk_id: int) -> dict[str, Any] | None:
         """Source metadata for a web chunk's parent artifact (task #68).
@@ -195,54 +224,3 @@ class DocumentStore(DatabaseConnection):
                 (web_chunk_id,),
             ).fetchone()
         return dict(row) if row else None
-
-    # ------------------------------------------------------------------
-    # Synth documents (frozen legacy table; only the summary-item lookup is live)
-    # ------------------------------------------------------------------
-
-    def get_synth_document_source_ids(
-        self, session_id: str, content: str, doc_type: str = "summary"
-    ) -> list[int]:
-        """Return source episode IDs for a synth document, looked up by (session_id, content).
-
-        Used by the extraction pipeline to associate KG edges derived from a summary
-        with the underlying episode IDs the summary covers. Returns [] if not found
-        or if source_ids is empty/missing.
-        """
-        with self._conn() as conn:
-            row = conn.execute(
-                """
-                SELECT source_ids FROM synth_documents
-                WHERE session_id = %s AND content = %s AND doc_type = %s
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (session_id, content, doc_type),
-            ).fetchone()
-        if not row or not row.get("source_ids"):
-            return []
-        raw = row["source_ids"]
-        # JSONB columns deserialize to Python lists already; defend against str fallback
-        if isinstance(raw, str):
-            try:
-                raw = orjson.loads(raw)
-            except (orjson.JSONDecodeError, ValueError):
-                return []
-        if not isinstance(raw, list):
-            return []
-        return [int(x) for x in raw if isinstance(x, int | str) and str(x).lstrip("-").isdigit()]
-
-    def get_unembedded_synth_docs(self, limit: int = 48) -> list[dict[str, Any]]:
-        with self._conn() as conn:
-            result = conn.execute(
-                "SELECT id, content FROM synth_documents WHERE is_embedded = FALSE LIMIT %s",
-                (limit,),
-            ).fetchall()
-        return cast(list[dict[str, Any]], result)
-
-    def set_synth_doc_embedding(self, doc_id: int, embedding: list[float]) -> None:
-        with self._conn() as conn:
-            conn.execute(
-                "UPDATE synth_documents SET embedding = %s::vector, is_embedded = TRUE WHERE id = %s",
-                (embedding, doc_id),
-            )

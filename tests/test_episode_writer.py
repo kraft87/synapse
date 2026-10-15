@@ -233,14 +233,14 @@ def test_project_default_labels_only_the_unlabelled(db, conn):
     assert [r[0] for r in rows] == ["fallback", "kept"]
 
 
-def test_a_nul_byte_in_a_turn_reaches_neither_the_episode_nor_its_queue_row(db, conn):
+def test_a_nul_byte_in_a_turn_does_not_reach_the_episode_and_the_queue_row_holds_no_text(db, conn):
     ep = Episode(
         session_id="w-10", sequence=1, span_id="jsonl:nul", content="[user] a\x00b", project="p"
     )
     assert store_episodes(db, [ep]).written == 1
-    stored = conn.execute("SELECT content FROM episodes").fetchone()[0]
-    queued = conn.execute("SELECT content FROM extraction_queue").fetchone()[0]
-    assert stored == queued == "[user] ab"
+    assert conn.execute("SELECT content FROM episodes").fetchone()[0] == "[user] ab"
+    # The worker reads the turn from the episode: the queue keeps no copy of it.
+    assert conn.execute("SELECT content FROM extraction_queue").fetchone()[0] == ""
 
 
 # ---------------------------------------------------------------------------

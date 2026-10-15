@@ -310,8 +310,7 @@ class TestProcessItemSplit:
         embedder = MagicMock()
         embedder.embed.side_effect = lambda names, task=None: [EMB for _ in names]
         db = MagicMock()
-        db.get_session_episodes.return_value = []
-        db.get_synth_document_source_ids.return_value = []
+        db.get_chunk_episode_ids.return_value = [1]
         pipe = ExtractionPipeline(
             db=db, llm_client=MagicMock(), embedder=embedder, kg_client=MagicMock()
         )
@@ -328,7 +327,7 @@ class TestProcessItemSplit:
         pipe._process_facts_for_group = MagicMock()  # type: ignore[method-assign]
 
         pipe.process_item(
-            {"content_type": "summary", "content": "x", "project": None, "session_id": "s1"}
+            {"content_type": "chunk", "content": "x", "project": None, "session_id": "s1"}
         )
 
         (call,) = pipe._stage5_write_nodes.call_args_list
