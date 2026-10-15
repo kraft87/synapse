@@ -30,12 +30,15 @@ def _load_config() -> Any:
         mod = importlib.util.module_from_spec(spec)
         sys.modules["config"] = mod
         spec.loader.exec_module(mod)
+        # A process that had the module before this one (the `synapse` CLI installing the
+        # Codex hooks) keeps its own name.
+        mod.USER_AGENT = f"synapse-codex-plugin/{mod.synapse_home.client_version()}"
     return mod
 
 
 config = _load_config()
 synapse_home = config.synapse_home
-USER_AGENT = config.USER_AGENT = f"synapse-codex-plugin/{synapse_home.client_version()}"
+USER_AGENT = config.USER_AGENT
 
 _cfg = config._cfg
 BASE_URL = config.BASE_URL
