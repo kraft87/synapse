@@ -317,8 +317,11 @@ class RecallSourcesMixin:
                     # kg_pg indexes rows positionally; recall borrows dict-row
                     # connections, so override at the cursor.
                     cur = conn.cursor(row_factory=tuple_row)
-                    cur.execute("SET LOCAL enable_seqscan = off")
-                    cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    # Both planner GUCs in one round trip; is_local = true is SET LOCAL.
+                    cur.execute(
+                        "SELECT set_config('enable_seqscan', 'off', true), "
+                        "set_config('max_parallel_workers_per_gather', '0', true)"
+                    )
                     return search_kg_postgres(
                         cur,
                         query,

@@ -10,7 +10,7 @@ Retrieval mirrors ``_search_kg`` exactly:
   1. fact-embedding vector KNN over live edges (partial HNSW: t_invalid IS NULL)
   2. fact BM25 over edge text (ParadeDB)
   3. entity-seed vector KNN + live-degree gate + session-focus bonus -> top 8 seeds
-  4. 1-hop traversal from each seed (per-seed LIMIT 8)
+  4. 1-hop traversal from the seeds (per-seed LIMIT 8, one statement for all of them)
   5. RRF fuse [vec, bm25, hop], take top ``limit``
 
 The caller's cursor MUST have these session GUCs set (see parity_kg_read.py):
@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ingestion.db_connection import bm25_query_text
 from ingestion.embedding import embed_dims
 
 # Embedding width for the halfvec casts below — must match the provisioned schema
@@ -150,10 +151,10 @@ def search_kg_postgres(
         fact_by_uuid.setdefault(u, (f, tv, og, sup))
         vec_uuids.append(u)
 
-    # 2 — BM25 full-text over fact text (ParadeDB). Same alnum/space sanitize as
-    # recall._search_kg so identifiers/error strings survive. t_invalid filtered
-    # in the WHERE (before LIMIT), matching the FalkorDB fulltext leg.
-    safe = "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
+    # 2 — BM25 full-text over fact text (ParadeDB). Sanitized by bm25_query_text so
+    # identifiers/error strings survive. t_invalid filtered in the WHERE (before LIMIT),
+    # matching the FalkorDB fulltext leg.
+    safe = bm25_query_text(query)
     bm25_uuids: list[str] = []
     if safe:
         cur.execute(
@@ -171,20 +172,21 @@ def search_kg_postgres(
             fact_by_uuid.setdefault(u, (f, tv, og, sup))
             bm25_uuids.append(u)
 
-    # 3 — entity seed vector KNN (top 25) + live-degree gate + focus bonus -> top 8.
+    # 3 — entity seed vector KNN (top 25) + live-edge gate + focus bonus -> top 8.
     # The seed KNN uses the SAME bare-predicate over-fetch trick as the fact leg
     # (step 1): an owner/group equality filter directly alongside the vector ORDER BY
-    # makes the planner pick a Bitmap Heap Scan on kg_entities_owner and sort EVERY
+    # makes the planner pick a Bitmap Heap Scan on kg_entities_norm and sort EVERY
     # in-scope entity (~1.25s once the graph passed ~36K entities — measured
     # 2026-06-20, the entity HNSW was never used). enable_seqscan=off does NOT prevent
-    # a bitmap scan. Fix: ORDER the GLOBAL HNSW on the bare partial-index predicate
+    # a bitmap scan. Fix: ORDER the GLOBAL HNSW on the bare predicate
     # (embedding IS NOT NULL -> stays on kg_entities_hnsw), over-fetch _OVERFETCH, then
     # filter the tenant scope on that small candidate set (single owner: ~97% survive,
     # 25 found trivially). 1248ms -> 26ms verified via EXPLAIN ANALYZE.
-    # Degree is computed LIVE over live edges (matches FalkorDB), batched into ONE query
-    # for all 25 seeds: a per-seed correlated count with an (src OR tgt) predicate can't
-    # use the btree indexes and seq-scans the whole edge table per seed. Splitting the OR
-    # into two index-driven `<col> IN (seeds)` semijoins keeps it on kg_rel_src/kg_rel_tgt.
+    # A seed must have at least one live edge (matches FalkorDB), asked as two EXISTS
+    # (src side, tgt side) over all 25 seeds in this ONE query: each probe stops at the
+    # first live edge, where a live-degree COUNT read every edge of every seed (the User
+    # supernode has thousands), and a correlated (src OR tgt) predicate could not use the
+    # btree indexes (kg_rel_pair / kg_rel_tgt) and seq-scanned the whole edge table per seed.
     cur.execute(
         "WITH seeds AS ("
         "  SELECT uuid, name, summary, dist FROM ("
@@ -194,21 +196,17 @@ def search_kg_postgres(
         f"    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
         "  ) e WHERE owner_id = %s AND group_id = %s "
         "  ORDER BY dist LIMIT 25"
-        "), deg AS ("
-        "  SELECT u, count(*) AS d FROM ("
-        "    SELECT src_uuid AS u FROM kg_relationships "
-        "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-        f"{scope_sql}"
-        "        AND src_uuid IN (SELECT uuid FROM seeds) "
-        "    UNION ALL "
-        "    SELECT tgt_uuid AS u FROM kg_relationships "
-        "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-        f"{scope_sql}"
-        "        AND tgt_uuid IN (SELECT uuid FROM seeds) "
-        "  ) z GROUP BY u"
         ") "
-        "SELECT s.uuid, s.name, s.summary, s.dist, COALESCE(d.d, 0) AS deg "
-        "FROM seeds s LEFT JOIN deg d ON d.u = s.uuid ORDER BY s.dist",
+        "SELECT s.uuid, s.name, s.summary, s.dist FROM seeds s "
+        "WHERE EXISTS (SELECT 1 FROM kg_relationships "
+        "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        f"{scope_sql}"
+        "        AND src_uuid = s.uuid) "
+        "   OR EXISTS (SELECT 1 FROM kg_relationships "
+        "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        f"{scope_sql}"
+        "        AND tgt_uuid = s.uuid) "
+        "ORDER BY s.dist",
         (
             emb_s,
             emb_s,
@@ -225,9 +223,7 @@ def search_kg_postgres(
     )
     focus_set = set(session_focus)
     connected: list[tuple[float, str, str | None, str | None]] = []
-    for uuid_, name, summary, dist, deg in cur.fetchall():
-        if not deg:
-            continue
+    for uuid_, name, summary, dist in cur.fetchall():
         bonus = 0.3 if (name in focus_set or uuid_ in focus_set) else 0.0
         connected.append((float(dist) - bonus, uuid_, name, summary))
         if len(connected) >= 8:
@@ -238,20 +234,32 @@ def search_kg_postgres(
         [] if restricted else [{"uuid": u, "name": n, "summary": s} for _, u, n, s in connected]
     )
 
-    # 4 — 1-hop traversal facts from the seeds (per-seed LIMIT 8, undirected).
+    # 4 — 1-hop traversal facts from the seeds (per-seed LIMIT 8, undirected), ONE statement:
+    # a LATERAL per seed, in seed order. ORDER BY t_valid DESC (2026-08-07): an unordered
+    # LIMIT 8 was fine when every entity had a handful of edges, but a supernode seed (the User
+    # node, live degree ~3.4k and growing with event facts) turned it into 8 arbitrary edges.
+    # Recency is the least-wrong single ordering for a "what about X" hop sample. Each side
+    # (src, tgt) takes its own newest 8 and the union its newest 8: the same 8 as sorting
+    # (src OR tgt) whole, but the optional kg_rel_src_live / kg_rel_tgt_live indexes (owner,
+    # group, endpoint, t_valid DESC) hand each side its 8 without reading the rest. A
+    # self-loop is one hop.
     hop_uuids: list[str] = []
-    for sd in seed_uuids:
-        cur.execute(
-            # ORDER BY t_valid DESC (2026-08-07): an unordered LIMIT 8 was fine when every
-            # entity had a handful of edges, but a supernode seed (the User node, live
-            # degree ~3.4k and growing with event facts) turned it into 8 arbitrary edges.
-            # Recency is the least-wrong single ordering for a "what about X" hop sample.
+    if seed_uuids:
+        hop_side = (
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM kg_relationships "
             "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-            "  AND (src_uuid = %s OR tgt_uuid = %s) "
             f"{scope_sql}"
-            "ORDER BY t_valid DESC LIMIT 8",
-            (owner_id, group_id, sd, sd, *scope_args),
+        )
+        cur.execute(
+            "SELECT h.uuid, h.fact, h.t_valid, h.ongoing, h.last_supported_at "
+            "FROM unnest(%s::text[]) WITH ORDINALITY AS s(sd, ord) "
+            "CROSS JOIN LATERAL ("
+            f"  ({hop_side}AND src_uuid = s.sd ORDER BY t_valid DESC LIMIT 8) "
+            "  UNION ALL "
+            f"  ({hop_side}AND tgt_uuid = s.sd AND src_uuid <> s.sd ORDER BY t_valid DESC LIMIT 8) "
+            "  ORDER BY t_valid DESC LIMIT 8"
+            ") h ORDER BY s.ord, h.t_valid DESC",
+            (seed_uuids, owner_id, group_id, *scope_args, owner_id, group_id, *scope_args),
         )
         for u, f, tv, og, sup in cur.fetchall():
             if u and f:
