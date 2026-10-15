@@ -1194,6 +1194,19 @@ class TestStage6bSaturationRounds:
         assert extra == 0  # never raises, invalidate keeps round-1 verdicts
         assert invalidate[0] == [f"s{i}" for i in range(5)]
 
+    def test_transport_failure_is_not_swallowed(self):
+        """An outage mid-rounds is not 'nothing more to retire': the item fails and retries."""
+        from ingestion.llm_client import LLMUnavailableError
+
+        round1_pool = self._edges("s", 8)
+        pipe, client = self._pipeline([], round1_pool + self._edges("n", 6))
+        client.messages.create.side_effect = LLMUnavailableError("claude CLI unreachable")
+        invalidate = {0: [f"s{i}" for i in range(5)]}
+        with pytest.raises(LLMUnavailableError):
+            pipe._stage6b_saturation_rounds(
+                self._fact(), {0: ([], round1_pool)}, invalidate, [[0.1, 0.2]], "technical"
+            )
+
 
 class TestStage6aDedup:
     """The pair-pool and semantic-pool overlap when an edge clears both checks.
@@ -1599,3 +1612,22 @@ class TestDeduperCache:
             pipe_b._deduper_for("technical").exact_match("shared register probe")
             == "uuid-shared-probe"
         )
+
+
+# ---------------------------------------------------------------------------
+# Chunk provenance lookup
+# ---------------------------------------------------------------------------
+
+
+class TestChunkProvenanceLookup:
+    def test_database_error_fails_the_item(self):
+        """Swallowing the lookup error wrote the chunk's edges with no source episodes and
+        t_valid=now, and the item was marked done. The queue retries a failed item."""
+        db = MagicMock()
+        db.get_chunk_episode_ids.side_effect = ConnectionError("database down")
+        pipe = ExtractionPipeline(
+            db=db, llm_client=MagicMock(), embedder=MagicMock(), kg_client=MagicMock()
+        )
+        item = {"content_type": "chunk", "content": "window", "session_id": "s1", "project": None}
+        with pytest.raises(ConnectionError):
+            pipe.process_item(item)

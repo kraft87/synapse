@@ -484,8 +484,8 @@ class NodeDeduper:
     def _exact_name_lookup(self, normalized: str) -> str | None:
         """Indexed exact lookup on ``normalized_name`` via the graph client.
 
-        Includes the slow lower(trim(name)) fallback for pre-migration rows
-        that lack the property.
+        A database error propagates: reading it as "no such entity" would mint a
+        duplicate node for a name that exists. The item fails and the queue retries it.
         """
         # Honor in-memory hits first — covers entities registered this run
         # (by ANY worker thread; the index is process-shared).
@@ -495,10 +495,7 @@ class NodeDeduper:
             if in_mem is not None:
                 return in_mem
 
-        try:
-            return self._kg.entity_uuid_by_normalized_name(normalized, self._group_id)
-        except Exception:
-            return None
+        return self._kg.entity_uuid_by_normalized_name(normalized, self._group_id)
 
     def _peek_index(self) -> _GroupIndex | None:
         """The group's shared index if already built, else None (never builds)."""
@@ -537,6 +534,10 @@ class NodeDeduper:
     def _build_index(self) -> _GroupIndex:
         """Hydrate a fresh _GroupIndex from every Entity in the group.
 
+        A failed load raises instead of returning a stand-in index: ``_index`` caches
+        what this returns for the whole TTL, and an empty one would find no fuzzy
+        candidate (so mint duplicates) until it expired.
+
         Shingle sets are NOT retained — they exist only long enough to
         compute each MinHash (storing them cost ~87MB at 48K entities);
         ``_lsh_candidates`` recomputes them per candidate from the name.
@@ -551,21 +552,12 @@ class NodeDeduper:
             logger.warning("dedup: numpy unavailable (%s); skipping LSH", exc)
             return _GroupIndex(_NullLSH())
 
-        try:
-            rows = self._kg.load_entities(self._group_id)
-        except Exception as exc:
-            logger.warning("dedup: failed to load entities for LSH (%s); skipping", exc)
-            return _GroupIndex(_NullLSH())
-
+        rows = self._kg.load_entities(self._group_id)
         idx = _GroupIndex(lsh)
 
         # Taxonomy map for the type-compatibility gate (empty if unseeded -> gate no-ops).
         if _TYPE_GATE_ON:
-            try:
-                idx.type_map = self._kg.load_type_map()
-            except Exception as exc:
-                logger.warning("dedup: failed to load type map (%s); type gate off", exc)
-                idx.type_map = {}
+            idx.type_map = self._kg.load_type_map()
 
         for row in rows:
             node_uuid = row[0]

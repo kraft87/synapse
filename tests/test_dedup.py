@@ -286,6 +286,54 @@ class TestTypeGate:
 
 
 # ---------------------------------------------------------------------------
+# Database errors surface (the extraction item fails and the queue retries it)
+# ---------------------------------------------------------------------------
+
+
+class _FlakyKGClient(_FakeKGClient):
+    """A KG client whose exact-name probe and/or entity load fail while their flag is set."""
+
+    def __init__(self, graph: _FakeGraph, *, exact_fails: bool = False, load_fails: bool = False):
+        super().__init__(graph)
+        self.exact_fails = exact_fails
+        self.load_fails = load_fails
+
+    def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
+        if self.exact_fails:
+            raise ConnectionError("database down")
+        return super().entity_uuid_by_normalized_name(normalized, group_id)
+
+    def load_entities(self, group_id: str) -> list[tuple[str, ...]]:
+        if self.load_fails:
+            raise ConnectionError("database down")
+        return super().load_entities(group_id)
+
+
+class TestDatabaseErrorsSurface:
+    def test_exact_name_lookup_error_is_not_read_as_no_match(self):
+        # A swallowed error here minted a duplicate node for a name that exists.
+        client = _FlakyKGClient(_FakeGraph(exact_match={"falkordb": "u-1"}), exact_fails=True)
+        deduper = NodeDeduper(client, group_id="technical")
+        with pytest.raises(ConnectionError):
+            deduper.exact_match("FalkorDB")
+        with pytest.raises(ConnectionError):
+            deduper.classify("FalkorDB")
+
+    def test_failed_index_load_raises_and_is_not_cached(self):
+        graph = _FakeGraph(entities=[("uuid-poller", "synapse-poller", "watches sessions")])
+        client = _FlakyKGClient(graph, load_fails=True)
+        deduper = NodeDeduper(client, group_id="technical")
+        with pytest.raises(ConnectionError):
+            deduper.classify("synapse poller")
+        # The next call rebuilds the index, instead of serving a stand-in that finds
+        # nothing for the whole cache TTL.
+        client.load_fails = False
+        kind, payload = deduper.classify("synapse poller")
+        assert kind == "candidates"
+        assert payload[0][0] == "uuid-poller"
+
+
+# ---------------------------------------------------------------------------
 # Summary merge
 # ---------------------------------------------------------------------------
 

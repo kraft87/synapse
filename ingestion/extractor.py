@@ -118,16 +118,12 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         elif content_type == "summary" and session_id:
             # Summaries -> the synth_document's source_ids so edges trace back to the
             # episodes they were derived from.
-            try:
-                episode_ids = self._db.get_synth_document_source_ids(session_id, content)
-            except Exception:
-                episode_ids = []
+            episode_ids = self._db.get_synth_document_source_ids(session_id, content)
         elif content_type == "chunk" and session_id:
-            # Chunks -> the window the chunk was built from (task #63).
-            try:
-                episode_ids = self._db.get_chunk_episode_ids(session_id, content)
-            except Exception:
-                episode_ids = []
+            # Chunks -> the window the chunk was built from (task #63). A database error
+            # fails the item (the queue retries it): swallowing it wrote edges with no
+            # provenance and t_valid=now.
+            episode_ids = self._db.get_chunk_episode_ids(session_id, content)
         # Episodes emit no facts and skip Stage 3, so their segment date is never
         # consumed — skip the lookup for them to keep the per-turn hot path lean.
         segment_valid_at = (
