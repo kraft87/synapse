@@ -447,6 +447,8 @@ def test_route_records_board_telemetry(conn, db_url):
     db = Database(db_url)
     kept = _note(db, type="user", hook="Telemetry fixture note")
     db.close()
+    _event(conn, "shipped the telemetry fixture")
+    event_id = conn.execute("SELECT id FROM timeline_events").fetchone()[0]
     engine = Recall(db_url=db_url, voyage_api_key="")
     with _client(db_url, get_recall=lambda: engine, resolve_trust=_full_trust) as client:
         r = client.get("/context", headers={"Authorization": f"Bearer {_TOKEN}"})
@@ -464,6 +466,9 @@ def test_route_records_board_telemetry(conn, db_url):
     assert ms_total is not None and chars > 0 and est_tokens == chars // 4
     # Served form ("n:N") — joinable against recall_feedback's helpful/noise ids.
     assert served_ids["notes"] == [f"n:{kept}"]
+    # The "Last 7 days" lines carry (t:N) handles recall_feedback accepts, so they are
+    # recorded too: without them nothing says whether the block is ever used.
+    assert served_ids["events"] == [f"t:{event_id}"]
     assert served_ids["n_notes"] == 1 and served_ids["overflow"] == 0
 
 

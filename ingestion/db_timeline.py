@@ -3,7 +3,18 @@ from __future__ import annotations
 from typing import Any, cast
 
 from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_literal
+from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import own_surface_columns_ready
+
+#: ``timeline_events.reported_refs`` (an optional migration): until it exists a merge records
+#: nothing about the re-telling turn, and the delete cascade removes a re-told row with its
+#: owner turn.
+REPORTED_REFS_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('timeline_events') AND attname = 'reported_refs' "
+    "AND NOT attisdropped",
+    "timeline_events.reported_refs",
+)
 
 
 class TimelineStore(DatabaseConnection):
@@ -29,7 +40,11 @@ class TimelineStore(DatabaseConnection):
         ``source_episode_id`` copies that turn's provenance stamp (schema 057) onto the
         event in the same statement, so an event is served to a restricted surface
         exactly when its source turn is. None (or an unstamped turn) stamps NULL, and
-        before schema 057 is applied the statement is the pre-057 one."""
+        before schema 057 is applied the statement is the pre-057 one.
+
+        An event whose turn is gone writes nothing (returns 0): the delete cascade already
+        ran, and an event inserted after it would keep serving the deleted turn's text. The
+        turn is locked until the insert commits, so a delete that starts meanwhile waits."""
         vlit = _vector_literal(embedding)
         params: list[Any] = [
             t_valid,
@@ -44,6 +59,14 @@ class TimelineStore(DatabaseConnection):
             domain,
         ]
         with self._conn() as conn:
+            if (
+                source_episode_id is not None
+                and conn.execute(
+                    "SELECT 1 FROM episodes WHERE id = %s FOR KEY SHARE", (source_episode_id,)
+                ).fetchone()
+                is None
+            ):
+                return 0
             stamped = source_episode_id is not None and own_surface_columns_ready(conn, self._url)
             if not stamped:
                 return conn.execute(
@@ -107,17 +130,26 @@ class TimelineStore(DatabaseConnection):
             ).fetchall()
         return cast(list[dict[str, Any]], rows)
 
-    def bump_timeline_reported(self, event_id: int, t_valid: str) -> None:
+    def bump_timeline_reported(self, event_id: int, t_valid: str, retold_by: str) -> None:
         """Record a re-assertion of an existing timeline event (dedup merge outcome):
-        increment reported_count and keep the EARLIEST t_valid — the canonical date of
-        a date-split re-telling is the first-resolved one, and a re-tell that resolves
-        an earlier true date corrects the row."""
+        keep the EARLIEST t_valid — the canonical date of a date-split re-telling is the
+        first-resolved one, and a re-tell that resolves an earlier true date corrects the
+        row — and append the re-telling turn's ref (``ep:<id>``) to ``reported_refs``
+        unless it is there already, so a retried item that merges again changes nothing."""
         with self._conn() as conn:
-            conn.execute(
-                "UPDATE timeline_events SET reported_count = reported_count + 1, "
-                "t_valid = LEAST(t_valid, %s::timestamptz) WHERE id = %s",
-                (t_valid, event_id),
-            )
+            if REPORTED_REFS_PROBE.ready(conn, self._url):
+                conn.execute(
+                    "UPDATE timeline_events SET t_valid = LEAST(t_valid, %s::timestamptz), "
+                    "reported_refs = CASE WHEN %s = ANY(reported_refs) THEN reported_refs "
+                    "ELSE array_append(reported_refs, %s) END WHERE id = %s",
+                    (t_valid, retold_by, retold_by, event_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE timeline_events SET t_valid = LEAST(t_valid, %s::timestamptz) "
+                    "WHERE id = %s",
+                    (t_valid, event_id),
+                )
 
     def timeline_ident_exists(
         self, idents: list[str], project: str | None, t_valid: str, window_hours: int

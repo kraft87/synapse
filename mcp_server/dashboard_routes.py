@@ -58,8 +58,10 @@ from starlette.responses import (
 from ingestion import pg_pool
 from ingestion.db_connection import bm25_query_text
 from ingestion.db_episodes import DELETED_TURNS_PROBE
+from ingestion.db_timeline import REPORTED_REFS_PROBE
 from ingestion.dedup import _normalize_name
 from ingestion.llm_schemas import _EVENT_TYPES
+from ingestion.surfaces import OWN_SURFACE_PROBE
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -1718,6 +1720,28 @@ def _clear_invalidated_by(conn: psycopg.Connection[dict[str, Any]], uuids: list[
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
+def _repoint_event(
+    conn: psycopg.Connection[dict[str, Any]], event_id: int, episode_id: int
+) -> bool:
+    """Make the surviving turn ``episode_id`` the owner of a timeline event: its
+    source_ref becomes the first free ``ep:<id>`` / ``ep:<id>#<k>`` (the turn's own events
+    may hold some), and the event takes that turn's provenance stamp (schema 057), since it
+    is now served on that turn's account. False when the turn no longer exists."""
+    stamp = ", surface_id = e.surface_id" if OWN_SURFACE_PROBE.ready(conn) else ""
+    return bool(
+        conn.execute(
+            "UPDATE timeline_events t SET source_ref = free.ref"  # nosec B608 — a fixed fragment
+            + stamp
+            + " FROM episodes e, LATERAL (SELECT 'ep:' || e.id || CASE WHEN n = 1 THEN '' "
+            "ELSE '#' || n END AS ref FROM generate_series(1, 50) n WHERE NOT EXISTS "
+            "(SELECT 1 FROM timeline_events o WHERE o.source = 'chat' AND "
+            "o.source_ref = 'ep:' || e.id || CASE WHEN n = 1 THEN '' ELSE '#' || n END) "
+            "ORDER BY n LIMIT 1) free WHERE t.id = %s AND e.id = %s",
+            (event_id, episode_id),
+        ).rowcount
+    )
+
+
 def delete_episode_content(
     conn: psycopg.Connection[dict[str, Any]], episode_ids: list[int]
 ) -> dict[str, Any]:
@@ -1801,21 +1825,34 @@ def delete_episode_content(
     # --- timeline events -----------------------------------------------------
     # Chat events carry source_ref 'ep:<id>' (or 'ep:<id>#<k>' when one turn
     # yielded several — ingestion/timeline_gate.py). UNIQUE (source, source_ref)
-    # makes the first telling's turn the row's owner, so the rule resolves to delete;
-    # keeping them would go on serving the deleted turn from recall()'s timeline leg.
-    # That includes a row a later turn re-told: schema 037's dedup merge only bumps
-    # reported_count and records no list of re-telling turns, so there is no telling
-    # whether one survives, and a kept row would still carry the deleted turn's text.
-    deleted_events = [
-        r["id"]
-        for r in conn.execute(
-            "DELETE FROM timeline_events WHERE source_ref = ANY(%s) OR source_ref LIKE ANY(%s) "
-            "RETURNING id",
-            ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids]),
-        ).fetchall()
-    ]
+    # makes the first telling's turn the row's owner. An event no other stored turn
+    # backs goes with it: keeping it would go on serving the deleted turn's text. One a
+    # later turn re-told (schema 104's reported_refs) moves to the first such turn that
+    # survives. Rows merged before 104 list no turns, so they are deleted.
+    has_refs = REPORTED_REFS_PROBE.ready(conn)
+    owned = conn.execute(
+        "SELECT id, " + ("reported_refs" if has_refs else "'{}'::text[] AS reported_refs") + " "  # nosec B608 — a fixed fragment
+        "FROM timeline_events WHERE source_ref = ANY(%s) OR source_ref LIKE ANY(%s) FOR UPDATE",
+        ([f"ep:{i}" for i in episode_ids], [f"ep:{i}#%" for i in episode_ids]),
+    ).fetchall()
+    deleted_events = []
+    for r in owned:
+        survivors = [
+            ep for ref in r["reported_refs"] if (ep := _episode_id_from_ref(ref)) not in ids
+        ]
+        if not any(_repoint_event(conn, r["id"], ep) for ep in survivors):
+            deleted_events.append(r["id"])
     if deleted_events:
+        conn.execute("DELETE FROM timeline_events WHERE id = ANY(%s)", (deleted_events,))
         retire_flags(conn, "timeline_event", [str(i) for i in deleted_events])
+    if has_refs:
+        # A turn that is gone has re-told nothing: a later cascade must not move an
+        # event onto it.
+        conn.execute(
+            "UPDATE timeline_events SET reported_refs = ARRAY(SELECT x FROM "
+            "unnest(reported_refs) x WHERE x <> ALL(%s)) WHERE reported_refs && %s",
+            ([f"ep:{i}" for i in episode_ids],) * 2,
+        )
 
     # --- tombstones, while the rows still say what the turns were ------------------------
     # Without the table (its migration is optional) there is nothing to record and the

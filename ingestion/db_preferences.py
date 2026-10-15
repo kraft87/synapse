@@ -38,10 +38,24 @@ class PreferenceStore(DatabaseConnection):
         embedding: list[float] | None,
         embed_model: str | None,
         source_ref: str | None,
-    ) -> int:
-        """Append one live preference (assert_count=1). Returns the new row id."""
+        source_episode_id: int | None = None,
+    ) -> int | None:
+        """Append one live preference (assert_count=1). Returns the new row id.
+
+        ``source_episode_id`` is the turn it was stated in. If that turn is gone, nothing
+        is written and None comes back: a delete that ran while the gate was thinking has
+        already purged the turn's preferences and would not run again. The turn stays
+        locked until the insert commits, so a delete that starts meanwhile waits for it."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
+            if (
+                source_episode_id is not None
+                and conn.execute(
+                    "SELECT 1 FROM episodes WHERE id = %s FOR KEY SHARE", (source_episode_id,)
+                ).fetchone()
+                is None
+            ):
+                return None
             row = conn.execute(
                 "INSERT INTO preferences "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "(owner_id, group_id, project, pref, polarity, embedding, embed_model, source_ref) "
@@ -94,15 +108,3 @@ class PreferenceStore(DatabaseConnection):
                 "UPDATE preferences SET t_invalid = now(), superseded_by = %s WHERE id = %s",
                 (new_id, old_id),
             )
-
-    def top_preferences(self, owner_id: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Live preferences for the session-start block: strongest first — most-reasserted,
-        then most-recent. Across ALL groups (a standing preference shapes every session)."""
-        with self._conn() as conn:
-            rows = conn.execute(
-                "SELECT pref, polarity, assert_count, left(first_seen::text, 10) AS since "
-                "FROM preferences WHERE owner_id = %s AND t_invalid IS NULL "
-                "ORDER BY assert_count DESC, last_asserted DESC LIMIT %s",
-                (owner_id, limit),
-            ).fetchall()
-        return [dict(r) for r in rows]

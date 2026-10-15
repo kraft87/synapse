@@ -37,6 +37,7 @@ from typing import Any
 
 from ingestion.extraction_policy import _default_group_for_project
 from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError, parse_with_retry
+from ingestion.turns import compact_turn, user_text
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,10 @@ logger = logging.getLogger(__name__)
 # so a future multi-tenant split threads the same env var through preferences too.
 _OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
-_MIN_CONTENT = 40  # turns shorter than this can't carry a stated preference worth keeping
+# A turn whose [user] text is shorter than this ("ok", "continue", "yes, do it") asserts no
+# standing preference. Measured on the user's text, not the whole turn: a bare "ok" that
+# followed a long tool trace used to pay for the gate call.
+_MIN_USER_CHARS = 20
 
 # Dedup / supersession thresholds against the live-set cosine similarity.
 #
@@ -245,12 +249,12 @@ class PreferencesGate:
     def _process(self, item: dict[str, Any]) -> None:
         content = (item.get("content") or "").strip()
         episode_id = item.get("episode_id")
-        if not episode_id or len(content) < _MIN_CONTENT:
+        if not episode_id or len(user_text(content).strip()) < _MIN_USER_CHARS:
             return
 
         prefs = parse_with_retry(
             self._llm_client,
-            base_prompt=f"{GATE_PROMPT}\n\nTHE TURN:\n{content[:6000]}",
+            base_prompt=f"{GATE_PROMPT}\n\nTHE TURN:\n{compact_turn(content)}",
             parser=_parse_prefs,
             model=self._model,
             max_tokens=512,
@@ -260,9 +264,8 @@ class PreferencesGate:
 
         project = item.get("project")
         group_id = _group_for(project)
-        source_ref = f"ep:{episode_id}"
         for p in prefs:
-            self._store_one(p, project, group_id, source_ref)
+            self._store_one(p, project, group_id, int(episode_id))
 
     def _confirm_duplicate(self, new_pref: str, existing_pref: str) -> dict[str, Any]:
         """One small LLM call: is ``new_pref`` the same standing preference as
@@ -309,7 +312,7 @@ class PreferencesGate:
         return True
 
     def _store_one(
-        self, p: dict[str, Any], project: str | None, group_id: str, source_ref: str
+        self, p: dict[str, Any], project: str | None, group_id: str, episode_id: int
     ) -> None:
         # Embed the BARE pref text (no metadata prefix): the recall serving leg ranks live
         # prefs against the plain query embedding, so the store must share that space, and
@@ -352,8 +355,12 @@ class PreferencesGate:
             polarity=p["polarity"],
             embedding=vec,
             embed_model=embed_model,
-            source_ref=source_ref,
+            source_ref=f"ep:{episode_id}",
+            source_episode_id=episode_id,
         )
+        if new_id is None:
+            logger.info("preference not stored: its turn ep:%s was deleted meanwhile", episode_id)
+            return
         if action["action"] == "supersede":
             self._db.supersede_preference(action["target_id"], new_id)
             logger.info(

@@ -176,6 +176,10 @@ class _Boom:
         raise AssertionError("should not be touched")
 
 
+# A turn whose user text is long enough to assert something.
+_TURN = "[user] I always want concise answers, no padding.\n\n[assistant] Understood."
+
+
 def _gate(enabled=True, monkeypatch=None):
     if monkeypatch:
         monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1" if enabled else "0")
@@ -187,20 +191,23 @@ def test_disabled_gate_is_noop(monkeypatch):
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500})  # would explode if it ran
 
 
-def test_short_content_skips_llm(monkeypatch):
+def test_a_near_empty_user_text_skips_llm_whatever_else_the_turn_holds(monkeypatch):
+    """ "ok" after a long tool trace is not a stated preference, and used to pay for the call."""
     g = _gate(enabled=True, monkeypatch=monkeypatch)
-    g.process({"id": 1, "episode_id": 5, "content": "ok thanks"})  # under _MIN_CONTENT
+    trace = "\n\n".join(f"[tool:Bash] step {k}\n\n[result] {'x' * 300}" for k in range(20))
+    g.process({"id": 1, "episode_id": 5, "content": f"[user] ok\n\n{trace}\n\n[assistant] done"})
+    g.process({"id": 1, "episode_id": 5, "content": "[assistant] there is no user text"})
 
 
 def test_missing_episode_id_skips(monkeypatch):
     g = _gate(enabled=True, monkeypatch=monkeypatch)
-    g.process({"id": 1, "content": "x" * 500})
+    g.process({"id": 1, "content": _TURN})
 
 
 def test_errors_are_swallowed(monkeypatch):
     # llm blows up -> process() logs and returns, never raises (KG work must not break)
     g = _gate(enabled=True, monkeypatch=monkeypatch)
-    g.process({"id": 1, "episode_id": 5, "content": "x" * 500})
+    g.process({"id": 1, "episode_id": 5, "content": _TURN})
 
 
 def test_transport_failures_are_not_swallowed(monkeypatch):
@@ -217,7 +224,7 @@ def test_transport_failures_are_not_swallowed(monkeypatch):
     g = pg.PreferencesGate(db=_Boom(), llm_client=object(), embedder=_Boom())
     monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
     with pytest.raises(LLMUnavailableError):
-        g.process({"id": 1, "episode_id": 5, "content": "x" * 500})
+        g.process({"id": 1, "episode_id": 5, "content": _TURN})
 
 
 def test_usage_limits_reach_the_poller(monkeypatch):
@@ -232,7 +239,7 @@ def test_usage_limits_reach_the_poller(monkeypatch):
     g = pg.PreferencesGate(db=_Boom(), llm_client=object(), embedder=_Boom())
     monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
     with pytest.raises(UsageLimitError):
-        g.process({"id": 1, "episode_id": 5, "content": "x" * 500})
+        g.process({"id": 1, "episode_id": 5, "content": _TURN})
 
 
 # ---- full write flow (stubbed db + embedder + gate return) ----
@@ -306,7 +313,7 @@ def _run_flow(monkeypatch, prefs, candidates, confirm=None, embedder=None):
     monkeypatch.setattr(pg, "parse_with_retry", _fake_parse_with_retry)
     db = _RecDB(candidates)
     g = pg.PreferencesGate(db=db, llm_client=object(), embedder=embedder or _StubEmb())
-    g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "synapse"})
+    g.process({"id": 1, "episode_id": 5, "content": _TURN, "project": "synapse"})
     return db
 
 
@@ -510,3 +517,47 @@ def test_flow_confirm_merge_embed_failure_falls_back_to_reassert(monkeypatch):
         embedder=_StubEmb(fail_after=1),
     )
     assert db.merged == [] and db.reasserted == [42] and db.inserted == []
+
+
+def test_the_gate_reads_the_ask_and_the_ending_of_a_long_turn(monkeypatch):
+    """The head of a long turn is tool trace; the ending is where the user's reaction and
+    the agent's answer are, so the prompt carries the compact view, not the first 6000."""
+    import ingestion.preferences_gate as pg
+
+    monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
+    prompts: list[str] = []
+
+    def _capture(*a, **k):
+        prompts.append(k["base_prompt"])
+        return []
+
+    monkeypatch.setattr(pg, "parse_with_retry", _capture)
+    trace = "\n\n".join(f"[tool:Bash] step {k}\n\n[result] {'x' * 400}" for k in range(80))
+    turn = f"[user] never summarize my own code back to me\n\n{trace}\n\n[assistant] THE END"
+    pg.PreferencesGate(db=_Boom(), llm_client=object(), embedder=_Boom()).process(
+        {"id": 1, "episode_id": 5, "content": turn}
+    )
+    assert "never summarize my own code back to me" in prompts[0]
+    assert "[assistant] THE END" in prompts[0]
+    assert "[result]" not in prompts[0]
+
+
+def test_flow_a_preference_whose_turn_was_deleted_meanwhile_supersedes_nothing(monkeypatch):
+    class _GoneDB(_RecDB):
+        def insert_preference(self, **kw):
+            self.inserted.append(kw)
+            return None  # the turn was deleted while the gate was thinking
+
+    import ingestion.preferences_gate as pg
+
+    monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
+    monkeypatch.setattr(pg, "_group_for", lambda project: "technical")
+    monkeypatch.setattr(
+        pg, "parse_with_retry", lambda *a, **k: [{"pref": "User prefers tabs", "polarity": "like"}]
+    )
+    db = _GoneDB([{"id": 7, "pref": "User prefers spaces", "polarity": "dislike", "sim": 0.8}])
+    pg.PreferencesGate(db=db, llm_client=object(), embedder=_StubEmb()).process(
+        {"id": 1, "episode_id": 5, "content": _TURN}
+    )
+    assert db.inserted[0]["source_episode_id"] == 5
+    assert db.superseded == []

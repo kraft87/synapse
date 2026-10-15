@@ -37,6 +37,7 @@ from ingestion.llm_client import (
 from ingestion.llm_schemas import TimelineGateEvents
 from ingestion.localtime import local_date
 from ingestion.scope import personal_scope_enabled
+from ingestion.turns import compact_turn
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,7 @@ _MAX_EVENTS_PER_TURN = 3
 # in the SOURCE TURNS ("cleaned up segments" = N distinct jobs with identical
 # event text). The surviving form — both full turns in the prompt + both-orders
 # SAME consensus — leaves ~2% true false-merge, all recoverable (non-destructive
-# reported_count bump, no deletes). See workspace/timeline-dedup-decision.md.
+# reported_refs append, no deletes). See workspace/timeline-dedup-decision.md.
 # ---------------------------------------------------------------------------
 
 _DEDUP_WINDOW_DAYS = 14
@@ -198,7 +199,6 @@ class TimelineGate:
         self._embedder = embedder
         self._model = model
         self.enabled = os.environ.get("SYNAPSE_TIMELINE_GATE", "1") != "0"
-        self.dedup_enabled = os.environ.get("SYNAPSE_TIMELINE_DEDUP", "1") != "0"
 
     def process(self, item: dict[str, Any]) -> None:
         """Gate one turn. Fail-soft for CONTENT failures; transport failures re-raise.
@@ -238,7 +238,7 @@ class TimelineGate:
             output_model=TimelineGateEvents,
             base_prompt=(
                 f"{gate_prompt()}\nThis turn happened on {turn_date}."
-                f"\n\nTHE TURN:\n{content[:6000]}"
+                f"\n\nTHE TURN:\n{compact_turn(content)}"
             ),
             model=self._model,
             max_tokens=512,
@@ -272,18 +272,18 @@ class TimelineGate:
                     logger.info("timeline gate skip (ident dup %s) ep:%s", idents, episode_id)
                     continue
 
-            if self.dedup_enabled and self._merge_if_retold(
+            if self._merge_if_retold(
                 gate["event"], vec, project, t_valid, episode_id, content, turn_date
             ):
                 continue
 
-            self._db.insert_timeline_event(
+            written = self._db.insert_timeline_event(
                 t_valid=t_valid,
                 fact=gate["event"],
                 source="chat",
                 # "ep:<id>" for the first event keeps the historic key shape (idempotent
                 # re-processing); "#k" suffixes let 2nd/3rd events coexist under the
-                # UNIQUE(source, source_ref) constraint. Nothing parses source_ref at serve.
+                # UNIQUE(source, source_ref) constraint. The dashboard cascade parses it (ep:<id>[#k]).
                 source_ref=f"ep:{episode_id}" if k == 1 else f"ep:{episode_id}#{k}",
                 project=project,
                 salience=gate["salience"],
@@ -298,12 +298,13 @@ class TimelineGate:
                 # Inherit the turn's provenance (schema 057) for restricted-board serving.
                 source_episode_id=int(episode_id),
             )
-            logger.info(
-                "timeline event (s%d) from ep:%s: %s",
-                gate["salience"],
-                episode_id,
-                gate["event"][:80],
-            )
+            if written:
+                logger.info(
+                    "timeline event (s%d) from ep:%s: %s",
+                    gate["salience"],
+                    episode_id,
+                    gate["event"][:80],
+                )
 
     # ------------------------------------------------------------------
     # Dedup confirm-merge
@@ -343,9 +344,9 @@ class TimelineGate:
             a = (str(cand["t_valid"])[:10], cand["fact"], cand_turn[:_DEDUP_TURN_CHARS])
             b = (turn_date, event, turn_content[:_DEDUP_TURN_CHARS])
             if self._confirm_same(a, b) and self._confirm_same(b, a):
-                self._db.bump_timeline_reported(cand["id"], t_valid)
+                self._db.bump_timeline_reported(cand["id"], t_valid, f"ep:{episode_id}")
                 logger.info(
-                    "timeline dedup merge: ep:%s '%s' -> event %s (reported_count+1)",
+                    "timeline dedup merge: ep:%s '%s' -> event %s",
                     episode_id,
                     event[:60],
                     cand["id"],

@@ -282,8 +282,8 @@ class _DedupDb(_Rec):
     def timeline_near_candidates(self, *a, **k):
         return self._cands
 
-    def bump_timeline_reported(self, event_id, t_valid):
-        self.bumped.append((event_id, t_valid))
+    def bump_timeline_reported(self, event_id, t_valid, retold_by):
+        self.bumped.append((event_id, t_valid, retold_by))
 
     def get_episode(self, episode_id):
         return {"content": f"full source turn text for ep {episode_id}"}
@@ -300,12 +300,11 @@ _CAND = [
 ]
 
 
-def _dedup_gate(monkeypatch, cands, verdicts, dedup_env="1"):
+def _dedup_gate(monkeypatch, cands, verdicts):
     """Drive one gated event through the dedup path with scripted confirm verdicts."""
     import ingestion.timeline_gate as tg
 
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
-    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", dedup_env)
     db = _DedupDb(cands)
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
@@ -331,7 +330,7 @@ def _dedup_gate(monkeypatch, cands, verdicts, dedup_env="1"):
 def test_both_orders_same_merges_instead_of_inserting(monkeypatch):
     db = _dedup_gate(monkeypatch, _CAND, [True, True])
     assert db.inserted == []
-    assert db.bumped == [(42, "2026-07-02T10:00:00+00:00")]
+    assert db.bumped == [(42, "2026-07-02T10:00:00+00:00", "ep:5")]
 
 
 def test_order_flip_keeps_the_event(monkeypatch):
@@ -352,13 +351,6 @@ def test_no_candidates_skips_confirm_entirely(monkeypatch):
     assert len(db.inserted) == 1
 
 
-def test_dedup_kill_switch(monkeypatch):
-    # candidates present and confirms would say SAME, but the env gate is off
-    db = _dedup_gate(monkeypatch, _CAND, [True, True], dedup_env="0")
-    assert len(db.inserted) == 1
-    assert db.bumped == []
-
-
 def test_dedup_db_error_fails_soft_to_insert(monkeypatch):
     # _Rec has no timeline_near_candidates at all -> AttributeError inside the
     # dedup path -> logged, event inserts normally (dup cheaper than lost event)
@@ -374,7 +366,6 @@ def test_missing_candidate_turn_means_no_merge(monkeypatch):
     import ingestion.timeline_gate as tg
 
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
-    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "1")
     db = _NoTurn(_CAND)
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(
@@ -388,3 +379,25 @@ def test_missing_candidate_turn_means_no_merge(monkeypatch):
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "p"})
     assert len(db.inserted) == 1
     assert db.bumped == []
+
+
+def test_the_gate_reads_the_ending_of_a_long_turn(monkeypatch):
+    """A long turn is mostly tool trace; its head used to fill the 6000 chars and the
+    agent's closing summary, where the outcome is stated, never reached the gate."""
+    import ingestion.timeline_gate as tg
+
+    monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
+    prompts: list[str] = []
+
+    def _capture(*a, **k):
+        prompts.append(k["base_prompt"])
+        return _gate_events([])
+
+    monkeypatch.setattr(tg, "structured_call", _capture)
+    trace = "\n\n".join(f"[tool:Bash] step {k}\n\n[result] {'x' * 400}" for k in range(80))
+    turn = f"[user] fix the poller\n\n{trace}\n\n[assistant] shipped the fix to prod"
+    tg.TimelineGate(db=_Rec(False), llm_client=object(), embedder=_StubEmb()).process(
+        {"id": 1, "episode_id": 5, "content": turn}
+    )
+    assert "[assistant] shipped the fix to prod" in prompts[0]
+    assert "[tool:Bash] step 79" in prompts[0] and "[result]" not in prompts[0]

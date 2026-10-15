@@ -205,6 +205,9 @@ class _RecordingDb:
     def timeline_ident_exists(self, *a, **k):
         return False
 
+    def timeline_near_candidates(self, *a, **k):
+        return []
+
     def insert_timeline_event(self, **kw):
         self.inserted.append(kw)
         return 1
@@ -222,7 +225,6 @@ def _gate_with(monkeypatch, domain):
     from ingestion.llm_schemas import TimelineGateEvents
 
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
-    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "0")
     db = _RecordingDb()
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
     monkeypatch.setattr(

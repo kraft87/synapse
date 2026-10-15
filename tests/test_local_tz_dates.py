@@ -147,6 +147,9 @@ class _GateDb:
     def timeline_ident_exists(self, *a, **k):
         return False
 
+    def timeline_near_candidates(self, *a, **k):
+        return []
+
     def insert_timeline_event(self, **kw):
         self.inserted.append(kw)
         return 1
@@ -164,7 +167,6 @@ def _gate(monkeypatch, valid_at: str, date: str | None = None):
     from ingestion.llm_schemas import TimelineGateEvents
 
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
-    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "0")
     prompts: list[str] = []
 
     def _call(*a, **k):

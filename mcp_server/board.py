@@ -315,9 +315,10 @@ def build_board(
 ) -> dict[str, Any]:
     """Build the rendered board block. Pure SQL, no embedding calls.
 
-    Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids", "trust"}`` —
-    ``note_ids`` is the telemetry envelope's serve list; serve paths pop it before
-    returning the block to callers (the ids the caller needs are inline as ``n:ID``).
+    Returns ``{"status": "ok", "text", "n_notes", "overflow", "note_ids", "event_ids",
+    "trust"}`` — ``note_ids`` and ``event_ids`` are the telemetry envelope's serve lists;
+    serve paths pop them before returning the block to callers (the ids the caller needs
+    are inline as ``n:ID`` and ``t:ID``).
 
     ``notice`` is a serve-nothing explanation (recall_warnings.serving_notice) that the
     route computed for an authenticated caller. It renders as a ``WARNING:`` line right
@@ -351,6 +352,8 @@ def build_board(
         notes = []
 
     try:
+        # Every project the caller may see, not just the requested one: the board is the
+        # one place a session learns what else moved this week.
         events = _recent_events(
             db_url,
             days=7,
@@ -377,6 +380,7 @@ def build_board(
         "n_notes": len(kept),
         "overflow": dropped,
         "note_ids": [n["id"] for n in kept],
+        "event_ids": [e["id"] for e in events],
         # Told to the caller so an unexpectedly thin board is diagnosable as "this host
         # isn't registered" instead of "memory is empty". It reveals nothing filtered.
         "trust": st.trust,
@@ -389,8 +393,9 @@ def build_board(
 def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[str, Any]) -> None:
     """One recall_metrics row (kind='board') per serve, through Recall's fire-and-forget
     writer (record_event). served_ids is the existing free-form JSONB envelope — no new
-    DDL. Note ids are recorded in served form ("n:N") so board serves join directly
-    against recall_feedback's helpful/noise ids (item 6: notes must be measurable).
+    DDL. Note and timeline-event ids are recorded in served form ("n:N", "t:N") so board
+    serves join directly against recall_feedback's helpful/noise ids (notes and the "Last
+    7 days" block must both be measurable).
     Fail-soft: telemetry must never break a serve."""
     try:
         text = board.get("text") or ""
@@ -402,6 +407,7 @@ def record_board_metrics(engine: Any, source: str, ms_total: float, board: dict[
             est_tokens=len(text) // 4,
             served_ids={
                 "notes": [f"n:{i}" for i in (board.get("note_ids") or [])],
+                "events": [f"t:{i}" for i in (board.get("event_ids") or [])],
                 "n_notes": board.get("n_notes", 0),
                 "overflow": board.get("overflow", 0),
                 # Restricted serves are expected to be thinner; without this the metrics
@@ -463,4 +469,5 @@ def register(
         if get_recall is not None:
             record_board_metrics(get_recall(), "http", (time.perf_counter() - t0) * 1000.0, board)
         board.pop("note_ids", None)
+        board.pop("event_ids", None)
         return JSONResponse(board)

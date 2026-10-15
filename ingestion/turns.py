@@ -9,6 +9,7 @@ parsing, so a parser only walks its own format and the sources cannot drift apar
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -108,3 +109,64 @@ class TurnSequence:
             self._seen_span_ids.add(span_id)
         self._prev_assistant = turn.assistant
         return True
+
+
+# ---------------------------------------------------------------------------
+# Reading a stored turn back
+# ---------------------------------------------------------------------------
+
+#: A tagged line starts a block; any other line belongs to the block above it. Only the
+#: tags this module and the parsers write count, so a user's own "[x] done" stays text.
+_BLOCK_START = re.compile(
+    r"^(?=\[(?:context|title|user|assistant|result|attachments|tool:[^\]\n]*)\] )", re.M
+)
+#: Tool-call lines the per-turn gates read from the end of a long turn.
+_TAIL_TOOL_LINES = 40
+
+
+def _blocks(content: str) -> list[tuple[str, str]]:
+    """``(tag, text)`` for each tagged block of a stored turn, in order. Text before the
+    first tag (a turn with no tags at all) comes back under the empty tag."""
+    out: list[tuple[str, str]] = []
+    for part in _BLOCK_START.split(content):
+        if part.strip():
+            m = re.match(r"\[([^\]\n]*)\] ", part)
+            out.append((m.group(1).split(":")[0] if m else "", part.strip()))
+    return out
+
+
+def user_text(content: str) -> str:
+    """The turn's ``[user]`` text, without its tag; empty when it has none."""
+    return " ".join(text[len("[user] ") :] for tag, text in _blocks(content) if tag == "user")
+
+
+def compact_turn(content: str, limit: int = TEXT_CHARS * 2) -> str:
+    """The turn as a per-turn gate should read it: what was asked and how the turn ended.
+
+    ``content`` is 75-90% tool trace on a long turn, and cutting its head to a fixed size
+    kept the trace and lost the ending. This keeps the lead (``[context]``, ``[title]``),
+    the ``[user]`` text and the LAST ``[assistant]`` text whole, then as many of the last
+    tool-call lines as fit in ``limit`` (at most ``_TAIL_TOOL_LINES``) with no ``[result]``
+    bodies; an earlier assistant message or tool line is the part that goes. A turn with no
+    tags is cut to ``limit``. ``episodes.content`` itself is not changed: the skills lane
+    mines its tool lines.
+    """
+    blocks = _blocks(content)
+    if not any(tag for tag, _ in blocks):
+        return content[:limit]
+    final = max((i for i, (tag, _) in enumerate(blocks) if tag == "assistant"), default=-1)
+    kept = [
+        (i, text)
+        for i, (tag, text) in enumerate(blocks)
+        if tag in ("context", "title", "user", "attachments") or i == final
+    ]
+    budget = limit - sum(len(text) for _, text in kept)
+    tools: list[tuple[int, str]] = []
+    for i, (tag, text) in reversed(list(enumerate(blocks))):
+        if tag != "tool":
+            continue
+        if len(tools) == _TAIL_TOOL_LINES or len(text) > budget:
+            break
+        tools.append((i, text))
+        budget -= len(text)
+    return "\n\n".join(text for _, text in sorted(kept + tools))

@@ -19,7 +19,7 @@ from ingestion import codex_client, jsonl_client
 from ingestion.claude_ai_client import ClaudeAIParser, parse_export
 from ingestion.cursor_sqlite_client import CursorSQLiteParser, _project_from_uris
 from ingestion.models import Episode
-from ingestion.turns import TurnSequence, parse_iso
+from ingestion.turns import TurnSequence, compact_turn, parse_iso, user_text
 
 _REPO = Path(__file__).resolve().parents[1]
 
@@ -98,6 +98,58 @@ def test_parse_iso_takes_a_z_suffix_and_shrugs_off_junk():
     assert parse_iso("2026-09-01").year == 2026
     assert parse_iso("not a date") is None
     assert parse_iso(None) is None and parse_iso("") is None
+
+
+def _long_turn(n_tools: int = 100, answer: str = "FINAL ANSWER") -> str:
+    seq = TurnSequence()
+    turn = seq.begin("a title")
+    turn.user("please fix the poller")
+    turn.assistant_text("looking at it")
+    for k in range(n_tools):
+        turn.line(f"[tool:Bash] step-{k}")
+        turn.result(f"output of step {k} " + "x" * 400)
+    turn.assistant_text(answer)
+    return turn.content
+
+
+def test_compact_turn_keeps_the_ask_and_the_ending_and_drops_result_bodies():
+    out = compact_turn(_long_turn())
+    assert "[title] a title" in out and "[user] please fix the poller" in out
+    assert out.rstrip().endswith("[assistant] FINAL ANSWER")
+    assert "[result]" not in out and "output of step" not in out
+    assert "looking at it" not in out  # an earlier assistant message is the part that goes
+    assert len(out) < 6000 < len(_long_turn())
+
+
+def test_compact_turn_keeps_the_last_tool_lines_in_order():
+    out = compact_turn(_long_turn())
+    tools = [line for line in out.split("\n\n") if line.startswith("[tool:")]
+    assert tools == [f"[tool:Bash] step-{k}" for k in range(60, 100)]
+
+
+def test_compact_turn_does_not_reorder_a_short_turn():
+    seq = TurnSequence()
+    turn = seq.begin()
+    turn.user("run it")
+    turn.line("[tool:Bash] pytest")
+    turn.assistant_text("3 passed")
+    assert (
+        compact_turn(turn.content) == "[user] run it\n\n[tool:Bash] pytest\n\n[assistant] 3 passed"
+    )
+
+
+def test_compact_turn_cuts_text_without_tags_to_the_limit():
+    assert compact_turn("x" * 500, limit=100) == "x" * 100
+
+
+def test_user_text_is_the_user_block_only():
+    seq = TurnSequence()
+    turn = seq.begin()
+    turn.user("always use tabs\n[x] and this checkbox")
+    turn.assistant_text("ok")
+    assert user_text(turn.content) == "always use tabs\n[x] and this checkbox"
+    assert user_text("[assistant] no user here") == ""
+    assert user_text("x" * 50) == ""
 
 
 # ---------------------------------------------------------------------------

@@ -153,12 +153,12 @@ def _event(
     event_type=None,
     t_valid=None,
     ingested_at=None,
-    reported_count=1,
+    reported_refs=(),
 ):
     return conn.execute(
         "INSERT INTO timeline_events "
         "(t_valid, fact, source, source_ref, project, salience, domain, event_type, ingested_at, "
-        " reported_count) "
+        " reported_refs) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
             t_valid or _t(0),
@@ -170,7 +170,7 @@ def _event(
             domain,
             event_type,
             ingested_at or _t(0),
-            reported_count,
+            list(reported_refs),
         ),
     ).fetchone()[0]
 
@@ -3112,21 +3112,75 @@ def test_delete_episode_retires_flags_on_cascaded_facts_and_events(clean, conn, 
     assert [(f["kind"], f["item_id"]) for f in flags] == [("fact", "j-shared")]
 
 
-def test_delete_episode_deletes_retold_events_with_their_owner_turn(clean, conn, db_url):
-    """Schema 037's merge bumps reported_count when a later turn re-tells an event but
-    records no list of re-telling turns, so the cascade cannot tell whether one still
-    exists. Keeping the row would leave text from the deleted turn that no stored turn
-    backs; the owner's delete removes it whatever its count."""
+def test_delete_episode_deletes_retold_events_nothing_backs(clean, conn, db_url):
+    """A re-told event whose re-telling turns are all gone (or were never recorded: rows
+    merged before schema 104 have an empty list) goes with its owner turn: keeping it
+    would leave text from the deleted turn that no stored turn backs."""
     doomed = _episode(conn, session="d9", seq=1, content="doomed turn")
-    sole = _event(conn, fact="told once", source_ref=f"ep:{doomed}", reported_count=1)
-    retold = _event(conn, fact="told twice", source_ref=f"ep:{doomed}#2", reported_count=2)
+    sole = _event(conn, fact="told once", source_ref=f"ep:{doomed}")
+    unrecorded = _event(conn, fact="told twice, who unknown", source_ref=f"ep:{doomed}#2")
+    only_doomed = _event(
+        conn, fact="told by itself", source_ref=f"ep:{doomed}#3", reported_refs=[f"ep:{doomed}"]
+    )
 
     with _client(db_url) as client:
         body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
-    assert body["events_deleted"] == 2
-    assert sorted(body["deleted_event_ids"]) == sorted([sole, retold])
-    assert "events_kept" not in body
+    assert body["events_deleted"] == 3
+    assert sorted(body["deleted_event_ids"]) == sorted([sole, unrecorded, only_doomed])
     assert conn.execute("SELECT count(*) FROM timeline_events").fetchone()[0] == 0
+
+
+def test_delete_episode_repoints_a_retold_event_to_a_surviving_turn(clean, conn, db_url):
+    """An event a later turn re-told is backed by that turn: it moves to the first
+    re-telling turn that survives instead of being deleted with the turn that wrote it,
+    and again when that one goes, until no stored turn backs it."""
+    keep = _episode(conn, session="d10", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d10", seq=2, content="doomed turn")
+    second = _episode(conn, session="d10", seq=3, content="re-told it too")
+    retold = _event(
+        conn,
+        fact="told thrice",
+        source_ref=f"ep:{doomed}",
+        reported_refs=[f"ep:{second}", f"ep:{keep}"],
+    )
+    # The survivor already owns ep:<keep>, so a row moved onto it takes the next free suffix.
+    own = _event(conn, fact="survivor's own", source_ref=f"ep:{keep}")
+
+    def stored(event_id):
+        return tuple(
+            conn.execute(
+                "SELECT source_ref, reported_refs FROM timeline_events WHERE id = %s", (event_id,)
+            ).fetchone()
+        )
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+        assert body["events_deleted"] == 0 and body["deleted_event_ids"] == []
+        assert stored(retold) == (f"ep:{second}", [f"ep:{second}", f"ep:{keep}"])
+
+        client.request("DELETE", f"/dash/api/episodes/{second}", headers=_H)
+        # The turn that is gone re-told nothing any more.
+        assert stored(retold) == (f"ep:{keep}#2", [f"ep:{keep}"])
+
+        body = client.request("DELETE", f"/dash/api/episodes/{keep}", headers=_H).json()
+    assert sorted(body["deleted_event_ids"]) == sorted([retold, own])
+    assert conn.execute("SELECT count(*) FROM timeline_events").fetchone()[0] == 0
+
+
+def test_delete_episode_without_reported_refs_deletes_retold_events(
+    clean, conn, db_url, monkeypatch
+):
+    """Before schema 104 is applied the cascade cannot tell who re-told an event."""
+    from ingestion import db_timeline
+
+    monkeypatch.setattr(db_timeline.REPORTED_REFS_PROBE, "ready", lambda *a, **k: False)
+    keep = _episode(conn, session="d11", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d11", seq=2, content="doomed turn")
+    _event(conn, fact="told twice", source_ref=f"ep:{doomed}", reported_refs=[f"ep:{keep}"])
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["events_deleted"] == 1
 
 
 def test_delete_bad_id_missing_row_and_auth(clean, conn, db_url):

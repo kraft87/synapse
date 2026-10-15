@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from ingestion import db_timeline
 from ingestion.db import Database
 from ingestion.db_queue import CHUNK_ID_PROBE
 from ingestion.models import Episode, ExtractionItem
@@ -250,22 +251,131 @@ class TestTimelineDedup:
         )
         assert cands == []
 
+    def _event_id(self, conn, ref: str) -> int:
+        row = conn.execute(
+            "SELECT id FROM timeline_events WHERE source_ref = %s", (ref,)
+        ).fetchone()
+        return row[0] if not isinstance(row, dict) else row["id"]
+
     def test_bump_keeps_earliest_t_valid(self, db, conn):
         self._insert(db, "ep:920", self._vec(0), t_valid="2026-07-01T10:00:00+00:00")
-        row = conn.execute("SELECT id FROM timeline_events WHERE source_ref = 'ep:920'").fetchone()
-        eid = row[0] if not isinstance(row, dict) else row["id"]
+        eid = self._event_id(conn, "ep:920")
 
         # re-tell resolves an EARLIER date -> t_valid corrects backward
-        db.bump_timeline_reported(eid, "2026-06-28T12:00:00+00:00")
-        # re-tell with a LATER date -> earliest wins, count still increments
-        db.bump_timeline_reported(eid, "2026-07-03T12:00:00+00:00")
+        db.bump_timeline_reported(eid, "2026-06-28T12:00:00+00:00", "ep:921")
+        # re-tell with a LATER date -> earliest wins
+        db.bump_timeline_reported(eid, "2026-07-03T12:00:00+00:00", "ep:922")
 
-        r = conn.execute(
-            "SELECT reported_count, t_valid FROM timeline_events WHERE id = %s", (eid,)
-        ).fetchone()
-        cnt, tv = (r[0], r[1]) if not isinstance(r, dict) else (r["reported_count"], r["t_valid"])
-        assert cnt == 3
+        tv = conn.execute("SELECT t_valid FROM timeline_events WHERE id = %s", (eid,)).fetchone()[0]
         assert str(tv).startswith("2026-06-28")
+
+    def test_bump_records_each_retelling_turn_once(self, db, conn):
+        """A retried item re-runs the gate, which merges into the same event again: the
+        second bump from the same turn must change nothing."""
+        self._insert(db, "ep:930", self._vec(0))
+        eid = self._event_id(conn, "ep:930")
+
+        db.bump_timeline_reported(eid, "2026-07-01T10:00:00+00:00", "ep:931")
+        db.bump_timeline_reported(eid, "2026-07-01T10:00:00+00:00", "ep:931")  # the retry
+        db.bump_timeline_reported(eid, "2026-07-01T10:00:00+00:00", "ep:932")
+
+        refs = conn.execute(
+            "SELECT reported_refs FROM timeline_events WHERE id = %s", (eid,)
+        ).fetchone()[0]
+        assert refs == ["ep:931", "ep:932"]
+
+    def test_bump_before_the_reported_refs_migration_still_moves_t_valid(
+        self, db, conn, monkeypatch
+    ):
+        monkeypatch.setattr(db_timeline.REPORTED_REFS_PROBE, "ready", lambda *a, **k: False)
+        self._insert(db, "ep:940", self._vec(0), t_valid="2026-07-01T10:00:00+00:00")
+        eid = self._event_id(conn, "ep:940")
+
+        db.bump_timeline_reported(eid, "2026-06-28T12:00:00+00:00", "ep:941")
+
+        row = conn.execute(
+            "SELECT t_valid, reported_refs FROM timeline_events WHERE id = %s", (eid,)
+        ).fetchone()
+        assert str(row[0]).startswith("2026-06-28")
+        assert row[1] == []  # nothing recorded without the column's probe
+
+
+class TestTimelineInsertNeedsItsTurn:
+    """An event is written for a turn; a turn deleted while the gate was thinking leaves
+    nothing behind (the delete cascade has already run, and would not run again)."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_timeline(self, conn):
+        conn.execute("DELETE FROM timeline_events WHERE project = 'db-test-tl-turn'")
+        yield
+        conn.execute("DELETE FROM timeline_events WHERE project = 'db-test-tl-turn'")
+
+    def _insert(self, db, episode_id: int) -> int:
+        return db.insert_timeline_event(
+            t_valid="2026-07-01T10:00:00+00:00",
+            fact="shipped the thing",
+            source="chat",
+            source_ref=f"ep:{episode_id}",
+            project="db-test-tl-turn",
+            salience=1,
+            embedding=None,
+            embed_model=None,
+            source_episode_id=episode_id,
+        )
+
+    def test_event_for_a_live_turn_is_written(self, db):
+        ep = db.upsert_episode(Episode(session_id="tl-turn-live", sequence=1, content="a turn"))
+        assert self._insert(db, ep) == 1
+
+    def test_event_for_a_deleted_turn_is_not(self, db, conn):
+        ep = db.upsert_episode(Episode(session_id="tl-turn-gone", sequence=1, content="a turn"))
+        conn.execute("DELETE FROM episodes WHERE id = %s", (ep,))
+        assert self._insert(db, ep) == 0
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM timeline_events WHERE project = 'db-test-tl-turn'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+class TestPreferenceInsertNeedsItsTurn:
+    """A preference is stated in a turn; one stored after the turn was deleted would keep
+    its words (the purge that deletes a turn's preferences does not run again)."""
+
+    def _insert(self, db, episode_id):
+        return db.insert_preference(
+            owner_id="db-test-pref-turn",
+            group_id="technical",
+            project=None,
+            pref="User prefers tabs",
+            polarity="like",
+            embedding=None,
+            embed_model=None,
+            source_ref=f"ep:{episode_id}",
+            source_episode_id=episode_id,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, conn):
+        conn.execute("DELETE FROM preferences WHERE owner_id = 'db-test-pref-turn'")
+        yield
+        conn.execute("DELETE FROM preferences WHERE owner_id = 'db-test-pref-turn'")
+
+    def test_a_live_turn_stores_it(self, db):
+        ep = db.upsert_episode(Episode(session_id="pref-turn-live", sequence=1, content="a turn"))
+        assert isinstance(self._insert(db, ep), int)
+
+    def test_a_deleted_turn_stores_nothing(self, db, conn):
+        ep = db.upsert_episode(Episode(session_id="pref-turn-gone", sequence=1, content="a turn"))
+        conn.execute("DELETE FROM episodes WHERE id = %s", (ep,))
+        assert self._insert(db, ep) is None
+        assert (
+            conn.execute(
+                "SELECT count(*) FROM preferences WHERE owner_id = 'db-test-pref-turn'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def _pending(db, limit: int) -> list[dict]:
