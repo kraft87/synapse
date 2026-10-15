@@ -19,7 +19,7 @@ import pytest
 from starlette.testclient import TestClient
 
 import ingestion.notes as notes_mod
-from ingestion.notes import _OWNER
+from ingestion.settings import KG_OWNER_ID
 from mcp_server import server
 from mcp_server.recall import Recall
 from mcp_server.remember_routes import register
@@ -141,7 +141,7 @@ def test_replay_writes_a_real_note_and_episode(env, db_url):
     ).fetchone()
     assert note[0] == "User prefers absolute dates in notes"
     assert note[1].startswith("Stated 2026-08-25:")
-    assert note[2] == "user" and note[3] == "synapse" and note[4] == _OWNER
+    assert note[2] == "user" and note[3] == "synapse" and note[4] == KG_OWNER_ID
 
     # the episode archive + KG extraction stay fed, exactly as via the MCP tool
     ep = env.execute(

@@ -37,9 +37,9 @@ logfire.instrument_claude_agent_sdk()
 logfire.instrument_pydantic_ai(include_content=False)
 logfire.instrument_httpx()
 
-from ingestion.config import get_settings  # noqa: E402
 from ingestion.poller import make_poller  # noqa: E402
 from ingestion.schema_check import check_schema_version  # noqa: E402
+from ingestion.settings import get_settings  # noqa: E402
 
 cfg = get_settings()
 check_schema_version(cfg.db_url)

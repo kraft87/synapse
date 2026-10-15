@@ -61,6 +61,21 @@ def test_open_mode_has_no_auth(monkeypatch):
     assert s._machine_authorized(_Req({})) is True
 
 
+def test_the_machine_token_can_come_from_the_env_file(monkeypatch, tmp_path):
+    """A bare run (no compose env) resolves config from the one .env fallback, an empty
+    environment variable counting as unset."""
+    from mcp_server.auth_tokens import SynapseTokenVerifier
+
+    env_file = tmp_path / "synapse.env"
+    env_file.write_text("SYNAPSE_MACHINE_TOKEN=file-token  # root bearer\n")
+    s = _reload(monkeypatch, {})
+    assert s._auth is None
+    monkeypatch.setenv("SYNAPSE_ENV_FILE", str(env_file))
+    s = importlib.reload(s)
+    assert s.MACHINE_TOKEN == "file-token"
+    assert isinstance(s._auth, SynapseTokenVerifier)
+
+
 def test_bearer_only(monkeypatch):
     from mcp_server.auth_tokens import SynapseTokenVerifier
 

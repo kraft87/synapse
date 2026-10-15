@@ -13,7 +13,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-from pathlib import Path
 from typing import Any
 
 import logfire
@@ -26,6 +25,7 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.scope import personal_scope_enabled
+from ingestion.settings import setting
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.auth_tokens import (
     DEVICE_CLIENT_ID as _DEVICE_CLIENT_ID,
@@ -72,38 +72,11 @@ logfire.instrument_mcp()
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Config (from env / .env file)
+# Config (from env / .env file; ingestion.settings has the rules)
 # ---------------------------------------------------------------------------
 
-
-def _load_env() -> dict[str, str]:
-    """Parse the dotenv fallback layer. Real env vars always win over this (see _cfg).
-
-    SYNAPSE_ENV_FILE overrides the path. Tests that reload this module point it at a
-    nonexistent path so a developer's repo-root .env can't leak into an assertion about
-    unset config — `monkeypatch.setenv(k, "")` alone does NOT neutralize this layer,
-    because _cfg treats an empty env var as absent and falls through to it.
-    """
-    override = os.environ.get("SYNAPSE_ENV_FILE")
-    env_path = Path(override) if override else Path(__file__).resolve().parent.parent / ".env"
-    env: dict[str, str] = {}
-    if env_path.exists():
-        for line in env_path.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip()
-    return env
-
-
-_env = _load_env()
-
-DB_URL = os.environ.get("SYNAPSE_DB_URL") or _env.get("SYNAPSE_DB_URL", "")
-VOYAGE_API_KEY = os.environ.get("VOYAGE_API_KEY") or _env.get("VOYAGE_API_KEY", "")
-
-
-def _cfg(key: str, default: str = "") -> str:
-    return os.environ.get(key) or _env.get(key, default)
+DB_URL = setting("SYNAPSE_DB_URL")
+VOYAGE_API_KEY = setting("VOYAGE_API_KEY")
 
 
 # --- Auth (machine token REQUIRED to start; SYNAPSE_ALLOW_OPEN=1 is the dev/stdio hatch) ---
@@ -114,39 +87,43 @@ def _cfg(key: str, default: str = "") -> str:
 # credential a machine has to hold in order to join must not also be the credential that
 # decides who may join. Set GITHUB_CLIENT_ID to additionally stand up the claude.ai-web
 # OAuth leg via MultiAuth.
-MACHINE_TOKEN = _cfg("SYNAPSE_MACHINE_TOKEN")
+MACHINE_TOKEN = setting("SYNAPSE_MACHINE_TOKEN")
 # Placeholders .env.example ships. Treated as "not set", so a copied-but-unedited .env
 # fails the startup check instead of standing up a server with a guessable root bearer.
 _TOKEN_PLACEHOLDERS = {"changeme", "change-me", "changeme!", "todo", "xxx"}
-GITHUB_CLIENT_ID = _cfg("GITHUB_CLIENT_ID")
-GITHUB_CLIENT_SECRET = _cfg("GITHUB_CLIENT_SECRET")
-PUBLIC_URL = _cfg("SYNAPSE_PUBLIC_URL", "https://synapse.example.net")
-OAUTH_SIGNING_KEY = _cfg(
+GITHUB_CLIENT_ID = setting("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = setting("GITHUB_CLIENT_SECRET")
+PUBLIC_URL = setting("SYNAPSE_PUBLIC_URL", "https://synapse.example.net")
+OAUTH_SIGNING_KEY = setting(
     "SYNAPSE_OAUTH_SIGNING_KEY"
 )  # stable => issued OAuth tokens survive restart
 ALLOWED_GITHUB_USERS = {
-    u.strip().lower() for u in _cfg("ALLOWED_GITHUB_USERS").split(",") if u.strip()
+    u.strip().lower() for u in setting("ALLOWED_GITHUB_USERS").split(",") if u.strip()
 }
 # Alternative interactive IdP: any OIDC-compliant provider (e.g. self-hosted Authelia or
 # Keycloak). When set it REPLACES GitHub for all three interactive flows (MCP OAuth,
 # dashboard login, device login) — MCP discovery can only advertise one authorization
 # server, so "alternative" is a per-deployment choice, not a login picker. Leave unset to
 # keep the GitHub default; the machine-bearer leg is unaffected either way.
-OIDC_CONFIG_URL = _cfg("OIDC_CONFIG_URL")  # .../.well-known/openid-configuration
-OIDC_CLIENT_ID = _cfg("OIDC_CLIENT_ID")
-OIDC_CLIENT_SECRET = _cfg("OIDC_CLIENT_SECRET")
+OIDC_CONFIG_URL = setting("OIDC_CONFIG_URL")  # .../.well-known/openid-configuration
+OIDC_CLIENT_ID = setting("OIDC_CLIENT_ID")
+OIDC_CLIENT_SECRET = setting("OIDC_CLIENT_SECRET")
 # Matched against the identity claims below (lowercased).
-ALLOWED_OIDC_USERS = {u.strip().lower() for u in _cfg("ALLOWED_OIDC_USERS").split(",") if u.strip()}
+ALLOWED_OIDC_USERS = {
+    u.strip().lower() for u in setting("ALLOWED_OIDC_USERS").split(",") if u.strip()
+}
 # Scopes requested/advertised/enforced on the MCP leg (space- or comma-separated).
 # offline_access is what makes the IdP issue refresh tokens (long-lived connector
 # sessions) — trim it if the IdP rejects the scope (e.g. Google).
 OIDC_SCOPES = [
-    s for s in re.split(r"[ ,]+", _cfg("OIDC_SCOPES", "openid profile email offline_access")) if s
+    s
+    for s in re.split(r"[ ,]+", setting("OIDC_SCOPES", "openid profile email offline_access"))
+    if s
 ]
 # Claims consulted (in order) for the user's identity, in both the id_token (MCP leg)
 # and userinfo (dashboard/device flows). Adjust per IdP, e.g. "email" for Google.
 OIDC_USER_CLAIMS = tuple(
-    c for c in re.split(r"[ ,]+", _cfg("OIDC_USER_CLAIMS", "preferred_username,email")) if c
+    c for c in re.split(r"[ ,]+", setting("OIDC_USER_CLAIMS", "preferred_username,email")) if c
 )
 # ---------------------------------------------------------------------------
 # Server bootstrap
@@ -545,7 +522,7 @@ def _startup_auth_mode() -> str:
     """
     if MACHINE_TOKEN and MACHINE_TOKEN.strip().lower() not in _TOKEN_PLACEHOLDERS:
         return "authenticated"
-    if _cfg("SYNAPSE_ALLOW_OPEN", "0") not in ("", "0"):
+    if setting("SYNAPSE_ALLOW_OPEN", "0") not in ("", "0"):
         logger.warning(_OPEN_BANNER)
         return "open"
     raise SystemExit(_MISSING_TOKEN_ERROR)

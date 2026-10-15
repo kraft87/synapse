@@ -31,7 +31,8 @@ import pytest
 
 import ingestion.notes as notes_mod
 from ingestion.db import Database
-from ingestion.notes import _OWNER, reconcile_note
+from ingestion.notes import reconcile_note
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     derive_audience,
@@ -67,7 +68,7 @@ def _note(db_url, hook, *, audience="personal", type="user", project=None):
     db = Database(db_url)
     try:
         return db.insert_note(
-            owner_id=_OWNER,
+            owner_id=KG_OWNER_ID,
             group_id="technical",
             project=project,
             type=type,

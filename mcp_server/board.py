@@ -22,7 +22,6 @@ through ingestion/pg_pool, one after another, never two at once.
 from __future__ import annotations
 
 import logging
-import os
 import time
 from collections.abc import Callable
 from typing import Any
@@ -34,6 +33,7 @@ from starlette.requests import Request
 from ingestion import pg_pool
 from ingestion.db_notes import select_board_notes
 from ingestion.schema_check import ColumnProbe
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     SurfaceTrust,
@@ -49,8 +49,6 @@ from mcp_server.timeline_routes import _recent_events
 
 logger = logging.getLogger(__name__)
 
-# Single-owner constant, mirroring preferences_routes/notes — one env axis.
-_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
 # HARD CAP on the rendered block: whichever hits first. The board must stay a cheap
 # always-injected index, never a context tax. est tokens = chars // 4.
@@ -346,7 +344,7 @@ def build_board(
 
     try:
         with pg_pool.connection(db_url) as conn:
-            notes = select_board_notes(conn, _OWNER, project, audience=audience)
+            notes = select_board_notes(conn, KG_OWNER_ID, project, audience=audience)
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
         notes = []
 

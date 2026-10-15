@@ -20,7 +20,6 @@ unknown caller (the root token included) gets none.
 from __future__ import annotations
 
 import logging
-import os
 from collections.abc import Callable
 from typing import Any
 
@@ -28,13 +27,12 @@ from starlette.requests import Request
 
 from ingestion import pg_pool
 from ingestion.localtime import local_date
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server.http_helpers import route
 
 logger = logging.getLogger(__name__)
 
-# Single-owner constant, mirroring kg_pg_write.OWNER / the recall leg.
-_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 _MAX_LIMIT = 50
 
 
@@ -54,7 +52,7 @@ def _top_preferences(
         "SELECT pref, polarity, assert_count, first_seen AS since "
         "FROM preferences WHERE owner_id = %s AND t_invalid IS NULL"
     )
-    params: list[Any] = [_OWNER]
+    params: list[Any] = [KG_OWNER_ID]
     if allowed_projects is not None:
         sql += " AND project = ANY(%s)"
         params.append(allowed_projects)

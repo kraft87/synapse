@@ -23,8 +23,9 @@ import uuid
 import pytest
 
 from ingestion.db import Database
+from ingestion.settings import KG_OWNER_ID
 from mcp_server import server
-from mcp_server.board import _OWNER, build_board, record_board_metrics
+from mcp_server.board import build_board, record_board_metrics
 from mcp_server.recall import Recall
 from mcp_server.recall_config import RecallConfig
 
@@ -356,7 +357,7 @@ def test_board_kind_row_shape(conn, db_url, full_surface):
     conn.execute("DELETE FROM timeline_events")
     db = Database(db_url)
     nid = db.insert_note(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id="technical",
         project=None,
         type="user",

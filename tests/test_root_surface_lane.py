@@ -26,7 +26,7 @@ from fastmcp import FastMCP
 from starlette.testclient import TestClient
 
 from ingestion.db import Database
-from ingestion.notes import _OWNER
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import UNKNOWN_SURFACE
 from mcp_server import board, recall_route, remember_routes, server
 from mcp_server.auth_tokens import SynapseTokenVerifier
@@ -98,7 +98,7 @@ def lane(conn, db_url, monkeypatch):
     try:
         for hook, audience in ((_PERSONAL, "personal"), (_WORK_SAFE, "work-safe")):
             db.insert_note(
-                owner_id=_OWNER,
+                owner_id=KG_OWNER_ID,
                 group_id="technical",
                 project=None,
                 type="user",

@@ -33,12 +33,12 @@ from ingestion.chatgpt_export import parse_export as parse_chatgpt_export
 from ingestion.chunks import rebuild_chunks
 from ingestion.claude_ai_client import parse_export as parse_claude_ai_export
 from ingestion.codex_client import CodexRolloutParser
-from ingestion.config import get_settings
 from ingestion.cursor_sqlite_client import CursorSQLiteParser
 from ingestion.db import Database
 from ingestion.episode_writer import StoreStats, store_episodes
 from ingestion.jsonl_client import JSONLParser
 from ingestion.models import Episode
+from ingestion.settings import get_settings
 
 logger = logging.getLogger(__name__)
 

@@ -37,13 +37,10 @@ from typing import Any
 
 from ingestion.extraction_policy import _default_group_for_project
 from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError, parse_with_retry
+from ingestion.settings import KG_OWNER_ID
 from ingestion.turns import compact_turn, user_text
 
 logger = logging.getLogger(__name__)
-
-# Single-owner constant for the live store today, mirroring kg_client.OWNER — one axis
-# so a future multi-tenant split threads the same env var through preferences too.
-_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
 # A turn whose [user] text is shorter than this ("ok", "continue", "yes do it") asserts no
 # standing preference; short ones that do ("never use emojis", "always use uv") are longer. Measured on the user's text, not the whole turn: a bare "ok" that
@@ -325,7 +322,7 @@ class PreferencesGate:
         # prefs against the plain query embedding, so the store must share that space, and
         # the gate's own dedup KNN then compares like-with-like.
         vec = self._embedder.embed([p["pref"]], task="document")[0]
-        candidates = self._db.find_live_preferences(_OWNER, group_id, vec, limit=5)
+        candidates = self._db.find_live_preferences(KG_OWNER_ID, group_id, vec, limit=5)
         action = decide_pref_action(p["polarity"], candidates)
         embed_model = getattr(self._embedder, "model_name", None) or "voyage-4-large"
 
@@ -364,7 +361,7 @@ class PreferencesGate:
             return
 
         new_id = self._db.insert_preference(
-            owner_id=_OWNER,
+            owner_id=KG_OWNER_ID,
             group_id=group_id,
             project=project,
             pref=p["pref"],

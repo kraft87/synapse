@@ -18,7 +18,7 @@ import pytest
 
 import ingestion.notes as notes_mod
 from ingestion.db import Database
-from ingestion.notes import _OWNER
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust
 from mcp_server import server
 from mcp_server.recall import Recall
@@ -83,7 +83,7 @@ def env(monkeypatch, conn, db_url):
 
 def _seed_note(env, *, hook="User prefers dark mode", type="user", slot=1, project=None) -> int:
     return env.db.insert_note(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=project,
         type=type,

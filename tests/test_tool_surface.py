@@ -18,9 +18,9 @@ import pytest
 from fastmcp import Client
 
 from ingestion.db import Database
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import UNKNOWN_SURFACE
 from mcp_server import server
-from mcp_server.board import _OWNER
 from mcp_server.recall import Recall
 
 pytestmark = pytest.mark.db
@@ -150,7 +150,7 @@ def _note(db_url: str, hook: str, body: str) -> int:
     db = Database(db_url)
     try:
         return db.insert_note(
-            owner_id=_OWNER,
+            owner_id=KG_OWNER_ID,
             group_id="technical",
             project="tool-surface",
             type="project",

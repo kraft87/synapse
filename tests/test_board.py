@@ -12,8 +12,9 @@ import pytest
 from starlette.testclient import TestClient
 
 from ingestion.db import Database
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import FULL_TRUST
-from mcp_server.board import _OWNER, build_board, record_board_metrics, register
+from mcp_server.board import build_board, record_board_metrics, register
 from tests.helpers.embed import GROUP
 from tests.helpers.surfaces import register_full, register_restricted
 
@@ -41,7 +42,7 @@ def _wipe(conn):
 def _note(db, *, type="user", hook="User prefers X", project=None):
     """Board tests never exercise the KNN, so notes land with NULL embedding."""
     return db.insert_note(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=project,
         type=type,

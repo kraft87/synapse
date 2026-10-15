@@ -36,19 +36,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import UTC, datetime
 from typing import Any
 
 from ingestion.llm_client import MalformedResponseError, parse_with_retry, stage_model
 from ingestion.preferences_gate import _group_for
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import derive_audience
 
 logger = logging.getLogger(__name__)
-
-# Single-owner constant for the live store today, mirroring preferences_gate._OWNER —
-# one env axis (SYNAPSE_KG_OWNER_ID) so a future multi-tenant split threads through here.
-_OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
 _VALID_TYPES = ("user", "feedback", "project", "reference")
 
@@ -240,7 +236,7 @@ def reconcile_note(
         top = next(
             (
                 c
-                for c in db.find_live_notes(_OWNER, group_id, vec, limit=5)
+                for c in db.find_live_notes(KG_OWNER_ID, group_id, vec, limit=5)
                 if c["type"] == type and (type != "project" or c["project"] == project)
             ),
             None,
@@ -281,7 +277,7 @@ def reconcile_note(
     # inheriting the retired note's: inheriting would let a personal statement arrive
     # work-safe just because it reversed a work-safe one.
     new_id = db.insert_note(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=group_id,
         project=project,
         type=type,

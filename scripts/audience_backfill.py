@@ -39,7 +39,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ingestion.db import Database
-from ingestion.notes import _OWNER
+from ingestion.settings import KG_OWNER_ID
 from ingestion.surfaces import (
     AUDIENCES,
     DEFAULT_AUDIENCE,
@@ -94,7 +94,7 @@ def _live_notes(db: Database) -> list[dict[str, Any]]:
         rows = conn.execute(
             "SELECT id, hook, type, project, audience FROM notes "
             "WHERE owner_id = %s AND superseded_by IS NULL ORDER BY id",
-            (_OWNER,),
+            (KG_OWNER_ID,),
         ).fetchall()
     return [dict(r) for r in rows]
 

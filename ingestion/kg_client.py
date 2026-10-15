@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -44,6 +43,7 @@ import psycopg
 from ingestion import pg_pool
 from ingestion.db_connection import bm25_query_text
 from ingestion.embedding import embed_dims
+from ingestion.settings import KG_OWNER_ID
 from ingestion.textsafe import strip_nul
 from ingestion.vector import vec_literal
 
@@ -52,9 +52,6 @@ logger = logging.getLogger(__name__)
 # Embedding width for the halfvec/vector casts below -- must match the provisioned schema
 # (and its HNSW index expressions) verbatim. Default 2048 (Voyage prod, unchanged).
 _EMBED_DIMS = embed_dims()
-
-# Single-owner constant today; #49 owner axis threads a real owner through env.
-OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 
 # Over-fetch pool for global-HNSW-then-filter (see module docstring / kg_pg.py).
 _OVERFETCH = 200
@@ -198,7 +195,7 @@ class KGClient:
                     "  FROM kg_entities WHERE embedding IS NOT NULL "
                     "  ORDER BY dist LIMIT %s"
                     ") sub WHERE owner_id = %s AND group_id = %s LIMIT %s",
-                    (emb_s, _OVERFETCH, OWNER, group_id, limit),
+                    (emb_s, _OVERFETCH, KG_OWNER_ID, group_id, limit),
                 )
                 return [{"uuid": u, "name": n, "score": float(d)} for u, n, d in cur.fetchall()]
 
@@ -213,7 +210,7 @@ class KGClient:
             row = conn.execute(
                 "SELECT uuid FROM kg_entities "
                 "WHERE owner_id = %s AND group_id = %s AND normalized_name = %s LIMIT 1",
-                (OWNER, group_id, normalized),
+                (KG_OWNER_ID, group_id, normalized),
             ).fetchone()
             return str(row[0]) if row else None
 
@@ -239,7 +236,7 @@ class KGClient:
             rows = conn.execute(
                 "SELECT uuid, COALESCE(name, ''), entity_supertype "
                 "FROM kg_entities WHERE owner_id = %s AND group_id = %s",
-                (OWNER, group_id),
+                (KG_OWNER_ID, group_id),
             ).fetchall()
             return [(str(u), n, st) for u, n, st in rows]
 
@@ -254,7 +251,7 @@ class KGClient:
             rows = conn.execute(
                 "SELECT uuid, COALESCE(summary, '') FROM kg_entities "
                 "WHERE owner_id = %s AND group_id = %s AND uuid = ANY(%s)",
-                (OWNER, group_id, uuids),
+                (KG_OWNER_ID, group_id, uuids),
             ).fetchall()
             return {str(u): s for u, s in rows}
 
@@ -289,7 +286,7 @@ class KGClient:
                     "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
                     "  ORDER BY dist LIMIT %s"
                     ") sub WHERE owner_id = %s AND group_id = %s AND dist <= %s LIMIT %s",
-                    (emb_s, _OVERFETCH, OWNER, group_id, distance_threshold, limit),
+                    (emb_s, _OVERFETCH, KG_OWNER_ID, group_id, distance_threshold, limit),
                 )
                 return [{"uuid": u, "fact": f, "score": float(d)} for u, f, d in cur.fetchall()]
 
@@ -332,7 +329,7 @@ class KGClient:
                     (
                         [vec_literal(e) for e in fact_embeddings],
                         _RESTATED_OVERFETCH,
-                        OWNER,
+                        KG_OWNER_ID,
                         group_id,
                         max_distance,
                         limit,
@@ -369,7 +366,14 @@ class KGClient:
                 f"ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) "
                 "  NULLS LAST, id "
                 "LIMIT %s",
-                (OWNER, group_id, source_uuid, target_uuid, vec_literal(fact_embedding), limit),
+                (
+                    KG_OWNER_ID,
+                    group_id,
+                    source_uuid,
+                    target_uuid,
+                    vec_literal(fact_embedding),
+                    limit,
+                ),
             ).fetchall()
             return [{"uuid": u, "fact": f} for u, f in rows]
 
@@ -394,10 +398,10 @@ class KGClient:
             return []
         args: tuple[Any, ...]
         if fact_embedding is None:
-            dist_sql, args = "NULL", (safe, OWNER, group_id, limit)
+            dist_sql, args = "NULL", (safe, KG_OWNER_ID, group_id, limit)
         else:
             dist_sql = f"fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})"
-            args = (vec_literal(fact_embedding), safe, OWNER, group_id, limit)
+            args = (vec_literal(fact_embedding), safe, KG_OWNER_ID, group_id, limit)
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             rows = conn.execute(
@@ -449,7 +453,7 @@ class KGClient:
         now = datetime.now(UTC)
         params = (
             node_uuid,
-            OWNER,
+            KG_OWNER_ID,
             group_id,
             project or "",
             strip_nul(name or ""),
@@ -507,7 +511,7 @@ class KGClient:
                 "WHERE k.uuid = cur.uuid AND k.owner_id = %(o)s "
                 "  AND (length(%(s)s::text) > length(COALESCE(k.summary, '')) "
                 "       OR k.entity_supertype IS DISTINCT FROM cur.st)",
-                {"s": new_summary, "r": refresh_supertype, "u": node_uuid, "o": OWNER},
+                {"s": new_summary, "r": refresh_supertype, "u": node_uuid, "o": KG_OWNER_ID},
             )
 
         self._run(_do)
@@ -535,7 +539,7 @@ class KGClient:
             params.append(
                 (
                     r["edge_uuid"],
-                    OWNER,
+                    KG_OWNER_ID,
                     group_id,
                     r["src"],
                     r["tgt"],

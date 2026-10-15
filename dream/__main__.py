@@ -28,7 +28,7 @@ import logfire
 import psycopg
 from psycopg.types.json import Json
 
-from dream.skills import config as skills_config
+from ingestion.settings import require_setting
 
 logging.basicConfig(
     level=logging.INFO,
@@ -39,12 +39,9 @@ logger = logging.getLogger(__name__)
 
 
 def _require_db_url() -> str:
-    """The Postgres DSN, resolved via the skills-lane config (env, then .env fallback).
-    Hard-fails if unset — the pipeline cannot run without a database."""
-    url = skills_config.db_url()
-    if not url:
-        raise RuntimeError("SYNAPSE_DB_URL not set")
-    return url
+    """The Postgres DSN (env, then the .env fallback). Hard-fails if unset — the pipeline
+    cannot run without a database."""
+    return require_setting("SYNAPSE_DB_URL")
 
 
 _SAMPLE_CAP = 10  # bound per-count sample arrays (schema 044 header)

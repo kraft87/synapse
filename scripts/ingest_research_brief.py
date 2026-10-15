@@ -22,26 +22,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
 import psycopg
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-def load_db_url() -> str:
-    db_url = os.environ.get("SYNAPSE_DB_URL")
-    env_path = Path(__file__).resolve().parent.parent / ".env"
-    if not db_url and env_path.exists():
-        for line in env_path.read_text().splitlines():
-            if line.startswith("SYNAPSE_DB_URL="):
-                db_url = line.split("=", 1)[1].strip().strip('"').strip("'")
-                break
-    if not db_url:
-        print("error: SYNAPSE_DB_URL not set", file=sys.stderr)
-        sys.exit(2)
-    return db_url
+from ingestion.settings import require_setting
 
 
 def main() -> int:
@@ -73,7 +62,12 @@ def main() -> int:
     tool_use_id = f"brief:{args.slug}:{day}"
     content_hash = hashlib.sha256(content.encode("utf-8", errors="ignore")).hexdigest()
 
-    with psycopg.connect(load_db_url()) as conn:
+    try:
+        db_url = require_setting("SYNAPSE_DB_URL")
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
+    with psycopg.connect(db_url) as conn:
         cur = conn.execute(
             """
             INSERT INTO web_artifacts

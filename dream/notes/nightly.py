@@ -60,9 +60,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from dream.skills.config import db_url
 from ingestion.llm_client import MalformedResponseError, create_llm_client, parse_with_retry
-from ingestion.notes import _OWNER, extract_obj, fmt_note, judge_model, judge_pair
+from ingestion.notes import extract_obj, fmt_note, judge_model, judge_pair
+from ingestion.settings import KG_OWNER_ID, require_setting
 from ingestion.surfaces import RESTRICTED_AUDIENCE, project_audience, restricted_project_union
 
 logger = logging.getLogger(__name__)
@@ -251,10 +251,7 @@ def run_lane(
     if db is None:
         from ingestion.db import Database
 
-        url = db_url()
-        if not url:
-            raise RuntimeError("SYNAPSE_DB_URL not set")
-        db = Database(url)
+        db = Database(require_setting("SYNAPSE_DB_URL"))
     if llm is None:
         llm = create_llm_client()
 
@@ -262,7 +259,7 @@ def run_lane(
     try:
         # ---- stages A + B: candidate pairs, judged both ways, merged on consensus.
         retired: set[int] = set()
-        for cand in db.find_note_pair_candidates(_OWNER, sim_floor=sim_floor, limit=max_judge):
+        for cand in db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=sim_floor, limit=max_judge):
             if applied >= max_apply:
                 break
             a, b = cand["a"], cand["b"]
@@ -311,7 +308,7 @@ def run_lane(
         # right answer. Read the restricted-surface allowlist union ONCE for the batch —
         # it can't change mid-run, and re-deriving per note would be one query each.
         restricted_projects = restricted_project_union(db)
-        for note in db.find_retype_candidates(_OWNER, limit=max_retype_judge):
+        for note in db.find_retype_candidates(KG_OWNER_ID, limit=max_retype_judge):
             if applied >= max_apply:
                 break
             try:
@@ -468,7 +465,7 @@ if __name__ == "__main__":  # pragma: no cover - manual runs
     if args.list is not None or args.revert is not None:
         from ingestion.db import Database
 
-        cli_db = Database(db_url())
+        cli_db = Database(require_setting("SYNAPSE_DB_URL"))
         try:
             if args.revert is not None:
                 print(revert_curation(cli_db, args.revert))

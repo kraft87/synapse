@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ingestion import embedding as _embedding
+from ingestion.settings import KG_OWNER_ID
 
 
 def _env_float(name: str, default: float) -> Callable[[], float]:
@@ -25,7 +26,7 @@ def _env_int(name: str, default: int) -> Callable[[], int]:
 
 @dataclass(frozen=True)
 class RecallConfig:
-    kg_owner: str = field(default_factory=lambda: os.environ.get("SYNAPSE_KG_OWNER_ID", "default"))
+    kg_owner: str = KG_OWNER_ID
     # Embedding width for every vector/halfvec SQL cast. Must match the width the schema was
     # provisioned with or the halfvec HNSW index expressions don't apply (validated against
     # synapse_meta, see ingestion/embedding.py).

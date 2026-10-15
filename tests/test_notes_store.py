@@ -23,7 +23,8 @@ from ingestion.db_notes import (
     search_live_notes,
     select_board_notes,
 )
-from ingestion.notes import _OWNER, reconcile_note
+from ingestion.notes import reconcile_note
+from ingestion.settings import KG_OWNER_ID
 from tests.helpers.embed import GROUP, onehot
 
 pytestmark = pytest.mark.db
@@ -35,7 +36,7 @@ def _wipe(conn):
 
 def _insert(db, *, type="user", hook="User prefers X", body="Body.", slot=1, **kw):
     args = {
-        "owner_id": _OWNER,
+        "owner_id": KG_OWNER_ID,
         "group_id": GROUP,
         "project": None,
         "embedding": onehot(slot),
@@ -56,7 +57,7 @@ def test_insert_and_cosine_knn(conn, db_url):
     db = Database(db_url)
     a = _insert(db, hook="User prefers bullet lists", slot=1, source_ref="ep:1")
     _insert(db, hook="User dislikes em-dashes", slot=2, source_ref="ep:2")
-    hits = db.find_live_notes(_OWNER, GROUP, onehot(1), limit=5)
+    hits = db.find_live_notes(KG_OWNER_ID, GROUP, onehot(1), limit=5)
     assert hits[0]["id"] == a
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-3)
@@ -85,7 +86,7 @@ def test_update_refreshes_hook_body_and_updated_at(conn, db_url):
     assert row[3] == "ep:2"  # provenance follows the wording
     assert row[4] > before
     # The refreshed embedding moved the note to slot 4 in KNN space.
-    hits = db.find_live_notes(_OWNER, GROUP, onehot(4), limit=1)
+    hits = db.find_live_notes(KG_OWNER_ID, GROUP, onehot(4), limit=1)
     assert hits[0]["id"] == nid and hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     db.close()
     _wipe(conn)
@@ -160,7 +161,7 @@ def test_supersede_retires_old_and_links_lineage(conn, db_url):
     db.supersede_note(old, new)
     row = conn.execute("SELECT superseded_by FROM notes WHERE id = %s", (old,)).fetchone()
     assert row[0] == new  # lineage FK points at the replacement
-    live_ids = {h["id"] for h in db.find_live_notes(_OWNER, GROUP, onehot(5), limit=5)}
+    live_ids = {h["id"] for h in db.find_live_notes(KG_OWNER_ID, GROUP, onehot(5), limit=5)}
     assert new in live_ids and old not in live_ids
     db.close()
     _wipe(conn)
@@ -181,7 +182,7 @@ def test_group_and_owner_scoping(conn, db_url):
     mine = _insert(db, hook="Mine, technical", slot=6)
     _insert(db, hook="Mine, personal", group_id="personal", slot=6)
     _insert(db, hook="Someone else's", owner_id="other", slot=6)
-    hits = db.find_live_notes(_OWNER, GROUP, onehot(6), limit=5)
+    hits = db.find_live_notes(KG_OWNER_ID, GROUP, onehot(6), limit=5)
     assert [h["id"] for h in hits] == [mine]
     db.close()
     _wipe(conn)
@@ -193,14 +194,14 @@ def test_null_embedding_insert_ok_and_skipped_by_knn(conn, db_url):
     nid = _insert(db, hook="Keyless note", embedding=None, embed_model="ignored")
     row = conn.execute("SELECT embedding, embed_model FROM notes WHERE id = %s", (nid,)).fetchone()
     assert row[0] is None and row[1] is None  # embed_model nulled alongside the vector
-    assert db.find_live_notes(_OWNER, GROUP, onehot(1), limit=5) == []
+    assert db.find_live_notes(KG_OWNER_ID, GROUP, onehot(1), limit=5) == []
     db.close()
     _wipe(conn)
 
 
 def _board(db, project):
     with db._conn() as conn:
-        return select_board_notes(conn, _OWNER, project)
+        return select_board_notes(conn, KG_OWNER_ID, project)
 
 
 def test_board_notes_ordering_and_project_filter(conn, db_url):
@@ -250,10 +251,12 @@ def test_recall_reads_notes_on_an_autocommit_borrow(conn, db_url):
     retired = _insert(db, type="user", hook="Retired fact", slot=18)
     db.supersede_note(retired, usr)
     with pg_pool.connection(db_url) as borrowed:
-        hits = search_live_notes(borrowed, _OWNER, "proj-a", onehot(19), limit=10)
+        hits = search_live_notes(borrowed, KG_OWNER_ID, "proj-a", onehot(19), limit=10)
         assert hits[0]["id"] == pa  # nearest first
         assert {h["id"] for h in hits} == {usr, pa}  # proj-b and the retired row are out
-        assert [h["id"] for h in search_live_notes(borrowed, _OWNER, None, onehot(19))] == [usr]
+        assert [h["id"] for h in search_live_notes(borrowed, KG_OWNER_ID, None, onehot(19))] == [
+            usr
+        ]
         assert borrowed.info.transaction_status != psycopg.pq.TransactionStatus.INTRANS
         assert [r["id"] for r in get_notes_by_ids(borrowed, [pa, usr, 999999999])] == [usr, pa]
         assert get_notes_by_ids(borrowed, []) == []

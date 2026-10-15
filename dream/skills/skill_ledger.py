@@ -23,9 +23,8 @@ import logging
 import re
 
 from ingestion.schema_check import ColumnProbe
+from ingestion.settings import require_setting
 from ingestion.vector import vec_literal
-
-from . import config
 
 logger = logging.getLogger(__name__)
 
@@ -84,17 +83,10 @@ _STOP = {
 }
 
 
-def _env(key: str) -> str:
-    v = config.db_url() if key == "SYNAPSE_DB_URL" else config.secret(key)
-    if not v:
-        raise RuntimeError(f"{key} not configured (set env or {config.ENV_FILE})")
-    return v
-
-
 def connect():
     import psycopg
 
-    return psycopg.connect(_env("SYNAPSE_DB_URL"), connect_timeout=10)
+    return psycopg.connect(require_setting("SYNAPSE_DB_URL"), connect_timeout=10)
 
 
 # --------------------------------------------------------------------- embeddings
@@ -113,7 +105,7 @@ def embed(texts: list[str], input_type: str = "document") -> list[list[float]]:
 
         # Keep the loud missing-key error on the default (Voyage) backend;
         # other providers resolve their own SYNAPSE_EMBED_* env.
-        key = _env("VOYAGE_API_KEY") if embed_provider() == "voyage" else None
+        key = require_setting("VOYAGE_API_KEY") if embed_provider() == "voyage" else None
         _embedder = create_embedder(voyage_api_key=key)
     task = "query" if input_type == "query" else "document"
     return _embedder.embed(texts, task=task)

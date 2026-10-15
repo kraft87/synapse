@@ -2820,7 +2820,6 @@ dependencies = [
     { name = "py-key-value-aio", extra = ["postgresql"] },
     { name = "pydantic" },
     { name = "pydantic-ai-slim", extra = ["openai"] },
-    { name = "pydantic-settings" },
     { name = "tenacity" },
     { name = "voyageai" },
 ]
@@ -2848,7 +2847,6 @@ requires-dist = [
     { name = "py-key-value-aio", extras = ["postgresql"], specifier = ">=0.4.5" },
     { name = "pydantic", specifier = ">=2.10" },
     { name = "pydantic-ai-slim", extras = ["openai"], specifier = ">=2.13.0" },
-    { name = "pydantic-settings", specifier = ">=2.14.2" },
     { name = "tenacity", specifier = ">=8.0" },
     { name = "voyageai", specifier = ">=0.3" },
 ]

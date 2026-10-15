@@ -22,7 +22,7 @@ import dream.notes.nightly as lane
 from dream.notes.nightly import list_applied, revert_curation, run_lane
 from ingestion.db import Database
 from ingestion.embedding import embed_dims
-from ingestion.notes import _OWNER
+from ingestion.settings import KG_OWNER_ID
 from tests.helpers.embed import GROUP
 
 pytestmark = pytest.mark.db
@@ -52,7 +52,7 @@ def _insert(
     db, *, hook, type="user", project=None, degrees=0.0, body="Example body.", audience=None
 ):
     return db.insert_note(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=project,
         type=type,
@@ -91,7 +91,7 @@ def test_pair_candidates_respect_floor_and_order(conn, db_url):
     c = _insert(db, hook="Release cuts happen on the release branch", degrees=35)  # cos15 = .97
     _insert(db, hook="Unrelated: the office coffee machine", degrees=100)
 
-    got = db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10)
+    got = db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10)
     assert [(p["a"]["id"], p["b"]["id"]) for p in got] == [(b, c), (a, b), (a, c)]
     assert got[0]["sim"] > got[1]["sim"] > got[2]["sim"]  # ordered by similarity, descending
     assert got[0]["sim"] == pytest.approx(math.cos(math.radians(15)), abs=1e-3)
@@ -108,7 +108,7 @@ def test_pair_candidates_respect_floor_and_order(conn, db_url):
     # The far-away note pairs with nothing above the floor.
     assert all(0.60 <= p["sim"] for p in got)
 
-    assert db.find_note_pair_candidates(_OWNER, sim_floor=0.95, limit=10) == [
+    assert db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.95, limit=10) == [
         p for p in got if p["sim"] >= 0.95
     ]
     db.close()
@@ -121,7 +121,7 @@ def test_pair_candidates_skip_superseded_and_null_embedding(conn, db_url):
     a = _insert(db, hook="Alpha", degrees=0)
     b = _insert(db, hook="Alpha restated", degrees=10)
     db.insert_note(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         type="user",
@@ -131,9 +131,9 @@ def test_pair_candidates_skip_superseded_and_null_embedding(conn, db_url):
         embed_model=None,
         source_ref=None,
     )
-    assert len(db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10)) == 1
+    assert len(db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10)) == 1
     db.supersede_note(a, b)
-    assert db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10) == []
+    assert db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10) == []
     db.close()
     _wipe(conn)
 
@@ -143,14 +143,14 @@ def test_memo_hides_a_judged_pair_until_a_note_changes(conn, db_url):
     db = Database(db_url)
     a = _insert(db, hook="Alpha", degrees=0)
     b = _insert(db, hook="Alpha restated", degrees=10)
-    assert len(db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10)) == 1
+    assert len(db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10)) == 1
 
     db.record_curation(op="pair", note_a=a, note_b=b, verdict="DISTINCT", applied=False)
-    assert db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10) == []
+    assert db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10) == []
 
     # An edit to EITHER note makes the verdict stale — the pair comes back.
     conn.execute("UPDATE notes SET updated_at = now() + interval '1 hour' WHERE id = %s", (b,))
-    assert len(db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10)) == 1
+    assert len(db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10)) == 1
     db.close()
     _wipe(conn)
 
@@ -162,7 +162,7 @@ def test_memo_is_order_insensitive(conn, db_url):
     b = _insert(db, hook="Alpha restated", degrees=10)
     # Recorded with the ids reversed — still the same judgement.
     db.record_curation(op="pair", note_a=b, note_b=a, verdict="DISTINCT", applied=False)
-    assert db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10) == []
+    assert db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10) == []
     db.close()
     _wipe(conn)
 
@@ -193,7 +193,7 @@ def test_pair_candidates_never_pair_notes_of_different_projects(conn, db_url):
 
     pairs = {
         frozenset((p["a"]["id"], p["b"]["id"]))
-        for p in db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=20)
+        for p in db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=20)
     }
     assert frozenset((alpha, beta)) not in pairs
     assert frozenset((beta, alpha2)) not in pairs
@@ -211,13 +211,13 @@ def test_retype_candidates_are_global_live_and_unjudged(conn, db_url):
     _insert(db, hook="Service X caches tokens for an hour", type="project", project="demo-api")
     _insert(db, hook="See the deployment runbook", type="reference")
 
-    assert [n["id"] for n in db.find_retype_candidates(_OWNER, limit=10)] == [u, f]
+    assert [n["id"] for n in db.find_retype_candidates(KG_OWNER_ID, limit=10)] == [u, f]
 
     db.record_curation(op="retype", note_a=u, note_b=None, verdict="GLOBAL", applied=False)
-    assert [n["id"] for n in db.find_retype_candidates(_OWNER, limit=10)] == [f]
+    assert [n["id"] for n in db.find_retype_candidates(KG_OWNER_ID, limit=10)] == [f]
 
     conn.execute("UPDATE notes SET updated_at = now() + interval '1 hour' WHERE id = %s", (u,))
-    assert [n["id"] for n in db.find_retype_candidates(_OWNER, limit=10)] == [u, f]
+    assert [n["id"] for n in db.find_retype_candidates(KG_OWNER_ID, limit=10)] == [u, f]
     db.close()
     _wipe(conn)
 
@@ -327,7 +327,7 @@ def test_lane_distinct_verdict_leaves_both_notes_live(conn, db_url, monkeypatch)
     ).fetchone()[0]
     assert live == 2
     # ...but the pair is memoized, so it is not re-judged tomorrow.
-    assert db.find_note_pair_candidates(_OWNER, sim_floor=0.60, limit=10) == []
+    assert db.find_note_pair_candidates(KG_OWNER_ID, sim_floor=0.60, limit=10) == []
     db.close()
     _wipe(conn)
 
@@ -377,7 +377,7 @@ def test_lane_retype_applies_only_for_an_existing_slug(conn, db_url, monkeypatch
         "audience": "personal",
     }
     # The retype did not bump updated_at, so its own memo row is not instantly stale.
-    assert [n["id"] for n in db.find_retype_candidates(_OWNER, limit=10)] == []
+    assert [n["id"] for n in db.find_retype_candidates(KG_OWNER_ID, limit=10)] == []
     assert known  # the pre-existing project note is untouched
     db.close()
     _wipe(conn)
@@ -492,7 +492,9 @@ def test_revert_puts_a_retyped_note_back_exactly(conn, db_url, monkeypatch):
     assert conn.execute(
         "SELECT type, project, audience FROM notes WHERE id = %s", (note,)
     ).fetchone() == ("feedback", "old-shelf", "work-safe")
-    assert [n["id"] for n in db.find_retype_candidates(_OWNER, limit=10)] == []  # still memoized
+    assert [
+        n["id"] for n in db.find_retype_candidates(KG_OWNER_ID, limit=10)
+    ] == []  # still memoized
     db.close()
     _wipe(conn)
 

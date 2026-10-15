@@ -10,21 +10,22 @@ import psycopg
 import pytest
 
 from ingestion.db import Database
-from mcp_server.preferences_routes import _OWNER, _top_preferences
+from ingestion.settings import KG_OWNER_ID
+from mcp_server.preferences_routes import _top_preferences
 from tests.helpers.embed import GROUP, onehot
 
 pytestmark = pytest.mark.db
 
 
 def _wipe(conn):
-    conn.execute("DELETE FROM preferences WHERE owner_id = %s", (_OWNER,))
+    conn.execute("DELETE FROM preferences WHERE owner_id = %s", (KG_OWNER_ID,))
 
 
 def test_insert_and_cosine_knn(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
     a = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project="synapse",
         pref="User prefers bullet lists over tables",
@@ -34,7 +35,7 @@ def test_insert_and_cosine_knn(conn, db_url):
         source_ref="ep:1",
     )
     db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project="synapse",
         pref="User dislikes em-dashes",
@@ -44,7 +45,7 @@ def test_insert_and_cosine_knn(conn, db_url):
         source_ref="ep:2",
     )
     # Query nearest to slot-1: the matching pref comes back with sim ~1, ahead of the other.
-    hits = db.find_live_preferences(_OWNER, GROUP, onehot(1), limit=5)
+    hits = db.find_live_preferences(KG_OWNER_ID, GROUP, onehot(1), limit=5)
     assert hits[0]["id"] == a
     assert hits[0]["source_ref"] == "ep:1"  # the gate tells a retry its own turn's row by this
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-4)
@@ -57,7 +58,7 @@ def test_reassert_bumps_count_and_keeps_text(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
     pid = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         pref="User prefers concise answers",
@@ -81,7 +82,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
     old = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         pref="User prefers dark mode",
@@ -91,7 +92,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
         source_ref="ep:4",
     )
     new = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         pref="User now prefers light mode",
@@ -106,7 +107,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
         "SELECT t_invalid, superseded_by FROM preferences WHERE id = %s", (old,)
     ).fetchone()
     assert row[0] is not None and row[1] == new
-    live_ids = {h["id"] for h in db.find_live_preferences(_OWNER, GROUP, onehot(4), limit=5)}
+    live_ids = {h["id"] for h in db.find_live_preferences(KG_OWNER_ID, GROUP, onehot(4), limit=5)}
     assert new in live_ids and old not in live_ids
     db.close()
     _wipe(conn)
@@ -116,7 +117,7 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
     db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         pref="User likes short commit messages",
@@ -126,7 +127,7 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
         source_ref="ep:6",
     )
     strong = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id="personal",  # cross-group: the block spans all groups for the owner
         project=None,
         pref="User never wants contract roles surfaced",
@@ -137,7 +138,7 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     )
     db.reassert_preference(strong)  # assert_count 2 -> ranks above weak
     retired = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         pref="User prefers tabs",
@@ -188,7 +189,7 @@ def test_a_preference_is_dated_by_the_users_day(conn, db_url, monkeypatch):
     _wipe(conn)
     db = Database(db_url)
     pref_id = db.insert_preference(
-        owner_id=_OWNER,
+        owner_id=KG_OWNER_ID,
         group_id=GROUP,
         project=None,
         pref="User likes evening deploys",

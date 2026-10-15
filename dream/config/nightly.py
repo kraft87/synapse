@@ -31,8 +31,8 @@ import psycopg
 
 from dream import lane
 from dream.skills import skill_measure as SM
-from dream.skills.config import db_url
 from dream.skills.skill_measure import _extract_json
+from ingestion.settings import require_setting
 
 LEARNED_FILE = os.environ.get("CONFIG_LEARNED_FILE", "rules/learned.md")
 PROPOSE_SESSIONS = 2  # distinct sessions a correction must recur in before it is proposed
@@ -282,7 +282,7 @@ def _known_rules(cur) -> list[_Rule]:
 def run_lane(limit: int = 30, backfill: bool = False) -> dict:
     # Autocommit: every write below stands alone, and a transaction opened by the first read
     # would sit idle (holding locks) through all of the judge calls.
-    conn = psycopg.connect(db_url(), autocommit=True)
+    conn = psycopg.connect(require_setting("SYNAPSE_DB_URL"), autocommit=True)
     try:
         cur = conn.cursor()
         cur.execute("SELECT last_scan_at FROM config_lane.config_scan_cursor WHERE id")
