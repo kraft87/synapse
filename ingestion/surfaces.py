@@ -453,6 +453,15 @@ def restricted_project_union(db: Any) -> set[str]:
         return set()
 
 
+def project_audience(project: str | None, restricted_projects: set[str]) -> str:
+    """Rule 3 of :func:`derive_audience`: ``work-safe`` when ``project`` is one a registered
+    restricted surface may read, else ``personal``. Labels compare case-folded, like the
+    allowlists themselves, so every writer (remember(), the notes lane's retype) agrees."""
+    if project and project.lower() in {p.lower() for p in restricted_projects}:
+        return RESTRICTED_AUDIENCE
+    return DEFAULT_AUDIENCE
+
+
 def derive_audience(
     db: Any,
     *,
@@ -478,9 +487,7 @@ def derive_audience(
         return explicit
     if caller_restricted:
         return RESTRICTED_AUDIENCE
-    if project and project.lower() in {p.lower() for p in restricted_project_union(db)}:
-        return RESTRICTED_AUDIENCE
-    return DEFAULT_AUDIENCE
+    return project_audience(project, restricted_project_union(db))
 
 
 # ---------------------------------------------------------------------------
