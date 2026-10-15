@@ -55,16 +55,20 @@ def run_once() -> None:
     errors: list[str] = []
     overall_ok = True
 
-    # dream→skills lane: an optional feature, opt-in per deployment (SKILLS_LANE_ENABLED=1).
-    # It mines past sessions for new-skill / retune / merge proposals and pings Discord; nothing
-    # changes until a proposal is accepted in review. Lazy import + try/except so a lane error
-    # can't crash the dream loop.
-    if os.environ.get("SKILLS_LANE_ENABLED") == "1":
+    # dream→skills lane: mines past sessions for new-skill / retune / merge proposals and pings
+    # Discord; nothing changes until a proposal is accepted in review. ON by default; the env var
+    # is a KILL SWITCH (SKILLS_LANE_ENABLED=0 to disable), like the two lanes below. Lazy import +
+    # try/except so a lane error can't crash the dream loop. The lane isolates its own stages and
+    # lists the ones that failed; any of them marks the run not ok.
+    if os.environ.get("SKILLS_LANE_ENABLED", "1") != "0":
         try:
             from dream.skills.nightly import run_lane
 
-            run_lane(limit=int(os.environ.get("SKILLS_LANE_LIMIT", "30")))
-            run_stages["skills"] = {"ran": True, "ok": True}
+            res = run_lane(limit=int(os.environ.get("SKILLS_LANE_LIMIT", "30")))
+            run_stages["skills"] = {"ran": True, "ok": not res["errors"]}
+            if res["errors"]:
+                errors.extend(f"skills lane {e}" for e in res["errors"])
+                overall_ok = False
         except Exception as e:
             logger.error("dream→skills lane failed: %s", e, exc_info=True)
             run_stages["skills"] = {"ran": True, "ok": False}

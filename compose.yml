@@ -173,7 +173,6 @@ services:
       # Emit spans to a dedicated telemetry project so Synapse's own traces
       # stay separate from any project it reads from.
       - LOGFIRE_TOKEN=${LOGFIRE_TOKEN:-}
-      - CLAUDE_DANGEROUSLY_SKIP_PERMISSIONS=1
       - LOGFIRE_SERVICE_NAME=synapse-dream
     depends_on:
       postgres:
