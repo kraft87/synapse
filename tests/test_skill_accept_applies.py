@@ -389,6 +389,132 @@ def test_draft_pending_counts_a_row_whose_draft_fails_and_goes_on(acc, monkeypat
     assert DR.draft_pending(acc)["errors"] >= 1
 
 
+_WIDEN_EV = [
+    {
+        "session_id": "acc-s1",
+        "class": "judge",
+        "signal": "under_trigger",
+        "missing_phrasing": "snapshot the db",
+    }
+]
+_SCHEMA_113 = Path(__file__).resolve().parents[1] / "schema" / "113_skill_draft_attempts.sql"
+
+
+def _draft_row(conn, cid):
+    return conn.execute(
+        "SELECT draft_attempts, last_draft_error, proposal_body IS NOT NULL "
+        "FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (cid,),
+    ).fetchone()
+
+
+def _bad_model(monkeypatch):
+    calls: list[str] = []
+
+    def bad(prompt):
+        calls.append(prompt)
+        return "I would rather not."
+
+    monkeypatch.setattr(lane, "draft", bad)
+    return calls
+
+
+def test_a_failed_draft_is_recorded_backs_off_and_is_cleared_by_a_good_one(
+    acc, db_url, monkeypatch
+):
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    calls = _bad_model(monkeypatch)
+
+    stats = DR.draft_pending(acc)
+    assert stats["no_draft"] == 1 and len(calls) == 1
+    attempts, error, has_body = _draft_row(acc, cid)
+    assert (attempts, has_body) == (1, False) and "had no description" in error
+
+    # tonight's retry would burn the same Opus call: it waits a day
+    stats = DR.draft_pending(acc)
+    assert stats["backed_off"] == 1 and stats["no_draft"] == 0 and len(calls) == 1
+
+    # a day later it is tried again, fails again, and then waits two
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET last_draft_at = now() - interval '1 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    DR.draft_pending(acc)
+    assert len(calls) == 2 and _draft_row(acc, cid)[0] == 2
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET last_draft_at = now() - interval '1 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    assert DR.draft_pending(acc)["backed_off"] == 1 and len(calls) == 2
+
+    # a good draft stores the body and forgets the failures
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET last_draft_at = now() - interval '3 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    monkeypatch.setattr(
+        lane, "draft", lambda prompt: json.dumps({"description": "Back up or snapshot the db."})
+    )
+    assert DR.draft_pending(acc)["drafted"] == 1
+    assert _draft_row(acc, cid) == (0, None, True)
+
+
+def test_rows_with_fewer_failed_drafts_go_first_when_the_budget_is_short(acc, db_url, monkeypatch):
+    _publish(db_url, "acc-backup", V1)
+    failing = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET draft_attempts = 2, "
+        "last_draft_at = now() - interval '9 days', salience = 5 WHERE id=%s",
+        (failing,),
+    )
+    fresh = _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
+    monkeypatch.setattr(lane, "draft", lambda prompt: _NEW)
+
+    DR.draft_pending(acc, cap=1)
+
+    assert _draft_row(acc, fresh)[2] is True  # drafted first despite the lower salience
+    assert _draft_row(acc, failing)[2] is False
+
+
+def test_before_schema_113_a_failed_draft_is_just_retried(acc, db_url, monkeypatch):
+    from dream.skills import skill_ledger as L
+
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    acc.execute(
+        "ALTER TABLE skills_lane.skill_gap_candidates DROP COLUMN draft_attempts, "
+        "DROP COLUMN last_draft_at, DROP COLUMN last_draft_error"
+    )
+    L.DRAFT_STATE.reset()
+    try:
+        calls = _bad_model(monkeypatch)
+        assert DR.draft_pending(acc)["no_draft"] == 1
+        assert DR.draft_pending(acc)["no_draft"] == 1  # nothing to remember it by
+        assert len(calls) == 2
+        assert acc.execute(
+            "SELECT proposal_body IS NULL FROM skills_lane.skill_gap_candidates WHERE id=%s",
+            (cid,),
+        ).fetchone() == (True,)
+    finally:
+        acc.execute(_SCHEMA_113.read_text())
+        L.DRAFT_STATE.reset()
+
+
+def test_detail_carries_why_the_draft_failed(acc, db_url, monkeypatch):
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    _bad_model(monkeypatch)
+    DR.draft_pending(acc)
+
+    d = _proposal_detail(db_url, cid)
+
+    assert d["draft_attempts"] == 1 and "had no description" in d["last_draft_error"]
+
+
 def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url, monkeypatch):
     _publish(db_url, "acc-backup", V1)
     ev = [

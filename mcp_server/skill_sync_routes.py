@@ -25,7 +25,8 @@ Routes (all POST):
   /skills/rescope     {name, scope}                  -> move an active skill to another scope
   /skills/overwrite   {name, scope, body, mtime}     -> record a clobbered local edit in history
   /skills/proposals   {id?}                          -> list proposed candidates, or one's detail
-                                                        (detail: + where accept would apply it)
+                                                        (detail: + where accept would apply it,
+                                                        + why its last draft failed)
   /skills/proposals/act {id, action, reason?, body?, scope?, force?}
                                                      -> accept (applies) | reject
 
@@ -66,6 +67,7 @@ from dream.skills.skill_doc import (
     skill_description,
     valid_skill_name,
 )
+from dream.skills.skill_ledger import DRAFT_STATE, _rollup
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
@@ -772,6 +774,14 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
         if not r:
             return {"found": False}
         d = dict(r)
+        if DRAFT_STATE.ready(c, c.info.dsn):  # why the nightly draft failed, if it did
+            d.update(
+                c.execute(
+                    "SELECT draft_attempts, last_draft_error "
+                    "FROM skills_lane.skill_gap_candidates WHERE id=%s",
+                    (cid,),
+                ).fetchone()
+            )
         plan = _plan_apply(c, r, r["proposal_body"] or "", None)
         d["apply_to"] = {"skill": plan["skill"], "scope": plan["scope"], "exists": plan["exists"]}
         d["registry_body"] = plan["registry_body"]
@@ -783,8 +793,6 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
 def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool) -> dict:
     """One transaction: lock the candidate, re-check the plan, write the registry the way a
     publish does, and mark the candidate promoted with the grounded accept recorded."""
-    from dream.skills.skill_ledger import _rollup
-
     row = c.execute(
         f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE",
         (cid,),
@@ -857,8 +865,6 @@ def _proposal_act(
     scope: str | None = None,
     force: bool = False,
 ) -> dict:
-    from dream.skills.skill_ledger import _rollup
-
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         cur = c.cursor()
         row = c.execute(

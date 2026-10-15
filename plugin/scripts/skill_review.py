@@ -115,7 +115,15 @@ def cmd_show(cid: int) -> None:
             force = " [--force overrides]" if issue.get("force") else ""
             print(f"  ! {issue['detail']}{force}")
     if not body:
-        print(f"\n{_NO_DRAFT}")
+        if r.get("last_draft_error"):
+            n = r.get("draft_attempts") or 1
+            print(
+                f"\nthe nightly draft failed ({n} attempt{'s' if n != 1 else ''}, retried less "
+                f"often each time): {r['last_draft_error']}\n"
+                "Write the SKILL.md yourself and pass it with accept --body-file, or reject."
+            )
+        else:
+            print(f"\n{_NO_DRAFT}")
         return
     reg = r.get("registry_body")
     if reg is None:

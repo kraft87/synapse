@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import re
 
+from ingestion.schema_check import ColumnProbe
+
 from . import config
 
 # identity / classification knobs (Oracle-reviewed defaults)
@@ -36,6 +38,15 @@ PHRASING_CAP = 12  # trigger phrasings kept on a derive candidate
 # The states a retune's (name, direction) key is unique among (schema 112's index predicate):
 # the ones still waiting on a decision. A promoted or retired row is history.
 _OPEN = "status IN ('observe', 'proposed', 'rejected')"
+
+#: Schema 113 adds the draft-attempt columns. The image ships before it is applied, so every
+#: statement that names them asks this probe first.
+DRAFT_STATE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('skills_lane.skill_gap_candidates') "
+    "  AND attname = 'draft_attempts' AND NOT attisdropped",
+    "schema 113 (skill_gap_candidates.draft_attempts)",
+)
 
 # grounded signals advance toward apply; judge signals only nominate (and get 0.5x'd by `score`).
 _GROUNDED_W = {

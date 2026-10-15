@@ -187,9 +187,12 @@ def run_retune(conn, substantive, analyses, seen_ids, descriptions):
     return stats
 
 
-def capture_grounded(conn, window, fires, seen_ids):
-    # dismissals -> retune/narrow (grounded); `fires` is sync_usage's read of the same window
-    dis = [e for e in fires if e["dismissed"]]
+def capture_grounded(conn, window, fires, seen_ids, *, catalog):
+    # dismissals -> retune/narrow (grounded); `fires` is sync_usage's read of the same window.
+    # Only a skill the lane owns can be narrowed: a dismissal of one the registry doesn't carry
+    # (a built-in) would be a proposal with nothing to draft against.
+    registered = {name for name, _ in catalog}
+    dis = [e for e in fires if e["dismissed"] and e["skill"] in registered]
     for e in dis:
         ev = [
             {
@@ -366,7 +369,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
         stage("judge", judge_sessions, conn, substantive, catalog_text, dict(catalog), seen)
         if "judge" not in errors:
             lane.mark_judged(conn, "skills", substantive)
-        stage("grounded", capture_grounded, conn, covered, fires, seen)
+        stage("grounded", capture_grounded, conn, covered, fires, seen, catalog=catalog)
         stage("struggle_arc", struggle_arc.run, conn, window=covered, catalog=catalog)
         stage("post_fire", post_fire.run, conn, fires=fires, catalog=catalog)
         stage("procedure_miner", run_procedure_miner, conn, catalog)

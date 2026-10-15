@@ -315,8 +315,8 @@ def test_an_explicit_request_is_its_own_candidate_and_leaves_the_sessions_gap_al
             {"session_id": "v2t-sess-x", "ts": None, "phrasing": "make this into a skill"}
         ],
     )
-    N.capture_grounded(lane, None, [], set())
-    N.capture_grounded(lane, None, [], set())  # a re-scan of the same request adds nothing
+    N.capture_grounded(lane, None, [], set(), catalog=[])
+    N.capture_grounded(lane, None, [], set(), catalog=[])  # a re-scan adds nothing
     assert (
         _row(lane, gap["id"], "summary, signature_key, trigger_phrasings, grounded_weight, status")
         == before
@@ -326,6 +326,24 @@ def test_an_explicit_request_is_its_own_candidate_and_leaves_the_sessions_gap_al
         "WHERE kind='derive' AND name LIKE 'explicit:v2t-sess%'"
     ).fetchone()
     assert (n, weight) == (1, 3.0)
+
+
+def test_only_a_dismissal_of_a_registered_skill_becomes_a_narrow_candidate(lane, monkeypatch):
+    monkeypatch.setattr(N.DB, "explicit_skill_requests", lambda conn, window: [])
+    fires = [
+        {"skill": "v2t-owned", "session_id": "v2t-sess-d1", "dismissed": True},
+        {"skill": "v2t-builtin", "session_id": "v2t-sess-d1", "dismissed": True},
+        {"skill": "v2t-owned", "session_id": "v2t-sess-d2", "dismissed": False},
+    ]
+
+    stats = N.capture_grounded(lane, None, fires, set(), catalog=[("v2t-owned", "does a thing")])
+
+    assert stats["dismissals"] == 1
+    names = lane.execute(
+        "SELECT name FROM skills_lane.skill_gap_candidates "
+        "WHERE name LIKE 'v2t-%' AND direction = 'narrow'"
+    ).fetchall()
+    assert names == [("v2t-owned",)]  # the built-in has nothing to draft against
 
 
 # ------------------------------------------- terminal-state re-sightings (unique key)

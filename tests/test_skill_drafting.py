@@ -112,7 +112,13 @@ def test_widen_draft_handles_block_scalar_descriptions():
     ],
 )
 def test_widen_draft_refuses_unsafe_descriptions(new_value):
-    assert D.widen_draft(_BODY, new_value) is None
+    with pytest.raises(D.DraftProblem):
+        D.widen_draft(_BODY, new_value)
+
+
+def test_a_refused_widen_says_why():
+    with pytest.raises(D.DraftProblem, match=r"1025 chars, over Claude Code's 1024"):
+        D.widen_draft(_BODY, "x" * 1025)
 
 
 def test_only_description_changed_rejects_any_other_edit():
@@ -175,12 +181,14 @@ def test_draft_widen_rewrites_only_the_description(monkeypatch):
 )
 def test_draft_widen_falls_back_to_no_draft(monkeypatch, reply):
     _stub_llm(monkeypatch, reply)
-    assert DR.draft_widen("demo-backup", _BODY, _WIDEN_EV) is None
+    with pytest.raises(D.DraftProblem):
+        DR.draft_widen("demo-backup", _BODY, _WIDEN_EV)
 
 
 def test_draft_widen_needs_a_stated_gap(monkeypatch):
     calls = _stub_llm(monkeypatch, json.dumps({"description": "whatever"}))
-    assert DR.draft_widen("demo-backup", _BODY, [{"signal": "dismissal"}]) is None
+    with pytest.raises(D.DraftProblem, match="no missing phrasing"):
+        DR.draft_widen("demo-backup", _BODY, [{"signal": "dismissal"}])
     assert calls == []  # no gap, no LLM call
 
 
@@ -203,7 +211,8 @@ def test_draft_revision_applies_patch_and_checks_result(monkeypatch):
 
     # a revision that renames the skill is not offered
     _stub_llm(monkeypatch, revised.replace("name: demo-backup", "name: renamed"))
-    assert DR.draft(row, _BODY) is None
+    with pytest.raises(D.DraftProblem, match="frontmatter name changed"):
+        DR.draft(row, _BODY)
 
 
 def test_draft_revision_falls_back_to_evidence_without_a_patch(monkeypatch):
@@ -233,7 +242,8 @@ def test_draft_derive_and_unusable_reply(monkeypatch):
     }
     assert DR.draft(row, None) == (_BODY, None)
     _stub_llm(monkeypatch, "Sorry, I can't help with that.")
-    assert DR.draft(row, None) is None
+    with pytest.raises(D.DraftProblem, match="frontmatter name missing"):
+        DR.draft(row, None)
 
 
 def test_draft_derive_shows_the_model_the_shell_commands_in_the_evidence(monkeypatch):
@@ -256,7 +266,8 @@ def test_draft_derive_shows_the_model_the_shell_commands_in_the_evidence(monkeyp
 def test_missing_registry_body_is_never_drafted(monkeypatch):
     calls = _stub_llm(monkeypatch, _BODY)
     row = {"id": 6, "kind": "retune", "direction": "fix", "name": "gone", "target_skills": []}
-    assert DR.draft(row, None) is None
+    with pytest.raises(D.DraftProblem, match="'gone' is not in the skill registry"):
+        DR.draft(row, None)
     assert calls == []
 
 

@@ -9,6 +9,8 @@ Pure functions, no DB and no LLM:
   * the description-only splice a retune/widen draft is built from, and the deterministic
     check that nothing but the description moved,
   * sanity checks for a drafted revision (extend/fix/narrow) and a drafted new skill.
+
+A draft that can't be offered raises DraftProblem with the reason a reviewer reads.
 """
 
 from __future__ import annotations
@@ -25,6 +27,11 @@ MIN_SHRINK = 0.4
 MAX_GROWTH = 3
 GROWTH_SLACK = 2000
 MAX_DESCRIPTION = 1024  # Claude Code's skill description cap
+
+
+class DraftProblem(ValueError):
+    """A drafted SKILL.md that can't be offered; the message says why. The nightly pass
+    stores it on the candidate, and the review shows it."""
 
 
 def skill_description(text: str) -> str:
@@ -182,17 +189,27 @@ def only_description_changed(old: str, new: str) -> bool:
     return skill_description(old) != skill_description(new)
 
 
-def widen_draft(old: str, new_description: str) -> str | None:
-    """The widen draft: `old` with only its description replaced, verified. None when the
-    splice can't be made, didn't round-trip, or touched anything else."""
+def widen_draft(old: str, new_description: str) -> str:
+    """The widen draft: `old` with only its description replaced, verified. Raises
+    DraftProblem when the splice can't be made, didn't round-trip, or touched anything else."""
     new_description = (new_description or "").strip()
-    if not new_description or len(new_description) > MAX_DESCRIPTION:
-        return None
+    if not new_description:
+        raise DraftProblem("the model returned an empty description")
+    if len(new_description) > MAX_DESCRIPTION:
+        raise DraftProblem(
+            f"the new description is {len(new_description)} chars, over Claude Code's "
+            f"{MAX_DESCRIPTION}"
+        )
     draft = replace_description(old, new_description)
-    if draft is None or not only_description_changed(old, draft):
-        return None
+    if draft is None:
+        raise DraftProblem(
+            "the new description can't be written in the skill's YAML style "
+            "(its quotes or special characters)"
+        )
+    if not only_description_changed(old, draft):
+        raise DraftProblem("splicing the description in changed more than the description")
     if skill_description(draft) != new_description:
-        return None
+        raise DraftProblem("the new description did not read back as written")
     return draft
 
 
