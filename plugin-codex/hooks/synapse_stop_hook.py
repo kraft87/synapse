@@ -32,10 +32,9 @@ Failed uploads are retried however old they are. A POST that fails (server
 down, 401/403 from a revoked token or a proxy/WAF, timeout) marks the
 rollout's cursor entry `pending`, with the time and a short reason; the next
 successful POST for that rollout clears it. The sweep takes every lagging
-rollout modified within SYNAPSE_CODEX_CATCHUP_DAYS, plus every pending one
-regardless of age, least recently touched first, at most
-SYNAPSE_CODEX_CATCHUP_MAX per session start. Pending entries are exempt from
-the cursor TTL. A rollout older than the window that the hook never attempted
+rollout modified within the catch-up window, plus every pending one
+regardless of age, least recently touched first, at most one capped batch per session
+start. Pending entries are exempt from the cursor TTL. A rollout older than the window that the hook never attempted
 (history from before install) is left alone; `python -m
 ingestion.codex_backfill` is the tool for that.
 
@@ -59,52 +58,84 @@ Env:
   SYNAPSE_INGEST_TOKEN        bearer token (an enrolled machine's saved device
                               token wins)
   SYNAPSE_CODEX_CURSORS       cursor state file  (default ~/.synapse/codex_cursors.json)
-  SYNAPSE_CODEX_CATCHUP_DAYS  default 3 (the sweep picks up any lagging rollout
-                              modified this recently; one whose upload failed
-                              is retried regardless of age)
-  SYNAPSE_CODEX_CATCHUP_MAX   default 20 (rollouts per sweep; the rest defer to
-                              the next session start, logged)
   SYNAPSE_PRIVATE_DIR         private markers    (default ~/.synapse/private)
+
+The sweep's window, cap and active-write grace and the private-marker expiry are the
+Claude hook's constants (synapse_ingest_retry); the POST timeout is 30 s.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
-import time
-import urllib.request
 from pathlib import Path
-from typing import Any
+
+# The shared bookkeeping and config are the Claude plugin's (synapse_ingest_retry,
+# config), from this checkout. Appended, not prepended, so nothing there can shadow a
+# module this hook imports.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
+
+
+def _log(msg: str) -> None:
+    import synapse_home  # not common: the Stop parent below runs before config is imported
+
+    synapse_home.log("codex-hook", msg)
+
+
+def _stop_hook() -> None:
+    """The Stop hook proper: hand the session to a detached `--ship` child."""
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        return
+    # Detach the actual work so the Stop hook returns instantly even if the
+    # server is slow or down. The child gets only what _ship reads: the payload also
+    # carries the whole final answer, which must not ride in argv (Windows caps it at
+    # 32,767 characters, and any process listing shows it).
+    child = {k: payload.get(k) for k in ("session_id", "transcript_path", "cwd")}
+    try:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--ship", json.dumps(child)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        _log(f"detach failed: {e}")
+
+
+if __name__ == "__main__" and len(sys.argv) == 1:
+    # Codex waits for this process at the end of every turn, and all it does is spawn the
+    # child: answer before the imports below (config, the retry bookkeeping, urllib).
+    _stop_hook()
+    raise SystemExit(0)
+
+import re  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+from typing import Any  # noqa: E402
 
 # The URL and bearer come from the shared resolver so this hook, the board and the MCP
 # header helper always agree (env, then ~/.synapse/config.json, then the Claude plugin's
 # saved options): on an enrolled machine the saved device token beats a stale env
-# SYNAPSE_INGEST_TOKEN (common._resolve_token). Stdlib-only, like this hook.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-# The failure bookkeeping is the Claude plugin's (synapse_ingest_retry), from this
-# checkout. Appended, not prepended, so nothing there can shadow a module this hook
-# imports.
-sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
-import synapse_home
-import synapse_ingest_retry as retry
-import synapse_project
-from common import INGEST_URL, TOKEN
-from synapse_filelock import lock_exclusive
+# SYNAPSE_INGEST_TOKEN (config._resolve_ingest_token).
+import synapse_ingest_retry as retry  # noqa: E402
+import synapse_project  # noqa: E402
+from common import INGEST_URL, PRIVATE_DIR, TOKEN, USER_AGENT  # noqa: E402
+from synapse_filelock import lock_exclusive  # noqa: E402
 
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
+TIMEOUT = 30.0
 CURSORS_PATH = Path(
     os.path.expanduser(os.environ.get("SYNAPSE_CODEX_CURSORS", "~/.synapse/codex_cursors.json"))
 )
-PRIVATE_DIR = Path(os.path.expanduser(os.environ.get("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
 SESSIONS_ROOT = Path(os.path.expanduser("~/.codex/sessions"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_CODEX_CATCHUP_DAYS", "3"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_CODEX_CATCHUP_MAX", "20"))
-# The sweep skips rollouts written this recently: a live session's own Stop hook
-# owns them, and a sweep that caught one mid-turn would ship half a turn.
-ACTIVE_GRACE = 300.0
+CATCHUP_DAYS = retry.CATCHUP_DAYS
+CATCHUP_MAX_FILES = retry.CATCHUP_MAX_FILES
+ACTIVE_GRACE = retry.ACTIVE_GRACE
 _CURSOR_TTL_DAYS = 45  # drop state for rollouts idle this long (or deleted); pending ones stay
 _ROLLOUT_ID = re.compile(r"rollout-.*-([0-9a-f-]{36})\.jsonl$")
 
@@ -120,10 +151,6 @@ _MACHINERY_PREFIXES = (
     "<collaboration_mode>",
     "<system-reminder>",
 )
-
-
-def _log(msg: str) -> None:
-    synapse_home.log("codex-hook", msg)
 
 
 def _is_user_boundary(rec: dict[str, Any]) -> bool:
@@ -260,7 +287,7 @@ def _post(
         # Resolved the way every client labels a project (synapse_project). Without it
         # the server labels the turns from the rollout's cwd: just the folder's name.
         body["project"] = project
-    headers = {"Content-Type": "application/json", "User-Agent": "synapse-codex-hook/0.1"}
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
     req = urllib.request.Request(
@@ -280,7 +307,7 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
     if not session_id:
         _log("skip: no session_id in hook payload")
         return (0, 0)
-    if (PRIVATE_DIR / session_id).exists():
+    if retry.is_private(session_id, PRIVATE_DIR, _log):
         _log(f"skip: private session {session_id}")
         return (0, 0)
     path = Path(transcript) if transcript else _find_rollout(session_id)
@@ -399,26 +426,7 @@ def main() -> int:
     if len(sys.argv) >= 3 and sys.argv[1] == "--ship":
         _ship(json.loads(sys.argv[2]))
         return 0
-
-    try:
-        payload = json.loads(sys.stdin.read() or "{}")
-    except ValueError:
-        return 0
-    # Detach the actual work so the Stop hook returns instantly even if the
-    # server is slow or down. The child gets only what _ship reads: the payload also
-    # carries the whole final answer, which must not ride in argv (Windows caps it at
-    # 32,767 characters, and any process listing shows it).
-    child = {k: payload.get(k) for k in ("session_id", "transcript_path", "cwd")}
-    try:
-        subprocess.Popen(
-            [sys.executable, os.path.abspath(__file__), "--ship", json.dumps(child)],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception as e:
-        _log(f"detach failed: {e}")
+    _stop_hook()  # the default; run as a script this is answered before the imports above
     return 0
 
 

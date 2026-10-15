@@ -31,8 +31,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
-from datetime import UTC, datetime
 from pathlib import Path
 
 #: config.json key -> the env / plugin-option name the rest of the client resolves by.
@@ -62,6 +60,16 @@ def config_file() -> Path:
     return home() / "config.json"
 
 
+def client_version() -> str:
+    """The installed client's version (plugin/.claude-plugin/plugin.json, which ships in
+    every install), or "unknown" when the manifest is missing."""
+    manifest = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
+    try:
+        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown")
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+
+
 def load(path: Path | None = None) -> dict:
     """The parsed config, or ``{}`` when it is missing, unreadable or not an object.
     Hooks call this at import, so it never raises."""
@@ -78,6 +86,8 @@ def atomic_write_json(path: Path, data: dict) -> None:
     config.json holds a credential), and a symlinked ``path`` (a dotfiles repo) keeps its
     link: the file it points at is the one replaced. Creates the parent directory. Raises
     OSError."""
+    import tempfile  # deferred: every hook imports this module, only a writer needs it
+
     path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -203,6 +213,8 @@ def log(name: str, msg: str) -> None:
     place every client script logs (hooks run detached, so nothing else would see it).
     A file past 64 KB starts over. Never raises: a log is not worth failing a hook for."""
     try:
+        from datetime import UTC, datetime  # deferred: every hook imports this module
+
         path = home() / "logs" / f"{name}.log"
         path.parent.mkdir(parents=True, exist_ok=True)
         mode = "w" if path.exists() and path.stat().st_size > _LOG_CAP else "a"

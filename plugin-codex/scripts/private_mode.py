@@ -1,214 +1,25 @@
 #!/usr/bin/env python3
-# mypy: ignore-errors
-"""Private mode toggle for Codex sessions — port of plugin/scripts/private_mode.py.
+"""Private mode toggle for Codex sessions.
 
-    private_mode.py on  <session_id>          # nothing this session says ingests from now on
-    private_mode.py on  <session_id> --purge  # ALSO delete what it already stored
-    private_mode.py off <session_id>          # stop skipping locally (row stays)
-    private_mode.py off <session_id> --forget # ALSO delete the server row
-    private_mode.py status <session_id>
-    private_mode.py --session-end             # SessionEnd hook: payload on stdin
-
-Same two-write contract as the Claude plugin, against the same marker dir and
-server routes (Codex and Claude session ids share the private_sessions table):
-
-  1. marker file at ~/.synapse/private/<session_id> — the Stop hook stats it
-     before every POST;
-  2. row in private_sessions on the server — the durable half that keeps a
-     later catchup/backfill from ingesting what the hook skipped.
-
-`on` verifies BOTH landed and exits nonzero loudly if either did not.
-
-`on` covers the session from NOW ON; turns stored before it stay recallable. The server
-reports how many and `on` prints it; `--purge` asks it to delete them (see
-plugin/scripts/private_mode.py for the contract: only ever by name, a deletion is claimed
-only when the server says what it deleted, a refusal or an older server exits nonzero
-with private mode still ON).
+Runs plugin/scripts/private_mode.py (usage, the two-write contract and --purge are
+documented there) against the same marker dir and server routes: Codex and Claude
+session ids share the private_sessions table. Codex's SessionEnd hook names this file
+(`private_mode.py --session-end`), so it stays in place; common.py points the shared
+script at the user-level settings only and gives it the Codex User-Agent.
 """
 
 from __future__ import annotations
 
-import json
 import os
+import runpy
 import sys
-import urllib.error
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import common
+import common  # noqa: F401  (loads the shared config the script below imports)
 
-PRIVATE_DIR = common.PRIVATE_DIR
-
-
-def _marker(session_id: str):
-    return PRIVATE_DIR / session_id
-
-
-def _write_marker(session_id: str) -> None:
-    PRIVATE_DIR.mkdir(parents=True, exist_ok=True)
-    _marker(session_id).write_text("", encoding="utf-8")
-
-
-def _remove_marker(session_id: str) -> bool:
-    try:
-        _marker(session_id).unlink()
-    except FileNotFoundError:
-        pass
-    return not _marker(session_id).exists()
-
-
-def _server(method: str, session_id: str, *, purge: bool = False) -> dict:
-    # A purge deletes a whole session's cascade in one transaction: give it longer.
-    path = f"/private-sessions/{session_id}" + ("?purge=1" if purge else "")
-    return common.request_json(method, path, timeout=60 if purge else 15)
-
-
-def _refusal(e: urllib.error.HTTPError) -> str:
-    """The server's reason for an HTTP error (its envelope's ``detail``), else the status."""
-    try:
-        return str(json.loads(e.read()).get("detail") or "")[:300] or f"HTTP {e.code}"
-    except (OSError, ValueError, AttributeError):
-        return f"HTTP {e.code}"
-
-
-def _server_private(session_id: str) -> bool:
-    return bool(_server("GET", session_id).get("private"))
-
-
-def _fail(msg: str) -> int:
-    print(f"private mode FAILED: {msg}", file=sys.stderr)
-    print("This session is NOT off the record. Do not tell the user it is.", file=sys.stderr)
-    return 1
-
-
-def _on(session_id: str, purge: bool) -> int:
-    # Marker first: it is the half that works with no network, and it protects the very
-    # next turn. If the server write then fails we say so loudly rather than silently
-    # relying on a marker that expires in 12h.
-    try:
-        _write_marker(session_id)
-    except OSError as e:
-        return _fail(f"could not write marker {_marker(session_id)}: {e}")
-    refused = ""
-    try:
-        try:
-            reply = _server("PUT", session_id, purge=purge)
-        except urllib.error.HTTPError as e:
-            if not (purge and e.code == 403):
-                raise
-            # The server sets the flag before it checks the purge, so private mode is on;
-            # only the deletion was refused.
-            reply, refused = {}, _refusal(e)
-        if not _server_private(session_id):
-            return _fail("server did not record the session as private (read-back said false)")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return _fail(
-            f"server flag not set ({type(e).__name__}: {str(e)[:160]}). Local marker is in place, but a later backfill could still ingest this session."
-        )
-    if refused:
-        print(
-            f"private mode is ON for {session_id}, but --purge was refused and nothing was "
-            f"deleted: {refused}",
-            file=sys.stderr,
-        )
-        return 1
-    purged, stored = reply.get("purged"), reply.get("stored_turns")
-    if purge and not isinstance(purged, dict):
-        # An older server drops the unknown ?purge=1 and answers a plain 200.
-        print(
-            f"private mode is ON for {session_id}, but --purge did not run: this server "
-            "predates it, so turns stored before now are still stored. Update the server "
-            "and run it again.",
-            file=sys.stderr,
-        )
-        return 1
-    print(f"private mode ON for {session_id}")
-    print(f"  marker: {_marker(session_id)}")
-    print("  server: private_sessions row written (permanent)")
-    if isinstance(purged, dict):
-        print(
-            f"  purged {purged.get('episodes_deleted', 0)} stored turn(s) of this session, and "
-            f"with them {purged.get('facts_deleted', 0)} fact(s), "
-            f"{purged.get('events_deleted', 0)} event(s), "
-            f"{purged.get('preferences_deleted', 0)} preference(s)"
-        )
-    if isinstance(stored, int) and stored > 0:
-        if isinstance(purged, dict):
-            print(f"  still stored: {stored} turn(s) written while the purge ran; run it again")
-        else:
-            print(
-                f"  note: {stored} turn(s) of this session were already stored and are still "
-                f"recallable; `synapse private on {session_id} --purge` deletes them"
-            )
-    return 0
-
-
-def _off(session_id: str, forget: bool) -> int:
-    if not _remove_marker(session_id):
-        return _fail(f"could not remove marker {_marker(session_id)}")
-    if not forget:
-        print(f"private mode OFF for {session_id} (marker removed)")
-        print("  server: row KEPT — those turns stay uningestable. --forget to delete it.")
-        return 0
-    try:
-        _server("DELETE", session_id)
-        if _server_private(session_id):
-            return _fail("server still reports the session as private after DELETE")
-    except (urllib.error.URLError, OSError, ValueError) as e:
-        return _fail(f"server row not deleted ({type(e).__name__}: {str(e)[:160]})")
-    print(f"private mode OFF for {session_id} (marker removed, server row deleted)")
-    return 0
-
-
-def _status(session_id: str) -> int:
-    marker = _marker(session_id).exists()
-    try:
-        server = "yes" if _server_private(session_id) else "no"
-    except Exception as e:
-        server = f"unknown ({type(e).__name__})"
-    print(f"{session_id}: marker={'yes' if marker else 'no'} server={server}")
-    return 0
-
-
-def _session_end() -> int:
-    """SessionEnd hook: drop the marker for the ending session, keep the row.
-    Fail-soft, always exit 0 — a hook must not break session teardown."""
-    try:
-        session_id = (json.load(sys.stdin) or {}).get("session_id") or ""
-    except Exception:
-        return 0
-    if session_id:
-        try:
-            _remove_marker(session_id)
-        except OSError:
-            pass
-    return 0
-
-
-def main(argv: list[str]) -> int:
-    if argv and argv[0] == "--session-end":
-        return _session_end()
-    if len(argv) < 2 or argv[0] not in ("on", "off", "status"):
-        print(
-            "usage: private_mode.py on <session_id> [--purge] | off <session_id> [--forget]"
-            " | status <session_id>",
-            file=sys.stderr,
-        )
-        return 2
-    action, session_id = argv[0], argv[1].strip()
-    purge = "--purge" in argv[2:]
-    if purge and action != "on":
-        print("--purge only applies to `on`", file=sys.stderr)
-        return 2
-    if not session_id or "/" in session_id or session_id in (".", ".."):
-        return _fail(f"invalid session id {session_id!r}")
-    if session_id.startswith("-"):
-        return _fail(f"session id {session_id!r} looks like a flag")
-    if action == "on":
-        return _on(session_id, purge)
-    if action == "off":
-        return _off(session_id, forget="--forget" in argv[2:])
-    return _status(session_id)
-
+_SHARED = Path(__file__).resolve().parents[2] / "plugin" / "scripts" / "private_mode.py"
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.argv[0] = str(_SHARED)
+    runpy.run_path(str(_SHARED), run_name="__main__")

@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import importlib
-import json
 import os
 import re
 import subprocess
@@ -40,7 +39,6 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -57,14 +55,6 @@ _KEY_HELP = {
     "config_sync": "mirror CLAUDE.md + rules/*.md to Synapse for the dream lane (on/off)",
     "config_paths": "extra globs under ~/.claude to mirror, comma-separated",
 }
-
-
-def _version() -> str:
-    manifest = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
-    try:
-        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown")
-    except (OSError, ValueError):
-        return "unknown"
 
 
 def _interactive() -> bool:
@@ -725,7 +715,7 @@ def _parser() -> argparse.ArgumentParser:
     skill.set_defaults(func=cmd_skill)
 
     ver = sub.add_parser("version", help="print the client version")
-    ver.set_defaults(func=lambda _a: print(_version()) or 0)
+    ver.set_defaults(func=lambda _a: print(synapse_home.client_version()) or 0)
 
     for name, module in _PASSTHROUGH.items():
         sub.add_parser(name, help=f"same as synapse-{name}", add_help=False).set_defaults(

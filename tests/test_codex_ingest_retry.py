@@ -48,11 +48,16 @@ _ENV_VARS = (
     "SYNAPSE_URL",
     "SYNAPSE_INGEST_URL",
     "SYNAPSE_INGEST_TOKEN",
-    "SYNAPSE_CODEX_CATCHUP_DAYS",
-    "SYNAPSE_CODEX_CATCHUP_MAX",
-    "SYNAPSE_CODEX_CATCHUP",
     "SYNAPSE_DATA_DIR",
 )
+# common.py loads plugin/scripts/config.py under the name ``config``; both resolve the token
+# at import time, so each test gets fresh ones.
+_RESOLVERS = ("common", "config")
+
+
+def _forget_resolvers() -> dict[str, ModuleType | None]:
+    return {name: sys.modules.pop(name, None) for name in _RESOLVERS}
+
 
 DAY = 86400.0
 
@@ -78,18 +83,19 @@ def env(monkeypatch, tmp_path) -> Iterator[Path]:
     monkeypatch.setenv("SYNAPSE_PRIVATE_DIR", str(tmp_path / "private"))
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
-    saved = sys.modules.pop("common", None)
+    saved = _forget_resolvers()
     yield home
-    sys.modules.pop("common", None)
-    if saved is not None:
-        sys.modules["common"] = saved
+    _forget_resolvers()
+    for name, mod in saved.items():
+        if mod is not None:
+            sys.modules[name] = mod
 
 
 @pytest.fixture()
 def hook(env, tmp_path, monkeypatch) -> ModuleType:
     """A fresh Codex Stop-hook module whose rollouts and state live under tmp_path."""
     mod = _load("codex_stop_hook_retry_test", _STOP_HOOK)
-    sys.modules.pop("common", None)  # a later load (session_start) resolves its own
+    _forget_resolvers()  # a later load (session_start) resolves its own
     monkeypatch.setattr(mod, "SESSIONS_ROOT", tmp_path / "sessions")
     return mod
 
@@ -387,7 +393,7 @@ def test_cap_holds_and_failing_rollouts_rotate(hook, monkeypatch):
     assert attempted == [b, a, c, d]  # the two that just failed moved to the back
     assert (
         "2 deferred to next session start"
-        in (hook.synapse_home.home() / "logs" / "codex-hook.log").read_text()
+        in (sys.modules["synapse_home"].home() / "logs" / "codex-hook.log").read_text()
     )
 
 
@@ -439,6 +445,69 @@ def test_stop_hook_hands_the_child_only_the_ids_it_ships_by(hook, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Private mode: the Claude hook's marker check, with its expiry and fail-safe
+# ---------------------------------------------------------------------------
+
+
+def _private_marker(tmp_path: Path, path: str, age_s: float = 0.0) -> Path:
+    marker = tmp_path / "private" / _sid(path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("")
+    when = time.time() - age_s
+    os.utime(marker, (when, when))
+    return marker
+
+
+def test_a_live_private_marker_ships_nothing(hook, tmp_path, monkeypatch):
+    path = _mk(hook.SESSIONS_ROOT, age_s=3600, now=time.time())
+    _private_marker(tmp_path, path, age_s=11 * 3600)
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    assert _stop(hook, path) == (0, 0)
+    assert posted == []
+
+
+def test_a_stale_private_marker_is_ignored_and_removed(hook, tmp_path, monkeypatch):
+    """Markers expire (12 h), as on the Claude side: this check used to be a bare
+    ``.exists()``, so an orphan left by a crashed SessionEnd muted the session forever."""
+    path = _mk(hook.SESSIONS_ROOT, age_s=3600, now=time.time())
+    marker = _private_marker(tmp_path, path, age_s=13 * 3600)
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    assert _stop(hook, path) == (1, 6)
+    assert not marker.exists()
+
+
+def test_an_unreadable_private_marker_dir_counts_as_private(hook, tmp_path, monkeypatch):
+    """Fail-safe direction: ``Path.exists()`` answers False on a permission error, so the
+    turn shipped. A deferred turn is recoverable; a silently captured one is not."""
+    path = _mk(hook.SESSIONS_ROOT, age_s=3600, now=time.time())
+    posted: list[list[dict]] = []
+    monkeypatch.setattr(hook, "_post", _ok(posted))
+    real_stat = os.stat
+
+    def stat(p, *a, **k):
+        if str(tmp_path / "private") in str(p):
+            raise PermissionError("EACCES")
+        return real_stat(p, *a, **k)
+
+    monkeypatch.setattr(hook.os, "stat", stat)
+    assert _stop(hook, path) == (0, 0)
+    assert posted == []
+
+
+def test_the_sweep_constants_are_the_shared_ones(hook):
+    """One window, cap and grace for both hosts (they had separate env names, and the
+    Codex hook hard-coded the grace)."""
+    r = hook.retry
+    assert (hook.CATCHUP_DAYS, hook.CATCHUP_MAX_FILES, hook.ACTIVE_GRACE) == (
+        r.CATCHUP_DAYS,
+        r.CATCHUP_MAX_FILES,
+        r.ACTIVE_GRACE,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Session-start warning
 # ---------------------------------------------------------------------------
 
@@ -482,9 +551,9 @@ def test_warning_after_a_long_silent_failure(hook):
 @pytest.fixture()
 def session_start(env, monkeypatch) -> ModuleType:
     """session_start.py loaded fresh, with its network blocks stubbed out."""
-    sys.modules.pop("common", None)
+    _forget_resolvers()
     mod = _load("codex_session_start_retry_test", _SESSION_START)
-    sys.modules.pop("common", None)
+    _forget_resolvers()
     monkeypatch.setattr(mod, "_prefs_text", lambda: None)
     monkeypatch.setattr(mod, "_board_text", lambda project: None)
     monkeypatch.setattr(mod, "_sync_skills", lambda cwd=None: None)

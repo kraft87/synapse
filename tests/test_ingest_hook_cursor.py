@@ -412,5 +412,5 @@ def test_post_records_sends_a_real_user_agent(hook, monkeypatch):
 
     monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
     hook._post_records([_u("u1")])
-    assert seen.get("user-agent") == hook.config._UA
+    assert seen.get("user-agent") == hook.config.USER_AGENT
     assert not seen["user-agent"].startswith("Python-urllib")

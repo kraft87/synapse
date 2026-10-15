@@ -76,48 +76,83 @@ resolution applies there.
 
 Log: ~/.synapse/logs/ingest-hook.log (one line per upload or failure).
 
-Env (all optional):
-  SYNAPSE_INGEST_TIMEOUT       default 30 (seconds per POST)
-  SYNAPSE_INGEST_TAIL          default 400 (records per POST chunk; also the
-                               first-run seed window on the Stop path)
-  SYNAPSE_INGEST_CATCHUP_DAYS  default 3 (the sweep picks up any lagging file
-                               modified this recently; a file whose upload
-                               failed is retried regardless of age)
-  SYNAPSE_INGEST_ACTIVE_GRACE  default 300 (skip files modified this recently —
-                               a live session's own Stop hooks handle them)
-  SYNAPSE_INGEST_CATCHUP_MAX   default 20 (files per sweep; the rest defer to
-                               the next SessionStart, logged, never silent)
+The sweep window (3 days), its cap (20 files), the active-write grace (300 s), the POST
+chunk (400 records, also the first-run seed window on the Stop path), the POST timeout
+(30 s) and the private-marker expiry (12 h) are constants, not settings; the window, cap,
+grace and expiry live in synapse_ingest_retry and are shared with the Codex hook.
 """
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import subprocess
 import sys
-import time
-import urllib.request
-from collections.abc import Callable
-from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
-import synapse_ingest_retry as retry
-import synapse_project
-from synapse_filelock import lock_exclusive
+
+
+def _spawn_detached(args: list[str]) -> None:
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), *args],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_hook() -> None:
+    """The Stop hook proper: hand the transcript to a detached `--ship` child."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+    transcript_path = payload.get("transcript_path") or ""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return
+    try:
+        _spawn_detached(["--ship", transcript_path])
+    except Exception as e:
+        _log(f"SPAWN-ERR: {type(e).__name__}: {str(e)[:160]}")
+
+
+def _log(msg: str) -> None:
+    import synapse_home  # not config: the Stop parent below runs before config is imported
+
+    synapse_home.log("ingest-hook", msg)
+
+
+if __name__ == "__main__" and len(sys.argv) == 1:
+    # Claude waits for this process at the end of every turn, and all it does is spawn the
+    # child: answer before the imports below (config, the retry bookkeeping, urllib), which
+    # cost about as much again as the spawn.
+    try:
+        _stop_hook()
+    finally:
+        sys.exit(0)
+
+import glob  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+from collections.abc import Callable  # noqa: E402
+from typing import Any  # noqa: E402
+
+import config  # noqa: E402
+import synapse_ingest_retry as retry  # noqa: E402
+import synapse_project  # noqa: E402
+from synapse_filelock import lock_exclusive  # noqa: E402
 
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
-TAIL_RECORDS = int(os.environ.get("SYNAPSE_INGEST_TAIL", "400"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_INGEST_CATCHUP_DAYS", "3"))
-ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
+TIMEOUT = 30.0
+TAIL_RECORDS = 400
+CATCHUP_DAYS = retry.CATCHUP_DAYS
+ACTIVE_GRACE = retry.ACTIVE_GRACE
+CATCHUP_MAX_FILES = retry.CATCHUP_MAX_FILES
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
-_PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -130,10 +165,6 @@ _MACHINERY_PREFIXES = (
     "<local-command-caveat>",
     "<system-reminder>",
 )
-
-
-def _log(msg: str) -> None:
-    config.synapse_home.log("ingest-hook", msg)
 
 
 def _is_turn_start(rec: dict[str, Any]) -> bool:
@@ -332,40 +363,9 @@ def _emit_failure_warning() -> None:
 
 
 def _is_private(session_id: str) -> bool:
-    """True if `session_id` is in private mode → ship NOTHING for it.
-
-    Private mode is a marker file at PRIVATE_DIR/<session_id>, written by
-    private_mode.py (which also sets the durable server-side flag). This local check
-    is the fast half: it keeps the turns from ever leaving the machine, and it works
-    while the server is unreachable.
-
-    Two deliberate behaviours:
-      * STALE markers (older than _PRIVATE_TTL_HOURS) are ignored AND deleted. A
-        marker outlives its session — a crashed SessionEnd hook leaves one behind, and
-        Claude Code reuses no session id, so an orphan would otherwise sit there
-        forever. The server-side row is the durable record; the marker is a live flag.
-      * UNREADABLE marker dir → treated as PRIVATE. If we can't prove a session is not
-        private, silently capturing it is the unacceptable failure; a deferred turn is
-        not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
-    """
-    if not session_id:
-        return False
-    marker = os.path.join(str(PRIVATE_DIR), session_id)
-    try:
-        age = time.time() - os.stat(marker).st_mtime
-    except FileNotFoundError:
-        return False  # no marker (or no private dir at all) — normal case
-    except OSError as e:
-        _log(f"PRIVATE unreadable {session_id}: {type(e).__name__} — skipping ingestion")
-        return True
-    if age > _PRIVATE_TTL_HOURS * 3600:
-        try:
-            os.unlink(marker)
-        except OSError:
-            pass
-        _log(f"PRIVATE stale marker removed {session_id} (age {int(age)}s)")
-        return False
-    return True
+    """True if `session_id` is in private mode → ship NOTHING for it
+    (synapse_ingest_retry.is_private, shared with the Codex hook)."""
+    return retry.is_private(session_id, PRIVATE_DIR, _log)
 
 
 def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
@@ -396,7 +396,7 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
     # soft, so without it every ingest is silently dropped.
-    headers = {"Content-Type": "application/json", "User-Agent": config._UA}
+    headers = {"Content-Type": "application/json", "User-Agent": config.USER_AGENT}
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
@@ -567,16 +567,6 @@ def _projects_root_from(transcript_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _spawn_detached(args: list[str]) -> None:
-    subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), *args],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def main() -> None:
     # Detached children do the actual work.
     if len(sys.argv) >= 3 and sys.argv[1] == "--ship":
@@ -586,15 +576,14 @@ def main() -> None:
         _catchup(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else "")
         return
 
-    # Parent (invoked by Claude): read the hook payload, spawn a detached
-    # worker, and return immediately so the turn/session isn't delayed.
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        return
-    transcript_path = payload.get("transcript_path") or ""
-
     if len(sys.argv) >= 2 and sys.argv[1] == "--catchup":
+        # Parent (invoked by Claude at SessionStart): read the hook payload, spawn a
+        # detached sweep, and return immediately so the session isn't delayed.
+        try:
+            payload = json.load(sys.stdin)
+        except Exception:
+            return
+        transcript_path = payload.get("transcript_path") or ""
         # Say so when uploads keep failing. Before the sweep runs, so the line
         # reflects the streak as it stood; a sweep that succeeds ends the streak.
         _emit_failure_warning()
@@ -613,13 +602,7 @@ def main() -> None:
             _log(f"SPAWN-ERR catchup: {type(e).__name__}: {str(e)[:160]}")
         return
 
-    # Default: the Stop-hook shipper.
-    if not transcript_path or not os.path.exists(transcript_path):
-        return
-    try:
-        _spawn_detached(["--ship", transcript_path])
-    except Exception as e:
-        _log(f"SPAWN-ERR: {type(e).__name__}: {str(e)[:160]}")
+    _stop_hook()  # the default; run as a script this is answered before the imports above
 
 
 if __name__ == "__main__":

@@ -34,6 +34,7 @@ import json
 import os
 import stat
 import sys
+import urllib.request
 from pathlib import Path
 from types import ModuleType
 
@@ -197,7 +198,7 @@ def _capture_requests(monkeypatch, cfg: ModuleType) -> list[tuple[str, str | Non
         seen.append((req.full_url, req.get_header("Authorization")))
         return _Resp(b"{}")
 
-    monkeypatch.setattr(cfg.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     return seen
 
 

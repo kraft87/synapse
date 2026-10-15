@@ -25,6 +25,7 @@ import io
 import json
 import os
 import sys
+import urllib.request
 from pathlib import Path
 from types import ModuleType
 
@@ -201,7 +202,7 @@ def test_every_hook_sends_the_device_token(monkeypatch, tmp_path):
         seen.append(req.get_header("Authorization"))
         return _Resp(b"{}")
 
-    monkeypatch.setattr(cfg.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     cfg.post_json("/x", {})
     cfg.get_json("/x")
     cfg.request_json("PUT", "/x")
@@ -516,7 +517,7 @@ def test_reenroll_replaces_the_hash(monkeypatch, tmp_path):
 
 def _codex_common(monkeypatch, tmp_path, *, record, env_token, plugin: bool = True):
     """plugin-codex/scripts/common.py reads ~/.claude/settings.json and the Claude
-    plugin's device.json; HOME points both at the scratch dir. ``plugin`` False: no
+    plugin's device.json through the shared config.py; HOME points both at the scratch dir. ``plugin`` False: no
     Claude plugin config there."""
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True, exist_ok=True)
@@ -531,10 +532,12 @@ def _codex_common(monkeypatch, tmp_path, *, record, env_token, plugin: bool = Tr
         (data / "device.json").write_text(json.dumps(record), encoding="utf-8")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(data))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     for var in _ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     if env_token:
         monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", env_token)
+    sys.modules.pop("config", None)  # common.py loads the shared config.py under this name
     sys.modules.pop("common", None)
     spec = importlib.util.spec_from_file_location("common", _CODEX / "scripts" / "common.py")
     assert spec and spec.loader

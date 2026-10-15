@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -334,6 +335,7 @@ class _StubServer:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.queries: list[dict[str, list[str]]] = []
+        self.agents: list[str] = []
         self.rows: set[str] = set()
         self.lie_on_put = False  # simulate a write that silently doesn't land
         self.stored_turns: int | None = None
@@ -355,6 +357,7 @@ class _StubServer:
                 query = parse_qs(url.query)
                 outer.calls.append((self.command, sid))
                 outer.queries.append(query)
+                outer.agents.append(self.headers.get("User-Agent", ""))
                 if self.command == "PUT" and not outer.lie_on_put:
                     outer.rows.add(sid)
                 elif self.command == "DELETE":
@@ -572,32 +575,93 @@ def test_flag_shaped_session_id_is_rejected(toggle, stub_server, capsys):
 
 
 # ---------------------------------------------------------------------------
-# The Codex port of the toggle CLI follows the same --purge contract
+# The Codex entry point is the shared script, not a copy of it
 # ---------------------------------------------------------------------------
 
-
-@pytest.fixture()
-def codex_toggle(monkeypatch, tmp_path, stub_server) -> ModuleType:
-    _isolate(monkeypatch, tmp_path)
-    monkeypatch.setenv("SYNAPSE_URL", stub_server.url)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delitem(sys.modules, "common", raising=False)
-    mod = _load(_REPO / "plugin-codex" / "scripts" / "private_mode.py", "codex_private_mode_test")
-    monkeypatch.delitem(sys.modules, "common", raising=False)
-    return mod
+_CODEX_TOGGLE = _REPO / "plugin-codex" / "scripts" / "private_mode.py"
 
 
-def test_codex_on_reports_earlier_turns_and_purges_by_name(codex_toggle, stub_server, capsys):
+def _codex(tmp_path, stub_server, *args: str) -> subprocess.CompletedProcess:
+    """plugin-codex/scripts/private_mode.py as Codex runs it: a subprocess in the session's
+    directory, with the server URL only in the user-level Claude settings."""
+    cfg_dir = tmp_path / "claude"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "settings.json").write_text(
+        json.dumps(
+            {"pluginConfigs": {"synapse@synapse": {"options": {"SYNAPSE_URL": stub_server.url}}}}
+        )
+    )
+    project = tmp_path / "project"
+    (project / ".claude").mkdir(parents=True, exist_ok=True)
+    # A repository's own settings are not Codex's: they must not redirect the toggle.
+    (project / ".claude" / "settings.json").write_text(
+        json.dumps(
+            {
+                "pluginConfigs": {
+                    "synapse@synapse": {"options": {"SYNAPSE_URL": "http://127.0.0.1:9"}}
+                }
+            }
+        )
+    )
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("SYNAPSE_", "CLAUDE_PLUGIN_OPTION_"))
+    }
+    env |= {
+        "HOME": str(tmp_path),
+        "CLAUDE_CONFIG_DIR": str(cfg_dir),
+        "SYNAPSE_HOME": str(tmp_path / "synapse-home"),
+        "SYNAPSE_DATA_DIR": str(tmp_path / "data"),
+        "SYNAPSE_PRIVATE_DIR": str(tmp_path / "private"),
+    }
+    return subprocess.run(
+        [sys.executable, str(_CODEX_TOGGLE), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=project,
+        check=False,
+    )
+
+
+def test_codex_toggle_runs_the_shared_script_as_codex(stub_server, tmp_path):
+    stub_server.stored_turns = 2
+    done = _codex(tmp_path, stub_server, "on", "s-abc")
+    assert done.returncode == 0, done.stderr
+    assert "2 turn(s) of this session were already stored" in done.stdout
+    assert (tmp_path / "private" / "s-abc").exists()
+    assert "s-abc" in stub_server.rows
+    assert stub_server.agents and all(
+        a.startswith("synapse-codex-plugin/") for a in stub_server.agents
+    )
+
+
+def test_codex_toggle_purges_by_name_and_refuses_a_flag_for_an_id(stub_server, tmp_path):
     stub_server.stored_turns = 2
     stub_server.purge = "ok"
-    assert codex_toggle.main(["on", "s-abc"]) == 0
-    assert "2 turn(s) of this session were already stored" in capsys.readouterr().out
-    assert codex_toggle.main(["on", "s-abc", "--purge"]) == 0
-    assert "purged 2 stored turn(s)" in capsys.readouterr().out
+    done = _codex(tmp_path, stub_server, "on", "s-abc", "--purge")
+    assert done.returncode == 0, done.stderr
+    assert "purged 2 stored turn(s)" in done.stdout
     assert stub_server.queries[-2] == {"purge": ["1"]}  # the PUT; the read-back GET follows
+    assert _codex(tmp_path, stub_server, "status", "s-abc", "--purge").returncode == 2
 
 
-def test_codex_on_purge_against_an_older_server_is_not_a_success(codex_toggle, stub_server, capsys):
-    assert codex_toggle.main(["on", "s-abc", "--purge"]) == 1
-    assert "--purge did not run" in capsys.readouterr().err
-    assert codex_toggle.main(["status", "s-abc", "--purge"]) == 2
+def test_codex_toggle_against_an_older_server_does_not_claim_a_purge(stub_server, tmp_path):
+    done = _codex(tmp_path, stub_server, "on", "s-abc", "--purge")
+    assert done.returncode == 1
+    assert "--purge did not run" in done.stderr
+
+
+def test_codex_session_end_drops_the_marker(stub_server, tmp_path):
+    assert _codex(tmp_path, stub_server, "on", "s-end").returncode == 0
+    done = subprocess.run(
+        [sys.executable, str(_CODEX_TOGGLE), "--session-end"],
+        input=json.dumps({"session_id": "s-end"}),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "SYNAPSE_PRIVATE_DIR": str(tmp_path / "private")},
+        check=False,
+    )
+    assert done.returncode == 0
+    assert not (tmp_path / "private" / "s-end").exists()

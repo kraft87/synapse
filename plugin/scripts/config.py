@@ -31,16 +31,13 @@ Every setting resolves env var -> ~/.synapse/config.json (synapse_home.py, writt
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
 import re
 import socket
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 
@@ -298,6 +295,8 @@ def token_sha256(token: str) -> str:
     """Fingerprint a credential for the enrollment record. The record has to recognise
     the device token without becoming a second copy of it: data dirs get copied by
     backups and sync tools, and the hash of a random bearer gives nothing back."""
+    import hashlib  # deferred: an unenrolled machine's hooks never fingerprint a token
+
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
@@ -566,53 +565,31 @@ def requested_trust() -> str | None:
     return _ROLE_TRUST.get(machine_role())
 
 
-_UA = "synapse-plugin/0.9"
-
-
-def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
-    """POST JSON to a Synapse endpoint under BASE_URL and return the parsed JSON reply.
-
-    `path` is endpoint-relative ("/skills/list") or absolute ("http://..."). Sends the bearer
-    when one is configured. Raises on transport / HTTP error — callers decide whether to
-    fail-open (hooks) or surface it (the review CLI)."""
-    url = path if path.startswith("http") else BASE_URL + path
-    headers = {"User-Agent": _UA, "Content-Type": "application/json"}
-    if INGEST_TOKEN:
-        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), method="POST", headers=headers
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"{}")
-
-
-def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
-    """GET JSON from a Synapse endpoint under BASE_URL and return the parsed reply.
-
-    `path` is endpoint-relative ("/preferences/top") or absolute. `params` are urlencoded
-    onto the query string. Sends the bearer when one is configured. Raises on transport /
-    HTTP error — callers decide whether to fail-open (hooks) or surface it."""
-    url = path if path.startswith("http") else BASE_URL + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    headers = {"User-Agent": _UA}
-    if INGEST_TOKEN:
-        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
-    req = urllib.request.Request(url, method="GET", headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"{}")
+#: Every request names the client and its version: Cloudflare (and similar) 403 urllib's
+#: default User-Agent, and the server's logs say which clients still call a legacy route.
+#: The Codex scripts, which load this module through common.py, set their own product name.
+USER_AGENT = f"synapse-plugin/{synapse_home.client_version()}"
 
 
 def request_json(
-    method: str, path: str, payload: dict | None = None, timeout: float = 30.0
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    timeout: float = 30.0,
+    params: dict | None = None,
 ) -> dict:
-    """Send an arbitrary-verb JSON request to a Synapse endpoint under BASE_URL.
+    """Send a JSON request to a Synapse endpoint under BASE_URL and return the parsed reply.
 
-    The sibling helpers cover the POST/GET lanes; private mode's routes are PUT/DELETE
-    (the session id is the resource, not a body field), which urllib only reaches through
-    an explicit method. Same bearer + error contract: raises on transport / HTTP error."""
+    `path` is endpoint-relative ("/skills/list") or absolute ("http://..."); `params` are
+    urlencoded onto the query string. Sends the bearer when one is configured. Raises on
+    transport / HTTP error: callers decide whether to fail-open (hooks) or surface it (the
+    review CLI)."""
+    import urllib.request  # deferred: the hooks that never reach the server skip ~25 ms
+
     url = path if path.startswith("http") else BASE_URL + path
-    headers = {"User-Agent": _UA}
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": USER_AGENT}
     if payload is not None:
         headers["Content-Type"] = "application/json"
     if INGEST_TOKEN:
@@ -621,6 +598,14 @@ def request_json(
     req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
+
+
+def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
+    return request_json("POST", path, payload, timeout)
+
+
+def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
+    return request_json("GET", path, None, timeout, params)
 
 
 def act(endpoint: str, cid: int, action: str, *, expect: str, **extra) -> dict | None:
