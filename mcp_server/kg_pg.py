@@ -83,12 +83,13 @@ def search_kg_postgres(
     limit: int,
     allowed_projects: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Mirror of recall._search_kg over the Postgres KG mirror.
+    """The facts leg: fact KNN + fact BM25 + one-hop traversal from entity seeds, RRF-fused.
 
     Returns ``(facts, seed_entities)``: facts carry internal ``_uuid`` (for
     retrieval-count bumps + history lookup) and ``_id`` (``kg_relationships.id``, the
-    number a fact is served and rated under), seed_entities is the ranked list of
-    connected seeds used by the entity bucket downstream.
+    number a fact is served and rated under); seed_entities is the ranked list of
+    connected seeds the hops started from, which recall does not serve (the entity
+    display bucket is retired).
 
     ``allowed_projects`` (a restricted surface's allowlist) applies
     :func:`scope_predicate` to every fact-returning leg and to the seed degree gate,

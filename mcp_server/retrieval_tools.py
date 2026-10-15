@@ -65,9 +65,7 @@ def register(
         generic-knowledge questions with no user-history angle.
 
         This is the overview: compressed passages plus the buckets below, the right
-        first call. Its drill-down sibling recall_full_turns serves complete raw
-        turns: the follow-up when a passage is truncated, the retry when this comes
-        back thin.
+        first call. Its drill-down sibling recall_full_turns serves complete raw turns.
 
         Query in plain language carrying the message's distinctive nouns; leave
         `project` unset unless results come back noisy from another domain. Served
@@ -89,7 +87,8 @@ def register(
         A `warnings` list means a leg degraded or this connection is served (almost)
         nothing: a config problem, not empty memory.
 
-        Follow-ups: fetch(ids) expands a truncated passage or note body;
+        Follow-ups: fetch(ids) expands a truncated passage or note body; recall_full_turns
+        retries a thin result with whole turns.
 
         Args:
             query: Natural language search query.

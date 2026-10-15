@@ -83,7 +83,7 @@ def test_descriptions_and_instructions_fit_claude_code_truncation():
 # from the wire description — remember once lost its whole type-semantics block this
 # way. Pinning each tail proves no description got section-swallowed.
 _DESCRIPTION_TAILS = {
-    "recall": "expands a truncated passage or note body;",
+    "recall": "retries a thin result with whole turns.",
     "recall_full_turns": "rateable in recall_feedback",
     "fetch": "at most 20 ids per call",
     "fetch_session": "read the on-disk transcript instead",
