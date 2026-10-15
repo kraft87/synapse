@@ -2,7 +2,7 @@
 
 Exercises every reader against the real kg_entities / kg_relationships schema
 (017) on the shared test DB, asserting the FalkorDB-mirroring contracts the
-callers depend on: valid_at as ISO string, fact_embedding as list[float],
+callers depend on: fact_embedding as list[float],
 vector score as cosine distance, live-edge (t_invalid IS NULL) filtering, and
 owner/group scoping.
 """
@@ -12,7 +12,7 @@ from __future__ import annotations
 import psycopg
 import pytest
 
-from ingestion.kg_client import KGClient, _iso
+from ingestion.kg_client import KGClient
 from tests.helpers.embed import GROUP
 from tests.helpers.kg import DIM, _axis_list
 
@@ -43,33 +43,24 @@ def kg_tables(conn, db_url):
     )
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, "
-        "name, fact, fact_embedding, valid_at, t_valid, t_invalid) VALUES "
+        "name, fact, fact_embedding, t_valid, t_invalid) VALUES "
         "('r-live', 'default', %(g)s, 'e-syn', 'e-fdb', 'USES', "
         " 'Synapse uses FalkorDB as its graph layer', %(v0)s, "
-        " '2026-06-01T00:00:00+00:00', '2026-06-01T00:00:00+00:00', NULL), "
+        " '2026-06-01T00:00:00+00:00', NULL), "
         "('r-dead', 'default', %(g)s, 'e-syn', 'e-fdb', 'USES', "
         " 'Synapse uses OpenAI embeddings', %(v0)s, "
-        " '2026-05-01T00:00:00+00:00', '2026-05-01T00:00:00+00:00', "
-        " '2026-06-01T00:00:00+00:00'), "
+        " '2026-05-01T00:00:00+00:00', '2026-06-01T00:00:00+00:00'), "
         "('r-far', 'default', %(g)s, 'e-fdb', 'e-syn', 'RUNS_ON', "
-        " 'FalkorDB runs on the docker VM', %(v1)s, NULL, NULL, NULL), "
+        " 'FalkorDB runs on the docker VM', %(v1)s, NULL, NULL), "
         "('r-noemb', 'default', %(g)s, 'e-syn', 'e-fdb', 'USES', "
-        " 'Synapse stores episodes in Postgres', NULL, NULL, NULL, NULL), "
+        " 'Synapse stores episodes in Postgres', NULL, NULL, NULL), "
         "('r-other', 'tenant2', %(g)s, 'e-syn', 'e-fdb', 'USES', "
-        " 'tenant2 edge must not surface', %(v0)s, NULL, NULL, NULL)",
+        " 'tenant2 edge must not surface', %(v0)s, NULL, NULL)",
         {"g": GROUP, "v0": _axis(0), "v1": _axis(1)},
     )
     client = KGClient(db_url)
     yield client
     client._reset()
-
-
-class TestHelpers:
-    def test_iso(self):
-        from datetime import UTC, datetime
-
-        assert _iso(None) is None
-        assert _iso(datetime(2026, 6, 1, tzinfo=UTC)) == "2026-06-01T00:00:00+00:00"
 
 
 class TestConnection:
@@ -133,7 +124,6 @@ class TestEdgeReads:
         assert "r-dead" not in uuids  # invalidated edges must not re-enter the pool
         assert "r-other" not in uuids
         assert uuids[0] == "r-live"  # identical embedding first; the unembedded edge last
-        assert hits[0]["valid_at"] == "2026-06-01T00:00:00+00:00"  # ISO string, not datetime
         assert "fact_embedding" not in hits[0]  # ~24 KB of text per edge nothing reads
 
     def test_find_edges_by_pair_cap_keeps_the_nearest(self, kg_tables, conn):

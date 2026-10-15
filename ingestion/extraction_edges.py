@@ -442,15 +442,9 @@ class ExtractionEdgesMixin:
                     "name": fact.relationship,
                     "fact": fact.fact,
                     "episodes": episode_ids,
-                    "created_at": now,
-                    "valid_at": valid_at_ts,
                     "t_created": now,
                     "t_valid": valid_at_ts,
                     "emb": emb,
-                    # Never born-invalidated (see the note above the invalidation
-                    # block); create_edges_batch still honours a t_invalid for
-                    # callers that genuinely know one, this lane does not pass it.
-                    "t_invalid": None,
                     # Web provenance (task #68). None on the episode lane.
                     "web_artifact_id": web_artifact_id,
                     # Evidence metadata (schema 058).

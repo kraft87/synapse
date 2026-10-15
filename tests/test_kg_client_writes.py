@@ -3,9 +3,9 @@
 Exercises every mutation against the real kg_entities / kg_relationships
 schema (017) on the shared test DB, asserting the contracts the pipeline
 depends on: a matched entity's update carries only a longer summary and a known
-supertype (never its name, embedding or subtype), edge re-creation is a retry no-op, invalidation sets both t_invalid and the
-legacy invalid_at, and failures RAISE (Postgres is the source of truth now —
-no best-effort swallowing).
+supertype (never its name, embedding or subtype), edge re-creation is a retry no-op,
+only the t_* time columns are written (never the FalkorDB-era mirrors), and failures
+RAISE (Postgres is the source of truth now — no best-effort swallowing).
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ class TestInsertNode:
             supertype="Service",
         )
         row = conn.execute(
-            "SELECT owner_id, group_id, project, name, normalized_name, entity_type, summary, "
+            "SELECT owner_id, group_id, project, name, normalized_name, summary, "
             "entity_subtype, entity_supertype, embedding IS NOT NULL "
             "FROM kg_entities WHERE uuid = 'e-1'"
         ).fetchone()
@@ -80,12 +80,20 @@ class TestInsertNode:
             "synapse",
             "Synapse",
             "synapse",
-            "Tool",
             "memory layer",
             "Tool",
             "Service",
             True,
         )
+
+    def test_only_the_t_columns_and_the_subtype_are_written(self, kg_writer, conn):
+        kg_writer.insert_node(
+            node_uuid="e-1", name="Synapse", entity_type="Tool", summary="", group_id=GROUP
+        )
+        assert conn.execute(
+            "SELECT entity_type, created_at, valid_at, t_created IS NOT NULL, t_valid IS NOT NULL "
+            "FROM kg_entities WHERE uuid = 'e-1'"
+        ).fetchone() == (None, None, None, True, True)
 
     def test_reinserting_a_uuid_is_a_retry_no_op(self, kg_writer, conn):
         kg_writer.insert_node(
@@ -209,22 +217,30 @@ class TestCreateEdges:
         rows = conn.execute("SELECT fact FROM kg_relationships WHERE uuid = 'r-1'").fetchall()
         assert rows == [("fact for r-1",)]  # original wins; conflict is a no-op
 
-    def test_garbage_valid_at_falls_back_to_created(self, kg_writer, conn):
+    def test_garbage_t_valid_falls_back_to_t_created(self, kg_writer, conn):
         kg_writer.create_edges_batch(
-            [self._row("r-1", valid_at="-4599999974-05-27T00:00:00Z", t_valid=None)],
+            [self._row("r-1", t_valid="-4599999974-05-27T00:00:00Z")],
             GROUP,
         )
         row = conn.execute(
-            "SELECT valid_at, created_at FROM kg_relationships WHERE uuid = 'r-1'"
+            "SELECT t_valid, t_created FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
-        assert row[0] == row[1]  # nulled garbage falls back to created_at
+        assert row[0] == row[1]  # nulled garbage falls back to t_created
+
+    def test_legacy_time_columns_are_not_written(self, kg_writer, conn):
+        kg_writer.create_edges_batch([self._row("r-1")], GROUP)
+        legacy = conn.execute(
+            "SELECT created_at, valid_at, invalid_at, t_created IS NOT NULL, t_valid IS NOT NULL "
+            "FROM kg_relationships WHERE uuid = 'r-1'"
+        ).fetchone()
+        assert legacy == (None, None, None, True, True)
 
     def test_empty_rows_is_noop(self, kg_writer):
         kg_writer.create_edges_batch([], GROUP)  # must not raise or connect
 
 
 class TestInvalidateEdges:
-    def test_sets_both_lifecycle_fields(self, kg_writer, conn):
+    def test_sets_t_invalid_and_never_the_legacy_mirror(self, kg_writer, conn):
         kg_writer.create_edges_batch(
             [
                 {
@@ -234,8 +250,8 @@ class TestInvalidateEdges:
                     "name": "USES",
                     "fact": "f",
                     "episodes": None,
-                    "created_at": "2026-06-01T00:00:00+00:00",
-                    "valid_at": "2026-06-01T00:00:00+00:00",
+                    "t_created": "2026-06-01T00:00:00+00:00",
+                    "t_valid": "2026-06-01T00:00:00+00:00",
                 },
                 {
                     "src": "e-s",
@@ -244,8 +260,8 @@ class TestInvalidateEdges:
                     "name": "USES",
                     "fact": "g",
                     "episodes": None,
-                    "created_at": "2026-06-01T00:00:00+00:00",
-                    "valid_at": "2026-06-01T00:00:00+00:00",
+                    "t_created": "2026-06-01T00:00:00+00:00",
+                    "t_valid": "2026-06-01T00:00:00+00:00",
                 },
             ],
             GROUP,
@@ -258,7 +274,7 @@ class TestInvalidateEdges:
         ).fetchall()
         for _uuid, t_inv, inv in rows:
             assert t_inv is not None
-            assert t_inv == inv  # legacy field mirrors the canonical one
+            assert inv is None  # the FalkorDB-era mirror is no longer written
         assert str(rows[0][1]).startswith("2026-06-05")  # explicit ts honored
 
     def test_records_superseder_when_provided(self, kg_writer, conn):
@@ -271,8 +287,8 @@ class TestInvalidateEdges:
                     "name": "USES",
                     "fact": "f",
                     "episodes": None,
-                    "created_at": "2026-06-01T00:00:00+00:00",
-                    "valid_at": "2026-06-01T00:00:00+00:00",
+                    "t_created": "2026-06-01T00:00:00+00:00",
+                    "t_valid": "2026-06-01T00:00:00+00:00",
                 },
             ],
             GROUP,
@@ -298,9 +314,8 @@ class TestInvalidateEdges:
 
 class TestReinforceEdges:
     def _row(self, uuid: str, **over):
-        # Reinforce path carries only src/tgt/fact/episodes + created_at/valid_at;
-        # it drops the create-time embedding and the t_created/t_valid columns.
-        return make_edge_row(uuid, drop=("t_created", "t_valid", "emb"), **over)
+        # Reinforce path drops the create-time embedding.
+        return make_edge_row(uuid, drop=("emb",), **over)
 
     def test_bumps_count_and_unions_episodes(self, kg_writer, conn):
         kg_writer.create_edges_batch(
@@ -407,10 +422,10 @@ class TestEvidenceCurrency:
         kg_writer.invalidate_edges_batch(
             [("r-1", "2026-03-01T00:00:00+00:00")], GROUP, invalidated_by="n"
         )
-        t_inv, inv, by = conn.execute(
-            "SELECT t_invalid, invalid_at, invalidated_by FROM kg_relationships WHERE uuid = 'r-1'"
+        t_inv, by = conn.execute(
+            "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
-        assert str(t_inv).startswith("2026-06-01") and t_inv == inv and by == "n"
+        assert str(t_inv).startswith("2026-06-01") and by == "n"
 
     def test_invalidate_keeps_the_earlier_retirement(self, kg_writer, conn):
         kg_writer.create_edges_batch([self._row("r-1")], GROUP)
@@ -428,7 +443,7 @@ class TestEvidenceCurrency:
 class TestDeleteOrphanEntities:
     def _entity(self, conn, uuid: str, age_hours: int, group: str = GROUP) -> None:
         conn.execute(
-            "INSERT INTO kg_entities (uuid, group_id, name, created_at) "
+            "INSERT INTO kg_entities (uuid, group_id, name, t_created) "
             "VALUES (%s, %s, %s, now() - make_interval(hours => %s))",
             (uuid, group, uuid, age_hours),
         )

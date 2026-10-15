@@ -210,7 +210,7 @@ class TestNeverBornInvalid:
         pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {}, default_valid_at=SEG)
         (row,) = _created(pipe)
         assert row["t_valid"] == "2026-08-29T00:00:00Z"
-        assert row["t_invalid"] is None
+        assert "t_invalid" not in row  # the writer has no column to born-retire an edge with
         pipe._kg.invalidate_edges_batch.assert_not_called()
 
     def test_bounded_past_state_is_written_live(self):
@@ -220,4 +220,4 @@ class TestNeverBornInvalid:
         pipe = _pipe(1, dates=[("2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z")])
         pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {})
         (row,) = _created(pipe)
-        assert row["t_invalid"] is None
+        assert "t_invalid" not in row  # the writer has no column to born-retire an edge with

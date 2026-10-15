@@ -11,8 +11,10 @@ idle worker). That is safe because every statement is a read or idempotent (``ON
 CONFLICT`` upsert/no-op, ``UPDATE`` by uuid).
 
 Return shapes are contracts the callers depend on (they feed prompts and ``rrf_merge``):
-``valid_at`` comes back as an ISO string and the vector ``score`` as cosine distance
-(0 = identical) -- the scale the stage-6a ``distance_threshold=0.20`` gate expects.
+the vector ``score`` is cosine distance (0 = identical) -- the scale the stage-6a
+``distance_threshold=0.20`` gate expects. The graph's time columns are ``t_created`` /
+``t_valid`` / ``t_invalid`` (the FalkorDB-era ``created_at`` / ``valid_at`` /
+``invalid_at`` mirrors are no longer written), and the type is ``entity_subtype``.
 
 The ParadeDB BM25 leg intentionally has NO score floor: the pool is capped by the caller
 (``_SEMANTIC_POOL_LIMIT``), rank-only RRF (k=1) does the weighting, and stage 6b's LLM
@@ -65,11 +67,6 @@ def _vec(v: Any) -> str | None:
     if not v:
         return None
     return "[" + ",".join(map(str, v)) + "]"
-
-
-def _iso(v: Any) -> str | None:
-    """TIMESTAMPTZ -> ISO string, mirroring FalkorDB's string-property reads."""
-    return v.isoformat() if v is not None else None
 
 
 def _ts(v: Any) -> str | None:
@@ -260,8 +257,8 @@ class KGClient:
                 cur = conn.cursor()
                 cur.execute("SET LOCAL enable_seqscan = off")
                 cur.execute(
-                    "SELECT uuid, fact, valid_at, dist FROM ("  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                    "  SELECT uuid, fact, valid_at, owner_id, group_id, "
+                    "SELECT uuid, fact, dist FROM ("  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                    "  SELECT uuid, fact, owner_id, group_id, "
                     f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
                     "  FROM kg_relationships "
                     "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
@@ -269,10 +266,7 @@ class KGClient:
                     ") sub WHERE owner_id = %s AND group_id = %s AND dist <= %s LIMIT %s",
                     (emb_s, _OVERFETCH, OWNER, group_id, distance_threshold, limit),
                 )
-                return [
-                    {"uuid": u, "fact": f, "valid_at": _iso(v), "score": float(d)}
-                    for u, f, v, d in cur.fetchall()
-                ]
+                return [{"uuid": u, "fact": f, "score": float(d)} for u, f, d in cur.fetchall()]
 
         return self._run(_q)
 
@@ -344,7 +338,7 @@ class KGClient:
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             rows = conn.execute(
-                "SELECT uuid, fact, valid_at FROM kg_relationships "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                "SELECT uuid, fact FROM kg_relationships "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "WHERE owner_id = %s AND group_id = %s "
                 "  AND src_uuid = %s AND tgt_uuid = %s AND t_invalid IS NULL "
                 f"ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) "
@@ -352,7 +346,7 @@ class KGClient:
                 "LIMIT %s",
                 (OWNER, group_id, source_uuid, target_uuid, _vec(fact_embedding), limit),
             ).fetchall()
-            return [{"uuid": u, "fact": f, "valid_at": _iso(v)} for u, f, v in rows]
+            return [{"uuid": u, "fact": f} for u, f in rows]
 
         return self._run(_q)
 
@@ -382,7 +376,7 @@ class KGClient:
 
         def _q(conn: psycopg.Connection[Any]) -> list[dict[str, Any]]:
             rows = conn.execute(
-                f"SELECT uuid, fact, valid_at, paradedb.score(id) AS sc, {dist_sql} AS dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"SELECT uuid, fact, paradedb.score(id) AS sc, {dist_sql} AS dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "FROM kg_relationships "
                 "WHERE id @@@ paradedb.match('fact', %s) "
                 "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
@@ -393,11 +387,10 @@ class KGClient:
                 {
                     "uuid": u,
                     "fact": f,
-                    "valid_at": _iso(v),
                     "score": float(sc),
                     "dist": None if d is None else float(d),
                 }
-                for u, f, v, sc, d in rows
+                for u, f, sc, d in rows
             ]
 
         return self._run(_q)
@@ -421,8 +414,8 @@ class KGClient:
 
         ``normalized_name`` (lowercase, whitespace-collapsed, leading/trailing
         punctuation stripped) is what ``ingestion.dedup.NodeDeduper`` serves the
-        exact-name short-circuit from, via an indexed lookup. entity_subtype = the raw
-        entity_type; supertype is the caller-derived taxonomy rollup. Re-inserting an
+        exact-name short-circuit from, via an indexed lookup. ``entity_type`` is stored as
+        entity_subtype; supertype is the caller-derived taxonomy rollup. Re-inserting an
         existing uuid is a retry no-op; a mention that matched an existing entity goes
         through :meth:`update_node`, which never touches its identity.
         """
@@ -436,11 +429,8 @@ class KGClient:
             project or "",
             strip_nul(name or ""),
             strip_nul(_normalize_name(name) or ""),
-            entity_type or "",
             strip_nul(summary or ""),
             _vec(embedding),
-            now,
-            now,
             now,
             now,
             supertype,
@@ -451,9 +441,8 @@ class KGClient:
             conn.execute(
                 "INSERT INTO kg_entities "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "  (uuid, owner_id, group_id, project, name, normalized_name, "
-                "   entity_type, summary, embedding, created_at, t_created, "
-                "   valid_at, t_valid, entity_supertype, entity_subtype) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,%s,%s,%s) "
+                "   summary, embedding, t_created, t_valid, entity_supertype, entity_subtype) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,%s) "
                 "ON CONFLICT (uuid) DO NOTHING",
                 params,
             )
@@ -489,8 +478,8 @@ class KGClient:
         """Insert relationship edges. One multi-row INSERT, ON CONFLICT (uuid)
         DO NOTHING (re-creating an existing edge is a retry no-op).
 
-        Each row carries: src, tgt, edge_uuid, name, fact, episodes,
-        created_at, t_created, valid_at, t_valid, optional emb (fact embedding),
+        Each row carries: src, tgt, edge_uuid, name, fact, episodes, t_created, t_valid
+        (an unparseable one falls back to t_created), optional emb (fact embedding),
         optional web_artifact_id (web-lane provenance, task #68), and the optional
         schema-058 evidence fields ongoing / last_supported_at / last_supported_by
         (absent or None -> NULL: unknown, never-confirmed).
@@ -503,9 +492,7 @@ class KGClient:
 
         params: list[tuple[Any, ...]] = []
         for r in rows:
-            created = _ts(r.get("created_at")) or _ts(r.get("t_created"))
-            valid = _ts(r.get("valid_at")) or created
-            t_valid = _ts(r.get("t_valid")) or _ts(r.get("valid_at")) or created
+            created = _ts(r.get("t_created"))
             eps = r.get("episodes")
             params.append(
                 (
@@ -520,9 +507,7 @@ class KGClient:
                     json.dumps(eps) if eps is not None else None,
                     0,
                     created,
-                    _ts(r.get("t_created")) or created,
-                    valid,
-                    t_valid,
+                    _ts(r.get("t_valid")) or created,
                     r.get("web_artifact_id"),
                     r.get("ongoing"),
                     _ts(r.get("last_supported_at")),
@@ -537,11 +522,9 @@ class KGClient:
                 cur.executemany(
                     "INSERT INTO kg_relationships "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                     "(uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
-                    "fact_embedding, episodes, retrieval_count, created_at, t_created, "
-                    "valid_at, t_valid, web_artifact_id, ongoing, last_supported_at, "
-                    "last_supported_by) VALUES "
-                    f"(%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s::jsonb,%s,%s,%s,%s,%s,%s,"
-                    "%s,%s,%s) "
+                    "fact_embedding, episodes, retrieval_count, t_created, t_valid, "
+                    "web_artifact_id, ongoing, last_supported_at, last_supported_by) VALUES "
+                    f"(%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s::jsonb,%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (uuid) DO NOTHING",
                     params,
                 )
@@ -554,7 +537,7 @@ class KGClient:
         group_id: str,
         invalidated_by: str | None = None,
     ) -> None:
-        """Set ``t_invalid`` (and the legacy ``invalid_at``) on each edge.
+        """Set ``t_invalid`` on each edge.
         ``items`` is a list of (edge_uuid, invalid_at); a None invalid_at falls back to
         now() per-row, so callers can mix "invalidate as of the fact's evidenced date"
         rows with "as of right now" rows in one call. ``invalidated_by`` (the superseding
@@ -574,10 +557,9 @@ class KGClient:
                 conn.execute(
                     "UPDATE kg_relationships "
                     "SET t_invalid = COALESCE(t_invalid, GREATEST(t_valid, COALESCE(%s, now()))), "
-                    "    invalid_at = COALESCE(t_invalid, GREATEST(t_valid, COALESCE(%s, now()))), "
                     "    invalidated_by = COALESCE(%s, invalidated_by) "
                     "WHERE uuid = %s",
-                    (ts, ts, invalidated_by, edge_uuid),
+                    (ts, invalidated_by, edge_uuid),
                 )
 
         self._run(_do)
@@ -662,7 +644,7 @@ class KGClient:
                 "  SELECT e2.id FROM kg_entities e2 "
                 "  LEFT JOIN (SELECT src_uuid AS u FROM kg_relationships "
                 "             UNION SELECT tgt_uuid FROM kg_relationships) r ON r.u = e2.uuid "
-                "  WHERE r.u IS NULL AND e2.created_at < now() - make_interval(hours => %s)"
+                "  WHERE r.u IS NULL AND e2.t_created < now() - make_interval(hours => %s)"
                 ") o "
                 "WHERE e.id = o.id "
                 "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "

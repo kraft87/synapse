@@ -31,9 +31,7 @@ def make_edge_row(uuid: str, *, drop: tuple[str, ...] = (), **over) -> dict:
         "name": "USES",
         "fact": f"fact for {uuid}",
         "episodes": [1, 2],
-        "created_at": "2026-06-01T00:00:00+00:00",
         "t_created": "2026-06-01T00:00:00+00:00",
-        "valid_at": "2026-06-01T00:00:00+00:00",
         "t_valid": "2026-06-01T00:00:00+00:00",
         "emb": _axis_list(0),
     }
