@@ -185,7 +185,8 @@ class Maintenance:
         """Chunk the captured web pages that have no chunks yet. Returns the chunks built.
 
         A page enters recall here, in its own good time: chunks, then
-        :meth:`contextualize_web_chunks`, then :meth:`embed_pending`. (Pages come from
+        :meth:`contextualize_web_chunks`, then :meth:`embed_pending` (the next cycle's, as the
+        embed step runs before the context stage). (Pages come from
         ``ingestion.capture``; result lists have no body and are not chunked.)"""
         built = 0
         for page in self._db.artifacts_without_chunks(_WEB_PAGES_PER_CYCLE):
@@ -244,8 +245,11 @@ class Maintenance:
         stages: list[tuple[str, Callable[[], int]]] = [
             ("Chunk rebuild", self.rebuild_pending_chunks),
             ("Web chunking", self.chunk_web_artifacts),
-            ("Web context", self.contextualize_web_chunks),
             ("Embed pending", self.embed_pending),
+            # After the embed step: this stage can spend minutes of LLM time on a web backlog,
+            # and new turns must not wait for their vectors behind it. The chunks it prefixes
+            # are embedded by the next cycle.
+            ("Web context", self.contextualize_web_chunks),
             ("Web extraction enqueue", self.enqueue_web_extraction),
             ("Stale-claim sweep", self.release_stale_claims),
         ]

@@ -1,6 +1,7 @@
 """Captured pages reach recall without an outside cron: the poller's maintenance stages
-chunk them, give the chunks their context, embed them, and queue the trusted ones for
-extraction. Against the scratch DB, with a scripted LLM and embedder."""
+chunk them, embed them, give the chunks their context (the next cycle embeds them again, now
+with it), and queue the trusted ones for extraction. Against the scratch DB, with a scripted
+LLM and embedder."""
 
 from __future__ import annotations
 
@@ -76,8 +77,11 @@ def chunks(conn, artifact_id: int) -> list[tuple]:
     ).fetchall()
 
 
-def test_one_cycle_takes_a_captured_page_from_text_to_vectors(maintenance, conn):
+def test_two_cycles_take_a_captured_page_from_text_to_vectors(maintenance, conn):
     aid = page(conn, "t1")
+    maintenance.cycle(daily=False)  # chunked and given their context; embedding is the next one
+    assert {(r[1] is not None, r[2], r[4]) for r in chunks(conn, aid)} == {(True, False, False)}
+    assert maintenance.embedder.texts == []
     maintenance.cycle(daily=False)
     rows = chunks(conn, aid)
     assert len(rows) >= 3
@@ -92,6 +96,18 @@ def test_one_cycle_takes_a_captured_page_from_text_to_vectors(maintenance, conn)
         "SELECT content, char_start, char_end FROM web_chunks ORDER BY idx"
     ).fetchall():
         assert PAGE[start:end] == content
+
+
+def test_a_web_backlog_never_delays_the_embedding_of_new_turns(maintenance, monkeypatch):
+    # The context stage can spend minutes of LLM time; the embed step runs before it.
+    order: list[str] = []
+    for name in ("embed_pending", "contextualize_web_chunks"):
+        stage = getattr(maintenance, name)
+        monkeypatch.setattr(
+            maintenance, name, lambda stage=stage, name=name: order.append(name) or stage()
+        )
+    maintenance.cycle(daily=False)
+    assert order == ["embed_pending", "contextualize_web_chunks"]
 
 
 def test_chunks_wait_for_their_context_before_they_are_embedded(maintenance, conn):
@@ -111,13 +127,15 @@ def test_an_llm_outage_leaves_the_chunks_waiting_not_embedded_bare(maintenance, 
     assert maintenance.contextualize_web_chunks() == 0
     assert maintenance.embed_pending() == 0
     assert {(r[1], r[2]) for r in chunks(conn, aid)} == {(None, False)}
-    maintenance._llm = _LLM()  # back up: the next cycle finishes the job
+    maintenance._llm = _LLM()  # back up: the next cycles finish the job
+    maintenance.cycle(daily=False)
     maintenance.cycle(daily=False)
     assert {r[2] for r in chunks(conn, aid)} == {True}
 
 
 def test_a_short_page_is_one_chunk_with_no_context_and_no_llm_call(maintenance, conn):
     aid = page(conn, "t1", body="A short but complete note about chunking.")
+    maintenance.cycle(daily=False)
     maintenance.cycle(daily=False)
     assert [(r[0], r[1], r[2]) for r in chunks(conn, aid)] == [(0, "", True)]
     assert maintenance._llm.calls == 0
@@ -141,6 +159,7 @@ def test_a_chunk_embedded_before_its_context_is_embedded_again_with_it(maintenan
         (aid, "[" + ",".join(["0.1"] * 2048) + "]"),
     )
     maintenance.cycle(daily=False)
+    maintenance.cycle(daily=False)
     assert [(r[1], r[2]) for r in chunks(conn, aid)] == [("", True)]
     assert len(maintenance.embedder.texts) == 1  # embedded again, once, now that it has a prefix
 
@@ -149,6 +168,7 @@ def test_only_pages_marked_for_the_graph_are_queued_for_extraction(maintenance, 
     generic = page(conn, "t1", meta='{"capture": "generic", "kg_extract": false}')
     trusted = page(conn, "t2", meta='{"capture": "docs_site", "kg_extract": true}')
     unmarked = page(conn, "t3")
+    maintenance.cycle(daily=False)
     maintenance.cycle(daily=False)
     queued = [
         r[0]
