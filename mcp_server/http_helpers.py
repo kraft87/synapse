@@ -15,6 +15,7 @@ module, so it can be imported from all of them without a cycle.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -23,6 +24,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
+
+_ORIGIN_RE = re.compile(r"^https?://(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$")
 
 
 def err(detail: str, status: int) -> JSONResponse:
@@ -67,3 +70,14 @@ async def guarded_json(
     if isinstance(out, JSONResponse):
         return out
     return JSONResponse(out)
+
+
+def request_origin(request: Request) -> str:
+    """The origin this request was addressed to, as the client sees it: the first entry of
+    X-Forwarded-Proto / -Host when a proxy set them, validated, else the request's own."""
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host", "").split(",")[0].strip()
+    origin = f"{proto or request.url.scheme}://{host or request.headers.get('host', '')}"
+    if _ORIGIN_RE.match(origin):
+        return origin
+    return str(request.base_url).rstrip("/")

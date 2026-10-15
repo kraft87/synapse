@@ -8,12 +8,12 @@
 // cross-domain (spec §1), so they ignore it.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
-  fetchTimeline, fetchPreferences,
+  fetchTimeline, fetchTimelineMonths, fetchPreferences, onDeleted, TIMELINE_TYPES,
   type TimelineEvent, type Preference,
 } from '../api';
 import { useStore } from '../state';
 import { openEpisode } from '../hash';
-import { mono, monoHead } from '../tokens';
+import { localDay, localMonth, mono, monoHead } from '../tokens';
 import { FlagButton, ErrorBox, EmptyState } from '../components/ui';
 import { useAsync } from '../hooks';
 
@@ -25,11 +25,9 @@ const TABS = [
 ] as const;
 type Tab = (typeof TABS)[number]['key'];
 
-// The five type-filter chips (README §4). Colored border+text when active.
-const TL_TYPES = ['work', 'life', 'idea', 'health', 'milestone'] as const;
+// The type-filter chips: the event types the pipeline writes. Colored border+text when active.
 const TL_TYPE_COLOR: Record<string, string> = {
-  work: 'var(--acc)', life: 'var(--et-person)', idea: 'var(--et-tech)',
-  health: 'var(--ok)', milestone: 'var(--warn)',
+  decision: 'var(--acc)', action: 'var(--et-tech)', finding: 'var(--et-concept)', milestone: 'var(--warn)',
 };
 const typeColor = (t?: string | null): string => (t && TL_TYPE_COLOR[t]) || 'var(--txt2)';
 
@@ -42,17 +40,9 @@ const salRamp = (sal: number): { fontSize: string; fontWeight: number } =>
 const dotColor = (sal: number): string => (sal > 0.75 ? 'var(--acc)' : sal > 0.55 ? 'var(--warn)' : 'var(--txt3)');
 
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-const monthKey = (iso: string): string => iso.slice(0, 7); // YYYY-MM
 const monthLabel = (key: string): string => {
   const [y, m] = key.split('-');
   return (MONTHS[Number(m) - 1] || m) + ' ' + y;
-};
-// First instant of the month AFTER `key` — the `before=` boundary that loads that month down.
-const monthAfter = (key: string): string => {
-  const [y, m] = key.split('-').map(Number);
-  const ny = m === 12 ? y + 1 : y;
-  const nm = m === 12 ? 1 : m + 1;
-  return `${ny}-${String(nm).padStart(2, '0')}-01T00:00:00+00:00`;
 };
 
 // =====================================================================================
@@ -69,7 +59,7 @@ function EventCard({ ev }: { ev: TimelineEvent }) {
       </div>
       <article style={{ flex: 1, minWidth: 0, background: 'var(--bg1)', border: '1px solid var(--line)', borderRadius: '10px', padding: '12px 14px', marginBottom: '8px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)' }}>{ev.t_valid.slice(5, 10)}</span>
+          <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)' }}>{localDay(ev.t_valid).slice(5)}</span>
           {ev.event_type && <span style={{ fontFamily: mono, fontSize: '11px', color: typeColor(ev.event_type) }}>{ev.event_type}</span>}
           <span style={{ flex: 1 }} />
           <FlagButton kind="timeline_event" itemId={String(ev.id)} initial={ev.flagged} />
@@ -96,39 +86,53 @@ function Events() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(false);
   const seenRef = useRef<Set<number>>(new Set());
+  // Bumped by every load: a response (page 1 or load more) started before it is dropped on
+  // arrival, so the list and its cursor always belong to the chip, group and jump on screen.
+  const epoch = useRef(0);
 
   const groupId = group === 'all' ? undefined : group;
 
   const load = (before?: string) => {
-    setLoading(true); setError(false);
-    seenRef.current = new Set();
+    const mine = ++epoch.current;
+    setLoading(true); setLoadingMore(false); setError(false);
     fetchTimeline({ before, type: activeType || undefined, group_id: groupId })
-      .then((r) => { seenRef.current = new Set(r.events.map((e) => e.id)); setEvents(r.events); setNextBefore(r.next_before); })
-      .catch(() => setError(true))
-      .finally(() => setLoading(false));
+      .then((r) => {
+        if (mine !== epoch.current) return;
+        seenRef.current = new Set(r.events.map((e) => e.id));
+        setEvents(r.events); setNextBefore(r.next_before);
+      })
+      .catch(() => { if (mine === epoch.current) setError(true); })
+      .finally(() => { if (mine === epoch.current) setLoading(false); });
   };
 
   // (re)load whenever the type chip or the header group filter changes.
   useEffect(() => { setJump(''); load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [activeType, group]);
 
+  // Every month that has events under the active filters, from the server: the jump-to-date
+  // options are not just the months of the page on screen.
+  const months = useAsync(() => fetchTimelineMonths({ type: activeType || undefined, group_id: groupId }), [activeType, group]);
+  const reloadMonths = months.reload;
+
   const loadMore = () => {
     if (!nextBefore || loadingMore) return;
+    const mine = epoch.current;
     setLoadingMore(true);
     fetchTimeline({ before: nextBefore, type: activeType || undefined, group_id: groupId })
       .then((r) => {
+        if (mine !== epoch.current) return;
         const fresh = r.events.filter((e) => !seenRef.current.has(e.id));
         fresh.forEach((e) => seenRef.current.add(e.id));
         setEvents((prev) => prev.concat(fresh));
         setNextBefore(r.next_before);
       })
-      .catch(() => setError(true))
-      .finally(() => setLoadingMore(false));
+      .catch(() => { if (mine === epoch.current) setError(true); })
+      .finally(() => { if (mine === epoch.current) setLoadingMore(false); });
   };
 
   const buckets = useMemo(() => {
     const map = new Map<string, TimelineEvent[]>();
     for (const e of events) {
-      const k = monthKey(e.t_valid);
+      const k = localMonth(e.t_valid);
       let arr = map.get(k);
       if (!arr) { arr = []; map.set(k, arr); }
       arr.push(e);
@@ -136,11 +140,20 @@ function Events() {
     return [...map.entries()]; // events already t_valid DESC, so keys land newest-first
   }, [events]);
 
-  const monthsPresent = useMemo(() => buckets.map(([k]) => k), [buckets]);
+  // An episode's cascade takes the events derived only from it: they leave the list, and the
+  // jump-to-date counts are refetched.
+  useEffect(() => onDeleted((d) => {
+    if (!d.events.length) return;
+    setEvents((prev) => prev.filter((e) => !d.events.includes(String(e.id))));
+    reloadMonths();
+  }), [reloadMonths]);
 
+  const monthList = months.data?.months ?? [];
+
+  // A month loads from its end down; the blank option returns to the newest events.
   const onJump = (key: string) => {
     setJump(key);
-    if (key) load(monthAfter(key));
+    load(monthList.find((m) => m.month === key)?.before);
   };
 
   return (
@@ -148,7 +161,7 @@ function Events() {
       {/* filter row: type chips + jump-to-date */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap', marginBottom: '18px' }}>
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
-          {TL_TYPES.map((t) => {
+          {TIMELINE_TYPES.map((t) => {
             const on = activeType === t;
             const c = TL_TYPE_COLOR[t];
             return (
@@ -161,10 +174,10 @@ function Events() {
           })}
         </div>
         <span style={{ flex: 1 }} />
-        <select value={jump} onChange={(e) => onJump(e.target.value)}
-          style={{ background: 'var(--bg2)', border: '1px solid var(--line2)', borderRadius: '6px', padding: '5px 8px', fontFamily: mono, fontSize: '12px', color: monthsPresent.length ? 'var(--txt)' : 'var(--txt3)', cursor: 'pointer' }}>
-          <option value="">jump to date…</option>
-          {monthsPresent.map((k) => <option key={k} value={k}>{monthLabel(k)}</option>)}
+        <select value={jump} onChange={(e) => onJump(e.target.value)} disabled={months.error != null}
+          style={{ background: 'var(--bg2)', border: '1px solid var(--line2)', borderRadius: '6px', padding: '5px 8px', fontFamily: mono, fontSize: '12px', color: monthList.length ? 'var(--txt)' : 'var(--txt3)', cursor: 'pointer' }}>
+          <option value="">{months.error != null ? 'months unavailable' : 'jump to date…'}</option>
+          {monthList.map((m) => <option key={m.month} value={m.month}>{monthLabel(m.month)} · {m.n}</option>)}
         </select>
       </div>
 
@@ -207,7 +220,7 @@ function PolarityChip({ polarity }: { polarity: string }) {
   return <span style={{ fontFamily: mono, fontSize: '10.5px', border: '1px solid ' + c, color: c, borderRadius: '4px', padding: '2px 8px', justifySelf: 'start' }}>{polarity}</span>;
 }
 
-const PREF_GRID = 'minmax(0,1fr) 74px 96px 74px';
+const PREF_GRID = 'minmax(0,1fr) 74px 96px 74px 28px';
 
 function PrefRow({ p }: { p: Preference }) {
   const superseded = p.t_invalid != null;
@@ -217,13 +230,14 @@ function PrefRow({ p }: { p: Preference }) {
         <div style={{ fontSize: '13.5px', color: superseded ? 'var(--txt3)' : 'var(--txt)', textDecoration: superseded ? 'line-through' : 'none' }}>{p.pref}</div>
         {superseded && (
           <div style={{ fontFamily: mono, fontSize: '11px', color: 'var(--txt3)', marginTop: '3px' }}>
-            ↳ superseded by: {p.superseded_by_text || `#${p.superseded_by}`}{p.t_invalid ? ` (${p.t_invalid.slice(0, 7)})` : ''}
+            ↳ superseded by: {p.superseded_by_text || `#${p.superseded_by}`}{p.t_invalid ? ` (${localMonth(p.t_invalid)})` : ''}
           </div>
         )}
       </div>
       <PolarityChip polarity={p.polarity} />
-      <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)', textAlign: 'right' }}>{(p.first_seen || '').slice(0, 10)}</span>
+      <span style={{ fontFamily: mono, fontSize: '11.5px', color: 'var(--txt3)', textAlign: 'right' }}>{localDay(p.first_seen)}</span>
       <span style={{ fontFamily: mono, fontSize: '12px', color: superseded ? 'var(--txt3)' : 'var(--txt2)', textAlign: 'right' }}>{p.assert_count}×</span>
+      <FlagButton kind="preference" itemId={String(p.id)} initial={p.flagged} />
     </div>
   );
 }
@@ -264,6 +278,7 @@ function Preferences() {
             <span style={{ ...monoHead, justifySelf: 'start' }}>polarity</span>
             <span style={{ ...monoHead, textAlign: 'right' }}>since</span>
             <span style={{ ...monoHead, textAlign: 'right' }}>asserts</span>
+            <span />
           </div>
           {prefs.map((p) => <PrefRow key={p.id} p={p} />)}
         </div>

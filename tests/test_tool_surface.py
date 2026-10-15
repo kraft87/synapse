@@ -12,31 +12,18 @@ client, which drives the same request pipeline (middleware included) as HTTP.
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
 
-import psycopg
 import pytest
+from fastmcp import Client
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion.db import Database
+from ingestion.surfaces import UNKNOWN_SURFACE
+from mcp_server import server
+from mcp_server.board import _OWNER
+from mcp_server.recall import Recall
 
-# Skip the whole module if the shared Postgres test DB isn't up — the fetch tests are
-# DB-only and the surface pins are cheap enough to re-run wherever the DB lives.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from fastmcp import Client  # noqa: E402
-
-from ingestion.db import Database  # noqa: E402
-from ingestion.surfaces import UNKNOWN_SURFACE  # noqa: E402
-from mcp_server import server  # noqa: E402
-from mcp_server.board import _OWNER  # noqa: E402
-from mcp_server.recall import Recall  # noqa: E402
+pytestmark = pytest.mark.db
 
 # ---------------------------------------------------------------------------
 # The listed surface: names, order, absences, descriptions

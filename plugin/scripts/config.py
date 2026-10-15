@@ -15,7 +15,7 @@ Every setting resolves env var -> ~/.synapse/config.json (synapse_home.py, writt
 (CLAUDE_PLUGIN_OPTION_*, then settings.json) -> default. Env vars (all optional):
   CLAUDE_SKILLS_DIR     skills library to maintain   (default ~/.claude/skills)
   CLAUDE_PROJECTS_DIR   transcript root              (default ~/.claude/projects)
-  SYNAPSE_DATA_DIR      local state / proposal drafts (default ~/.local/share/synapse-skills)
+  SYNAPSE_DATA_DIR      local state: cursors, the remember spool (default ~/.local/share/synapse-skills)
   SYNAPSE_HOME          config.json + the installed client (default ~/.synapse)
   SYNAPSE_URL           base URL of the server       (default http://localhost:8765)
   SYNAPSE_INGEST_TOKEN  bearer token. Prefer config.json (`synapse login` writes it
@@ -31,16 +31,13 @@ Every setting resolves env var -> ~/.synapse/config.json (synapse_home.py, writt
 
 from __future__ import annotations
 
-import hashlib
 import importlib.util
 import json
 import os
 import re
 import socket
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 
@@ -84,7 +81,6 @@ def _path(env: str, default: str) -> Path:
 SKILLS_DIR = _path("CLAUDE_SKILLS_DIR", "~/.claude/skills")
 PROJECTS_DIR = _path("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
 DATA_DIR = _path("SYNAPSE_DATA_DIR", "~/.local/share/synapse-skills")
-PROPOSALS_DIR = DATA_DIR / "proposals"
 
 # Private mode: one marker file per off-the-record session (name = session id). The Stop
 # hook stats this directory before every POST, so it lives outside DATA_DIR on a short,
@@ -155,19 +151,14 @@ def write_user_config(key: str, value: str) -> None:
     store: the MCP entry interpolates `${user_config.<key>}` from here. Used for the server
     URL (the one value the Claude harness must hold itself) and to keep a legacy plaintext
     token slot in step with config.json. Touches only
-    pluginConfigs['synapse@<marketplace>'].options[key]; every other setting is preserved."""
+    pluginConfigs['synapse@<marketplace>'].options[key]; every other setting is preserved.
+    Raises RuntimeError when settings.json isn't valid JSON, OSError when it can't be written."""
     settings = CONFIG_DIR / "settings.json"
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8")) if settings.exists() else {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    plugin_configs = data.setdefault("pluginConfigs", {})
+    data = synapse_home.settings_for_update(settings)
     pc_key = _plugin_block(data) or "synapse@synapse"
-    plugin_configs.setdefault(pc_key, {}).setdefault("options", {})[key] = value
-    settings.parent.mkdir(parents=True, exist_ok=True)
-    settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    options = data.setdefault("pluginConfigs", {}).setdefault(pc_key, {}).setdefault("options", {})
+    options[key] = value
+    synapse_home.atomic_write_json(settings, data)
     # Refresh the in-process cache so a same-run read (and any later import) sees the new value.
     _FILE_OPTIONS[key] = value
 
@@ -193,25 +184,6 @@ def plugin_block_options() -> dict:
     key = _plugin_block(data) if isinstance(data, dict) else ""
     opts = ((data.get("pluginConfigs") or {}).get(key) or {}).get("options") if key else None
     return dict(opts) if isinstance(opts, dict) else {}
-
-
-def _drop_user_option(key: str) -> None:
-    """Remove ``key`` from every synapse@* options block in the user settings.json; an
-    unreadable file is left alone."""
-    settings = CONFIG_DIR / "settings.json"
-    try:
-        data = json.loads(settings.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return
-    touched = False
-    for cfg_key, cfg in (data.get("pluginConfigs") or {}).items() if isinstance(data, dict) else ():
-        opts = cfg.get("options") if isinstance(cfg, dict) else None
-        if str(cfg_key).split("@", 1)[0] == "synapse" and isinstance(opts, dict) and key in opts:
-            del opts[key]
-            touched = True
-    if touched:
-        settings.write_text(json.dumps(data, indent=2), encoding="utf-8")
-    _FILE_OPTIONS.pop(key, None)
 
 
 # Legacy: pre-consolidation `synapse login` stashed the token here. Read-only fallback so a
@@ -314,13 +286,16 @@ def store_token(token: str, record: dict | None = None, server: str = "") -> Non
         if plugin_url and _origin(plugin_url) == _origin(server):
             write_user_config(_TOKEN_KEY, token)
         else:
-            _drop_user_option(_TOKEN_KEY)
+            synapse_home.drop_plugin_options(CONFIG_DIR / "settings.json", [_TOKEN_KEY])
+            _FILE_OPTIONS.pop(_TOKEN_KEY, None)
 
 
 def token_sha256(token: str) -> str:
     """Fingerprint a credential for the enrollment record. The record has to recognise
     the device token without becoming a second copy of it: data dirs get copied by
     backups and sync tools, and the hash of a random bearer gives nothing back."""
+    import hashlib  # deferred: an unenrolled machine's hooks never fingerprint a token
+
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
@@ -589,53 +564,31 @@ def requested_trust() -> str | None:
     return _ROLE_TRUST.get(machine_role())
 
 
-_UA = "synapse-plugin/0.9"
-
-
-def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
-    """POST JSON to a Synapse endpoint under BASE_URL and return the parsed JSON reply.
-
-    `path` is endpoint-relative ("/skills/list") or absolute ("http://..."). Sends the bearer
-    when one is configured. Raises on transport / HTTP error — callers decide whether to
-    fail-open (hooks) or surface it (the review CLI)."""
-    url = path if path.startswith("http") else BASE_URL + path
-    headers = {"User-Agent": _UA, "Content-Type": "application/json"}
-    if INGEST_TOKEN:
-        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), method="POST", headers=headers
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"{}")
-
-
-def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
-    """GET JSON from a Synapse endpoint under BASE_URL and return the parsed reply.
-
-    `path` is endpoint-relative ("/preferences/top") or absolute. `params` are urlencoded
-    onto the query string. Sends the bearer when one is configured. Raises on transport /
-    HTTP error — callers decide whether to fail-open (hooks) or surface it."""
-    url = path if path.startswith("http") else BASE_URL + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    headers = {"User-Agent": _UA}
-    if INGEST_TOKEN:
-        headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
-    req = urllib.request.Request(url, method="GET", headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read() or b"{}")
+#: Every request names the client and its version: Cloudflare (and similar) 403 urllib's
+#: default User-Agent, and the server's logs say which clients still call a legacy route.
+#: The Codex scripts, which load this module through common.py, set their own product name.
+USER_AGENT = f"synapse-plugin/{synapse_home.client_version()}"
 
 
 def request_json(
-    method: str, path: str, payload: dict | None = None, timeout: float = 30.0
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    timeout: float = 30.0,
+    params: dict | None = None,
 ) -> dict:
-    """Send an arbitrary-verb JSON request to a Synapse endpoint under BASE_URL.
+    """Send a JSON request to a Synapse endpoint under BASE_URL and return the parsed reply.
 
-    The sibling helpers cover the POST/GET lanes; private mode's routes are PUT/DELETE
-    (the session id is the resource, not a body field), which urllib only reaches through
-    an explicit method. Same bearer + error contract: raises on transport / HTTP error."""
+    `path` is endpoint-relative ("/skills/list") or absolute ("http://..."); `params` are
+    urlencoded onto the query string. Sends the bearer when one is configured. Raises on
+    transport / HTTP error: callers decide whether to fail-open (hooks) or surface it (the
+    review CLI)."""
+    import urllib.request  # deferred: the hooks that never reach the server skip ~25 ms
+
     url = path if path.startswith("http") else BASE_URL + path
-    headers = {"User-Agent": _UA}
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    headers = {"User-Agent": USER_AGENT}
     if payload is not None:
         headers["Content-Type"] = "application/json"
     if INGEST_TOKEN:
@@ -644,6 +597,14 @@ def request_json(
     req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
+
+
+def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
+    return request_json("POST", path, payload, timeout)
+
+
+def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> dict:
+    return request_json("GET", path, None, timeout, params)
 
 
 def act(endpoint: str, cid: int, action: str, *, expect: str, **extra) -> dict | None:
@@ -655,8 +616,3 @@ def act(endpoint: str, cid: int, action: str, *, expect: str, **extra) -> dict |
         print(r.get("detail") or "not found")
         return None
     return r
-
-
-def ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)

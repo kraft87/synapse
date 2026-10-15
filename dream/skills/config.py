@@ -14,18 +14,9 @@ import os
 import re
 from pathlib import Path
 
-# Lane state / proposal drafts / logs. In-container default; overridable via env.
-DATA_DIR = Path(
-    os.path.expanduser(os.environ.get("SYNAPSE_DATA_DIR", "~/.local/share/synapse-skills"))
-)
-PROPOSALS_DIR = DATA_DIR / "proposals"
-
-# dev-only --source jsonl path (the nightly reads episodes from Postgres, not disk).
-PROJECTS_DIR = Path(os.path.expanduser(os.environ.get("CLAUDE_PROJECTS_DIR", "~/.claude/projects")))
-
-JUDGE_MODEL = os.environ.get("SKILLS_JUDGE_MODEL", "claude-opus-4-8")
-JUDGE_BACKEND = os.environ.get("SKILLS_JUDGE_BACKEND", "claude")
 DISCORD_WEBHOOK = os.environ.get("SKILLS_DISCORD_WEBHOOK", "")
+# The only project exclusion: every detector and the config lane skip these project ids, and no
+# project is excluded by default.
 EXCLUDE_PROJECTS = tuple(
     p.strip() for p in os.environ.get("SKILLS_EXCLUDE_PROJECTS", "").split(",") if p.strip()
 )
@@ -50,10 +41,5 @@ def db_url() -> str:
 
 
 def secret(key: str) -> str:
-    """Resolve an API key (VOYAGE_API_KEY, OPENROUTER_API_KEY, ...): env then .env fallback."""
+    """Resolve an API key (VOYAGE_API_KEY, ...): env then .env fallback."""
     return os.environ.get(key) or _from_env_file(key) or ""
-
-
-def ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)

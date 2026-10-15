@@ -43,12 +43,8 @@ SessionStart flush runs on a bounded budget so it cannot outlive its hook timeou
 spool must never break a turn — but it must also never quietly drop a memory write, so the
 CLI paths (add/flush) DO report failure on stderr and exit nonzero.
 
-Env (all optional):
-  SYNAPSE_SPOOL_LOG            default /tmp/synapse-remember-spool.log
-  SYNAPSE_SPOOL_TIMEOUT        default 10   (seconds per replay POST)
-  SYNAPSE_SPOOL_PROBE_TIMEOUT  default 4    (seconds for the SessionStart reachability probe)
-  SYNAPSE_SPOOL_BUDGET         default 12   (seconds a SessionStart flush may spend)
-  SYNAPSE_SPOOL_MAX            default 25   (intents per flush; the rest defer, logged)
+Limits (constants): 10 s per replay POST, 4 s for the SessionStart reachability probe, 12 s
+for a SessionStart flush, 25 intents per flush (the rest defer, logged).
 """
 
 from __future__ import annotations
@@ -68,23 +64,17 @@ from synapse_filelock import lock_exclusive
 SPOOL_PATH = config.DATA_DIR / "remember_spool.jsonl"
 LOCK_PATH = str(SPOOL_PATH) + ".lock"
 FLUSH_LOCK_PATH = str(SPOOL_PATH) + ".flush.lock"
-LOG_PATH = os.environ.get("SYNAPSE_SPOOL_LOG", "/tmp/synapse-remember-spool.log")
-TIMEOUT = float(os.environ.get("SYNAPSE_SPOOL_TIMEOUT", "10"))
-PROBE_TIMEOUT = float(os.environ.get("SYNAPSE_SPOOL_PROBE_TIMEOUT", "4"))
-BUDGET = float(os.environ.get("SYNAPSE_SPOOL_BUDGET", "12"))
-MAX_PER_FLUSH = int(os.environ.get("SYNAPSE_SPOOL_MAX", "25"))
+TIMEOUT = 10.0  # seconds per replay POST
+PROBE_TIMEOUT = 4.0  # seconds for the SessionStart reachability probe
+BUDGET = 12.0  # seconds a SessionStart flush may spend
+MAX_PER_FLUSH = 25  # intents per flush; the rest defer, logged
 
 ROUTE = "/remember/spool"
 _VALID_TYPES = ("user", "feedback", "project", "reference")
 
 
 def _log(msg: str) -> None:
-    """Same shape as ingest_hook._log: ISO timestamp + message, failures swallowed."""
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(UTC).isoformat()} {msg}\n")
-    except Exception:
-        pass
+    config.synapse_home.log("remember-spool", msg)
 
 
 # ---------------------------------------------------------------------------

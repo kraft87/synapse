@@ -17,9 +17,10 @@ from pathlib import Path
 import pytest
 from psycopg.types.json import Json
 
-import dream.skills.skill_derive as SD
 import dream.skills.skill_draft as DR
+from dream import lane
 from dream.skills.skill_doc import body_hash
+from ingestion.llm_client import UsageLimitError
 from mcp_server.skill_sync_routes import (
     _fetch_skill,
     _list_skills,
@@ -99,7 +100,7 @@ def _episode(conn, session, project, cwd):
 
 
 def _accept(db_url, cid, **kw):
-    return _proposal_act(db_url, cid, "accept", None, lambda *_: "routing-eval: stub", **kw)
+    return _proposal_act(db_url, cid, "accept", None, **kw)
 
 
 def _registry(conn, name):
@@ -129,7 +130,6 @@ def test_accept_writes_registry_records_history_and_promotes(acc, db_url):
 
     assert r["status"] == "promoted" and r["applied"] is True
     assert (r["skill"], r["scope"], r["created"]) == ("acc-backup", "global", False)
-    assert r["routing_eval"] == "routing-eval: stub"
     body, scope, desc, cmod, status = _registry(acc, "acc-backup")
     assert body == V2 and scope == "global" and status == "active"
     assert desc == "Back up the demo database."  # parsed from frontmatter, like a publish
@@ -266,34 +266,29 @@ def test_legacy_row_without_a_body_is_refused_cleanly(acc, db_url):
 
     assert r["status"] == "refused" and r["reason"] == "no_draft"
     assert r["detail"].startswith("no draft yet; re-drafts on the next nightly run")
-    assert "routing_eval" not in r  # no advisory LLM call for a guaranteed refusal
     assert _registry(acc, "acc-backup")[0] == V1 and _cand(acc, cid)[0] == "proposed"
     # the reviewer can still apply it by supplying the body
     assert _accept(db_url, cid, body=V2)["status"] == "promoted"
 
 
-def test_promote_is_a_noop(acc, db_url):
+def test_a_second_accept_is_refused_and_promote_is_gone(acc, db_url):
     _publish(db_url, "acc-backup", V1)
     cid = _candidate(acc, body=V2, base=body_hash(V1))
-    r = _proposal_act(db_url, cid, "promote", None, None)
-    assert r["status"] == "refused" and "no separate promote step" in r["detail"]
-
-    _accept(db_url, cid)
-    r = _proposal_act(db_url, cid, "promote", None, None)
-    assert r["status"] == "promoted" and r["noop"] is True
-    assert "applied at accept" in r["detail"]
+    assert _accept(db_url, cid)["status"] == "promoted"
     assert _registry(acc, "acc-backup")[0] == V2
 
     again = _accept(db_url, cid)
     assert again["status"] == "refused" and again["reason"] == "already_applied"
+    assert _proposal_act(db_url, cid, "promote", None)["status"] == "error"
 
 
-def test_consolidate_accept_still_only_records(acc, db_url):
+def test_a_leftover_consolidate_row_can_be_rejected_but_not_accepted(acc, db_url):
     cid = _candidate(
         acc, kind="consolidate", name="acc-a+acc-b", direction=None, target=("acc-a", "acc-b")
     )
-    assert _accept(db_url, cid)["status"] == "accepted"
-    assert _proposal_act(db_url, cid, "promote", None, None)["status"] == "promoted"
+    r = _accept(db_url, cid, body=V2)
+    assert r["status"] == "refused" and r["reason"] == "bad_kind"
+    assert _proposal_act(db_url, cid, "reject", "not a thing")["status"] == "rejected"
 
 
 def test_detail_reports_target_scope_and_registry_body(acc, db_url):
@@ -369,6 +364,161 @@ def test_accepted_new_skill_is_materialized_in_its_project(acc, db_url, tmp_path
 # ------------------------------------------------------------------ nightly draft pass
 
 
+def test_draft_pending_stops_when_the_model_cannot_be_reached(acc, monkeypatch):
+    """A usage limit raises out of the pass instead of counting every pending row as failed."""
+    _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
+    calls: list[str] = []
+
+    def down(prompt):
+        calls.append(prompt)
+        raise UsageLimitError("5-hour limit reached")
+
+    monkeypatch.setattr(lane, "draft", down)
+    with pytest.raises(UsageLimitError):
+        DR.draft_pending(acc)
+    assert len(calls) == 1
+
+
+def test_draft_pending_counts_a_row_whose_draft_fails_and_goes_on(acc, monkeypatch):
+    _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
+
+    def broken(prompt):
+        raise ValueError("the model rambled")
+
+    monkeypatch.setattr(lane, "draft", broken)
+    assert DR.draft_pending(acc)["errors"] >= 1
+
+
+_WIDEN_EV = [
+    {
+        "session_id": "acc-s1",
+        "class": "judge",
+        "signal": "under_trigger",
+        "missing_phrasing": "snapshot the db",
+    }
+]
+_DRAFT_ATTEMPTS_MIGRATION = next(
+    (Path(__file__).resolve().parents[1] / "schema").glob("*_skill_draft_attempts.sql")
+)
+
+
+def _draft_row(conn, cid):
+    return conn.execute(
+        "SELECT draft_attempts, last_draft_error, proposal_body IS NOT NULL "
+        "FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (cid,),
+    ).fetchone()
+
+
+def _bad_model(monkeypatch):
+    calls: list[str] = []
+
+    def bad(prompt):
+        calls.append(prompt)
+        return "I would rather not."
+
+    monkeypatch.setattr(lane, "draft", bad)
+    return calls
+
+
+def test_a_failed_draft_is_recorded_backs_off_and_is_cleared_by_a_good_one(
+    acc, db_url, monkeypatch
+):
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    calls = _bad_model(monkeypatch)
+
+    stats = DR.draft_pending(acc)
+    assert stats["no_draft"] == 1 and len(calls) == 1
+    attempts, error, has_body = _draft_row(acc, cid)
+    assert (attempts, has_body) == (1, False) and "had no description" in error
+
+    # tonight's retry would burn the same Opus call: it waits a day
+    stats = DR.draft_pending(acc)
+    assert stats["backed_off"] == 1 and stats["no_draft"] == 0 and len(calls) == 1
+
+    # a day later it is tried again, fails again, and then waits two
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET last_draft_at = now() - interval '1 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    DR.draft_pending(acc)
+    assert len(calls) == 2 and _draft_row(acc, cid)[0] == 2
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET last_draft_at = now() - interval '1 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    assert DR.draft_pending(acc)["backed_off"] == 1 and len(calls) == 2
+
+    # a good draft stores the body and forgets the failures
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET last_draft_at = now() - interval '3 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    monkeypatch.setattr(
+        lane, "draft", lambda prompt: json.dumps({"description": "Back up or snapshot the db."})
+    )
+    assert DR.draft_pending(acc)["drafted"] == 1
+    assert _draft_row(acc, cid) == (0, None, True)
+
+
+def test_rows_with_fewer_failed_drafts_go_first_when_the_budget_is_short(acc, db_url, monkeypatch):
+    _publish(db_url, "acc-backup", V1)
+    failing = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    acc.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET draft_attempts = 2, "
+        "last_draft_at = now() - interval '9 days', salience = 5 WHERE id=%s",
+        (failing,),
+    )
+    fresh = _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
+    monkeypatch.setattr(lane, "draft", lambda prompt: _NEW)
+
+    DR.draft_pending(acc, cap=1)
+
+    assert _draft_row(acc, fresh)[2] is True  # drafted first despite the lower salience
+    assert _draft_row(acc, failing)[2] is False
+
+
+def test_before_the_draft_attempts_migration_a_failed_draft_is_just_retried(
+    acc, db_url, monkeypatch
+):
+    from dream.skills import skill_ledger as L
+
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    acc.execute(
+        "ALTER TABLE skills_lane.skill_gap_candidates DROP COLUMN draft_attempts, "
+        "DROP COLUMN last_draft_at, DROP COLUMN last_draft_error"
+    )
+    L.DRAFT_STATE.reset()
+    try:
+        calls = _bad_model(monkeypatch)
+        assert DR.draft_pending(acc)["no_draft"] == 1
+        assert DR.draft_pending(acc)["no_draft"] == 1  # nothing to remember it by
+        assert len(calls) == 2
+        assert acc.execute(
+            "SELECT proposal_body IS NULL FROM skills_lane.skill_gap_candidates WHERE id=%s",
+            (cid,),
+        ).fetchone() == (True,)
+    finally:
+        acc.execute(_DRAFT_ATTEMPTS_MIGRATION.read_text())
+        L.DRAFT_STATE.reset()
+
+
+def test_detail_carries_why_the_draft_failed(acc, db_url, monkeypatch):
+    _publish(db_url, "acc-backup", V1)
+    cid = _candidate(acc, direction="widen", body=None, evidence=_WIDEN_EV)
+    _bad_model(monkeypatch)
+    DR.draft_pending(acc)
+
+    d = _proposal_detail(db_url, cid)
+
+    assert d["draft_attempts"] == 1 and "had no description" in d["last_draft_error"]
+
+
 def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url, monkeypatch):
     _publish(db_url, "acc-backup", V1)
     ev = [
@@ -382,9 +532,6 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
     widen = _candidate(acc, direction="widen", body=None, evidence=ev)
     fix = _candidate(acc, direction="fix", body=V1 + "old draft\n", base="0" * 64)  # stale
     derive = _candidate(acc, kind="derive", name="acc-new", direction=None, target=(), body=None)
-    merge = _candidate(
-        acc, kind="consolidate", name="acc-a+acc-b", direction=None, target=("acc-a", "acc-b")
-    )
 
     def fake_llm(prompt):
         if '{"description"' in prompt:
@@ -393,7 +540,7 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
             return V2
         return _NEW
 
-    monkeypatch.setattr(SD, "_draft_call", fake_llm)
+    monkeypatch.setattr(lane, "draft", fake_llm)
 
     stats = DR.draft_pending(acc)
 
@@ -410,9 +557,8 @@ def test_draft_pending_drafts_bodyless_rows_and_redrafts_stale_ones(acc, db_url,
     )
     assert row(fix) == (V2, body_hash(V1))
     assert row(derive) == (_NEW, None)
-    assert row(merge) == (None, None)
     # drafted and current: a second pass leaves them alone
-    monkeypatch.setattr(SD, "_draft_call", lambda prompt: pytest.fail("re-drafted"))
+    monkeypatch.setattr(lane, "draft", lambda prompt: pytest.fail("re-drafted"))
     ours = {widen, fix, derive}
     monkeypatch.setattr(DR, "needs_draft", lambda r, _f=DR.needs_draft: r["id"] in ours and _f(r))
     assert DR.draft_pending(acc)["pending"] == 0

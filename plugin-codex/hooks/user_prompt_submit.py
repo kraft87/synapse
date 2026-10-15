@@ -2,25 +2,30 @@
 # mypy: ignore-errors
 """Codex ``UserPromptSubmit`` hook — per-prompt reminder to use Synapse.
 
-Port of plugin/scripts/recall_nudge.py: standing instructions at the top of a
-long context get ignored under pressure; a static ~45-token directive injected
-WITH each prompt rides recency and keeps recall/remember use consistent. Zero
-latency, zero API calls — the model still decides relevance.
+The Codex wording of plugin/scripts/recall_nudge.py, which builds the output (the
+timestamp line, then the directive) and owns the switches: standing instructions at the
+top of a long context get ignored under pressure; a directive injected WITH each prompt
+rides recency and keeps recall/remember use consistent. Zero latency, zero API calls —
+the model still decides relevance.
 
 Codex reads the JSON envelope, not plain stdout.
-Kill switch: SYNAPSE_RECALL_NUDGE=0.
+Switches: SYNAPSE_RECALL_NUDGE=0, SYNAPSE_PROMPT_TIMESTAMP=0.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-from common import _cfg
+import common  # noqa: F401  (loads the shared config recall_nudge imports)
 
-_NUDGE = (
+sys.path.append(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugin", "scripts")
+)
+from recall_nudge import envelope
+
+_DIRECTIVE = (
     "[Synapse] IMPORTANT: the user's cross-session history is searchable — assume "
     "it has context on any past work, project, device, or person they name. BEFORE "
     "answering anything that references the past: synapse recall (skip only if the "
@@ -30,18 +35,9 @@ _NUDGE = (
 
 
 def main() -> None:
-    if _cfg("SYNAPSE_RECALL_NUDGE", "1") == "0":
-        return
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": _NUDGE,
-                },
-            }
-        )
-    )
+    out = envelope(_DIRECTIVE)
+    if out:
+        print(out)
 
 
 if __name__ == "__main__":

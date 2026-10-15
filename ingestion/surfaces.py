@@ -56,7 +56,6 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any
 
-import psycopg
 from psycopg.rows import dict_row
 
 from ingestion import pg_pool
@@ -66,12 +65,10 @@ logger = logging.getLogger(__name__)
 
 AUDIENCES = ("personal", "work-safe")
 TRUST_LEVELS = ("full", "restricted")
-STATUSES = ("approved", "revoked")
 
 #: Only this status serves anything. Revoking clears the token hash too, so a revoked
 #: credential matches no row at all.
 APPROVED = "approved"
-REVOKED = "revoked"
 
 #: The default audience for an unclassified note — never leaves a trusted host.
 DEFAULT_AUDIENCE = "personal"
@@ -217,9 +214,10 @@ def own_surface_served(db_url: str, trust: SurfaceTrust | None) -> bool:
 # Case-insensitive allowlists
 # ---------------------------------------------------------------------------
 
-#: A valid, whole-table btree index on episodes that leads with ``project`` (schema 001's
-#: ``episodes_project_idx``, or 061's ``(project, created_at)``). The variant walk below is
-#: a skip scan over it; without one it would read the whole table per step, so until one
+#: A valid, whole-table btree index on episodes that leads with ``project`` (061's
+#: ``(project, created_at)``, or schema 001's ``episodes_project_idx`` until the
+#: redundant-index migration drops it in favour of 061's). The variant walk below is a
+#: skip scan over it; without one it would read the whole table per step, so until one
 #: exists an allowlist matches exactly as written (the pre-0.21 behaviour).
 PROJECT_INDEX_PROBE = ColumnProbe(
     "SELECT 1 FROM pg_index i "
@@ -333,8 +331,11 @@ def _row_to_trust(surface_id: str, row: Any, credential_bound: bool = False) -> 
 #: Written out in full rather than interpolated: every SQL string in this module is a
 #: literal, so a reader (and a static scanner) can see there is no query construction
 #: anywhere near a credential.
+#: ``seen_recently`` rides along so a device inside its last-seen window costs no write.
 _SELECT_BY_TOKEN = (
-    "SELECT surface_id, trust, allowed_projects, status FROM surfaces WHERE token_hash = %s"
+    "SELECT surface_id, trust, allowed_projects, status, "
+    "coalesce(last_seen_at >= now() - %s::interval, false) AS seen_recently "
+    "FROM surfaces WHERE token_hash = %s"
 )
 #: The id lane only ever matches a CREDENTIAL-LESS row (``oauth:<login>``, a legacy
 #: hostname). A device row, the dashboard's full-trust ``dash:<login>`` rows included,
@@ -349,10 +350,7 @@ _SELECT_BY_ID = (
 #: all an operator "is this laptop still alive" column needs.
 _LAST_SEEN_WINDOW = "5 minutes"
 
-_TOUCH_SQL = (
-    "UPDATE surfaces SET last_seen_at = now() WHERE token_hash = %s "
-    "AND (last_seen_at IS NULL OR last_seen_at < now() - %s::interval)"
-)
+_TOUCH_SQL = "UPDATE surfaces SET last_seen_at = now() WHERE token_hash = %s"
 
 
 def _touch_last_seen(conn: Any, th: str) -> None:
@@ -362,7 +360,7 @@ def _touch_last_seen(conn: Any, th: str) -> None:
     disk, or a lock wait would otherwise turn a liveness nicety into a total outage.
     """
     try:
-        conn.execute(_TOUCH_SQL, (th, _LAST_SEEN_WINDOW))
+        conn.execute(_TOUCH_SQL, (th,))
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("last_seen_at stamp failed: %s", e)
 
@@ -399,8 +397,8 @@ def resolve_caller(
     try:
         with pg_pool.connection(db_url) as conn, conn.cursor(row_factory=dict_row) as cur:
             if th:
-                row = cur.execute(_SELECT_BY_TOKEN, (th,)).fetchone()
-                if row is not None:
+                row = cur.execute(_SELECT_BY_TOKEN, (_LAST_SEEN_WINDOW, th)).fetchone()
+                if row is not None and not row["seen_recently"]:
                     _touch_last_seen(conn, th)
             else:
                 row = cur.execute(_SELECT_BY_ID, (sid,)).fetchone()
@@ -453,6 +451,15 @@ def restricted_project_union(db: Any) -> set[str]:
         return set()
 
 
+def project_audience(project: str | None, restricted_projects: set[str]) -> str:
+    """Rule 3 of :func:`derive_audience`: ``work-safe`` when ``project`` is one a registered
+    restricted surface may read, else ``personal``. Labels compare case-folded, like the
+    allowlists themselves, so every writer (remember(), the notes lane's retype) agrees."""
+    if project and project.lower() in {p.lower() for p in restricted_projects}:
+        return RESTRICTED_AUDIENCE
+    return DEFAULT_AUDIENCE
+
+
 def derive_audience(
     db: Any,
     *,
@@ -478,9 +485,7 @@ def derive_audience(
         return explicit
     if caller_restricted:
         return RESTRICTED_AUDIENCE
-    if project and project.lower() in {p.lower() for p in restricted_project_union(db)}:
-        return RESTRICTED_AUDIENCE
-    return DEFAULT_AUDIENCE
+    return project_audience(project, restricted_project_union(db))
 
 
 # ---------------------------------------------------------------------------
@@ -493,10 +498,6 @@ def derive_audience(
 # database. A second confirmation step after an owner-authenticated request confirms
 # nothing, and a state that serves nothing is a state that silently breaks a laptop.
 # ---------------------------------------------------------------------------
-
-
-class SchemaMissing(Exception):
-    """schema/053+054 not applied on this deployment — reported as 503, never as success."""
 
 
 def _surface_row(r: Any) -> dict[str, Any]:
@@ -529,10 +530,7 @@ _LIST_SQL = (
 def list_surfaces(db_url: str) -> list[dict[str, Any]]:
     """Every surface, live ones first. Operator read — "who can see what"."""
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        try:
-            rows = conn.execute(_LIST_SQL).fetchall()
-        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-            raise SchemaMissing from e
+        rows = conn.execute(_LIST_SQL).fetchall()
     return [_surface_row(r) for r in rows]
 
 
@@ -617,23 +615,18 @@ def mint_surface(
     )
     tok = new_device_token()
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
-        try:
-            with conn.transaction():
-                projects: list[str] = []
-                if granted == "restricted":
-                    projects = (
-                        explicit if explicit is not None else _approved_restricted_projects(conn)
-                    )
-                surface = _insert_surface(
-                    conn,
-                    surface_id=_new_surface_id(),
-                    trust=granted,
-                    label=(label or "").strip()[:200] or None,
-                    allowed_projects=projects,
-                    th=token_hash(tok),
-                )
-        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-            raise SchemaMissing from e
+        with conn.transaction():
+            projects: list[str] = []
+            if granted == "restricted":
+                projects = explicit if explicit is not None else _approved_restricted_projects(conn)
+            surface = _insert_surface(
+                conn,
+                surface_id=_new_surface_id(),
+                trust=granted,
+                label=(label or "").strip()[:200] or None,
+                allowed_projects=projects,
+                th=token_hash(tok),
+            )
     logger.info(
         "surface created: %s trust=%s projects=%s label=%r",
         surface["surface_id"],
@@ -672,16 +665,13 @@ def issue_dash_token(db_url: str, identity: str) -> str:
         raise ValueError("identity required")
     tok = new_device_token()
     with pg_pool.connection(db_url) as conn:
-        try:
-            conn.execute(
-                "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, label) "
-                "VALUES (%s, 'full', '{}', %s, 'approved', %s) "
-                "ON CONFLICT (surface_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, "
-                "  trust = 'full', status = 'approved', updated_at = now()",
-                (f"{DASH_SURFACE_PREFIX}{ident}", token_hash(tok), f"dashboard ({ident})"),
-            )
-        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-            raise SchemaMissing from e
+        conn.execute(
+            "INSERT INTO surfaces (surface_id, trust, allowed_projects, token_hash, status, label) "
+            "VALUES (%s, 'full', '{}', %s, 'approved', %s) "
+            "ON CONFLICT (surface_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, "
+            "  trust = 'full', status = 'approved', updated_at = now()",
+            (f"{DASH_SURFACE_PREFIX}{ident}", token_hash(tok), f"dashboard ({ident})"),
+        )
     return tok
 
 
@@ -704,22 +694,19 @@ def upsert_surface(
         raise ValueError(f"invalid trust {trust!r} — expected one of {TRUST_LEVELS}")
     projects = [str(p).strip() for p in allowed_projects if str(p).strip()]
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
-        try:
-            row = conn.execute(
-                "INSERT INTO surfaces (surface_id, trust, allowed_projects, status) "
-                "VALUES (%s, %s, %s, 'approved') "
-                "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
-                "  allowed_projects = EXCLUDED.allowed_projects, status = 'approved', "
-                "  updated_at = now() "
-                # A device row must not be reachable by id: that would let a PUT hand an
-                # already-issued token full trust without an owner-authenticated enrollment.
-                "  WHERE surfaces.token_hash IS NULL "
-                "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
-                "          last_seen_at, created_at, updated_at",
-                (surface_id, trust, projects),
-            ).fetchone()
-        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-            raise SchemaMissing from e
+        row = conn.execute(
+            "INSERT INTO surfaces (surface_id, trust, allowed_projects, status) "
+            "VALUES (%s, %s, %s, 'approved') "
+            "ON CONFLICT (surface_id) DO UPDATE SET trust = EXCLUDED.trust, "
+            "  allowed_projects = EXCLUDED.allowed_projects, status = 'approved', "
+            "  updated_at = now() "
+            # A device row must not be reachable by id: that would let a PUT hand an
+            # already-issued token full trust without an owner-authenticated enrollment.
+            "  WHERE surfaces.token_hash IS NULL "
+            "RETURNING surface_id, trust, status, label, allowed_projects, token_hash, "
+            "          last_seen_at, created_at, updated_at",
+            (surface_id, trust, projects),
+        ).fetchone()
     if row is None:
         raise ValueError(f"{surface_id!r} is a device surface — use enroll/mint/revoke")
     return _surface_row(row)
@@ -736,18 +723,10 @@ def revoke_surface(db_url: str, surface_id: str) -> int:
     Returns the number of rows changed (0 for an unknown id — idempotent, not an error).
     """
     with pg_pool.connection(db_url) as conn:
-        try:
-            cur = conn.execute(
-                "UPDATE surfaces SET status = 'revoked', token_hash = NULL, "
-                "  trust = 'restricted', allowed_projects = '{}', updated_at = now() "
-                "WHERE surface_id = %s AND status <> 'revoked'",
-                (surface_id,),
-            )
-            return cur.rowcount
-        except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn) as e:
-            raise SchemaMissing from e
-
-
-#: Pre-054 name. Revocation replaced deletion (the row is the audit trail), but the
-#: DELETE /surfaces/{id} verb and its callers kept their spelling.
-delete_surface = revoke_surface
+        cur = conn.execute(
+            "UPDATE surfaces SET status = 'revoked', token_hash = NULL, "
+            "  trust = 'restricted', allowed_projects = '{}', updated_at = now() "
+            "WHERE surface_id = %s AND status <> 'revoked'",
+            (surface_id,),
+        )
+        return cur.rowcount

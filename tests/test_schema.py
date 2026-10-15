@@ -34,7 +34,6 @@ def test_pg_search_extension(conn):
 
 EXPECTED_TABLES = [
     "episodes",
-    "search_cache",
     "ingestion_state",
     "extraction_queue",
 ]
@@ -147,33 +146,43 @@ def test_schema_059_does_not_block_boot():
 
 
 # ---------------------------------------------------------------------------
-# search_cache
+# the episode-citation index, and the dead table and redundant indexes dropped
 # ---------------------------------------------------------------------------
 
 
-def test_search_cache_unique_query_url(conn):
-    conn.execute("""
-        INSERT INTO search_cache (query, source_url, content)
-        VALUES ('FalkorDB performance', 'https://example.com/falkordb', 'FalkorDB is fast')
-    """)
-    with pytest.raises(psycopg.errors.UniqueViolation):
-        conn.execute("""
-            INSERT INTO search_cache (query, source_url, content)
-            VALUES ('FalkorDB performance', 'https://example.com/falkordb', 'duplicate')
-        """)
+def test_search_cache_dropped(conn):
+    assert conn.execute("SELECT to_regclass('public.search_cache')").fetchone()[0] is None
 
 
-def test_search_cache_bm25(conn):
-    conn.execute("""
-        INSERT INTO search_cache (query, source_url, title, content)
-        VALUES ('graph databases', 'https://example.com/graph',
-                'Graph DB overview', 'Neo4j and FalkorDB comparison')
-    """)
-    row = conn.execute("""
-        SELECT id FROM search_cache
-        WHERE id @@@ paradedb.match('content', 'FalkorDB comparison')
-    """).fetchone()
-    assert row is not None
+def test_redundant_prefix_indexes_dropped(conn):
+    """Each dropped index is the prefix of one that stays, so lookups on it keep an index."""
+    dropped = {
+        "episodes_session_idx",
+        "episodes_project_idx",
+        "kg_rel_src",
+        "kg_rel_owner",
+        "kg_entities_owner",
+    }
+    rows = conn.execute(
+        "SELECT indexname FROM pg_indexes WHERE schemaname='public' AND indexname = ANY(%s)",
+        (sorted(dropped),),
+    ).fetchall()
+    assert rows == []
+
+
+def test_episode_citation_lookup_is_indexed(conn):
+    """The 056 relabel trigger and the dashboard drill-down ask `episodes @> [id]` (number
+    and text shapes); the kg_rel_episodes_gin index serves both through one BitmapOr."""
+    with conn.transaction():
+        conn.execute("SET LOCAL enable_seqscan = off")
+        plan = "\n".join(
+            r[0]
+            for r in conn.execute(
+                "EXPLAIN SELECT 1 FROM kg_relationships "
+                "WHERE episodes @> jsonb_build_array(7) OR episodes @> jsonb_build_array('7'::text)"
+            ).fetchall()
+        )
+    assert "kg_rel_episodes_gin" in plan, plan
 
 
 # ---------------------------------------------------------------------------

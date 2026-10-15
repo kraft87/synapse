@@ -2,8 +2,8 @@
 // optimistic ⚑ flag toggle (spec §5c — quiet, txt3 at rest, warn when set).
 import type React from 'react';
 import { useEffect, useState, type CSSProperties } from 'react';
-import { postFlag } from '../api';
-import { srcColor, typeColor, typeLabel } from '../tokens';
+import { onFlagged, postFlag } from '../api';
+import { localDay, srcColor, typeColor, typeLabel } from '../tokens';
 
 const chipBase: CSSProperties = {
   fontFamily: 'var(--font-data)', fontSize: '10.5px', padding: '2px 7px',
@@ -18,6 +18,10 @@ export const TypeChip = ({ type }: { type: string }) => (
 
 export const ProjectChip = ({ project }: { project?: string | null }) =>
   project ? <span style={{ ...chipBase, background: 'var(--acc-bg)', color: 'var(--acc)' }}>{project}</span> : null;
+
+// A fact a later one replaced (t_invalid set): still true of its time, no longer current.
+export const SupersededChip = ({ at }: { at?: string | null }) =>
+  at ? <span title={'superseded ' + localDay(at)} style={{ ...chipBase, border: '1px solid var(--warn)', color: 'var(--warn)' }}>superseded</span> : null;
 
 export const SourceChip = ({ source }: { source?: string | null }) =>
   source ? <span style={{ ...chipBase, border: '1px solid ' + srcColor(source), color: srcColor(source) }}>{source}</span> : null;
@@ -37,13 +41,17 @@ export const Dot = ({ color, size = 10 }: { color: string; size?: number }) => (
 export function FlagButton({ kind, itemId, initial, size = 12 }: { kind: string; itemId: string; initial: boolean; size?: number }) {
   const [on, setOn] = useState(initial);
   const [busy, setBusy] = useState(false);
+  // The row can change under the button: a reloaded list brings its flagged state, and the
+  // same row's other ⚑ (the dossier over the Feed) announces the flag it just set.
+  useEffect(() => setOn(initial), [initial]);
+  useEffect(() => onFlagged((d) => { if (d.kind === kind && d.id === itemId) setOn(d.flagged); }), [kind, itemId]);
   const toggle = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (busy) return;
     const next = !on;
     setOn(next); // optimistic
     setBusy(true);
-    postFlag(kind, itemId).then((r) => { if (typeof r.flagged === 'boolean') setOn(r.flagged); })
+    postFlag(kind, itemId, next).then((r) => { if (typeof r.flagged === 'boolean') setOn(r.flagged); })
       .catch(() => setOn(!next)) // revert on failure
       .finally(() => setBusy(false));
   };

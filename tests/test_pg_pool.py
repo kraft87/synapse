@@ -21,22 +21,14 @@ from pathlib import Path
 
 import psycopg
 import pytest
+from fastmcp import Client
+from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+from ingestion import pg_pool
+from ingestion.surfaces import resolve_caller, token_hash
+from tests.helpers.db import DB_URL as _DB_URL
 
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from fastmcp import Client  # noqa: E402
-from starlette.testclient import TestClient  # noqa: E402
-
-from ingestion import pg_pool  # noqa: E402
-from ingestion.surfaces import resolve_caller, token_hash  # noqa: E402
+pytestmark = pytest.mark.db
 
 
 def _keyed(name: str) -> str:
@@ -342,6 +334,6 @@ def test_the_pooled_run_really_borrows():
     pool = pg_pool._POOLS[_DB_URL]
     before = pool.get_stats().get("requests_num", 0)
     db = Database(_DB_URL)
-    db.list_board_notes("default", None)
+    db.known_project_slugs()
     resolve_caller(_DB_URL, token_hash_hex="0" * 64)
     assert pool.get_stats().get("requests_num", 0) >= before + 2

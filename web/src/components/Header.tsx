@@ -3,6 +3,7 @@
 // theme toggle.
 import { useState, type CSSProperties } from 'react';
 import { useStore, type Page } from '../state';
+import { queueBadge } from '../liveLink';
 
 const NAV: { key: Page; label: string }[] = [
   { key: 'feed', label: 'Feed' },
@@ -30,7 +31,9 @@ const selStyle: CSSProperties = {
   // Native selects size to their longest <option>; a live catalog carries 70+
   // project names, so an unclamped select eats the whole filter row and wraps
   // the source select off the header.
-  maxWidth: '160px', textOverflow: 'ellipsis',
+  // min-width 0 and a 100% cap let a lone select shrink to a narrow phone instead of
+  // pushing the page wider than the screen.
+  maxWidth: '160px', textOverflow: 'ellipsis', minWidth: 0,
 };
 
 export function Header() {
@@ -38,6 +41,7 @@ export function Header() {
   const scope = SCOPE[s.page];
   // Review pending-proposal count (phase 2b) — accent pill, dark text; hidden at 0.
   const reviewBadge = s.reviewPending;
+  const queue = queueBadge(s.link, s.queue);
   const dim = (applies: boolean): CSSProperties =>
     applies ? {} : { opacity: 0.4 };
   const dimTitle = (applies: boolean) => (applies ? undefined : 'not scoped on this page');
@@ -66,7 +70,7 @@ export function Header() {
       </div>
 
       {/* nav */}
-      <nav style={{ display: 'flex', gap: '2px' }}>
+      <nav style={{ display: 'flex', flexWrap: 'wrap', gap: '2px' }}>
         {NAV.map((n) => {
           const active = s.page === n.key;
           return (
@@ -96,16 +100,16 @@ export function Header() {
       </div>
 
       {/* filter cluster */}
-      <div className="hdr-filters" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+      <div className="hdr-filters" style={{ display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: '8px', maxWidth: '100%' }}>
         <div title={dimTitle(scope.group)} style={{ display: 'flex', border: '1px solid var(--line2)', borderRadius: '6px', overflow: 'hidden', ...dim(scope.group) }}>
-          <button onClick={() => s.setGroup(s.group === 'technical' ? 'all' : 'technical')} style={grpBtn('technical')}>technical</button>
-          <button onClick={() => s.setGroup(s.group === 'personal' ? 'all' : 'personal')} style={{ ...grpBtn('personal'), borderLeft: '1px solid var(--line2)' }}>personal</button>
+          <button aria-pressed={s.group === 'technical'} onClick={() => s.setGroup(s.group === 'technical' ? 'all' : 'technical')} style={grpBtn('technical')}>technical</button>
+          <button aria-pressed={s.group === 'personal'} onClick={() => s.setGroup(s.group === 'personal' ? 'all' : 'personal')} style={{ ...grpBtn('personal'), borderLeft: '1px solid var(--line2)' }}>personal</button>
         </div>
-        <select title={dimTitle(scope.project)} value={s.project} onChange={(e) => s.setProject(e.target.value)} style={{ ...selStyle, ...dim(scope.project) }}>
+        <select aria-label="project filter" title={dimTitle(scope.project)} value={s.project} onChange={(e) => s.setProject(e.target.value)} style={{ ...selStyle, ...dim(scope.project) }}>
           <option value="all">all projects</option>
           {s.catalog?.projects.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
         </select>
-        <select title={dimTitle(scope.source)} value={s.source} onChange={(e) => s.setSource(e.target.value)} style={{ ...selStyle, ...dim(scope.source) }}>
+        <select aria-label="source filter" title={dimTitle(scope.source)} value={s.source} onChange={(e) => s.setSource(e.target.value)} style={{ ...selStyle, ...dim(scope.source) }}>
           <option value="all">all sources</option>
           {s.catalog?.sources.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}
         </select>
@@ -113,9 +117,11 @@ export function Header() {
 
       {/* live status + theme */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-        <div title={s.online ? 'live stream connected — extraction queue depth' : 'stream lost — reconnecting (showing last loaded items)'} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt2)' }}>
-          <span style={{ width: 7, height: 7, borderRadius: '50%', background: s.online ? 'var(--ok)' : 'var(--warn)', animation: s.online ? 'pulse 1.6s ease-in-out infinite' : 'none' }} />
-          <span>{s.online ? `queue ${s.queueDepth}` : 'reconnecting'}</span>
+        <div title={queue.title} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontFamily: 'var(--font-data)', fontSize: '11.5px', color: 'var(--txt2)' }}>
+          <span style={{ width: 7, height: 7, borderRadius: '50%', background: queue.live ? 'var(--ok)' : 'var(--warn)', animation: queue.live ? 'pulse 1.6s ease-in-out infinite' : 'none' }} />
+          <span>{queue.label}</span>
+          {queue.running > 0 && <span>· {queue.running} running</span>}
+          {queue.failed > 0 && <span style={{ color: 'var(--warn)' }}>· {queue.failed} failed</span>}
         </div>
         <button className="iconbtn" onClick={s.toggleTheme} title="Toggle theme"
           style={{ border: '1px solid var(--line2)', background: 'var(--bg2)', borderRadius: '6px', width: 28, height: 28, color: 'var(--txt2)', fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>

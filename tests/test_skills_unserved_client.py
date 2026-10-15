@@ -83,7 +83,6 @@ _ENV_VARS = (
     *_SETTINGS,
     *(f"CLAUDE_PLUGIN_OPTION_{k}" for k in _SETTINGS),
     "SYNAPSE_CODEX_SKILLS_DIR",
-    "SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT",
     "CLAUDE_PROJECT_DIR",
 )
 
@@ -1571,12 +1570,16 @@ def test_codex_project_pass_is_none(codex, tmp_path, cwd):
     assert codex.project_pass(value, user_dir) is None
 
 
-def test_codex_run_syncs_global_then_the_project_under_one_lock(codex, git, tmp_path):
+def test_codex_run_syncs_global_then_the_project_each_under_its_lock(codex, git, tmp_path):
     repo = _init_repo(git, tmp_path / "widget")
     user_dir = tmp_path / "home" / ".agents" / "skills"
     project_dir = repo / ".agents" / "skills"
     _write_skill(project_dir, "mine", _LOCAL)
-    lock_path = tmp_path / "home" / ".synapse" / "codex_skills_sync.lock"
+    engine = codex._engine()
+    locks = {
+        "global": engine._lock_path(user_dir),
+        "project:widget": engine._lock_path(project_dir),
+    }
     server = FakeServer()
     server.put("tool", _OTHER, scope="global")
     server.put("alpha", _V1, scope="project:widget")
@@ -1585,7 +1588,9 @@ def test_codex_run_syncs_global_then_the_project_under_one_lock(codex, git, tmp_
     held_during: list[bool] = []
 
     def lock_is_held(path, payload):
-        with open(lock_path, "a") as other:
+        if path != "/skills/list":
+            return
+        with open(locks[payload["scope"]], "a") as other:
             try:
                 filelock.lock_exclusive(other, blocking=False)
             except OSError:
@@ -1595,11 +1600,11 @@ def test_codex_run_syncs_global_then_the_project_under_one_lock(codex, git, tmp_
 
     server.on_call = lock_is_held
 
-    result = codex.run(server, user_dir, lock_path, ("project:widget", project_dir))
+    result = codex.run(server, user_dir, ("project:widget", project_dir))
 
     assert result == (3, 1, 0)
     assert [p["scope"] for p in server.listed()] == ["global", "project:widget"]
-    assert held_during and all(held_during)
+    assert held_during == [True, True]
     assert sorted(p.name for p in user_dir.iterdir()) == ["tool"]
     assert sorted(p.name for p in project_dir.iterdir()) == ["alpha", "beta", "mine"]
     assert [(p["name"], p["scope"]) for p in server.published()] == [("mine", "project:widget")]
@@ -1608,8 +1613,9 @@ def test_codex_run_syncs_global_then_the_project_under_one_lock(codex, git, tmp_
     assert "/.agents/skills/mine/" not in lines
     assert _untracked(git, repo) == [".agents/skills/mine/SKILL.md"]
     # Released afterwards.
-    with open(lock_path, "a") as again:
-        filelock.lock_exclusive(again, blocking=False)
+    for lock_path in locks.values():
+        with open(lock_path, "a") as again:
+            filelock.lock_exclusive(again, blocking=False)
 
 
 def test_codex_run_without_a_project_is_the_global_pass_alone(codex, tmp_path):
@@ -1617,21 +1623,24 @@ def test_codex_run_without_a_project_is_the_global_pass_alone(codex, tmp_path):
     server.put("tool", _OTHER)
     server.put("alpha", _V1, scope="project:widget")
 
-    assert codex.run(server, tmp_path / "agents", tmp_path / "lock") == (1, 0, 0)
+    assert codex.run(server, tmp_path / "agents") == (1, 0, 0)
     assert [p["scope"] for p in server.listed()] == ["global"]
 
 
-def test_codex_run_holds_off_both_passes_when_the_lock_is_taken(codex, tmp_path):
-    lock_path = tmp_path / "lock"
-    filelock = _load("synapse_filelock_unserved_t", _SCRIPTS / "synapse_filelock.py")
+def test_codex_run_skips_the_folders_whose_lock_is_taken(codex, tmp_path):
+    agents, project = tmp_path / "agents", tmp_path / "w" / "skills"
+    engine = codex._engine()
+    engine._lock_path(agents).parent.mkdir(parents=True, exist_ok=True)
     server = FakeServer()
-    with open(lock_path, "w") as held:
-        filelock.lock_exclusive(held, blocking=False)
-        result = codex.run(
-            server, tmp_path / "agents", lock_path, ("project:w", tmp_path / "w" / "skills")
-        )
+    with (
+        open(engine._lock_path(agents), "w") as held_global,
+        open(engine._lock_path(project), "w") as held_project,
+    ):
+        engine.lock_exclusive(held_global, blocking=False)
+        engine.lock_exclusive(held_project, blocking=False)
+        result = codex.run(server, agents, ("project:w", project))
 
-    assert result is None and server.calls == []
+    assert result == (0, 0, 0) and server.calls == []
 
 
 @pytest.mark.parametrize(
@@ -1659,7 +1668,7 @@ def test_codex_main_passes_the_cwd_project_to_run(codex, git, tmp_path, monkeypa
 
     assert codex.main() == 0
 
-    ((_client, target_dir, _lock, project),) = seen
+    ((_client, target_dir, project),) = seen
     assert target_dir == user_dir
     assert project == ("project:widget", repo.resolve() / ".agents" / "skills")
 
@@ -1672,7 +1681,7 @@ def test_codex_main_without_cwd_runs_no_project_pass(codex, tmp_path, monkeypatc
     monkeypatch.setattr(codex, "run", lambda *a: seen.append(a) or (0, 0, 0))
 
     assert codex.main() == 0
-    assert seen[0][3] is None
+    assert seen[0][2] is None
 
 
 # ---------------------------------------------------------------------------

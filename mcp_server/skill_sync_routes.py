@@ -12,7 +12,9 @@ auth via the shared machine token (custom routes bypass FastMCP's auth middlewar
 PG work in a threadpool, fail-soft JSON.
 
 Routes (all POST):
-  /skills/list        {scope, held?}                 -> active skills (name, desc, mtime, file shas)
+  /skills/list        {scope, held?}                 -> active skills (name, desc, mtime, file shas,
+                                                        content_hash: the whole-skill hash, so a
+                                                        client compares it instead of the body)
                                                         + retired ones (name, hashes, retired_at)
                                                         + withdrawn ones among `held` (below)
                                                         + publish: may this caller push here
@@ -25,9 +27,10 @@ Routes (all POST):
   /skills/rescope     {name, scope}                  -> move an active skill to another scope
   /skills/overwrite   {name, scope, body, mtime}     -> record a clobbered local edit in history
   /skills/proposals   {id?}                          -> list proposed candidates, or one's detail
-                                                        (detail: + where accept would apply it)
+                                                        (detail: + where accept would apply it,
+                                                        + why its last draft failed)
   /skills/proposals/act {id, action, reason?, body?, scope?, force?}
-                                                     -> accept (applies) | reject | promote (no-op)
+                                                     -> accept (applies) | reject
 
 Who is served what (schema 053/054 trust, the board's rule applied to skills): a full-trust
 device reads and writes every scope. A restricted device is served only ``project:<p>``
@@ -60,8 +63,13 @@ from psycopg.types.json import Json
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
-from dream.skills.skill_measure import skill_description
+from dream.skills.skill_doc import (
+    body_hash,
+    frontmatter_name,
+    skill_description,
+    valid_skill_name,
+)
+from dream.skills.skill_ledger import DRAFT_STATE, _rollup
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
@@ -188,11 +196,21 @@ def whole_skill_hash(body: str, files) -> str:
     return h.hexdigest()
 
 
+def _files_by_skill(c, names: list[str]) -> dict[str, list[dict]]:
+    """{name: [{path, sha256}, ...] by path} for each of `names`, in one query."""
+    out: dict[str, list[dict]] = {n: [] for n in names}
+    rows = c.cursor(row_factory=dict_row).execute(  # whatever row factory `c` has
+        "SELECT skill_name, path, sha256 FROM skills_lane.skill_files "
+        "WHERE skill_name = ANY(%s) ORDER BY skill_name, path",
+        (names,),
+    )
+    for r in rows.fetchall():
+        out[r["skill_name"]].append({"path": r["path"], "sha256": r["sha256"]})
+    return out
+
+
 def _file_shas(c, name: str) -> list[dict]:
-    return c.execute(
-        "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
-        (name,),
-    ).fetchall()
+    return _files_by_skill(c, [name])[name]
 
 
 def _held_names(held) -> list[str] | None:
@@ -224,15 +242,19 @@ def _list_skills(db_url: str, scope: str, access: SkillAccess = FULL_ACCESS, hel
             if served
             else []
         )
+        files = _files_by_skill(c, [s["name"] for s in skills])
         listing = {
             "skills": [
                 {
                     "name": s["name"],
                     "scope": s["scope"],
+                    # body and description stay for a client that predates content_hash (the
+                    # plugin updates from the marketplace independently of the server)
                     "body": s["body"],
                     "description": s["description"],
                     "content_modified_at": _iso(s["content_modified_at"]),
-                    "files": _file_shas(c, s["name"]),
+                    "files": files[s["name"]],
+                    "content_hash": whole_skill_hash(s["body"], _pairs(files[s["name"]])),
                 }
                 for s in skills
             ],
@@ -258,24 +280,36 @@ def _shown_scope(scope: str, asked: str, access: SkillAccess) -> str:
     return scope if access.serves(scope) else ""
 
 
-def _past_hashes(c, name: str, files) -> list[str]:
-    """Whole-skill hashes of the skill's recent past registry bodies, with today's files:
-    a copy pulled before the latest edit is still a copy Synapse delivered. Only bodies
-    the registry itself held ('superseded' by the history trigger); a 'disk_overwrite'
-    row is a local edit a pull replaced, which Synapse never delivered."""
-    rows = c.execute(
-        "SELECT COALESCE(body,'') AS body FROM skills_lane.skill_history "
-        "WHERE name=%s AND op='superseded' ORDER BY recorded_at DESC LIMIT %s",
-        (name, _MAX_PAST_VERSIONS),
-    ).fetchall()
-    return list(dict.fromkeys(whole_skill_hash(r["body"], files) for r in rows))
+def _pairs(files: list[dict]) -> list[tuple[str, str]]:
+    return [(f["path"], f["sha256"]) for f in files]
 
 
-def _entry_hashes(c, name: str, body: str) -> tuple[str, list[str]]:
-    files = [(f["path"], f["sha256"]) for f in _file_shas(c, name)]
-    current = whole_skill_hash(body, files)
-    past = [h for h in _past_hashes(c, name, files) if h != current]
-    return current, [current, *past]
+def _past_bodies(c, names: list[str]) -> dict[str, list[str]]:
+    """{name: its recent past registry bodies, newest first} for each of `names`, in one
+    query. Only bodies the registry itself held ('superseded' by the history trigger); a
+    'disk_overwrite' row is a local edit a pull replaced, which Synapse never delivered."""
+    out: dict[str, list[str]] = {n: [] for n in names}
+    rows = c.cursor(row_factory=dict_row).execute(
+        "SELECT name, body FROM ("
+        "  SELECT name, COALESCE(body,'') AS body, "
+        "         row_number() OVER (PARTITION BY name ORDER BY recorded_at DESC) AS n "
+        "  FROM skills_lane.skill_history WHERE name = ANY(%s) AND op='superseded'"
+        ") h WHERE n <= %s ORDER BY name, n",
+        (names, _MAX_PAST_VERSIONS),
+    )
+    for r in rows.fetchall():
+        out[r["name"]].append(r["body"])
+    return out
+
+
+def _entry_hashes(body: str, files: list[dict], past_bodies: list[str]) -> tuple[str, list[str]]:
+    """The whole-skill hash of the skill as it is, and with it the hashes of its recent past
+    bodies under today's files: a copy pulled before the latest edit is still a copy Synapse
+    delivered."""
+    pairs = _pairs(files)
+    current = whole_skill_hash(body, pairs)
+    past = dict.fromkeys(whole_skill_hash(b, pairs) for b in past_bodies)
+    return current, [current, *(h for h in past if h != current)]
 
 
 def _retired_skills(c, asked: str, access: SkillAccess, held: list[str] | None) -> list[dict]:
@@ -289,16 +323,20 @@ def _retired_skills(c, asked: str, access: SkillAccess, held: list[str] | None) 
 
     Full trust is told every retirement, whatever scope it asks about. A restricted caller
     only of the skills it could have been served, and of the names it says it holds."""
-    rows = c.execute(
-        "SELECT name, scope, COALESCE(body,'') AS body, retired_at "
-        "FROM skills_lane.skill_registry "
-        "WHERE status='retired' AND retired_at IS NOT NULL ORDER BY name",
-    ).fetchall()
+    rows = [
+        r
+        for r in c.execute(
+            "SELECT name, scope, COALESCE(body,'') AS body, retired_at "
+            "FROM skills_lane.skill_registry "
+            "WHERE status='retired' AND retired_at IS NOT NULL ORDER BY name",
+        ).fetchall()
+        if access.serves(r["scope"]) or (held is not None and r["name"] in held)
+    ]
+    names = [r["name"] for r in rows]
+    files, past = _files_by_skill(c, names), _past_bodies(c, names)
     out = []
     for r in rows:
-        if not (access.serves(r["scope"]) or (held is not None and r["name"] in held)):
-            continue
-        current, hashes = _entry_hashes(c, r["name"], r["body"])
+        current, hashes = _entry_hashes(r["body"], files[r["name"]], past[r["name"]])
         out.append(
             {
                 "name": r["name"],
@@ -323,9 +361,11 @@ def _withdrawn_skills(c, asked: str, access: SkillAccess, names: list[str]) -> l
         "WHERE status='active' AND name = ANY(%s) ORDER BY name",
         (names,),
     ).fetchall()
+    found = [r["name"] for r in rows]
+    files, past = _files_by_skill(c, found), _past_bodies(c, found)
     out = []
     for r in rows:
-        current, hashes = _entry_hashes(c, r["name"], r["body"])
+        current, hashes = _entry_hashes(r["body"], files[r["name"]], past[r["name"]])
         out.append(
             {
                 "name": r["name"],
@@ -377,10 +417,9 @@ def _upsert_registry(
     """THE registry write for a skill's SKILL.md — /skills/publish and the review accept both
     go through it, so an accepted proposal lands exactly like a client publish.
 
-    Nulls the description embedding when the description changed so the server lane
-    re-embeds it (overlap detection). The skill_history trigger fires automatically on a body
-    change, so a superseded body stays recoverable. A write is the skill's newest edit, so
-    it ends any retirement (callers refuse the writes that must not)."""
+    The skill_history trigger fires automatically on a body change, so a superseded body stays
+    recoverable. A write is the skill's newest edit, so it ends any retirement (callers refuse
+    the writes that must not)."""
     cur.execute(
         """INSERT INTO skills_lane.skill_registry
                (name, scope, body, description, status, content_modified_at)
@@ -388,9 +427,6 @@ def _upsert_registry(
            ON CONFLICT (name) DO UPDATE SET
              scope=EXCLUDED.scope, body=EXCLUDED.body, description=EXCLUDED.description,
              status='active', content_modified_at=EXCLUDED.content_modified_at,
-             description_embedding = CASE
-               WHEN skills_lane.skill_registry.description IS DISTINCT FROM EXCLUDED.description
-               THEN NULL ELSE skills_lane.skill_registry.description_embedding END,
              updated_at=now()""",
         (name, scope, body, description, content_modified_at),
     )
@@ -423,7 +459,7 @@ def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
         return None
     if edited is None or _utc(edited) <= row[1]:
         return row[1]
-    retired = whole_skill_hash(row[2], [(f[0], f[1]) for f in _file_shas(c, name)])
+    retired = whole_skill_hash(row[2], _pairs(_file_shas(c, name)))
     pushed = whole_skill_hash(
         p.get("body", ""), [(f["path"], f["sha256"]) for f in p.get("files", [])]
     )
@@ -620,7 +656,7 @@ _HOME_DIR_RE = re.compile(
     r"^(?:/home/[^/]+|/Users/[^/]+|/root|[A-Za-z]:[\\/]+Users[\\/]+[^\\/]+)[\\/]*$"
 )
 _CANDIDATE_COLS = (
-    "id, kind, name, direction, target_skills, status, score, evidence, proposal_path, "
+    "id, kind, name, direction, target_skills, status, score, evidence, "
     "proposal_body, base_body_hash, summary, salience, source_detector, proposed_patch"
 )
 _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-file"
@@ -630,7 +666,7 @@ def _proposals_list(db_url: str) -> dict:
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         rows = c.execute(
             """SELECT id, kind, name, direction, target_skills, status, score,
-                      grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings,
+                      grounded_sessions, judge_sessions, summary, trigger_phrasings,
                       salience, source_detector, (proposal_body IS NOT NULL) AS has_draft
                  FROM skills_lane.skill_gap_candidates
                 WHERE status='proposed' AND (rejected_until IS NULL OR rejected_until < now())
@@ -698,7 +734,9 @@ def _plan_apply(c, row, body: str, scope_override: str | None, *, lock: bool = F
         issue("no_draft", _NO_DRAFT)
     if scope_override is not None and not _SCOPE_RE.match(scope_override):
         issue("bad_scope", f"scope must be 'global' or 'project:<name>', got {scope_override!r}")
-    if kind == "derive":
+    if kind not in ("derive", "retune"):  # a leftover 'consolidate' row: nothing applies it
+        issue("bad_kind", f"{kind} candidates can't be applied; reject it")
+    elif kind == "derive":
         if not valid_skill_name(skill):
             issue(
                 "bad_name", f"no usable skill name (frontmatter name or candidate {row['name']!r})"
@@ -770,15 +808,18 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
         if not r:
             return {"found": False}
         d = dict(r)
-        if r["kind"] != "consolidate":  # consolidate is never applied (merge by hand)
-            plan = _plan_apply(c, r, r["proposal_body"] or "", None)
-            d["apply_to"] = {
-                "skill": plan["skill"],
-                "scope": plan["scope"],
-                "exists": plan["exists"],
-            }
-            d["registry_body"] = plan["registry_body"]
-            d["apply_issues"] = plan["issues"]
+        if DRAFT_STATE.ready(c, c.info.dsn):  # why the nightly draft failed, if it did
+            d.update(
+                c.execute(
+                    "SELECT draft_attempts, last_draft_error "
+                    "FROM skills_lane.skill_gap_candidates WHERE id=%s",
+                    (cid,),
+                ).fetchone()
+            )
+        plan = _plan_apply(c, r, r["proposal_body"] or "", None)
+        d["apply_to"] = {"skill": plan["skill"], "scope": plan["scope"], "exists": plan["exists"]}
+        d["registry_body"] = plan["registry_body"]
+        d["apply_issues"] = plan["issues"]
     d["found"] = True
     return d
 
@@ -786,8 +827,6 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
 def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool) -> dict:
     """One transaction: lock the candidate, re-check the plan, write the registry the way a
     publish does, and mark the candidate promoted with the grounded accept recorded."""
-    from dream.skills.skill_ledger import _rollup
-
     row = c.execute(
         f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE",
         (cid,),
@@ -855,53 +894,23 @@ def _proposal_act(
     cid: int,
     action: str,
     reason: str | None,
-    llm: Callable,
     *,
     body: str | None = None,
     scope: str | None = None,
     force: bool = False,
 ) -> dict:
-    from dream.skills.skill_ledger import _rollup
-
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
         cur = c.cursor()
         row = c.execute(
-            "SELECT kind, status, name, proposal_path, proposal_body, evidence "
-            "FROM skills_lane.skill_gap_candidates WHERE id=%s",
+            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s",
             (cid,),
         ).fetchone()
         if not row:
             return {"found": False}
 
-        if action == "accept" and row["kind"] != "consolidate":
-            note = ""
-            drafted = (body if body is not None else row["proposal_body"] or "").strip()
-            if row["kind"] == "retune" and row["status"] != "promoted" and drafted:
-                note = llm(c, cid, row["name"])  # advisory routing-eval, never blocks
+        if action == "accept":
             c.commit()  # close the read; the apply runs in its own locked transaction
-            res = _apply_accept(c, cid, body, scope, force)
-            if note and res.get("status") == "promoted":
-                res["routing_eval"] = note
-            return res
-
-        if action == "accept":  # consolidate: a merge is done by hand, accept only records it
-            ev = row["evidence"] or []
-            ev.append({"session_id": None, "class": "grounded", "signal": "accept"})
-            _js, gs, _jw, gw = _rollup(ev)
-            cur.execute(
-                "UPDATE skills_lane.skill_gap_candidates SET status='accepted', evidence=%s::jsonb, "
-                "grounded_sessions=%s, grounded_weight=%s, updated_at=now() WHERE id=%s",
-                (Json(ev), gs, gw, cid),
-            )
-            c.commit()
-            return {
-                "status": "accepted",
-                "id": cid,
-                "name": row["name"],
-                "proposal_path": row["proposal_path"],
-                "proposal_body": row["proposal_body"],
-                "routing_eval": "",
-            }
+            return _apply_accept(c, cid, body, scope, force)
 
         if action == "reject":
             ev = row["evidence"] or []
@@ -916,92 +925,7 @@ def _proposal_act(
             c.commit()
             return {"status": "rejected", "id": cid, "reason": reason or "user_rejected"}
 
-        if action == "promote":
-            # Kept for older clients: accept now applies, so promote has nothing left to do
-            # except confirm a hand-merged consolidate (the one kind accept doesn't apply).
-            if row["status"] == "promoted":
-                return {
-                    "status": "promoted",
-                    "noop": True,
-                    "id": cid,
-                    "name": row["name"],
-                    "detail": f"[{cid}] {row['name']} was applied at accept; nothing to promote",
-                }
-            if row["status"] == "accepted" and row["kind"] == "consolidate":
-                cur.execute(
-                    "UPDATE skills_lane.skill_gap_candidates SET status='promoted', "
-                    "updated_at=now() WHERE id=%s",
-                    (cid,),
-                )
-                c.commit()
-                return {"status": "promoted", "id": cid, "name": row["name"]}
-            if row["status"] == "accepted":
-                detail = (
-                    f"[{cid}] was accepted before accept applied changes; "
-                    f"run `accept {cid}` to apply it now"
-                )
-            else:
-                detail = (
-                    f"candidate is '{row['status']}'; `accept {cid}` applies the change, "
-                    "there is no separate promote step"
-                )
-            return {"status": "refused", "id": cid, "detail": detail}
-
     return {"status": "error", "detail": f"unknown action {action!r}"}
-
-
-def _routing_eval(c, cid: int, name: str) -> str:
-    """Advisory: would the under-trigger phrasings route to `name` under current descriptions?
-    Best-effort single LLM pass; any failure degrades to a skip note (never blocks accept)."""
-    try:
-        import json as _json
-
-        from ingestion.llm_client import create_llm_client
-
-        cur = c.cursor()
-        ev = cur.execute(
-            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
-        ).fetchone()[0]
-        phrasings = [
-            e.get("phrasing", "")
-            for e in ev
-            if e.get("signal") == "under_trigger" and e.get("phrasing")
-        ]
-        if not phrasings:
-            return "routing-eval: no phrasings to eval"
-        catalog = "\n".join(
-            f"- {n}: {d}"
-            for n, d in cur.execute(
-                "SELECT name, description FROM skills_lane.skill_registry ORDER BY name"
-            ).fetchall()
-        )
-        prompt = (
-            f"Skill catalog:\n{catalog}\n\nFor each user phrasing, name the ONE skill whose "
-            f"description best matches, or 'none'. We expect '{name}' to be the match.\n"
-            + "\n".join(f"- {p}" for p in phrasings[:8])
-            + '\n\nOutput JSON only: {"matches":["skill-or-none", ...]} in phrasing order.'
-        )
-
-        def _gen() -> str:
-            from ingestion.llm_client import stage_model
-
-            resp = create_llm_client().messages.create(
-                model=stage_model("SKILLS", "claude-opus-4-8"),
-                max_tokens=400,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return str(resp.content[0].text)
-
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            raw = pool.submit(_gen).result(timeout=120)
-        s, e = raw.find("{"), raw.rfind("}")
-        matches = _json.loads(raw[s : e + 1]).get("matches", []) if s >= 0 else []
-        hit = sum(1 for m in matches if m == name)
-        return f"routing-eval: {hit}/{len(matches)} missed phrasings already map to '{name}'"
-    except Exception as ex:  # pragma: no cover - advisory only
-        return f"routing-eval skipped: {ex}"
 
 
 # -------------------------------------------------------------------- register
@@ -1094,7 +1018,6 @@ def register(
                 int(b["id"]),
                 b["action"],
                 b.get("reason"),
-                _routing_eval,
                 body=body,
                 scope=scope,
                 force=bool(b.get("force")),

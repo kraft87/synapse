@@ -60,7 +60,7 @@ import config
 
 MCP_URL = os.environ.get("SYNAPSE_MCP_URL") or config.MCP_URL
 BASE = config.BASE_URL
-UA = "synapse-login/1.0"
+UA = f"synapse-login/{config.synapse_home.client_version()}"
 # Cloudflare (and similar) 403 a default urllib User-Agent; always send a real one.
 _HDRS = {"User-Agent": UA}
 _TIMEOUT = 30

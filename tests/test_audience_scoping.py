@@ -24,38 +24,31 @@ fetch_session's predicates in test_fetch_session.py — both next to the code th
 from __future__ import annotations
 
 import asyncio
-import os
 import uuid
+from datetime import UTC, datetime
 
-import psycopg
 import pytest
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-import ingestion.notes as notes_mod  # noqa: E402
-from ingestion.db import Database  # noqa: E402
-from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-from ingestion.surfaces import (  # noqa: E402
+import ingestion.notes as notes_mod
+from ingestion.db import Database
+from ingestion.notes import _OWNER, reconcile_note
+from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     derive_audience,
     lookup_surface,
+    project_audience,
     restricted_project_union,
 )
-from mcp_server import server  # noqa: E402
-from mcp_server.recall import Recall  # noqa: E402
-from tests.helpers.surfaces import (  # noqa: E402
+from mcp_server import server
+from mcp_server.recall import Recall
+from tests.helpers.db import DB_URL as _DB_URL
+from tests.helpers.surfaces import (
     clear_surfaces,
     register_full,
     register_restricted,
 )
+
+pytestmark = pytest.mark.db
 
 
 @pytest.fixture()
@@ -377,6 +370,16 @@ def test_derive_audience_precedence(clean, db_url):
     )
 
 
+def test_project_audience_compares_case_folded():
+    """The one rule 3, shared by remember() and the notes lane's retype."""
+    allowlist = {"Synapse", "alpha"}
+    assert project_audience("synapse", allowlist) == "work-safe"
+    assert project_audience("ALPHA", allowlist) == "work-safe"
+    assert project_audience("gamma", allowlist) == "personal"
+    assert project_audience(None, allowlist) == "personal"
+    assert project_audience("synapse", set()) == "personal"
+
+
 def test_derive_audience_rejects_an_invalid_explicit_value(clean, db_url):
     db = Database(db_url)
     try:
@@ -468,6 +471,10 @@ def test_remember_rejects_an_invalid_audience_before_writing(remember_env):
 # ---------------------------------------------------------------------------
 
 
+_DUPLICATE = {"verdict": "DUPLICATE", "keep": None}
+_NEW_CORRECTS = {"verdict": "CORRECTION", "keep": 2}
+
+
 class _StubDB:
     """reconcile_note's collaborators, stubbed: one high-similarity candidate so the
     restatement path runs, and no restricted surfaces so derivation says 'personal'."""
@@ -485,6 +492,7 @@ class _StubDB:
                 "body": "Existing.",
                 "type": self._candidate_type,
                 "project": None,
+                "updated_at": datetime(2026, 1, 1, tzinfo=UTC),
                 "sim": 0.95,
             }
         ]
@@ -514,7 +522,7 @@ def test_restatement_preserves_the_stored_audience(monkeypatch):
     """Rephrasing a note is not reclassifying it. update_note gets audience=None, which
     COALESCEs to the stored value — so a work-safe note stays work-safe through an
     update that has no idea what tier it was on."""
-    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: _DUPLICATE)
     db = _StubDB()
     res = reconcile_note(
         db,
@@ -532,7 +540,7 @@ def test_restatement_preserves_the_stored_audience(monkeypatch):
 
 def test_restatement_with_an_explicit_audience_does_reclassify(monkeypatch):
     """The one way an existing note moves tier: someone said so."""
-    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: _DUPLICATE)
     db = _StubDB()
     res = reconcile_note(
         db,
@@ -552,7 +560,7 @@ def test_restatement_with_an_explicit_audience_does_reclassify(monkeypatch):
 def test_contradiction_derives_rather_than_inheriting(monkeypatch):
     """A contradiction is a NEW assertion. Inheriting the retired note's tier would let
     a personal statement arrive work-safe purely because it reversed a work-safe one."""
-    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "contradicts")
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: _NEW_CORRECTS)
     db = _StubDB()
     res = reconcile_note(
         db,
@@ -600,7 +608,7 @@ def as_oauth_caller(monkeypatch):
 
 def test_oauth_identity_becomes_its_own_surface_id(as_oauth_caller):
     as_oauth_caller("Kyle")
-    assert server._caller_surface() == "oauth:kyle"  # lowercased, namespaced
+    assert server._caller_trust().surface_id == "oauth:kyle"  # lowercased, namespaced
 
 
 def test_machine_token_callers_resolve_to_no_surface(monkeypatch):
@@ -611,7 +619,7 @@ def test_machine_token_callers_resolve_to_no_surface(monkeypatch):
         "get_access_token",
         lambda: _OAuthToken({"preferred_username": "kyle"}, server._MACHINE_CLIENT_ID),
     )
-    assert server._caller_surface() is None
+    assert server._caller_trust().surface_id is None
     assert server._caller_trust() == UNKNOWN_SURFACE
 
 
@@ -619,7 +627,7 @@ def test_no_token_context_resolves_to_no_surface(monkeypatch):
     """Open dev/stdio servers and any call outside a request: no credential evidence,
     so the fail-closed verdict applies."""
     monkeypatch.setattr(server, "get_access_token", lambda: None)
-    assert server._caller_surface() is None
+    assert server._caller_trust().surface_id is None
     assert server._caller_trust() == UNKNOWN_SURFACE
 
 
@@ -627,7 +635,7 @@ def test_an_oauth_token_with_no_identity_claim_derives_nothing(monkeypatch):
     """Fail-closed on a malformed token: no claim means no derived id, never a guess."""
     monkeypatch.setattr(server, "_IDENTITY_CLAIMS", ("preferred_username",))
     monkeypatch.setattr(server, "get_access_token", lambda: _OAuthToken({}))
-    assert server._caller_surface() is None
+    assert server._caller_trust().surface_id is None
 
 
 @pytest.fixture()

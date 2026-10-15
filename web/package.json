@@ -2,9 +2,11 @@
   "name": "synapse-dashboard",
   "version": "1.0.0",
   "private": true,
+  "type": "module",
   "description": "Synapse operator dashboard — phase 1 (Feed, Search, overlays).",
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "test": "esbuild test/*.test.ts --bundle --platform=node --format=esm --outdir=.test --out-extension:.js=.mjs --log-level=warning && node --test .test/*.test.mjs",
     "build": "tsc --noEmit && node build.mjs"
   },
   "dependencies": {

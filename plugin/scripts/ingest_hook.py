@@ -17,8 +17,11 @@ lifecycle is the scheduler.
 
 Cursor semantics:
   * offset = byte position of the START of the last shipped turn, never EOF —
-    the last turn may still be mid-flight at Stop time, so it is re-shipped on
-    the next run and lands as a span_id no-op once complete;
+    the transcript can lag the hook (Claude Code may write a turn's final
+    message after Stop fires), so the last turn is re-shipped on the next run.
+    A turn that did not grow is a span_id no-op; one that did lands as a new
+    episode under its new span_id (the turn's LAST uuid), beside the shorter
+    episode it grew from;
   * size   = file EOF at the last FULLY successful run; when the current EOF
     matches, there is nothing new and the file is skipped without a POST;
   * a cursor pointing past EOF means the transcript was truncated/rewritten —
@@ -26,13 +29,15 @@ Cursor semantics:
 
 SessionStart runs `--catchup`: a detached sweep over the projects dir that ships
 any recently-modified transcript whose cursor lags its size — sessions that died
-without a Stop hook, or turns dropped while the server was unreachable.
+without a Stop hook, or turns dropped while the server was unreachable. After a /clear
+or an auto-compaction (SessionStart fires for those too) it only repeats the upload
+warning below, which the fresh context window needs again; the sweep has already run.
 
 Failed uploads are retried however old they are. A POST that fails (server
 down, 401/403 from a revoked token or a proxy/WAF, timeout) marks the file's
 cursor entry `pending`, with the time and a short reason; the next successful
 POST for that file clears it. The sweep takes every lagging file modified
-within SYNAPSE_INGEST_CATCHUP_DAYS, plus every pending or half-shipped file
+within the catch-up window (3 days), plus every pending or half-shipped file
 regardless of age, and pending entries are exempt from the cursor TTL. An
 outage longer than the window therefore no longer loses the history it
 covered. A file the hook never attempted that is older than the window
@@ -45,7 +50,7 @@ and a file that keeps failing goes to the back of the queue instead of holding
 a slot.
 
 The cursor file also keeps one `_health` record of the upload streak. After
-_WARN_AFTER_FAILS failed POSTs in a row, or _WARN_AFTER_HOURS of failure, with
+WARN_AFTER_FAILS failed POSTs in a row, or WARN_AFTER_HOURS of failure, with
 no success since, the SessionStart parent prints one line, shown to the user
 and to the model: "Synapse uploads have been failing since <date> (<reason>);
 transcripts will be retried automatically." Reasons come from a short fixed
@@ -71,54 +76,85 @@ SYNAPSE_INGEST_URL / SYNAPSE_INGEST_TOKEN env vars still win when set, per
 config.py's precedence. The detached child re-imports config, so the same
 resolution applies there.
 
-Env (all optional):
-  SYNAPSE_INGEST_LOG           default /tmp/synapse-ingest-hook.log
-  SYNAPSE_INGEST_TIMEOUT       default 30 (seconds per POST)
-  SYNAPSE_INGEST_TAIL          default 400 (records per POST chunk; also the
-                               first-run seed window on the Stop path)
-  SYNAPSE_INGEST_CATCHUP_DAYS  default 3 (the sweep picks up any lagging file
-                               modified this recently; a file whose upload
-                               failed is retried regardless of age)
-  SYNAPSE_INGEST_ACTIVE_GRACE  default 300 (skip files modified this recently —
-                               a live session's own Stop hooks handle them)
-  SYNAPSE_INGEST_CATCHUP_MAX   default 20 (files per sweep; the rest defer to
-                               the next SessionStart, logged, never silent)
+Log: ~/.synapse/logs/ingest-hook.log (one line per upload or failure).
+
+The sweep window (3 days), its cap (20 files), the active-write grace (300 s), the POST
+chunk (400 records, also the first-run seed window on the Stop path), the POST timeout
+(30 s) and the private-marker expiry (12 h) are constants, not settings; the window, cap,
+grace and expiry live in synapse_ingest_retry and are shared with the Codex hook.
 """
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import subprocess
 import sys
-import time
-import urllib.request
-from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import config
-import synapse_ingest_retry as retry
-import synapse_project
-from synapse_filelock import lock_exclusive
+
+
+def _spawn_detached(args: list[str]) -> None:
+    subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), *args],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_hook() -> None:
+    """The Stop hook proper: hand the transcript to a detached `--ship` child."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return
+    transcript_path = payload.get("transcript_path") or ""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return
+    try:
+        _spawn_detached(["--ship", transcript_path])
+    except Exception as e:
+        _log(f"SPAWN-ERR: {type(e).__name__}: {str(e)[:160]}")
+
+
+def _log(msg: str) -> None:
+    import synapse_home  # not config: the Stop parent below runs before config is imported
+
+    synapse_home.log("ingest-hook", msg)
+
+
+if __name__ == "__main__" and len(sys.argv) == 1:
+    # Claude waits for this process at the end of every turn, and all it does is spawn the
+    # child: answer before the imports below (config, the retry bookkeeping, urllib), which
+    # cost about as much again as the spawn.
+    try:
+        _stop_hook()
+    finally:
+        sys.exit(0)
+
+import glob  # noqa: E402
+import time  # noqa: E402
+import urllib.request  # noqa: E402
+from collections.abc import Callable  # noqa: E402
+from typing import Any  # noqa: E402
+
+import config  # noqa: E402
+import synapse_ingest_retry as retry  # noqa: E402
+import synapse_project  # noqa: E402
+from synapse_filelock import lock_exclusive  # noqa: E402
 
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
-LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", "/tmp/synapse-ingest-hook.log")
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
-TAIL_RECORDS = int(os.environ.get("SYNAPSE_INGEST_TAIL", "400"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_INGEST_CATCHUP_DAYS", "3"))
-ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
+TIMEOUT = 30.0
+TAIL_RECORDS = 400
+CATCHUP_DAYS = retry.CATCHUP_DAYS
+ACTIVE_GRACE = retry.ACTIVE_GRACE
+CATCHUP_MAX_FILES = retry.CATCHUP_MAX_FILES
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
-_HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
-_WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
-_WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
-_PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -131,14 +167,6 @@ _MACHINERY_PREFIXES = (
     "<local-command-caveat>",
     "<system-reminder>",
 )
-
-
-def _log(msg: str) -> None:
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(UTC).isoformat()} {msg}\n")
-    except Exception:
-        pass
 
 
 def _is_turn_start(rec: dict[str, Any]) -> bool:
@@ -175,29 +203,15 @@ def _parse_lines(lines: list[bytes]) -> list[dict[str, Any]]:
     return out
 
 
-def _select_tail(raw_lines: list[bytes]) -> tuple[list[dict[str, Any]], str]:
-    """Pick the records for a first-encounter seed: a turn-boundary-aligned tail,
-    or the full file when the tail window holds no boundary (one mega-turn).
-    Returns (records, mode). Pure (no I/O) so it's unit-testable.
-
-    Kept for the Stop path's cursor seeding: a long-lived pre-cursor session was
-    already shipped turn-by-turn by earlier hook fires, so re-parsing the whole
-    file wholesale on the first cursored run would be pure churn.
-    """
-    tail = _parse_lines(raw_lines[-TAIL_RECORDS:])
-    start = next((i for i, r in enumerate(tail) if _is_turn_start(r)), None)
-    if start is not None:
-        return tail[start:], "tail"
-    return _parse_lines(raw_lines), "full-fallback"
-
-
 # ---------------------------------------------------------------------------
 # Cursor planning (pure) + cursor store (flocked)
 # ---------------------------------------------------------------------------
 
 
-def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], int]:
-    """Read a transcript as [(byte_offset, record), ...] plus the EOF offset.
+def _read_offset_records(path: str, start: int = 0) -> tuple[list[tuple[int, dict[str, Any]]], int]:
+    """Read a transcript from byte `start` as [(byte_offset, record), ...] plus the EOF
+    offset. `start` must be a line start (0, or a cursor from this module): the steady
+    state parses only what is new, never the whole session again.
 
     Offsets are line starts, so any offset this returns is a valid cursor.
     Unparseable/blank lines are skipped (their bytes still count toward EOF).
@@ -205,6 +219,7 @@ def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], i
     out: list[tuple[int, dict[str, Any]]] = []
     eof = 0
     with open(path, "rb") as f:
+        f.seek(start)
         while True:
             off = f.tell()
             line = f.readline()
@@ -223,6 +238,15 @@ def _read_offset_records(path: str) -> tuple[list[tuple[int, dict[str, Any]]], i
     return out, eof
 
 
+def _starts_a_line(path: str, offset: int) -> bool:
+    """True if `offset` is 0 or follows a newline, i.e. can be read from."""
+    if offset == 0:
+        return True
+    with open(path, "rb") as f:
+        f.seek(offset - 1)
+        return f.read(1) == b"\n"
+
+
 def _plan_from_cursor(
     offset_recs: list[tuple[int, dict[str, Any]]],
     cursor: int,
@@ -235,8 +259,9 @@ def _plan_from_cursor(
       * chunks split only at turn boundaries — a chunk never ends mid-turn,
         which would mint a bogus span_id for a turn a later chunk completes;
       * the FINAL chunk's cursor_after is the offset of the last turn-start:
-        that turn may still be growing, so it re-ships next run (span_id no-op
-        once complete) instead of leaving a half-turn stranded behind EOF;
+        that turn may still be growing, so it re-ships next run (a span_id no-op
+        if it did not grow, a new episode under its new span_id if it did)
+        instead of leaving a half-turn stranded behind EOF;
       * no turn boundary at/after the cursor → one chunk, cursor_after stays at
         `cursor`, and the mega-turn keeps re-shipping until a boundary appears
         (the server dedups every repeat).
@@ -266,9 +291,6 @@ def _plan_from_cursor(
 
 def _load_state() -> dict[str, Any]:
     return retry.load_state(CURSOR_PATH)
-
-
-_needs_retry = retry.needs_retry  # attempted and not completed: swept at any age, never pruned
 
 
 def _update_state(path: str, apply: Callable[[dict[str, Any], float], None]) -> None:
@@ -315,23 +337,12 @@ def _record_failure(path: str, reason: str, offset: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _scrub(text: str) -> str:
-    return retry.scrub(text, INGEST_TOKEN)
-
-
-_short_reason = retry.short_reason  # fixed vocabulary, never message text
-
-
-def _failure_warning(state: dict[str, Any], now: float) -> str | None:
-    return retry.failure_warning(state, now, INGEST_TOKEN)
-
-
 def _emit_failure_warning() -> None:
     """Print the sustained-failure line at SessionStart: `systemMessage` shows it
     to the user, `additionalContext` to the model. Reads local state only (no
     network), prints nothing while uploads are healthy, and never raises."""
     try:
-        line = _failure_warning(_load_state(), time.time())
+        line = retry.failure_warning(_load_state(), time.time(), INGEST_TOKEN)
         if line:
             print(
                 json.dumps(
@@ -354,40 +365,9 @@ def _emit_failure_warning() -> None:
 
 
 def _is_private(session_id: str) -> bool:
-    """True if `session_id` is in private mode → ship NOTHING for it.
-
-    Private mode is a marker file at PRIVATE_DIR/<session_id>, written by
-    private_mode.py (which also sets the durable server-side flag). This local check
-    is the fast half: it keeps the turns from ever leaving the machine, and it works
-    while the server is unreachable.
-
-    Two deliberate behaviours:
-      * STALE markers (older than _PRIVATE_TTL_HOURS) are ignored AND deleted. A
-        marker outlives its session — a crashed SessionEnd hook leaves one behind, and
-        Claude Code reuses no session id, so an orphan would otherwise sit there
-        forever. The server-side row is the durable record; the marker is a live flag.
-      * UNREADABLE marker dir → treated as PRIVATE. If we can't prove a session is not
-        private, silently capturing it is the unacceptable failure; a deferred turn is
-        not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
-    """
-    if not session_id:
-        return False
-    marker = os.path.join(str(PRIVATE_DIR), session_id)
-    try:
-        age = time.time() - os.stat(marker).st_mtime
-    except FileNotFoundError:
-        return False  # no marker (or no private dir at all) — normal case
-    except OSError as e:
-        _log(f"PRIVATE unreadable {session_id}: {type(e).__name__} — skipping ingestion")
-        return True
-    if age > _PRIVATE_TTL_HOURS * 3600:
-        try:
-            os.unlink(marker)
-        except OSError:
-            pass
-        _log(f"PRIVATE stale marker removed {session_id} (age {int(age)}s)")
-        return False
-    return True
+    """True if `session_id` is in private mode → ship NOTHING for it
+    (synapse_ingest_retry.is_private, shared with the Codex hook)."""
+    return retry.is_private(session_id, PRIVATE_DIR, _log)
 
 
 def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
@@ -400,18 +380,11 @@ def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
     return {c: lb for c in cwds if (lb := synapse_project.project_label(c))}
 
 
-def _records_project(records: list[dict[str, Any]]) -> str | None:
-    """The batch's one project label, or None when no record carries a cwd or the cwds
-    resolve to different projects (then the body carries ``cwd_projects`` instead)."""
-    labels = set(_cwd_labels(records).values())
-    return labels.pop() if len(labels) == 1 else None
-
-
 def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     """POST a batch of raw transcript records to /ingest; returns the (truncated)
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
     bulk history import (import_history.py), so all resolve URL/token identically
-    through config.py, and all send the batch's project label (_records_project).
+    through config.py, and all send the batch's project label (_cwd_labels).
     Raises on transport/HTTP errors — callers decide how to fail-soft."""
     payload: dict[str, Any] = {"records": records, "source": source}
     by_cwd = _cwd_labels(records)
@@ -425,7 +398,7 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     # A real User-Agent, same as config.post_json: Cloudflare in front of a hosted server
     # 403s urllib's default "Python-urllib/x" ("error code: 1010"), and this hook fails
     # soft, so without it every ingest is silently dropped.
-    headers = {"Content-Type": "application/json", "User-Agent": config._UA}
+    headers = {"Content-Type": "application/json", "User-Agent": config.USER_AGENT}
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
@@ -453,27 +426,19 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
         _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)}")
         return (0, 0)
     try:
-        offset_recs, eof = _read_offset_records(transcript_path)
-        if not offset_recs:
-            return (0, 0)
-
-        # Belt and braces: a resumed/compacted transcript can carry records whose
-        # sessionId differs from the filename, and it's the record's id that the
-        # server stores (and that private_mode.py marked).
-        for sid in {str(r.get("sessionId") or "") for _, r in offset_recs} - {"", session_id}:
-            if _is_private(sid):
-                _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (record sid)")
-                return (0, 0)
-
+        size = os.stat(transcript_path).st_size
         ent = _load_state().get(transcript_path)
         cursor: int | None = None
         force = False
         if isinstance(ent, dict):
             cursor = int(ent.get("offset", 0))
-            if cursor > eof:  # transcript truncated/rewritten — start over
-                cursor, force = None, True
-            elif int(ent.get("size", -1)) == eof:
+            if cursor > size or not _starts_a_line(transcript_path, cursor):
+                cursor, force = None, True  # transcript truncated/rewritten — start over
+            elif int(ent.get("size", -1)) == size:
                 return (0, 0)  # nothing new since the last fully-shipped run
+        offset_recs, eof = _read_offset_records(transcript_path, cursor or 0)
+        if not offset_recs:
+            return (0, 0)
         if cursor is None:
             if mode == "stop":
                 tail = offset_recs[-TAIL_RECORDS:]
@@ -483,6 +448,16 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
                 cursor = 0
 
         plans = _plan_from_cursor(offset_recs, cursor, TAIL_RECORDS)
+
+        # Belt and braces: a resumed/compacted transcript can carry records whose
+        # sessionId differs from the filename, and it's the record's id that the
+        # server stores (and that private_mode.py marked). Only the records about
+        # to ship matter.
+        shipping = {str(r.get("sessionId") or "") for recs, _ in plans for r in recs}
+        for sid in shipping - {"", session_id}:
+            if _is_private(sid):
+                _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (record sid)")
+                return (0, 0)
     except Exception as e:
         _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
         return (0, 0)
@@ -501,7 +476,7 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
             # it ages out of the catch-up window.
             _log(f"ERR {mode} {transcript_path}: {type(e).__name__}: {str(e)[:160]}")
             try:
-                _record_failure(transcript_path, _short_reason(e), chunk_start)
+                _record_failure(transcript_path, retry.short_reason(e), chunk_start)
             except Exception as e2:
                 _log(f"ERR {mode} record-failure: {type(e2).__name__}: {str(e2)[:160]}")
             break
@@ -536,7 +511,7 @@ def _catchup_candidates(
     """Transcripts worth sweeping: not the live session, not mid-write
     (ACTIVE_GRACE — an active session's own Stop hooks own it), with bytes past
     their cursor, and either modified within CATCHUP_DAYS or owed a retry (a
-    failed or half-finished upload, _needs_retry) however old.
+    failed or half-finished upload, retry.needs_retry) however old.
 
     A file older than the window that the hook never attempted is NOT a
     candidate: that is history from before the plugin was installed (or from
@@ -594,16 +569,6 @@ def _projects_root_from(transcript_path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _spawn_detached(args: list[str]) -> None:
-    subprocess.Popen(
-        [sys.executable, os.path.abspath(__file__), *args],
-        start_new_session=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
 def main() -> None:
     # Detached children do the actual work.
     if len(sys.argv) >= 3 and sys.argv[1] == "--ship":
@@ -613,18 +578,19 @@ def main() -> None:
         _catchup(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else "")
         return
 
-    # Parent (invoked by Claude): read the hook payload, spawn a detached
-    # worker, and return immediately so the turn/session isn't delayed.
-    try:
-        payload = json.load(sys.stdin)
-    except Exception:
-        return
-    transcript_path = payload.get("transcript_path") or ""
-
     if len(sys.argv) >= 2 and sys.argv[1] == "--catchup":
+        # Parent (invoked by Claude at SessionStart): read the hook payload, spawn a
+        # detached sweep, and return immediately so the session isn't delayed.
+        try:
+            payload = json.load(sys.stdin)
+        except Exception:
+            return
+        transcript_path = payload.get("transcript_path") or ""
         # Say so when uploads keep failing. Before the sweep runs, so the line
         # reflects the streak as it stood; a sweep that succeeds ends the streak.
         _emit_failure_warning()
+        if payload.get("source") in ("clear", "compact"):
+            return  # a fresh context window, not a new session: the sweep ran at its start
         root = (
             _projects_root_from(transcript_path)
             if transcript_path
@@ -640,13 +606,7 @@ def main() -> None:
             _log(f"SPAWN-ERR catchup: {type(e).__name__}: {str(e)[:160]}")
         return
 
-    # Default: the Stop-hook shipper.
-    if not transcript_path or not os.path.exists(transcript_path):
-        return
-    try:
-        _spawn_detached(["--ship", transcript_path])
-    except Exception as e:
-        _log(f"SPAWN-ERR: {type(e).__name__}: {str(e)[:160]}")
+    _stop_hook()  # the default; run as a script this is answered before the imports above
 
 
 if __name__ == "__main__":

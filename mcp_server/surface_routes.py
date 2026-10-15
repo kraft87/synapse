@@ -65,7 +65,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion.surfaces import (
-    SchemaMissing,
     enroll_surface,
     list_surfaces,
     mint_surface,
@@ -91,21 +90,20 @@ _PENDING_ERRORS = {"authorization_pending", "slow_down", "temporarily_unavailabl
 def register(
     mcp: Any,
     db_url: str,
-    authorized: Callable[[Request], bool],
-    admin: Callable[[Request], bool] | None = None,
+    admin: Callable[[Request], bool],
     idp: Any = None,
 ) -> None:
     """Mount the surface routes.
 
-    ``admin`` defaults to ``authorized`` only so an un-updated caller still boots; every
-    real deployment passes the stricter gate. ``idp`` enables ``/surfaces/enroll``:
-    without an identity provider there is no identity to anchor an enrollment to, so
-    that route reports 503 and the operator uses ``synapse-admin bootstrap``.
+    ``admin`` gates mint, list, PUT and revoke. It is required, with no fallback to the
+    client gate: the root token clears that one, and these routes create credentials.
+    ``idp`` enables ``/surfaces/enroll``: without an identity provider there is no
+    identity to anchor an enrollment to, so that route reports 503 and the operator uses
+    ``synapse-admin bootstrap``.
     """
     if not db_url:
         logger.info("surface routes disabled (no DB_URL)")
         return
-    admin_gate = admin if admin is not None else authorized
 
     def _surface_id(request: Request) -> str:
         return (request.path_params.get("surface_id") or "").strip()
@@ -120,8 +118,6 @@ def register(
             return unauthorized()
         try:
             return await run_in_threadpool(work)
-        except SchemaMissing:
-            return err("surfaces table missing (apply schema/053+054)", 503)
         except ValueError as e:
             return err(str(e)[:200], 400)
         except Exception as e:  # pragma: no cover - defensive
@@ -256,7 +252,7 @@ def register(
             return grant
         trust, projects = grant
         label = str(body.get("label") or "")[:_MAX_LABEL_LEN]
-        out = await _run(request, lambda: mint_surface(db_url, label, trust, projects), admin_gate)
+        out = await _run(request, lambda: mint_surface(db_url, label, trust, projects), admin)
         if isinstance(out, JSONResponse):
             return out
         return JSONResponse({"status": "ok", "surface": out["surface"], "token": out["token"]})
@@ -267,7 +263,7 @@ def register(
     async def surfaces_list(request: Request) -> JSONResponse:
         """Every surface — "who can see what", in one read. ADMIN gated: the listing is
         the map of what each credential reaches."""
-        out = await _run(request, lambda: list_surfaces(db_url), admin_gate)
+        out = await _run(request, lambda: list_surfaces(db_url), admin)
         if isinstance(out, JSONResponse):
             return out
         return JSONResponse({"status": "ok", "surfaces": out})
@@ -294,7 +290,7 @@ def register(
         out = await _run(
             request,
             lambda: upsert_surface(db_url, surface_id, trust or "restricted", projects or []),
-            admin_gate,
+            admin,
         )
         if isinstance(out, JSONResponse):
             return out
@@ -307,10 +303,7 @@ def register(
         surface_id = _surface_id(request)
         if not surface_id or len(surface_id) > _MAX_ID_LEN:
             return err("surface_id required", 400)
-        out = await _run(request, lambda: revoke_surface(db_url, surface_id), admin_gate)
+        out = await _run(request, lambda: revoke_surface(db_url, surface_id), admin)
         if isinstance(out, JSONResponse):
             return out
-        return JSONResponse(
-            # "deleted" kept alongside "revoked" for the 0.16.x clients still reading it.
-            {"status": "ok", "surface_id": surface_id, "revoked": int(out), "deleted": int(out)}
-        )
+        return JSONResponse({"status": "ok", "surface_id": surface_id, "revoked": int(out)})

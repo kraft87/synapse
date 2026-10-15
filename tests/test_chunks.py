@@ -127,3 +127,17 @@ def test_on_new_skips_existing_windows() -> None:
         on_new=lambda c: fired.append((c["start_sequence"], c["end_sequence"])),
     )
     assert fired == [(7, 10)]
+
+
+def test_remember_archive_episodes_stay_out_of_chunk_text() -> None:
+    """A remember() archive is already a note, and the turn that prompted it is in the
+    window: chunking it too would extract the same statement twice. The window itself
+    (its sequence range) is unchanged, so existing chunks still line up."""
+    eps = _eps(4)
+    eps[2]["source"] = "manual"
+    db = _FakeDB(eps)
+    rebuild_chunks(db, "s")  # type: ignore[arg-type]
+    (chunk,) = db.chunks
+    assert (chunk["start"], chunk["end"]) == (1, 4)
+    assert chunk["episode_ids"] == [1, 2, 4]
+    assert "turn 3" not in chunk["content"] and "turn 4" in chunk["content"]

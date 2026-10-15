@@ -17,13 +17,15 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
-import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from types import ModuleType
 
 import pytest
+
+from tests.helpers.http import LoopbackServer
 
 _REPO = Path(__file__).resolve().parents[1]
 _SPOOL = _REPO / "plugin" / "scripts" / "remember_spool.py"
@@ -84,14 +86,11 @@ class _StubServer:
             def log_message(self, *args) -> None:  # keep pytest output clean
                 pass
 
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._httpd.server_port}"
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
+        self._server = LoopbackServer(Handler)
+        self.url = self._server.url
 
     def close(self) -> None:
-        self._httpd.shutdown()
-        self._httpd.server_close()
+        self._server.close()
 
 
 @pytest.fixture()
@@ -107,9 +106,6 @@ def _load(monkeypatch, tmp_path, url: str) -> ModuleType:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("SYNAPSE_SPOOL_LOG", str(tmp_path / "spool.log"))
-    monkeypatch.setenv("SYNAPSE_SPOOL_TIMEOUT", "5")
-    monkeypatch.setenv("SYNAPSE_SPOOL_PROBE_TIMEOUT", "5")
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("SYNAPSE_URL", url)
@@ -421,7 +417,7 @@ def test_session_start_flushes_and_reports(spool, monkeypatch, capsys, tmp_path)
     assert line.startswith("[Synapse] flushed 2 spooled memory write(s):")
     assert "First correction" in line and "Second correction" in line
     assert spool.load() == []
-    log = (tmp_path / "spool.log").read_text()
+    log = (Path(os.environ["SYNAPSE_HOME"]) / "logs" / "remember-spool.log").read_text()
     assert "flushed 2 spooled memory write(s)" in log and "OK flush" in log
 
 
@@ -468,8 +464,6 @@ def test_hook_paths_never_fail_the_turn(tmp_path):
         **os.environ,
         "SYNAPSE_URL": "http://127.0.0.1:9",
         "SYNAPSE_DATA_DIR": str(tmp_path / "data"),
-        "SYNAPSE_SPOOL_LOG": str(tmp_path / "spool.log"),
-        "SYNAPSE_SPOOL_PROBE_TIMEOUT": "2",
         "CLAUDE_CONFIG_DIR": str(tmp_path / "claude"),
     }
     for var in _PLUGIN_ENV_VARS:

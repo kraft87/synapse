@@ -7,6 +7,13 @@ import psycopg
 from psycopg.rows import dict_row
 
 from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_literal
+from ingestion.schema_check import ColumnProbe
+
+#: The ``notes_history`` table (an optional migration): until it exists an in-place update
+#: keeps no record of the wording it replaces, which is how it behaved before the table.
+NOTES_HISTORY_PROBE = ColumnProbe(
+    "SELECT 1 WHERE to_regclass('notes_history') IS NOT NULL", "notes_history table"
+)
 
 
 class NoteStore(DatabaseConnection):
@@ -14,12 +21,14 @@ class NoteStore(DatabaseConnection):
         self, owner_id: str, group_id: str, embedding: list[float], limit: int = 5
     ) -> list[dict[str, Any]]:
         """Live notes for one owner/group, nearest to ``embedding`` by cosine (over the
-        HOOK — the embed target). Returns ``[{id, hook, body, type, project, sim}]`` in
-        DESCENDING similarity. The reconcile path's dedup/supersession decision reads this."""
+        HOOK — the embed target). Returns ``[{id, hook, body, type, project, updated_at,
+        sim}]`` in DESCENDING similarity. The reconcile path's dedup/supersession decision
+        reads this."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT id, hook, body, type, project, 1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                "SELECT id, hook, body, type, project, updated_at, "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "
                 "FROM notes "
                 "WHERE owner_id = %s AND group_id = %s AND superseded_by IS NULL "
                 "AND embedding IS NOT NULL "
@@ -33,6 +42,7 @@ class NoteStore(DatabaseConnection):
                 "body": r["body"],
                 "type": r["type"],
                 "project": r["project"],
+                "updated_at": r["updated_at"],
                 "sim": float(r["sim"]),
             }
             for r in rows
@@ -130,26 +140,43 @@ class NoteStore(DatabaseConnection):
         body: str,
         embedding: list[float] | None,
         embed_model: str | None,
+        source_ref: str | None = None,
         audience: str | None = None,
     ) -> None:
         """A restated note: refresh hook/body/embedding in place and bump updated_at
         (the note keeps its id — the board line just gets the newer phrasing).
+
+        The wording it replaces is copied to ``notes_history`` in the same transaction
+        (once that optional table exists), unless the text did not change. ``source_ref``
+        moves to the episode that carries the new wording; ``None`` keeps the stored one.
+        Without the history table it is the only pointer left to the old wording, so it
+        stays where it is.
 
         ``audience=None`` PRESERVES the stored tier. A restatement must never silently
         re-classify a note: the only thing that moves an existing note between audiences
         is an explicit override (COALESCE keeps the current value otherwise)."""
         vlit = _vector_literal(embedding)
         with self._conn() as conn:
+            history = NOTES_HISTORY_PROBE.ready(conn, self._url)
+            if history:
+                conn.execute(
+                    "INSERT INTO notes_history (note_id, hook, body, source_ref) "
+                    "SELECT id, hook, body, source_ref FROM notes "
+                    "WHERE id = %s AND (hook, body) IS DISTINCT FROM (%s, %s)",
+                    (note_id, hook, body),
+                )
             conn.execute(
                 "UPDATE notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 f"SET hook = %s, body = %s, embedding = %s::halfvec({_EMBED_DIMS}), "
-                "embed_model = %s, audience = COALESCE(%s, audience), updated_at = now() "
+                "embed_model = %s, source_ref = COALESCE(%s, source_ref), "
+                "audience = COALESCE(%s, audience), updated_at = now() "
                 "WHERE id = %s",
                 (
                     hook,
                     body,
                     vlit,
                     embed_model if embedding is not None else None,
+                    source_ref if history else None,
                     audience,
                     note_id,
                 ),
@@ -163,13 +190,6 @@ class NoteStore(DatabaseConnection):
                 "UPDATE notes SET superseded_by = %s WHERE id = %s",
                 (new_id, old_id),
             )
-
-    def list_board_notes(
-        self, owner_id: str, project: str | None, audience: str | None = None
-    ) -> list[dict[str, Any]]:
-        """:func:`select_board_notes` on this store's connection."""
-        with self._conn() as conn:
-            return select_board_notes(conn, owner_id, project, audience)
 
     def get_notes_by_ids(self, ids: list[int], audience: str | None = None) -> list[dict[str, Any]]:
         """Fetch note bodies by id — the on-demand half of the board (hook on the board,
@@ -210,17 +230,6 @@ class NoteStore(DatabaseConnection):
             ).fetchall()
         return [cast(str, r["project"]) for r in rows if r["project"]]
 
-    def find_note_by_source_ref(self, source_ref: str) -> dict[str, Any] | None:
-        """Newest note carrying this provenance ref, live or retired — the seed
-        importer's idempotency probe (re-imports must not duplicate)."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT id, hook, body, type, project, superseded_by, updated_at "
-                "FROM notes WHERE source_ref = %s ORDER BY id DESC LIMIT 1",
-                (source_ref,),
-            ).fetchone()
-        return dict(row) if row is not None else None
-
     # ------------------------------------------------------------------
     # Notes curation (schema 051) — the read/write surface for the nightly
     # dream→notes lane (dream/notes/). The lane owns the policy (what counts as
@@ -242,14 +251,20 @@ class NoteStore(DatabaseConnection):
         memo index keys on. The floor is deliberately permissive (corrections often
         share little hook wording); the LLM judge downstream is the precision layer.
 
+        Two project notes of DIFFERENT projects are never a pair: each is served only on
+        its own project's board, so neither can stand in for the other. (A project note
+        and a global one can pair; the lane decides which direction may retire.)
+
         Returns ``[{a: {...}, b: {...}, sim: float}]`` where each side carries
-        ``id, hook, body, type, project, updated_at``."""
+        ``id, hook, body, type, project, audience, updated_at``."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT a.id AS a_id, a.hook AS a_hook, a.body AS a_body, a.type AS a_type, "
-                "       a.project AS a_project, a.updated_at AS a_updated_at, "
+                "       a.project AS a_project, a.audience AS a_audience, "
+                "       a.updated_at AS a_updated_at, "
                 "       b.id AS b_id, b.hook AS b_hook, b.body AS b_body, b.type AS b_type, "
-                "       b.project AS b_project, b.updated_at AS b_updated_at, "
+                "       b.project AS b_project, b.audience AS b_audience, "
+                "       b.updated_at AS b_updated_at, "
                 "       1 - (a.embedding <=> b.embedding) AS sim "
                 "FROM notes a "
                 "JOIN notes b ON b.owner_id = a.owner_id AND b.id > a.id "
@@ -259,16 +274,17 @@ class NoteStore(DatabaseConnection):
                 "            AND greatest(c.note_a, c.note_b) = b.id "
                 "WHERE a.owner_id = %s AND a.superseded_by IS NULL AND a.embedding IS NOT NULL "
                 "  AND 1 - (a.embedding <=> b.embedding) >= %s "
+                "  AND (a.type <> 'project' OR b.type <> 'project' "
+                "       OR a.project IS NOT DISTINCT FROM b.project) "
                 "  AND (c.id IS NULL OR c.judged_at < greatest(a.updated_at, b.updated_at)) "
                 "ORDER BY sim DESC, a.id, b.id LIMIT %s",
                 (owner_id, sim_floor, limit),
             ).fetchall()
+        keys = ("id", "hook", "body", "type", "project", "audience", "updated_at")
         return [
             {
-                "a": {k: r[f"a_{k}"] for k in ("id", "hook", "body", "type", "project")}
-                | {"updated_at": r["a_updated_at"]},
-                "b": {k: r[f"b_{k}"] for k in ("id", "hook", "body", "type", "project")}
-                | {"updated_at": r["b_updated_at"]},
+                "a": {k: r[f"a_{k}"] for k in keys},
+                "b": {k: r[f"b_{k}"] for k in keys},
                 "sim": float(r["sim"]),
             }
             for r in rows
@@ -283,7 +299,8 @@ class NoteStore(DatabaseConnection):
         it back in the queue."""
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT n.id, n.hook, n.body, n.type, n.project, n.updated_at FROM notes n "
+                "SELECT n.id, n.hook, n.body, n.type, n.project, n.audience, n.updated_at "
+                "FROM notes n "
                 "LEFT JOIN notes_curation c ON c.op = 'retype' AND c.note_a = n.id "
                 "WHERE n.owner_id = %s AND n.superseded_by IS NULL "
                 "  AND n.type IN ('user','feedback') "
@@ -310,18 +327,6 @@ class NoteStore(DatabaseConnection):
                 (limit,),
             ).fetchall()
         return [cast(str, r["project"]) for r in rows]
-
-    def project_slug_exists(self, slug: str) -> bool:
-        """True if ``slug`` is already a known project id — either on a note or on an
-        episode. The retype apply is gated on this so a hallucinated slug can only ever
-        be recorded, never written into the store as a new (unreachable) scope."""
-        with self._conn() as conn:
-            row = conn.execute(
-                "SELECT EXISTS (SELECT 1 FROM notes WHERE project = %s) "
-                "    OR EXISTS (SELECT 1 FROM episodes WHERE project = %s) AS found",
-                (slug, slug),
-            ).fetchone()
-        return bool(row is not None and row["found"])
 
     def retype_note(
         self, note_id: int, *, type: str, project: str | None, audience: str | None = None
@@ -372,6 +377,49 @@ class NoteStore(DatabaseConnection):
             ).fetchone()
         assert row is not None, "INSERT ... RETURNING id returned nothing"
         return cast(int, row["id"])
+
+    def list_applied_curation(self, *, limit: int) -> list[dict[str, Any]]:
+        """The newest curation rows the lane acted on, with both notes' current hooks —
+        what the operator reads before undoing one (dream/notes/nightly.py ``--list``)."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT c.id, c.op, c.note_a, c.note_b, c.verdict, c.detail, c.judged_at, "
+                "       na.hook AS hook_a, nb.hook AS hook_b "
+                "FROM notes_curation c "
+                "JOIN notes na ON na.id = c.note_a "
+                "LEFT JOIN notes nb ON nb.id = c.note_b "
+                "WHERE c.applied ORDER BY c.judged_at DESC, c.id DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_curation(self, curation_id: int) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT id, op, note_a, note_b, verdict, applied, detail "
+                "FROM notes_curation WHERE id = %s",
+                (curation_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def unsupersede_note(self, old_id: int, new_id: int) -> bool:
+        """Make a retired note live again, but only while ``new_id`` is still what retired
+        it. Returns whether anything changed."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                "UPDATE notes SET superseded_by = NULL WHERE id = %s AND superseded_by = %s",
+                (old_id, new_id),
+            )
+            return cur.rowcount > 0
+
+    def mark_curation_reverted(self, curation_id: int) -> None:
+        """Flag an undone row. It stays in the table, so the memo still keeps the lane
+        from judging and applying the same pair or note again."""
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE notes_curation SET verdict = 'REVERTED', applied = false WHERE id = %s",
+                (curation_id,),
+            )
 
 
 def select_board_notes(

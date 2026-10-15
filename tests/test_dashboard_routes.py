@@ -4,36 +4,25 @@ Covers the /dash/api/* contract (catalog, feed merge + keyset cursor + type-filt
 behavior, episode detail, derived facts/events, session ordering, entity dossier,
 search per-type + total_by_type, flag toggle + audit + feed reflection) and the
 unauthenticated static bundle routes (503 without a build, 200 + traversal rejection
-with a monkeypatched dist dir). Skips cleanly when no test DB is reachable (mirrors
-test_board.py). ALL fixture data is synthetic — this repo is public.
+with a monkeypatched dist dir). ALL fixture data is synthetic — this repo is public.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import quote
 
 import psycopg
 import pytest
 from psycopg.types.json import Json
+from starlette.testclient import TestClient
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
+import mcp_server.dashboard_routes as dr
+from mcp_server.dashboard_routes import register
 
-# Skip the whole module if the shared Postgres test DB isn't up — these tests are DB-only.
-try:
-    _probe = psycopg.connect(_DB_URL, connect_timeout=2)
-    _probe.close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
-
-from starlette.testclient import TestClient  # noqa: E402
-
-import mcp_server.dashboard_routes as dr  # noqa: E402
-from mcp_server.dashboard_routes import register  # noqa: E402
+pytestmark = pytest.mark.db
 
 _TOKEN = "test-dash-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}
@@ -100,14 +89,21 @@ def _episode(
     ).fetchone()[0]
 
 
-def _entity(
-    conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0, group_id="technical"
-):
+# The KG helpers write only the bitemporal t_* columns and entity_subtype, never the
+# FalkorDB-era created_at / valid_at / invalid_at / entity_type mirrors: the dashboard
+# reads the former, so a read that slips back onto a legacy column fails here.
+def _entity(conn, uuid, *, name, entity_type="Technology", summary="a thing", group_id="technical"):
     return conn.execute(
-        "INSERT INTO kg_entities (uuid, group_id, name, entity_type, summary, degree, created_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
-        (uuid, group_id, name, entity_type, summary, degree, _t(0)),
+        "INSERT INTO kg_entities (uuid, group_id, name, entity_subtype, summary, t_created) "
+        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        (uuid, group_id, name, entity_type, summary, _t(0)),
     ).fetchone()[0]
+
+
+def _spokes(conn, hub, n, *, prefix=None):
+    """n live edges from `hub` to throwaway endpoints: gives it a live degree of n."""
+    for i in range(n):
+        _rel(conn, f"{prefix or hub}-sp{i}", src=hub, tgt=f"{prefix or hub}-leaf{i}")
 
 
 def _rel(
@@ -128,7 +124,7 @@ def _rel(
     return conn.execute(
         "INSERT INTO kg_relationships "
         "(uuid, group_id, src_uuid, tgt_uuid, name, fact, episodes, retrieval_count, "
-        " created_at, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        " t_created, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             group_id,
@@ -157,11 +153,13 @@ def _event(
     event_type=None,
     t_valid=None,
     ingested_at=None,
+    reported_count=1,
 ):
     return conn.execute(
         "INSERT INTO timeline_events "
-        "(t_valid, fact, source, source_ref, project, salience, domain, event_type, ingested_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "(t_valid, fact, source, source_ref, project, salience, domain, event_type, ingested_at, "
+        " reported_count) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
             t_valid or _t(0),
             fact,
@@ -172,6 +170,7 @@ def _event(
             domain,
             event_type,
             ingested_at or _t(0),
+            reported_count,
         ),
     ).fetchone()[0]
 
@@ -210,14 +209,14 @@ def _metric(
     est_tokens=100,
     rerank_top_score=0.5,
     created_at=None,
-    legs=None,  # optional {embed,bm25,vector,kg,web,rerank,timeline,prefs} → ms_* columns
+    legs=None,  # optional {embed,bm25,vector,kg,web,rerank,notes} → ms_* columns
 ):
     legs = legs or {}
     return conn.execute(
         "INSERT INTO recall_metrics (kind, source, query, ms_total, est_tokens, "
         " rerank_top_score, created_at, ms_embed, ms_bm25, ms_vector, ms_kg, ms_web, "
-        " ms_rerank, ms_timeline, ms_prefs) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        " ms_rerank, ms_notes) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
             kind,
             source,
@@ -232,8 +231,7 @@ def _metric(
             legs.get("kg"),
             legs.get("web"),
             legs.get("rerank"),
-            legs.get("timeline"),
-            legs.get("prefs"),
+            legs.get("notes"),
         ),
     ).fetchone()[0]
 
@@ -248,12 +246,25 @@ def _queue(
     attempts=0,
     enqueued_at=None,
     processed_at=None,
+    content_type="episode",
+    session_id=None,
 ):
     return conn.execute(
         "INSERT INTO extraction_queue "
-        "(episode_id, content, status, error, attempts, enqueued_at, processed_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-        (episode_id, content, status, error, attempts, enqueued_at, processed_at),
+        "(episode_id, content, status, error, attempts, enqueued_at, processed_at, "
+        " content_type, session_id) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (
+            episode_id,
+            content,
+            status,
+            error,
+            attempts,
+            enqueued_at,
+            processed_at,
+            content_type,
+            session_id,
+        ),
     ).fetchone()[0]
 
 
@@ -439,6 +450,83 @@ def test_feed_filters_apply_only_where_column_exists(clean, conn, db_url):
         assert ("fact", "ft") in got and ("timeline_event", str(et)) in got  # not excluded
 
 
+def test_feed_untagged_filter_matches_null_empty_and_literal(clean, conn, db_url):
+    """'untagged' is the catalog's bucket for NULL and '' (and a literal 'untagged'
+    label lands in the same bucket); a real label is a plain equality the
+    (project, created_at) index can serve."""
+    null_ep = _episode(conn, session="u", seq=1, project=None, source=None, created_at=_t(4))
+    blank_ep = _episode(conn, session="u", seq=2, project="", source="", created_at=_t(3))
+    lit_ep = _episode(conn, session="u", seq=3, project="untagged", created_at=_t(2))
+    tagged = _episode(conn, session="u", seq=4, project="synapse", created_at=_t(1))
+    null_ev = _event(conn, fact="unlabelled event", source_ref="tb:u", project=None)
+    tagged_ev = _event(conn, fact="labelled event", source_ref="tb:t", project="synapse")
+
+    with _client(db_url) as client:
+        got = {(i["type"], i["id"]) for i in _feed_page(client, project="untagged")["items"]}
+        assert {("episode", str(e)) for e in (null_ep, blank_ep, lit_ep)} <= got
+        assert ("timeline_event", str(null_ev)) in got
+        assert ("episode", str(tagged)) not in got
+        assert ("timeline_event", str(tagged_ev)) not in got
+
+        got = {(i["type"], i["id"]) for i in _feed_page(client, source="untagged")["items"]}
+        assert {("episode", str(null_ep)), ("episode", str(blank_ep))} <= got
+        assert ("episode", str(tagged)) not in got
+
+        got = {(i["type"], i["id"]) for i in _feed_page(client, project="synapse")["items"]}
+        assert ("episode", str(tagged)) in got and ("timeline_event", str(tagged_ev)) in got
+        assert ("episode", str(null_ep)) not in got
+
+        hits = client.get(
+            "/dash/api/search", params={"q": "turn", "project": "untagged"}, headers=_H
+        ).json()["hits"]
+        assert {h["id"] for h in hits} == {str(null_ep), str(blank_ep), str(lit_ep)}
+
+
+def test_timeline_item_resolves_the_kth_event_ref(clean, conn, db_url):
+    eid = _episode(conn, session="k", seq=1, content="turn with two events", created_at=_t(0))
+    ev = _event(conn, fact="second event of the turn", source_ref=f"ep:{eid}#2", ingested_at=_t(5))
+    with _client(db_url) as client:
+        items = _feed_page(client)["items"]
+        tl = client.get("/dash/api/timeline", headers=_H).json()["events"]
+    by_key = {(i["type"], i["id"]): i for i in items}
+    assert by_key[("timeline_event", str(ev))]["data"]["episode_id"] == eid
+    assert tl[0]["episode_id"] == eid
+
+
+def test_kg_reads_migration_backfills_legacy_only_rows(clean, conn, db_url):
+    """The optional migration behind the t_created / entity_subtype reads copies the
+    FalkorDB-era mirror into rows that only ever had it, so they stay on the feed and
+    keep their type; a re-run changes nothing. The image runs without it (marker)."""
+    from ingestion.schema_check import is_optional_migration
+
+    schema = Path(__file__).resolve().parent.parent / "schema"
+    (path,) = schema.glob("*_kg_dashboard_reads.sql")
+    assert is_optional_migration(path)
+
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, group_id, name, entity_type, created_at) "
+        "VALUES ('legacy-e', 'technical', 'Old Tool', 'Tool', %s)",
+        (_t(0),),
+    )
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, created_at) "
+        "VALUES ('legacy-r', 'technical', 'legacy-e', 'legacy-e', 'an old fact', %s)",
+        (_t(1),),
+    )
+    with _client(db_url) as client:
+        before = _feed_page(client)["items"]
+        assert ("fact", "legacy-r") not in {(i["type"], i["id"]) for i in before}
+
+        conn.execute(path.read_text())
+        conn.execute(path.read_text())  # idempotent
+
+        items = {(i["type"], i["id"]): i for i in _feed_page(client)["items"]}
+        assert datetime.fromisoformat(items[("fact", "legacy-r")]["ts"]) == _t(1)
+        ent = client.get("/dash/api/entity/legacy-e", headers=_H).json()["entity"]
+        assert ent["entity_type"] == "Tool"
+        assert datetime.fromisoformat(ent["created_at"]) == _t(0)
+
+
 # ---------------------------------------------------------------------------
 # Episode detail + derived
 # ---------------------------------------------------------------------------
@@ -477,14 +565,26 @@ def test_episode_derived_containment_and_ep_ref(clean, conn, db_url):
     _rel(conn, "dn", src="a", tgt="b", fact="numeric-linked", episodes=[eid])
     _rel(conn, "ds", src="a", tgt="b", fact="string-linked", episodes=[str(eid)])
     _rel(conn, "dx", src="a", tgt="b", fact="other-linked", episodes=[other])
-    # Timeline event via ep:<id> source_ref.
-    ev = _event(conn, fact="linked event", source_ref=f"ep:{eid}")
+    # Timeline events via source_ref: 'ep:<id>' for a turn's first event, 'ep:<id>#<k>'
+    # for the k-th (ingestion/timeline_gate.py). The id-prefix near-miss must not match.
+    ev = _event(conn, fact="linked event", source_ref=f"ep:{eid}", t_valid=_t(2))
+    ev2 = _event(conn, fact="second event", source_ref=f"ep:{eid}#2", t_valid=_t(1))
     _event(conn, fact="other event", source_ref=f"ep:{other}")
+    _event(conn, fact="prefix near-miss", source_ref=f"ep:{eid}9")
     with _client(db_url) as client:
         body = client.get(f"/dash/api/episode/{eid}/derived", headers=_H).json()
     fact_uuids = {f["uuid"] for f in body["facts"]}
     assert fact_uuids == {"dn", "ds"}  # both containment forms, other excluded
-    assert [e["id"] for e in body["timeline_events"]] == [ev]
+    assert [e["id"] for e in body["timeline_events"]] == [ev, ev2]
+
+
+def test_episode_id_from_ref_reads_the_kth_event_form():
+    assert dr._episode_id_from_ref("ep:12") == 12
+    assert dr._episode_id_from_ref("ep:12#3") == 12
+    assert dr._episode_id_from_ref("ep:12#") is None
+    assert dr._episode_id_from_ref("ep:x#2") is None
+    assert dr._episode_id_from_ref("deadbeef") is None
+    assert dr._episode_id_from_ref(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -502,8 +602,44 @@ def test_session_ordering_and_highlight_echo(clean, conn, db_url):
     assert body["session_id"] == "sess"
     assert body["project"] == "synapse" and body["source"] == "claude-code"
     assert body["highlight"] == first  # echoed as int
+    assert body["total"] == 3
     assert [e["sequence"] for e in body["episodes"]] == [1, 2, 3]
-    assert body["episodes"][0]["content"] == "first"
+    # The drawer renders human_turn/assistant_turn only; content is not shipped.
+    assert set(body["episodes"][0]) == {
+        "id",
+        "sequence",
+        "created_at",
+        "human_turn",
+        "assistant_turn",
+    }
+
+
+def test_session_cap_windows_around_the_highlight(clean, conn, db_url, monkeypatch):
+    """A session longer than the cap is cut to a window around the highlighted turn,
+    so the drawer can always show the turn it was opened for."""
+    monkeypatch.setattr(dr, "_SESSION_CAP", 4)
+    ids = {seq: _episode(conn, session="long", seq=seq, created_at=_t(seq)) for seq in range(1, 11)}
+    with _client(db_url) as client:
+        hl = client.get(f"/dash/api/session/long?highlight={ids[8]}", headers=_H).json()
+        assert [e["sequence"] for e in hl["episodes"]] == [6, 7, 8, 9]
+        # The window slides back from the session's end to stay full.
+        end = client.get(f"/dash/api/session/long?highlight={ids[10]}", headers=_H).json()
+        assert [e["sequence"] for e in end["episodes"]] == [7, 8, 9, 10]
+        # No highlight (or one outside the session): the first turns, as before.
+        plain = client.get("/dash/api/session/long", headers=_H).json()
+        assert [e["sequence"] for e in plain["episodes"]] == [1, 2, 3, 4]
+        stray = client.get("/dash/api/session/long?highlight=999999", headers=_H).json()
+        assert [e["sequence"] for e in stray["episodes"]] == [1, 2, 3, 4]
+        # The window is not the session: the drawer is told how many turns there are.
+        assert hl["total"] == end["total"] == plain["total"] == stray["total"] == 10
+
+
+def test_session_unknown_id_is_a_404(clean, conn, db_url):
+    """A session with no stored turns is not an empty session: the drawer says so."""
+    with _client(db_url) as client:
+        r = client.get("/dash/api/session/nope", headers=_H)
+    assert r.status_code == 404
+    assert r.json() == {"status": "error", "detail": "session not found"}
 
 
 # ---------------------------------------------------------------------------
@@ -518,7 +654,6 @@ def test_entity_dossier(clean, conn, db_url):
         name="MainThing",
         entity_type="Technology",
         summary="the subject",
-        degree=1,
     )
     _entity(conn, "ent-o1", name="OtherOne")
     _entity(conn, "ent-o2", name="OtherTwo")
@@ -579,6 +714,80 @@ def test_entity_dossier(clean, conn, db_url):
         assert client.get("/dash/api/entity/nope", headers=_H).status_code == 404
 
 
+def test_entity_dossier_pages_facts_live_first(clean, conn, db_url, monkeypatch):
+    """The header counts every fact, so the list pages to match: live facts first (newest
+    first), superseded ones after, `facts_offset` walks the rest."""
+    monkeypatch.setattr(dr, "_ENTITY_FACTS_PAGE", 3)
+    _entity(conn, "hub", name="Hub")
+    _entity(conn, "o", name="Other")
+    # Five facts. The two superseded ones are the NEWEST by t_valid, and one live fact has no
+    # t_valid at all: a plain t_valid-DESC cut would fill page 1 with the dead ones.
+    for name, t_valid, t_invalid in (
+        ("dead-new", _t(50), _t(60)),
+        ("dead-newer", _t(40), _t(45)),
+        ("live-old", _t(1), None),
+        ("live-mid", _t(10), None),
+        ("live-undated", None, None),
+    ):
+        _rel(conn, name, src="hub", tgt="o", t_valid=t_valid, t_invalid=t_invalid)
+    with _client(db_url) as client:
+        p1 = client.get("/dash/api/entity/hub", headers=_H).json()
+        p2 = client.get("/dash/api/entity/hub?facts_offset=3", headers=_H).json()
+        p3 = client.get("/dash/api/entity/hub?facts_offset=99", headers=_H).json()
+    assert [f["uuid"] for f in p1["facts"]] == ["live-mid", "live-old", "live-undated"]
+    assert [f["uuid"] for f in p2["facts"]] == ["dead-new", "dead-newer"]
+    assert p3["facts"] == []
+    assert p1["stats"]["facts"] == p2["stats"]["facts"] == 5  # the count the UI pages against
+
+
+def test_entity_degree_counts_live_edges_not_the_stored_column(clean, conn, db_url):
+    """kg_entities.degree is a one-off backfill that nothing maintains (0 for every entity
+    extraction wrote since). Every dashboard read counts live edges instead."""
+    _entity(conn, "fresh", name="Fresh entity")  # stored degree 0: what the extractor writes
+    _entity(conn, "stale", name="Stale entity")
+    conn.execute("UPDATE kg_entities SET degree = 57 WHERE uuid = 'stale'")  # old backfill
+    _spokes(conn, "fresh", 5)
+    _spokes(conn, "stale", 2)
+    _rel(conn, "gone", src="stale", tgt="x", t_invalid=_t(3))  # superseded: not an edge
+    with _client(db_url) as client:
+        dossier = client.get("/dash/api/entity/fresh", headers=_H).json()
+        search = client.get(
+            "/dash/api/search", params={"q": "entity", "type": "entities"}, headers=_H
+        ).json()
+        ta = client.get("/dash/api/graph/entities", params={"q": "entity"}, headers=_H).json()
+        nb = client.get("/dash/api/graph/neighborhood?entity=fresh&depth=1", headers=_H).json()
+    assert dossier["entity"]["degree"] == dossier["stats"]["edges"] == 5
+    # Ranked by live degree: fresh (5) outranks stale (2) although its stored column says 0.
+    assert [(h["id"], h["meta"]["degree"]) for h in search["hits"]] == [("fresh", 5), ("stale", 2)]
+    assert [(e["uuid"], e["degree"]) for e in ta] == [("fresh", 5), ("stale", 2)]
+    assert {n["uuid"]: n["degree"] for n in nb["nodes"]}["fresh"] == 5
+
+
+def test_graph_seed_and_truncation_use_live_degree(clean, conn, db_url):
+    # Two same-name nodes: the stored column favours the dead one, live edges the real one.
+    _gent(conn, "dup-dead", name="Twin")
+    _gent(conn, "dup-live", name="Twin")
+    conn.execute("UPDATE kg_entities SET degree = 99 WHERE uuid = 'dup-dead'")
+    _spokes(conn, "dup-live", 3)
+    # Truncation keeps the highest LIVE degree: 'busy' has stored 0 but three edges.
+    _gent(conn, "t-seed", name="Seed")
+    _gent(conn, "t-busy", name="Busy")
+    _gent(conn, "t-idle", name="Idle")
+    conn.execute("UPDATE kg_entities SET degree = 50 WHERE uuid = 't-idle'")
+    _rel(conn, "t1", src="t-seed", tgt="t-busy")
+    _rel(conn, "t2", src="t-seed", tgt="t-idle")
+    _spokes(conn, "t-busy", 3, prefix="tb")
+    with _client(db_url) as client:
+        by_norm = client.get("/dash/api/graph/neighborhood?entity=Twin", headers=_H).json()
+        by_like = client.get("/dash/api/graph/neighborhood?entity=twi", headers=_H).json()
+        cut = client.get(
+            "/dash/api/graph/neighborhood?entity=t-seed&depth=1&limit=2", headers=_H
+        ).json()
+    assert by_norm["seed"] == by_like["seed"] == "dup-live"
+    assert cut["truncated"] is True
+    assert {n["uuid"] for n in cut["nodes"]} == {"t-seed", "t-busy"}
+
+
 # ---------------------------------------------------------------------------
 # Search
 # ---------------------------------------------------------------------------
@@ -589,7 +798,8 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
     epid = _episode(conn, session="q", seq=1, content=f"the {tok} subsystem failed")
     _rel(conn, "sr", src="a", tgt="b", fact=f"{tok} relates to widget", episodes=[epid])
     evid = _event(conn, fact=f"shipped {tok}", source_ref="tb:z")
-    _entity(conn, "se", name=f"{tok} engine", degree=4)
+    _entity(conn, "se", name=f"{tok} engine")
+    _spokes(conn, "se", 4)
 
     with _client(db_url) as client:
         ep = client.get(f"/dash/api/search?q={tok}&type=episodes", headers=_H).json()
@@ -605,6 +815,9 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
 
         ev = client.get(f"/dash/api/search?q={tok}&type=events", headers=_H).json()
         assert ev["hits"][0]["type"] == "events" and ev["hits"][0]["id"] == str(evid)
+        # a git-sourced event has no episode to open: the SHA is all the hit can show
+        assert ev["hits"][0]["meta"]["episode_id"] is None
+        assert ev["hits"][0]["meta"]["source_ref"] == "tb:z"
 
         en = client.get(f"/dash/api/search?q={tok}&type=entities", headers=_H).json()
         assert en["hits"][0]["type"] == "entities" and en["hits"][0]["id"] == "se"
@@ -613,6 +826,57 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
             "entity_type": "Technology",
             "degree": 4,
         }
+
+
+def test_entity_name_matching_is_a_literal_substring(clean, conn, db_url):
+    """'%' and '_' typed into the omnibox, the graph typeahead or the seed box are text, not
+    LIKE wildcards: 'my_skill' must not pull in 'myXskill' ahead of the real entity."""
+    _entity(conn, "w1", name="myXskill")
+    _spokes(conn, "w1", 3)
+    _entity(conn, "w2", name="my_skill")
+    _entity(conn, "w3", name="100% done")
+    with _client(db_url) as client:
+        for q, want in (("my_skill", ["w2"]), ("_", ["w2"]), ("%", ["w3"]), ("y_s", ["w2"])):
+            se = client.get(
+                "/dash/api/search", params={"q": q, "type": "entities"}, headers=_H
+            ).json()
+            assert [h["id"] for h in se["hits"]] == want, q
+            assert se["total_by_type"]["entities"] == len(want), q
+            ta = client.get("/dash/api/graph/entities", params={"q": q}, headers=_H).json()
+            assert [e["uuid"] for e in ta] == want, q
+        # The seed fallback (no uuid, no normalized_name hit) resolves to the literal match.
+        for q, want in (("my_skill", "w2"), ("%", "w3")):
+            nb = client.get("/dash/api/graph/neighborhood", params={"entity": q}, headers=_H).json()
+            assert nb["seed"] == want, q
+        # A backslash is text too, not an escape that swallows the next character.
+        assert client.get("/dash/api/graph/entities", params={"q": "\\"}, headers=_H).json() == []
+
+
+def test_search_survives_query_language_metacharacters(clean, conn, db_url):
+    from ingestion.db_connection import bm25_query_text
+
+    assert bm25_query_text('  err:"E42" (retry)* ') == "err  E42   retry"
+    tok = "metachar"
+    _episode(conn, session="mc", seq=1, content=f"the {tok} E42 failure")
+    with _client(db_url) as client:
+        r = client.get(f"/dash/api/search?q={tok}%3A%22E42%22*&type=episodes", headers=_H)
+        assert r.status_code == 200 and len(r.json()["hits"]) == 1
+
+
+def test_search_load_more_skips_the_tab_counts(clean, conn, db_url):
+    """The four counts belong to the first page of a query; a later page carries only hits
+    (the client keeps the totals it already holds)."""
+    tok = "quibblesome"
+    for i in range(3):
+        _episode(conn, session="lm", seq=i + 1, content=f"the {tok} thing number {i}")
+
+    with _client(db_url) as client:
+        first = client.get(f"/dash/api/search?q={tok}&type=episodes&limit=2", headers=_H).json()
+        assert first["total_by_type"]["episodes"] == 3 and len(first["hits"]) == 2
+        more = client.get(
+            f"/dash/api/search?q={tok}&type=episodes&limit=2&offset=2", headers=_H
+        ).json()
+        assert len(more["hits"]) == 1 and "total_by_type" not in more
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +932,77 @@ def test_flag_toggle_audit_and_feed_reflection(clean, conn, db_url):
     assert [a[0] for a in audit] == ["flag", "unflag", "flag"]
 
 
+def test_flag_with_explicit_state_is_idempotent(clean, conn, db_url):
+    """`flagged` says which state the operator wants, so a stale button or the Flags tab's
+    'unflag' can't invert the intent; a repeat changes nothing and writes no audit row.
+    Without `flagged` the route still toggles (older clients)."""
+    eid = _episode(conn, session="f2", seq=1, content="flag me", created_at=_t(1))
+
+    def post(**body):
+        with _client(db_url) as client:
+            r = client.post(
+                "/dash/api/flag", json={"kind": "episode", "id": str(eid), **body}, headers=_H
+            )
+        assert r.status_code == 200
+        return r.json()["flagged"]
+
+    assert [post(flagged=True), post(flagged=True)] == [True, True]
+    assert [post(flagged=False), post(flagged=False)] == [False, False]
+    assert post() is True  # no state given: toggle
+    assert post() is False
+    assert post(flagged=False) is False
+
+    active = conn.execute(
+        "SELECT count(*) FROM dashboard_flags WHERE item_id=%s AND removed_at IS NULL",
+        (str(eid),),
+    ).fetchone()[0]
+    assert active == 0
+    audit = conn.execute(
+        "SELECT action FROM dashboard_audit WHERE item_id=%s ORDER BY id", (str(eid),)
+    ).fetchall()
+    assert [a[0] for a in audit] == ["flag", "unflag", "flag", "unflag"]
+
+
+def test_flag_concurrent_requests_settle_without_error(clean, conn, db_url):
+    """Two simultaneous requests used to collide on the partial-unique index (500) while
+    the server ended up flagged. Whatever the interleaving, every request now answers 200
+    with a state, and exactly one active row exists."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    eid = _episode(conn, session="f3", seq=1, content="flag me", created_at=_t(1))
+    n = 8
+    gate = Barrier(n)
+
+    def hit(_):
+        gate.wait()
+        return dr._set_flag(db_url, "episode", str(eid), None, True)
+
+    with ThreadPoolExecutor(n) as pool:
+        assert list(pool.map(hit, range(n))) == [True] * n
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_flags WHERE item_id=%s AND removed_at IS NULL",
+            (str(eid),),
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (str(eid),)
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_flag_rejects_non_boolean_state(clean, conn, db_url):
+    with _client(db_url) as client:
+        r = client.post(
+            "/dash/api/flag", json={"kind": "note", "id": "1", "flagged": "yes"}, headers=_H
+        )
+    assert r.status_code == 400
+
+
 def test_flags_list_resolves_gist_per_kind(clean, conn, db_url):
     eid = _episode(conn, session="g", seq=1, content="episode gist line")
     _rel(conn, "gf", src="a", tgt="b", fact="fact gist line")
@@ -692,6 +1027,60 @@ def test_flags_list_resolves_gist_per_kind(clean, conn, db_url):
     assert flags[("timeline_event", str(evid))] == "event gist line"
     assert flags[("note", str(nid))] == "note gist line"
     assert flags[("preference", str(pid))] == "pref gist line"
+
+
+def test_flags_list_carries_a_notes_full_body_for_inline_display(clean, conn, db_url):
+    """A note has no turn to jump to, so the Flags tab shows its hook and body in place;
+    every other kind reports no body."""
+    nid = _note(conn, hook="note hook")
+    conn.execute("UPDATE notes SET body = %s WHERE id = %s", ("line one\nline two", nid))
+    evid = _event(conn, fact="event text", source_ref="tb:b")
+    with _client(db_url) as client:
+        for kind, item in (("note", str(nid)), ("timeline_event", str(evid))):
+            client.post("/dash/api/flag", json={"kind": kind, "id": item}, headers=_H)
+        flags = client.get("/dash/api/flags", headers=_H).json()["flags"]
+    bodies = {f["kind"]: f["body"] for f in flags}
+    assert bodies == {"note": "line one\nline two", "timeline_event": None}
+
+
+def test_flags_list_names_the_episode_each_flag_leads_to(clean, conn, db_url):
+    """Jump needs a target: a fact's first provenance episode, the ep:<id> turn an event,
+    preference or note was born from, and the episode itself. A ref that is not a turn
+    (a git SHA) or whose episode is gone resolves to null."""
+    ep = _episode(conn, session="g2", seq=1, content="source turn")
+    gone = ep + 1000
+    _entity(conn, "ge1", name="Widget")
+    _rel(conn, "gf-ok", src="ge1", tgt="ge1", episodes=[ep, gone])
+    _rel(conn, "gf-none", src="ge1", tgt="ge1", episodes=None)
+    ev_ok = _event(conn, source_ref=f"ep:{ep}#2")
+    ev_sha = _event(conn, source="git:synapse", source_ref="deadbeef")
+    ev_gone = _event(conn, source_ref=f"ep:{gone}")
+    pid = _pref(conn, pref="p", source_ref=f"ep:{ep}")
+    nid = _note(conn, hook="n", source_ref=f"ep:{ep}")
+    with _client(db_url) as client:
+        for kind, item in (
+            ("episode", str(ep)),
+            ("fact", "gf-ok"),
+            ("fact", "gf-none"),
+            ("timeline_event", str(ev_ok)),
+            ("timeline_event", str(ev_sha)),
+            ("timeline_event", str(ev_gone)),
+            ("preference", str(pid)),
+            ("note", str(nid)),
+        ):
+            client.post("/dash/api/flag", json={"kind": kind, "id": item}, headers=_H)
+        flags = client.get("/dash/api/flags", headers=_H).json()["flags"]
+    got = {(f["kind"], f["item_id"]): f["episode_id"] for f in flags}
+    assert got == {
+        ("episode", str(ep)): ep,
+        ("fact", "gf-ok"): ep,
+        ("fact", "gf-none"): None,
+        ("timeline_event", str(ev_ok)): ep,
+        ("timeline_event", str(ev_sha)): None,
+        ("timeline_event", str(ev_gone)): None,
+        ("preference", str(pid)): ep,
+        ("note", str(nid)): ep,
+    }
 
 
 def test_flag_rejects_bad_input(clean, conn, db_url):
@@ -895,8 +1284,32 @@ def test_proposals_unified_list_and_pending_count(clean_proposals, conn, db_url)
         assert {r["kind"] for r in only_skill["proposals"]} == {"skill"}
 
 
+def test_proposals_list_keeps_old_proposed_rows_behind_a_decided_backlog(
+    clean_proposals, conn, db_url, monkeypatch
+):
+    """The per-lane cap must not hide a still-'proposed' row behind newer decided ones:
+    proposed rows come first inside each lane's window, and ?status= is applied in SQL."""
+    monkeypatch.setattr(dr, "_PROPOSALS_LANE_CAP", 3)
+    old_skill = _skill_proposal(conn, name="old-skill", status="proposed", created_at=_t(1))
+    old_cfg = _config_proposal(conn, file_key="old.md", status="proposed", created_at=_t(1))
+    for i in range(4):  # newer decided rows that would fill each lane's window
+        _skill_proposal(conn, name=f"done-{i}", status="rejected", created_at=_t(10 + i))
+        _config_proposal(conn, file_key=f"done-{i}.md", status="rejected", created_at=_t(10 + i))
+
+    with _client(db_url) as client:
+        ids = [r["id"] for r in client.get("/dash/api/proposals", headers=_H).json()["proposals"]]
+        assert f"skill:{old_skill}" in ids and f"config:{old_cfg}" in ids
+        only = client.get("/dash/api/proposals?status=rejected", headers=_H).json()
+        assert {r["status"] for r in only["proposals"]} == {"rejected"}
+        assert len(only["proposals"]) == 6  # the cap applies per lane, after the filter
+        # a status no row has is an empty view, not an error
+        assert (
+            client.get("/dash/api/proposals?status=applied", headers=_H).json()["proposals"] == []
+        )
+
+
 def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_url):
-    # Episode sharing the skill evidence's session_id → best-effort provenance resolves.
+    # Episode sharing the skill evidence's session_id: the session is named, the turn is not.
     ep = _episode(conn, session="sess-sk", seq=1, content="the p95 regression session")
     sk = _skill_proposal(conn, name="latency-triage", status="proposed")
     cf = _config_proposal(conn, file_key="CLAUDE.md", status="proposed")
@@ -909,7 +1322,8 @@ def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_
         assert (
             isinstance(sd["evidence"], list) and sd["evidence"][0]["signal"] == "explicit_request"
         )
-        assert ep in sd["provenance_episodes"]  # resolved from evidence session_id
+        assert sd["provenance_sessions"] == ["sess-sk"]
+        assert ep not in sd["provenance_episodes"]  # nothing in the evidence names a turn
         assert sd["audit_log"] == []  # not decided yet
 
         cd = client.get(f"/dash/api/proposals/config:{cf}", headers=_H).json()
@@ -920,6 +1334,30 @@ def test_proposal_detail_payload_types_and_provenance(clean_proposals, conn, db_
         # malformed id -> 400, missing -> 404.
         assert client.get("/dash/api/proposals/bogus", headers=_H).status_code == 400
         assert client.get("/dash/api/proposals/skill:999999", headers=_H).status_code == 404
+
+
+def test_proposal_provenance_names_cited_turns_and_every_evidence_session(
+    clean_proposals, conn, db_url
+):
+    """Chips used to be the lowest-id turns of the evidence sessions under one global cap of
+    40, so later sessions got none and the turns shown were not the ones cited. Now explicit
+    refs are the episode chips, and every evidence session is listed once, in order."""
+    cited = _episode(conn, session="sess-a", seq=5, content="the cited turn")
+    for i in range(1, 60):  # more early turns than the old cap would have shown
+        _episode(conn, session="sess-a", seq=100 + i, content=f"filler {i}")
+    _episode(conn, session="sess-b", seq=1, content="late session turn")
+    evidence = [
+        {"session_id": "sess-a", "signal": "correction", "episode_id": cited},
+        {"session_id": "sess-b", "signal": "correction", "source_ref": f"ep:{cited}#2"},
+        {"session_id": "sess-a", "signal": "correction"},
+        {"session_id": "sess-c", "signal": "correction", "episode_id": str(cited + 1)},
+        {"signal": "correction", "why": "no session"},
+    ]
+    sk = _skill_proposal(conn, name="latency-triage", evidence=evidence)
+    with _client(db_url) as client:
+        d = client.get(f"/dash/api/proposals/skill:{sk}", headers=_H).json()
+    assert d["provenance_episodes"] == [cited, cited + 1]
+    assert d["provenance_sessions"] == ["sess-a", "sess-b", "sess-c"]
 
 
 def test_proposal_decision_approve_writes_state_and_audit(clean_proposals, conn, db_url):
@@ -980,6 +1418,58 @@ def test_proposal_approve_without_draft_is_refused_and_not_audited(clean_proposa
             "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (f"skill:{sk}",)
         ).fetchone()[0]
         == 0
+    )
+
+
+def test_proposal_decision_only_applies_to_a_proposed_row(clean_proposals, conn, db_url):
+    """A pane loaded earlier (another tab, the CLI) can show 'proposed' for a row that
+    has moved on. Approving an applied config proposal used to put it back to 'accepted'
+    (the CLI would apply it again) and rejecting a promoted skill left it live in the
+    registry with a 30-day cooldown. Anything but 'proposed' is refused and not audited."""
+    applied = _config_proposal(conn, file_key="a.md", status="applied")
+    rejected = _config_proposal(conn, file_key="b.md", status="rejected")
+    promoted = _skill_proposal(conn, name="latency-triage", status="promoted")
+    with _client(db_url) as client:
+        for pid, action in (
+            (f"config:{applied}", "approve"),
+            (f"config:{applied}", "reject"),
+            (f"config:{rejected}", "approve"),
+            (f"skill:{promoted}", "reject"),
+            (f"skill:{promoted}", "approve"),
+        ):
+            r = client.post(
+                f"/dash/api/proposals/{pid}/decision",
+                json={"action": action, "note": "second thoughts"},
+                headers=_H,
+            )
+            assert r.status_code == 200
+            body = r.json()
+            assert body["status"] == "refused", (pid, action)
+            assert "not 'proposed'" in body["detail"]
+    assert conn.execute(
+        "SELECT status FROM config_lane.config_proposals WHERE id = ANY(%s) ORDER BY id",
+        ([applied, rejected],),
+    ).fetchall() == [("applied",), ("rejected",)]
+    assert conn.execute(
+        "SELECT status, rejected_until FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (promoted,),
+    ).fetchone() == ("promoted", None)
+    assert conn.execute("SELECT count(*) FROM dashboard_audit").fetchone()[0] == 0
+
+
+def test_proposal_double_decision_is_refused_the_second_time(clean_proposals, conn, db_url):
+    cf = _config_proposal(conn, file_key="rules/testing.md", status="proposed")
+    with _client(db_url) as client:
+        url = f"/dash/api/proposals/config:{cf}/decision"
+        first = client.post(url, json={"action": "reject", "note": "too generic"}, headers=_H)
+        again = client.post(url, json={"action": "reject", "note": "too generic"}, headers=_H)
+    assert first.json()["status"] == "rejected"
+    assert again.json()["status"] == "refused"
+    assert (
+        conn.execute(
+            "SELECT count(*) FROM dashboard_audit WHERE item_id=%s", (f"config:{cf}",)
+        ).fetchone()[0]
+        == 1
     )
 
 
@@ -1135,10 +1625,193 @@ async def test_stream_manager_hydrates_notify_into_buffer(clean, conn, db_url):
         assert item["gist"] == "stream me" and item["flagged"] is False
         assert item["project"] == "synapse"
         # The status refresher populated the shared snapshot the header badge reads.
-        assert set(mgr.status) == {"queue_depth", "active"}
+        await asyncio.wait_for(mgr.status_ready.wait(), timeout=10)
+        assert set(mgr.status) == {"queue_depth", "processing", "failed", "active"}
         assert isinstance(mgr.status["queue_depth"], int)
     finally:
         mgr.unsubscribe()
+
+
+async def test_stream_manager_relistens_after_the_connection_drops(
+    clean, conn, db_url, monkeypatch
+):
+    """A dropped LISTEN connection (Postgres restart, network blip) must not leave the
+    feed silently stale while clients stay subscribed: the worker reconnects, marks the
+    gap with a `reset` event in the ring (clients refetch page 1), and delivers again."""
+    from mcp_server.dashboard_routes import _StreamManager
+
+    monkeypatch.setattr(dr, "_STREAM_RECONNECT_MIN_S", 0.05)
+    mgr = _StreamManager(db_url)
+    mgr.subscribe()
+    try:
+        await asyncio.wait_for(mgr.listening.wait(), timeout=10)
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND query LIKE 'LISTEN dash_feed%'"
+        )
+        for _ in range(100):  # the drop is seen, then the worker is listening again
+            await asyncio.sleep(0.1)
+            if mgr.buffer.head >= 1 and mgr.listening.is_set():
+                break
+        assert mgr.buffer.head == 1 and mgr.listening.is_set(), "worker did not re-LISTEN"
+        assert mgr.buffer._events[-1][1] == {"type": "reset"}
+
+        eid = _episode(conn, session="strm2", seq=1, content="after the drop")
+        for _ in range(100):
+            if mgr.buffer.head >= 2:
+                break
+            await asyncio.sleep(0.1)
+        assert mgr.buffer.head == 2, "delivery did not resume after the reconnect"
+        assert mgr.buffer._events[-1][1]["id"] == str(eid)
+    finally:
+        mgr.unsubscribe()
+
+
+async def _never_disconnected() -> bool:
+    return False
+
+
+async def _frames_until(stream, event: str, limit: int = 30) -> list[str]:
+    """Pull frames off an _event_stream until one is `event:`-named (inclusive)."""
+    out: list[str] = []
+    for _ in range(limit):
+        frame = await asyncio.wait_for(stream.__anext__(), timeout=10)
+        out.append(frame)
+        if frame.startswith(f"event: {event}\n"):
+            return out
+    raise AssertionError(f"no {event} frame in {limit} frames: {out}")
+
+
+def _frame_payload(frame: str) -> dict:
+    import json as _json
+
+    return _json.loads(frame.split("data: ", 1)[1])
+
+
+def test_processing_status_counts_pending_processing_and_failed(clean, conn, db_url):
+    """The header badge needs more than the pending count: claimed rows (processing) used to
+    vanish from it, and failed rows never showed. queue_depth/active stay for compatibility."""
+    for status in ("pending", "pending", "processing", "failed", "done"):
+        _queue(conn, status=status, enqueued_at=_t(0))
+    assert dr._processing_status(db_url) == {
+        "queue_depth": 2,
+        "processing": 1,
+        "failed": 1,
+        "active": True,
+    }
+
+
+async def test_stream_first_frames_are_ready_then_a_fresh_status(clean, conn, db_url):
+    """A connection opens with `ready` (the stream is positioned and LISTENing: the client
+    refetches page 1 now) and then a status snapshot computed for THIS connection, not the
+    zeros the manager starts with or the previous run's leftovers."""
+    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+
+    _queue(conn, status="pending", enqueued_at=_t(0))
+    _queue(conn, status="processing", enqueued_at=_t(0))
+    mgr = _StreamManager(db_url)
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        frames = await _frames_until(stream, "processing_status")
+        assert frames[0] == "event: ready\ndata: {}\n\n"
+        assert _frame_payload(frames[-1]) == {
+            "queue_depth": 1,
+            "processing": 1,
+            "failed": 0,
+            "active": True,
+        }
+    finally:
+        await stream.aclose()
+    assert mgr.status is None  # the last client left: the snapshot is dropped, not kept stale
+
+    # Next connection, after the queue changed: its first status reflects the change.
+    _queue(conn, status="pending", enqueued_at=_t(0))
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        frames = await _frames_until(stream, "processing_status")
+        assert _frame_payload(frames[-1])["queue_depth"] == 2
+    finally:
+        await stream.aclose()
+
+
+async def test_stream_delivers_a_row_committed_right_after_ready(clean, conn, db_url):
+    """`ready` means the lazily-started worker is LISTENing: a row committed the moment the
+    client sees it (the client's page-1 fetch follows it) is delivered, not lost to the
+    worker's startup the way a first-subscriber NOTIFY used to be."""
+    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+
+    mgr = _StreamManager(db_url)
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        await _frames_until(stream, "ready")
+        assert mgr.listening.is_set()
+        eid = _episode(conn, session="after-ready", seq=1, content="right after ready")
+        frames = await _frames_until(stream, "new_episode")
+        assert _frame_payload(frames[-1])["id"] == str(eid)
+    finally:
+        await stream.aclose()
+
+
+async def test_stream_status_is_dropped_when_the_refresh_fails(clean, db_url, monkeypatch):
+    """A count that can no longer be read is withdrawn (no status frames), not served stale."""
+    from mcp_server.dashboard_routes import _StreamManager
+
+    def boom(_url):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(dr, "_processing_status", boom)
+    mgr = _StreamManager(db_url)
+    mgr.status = {"queue_depth": 9, "active": False}
+    mgr.subscribe()
+    try:
+        await asyncio.wait_for(mgr.status_ready.wait(), timeout=10)
+        assert mgr.status is None
+    finally:
+        mgr.unsubscribe()
+
+
+async def test_stream_replays_buffered_events_after_ready(clean, db_url):
+    from mcp_server.dashboard_routes import _event_stream, _StreamManager
+
+    mgr = _StreamManager(db_url)
+    for i in (1, 2, 3):
+        mgr.buffer.append({"type": "episode", "id": str(i)})
+    stream = _event_stream(mgr, _never_disconnected, 1)  # client has event 1, missed 2 and 3
+    try:
+        frames = await _frames_until(stream, "processing_status")
+        assert [f.split("\n")[0] for f in frames] == [
+            "event: ready",
+            "event: new_episode",
+            "event: new_episode",
+            "event: processing_status",
+        ]
+        assert [f.split("\n")[1] for f in frames[1:3]] == ["id: 2", "id: 3"]
+    finally:
+        await stream.aclose()
+
+
+async def test_stream_resets_a_connection_the_ring_buffer_outran(clean, db_url):
+    """A reader blocked on a yield while the ring evicts events it has not sent must be told
+    (`reset`: refetch page 1), the same as a resume across the gap, not skipped silently."""
+    from mcp_server.dashboard_routes import _event_stream, _FeedEventBuffer, _StreamManager
+
+    mgr = _StreamManager(db_url)
+    mgr.buffer = _FeedEventBuffer(capacity=3)
+    stream = _event_stream(mgr, _never_disconnected, None)
+    try:
+        await _frames_until(stream, "processing_status")  # suspended on that yield
+        for i in range(1, 6):  # a burst of 5 into 3 slots: events 1 and 2 are evicted
+            mgr.buffer.append({"type": "episode", "id": str(i)})
+        frame = await asyncio.wait_for(stream.__anext__(), timeout=10)
+        assert frame == "event: reset\ndata: {}\n\n"
+        # It resumed from the head: later events stream normally, the evicted ones are not
+        # replayed as if nothing happened.
+        mgr.buffer.append({"type": "episode", "id": "6"})
+        frames = await _frames_until(stream, "new_episode")
+        assert frames[-1].splitlines()[1] == "id: 6"
+    finally:
+        await stream.aclose()
 
 
 def test_sse_frame_format():
@@ -1184,7 +1857,15 @@ def test_parse_window_caps_and_defaults():
 def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url):
     now = datetime.now(UTC)
     h = now.replace(minute=0, second=0, microsecond=0)  # current hour-bucket start
-    legs = {"embed": 10.0, "bm25": 20.0, "vector": 30.0, "kg": 40.0, "web": 5.0, "rerank": 50.0}
+    legs = {
+        "embed": 10.0,
+        "bm25": 20.0,
+        "vector": 30.0,
+        "kg": 40.0,
+        "web": 5.0,
+        "rerank": 50.0,
+        "notes": 15.0,
+    }
     # bucket A (current hour): three recall rows, ms 100/200/300 (float32-exact)
     _metric(
         conn,
@@ -1241,7 +1922,7 @@ def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url
     assert big["p50"] == 200.0  # percentile_cont(0.5) over [100,200,300]
     assert big["p95"] == 290.0  # percentile_cont(0.95) interpolates 200→300
     assert big["tokens_p50"] == 1000
-    # only timed legs appear; timeline/prefs were NULL so they're absent
+    # only timed legs appear (notes included; the retired timeline/prefs legs never do)
     assert big["legs_p50"] == {
         "embed": 10.0,
         "bm25": 20.0,
@@ -1249,6 +1930,7 @@ def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url
         "kg": 40.0,
         "web": 5.0,
         "rerank": 50.0,
+        "notes": 15.0,
     }
 
     slow = body["slowest"]
@@ -1262,6 +1944,42 @@ def test_metrics_recall_series_percentiles_slowest_histogram(clean, conn, db_url
     # 0.35→[0.3,0.4), 0.55→[0.5,0.6), 0.72→[0.7,0.8), 0.95→[0.9,1.0)
     assert by_lo[0.3] == 1 and by_lo[0.5] == 1 and by_lo[0.7] == 1 and by_lo[0.9] == 1
     assert sum(b["n"] for b in hist) == 4
+
+
+def test_metrics_recall_retired_legs_are_not_reported(clean, conn, db_url):
+    """Rows written while the timeline/prefs legs ran still carry their timings; the engine
+    no longer produces those legs, so the per-leg stack must not draw them."""
+    mid = _metric(conn, created_at=datetime.now(UTC) - timedelta(minutes=5))
+    conn.execute("UPDATE recall_metrics SET ms_timeline = 7, ms_prefs = 9 WHERE id = %s", (mid,))
+    with _client(db_url) as client:
+        series = client.get("/dash/api/metrics/recall?window=7d", headers=_H).json()["series"]
+    assert series[0]["legs_p50"] == {}
+
+
+def test_metrics_recall_summary_is_window_percentiles(clean, conn, db_url):
+    """The tiles are percentiles of the window's calls, not an average of per-hour
+    percentiles: nine calls at 100 ms in one hour and one at 2000 ms in another average out
+    to ~290 ms, but the window p50 is 100 and p95 is 1145."""
+    h = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    for i in range(9):
+        _metric(
+            conn,
+            ms_total=100.0,
+            est_tokens=500,
+            created_at=h - timedelta(hours=3) + timedelta(minutes=i),
+        )
+    _metric(conn, ms_total=2000.0, est_tokens=1500, created_at=h - timedelta(hours=1))
+    _metric(conn, kind="episodes", ms_total=9999.0, created_at=h - timedelta(hours=1))
+    with _client(db_url) as client:
+        body = client.get("/dash/api/metrics/recall?window=7d", headers=_H).json()
+    assert body["summary"] == {"calls": 10, "p50": 100.0, "p95": 1145.0, "tokens_p50": 500}
+    assert [p["calls"] for p in body["series"]] == [9, 1]
+
+
+def test_metrics_recall_summary_empty_window(clean, conn, db_url):
+    with _client(db_url) as client:
+        body = client.get("/dash/api/metrics/recall?window=7d", headers=_H).json()
+    assert body["summary"] == {"calls": 0, "p50": None, "p95": None, "tokens_p50": None}
 
 
 def test_metrics_ingestion_shape(clean, conn, db_url):
@@ -1305,14 +2023,59 @@ def test_metrics_ingestion_shape(clean, conn, db_url):
     assert b["queue"] == {"pending": 3, "processing": 1, "failed": 1}
     # enqueued/hour: only rows enqueued within 48h (5 of 6; the 5-day-old one is out)
     assert sum(p["n"] for p in b["throughput"]["enqueued_per_hour"]) == 5
-    # completed/hour: rows with processed_at within 48h (failed + done)
-    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 2
+    # completed/hour: rows that finished (status done) within 48h; the failed row is no completion
+    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 1
     assert len(b["failures"]) == 1
     assert b["failures"][0]["error"] == "boom timeout" and b["failures"][0]["attempts"] == 3
     assert b["last_dream"]["id"] == run_id
     assert b["last_dream"]["counts"]["proposals_raised"] == 2
     assert round(b["last_dream"]["duration_s"]) == 41
     assert b["last_dream"]["samples"]["proposals"][0]["id"] == "config:4"
+
+
+def test_metrics_ingestion_failures_stay_inside_the_window(clean, conn, db_url):
+    """A failed row stamps processed_at too, so it must not count as a completion; and the
+    failures panel is the window's, not every failure since the table began."""
+    now = datetime.now(UTC)
+    _queue(
+        conn,
+        status="failed",
+        error="recent",
+        enqueued_at=now - timedelta(hours=3),
+        processed_at=now - timedelta(hours=2),
+    )
+    _queue(
+        conn,
+        status="failed",
+        error="last month",
+        enqueued_at=now - timedelta(days=30),
+        processed_at=now - timedelta(days=29),
+    )
+    _queue(conn, status="done", enqueued_at=now - timedelta(hours=3), processed_at=now)
+    with _client(db_url) as client:
+        b = client.get("/dash/api/metrics/ingestion?window=48h", headers=_H).json()
+    assert [f["error"] for f in b["failures"]] == ["recent"]
+    assert sum(p["n"] for p in b["throughput"]["completed_per_hour"]) == 1
+    assert b["queue"]["failed"] == 2  # the live snapshot still counts both
+
+
+def test_metrics_ingestion_last_dream_prefers_a_finished_run(clean, conn, db_url):
+    """A crashed run (finished_at NULL) must not pin the 'last run' tile until the next
+    nightly run: the latest FINISHED run wins; an unfinished one is the fallback."""
+    now = datetime.now(UTC)
+    done = _dream_run(
+        conn, started_at=now - timedelta(hours=30), finished_at=now - timedelta(hours=29), counts={}
+    )
+    crashed = _dream_run(
+        conn, started_at=now - timedelta(hours=6), finished_at=None, counts={}, ok=None
+    )
+    with _client(db_url) as client:
+        assert (
+            client.get("/dash/api/metrics/ingestion", headers=_H).json()["last_dream"]["id"] == done
+        )
+        conn.execute("DELETE FROM dream_runs WHERE id = %s", (done,))
+        only = client.get("/dash/api/metrics/ingestion", headers=_H).json()["last_dream"]
+    assert only["id"] == crashed and only["finished_at"] is None
 
 
 def test_metrics_ingestion_empty_last_dream(clean, conn, db_url):
@@ -1352,6 +2115,7 @@ def test_metrics_corpus_shape_and_cache(clean, conn, db_url):
     )  # outside the 30d sparkline
     _note(conn)
     _pref(conn)
+    _rel(conn, "c-r1", src="x", tgt="y", created_at=now - timedelta(days=1))
 
     with _client(db_url) as client:
         first = client.get("/dash/api/metrics/corpus", headers=_H).json()
@@ -1373,6 +2137,7 @@ def test_metrics_corpus_shape_and_cache(clean, conn, db_url):
     assert ep["rows"] == 3 and ep["rows_estimated"] is False  # exact count on a small table
     assert len(ep["spark_30d"]) == 30
     assert ep["delta_30d"] == 2  # only the two within 30d
+    assert tables["kg_relationships"]["delta_30d"] == 1  # sparkline off t_created
     proj = {p["name"]: p["n"] for p in first["by_project"]}
     assert proj["alpha"] == 2 and proj["beta"] == 1
     src = {p["name"]: p["n"] for p in first["by_source"]}
@@ -1474,15 +2239,15 @@ def _pref_row(
 # ---------------------------------------------------------------------------
 
 
-def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name=None):
+def _gent(conn, uuid, *, name, entity_type="Technology", normalized_name=None):
     """Entity insert that ALSO sets normalized_name (the shared _entity helper doesn't),
     so the exact-normalized-name seed path is exercisable. entity_supertype mirrors
-    entity_type — the graph payloads serve BOTH (client colors by supertype)."""
+    the subtype — the graph payloads serve BOTH (client colors by supertype)."""
     return conn.execute(
         "INSERT INTO kg_entities "
-        "(uuid, group_id, name, normalized_name, entity_type, entity_supertype, summary, "
-        " degree, created_at) "
-        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        "(uuid, group_id, name, normalized_name, entity_subtype, entity_supertype, summary, "
+        " t_created) "
+        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             name,
@@ -1490,7 +2255,6 @@ def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name
             entity_type,
             entity_type,
             f"{name} summary",
-            degree,
             _t(0),
         ),
     ).fetchone()[0]
@@ -1534,7 +2298,7 @@ def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
         source_ref=f"ep:{eid}",
         salience=2,
         domain="technical",
-        event_type="work",
+        event_type="decision",
         t_valid=_t(30),
     )
     e_mid = _event(
@@ -1544,7 +2308,7 @@ def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
         source_ref="deadbeef",  # git-style ref -> episode_id None
         salience=1,
         domain="personal",
-        event_type="health",
+        event_type="finding",
         t_valid=_t(20),
     )
     e_lo = _event(
@@ -1564,7 +2328,7 @@ def test_timeline_events_default_fields_and_salience(clean, conn, db_url):
     assert ids == [e_hi, e_mid, e_lo]  # t_valid DESC
     by_id = {e["id"]: e for e in body["events"]}
     assert by_id[e_hi]["sal"] == 0.9 and by_id[e_hi]["salience"] == 2
-    assert by_id[e_hi]["event_type"] == "work" and by_id[e_hi]["episode_id"] == eid
+    assert by_id[e_hi]["event_type"] == "decision" and by_id[e_hi]["episode_id"] == eid
     assert by_id[e_mid]["sal"] == 0.6 and by_id[e_mid]["episode_id"] is None
     assert by_id[e_lo]["sal"] == 0.3 and by_id[e_lo]["event_type"] is None  # untyped shown
     assert by_id[e_hi]["flagged"] is False
@@ -1602,19 +2366,118 @@ def test_timeline_keyset_pagination_with_ties(clean, conn, db_url):
 
 
 def test_timeline_type_and_domain_filters(clean, conn, db_url):
-    work = _event(conn, fact="work event", source_ref="tb:w", event_type="work", domain="technical")
-    life = _event(conn, fact="life event", source_ref="tb:l", event_type="life", domain="personal")
+    decision = _event(
+        conn, fact="decided", source_ref="tb:w", event_type="decision", domain="technical"
+    )
+    finding = _event(
+        conn, fact="found out", source_ref="tb:l", event_type="finding", domain="personal"
+    )
     untyped = _event(conn, fact="untyped", source_ref="tb:u", event_type=None, domain="technical")
     with _client(db_url) as client:
         # type chip narrows to that event_type; untyped rows drop out when a chip is active.
-        only_work = client.get("/dash/api/timeline?type=work", headers=_H).json()
-        assert {e["id"] for e in only_work["events"]} == {work}
+        only = client.get("/dash/api/timeline?type=decision", headers=_H).json()
+        assert {e["id"] for e in only["events"]} == {decision}
         # group_id maps to the domain column (schema 038).
         personal = client.get("/dash/api/timeline?group_id=personal", headers=_H).json()
-        assert {e["id"] for e in personal["events"]} == {life}
+        assert {e["id"] for e in personal["events"]} == {finding}
         # No filter -> everything, including the untyped row.
         allrows = client.get("/dash/api/timeline", headers=_H).json()
-        assert {e["id"] for e in allrows["events"]} == {work, life, untyped}
+        assert {e["id"] for e in allrows["events"]} == {decision, finding, untyped}
+
+
+def test_timeline_rejects_a_type_the_pipeline_never_writes(clean, conn, db_url):
+    """Every writer emits decision|action|finding|milestone; any other chip value is a
+    client bug, so it is a 400 rather than a silently empty list."""
+    _event(conn, fact="decided", source_ref="tb:w", event_type="decision")
+    with _client(db_url) as client:
+        for t in ("decision", "action", "finding", "milestone"):
+            assert client.get(f"/dash/api/timeline?type={t}", headers=_H).status_code == 200
+        r = client.get("/dash/api/timeline?type=work", headers=_H)
+        assert r.status_code == 400 and "type" in r.json()["detail"]
+
+
+def test_group_filter_keeps_events_with_no_domain(clean, conn, db_url):
+    """schema 038: a NULL domain FAILS OPEN at read. An unlabelled event (legacy row, gate
+    parse miss, pushed non-git event) stays visible under either group filter, in the
+    timeline, the feed and the search tab (count and hits alike)."""
+    tok = "unlabelledquux"
+    tech = _event(conn, fact=f"{tok} tech", source_ref="tb:t", domain="technical")
+    pers = _event(conn, fact=f"{tok} personal", source_ref="tb:p", domain="personal")
+    blank = _event(conn, fact=f"{tok} blank", source_ref="tb:n", domain=None)
+    with _client(db_url) as client:
+        for group, want in (
+            ("technical", {tech, blank}),
+            ("personal", {pers, blank}),
+            (None, {tech, pers, blank}),
+        ):
+            params = {"group_id": group} if group else {}
+            tl = client.get("/dash/api/timeline", params=params, headers=_H).json()
+            assert {e["id"] for e in tl["events"]} == want, group
+            feed = _feed_page(client, **params)
+            got = {int(i["id"]) for i in feed["items"] if i["type"] == "timeline_event"}
+            assert got == want, group
+            se = client.get(
+                "/dash/api/search",
+                params={"q": tok, "type": "events", **params},
+                headers=_H,
+            ).json()
+            assert {int(h["id"]) for h in se["hits"]} == want, group
+            assert se["total_by_type"]["events"] == len(want), group
+
+
+def test_timeline_months_counts_each_month_in_the_requested_zone(clean, conn, db_url):
+    """The jump-to-date options come from the server: every month that has events under the
+    active filters, newest first, bucketed in the viewer's zone. An evening event the UTC
+    string files under the next month belongs to the month the viewer lived it in, and
+    `before` is that month's end, the cursor that loads the month and everything older."""
+    # 2026-10-01T00:30Z is 2026-09-30 20:30 in Toronto; 2026-09-15 and 2026-07-04 are plain.
+    late = _event(
+        conn, fact="evening", source_ref="m:1", t_valid=datetime(2026, 10, 1, 0, 30, tzinfo=UTC)
+    )
+    sep = _event(
+        conn, fact="mid", source_ref="m:2", t_valid=datetime(2026, 9, 15, 16, 0, tzinfo=UTC)
+    )
+    jul = _event(
+        conn, fact="old", source_ref="m:3", event_type="decision",
+        t_valid=datetime(2026, 7, 4, 16, 0, tzinfo=UTC), domain="personal",
+    )  # fmt: skip
+    with _client(db_url) as client:
+        got = client.get(
+            "/dash/api/timeline/months", params={"tz": "America/Toronto"}, headers=_H
+        ).json()
+        assert [(m["month"], m["n"]) for m in got["months"]] == [("2026-09", 2), ("2026-07", 1)]
+        # The jump boundary is the first instant of October in Toronto (EDT, UTC-4).
+        assert got["months"][0]["before"].startswith("2026-10-01T04:00:00")
+        utc = client.get("/dash/api/timeline/months", params={"tz": "UTC"}, headers=_H).json()
+        assert [(m["month"], m["n"]) for m in utc["months"]] == [
+            ("2026-10", 1), ("2026-09", 1), ("2026-07", 1),
+        ]  # fmt: skip
+        # Same filters as the events list: type, group.
+        typed = client.get(
+            "/dash/api/timeline/months", params={"tz": "UTC", "type": "decision"}, headers=_H
+        ).json()
+        assert [m["month"] for m in typed["months"]] == ["2026-07"]
+        grp = client.get(
+            "/dash/api/timeline/months", params={"tz": "UTC", "group_id": "personal"}, headers=_H
+        ).json()
+        assert [m["month"] for m in grp["months"]] == ["2026-07"]
+        # Loading a month through its `before` returns that month and older, nothing newer.
+        page = client.get(
+            "/dash/api/timeline", params={"before": got["months"][0]["before"]}, headers=_H
+        ).json()
+        assert [e["id"] for e in page["events"]] == [late, sep, jul]
+        july = client.get(
+            "/dash/api/timeline", params={"before": got["months"][1]["before"]}, headers=_H
+        ).json()
+        assert [e["id"] for e in july["events"]] == [jul]
+        # A zone Postgres cannot resolve is a 400, not a 500.
+        assert (
+            client.get(
+                "/dash/api/timeline/months", params={"tz": "Mars/Olympus"}, headers=_H
+            ).status_code
+            == 400
+        )
+        assert client.get("/dash/api/timeline/months", headers=_H).status_code == 400
 
 
 def test_timeline_flag_reflection(clean, conn, db_url):
@@ -1717,7 +2580,7 @@ def test_dream_report_empty(clean, conn, db_url):
 # ---- Behavior files ----
 
 
-def test_behavior_files_grouping_content_and_linkgraph(clean_behavior, conn, db_url):
+def test_behavior_files_grouping_and_content(clean_behavior, conn, db_url):
     _config_reg(
         conn,
         file_key="CLAUDE.md",
@@ -1754,17 +2617,6 @@ def test_behavior_files_grouping_content_and_linkgraph(clean_behavior, conn, db_
             == 404
         )
 
-        # linkgraph: node per logical file_key + one edge per [[wikilink]] instance
-        lg = client.get("/dash/api/behavior/linkgraph", headers=_H).json()
-        node_keys = {n["file_key"] for n in lg["nodes"]}
-        assert node_keys == {"CLAUDE.md", "rules/voice.md", "memory/note1.md", "AGENTS.md"}
-        edge_pairs = {(e["source"], e["target"]) for e in lg["edges"]}
-        assert ("CLAUDE.md", "voice") in edge_pairs and ("CLAUDE.md", "job_crons") in edge_pairs
-        assert ("rules/voice.md", "CLAUDE") in edge_pairs
-        assert ("memory/note1.md", "voice") in edge_pairs
-        # CLAUDE.md's duplicate [[voice]] is deduped in links but the edge list holds one 'voice'.
-        assert sum(1 for e in lg["edges"] if e["source"] == "CLAUDE.md") == 2
-
 
 def test_behavior_file_surface_disambiguation(clean_behavior, conn, db_url):
     # Same file_key on two surfaces (PK includes surface_id) — explicit surface selects one.
@@ -1784,11 +2636,15 @@ def test_phase5_routes_require_machine_token(clean, conn, db_url):
     with _client(db_url) as client:
         for path in (
             "/dash/api/timeline",
+            "/dash/api/timeline?type=work",
+            "/dash/api/timeline?tz=Not/AZone",
+            "/dash/api/timeline/months",
+            "/dash/api/timeline/months?tz=UTC",
+            "/dash/api/timeline/months?tz=Not/AZone",
             "/dash/api/preferences",
             "/dash/api/dream/report",
             "/dash/api/behavior/files",
             "/dash/api/behavior/file?key=CLAUDE.md",
-            "/dash/api/behavior/linkgraph",
         ):
             r = client.get(path)
             assert r.status_code == 401
@@ -1796,17 +2652,18 @@ def test_phase5_routes_require_machine_token(clean, conn, db_url):
 
 
 def _mini_graph(conn):
-    """6-8 entities, ~10 edges, one superseded + one not-yet-valid. Degrees are set so
-    truncation order is deterministic. Returns the seed episode id for provenance checks."""
-    _gent(conn, "g-hub", name="Synapse", degree=10, entity_type="Project")
-    _gent(conn, "g-pg", name="Postgres", degree=8)
-    _gent(conn, "g-cc", name="Claude Code", degree=6)
-    _gent(conn, "g-kg", name="knowledge graph", degree=5, entity_type="Concept")
-    _gent(conn, "g-anthropic", name="Anthropic", degree=4, entity_type="Organization")
-    _gent(conn, "g-nuc", name="homelab NUC", degree=3)  # depth-2 (via g-pg)
-    _gent(conn, "g-sse", name="SSE stream", degree=2)  # depth-2 (via g-cc)
-    _gent(conn, "g-far", name="embedding cache", degree=1)  # depth-2 (via g-pg)
-    _gent(conn, "g-future", name="future thing", degree=0)  # only via a not-yet-valid edge
+    """9 entities, ~10 edges, one superseded + one not-yet-valid. Live degrees come out
+    hub 5 > pg 3 > cc 2 > the rest 1, so truncation order is deterministic. Returns the
+    seed episode id for provenance checks."""
+    _gent(conn, "g-hub", name="Synapse", entity_type="Project")
+    _gent(conn, "g-pg", name="Postgres")
+    _gent(conn, "g-cc", name="Claude Code")
+    _gent(conn, "g-kg", name="knowledge graph", entity_type="Concept")
+    _gent(conn, "g-anthropic", name="Anthropic", entity_type="Organization")
+    _gent(conn, "g-nuc", name="homelab NUC")  # depth-2 (via g-pg)
+    _gent(conn, "g-sse", name="SSE stream")  # depth-2 (via g-cc)
+    _gent(conn, "g-far", name="embedding cache")  # depth-2 (via g-pg)
+    _gent(conn, "g-future", name="future thing")  # only via a not-yet-valid edge
 
     ep = _episode(conn, session="g", seq=1, content="synapse stores in postgres")
     # Depth-1 (from g-hub) live edges.
@@ -1911,8 +2768,11 @@ def test_graph_nodes_carry_supertype(clean, conn, db_url):
     with _client(db_url) as client:
         nb = client.get("/dash/api/graph/neighborhood?entity=g-hub&depth=1", headers=_H).json()
         assert all("supertype" in n for n in nb["nodes"])
+        # entity_type on the wire is the taxonomy subtype (entity_subtype, schema 020).
+        assert {n["uuid"]: n["entity_type"] for n in nb["nodes"]}["g-hub"] == "Project"
         ta = client.get("/dash/api/graph/entities?q=Synapse", headers=_H).json()
         assert all("supertype" in e for e in ta)
+        assert [e["entity_type"] for e in ta] == ["Project"]
 
 
 def test_graph_typeahead(clean, conn, db_url):
@@ -2006,7 +2866,7 @@ def test_graph_neighborhood_truncation_keeps_highest_degree(clean, conn, db_url)
         ).json()
         assert r["truncated"] is True
         kept = {n["uuid"] for n in r["nodes"]}
-        # budget 3 -> seed (always) + the two highest-degree reachable nodes (g-pg=8, g-cc=6).
+        # budget 3 -> seed (always) + the two highest-degree reachable nodes (g-pg=3, g-cc=2 live edges).
         assert kept == {"g-hub", "g-pg", "g-cc"}
         # every returned edge connects two kept nodes.
         for e in r["edges"]:
@@ -2018,9 +2878,9 @@ def test_graph_neighborhood_edge_cap_prunes_orphans(clean, conn, db_url):
     most-retrieved edges win, truncated flips, and nodes the cut orphaned are pruned
     (regression: the live 707-degree hub returned 150 nodes / ~2K edges and hung the
     browser in layout)."""
-    _gent(conn, "ec-hub", name="Hub", degree=9)
+    _gent(conn, "ec-hub", name="Hub")
     for i in range(4):
-        _gent(conn, f"ec-n{i}", name=f"Node {i}", degree=4 - i)
+        _gent(conn, f"ec-n{i}", name=f"Node {i}")
     # 4 seed-adjacent edges with distinct retrieval_counts + 2 leaf-leaf edges.
     for i in range(4):
         _rel(conn, f"ec-e{i}", src="ec-hub", tgt=f"ec-n{i}", retrieval_count=10 - i)
@@ -2179,6 +3039,94 @@ def test_delete_episode_retires_flag_and_audits(clean, conn, db_url):
     assert [a[0] for a in audit] == ["flag", "delete_episode"]
     assert audit[1][1] == "episode"
     assert audit[1][2] == body  # the cascade summary IS the audit detail
+
+
+def test_delete_episode_removes_chunk_queue_rows_in_every_status(clean, conn, db_url):
+    """Chunk queue rows are keyed by (session_id, content) with no episode_id, so the 001
+    FK never reaches them. A pending one would re-extract the deleted text into facts with
+    no provenance; a done one still stores it verbatim. Both must go with the chunk."""
+    keep = _episode(conn, session="d6", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d6", seq=2, content="doomed turn with sk-SECRET")
+    window = "survivor turn\ndoomed turn with sk-SECRET"
+    _chunk(conn, session="d6", start=1, end=2, episode_ids=[keep, doomed], content=window)
+    _chunk(conn, session="d6", start=3, end=4, episode_ids=[keep], content="untouched window")
+    for status in ("pending", "processing", "done", "failed"):
+        _queue(
+            conn,
+            content=window,
+            status=status,
+            content_type="chunk",
+            session_id="d6",
+            enqueued_at=_t(0),
+        )
+    _queue(
+        conn, content=window, content_type="chunk", session_id="other-session", enqueued_at=_t(0)
+    )
+    _queue(
+        conn, content="untouched window", content_type="chunk", session_id="d6", enqueued_at=_t(0)
+    )
+
+    with _client(db_url) as client:
+        r = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H)
+    assert r.status_code == 200
+    left = conn.execute("SELECT content, session_id FROM extraction_queue ORDER BY id").fetchall()
+    assert left == [(window, "other-session"), ("untouched window", "d6")]
+
+
+def test_delete_episode_reports_cascaded_fact_and_event_ids(clean, conn, db_url):
+    """The client drops the cascade's rows from its lists: the response names the facts
+    and events that went, and only those (an unlinked fact is still there)."""
+    keep = _episode(conn, session="d7", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d7", seq=2, content="doomed turn")
+    _entity(conn, "i-e1", name="Widget")
+    _rel(conn, "i-sole", src="i-e1", tgt="i-e1", episodes=[doomed])
+    _rel(conn, "i-shared", src="i-e1", tgt="i-e1", episodes=[keep, doomed])
+    ev = _event(conn, fact="event one", source_ref=f"ep:{doomed}")
+    _event(conn, fact="other episode", source_ref=f"ep:{keep}")
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["deleted_fact_ids"] == ["i-sole"]
+    assert body["deleted_event_ids"] == [ev]
+
+
+def test_delete_episode_retires_flags_on_cascaded_facts_and_events(clean, conn, db_url):
+    """A flag on a row the cascade removed must not outlive it as a ghost in the Flags
+    list; flags on rows that survive (an unlinked fact) stay."""
+    keep = _episode(conn, session="d8", seq=1, content="survivor turn")
+    doomed = _episode(conn, session="d8", seq=2, content="doomed turn")
+    _entity(conn, "j-e1", name="Widget")
+    _rel(conn, "j-sole", src="j-e1", tgt="j-e1", episodes=[doomed])
+    _rel(conn, "j-shared", src="j-e1", tgt="j-e1", episodes=[keep, doomed])
+    ev = _event(conn, fact="event one", source_ref=f"ep:{doomed}")
+    with _client(db_url) as client:
+        for kind, item in (
+            ("episode", str(doomed)),
+            ("fact", "j-sole"),
+            ("fact", "j-shared"),
+            ("timeline_event", str(ev)),
+        ):
+            client.post("/dash/api/flag", json={"kind": kind, "id": item}, headers=_H)
+        client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H)
+        flags = client.get("/dash/api/flags", headers=_H).json()["flags"]
+    assert [(f["kind"], f["item_id"]) for f in flags] == [("fact", "j-shared")]
+
+
+def test_delete_episode_deletes_retold_events_with_their_owner_turn(clean, conn, db_url):
+    """Schema 037's merge bumps reported_count when a later turn re-tells an event but
+    records no list of re-telling turns, so the cascade cannot tell whether one still
+    exists. Keeping the row would leave text from the deleted turn that no stored turn
+    backs; the owner's delete removes it whatever its count."""
+    doomed = _episode(conn, session="d9", seq=1, content="doomed turn")
+    sole = _event(conn, fact="told once", source_ref=f"ep:{doomed}", reported_count=1)
+    retold = _event(conn, fact="told twice", source_ref=f"ep:{doomed}#2", reported_count=2)
+
+    with _client(db_url) as client:
+        body = client.request("DELETE", f"/dash/api/episodes/{doomed}", headers=_H).json()
+    assert body["events_deleted"] == 2
+    assert sorted(body["deleted_event_ids"]) == sorted([sole, retold])
+    assert "events_kept" not in body
+    assert conn.execute("SELECT count(*) FROM timeline_events").fetchone()[0] == 0
 
 
 def test_delete_bad_id_missing_row_and_auth(clean, conn, db_url):

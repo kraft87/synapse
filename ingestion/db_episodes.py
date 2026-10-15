@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any, cast
 
 import orjson
@@ -7,8 +8,15 @@ import psycopg
 
 from ingestion.db_connection import DatabaseConnection
 from ingestion.models import Episode
+from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import OWN_SURFACE_PROBE, own_surface_columns_ready
 from ingestion.textsafe import strip_nul
+
+#: The ``deleted_turns`` tombstone table (an optional migration): until it exists nothing is
+#: tombstoned and the ingest check is skipped, which is the pre-migration behaviour.
+DELETED_TURNS_PROBE = ColumnProbe(
+    "SELECT 1 WHERE to_regclass('deleted_turns') IS NOT NULL", "deleted_turns tombstones"
+)
 
 _UPSERT_COLUMNS = """
     (session_id, sequence, project, platform, model,
@@ -33,6 +41,23 @@ ON CONFLICT (session_id, sequence) DO UPDATE SET
 RETURNING id
 """
 
+#: append_episode: the next sequence is read in the INSERT itself, with the same 057 split
+#: as the upsert above. DO NOTHING (no row back) is a writer that holds this sequence in a
+#: transaction that has now committed; the caller reads the maximum again.
+_APPEND_SQL = """
+INSERT INTO episodes (session_id, sequence, project, content, source, metadata{extra_col})
+SELECT %(session_id)s, coalesce(max(sequence), 0) + 1, %(project)s, %(content)s, %(source)s,
+       '{{}}'::jsonb{extra_val}
+FROM episodes WHERE session_id = %(session_id)s
+ON CONFLICT (session_id, sequence) DO NOTHING
+RETURNING id
+"""
+#: Each lost pass means another writer committed a higher sequence, so a second pass
+#: nearly always wins; this only bounds a session under a continuous write storm.
+_APPEND_ATTEMPTS = 5
+_APPEND = _APPEND_SQL.format(extra_col="", extra_val="")
+_APPEND_STAMPED = _APPEND_SQL.format(extra_col=", surface_id", extra_val=", %(surface_id)s")
+
 #: The pre-057 statement: what runs until the provenance column exists.
 _UPSERT = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(extra_col="", extra_val="", extra_set="")
 
@@ -50,6 +75,13 @@ _UPSERT_STAMPED = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(
         " EXCLUDED.surface_id\n                          THEN episodes.surface_id END"
     ),
 )
+
+
+def content_md5(content: str) -> str:
+    """Hex md5 of ``content`` as Postgres's ``md5(text)`` computes it (UTF-8 bytes): the
+    key of ``episodes_content_md5_idx`` and of ``deleted_turns.content_md5``. A dedup
+    key, not a security hash."""
+    return hashlib.md5(content.encode(), usedforsecurity=False).hexdigest()
 
 
 class EpisodeStore(DatabaseConnection):
@@ -71,12 +103,31 @@ class EpisodeStore(DatabaseConnection):
         assistant/tool half of the turn. The ``cwd`` leg catches a replay whose first
         copy was stored under an older label for the same folder (a subfolder or
         worktree name, a whole Windows path) until relabel_projects merges them.
-        Probe is an index hit via episodes_content_md5_idx (schema 036)."""
+        Probe is an index hit via episodes_content_md5_idx (schema 036); the digest is
+        computed here so the turn's text crosses the wire once, in the INSERT."""
         with self._conn() as conn:
             row = conn.execute(
-                "SELECT 1 FROM episodes WHERE md5(content) = md5(%s) "
+                "SELECT 1 FROM episodes WHERE md5(content) = %s "
                 "AND (project IS NOT DISTINCT FROM %s OR metadata->>'cwd' = %s) LIMIT 1",
-                (content, project, cwd or None),
+                (content_md5(content), project, cwd or None),
+            ).fetchone()
+        return row is not None
+
+    def is_tombstoned(
+        self, span_id: str | None, project: str | None, content: str, cwd: str | None
+    ) -> bool:
+        """True if this turn was deleted from memory (``deleted_turns``) and must not come
+        back: its span_id was deleted, or byte-identical content was deleted from this
+        project or working directory (the same scope as :meth:`content_dup_exists`, and
+        for the same reason: a re-shipped session carries fresh span ids). Always False
+        until the tombstone migration is applied."""
+        with self._conn() as conn:
+            if not DELETED_TURNS_PROBE.ready(conn, self._url):
+                return False
+            row = conn.execute(
+                "SELECT 1 FROM deleted_turns WHERE span_id = %s "
+                "OR (content_md5 = %s AND (project IS NOT DISTINCT FROM %s OR cwd = %s)) LIMIT 1",
+                (span_id, content_md5(content), project, cwd or None),
             ).fetchone()
         return row is not None
 
@@ -88,13 +139,14 @@ class EpisodeStore(DatabaseConnection):
         schema/050 has no private sessions to honour, so it reads as not-private rather
         than blocking all ingestion. Every other error propagates — see
         ``ingestion.private_sessions.PrivateSessions`` for why this leg fails closed."""
-        try:
-            with self._conn() as conn:
-                row = conn.execute(
-                    "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
-                ).fetchone()
-        except psycopg.errors.UndefinedTable:
-            return False
+        with self._conn() as conn:
+            try:
+                with conn.transaction():  # a savepoint, so a caller's open transaction survives
+                    row = conn.execute(
+                        "SELECT 1 FROM private_sessions WHERE session_id = %s", (session_id,)
+                    ).fetchone()
+            except psycopg.errors.UndefinedTable:
+                return False
         return row is not None
 
     def upsert_episode(self, ep: Episode) -> int:
@@ -105,34 +157,33 @@ class EpisodeStore(DatabaseConnection):
         # ranking, and the KG's fact t_valid via get_episodes_valid_at. NULL
         # (no transcript ts) falls back to now(), right for live ingestion.
         #
-        # strip_nul on the text/metadata fields: TEXT columns reject NUL bytes
-        # and jsonb rejects the u0000 escape, so one stray byte in a transcript
-        # would fail the whole INSERT.
+        # The text fields arrive NUL-free (Episode strips them); metadata is stripped here
+        # because jsonb rejects the u0000 escape and one stray byte would fail the INSERT.
         params = {
             "session_id": ep.session_id,
             "sequence": ep.sequence,
             "project": ep.project,
             "platform": ep.platform,
             "model": ep.model,
-            "human_turn": strip_nul(ep.human_turn),
-            "assistant_turn": strip_nul(ep.assistant_turn),
-            "content": strip_nul(ep.content),
+            "human_turn": ep.human_turn,
+            "assistant_turn": ep.assistant_turn,
+            "content": ep.content,
             "span_id": ep.span_id,
             "metadata": orjson.dumps(strip_nul(ep.metadata)).decode(),
             "source": ep.source,
             "created_at": ep.created_at,
             "surface_id": ep.surface_id,
         }
-        try:
-            with self._conn() as conn:
-                # Schema 057 names the provenance column; before it is applied the
-                # statement is exactly the pre-057 one and the stamp is dropped.
-                sql = _UPSERT_STAMPED if own_surface_columns_ready(conn, self._url) else _UPSERT
-                row = conn.execute(sql, params).fetchone()
-        except psycopg.errors.UndefinedColumn as e:
-            # 057 rolled back under a running process: note it, write the pre-057 row.
-            OWN_SURFACE_PROBE.missing(self._url, e)
-            with self._conn() as conn:
+        with self._conn() as conn:
+            # Schema 057 names the provenance column; before it is applied the
+            # statement is exactly the pre-057 one and the stamp is dropped.
+            sql = _UPSERT_STAMPED if own_surface_columns_ready(conn, self._url) else _UPSERT
+            try:
+                with conn.transaction():  # a savepoint, so a caller's open transaction survives
+                    row = conn.execute(sql, params).fetchone()
+            except psycopg.errors.UndefinedColumn as e:
+                # 057 rolled back under a running process: note it, write the pre-057 row.
+                OWN_SURFACE_PROBE.missing(self._url, e)
                 row = conn.execute(_UPSERT, params).fetchone()
 
         assert row is not None, "INSERT RETURNING id returned nothing"
@@ -154,12 +205,12 @@ class EpisodeStore(DatabaseConnection):
     def get_session_span_index(self, session_id: str) -> tuple[set[str], int]:
         """Return (stored span_ids, max sequence) for a session.
 
-        Lean companion to :meth:`get_session_episodes` for the /ingest hot path.
-        The push keys turns by span_id (the stable identity — a turn's last record
-        uuid) and appends new ones at ``max(sequence) + 1``, so a bounded-tail POST
-        renumbers from the DB high-water mark instead of the parser's positional
-        counter. Pulls two columns instead of full rows since that's all the dedup
-        needs.
+        Lean companion to :meth:`get_session_episodes` for the episode writer (/ingest
+        and every backfill). It keys turns by span_id (the stable identity — a turn's
+        last record uuid) and appends new ones at ``max(sequence) + 1``, so a
+        bounded-tail POST renumbers from the DB high-water mark instead of the parser's
+        positional counter. Pulls two columns instead of full rows (the 2048-dim vector
+        alone is ~20KB of text per row) since that's all the dedup needs.
         """
         with self._conn() as conn:
             rows = conn.execute(
@@ -169,6 +220,35 @@ class EpisodeStore(DatabaseConnection):
         span_ids: set[str] = {r["span_id"] for r in rows if r["span_id"]}
         max_seq = max((int(r["sequence"]) for r in rows), default=0)
         return span_ids, max_seq
+
+    def append_episode(self, ep: Episode) -> int:
+        """Insert ``ep`` at the next free sequence of its session (``ep.sequence`` is
+        ignored) and return the new row's id. For writers that are not the transcript
+        parser, such as remember()'s archive.
+
+        Unlike :meth:`upsert_episode` this never rewrites a row. The sequence is
+        ``max + 1`` read in the same statement as the insert, under a per-session advisory
+        lock, so two appends to one session (parallel remember() calls) take consecutive
+        sequences instead of one replacing the other. A transcript ingest that has not
+        committed yet can hold the same sequence: the insert waits for it, finds the
+        sequence taken and runs again against the new maximum."""
+        params = {
+            "session_id": ep.session_id,
+            "project": ep.project,
+            "content": strip_nul(ep.content),
+            "source": ep.source,
+            "surface_id": ep.surface_id,
+        }
+        with self._conn() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (ep.session_id,))
+            # Schema 057 names the provenance column; before it is applied the stamp is
+            # dropped, as in upsert_episode.
+            sql = _APPEND_STAMPED if own_surface_columns_ready(conn, self._url) else _APPEND
+            for _ in range(_APPEND_ATTEMPTS):
+                row = conn.execute(sql, params).fetchone()
+                if row is not None:
+                    return cast(int, row["id"])
+        raise RuntimeError(f"no free sequence in session {ep.session_id!r} after retries")
 
     def get_episodes_valid_at(self, episode_ids: list[int]) -> str | None:
         """Representative valid-time for a set of source episodes = MAX(created_at),

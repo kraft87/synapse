@@ -23,7 +23,7 @@
   --et-person:#e0a1b8; --et-project:#56c8d8; --et-tech:#9b87e0; --et-org:#d9a05b; --et-concept:#7fbf7f; --et-event:#aeb8c2;
   /* recall waterfall legs — stable across the Recall waterfall + the Metrics stack */
   --leg-embed:#5a6774; --leg-bm25:#d9a05b; --leg-vector:#56c8d8; --leg-kg:#9b87e0;
-  --leg-timeline:#7fbf7f; --leg-prefs:#e0a1b8; --leg-web:#8b99a6; --leg-rerank:#e08b7a;
+  --leg-notes:#7fbf7f; --leg-web:#8b99a6; --leg-rerank:#e08b7a;
   --scrim:rgba(5,8,11,.6);
   --font-prose:'IBM Plex Sans', system-ui, sans-serif;
   --font-data:'IBM Plex Mono', ui-monospace, monospace;
@@ -86,6 +86,10 @@ a { color:var(--acc); }
 .field:focus.field-err { border-color:var(--err) !important; }
 .gbtn:hover { border-color:var(--line2) !important; }
 
+/* a table wider than its panel scrolls inside the panel; the panel clips its corners, so no
+   inline overflow (an inline style would beat this rule) */
+.scrollx { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+
 /* ---- metrics ---- */
 .metrics-tab:hover { color:var(--txt) !important; }
 .corpus-row:hover { background:var(--bg2); }
@@ -128,7 +132,6 @@ a { color:var(--acc); }
   .duo { grid-template-columns:1fr !important; }
   .proposals-grid { grid-template-columns:1fr !important; }
   .statgrid { grid-template-columns:repeat(2,1fr) !important; }
-  .scrollx { overflow-x:auto; -webkit-overflow-scrolling:touch; }
   .hdr-filters { order:3; }
   .search-tabs { overflow-x:auto; }
 }

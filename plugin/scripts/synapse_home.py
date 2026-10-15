@@ -16,6 +16,8 @@ as fallbacks, so an existing install keeps working with no action.
       "skills_sync": true,
       "config_sync": false,
       "config_paths": ["output-styles/*.md"],
+      "timeline_repos": ["~/code/synapse"],
+      "recall_nudge": false,
       "device": {"surface_id": ..., "trust": ..., "token_sha256": ..., "server": ...}
     }
 
@@ -31,7 +33,6 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
 from pathlib import Path
 
 #: config.json key -> the env / plugin-option name the rest of the client resolves by.
@@ -42,9 +43,26 @@ KEYS = {
     "skills_sync": "SYNAPSE_SKILLS_SYNC",
     "config_sync": "SYNAPSE_CONFIG_SYNC",
     "config_paths": "SYNAPSE_CONFIG_PATHS",
+    "timeline_repos": "SYNAPSE_TIMELINE_REPOS",
+    "board": "SYNAPSE_BOARD",
+    "prefs_block": "SYNAPSE_PREFS_BLOCK",
+    "recall_nudge": "SYNAPSE_RECALL_NUDGE",
+    "prompt_timestamp": "SYNAPSE_PROMPT_TIMESTAMP",
+    "recall_feedback_nudge": "SYNAPSE_RECALL_FEEDBACK_NUDGE",
 }
 _BY_OPTION = {opt: key for key, opt in KEYS.items()}
-BOOL_KEYS = frozenset({"skills_sync", "config_sync"})
+BOOL_KEYS = frozenset(
+    {
+        "skills_sync",
+        "config_sync",
+        "board",
+        "prefs_block",
+        "recall_nudge",
+        "prompt_timestamp",
+        "recall_feedback_nudge",
+    }
+)
+LIST_KEYS = frozenset({"config_paths", "timeline_repos"})
 
 _TRUE = frozenset({"1", "true", "yes", "y", "on"})
 _FALSE = frozenset({"0", "false", "no", "n", "off"})
@@ -61,6 +79,16 @@ def config_file() -> Path:
     return home() / "config.json"
 
 
+def client_version() -> str:
+    """The installed client's version (plugin/.claude-plugin/plugin.json, which ships in
+    every install), or "unknown" when the manifest is missing."""
+    manifest = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
+    try:
+        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown")
+    except (OSError, ValueError, AttributeError):
+        return "unknown"
+
+
 def load(path: Path | None = None) -> dict:
     """The parsed config, or ``{}`` when it is missing, unreadable or not an object.
     Hooks call this at import, so it never raises."""
@@ -71,15 +99,17 @@ def load(path: Path | None = None) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def save(data: dict, path: Path | None = None) -> None:
-    """Write ``data`` atomically, owner-only. Raises OSError: callers decide whether a
-    failed write is fatal (the CLI) or ignorable (hook bookkeeping)."""
-    path = path or config_file()
-    created = not path.parent.exists()
+def atomic_write_json(path: Path, data: dict) -> None:
+    """Write ``data`` to ``path`` as JSON through a fresh temp file renamed over it, so a
+    crash leaves the previous file, never half of one. The new file is owner-only (a
+    config.json holds a credential), and a symlinked ``path`` (a dotfiles repo) keeps its
+    link: the file it points at is the one replaced. Creates the parent directory. Raises
+    OSError."""
+    import tempfile  # deferred: every hook imports this module, only a writer needs it
+
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True)
-    if created and os.name != "nt":
-        os.chmod(path.parent, 0o700)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".config.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -91,6 +121,17 @@ def save(data: dict, path: Path | None = None) -> None:
         except OSError:
             pass
         raise
+
+
+def save(data: dict, path: Path | None = None) -> None:
+    """Write ``data`` atomically, owner-only. Raises OSError: callers decide whether a
+    failed write is fatal (the CLI) or ignorable (hook bookkeeping)."""
+    path = path or config_file()
+    created = not path.parent.exists()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if created and os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    atomic_write_json(path, data)
 
 
 def update(changes: dict, path: Path | None = None) -> dict:
@@ -151,3 +192,52 @@ def plugin_options(settings_files) -> dict:
             if str(cfg_key).split("@", 1)[0] == "synapse" and isinstance(opts, dict):
                 merged.update({k: v for k, v in opts.items() if v not in (None, "")})
     return merged
+
+
+def settings_for_update(path: Path) -> dict:
+    """The Claude settings.json at ``path`` to edit and write back: ``{}`` when it doesn't
+    exist yet. Raises RuntimeError when it exists but isn't a readable JSON object, so a
+    rewrite never replaces the user's settings with only the keys this code knows about."""
+    if not path.exists():
+        return {}
+    data = load(path)
+    if not data and path.read_bytes().strip() not in (b"", b"{}"):
+        raise RuntimeError(f"{path} isn't valid JSON; fix it and run this again")
+    return data
+
+
+def drop_plugin_options(path: Path, names) -> None:
+    """Remove ``names`` from every pluginConfigs."synapse@<any>" options block of the
+    settings.json at ``path``. An unreadable file is left alone. Raises OSError."""
+    data = load(path)
+    configs = data.get("pluginConfigs")
+    touched = False
+    for cfg_key, cfg in configs.items() if isinstance(configs, dict) else ():
+        opts = cfg.get("options") if isinstance(cfg, dict) else None
+        if str(cfg_key).split("@", 1)[0] != "synapse" or not isinstance(opts, dict):
+            continue
+        for name in names:
+            if name in opts:
+                del opts[name]
+                touched = True
+    if touched:
+        atomic_write_json(path, data)
+
+
+_LOG_CAP = 64 * 1024
+
+
+def log(name: str, msg: str) -> None:
+    """Append a timestamped line to ``logs/<name>.log`` under the Synapse home, the one
+    place every client script logs (hooks run detached, so nothing else would see it).
+    A file past 64 KB starts over. Never raises: a log is not worth failing a hook for."""
+    try:
+        from datetime import UTC, datetime  # deferred: every hook imports this module
+
+        path = home() / "logs" / f"{name}.log"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = "w" if path.exists() and path.stat().st_size > _LOG_CAP else "a"
+        with open(path, mode, encoding="utf-8") as f:
+            f.write(f"{datetime.now(UTC).isoformat(timespec='seconds')} {msg}\n")
+    except (OSError, ValueError):
+        pass

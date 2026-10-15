@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from datetime import datetime
 from typing import Any
@@ -9,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ingestion.secret_redact import redact_secrets
+from ingestion.textsafe import strip_nul
 
 logger = logging.getLogger(__name__)
 
@@ -44,9 +44,6 @@ MAX_FACT_LEN = 2000
 #     all survive.
 #   * abstraction is judged on the HEAD noun (the LAST word), so "Statement of Defence"
 #     and "Certificate of Insurance" survive while a bare "statement" does not.
-#
-# SYNAPSE_BANNED_NAME_FILTER=0 disables the drop for instant rollback (and lets the
-# prompt A/B harness run a filter-free control arm against the same code).
 _UNIT = (
     r"%|am|pm|lbs?|kgs?|kms?|mb|gb|tb|hours?|hrs?|min(?:ute)?s?|days?|weeks?|months?|"
     r"years?|business\s+days?|cases|applicants|reps?|pipelines?|candidates?|"
@@ -121,15 +118,6 @@ def banned_name(name: str) -> str | None:
     return None
 
 
-def _name_filter_on() -> bool:
-    """Read the rollback flag per call, not at import.
-
-    The A/B harness flips it between arms inside one process; a module-level
-    constant would freeze whichever value happened to be set at import time.
-    """
-    return os.getenv("SYNAPSE_BANNED_NAME_FILTER", "1") not in ("0", "false", "")
-
-
 def _normalize_entity_name(name: str) -> str:
     """Case-insensitive, whitespace-collapsed normalization for cross-ref matching.
 
@@ -158,29 +146,14 @@ class Episode(BaseModel):
     surface_id: str | None = None
 
     # Every ingest path builds an Episode, so this is the one place a credential in a
-    # transcript is stopped before it is stored, chunked, extracted or served.
+    # transcript is stopped before it is stored, chunked, extracted or served, and the
+    # one place NUL bytes go (TEXT columns reject them, so one stray byte would fail the
+    # episode INSERT and its queue row). NULs first, so one cannot split a credential.
     @field_validator("human_turn", "assistant_turn", "content")
     @classmethod
-    def _redact(cls, v: str | None) -> str | None:
-        return redact_secrets(v)
-
-
-class SessionSummary(BaseModel):
-    session_id: str
-    project: str | None = None
-    platform: str | None = None
-    summary: str
-    last_summarized_sequence: int
-
-
-class LogfireSpan(BaseModel):
-    span_id: str
-    trace_id: str
-    message: str
-    model: str | None = None
-    input_messages: Any = None  # raw JSON from Logfire
-    output_messages: Any = None  # raw JSON from Logfire
-    start_timestamp: str
+    def _clean(cls, v: str | None) -> str | None:
+        text: str | None = strip_nul(v)
+        return redact_secrets(text)
 
 
 class ExtractionItem(BaseModel):
@@ -299,7 +272,7 @@ class CombinedExtraction(BaseModel):
                 )
                 dropped_entities.append(entity)
                 continue
-            reason = banned_name(entity.name) if _name_filter_on() else None
+            reason = banned_name(entity.name)
             if reason:
                 # Facts using this entity as an endpoint fall out below via the
                 # cross-reference pass (an edge cannot survive a missing

@@ -1,121 +1,124 @@
 #!/usr/bin/env bash
 # Apply the Synapse schema, in order, to a Postgres database.
 #
-# THE single source of truth for schema file order. All three consumers run
-# this same script so the tested path and the shipped path can't drift:
+# THE single source of truth for schema file order: every numbered
+# schema/NNN_*.sql, ascending. All consumers run this same script so the tested
+# path and the shipped path can't drift:
 #   * CI's ephemeral test-DB provision (.github/workflows/ci.yml)
 #   * first container boot (init/01_apply_schema.sh via docker-entrypoint-initdb.d)
-#   * manual runs against an existing database (see README "Upgrading")
+#   * manual runs against an existing database (docs/install.md "Upgrading", `make schema`)
 #
 # Usage:
-#   scripts/apply_schema.sh [DSN]
+#   scripts/apply_schema.sh [--all | --from NNN] [DSN]
 #     DSN    e.g. postgresql://synapse:pw@localhost:5432/synapse
 #            Defaults to $SYNAPSE_DB_URL. If that is empty too, psql falls back
 #            to its standard PG* env vars / local socket — that's how the
 #            first-boot init hook connects.
+#     (none) applies only the files numbered ABOVE synapse_meta.schema_version, the
+#            stamp this script writes (a fresh database gets every file). An
+#            upgrade is therefore one command that doesn't repeat what was applied.
+#     --all  applies every file regardless of the stamp. Every file is safe to
+#            re-run, but it repeats their backfills too (056's), so expect it to
+#            take a while on a large database.
+#     --from NNN  applies the files numbered NNN and above. Needed once for a
+#            database that has tables but no stamp (it predates migration 034),
+#            and to catch up a migration numbered below the stamp.
 #   SCHEMA_DIR=/path  overrides the schema directory (default: <repo>/schema;
 #            the first-boot hook sets /schema, a read-only mount).
 #
-# Every file runs with ON_ERROR_STOP=1. Designed for a fresh/empty database;
-# most files are idempotent (IF NOT EXISTS / IF EXISTS guards) but a full
-# re-run against a large populated database can be slow (e.g. 003's ALTER
-# COLUMN TYPE rewrites the episodes table) — for upgrades, prefer applying
-# only the files newer than the database's current state.
+# Every file runs with ON_ERROR_STOP=1. Migrations are applied by number, so a
+# new one must be numbered above every migration already shipped.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCHEMA_DIR="${SCHEMA_DIR:-$SCRIPT_DIR/../schema}"
-DSN="${1:-${SYNAPSE_DB_URL:-}}"
 
-# Ordered list of every migration. CI's old inline provision list omitted
-# 006-010 and 014; that only worked because the test suite doesn't exercise
-# those paths — they are NOT superseded, the runtime needs all of them:
-#   006  episodes.retrieval_count       — read+bumped by mcp_server/recall.py
-#   007  drops session_summaries        — real migration (001 creates it, 004
-#                                         alters it, 007 retires it)
-#   008  chunks                         — written by the poller (ingestion/db.py)
-#   009  synth_documents                — joined by mcp_server
-#                                         (generation retired, table still read)
-#   014  halfvec HNSW indexes           — instant on an empty DB; IF NOT EXISTS
-#                                         no-op where already built. On a large
-#                                         populated DB build CONCURRENTLY by
-#                                         hand instead (see the file header).
-FILES=(
-  001_initial.sql
-  002_span_id.sql
-  003_voyage_dims.sql
-  004_session_embeddings.sql
-  005_paradedb.sql
-  006_feedback_weights.sql
-  007_drop_summaries.sql
-  008_chunks.sql
-  009_synth_documents.sql
-  011_web_artifacts.sql
-  012_web_chunks.sql
-  013_web_chunk_context.sql
-  014_halfvec_hnsw_indexes.sql
-  015_extraction_priority.sql
-  016_extraction_claimed_at.sql
-  017_kg_postgres.sql
-  018_web_extraction.sql
-  019_kg_mention_count.sql
-  020_entity_type_taxonomy.sql
-  021_recall_metrics.sql
-  022_skill_gap_candidates.sql
-  023_skill_ledger_hardening.sql
-  024_skill_serving.sql
-  025_skill_sync.sql
-  026_skill_history.sql
-  027_skill_proposal_body.sql
-  028_kg_invalidated_by.sql
-  029_kg_superseded_episodes_gin.sql
-  030_config_lane.sql
-  031_config_scope.sql
-  032_config_scan_cursor.sql
-  033_timeline.sql
-  034_embedding_meta.sql
-  035_preferences.sql
-  036_content_md5_index.sql
-  037_timeline_reported_count.sql
-  038_timeline_domain.sql
-  039_recall_metrics_served_ids.sql
-  040_dedup_gate_shadow.sql
-  041_notes.sql
-  042_dashboard.sql
-  043_dash_notify.sql
-  044_dream_runs.sql
-  045_skills_v2_foundation.sql
-  046_recall_feedback.sql
-  047_drop_memory_proposals.sql
-  048_feedback_found_via.sql
-  049_recall_metrics_notes.sql
-  050_private_sessions.sql
-  051_notes_curation.sql
-  052_remember_intents.sql
-  053_audience_scoping.sql
-  054_credential_bound_trust.sql
-  055_skill_proposal_base_hash.sql
-  056_kg_source_projects.sql
-  057_own_surface_episodes.sql
-  058_kg_evidence_currency.sql
-  059_drop_dedup_gate_shadow.sql
-  060_skill_retired_at.sql
-  061_episodes_project_recency_index.sql
-)
-
-# Drift guard: a numbered .sql in schema/ that isn't in the list above means
-# someone added a migration without registering it here. Fail loudly.
-for f in "$SCHEMA_DIR"/[0-9]*.sql; do
-  b="$(basename "$f")"
-  case " ${FILES[*]} " in
-    *" $b "*) ;;
-    *)
-      echo "ERROR: $b exists in $SCHEMA_DIR but is not in apply_schema.sh's ordered list." >&2
-      echo "Add it to FILES — this script is the single source of truth for schema order." >&2
-      exit 1
+ALL=0
+FROM=""
+POSITIONAL=()
+while (( $# > 0 )); do
+  case "$1" in
+    --all) ALL=1; shift ;;
+    --from)
+      FROM="${2:-}"
+      if ! [[ "$FROM" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: --from needs a migration number, e.g. --from 062." >&2
+        exit 1
+      fi
+      shift 2
       ;;
+    -*) echo "ERROR: unknown option $1 (see the usage in $0)." >&2; exit 1 ;;
+    *) POSITIONAL+=("$1"); shift ;;
   esac
 done
+if (( ALL )) && [[ -n "$FROM" ]]; then
+  echo "ERROR: --all and --from are mutually exclusive." >&2
+  exit 1
+fi
+DSN="${POSITIONAL[0]:-${SYNAPSE_DB_URL:-}}"
+
+run_psql() {
+  if [[ -n "$DSN" ]]; then
+    psql "$DSN" -v ON_ERROR_STOP=1 "$@"
+  else
+    psql -v ON_ERROR_STOP=1 "$@"
+  fi
+}
+
+# Every migration, in order. Zero-padded NNN_ prefixes make the glob's order the
+# numeric order; a .sql that doesn't follow the pattern would silently never run.
+shopt -s nullglob
+ALL_FILES=()
+for f in "$SCHEMA_DIR"/*.sql; do
+  b="$(basename "$f")"
+  if ! [[ "$b" =~ ^[0-9]{3}_.+\.sql$ ]]; then
+    echo "ERROR: $b in $SCHEMA_DIR is not named NNN_name.sql, so it would never be applied." >&2
+    exit 1
+  fi
+  ALL_FILES+=("$b")
+done
+if (( ${#ALL_FILES[@]} == 0 )); then
+  echo "ERROR: no NNN_*.sql files in $SCHEMA_DIR." >&2
+  exit 1
+fi
+
+# First file number to apply: 0 for everything, else one past the database's stamp.
+if (( ALL )); then
+  FIRST=0
+elif [[ -n "$FROM" ]]; then
+  FIRST=$((10#$FROM))
+else
+  read -r HAS_TABLES HAS_META < <(
+    run_psql -qAtX -F ' ' \
+      -c "SELECT to_regclass('episodes') IS NOT NULL, to_regclass('synapse_meta') IS NOT NULL"
+  )
+  if [[ "$HAS_TABLES" == "f" ]]; then
+    FIRST=0
+  else
+    STAMP=""
+    if [[ "$HAS_META" == "t" ]]; then
+      STAMP="$(run_psql -qAtX -c "SELECT value FROM synapse_meta WHERE key = 'schema_version'")"
+    fi
+    if ! [[ "$STAMP" =~ ^[0-9]+$ ]]; then
+      echo "ERROR: this database has tables but no schema_version stamp (it predates the stamp," >&2
+      echo "or init was interrupted). Say where to start: --from NNN, or --all for a full re-run." >&2
+      exit 1
+    fi
+    FIRST=$((10#$STAMP + 1))
+    echo "==> database is at schema $STAMP; applying the newer files"
+  fi
+fi
+
+FILES=()
+for f in "${ALL_FILES[@]}"; do
+  if (( 10#${f%%_*} >= FIRST )); then
+    FILES+=("$f")
+  fi
+done
+if (( ${#FILES[@]} == 0 )); then
+  echo "Schema is current (newest file ${ALL_FILES[-1]%%_*}); nothing to apply."
+  exit 0
+fi
 
 # --- Embedding geometry (pluggable embeddings) ------------------------------
 # The schema declares vector/halfvec columns and HNSW index expressions at 2048
@@ -152,27 +155,14 @@ fi
 
 for f in "${FILES[@]}"; do
   echo "==> $f"
-  if [[ -n "$DSN" ]]; then
-    psql "$DSN" -v ON_ERROR_STOP=1 \
-      -v embed_dims="$EMBED_DIMS" -v embed_model="$EMBED_MODEL" \
-      -f "$SCHEMA_DIR/$f"
-  else
-    psql -v ON_ERROR_STOP=1 \
-      -v embed_dims="$EMBED_DIMS" -v embed_model="$EMBED_MODEL" \
-      -f "$SCHEMA_DIR/$f"
-  fi
+  run_psql -v embed_dims="$EMBED_DIMS" -v embed_model="$EMBED_MODEL" -f "$SCHEMA_DIR/$f"
 done
 
 # Stamp the applied schema version (synapse_meta is created by 034) so
 # services can verify at boot that the database matches the code — see
 # ingestion/schema_check.py. Value = numeric prefix of the newest migration.
 SCHEMA_VERSION="${FILES[-1]%%_*}"
-STAMP_SQL="INSERT INTO synapse_meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
+run_psql -c "INSERT INTO synapse_meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}')
   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;"
-if [[ -n "$DSN" ]]; then
-  psql "$DSN" -v ON_ERROR_STOP=1 -c "$STAMP_SQL"
-else
-  psql -v ON_ERROR_STOP=1 -c "$STAMP_SQL"
-fi
 
 echo "Schema apply complete (${#FILES[@]} files, embed dims ${EMBED_DIMS}, stamped schema_version=${SCHEMA_VERSION})."

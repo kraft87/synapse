@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import getpass
 import importlib
-import json
 import os
 import re
 import subprocess
@@ -40,7 +39,6 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
@@ -56,15 +54,13 @@ _KEY_HELP = {
     "skills_sync": "two-way sync of your skills library at session start (on/off)",
     "config_sync": "mirror CLAUDE.md + rules/*.md to Synapse for the dream lane (on/off)",
     "config_paths": "extra globs under ~/.claude to mirror, comma-separated",
+    "timeline_repos": "git checkouts whose commits feed the board's last-week block, comma-separated",
+    "board": "print the board (curated notes, last week) at session start (on/off, default on)",
+    "prefs_block": "print your standing preferences at session start (on/off, default on)",
+    "recall_nudge": "remind the model to recall/remember with every prompt (on/off, default on)",
+    "prompt_timestamp": "put the current date and time in every prompt (on/off, default on)",
+    "recall_feedback_nudge": "ask for recall_feedback after each recall (on/off, default off)",
 }
-
-
-def _version() -> str:
-    manifest = Path(__file__).resolve().parents[1] / ".claude-plugin" / "plugin.json"
-    try:
-        return str(json.loads(manifest.read_text(encoding="utf-8")).get("version") or "unknown")
-    except (OSError, ValueError):
-        return "unknown"
 
 
 def _interactive() -> bool:
@@ -470,7 +466,7 @@ def _parse_value(key: str, text: str):
         if parsed is None:
             raise ValueError(f"{key} takes on/off (or yes/no, 1/0)")
         return parsed
-    if key == "config_paths":
+    if key in synapse_home.LIST_KEYS:
         return [g for g in re.split(r"[,\s]+", text) if g]
     if not text.strip():
         raise ValueError(f"{key} can't be empty; use --unset")
@@ -483,10 +479,10 @@ def cmd_config(args) -> int:
         print(f"# {synapse_home.config_file()}")
         for key in synapse_home.KEYS:
             shown = _show(key, home.get(key)) if key in home else _elsewhere(key)
-            print(f"{key:<13} {shown:<28} {_KEY_HELP[key]}")
+            print(f"{key:<22} {shown:<28} {_KEY_HELP[key]}")
         record = config.read_device_state()
         if record.get("surface_id"):
-            print(f"{'(enrolled)':<13} {record['surface_id']} ({record.get('trust') or '?'})")
+            print(f"{'(enrolled)':<22} {record['surface_id']} ({record.get('trust') or '?'})")
         return 0
     key = args.key
     if key not in synapse_home.KEYS:
@@ -725,7 +721,7 @@ def _parser() -> argparse.ArgumentParser:
     skill.set_defaults(func=cmd_skill)
 
     ver = sub.add_parser("version", help="print the client version")
-    ver.set_defaults(func=lambda _a: print(_version()) or 0)
+    ver.set_defaults(func=lambda _a: print(synapse_home.client_version()) or 0)
 
     for name, module in _PASSTHROUGH.items():
         sub.add_parser(name, help=f"same as synapse-{name}", add_help=False).set_defaults(

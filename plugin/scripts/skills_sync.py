@@ -68,6 +68,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import synapse_project
+from synapse_filelock import lock_exclusive
 
 
 def _skill_description(text: str) -> str:
@@ -279,8 +280,15 @@ def _ledger_path(target_dir: Path, kind: str = "delivered") -> Path:
     with the server (pulled, pushed, or seen identical; clients before 0.22 also counted
     a push a newer server refused). "pulled": only the versions a pull wrote here, so
     exactly what Synapse put in this folder, never the folder's own content."""
-    key = hashlib.sha256(str(target_dir.resolve()).encode("utf-8")).hexdigest()[:16]
-    return config.synapse_home.home() / "skills" / f"{kind}-{key}.json"
+    return config.synapse_home.home() / "skills" / f"{kind}-{_folder_key(target_dir)}.json"
+
+
+def _lock_path(target_dir: Path) -> Path:
+    return config.synapse_home.home() / "skills" / f"sync-{_folder_key(target_dir)}.lock"
+
+
+def _folder_key(target_dir: Path) -> str:
+    return hashlib.sha256(str(target_dir.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
 def _load_ledger(target_dir: Path, kind: str = "delivered") -> dict:
@@ -424,6 +432,24 @@ def _sync(
 ) -> tuple[int, int, int]:
     """One two-way pass over ``target_dir``. Returns (pulled, pushed, removed).
 
+    Sessions starting together (or a compaction beside a start) would run two passes over
+    one folder, through the same pull temp file and ledgers, so a pass takes a lock per
+    folder and a second one skips: (0, 0, 0), the next session start syncs it."""
+    lock = _lock_path(target_dir)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock, "w") as lf:
+        try:
+            lock_exclusive(lf, blocking=False)
+        except OSError:
+            return 0, 0, 0
+        return _sync_folder(scope, target_dir, client, git_exclude=git_exclude)
+
+
+def _sync_folder(
+    scope: str, target_dir: Path, client, *, git_exclude: bool
+) -> tuple[int, int, int]:
+    """The pass ``_sync`` runs under the folder's lock.
+
     ``git_exclude`` (project folders): add each skill folder this pass pulls to its
     repository's .git/info/exclude. A skill folder the repository tracks is its own: git
     distributes it, so no pull writes into it (or lists it) and it is only published. The
@@ -437,15 +463,15 @@ def _sync(
 
     # "held" asks the server which of these it no longer serves here ("withdrawn").
     reply = client.post_json("/skills/list", {"scope": scope, "held": sorted(disk)})
-    server = {
-        s["name"]: (
-            s.get("body", ""),
-            [(f["path"], f["sha256"]) for f in s.get("files", [])],
-            s.get("content_modified_at"),
-        )
-        for s in reply.get("skills", [])
-        if _safe_name(s.get("name"))
-    }
+    server = {}
+    for s in reply.get("skills", []):
+        if not _safe_name(s.get("name")):
+            continue
+        files = [(f["path"], f["sha256"]) for f in s.get("files", [])]
+        # The server names each skill's whole-skill hash; one that predates the field sends
+        # the body, hashed here (a pull refetches the body, so the listing needs no copy).
+        digest = s.get("content_hash") or _whole_hash(s.get("body", ""), files)
+        server[s["name"]] = (digest, files, s.get("content_modified_at"))
     # Retired and withdrawn skills come in their own keys, which older clients don't read:
     # listed with the active ones, an old client would pull (nothing) or push them back
     # every session.
@@ -481,8 +507,8 @@ def _sync(
             if repository_owns(name):
                 continue
             _pull(scope, target_dir, name, g[2], client=client)
-            _remember(ledger, name, _whole_hash(g[0], g[1]))
-            _remember(pulled_ledger, name, _whole_hash(g[0], g[1]))
+            _remember(ledger, name, g[0])
+            _remember(pulled_ledger, name, g[0])
             pulled_here(name)
             pulled += 1
             continue
@@ -514,9 +540,9 @@ def _sync(
                 pushed += 1
             continue
         body_d, files_d, mt_d = d
-        body_g, fmeta_g, cmod_g = g
+        hash_g, fmeta_g, cmod_g = g
         disk_hash = _whole_hash(body_d, [(f[0], f[1]) for f in files_d])
-        if disk_hash == _whole_hash(body_g, fmeta_g):
+        if disk_hash == hash_g:
             _remember(ledger, name, disk_hash)
             continue  # identical content
         gt = _ts(cmod_g) or 0.0
@@ -549,8 +575,8 @@ def _sync(
                 pushed += 1
         else:
             _pull(scope, target_dir, name, cmod_g, client=client)
-            _remember(ledger, name, _whole_hash(body_g, fmeta_g))
-            _remember(pulled_ledger, name, _whole_hash(body_g, fmeta_g))
+            _remember(ledger, name, hash_g)
+            _remember(pulled_ledger, name, hash_g)
             pulled_here(name)
             pulled += 1
     _save_ledger(target_dir, ledger)

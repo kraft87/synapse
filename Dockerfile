@@ -8,20 +8,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
-# Bake the Claude Code CLI into the image for the dream lanes that still shell
-# out to a bare `claude -p` on PATH (dream/skills, dream/config). The extraction
-# pipeline (ingestion/llm_client.py) does not use it: the Agent SDK runs its own
-# bundled CLI, pinned by uv.lock. Drop this layer once those lanes call through
-# ingestion.llm_client. Auth comes from CLAUDE_CODE_OAUTH_TOKEN or
-# ANTHROPIC_API_KEY in the environment at runtime. The installer puts a launcher
-# at /root/.local/bin/claude. Unpinned: an image rebuild picks up the current
-# stable, same behavior the old host-mounted install had.
-RUN curl -fsSL https://claude.ai/install.sh | bash
-
-ENV PATH="/root/.local/bin:$PATH"
-
 WORKDIR /app
 RUN mkdir -p /root/logs
 
@@ -98,6 +84,15 @@ COPY --from=builder /app/plugin /app/plugin
 COPY --from=builder /app/plugin-codex /app/plugin-codex
 # The prebuilt dashboard bundle — the /dash routes serve it from here.
 COPY --from=webbuild /app/web/dist /app/web/dist
+
+# The Claude Code CLI is the one the Agent SDK wheel bundles (the extraction pipeline
+# in ingestion/llm_client.py spawns it; auth comes from CLAUDE_CODE_OAUTH_TOKEN or
+# ANTHROPIC_API_KEY at runtime), so uv.lock pins it and a Dependabot bump of
+# claude-agent-sdk is the only way it changes. The symlink puts it on PATH for the dream
+# lanes, which shell out to `claude -p`; `test -x` fails the build if a wheel stops
+# bundling it, instead of shipping a dangling link.
+RUN ln -s /app/.venv/lib/python3.12/site-packages/claude_agent_sdk/_bundled/claude /usr/local/bin/claude \
+    && test -x /usr/local/bin/claude
 
 ENV PATH="/app/.venv/bin:$PATH"
 

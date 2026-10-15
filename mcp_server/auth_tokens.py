@@ -22,7 +22,9 @@ Two lanes, deliberately asymmetric:
 
 The claims dict is the single carrier of "who is calling" for everything downstream:
 ``mcp_server/server`` reads it to build the caller's :class:`~ingestion.surfaces.SurfaceTrust`
-without a second lookup, and to decide which routes a caller may reach at all.
+without a second lookup, and to decide which routes a caller may reach at all. FastMCP
+runs this verifier app-wide, so the custom HTTP routes read the same claims
+(``mcp_server/http_auth.request_trust``) instead of looking the bearer up again.
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ import logging
 from typing import Any
 
 from fastmcp.server.auth.auth import AccessToken, TokenVerifier
+from starlette.concurrency import run_in_threadpool
 
 from ingestion.surfaces import resolve_caller, token_hash
 
@@ -87,8 +90,10 @@ class SynapseTokenVerifier(TokenVerifier):
         if not self._db_url:
             return None
         # resolve_caller never raises and never fails open: an unreachable DB, a missing
-        # table, or a non-approved row all come back UNKNOWN, which has known=False.
-        st = resolve_caller(self._db_url, token_hash_hex=token_hash(token))
+        # table, or a non-approved row all come back UNKNOWN, which has known=False. It
+        # runs in a worker thread: a pool borrow during a Postgres stall must not hold
+        # the event loop, which also serves /health and the root-token lane.
+        st = await run_in_threadpool(resolve_caller, self._db_url, token_hash_hex=token_hash(token))
         if not st.known:
             return None
         return AccessToken(

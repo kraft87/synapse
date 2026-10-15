@@ -967,7 +967,7 @@ def stage_model(stage: str, default: str = DEFAULT_MODEL) -> str:
     bare Claude id the provider wouldn't recognise).
 
     Stages: EXTRACTOR, TIMELINE, PREFERENCES, DEDUP, CONTRADICTION, EDGE_DATES,
-    NOTES_CONFIRM, NOTES_CURATE, SKILLS. The A/B work behind this (Flash-vs-Haiku,
+    NOTES_CONFIRM, NOTES_CURATE, SKILLS_JUDGE, SKILLS_DRAFT. The A/B work behind this (Flash-vs-Haiku,
     DeepSeek-vs-Haiku) showed model choice matters per stage — a cheap model
     can be fine for binary confirms while extraction wants a stronger one.
     """

@@ -51,14 +51,11 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.turns import TurnSequence
 
 logger = logging.getLogger(__name__)
 
 _CONTENT_TYPES = ("text", "multimodal_text")
-
-
-def _strip_nulls(text: str) -> str:
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _epoch_to_dt(ts: Any) -> datetime | None:
@@ -141,25 +138,15 @@ class OpenAIChatParser:
         title = (convo.get("title") or "").strip()
         default_model = convo.get("default_model_slug")
         episodes: list[Episode] = []
-        prev_assistant: str | None = None
-        seq = 0
-        seen_span_ids: set[str] = set()
+        turns = TurnSequence()
 
         for group in groups:
             if not group:
                 continue
-            seq += 1
-            content_parts: list[str] = []
-            human_turn: str | None = None
-            assistant_turn: str | None = None
+            turn = turns.begin(title=title)
             model: str | None = None
             ts: Any = None
             last_msg_id: str | None = None
-
-            if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
-            elif seq == 1 and title:
-                content_parts.append(f"[title] {title[:200]}")
 
             for m in group:
                 ts = ts or m.get("create_time")
@@ -167,34 +154,26 @@ class OpenAIChatParser:
                 model = model or (m.get("metadata") or {}).get("model_slug")
                 text = _msg_text(m)
                 if (m.get("author") or {}).get("role") == "user":
-                    if human_turn is None:
-                        human_turn = text[:3000]
-                        content_parts.append(f"[user] {human_turn}")
+                    turn.user(text)
                 else:
-                    assistant_turn = text
-                    content_parts.append(f"[assistant] {text[:3000]}")
-
-            if not content_parts:
-                continue
+                    turn.assistant_text(text)
 
             span_id = f"openai:{last_msg_id}" if last_msg_id else None
-            if span_id is not None:
-                if span_id in seen_span_ids:
-                    continue
-                seen_span_ids.add(span_id)
+            if not turns.accept(turn, span_id):
+                continue
 
             created_at = _epoch_to_dt(ts) or _epoch_to_dt(convo.get("create_time"))
 
             episodes.append(
                 Episode(
                     session_id=str(session_id),
-                    sequence=seq,
+                    sequence=turn.sequence,
                     project=None,
                     platform="chatgpt",
                     model=model or default_model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=turn.human,
+                    assistant_turn=turn.assistant,
+                    content=turn.content,
                     span_id=span_id,
                     source="openai",
                     metadata={
@@ -205,7 +184,6 @@ class OpenAIChatParser:
                     created_at=created_at,
                 )
             )
-            prev_assistant = assistant_turn
 
         return episodes
 

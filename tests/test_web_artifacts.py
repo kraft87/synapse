@@ -265,21 +265,8 @@ class TestIterWebEvents:
 
 
 @pytest.fixture
-def db_test_url():
-    import os
-
-    return os.environ.get(
-        "SYNAPSE_TEST_URL",
-        "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test",
-    )
-
-
-@pytest.fixture
-def test_conn(db_test_url):
-    try:
-        conn = psycopg.connect(db_test_url, autocommit=False)
-    except psycopg.OperationalError:
-        pytest.skip("test DB unreachable")
+def test_conn(db_url):
+    conn = psycopg.connect(db_url, autocommit=False)
     yield conn
     conn.rollback()
     conn.close()
@@ -287,12 +274,6 @@ def test_conn(db_test_url):
 
 @pytest.fixture
 def clean_web_artifacts(test_conn):
-    # Skip cleanly if the test DB hasn't had migration 011 applied yet
-    # (e.g. CI workflow only runs 001_initial.sql via `make migrate`).
-    exists = test_conn.execute("SELECT to_regclass('public.web_artifacts')").fetchone()
-    test_conn.commit()
-    if exists is None or exists[0] is None:
-        pytest.skip("web_artifacts table not present in test DB (migration 011 unapplied)")
     test_conn.execute("TRUNCATE web_artifacts, ingestion_state RESTART IDENTITY CASCADE")
     test_conn.commit()
     yield

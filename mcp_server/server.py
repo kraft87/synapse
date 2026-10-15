@@ -45,11 +45,9 @@ from mcp_server.auth_tokens import (
 # allowlist applies, and `kind` decides which trust lane a call resolves through.
 from mcp_server.auxiliary_routes import register as _register_auxiliary_routes
 from mcp_server.caller_trust import caller_trust as _resolve_caller_trust
-from mcp_server.caller_trust import request_trust as _resolve_request_trust
 from mcp_server.feedback_tools import register as _register_feedback_tools
 from mcp_server.hidden_tools import HiddenToolsList as _HiddenToolsList
-from mcp_server.http_auth import admin_authorized, authenticated, is_root, machine_authorized
-from mcp_server.http_auth import bearer as _bearer
+from mcp_server.http_auth import admin_authorized, authenticated, machine_authorized, request_trust
 from mcp_server.ingest_route import register as _register_ingest_route
 from mcp_server.recall_route import register as _register_recall_route
 from mcp_server.remember_tool import register as _register_remember_tool
@@ -164,7 +162,7 @@ def _claims_identity(claims: dict, claim_keys: tuple[str, ...]) -> str:
     """First non-empty identity claim, lowercased; "" when none is present.
 
     Deliberately ONE definition: the allowlist gate below and the audience-scoping
-    surface derivation (:func:`_caller_surface`) must never disagree about who a caller
+    surface derivation (:func:`_caller_trust`) must never disagree about who a caller
     is, or a login could clear the gate as one identity and be served as another.
     """
     return next((str(claims[k]).lower() for k in claim_keys if claims.get(k)), "")
@@ -244,14 +242,6 @@ def _access_token() -> Any:
         return None
 
 
-def _caller_surface() -> str | None:
-    """The surface ID for this call, for display and telemetry.
-
-    See :func:`_caller_trust` for the verdict itself; this is the id that goes with it.
-    """
-    return _caller_trust().surface_id
-
-
 def _caller_trust() -> SurfaceTrust:
     """Caller scope from the credential alone (no ``surface``); see caller_trust."""
     return _resolve_caller_trust(
@@ -266,16 +256,12 @@ def _caller_trust() -> SurfaceTrust:
 def _request_trust(request: Request) -> SurfaceTrust:
     """:func:`_caller_trust` for the plain-HTTP custom routes.
 
-    Custom routes bypass FastMCP's auth middleware by design (issue #3704), so there is
-    no token context to read — the bearer has to be re-resolved from the header. Same
-    precedence, minus the OAuth lane, which never reaches these routes: browsers and
-    hooks send a bearer, not an OIDC token.
+    Custom routes bypass FastMCP's token-context plumbing by design (issue #3704), so
+    the verdict comes from the request: the verifier's result for this bearer, shared
+    with the gates (http_auth.request_trust). Same precedence, minus the OAuth lane,
+    which never reaches these routes: browsers and hooks send a bearer, not an OIDC token.
     """
-    return _resolve_request_trust(
-        db_url=DB_URL,
-        machine_token=MACHINE_TOKEN,
-        bearer=_bearer(request),
-    )
+    return request_trust(request, MACHINE_TOKEN, DB_URL)
 
 
 # Server instructions: with tool search on (Claude Code's default) only tool NAMES and
@@ -319,10 +305,6 @@ if DB_URL:
     from mcp_server.skills_provider import PgSkillsProvider
 
     mcp.add_provider(PgSkillsProvider(DB_URL, lambda: _caller_trust()))
-
-
-def _is_root(request: Request) -> bool:
-    return is_root(request, MACHINE_TOKEN)
 
 
 def _machine_authorized(request: Request) -> bool:

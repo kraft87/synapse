@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tomllib
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -110,7 +110,10 @@ def test_header_helper_fails_closed(monkeypatch, capsys, tmp_path, token, url, s
     config.BASE_URL = "https://memory.example"
     config.INGEST_TOKEN = token
     config._FILE_OPTIONS = {}
-    config.synapse_home = SimpleNamespace(home=lambda: tmp_path)
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path))
+    config.synapse_home = _load(
+        "synapse_home_helper_test", _SHARED_HELPER.with_name("synapse_home.py")
+    )
     # config decides whether the device token may go there (config._device_origins).
     withheld = bool(server) and server != "https://memory.example"
     config.TOKEN_OVERRIDE = (
@@ -133,7 +136,8 @@ def test_header_helper_fails_closed(monkeypatch, capsys, tmp_path, token, url, s
 
 
 def test_saved_credentials_work_without_env_token(monkeypatch, tmp_path):
-    settings = tmp_path / "settings.json"
+    settings = tmp_path / "claude" / "settings.json"
+    settings.parent.mkdir()
     settings.write_text(
         json.dumps(
             {
@@ -151,11 +155,11 @@ def test_saved_credentials_work_without_env_token(monkeypatch, tmp_path):
     monkeypatch.delenv("SYNAPSE_INGEST_TOKEN", raising=False)
     monkeypatch.delenv("SYNAPSE_URL", raising=False)
     monkeypatch.delenv("SYNAPSE_INGEST_URL", raising=False)
-    monkeypatch.setattr(
-        "os.path.expanduser",
-        lambda value: str(settings) if value.endswith("settings.json") else value,
-    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(settings.parent))
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path / "home"))
+    monkeypatch.delitem(sys.modules, "config", raising=False)
     common = _load("synapse_common_test", _PLUGIN / "scripts/common.py")
+    monkeypatch.delitem(sys.modules, "config", raising=False)
     assert common.TOKEN == "saved-device-token"
     assert common.BASE_URL == "https://memory.example"
 

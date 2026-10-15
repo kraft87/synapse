@@ -26,28 +26,18 @@ export — claude.ai didn't capture it.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import orjson
 
 from ingestion.models import Episode
+from ingestion.turns import TurnSequence, parse_iso
 
 logger = logging.getLogger(__name__)
 
-
-def _strip_nulls(text: str) -> str:
-    return text.replace("\x00", "") if "\x00" in text else text
-
-
-def _parse_iso(ts: Any) -> datetime | None:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
+#: claude.ai turns are long-form chat, so they keep more text than a coding turn.
+_TEXT_CHARS = 5000
 
 
 def _msg_text(msg: dict[str, Any]) -> str:
@@ -115,23 +105,14 @@ class ClaudeAIParser:
 
         name = (convo.get("name") or "").strip()
         episodes: list[Episode] = []
-        prev_assistant: str | None = None
-        seq = 0
+        turns = TurnSequence(text_chars=_TEXT_CHARS)
 
         for group in groups:
             if not group:
                 continue
-            seq += 1
-            content_parts: list[str] = []
-            human_turn: str | None = None
-            assistant_turn: str | None = None
+            turn = turns.begin(title=name)
             ts: str | None = None
             last_msg_uuid: str | None = None
-
-            if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
-            elif seq == 1 and name:
-                content_parts.append(f"[title] {name[:200]}")
 
             for m in group:
                 ts = ts or m.get("created_at")
@@ -141,44 +122,36 @@ class ClaudeAIParser:
                 attachments = _attachments_summary(m)
 
                 if sender == "human":
-                    if text and human_turn is None:
-                        human_turn = text[:5000]
-                        content_parts.append(f"[user] {human_turn}")
+                    turn.user(text)
                     if attachments:
-                        content_parts.append(f"[attachments] {attachments}")
+                        turn.line(f"[attachments] {attachments}")
                 elif sender == "assistant":
-                    if text:
-                        assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:5000]}")
+                    turn.assistant_text(text)
 
-            if not content_parts or not (human_turn or assistant_turn):
+            span_id = f"claude_ai:{session_id}:{last_msg_uuid}" if last_msg_uuid else None
+            # A group of only attachments (before the first prompt) is not a turn.
+            if not (turn.human or turn.assistant) or not turns.accept(turn, span_id):
                 continue
-
-            try:
-                created_at = _parse_iso(ts)
-            except (ValueError, TypeError):
-                created_at = None
 
             episodes.append(
                 Episode(
                     session_id=session_id,
-                    sequence=seq,
+                    sequence=turn.sequence,
                     project=None,
                     platform="claude_ai",
                     model=None,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
-                    span_id=f"claude_ai:{session_id}:{last_msg_uuid}" if last_msg_uuid else None,
+                    human_turn=turn.human,
+                    assistant_turn=turn.assistant,
+                    content=turn.content,
+                    span_id=span_id,
                     source="claude_ai",
                     metadata={
                         "name": name or None,
                         "ts": ts,
                     },
-                    created_at=created_at,
+                    created_at=parse_iso(ts),
                 )
             )
-            prev_assistant = assistant_turn
 
         return episodes
 

@@ -14,22 +14,13 @@ went to every caller. Now:
 from __future__ import annotations
 
 import json
-import os
 import uuid
 
-import psycopg
 import pytest
 
 from mcp_server import caller_trust as ct
 
-_DB_URL = os.environ.get(
-    "SYNAPSE_TEST_URL", "postgresql://synapse:synapse@127.0.0.1:5432/synapse_test"
-)
-
-try:
-    psycopg.connect(_DB_URL, connect_timeout=2).close()
-except Exception:  # pragma: no cover - environment dependent
-    pytest.skip("no test DB reachable", allow_module_level=True)
+pytestmark = pytest.mark.db
 
 _ROOT = "root-test-token"
 
@@ -115,58 +106,22 @@ def env(conn, db_url):
     _wipe()
 
 
-def _list(c, tok, surface=None):
-    body = {"surface": surface} if surface else {}
-    r = c.post("/config/list", json=body, headers=_h(tok))
-    assert r.status_code == 200
-    return r.json()["files"]
-
-
-def _fetch(c, tok, surface=None):
-    body = {"file_key": "CLAUDE.md", **({"surface": surface} if surface else {})}
-    r = c.post("/config/fetch", json=body, headers=_h(tok))
-    assert r.status_code == 200
-    return r.json()
-
-
 def _proposal_ids(c, tok):
     r = c.post("/config/proposals", json={}, headers=_h(tok))
     assert r.status_code == 200
     return sorted(p["id"] for p in r.json()["proposals"])
 
 
-# --------------------------------------------------------------------------- mirror reads
-
-
-def test_restricted_reads_only_its_own_mirror_and_body_surface_is_ignored(env, db_url):
-    c = _client(db_url)
-    work = env["tok"]["work"]
-    # No surface in the body: the bearer decides.
-    assert _fetch(c, work)["content"] == "work rules"
-    assert [f["content_hash"] for f in _list(c, work)] == ["h-work"]
-    # Naming another surface is ignored, not honoured.
-    assert _fetch(c, work, surface=env["sid"]["home"])["content"] == "work rules"
-    assert [f["content_hash"] for f in _list(c, work, surface=env["sid"]["full"])] == ["h-work"]
-
-
-def test_full_trust_may_still_name_any_surface(env, db_url):
-    c = _client(db_url)
-    full = env["tok"]["full"]
-    assert _fetch(c, full, surface=env["sid"]["home"])["content"] == "home rules"
-    assert [f["content_hash"] for f in _list(c, full, surface=env["sid"]["work"])] == ["h-work"]
+# --------------------------------------------------------------------------- unknown callers
 
 
 @pytest.mark.parametrize("tok", [_ROOT, None], ids=["root", "no-token"])
-def test_unknown_callers_read_nothing(env, db_url, tok):
-    c = _client(db_url)
-    assert _list(c, tok, surface=env["sid"]["home"]) == []
-    assert _fetch(c, tok, surface=env["sid"]["home"]) == {"found": False}
-    assert _proposal_ids(c, tok) == []
+def test_unknown_callers_read_no_proposals(env, db_url, tok):
+    assert _proposal_ids(_client(db_url), tok) == []
 
 
 def test_unwired_routes_fail_closed(env, db_url):
     c = _client(db_url, wired=False)
-    assert _list(c, env["tok"]["full"], surface=env["sid"]["home"]) == []
     assert _proposal_ids(c, env["tok"]["full"]) == []
 
 
@@ -193,6 +148,27 @@ def test_restricted_publish_lands_on_its_own_surface_only(env, conn, db_url):
     )
     assert rows[env["sid"]["home"]] == "home rules"  # untouched
     assert rows[env["sid"]["work"]] == "overwritten"
+
+
+def test_a_restricted_batch_lands_on_its_own_surface_only(env, conn, db_url):
+    r = _client(db_url).post(
+        "/config/publish",
+        json={
+            "surface": env["sid"]["home"],  # spoof attempt
+            "files": [
+                {"file_key": "CLAUDE.md", "content": "batch one"},
+                {"scope": "project:repo", "file_key": "CLAUDE.md", "content": "batch two"},
+            ],
+        },
+        headers=_h(env["tok"]["work"]),
+    )
+    assert r.status_code == 200 and r.json() == {"status": "ok", "changed": 2}
+    rows = conn.execute(
+        "SELECT surface_id, scope, content FROM config_lane.config_registry ORDER BY content"
+    ).fetchall()
+    work = env["sid"]["work"]
+    assert (work, "global", "batch one") in rows and (work, "project:repo", "batch two") in rows
+    assert (env["sid"]["home"], "global", "home rules") in rows  # untouched
 
 
 @pytest.mark.parametrize("tok", [_ROOT, None], ids=["root", "no-token"])
@@ -288,7 +264,7 @@ def test_unknown_and_full_act_paths(env, db_url):
 def test_before_057_a_restricted_device_owns_no_proposals(env, conn, db_url):
     """Without the provenance column nothing can be proven a device's own, so a restricted
     caller sees no proposals (and gets 403 acting on one) rather than an error. Full trust
-    and the mirror lane do not depend on the column at all."""
+    and the mirror push do not depend on the column at all."""
     from tests.helpers.pre057 import pre057_schema
 
     with pre057_schema(conn, db_url) as (url, _schema):
@@ -303,5 +279,10 @@ def test_before_057_a_restricted_device_owns_no_proposals(env, conn, db_url):
             headers=_h(work),
         )
         assert r.status_code == 403
-        assert _fetch(c, work)["content"] == "work rules"
+        r = c.post(
+            "/config/publish",
+            json={"file_key": "CLAUDE.md", "content": "still pushes"},
+            headers=_h(work),
+        )
+        assert r.status_code == 200
         assert _proposal_ids(c, env["tok"]["full"]) == sorted(env["prop"].values())

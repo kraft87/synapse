@@ -31,9 +31,12 @@ CLAIMS the id before writing anything:
   * claim wins            -> do the write, mark the row 'done' with its note/episode ids;
   * row already 'done'    -> return the recorded ids with outcome 'duplicate', write nothing;
   * row still 'pending'   -> a previous attempt crashed mid-write; re-run it. reconcile_note
-                             is convergent (the identical hook resolves onto the same live
-                             note as an update), so re-running cannot fork a second note,
-                             whereas skipping could lose the note entirely.
+                             is convergent (the identical text resolves onto the same live
+                             note as an update, with no LLM call), so re-running cannot fork a
+                             second note, whereas skipping could lose the note entirely. The
+                             archive episode is written once: its id is recorded on the row as
+                             soon as it is stored, and a re-run reuses it instead of archiving
+                             and extracting the text again.
 """
 
 from __future__ import annotations
@@ -42,7 +45,6 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-import psycopg
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -57,49 +59,48 @@ logger = logging.getLogger(__name__)
 _MAX_INTENT_ID = 200
 
 
-class _SchemaMissing(Exception):
-    """schema/052 not applied on this deployment — reported as 503, never as success."""
-
-
 def _claim(db_url: str, intent_id: str, hook: str | None) -> dict[str, Any] | None:
     """Reserve ``intent_id``. Returns None when this caller won the claim (proceed with the
     write), or the existing row when someone already claimed it (see the module docstring)."""
     with pg_pool.connection(db_url) as conn:
-        try:
-            row = conn.execute(
-                "INSERT INTO remember_intents (intent_id, hook) VALUES (%s, %s) "
-                "ON CONFLICT (intent_id) DO NOTHING RETURNING intent_id",
-                (intent_id, (hook or "")[:200] or None),
-            ).fetchone()
-            if row is not None:
-                return None
-            prior = conn.execute(
-                "SELECT status, note_id, episode_id, outcome FROM remember_intents WHERE intent_id = %s",
-                (intent_id,),
-            ).fetchone()
-            if prior is None:  # raced with a delete — treat as ours
-                return None
-            return {
-                "status": prior[0],
-                "note_id": prior[1],
-                "episode_id": prior[2],
-                "outcome": prior[3],
-            }
-        except psycopg.errors.UndefinedTable as e:
-            raise _SchemaMissing from e
+        row = conn.execute(
+            "INSERT INTO remember_intents (intent_id, hook) VALUES (%s, %s) "
+            "ON CONFLICT (intent_id) DO NOTHING RETURNING intent_id",
+            (intent_id, (hook or "")[:200] or None),
+        ).fetchone()
+        if row is not None:
+            return None
+        prior = conn.execute(
+            "SELECT status, note_id, episode_id, outcome FROM remember_intents WHERE intent_id = %s",
+            (intent_id,),
+        ).fetchone()
+        if prior is None:  # raced with a delete — treat as ours
+            return None
+        return {
+            "status": prior[0],
+            "note_id": prior[1],
+            "episode_id": prior[2],
+            "outcome": prior[3],
+        }
+
+
+def _record_episode(db_url: str, intent_id: str, episode_id: int) -> None:
+    """Note the archive episode against the claim, so a re-run of a crashed write reuses it."""
+    with pg_pool.connection(db_url) as conn:
+        conn.execute(
+            "UPDATE remember_intents SET episode_id = %s WHERE intent_id = %s",
+            (episode_id, intent_id),
+        )
 
 
 def _complete(db_url: str, intent_id: str, result: dict[str, Any]) -> None:
     """Record the write's ids against the claim. Only a 'done' row short-circuits a replay."""
     with pg_pool.connection(db_url) as conn:
-        try:
-            conn.execute(
-                "UPDATE remember_intents SET status = 'done', note_id = %s, episode_id = %s, "
-                "outcome = %s, completed_at = now() WHERE intent_id = %s",
-                (result.get("note_id"), result.get("episode_id"), result.get("outcome"), intent_id),
-            )
-        except psycopg.errors.UndefinedTable as e:  # pragma: no cover - claim would have raised
-            raise _SchemaMissing from e
+        conn.execute(
+            "UPDATE remember_intents SET status = 'done', note_id = %s, episode_id = %s, "
+            "outcome = %s, completed_at = now() WHERE intent_id = %s",
+            (result.get("note_id"), result.get("episode_id"), result.get("outcome"), intent_id),
+        )
 
 
 def _validate(body: dict[str, Any]) -> str | None:
@@ -159,8 +160,6 @@ def register(
 
         try:
             prior = await run_in_threadpool(_claim, db_url, intent_id, body.get("hook"))
-        except _SchemaMissing:
-            return err("remember_intents missing (apply schema/052)", 503)
         except Exception as e:
             logger.warning("remember spool claim failed: %s", e)
             return err(str(e)[:200], 500)
@@ -194,6 +193,10 @@ def register(
             kwargs["body"] = body["body"]
         if str(body.get("content") or "").strip():
             kwargs["content"] = body["content"]
+        # A re-run of a crashed write reuses the episode the first attempt archived.
+        if prior is not None and prior.get("episode_id") is not None:
+            kwargs["archived_episode_id"] = prior["episode_id"]
+        kwargs["on_archived"] = lambda episode_id: _record_episode(db_url, intent_id, episode_id)
 
         try:
             result = await remember_fn(**kwargs)

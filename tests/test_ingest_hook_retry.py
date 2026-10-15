@@ -57,7 +57,6 @@ def hook(monkeypatch, tmp_path) -> ModuleType:
     cfg_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setenv("SYNAPSE_INGEST_LOG", str(tmp_path / "hook.log"))
     monkeypatch.chdir(tmp_path)
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
@@ -229,7 +228,7 @@ def test_success_clears_marker_and_streak(hook, tmp_path, monkeypatch):
     first_since = state[path]["pending"]
     assert state[path]["fails"] == 2
     assert state[path]["last_error"] == "HTTP 503 Service Unavailable"
-    assert state[hook._HEALTH_KEY]["fails"] == 2
+    assert state[hook.retry.HEALTH_KEY]["fails"] == 2
     # the marker keeps the FIRST failure time; `tried` moves on every failure
     assert state[path]["tried"] >= first_since
 
@@ -240,8 +239,8 @@ def test_success_clears_marker_and_streak(hook, tmp_path, monkeypatch):
     for key in ("pending", "tried", "fails", "last_error"):
         assert key not in ent
     assert ent["size"] == os.path.getsize(path)
-    assert "fail_since" not in state[hook._HEALTH_KEY]
-    assert state[hook._HEALTH_KEY]["last_ok"]
+    assert "fail_since" not in state[hook.retry.HEALTH_KEY]
+    assert state[hook.retry.HEALTH_KEY]["last_ok"]
 
 
 def test_pending_entries_survive_the_cursor_ttl(hook, tmp_path):
@@ -322,18 +321,22 @@ def test_warning_appears_after_a_streak_and_clears_on_success(hook, tmp_path, mo
     _, proj = _projects(tmp_path)
     path = _mk(proj, "s.jsonl", age_s=3600, now=time.time())
     now = time.time()
-    assert hook._failure_warning(hook._load_state(), now) is None  # nothing on record
+    assert (
+        hook.retry.failure_warning(hook._load_state(), now, hook.INGEST_TOKEN) is None
+    )  # nothing on record
 
     monkeypatch.setattr(hook, "_post_records", _fail(_http_error(403)))
-    for _ in range(hook._WARN_AFTER_FAILS - 1):
+    for _ in range(hook.retry.WARN_AFTER_FAILS - 1):
         hook._ship(path, mode="stop")
-    assert hook._failure_warning(hook._load_state(), time.time()) is None  # a blip
+    assert (
+        hook.retry.failure_warning(hook._load_state(), time.time(), hook.INGEST_TOKEN) is None
+    )  # a blip
 
     hook._ship(path, mode="stop")
     state = hook._load_state()
-    line = hook._failure_warning(state, time.time())
+    line = hook.retry.failure_warning(state, time.time(), hook.INGEST_TOKEN)
     assert line is not None
-    since = time.strftime("%Y-%m-%d", time.localtime(state[hook._HEALTH_KEY]["fail_since"]))
+    since = time.strftime("%Y-%m-%d", time.localtime(state[hook.retry.HEALTH_KEY]["fail_since"]))
     assert line.startswith(f"Synapse uploads have been failing since {since} ")
     assert "(HTTP 403 Forbidden)" in line
     assert line.endswith("transcripts will be retried automatically.")
@@ -341,22 +344,24 @@ def test_warning_appears_after_a_streak_and_clears_on_success(hook, tmp_path, mo
 
     monkeypatch.setattr(hook, "_post_records", lambda recs, source="hook": "ok")
     hook._ship(path, mode="stop")
-    assert hook._failure_warning(hook._load_state(), time.time()) is None
+    assert hook.retry.failure_warning(hook._load_state(), time.time(), hook.INGEST_TOKEN) is None
 
 
 def test_warning_after_a_long_silent_failure(hook):
     """One failure is a blip, unless nothing has succeeded for a day since."""
     now = time.time()
-    fresh = {hook._HEALTH_KEY: {"fail_since": now - 3600, "fails": 1, "last_error": "timed out"}}
+    fresh = {
+        hook.retry.HEALTH_KEY: {"fail_since": now - 3600, "fails": 1, "last_error": "timed out"}
+    }
     stale = {
-        hook._HEALTH_KEY: {
-            "fail_since": now - hook._WARN_AFTER_HOURS * 3600 - 60,
+        hook.retry.HEALTH_KEY: {
+            "fail_since": now - hook.retry.WARN_AFTER_HOURS * 3600 - 60,
             "fails": 1,
             "last_error": "timed out",
         }
     }
-    assert hook._failure_warning(fresh, now) is None
-    assert "(timed out)" in (hook._failure_warning(stale, now) or "")
+    assert hook.retry.failure_warning(fresh, now, hook.INGEST_TOKEN) is None
+    assert "(timed out)" in (hook.retry.failure_warning(stale, now, hook.INGEST_TOKEN) or "")
 
 
 def test_catchup_hook_prints_warning_for_user_and_model(hook, tmp_path, monkeypatch, capsys):
@@ -365,7 +370,7 @@ def test_catchup_hook_prints_warning_for_user_and_model(hook, tmp_path, monkeypa
     root, proj = _projects(tmp_path)
     path = _mk(proj, "s.jsonl", age_s=3600, now=time.time())
     monkeypatch.setattr(hook, "_post_records", _fail(_http_error(401, "Unauthorized")))
-    for _ in range(hook._WARN_AFTER_FAILS):
+    for _ in range(hook.retry.WARN_AFTER_FAILS):
         hook._ship(path, mode="stop")
 
     spawned: list[list[str]] = []
@@ -381,6 +386,33 @@ def test_catchup_hook_prints_warning_for_user_and_model(hook, tmp_path, monkeypa
         "additionalContext": out["systemMessage"],
     }
     assert spawned and spawned[0][:2] == ["--catchup-run", str(root)]
+
+
+@pytest.mark.parametrize("source", ["clear", "compact"])
+def test_catchup_hook_warns_but_does_not_sweep_on_a_clear_or_compaction(
+    hook, tmp_path, monkeypatch, capsys, source
+):
+    """SessionStart fires again for /clear and auto-compaction: a fresh context window needs
+    the warning again, but the sweep ran when the session started."""
+    _, proj = _projects(tmp_path)
+    path = _mk(proj, "s.jsonl", age_s=3600, now=time.time())
+    monkeypatch.setattr(hook, "_post_records", _fail(_http_error(401, "Unauthorized")))
+    for _ in range(hook.retry.WARN_AFTER_FAILS):
+        hook._ship(path, mode="stop")
+
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(hook, "_spawn_detached", spawned.append)
+    monkeypatch.setattr(sys, "argv", ["ingest_hook.py", "--catchup"])
+    payload = {"transcript_path": path, "source": source}
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    hook.main()
+    assert "have been failing" in capsys.readouterr().out
+    assert spawned == []
+
+    payload["source"] = "resume"
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    hook.main()
+    assert spawned and spawned[0][0] == "--catchup-run"
 
 
 def test_catchup_hook_is_silent_when_healthy(hook, tmp_path, monkeypatch, capsys):
@@ -413,7 +445,7 @@ def test_catchup_hook_is_silent_when_healthy(hook, tmp_path, monkeypatch, capsys
     ],
 )  # fmt: skip
 def test_short_reason_vocabulary(hook, exc, reason):
-    assert hook._short_reason(exc) == reason
+    assert hook.retry.short_reason(exc) == reason
 
 
 def test_token_never_lands_in_state_or_warning(hook, tmp_path, monkeypatch, capsys):
@@ -435,7 +467,7 @@ def test_token_never_lands_in_state_or_warning(hook, tmp_path, monkeypatch, caps
 
     raw = hook.CURSOR_PATH.read_text()
     assert secret not in raw
-    line = hook._failure_warning(json.loads(raw), time.time())
+    line = hook.retry.failure_warning(json.loads(raw), time.time(), hook.INGEST_TOKEN)
     assert line and secret not in line
 
     monkeypatch.setattr(hook, "_spawn_detached", lambda args: None)

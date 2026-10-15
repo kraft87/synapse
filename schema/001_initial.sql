@@ -19,7 +19,15 @@ CREATE TABLE IF NOT EXISTS episodes (
     UNIQUE (session_id, sequence)
 );
 
-CREATE INDEX IF NOT EXISTS episodes_content_tsv_idx ON episodes USING GIN (content_tsv);
+-- 005 drops content_tsv (BM25 replaced it), so on a re-run against a later schema the
+-- column is gone and the index cannot be created.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+               WHERE attrelid = 'episodes'::regclass AND attname = 'content_tsv' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS episodes_content_tsv_idx ON episodes USING GIN (content_tsv);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS episodes_project_idx     ON episodes (project);
 CREATE INDEX IF NOT EXISTS episodes_session_idx     ON episodes (session_id);
 CREATE INDEX IF NOT EXISTS episodes_created_at_idx  ON episodes (created_at DESC);
@@ -51,7 +59,13 @@ CREATE TABLE IF NOT EXISTS search_cache (
     UNIQUE (query, source_url)
 );
 
-CREATE INDEX IF NOT EXISTS search_cache_content_tsv_idx ON search_cache USING GIN (content_tsv);
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+               WHERE attrelid = 'search_cache'::regclass AND attname = 'content_tsv' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS search_cache_content_tsv_idx ON search_cache USING GIN (content_tsv);
+    END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS search_cache_query_idx       ON search_cache (query);
 CREATE INDEX IF NOT EXISTS search_cache_project_idx     ON search_cache (project);
 

@@ -96,6 +96,8 @@ Settings live in `~/.synapse/config.json`, owned by no harness:
 synapse config                         # list
 synapse config skills_sync on          # two-way skill sync at session start
 synapse config config_sync on          # mirror CLAUDE.md + rules/*.md for the dream lane
+synapse config timeline_repos ~/code/app  # git checkouts that feed the board's last-week block
+synapse config recall_nudge off        # also board, prefs_block, prompt_timestamp (default on)
 synapse config url https://...         # same server, new address; also rewires the harnesses
 ```
 
@@ -134,9 +136,8 @@ work through [the troubleshooting list](../docs/install.md#troubleshooting).
 
 A failed upload is not lost. The hook records it, and every session start's catch-up sweep
 retries it, however long the outage lasted: a down server, a revoked token, a proxy answering
-`403`. The sweep picks up any lagging transcript modified in the last
-`SYNAPSE_INGEST_CATCHUP_DAYS` (default 3) plus every transcript whose upload failed, at any
-age, `SYNAPSE_INGEST_CATCHUP_MAX` (default 20) files per session start. When uploads keep
+`403`. The sweep picks up any lagging transcript modified in the last 3 days plus every
+transcript whose upload failed, at any age, 20 files per session start. When uploads keep
 failing, session start shows one line saying so:
 
 ```
@@ -173,7 +174,7 @@ CLI (`synapse …` from any terminal once the client is installed; `!` prefix in
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
 - **`synapse import`** / **`! synapse-import`** — backfill your existing history (step 4).
-- **`synapse private on|off|status <session-id>`** — private mode (below).
+- **`synapse private on [--purge]|off [--forget]|status <session-id>`** — private mode (below).
 
 ## Retiring a skill
 
@@ -206,7 +207,7 @@ Scripts (run by full path; see [Memory-write spool](#memory-write-spool)):
 
 ## Private mode
 
-Take one session off the record — nothing from it becomes memory, ever:
+Take one session off the record — nothing it says from now on becomes memory:
 
 ```
 ! synapse-private on <session-id>
@@ -221,6 +222,16 @@ fails, so "off the record" is never claimed on a half-write:
 - a row in `private_sessions` on the server — the durable half. Your transcript stays on disk
   after the marker is gone, so this row is what stops a later catch-up sweep or
   `synapse-import` from ingesting the very turns the hook skipped.
+
+Private mode covers the session **from now on**. Turns it stored before you switched it on
+are already memory and stay recallable; `on` prints how many (an older server doesn't say).
+`on --purge` deletes them, with the facts, events and preferences derived from them, in one
+transaction. It is destructive, so it only runs when you ask for it. A device that may not
+delete those turns (a restricted one, for turns another device wrote) is refused: private mode
+is on, nothing was deleted, and the command exits nonzero saying so. The same goes for a purge
+that fails or times out on the server: the flag is committed first, so private mode is on
+(the command reads it back), the command exits nonzero and claims no deletion. A server that
+predates purge ignores the flag, and the command exits nonzero instead of claiming a deletion.
 
 `off` removes the marker and **keeps** the row: private turns already spoken stay
 uningestable, which is the only honest reading of "we were off the record". `--forget`
@@ -252,7 +263,7 @@ python3 <plugin>/scripts/remember_spool.py flush     # replay now
 `add` also accepts the same fields as JSON on stdin, and tries an immediate write-through
 before queueing. Nothing leaves the spool until the server confirms, and each intent carries
 a client-generated id the server dedups on — so a flush interrupted mid-way neither loses an
-intent nor writes one twice. Log: `/tmp/synapse-remember-spool.log` (`SYNAPSE_SPOOL_LOG`).
+intent nor writes one twice. Log: `~/.synapse/logs/remember-spool.log`.
 
 Server requirement: schema 052 (`remember_intents`) and the `/remember/spool` route. Against
 an older server the flush fails loudly into the log and the spool simply keeps its intents.

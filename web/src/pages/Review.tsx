@@ -11,11 +11,13 @@ import {
   type EvidenceItem, type ProposalDetail, type ProposalSummary,
   type DreamRun, type BehaviorFileEntry, type BehaviorFile, type FlagRow,
 } from '../api';
+import { copyText } from '../clipboard';
 import { useStore } from '../state';
-import { openEpisode } from '../hash';
-import { relTime, monoHead } from '../tokens';
+import { openEpisode, openSession } from '../hash';
+import { relTime, monoHead, localMinute } from '../tokens';
 import { ErrorBox, EmptyState } from '../components/ui';
 import { useAsync } from '../hooks';
+import { defaultRun, runDuration, runState } from '../dream';
 
 const TABS = [
   { key: 'proposals', label: 'Proposals' },
@@ -114,6 +116,7 @@ function DiffView({ src }: { src: string }) {
 // ---------------------------------------------------------------------------
 
 const evText = (e: EvidenceItem): string => e.why || e.quote || e.phrasing || e.note || '';
+const chipStyle: CSSProperties = { ...mono, fontSize: '10.5px', border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--acc)', borderRadius: '4px', padding: '2px 8px', cursor: 'pointer' };
 
 function Evidence({ detail }: { detail: ProposalDetail }) {
   const ev = detail.evidence;
@@ -139,12 +142,18 @@ function Evidence({ detail }: { detail: ProposalDetail }) {
           </div>
         </>
       )}
-      {detail.provenance_episodes.length > 0 && (
+      {(detail.provenance_episodes.length > 0 || detail.provenance_sessions.length > 0) && (
         <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginTop: '10px' }}>
           {detail.provenance_episodes.map((id) => (
-            <button key={id} className="chipbtn" onClick={() => openEpisode(id)} title="open episode"
-              style={{ ...mono, fontSize: '10.5px', border: '1px solid var(--line2)', background: 'var(--bg2)', color: 'var(--acc)', borderRadius: '4px', padding: '2px 8px', cursor: 'pointer' }}>
+            <button key={'ep' + id} className="chipbtn" onClick={() => openEpisode(id)} title="open episode"
+              style={chipStyle}>
               ep-{id} ↗
+            </button>
+          ))}
+          {detail.provenance_sessions.map((sid) => (
+            <button key={'s' + sid} className="chipbtn" onClick={() => openSession(sid)} title={'open session ' + sid}
+              style={chipStyle}>
+              session {sid.slice(0, 8)} ↗
             </button>
           ))}
         </div>
@@ -178,30 +187,38 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
   const [rejecting, setRejecting] = useState(false);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState(false);
-  // A skills approve APPLIES the proposal; the lane refuses (200, status 'refused') when it
-  // can't — no draft yet, a stale draft, a taken name — and nothing changed, so say why.
-  const [refusal, setRefusal] = useState<string | null>(null);
-
-  useEffect(() => { setRejecting(false); setReason(''); setRefusal(null); }, [id]);
+  // What the last press of "discuss" did, shown for a moment.
+  const [copied, setCopied] = useState<'ok' | 'failed' | null>(null);
+  // Why a decision did not go through. A refusal (200, status 'refused') changed nothing: the
+  // row is no longer 'proposed', or a skills approve can't apply it (no draft yet, a stale
+  // draft, a taken name). A failed request says nothing about the outcome, so the pane is
+  // reloaded to show the status the server has.
+  const [problem, setProblem] = useState<string | null>(null);
+  // The pane is mounted per proposal (see Proposals), so nothing here outlives a selection.
+  const locked = busy || loading;
 
   const decide = (action: 'approve' | 'reject', note?: string) => {
     setBusy(true);
-    setRefusal(null);
+    setProblem(null);
     postProposalDecision(id, action, note)
       .then((r) => {
-        if (r.status === 'refused') { setRefusal(String(r.detail ?? 'refused by the lane')); return; }
+        if (r.status === 'refused') {
+          setProblem('not applied: ' + String(r.detail ?? 'refused by the lane'));
+          reload(); onDecided();
+          return;
+        }
         setRejecting(false); setReason(''); reload(); onDecided();
       })
-      .catch(() => {})
+      .catch((e) => { setProblem('decision failed: ' + String(e?.message || e)); reload(); })
       .finally(() => setBusy(false));
   };
 
   const discuss = (d: ProposalDetail) => {
     const text = summaryText(d);
-    const done = () => { setCopied(true); window.setTimeout(() => setCopied(false), 1600); };
-    if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done).catch(done);
-    else done();
+    void copyText(text).then((ok) => {
+      setCopied(ok ? 'ok' : 'failed');
+      window.setTimeout(() => setCopied(null), 1600);
+    });
   };
 
   if (loading && !detail) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading proposal…</div>;
@@ -246,16 +263,16 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
       {/* decision bar (proposed only) */}
       {!decided && (
         <div style={{ borderTop: '1px solid var(--line)', paddingTop: '14px', marginTop: '16px' }}>
-          {refusal && <div style={{ fontSize: '12.5px', color: 'var(--err)', lineHeight: 1.5, marginBottom: '10px' }}>not applied: {refusal}</div>}
+          {problem && <div role="alert" style={{ fontSize: '12.5px', color: 'var(--err)', lineHeight: 1.5, marginBottom: '10px' }}>{problem}</div>}
           {!rejecting ? (
             <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
-              <button disabled={busy} onClick={() => decide('approve')}
-                style={{ border: 'none', background: 'var(--ok)', color: '#0d1116', borderRadius: '6px', padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: 'pointer', opacity: busy ? 0.6 : 1 }}>approve</button>
-              <button className="softbtn" disabled={busy} onClick={() => setRejecting(true)}
+              <button disabled={locked} onClick={() => decide('approve')}
+                style={{ border: 'none', background: 'var(--ok)', color: '#0d1116', borderRadius: '6px', padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: 'pointer', opacity: locked ? 0.6 : 1 }}>approve</button>
+              <button className="softbtn" disabled={locked} onClick={() => setRejecting(true)}
                 style={{ borderRadius: '6px', padding: '7px 14px', fontSize: '13px' }}>reject…</button>
               <span style={{ flex: 1 }} />
               <button className="softbtn" onClick={() => discuss(detail)}
-                style={{ color: copied ? 'var(--ok)' : 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '12.5px', ...mono }}>{copied ? 'copied for chat ✓' : 'discuss →'}</button>
+                style={{ color: copied === 'ok' ? 'var(--ok)' : copied === 'failed' ? 'var(--err)' : 'var(--txt2)', borderRadius: '6px', padding: '7px 14px', fontSize: '12.5px', ...mono }}>{copied === 'ok' ? 'copied for chat ✓' : copied === 'failed' ? 'copy failed' : 'discuss →'}</button>
             </div>
           ) : (
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -266,8 +283,8 @@ function Detail({ id, onDecided }: { id: string; onDecided: () => void }) {
                 placeholder="why is this proposal wrong?"
                 style={{ background: 'var(--bg2)', border: '1px solid var(--line2)', borderRadius: '6px', padding: '7px 10px', fontFamily: 'var(--font-data)', fontSize: '12.5px', color: 'var(--txt)' }} />
               <div style={{ display: 'flex', gap: '8px' }}>
-                <button disabled={busy || !reason.trim()} onClick={() => decide('reject', reason.trim())}
-                  style={{ border: 'none', background: 'var(--err)', color: '#0d1116', borderRadius: '6px', padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: reason.trim() ? 'pointer' : 'not-allowed', opacity: (busy || !reason.trim()) ? 0.55 : 1 }}>confirm reject</button>
+                <button disabled={locked || !reason.trim()} onClick={() => decide('reject', reason.trim())}
+                  style={{ border: 'none', background: 'var(--err)', color: '#0d1116', borderRadius: '6px', padding: '7px 16px', fontSize: '13px', fontWeight: 600, cursor: reason.trim() ? 'pointer' : 'not-allowed', opacity: (locked || !reason.trim()) ? 0.55 : 1 }}>confirm reject</button>
                 <button className="softbtn" onClick={() => { setRejecting(false); setReason(''); }}
                   style={{ borderRadius: '6px', padding: '7px 14px', fontSize: '13px' }}>cancel</button>
               </div>
@@ -327,7 +344,7 @@ function Proposals() {
         {list.map((p) => <ProposalCard key={p.id} p={p} selected={p.id === sel} onClick={() => setSel(p.id)} />)}
       </div>
       <div style={{ border: '1px solid var(--line)', borderRadius: '11px', background: 'var(--bg1)', padding: '16px 18px', minWidth: 0 }}>
-        {sel ? <Detail id={sel} onDecided={reload} /> : <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)' }}>select a proposal.</div>}
+        {sel ? <Detail key={sel} id={sel} onDecided={reload} /> : <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)' }}>select a proposal.</div>}
       </div>
     </div>
   );
@@ -348,7 +365,7 @@ const DREAM_CARDS: { count: string; sample: string; label: string; color: string
   { count: 'proposals_raised', sample: 'proposals', label: 'proposals raised', color: 'var(--acc)' },
 ];
 
-const runLabel = (r: DreamRun): string => (r.started_at || '').replace('T', ' ').slice(0, 16);
+const runLabel = (r: DreamRun): string => localMinute(r.started_at) + (r.finished_at ? '' : ' · ' + runState(r));
 const sampleText = (s: unknown): string => {
   if (typeof s === 'string') return s;
   if (s && typeof s === 'object') {
@@ -361,9 +378,10 @@ const sampleText = (s: unknown): string => {
 function DreamTab() {
   const { data, error } = useAsync(() => fetchDreamReport(), []);
   const runs = data?.runs ?? null;
-  // default-select the newest run without an effect (avoids an empty-state flash on load).
+  // default-select the newest finished run without an effect (avoids an empty-state flash
+  // on load); a crashed run stays in the list but does not pin the report.
   const [selRaw, setSel] = useState<number | null>(null);
-  const sel = selRaw ?? runs?.[0]?.id ?? null;
+  const sel = selRaw ?? (runs ? defaultRun(runs)?.id : undefined) ?? null;
   const [drill, setDrill] = useState<string>('proposals_raised');
 
   const run = useMemo(() => runs?.find((r) => r.id === sel) || null, [runs, sel]);
@@ -374,7 +392,6 @@ function DreamTab() {
     return <EmptyState title="no runs recorded yet" subtitle="the nightly dream pipeline writes a row per run." />;
   }
 
-  const mins = run.duration_s != null ? Math.round(run.duration_s / 60) : null;
   const samples = (run.samples || {}) as Record<string, unknown[]>;
   const drillCard = DREAM_CARDS.find((c) => c.count === drill);
   const drillItems: unknown[] = drillCard ? (samples[drillCard.sample] || []) : [];
@@ -389,7 +406,7 @@ function DreamTab() {
           {runs.map((r) => <option key={r.id} value={r.id}>{runLabel(r)}</option>)}
         </select>
         <span style={{ ...mono, fontSize: '11.5px', color: 'var(--txt3)' }}>
-          {mins != null ? `${mins} min` : 'in flight'} · {run.errors.length} error{run.errors.length === 1 ? '' : 's'}
+          {runDuration(run)} · {run.errors.length} error{run.errors.length === 1 ? '' : 's'}
           {run.ok === false ? ' · failed' : ''}
         </span>
       </div>
@@ -465,11 +482,15 @@ function BehaviorTab() {
     }).catch(() => setError(true));
   }, []);
 
+  // The last click wins: a slower earlier file arriving after it is dropped.
   useEffect(() => {
     if (!sel) return;
+    let live = true;
     setFile(null); setFileErr(false);
     fetchBehaviorFile(sel.file_key, sel.scope, sel.surface_id)
-      .then(setFile).catch(() => setFileErr(true));
+      .then((f) => { if (live) setFile(f); })
+      .catch(() => { if (live) setFileErr(true); });
+    return () => { live = false; };
   }, [sel]);
 
   // Resolve a [[wikilink]] to a known file entry (exact file_key, or basename-without-ext).
@@ -499,11 +520,14 @@ function BehaviorTab() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '2px' }}>
               {g.files.map((f) => {
                 const active = sel?.file_key === f.file_key && sel?.scope === f.scope && sel?.surface_id === f.surface_id;
+                // The same file mirrored from two surfaces (or scopes) would read as one entry twice.
+                const twin = g.files.some((o) => o !== f && o.file_key === f.file_key);
                 return (
                   <button key={f.scope + '/' + f.surface_id + '/' + f.file_key} onClick={() => setSel(f)}
                     style={{ textAlign: 'left', cursor: 'pointer', border: 'none', borderRadius: '6px', padding: '6px 9px', ...mono, fontSize: '12px',
                       background: active ? 'var(--acc-bg)' : 'transparent', color: active ? 'var(--acc)' : 'var(--txt2)' }}>
                     {f.file_key}
+                    {twin && <span style={{ display: 'block', fontSize: '10.5px', color: 'var(--txt3)' }}>{[f.surface_id, f.scope].filter(Boolean).join(' · ')}</span>}
                   </button>
                 );
               })}
@@ -569,25 +593,28 @@ function FlagsTab() {
   };
   useEffect(() => { load(); }, []);
 
+  // Where a flag leads: the episode behind it (the item itself for an episode, a fact's
+  // provenance, the turn an event or note was born from), or the Preferences tab. A row with
+  // no episode to open (a git event, a note from `remember`) has no jump: its gist is shown,
+  // and a note's body with it.
+  const canJump = (f: FlagRow): boolean => f.kind === 'preference' || f.episode_id != null;
   const jump = (f: FlagRow) => {
-    if (f.kind === 'episode') openEpisode(f.item_id);
-    else if (f.kind === 'timeline_event') s.setPage('timeline');
-    else if (f.kind === 'preference') {
+    if (f.kind === 'preference') {
       if (typeof sessionStorage !== 'undefined') sessionStorage.setItem('synapse.tlTab', 'preferences');
       s.setPage('timeline');
-    } else s.setPage('feed'); // fact / note surface in the live feed
+    } else if (f.episode_id != null) openEpisode(f.episode_id);
   };
 
   const unflag = (f: FlagRow) => {
     const k = f.kind + ':' + f.item_id;
     setBusy(k);
-    postFlag(f.kind, f.item_id).then(() => load()).catch(() => setError(true)).finally(() => setBusy(null));
+    postFlag(f.kind, f.item_id, false).then(() => load()).catch(() => setError(true)).finally(() => setBusy(null));
   };
 
   if (error && !flags) return <ErrorBox>failed to load flags.</ErrorBox>;
   if (!flags) return <div style={{ ...mono, fontSize: '12px', color: 'var(--txt3)', padding: '10px 0' }}>loading flags…</div>;
   if (flags.length === 0) {
-    return <EmptyState title="nothing flagged" subtitle="flag an item anywhere (⚑) to queue it for review here." />;
+    return <EmptyState title="nothing flagged" subtitle="flag an episode, fact, event or preference (⚑) to queue it for review here." />;
   }
 
   return (
@@ -598,10 +625,13 @@ function FlagsTab() {
           <div key={f.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', border: '1px solid var(--line)', borderRadius: '9px', background: 'var(--bg1)', padding: '10px 13px' }}>
             <span style={{ color: 'var(--warn)', fontSize: '13px' }}>⚑</span>
             <span style={{ ...mono, fontSize: '10.5px', border: '1px solid var(--line2)', color: FLAG_KIND_COLOR[f.kind] || 'var(--txt2)', borderRadius: '4px', padding: '2px 7px', whiteSpace: 'nowrap' }}>{f.kind}</span>
-            <span style={{ flex: 1, minWidth: 0, fontSize: '13px', color: 'var(--txt)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.gist || <span style={{ color: 'var(--txt3)' }}>({f.kind} #{f.item_id})</span>}</span>
+            <span style={{ flex: 1, minWidth: 0, fontSize: '13px', lineHeight: 1.45, color: 'var(--txt)', overflowWrap: 'anywhere' }}>
+              {f.gist || <span style={{ color: 'var(--txt3)' }}>({f.kind} #{f.item_id})</span>}
+              {f.body && <div style={{ marginTop: '5px', maxHeight: '14em', overflowY: 'auto', whiteSpace: 'pre-wrap', fontSize: '12.5px', color: 'var(--txt2)' }}>{f.body}</div>}
+            </span>
             {f.note && <span style={{ ...mono, fontSize: '11px', color: 'var(--txt3)' }}>{f.note}</span>}
-            <button className="linkbtn" onClick={() => jump(f)}
-              style={{ border: 'none', background: 'none', color: 'var(--acc)', cursor: 'pointer', ...mono, fontSize: '11.5px' }}>jump ↗</button>
+            {canJump(f) && <button className="linkbtn" onClick={() => jump(f)}
+              style={{ border: 'none', background: 'none', color: 'var(--acc)', cursor: 'pointer', ...mono, fontSize: '11.5px' }}>jump ↗</button>}
             <button className="softbtn" disabled={busy === k} onClick={() => unflag(f)}
               style={{ borderRadius: '5px', padding: '4px 10px', ...mono, fontSize: '11px', opacity: busy === k ? 0.6 : 1 }}>unflag</button>
           </div>

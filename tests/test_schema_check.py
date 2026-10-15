@@ -43,6 +43,13 @@ def test_repo_schema_dir_is_discovered():
     assert v is not None and v >= "038"
 
 
+def test_repo_migration_numbers_are_unique():
+    # apply_schema.sh orders, gates and stamps by number; a shared number would leave the
+    # order to the filenames and make "applied everything up to the stamp" untrue.
+    numbers = [num for num, _ in schema_check._migrations(None)]
+    assert len(numbers) == len(set(numbers))
+
+
 def test_check_passes_on_match(tmp_path, monkeypatch):
     d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
     monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: "039")
@@ -126,11 +133,13 @@ def test_check_exits_on_unparseable_stamp(tmp_path, monkeypatch):
         check_schema_version("postgresql://x", schema_dir=d)
 
 
-def test_check_exits_when_stamp_is_missing(tmp_path, monkeypatch):
+def test_check_exits_when_stamp_is_missing(tmp_path, monkeypatch, caplog):
     d = _make_schema_dir(tmp_path, ["039_schema_meta.sql"])
     monkeypatch.setattr(schema_check, "applied_schema_version", lambda url: None)
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit), caplog.at_level("CRITICAL"):
         check_schema_version("postgresql://x", schema_dir=d)
+    # apply_schema.sh refuses an unstamped database without an explicit start
+    assert "scripts/apply_schema.sh --all" in caplog.text
 
 
 def test_kill_switch_skips_check(tmp_path, monkeypatch):
