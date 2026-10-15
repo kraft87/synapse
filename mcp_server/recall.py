@@ -23,7 +23,9 @@ community refresh was shelved, and it was the last FalkorDB read in recall.
 
 recall_episodes() exposes the raw episode drill-down. The summary layer and the
 chunk bucket were both retired (task #63): the KG owns facts and the direct
-episode leg owns broad/needle, so neither earned its serving slot.
+episode leg owns broad/needle, so neither earned its serving slot. Chunks come back
+as a candidate source only: with SYNAPSE_RECALL_CHUNK_CANDIDATES on, the episodes of
+the best-matching chunks join the pool the cross-encoder reranks (see _CHUNK_CANDIDATES).
 """
 
 from __future__ import annotations
@@ -242,6 +244,18 @@ _NOTES_LIMIT = int(os.getenv("SYNAPSE_RECALL_NOTES_LIMIT", "3") or "3")
 _NOTES_FETCH = int(os.getenv("SYNAPSE_RECALL_NOTES_FETCH", "24") or "24")
 _NOTES_BODY_CAP = 700  # serve capped bodies; fetch("n:N") returns the full note
 
+# Chunk candidate source (OFF by default; SYNAPSE_RECALL_CHUNK_CANDIDATES=1 turns it on).
+# Chunks (4 consecutive turns of a session, advanced 3 at a time) are embedded and BM25-indexed
+# at ingest, but nothing read them: the episode legs search single turns, so a turn whose own
+# text misses the question's words while its neighbours carry them never entered the pool. With
+# this on, the top chunks by keyword and by embedding name their episodes, which join the pool
+# the cross-encoder reranks, through the same project and surface predicates as the episode
+# legs. Chunks are never served, only their episodes. The vector half needs the optional chunks
+# vector index (without it that half says so in `warnings` and serves nothing).
+# scripts/ab_chunk_candidates.py compares the two settings on a set of goldens; the losing
+# side gets deleted.
+_CHUNK_CANDIDATES = os.getenv("SYNAPSE_RECALL_CHUNK_CANDIDATES", "0") == "1"
+
 # Adaptive episode serving (variable-k) for recall_episodes() — OFF by default.
 # When SYNAPSE_EPISODE_CUTOFF_TAU > 0, recall_episodes() serves the reranked turns
 # scoring >= tau*top_score instead of a fixed top-`limit`, clamped to [MIN_K, MAX_K]:
@@ -379,6 +393,7 @@ class Recall(
             _RERANK_WINDOW=_RERANK_WINDOW,
             _ECHO_MIN_QUERY_LEN=_ECHO_MIN_QUERY_LEN,
             _RECALL_FACT_FLOOR=_RECALL_FACT_FLOOR,
+            _CHUNK_CANDIDATES=_CHUNK_CANDIDATES,
             _RECALL_PASSAGE_CAND=_RECALL_PASSAGE_CAND,
             _EPISODE_CUTOFF_TAU=_EPISODE_CUTOFF_TAU,
             _EPISODE_CUTOFF_MIN_K=_EPISODE_CUTOFF_MIN_K,

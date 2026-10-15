@@ -9,6 +9,7 @@ from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from ingestion import embedding as _embedding
+from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import (
     OWN_SURFACE_PROBE,
     SurfaceTrust,
@@ -26,6 +27,18 @@ from mcp_server.recall_warnings import warn as _warn
 
 logger = logging.getLogger(__name__)
 
+#: Chunks taken from each chunk source (a chunk is 4 consecutive episodes, advanced 3 at a
+#: time), so each source adds at most ~40 episodes to a pool the episode legs fill with 200.
+_CHUNK_FETCH = 10
+
+#: The optional chunks vector index (its migration builds it CONCURRENTLY). Without it the
+#: chunk vector source would scan every chunk's 2048-dim embedding, so it stays off until
+#: the index is valid; an interrupted CONCURRENTLY build leaves an invalid one.
+CHUNK_VECTOR_INDEX = ColumnProbe(
+    "SELECT 1 FROM pg_index WHERE indexrelid = to_regclass('chunks_embedding_hnsw') AND indisvalid",
+    "the chunks vector index",
+)
+
 
 class EpisodeLegs(NamedTuple):
     """The episode candidate legs in flight (see ``_start_episode_legs``)."""
@@ -34,6 +47,10 @@ class EpisodeLegs(NamedTuple):
     f_vec: Future[tuple[list[dict[str, Any]], float]] | None  # None: no query embedding
     query_emb: list[float] | None
     ms_embed: float
+    # The chunk candidate sources (SYNAPSE_RECALL_CHUNK_CANDIDATES): each is a ranked list
+    # of episodes, like the legs above. None: the setting is off, or the source cannot run.
+    f_chunk_bm25: Future[list[dict[str, Any]]] | None = None
+    f_chunk_vec: Future[list[dict[str, Any]]] | None = None
 
 
 class EpisodePool(NamedTuple):
@@ -92,8 +109,6 @@ class RecallEpisodeSearchMixin:
         # dropped from the caller-facing item by _to_recall_item — internal ranking use only.
         if table == "episodes":
             return ", retrieval_count, session_id"
-        if table == "chunks":
-            return ", episode_ids"  # chunk = retrieval signal; serve its episodes
         return ""
 
     def _bm25_table(
@@ -250,6 +265,108 @@ class RecallEpisodeSearchMixin:
             own_surface,
         )
 
+    def _chunk_episodes(
+        self,
+        chunks: list[dict[str, Any]],
+        project: str | None,
+        allowed_projects: list[str] | None,
+        own_surface: str | None,
+    ) -> list[dict[str, Any]]:
+        """The episodes of ranked ``chunks``, in rank order and the shape the other episode
+        legs return them in. A chunk is never served; it only names episodes. They load
+        through the same project and surface predicates as the episode legs, so a chunk
+        cannot lead a restricted caller to a turn it could not have searched for."""
+        ids = list(dict.fromkeys(i for chunk in chunks for i in chunk["episode_ids"]))
+        if not ids:
+            return []
+        where = ["id = ANY(%s)"]
+        params: list[Any] = [ids]
+        if project:
+            where.append("project = %s")
+            params.append(project)
+        scope = episode_scope_sql(allowed_projects, own_surface)
+        if scope is not None:
+            where.append(scope[0])
+            params.extend(scope[1])
+        with self._pg() as pg:
+            rows = pg.execute(
+                "SELECT id, content, project, created_at, retrieval_count, session_id "
+                f"FROM episodes WHERE {' AND '.join(where)}",
+                params,
+            ).fetchall()
+        by_id = {r["id"]: r for r in rows}
+        return [{**by_id[i], "doc_type": "episode", "id": f"e:{i}"} for i in ids if i in by_id]
+
+    def _search_chunks_bm25(
+        self,
+        query: str,
+        project: str | None,
+        allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Episodes of the chunks whose text best matches ``query`` by keyword: a candidate
+        source for episodes whose own text misses the words a neighbouring turn carries."""
+        if not any(c.isalnum() for c in query):  # see _bm25_table
+            return []
+        where = ["id @@@ paradedb.match('content', %s)"]
+        params: list[Any] = [query]
+        if project:
+            where.append("project = %s")
+            params.append(project)
+        try:
+            with self._pg() as pg:
+                chunks = pg.execute(
+                    "SELECT id, episode_ids, paradedb.score(id) AS bm25_score FROM chunks "
+                    f"WHERE {' AND '.join(where)} ORDER BY bm25_score DESC LIMIT %s",
+                    (*params, _CHUNK_FETCH),
+                ).fetchall()
+            return self._chunk_episodes(chunks, project, allowed_projects, own_surface)
+        except Exception as e:
+            logger.warning("BM25 chunks search failed: %s", e)
+            _warn(
+                f"BM25 chunks search failed ({_err_brief(e)}): chunk keyword source served nothing."
+            )
+            return []
+
+    def _search_chunks_vector(
+        self,
+        query_emb: list[float],
+        project: str | None,
+        allowed_projects: list[str] | None = None,
+        own_surface: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Episodes of the chunks nearest to the query embedding. Needs the optional chunks
+        vector index; without it the source says so and serves nothing, because the
+        alternative is an exact scan of every chunk on every recall."""
+        dims = self._settings()._EMBED_DIMS
+        emb_literal = _vec_literal(query_emb)
+        where = ["is_embedded = TRUE"]
+        params: list[Any] = []
+        if project:
+            where.append("project = %s")
+            params.append(project)
+        try:
+            with self._pg() as pg:
+                if not CHUNK_VECTOR_INDEX.ready(pg, self._db_url):
+                    _warn(
+                        "chunk vector source skipped: the chunks vector index is not built "
+                        "(optional migration), and without it every recall would scan all chunks."
+                    )
+                    return []
+                chunks = pg.execute(
+                    "SELECT id, episode_ids FROM chunks "
+                    f"WHERE {' AND '.join(where)} "
+                    f"ORDER BY embedding::halfvec({dims}) <=> %s::halfvec({dims}) LIMIT %s",
+                    (*params, emb_literal, _CHUNK_FETCH),
+                ).fetchall()
+            return self._chunk_episodes(chunks, project, allowed_projects, own_surface)
+        except Exception as e:
+            logger.warning("Vector chunks search failed: %s", e)
+            _warn(
+                f"vector chunks search failed ({_err_brief(e)}): chunk semantic source served nothing."
+            )
+            return []
+
     def _embed_query(self, query: str) -> tuple[list[float] | None, float]:
         """Embed the query for the vector legs: ``(embedding, ms)``. A dead backend yields
         ``None`` and a degradation notice; the legs then run BM25-only."""
@@ -286,7 +403,11 @@ class RecallEpisodeSearchMixin:
         project allowlist to BOTH legs: it filters the pool, not the served slice, so the
         allowlisted content still gets the full deep-fetch width. ``own_surface`` widens
         that filter to the rows the calling surface ingested itself (schema 057)."""
-        fetch = self._settings()._EPISODE_FETCH
+        settings = self._settings()
+        fetch = settings._EPISODE_FETCH
+        # Chunk sources feed more candidates into the same pool. A session-scoped drill-down
+        # greps one conversation, which the episode legs already cover.
+        chunks = settings._CHUNK_CANDIDATES and session_id is None
         f_bm25 = _submit_ctx(
             self._leg_executor,
             _timed,
@@ -297,6 +418,18 @@ class RecallEpisodeSearchMixin:
             session_id,
             allowed_projects,
             own_surface,
+        )
+        f_chunk_bm25 = (
+            _submit_ctx(
+                self._leg_executor,
+                self._search_chunks_bm25,
+                query,
+                project,
+                allowed_projects,
+                own_surface,
+            )
+            if chunks
+            else None
         )
         query_emb, ms_embed = self._embed_query(query)
         f_vec = (
@@ -314,7 +447,19 @@ class RecallEpisodeSearchMixin:
             if query_emb is not None
             else None
         )
-        return EpisodeLegs(f_bm25, f_vec, query_emb, ms_embed)
+        f_chunk_vec = (
+            _submit_ctx(
+                self._leg_executor,
+                self._search_chunks_vector,
+                query_emb,
+                project,
+                allowed_projects,
+                own_surface,
+            )
+            if chunks and query_emb is not None
+            else None
+        )
+        return EpisodeLegs(f_bm25, f_vec, query_emb, ms_embed, f_chunk_bm25, f_chunk_vec)
 
     def _join_episode_pool(self, legs: EpisodeLegs, self_session: str | None = None) -> EpisodePool:
         """Fuse the legs (RRF) into the PRE-rerank pool the cross-encoder scores.
@@ -326,7 +471,9 @@ class RecallEpisodeSearchMixin:
         session-scoped drill-down never does)."""
         bm25_eps, ms_bm25 = legs.f_bm25.result()
         vec_eps, ms_vec = legs.f_vec.result() if legs.f_vec is not None else ([], 0.0)
-        fused = _merge_rrf(bm25_eps, vec_eps, id_key="id")
+        chunk_bm25 = legs.f_chunk_bm25.result() if legs.f_chunk_bm25 is not None else []
+        chunk_vec = legs.f_chunk_vec.result() if legs.f_chunk_vec is not None else []
+        fused = _merge_rrf(bm25_eps, vec_eps, chunk_bm25, chunk_vec, id_key="id")
         n_self_excluded = 0
         if self_session:
             kept = self._exclude_self(fused, self_session)
