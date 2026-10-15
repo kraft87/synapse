@@ -35,17 +35,17 @@ PROPOSE_DAYS = 2  # derive: propose when its evidence dates span this many disti
 DECAY_TTL_DAYS = 28  # last_seen older than this -> retired (time-based; no nightly mass-bump)
 EVIDENCE_CAP = 60  # bound the JSONB
 PHRASING_CAP = 12  # trigger phrasings kept on a derive candidate
-# The states a retune's (name, direction) key is unique among (schema 112's index predicate):
-# the ones still waiting on a decision. A promoted or retired row is history.
+# The states a retune's (name, direction) key is unique among (the open-identity migration's
+# index predicate): the ones still waiting on a decision. A promoted or retired row is history.
 _OPEN = "status IN ('observe', 'proposed', 'rejected')"
 
-#: Schema 113 adds the draft-attempt columns. The image ships before it is applied, so every
-#: statement that names them asks this probe first.
+#: The draft-attempts migration adds the draft-attempt columns. The image ships before it is
+#: applied, so every statement that names them asks this probe first.
 DRAFT_STATE = ColumnProbe(
     "SELECT 1 FROM pg_attribute "
     "WHERE attrelid = to_regclass('skills_lane.skill_gap_candidates') "
     "  AND attname = 'draft_attempts' AND NOT attisdropped",
-    "schema 113 (skill_gap_candidates.draft_attempts)",
+    "the draft-attempts migration (skill_gap_candidates.draft_attempts)",
 )
 
 # grounded signals advance toward apply; judge signals only nominate (and get 0.5x'd by `score`).
@@ -209,10 +209,10 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
     None. `cooling` is True when the row is rejected inside its 30d suppression window
     (rejected_until)."""
     if kind == "retune":
-        # Match skill_gap_named_idx's unique key among the open states (schema 112): a
-        # promoted or retired row is history, so a new sighting opens a fresh candidate. On a
-        # database still on the old index (unique across every status) the INSERT then
-        # conflicts with the closed row; merge_candidate reports that row untouched.
+        # Match skill_gap_named_idx's unique key among the open states (the open-identity
+        # migration): a promoted or retired row is history, so a new sighting opens a fresh
+        # candidate. On a database still on the old index (unique across every status) the
+        # INSERT then conflicts with the closed row; merge_candidate reports that row untouched.
         cur.execute(
             "SELECT id, evidence, trigger_phrasings, "
             "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
@@ -296,12 +296,12 @@ def merge_candidate(
     """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
 
     A retune's (name, direction) is one row among the OPEN candidates (observe / proposed /
-    rejected; schema 112). A sighting of a skill whose earlier row is promoted or retired
+    rejected; the open-identity migration). A sighting of a skill whose earlier row is promoted or retired
     therefore opens a fresh candidate holding only the new evidence; the closed row is
     history. A re-sighted rejected row:
       - inside its 30d cooldown: skipped silently, no write;
       - past the cooldown: evidence merges and the row REOPENS to 'observe'.
-    Before schema 112 the closed row still occupies the key: the INSERT does nothing and the
+    Before that migration the closed row still occupies the key: the INSERT does nothing and the
     row is reported untouched.
 
     salience persists as max(existing, new) — a candidate's pain rating only ratchets up.
@@ -404,9 +404,9 @@ def merge_candidate(
     row = cur.fetchone()
     if row is None:
         # ON CONFLICT backstop fired: the unique key is occupied by a row the resolver
-        # didn't see (a concurrent writer landed it between resolve and insert, or, before
-        # schema 112, a closed row). Never crash the lane — report the occupying row,
-        # untouched; an open one first.
+        # didn't see (a concurrent writer landed it between resolve and insert, or, before the
+        # open-identity migration, a closed row). Never crash the lane — report the occupying
+        # row, untouched; an open one first.
         conn.commit()
         cur.execute(
             "SELECT id, status, score FROM skills_lane.skill_gap_candidates "

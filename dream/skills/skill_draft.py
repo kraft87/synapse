@@ -16,7 +16,8 @@ body the draft was made from; accept refuses when the registry has moved on):
                             applied: frontmatter name unchanged, body non-empty, size sane
 
 A draft that fails its checks is not stored: the row stays body-less, and the reason and the
-attempt are recorded on the candidate (schema 113; the review CLI shows the reason). A failed
+attempt are recorded on the candidate (the draft-attempts migration; the review CLI shows the
+reason). A failed
 row waits 1, 2, 4... nights (at most 16 days) before it is tried again and rows with fewer
 failures go first, so a few permanently failing rows can't use up the night's budget.
 """
@@ -251,7 +252,7 @@ def draft_pending(conn, cap: int = DRAFT_CAP) -> dict:
     cur.execute(_PENDING_SQL)
     cols = [d.name for d in cur.description]
     rows = [r for r in (dict(zip(cols, t, strict=True)) for t in cur.fetchall()) if needs_draft(r)]
-    has_state = L.DRAFT_STATE.ready(conn, conn.info.dsn)  # schema 113
+    has_state = L.DRAFT_STATE.ready(conn, conn.info.dsn)  # the draft-attempts migration
     state = _draft_state(conn, [r["id"] for r in rows]) if has_state else {}
     today = datetime.now(UTC).date()
     due = [r for r in rows if not _backed_off(*state.get(r["id"], (0, None)), today)]
@@ -287,8 +288,8 @@ def draft_pending(conn, cap: int = DRAFT_CAP) -> dict:
 
 
 def _note_failure(conn, cid: int, error: str, has_state: bool) -> None:
-    """Record a failed draft on the candidate: one more attempt, when, and why. Before schema
-    113 there is nowhere to record it."""
+    """Record a failed draft on the candidate: one more attempt, when, and why. Before the
+    draft-attempts migration there is nowhere to record it."""
     if not has_state:
         return
     conn.execute(

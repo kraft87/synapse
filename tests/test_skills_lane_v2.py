@@ -33,7 +33,7 @@ from mcp_server.skill_sync_routes import _proposal_detail, _proposals_list
 
 SCHEMA = Path(__file__).resolve().parent.parent / "schema"
 MIGRATION = SCHEMA / "045_skills_v2_foundation.sql"
-MIGRATION_112 = SCHEMA / "112_skill_candidate_open_identity.sql"
+OPEN_IDENTITY_MIGRATION = next(SCHEMA.glob("*_skill_candidate_open_identity.sql"))
 
 _GHOSTS = ("research", "multi-research", "deep-research")
 
@@ -348,7 +348,7 @@ def test_only_a_dismissal_of_a_registered_skill_becomes_a_narrow_candidate(lane,
 
 
 # ------------------------------------------- terminal-state re-sightings (unique key)
-# A retune's (name, direction) is unique among OPEN rows only (schema 112: observe, proposed,
+# A retune's (name, direction) is unique among OPEN rows only (the open-identity migration: observe, proposed,
 # rejected). A promoted or retired row is history: a sighting after it opens a fresh candidate
 # instead of being folded into the closed one, and an INSERT never hits a UniqueViolation.
 
@@ -407,7 +407,7 @@ def test_a_sighting_after_a_retirement_opens_a_fresh_candidate(lane):
     assert _row(lane, r1["id"], "status") == ("retired",)
 
 
-def test_before_schema_112_a_sighting_after_an_accept_is_reported_not_raised(lane):
+def test_before_the_open_identity_migration_a_sighting_after_an_accept_is_reported(lane):
     old_index = (
         "CREATE UNIQUE INDEX skill_gap_named_idx ON skills_lane.skill_gap_candidates "
         "(kind, name, COALESCE(direction, '-')) WHERE kind IN ('retune', 'consolidate')"
@@ -421,7 +421,7 @@ def test_before_schema_112_a_sighting_after_an_accept_is_reported_not_raised(lan
         assert r2["id"] == r1["id"] and r2["merged"] is False and r2["status"] == "promoted"
         assert _row(lane, r1["id"], "jsonb_array_length(evidence)") == (2,)
     finally:
-        lane.execute(MIGRATION_112.read_text())
+        lane.execute(OPEN_IDENTITY_MIGRATION.read_text())
 
 
 def test_resighting_rejected_row_in_cooldown_skips_silently(lane):

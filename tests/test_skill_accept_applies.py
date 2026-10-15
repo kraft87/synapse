@@ -397,7 +397,9 @@ _WIDEN_EV = [
         "missing_phrasing": "snapshot the db",
     }
 ]
-_SCHEMA_113 = Path(__file__).resolve().parents[1] / "schema" / "113_skill_draft_attempts.sql"
+_DRAFT_ATTEMPTS_MIGRATION = next(
+    (Path(__file__).resolve().parents[1] / "schema").glob("*_skill_draft_attempts.sql")
+)
 
 
 def _draft_row(conn, cid):
@@ -480,7 +482,9 @@ def test_rows_with_fewer_failed_drafts_go_first_when_the_budget_is_short(acc, db
     assert _draft_row(acc, failing)[2] is False
 
 
-def test_before_schema_113_a_failed_draft_is_just_retried(acc, db_url, monkeypatch):
+def test_before_the_draft_attempts_migration_a_failed_draft_is_just_retried(
+    acc, db_url, monkeypatch
+):
     from dream.skills import skill_ledger as L
 
     _publish(db_url, "acc-backup", V1)
@@ -500,7 +504,7 @@ def test_before_schema_113_a_failed_draft_is_just_retried(acc, db_url, monkeypat
             (cid,),
         ).fetchone() == (True,)
     finally:
-        acc.execute(_SCHEMA_113.read_text())
+        acc.execute(_DRAFT_ATTEMPTS_MIGRATION.read_text())
         L.DRAFT_STATE.reset()
 
 
