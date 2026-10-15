@@ -67,8 +67,9 @@ the last answer (DATA_DIR/server_captures exists while it was yes), and only whi
     record when the call looks like web research (persisted_outputs.py: capped per result
     and per POST, only files that exist under the projects directory);
   * the Stop hook and the sweep also ship the session's sub-agent transcripts
-    (<session>/subagents/agent-<id>.jsonl, where most research runs), each under its own
-    cursor, from byte 0 (a sub-agent file has no turns to seed a tail from).
+    (<session>/subagents/agent-<id>.jsonl, and a workflow's under subagents/workflows/<wf>/;
+    where most research runs), each under its own cursor, from byte 0 (a sub-agent file has
+    no turns to seed a tail from).
 An old server never says yes, so a disabled or older server is not sent what it would drop.
 
 Design constraints:
@@ -459,12 +460,16 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
 
 
 def _parent_session(transcript_path: str) -> str | None:
-    """The session a sub-agent transcript (<session>/subagents/agent-<id>.jsonl) belongs to;
-    None for any other file. Its records carry the parent's sessionId."""
-    subagents = os.path.dirname(transcript_path)
-    if os.path.basename(subagents) != "subagents":
-        return None
-    return os.path.basename(os.path.dirname(subagents))
+    """The session a sub-agent transcript belongs to: <session>/subagents/agent-<id>.jsonl, or
+    deeper under its subagents directory (a workflow's agents are in workflows/<wf>/); None for
+    any other file. Its records carry the parent's sessionId."""
+    where = os.path.dirname(transcript_path)
+    while os.path.basename(where) != "subagents":
+        above = os.path.dirname(where)
+        if above == where:
+            return None
+        where = above
+    return os.path.basename(os.path.dirname(where))
 
 
 def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
@@ -563,10 +568,11 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
 
 
 def _subagent_files(transcript_path: str) -> list[str]:
-    """The session's sub-agent transcripts, which Claude Code writes beside its own."""
+    """The session's sub-agent transcripts, which Claude Code writes beside its own (a
+    workflow's agents a few directories down)."""
     session_id = os.path.splitext(os.path.basename(transcript_path))[0]
     subagents = os.path.join(os.path.dirname(transcript_path), session_id, "subagents")
-    return sorted(glob.glob(os.path.join(glob.escape(subagents), "*.jsonl")))
+    return sorted(glob.glob(os.path.join(glob.escape(subagents), "**", "*.jsonl"), recursive=True))
 
 
 def _ship_session(transcript_path: str) -> None:
@@ -606,11 +612,13 @@ def _catchup_candidates(
     os.stat results — patchable in tests. The rules are
     synapse_ingest_retry.sweep_candidates, shared with the Codex hook.
 
-    ``subagents`` adds the sub-agent transcripts (<session>/subagents/agent-<id>.jsonl)
+    ``subagents`` adds the sub-agent transcripts (<session>/subagents/**/agent-<id>.jsonl)
     under the same rules; the caller asks for them only while the server captures."""
     paths = glob.glob(os.path.join(projects_root, "*", "*.jsonl"))
     if subagents:
-        paths += glob.glob(os.path.join(projects_root, "*", "*", "subagents", "*.jsonl"))
+        paths += glob.glob(
+            os.path.join(projects_root, "*", "*", "subagents", "**", "*.jsonl"), recursive=True
+        )
     return retry.sweep_candidates(
         paths,
         state,

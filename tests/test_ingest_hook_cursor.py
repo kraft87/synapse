@@ -450,13 +450,16 @@ def _subagent_records(sid: str) -> list[dict]:
     return [{**r, "sessionId": sid, "isSidechain": True} for r in recs]
 
 
-def _session(root: Path, sid: str = "sess1") -> tuple[Path, Path]:
-    """<root>/-proj/<sid>.jsonl and its sub-agent transcript beside it, as Claude Code writes
-    them (the records carry the parent's sessionId)."""
+WORKFLOW_AGENT = "workflows/wf_x/agent-b.jsonl"  # where a workflow's sub-agents write
+
+
+def _session(root: Path, sid: str = "sess1", agent: str = "agent-a1.jsonl") -> tuple[Path, Path]:
+    """<root>/-proj/<sid>.jsonl and its sub-agent transcript beside it (<sid>/subagents/<agent>),
+    as Claude Code writes them (the records carry the parent's sessionId)."""
     main = root / "-proj" / f"{sid}.jsonl"
     main.parent.mkdir(parents=True, exist_ok=True)
     _write_jsonl(main, [{**r, "sessionId": sid} for r in (_u("u1"), _a("a1"))])
-    side = main.parent / sid / "subagents" / "agent-a1.jsonl"
+    side = main.parent / sid / "subagents" / agent
     side.parent.mkdir(parents=True)
     _write_jsonl(side, _subagent_records(sid))
     return main, side
@@ -574,3 +577,57 @@ def test_the_sweep_ships_a_subagent_transcript_from_byte_zero(hook, tmp_path, mo
     hook._catchup(str(root), skip_path="")
     assert len(server.bodies) == 2
     assert any(r.get("isSidechain") for b in server.bodies for r in b["records"])
+
+
+def test_a_workflow_subagent_transcript_is_shipped_like_any_other(hook, tmp_path, monkeypatch):
+    main, side = _session(tmp_path / "projects", agent=WORKFLOW_AGENT)
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook._ship_session(str(main))
+    sent = [[r["uuid"] for r in b["records"]] for b in server.bodies]
+    assert sent == [["u1", "a1"], ["s1", "s2", "s3", "s4"]]
+    assert hook._load_state()[str(side)]["offset"] == 0
+
+
+def test_a_workflow_subagent_transcript_is_read_from_byte_zero_in_stop_mode(
+    hook, tmp_path, monkeypatch
+):
+    main, side = _session(tmp_path / "projects", agent=WORKFLOW_AGENT)
+    with open(side, "ab") as f:  # a second prompt: a tail seed would start there, not at s1
+        for r in (_u("s5", "again"), _a("s6", "ok")):
+            f.write(json.dumps({**r, "sessionId": "sess1", "isSidechain": True}).encode() + b"\n")
+    monkeypatch.setattr(hook, "TAIL_RECORDS", 3)
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    hook._ship_session(str(main))
+    shipped = [r["uuid"] for b in server.bodies[1:] for r in b["records"]]
+    assert shipped == ["s1", "s2", "s3", "s4", "s5", "s6"]
+
+
+def test_the_parent_of_a_subagent_transcript_is_the_session_above_its_subagents_dir(hook):
+    root = "/p/-proj/sess1/subagents"
+    assert hook._parent_session(f"{root}/agent-a.jsonl") == "sess1"
+    assert hook._parent_session(f"{root}/workflows/wf_x/agent-b.jsonl") == "sess1"
+    assert hook._parent_session("/p/-proj/sess1.jsonl") is None
+
+
+def test_a_private_sessions_workflow_subagent_transcripts_are_not_read(hook, tmp_path, monkeypatch):
+    _main, side = _session(tmp_path / "projects", agent=WORKFLOW_AGENT)
+    # records whose own sessionId would not tell: only the directory names the parent
+    _write_jsonl(side, [{**r, "sessionId": "other"} for r in _subagent_records("other")])
+    monkeypatch.setattr(hook, "PRIVATE_DIR", tmp_path / "private")
+    (tmp_path / "private").mkdir()
+    (tmp_path / "private" / "sess1").write_text("")
+    server = _Server(hook, monkeypatch, {"status": "ok", "capture": True})
+    assert hook._ship(str(side), mode="catchup") == (0, 0) and server.bodies == []
+
+
+def test_the_sweep_finds_workflow_subagent_transcripts(hook, tmp_path):
+    root = tmp_path / "projects"
+    main, side = _session(root, agent=WORKFLOW_AGENT)
+    direct = side.parents[2] / "agent-a1.jsonl"  # <sid>/subagents/agent-a1.jsonl beside workflows/
+    _write_jsonl(direct, _subagent_records("sess1"))
+    old = time.time() - 3600
+    for p in (main, side, direct):
+        os.utime(p, (old, old))
+    assert hook._catchup_candidates(str(root), "", {}, time.time()) == [str(main)]
+    got = hook._catchup_candidates(str(root), "", {}, time.time(), subagents=True)
+    assert sorted(got) == sorted([str(main), str(side), str(direct)])
