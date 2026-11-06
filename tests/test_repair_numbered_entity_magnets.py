@@ -198,6 +198,28 @@ def test_plan_moves_each_edge_to_the_entity_named_for_its_id():
     assert plan.clear_summaries == ["m"]
 
 
+def test_plan_lands_on_an_existing_entity_spelled_another_way():
+    # 'PR 140' and 'abc-123' are the identifiers 'PR #140' and 'ABC-123': the moves land
+    # there instead of creating a second entity for the same number.
+    ents = [
+        _ent("m", "PR #290"),
+        _ent("p140", "PR 140"),
+        _ent("km", "ABC-100", etype="ticket"),
+        _ent("k123", "abc-123", etype="ticket"),
+        _ent("x", "widget"),
+    ]
+    edges = [
+        _edge("a", "m", "x", "PR #140 was merged"),
+        _edge("b", "km", "x", "ABC-123 tracks the widget"),
+        _edge("c", "p140", "x", "PR #12 was opened"),
+    ]
+    plan = rm.plan_repair(ents, edges)
+    assert {m.edge: m.to_uuid for m in plan.moves} == {"a": "p140", "b": "k123"}
+    assert plan.new_targets() == []
+    # A landing is not a magnet: what sits on 'PR 140' is not read for other numbers.
+    assert rm.entity_ident("PR 140") is None
+
+
 def test_plan_names_a_new_entity_as_the_facts_write_it():
     ents = [_ent("m", "PR #290"), _ent("x", "widget")]
     edges = [

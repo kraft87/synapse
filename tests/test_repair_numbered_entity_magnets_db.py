@@ -348,6 +348,78 @@ def test_restore_keeps_a_created_entity_that_new_facts_use(kg, db_url, embedder,
     assert _ends(kg, "later") == (p218, "svc")
 
 
+def test_restore_keeps_what_was_written_after_the_repair(kg, db_url, embedder, tmp_path):
+    """--restore reverts what the repair changed and nothing written since: a moved fact
+    that extraction later superseded goes back to its old pair still retired, an
+    un-retired fact that was retired again keeps the newer retirement, and a summary the
+    next mention wrote over the cleared one is kept."""
+    ep = _seed(kg)["ep"]
+    _run(db_url, "--apply", "--date", DAY, "--unretire-allow", _allow(tmp_path, "old205"))
+    p218 = _uuid_named(kg, "PR #218")
+    _edge(kg, "later", p218, "svc", "PR #218 was reverted", ep, created="2026-03-01")
+    kg.execute(
+        "UPDATE kg_relationships SET t_invalid = '2026-03-01', invalid_at = '2026-03-01', "
+        "  invalidated_by = 'later' WHERE uuid IN ('to218', 'old205')"
+    )
+    kg.execute("UPDATE kg_entities SET summary = 'PR #290 changed the widget' WHERE uuid = 'mag'")
+
+    _run(db_url, "--restore", DAY, "--apply")
+    assert _ends(kg, "to218") == ("mag", "svc")
+    assert _ends(kg, "old205") == ("mag", "br")
+    for uid in ("to218", "old205"):
+        assert kg.execute(
+            "SELECT t_invalid IS NOT NULL, invalidated_by FROM kg_relationships WHERE uuid = %s",
+            (uid,),
+        ).fetchone() == (True, "later")
+    summaries = dict(kg.execute("SELECT uuid, summary FROM kg_entities").fetchall())
+    assert summaries["mag"] == "PR #290 changed the widget"
+    assert summaries["key"] == "an epic"  # still cleared, so the backup's comes back
+
+
+@pytest.mark.parametrize("summary", ["", "describes some other PR"])
+def test_restore_brings_back_a_magnet_the_orphan_sweep_deleted(
+    kg, db_url, embedder, monkeypatch, summary
+):
+    """A magnet whose every edge moved has no edge left, and the poller's daily orphan
+    sweep deletes it. --restore re-creates it from the backup (every entity that loses an
+    edge is backed up, summary or not) before pointing the edges back at it."""
+    from ingestion.kg_pg_write import KGPostgresWriter
+
+    ep = _ep(kg, "alpha")
+    _ent(kg, "drained", "PR #95", summary=summary)
+    _ent(kg, "svc", "widget service", etype="service")
+    _edge(kg, "only", "drained", "svc", "PR #94 was deployed to the widget service", ep)
+    before = _state(kg)
+    _run(db_url, "--apply", "--date", DAY)
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    assert KGPostgresWriter().delete_orphan_entities(0) == 1
+
+    _run(db_url, "--restore", DAY, "--apply")
+    assert _state(kg) == before
+    assert kg.execute(
+        "SELECT entity_type, project, embedding IS NOT NULL FROM kg_entities WHERE uuid = 'drained'"
+    ).fetchone() == ("pull_request", "alpha", True)
+
+
+def test_the_dry_run_and_metrics_read_through_a_read_only_connection(
+    kg, db_url, embedder, monkeypatch
+):
+    seen: list[tuple[bool, str]] = []
+    real = rm._connect
+
+    def spy(url: str, *, read_only: bool) -> Any:
+        c = real(url, read_only=read_only)
+        seen.append((read_only, c.execute("SHOW transaction_read_only").fetchone()[0]))
+        c.rollback()
+        return c
+
+    monkeypatch.setattr(rm, "_connect", spy)
+    _seed(kg)
+    _run(db_url)
+    _run(db_url, "--metrics")
+    assert seen == [(True, "on"), (True, "on")]
+
+
 def test_metrics_report_the_audit_numbers_before_and_after(kg, db_url, embedder, tmp_path, capsys):
     _seed(kg)
     _run(db_url, "--metrics")

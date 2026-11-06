@@ -178,19 +178,30 @@ def entity_ident(name: str) -> Ident | None:
     return None
 
 
+_KEY_TARGET = re.compile(r"^([A-Za-z][A-Za-z0-9]{1,9})-(\d{2,})$")
+
+
+def target_ident(name: str) -> Ident | None:
+    """The identifier ``name`` is exactly, if a move may land on it: "PR #218", "PR 218",
+    "pull request 218", "issue #3", "task #4", "ABC-123" or "abc-123". Wider than
+    ``entity_ident`` on purpose: an existing "PR 218" is reused rather than duplicated,
+    but what sits on it is not read for other numbers."""
+    name = (name or "").strip()
+    if len(identifier_tokens(name)) != 1:
+        return None
+    for kind, rx in _TARGET_SHAPES.items():
+        m = rx.match(name)
+        if m:
+            return Ident(kind, _num(m.group(1)))
+    m = _KEY_TARGET.match(name)
+    if m and re.search(r"[A-Za-z]", m.group(1)):
+        return Ident(f"key:{m.group(1).upper()}", _num(m.group(2)))
+    return None
+
+
 def is_target_name(name: str, ident: Ident) -> bool:
     """True if ``name`` is exactly ``ident`` (an entity a move may land on)."""
-    name = (name or "").strip()
-    if ident.kind.startswith("key:"):
-        m = re.match(r"^([A-Za-z][A-Za-z0-9]{1,9})-(\d{2,})$", name)
-        return (
-            bool(m)
-            and f"key:{m.group(1).upper()}" == ident.kind
-            and _num(m.group(2)) == ident.number
-        )
-    rx = _TARGET_SHAPES.get(ident.kind)
-    m = rx.match(name) if rx else None
-    return bool(m) and _num(m.group(1)) == ident.number
+    return target_ident(name) == ident
 
 
 @dataclass(frozen=True)
@@ -363,6 +374,7 @@ class Plan:
     moves: list[Move] = field(default_factory=list)
     targets: dict[tuple[str, str, Ident], Target] = field(default_factory=dict)
     candidates: list[Candidate] = field(default_factory=list)
+    losers: list[str] = field(default_factory=list)  # every entity that loses an edge
     clear_summaries: list[str] = field(default_factory=list)
     stats: dict[str, Counter[str]] = field(default_factory=lambda: defaultdict(Counter))
 
@@ -386,8 +398,8 @@ def plan_repair(entities: Iterable[Entity], edges: Iterable[Edge]) -> Plan:
     for e in sorted(
         ents.values(), key=lambda e: (-live_deg[e.uuid], str(e.created_at or ""), e.uuid)
     ):
-        i = idents.get(e.uuid)
-        if i is not None and is_target_name(e.name, i):
+        i = target_ident(e.name)
+        if i is not None:
             landing.setdefault((e.owner_id, e.group_id, i), e)
 
     plan = Plan()
@@ -452,7 +464,8 @@ def plan_repair(entities: Iterable[Entity], edges: Iterable[Edge]) -> Plan:
             st[fam]["move (live edge)" if ed.live else "move (retired edge)"] += 1
             plan.moves.append(Move(ed.uuid, side, ent.uuid, t.uuid, fam, ed.live))
             losers.add(ent.uuid)
-    plan.clear_summaries = sorted(u for u in losers if ents[u].summary)
+    plan.losers = sorted(losers)
+    plan.clear_summaries = [u for u in plan.losers if ents[u].summary]
 
     # Rule 3: supersession candidates.
     by_uuid = {e.uuid: e for e in edges}
@@ -647,9 +660,10 @@ def apply(conn: Any, plan: Plan, embedder: Any, day: str, allow: set[str]) -> Co
         if len(embs) != len(new) or any(not v for v in embs):
             raise SystemExit("embedder returned no vector for some new entities; nothing written")
         vectors = {t.uuid: v for t, v in zip(new, embs, strict=True)}
-    backup(conn, day, moved_edges + [c.old for c in unretire], plan.clear_summaries)
-    done["rows backed up (edges)"] = len(moved_edges) + len(unretire)
-    done["rows backed up (entities)"] = len(plan.clear_summaries)
+    backed_edges = sorted(set(moved_edges) | {c.old for c in unretire})
+    backup(conn, day, backed_edges, plan.losers)
+    done["rows backed up (edges)"] = len(backed_edges)
+    done["rows backed up (entities)"] = len(plan.losers)
     _rel, _ent, created_table = _tables(day)
 
     by_magnet: dict[str, list[Move]] = defaultdict(list)
@@ -703,7 +717,20 @@ def apply(conn: Any, plan: Plan, embedder: Any, day: str, allow: set[str]) -> Co
 
 
 def restore(conn: Any, day: str, *, write: bool) -> dict[str, int]:
-    """Undo a run from its backup tables (one transaction; rolled back unless ``write``)."""
+    """Undo a run from its backup tables (one transaction; rolled back unless ``write``).
+
+    Reverts what the run changed and nothing written since, from the earliest backed-up
+    copy of each row:
+
+    * an entity the run drained of every edge, which the poller's daily orphan sweep then
+      deleted, is re-created from its backup row first, so no edge points at nothing;
+    * every backed-up edge gets its endpoints back;
+    * an edge the run un-retired that is still live is retired again as it was. A
+      retirement written after the run (a moved fact superseded on its new pair, an
+      un-retired fact retired again) is kept: nothing else ever clears ``t_invalid``;
+    * a summary the run emptied gets its text back unless a mention has written one since;
+    * the entities the run created are deleted unless an edge references them now.
+    """
     from psycopg import sql
 
     rel, ent, created = _tables(day)
@@ -711,25 +738,51 @@ def restore(conn: Any, day: str, *, write: bool) -> dict[str, int]:
     import psycopg
 
     with conn.transaction():
+        cols_sql = (
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s "
+            "ORDER BY ordinal_position"
+        )
+        backed = [r[0] for r in conn.execute(cols_sql, (f"kg_magnet_repair_{day}_entities",))]
+        if not backed:
+            raise SystemExit(f"no backup tables for {day}")
+        now_cols = {r[0] for r in conn.execute(cols_sql, ("kg_entities",))}
+        cols = sql.SQL(", ").join(sql.Identifier(c) for c in backed if c in now_cols)
         cur = conn.execute(
             sql.SQL(
-                "UPDATE kg_relationships r SET src_uuid = b.src_uuid, tgt_uuid = b.tgt_uuid, "
-                "  t_invalid = b.t_invalid, invalid_at = b.invalid_at, "
-                "  invalidated_by = b.invalidated_by "
-                "FROM (SELECT DISTINCT ON (uuid) uuid, src_uuid, tgt_uuid, t_invalid, "
-                "        invalid_at, invalidated_by FROM {} ORDER BY uuid, backed_up_at) b "
-                "WHERE r.uuid = b.uuid AND (r.src_uuid, r.tgt_uuid, r.t_invalid, r.invalid_at, "
-                "  r.invalidated_by) IS DISTINCT FROM (b.src_uuid, b.tgt_uuid, b.t_invalid, "
-                "  b.invalid_at, b.invalidated_by)"
+                "INSERT INTO kg_entities ({cols}) SELECT {cols} FROM "
+                "  (SELECT DISTINCT ON (uuid) * FROM {ent} ORDER BY uuid, backed_up_at) b "
+                "WHERE NOT EXISTS (SELECT 1 FROM kg_entities e WHERE e.uuid = b.uuid)"
+            ).format(cols=cols, ent=ent)
+        )
+        out["entities re-created (deleted since the run)"] = cur.rowcount
+        cur = conn.execute(
+            sql.SQL(
+                "UPDATE kg_relationships r SET src_uuid = b.src_uuid, tgt_uuid = b.tgt_uuid "
+                "FROM (SELECT DISTINCT ON (uuid) uuid, src_uuid, tgt_uuid FROM {} "
+                "      ORDER BY uuid, backed_up_at) b "
+                "WHERE r.uuid = b.uuid "
+                "  AND (r.src_uuid, r.tgt_uuid) IS DISTINCT FROM (b.src_uuid, b.tgt_uuid)"
             ).format(rel)
         )
         out["edges restored"] = cur.rowcount
         cur = conn.execute(
             sql.SQL(
+                "UPDATE kg_relationships r SET t_invalid = b.t_invalid, "
+                "  invalid_at = b.invalid_at, invalidated_by = b.invalidated_by "
+                "FROM (SELECT DISTINCT ON (uuid) uuid, t_invalid, invalid_at, invalidated_by "
+                "      FROM {} ORDER BY uuid, backed_up_at) b "
+                "WHERE r.uuid = b.uuid AND b.t_invalid IS NOT NULL AND r.t_invalid IS NULL"
+            ).format(rel)
+        )
+        out["un-retirements reverted"] = cur.rowcount
+        cur = conn.execute(
+            sql.SQL(
                 "UPDATE kg_entities e SET summary = b.summary "
                 "FROM (SELECT DISTINCT ON (uuid) uuid, summary FROM {} "
                 "      ORDER BY uuid, backed_up_at) b "
-                "WHERE e.uuid = b.uuid AND e.summary IS DISTINCT FROM b.summary"
+                "WHERE e.uuid = b.uuid AND COALESCE(e.summary, '') = '' "
+                "  AND COALESCE(b.summary, '') <> ''"
             ).format(ent)
         )
         out["summaries restored"] = cur.rowcount
