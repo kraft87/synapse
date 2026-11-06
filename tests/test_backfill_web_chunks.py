@@ -2,6 +2,7 @@
 
 Against the shared Postgres test DB (skipped cleanly when it's down):
   * the chunk phase takes research briefs only by default; other kinds need --kinds
+  * --reset deletes only the selected kinds' chunks
   * --dry-run lists what it would chunk, writes nothing, needs no embedding key,
     and runs on a read-only connection
   * the embed phase builds its embedder through ingestion.embedding.create_embedder
@@ -101,6 +102,19 @@ class TestChunkPhase:
         assert arts == 1
         assert _chunk_counts(conn).get(scrape, 0) > 0
 
+    def test_reset_deletes_only_the_selected_kinds(self, conn, web_tables):
+        brief = _mk_artifact(conn, tool_use_id="brief:coffee:2026-09-01", kind="research_brief")
+        scrape = _mk_artifact(conn, tool_use_id="toolu_1", kind="web_scrape")
+        with psycopg.connect(_DB_URL) as c:
+            bwc.phase_chunk(c, kinds=("research_brief", "web_scrape"))
+        before = _chunk_counts(conn)
+
+        assert bwc.main(["--reset", "--chunk-only"]) == 0
+
+        # the brief is re-chunked; the web_scrape's chunks, outside --kinds, survive
+        assert _chunk_counts(conn) == before
+        assert before[brief] > 0 and before[scrape] > 0
+
 
 @pytest.mark.db
 class TestDryRun:
@@ -113,9 +127,18 @@ class TestDryRun:
             raise AssertionError("dry run must not build an embedder")
 
         monkeypatch.setattr(bwc, "create_embedder", _no_embedder)
+        read_only: list[bool] = []
+        real_dry_run = bwc.dry_run
+
+        def _spy(c: psycopg.Connection[Any], kinds: Any) -> tuple[int, int]:
+            read_only.append(c.read_only)
+            return real_dry_run(c, kinds)
+
+        monkeypatch.setattr(bwc, "dry_run", _spy)
 
         assert bwc.main(["--dry-run"]) == 0
 
+        assert read_only == [True]  # main runs it on the server-enforced read-only connection
         out = capsys.readouterr().out
         assert "brief:coffee:2026-09-01" in out
         assert "toolu_1" not in out
