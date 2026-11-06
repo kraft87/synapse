@@ -223,6 +223,13 @@ class RecallOverviewMixin:
         bm25_eps, ms_bm25 = f_bm25.result()
         vec_eps, ms_vec = f_vec.result() if f_vec is not None else ([], 0.0)
         ep_pool = _merge_rrf(bm25_eps, vec_eps, id_key="id")[: settings._EPISODE_RERANK_POOL]
+        # The cross-encoder rerank (Voyage HTTP) needs only the episode pool, so it starts
+        # now, on a worker BM25 or vector just freed, and overlaps the KG and web legs still
+        # in flight. Waiting for them first cost ~420ms p50 (modelled from recall_metrics
+        # leg timings, 2026-11-06). Use the SCORED rerank — same ordering as _rerank_pool,
+        # but it also yields the top relevance score (a recall-confidence signal, and the
+        # basis for an eventual inject-only-if-relevant gate).
+        f_rerank = _submit_ctx(ex, _timed, self._rerank_pool_scored, query, ep_pool)
         web_ranked, ms_web = f_web.result()
         (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
 
@@ -245,11 +252,8 @@ class RecallOverviewMixin:
         if surfaced_edge_uuids and write_feedback:
             self._increment_fact_retrieval_counts(surfaced_edge_uuids, group_id)
 
-        # Second wave, also concurrent: the cross-encoder rerank (Voyage HTTP) and the
-        # bi-temporal superseded-pairs fetch hit different backends. Use the SCORED rerank — same
-        # ordering as _rerank_pool, but it also yields the top relevance score (a recall-
-        # confidence signal, and the basis for an eventual inject-only-if-relevant gate).
-        f_rerank = _submit_ctx(ex, _timed, self._rerank_pool_scored, query, ep_pool)
+        # Second wave, concurrent with the episode rerank: the bi-temporal superseded-pairs
+        # fetch and the fact-floor rerank both need the KG leg's facts, nothing else.
         f_superseded = (
             None
             if kg_off
@@ -260,6 +264,11 @@ class RecallOverviewMixin:
                 surfaced_edge_uuids,
                 settings._SUPERSEDED_LIMIT,
             )
+        )
+        f_fact_floor = (
+            _submit_ctx(ex, self._floor_facts, query, facts_internal)
+            if settings._RECALL_FACT_FLOOR > 0 and len(facts_internal) > 1
+            else None
         )
         scored, ms_rerank = f_rerank.result()
         superseded_facts = f_superseded.result() if f_superseded is not None else []
@@ -328,9 +337,8 @@ class RecallOverviewMixin:
         # Optional relevance gate (SYNAPSE_RECALL_FACT_FLOOR > 0): drop off-topic facts —
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
         # default (adds one rerank of the served facts), so this is a no-op until enabled.
-        served_facts = facts_internal
-        if settings._RECALL_FACT_FLOOR > 0 and len(served_facts) > 1:
-            served_facts = self._floor_facts(query, served_facts)
+        # Its rerank was started with the second wave above, beside the episode rerank.
+        served_facts = f_fact_floor.result() if f_fact_floor is not None else facts_internal
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
         sup_extras = (

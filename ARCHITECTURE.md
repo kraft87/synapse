@@ -375,7 +375,7 @@ Contradictions **invalidate the old edge** (an `UPDATE` setting `invalid_at`/`t_
 
 ## 6. Recall Pipeline
 
-`recall()` fans out over a persistent `ThreadPoolExecutor`: wave 1 runs the episode pool, KG, web, and timeline ([§3.5](#35-timeline-events--the-episodic-date-log)) legs concurrently (the last is a single cheap DB read reusing the query embedding); wave 2 runs the cross-encoder rerank and the bitemporal history fetch. Returns a **compact, conditionally-populated** result.
+`recall()` fans out over a persistent `ThreadPoolExecutor`: wave 1 runs the episode pool, KG, web and notes legs concurrently; the cross-encoder rerank starts as soon as the episode pool is fused, overlapping the KG and web legs, and the bitemporal history fetch and fact-floor rerank start when the KG leg returns. Returns a **compact, conditionally-populated** result.
 
 ```mermaid
 flowchart TD
@@ -438,7 +438,7 @@ Seed entities come from a pgvector KNN over `kg_entities.embedding` (halfvec HNS
 
 ### 6.5 Parallelism
 
-Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor; Wave 2 (Voyage rerank HTTP + KG history) runs concurrently. PG connections are thread-local. A separate single-worker executor handles fire-and-forget `retrieval_count` writes. This took `recall()` from ~2.85s to ~1.3s (#60, #103, #104).
+Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor. Each second-wave call starts as soon as its own input is ready: the Voyage rerank once BM25 and vector are fused (it never waits on KG or web, ~420ms p50 modelled, 2026-11-06), the KG history fetch and the fact-floor rerank once KG returns. PG connections are thread-local. A separate single-worker executor handles fire-and-forget `retrieval_count` writes. This took `recall()` from ~2.85s to ~1.3s (#60, #103, #104).
 
 ---
 
