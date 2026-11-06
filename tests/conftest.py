@@ -45,6 +45,7 @@ _DB_FILES = {
     "test_mcp_server.py",
     "test_web_artifacts.py",
     "test_web_enqueue.py",
+    "test_backfill_web_chunks.py",
     "test_contradiction.py",
     "test_extractor.py",
     "test_extraction_twins_db.py",

@@ -258,7 +258,8 @@ def test_web_leg_failures_warn():
     del r._search_bm25_web
     del r._search_vector_web
     r._pg = lambda: nullcontext(_DeadPG())
-    msg = _joined(r.recall("anything"))
+    # The web leg runs for trusted hosts only (web chunks carry no provenance).
+    msg = _joined(r.recall("anything", trust=SurfaceTrust(trust="full", known=True)))
     assert "BM25 web search failed" in msg
     assert "vector web search failed" in msg
     assert "web bucket is degraded" in msg
