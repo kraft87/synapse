@@ -66,6 +66,128 @@ def test_other_skills_fire_does_not_match():
     assert PF.resolve_fire_position(eps, "widget-deploy", _T0) is None
 
 
+# ---------------------------------------- the skill loader's episode (real N / N+1 layout)
+# What prod stores for one Skill tool call (session 54c57747 seq 14/15, shape kept, text
+# synthetic): seq N carries the call, seq N+1 is the loader's user-role message, banner
+# first, then the skill body, then the assistant's work under it.
+_WIN_DIR = "C:\\Users\\someone\\.claude\\skills\\widget-deploy"
+
+
+def _loader(seq, folder=_WIN_DIR, minutes=0):
+    banner = f"Base directory for this skill: {folder}"
+    body = "# Widget Deploy\r\n\r\nDeploy the widget, then restart it and check it is up."
+    return _ep(
+        seq,
+        content=f"[user] {banner}\n\n{body}\n\n[assistant] deploying now",
+        human=f"{banner}\n\n{body}",
+        minutes=minutes,
+    )
+
+
+def _real_layout():
+    return [
+        _ep(13, human="deploy the widget please"),
+        _ep(14, content=f"[user] yeah go for it\n\n{_FIRE}", human="yeah go for it", minutes=1),
+        _loader(15, minutes=1),
+        _ep(16, human="that skipped the restart step", minutes=5),
+        _ep(17, content="[assistant] restarting now", minutes=6),
+    ]
+
+
+def test_fire_position_is_the_loader_episode_after_the_call():
+    eps = _real_layout()
+    # fired_at is the call's event time, so the closest marker is seq 14, the call itself
+    assert PF.resolve_fire_position(eps, "widget-deploy", _T0 + timedelta(minutes=1)) == 15
+    assert PF.resolve_fire_position(eps, "widget-deploy", None) == 15
+
+
+def test_window_starts_after_the_loader_episode():
+    eps = _real_layout()
+    seq = PF.resolve_fire_position(eps, "widget-deploy", _T0 + timedelta(minutes=1))
+    assert [e["sequence"] for e in PF.bound_window(eps, seq, skill="widget-deploy")] == [16, 17]
+    # handed the call's own sequence, the loader right after it is still skipped
+    assert [e["sequence"] for e in PF.bound_window(eps, 14, skill="widget-deploy")] == [16, 17]
+
+
+def test_unix_banner_and_banner_only_episode_still_resolve():
+    eps = [
+        _ep(1, content=_FIRE),
+        _loader(2, folder="/home/someone/.claude/skills/widget-deploy/"),
+        _ep(3, human="looks right"),
+    ]
+    assert PF.resolve_fire_position(eps, "widget-deploy", _T0) == 2
+    assert [e["sequence"] for e in PF.bound_window(eps, 1, skill="widget-deploy")] == [3]
+
+
+def test_banner_for_a_different_skill_ends_the_window():
+    eps = [
+        *_real_layout(),
+        _loader(18, folder="C:\\Users\\someone\\.claude\\skills\\other-skill"),
+        _ep(19, human="now the other thing is wrong too"),
+    ]
+    assert [e["sequence"] for e in PF.bound_window(eps, 15, skill="widget-deploy")] == [16, 17]
+
+
+def test_a_skill_whose_name_contains_another_is_a_different_skill():
+    # substring matching took widget-deploy-v2's banner for widget-deploy's loader
+    eps = [_ep(1, content=_FIRE), _loader(2, folder="/skills/widget-deploy-v2"), _ep(3)]
+    assert PF.resolve_fire_position(eps, "widget-deploy", _T0) == 1
+    assert PF.bound_window(eps, 1, skill="widget-deploy") == []
+
+
+def test_later_banner_for_the_same_skill_does_not_end_the_window():
+    eps = [*_real_layout(), _loader(18), _ep(19, human="and the restart is still missing")]
+    window = PF.bound_window(eps, 15, skill="widget-deploy")
+    assert [e["sequence"] for e in window] == [16, 17, 18, 19]
+
+
+def test_bannerless_loader_is_recognised_by_the_skill_body():
+    body = "---\nname: widget-deploy\ndescription: deploy\n---\n" + (
+        "# Widget Deploy\n\nDeploy the widget, then restart it and check it is up before done."
+    )
+    eps = [
+        _ep(1, content=_FIRE),
+        _ep(
+            2,
+            content="[user] # Widget Deploy\n\nDeploy the widget, then restart it and check "
+            "it is up before done.\n[assistant] ok",
+            human="# Widget Deploy\r\n\r\nDeploy the "
+            "widget, then restart it and check it is up before done.",
+        ),
+        _ep(3, human="you never restarted it"),
+    ]
+    assert PF.resolve_fire_position(eps, "widget-deploy", _T0, body) == 2
+    assert [e["sequence"] for e in PF.bound_window(eps, 1, skill="widget-deploy", body=body)] == [3]
+    # without the body to compare, the banner-less loader is an ordinary episode
+    assert PF.resolve_fire_position(eps, "widget-deploy", _T0) == 1
+
+
+def test_namespaced_skill_names_are_not_cut_at_the_colon():
+    for line in (
+        "{'skill': 'document-skills:docx'}",
+        "{'skill': 'synapse:skill-review', 'args': 'x'}",
+    ):
+        assert PF.DB._SKILL_NAME.search(line).group(1) == line.split("'")[3]
+        assert PF.DB._SKILL_IN.search(line).group(1) == line.split("'")[3]
+    # a plugin skill loads from its bare folder name
+    assert PF.DB.skill_folder("synapse:skill-review") == "skill-review"
+
+
+def test_real_layout_fire_is_judged_on_its_aftermath(monkeypatch):
+    calls = []
+    prompts, _ = _wire(
+        monkeypatch,
+        fires=[_fire(minutes=1)],
+        episodes={"s1": _real_layout()},
+        verdict_json=json.dumps(_DEVIATION_VERDICT),
+        calls=calls,
+    )
+    stats = PF.run(None, since=None)
+    assert stats["deviation"] == 1 and len(calls) == 1  # was: empty window, never judged
+    assert "[seq 16]" in prompts[0] and "[seq 15]" not in prompts[0]
+    assert stats["empty_window"] == 0 and stats["unassessable"] == 0
+
+
 # ------------------------------------------------------------------ small helpers
 def test_patch_text_renders_bullets():
     assert PF._patch_text(["add a check", "verify restart"]) == "- add a check\n- verify restart"
@@ -190,6 +312,7 @@ def test_deviation_emits_retune_call_shape(monkeypatch):
         "unassessable": 0,
         "last_episode": 0,
         "unlocated": 0,
+        "empty_window": 0,
         "candidates": 1,
         "judge_failures": 0,
         "unregistered": 0,
@@ -319,7 +442,7 @@ def test_window_stops_before_next_fire(monkeypatch):
     assert "unrelated later work" in prompts[0]
 
 
-def test_immediate_refire_is_unassessable(monkeypatch):
+def test_immediate_refire_is_an_empty_window(monkeypatch):
     calls = []
     eps = [
         _ep(1, content=_FIRE),
@@ -334,7 +457,9 @@ def test_immediate_refire_is_unassessable(monkeypatch):
         calls=calls,
     )
     stats = PF.run(None, since=None)
-    assert stats["unassessable"] == 1 and stats["last_episode"] == 0
+    # counted apart from the judge's unassessable, so a dead window shows up in the counts
+    assert stats["empty_window"] == 1 and stats["unassessable"] == 0
+    assert stats["last_episode"] == 0
     assert not prompts and not calls
 
 

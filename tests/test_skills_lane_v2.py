@@ -478,6 +478,49 @@ def test_fire_events_fall_back_to_created_at(lane, db_url, monkeypatch):
     assert events[0]["fired_at"] == fired_at
 
 
+def _fire_session(conn, sid, turns):
+    """Episodes 1..n for one session: (content, human_turn) pairs, a minute apart."""
+    t0 = datetime.now(UTC).replace(microsecond=0) - timedelta(days=1)
+    for i, (content, human) in enumerate(turns, start=1):
+        conn.execute(
+            "INSERT INTO episodes (session_id, sequence, platform, content, human_turn, "
+            "metadata, created_at) VALUES (%s, %s, 'claude_code', %s, %s, '{}'::jsonb, %s)",
+            (sid, i, content, human, t0 + timedelta(minutes=i)),
+        )
+
+
+def test_dismissal_reads_the_reply_after_the_loader_episode(lane, db_url, monkeypatch):
+    # prod's layout: the call, then the loader's banner + body as its own episode, then
+    # the user. The loader episode stood in for the user's reply, so no fire ever dismissed.
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    banner = "Base directory for this skill: C:\\Users\\someone\\.claude\\skills\\v2t-demo-skill"
+    _fire_session(
+        lane,
+        "v2t-dismiss-sess",
+        [
+            ("[user] deploy it\n\n[tool:Skill] {'skill': 'v2t-demo-skill'}", "deploy it"),
+            (f"[user] {banner}\n\n# Demo\n\nsteps\n[assistant] on it", f"{banner}\n\n# Demo"),
+            ("[user] no, that's wrong\n[assistant] sorry", "no, that's wrong"),
+        ],
+    )
+    events = [e for e in DBSRC.fire_events(days=30) if e["session_id"] == "v2t-dismiss-sess"]
+    assert [(e["skill"], e["dismissed"]) for e in events] == [("v2t-demo-skill", True)]
+
+
+def test_dismissal_without_a_loader_episode_reads_the_next_turn(lane, db_url, monkeypatch):
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    _fire_session(
+        lane,
+        "v2t-dismiss-sess2",
+        [
+            ("[tool:Skill] {'skill': 'v2t-demo-skill'}", "deploy it"),
+            ("[user] no, that's wrong", "no, that's wrong"),
+        ],
+    )
+    events = [e for e in DBSRC.fire_events(days=30) if e["session_id"] == "v2t-dismiss-sess2"]
+    assert [e["dismissed"] for e in events] == [True]
+
+
 # ------------------------------------------------- migration 045 / data repair
 
 
