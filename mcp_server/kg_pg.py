@@ -51,7 +51,8 @@ _RRF_K = 60
 # Fact-vector over-fetch pool: how many global-nearest live facts to pull before
 # applying the owner/group/web filter. For the technical group the outer LIMIT
 # (limit*3) is what bites: across 20 real queries (2026-11-06) the fewest in-group,
-# non-web survivors of the 200 was 46.
+# non-web survivors of the 200 was 46. The small personal group can under-fill with or
+# without the web filter (3 of 20 personal queries kept fewer than 36).
 _OVERFETCH = 200
 
 
