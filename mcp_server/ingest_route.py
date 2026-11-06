@@ -85,7 +85,9 @@ def register(
         if record_format not in ("claude_code", "codex"):
             return err(f"unknown format {record_format!r}", 400)
 
-        def _work() -> int:
+        def _work() -> tuple[int, int]:
+            import psycopg
+
             from ingestion.contamination import is_harness_call, is_transcript_contamination
             from ingestion.db import Database
             from ingestion.jsonl_client import JSONLParser
@@ -104,7 +106,7 @@ def register(
                     records, source_label, project_override, project_by_cwd=project_by_cwd or None
                 )
             if not episodes:
-                return 0
+                return 0, 0
             # Resolved from the credential only. Assigned unconditionally so nothing a
             # parser might ever lift out of the records can survive as a stamp.
             stamp = _request_trust(request).stamp_surface_id if _request_trust else None
@@ -131,6 +133,7 @@ def register(
                 dropped = 0
                 private_dropped = 0
                 content_dups = 0
+                span_collisions: list[tuple[str, str]] = []
                 for ep in episodes:
                     # Reject transcribe_ai deposition payloads before they ever land — third-party
                     # PII must not enter memory. Dev conversations about the domain still flow in.
@@ -167,11 +170,27 @@ def register(
                     ):
                         content_dups += 1
                         continue
+                    # span_id is unique across ALL sessions (episodes_span_id_idx), but the
+                    # index above is this session's only: a turn another session already
+                    # holds (a resumed or forked transcript keeps the records' uuids) would
+                    # raise on the INSERT and 500 the batch, and the hook never advances
+                    # its cursor past a failed POST. It is the same turn: skip it, as the
+                    # backfill does. The except leg covers the span landing between this
+                    # probe and the INSERT, so a race can't fail the batch either.
+                    if db.span_id_exists(ep.span_id):
+                        span_collisions.append((ep.session_id, ep.span_id))
+                        continue
+                    ep.sequence = max_seq + 1
+                    try:
+                        eid = db.upsert_episode(ep)
+                    except psycopg.errors.UniqueViolation as exc:
+                        if exc.diag.constraint_name != "episodes_span_id_idx":
+                            raise
+                        span_collisions.append((ep.session_id, ep.span_id))
+                        continue
                     max_seq += 1
-                    ep.sequence = max_seq
                     seen.add(ep.span_id)
                     index[ep.session_id] = (seen, max_seq)
-                    eid = db.upsert_episode(ep)
                     if ep.content and ep.content.strip():
                         db.enqueue_extraction(
                             ExtractionItem(
@@ -193,15 +212,26 @@ def register(
                     logger.info(
                         "ingest skipped %d cross-session content-duplicate turn(s)", content_dups
                     )
-                return written
+                if span_collisions:
+                    # Bounded: with SYNAPSE_CONTENT_DEDUP=0 a whole replayed history lands here.
+                    shown = ", ".join(f"{s}:{sp}" for s, sp in span_collisions[:5])
+                    more = len(span_collisions) - 5
+                    logger.warning(
+                        "ingest skipped %d turn(s) whose span_id is already stored under "
+                        "another session (incoming session:span_id): %s%s",
+                        len(span_collisions),
+                        shown,
+                        f" and {more} more" if more > 0 else "",
+                    )
+                return written, len(span_collisions)
             finally:
                 db.close()
 
         try:
-            n = await run_in_threadpool(_work)
+            n, collided = await run_in_threadpool(_work)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("ingest failed")
             return err(str(exc)[:200], 500)
-        return JSONResponse({"status": "ok", "ingested": n})
+        return JSONResponse({"status": "ok", "ingested": n, "span_collisions": collided})
 
     return ingest_turns
