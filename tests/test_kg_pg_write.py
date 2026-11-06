@@ -164,13 +164,13 @@ class TestUpsertNode:
         # still fills it in, a merge under another name leaves the row's name alone.
         conn.execute(
             "INSERT INTO kg_entities (uuid, group_id, name, normalized_name) "
-            "VALUES ('e-pr', %s, 'OODA Creator', '')",
+            "VALUES ('e-pr', %s, 'Legacy Widget', '')",
             (GROUP,),
         )
-        self._upsert(kg_writer, "OODA pipeline", "ooda pipeline", "s", axis=0)
-        assert self._name_row(conn)[:2] == ("OODA Creator", "")
-        self._upsert(kg_writer, "OODA Creator", "ooda creator", "s", axis=0)
-        assert self._name_row(conn)[:2] == ("OODA Creator", "ooda creator")
+        self._upsert(kg_writer, "widget pipeline", "widget pipeline", "s", axis=0)
+        assert self._name_row(conn)[:2] == ("Legacy Widget", "")
+        self._upsert(kg_writer, "Legacy Widget", "legacy widget", "s", axis=0)
+        assert self._name_row(conn)[:2] == ("Legacy Widget", "legacy widget")
 
 
 class TestCreateEdges:
