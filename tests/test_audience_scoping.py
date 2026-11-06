@@ -193,6 +193,29 @@ def test_restricted_recall_filters_episodes_to_the_allowlist(clean, db_url, monk
     assert len(out_full.get("episodes", [])) == 3
 
 
+def test_restricted_recall_serves_no_web_chunks(clean, db_url, monkeypatch):
+    """Web chunks (research briefs, scrapes) have no project or audience provenance, so
+    only a trusted host may be served them."""
+    _episode(clean, "alpha", "alpha discussion of the widget")
+    web_calls: list[str] = []
+
+    def _web(q, emb):
+        web_calls.append(q)
+        return [{"id": "w:1", "content": "a research brief about the widget", "url": "u"}]
+
+    sid = register_restricted(clean, ["alpha"])
+    r = _engine(db_url, monkeypatch)
+    r._search_web_reranked = _web
+    out = r.recall("widget", surface=sid)
+    assert "web" not in out
+    assert web_calls == []
+
+    full = register_full(clean)
+    r_full = _engine(db_url, monkeypatch)
+    r_full._search_web_reranked = _web
+    assert [w["id"] for w in r_full.recall("widget", surface=full).get("web", [])] == ["w:1"]
+
+
 def test_recall_without_a_surface_serves_no_episodes(clean, db_url, monkeypatch):
     """Bare calls get the empty allowlist. This is intended: a serving path that can't
     identify its caller is not a trusted caller."""
