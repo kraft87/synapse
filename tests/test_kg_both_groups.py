@@ -5,11 +5,11 @@ regex, so the owner's facts on one topic land in both, and a recall that read on
 requested group missed the other half. The group is not a trust boundary: a restricted
 surface is scoped by fact provenance (schema 056). Full trust keeps the requested group's
 serve exactly as a one-group read and ADDS what the other group has: up to
-``CROSS_GROUP_EXTRAS`` vector/BM25 facts (no seed/hop leg), supersession extras within the
-caps the requested group left. Sections:
+``CROSS_GROUP_EXTRAS`` vector/BM25 facts (no seed/hop leg) and the superseded pairs of the
+extras it serves; the supersession surface and overlay stay on the requested group. Sections:
   * the group list a recall reads, per trust and per personal-scope switch
   * full trust: the requested group's facts unchanged, the other group's added after
-  * the supersession extras, the fact floor and the retrieval-count bump
+  * superseded pairs and supersession calls, the fact floor and the retrieval-count bump
   * restricted callers and single-group reads send the statements they always did
 """
 
@@ -273,20 +273,38 @@ def _spied_engine(db_url: str, surface: list, overlay: list, metrics: list) -> R
     return r
 
 
-def test_other_group_supersession_extras_only_fill_what_is_left(kg, db_url):
+def test_full_trust_supersession_surface_and_overlay_stay_on_the_requested_group(kg, db_url):
+    """The other group's surface is a serial scan over its retired edges (0.4-2s on a
+    real graph) and its overlay attached off-topic successors on the bench, so full trust
+    makes exactly the one-group calls; their facts are not cross-group extras."""
     surface: list = []
     overlay: list = []
     metrics: list = []
     out = _spied_engine(db_url, surface, overlay, metrics).recall(
         "widget", group_id=PERS, trust=FULL_TRUST
     )
-    # The requested group's calls are exactly a one-group recall's; the other group's
-    # come second, the surface one capped at what the first left of the 3.
-    assert surface == [(PERS, 3, {}), ([TECH], 2, {})]
-    assert [g for g, _ in overlay] == [PERS, [TECH]]
-    assert out["episodes"][0]["superseded_by"] == ["successor 1", "successor 2"]
-    assert [f["id"] for f in out["facts"]] == ["f:sup-1", "f:sup-2"]
-    assert metrics[0]["served_ids"]["facts_cross_group"] == ["sup-2"]
+    assert surface == [(PERS, 3, {})]
+    assert [g for g, _ in overlay] == [PERS]
+    assert out["episodes"][0]["superseded_by"] == ["successor 1"]
+    assert [f["id"] for f in out["facts"]] == ["f:sup-1"]
+    assert "facts_cross_group" not in metrics[0]["served_ids"]
+
+
+@pytest.mark.parametrize(("extra_score", "paired"), [(0.9, True), (0.1, False)])
+def test_a_cross_group_extra_the_floor_drops_takes_its_superseded_pair_with_it(
+    kg, db_url, monkeypatch, extra_score, paired
+):
+    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
+    _supersession_in(kg, PERS)  # the other group's live "widget runs on postgres" + its predecessor
+    _fact(kg, "own-1", TECH, "widget alpha", _ep(kg), emb=0)
+    _fact(kg, "own-2", TECH, "widget beta", _ep(kg), emb=0)
+    r = _engine(db_url)
+    r._reranker = _Rerank(
+        {"widget alpha": 0.9, "widget beta": 0.9, "widget runs on postgres": extra_score}
+    )
+    out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
+    assert ("now" in _served(out)) is paired
+    assert _served(out, "superseded_facts") == ({"old"} if paired else set())
 
 
 def test_restricted_recall_makes_no_other_group_call(kg, db_url):

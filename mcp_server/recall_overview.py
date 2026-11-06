@@ -17,7 +17,6 @@ from mcp_server.recall_presentation import to_web_recall_item as _to_web_recall_
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_ranking import served_chars as _served_chars
 from mcp_server.recall_ranking import timed as _timed
-from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import config_hint as _config_hint
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import submit_with_context as _submit_ctx
@@ -83,10 +82,10 @@ class RecallOverviewMixin:
         model that asks for a scope this deployment does not run gets answers
         instead of an empty graph. A full-trust caller is then served the requested
         graph exactly as before PLUS what the other graph adds: up to
-        ``kg_pg.CROSS_GROUP_EXTRAS`` facts, and supersession extras within the caps the
-        requested graph left (``kg_pg.read_groups`` / ``kg_pg.search_kg``). A restricted
-        caller reads the requested graph alone. The recall_metrics row keeps the
-        requested group.
+        ``kg_pg.CROSS_GROUP_EXTRAS`` facts and the superseded pairs of those served
+        (``kg_pg.read_groups`` / ``kg_pg.search_kg``). The supersession surface and the
+        episode-validity overlay stay on the requested graph. A restricted caller reads
+        the requested graph alone. The recall_metrics row keeps the requested group.
 
         A ``warnings`` list is attached when a leg degraded (embedding or rerank
         backend down, KG or notes leg errored). The key is ABSENT on a healthy call,
@@ -352,19 +351,24 @@ class RecallOverviewMixin:
         served_facts = f_fact_floor.result() if f_fact_floor is not None else facts_internal
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
-        served_uuids = {f["_uuid"] for f in served_facts if f.get("_uuid")}
+        # Requested group only, on purpose: the other group's surface is a serial scan over its
+        # retired edges (no index orders them; 0.4-2s on prod 2026-11-06), on the critical path.
         sup_extras = (
             []
             if kg_off
-            else self._surface_supersessions(query_emb, group_id, served_uuids, **kg_scope)
-        )
-        # Full trust: the other group's successors fill only what the requested group's left
-        # of the cap, so the requested group's own extras are exactly what they were.
-        if other_groups and len(sup_extras) < _SUP_LIMIT:
-            more = self._surface_supersessions(
-                query_emb, other_groups, served_uuids, cap=_SUP_LIMIT - len(sup_extras)
+            else self._surface_supersessions(
+                query_emb,
+                group_id,
+                {f.get("_uuid") for f in served_facts if f.get("_uuid")},
+                **kg_scope,
             )
-            sup_extras += [{**f, "_cross": True} for f in more]
+        )
+        # A superseded pair fetched for a cross-group extra the floor then dropped would
+        # pair a fact nobody is served; the requested group's pairs keep the base behaviour.
+        if other_groups and superseded_facts:
+            served_now = {f["fact"] for f in served_facts}
+            dropped = {f["fact"] for f in facts_internal if f.get("_cross")} - served_now
+            superseded_facts = [p for p in superseded_facts if p["superseded_by"] not in dropped]
         if sup_extras and self_session:
             own_facts = self._self_session_facts(
                 [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
@@ -409,16 +413,6 @@ class RecallOverviewMixin:
                 served_text=served_text,
                 **kg_scope,
             )
-            if other_groups:  # full trust: the other group's successors go after
-                more_sup = self._episode_supersessions(
-                    list(served_text),
-                    other_groups,
-                    self_session=self_session,
-                    served_text=served_text,
-                )
-                for eid, now in more_sup.items():
-                    have = sup.setdefault(eid, [])
-                    have += [f for f in now if f not in have]
             if sup:
                 _apply_supersessions(ep_items, sup, {f["fact"] for f in facts})
 
