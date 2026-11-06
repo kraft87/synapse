@@ -1,7 +1,7 @@
 """The rules of scripts/repair_numbered_entity_magnets.py, without a database.
 
-The old resolver let near-identical numbered names ("PR #290" / "PR #269", "ABC-12895" /
-"ABC-12893") resolve onto one node, so one entity collected the facts of dozens of IDs.
+The old resolver let near-identical numbered names ("PR #290" / "PR #269", "ABC-4100" /
+"ABC-4102") resolve onto one node, so one entity collected the facts of dozens of IDs.
 These tests pin what the repair moves and what it leaves alone:
 
 * which entity names count as an identifier (whole-name shapes only, one number by the
@@ -49,7 +49,7 @@ G = "technical"
         ("pull request #7", Ident("pr", "7")),
         ("Issue #33", Ident("issue", "33")),
         ("Task #60", Ident("task", "60")),
-        ("ABC-12895", Ident("key:ABC", "12895")),
+        ("ABC-4100", Ident("key:ABC", "4100")),
         ("widget refactor (PR #12)", None),  # decorated: the extra words carry meaning
         ("PR #12 rules", None),
         ("PRs #180-182", None),  # two numbers
@@ -141,11 +141,11 @@ def test_decide_for_a_pr_endpoint(fact, verdict, number):
 
 
 def test_decide_for_a_ticket_key_endpoint():
-    key = Ident("key:ABC", "12895")
-    assert rm.decide(key, "ABC-12888 is blocked by a vendor")[0] == rm.MOVE
-    assert rm.decide(key, "ABC-12895 is the epic")[0] == rm.STAY_OWN
-    assert rm.decide(key, "XYZ-12888 is blocked")[0] == rm.STAY_NONE  # other prefix
-    assert rm.decide(key, "ABC-12888 replaces ABC-12177")[0] == rm.STAY_SEVERAL
+    key = Ident("key:ABC", "4100")
+    assert rm.decide(key, "ABC-4021 is blocked by a vendor")[0] == rm.MOVE
+    assert rm.decide(key, "ABC-4100 is the epic")[0] == rm.STAY_OWN
+    assert rm.decide(key, "XYZ-4021 is blocked")[0] == rm.STAY_NONE  # other prefix
+    assert rm.decide(key, "ABC-4021 replaces ABC-3990")[0] == rm.STAY_SEVERAL
     assert rm.decide(key, "PR #5 closes it")[0] == rm.STAY_NONE
 
 
