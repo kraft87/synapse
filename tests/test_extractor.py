@@ -866,6 +866,48 @@ class TestEntityResolver:
         mapping = resolver.resolve([_entity("Delta")], kg_client=falkordb, group_id="technical")
         assert mapping["Delta"] == "cand0"
 
+    def _no_llm(self) -> MagicMock:
+        llm_client = MagicMock()
+        llm_client.messages.create.side_effect = AssertionError("LLM must not be consulted")
+        return llm_client
+
+    @pytest.mark.parametrize("score", [0.03, 0.10])  # autoconfirm band, LLM-confirm band
+    def test_different_number_is_never_merged(self, score):
+        # Prod: 'PR #290' vs 'PR #269' name embeddings sit at cosine 0.970, over the
+        # 0.95 autoconfirm, so one PR's facts landed on another PR's node.
+        embedder = self._mock_embedder([self._make_embedding(0.1)])
+        falkordb = _mock_falkordb(
+            similar_nodes=[{"uuid": "u269", "name": "PR #269", "score": score}]
+        )
+        llm_client = self._no_llm()
+        resolver = EntityResolver(embedder=embedder, llm_client=llm_client)
+        mapping = resolver.resolve([_entity("PR #290")], kg_client=falkordb, group_id="technical")
+        assert mapping["PR #290"].startswith("new:")
+        llm_client.messages.create.assert_not_called()
+
+    def test_same_number_still_merges(self):
+        embedder = self._mock_embedder([self._make_embedding(0.1)])
+        falkordb = _mock_falkordb(
+            similar_nodes=[{"uuid": "u290", "name": "PR #290", "score": 0.03}]
+        )
+        resolver = EntityResolver(embedder=embedder, llm_client=self._no_llm())
+        mapping = resolver.resolve(
+            [_entity("pull request 290")], kg_client=falkordb, group_id="technical"
+        )
+        assert mapping["pull request 290"] == "u290"
+
+    def test_conflicting_top_candidate_falls_through_to_the_next(self):
+        embedder = self._mock_embedder([self._make_embedding(0.1)])
+        falkordb = _mock_falkordb(
+            similar_nodes=[
+                {"uuid": "u269", "name": "PR #269", "score": 0.02},
+                {"uuid": "u290", "name": "synapse PR #290", "score": 0.04},
+            ]
+        )
+        resolver = EntityResolver(embedder=embedder, llm_client=self._no_llm())
+        mapping = resolver.resolve([_entity("PR #290")], kg_client=falkordb, group_id="technical")
+        assert mapping["PR #290"] == "u290"
+
 
 # ---------------------------------------------------------------------------
 # Stage 6 — contradiction-detection pipeline (post-RRF + idx-based prompt)

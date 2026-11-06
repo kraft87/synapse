@@ -4,6 +4,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, cast
 
+from ingestion.dedup import ids_conflict
 from ingestion.llm_client import LLM_TRANSPORT_ERRORS
 from ingestion.models import (
     ExtractedEntity,
@@ -157,6 +158,12 @@ class EntityResolver:
             embeddings = self._embedder.embed(names, task="entity")
             for entity, emb in zip(vector_needed, embeddings, strict=True):
                 candidates = kg_client.find_similar_nodes(emb, group_id, limit=5)
+                # A node naming another number is never this entity, however close
+                # the embedding ('PR #290' vs 'PR #269' sits at cosine 0.97): drop it
+                # before both the autoconfirm and the LLM confirm see it.
+                candidates = [
+                    c for c in candidates if not ids_conflict(entity.name, str(c["name"] or ""))
+                ]
                 if not candidates:
                     mapping[entity.name] = _new_uuid()
                     continue

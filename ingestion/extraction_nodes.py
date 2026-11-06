@@ -124,6 +124,8 @@ class ExtractionNodesMixin:
             type_map = deduper.type_map if deduper is not None else {}
             if type_map:
                 supertype = type_map.get(entity.type, "other")
+            # For an EXISTING entity the writer keeps its name and embedding unless
+            # entity.name normalizes the same: a merged mention never renames it.
             self._kg.upsert_node(
                 node_uuid=clean_uuid,
                 name=entity.name,

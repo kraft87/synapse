@@ -118,12 +118,25 @@ class KGPostgresWriter:
         supertype: str | None = None,
     ) -> None:
         """Insert-or-update an entity. On conflict updates only the fields an
-        update is allowed to change (name/summary/normalized_name,
-        embedding-if-present, entity_supertype/subtype); created_at/entity_type/
+        update is allowed to change (summary, entity_supertype/subtype, and
+        name/normalized_name/embedding-if-present only when the incoming name
+        normalizes the same as the stored one); created_at/entity_type/
         valid_at are insert-only. entity_subtype = the raw entity_type; supertype
-        is the caller-derived taxonomy rollup (updatable so the fluid map propagates)."""
+        is the caller-derived taxonomy rollup (updatable so the fluid map propagates).
+
+        The conflict path is a merge: the extractor resolved a mention onto this
+        entity. A mention under another name ('PR #290' merged into 'PR #269') must
+        not rename the entity or swap in its own name embedding, or the next
+        near-identical mention matches the renamed node again and it ratchets into
+        a magnet. A casing/whitespace variant still updates both. A row written
+        before normalized_name existed ('') compares by lower(trim(name)), so a
+        same-name merge still fills it in."""
         created = _ts(created_at)
         valid = _ts(valid_at) or created
+        same_name = (
+            "EXCLUDED.normalized_name = COALESCE("
+            "NULLIF(kg_entities.normalized_name, ''), lower(trim(kg_entities.name)))"
+        )
 
         def _do(cur: Any) -> None:
             cur.execute(
@@ -133,10 +146,13 @@ class KGPostgresWriter:
                 "   valid_at, t_valid, entity_supertype, entity_subtype) "
                 f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (uuid) DO UPDATE SET "
-                "   name = EXCLUDED.name, "
+                f"   name = CASE WHEN {same_name} THEN EXCLUDED.name ELSE kg_entities.name END, "
                 "   summary = EXCLUDED.summary, "
-                "   normalized_name = EXCLUDED.normalized_name, "
-                "   embedding = COALESCE(EXCLUDED.embedding, kg_entities.embedding), "
+                f"   normalized_name = CASE WHEN {same_name} "
+                "      THEN EXCLUDED.normalized_name ELSE kg_entities.normalized_name END, "
+                f"   embedding = CASE WHEN {same_name} "
+                "      THEN COALESCE(EXCLUDED.embedding, kg_entities.embedding) "
+                "      ELSE kg_entities.embedding END, "
                 "   entity_supertype = EXCLUDED.entity_supertype, "
                 "   entity_subtype = EXCLUDED.entity_subtype",
                 (
