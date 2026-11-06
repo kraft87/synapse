@@ -160,6 +160,30 @@ def _type_compatible(a: str | None, b: str | None) -> bool:
     return frozenset((a, b)) in _TYPE_ALLOWLIST
 
 
+# --- Identifier gate for merge candidates -------------------------------------
+# Two names carrying different numbers (PR #290 / PR #269, JIRA-12895 / -12893,
+# Python 3.12 / 3.11) name different things, yet look near-identical as strings and as
+# embeddings: prod's 'PR #290' sat at name-embedding cosine 0.970 to 'PR #269', over the
+# 0.95 autoconfirm, and one 'PR #N' node collected the facts of 37 PRs. So when both
+# names carry digit runs and the sets differ, no threshold or LLM gets a say. Digits
+# only, so 'PR #290' still meets 'pull request 290'; a name with no number ('Python'
+# vs 'Python 3.12') is left to the other strategies; the same number in two repos is
+# not caught here. Strict on purpose ('RTX 3080' vs 'RTX 3080 16GB' stays split too):
+# a split costs a spare node, a wrong merge puts every later fact on the wrong one.
+_ID_TOKEN_RE = re.compile(r"[0-9]+")
+
+
+def identifier_tokens(name: str) -> frozenset[str]:
+    """The digit runs in ``name``, leading zeros dropped ('schema 058' -> {'58'})."""
+    return frozenset(t.lstrip("0") or "0" for t in _ID_TOKEN_RE.findall(name or ""))
+
+
+def ids_conflict(a: str, b: str) -> bool:
+    """True if both names carry numbers and the numbers differ (never one entity)."""
+    ids_a, ids_b = identifier_tokens(a), identifier_tokens(b)
+    return bool(ids_a) and bool(ids_b) and ids_a != ids_b
+
+
 def canonical_name(name: str) -> str | None:
     """The canonical entity name for a known alias, or None if not aliased."""
     return CANONICAL_ALIASES.get(_normalize_name(name))
@@ -414,6 +438,10 @@ class NodeDeduper:
         # Strategy 3: MinHash/LSH candidate generation (no LLM yet).
         idx = self._index()
         candidates = self._lsh_candidates(_normalize_for_fuzzy(name), idx)
+        # Identifier gate (hard): 'JIRA-12895' never merges into 'JIRA-12893'.
+        candidates = [
+            (u, j) for (u, j) in candidates if not ids_conflict(name, idx.name_by_uuid.get(u, ""))
+        ]
         if not candidates:
             return ("none", None)
 
@@ -972,5 +1000,7 @@ __all__ = [
     "_normalize_name",
     "_shingles",
     "has_high_entropy",
+    "identifier_tokens",
+    "ids_conflict",
     "index_by_normalized_name",
 ]

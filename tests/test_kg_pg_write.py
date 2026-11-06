@@ -2,8 +2,9 @@
 
 Exercises every mutation against the real kg_entities / kg_relationships
 schema (017) on the shared test DB, asserting the contracts the pipeline
-depends on: upsert updates only the rename-able fields (created_at /
-entity_type are insert-only, embedding survives a no-embedding update),
+depends on: upsert updates only the merge-able fields (created_at /
+entity_type are insert-only, embedding survives a no-embedding update, a
+merge under another name keeps the entity's name and embedding),
 edge re-creation is a retry no-op, invalidation sets both t_invalid and the
 legacy invalid_at, and failures RAISE (Postgres is the source of truth now —
 no best-effort swallowing).
@@ -100,14 +101,14 @@ class TestUpsertNode:
         created_at_first, has_emb = row[6], row[7]
         assert has_emb
 
-        # Update: rename + longer summary, NO embedding this time. The
-        # existing embedding and the insert-only fields must survive.
+        # Update: a casing variant of the same name + longer summary, NO embedding
+        # this time. The existing embedding and the insert-only fields must survive.
         kg_writer.upsert_node(
             uuid="e-1",
-            name="Synapse v2",
-            normalized_name="synapse v2",
+            name="SYNAPSE",
+            normalized_name="synapse",
             entity_type="SHOULD-NOT-CHANGE",
-            summary="memory layer, renamed",
+            summary="memory layer, longer",
             group_id=GROUP,
             project="synapse",
             created_at="2026-06-09T00:00:00+00:00",
@@ -118,12 +119,58 @@ class TestUpsertNode:
             "SELECT name, normalized_name, entity_type, summary, created_at, "
             "embedding IS NOT NULL FROM kg_entities WHERE uuid = 'e-1'"
         ).fetchone()
-        assert row[0] == "Synapse v2"
-        assert row[1] == "synapse v2"
+        assert row[0] == "SYNAPSE"
+        assert row[1] == "synapse"
         assert row[2] == "Tool"  # insert-only
-        assert row[3] == "memory layer, renamed"
+        assert row[3] == "memory layer, longer"
         assert row[4] == created_at_first  # insert-only
         assert row[5]  # embedding preserved through a no-embedding update
+
+    def _upsert(self, kg_writer, name: str, normalized: str, summary: str, axis: int) -> None:
+        kg_writer.upsert_node(
+            uuid="e-pr",
+            name=name,
+            normalized_name=normalized,
+            entity_type="PullRequest",
+            summary=summary,
+            group_id=GROUP,
+            project="synapse",
+            created_at=None,
+            valid_at=None,
+            embedding=_axis_list(axis),
+        )
+
+    def _name_row(self, conn) -> tuple:
+        return conn.execute(
+            "SELECT name, normalized_name, summary, embedding = %s::vector "
+            "FROM kg_entities WHERE uuid = 'e-pr'",
+            (_vec(_axis_list(0)),),
+        ).fetchone()
+
+    def test_merge_keeps_the_canonical_name_and_embedding(self, kg_writer, conn):
+        # A mention merged into an existing entity under another name must not rename it
+        # or swap in that mention's name embedding: prod's 'PR #290' node started life as
+        # PR #120 and was renamed by each merge, so every next 'PR #29x' matched it again.
+        self._upsert(kg_writer, "PR #120", "pr #120", "the PR", axis=0)
+        self._upsert(kg_writer, "PR #290", "pr #290", "the PR, with more detail", axis=1)
+        assert self._name_row(conn) == ("PR #120", "pr #120", "the PR, with more detail", True)
+
+        # The same name in other casing still updates name and embedding.
+        self._upsert(kg_writer, "pr #120", "pr #120", "the PR, with more detail", axis=2)
+        assert self._name_row(conn) == ("pr #120", "pr #120", "the PR, with more detail", False)
+
+    def test_merge_repairs_a_missing_normalized_name(self, kg_writer, conn):
+        # Rows written before normalized_name existed carry ''; a same-name merge
+        # still fills it in, a merge under another name leaves the row's name alone.
+        conn.execute(
+            "INSERT INTO kg_entities (uuid, group_id, name, normalized_name) "
+            "VALUES ('e-pr', %s, 'Legacy Widget', '')",
+            (GROUP,),
+        )
+        self._upsert(kg_writer, "widget pipeline", "widget pipeline", "s", axis=0)
+        assert self._name_row(conn)[:2] == ("Legacy Widget", "")
+        self._upsert(kg_writer, "Legacy Widget", "legacy widget", "s", axis=0)
+        assert self._name_row(conn)[:2] == ("Legacy Widget", "legacy widget")
 
 
 class TestCreateEdges:

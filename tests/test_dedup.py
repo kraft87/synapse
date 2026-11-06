@@ -286,6 +286,48 @@ class TestTypeGate:
         assert kind == "candidates"
 
 
+class TestIdentifierGuard:
+    """Names carrying different numbers (PR #290 / PR #269, JIRA-12895 / -12893,
+    Python 3.12 / 3.11) are never the same entity, whatever their string similarity."""
+
+    @pytest.mark.parametrize(
+        ("a", "b", "conflict"),
+        [
+            ("PR #290", "PR #269", True),
+            ("JIRA-12895", "JIRA-12893", True),
+            ("issue #4128", "issue #5275", True),
+            ("Python 3.12", "Python 3.11", True),
+            ("192.168.0.20", "192.168.0.2", True),
+            ("PR #290", "pull request 290", False),  # same number, different wording
+            ("PR #290", "PR #290", False),
+            ("Claude Opus 4.5", "claude-opus-4-5", False),
+            ("schema 058", "schema 58", False),  # leading zeros don't make a new number
+            ("Python", "Python 3.12", False),  # one side has no number: not this guard's call
+            ("Synapse", "synapse poller", False),
+        ],
+    )
+    def test_ids_conflict(self, a, b, conflict):
+        from ingestion.dedup import ids_conflict
+
+        assert ids_conflict(a, b) is conflict
+        assert ids_conflict(b, a) is conflict
+
+    def test_lsh_candidate_with_a_different_number_is_dropped(self):
+        # 'jira12895' vs 'jira12893' share 6 of 8 trigrams (Jaccard 0.75, over the
+        # 0.7 floor), so LSH alone would hand the other ticket over as a merge.
+        graph = _FakeGraph(entities=[("uuid-12893", "JIRA-12893", "the other ticket")])
+        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        assert deduper.classify("JIRA-12895", "a ticket") == ("none", None)
+        assert deduper.find_or_none("JIRA-12895", "a ticket") is None
+
+    def test_lsh_candidate_with_the_same_number_survives(self):
+        graph = _FakeGraph(entities=[("uuid-12895", "JIRA-12895", "the ticket")])
+        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        kind, payload = deduper.classify("jira 12895", "the ticket")
+        assert kind == "candidates"
+        assert payload[0][0] == "uuid-12895"
+
+
 # ---------------------------------------------------------------------------
 # Strategy 4 — LLM confirm
 # ---------------------------------------------------------------------------

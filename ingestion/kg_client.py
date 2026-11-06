@@ -86,10 +86,10 @@ class KGClient:
         """Create or update a node. Returns the node UUID.
 
         ``normalized_name`` (lowercase, whitespace-collapsed, leading/trailing
-        punctuation stripped) is recomputed on every write so
+        punctuation stripped) is computed on every write so
         ``ingestion.dedup.NodeDeduper`` can serve the exact-name short-circuit
-        via an indexed lookup, and a rename propagates to the dedup index
-        immediately.
+        via an indexed lookup. Updating an existing node never renames it to a
+        name that normalizes differently (see ``KGPostgresWriter.upsert_node``).
         """
         from ingestion.dedup import _normalize_name
 
