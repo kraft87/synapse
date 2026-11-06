@@ -96,7 +96,7 @@ def test_descriptions_and_instructions_fit_claude_code_truncation():
 # from the wire description — remember once lost its whole type-semantics block this
 # way. Pinning each tail proves no description got section-swallowed.
 _DESCRIPTION_TAILS = {
-    "recall": "expands a truncated passage or note body;",
+    "recall": "a config problem, not empty memory.",
     "recall_full_turns": "rateable in recall_feedback",
     "fetch": "at most 20 ids per call",
     "fetch_session": "read the on-disk transcript instead",
@@ -122,6 +122,32 @@ def test_description_tails_survive_docstring_section_parsing():
     assert "BEFORE falling back to files" in by_name["recall_full_turns"]
     # recall_feedback must invite board note ids, or n: feedback never gets filed:
     assert "note ids from the session-start board" in by_name["recall_feedback"]
+
+
+def test_always_loaded_text_describes_only_what_recall_serves():
+    """The timeline leg left recall on 2026-08-07, so no description may still offer
+    t:N ids or a timeline blend; and no sentence may be the stub of a deleted clause."""
+    by_name = {t.name: t.description or "" for t in _listed()}
+    for name in ("recall", "recall_full_turns", "recall_feedback"):
+        assert "timeline" not in by_name[name], name
+        assert "t:N" not in by_name[name], name
+    assert "fetch(ids) expands a truncated passage or note body." in " ".join(
+        by_name["recall"].split()
+    )
+    assert "Follow-ups:" not in by_name["recall"]
+    assert "questions;" not in (server.mcp.instructions or "")
+    assert "results; recall_full_turns searches" in (server.mcp.instructions or "")
+
+
+def test_fetch_session_schema_stays_short():
+    """fetch_session was called 3 times ever by 2026-11-06, but its schema loads in
+    every session that loads tools: description plus parameter docs stay short."""
+    (t,) = [t for t in _listed() if t.name == "fetch_session"]
+    params = t.parameters["properties"].values()
+    words = len((t.description or "").split()) + sum(
+        len((p.get("description") or "").split()) for p in params
+    )
+    assert words <= 120, words
 
 
 def test_issue_machine_token_hidden_from_list_but_callable():
