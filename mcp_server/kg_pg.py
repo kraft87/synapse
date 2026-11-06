@@ -34,6 +34,10 @@ Restricted surfaces (schema 053/054) pass ``allowed_projects``; every leg then s
 only facts whose cached provenance set (schema 056, ``source_projects``) is known,
 non-empty and inside the allowlist — see :func:`scope_predicate`. ``None`` is full trust
 and runs the original SQL unchanged.
+
+Full trust also reads the KG group it did not ask for (:func:`search_kg`), as a
+superset: the requested group's facts exactly as a one-group read serves them, then a
+few vector/BM25 matches from the other group.
 """
 
 from __future__ import annotations
@@ -41,6 +45,7 @@ from __future__ import annotations
 from typing import Any
 
 from ingestion.embedding import embed_dims
+from ingestion.scope import active_groups
 
 # Embedding width for the halfvec casts below — must match the provisioned schema
 # (and its HNSW index expressions) verbatim. Default 2048 (Voyage prod, unchanged).
@@ -54,6 +59,34 @@ _RRF_K = 60
 # non-web survivors of the 200 was 46. The small personal group can under-fill with or
 # without the web filter (3 of 20 personal queries kept fewer than 36).
 _OVERFETCH = 200
+# Facts a full-trust recall may add from the group it did not ask for, after the
+# requested group's own (see search_kg). recall_overview serves _FACT_LIMIT + this.
+CROSS_GROUP_EXTRAS = 4
+
+
+def read_groups(group_id: str, restricted: bool) -> str | list[str]:
+    """The KG group(s) a recall reads: the requested group alone (a plain string) for a
+    restricted caller; for full trust a list, the requested group first.
+
+    The extractor routes each fact into ``technical`` or ``personal`` by a name regex, so
+    the owner's facts on one topic sit in both graphs, and reading only the requested one
+    missed the other half: 48% of personal-group recalls over the 60 days to 2026-11-06
+    served exactly one fact, against 6% of technical ones. The group is not a trust
+    boundary (a restricted surface is scoped by fact provenance, schema 056), so full
+    trust reads every group the deployment keeps (:func:`ingestion.scope.active_groups`:
+    with the personal scope off that is one, and the plain string comes back as before).
+    """
+    if restricted:
+        return group_id
+    groups = [group_id, *(g for g in active_groups() if g != group_id)]
+    return groups if len(groups) > 1 else group_id
+
+
+def group_sql(group_id: str | list[str], col: str = "group_id") -> str:
+    """``col`` filtered to ``group_id``, one ``%s`` bound to it as given: equality for one
+    group (a string: the statement every single-group read always sent), ``= ANY`` for a
+    list (:func:`read_groups`)."""
+    return f"{col} = %s" if isinstance(group_id, str) else f"{col} = ANY(%s)"
 
 
 def scope_predicate(alias: str = "") -> str:
@@ -296,3 +329,111 @@ def search_kg_postgres(
         if len(results) >= limit:
             break
     return results, seed_entities
+
+
+def cross_group_facts(
+    cur: Any,
+    query: str,
+    query_emb: list[float],
+    owner_id: str,
+    groups: list[str],
+    taken: list[dict[str, Any]],
+    k: int,
+) -> list[dict[str, Any]]:
+    """Up to ``k`` live facts from ``groups``, the groups a full-trust recall did not ask
+    for: the fact-vector over-fetch and BM25 legs, RRF-fused, skipping any text already in
+    ``taken``. Same row shape as :func:`search_kg_postgres`, each marked ``_cross``.
+
+    No seed/hop leg: its facts are query-blind recency samples, and the other group's
+    copy of the owner identity node (thousands of live edges) would spend them. Full
+    trust only: no provenance predicate.
+    """
+    if k <= 0 or not groups:
+        return []
+    fact_by_uuid: dict[str, tuple[str, Any, Any, Any]] = {}
+    cur.execute(
+        "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM ("
+        "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id, "
+        "         web_artifact_id "
+        "  FROM kg_relationships "
+        "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
+        f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
+        ") sub WHERE owner_id = %s AND group_id = ANY(%s) AND web_artifact_id IS NULL LIMIT %s",
+        (_vec_literal(query_emb), _OVERFETCH, owner_id, groups, k * 3),
+    )
+    vec_uuids: list[str] = []
+    for u, f, tv, og, sup in cur.fetchall():
+        if f:
+            fact_by_uuid.setdefault(u, (f, tv, og, sup))
+            vec_uuids.append(u)
+    safe = "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
+    bm25_uuids: list[str] = []
+    if safe:
+        cur.execute(
+            "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
+            "FROM kg_relationships "
+            "WHERE id @@@ paradedb.match('fact', %s) "
+            "  AND owner_id = %s AND group_id = ANY(%s) AND t_invalid IS NULL "
+            "  AND web_artifact_id IS NULL "
+            "ORDER BY sc DESC LIMIT %s",
+            (safe, owner_id, groups, k * 3),
+        )
+        for u, f, tv, og, sup, _sc in cur.fetchall():
+            if f:
+                fact_by_uuid.setdefault(u, (f, tv, og, sup))
+                bm25_uuids.append(u)
+    fused = _rrf_fuse([vec_uuids, bm25_uuids])
+    seen_text = {" ".join(t["fact"].lower().split()) for t in taken}
+    out: list[dict[str, Any]] = []
+    for u, _ in sorted(fused.items(), key=lambda kv: kv[1], reverse=True):
+        fact, t_valid, ongoing, supported = fact_by_uuid[u]
+        text_key = " ".join(fact.lower().split())
+        if text_key in seen_text:
+            continue
+        seen_text.add(text_key)
+        out.append(
+            {
+                "fact": fact,
+                "_uuid": u,
+                "_date": t_valid,
+                "_ongoing": ongoing,
+                "_supported": supported,
+                "_cross": True,
+            }
+        )
+        if len(out) >= k:
+            break
+    return out
+
+
+def search_kg(
+    cur: Any,
+    query: str,
+    query_emb: list[float],
+    owner_id: str,
+    group_id: str | list[str],
+    session_focus: list[str],
+    limit: int,
+    allowed_projects: list[str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """:func:`search_kg_postgres` over the group spec :func:`read_groups` returns.
+
+    A string is one group, read exactly as it always was. A list (full trust) reads its
+    first, requested, group exactly as a one-group read would, with every leg, then
+    appends up to :data:`CROSS_GROUP_EXTRAS` facts from the rest (:func:`cross_group_facts`).
+    The extras never compete for the requested group's ``limit`` slots: letting them
+    compete (one fused top-12 over both groups) served 14 fewer of the 352 rated-helpful
+    items on the 200 most recent rated recalls, a regression the bench rejects.
+    """
+    if isinstance(group_id, str):
+        return search_kg_postgres(
+            cur, query, query_emb, owner_id, group_id, session_focus, limit, allowed_projects
+        )
+    facts, seeds = search_kg_postgres(
+        cur, query, query_emb, owner_id, group_id[0], session_focus, limit, allowed_projects
+    )
+    if allowed_projects is None:
+        facts += cross_group_facts(
+            cur, query, query_emb, owner_id, group_id[1:], facts, CROSS_GROUP_EXTRAS
+        )
+    return facts, seeds

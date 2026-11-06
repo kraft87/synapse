@@ -10,12 +10,14 @@ from typing import Any
 from ingestion import embedding as _embedding
 from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
+from mcp_server.kg_pg import CROSS_GROUP_EXTRAS, read_groups
 from mcp_server.recall_presentation import apply_supersessions as _apply_supersessions
 from mcp_server.recall_presentation import parse_episode_ids as _parse_episode_ids
 from mcp_server.recall_presentation import to_web_recall_item as _to_web_recall_item
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_ranking import served_chars as _served_chars
 from mcp_server.recall_ranking import timed as _timed
+from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import config_hint as _config_hint
 from mcp_server.recall_warnings import error_brief as _err_brief
 from mcp_server.recall_warnings import submit_with_context as _submit_ctx
@@ -79,7 +81,12 @@ class RecallOverviewMixin:
         off (SYNAPSE_PERSONAL_SCOPE=0) a request for the personal graph is served
         from the technical one, because that is where every fact was written. A
         model that asks for a scope this deployment does not run gets answers
-        instead of an empty graph.
+        instead of an empty graph. A full-trust caller is then served the requested
+        graph exactly as before PLUS what the other graph adds: up to
+        ``kg_pg.CROSS_GROUP_EXTRAS`` facts, and supersession extras within the caps the
+        requested graph left (``kg_pg.read_groups`` / ``kg_pg.search_kg``). A restricted
+        caller reads the requested graph alone. The recall_metrics row keeps the
+        requested group.
 
         A ``warnings`` list is attached when a leg degraded (embedding or rerank
         backend down, KG or notes leg errored). The key is ABSENT on a healthy call,
@@ -132,6 +139,10 @@ class RecallOverviewMixin:
         # subset of nothing.
         kg_scope: dict[str, Any] = {"allowed_projects": allowed} if st.restricted else {}
         kg_off = st.restricted and not allowed
+        # Every KG read below, the bump included, covers these groups. A list (full trust)
+        # adds the other group's facts after the requested group's, never in their place.
+        kg_groups = read_groups(group_id, st.restricted)
+        other_groups = kg_groups[1:] if isinstance(kg_groups, list) else []
 
         # BM25 is pure text search — it does NOT need the query embedding. Start it
         # FIRST so its ~165ms fetch overlaps the ~170ms Voyage query-embedding call
@@ -185,7 +196,7 @@ class RecallOverviewMixin:
             return self._search_kg(
                 query,
                 query_emb,
-                group_id,
+                kg_groups,
                 session_focus or [],
                 fact_limit=settings._FACT_LIMIT,
                 **kg_scope,
@@ -233,9 +244,8 @@ class RecallOverviewMixin:
         web_ranked, ms_web = f_web.result()
         (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
 
-        facts_internal = kg_results[
-            : settings._FACT_LIMIT
-        ]  # carry _uuid for bump + superseded pairs
+        # carry _uuid for bump + superseded pairs; cross-group extras ride after the limit
+        facts_internal = kg_results[: settings._FACT_LIMIT + CROSS_GROUP_EXTRAS]
         # Self-exclusion, facts half: drop facts sourced only from the calling session.
         # Runs before the retrieval_count bump so an unserved fact is not reinforced.
         n_self_facts_excluded = 0
@@ -250,7 +260,7 @@ class RecallOverviewMixin:
         # float higher next time. Already fire-and-forget — never blocks the response.
         surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
         if surfaced_edge_uuids and write_feedback:
-            self._increment_fact_retrieval_counts(surfaced_edge_uuids, group_id)
+            self._increment_fact_retrieval_counts(surfaced_edge_uuids, kg_groups)
 
         # Second wave, concurrent with the episode rerank: the bi-temporal superseded-pairs
         # fetch and the fact-floor rerank both need the KG leg's facts, nothing else.
@@ -260,14 +270,15 @@ class RecallOverviewMixin:
             else _submit_ctx(
                 ex,
                 functools.partial(self._fetch_superseded_pairs_pg, **kg_scope),
-                group_id,
+                kg_groups,
                 surfaced_edge_uuids,
                 settings._SUPERSEDED_LIMIT,
             )
         )
         f_fact_floor = (
             _submit_ctx(ex, self._floor_facts, query, facts_internal)
-            if settings._RECALL_FACT_FLOOR > 0 and len(facts_internal) > 1
+            if settings._RECALL_FACT_FLOOR > 0
+            and (len(facts_internal) > 1 or any(f.get("_cross") for f in facts_internal))
             else None
         )
         scored, ms_rerank = f_rerank.result()
@@ -341,16 +352,19 @@ class RecallOverviewMixin:
         served_facts = f_fact_floor.result() if f_fact_floor is not None else facts_internal
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
+        served_uuids = {f["_uuid"] for f in served_facts if f.get("_uuid")}
         sup_extras = (
             []
             if kg_off
-            else self._surface_supersessions(
-                query_emb,
-                group_id,
-                {f.get("_uuid") for f in served_facts if f.get("_uuid")},
-                **kg_scope,
-            )
+            else self._surface_supersessions(query_emb, group_id, served_uuids, **kg_scope)
         )
+        # Full trust: the other group's successors fill only what the requested group's left
+        # of the cap, so the requested group's own extras are exactly what they were.
+        if other_groups and len(sup_extras) < _SUP_LIMIT:
+            more = self._surface_supersessions(
+                query_emb, other_groups, served_uuids, cap=_SUP_LIMIT - len(sup_extras)
+            )
+            sup_extras += [{**f, "_cross": True} for f in more]
         if sup_extras and self_session:
             own_facts = self._self_session_facts(
                 [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
@@ -395,6 +409,16 @@ class RecallOverviewMixin:
                 served_text=served_text,
                 **kg_scope,
             )
+            if other_groups:  # full trust: the other group's successors go after
+                more_sup = self._episode_supersessions(
+                    list(served_text),
+                    other_groups,
+                    self_session=self_session,
+                    served_text=served_text,
+                )
+                for eid, now in more_sup.items():
+                    have = sup.setdefault(eid, [])
+                    have += [f for f in now if f not in have]
             if sup:
                 _apply_supersessions(ep_items, sup, {f["fact"] for f in facts})
 
@@ -458,6 +482,11 @@ class RecallOverviewMixin:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
             served_ids["n_self_facts_excluded"] = n_self_facts_excluded
+        # Which served facts came from the group the caller did not ask for (key present
+        # only when some did), so their helpful/noise rate can be read off recall_feedback.
+        cross = [f["_uuid"] for f in served_facts if f.get("_cross") and f.get("_uuid")]
+        if cross:
+            served_ids["facts_cross_group"] = cross
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.
