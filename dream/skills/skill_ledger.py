@@ -168,11 +168,12 @@ def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
     """Append new, dedup by (session_id, signal, class, scan_night): a re-sighting on a LATER
     scan night counts as fresh recurrence evidence, while same-night duplicates still collapse.
     Legacy entries without scan_night all key to one bucket (scan_night=None) — same collapse
-    behavior they had before scan nights existed."""
+    behavior they had before scan nights existed. A review act (a session-less grounded
+    entry: accept / reject / revive) is never a duplicate: reject, revive, reject is three acts."""
     out, seen = [], set()
     for e in list(old) + list(new):
         k = (e.get("session_id"), e.get("signal"), e.get("class"), e.get("scan_night"))
-        if k in seen:
+        if k in seen and not (e.get("class") == "grounded" and not e.get("session_id")):
             continue
         seen.add(k)
         out.append(e)
@@ -195,6 +196,16 @@ def _recurrence(evidence: list[dict]) -> bool:
     """The derive recurrence gate: PROPOSE_SESSIONS distinct sessions on as many distinct
     session days. An undated session (its episodes are gone) can't make up a day."""
     return len({d for d in _session_dates(evidence).values() if d}) >= PROPOSE_SESSIONS
+
+
+def _standing_reject(evidence: list[dict]) -> bool:
+    """True when a person's reject is the last word in the evidence (no revive or accept
+    after it)."""
+    last = None
+    for e in evidence:
+        if e.get("class") == "grounded" and e.get("signal") in ("reject", "revive", "accept"):
+            last = e["signal"]
+    return last == "reject"
 
 
 def _fill_session_dates(cur, evidence: list[dict]) -> None:
@@ -298,6 +309,9 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
         deviation/correction moment). Cheap to review, high prior.
       - derive: recurrence (PROPOSE_SESSIONS distinct sessions on as many distinct days;
         entries need their `date`, see _fill_session_dates) OR high detector salience.
+        Neither applies while a person's reject stands: a rejected derive reopened past
+        its cooldown still has the salience and session days it was rejected with, so
+        only the score, which carries the -3, can re-propose it.
       - consolidate: legacy score path only (overlap nominations carry no quotes; one
         cosine sighting is not review-worthy on its own).
     Junk is controlled downstream (candidate decay + human review), not at this gate."""
@@ -306,6 +320,8 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
     if kind == "retune":
         return any((e.get("quote") or "").strip() for e in evidence)
     if kind == "derive":
+        if _standing_reject(evidence):
+            return False
         if salience is not None and salience >= PROPOSE_SALIENCE:
             return True
         return _recurrence(evidence)
@@ -457,7 +473,8 @@ def merge_candidate(
 
     # A re-sighted terminal row REOPENS (rejected past its cooldown, or retired-stale):
     # back to 'observe' so the gates below re-decide. The old reject evidence merged in
-    # above still weighs against it (-3 grounded), so reopening stays conservative.
+    # above still weighs against it (-3 grounded; for a derive it also keeps the salience
+    # and recurrence gates shut, see _passes_gate), so reopening stays conservative.
     if status in ("rejected", "retired"):
         cur.execute(
             "UPDATE skills_lane.skill_gap_candidates SET status='observe', "

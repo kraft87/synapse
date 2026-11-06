@@ -202,6 +202,30 @@ def test_rejected_derive_past_cooldown_reopens_with_its_reject(lane):
     assert gw == -3.0  # the human reject came along
 
 
+@pytest.mark.parametrize("path", ["salience", "recurrence"])
+def test_rejected_derive_does_not_come_back_on_its_old_evidence(lane, path):
+    # #74's shape (salience 4, Kyle: "single incident, permanently fixed"): past the cooldown
+    # one sighting reopens the row, but the salience and session days it had when Kyle
+    # rejected it must not re-propose it; only the score, which carries the -3, can
+    old = [_gap("v2t-sess-a", "2026-07-17", "2026-07-16")]
+    if path == "recurrence":
+        old.append(_gap("v2t-sess-b", "2026-07-21", "2026-07-20"))
+    r1 = _mc(lane, "derive", "v2t-proc", old, signature=_SIG, salience=4)
+    assert r1["status"] == "proposed"
+    reject = {"session_id": None, "class": "grounded", "signal": "reject"}
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', reject_reason='user_rejected', "
+        "rejected_until=now() - interval '1 day', evidence = evidence || %s::jsonb, "
+        "salience = %s WHERE id=%s",
+        (json.dumps([reject]), 4 if path == "salience" else None, r1["id"]),
+    )
+    new = [_gap("v2t-sess-c", "2026-09-02", "2026-09-01")]
+    r2 = _mc(lane, "derive", "v2t-proc", new, signature=_SIG)
+    assert r2["id"] == r1["id"] and r2["status"] == "observe"
+    L.regate_observe(lane)  # the nightly re-gate doesn't raise it either
+    assert _row(lane, r1["id"])[0] == "observe"
+
+
 @pytest.mark.parametrize(("retired_days_ago", "reopens"), [(30, True), (90, False)])
 def test_recently_retired_derive_reopens(lane, retired_days_ago, reopens):
     r1 = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-17")], signature=_SIG)

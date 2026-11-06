@@ -156,6 +156,33 @@ def test_derive_proposes_on_salience():
     assert not _passes_gate("derive", [_ev(night="2026-07-18")], 0.5, 3)
 
 
+def test_a_standing_human_reject_turns_the_derive_looseners_off():
+    reject = _ev(sid=None, cls="grounded", signal="reject")
+    two_days = [_ev(sid="a", date="2026-07-19"), _ev(sid="b", date="2026-07-20")]
+    # salience and recurrence earned before the reject don't re-propose it
+    assert not _passes_gate("derive", [*two_days, reject], -2.0, 4)
+    # a person's revive (or accept) after the reject lifts it
+    revive = _ev(sid=None, cls="grounded", signal="revive")
+    assert _passes_gate("derive", [*two_days, reject, revive], 1.0, None)
+    # the score path, which carries the -3, still can
+    assert _passes_gate("derive", [*two_days, reject], PROPOSE_SCORE, None)
+    # retunes keep their quote gate
+    assert _passes_gate("retune", [_ev(quote="synthetic"), reject], -2.5, None)
+
+
+def test_union_keeps_every_review_act():
+    # reject, revive, reject again: the second reject is a new act, not a duplicate
+    # sighting, and dropping it at the next merge would leave the row looking revived
+    acts = [_ev(sid=None, cls="grounded", signal=s) for s in ("reject", "revive", "reject")]
+    merged = _union_evidence([_ev(), *acts], [_ev(sid="sess-2")])
+    assert [e["signal"] for e in merged if e["class"] == "grounded"] == [
+        "reject",
+        "revive",
+        "reject",
+    ]
+    assert not _passes_gate("derive", merged, -2.0, 4)
+
+
 def test_legacy_score_gate_still_applies_to_all_kinds():
     for kind in ("derive", "retune", "consolidate"):
         assert _passes_gate(kind, [_ev()], PROPOSE_SCORE, None)

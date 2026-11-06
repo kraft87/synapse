@@ -16,8 +16,9 @@ changed, what to do on each machine, what was proven, and what is still open.
   (salience and score paths unchanged). Scan nights no longer count, and a judge signal
   votes once per session. Session days come from episodes (min created_at) when an entry
   has none, and a nightly re-gate applies this to open rows.
-- **Derive identity** also matches rejected rows (cooldown and -3 kept) and rows retired in
-  the last 60 days (they reopen instead of starting over).
+- **Derive identity** also matches rejected rows (cooldown and -3 kept; while a person's
+  reject stands, only the score path can re-propose one) and rows retired in the last 60
+  days (they reopen instead of starting over).
 - **Under-trigger judges each session against the skills it was served** (global +
   `project:<label>` by `_evidence_scope`; a multi-project session is global).
 - **The review queue looks after itself** (`dream/skills/review_queue.py`, after drafting):
