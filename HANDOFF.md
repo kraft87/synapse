@@ -12,8 +12,9 @@ changed, what to do on each machine, what was proven, and what is still open.
   name is an identifier (`PR #N`, `draft PR #N`, `pull request #N`, `issue #N`, `task #N`,
   a ticket key `ABC-123`), it reads the fact for identifiers of the same kind. A fact that
   names exactly one, other than the endpoint's own number, moves that endpoint to the
-  entity named for it in the same group (created if missing, embedded as an entity, type
-  and project copied). Facts naming their own number, none, several or a range stay; so
+  entity named for it in the same group (an existing one spelled `PR #N`, `PR N` or
+  `pull request N` is reused; created if missing, embedded as an entity, type and project
+  copied). Facts naming their own number, none, several or a range stay; so
   does a move that would join an edge to itself. Entities that lose an edge get an empty
   summary, refilled by the next mention. Fact text, embeddings, `episodes` and
   `source_projects` are never touched.
@@ -29,13 +30,19 @@ samples hold private text: keep them outside the repository)
    --plan-out <outside>/plan.json`. It prints counts per family, the health numbers now and
    as they will be after the plan, and sample moves.
 2. Review `unretire_candidates` in the plan; write the uuids to un-retire, one per line, to
-   an allow file.
-3. Benchmark before, then `--apply --unretire-allow <file>`. The plan is recomputed at apply
-   time and every write is conditional on the row still holding the planned value. Every
-   touched row is first copied to `kg_magnet_repair_<YYYYMMDD>_{relationships,entities,created}`.
+   an allow file. Leave out a candidate whose old edge does not move (it would come back
+   live on an entity named for another number).
+3. Benchmark before, then `--apply --unretire-allow <file> --date <YYYYMMDD>`. The plan is
+   recomputed at apply time and every write is conditional on the row still holding the
+   planned value. Every touched row (each moved or un-retired edge, each entity that loses
+   an edge) is first copied to `kg_magnet_repair_<YYYYMMDD>_{relationships,entities,created}`.
 4. `--metrics` prints the audit's two numbers to verify.
-5. Undo: `--restore <YYYYMMDD>` (dry run) then `--restore <YYYYMMDD> --apply`. Created
-   entities that new facts have attached to since are kept and counted.
+5. Undo: `--restore <YYYYMMDD>` (dry run) then `--restore <YYYYMMDD> --apply`. It reverts
+   what the run changed and keeps what was written since: an entity drained of every edge
+   and then deleted by the daily orphan sweep is re-created from its backup, endpoints go
+   back, an un-retired edge is retired again unless something retired it since, a cleared
+   summary comes back unless a mention rewrote it, and created entities that new facts
+   have attached to are kept and counted.
 
 No restart is needed: the extractor's dedup index re-reads entities within its TTL
 (`SYNAPSE_DEDUP_CACHE_TTL_SECONDS`, 900 s), and its exact-name lookup falls through to
@@ -43,24 +50,35 @@ the database.
 
 **Proven**
 
-- Rules: 45 unit tests; 7 database tests on a scratch database (dry run writes nothing,
-  apply moves/creates/clears/backs up, provenance unchanged, a second apply is a no-op, a
-  row changed after the read is skipped, restore returns every row, metrics before/after).
-- Read-only dry run on prod, 2026-11-06: 2,958 identifier endpoints examined; 1,175
-  endpoint moves (966 live, 209 retired) out of 83 entities; 57 existing targets reused,
-  218 created; 10 supersession candidates, 2 un-retired after review (the other 8 are real
-  updates or stale on their own). The audit's numbers as planned: live edges on `PR #N`
-  entities lacking their own number 72.4% -> 13.7% (whole name) and 75.5% -> 26.2% (name
-  contains `PR #N`); disjoint-ID supersessions 29 -> 27.
+- Rules: 46 unit tests; 11 database tests on a scratch database (dry run and metrics read
+  through a read-only connection and write nothing, apply moves/creates/clears/backs up,
+  provenance unchanged, a second apply is a no-op, a row changed after the read is
+  skipped, restore returns every row, keeps a retirement or summary written after the run,
+  re-creates a magnet the orphan sweep deleted, metrics before/after).
+- Read-only dry run on prod, 2026-11-06: 2,961 identifier endpoints examined; 1,175
+  endpoint moves (966 live, 209 retired) out of 83 entities, 10 of which lose every edge;
+  62 existing targets reused, 213 created; 10 supersession candidates, 1 un-retired after
+  review (the other 9 are real updates, stale on their own, or stay on the magnet). The
+  audit's numbers as planned: live edges on `PR #N` entities lacking their own number
+  72.4% -> 13.8% (whole name) and 75.5% -> 26.4% (name contains `PR #N`); disjoint-ID
+  supersessions 29 -> 28.
+- Independent review read 51 sampled moves (all families, live and retired) and 33 sampled
+  stays against their fact text: no wrong move, no wrong stay.
 
 **Open**
 
 - The prod `--apply` and the after-benchmark: run by an operator (this session's
   permission policy refused the production write).
-- Left alone by design: facts naming no or several identifiers (the residual 13.7%),
+- Left alone by design: facts naming no or several identifiers (the residual 13.8%),
   entities whose name decorates the identifier ("widget refactor (PR #12)": 56 edges there
   would match the rule), bare `#N` entities, and the same number in two repositories (one
-  target, as the guard itself cannot tell them apart).
+  target, as the guard itself cannot tell them apart: of 20 targets fed by facts carrying
+  a repository URL, 1 is fed by two repositories).
+- A plan's "PR 1" / "PR 3" (a step in a planned series, not a pull request number) moves
+  onto the real early `PR #1` / `PR #3` entities: 2 edges on prod, no rule can tell them
+  apart.
+- Between the plan and the write, live extraction can create the same target the run
+  creates (seconds wide): the result is a duplicate entity, not a wrong edge.
 
 ## 2026-11-06 — dream→skills lane: live detectors, a real recurrence gate, a queue that tends itself (plugin 0.22.1, schema 062)
 

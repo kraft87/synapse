@@ -21,7 +21,8 @@ Rules (``plan`` below; pinned in tests/test_repair_numbered_entity_magnets*.py):
    SAME kind (a PR entity reads "PR #N", "pull request N", ".../pull/N" and a bare "#N";
    a ticket key reads keys with the same prefix). If the fact names exactly one such
    identifier and it is not the endpoint's own number, the endpoint moves to the entity
-   named for that identifier in the same group (an exact-ID name such as "PR #218"),
+   named for that identifier in the same group (an exact-ID name such as "PR #218"; an
+   existing "PR 218" or "pull request 218" is reused, see ``target_ident``),
    created if missing: name as written in the fact, entity type/project copied from the
    magnet, embedding from ``ingestion.embedding.create_embedder`` with ``task='entity'``.
    An edge stays where it is when the fact names its own number, no identifier, several,
@@ -60,7 +61,8 @@ from>``), so a row that changed since the read is skipped and counted. Before th
 write, one transaction copies every row the run will touch into backup tables
 
     kg_magnet_repair_<YYYYMMDD>_relationships   full kg_relationships rows (moved/un-retired)
-    kg_magnet_repair_<YYYYMMDD>_entities        full kg_entities rows (summaries cleared)
+    kg_magnet_repair_<YYYYMMDD>_entities        full kg_entities rows (every entity that
+                                                loses an edge)
     kg_magnet_repair_<YYYYMMDD>_created         uuids of the entities this run created
 
 each with a ``backed_up_at`` column. Then one transaction per magnet entity: create the
@@ -68,9 +70,11 @@ targets it needs (recorded in ``_created`` in the same transaction), re-point it
 clear its summary. Un-retirements run last, in one transaction. A re-run is a no-op:
 moved edges name their own number now.
 
-``--restore YYYYMMDD`` puts back, from the earliest backed-up copy of each row, every
-edge's endpoints and supersession state and every entity's summary, then deletes the
-created entities nothing references any more (one transaction; dry run unless --apply).
+``--restore YYYYMMDD`` reverts, from the earliest backed-up copy of each row, what the run
+changed and keeps what was written since: it re-creates a backed-up entity the orphan
+sweep deleted, puts every edge's endpoints back, re-retires an un-retired edge that is
+still live, restores a summary that is still empty, then deletes the created entities
+nothing references any more (one transaction; dry run unless --apply; see ``restore``).
 
 Usage:
     scripts/repair_numbered_entity_magnets.py [--db-url DSN] [--samples N] [--plan-out FILE]
