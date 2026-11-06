@@ -91,6 +91,7 @@ _DB_FILES = {
     "test_relabel_projects_db.py",
     "test_skill_trust_scoping.py",
     "test_ingest_span_collision_db.py",
+    "test_web_audience_db.py",
 }
 
 

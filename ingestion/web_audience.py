@@ -12,10 +12,10 @@ shape of the precedence (:func:`ingestion.surfaces.derive_audience`):
 2. **own surface** — an artifact captured in a session whose turns were uploaded by one
    approved restricted surface (057 provenance on ``episodes.surface_id``) is work-safe:
    the content is already on that machine.
-3. **classifier** — a cheap structured LLM call on the pipeline's own provider. It is
-   conservative by construction: ``work-safe`` needs the model to answer work-safe AND
-   to name no personal signal. ``unsure``, mixed content, any named signal, or a reply
-   that never validates all land on ``personal``.
+3. **classifier** — cheap structured LLM calls on the pipeline's own provider. It is
+   conservative by construction: ``work-safe`` needs every one of several independent
+   calls to answer work-safe AND to name no personal signal. ``unsure``, mixed content,
+   any named signal, or a reply that never validates all land on ``personal``.
 
 Rule 3 runs server-side, in the poller's maintenance cycle (:func:`label_pending`), not
 in the brief script: the script runs on a client machine whose environment has no
@@ -59,10 +59,19 @@ STAGE = "WEB_AUDIENCE"
 #: research-job refs have no chunks, so they are never labelled and never served.
 SERVED_KINDS = ("research_brief", "web_scrape")
 
-#: How much of a document the classifier reads: the head, plus the tail of a long one
-#: (a research brief often ends with a section addressed to its reader).
-HEAD_CHARS = 9000
-TAIL_CHARS = 3000
+#: How much of a document the classifier reads. A research brief is read whole (up to a
+#: cap far above any real one): its personal detail tends to sit in a mid-document
+#: "how this applies to the reader" section that a head+tail window would drop. A scrape
+#: is somebody else's page, so its topic shows in the title, URL and head; a long one is
+#: read as head plus tail.
+BRIEF_CHARS = 60000
+SCRAPE_CHARS = 12000
+
+#: Independent classifier calls per artifact (``SYNAPSE_WEB_AUDIENCE_VOTES``). The model
+#: is sampled, so one call on a borderline document can come back either way; requiring
+#: every vote to be a clean work-safe turns a per-call slip into a miss only when it
+#: repeats. The first non-work-safe vote ends the poll, so personal pages cost one call.
+DEFAULT_VOTES = 3
 
 Connect = Callable[[], AbstractContextManager[Any]]
 
@@ -92,10 +101,16 @@ infrastructure, security, engineering, science, tools and products as used for w
 industry news, general how-to.
 2. Neither its content nor its TOPIC says or implies anything about a particular person's \
 health, body, medical conditions, medications, diet or fitness; money, debts, taxes, \
-insurance, purchases or shopping decisions; romantic relationships or dating; family or \
-children; legal matters; identity or personal details; job search, resumes, interviews, \
-compensation or plans to change employer; home, housing or real estate; religion, \
-politics or sexuality; hobbies, entertainment, travel or other private life.
+insurance, purchases or shopping decisions (a shop, marketplace or product listing that \
+offers something for sale counts, whatever the product); romantic relationships or dating; family, \
+children, partners or friends (including any mention of the reader's own parent, spouse, \
+child or friend, whatever role they play in the document); legal matters, including \
+lawsuits, court cases, depositions or other legal proceedings and work done on them; \
+identity or personal details; job search, resumes, interviews, compensation or plans to \
+change employer; a side business, freelance or client work of their own outside their \
+employer (its clients, cases, customers, pricing or revenue); home, housing or real \
+estate; religion, politics or sexuality; hobbies, entertainment, travel or other private \
+life.
 
 The topic alone is enough to make a document personal: a generic article about a medical \
 condition, a medication, personal finance, dating, parenting, a legal dispute, buying a \
@@ -117,13 +132,24 @@ url: {url}
 ---"""
 
 
-def excerpt(content: str | None) -> str:
-    """What the classifier reads: the whole document, or its head and tail when long."""
+def excerpt(content: str | None, kind: str | None = None) -> str:
+    """What the classifier reads: the whole document, or its head and tail past the
+    kind's window (:data:`BRIEF_CHARS` / :data:`SCRAPE_CHARS`)."""
     text = (content or "").strip()
-    if len(text) <= HEAD_CHARS + TAIL_CHARS:
+    limit = BRIEF_CHARS if kind == "research_brief" else SCRAPE_CHARS
+    if len(text) <= limit:
         return text
-    omitted = len(text) - HEAD_CHARS - TAIL_CHARS
-    return f"{text[:HEAD_CHARS]}\n\n[... {omitted} characters omitted ...]\n\n{text[-TAIL_CHARS:]}"
+    head, tail = limit * 3 // 4, limit // 4
+    omitted = len(text) - head - tail
+    return f"{text[:head]}\n\n[... {omitted} characters omitted ...]\n\n{text[-tail:]}"
+
+
+def votes_from_env() -> int:
+    """``SYNAPSE_WEB_AUDIENCE_VOTES`` (default :data:`DEFAULT_VOTES`, at least 1)."""
+    try:
+        return max(1, int(os.environ.get("SYNAPSE_WEB_AUDIENCE_VOTES", DEFAULT_VOTES)))
+    except ValueError:
+        return DEFAULT_VOTES
 
 
 def classify(
@@ -134,31 +160,39 @@ def classify(
     url: str | None,
     content: str | None,
     model: str | None = None,
+    votes: int | None = None,
 ) -> AudienceDecision:
-    """Rule 3: the conservative classifier. Transport errors propagate (the caller leaves
-    the row unlabelled and retries later); every other failure answers ``personal``."""
+    """Rule 3: the conservative classifier. ``work-safe`` only when every one of ``votes``
+    independent calls answers work-safe and names no personal signal; the first vote that
+    does not ends the poll with ``personal``. Transport errors propagate (the caller
+    leaves the row unlabelled and retries later); every other failure answers
+    ``personal``."""
+    n = votes if votes is not None else votes_from_env()
     prompt = PROMPT.format(
-        kind=kind or "-", title=(title or "-").strip(), url=url or "-", text=excerpt(content)
+        kind=kind or "-",
+        title=(title or "-").strip(),
+        url=url or "-",
+        text=excerpt(content, kind),
     )
-    try:
-        verdict = structured_call(
-            llm,
-            output_model=WebAudienceVerdict,
-            base_prompt=prompt,
-            model=model or stage_model(STAGE),
-            max_tokens=400,
-            max_attempts=2,
-        )
-    except LLM_TRANSPORT_ERRORS:
-        raise
-    except Exception as e:
-        return AudienceDecision(DEFAULT_AUDIENCE, "classifier-fallback", f"error: {e}"[:200])
-    signals = [s.strip() for s in verdict.personal_signals if s and s.strip()]
-    if verdict.verdict == "work-safe" and not signals:
-        return AudienceDecision(RESTRICTED_AUDIENCE, "classifier")
-    return AudienceDecision(
-        DEFAULT_AUDIENCE, "classifier", "; ".join(signals)[:300] or verdict.verdict
-    )
+    for i in range(1, max(1, n) + 1):
+        try:
+            verdict = structured_call(
+                llm,
+                output_model=WebAudienceVerdict,
+                base_prompt=prompt,
+                model=model or stage_model(STAGE),
+                max_tokens=400,
+                max_attempts=2,
+            )
+        except LLM_TRANSPORT_ERRORS:
+            raise
+        except Exception as e:
+            return AudienceDecision(DEFAULT_AUDIENCE, "classifier-fallback", f"error: {e}"[:200])
+        signals = [s.strip() for s in verdict.personal_signals if s and s.strip()]
+        if verdict.verdict != "work-safe" or signals:
+            detail = "; ".join(signals) or verdict.verdict
+            return AudienceDecision(DEFAULT_AUDIENCE, "classifier", f"vote {i}: {detail}"[:300])
+    return AudienceDecision(RESTRICTED_AUDIENCE, "classifier", f"{n}/{n} votes")
 
 
 _OWN_SURFACE_SQL = """
