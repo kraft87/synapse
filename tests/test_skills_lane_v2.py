@@ -216,6 +216,24 @@ def test_recently_retired_derive_reopens(lane, retired_days_ago, reopens):
         assert r2["status"] == "observe" and _row(lane, r1["id"])[0] == "observe"
 
 
+def test_an_open_row_wins_a_tie_with_a_cooling_rejected_one(lane):
+    # the duplicate pair the audit found (#2 rejected, #129 open): a new sighting that
+    # matches both equally joins the open row instead of vanishing into the cooldown
+    old = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-17")], signature=_SIG)
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', "
+        "rejected_until=now() + interval '30 days' WHERE id=%s",
+        (old["id"],),
+    )
+    lane.execute(
+        "INSERT INTO skills_lane.skill_gap_candidates (kind, name, signature_key, evidence) "
+        "VALUES ('derive', 'v2t-proc-dup', %s, %s::jsonb)",
+        (L.signature_key(_SIG, None), json.dumps([_gap("v2t-sess-b", "2026-08-01")])),
+    )
+    r = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-c", "2026-09-01")], signature=_SIG)
+    assert r["id"] != old["id"] and r["merged"] is True
+
+
 def test_derive_proposes_on_salience(lane):
     r = _mc(
         lane,

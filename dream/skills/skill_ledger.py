@@ -260,13 +260,15 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
     # in the last REOPEN_RETIRED_DAYS (a repeat after decay reopens the row it repeats).
     # Empty-vs-empty is NOT identity: a candidate submitted without session ids / signature
     # must never wildcard-match (and clobber) an existing empty-keyed row — each leg only
-    # counts when BOTH sides are non-empty.
+    # counts when BOTH sides are non-empty. Open rows come first, so on a tie the sighting
+    # joins the open row rather than an old one's cooldown.
     cur.execute(
         "SELECT id, evidence, signature_key, "
         "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
         "FROM skills_lane.skill_gap_candidates "
         "WHERE kind='derive' AND (status IN ('observe','proposed','rejected') "
-        "  OR (status='retired' AND updated_at > now() - (%s || ' days')::interval))",
+        "  OR (status='retired' AND updated_at > now() - (%s || ' days')::interval)) "
+        "ORDER BY (status IN ('observe','proposed')) DESC, id",
         (str(REOPEN_RETIRED_DAYS),),
     )
     best, best_score = None, 0.0
