@@ -3,6 +3,44 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-06 — repair numbered-entity magnets (script only, no schema or serving change)
+
+**What changed**
+
+- **`scripts/repair_numbered_entity_magnets.py`** repairs graphs written before the
+  numbered-name guard (#230). For every edge, live or retired, with an endpoint whose whole
+  name is an identifier (`PR #N`, `draft PR #N`, `pull request #N`, `issue #N`, `task #N`,
+  a ticket key `ABC-123`), it reads the fact for identifiers of the same kind. A fact that
+  names exactly one, other than the endpoint's own number, moves that endpoint to the
+  entity named for it in the same group (created if missing, embedded as an entity, type
+  and project copied). Facts naming their own number, none, several or a range stay; so
+  does a move that would join an edge to itself. Entities that lose an edge get an empty
+  summary, refilled by the next mention. Fact text, embeddings, `episodes` and
+  `source_projects` are never touched.
+- **Wrong supersessions are listed, not auto-fixed.** A retired edge whose successor shares
+  an identifier entity with it but names a disjoint set of identifiers is a candidate. Many
+  candidates are real corrections whose identifier is the changed value, so only uuids an
+  operator reviewed and listed in `--unretire-allow FILE` are un-retired.
+
+**How to run** (DSN from `--db-url` or `$SYNAPSE_DB_URL`; the plan, the allow file and the
+samples hold private text: keep them outside the repository)
+
+1. Dry run (read-only connection): `scripts/repair_numbered_entity_magnets.py --samples 20
+   --plan-out <outside>/plan.json`. It prints counts per family, the health numbers now and
+   as they will be after the plan, and sample moves.
+2. Review `unretire_candidates` in the plan; write the uuids to un-retire, one per line, to
+   an allow file.
+3. Benchmark before, then `--apply --unretire-allow <file>`. The plan is recomputed at apply
+   time and every write is conditional on the row still holding the planned value. Every
+   touched row is first copied to `kg_magnet_repair_<YYYYMMDD>_{relationships,entities,created}`.
+4. `--metrics` prints the audit's two numbers to verify.
+5. Undo: `--restore <YYYYMMDD>` (dry run) then `--restore <YYYYMMDD> --apply`. Created
+   entities that new facts have attached to since are kept and counted.
+
+No restart is needed: the extractor's dedup index re-reads entities within its TTL
+(`SYNAPSE_DEDUP_CACHE_TTL_SECONDS`, 900 s), and its exact-name lookup falls through to
+the database.
+
 ## 2026-11-06 — dream→skills lane: live detectors, a real recurrence gate, a queue that tends itself (plugin 0.22.1, schema 062)
 
 **What changed**
