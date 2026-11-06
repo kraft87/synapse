@@ -107,13 +107,28 @@ def _assert_skipped(conn, r, hx: str, sid_a: str, sid_b: str, span: str) -> None
     assert [tuple(h) for h in holders] == [(sid_a, 1)]
 
 
-def test_a_span_stored_under_another_session_is_skipped_not_a_500(tag, conn, db_url, caplog):
+def test_a_span_stored_under_another_session_is_skipped_not_a_500(
+    tag, conn, db_url, caplog, monkeypatch
+):
+    from ingestion.db import Database
+
     sid_a, sid_b, span, batch = _seed_and_replay(conn, db_url, tag)
+    # Every span the route tries to INSERT. The except leg alone would also return 200,
+    # so this is what holds the probe to its job: the stored span never reaches the INSERT.
+    attempted: list[str] = []
+    real_upsert = Database.upsert_episode
+
+    def _spy(self, ep):
+        attempted.append(ep.span_id)
+        return real_upsert(self, ep)
+
+    monkeypatch.setattr(Database, "upsert_episode", _spy)
 
     with caplog.at_level(logging.WARNING, logger="mcp_server.ingest_route"):
         r = _post(db_url, batch)
 
     _assert_skipped(conn, r, tag, sid_a, sid_b, span)
+    assert attempted == [f"jsonl:b1-{tag}", f"jsonl:b3-{tag}"]
     warnings = [m for m in caplog.records if m.levelno == logging.WARNING]
     assert len(warnings) == 1, [m.getMessage() for m in warnings]
     assert sid_b in warnings[0].getMessage() and span in warnings[0].getMessage()
