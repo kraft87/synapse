@@ -17,6 +17,7 @@ are also not stored. Pass source="jsonl" to skill-derive when you need either.
 
 Returns the SAME dict shape as skill-measure.parse_session, so it's a drop-in:
     {session, first_user, user_turns, user_msgs, tools(dict), bash_heads, fired}
+plus `date`, the session's first-episode day (YYYY-MM-DD).
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ def db_session_views(
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT session_id, sequence, human_turn, content
+        SELECT session_id, sequence, human_turn, content, created_at
         FROM episodes
         WHERE platform = %s
           AND created_at > now() - (%s || ' days')::interval
@@ -77,7 +78,7 @@ def db_session_views(
         (platform, str(days), list(exclude_projects)),
     )
     sessions: dict[str, dict] = {}
-    for sid, _seq, human, content in cur.fetchall():
+    for sid, _seq, human, content, created_at in cur.fetchall():
         sid = str(sid)
         s = sessions.get(sid)
         if s is None:
@@ -89,7 +90,10 @@ def db_session_views(
                 "tools": Counter(),
                 "bash_heads": [],
                 "fired": set(),
+                "started": created_at,
             }
+        if created_at is not None and (s["started"] is None or created_at < s["started"]):
+            s["started"] = created_at
         if human:
             h = human.strip()
             if h:
@@ -116,6 +120,10 @@ def db_session_views(
         s["tools"] = dict(s["tools"])
         s["bash_heads"] = s["bash_heads"][:25]
         s["fired"] = sorted(s["fired"])
+        started = s.pop("started")
+        # the session's first-episode day: the `date` its evidence carries (the ledger's
+        # derive recurrence gate counts these)
+        s["date"] = started.date().isoformat() if started is not None else None
         views.append(s)
     views.sort(key=lambda s: s["user_turns"], reverse=True)
     return views[: max_sessions * 4]  # caller re-filters to substantive + caps

@@ -27,7 +27,9 @@ Routes (all POST):
   /skills/proposals   {id?}                          -> list proposed candidates, or one's detail
                                                         (detail: + where accept would apply it)
   /skills/proposals/act {id, action, reason?, body?, scope?, force?}
-                                                     -> accept (applies) | reject | promote (no-op)
+                                                     -> accept (applies) | reject | revive
+                                                        (a rejected/retired row back to
+                                                        proposed) | promote (no-op)
 
 Who is served what (schema 053/054 trust, the board's rule applied to skills): a full-trust
 device reads and writes every scope. A restricted device is served only ``project:<p>``
@@ -626,12 +628,24 @@ _CANDIDATE_COLS = (
 _NO_DRAFT = "no draft yet; re-drafts on the next nightly run, or pass --body-file"
 
 
+def _queue_ready(c) -> bool:
+    """Schema 062 (proposed_at, recommendation) is applied: the dream lane's own probe."""
+    from dream.skills.skill_ledger import QUEUE_PROBE
+
+    return QUEUE_PROBE.ready(c, c.info.dsn)
+
+
 def _proposals_list(db_url: str) -> dict:
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
+        queue = (
+            ", recommendation, (now()::date - proposed_at::date) AS days_pending"
+            if _queue_ready(c)
+            else ""
+        )
         rows = c.execute(
-            """SELECT id, kind, name, direction, target_skills, status, score,
+            f"""SELECT id, kind, name, direction, target_skills, status, score,
                       grounded_sessions, judge_sessions, summary, proposal_path, trigger_phrasings,
-                      salience, source_detector, (proposal_body IS NOT NULL) AS has_draft
+                      salience, source_detector, (proposal_body IS NOT NULL) AS has_draft{queue}
                  FROM skills_lane.skill_gap_candidates
                 WHERE status='proposed' AND (rejected_until IS NULL OR rejected_until < now())
                 ORDER BY score DESC""",
@@ -915,6 +929,35 @@ def _proposal_act(
             )
             c.commit()
             return {"status": "rejected", "id": cid, "reason": reason or "user_rejected"}
+
+        if action == "revive":
+            # Back to the queue: an auto-reject, an expiry, a stale retirement, or a person's
+            # own reject undone. The revive is grounded (a person asked) and cancels an old
+            # reject, so accepting the revived row still meets grounded_required_to_apply.
+            if row["status"] not in ("rejected", "retired"):
+                return {
+                    "status": "refused",
+                    "id": cid,
+                    "detail": f"[{cid}] is '{row['status']}'; only a rejected or retired "
+                    "proposal can be revived",
+                }
+            ev = row["evidence"] or []
+            ev.append({"session_id": None, "class": "grounded", "signal": "revive"})
+            _js, gs, _jw, gw = _rollup(ev)
+            stamp = ", proposed_at=now()" if _queue_ready(c) else ""
+            cur.execute(
+                "UPDATE skills_lane.skill_gap_candidates SET status='proposed', reject_reason=NULL, "
+                "rejected_until=NULL, evidence=%s::jsonb, grounded_sessions=%s, grounded_weight=%s"
+                f"{stamp}, updated_at=now() WHERE id=%s",
+                (Json(ev), gs, gw, cid),
+            )
+            c.commit()
+            return {
+                "status": "proposed",
+                "id": cid,
+                "name": row["name"],
+                "has_draft": bool(row["proposal_body"]),
+            }
 
         if action == "promote":
             # Kept for older clients: accept now applies, so promote has nothing left to do

@@ -2,12 +2,14 @@
 # mypy: ignore-errors
 """dream->skills review CLI — the GROUNDED accept/reject gate (stdlib only, DSN-free).
 
-    skill_review.py list                    # proposed candidates
+    skill_review.py list                    # proposed candidates, with the nightly
+                                            # recommendation and days pending
     skill_review.py show <id>               # evidence + the proposal as a unified diff against
                                             # the registry body (the full body for a new skill)
     skill_review.py accept <id> [--body-file PATH] [--scope SCOPE] [--force]
                                             # APPLIES it: registry write + status=promoted
     skill_review.py reject <id> [reason]    # grounded reject -> rejected + 30d cooldown
+    skill_review.py revive <id>             # a rejected/expired/retired one back to proposed
     skill_review.py promote <id>            # no-op kept for compatibility: accept applied it
 
 accept/reject are the grounded signals (the LLM judge can only nominate). accept writes the
@@ -55,11 +57,15 @@ def cmd_list() -> None:
         draft = ""
         if r["kind"] != "consolidate" and "has_draft" in r:
             draft = "  [draft ready]" if r["has_draft"] else "  [no draft yet]"
+        age = f"  {r['days_pending']}d pending" if r.get("days_pending") is not None else ""
         print(
             f"[{r['id']}] [{badge}{d}] {r['name']}  score={r['score']:.1f} "
-            f"(g{r['grounded_sessions']}/j{r['judge_sessions']}){sal}{det}{draft}"
+            f"(g{r['grounded_sessions']}/j{r['judge_sessions']}){sal}{det}{draft}{age}"
         )
         print(f"      {(r.get('summary') or '')[:110]}")
+        rec = r.get("recommendation")
+        if isinstance(rec, dict) and rec.get("verdict"):
+            print(f"      recommends {rec['verdict']}: {(rec.get('reason') or '')[:160]}")
 
 
 def _diff(old: str, new: str, name: str) -> str:
@@ -211,6 +217,14 @@ def cmd_reject(cid: int, reason: str | None) -> None:
     print(f"rejected [{cid}] ({r.get('reason')}); suppressed 30d.")
 
 
+def cmd_revive(cid: int) -> None:
+    r = config.act("/skills", cid, "revive", expect="proposed")
+    if r is None:
+        return
+    nxt = "" if r.get("has_draft") else " It has no draft yet; the next nightly run drafts it."
+    print(f"revived [{cid}] {r.get('name')}: back in the review queue.{nxt}")
+
+
 def cmd_promote(cid: int) -> None:
     """Kept so old habits and scripts don't break: accept now applies the change, so this
     only reports that (or records a hand-merged consolidate)."""
@@ -225,7 +239,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
-    for c in ("show", "accept", "reject", "promote"):
+    for c in ("show", "accept", "reject", "revive", "promote"):
         p = sub.add_parser(c)
         p.add_argument("id", type=int)
         if c == "reject":
@@ -247,6 +261,8 @@ def main() -> None:
         cmd_accept(args.id, args.body_file, args.scope, args.force)
     elif args.cmd == "reject":
         cmd_reject(args.id, args.reason)
+    elif args.cmd == "revive":
+        cmd_revive(args.id)
     elif args.cmd == "promote":
         cmd_promote(args.id)
 

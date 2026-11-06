@@ -4,12 +4,14 @@ Runs against the shared Postgres test DB (tagged into the `db` xdist group via c
 All rows are synthetic (v2t- prefix) and cleaned up around each test.
 
 Covers:
-  - merge_candidate v2 gates (quote / scan-night recurrence / salience / legacy score)
+  - merge_candidate v2 gates (quote / session-day recurrence / salience / legacy score)
   - salience max-ratchet, source_detector + proposed_patch persistence, direction widening
-  - the derive-identity resolver never wildcard-matches on empty session/signature keys
+  - the derive-identity resolver never wildcard-matches on empty session/signature keys,
+    and takes rejected and recently retired rows (cooldown, -3 and reopen kept)
   - decay_stale: 'proposed' rows are exempt, 'observe' rows retire
-  - throttled discord digest: top-5 cap and new-proposals-only pinging
-  - fire_events resolves fired_at from the episode's own transcript timestamp
+  - fire_events resolves fired_at from the episode's own transcript timestamp, and reads
+    dismissals from the turn after the skill loader's episode
+  (the report that replaced the digest: tests/test_skills_review_queue.py)
   - migration 045 idempotency + the ghost skill_usage repair
 """
 
@@ -21,7 +23,6 @@ from pathlib import Path
 
 import pytest
 
-import dream.skills.nightly as N
 import dream.skills.skill_db_source as DBSRC
 import dream.skills.skill_ledger as L
 from mcp_server.skill_sync_routes import _proposal_detail, _proposals_list
@@ -103,29 +104,116 @@ def test_retune_without_quote_stays_observe(lane):
     assert r["status"] == "observe"
 
 
-def test_derive_proposes_on_second_scan_night(lane):
-    ev1 = [
-        {
-            "session_id": "v2t-sess-a",
-            "class": "judge",
-            "signal": "struggle_arc",
-            "scan_night": "2026-07-17",
-        }
-    ]
-    r1 = _mc(lane, "derive", "v2t-proc", ev1, signature="synthetic restic nas backup rclone")
+_SIG = "synthetic restic nas backup rclone"
+
+
+def _gap(sid, night, date=None):
+    e = {"session_id": sid, "class": "judge", "signal": "gap_scan", "scan_night": night}
+    if date:
+        e["date"] = date
+    return e
+
+
+def _session_on(conn, sid, day):
+    conn.execute(
+        "INSERT INTO episodes (session_id, sequence, platform, content, created_at) "
+        "VALUES (%s, 1, 'claude_code', '[user] synthetic', %s)",
+        (sid, f"{day}T15:00:00Z"),
+    )
+
+
+def test_derive_one_session_rescanned_next_night_stays_observe(lane):
+    # one long session that sessions_since re-scans the next night is not recurrence
+    r1 = _mc(
+        lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-17", "2026-07-16")], signature=_SIG
+    )
+    r2 = _mc(
+        lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-18", "2026-07-16")], signature=_SIG
+    )
+    assert r2["merged"] is True and r2["id"] == r1["id"]
+    assert r2["status"] == "observe"
+    # and the second night's entry is not a second judge vote (score stays one sighting)
+    assert _row(lane, r1["id"], cols="judge_weight, score") == (1.0, 0.5)
+
+
+def test_derive_proposes_on_a_second_session_on_another_day(lane):
+    r1 = _mc(
+        lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-10-24", "2026-10-23")], signature=_SIG
+    )
     assert r1["status"] == "observe"
-    ev2 = [
-        {
-            "session_id": "v2t-sess-a",
-            "class": "judge",
-            "signal": "struggle_arc",
-            "scan_night": "2026-07-18",
-        }
-    ]
-    r2 = _mc(lane, "derive", "v2t-proc", ev2, signature="synthetic restic nas backup rclone")
-    assert r2["merged"] is True
-    assert r2["id"] == r1["id"]
-    assert r2["status"] == "proposed"
+    r2 = _mc(
+        lane, "derive", "v2t-proc", [_gap("v2t-sess-b", "2026-10-29", "2026-10-28")], signature=_SIG
+    )
+    assert r2["id"] == r1["id"] and r2["status"] == "proposed"
+
+
+def test_derive_two_sessions_on_the_same_day_stay_observe(lane):
+    _mc(
+        lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-30", "2026-07-29")], signature=_SIG
+    )
+    r = _mc(
+        lane, "derive", "v2t-proc", [_gap("v2t-sess-b", "2026-07-30", "2026-07-29")], signature=_SIG
+    )
+    assert r["merged"] is True and r["status"] == "observe"
+
+
+def test_undated_legacy_evidence_takes_session_days_from_episodes(lane):
+    # rows written before the nightly stamped dates: the gate looks the days up from the
+    # sessions' episodes and stores them on the entries
+    _session_on(lane, "v2t-sess-old", "2026-10-23")
+    _session_on(lane, "v2t-sess-new", "2026-10-28")
+    legacy = [{"session_id": "v2t-sess-old", "class": "judge", "signal": "gap_scan"}]
+    r1 = _mc(lane, "derive", "v2t-proc", legacy, signature=_SIG)
+    assert r1["status"] == "observe"
+    new = [{"session_id": "v2t-sess-new", "class": "judge", "signal": "gap_scan"}]
+    r2 = _mc(lane, "derive", "v2t-proc", new, signature=_SIG)
+    assert r2["id"] == r1["id"] and r2["status"] == "proposed"
+    ev = _row(lane, r1["id"], cols="evidence")[0]
+    assert sorted(e["date"] for e in ev) == ["2026-10-23", "2026-10-28"]
+
+
+def test_rejected_derive_in_cooldown_absorbs_a_resighting(lane):
+    r1 = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-17")], signature=_SIG)
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', "
+        "reject_reason='user_rejected', rejected_until=now() + interval '30 days' WHERE id=%s",
+        (r1["id"],),
+    )
+    r2 = _mc(lane, "derive", "v2t-proc-renamed", [_gap("v2t-sess-a", "2026-09-01")], signature=_SIG)
+    assert r2 == {"id": r1["id"], "status": "rejected", "score": None, "merged": False}
+    n = lane.execute(
+        "SELECT count(*) FROM skills_lane.skill_gap_candidates WHERE name LIKE 'v2t-proc%%'"
+    ).fetchone()[0]
+    assert n == 1  # no fresh row beside the rejected one
+
+
+def test_rejected_derive_past_cooldown_reopens_with_its_reject(lane):
+    r1 = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-17")], signature=_SIG)
+    reject = {"session_id": None, "class": "grounded", "signal": "reject"}
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', reject_reason='user_rejected', "
+        "rejected_until=now() - interval '1 day', evidence = evidence || %s::jsonb, "
+        "grounded_weight=-3 WHERE id=%s",
+        (json.dumps([reject]), r1["id"]),
+    )
+    r2 = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-b", "2026-09-01")], signature=_SIG)
+    assert r2["id"] == r1["id"] and r2["merged"] is True
+    gw = _row(lane, r1["id"], cols="grounded_weight")[0]
+    assert gw == -3.0  # the human reject came along
+
+
+@pytest.mark.parametrize(("retired_days_ago", "reopens"), [(30, True), (90, False)])
+def test_recently_retired_derive_reopens(lane, retired_days_ago, reopens):
+    r1 = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-a", "2026-07-17")], signature=_SIG)
+    lane.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='retired', reject_reason='stale', "
+        "updated_at = now() - make_interval(days => %s) WHERE id=%s",
+        (retired_days_ago, r1["id"]),
+    )
+    r2 = _mc(lane, "derive", "v2t-proc", [_gap("v2t-sess-b", "2026-09-01")], signature=_SIG)
+    assert (r2["id"] == r1["id"]) is reopens
+    if reopens:
+        assert r2["status"] == "observe" and _row(lane, r1["id"])[0] == "observe"
 
 
 def test_derive_proposes_on_salience(lane):
@@ -371,62 +459,7 @@ def test_decay_retires_observe_but_never_proposed(lane):
     assert _row(lane, prop["id"])[0] == "proposed"  # waits for human review
 
 
-# -------------------------------------------------------------- digest throttle
-
-
-def test_digest_caps_at_five_and_pings_only_on_new(lane, capsys):
-    # the shared test DB may hold other proposed rows; run this window empty of them
-    lane.execute(
-        "UPDATE skills_lane.skill_gap_candidates SET status='observe' WHERE status='proposed'"
-    )
-    for i in range(7):
-        _mc(
-            lane,
-            "retune",
-            f"v2t-digest-{i}",
-            [
-                {
-                    "session_id": f"v2t-sess-d{i}",
-                    "class": "judge",
-                    "signal": "post_fire_deviation",
-                    "quote": f"synthetic quote {i}",
-                }
-            ],
-            direction="fix",
-            target_skills=[f"v2t-digest-{i}"],
-            salience=(i % 5) + 1,
-        )
-    r1 = N.discord_digest(lane, no_discord=True)
-    out1 = capsys.readouterr().out
-    assert r1 == {"proposed": 7, "new": 7}
-    assert out1.count("- `retune`") == 5  # capped at DIGEST_CAP
-    assert "+2 more pending (skill_review list)" in out1
-    assert "sal 5" in out1.splitlines()[1]  # ranked salience DESC first
-
-    # same pending set again -> no ping, no re-wall
-    r2 = N.discord_digest(lane, no_discord=True)
-    out2 = capsys.readouterr().out
-    assert r2 == {"proposed": 7, "new": 0}
-    assert "- `retune`" not in out2
-
-    # one genuinely new proposal -> pings again
-    _mc(
-        lane,
-        "retune",
-        "v2t-digest-new",
-        [
-            {
-                "session_id": "v2t-sess-dn",
-                "class": "judge",
-                "signal": "post_fire_deviation",
-                "quote": "synthetic fresh quote",
-            }
-        ],
-        direction="fix",
-        target_skills=["v2t-digest-new"],
-    )
-    r3 = N.discord_digest(lane, no_discord=True)
-    assert r3["proposed"] == 8 and r3["new"] == 1
+# ------------------------------------------------------------- cursor config
 
 
 def test_run_config_update_does_not_clobber_digest_state(lane):

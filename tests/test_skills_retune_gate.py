@@ -186,6 +186,52 @@ def test_fired_and_uncatalogued_skills_are_skipped(monkeypatch):
     }
 
 
+# ----------------------------------------------------------- the skills a session had
+
+
+_DOCX_DESC = "Render and edit transcript Word documents."
+
+
+def test_a_session_is_judged_only_against_the_skills_it_was_served(monkeypatch):
+    # #76: docx is project:transcribe_ai; a jobs session can't have fired it whatever its
+    # description says, so the judge must not see it there and no widen may come of it
+    calls: list[dict] = []
+    seen_catalogs: dict[str, str] = {}
+    gap = {"description_covers": False, "missing_phrasing": "resume tailoring"}
+
+    def judge(s, catalog):
+        seen_catalogs[s["session"]] = catalog
+        return {"would_have_helped": [{"skill": "docx", "why": "x", **gap}]}
+
+    monkeypatch.setattr(N.SM, "judge_session", judge)
+
+    def fake_merge(conn, kind, name, evidence, **kw):
+        calls.append({"name": name, "session": evidence[0]["session_id"]})
+        return {"id": len(calls), "status": "observe", "score": 0.5, "merged": False}
+
+    monkeypatch.setattr(N.L, "merge_candidate", fake_merge)
+    descriptions = {**_CATALOG, "docx": _DOCX_DESC}
+    scopes = {"db-query": "global", "pipeline-edit": "global", "docx": "project:transcribe_ai"}
+    jobs = dict(_session("sess-jobs"), scope="project:jobs")
+    mixed = dict(_session("sess-mixed"), scope="global")  # spans projects: global only
+    tai = dict(_session("sess-tai"), scope="project:Transcribe_AI")  # label case differs
+    stats = N.run_retune(None, [jobs, mixed, tai], "(all)", set(), descriptions, scopes)
+
+    assert "docx" not in seen_catalogs["sess-jobs"] and "docx" not in seen_catalogs["sess-mixed"]
+    assert "- db-query: " in seen_catalogs["sess-jobs"]
+    assert f"- docx: {_DOCX_DESC}" in seen_catalogs["sess-tai"]
+    assert calls == [{"name": "docx", "session": "sess-tai"}]
+    assert stats["under_trigger"] == 1
+
+
+def test_skill_served_rule():
+    assert SM.skill_served("global", "project:jobs") and SM.skill_served(None, "global")
+    assert SM.skill_served("project:transcribe_ai", "project:Transcribe_AI")
+    assert not SM.skill_served("project:transcribe_ai", "project:jobs")
+    assert not SM.skill_served("project:transcribe_ai", "global")
+    assert not SM.skill_served("project:transcribe_ai", None)
+
+
 # ------------------------------------------------------ deterministic coverage backstop
 
 

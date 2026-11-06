@@ -63,8 +63,12 @@ def run_once() -> None:
         try:
             from dream.skills.nightly import run_lane
 
-            run_lane(limit=int(os.environ.get("SKILLS_LANE_LIMIT", "30")))
+            sres = run_lane(limit=int(os.environ.get("SKILLS_LANE_LIMIT", "30")))
             run_stages["skills"] = {"ran": True, "ok": True}
+            # The lane's flat counts (sessions, per-detector tallies, candidates new/merged,
+            # to_proposed, auto_rejected, expired, retired, digest_sent), prefixed skills_.
+            if isinstance(sres, dict):
+                counts.update({f"skills_{k}": v for k, v in sres.items()})
         except Exception as e:
             logger.error("dream→skills lane failed: %s", e, exc_info=True)
             run_stages["skills"] = {"ran": True, "ok": False}
@@ -178,18 +182,23 @@ def _dream_collect_proposals(
             since = started[0]
             proposals: list[dict[str, Any]] = []
             total = 0
-            # skills lane — status 'proposed', created since the run began.
+            # skills lane — status 'proposed', raised since the run began: proposed_at
+            # (schema 062) catches a row that sat in observe and went proposed tonight;
+            # before 062 is applied, rows created tonight is the best this can count.
             try:
+                from dream.skills.skill_ledger import queue_ready
+
+                col = "proposed_at" if queue_ready(conn) else "created_at"
                 for pid, name in conn.execute(
                     "SELECT id, name FROM skills_lane.skill_gap_candidates "
-                    "WHERE status = 'proposed' AND created_at >= %s "
-                    "ORDER BY created_at DESC LIMIT %s",
+                    f"WHERE status = 'proposed' AND {col} >= %s "
+                    f"ORDER BY {col} DESC LIMIT %s",
                     (since, _SAMPLE_CAP),
                 ).fetchall():
                     proposals.append({"id": f"skill:{pid}", "kind": "skill", "name": name})
                 total += conn.execute(
                     "SELECT count(*) FROM skills_lane.skill_gap_candidates "
-                    "WHERE status = 'proposed' AND created_at >= %s",
+                    f"WHERE status = 'proposed' AND {col} >= %s",
                     (since,),
                 ).fetchone()[0]
             except Exception as e:  # pragma: no cover - lane may be absent
