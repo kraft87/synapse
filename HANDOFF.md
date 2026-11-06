@@ -79,6 +79,9 @@ the database.
   apart.
 - Between the plan and the write, live extraction can create the same target the run
   creates (seconds wide): the result is a duplicate entity, not a wrong edge.
+- For up to the dedup TTL after the apply, a mention of a magnet can write its old summary
+  back from the extractor's in-memory index (`NodeDeduper.summary_of`, longer wins).
+  Recall no longer serves entity summaries, so this is cosmetic.
 
 ## 2026-11-06 — dream→skills lane: live detectors, a real recurrence gate, a queue that tends itself (plugin 0.22.1, schema 062)
 
