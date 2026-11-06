@@ -8,12 +8,16 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
                       consolidate candidates (no disk access, no auto-merge)
   2. sync_usage     — episode [tool:Skill] markers -> skill_usage (+ dismissal); rollup into registry
   3. DERIVE         — gap scan -> cluster -> ledger (judge evidence); draft SKILL.md for proposed
-  4. RETUNE         — under-trigger judge -> ledger retune/widen (judge evidence)
+  4. RETUNE         — under-trigger judge -> ledger retune/widen (judge evidence), each
+                      session judged only against the skills served to it
   5. grounded       — dismissals -> retune/narrow; explicit "make a skill" -> derive grounded
+     (then the v2 detectors, and a re-gate of open derive rows)
   6. draft          — every proposed derive/retune without a body (or with a stale retune
                       draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
-  7. decay + digest — retire stale 'observe' candidates (proposed rows wait for review);
-                      throttled Discord digest (top 5, pings only on NEW proposals)
+  7. review queue   — auto-reject undeliverable retunes, expire unanswered proposals, store
+                      a recommendation per draft (review_queue.py)
+  8. decay + report — retire stale 'observe' candidates (proposed rows wait for review);
+                      the verdict-first report when the queue changed, weekly otherwise
 Incremental via skill_scan_cursor (whole-session scan since last_scan_at). --backfill ignores the watermark.
 
 The LLM finders honor SKILL_MEASURE_MODEL (deepseek for cheap backfill); drafting uses Opus.
@@ -24,12 +28,12 @@ accept does both (mcp_server/skill_sync_routes.py).
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
-import urllib.request
 
-from . import config, post_fire, procedure_miner, skill_draft, struggle_arc
+from psycopg.rows import dict_row
+
+from . import config, post_fire, procedure_miner, review_queue, skill_draft, struggle_arc
 from . import skill_db_source as DB
 from . import skill_derive as SD
 from . import skill_doc as D
@@ -131,9 +135,20 @@ def run_derive(conn, substantive, catalog, seen_ids):
         gaps += SD.scan_session(s, catalog)
     clusters = SD.cluster_gaps(gaps)
     n_proposed = 0
+    night = SM.scan_night()
+    dates = {s["session"]: s.get("date") for s in substantive}
     for c in clusters:
         sessions = c.get("sessions") or []
-        ev = [{"session_id": sid, "class": "judge", "signal": "gap_scan"} for sid in sessions]
+        ev = [
+            {
+                "session_id": sid,
+                "class": "judge",
+                "signal": "gap_scan",
+                "scan_night": night,
+                "date": dates.get(sid),
+            }
+            for sid in sessions
+        ]
         if not ev:
             continue
         res = L.merge_candidate(
@@ -153,7 +168,7 @@ def run_derive(conn, substantive, catalog, seen_ids):
     return {"gaps": len(gaps), "clusters": len(clusters), "proposed": n_proposed}
 
 
-def run_retune(conn, substantive, catalog, seen_ids, descriptions):
+def run_retune(conn, substantive, catalog, seen_ids, descriptions, scopes=None):
     """Under-trigger judge -> retune/widen candidates, gated on a REAL description gap.
 
     A would_have_helped skill whose current description already covers the request was a
@@ -162,17 +177,28 @@ def run_retune(conn, substantive, catalog, seen_ids, descriptions):
     rest is counted, never merged: covered / backstop-covered items are tallied per skill
     (matched-but-not-invoked telemetry), and items with no stated gap (incl. legacy judge
     output without description_covers / missing_phrasing) are dropped as `no_gap_stated`.
-    `descriptions` is name -> current description (the catalog the judge saw)."""
+    `descriptions` is name -> current description (the catalog the judge saw).
+
+    `scopes` (name -> registry scope): each session is judged only against the skills
+    served to it (its view's `scope`, see _session_scopes; global when unset). A project
+    skill can't fire in a session of another project whatever its description says, so
+    widening it there is noise: #76 asked to widen docx (project:transcribe_ai) on two
+    jobs/neuron sessions."""
     stats = {"under_trigger": 0, "covered_not_fired": 0, "backstop_covered": 0, "no_gap_stated": 0}
     covered_by_skill: dict[str, int] = {}
+    night = SM.scan_night()
     for s in substantive:
-        v = SM.judge_session(s, catalog)
+        served, cat = descriptions, catalog
+        if scopes is not None:
+            served = SM.served_skills(descriptions, scopes, s.get("scope", "global"))
+            cat = SM.format_catalog(sorted(served.items()))
+        v = SM.judge_session(s, cat)
         if not v:
             continue
         for m in v.get("would_have_helped", []):
             sk = m.get("skill")
             # a skill missing from the catalog has no description to widen
-            if not sk or sk in s["fired"] or sk not in descriptions:
+            if not sk or sk in s["fired"] or sk not in served:
                 continue
             phrasing = s.get("first_user", "")[:160]
             verdict = SM.under_trigger_verdict(m, descriptions[sk], phrasing)
@@ -195,6 +221,8 @@ def run_retune(conn, substantive, catalog, seen_ids, descriptions):
                     "phrasing": phrasing,
                     "missing_phrasing": missing,
                     "why": m.get("why", ""),
+                    "scan_night": night,
+                    "date": s.get("date"),
                 }
             ]
             res = L.merge_candidate(
@@ -285,68 +313,53 @@ def _draft_if_needed(conn, cid, cluster):
     conn.commit()
 
 
-# --------------------------------------------------------------------- 6. digest
-DIGEST_CAP = 5  # proposals shown per digest — flood control, the rest is a "+N pending" footer
+# ------------------------------------------------------------- 7. counts + scopes
+def _tally(counts: dict, stage: str, stats: dict) -> dict:
+    """Copy a stage's integer stats into the run's flat counts as `<stage>_<key>`, and hand
+    the stats back for the log line."""
+    for k, v in (stats or {}).items():
+        if isinstance(v, int) and not isinstance(v, bool):
+            counts[f"{stage}_{k}"] = v
+    return stats
 
 
-def discord_digest(conn, no_discord):
-    """Throttled review digest. Shows the top-DIGEST_CAP proposals (salience DESC, then
-    score), and PINGS only when there are proposals not covered by the previous digest —
-    a nightly re-wall of the same pending list is how review queues rot. The seen-ids
-    watermark lives in skill_scan_cursor.config['digest_ids'] (update_cursor merges,
-    never clobbers)."""
+def _session_scopes(conn, views) -> None:
+    """Stamp each view's `scope`: where its skills were served from, by the accept path's
+    own rule (mcp_server.skill_sync_routes._evidence_scope; one project is
+    project:<label>, a session that spans projects or can't be placed is global)."""
+    from mcp_server.skill_sync_routes import _evidence_scope
+
+    cur = conn.cursor(row_factory=dict_row)
+    for v in views:
+        v["scope"] = _evidence_scope(cur, [{"session_id": v["session"]}])
+
+
+def _ledger_counts(conn, since) -> dict:
+    """Candidate rows the run created, merged into, and raised to proposed (schema 062's
+    proposed_at; absent before it is applied)."""
     cur = conn.cursor()
     cur.execute(
-        """SELECT id, kind, name, score, grounded_sessions, judge_sessions, salience, source_detector
-             FROM skills_lane.skill_gap_candidates WHERE status='proposed'
-             ORDER BY salience DESC NULLS LAST, score DESC, id"""
+        "SELECT count(*) FILTER (WHERE created_at >= %s), "
+        "count(*) FILTER (WHERE created_at < %s AND last_seen >= %s) "
+        "FROM skills_lane.skill_gap_candidates",
+        (since, since, since),
     )
-    rows = cur.fetchall()
-    if not rows:
-        return {"proposed": 0, "new": 0}
-    ids = [r[0] for r in rows]
-    prev = set((L.get_cursor(conn).get("config") or {}).get("digest_ids") or [])
-    new = [i for i in ids if i not in prev]
-
-    lines = [f"**dream→skills — {len(rows)} proposal(s) awaiting review**"]
-    for _id, kind, name, score, gs, js, sal, det in rows[:DIGEST_CAP]:
-        g = f" · {gs} grounded" if gs else ""
-        s = f" · sal {sal}" if sal is not None else ""
-        v = f" · {det}" if det else ""
-        lines.append(f"- `{kind}` **{name}** (score {score:.1f}, {js} judge{g}{s}{v})")
-    if len(rows) > DIGEST_CAP:
-        lines.append(f"+{len(rows) - DIGEST_CAP} more pending (skill_review list)")
-    lines.append("\nReview: `/skill-review` (or skill_review.py list) · accept/reject <id>")
-    msg = "\n".join(lines)
-
-    cur.execute(
-        "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
-        "updated_at=now() WHERE id=1",
-        (json.dumps({"digest_ids": ids}),),
-    )
-    conn.commit()
-
-    if not new:
-        print(f"(digest: {len(rows)} pending, none new since last digest — not pinging)")
-        return {"proposed": len(rows), "new": 0}
-    # Notifier: POST to a Discord webhook if configured; otherwise just print (default).
-    if not no_discord and config.DISCORD_WEBHOOK:
-        try:
-            body = json.dumps({"content": msg[:1900]}).encode()
-            req = urllib.request.Request(
-                config.DISCORD_WEBHOOK, data=body, headers={"Content-Type": "application/json"}
-            )
-            urllib.request.urlopen(req, timeout=10)
-        except Exception as e:
-            print(f"(notifier failed: {e})\n{msg}")
-    else:
-        print(msg)
-    return {"proposed": len(rows), "new": len(new)}
+    new, merged = cur.fetchone()
+    out = {"candidates_new": new, "candidates_merged": merged}
+    if L.queue_ready(conn):
+        cur.execute(
+            "SELECT count(*) FROM skills_lane.skill_gap_candidates WHERE proposed_at >= %s",
+            (since,),
+        )
+        out["to_proposed"] = cur.fetchone()[0]
+    return out
 
 
-def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) -> None:
+def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) -> dict:
     """Run the whole dream→skills lane once. No argparse, so the dream container's run_once
-    can call it directly (the catalog comes from the registry, not disk)."""
+    can call it directly (the catalog comes from the registry, not disk). Returns the run's
+    flat counts (`<stage>_<key>` per stage, plus sessions and the candidate tallies), which
+    dream/__main__ records in dream_runs.counts as skills_*."""
     conn = L.connect()
     cur = conn.cursor()
     cur.execute("SELECT now()")
@@ -355,22 +368,29 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     last = None if backfill else cur_state.get("last_scan_at")
 
     skills = SM.load_skills()
+    scopes = SM.load_scopes(conn)
     catalog = "\n".join(f"- {n}: {d}" for n, d in sorted(skills.items()))
     seen: set[int] = set()
+    counts: dict = {}
 
     print(
         f"[dream→skills] last_scan_at={last}  model={os.environ.get('SKILL_MEASURE_MODEL', 'opus')}"
     )
-    print("consolidate:", consolidate_pass(conn, seen))
-    print("usage:", sync_usage(conn, last))
+    print("consolidate:", _tally(counts, "consolidate", consolidate_pass(conn, seen)))
+    print("usage:", _tally(counts, "usage", sync_usage(conn, last)))
 
     views = DB.sessions_since(last, max_sessions=limit * 4)
     substantive = [v for v in views if SM.is_substantive(v)][:limit]
+    _session_scopes(conn, substantive)
+    counts["sessions_touched"], counts["sessions"] = len(views), len(substantive)
     print(f"substantive sessions to judge: {len(substantive)}")
 
-    print("derive:", run_derive(conn, substantive, catalog, seen))
-    print("retune:", run_retune(conn, substantive, catalog, seen, skills))
-    print("grounded:", capture_grounded(conn, last, seen))
+    print("derive:", _tally(counts, "derive", run_derive(conn, substantive, catalog, seen)))
+    print(
+        "retune:",
+        _tally(counts, "retune", run_retune(conn, substantive, catalog, seen, skills, scopes)),
+    )
+    print("grounded:", _tally(counts, "grounded", capture_grounded(conn, last, seen)))
 
     # v2 detectors — on by default; SYNAPSE_SKILLS_DETECTORS is the kill switch
     # (comma list to run a subset, empty string to disable all).
@@ -382,15 +402,27 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
         if d.strip()
     }
     if "struggle_arc" in detectors:
-        print("struggle_arc:", struggle_arc.run(conn, since=last))
+        print("struggle_arc:", _tally(counts, "struggle_arc", struggle_arc.run(conn, since=last)))
     if "post_fire" in detectors:
-        print("post_fire:", post_fire.run(conn, since=last))
+        print("post_fire:", _tally(counts, "post_fire", post_fire.run(conn, since=last)))
     if "procedure_miner" in detectors and procedure_miner.due(conn):
-        print("procedure_miner:", procedure_miner.run(conn))
+        print("procedure_miner:", _tally(counts, "procedure_miner", procedure_miner.run(conn)))
 
-    print("drafts:", skill_draft.draft_pending(conn))
-    print("decay:", L.decay_stale(conn))
-    print("digest:", discord_digest(conn, no_discord))
+    print("regate:", _tally(counts, "regate", L.regate_observe(conn)))
+    print("drafts:", _tally(counts, "drafts", skill_draft.draft_pending(conn)))
+    rejected = review_queue.auto_reject(conn)
+    expired = review_queue.expire(conn)
+    counts["auto_rejected"], counts["expired"] = rejected["auto_rejected"], expired["expired"]
+    print(f"review: auto_rejected={rejected['auto_rejected']} expired={expired['expired']}")
+    print("recommend:", _tally(counts, "recommend", review_queue.recommend(conn)))
+    decay = L.decay_stale(conn)
+    counts["retired"] = decay["retired"]
+    print("decay:", decay)
+    changes = {"auto_rejected": rejected["items"], "expired": expired["items"]}
+    rep = review_queue.report(conn, run_started, changes, no_discord)
+    counts["digest_sent"] = rep["sent"]
+    print("report:", rep)
+    counts.update(_ledger_counts(conn, run_started))
 
     L.update_cursor(
         conn,
@@ -404,6 +436,7 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     )
     conn.close()
     print("done.")
+    return counts
 
 
 def main():

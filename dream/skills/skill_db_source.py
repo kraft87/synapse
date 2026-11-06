@@ -17,6 +17,7 @@ are also not stored. Pass source="jsonl" to skill-derive when you need either.
 
 Returns the SAME dict shape as skill-measure.parse_session, so it's a drop-in:
     {session, first_user, user_turns, user_msgs, tools(dict), bash_heads, fired}
+plus `date`, the session's first-episode day (YYYY-MM-DD).
 """
 
 from __future__ import annotations
@@ -26,9 +27,12 @@ from collections import Counter
 from datetime import datetime
 
 from . import config
+from .skill_doc import body_text
 
 _MARKER = re.compile(r"^\[tool:([\w-]+)\]\s*(.*)$")
-_SKILL_IN = re.compile(r"skill'?\s*[:=]\s*'?([\w-]+)")
+# ':' is part of a plugin skill's name ('document-skills:docx'); cutting there filed every
+# plugin fire under its namespace ('document-skills', 'synapse').
+_SKILL_IN = re.compile(r"skill'?\s*[:=]\s*'?([\w:-]+)")
 
 
 def _dsn() -> str:
@@ -64,7 +68,7 @@ def db_session_views(
     cur = conn.cursor()
     cur.execute(
         """
-        SELECT session_id, sequence, human_turn, content
+        SELECT session_id, sequence, human_turn, content, created_at
         FROM episodes
         WHERE platform = %s
           AND created_at > now() - (%s || ' days')::interval
@@ -74,7 +78,7 @@ def db_session_views(
         (platform, str(days), list(exclude_projects)),
     )
     sessions: dict[str, dict] = {}
-    for sid, _seq, human, content in cur.fetchall():
+    for sid, _seq, human, content, created_at in cur.fetchall():
         sid = str(sid)
         s = sessions.get(sid)
         if s is None:
@@ -86,7 +90,10 @@ def db_session_views(
                 "tools": Counter(),
                 "bash_heads": [],
                 "fired": set(),
+                "started": created_at,
             }
+        if created_at is not None and (s["started"] is None or created_at < s["started"]):
+            s["started"] = created_at
         if human:
             h = human.strip()
             if h:
@@ -113,6 +120,10 @@ def db_session_views(
         s["tools"] = dict(s["tools"])
         s["bash_heads"] = s["bash_heads"][:25]
         s["fired"] = sorted(s["fired"])
+        started = s.pop("started")
+        # the session's first-episode day: the `date` its evidence carries (the ledger's
+        # derive recurrence gate counts these)
+        s["date"] = started.date().isoformat() if started is not None else None
         views.append(s)
     views.sort(key=lambda s: s["user_turns"], reverse=True)
     return views[: max_sessions * 4]  # caller re-filters to substantive + caps
@@ -140,7 +151,64 @@ _BANNER = re.compile(
 )
 
 _SKILL_MARK = re.compile(r"^\[tool:Skill\]\s*(.*)$")
-_SKILL_NAME = re.compile(r"skill'?\s*[:=]\s*'?([\w-]+)")
+_SKILL_NAME = re.compile(r"skill'?\s*[:=]\s*'?([\w:-]+)")
+
+# The skill LOADER's output. Claude Code answers a Skill tool call with a user-role message
+# that opens "Base directory for this skill: <the skill's folder>" and then carries the skill
+# body, and ingestion stores that message as its own episode directly after the
+# [tool:Skill] one (94 of the 102 fires in the 60 days to 2026-11-06). Built-in and plugin
+# skills often send the body with no banner. Read as a real turn, it ended every post-fire
+# window before it began and stood in for the user's reply in dismissal detection.
+_LOADER_BANNER = re.compile(
+    r"^\s*(?:\[[\w:-]+\]\s*)?base directory for this skill:\s*(.*?)\s*$", re.IGNORECASE
+)
+_LOADER_BODY_CHARS = 120  # banner-less loader: the body prefix compared (whitespace-squashed)
+_LOADER_BODY_MIN = 40  # a body shorter than this is too generic to tell from a user turn
+
+
+def banner_skill(line: str) -> str | None:
+    """The folder a loader banner line names (its last path part, lowercased), or None
+    when `line` is not a banner. Either separator: Windows clients send C:\\...\\<skill>."""
+    m = _LOADER_BANNER.match(line or "")
+    if not m:
+        return None
+    return re.split(r"[\\/]", m.group(1).rstrip("\\/"))[-1].lower()
+
+
+def skill_folder(skill: str) -> str:
+    """The folder a skill loads from: its name without a plugin namespace, lowercased."""
+    return skill.rsplit(":", 1)[-1].lower()
+
+
+def _squash(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def is_loader_episode(content: str, human_turn: str, skill: str, body: str | None = None) -> bool:
+    """True when this episode is the loader's output for `skill`: its opening user line is a
+    banner naming the skill's folder, or, with no banner, the turn starts with the skill's
+    own `body` (the registry SKILL.md; its frontmatter is not part of what loads)."""
+    text = (human_turn or "").strip()
+    if not text:
+        # no human_turn column (or an empty one): the opening [user] line of the content
+        for line in (content or "").splitlines():
+            if line.startswith("[user]"):
+                text = line[len("[user]") :].strip()
+                break
+    first = text.splitlines()[0] if text else ""
+    named = banner_skill(first)
+    if named is not None:
+        return named == skill_folder(skill)
+    want = _squash(body_text(body or ""))[:_LOADER_BODY_CHARS]
+    return len(want) >= _LOADER_BODY_MIN and _squash(text).startswith(want)
+
+
+def _registry_bodies(cur) -> dict[str, str]:
+    """name -> registry body, so a banner-less loader can be recognised by its body."""
+    cur.execute(
+        "SELECT name, COALESCE(body, '') FROM skills_lane.skill_registry WHERE status <> 'retired'"
+    )
+    return dict(cur.fetchall())
 
 
 def _event_time(meta_ts, created_at):
@@ -195,7 +263,9 @@ def fire_events(
     exclude_projects: tuple[str, ...] = config.EXCLUDE_PROJECTS,
 ) -> list[dict]:
     """Skill-fire events from episode [tool:Skill] markers, with dismissal detection from the
-    NEXT user turn. Returns [{skill, session_id, fired_at, via, dismissed}]. Powers skill_usage.
+    NEXT user turn: the first one after the fire that is not the skill loader's output (see
+    is_loader_episode). Returns [{skill, session_id, fired_at, via, dismissed}]. Powers
+    skill_usage.
 
     fired_at is the fire-position episode's EVENT time: the transcript's own timestamp
     (metadata->>'ts', stamped by the JSONL parser on the episode carrying the skill-invocation
@@ -203,6 +273,7 @@ def fire_events(
     the ingest wall clock, which stamped week-old fires with import day."""
     conn = _connect(_dsn())
     cur = conn.cursor()
+    bodies = _registry_bodies(cur)
     if last_scan_at is not None:
         cur.execute(
             "SELECT session_id, sequence, created_at, human_turn, content, metadata->>'ts' "
@@ -233,8 +304,15 @@ def fire_events(
                 continue
             # dismissal: next turn is a SHORT, strong, leading negation (precision over recall)
             dismissed = False
-            if i + 1 < len(rows) and str(rows[i + 1][0]) == str(sid):
-                nxt = (rows[i + 1][3] or "").strip()
+            j = i + 1
+            if (
+                j < len(rows)
+                and str(rows[j][0]) == str(sid)
+                and is_loader_episode(rows[j][4], rows[j][3], nm.group(1), bodies.get(nm.group(1)))
+            ):
+                j += 1  # the loader's output, not the user's reply
+            if j < len(rows) and str(rows[j][0]) == str(sid):
+                nxt = (rows[j][3] or "").strip()
                 dismissed = bool(
                     nxt and len(nxt.split()) <= _DISMISS_MAX_WORDS and _CORRECTION.search(nxt)
                 )

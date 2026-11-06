@@ -5,15 +5,18 @@
 Run under the synapse venv (needs psycopg + voyageai):
     ~/services/synapse/.venv/bin/python ~/scripts/skill_ledger.py --selftest
 
-Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name;
+Owns: identity resolution (derive = signature_key + session-id Jaccard, NOT name, over
+open rows plus rejected ones and ones retired in the last REOPEN_RETIRED_DAYS;
 retune/consolidate = (name,direction)/target), evidence accumulation (dedup by
 (session, signal, class, scan_night), recompute weights from the FULL evidence every
-merge — never incrementally), the 0.5x judge discount (the score column does it),
+merge — never incrementally; a judge signal votes once per session however many nights
+re-scan it), the 0.5x judge discount (the score column does it),
 observe->proposed classification (v2 gates: retune proposes on one quote-carrying
-instance; derive on recurrence across scan nights, high salience, or the legacy
-score), and decay of unseen 'observe' candidates ('proposed' rows wait for human
-review). Grounded signals advance; the LLM judge only nominates. promoted is NEVER
-set here (only the review accept, which applies the proposal to skill_registry).
+instance; derive on recurrence — PROPOSE_SESSIONS distinct sessions on as many distinct
+days — high salience, or the legacy score), and decay of unseen 'observe' candidates
+('proposed' rows wait for human review). Grounded signals advance; the LLM judge only
+nominates. promoted is NEVER set here (only the review accept, which applies the
+proposal to skill_registry).
 
 Evidence entry shape (all fields beyond class/signal optional, backward compatible):
     {"class": "judge"|"grounded", "signal": str, "session_id": str|None,
@@ -26,7 +29,26 @@ import argparse
 import json
 import re
 
+from ingestion.schema_check import ColumnProbe
+
 from . import config
+
+#: Schema 062 adds skill_gap_candidates.proposed_at + recommendation. The image ships before
+#: it is applied, so every statement that names either column asks this probe first; until
+#: both exist the lane keeps its pre-062 behaviour (no proposed_at stamp, no expiry, no
+#: stored recommendations).
+QUEUE_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('skills_lane.skill_gap_candidates') "
+    "  AND attname IN ('proposed_at', 'recommendation') AND NOT attisdropped "
+    "HAVING count(*) = 2",
+    "schema 062 (skill_gap_candidates.proposed_at, recommendation)",
+)
+
+
+def queue_ready(conn) -> bool:
+    return QUEUE_PROBE.ready(conn, conn.info.dsn)
+
 
 # identity / classification knobs (Oracle-reviewed defaults)
 SESSION_JACCARD = 0.4  # derive identity: evidence-session overlap (ground truth, primary)
@@ -34,8 +56,14 @@ SIGNATURE_JACCARD = 0.6  # derive identity: signature-token overlap (secondary)
 SIGNATURE_VETO_FLOOR = 0.15  # session-overlap match vetoed when both signatures exist below this
 PROPOSE_SCORE = 1.5  # legacy observe -> proposed gate (3 judge sessions, or 1 grounded + 1 judge)
 PROPOSE_SALIENCE = 4  # derive: propose when detector-rated pain/severity reaches this (1-5)
-PROPOSE_SCAN_NIGHTS = 2  # derive: propose when seen on this many distinct nightly scans
+# derive recurrence: this many distinct sessions, started on this many distinct days. Scan
+# nights don't count: one long session re-scanned the next night is not a repeat (6 of the
+# 8 re-seen derive rows of the 60 days to 2026-11-06 were exactly that).
+PROPOSE_SESSIONS = 2
 DECAY_TTL_DAYS = 28  # last_seen older than this -> retired (time-based; no nightly mass-bump)
+# A derive retired this recently still takes a re-sighting (it reopens) instead of a fresh
+# row starting from zero.
+REOPEN_RETIRED_DAYS = 60
 EVIDENCE_CAP = 60  # bound the JSONB
 
 # grounded signals advance toward apply; judge signals only nominate (and get 0.5x'd by `score`).
@@ -43,6 +71,7 @@ _GROUNDED_W = {
     "explicit_request": 3.0,
     "accept": 3.0,
     "reject": -3.0,
+    "revive": 3.0,  # a person bringing a rejected/retired proposal back undoes their reject
     "post_change_fired": 2.0,
     "dismissal": 1.0,
     "user_correction": 1.0,
@@ -139,26 +168,70 @@ def _union_evidence(old: list[dict], new: list[dict]) -> list[dict]:
     """Append new, dedup by (session_id, signal, class, scan_night): a re-sighting on a LATER
     scan night counts as fresh recurrence evidence, while same-night duplicates still collapse.
     Legacy entries without scan_night all key to one bucket (scan_night=None) — same collapse
-    behavior they had before scan nights existed."""
+    behavior they had before scan nights existed. A review act (a session-less grounded
+    entry: accept / reject / revive) is never a duplicate: reject, revive, reject is three acts."""
     out, seen = [], set()
     for e in list(old) + list(new):
         k = (e.get("session_id"), e.get("signal"), e.get("class"), e.get("scan_night"))
-        if k in seen:
+        if k in seen and not (e.get("class") == "grounded" and not e.get("session_id")):
             continue
         seen.add(k)
         out.append(e)
     return out[-EVIDENCE_CAP:]
 
 
-def _scan_nights(evidence: list[dict]) -> int:
-    """DISTINCT scan nights across the evidence — the v2 recurrence unit. All legacy entries
-    (no scan_night) collectively count as ONE bucket (None is one set element)."""
-    return len({e.get("scan_night") for e in evidence}) if evidence else 0
+def _session_dates(evidence: list[dict]) -> dict[str, str | None]:
+    """session_id -> the earliest `date` its entries carry (None when none carries one)."""
+    out: dict[str, str | None] = {}
+    for e in evidence:
+        sid = e.get("session_id")
+        if not sid:
+            continue
+        d, prev = e.get("date") or None, out.get(sid)
+        out[sid] = min(prev, d) if prev and d else (prev or d)
+    return out
+
+
+def _recurrence(evidence: list[dict]) -> bool:
+    """The derive recurrence gate: PROPOSE_SESSIONS distinct sessions on as many distinct
+    session days. An undated session (its episodes are gone) can't make up a day."""
+    return len({d for d in _session_dates(evidence).values() if d}) >= PROPOSE_SESSIONS
+
+
+def _standing_reject(evidence: list[dict]) -> bool:
+    """True when a person's reject is the last word in the evidence (no revive or accept
+    after it)."""
+    last = None
+    for e in evidence:
+        if e.get("class") == "grounded" and e.get("signal") in ("reject", "revive", "accept"):
+            last = e["signal"]
+    return last == "reject"
+
+
+def _fill_session_dates(cur, evidence: list[dict]) -> None:
+    """Stamp `date` in place on the entries of every session with no dated entry yet: the
+    session's first episode day, min(created_at), the same clock the rest of the lane
+    dates by. Rows written before run_derive stamped dates get theirs at their next merge."""
+    sids = sorted(s for s, d in _session_dates(evidence).items() if not d)
+    if not sids:
+        return
+    cur.execute(
+        "SELECT session_id, min(created_at)::date FROM episodes "
+        "WHERE session_id = ANY(%s) GROUP BY session_id",
+        (sids,),
+    )
+    found = {sid: d.isoformat() for sid, d in cur.fetchall() if d}
+    for e in evidence:
+        if e.get("session_id") in found and not e.get("date"):
+            e["date"] = found[e["session_id"]]
 
 
 def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
-    """Recompute (judge_sessions, grounded_sessions, judge_weight, grounded_weight) from FULL evidence."""
+    """Recompute (judge_sessions, grounded_sessions, judge_weight, grounded_weight) from FULL
+    evidence. A judge signal votes once per session: entries are kept per scan night, and a
+    session re-scanned on three nights is still one sighting, not a 1.5 score on its own."""
     j_sess, g_sess = set(), set()
+    j_votes: set[tuple] = set()
     jw = gw = 0.0
     for e in evidence:
         sid, sig, cls = e.get("session_id"), e.get("signal"), e.get("class")
@@ -169,6 +242,9 @@ def _rollup(evidence: list[dict]) -> tuple[int, int, float, float]:
         else:
             if sid:
                 j_sess.add(sid)
+                if (sid, sig) in j_votes:
+                    continue
+                j_votes.add((sid, sig))
             jw += _JUDGE_W.get(sig, 1.0)
     return len(j_sess), len(g_sess), jw, gw
 
@@ -190,16 +266,25 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         )
         r = cur.fetchone()
         return (r[0], r[1], r[2]) if r else None
-    # derive: semantic identity over active rows. Empty-vs-empty is NOT identity: a candidate
-    # submitted without session ids / signature must never wildcard-match (and clobber) an
-    # existing empty-keyed row — each leg only counts when BOTH sides are non-empty.
+    # derive: semantic identity over open rows, rejected ones (a revival inherits the
+    # cooldown and the human reject instead of coming back as a fresh row) and ones retired
+    # in the last REOPEN_RETIRED_DAYS (a repeat after decay reopens the row it repeats).
+    # Empty-vs-empty is NOT identity: a candidate submitted without session ids / signature
+    # must never wildcard-match (and clobber) an existing empty-keyed row — each leg only
+    # counts when BOTH sides are non-empty. Open rows come first, so on a tie the sighting
+    # joins the open row rather than an old one's cooldown.
     cur.execute(
-        "SELECT id, evidence, signature_key FROM skills_lane.skill_gap_candidates "
-        "WHERE kind='derive' AND status IN ('observe','proposed')"
+        "SELECT id, evidence, signature_key, "
+        "(status='rejected' AND COALESCE(rejected_until > now(), false)) AS cooling "
+        "FROM skills_lane.skill_gap_candidates "
+        "WHERE kind='derive' AND (status IN ('observe','proposed','rejected') "
+        "  OR (status='retired' AND updated_at > now() - (%s || ' days')::interval)) "
+        "ORDER BY (status IN ('observe','proposed')) DESC, id",
+        (str(REOPEN_RETIRED_DAYS),),
     )
     best, best_score = None, 0.0
     new_toks = set((sigkey or "").split())
-    for cid, ev, rk in cur.fetchall():
+    for cid, ev, rk, cooling in cur.fetchall():
         old_sessions = _ev_sessions(ev or [])
         old_toks = set((rk or "").split())
         sj = _jaccard(new_sessions, old_sessions) if new_sessions and old_sessions else 0.0
@@ -213,7 +298,7 @@ def _resolve_id(cur, kind, name, direction, target_skills, sigkey, new_sessions)
         if session_match or tj >= SIGNATURE_JACCARD:
             rank = max(sj, tj * 0.9)  # session overlap weighted above signature tokens
             if rank > best_score:
-                best, best_score = (cid, ev or [], False), rank
+                best, best_score = (cid, ev or [], bool(cooling)), rank
     return best
 
 
@@ -222,7 +307,11 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
     kind (compat with existing rows/config); the new per-kind gates are ADDITIVE looseners:
       - retune: ONE strong instance — an evidence entry carrying a verbatim quote (the
         deviation/correction moment). Cheap to review, high prior.
-      - derive: recurrence (distinct scan nights) OR high detector salience.
+      - derive: recurrence (PROPOSE_SESSIONS distinct sessions on as many distinct days;
+        entries need their `date`, see _fill_session_dates) OR high detector salience.
+        Neither applies while a person's reject stands: a rejected derive reopened past
+        its cooldown still has the salience and session days it was rejected with, so
+        only the score, which carries the -3, can re-propose it.
       - consolidate: legacy score path only (overlap nominations carry no quotes; one
         cosine sighting is not review-worthy on its own).
     Junk is controlled downstream (candidate decay + human review), not at this gate."""
@@ -231,9 +320,11 @@ def _passes_gate(kind: str, evidence: list[dict], score, salience) -> bool:
     if kind == "retune":
         return any((e.get("quote") or "").strip() for e in evidence)
     if kind == "derive":
+        if _standing_reject(evidence):
+            return False
         if salience is not None and salience >= PROPOSE_SALIENCE:
             return True
-        return _scan_nights(evidence) >= PROPOSE_SCAN_NIGHTS
+        return _recurrence(evidence)
     return False
 
 
@@ -257,7 +348,8 @@ def merge_candidate(
     """Resolve identity, union evidence, recompute rollups, upsert. Returns {id, status, score, merged}.
 
     Re-sighting a row in a terminal state (retune/consolidate share one unique key per
-    (kind, name, direction) regardless of status):
+    (kind, name, direction) regardless of status; a derive matches rejected rows and rows
+    retired in the last REOPEN_RETIRED_DAYS):
       - rejected inside its 30d cooldown: skipped silently, no write;
       - rejected past cooldown / retired: evidence merges and the row REOPENS to 'observe';
       - accepted / promoted: evidence merges (the sighting is recorded) but status never
@@ -281,6 +373,8 @@ def merge_candidate(
         merged = True
     else:
         cid, evidence, merged = None, _union_evidence([], evidence_entries), False
+    if kind == "derive":
+        _fill_session_dates(cur, evidence)  # the recurrence gate counts session days
 
     js, gs, jw, gw = _rollup(evidence)
     emb_lit = None
@@ -379,7 +473,8 @@ def merge_candidate(
 
     # A re-sighted terminal row REOPENS (rejected past its cooldown, or retired-stale):
     # back to 'observe' so the gates below re-decide. The old reject evidence merged in
-    # above still weighs against it (-3 grounded), so reopening stays conservative.
+    # above still weighs against it (-3 grounded; for a derive it also keeps the salience
+    # and recurrence gates shut, see _passes_gate), so reopening stays conservative.
     if status in ("rejected", "retired"):
         cur.execute(
             "UPDATE skills_lane.skill_gap_candidates SET status='observe', "
@@ -390,13 +485,46 @@ def merge_candidate(
 
     # observe -> proposed via the v2 gates; grounded->accepted is the review path's job
     if status == "observe" and _passes_gate(kind, evidence, score, row_salience):
-        cur.execute(
-            "UPDATE skills_lane.skill_gap_candidates SET status='proposed', updated_at=now() WHERE id=%s",
-            (rid,),
-        )
+        _mark_proposed(conn, cur, rid)
         status = "proposed"
     conn.commit()
     return {"id": rid, "status": status, "score": score, "merged": merged}
+
+
+def _mark_proposed(conn, cur, rid) -> None:
+    """status -> 'proposed', stamping proposed_at once schema 062 is applied."""
+    stamp = ", proposed_at=now()" if queue_ready(conn) else ""
+    cur.execute(
+        f"UPDATE skills_lane.skill_gap_candidates SET status='proposed'{stamp}, "
+        "updated_at=now() WHERE id=%s",
+        (rid,),
+    )
+
+
+def regate_observe(conn) -> dict:
+    """Re-run the derive gate over 'observe' derive rows, so the recurrence gate (and the
+    session days of rows written before the nightly stamped them) takes effect without
+    waiting for a re-sighting. Only rows that now pass are written: their evidence with the
+    days filled in, and status 'proposed'."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, evidence, salience FROM skills_lane.skill_gap_candidates "
+        "WHERE kind='derive' AND status='observe'"
+    )
+    raised = []
+    for rid, ev, salience in cur.fetchall():
+        ev = list(ev or [])
+        _fill_session_dates(cur, ev)
+        _js, _gs, jw, gw = _rollup(ev)
+        if _passes_gate("derive", ev, gw + 0.5 * jw, salience):
+            cur.execute(
+                "UPDATE skills_lane.skill_gap_candidates SET evidence=%s::jsonb WHERE id=%s",
+                (json.dumps(ev), rid),
+            )
+            _mark_proposed(conn, cur, rid)
+            raised.append(rid)
+    conn.commit()
+    return {"regated": len(raised), "ids": raised}
 
 
 def decay_stale(conn, ttl_days: int = DECAY_TTL_DAYS) -> dict:

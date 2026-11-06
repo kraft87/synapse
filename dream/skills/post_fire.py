@@ -25,6 +25,14 @@ Two data-quality rules learned the hard way (2026-07-18 audit):
     content, using fired_at only to break ties between multiple fires of the same skill.
   * A fire on the session's LAST episode has no aftermath — count it unassessable and
     skip, never judge garbage.
+
+And one learned 2026-11-06: the skill loader's own output (the "Base directory for this
+skill: .../<skill>" banner and the skill body) is stored as the episode right after the
+[tool:Skill] one. Read as the next fire, it emptied every window from 07-18 on, when
+fired_at became the event time and the tie-break stopped landing on the banner by luck. The
+fire's position is now the loader episode when there is one, and only a [tool:Skill] line
+(any skill) or a DIFFERENT skill's banner ends the aftermath. A window that still comes out
+empty is counted as empty_window, apart from the judge's unassessable.
 """
 
 from __future__ import annotations
@@ -39,8 +47,6 @@ WINDOW_EPISODES = 10  # aftermath the judge reads
 BODY_CHARS = 4000  # skill-body cap in the judge prompt
 
 OUTCOMES = ("clean", "deviation", "fight", "unassessable")
-
-_BASE_DIR_MARKER = "base directory for this skill"
 
 _JUDGE_PROMPT = """You audit ONE firing of an agent SKILL (a procedure document injected into the agent's
 context when it fired). Below: the skill's trigger description and body, then the transcript window
@@ -82,39 +88,64 @@ deviation/fight else []}}"""
 
 
 # ------------------------------------------------------------------ fire position
-def _mentions_fire(content: str, skill: str) -> bool:
-    """True if this episode's content carries the invocation marker for `skill`:
-    a [tool:Skill] call naming it, or the skill loader's 'Base directory for this
-    skill' banner with the skill name on the same line."""
+def _tool_fire(content: str, skill: str | None = None) -> bool:
+    """True if the content carries a [tool:Skill] call (naming `skill`, when given)."""
     for line in (content or "").splitlines():
         m = DB._SKILL_MARK.match(line)
+        if m and skill is None:
+            return True
         if m:
             nm = DB._SKILL_NAME.search(m.group(1))
             if nm and nm.group(1) == skill:
                 return True
-        low = line.lower()
-        if _BASE_DIR_MARKER in low and skill.lower() in low:
-            return True
     return False
 
 
-def _mentions_any_fire(content: str) -> bool:
-    """True if the episode carries ANY skill invocation marker (any skill)."""
+def _mentions_fire(content: str, skill: str) -> bool:
+    """True if this episode's content carries the invocation marker for `skill`:
+    a [tool:Skill] call naming it, or a loader banner naming the skill's folder."""
+    if _tool_fire(content, skill):
+        return True
+    folder = DB.skill_folder(skill)
+    return any(DB.banner_skill(line) == folder for line in (content or "").splitlines())
+
+
+def _ends_window(content: str, skill: str | None) -> bool:
+    """True if this episode starts another fire: any [tool:Skill] line, or a loader banner
+    for a skill other than `skill` (any banner at all when `skill` is None)."""
+    if _tool_fire(content):
+        return True
+    folder = DB.skill_folder(skill) if skill else None
     for line in (content or "").splitlines():
-        if DB._SKILL_MARK.match(line) or _BASE_DIR_MARKER in line.lower():
+        named = DB.banner_skill(line)
+        if named is not None and named != folder:
             return True
     return False
 
 
-def bound_window(episodes: list[dict], fire_seq: int, cap: int = WINDOW_EPISODES) -> list[dict]:
+def _is_loader(ep: dict, skill: str, body: str | None) -> bool:
+    return DB.is_loader_episode(ep.get("content") or "", ep.get("human_turn") or "", skill, body)
+
+
+def bound_window(
+    episodes: list[dict],
+    fire_seq: int,
+    cap: int = WINDOW_EPISODES,
+    *,
+    skill: str | None = None,
+    body: str | None = None,
+) -> list[dict]:
     """The aftermath the judge may see: up to `cap` episodes after the fire, stopping
     BEFORE the next skill fire in the session — corrections past that point belong to
-    the next fire (or to unrelated work), not this one."""
+    the next fire (or to unrelated work), not this one. With `skill`, the fire's own loader
+    episode right after `fire_seq` is skipped, and a later banner for the same skill does
+    not end the window."""
+    after = [ep for ep in episodes if ep["sequence"] > fire_seq]
+    if skill and after and _is_loader(after[0], skill, body):
+        after = after[1:]
     out: list[dict] = []
-    for ep in episodes:
-        if ep["sequence"] <= fire_seq:
-            continue
-        if _mentions_any_fire(ep.get("content") or ""):
+    for ep in after:
+        if _ends_window(ep.get("content") or "", skill):
             break
         out.append(ep)
         if len(out) >= cap:
@@ -122,21 +153,31 @@ def bound_window(episodes: list[dict], fire_seq: int, cap: int = WINDOW_EPISODES
     return out
 
 
-def resolve_fire_position(episodes: list[dict], skill: str, fired_at) -> int | None:
+def resolve_fire_position(
+    episodes: list[dict], skill: str, fired_at, body: str | None = None
+) -> int | None:
     """Sequence of the episode where this fire happened, resolved from content markers
-    (fired_at only breaks ties between multiple fires of the same skill). None if the
-    marker can't be found — the caller counts that unassessable rather than guessing."""
-    hits = [ep for ep in episodes if _mentions_fire(ep.get("content") or "", skill)]
+    (fired_at only breaks ties between multiple fires of the same skill). A [tool:Skill]
+    call beats a banner-only sighting, and when the loader's episode follows the call the
+    fire sits there: the aftermath starts after it. None if no marker can be found — the
+    caller counts that unassessable rather than guessing."""
+    hits = [ep for ep in episodes if _tool_fire(ep.get("content") or "", skill)]
+    hits = hits or [ep for ep in episodes if _mentions_fire(ep.get("content") or "", skill)]
     if not hits:
         return None
     if len(hits) == 1 or fired_at is None:
-        return hits[0]["sequence"]
+        seq = hits[0]["sequence"]
+    else:
 
-    def _dist(ep):
-        ts = ep.get("created_at")
-        return abs((ts - fired_at).total_seconds()) if ts is not None else float("inf")
+        def _dist(ep):
+            ts = ep.get("created_at")
+            return abs((ts - fired_at).total_seconds()) if ts is not None else float("inf")
 
-    return min(hits, key=_dist)["sequence"]
+        seq = min(hits, key=_dist)["sequence"]
+    nxt = next((ep for ep in episodes if ep["sequence"] > seq), None)
+    if nxt is not None and _is_loader(nxt, skill, body):
+        return nxt["sequence"]
+    return seq
 
 
 # ------------------------------------------------------------------ DB fetches
@@ -240,7 +281,8 @@ def _patch_text(patch) -> str | None:
 # ------------------------------------------------------------------ entry
 def run(conn, *, since, model: str | None = None) -> dict:
     """Judge every skill fire recorded after `since`; deviations/fights become retune
-    candidates. Returns the per-outcome tally."""
+    candidates. Returns the per-outcome tally. empty_window (no aftermath between the fire
+    and the next one) is counted on its own, outside unassessable."""
     stats = {
         "fires": 0,
         "clean": 0,
@@ -249,6 +291,7 @@ def run(conn, *, since, model: str | None = None) -> dict:
         "unassessable": 0,
         "last_episode": 0,
         "unlocated": 0,
+        "empty_window": 0,
         "candidates": 0,
         "judge_failures": 0,
         "unregistered": 0,
@@ -261,6 +304,7 @@ def run(conn, *, since, model: str | None = None) -> dict:
     scan_night = SM.scan_night()
     registered = _registered_skills(conn)
     sessions: dict[str, list[dict]] = {}
+    docs: dict[str, tuple[str, str]] = {}
     for fire in fires:
         # Only skills the lane owns can be retuned. The other detectors already gate on
         # the registry (struggle_arc: name in skill_names; procedure_miner: extends in
@@ -277,8 +321,11 @@ def run(conn, *, since, model: str | None = None) -> dict:
         if sid not in sessions:
             sessions[sid] = _fetch_session_episodes(conn, sid)
         episodes = sessions[sid]
+        if fire["skill"] not in docs:
+            docs[fire["skill"]] = _load_skill_doc(conn, fire["skill"])
+        desc, body = docs[fire["skill"]]
 
-        seq = resolve_fire_position(episodes, fire["skill"], fire["fired_at"])
+        seq = resolve_fire_position(episodes, fire["skill"], fire["fired_at"], body)
         if seq is None:
             stats["unassessable"] += 1
             stats["unlocated"] += 1
@@ -287,12 +334,11 @@ def run(conn, *, since, model: str | None = None) -> dict:
             stats["unassessable"] += 1
             stats["last_episode"] += 1
             continue
-        window = bound_window(episodes, seq)
+        window = bound_window(episodes, seq, skill=fire["skill"], body=body)
         if not window:  # next fire is immediate: no aftermath attributable to this one
-            stats["unassessable"] += 1
+            stats["empty_window"] += 1
             continue
 
-        desc, body = _load_skill_doc(conn, fire["skill"])
         verdict = judge_fire(fire["skill"], desc, body, window, model)
         if verdict is None:
             stats["judge_failures"] += 1

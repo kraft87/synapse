@@ -189,6 +189,57 @@ def test_accept_refusal_exits_nonzero_with_the_reason(server):
     assert "refusing [7]: no draft yet" in str(e.value.code)
 
 
+def test_list_shows_the_recommendation_and_days_pending(server, capsys):
+    row = {
+        "id": 7,
+        "kind": "retune",
+        "name": "demo-backup",
+        "direction": "fix",
+        "score": 1.5,
+        "grounded_sessions": 0,
+        "judge_sessions": 2,
+        "summary": "skips verification",
+        "has_draft": True,
+        "days_pending": 12,
+        "recommendation": {"verdict": "accept", "reason": "Both sessions lost the dump."},
+    }
+    server.replies["/skills/proposals"] = {"proposals": [row, dict(row, id=8, recommendation=None)]}
+    skill_review.cmd_list()
+    out = capsys.readouterr().out
+    assert "[7] [RETUNE/fix] demo-backup" in out and "[draft ready]  12d pending" in out
+    assert "      recommends accept: Both sessions lost the dump." in out
+    assert out.count("recommends") == 1  # no line for the row without one
+
+
+def test_list_from_a_server_before_schema_062(server, capsys):
+    row = {
+        "id": 7,
+        "kind": "derive",
+        "name": "demo-new",
+        "score": 1.5,
+        "grounded_sessions": 0,
+        "judge_sessions": 2,
+        "summary": "s",
+    }
+    server.replies["/skills/proposals"] = {"proposals": [row]}
+    skill_review.cmd_list()
+    out = capsys.readouterr().out
+    assert "pending" not in out and "recommends" not in out
+
+
+def test_revive_sends_the_action(server, capsys):
+    server.replies["/skills/proposals/act"] = {
+        "status": "proposed",
+        "id": 7,
+        "name": "demo-backup",
+        "has_draft": False,
+    }
+    skill_review.cmd_revive(7)
+    assert server.sent == [("/skills/proposals/act", {"id": 7, "action": "revive"})]
+    out = capsys.readouterr().out
+    assert "revived [7] demo-backup" in out and "next nightly run drafts it" in out
+
+
 def test_promote_is_a_noop(server, capsys):
     server.replies["/skills/proposals/act"] = {
         "status": "promoted",

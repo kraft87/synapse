@@ -77,6 +77,32 @@ def load_catalog(conn) -> list[tuple[str, str]]:
     return [(name, desc) for name, desc in cur.fetchall()]
 
 
+def load_scopes(conn) -> dict[str, str]:
+    """name -> registry scope ('global' or 'project:<label>') for ACTIVE skills."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name, COALESCE(scope, 'global') FROM skills_lane.skill_registry "
+        "WHERE status = 'active'"
+    )
+    return dict(cur.fetchall())
+
+
+def skill_served(scope: str | None, session_scope: str | None) -> bool:
+    """True when a skill registered under `scope` is installed in a session whose evidence
+    scope is `session_scope` (mcp_server.skill_sync_routes._evidence_scope, the rule accept
+    scopes a new skill by): a global skill everywhere, a project:<label> skill only in a
+    session of that one project, in any case. A session that spans projects, or can't be
+    placed, scopes global and is served global skills only."""
+    if not scope or scope == "global":
+        return True
+    return isinstance(session_scope, str) and session_scope.lower() == scope.lower()
+
+
+def served_skills(descriptions: dict[str, str], scopes: dict[str, str], session_scope) -> dict:
+    """The part of a name -> description catalog that is served to `session_scope`."""
+    return {n: d for n, d in descriptions.items() if skill_served(scopes.get(n), session_scope)}
+
+
 def format_catalog(items) -> str:
     """Render a skill catalog for a judge prompt: one `- {name}: {desc}` line per entry,
     "(none)" when the catalog is empty."""
