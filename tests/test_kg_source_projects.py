@@ -377,14 +377,15 @@ def test_web_derived_facts_serve_on_no_leg(kg, db_url):
 
 def test_seed_with_only_web_derived_edges_takes_no_seed_slot(kg, db_url):
     """The degree gate counts the edges the hop leg can serve, so an entity known only
-    from web pages is not a seed (it would hop to nothing)."""
+    from web pages, at either end of its edges, is not a seed (it would hop to nothing)."""
     w = _ep(kg, WORK)
     kg.execute(
         "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, embedding) "
         "VALUES ('page-ent', 'default', %s, 'Page', 'page', %s::vector)",
         (GROUP, kg_pg._vec_literal(onehot(0))),
     )
-    _fact(kg, "page-edge", "kappa", f"[{w}]", emb=None, src="page-ent", web_artifact_id=7)
+    _fact(kg, "page-out", "kappa", f"[{w}]", emb=None, src="page-ent", web_artifact_id=7)
+    _fact(kg, "page-in", "lambda", f"[{w}]", emb=None, tgt="page-ent", web_artifact_id=7)
     facts, seeds = Recall(db_url, "")._search_kg("q", onehot(0), GROUP, [], 5)
     assert seeds == [] and facts == []
 
