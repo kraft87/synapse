@@ -3,6 +3,73 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-06 — dream→skills lane: live detectors, a real recurrence gate, a queue that tends itself (plugin 0.22.1, schema 062)
+
+**What changed**
+
+- **post_fire and dismissals see the user again.** A Skill fire is stored as the call
+  (seq N) and the loader's "Base directory for this skill: .../<skill>" banner + body
+  (seq N+1). Both detectors read N+1 as the next fire / the user's reply, so since 07-18
+  every post-fire window was empty and nothing was ever marked dismissed.
+  `skill_db_source.is_loader_episode` skips it; post_fire counts `empty_window` on its own.
+- **Derive proposes on real recurrence**: 2 distinct sessions started on 2 distinct days
+  (salience and score paths unchanged). Scan nights no longer count, and a judge signal
+  votes once per session. Session days come from episodes (min created_at) when an entry
+  has none, and a nightly re-gate applies this to open rows.
+- **Derive identity** also matches rejected rows (cooldown and -3 kept) and rows retired in
+  the last 60 days (they reopen instead of starting over).
+- **Under-trigger judges each session against the skills it was served** (global +
+  `project:<label>` by `_evidence_scope`; a multi-project session is global).
+- **The review queue looks after itself** (`dream/skills/review_queue.py`, after drafting):
+  undeliverable retunes are auto-rejected as `auto:<code>` (no_target, retired, renamed,
+  scope_mismatch, no_change, covered) with the 30-day cooldown and **no** -3; proposals
+  unanswered for 21 days retire as `expired`; each draft gets one stored recommendation
+  (accept/reject + a sentence) from the lane's judge. Nothing is auto-applied.
+- **Report** (replaces the new-ids-only digest): plain text, verdict first, under 1500
+  chars, sent when tonight added a proposal, auto-rejected or expired one, else once a week.
+  Still stdout when `SKILLS_DISCORD_WEBHOOK` is unset.
+- **dream_runs**: the lane's counts land in `counts` as `skills_*`; `proposals_raised`
+  counts `proposed_at` (a row that went proposed after sitting in observe now counts).
+- **Review CLI** (plugin 0.22.1): `skill_review.py list` shows the recommendation and days
+  pending; `skill_review.py revive <id>` puts a rejected/expired/retired proposal back.
+
+**Order of rollout**
+
+1. Merge → image (watchtower). The lane runs without 062: expiry, recommendations and
+   proposed_at stamping skip with one log line, proposals_raised keeps counting new rows.
+2. Apply `schema/062_skill_review_queue.sql` (marked optional; `scripts/apply_schema.sh`).
+   Its backfill sets proposed_at = updated_at on rows already proposed, so the first night
+   after it expires **#142** (bug-hunt extend, proposed 10-11). Review it before applying
+   062 if it should not expire; `revive 142` brings it back either way.
+3. Optional: set `SKILLS_DISCORD_WEBHOOK` in the docker VM's synapse `.env` so the report
+   reaches Discord instead of the container log.
+4. Optional: apply `/home/neuron/workspace/synapse-salvage/morning-briefing-skills.patch`
+   to `~/scripts/morning-briefing.py` (verdict + days pending per item; falls back before 062).
+5. `synapse update` on each machine for the 0.22.1 review CLI (older clients keep working;
+   they just don't show the new fields or have `revive`).
+
+**Proven** (read-only replays of prod, 2026-11-06)
+
+- post_fire over the 61 registered-skill fires of the last 60 days: 61/61 empty windows
+  before; after, 54 windows, 5 session-tail fires, 2 genuinely empty (the loader itself
+  chains into another skill). Dismissal over all 102 fires: the check read the loader
+  banner 94 times and a skill body 8 times; after, 67 short real turns, 13 long ones, 9
+  next-skill banners (0 dismissals in the window: no reply was a short negation).
+- The gate over the 84 gap_scan derive rows: 9 all-time, 2 opening in the last 60 days
+  (#153 job-application-tailoring 10-23 + 10-28, #157 android-tv-adb-debug 10-29 + 11-02),
+  matching the audit verifier; none of the six single-session re-scans passes.
+- First night on a scratch copy of prod's open rows: re-gate raises #153 and #157; #76
+  (docx widen) auto-rejects as scope_mismatch, keeping its 2 transcribe_ai sessions; #142
+  expires.
+
+**Open**
+
+- Embedding identity for derive (the audit's 0.78 cosine leg) is not in this change; the
+  signature check still misses the cited repeat pairs (sigJ 0.07-0.35).
+- Whether the lane should keep excluding transcribe_ai (it does not by default today) is
+  Kyle's call.
+- Auto-apply of any skill change is a separate policy decision; the 023 CHECK is unchanged.
+
 ## 2026-10-12 — skills scoped by trust and project (plugin 0.22.0, no schema change)
 
 **What changed**
