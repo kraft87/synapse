@@ -427,6 +427,8 @@ Three candidate lists over Postgres (`kg_relationships`), all filtering `t_inval
 2. **BM25 fulltext** (ParadeDB) over fact text.
 3. **1-hop join** from seed entities via `src_uuid`/`tgt_uuid`.
 
+All three lists, the seed degree gate and the supersession extras skip facts extracted from web pages (`web_artifact_id` set, schema 018): rated 1 helpful / 47 noise as facts over the 60 days to 2026-11-06, they are left to the web bucket. The rows stay in place.
+
 Seed entities come from a pgvector KNN over `kg_entities.embedding` (halfvec HNSW, fetch 25), degree-gated (drop orphans), capped at 8, with a `session_focus` bonus (0.3 subtracted from distance when a seed's name/uuid is in the caller-supplied focus set). `_FACT_LIMIT = 12` (#100 — doubled exact-fact keyword recall 0.119→0.214 at zero graph bloat). Returns `(facts, seed_entities)`; seeds feed the `entities` bucket.
 
 ### 6.4 Web & history legs

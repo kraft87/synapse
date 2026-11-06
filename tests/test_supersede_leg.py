@@ -164,6 +164,40 @@ def test_close_successor_link_still_overlays_its_episode(conn, db_url):
     assert [x["id"] for x in pairs] == ["f:p-1"]
 
 
+def test_no_supersession_helper_serves_a_web_derived_fact(conn, db_url):
+    """The fact legs skip facts extracted from web pages (web_artifact_id set); each
+    helper here serves fact text too, so the side it serves is skipped the same way."""
+    _seed(conn)
+    eid = conn.execute(
+        "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, 'x') RETURNING id",
+        (f"web-sup-{uuid.uuid4().hex[:10]}",),
+    ).fetchone()[0]
+    conn.execute(
+        "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)
+    )
+    r = Recall(db_url, "")
+
+    def _served() -> tuple[list[str], dict[int, list[str]], list[str]]:
+        surfaced = r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
+        return (
+            [x["_uuid"] for x in surfaced],
+            r._episode_supersessions([eid], GROUP),
+            [x["id"] for x in r._fetch_superseded_pairs_pg(GROUP, ["n-1"], 10)],
+        )
+
+    assert _served() == (["n-1"], {eid: ["Synapse uses Postgres now"]}, ["f:p-1"])
+    # A web-derived successor is never served as the current answer.
+    conn.execute("UPDATE kg_relationships SET web_artifact_id = 7 WHERE uuid = 'n-1'")
+    assert _served()[:2] == ([], {})
+    # A web-derived predecessor is never shown as the displaced fact; it still leads to
+    # its successor, whose own text is what gets served.
+    conn.execute(
+        "UPDATE kg_relationships SET web_artifact_id = CASE WHEN uuid = 'p-1' THEN 7 END "
+        "WHERE uuid IN ('n-1', 'p-1')"
+    )
+    assert _served() == (["n-1"], {eid: ["Synapse uses Postgres now"]}, [])
+
+
 def test_overlay_never_serves_a_retired_successor(conn, db_url):
     _seed(conn)
     eid = conn.execute(

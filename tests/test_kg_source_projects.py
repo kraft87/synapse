@@ -82,14 +82,15 @@ def _fact(
     tgt: str = "ent-y",
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
+    web_artifact_id: int | None = None,
 ) -> None:
     """Insert one edge. ``episodes`` is passed as raw JSON text (or None) so malformed
     shapes can be written exactly as a careless writer would."""
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by) "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, web_artifact_id) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00', %s, %s)",
+        "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
         (
             uid,
             GROUP,
@@ -100,6 +101,7 @@ def _fact(
             episodes,
             t_invalid,
             invalidated_by,
+            web_artifact_id,
         ),
     )
 
@@ -355,6 +357,36 @@ def test_full_trust_kg_leg_still_serves_everything(kg, db_url):
     facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), GROUP, [], 20)
     assert _uuids(facts) == _ALL
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
+
+
+def test_web_derived_facts_serve_on_no_leg(kg, db_url):
+    """A fact extracted from a web page (web_artifact_id set) never reaches the facts
+    bucket from the vector, BM25 or hop leg, at full trust or restricted. These carry an
+    in-scope episode, so only the web rule keeps them off a restricted serve."""
+    ids = _seed_kg(kg)
+    w = ids["w"]
+    _fact(kg, "v-page", "alpha page", f"[{w}]", emb=0, web_artifact_id=7)
+    _fact(kg, "b-page", "widget page", f"[{w}]", emb=None, web_artifact_id=7)
+    _fact(kg, "h-page", "iota", f"[{w}]", emb=None, src="seed-ent", web_artifact_id=7)
+    r = Recall(db_url, "")
+    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
+    assert _uuids(facts) == _ALL
+    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
+    assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}
+
+
+def test_seed_with_only_web_derived_edges_takes_no_seed_slot(kg, db_url):
+    """The degree gate counts the edges the hop leg can serve, so an entity known only
+    from web pages is not a seed (it would hop to nothing)."""
+    w = _ep(kg, WORK)
+    kg.execute(
+        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, embedding) "
+        "VALUES ('page-ent', 'default', %s, 'Page', 'page', %s::vector)",
+        (GROUP, kg_pg._vec_literal(onehot(0))),
+    )
+    _fact(kg, "page-edge", "kappa", f"[{w}]", emb=None, src="page-ent", web_artifact_id=7)
+    facts, seeds = Recall(db_url, "")._search_kg("q", onehot(0), GROUP, [], 5)
+    assert seeds == [] and facts == []
 
 
 def test_identical_fact_text_serves_once(kg, db_url):

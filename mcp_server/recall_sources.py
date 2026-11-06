@@ -360,6 +360,9 @@ class RecallSourcesMixin:
         assistant on 08-29 to stop X" showed up as superseded by an unrelated
         correction weeks later.
 
+        The displaced side is served as text too, so a predecessor extracted from a web
+        page is skipped like a web-derived fact on the legs (see kg_pg's module docstring).
+
         ``allowed_projects`` (restricted surface) requires BOTH sides of a pair, the
         served edge and the displaced one, to pass the schema-056 provenance rule, so a
         pair is dropped when either side is out of scope. The filter runs before
@@ -389,6 +392,7 @@ class RecallSourcesMixin:
                     WHERE a.owner_id = %s AND a.group_id = %s
                       AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                       AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
+                      AND o.web_artifact_id IS NULL
                       AND ((o.invalidated_by = a.uuid
                             AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
                            OR (o.invalidated_by IS NULL AND o.name = a.name))
@@ -453,7 +457,10 @@ class RecallSourcesMixin:
         overlay half of self-exclusion (see ``_self_session_facts``).
 
         ``served_text`` (episode id -> the text actually served for it) keeps a successor
-        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``)."""
+        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``).
+
+        A successor N extracted from a web page is never attached, like a web-derived
+        fact on the legs (see kg_pg's module docstring)."""
         settings = self._settings()
         if not episode_ids:
             return {}
@@ -483,6 +490,7 @@ class RecallSourcesMixin:
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                     f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
                     "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
+                    "  AND n.web_artifact_id IS NULL "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}"
                     "LIMIT %s",
@@ -536,7 +544,8 @@ class RecallSourcesMixin:
         Fail-open — a lookup error just yields no extras.
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
-        and its served successor to pass the schema-056 provenance rule."""
+        and its served successor to pass the schema-056 provenance rule. A successor
+        extracted from a web page is never served, like a web-derived fact on the legs."""
         settings = self._settings()
         if query_emb is None:
             return []
@@ -555,6 +564,7 @@ class RecallSourcesMixin:
                     f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
                     "FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
+                    "  AND n.web_artifact_id IS NULL "
                     "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
                     "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
