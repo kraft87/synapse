@@ -358,7 +358,7 @@ class RecallSourcesMixin:
         (2026-10-09): every retired edge between the same two entities was being
         paired with whatever live edge between them got served, so "User told the
         assistant on 08-29 to stop X" showed up as superseded by an unrelated
-        correction weeks later.
+        correction weeks later. A predecessor extracted from a web page is never shown.
 
         ``allowed_projects`` (restricted surface) requires BOTH sides of a pair, the
         served edge and the displaced one, to pass the schema-056 provenance rule, so a
@@ -388,7 +388,7 @@ class RecallSourcesMixin:
                      AND o.owner_id = a.owner_id AND o.group_id = a.group_id
                     WHERE a.owner_id = %s AND a.group_id = %s
                       AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
-                      AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid
+                      AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid AND o.web_artifact_id IS NULL
                       AND ((o.invalidated_by = a.uuid
                             AND {_link_close_sql("o", "a", settings._EMBED_DIMS)})
                            OR (o.invalidated_by IS NULL AND o.name = a.name))
@@ -483,6 +483,7 @@ class RecallSourcesMixin:
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                     f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
                     "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
+                    "  AND n.web_artifact_id IS NULL "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}"
                     "LIMIT %s",
@@ -555,6 +556,7 @@ class RecallSourcesMixin:
                     f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "
                     "FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
+                    "  AND n.web_artifact_id IS NULL "
                     "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
                     "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "

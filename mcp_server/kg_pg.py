@@ -13,6 +13,11 @@ Retrieval mirrors ``_search_kg`` exactly:
   4. 1-hop traversal from each seed (per-seed LIMIT 8)
   5. RRF fuse [vec, bm25, hop], take top ``limit``
 
+Every leg, and the seed degree gate, skips facts extracted from web pages
+(``web_artifact_id`` set, schema 018). Web content is served by recall's own web bucket
+under its own floor; as facts it rated 1 helpful / 47 noise over the 60 days to
+2026-11-06, the worst slice of the fact bucket. The rows stay in place.
+
 The caller's cursor MUST have these session GUCs set (see parity_kg_read.py):
   - ``hnsw.ef_search = 200``               (matches FalkorDB's efRuntime)
   - ``enable_seqscan = off``               } pgvector won't use the HNSW index when
@@ -44,8 +49,10 @@ _EMBED_DIMS = embed_dims()
 # RRF constant matches recall._rrf_fuse / bench_pg_kg (k=60, 1-indexed rank).
 _RRF_K = 60
 # Fact-vector over-fetch pool: how many global-nearest live facts to pull before
-# applying the owner/group filter. Headroom for multi-tenant filtering; for a single
-# owner every candidate matches and the outer LIMIT (limit*3) is what bites.
+# applying the owner/group/web filter. For the technical group the outer LIMIT
+# (limit*3) is what bites: across 20 real queries (2026-11-06) the fewest in-group,
+# non-web survivors of the 200 was 46. The small personal group can under-fill with or
+# without the web filter (3 of 20 personal queries kept fewer than 36).
 _OVERFETCH = 200
 
 
@@ -118,11 +125,12 @@ def search_kg_postgres(
     if not restricted:
         cur.execute(
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM ("
-            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id "
+            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id, "
+            "         web_artifact_id "
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
             f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
-            ") sub WHERE owner_id = %s AND group_id = %s LIMIT %s",
+            ") sub WHERE owner_id = %s AND group_id = %s AND web_artifact_id IS NULL LIMIT %s",
             (emb_s, _OVERFETCH, owner_id, group_id, limit * 3),
         )
     else:
@@ -137,7 +145,7 @@ def search_kg_postgres(
             f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
-            "    AND owner_id = %s AND group_id = %s "
+            "    AND owner_id = %s AND group_id = %s AND web_artifact_id IS NULL "
             f"   AND {scope_predicate()}"
             ") SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM cand "
             "ORDER BY dist LIMIT %s",
@@ -161,6 +169,7 @@ def search_kg_postgres(
             "FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s) "
             "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+            "  AND web_artifact_id IS NULL "
             f"{scope_sql}"
             "ORDER BY sc DESC LIMIT %s",
             (safe, owner_id, group_id, *scope_args, limit * 3),
@@ -198,11 +207,13 @@ def search_kg_postgres(
         "  SELECT u, count(*) AS d FROM ("
         "    SELECT src_uuid AS u FROM kg_relationships "
         "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        "        AND web_artifact_id IS NULL "
         f"{scope_sql}"
         "        AND src_uuid IN (SELECT uuid FROM seeds) "
         "    UNION ALL "
         "    SELECT tgt_uuid AS u FROM kg_relationships "
         "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        "        AND web_artifact_id IS NULL "
         f"{scope_sql}"
         "        AND tgt_uuid IN (SELECT uuid FROM seeds) "
         "  ) z GROUP BY u"
@@ -248,7 +259,7 @@ def search_kg_postgres(
             # Recency is the least-wrong single ordering for a "what about X" hop sample.
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM kg_relationships "
             "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-            "  AND (src_uuid = %s OR tgt_uuid = %s) "
+            "  AND web_artifact_id IS NULL AND (src_uuid = %s OR tgt_uuid = %s) "
             f"{scope_sql}"
             "ORDER BY t_valid DESC LIMIT 8",
             (owner_id, group_id, sd, sd, *scope_args),

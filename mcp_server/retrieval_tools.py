@@ -83,13 +83,12 @@ def register(
         document describes that document.
 
         Every served item carries an `id` (e:N episode, n:N note, f:<uuid> fact incl.
-        superseded_facts pairs, t:N timeline, w:N web); copy it into recall_feedback
-        to rate it. Only e:/n: ids are fetch()-able.
+        superseded_facts pairs, w:N web); copy it into recall_feedback to rate it.
+        Only e:/n: ids are fetch()-able: fetch(ids) expands a truncated passage or
+        note body.
 
         A `warnings` list means a leg degraded or this connection is served (almost)
         nothing: a config problem, not empty memory.
-
-        Follow-ups: fetch(ids) expands a truncated passage or note body;
 
         Args:
             query: Natural language search query.
@@ -136,8 +135,8 @@ def register(
         """Search the complete, unabridged text of past conversation turns — the
         drill-down and retry sibling of recall().
 
-        recall() serves compressed ~1400-char passage slices blended with facts and
-        timeline; this serves WHOLE turns and nothing else, ranked by relevance +
+        recall() serves compressed ~1400-char passage slices blended with facts,
+        notes and web; this serves WHOLE turns and nothing else, ranked by relevance +
         recency (keyword + semantic search + rerank over the full archive). `limit`
         sizes the response: 1-2 turns for a pinpoint quote, the default 5 to
         reconstruct a discussion (weak trailing matches drop automatically).
@@ -232,32 +231,20 @@ def register(
         self_session: str | None = None,
         surface: str | None = None,
     ) -> dict:
-        """Read one conversation sequentially — like opening the transcript file at
-        a spot, instead of searching. Every recall/fetch episode carries a `session`
-        field; pass it here to see what surrounded that turn.
+        """Read one conversation in order: the turn `around` (e:N) in full with
+        ±`radius` neighbor heads, or pages of a whole session via offset/limit.
 
-        WHEN a recalled turn is the middle of a discussion and you need how it
-        started or what was decided after — pass its e:N id as `around`: that anchor
-        comes back FULL, ±`radius` neighbors as 500-char heads with `full_chars`
-        (expand interesting ones via fetch()). WHEN you want to skim a whole
-        session, page it with offset/limit (heads only). Use "self" as session_id
-        for the current conversation.
-
-        Do NOT search with this — recall_full_turns(query, session_id=...) greps
-        within a session; this reads it in order. An unindexed session returns an
-        explicit error — THAT is the signal to read the on-disk transcript instead.
+        Do NOT search with this — recall_full_turns(query, session_id=...) does.
+        An unindexed session returns an error: read the on-disk transcript instead.
 
         Args:
-            session_id: Session to read — the `session` field from a recall/fetch
-                episode, or "self" for the current conversation.
-            around: Anchor episode id ("e:N") to center the window on.
-            radius: Neighbors per side around the anchor (0-10, default 3).
-            offset: Anchorless paging — turn index to start from (default 0).
-            limit: Anchorless paging — turns per page (1-25, default 10).
-            self_session: NEVER set this yourself; the client hook injects it to
-                resolve session_id="self".
-            surface: DEPRECATED and ignored — the server identifies the calling
-                device from its own credential. Never set it.
+            session_id: A recall/fetch episode's `session` field, or "self".
+            around: Anchor episode id ("e:N").
+            radius: Neighbors per side of the anchor (0-10, default 3).
+            offset: Anchorless paging start (default 0).
+            limit: Anchorless page size (1-25, default 10).
+            self_session: NEVER set this yourself; the client hook injects it.
+            surface: DEPRECATED and ignored. Never set it.
         """
         note_ignored_surface(surface, "mcp.fetch_session")
         with logfire.span("mcp.fetch_session {sid}", sid=session_id[:40], around=around):

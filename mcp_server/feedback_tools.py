@@ -29,8 +29,9 @@ def register(
         """Validation error for recall_feedback's helpful/noise lists, or None if valid.
 
         Accepts None or a list of served-id strings — "e:N" episode, "n:N" note,
-        "f:<uuid>" fact, "t:N" timeline, "w:N" web — exactly as recall() serves them.
-        Anything else is rejected."""
+        "f:<uuid>" fact, "w:N" web — exactly as recall() serves them, plus "t:N" from
+        the retired timeline leg (2026-08-07), so a report on an older recall still
+        files. Anything else is rejected."""
         if ids is None:
             return None
         if not isinstance(ids, list):
@@ -39,7 +40,7 @@ def register(
         if bad:
             return (
                 f"{field} contains invalid ids {bad!r} — expected recall-served ids: "
-                '"e:N" episode, "n:N" note, "f:<uuid>" fact, "t:N" timeline, "w:N" web'
+                '"e:N" episode, "n:N" note, "f:<uuid>" fact, "w:N" web'
             )
         return None
 
@@ -120,7 +121,7 @@ def register(
         "web" / "user" (memory never had it) vs "nowhere" (still unresolved).
 
         Rate any served id verbatim — "e:N" episodes, "f:<uuid>" facts (and
-        superseded_facts), "t:N" timeline, "w:N" web — plus
+        superseded_facts), "w:N" web — plus
         "n:N" note ids from the session-start board or fetch(): WHEN a board
         note shaped your answer (or misled it), rate it too. A comment-only
         report is still valuable when the serving itself was the problem.
