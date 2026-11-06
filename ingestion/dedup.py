@@ -161,7 +161,7 @@ def _type_compatible(a: str | None, b: str | None) -> bool:
 
 
 # --- Identifier gate for merge candidates -------------------------------------
-# Two names carrying different numbers (PR #290 / PR #269, MDROPS-12895 / -12893,
+# Two names carrying different numbers (PR #290 / PR #269, JIRA-12895 / -12893,
 # Python 3.12 / 3.11) name different things, yet look near-identical as strings and as
 # embeddings: prod's 'PR #290' sat at name-embedding cosine 0.970 to 'PR #269', over the
 # 0.95 autoconfirm, and one 'PR #N' node collected the facts of 37 PRs. So when both
@@ -438,7 +438,7 @@ class NodeDeduper:
         # Strategy 3: MinHash/LSH candidate generation (no LLM yet).
         idx = self._index()
         candidates = self._lsh_candidates(_normalize_for_fuzzy(name), idx)
-        # Identifier gate (hard): 'MDROPS-12895' never merges into 'MDROPS-12893'.
+        # Identifier gate (hard): 'JIRA-12895' never merges into 'JIRA-12893'.
         candidates = [
             (u, j) for (u, j) in candidates if not ids_conflict(name, idx.name_by_uuid.get(u, ""))
         ]
