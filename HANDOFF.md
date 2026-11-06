@@ -41,6 +41,27 @@ No restart is needed: the extractor's dedup index re-reads entities within its T
 (`SYNAPSE_DEDUP_CACHE_TTL_SECONDS`, 900 s), and its exact-name lookup falls through to
 the database.
 
+**Proven**
+
+- Rules: 45 unit tests; 7 database tests on a scratch database (dry run writes nothing,
+  apply moves/creates/clears/backs up, provenance unchanged, a second apply is a no-op, a
+  row changed after the read is skipped, restore returns every row, metrics before/after).
+- Read-only dry run on prod, 2026-11-06: 2,958 identifier endpoints examined; 1,175
+  endpoint moves (966 live, 209 retired) out of 83 entities; 57 existing targets reused,
+  218 created; 10 supersession candidates, 2 un-retired after review (the other 8 are real
+  updates or stale on their own). The audit's numbers as planned: live edges on `PR #N`
+  entities lacking their own number 72.4% -> 13.7% (whole name) and 75.5% -> 26.2% (name
+  contains `PR #N`); disjoint-ID supersessions 29 -> 27.
+
+**Open**
+
+- The prod `--apply` and the after-benchmark: run by an operator (this session's
+  permission policy refused the production write).
+- Left alone by design: facts naming no or several identifiers (the residual 13.7%),
+  entities whose name decorates the identifier ("widget refactor (PR #12)": 56 edges there
+  would match the rule), bare `#N` entities, and the same number in two repositories (one
+  target, as the guard itself cannot tell them apart).
+
 ## 2026-11-06 — dream→skills lane: live detectors, a real recurrence gate, a queue that tends itself (plugin 0.22.1, schema 062)
 
 **What changed**

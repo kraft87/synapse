@@ -850,14 +850,16 @@ def report(plan: Plan, edges: list[Edge]) -> dict[str, Any]:
     }
     summary["summaries to clear"] = len(plan.clear_summaries)
     summary["un-retire candidates"] = len(plan.candidates)
-    # Same number, different repos: targets fed by edges whose sole source project differs.
+    # The same number in two repositories is one target (the guard cannot tell them apart
+    # either). Upper bound: targets fed by facts whose single source project differs; a
+    # project that discusses several repositories counts too.
     by_target: dict[str, set[str]] = defaultdict(set)
     edge_by = {e.uuid: e for e in edges}
     for m in plan.moves:
         sp = edge_by[m.edge].source_projects or []
         if len(sp) == 1:
             by_target[m.to_uuid].add(sp[0].lower().replace("-", "_"))
-    summary["targets fed from more than one sole source project"] = sum(
+    summary["targets fed from 2+ single-project sources (upper bound on cross-repo)"] = sum(
         1 for v in by_target.values() if len(v) > 1
     )
     summary["moves from the 5 largest losers"] = [n for _u, n in magnets.most_common(5)]
