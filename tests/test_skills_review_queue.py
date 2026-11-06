@@ -468,6 +468,7 @@ def test_revive_brings_back_a_rejected_proposal_and_list_shows_its_age(rq, db_ur
 def test_queue_probe_answers_absent_while_062_is_missing(rq):
     probe = ColumnProbe(L.QUEUE_PROBE._sql, "t")
     with pytest.raises(RuntimeError), rq.transaction():
+        rq.execute("SET LOCAL lock_timeout = '5s'")  # fail, never hang, if a lock is held
         rq.execute("ALTER TABLE skills_lane.skill_gap_candidates DROP COLUMN recommendation")
         assert not probe.ready(rq, "without-062")
         raise RuntimeError("roll the DROP back")
