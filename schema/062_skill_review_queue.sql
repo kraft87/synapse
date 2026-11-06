@@ -12,10 +12,10 @@
 --                   row's current draft. It is asked again when the draft changes
 --                   (draft_hash no longer matches the draft).
 --
--- Backfill: a row already proposed gets proposed_at = updated_at, the last time anything
--- touched it, so its age reads as a lower bound. The first nightly run after this is
--- applied expires every such row older than 21 days (on 2026-11-06 that is #142, proposed
--- 10-11); the report says so and `skill_review.py revive <id>` brings one back.
+-- Backfill: a row already proposed gets proposed_at = updated_at, capped at 7 days ago.
+-- A row that has waited longer (on 2026-11-06, #142, proposed 10-11) gets a
+-- recommendation and two weeks in the new queue instead of expiring the night this is
+-- applied, before anyone saw a recommendation for it.
 --
 -- Deploy order: the image ships BEFORE this file is applied. Until it is, the lane probes
 -- for both columns and skips what needs them (the expiry, the recommendations, proposed_at
@@ -30,5 +30,5 @@ ALTER TABLE skills_lane.skill_gap_candidates
     ADD COLUMN IF NOT EXISTS recommendation JSONB;
 
 UPDATE skills_lane.skill_gap_candidates
-   SET proposed_at = updated_at
+   SET proposed_at = GREATEST(updated_at, now() - interval '7 days')
  WHERE status = 'proposed' AND proposed_at IS NULL;

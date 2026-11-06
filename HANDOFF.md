@@ -39,9 +39,9 @@ changed, what to do on each machine, what was proven, and what is still open.
 1. Merge → image (watchtower). The lane runs without 062: expiry, recommendations and
    proposed_at stamping skip with one log line, proposals_raised keeps counting new rows.
 2. Apply `schema/062_skill_review_queue.sql` (marked optional; `scripts/apply_schema.sh`).
-   Its backfill sets proposed_at = updated_at on rows already proposed, so the first night
-   after it expires **#142** (bug-hunt extend, proposed 10-11). Review it before applying
-   062 if it should not expire; `revive 142` brings it back either way.
+   Its backfill sets proposed_at = updated_at on rows already proposed, capped at 7 days
+   ago, so **#142** (bug-hunt extend, proposed 10-11) gets a recommendation and two weeks
+   in the queue instead of expiring on the first night.
 3. Optional: set `SKILLS_DISCORD_WEBHOOK` in the docker VM's synapse `.env` so the report
    reaches Discord instead of the container log.
 4. Optional: apply `/home/neuron/workspace/synapse-salvage/morning-briefing-skills.patch`
@@ -61,7 +61,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   matching the audit verifier; none of the six single-session re-scans passes.
 - First night on a scratch copy of prod's open rows: re-gate raises #153 and #157; #76
   (docx widen) auto-rejects as scope_mismatch, keeping its 2 transcribe_ai sessions; #142
-  expires.
+  would have expired under an uncapped backfill (the shipped backfill gives it two weeks).
 
 **Open**
 
