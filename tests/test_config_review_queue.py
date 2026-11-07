@@ -292,3 +292,70 @@ def test_a_failed_post_keeps_the_report_and_does_not_stamp_it_sent(q, monkeypatc
     assert stats["sent"] == 0
     cfg = cursor_config(q)
     assert "config_last_report" in cfg and "config_report_sent_at" not in cfg  # retry tomorrow
+
+
+# ---------------------------------------------------------------- dream_runs bookkeeping
+def test_dream_runs_counts_a_config_row_that_went_proposed_tonight(q, db_url):
+    from dream.__main__ import _dream_collect_proposals
+
+    run_id = q.execute(
+        "INSERT INTO dream_runs (started_at, errors) VALUES (now(), '[\"cq-test\"]') RETURNING id"
+    ).fetchone()[0]
+    rid = seed(q, "Rule raised late")
+    q.execute(
+        "UPDATE config_lane.config_proposals SET created_at = now() - interval '40 days', "
+        "proposed_at = now() + interval '1 second' WHERE id=%s",
+        (rid,),
+    )
+    counts: dict = {}
+    samples = _dream_collect_proposals(db_url, run_id, counts)
+    assert counts["proposals_raised"] >= 1
+    entry = {"id": f"config:{rid}", "kind": "config-edit", "name": "rules/learned.md"}
+    assert entry in samples["proposals"]
+    q.execute("DELETE FROM dream_runs WHERE id=%s", (run_id,))
+
+
+def _run_once_with(monkeypatch, lane_result):
+    import dream.__main__ as M
+
+    recorded = {}
+    monkeypatch.delenv("SKILLS_LANE_ENABLED", raising=False)
+    monkeypatch.setenv("CONFIG_LANE_ENABLED", "1")
+    monkeypatch.setenv("SYNAPSE_NOTES_LANE", "0")
+    monkeypatch.setattr(M, "_dream_record_start", lambda db_url: 1)
+    monkeypatch.setattr(M, "_dream_collect_proposals", lambda db_url, run_id, counts: {})
+    monkeypatch.setattr(
+        M, "_dream_record_finish", lambda *a: recorded.update(stages=a[2], counts=a[3])
+    )
+    monkeypatch.setattr(N, "run_lane", lambda limit: lane_result)
+    M.run_once()
+    return recorded
+
+
+def test_run_once_records_the_config_counts_in_dream_runs(monkeypatch):
+    result = {
+        "sessions": 4,
+        "found": 3,
+        "proposed": 1,
+        "covered": 1,
+        "expired": 0,
+        "recommended": 1,
+        "digest_sent": 1,
+    }
+    recorded = _run_once_with(monkeypatch, result)
+    assert recorded["counts"] == {
+        "config_sessions_scanned": 4,
+        "config_corrections_found": 3,
+        "config_proposals": 1,
+        "config_covered": 1,
+        "config_expired": 0,
+        "config_recommended": 1,
+        "config_digest_sent": 1,
+    }
+    assert recorded["stages"]["config"] == {"ran": True, "ok": True}
+
+
+def test_run_once_notes_a_lane_waiting_for_schema_065(monkeypatch):
+    recorded = _run_once_with(monkeypatch, {"skipped": "schema 065 not applied"})
+    assert recorded["counts"] == {}
+    assert recorded["stages"]["config"]["skipped"] == "schema 065 not applied"
