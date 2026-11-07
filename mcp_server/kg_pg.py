@@ -42,6 +42,8 @@ few vector/BM25 matches from the other group.
 
 from __future__ import annotations
 
+import math
+import os
 from typing import Any
 
 from ingestion.embedding import embed_dims
@@ -62,6 +64,12 @@ _OVERFETCH = 200
 # Facts a full-trust recall may add from the group it did not ask for, after the
 # requested group's own (see search_kg). recall_overview serves _FACT_LIMIT + this.
 CROSS_GROUP_EXTRAS = 4
+# Reinforcement prior on the fused fact score (SYNAPSE_KG_MENTION_W, default 0 = off): every
+# fused RRF score is multiplied by ``1 + w * ln(mention_count)`` before the top-``limit`` cut,
+# so a fact the owner re-asserted across conversations outranks a one-off of the same
+# relevance. mention_count counts re-assertions (schema 019); 1 (a fact stated once) is the
+# neutral value. See :func:`_mention_prior`.
+_MENTION_W = float(os.getenv("SYNAPSE_KG_MENTION_W", "0") or "0")
 
 
 def read_groups(group_id: str, restricted: bool) -> str | list[str]:
@@ -108,6 +116,23 @@ def _rrf_fuse(lists: list[list[str]], k: int = _RRF_K) -> dict[str, float]:
         for rank, uuid_ in enumerate(lst):
             scores[uuid_] = scores.get(uuid_, 0.0) + 1.0 / (k + rank + 1)
     return scores
+
+
+def _mention_prior(cur: Any, fused: dict[str, float], w: float) -> dict[str, float]:
+    """``fused`` with each score times ``1 + w * ln(mention_count)``.
+
+    One indexed lookup (``kg_rel_uuid``) over the candidate uuids the three legs already
+    returned, so the leg statements are untouched and ``w <= 0`` never reaches here. A NULL
+    or sub-1 count scores as 1 (``ln 1 = 0``: no change). The prior only reorders the
+    candidates the legs fetched: it never pulls in a fact no leg returned.
+    """
+    if w <= 0 or not fused:
+        return fused
+    cur.execute(
+        "SELECT uuid, mention_count FROM kg_relationships WHERE uuid = ANY(%s)", (list(fused),)
+    )
+    counts = {u: n for u, n in cur.fetchall()}
+    return {u: s * (1.0 + w * math.log(max(1, counts.get(u) or 1))) for u, s in fused.items()}
 
 
 def _vec_literal(emb: list[float]) -> str:
@@ -306,6 +331,7 @@ def search_kg_postgres(
     # as separate edges (same-batch twins: ~200 such groups were live on 2026-10-09) serves
     # once, and the next fact takes the freed slot.
     fused = _rrf_fuse([vec_uuids, bm25_uuids, hop_uuids])
+    fused = _mention_prior(cur, fused, _MENTION_W)
     top = sorted(fused.items(), key=lambda kv: kv[1], reverse=True)
     results: list[dict[str, Any]] = []
     seen_text: set[str] = set()
