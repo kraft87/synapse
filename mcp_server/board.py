@@ -25,6 +25,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from fractions import Fraction
 from typing import Any
 
 import psycopg
@@ -33,7 +34,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
-from ingestion.db_notes import select_board_notes
+from ingestion.db_notes import note_helpful_counts, select_board_notes
 from ingestion.schema_check import ColumnProbe
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
@@ -61,13 +62,29 @@ _MAX_EST_TOKENS = 2000
 # Timeline facts are hook-length lines on the board, never full prose: POST
 # /timeline/events accepts unbounded fact text, and the cap loop can only drop NOTES —
 # without this clamp one verbose feeder would both bust the hard cap and evict every
-# curated note for zero benefit. 10 events x ~200 chars stays well under the caps.
-_EVENT_FACT_MAX = 200
+# curated note for zero benefit. At most _EVENT_DAYS lines of ~180 chars stays well under
+# the caps.
+_EVENT_FACT_MAX = 160
 
-# Overflow drop priority (lower = dropped first): project + reference notes are
-# stale-managed here, user notes go next, feedback/rules are NEVER dropped before
-# the others — a standing correction is the board's whole point.
-_DROP_CLASS = {"project": 0, "reference": 0, "user": 1, "feedback": 2}
+# "Last 7 days" is a pulse, not a log: one line per day, newest days first, no more than
+# _EVENT_DAYS of them. Ten verbose lines took 27% of the budget on prod's board and
+# pushed out the notes the board exists for. The query still reads a wide pool of events
+# (_EVENT_POOL) so one busy day cannot crowd the other days out before the per-day cut.
+_EVENT_DAYS = 5
+_EVENT_POOL = 300
+
+# Overflow policy: PER-TYPE QUOTAS. The board used to drop project/reference notes first,
+# then user notes, then feedback, so on a full-trust board the feedback hooks alone filled
+# the cap and no user, project or reference note was ever shown (eight weeks of boards with
+# zero user notes). Each type now has a weight, and the notes that fit are the first k of a
+# weighted round-robin over the per-type rankings: at every k the mix follows the weights,
+# and a type with fewer notes than its share (a board with no project notes, a restricted
+# surface with three user notes) hands the slack to the others. Feedback weighs most
+# because a standing correction is what the board is for; user notes next because recall's
+# own ratings find them the most useful. A type missing from the table (notes_type_chk
+# makes that unreachable) weighs 1 and sorts last.
+_QUOTA_WEIGHT = {"feedback": 4, "user": 3, "project": 2, "reference": 1}
+_TYPE_ORDER = ("feedback", "user", "project", "reference")
 
 _SECTION_TITLES = {
     "feedback": "## Rules & feedback",
@@ -220,7 +237,7 @@ def _render(
         # "not shown", NOT "behind recall": recall() searches the episode archive, not
         # the notes store, and fetch() is by-id only — an overflowed note's id appears
         # nowhere, so pointing at recall would overpromise.
-        lines.append(f"(+ {dropped} older notes not shown)")
+        lines.append(f"(+ {dropped} notes not shown)")
 
     if events:
         lines.append("")
@@ -235,6 +252,50 @@ def _render(
     return "\n".join(lines)
 
 
+def _one_per_day(events: list[dict[str, Any]], max_days: int = _EVENT_DAYS) -> list[dict[str, Any]]:
+    """The board's "Last 7 days" rows: each day's best event (highest salience, ties to
+    the newest, which is the order ``_recent_events`` returns), for the ``max_days`` most
+    recent days that have one, newest day first."""
+    best: dict[str, dict[str, Any]] = {}
+    for e in events:
+        day = str(e["date"])
+        held = best.get(day)
+        if held is None or (e.get("salience") or 0) > (held.get("salience") or 0):
+            best[day] = e
+    return [best[day] for day in sorted(best, reverse=True)[:max_days]]
+
+
+def _keep_order(notes: list[dict[str, Any]]) -> list[int]:
+    """Indices into ``notes``, most deserving of a board line first.
+
+    Each type ranks its own notes by ``helpful`` (how many recall_feedback reports rated
+    the note helpful; absent counts as 0), then newest ``updated_at``, then highest id.
+    The types are then merged by weighted round-robin: the j-th note of a type with weight
+    w gets the virtual time (j + 1/2) / w, and the merge is by virtual time (ties go to the
+    earlier type in ``_TYPE_ORDER``). Every prefix of the result therefore holds each type
+    in proportion to its weight, and a type that runs out simply stops claiming slots, so
+    its unused share goes to the types that still have notes."""
+    by_type: dict[str, list[int]] = {}
+    for i, note in enumerate(notes):
+        by_type.setdefault(note["type"], []).append(i)
+    slots: list[tuple[Fraction, int, int]] = []
+    for t, idxs in by_type.items():
+        weight = _QUOTA_WEIGHT.get(t, 1)
+        rank = _TYPE_ORDER.index(t) if t in _TYPE_ORDER else len(_TYPE_ORDER)
+        ranked = sorted(
+            idxs,
+            key=lambda i: (
+                notes[i].get("helpful", 0),
+                notes[i]["updated_at"],
+                notes[i]["id"],
+            ),
+            reverse=True,
+        )
+        slots.extend((Fraction(2 * j + 1, 2 * weight), rank, i) for j, i in enumerate(ranked))
+    slots.sort()
+    return [i for _, _, i in slots]
+
+
 def _fit_notes(
     project: str | None,
     n_episodes: int,
@@ -245,8 +306,9 @@ def _fit_notes(
     n_projects: int | None = None,
 ) -> tuple[str, list[dict[str, Any]], int]:
     """Drop the fewest notes that brings the board under both caps: ``(text, kept,
-    dropped)``. Notes leave in drop order (drop class, then oldest updated_at, then id);
-    the survivors keep their list order.
+    dropped)``. Notes leave in reverse ``_keep_order`` (the per-type quotas: the least
+    deserving of the most over-represented type first); the survivors keep their list
+    order.
 
     Guard first: if the fixed portion (banner + clamped events) alone busts the caps, no
     amount of note-dropping can reach them, so every note is kept rather than draining
@@ -278,17 +340,8 @@ def _fit_notes(
     if not _fits(floor):
         return text, list(notes), 0
 
-    # A stable sort reproduces the old loop's tie-break: min() took the first of equals.
-    order = sorted(
-        range(n),
-        key=lambda i: (
-            _DROP_CLASS.get(notes[i]["type"], 0),
-            notes[i]["updated_at"],
-            notes[i]["id"],
-        ),
-    )
     drop_rank = [0] * n
-    for rank, i in enumerate(order):
+    for rank, i in enumerate(reversed(_keep_order(notes))):
         drop_rank[i] = rank
 
     def kept_after(k: int) -> list[dict[str, Any]]:
@@ -347,18 +400,24 @@ def build_board(
     try:
         with pg_pool.connection(db_url) as conn:
             notes = select_board_notes(conn, _OWNER, project, audience=audience)
+            if notes:  # the ranking signal: recall_feedback helpful ratings, same connection
+                helpful = note_helpful_counts(conn)
+                for note in notes:
+                    note["helpful"] = helpful.get(note["id"], 0)
     except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
         notes = []
 
     try:
-        events = _recent_events(
-            db_url,
-            days=7,
-            min_salience=2,
-            limit=10,
-            project=None,
-            allowed_projects=allowed,
-            own_surface=own,
+        events = _one_per_day(
+            _recent_events(
+                db_url,
+                days=7,
+                min_salience=2,
+                limit=_EVENT_POOL,
+                project=None,
+                allowed_projects=allowed,
+                own_surface=own,
+            )
         )
     except psycopg.errors.UndefinedTable:
         events = []

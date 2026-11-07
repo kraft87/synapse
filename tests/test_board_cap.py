@@ -2,7 +2,9 @@
 
 The old cap loop dropped one note at a time and re-rendered after each drop: exact by
 construction, one render per dropped note. ``_fit_notes`` binary-searches the drop count
-instead. These tests pin the two to the same ``(text, kept ids, dropped)`` on randomized
+instead. The loop here drops in the per-type quota order (``_quota_order``, a greedy
+re-derivation of ``board._keep_order`` that shares no code with it), so these tests also
+hold the policy to its definition. They pin the two to the same ``(text, kept ids, dropped)`` on randomized
 note sets and on padding sweeps that walk the cap boundary across every drop count, and
 bound the number of renders. Pure Python, no DB.
 """
@@ -12,22 +14,47 @@ from __future__ import annotations
 import math
 import random
 from datetime import UTC, datetime, timedelta
+from fractions import Fraction
 from typing import Any
 
 import pytest
 
 from mcp_server import board
-from mcp_server.board import _DROP_CLASS, _fit_notes, _fits, _render
+from mcp_server.board import _QUOTA_WEIGHT, _TYPE_ORDER, _fit_notes, _fits, _render
 
 _TYPES = ("feedback", "user", "project", "reference")
 _T0 = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
 
 
+def _quota_order(notes):
+    """The notes best-first under the per-type quotas, built one pick at a time: each
+    pick goes to the type whose next note has the smallest (taken + 1/2) / weight, ties
+    to the earlier type, and it takes that type's best-ranked note (most helpful, then
+    newest updated, then highest id)."""
+    queues: dict[str, list] = {}
+    for n in notes:
+        queues.setdefault(n["type"], []).append(n)
+    for q in queues.values():
+        q.sort(key=lambda n: (n.get("helpful", 0), n["updated_at"], n["id"]), reverse=True)
+    taken = dict.fromkeys(queues, 0)
+    out = []
+    while any(queues.values()):
+        t = min(
+            (t for t in queues if queues[t]),
+            key=lambda t: (Fraction(2 * taken[t] + 1, 2 * _QUOTA_WEIGHT[t]), _TYPE_ORDER.index(t)),
+        )
+        out.append(queues[t].pop(0))
+        taken[t] += 1
+    return out
+
+
 def _old_cap_loop(project, n_episodes, project_names, notes, events, notice, n_projects=None):
-    """The cap loop as it was before ``_fit_notes``, verbatim apart from the return and
-    the banner's project count passed through to ``_render``."""
+    """The cap loop as it was before ``_fit_notes``, apart from the return, the banner's
+    project count passed through to ``_render``, and the victim: the last note of the
+    quota order, not the old drop-class order."""
     kept = list(notes)
     dropped = 0
+    order = _quota_order(notes)
     floor = _render(project, n_episodes, project_names, [], len(notes), events, notice, n_projects)
     can_reach_cap = _fits(floor)
     while True:
@@ -36,8 +63,7 @@ def _old_cap_loop(project, n_episodes, project_names, notes, events, notice, n_p
         )
         if not kept or not can_reach_cap or _fits(text):
             break
-        victim = min(kept, key=lambda n: (_DROP_CLASS.get(n["type"], 0), n["updated_at"], n["id"]))
-        kept.remove(victim)
+        kept.remove(order.pop())
         dropped += 1
     return text, kept, dropped
 
@@ -69,6 +95,7 @@ def _notes(rng: random.Random, n: int, hook_len: tuple[int, int], newline_rate: 
                 "type": rng.choice(_TYPES),
                 "hook": hook,
                 "updated_at": _T0 - timedelta(days=rng.randint(0, 40)),
+                "helpful": rng.choice([0, 0, 0, 1, 2, 5]),
             }
         )
     return out
@@ -154,7 +181,7 @@ def test_k0_fitting_while_k1_does_not_is_kept_at_k0():
             continue
         old_kept = _old_cap_loop("alpha", 1234, ["alpha", "beta"], notes, [], notice)[1]
         if old_kept:  # k=0 fit; now render the board one drop later
-            victim = min(notes, key=lambda n: (_DROP_CLASS[n["type"]], n["updated_at"], n["id"]))
+            victim = _quota_order(notes)[-1]
             one_drop = [n for n in notes if n is not victim]
             if not _fits(_render("alpha", 1234, ["alpha", "beta"], one_drop, 1, [], notice)):
                 hit = True

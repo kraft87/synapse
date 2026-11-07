@@ -405,3 +405,28 @@ def select_board_notes(
             params,
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def note_helpful_counts(conn: psycopg.Connection[Any]) -> dict[int, int]:
+    """``{note id: reports that rated it helpful}`` from recall_feedback (schema 046).
+
+    Agents rate a served note as ``"n:<id>"`` in a report's ``helpful`` list; this counts
+    those, one per report. It is the board's ranking signal within a note type (see
+    mcp_server/board.py), not a recall input: recall's own scoring still ignores feedback.
+    The pattern keeps a malformed entry from raising on the cast, and the text prefilter
+    keeps the JSON expansion to the few reports that mention a note at all.
+
+    A database without recall_feedback yet (it predates schema 046) has no counts, which
+    ranks every note equal, so the board falls back to recency. Takes the connection so the
+    board can run it on the one it already holds; the statement is a single read, and
+    ``conn`` is expected to be in autocommit mode so a missing table leaves it usable."""
+    try:
+        rows = conn.execute(
+            "SELECT m[1]::bigint, count(DISTINCT f.id) FROM recall_feedback f, "
+            "LATERAL jsonb_array_elements_text(f.helpful) AS e, "
+            "LATERAL regexp_match(e, '^n:([0-9]{1,18})$') AS m "
+            "WHERE position('\"n:' IN f.helpful::text) > 0 AND m IS NOT NULL GROUP BY 1"
+        ).fetchall()
+    except psycopg.errors.UndefinedTable:
+        return {}
+    return {int(r[0]): int(r[1]) for r in rows}

@@ -4,7 +4,8 @@
 
 Injects a one-line reminder to close the retrieval-quality loop with recall_feedback().
 recall_feedback is offline labeled data (eval goldens, reranker tuning) that never changes
-live ranking, so the model has no in-band reason to call it and won't unprompted.
+recall's ranking (only the board's within-type note order reads it), so the model has no
+in-band reason to call it and won't unprompted.
 
 OFF by default since 2026-08-26 (was on): the labeled data only serves whoever tunes the
 retrieval stack — for everyone else it's ~60 tokens of noise after every recall plus an
