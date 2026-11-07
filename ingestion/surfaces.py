@@ -177,6 +177,17 @@ OWN_SURFACE_PROBE = ColumnProbe(
 )
 
 
+#: Schema 063 adds ``web_artifacts.audience``. Restricted web serving, the poller's labeller
+#: and the brief script's ``--audience`` all ask this first; until the column exists a
+#: restricted caller is served no web chunks (the pre-063 answer) and nothing is labelled.
+WEB_AUDIENCE_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE attrelid = to_regclass('web_artifacts') "
+    "  AND attname = 'audience' AND NOT attisdropped",
+    "schema 063 (web_artifacts.audience)",
+)
+
+
 def own_surface_columns_ready(conn: Any, key: str = "") -> bool:
     """True when schema 057's provenance columns exist on ``conn``'s database."""
     return OWN_SURFACE_PROBE.ready(conn, key)

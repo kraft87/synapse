@@ -162,7 +162,7 @@ def _engine(db_url, monkeypatch, notes_rows=None):
     r._compact_to_passages = lambda q, eps, n, **_k: [
         {"id": e["id"], "text": e.get("content", "")} for e in eps
     ]
-    r._search_web_reranked = lambda q, emb: []
+    r._search_web_reranked = lambda q, emb, **_k: []
     r._search_kg = lambda *a, **k: ([], [])
     r._fetch_superseded_pairs_pg = lambda gid, uuids, cap, allowed_projects=None: []
     r._surface_supersessions = lambda *a, **k: []
@@ -193,27 +193,92 @@ def test_restricted_recall_filters_episodes_to_the_allowlist(clean, db_url, monk
     assert len(out_full.get("episodes", [])) == 3
 
 
-def test_restricted_recall_serves_no_web_chunks(clean, db_url, monkeypatch):
-    """Web chunks (research briefs, scrapes) have no project or audience provenance, so
-    only a trusted host may be served them."""
-    _episode(clean, "alpha", "alpha discussion of the widget")
-    web_calls: list[str] = []
+class _Emb2048:
+    """Query embedder for the web tests: the real vector leg needs the column's width."""
 
-    def _web(q, emb):
-        web_calls.append(q)
-        return [{"id": "w:1", "content": "a research brief about the widget", "url": "u"}]
+    def embed(self, texts, task):
+        return [[0.5] * 2048 for _ in texts]
 
-    sid = register_restricted(clean, ["alpha"])
+
+@pytest.fixture()
+def web_rows(clean):
+    """Three researched pages that all match "widget": one labelled work-safe, one
+    personal, one never classified (NULL). Each has one embedded chunk."""
+    clean.execute("TRUNCATE web_artifacts RESTART IDENTITY CASCADE")
+    ids = {}
+    for label, audience in (("safe", "work-safe"), ("personal", "personal"), ("unlabelled", None)):
+        aid = clean.execute(
+            "INSERT INTO web_artifacts (kind, tool_name, tool_use_id, url, title, "
+            "content_markdown, fetched_at, audience) "
+            "VALUES ('research_brief', 'run-research', %s, %s, %s, %s, now(), %s) RETURNING id",
+            (f"brief:{label}", f"research://{label}", label, f"{label} widget notes", audience),
+        ).fetchone()[0]
+        cid = clean.execute(
+            "INSERT INTO web_chunks (web_artifact_id, idx, content, char_start, char_end, "
+            "embedding, is_embedded, content_ts) VALUES (%s, 0, %s, 0, 20, "
+            "array_fill(0.5::real, ARRAY[2048])::vector, true, now()) RETURNING id",
+            (aid, f"{label} widget notes"),
+        ).fetchone()[0]
+        ids[label] = f"w:{cid}"
+    yield ids
+    clean.execute("TRUNCATE web_artifacts RESTART IDENTITY CASCADE")
+
+
+def _web_engine(db_url, monkeypatch):
+    """_engine with the REAL web legs (BM25 + vector SQL), so the audience predicate is
+    what is under test; only the embedder and the cross-encoder are stubbed."""
     r = _engine(db_url, monkeypatch)
-    r._search_web_reranked = _web
-    out = r.recall("widget", surface=sid)
-    assert "web" not in out
-    assert web_calls == []
+    del r._search_web_reranked  # back to the class method: real SQL legs
+    r._ensure_embedder = lambda: _Emb2048()
+    return r
 
+
+def test_restricted_recall_serves_only_work_safe_web(web_rows, clean, db_url, monkeypatch):
+    """Schema 063: a restricted surface is served the web research labelled work-safe,
+    whatever project asked for it (the allowlist here is empty), and never a personal
+    or unlabelled page. Before 063 it was served no web at all."""
+    sid = register_restricted(clean, [])
+    out = _web_engine(db_url, monkeypatch).recall("widget", surface=sid)
+    assert [w["id"] for w in out.get("web", [])] == [web_rows["safe"]]
+
+
+def test_full_trust_web_is_unfiltered(web_rows, clean, db_url, monkeypatch):
+    """Full trust reads every label, NULL included: the audience only narrows restricted."""
     full = register_full(clean)
-    r_full = _engine(db_url, monkeypatch)
-    r_full._search_web_reranked = _web
-    assert [w["id"] for w in r_full.recall("widget", surface=full).get("web", [])] == ["w:1"]
+    out = _web_engine(db_url, monkeypatch).recall("widget", surface=full)
+    assert sorted(w["id"] for w in out.get("web", [])) == sorted(web_rows.values())
+
+
+def test_unknown_caller_gets_work_safe_web_only(web_rows, clean, db_url, monkeypatch):
+    """An unidentified caller is restricted (fail-closed), so it is held to the same
+    tier: work-safe or nothing."""
+    out = _web_engine(db_url, monkeypatch).recall("widget")
+    assert [w["id"] for w in out.get("web", [])] == [web_rows["safe"]]
+
+
+def test_restricted_recall_before_063_serves_no_web(web_rows, clean, db_url, monkeypatch):
+    """Until web_artifacts.audience exists there is no label to filter on, so a
+    restricted caller keeps the pre-063 answer: no web, and the legs never run."""
+    sid = register_restricted(clean, ["alpha"])
+    r = _web_engine(db_url, monkeypatch)
+    calls: list[str] = []
+    r._web_audience_ready = lambda: False
+    r._search_web_reranked = lambda q, emb, **k: calls.append(q) or []
+    out = r.recall("widget", surface=sid)
+    assert "web" not in out and calls == []
+
+
+def test_web_audience_probe_answers_absent_without_the_column(clean):
+    from ingestion.schema_check import ColumnProbe
+    from ingestion.surfaces import WEB_AUDIENCE_PROBE
+
+    probe = ColumnProbe(WEB_AUDIENCE_PROBE._sql, "t")
+    with pytest.raises(RuntimeError), clean.transaction():
+        clean.execute("SET LOCAL lock_timeout = '5s'")  # fail, never hang, if a lock is held
+        clean.execute("ALTER TABLE web_artifacts DROP COLUMN audience")
+        assert not probe.ready(clean, "without-063")
+        raise RuntimeError("roll the DROP back")
+    assert ColumnProbe(WEB_AUDIENCE_PROBE._sql, "t").ready(clean, "with-063")
 
 
 def test_recall_without_a_surface_serves_no_episodes(clean, db_url, monkeypatch):
