@@ -249,3 +249,75 @@ def test_promote_is_a_noop(server, capsys):
     skill_review.cmd_promote(7)
     assert server.sent == [("/skills/proposals/act", {"id": 7, "action": "promote"})]
     assert "applied at accept" in capsys.readouterr().out
+
+
+def test_revert_sends_the_action_and_reports_what_was_undone(server, capsys):
+    server.replies["/skills/proposals/act"] = {
+        "status": "reverted",
+        "id": 7,
+        "skill": "demo-backup",
+        "action": "restored",
+        "scope": "global",
+    }
+    skill_review.cmd_revert(7, "too broad", True)
+    assert server.sent == [
+        (
+            "/skills/proposals/act",
+            {"id": 7, "action": "revert", "reason": "too broad", "force": True},
+        )
+    ]
+    out = capsys.readouterr().out
+    assert "reverted [7] 'demo-backup': the previous version was restored" in out
+
+
+def test_revert_refusal_exits_nonzero_with_the_reason(server):
+    server.replies["/skills/proposals/act"] = {
+        "status": "refused",
+        "detail": "'demo-backup' was edited after the lane created it",
+    }
+    with pytest.raises(SystemExit) as e:
+        skill_review.cmd_revert(7, None, False)
+    assert "edited after the lane created it" in str(e.value)
+
+
+def test_report_prints_the_last_built_report(server, capsys):
+    server.replies["/skills/autopilot"] = {
+        "status": "ok",
+        "last_report": {
+            "at": "2026-11-06T08:00:00+00:00",
+            "text": "Skills lane 11-06: 1 auto-applied",
+        },
+    }
+    skill_review.cmd_report()
+    assert server.sent == [("/skills/autopilot", {"action": "report"})]
+    assert "1 auto-applied" in capsys.readouterr().out
+
+
+def test_autopilot_status_and_resume(server, capsys):
+    server.replies["/skills/autopilot"] = {
+        "status": "ok",
+        "last_mode": "shadow",
+        "last_run_at": "2026-11-06T08:00:00+00:00",
+        "breaker": {"tripped": True, "rollbacks": [{"id": 1}, {"id": 2}]},
+        "counts_14d": {"applied": 2},
+        "recent": [
+            {
+                "id": 9,
+                "candidate_id": 7,
+                "night": "2026-11-06",
+                "tier": "description",
+                "verdict": "applied",
+                "mode": "live",
+                "skill": "demo-backup",
+                "rolled_back_at": "2026-11-07T00:00:00+00:00",
+                "rollback_reason": "dismissed",
+            }
+        ],
+    }
+    skill_review.cmd_autopilot("status")
+    out = capsys.readouterr().out
+    assert "TRIPPED, running as shadow" in out and "ROLLED BACK (dismissed)" in out
+    server.replies["/skills/autopilot"] = {"status": "resumed", "tripped": False, "rollbacks": []}
+    skill_review.cmd_autopilot("resume")
+    assert server.sent[-1] == ("/skills/autopilot", {"action": "resume"})
+    assert "re-armed" in capsys.readouterr().out
