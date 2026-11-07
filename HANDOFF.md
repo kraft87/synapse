@@ -3,7 +3,7 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
-## 2026-11-07 — dream→config lane: identity by meaning, a coverage gate, a queue that tends itself (plugin 0.22.2, schema 065)
+## 2026-11-07 — dream→config lane: identity by meaning, a coverage gate, a queue that tends itself (plugin 0.23.1, schema 065)
 
 **What changed**
 
@@ -27,13 +27,15 @@ changed, what to do on each machine, what was proven, and what is still open.
   of opening a new proposal (closes the config-lane cooldown gap in
   `docs/dashboard-contract.md`).
 - `/config/proposals` and `config_review.py list|show` carry the recommendation and the
-  days pending (plugin 0.22.2).
+  days pending (plugin 0.23.1).
 
 **Order of rollout**
 
 1. Merge → the dream image. Until 065 is applied the lane probes, logs one line
    (`schema 065 not applied; the lane idles`) and does nothing; its scan watermark does not
-   move, so no session is skipped.
+   move, so the first run after 065 starts where the lane stopped. That run still scans at
+   most `CONFIG_LANE_LIMIT` x 4 sessions (120) before it moves the watermark, as the lane
+   always has, so apply 065 soon after the image to keep the backlog under that.
 2. Apply `schema/065_config_lane_identity.sql` (marked optional; four nullable columns,
    guarded, one UPDATE that stamps `proposed_at` for rows already proposed). Apply 063 and
    064 first if they have merged, so the version stamp stays in order.
@@ -46,12 +48,58 @@ changed, what to do on each machine, what was proven, and what is still open.
 4. Morning briefing: a separate patch to the operator's briefing script adds a "Config
    proposals" block (it reads `config_proposals` directly, with a pre-065 fallback); it is
    not part of this change.
-5. `synapse update` on each machine for the 0.22.2 review CLI (older clients keep working;
+5. `synapse update` on each machine for the 0.23.1 review CLI (older clients keep working;
    they just don't print the recommendation).
 
 **Note for restricted devices**: merged evidence spans sessions, so a restricted caller
 (`_OWN_PROPOSAL` needs every evidence session to be its own) sees fewer proposals; a full-trust
 caller is unaffected.
+
+## 2026-11-06 — dream→skills autopilot: the lane decides the routine proposals itself (plugin 0.23.0, schema 064)
+
+**What changed**
+
+- **Applied without a person** when a reviewer (the `claude` CLI, Opus) accepts and an
+  independent verifier (a non-Claude model, evidence in both orders) passes it: a new skill
+  that met the recurrence gate, or a description-only change to an unpinned skill. At most 3
+  a night, 1 new skill a night, 3 a week. **Auto-rejected** (30-day cooldown, no grounded -3)
+  when the reviewer rejects and the verifier agrees. Body edits, merges, pinned skills and
+  any disagreement stay proposed, with the reviewer's recommendation.
+- One write path: `skill_sync_routes.apply_candidate(actor)` serves a person's accept and the
+  autopilot; `skill_history` keeps the replaced body, two-way sync delivers the change. The
+  constraint is now "a grounded weight, or `applied_by='auto'` with a recorded review"; the
+  auto path never writes a grounded entry. Every decision is a row in
+  `skills_lane.skill_auto_reviews` (audit trail and judge-once memo).
+- **Undo**: `skill_review.py revert N` (retires an auto-created skill; puts a description back
+  and keeps later hand edits). Automatic for 14 days: a dismissed or deviating fire after the
+  change, the owner editing the description away or retiring the new skill. A local edit a sync
+  pulled over the change is kept: the description is merged onto it, or the local body is
+  restored and the row returns to the queue. Two rollbacks in 14 days pause the autopilot
+  (`skill_review.py autopilot status|resume`).
+- **Report**: auto-applied lines first, each ending `undo: revert N`; every built report is
+  also stored in `skill_scan_cursor.config.last_report` (`{at, text}`) for whoever delivers it
+  (`skill_review.py report`).
+- **The reviewer call is stripped** (`dream/skills/claude_cli.py`): no tools, settings, MCP,
+  hooks, memory files or side calls, so a call carries the prompt plus about 1.6k tokens of
+  preamble instead of 16k to 76k. The calibration script makes the same call.
+
+**Order of rollout**
+
+1. Merge → image. Until 064 is applied the stage logs one line and skips; a person's accept
+   works as before.
+2. Apply `schema/064_skills_autopilot.sql` (marked optional; `scripts/apply_schema.sh`).
+3. The reviewer needs a logged-in `claude` CLI. If the dream container has none, run
+   `scripts/skills_autopilot.py` on a host that does, after the nightly dream (drafting
+   happens there), through `scripts/skills_autopilot_cron.sh`, which reads the database URL
+   and the verifier's key from env files so no password sits in the crontab:
+   `<min> <hour> * * * <checkout>/scripts/skills_autopilot_cron.sh <file with SYNAPSE_DB_URL>
+   <file with OPENROUTER_API_KEY> [--notify-cmd '<command that posts its last argument>']
+   >> <log> 2>&1`. The nightly lane then reconciles and reports only. Set
+   `SKILLS_AUTOREVIEW_REVIEW=1` instead when the container has a login.
+4. `SKILLS_AUTOREVIEW` defaults to `live`; `shadow` records what it would do, `off` skips.
+5. `synapse update` on each machine for the 0.23.0 review CLI (`revert`, `report`, `autopilot`).
+
+**Still open**: see the PR's Not done list.
 
 ## 2026-11-06 — repair numbered-entity magnets (script only, no schema or serving change)
 

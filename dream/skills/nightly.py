@@ -16,13 +16,17 @@ skill_registry table (the client's skills_sync owns the disk<->registry publish)
                       draft) gets a complete SKILL.md + base_body_hash (skill_draft.py)
   7. review queue   — auto-reject undeliverable retunes, expire unanswered proposals, store
                       a recommendation per draft (review_queue.py)
+  7b. autopilot     — autoreview.run: roll back auto-applies that went wrong, and (when this
+                      container has the reviewer) judge the queue and apply/reject the routine
+                      rows; SKILLS_AUTOREVIEW = off | shadow | live
   8. decay + report — retire stale 'observe' candidates (proposed rows wait for review);
                       the verdict-first report when the queue changed, weekly otherwise
 Incremental via skill_scan_cursor (whole-session scan since last_scan_at). --backfill ignores the watermark.
 
 The LLM finders honor SKILL_MEASURE_MODEL (deepseek for cheap backfill); drafting uses Opus.
-Propose-only: nothing here writes skill_registry or sets status='promoted' — the review
-accept does both (mcp_server/skill_sync_routes.py).
+Nothing here writes skill_registry or sets status='promoted' except through
+skill_sync_routes.apply_candidate: a person's review accept, or the autopilot's own apply
+(dream/skills/autoreview.py, a recorded review row each).
 """
 
 from __future__ import annotations
@@ -33,7 +37,15 @@ import re
 
 from psycopg.rows import dict_row
 
-from . import config, post_fire, procedure_miner, review_queue, skill_draft, struggle_arc
+from . import (
+    autoreview,
+    config,
+    post_fire,
+    procedure_miner,
+    review_queue,
+    skill_draft,
+    struggle_arc,
+)
 from . import skill_db_source as DB
 from . import skill_derive as SD
 from . import skill_doc as D
@@ -414,11 +426,22 @@ def run_lane(limit: int = 40, backfill: bool = False, no_discord: bool = False) 
     expired = review_queue.expire(conn)
     counts["auto_rejected"], counts["expired"] = rejected["auto_rejected"], expired["expired"]
     print(f"review: auto_rejected={rejected['auto_rejected']} expired={expired['expired']}")
+    # The autopilot (autoreview): always reconciles what it applied before; judges and acts on
+    # the queue here only when SKILLS_AUTOREVIEW_REVIEW=1 (the reviewer is a logged-in claude
+    # CLI; the usual deployment runs it from the host, scripts/skills_autopilot.py).
+    auto = autoreview.run(
+        conn, run_started, review=os.environ.get("SKILLS_AUTOREVIEW_REVIEW", "") == "1"
+    )
+    print("autopilot:", _tally(counts, "autoreview", autoreview.flat_counts(auto)))
     print("recommend:", _tally(counts, "recommend", review_queue.recommend(conn)))
     decay = L.decay_stale(conn)
     counts["retired"] = decay["retired"]
     print("decay:", decay)
-    changes = {"auto_rejected": rejected["items"], "expired": expired["items"]}
+    changes = {
+        "auto_rejected": rejected["items"],
+        "expired": expired["items"],
+        "autopilot": auto,
+    }
     rep = review_queue.report(conn, run_started, changes, no_discord)
     counts["digest_sent"] = rep["sent"]
     print("report:", rep)

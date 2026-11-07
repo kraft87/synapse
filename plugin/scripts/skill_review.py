@@ -11,8 +11,16 @@
     skill_review.py reject <id> [reason]    # grounded reject -> rejected + 30d cooldown
     skill_review.py revive <id>             # a rejected/expired/retired one back to proposed
     skill_review.py promote <id>            # no-op kept for compatibility: accept applied it
+    skill_review.py revert <id> [reason] [--force]
+                                            # UNDO a change the autopilot applied (id = the
+                                            # candidate id in the report's "undo: revert N")
+    skill_review.py report                  # the last report the nightly lane built
+    skill_review.py autopilot status|resume # the autopilot's mode, breaker and recent reviews;
+                                            # resume re-arms it after the circuit breaker tripped
 
-accept/reject are the grounded signals (the LLM judge can only nominate). accept writes the
+accept/reject are the grounded signals (the LLM judge can only nominate; the autopilot,
+dream/skills/autoreview.py, applies or rejects the routine rows itself under a recorded
+review and never writes a grounded signal, `revert` undoes any of its applies). accept writes the
 drafted SKILL.md — or --body-file, a version you edited — into the server's skill registry in
 one transaction, through the same write a client publish makes. The machine that owns the
 skill pulls it at its next session start via the two-way skills sync; when this machine syncs
@@ -235,15 +243,78 @@ def cmd_promote(cid: int) -> None:
     print(r.get("detail") or "not found")
 
 
+def cmd_revert(cid: int, reason: str | None, force: bool) -> None:
+    r = config.post_json(
+        "/skills/proposals/act",
+        {"id": cid, "action": "revert", "reason": reason, "force": force},
+    )
+    status = r.get("status")
+    if status == "reverted":
+        how = {
+            "retired": "the new skill was retired",
+            "restored": "the previous version was restored",
+            "description_restored": "the description was put back; later edits were kept",
+            "description_already_gone": "the description had already been replaced",
+            "already_gone": "the skill was already gone",
+        }.get(r.get("action"), r.get("action"))
+        print(f"reverted [{cid}] '{r.get('skill')}': {how}. The candidate is rejected for 30 days.")
+        _deliver(r.get("scope") or "global")
+        return
+    if status == "refused":
+        sys.exit(f"refusing [{cid}]: {r.get('detail')}")
+    sys.exit(r.get("detail") or "not found")
+
+
+def cmd_report() -> None:
+    r = config.post_json("/skills/autopilot", {"action": "report"})
+    if r.get("status") != "ok":
+        sys.exit(r.get("detail") or "no answer")
+    last = r.get("last_report")
+    if not last:
+        print("no report built yet.")
+        return
+    print(f"(built {last.get('at')})")
+    print(last.get("text"))
+
+
+def cmd_autopilot(action: str) -> None:
+    r = config.post_json("/skills/autopilot", {"action": action})
+    if r.get("status") not in ("ok", "resumed"):
+        sys.exit(r.get("detail") or "no answer")
+    br = r.get("breaker") or {}
+    if action == "resume":
+        print("autopilot re-armed: rollbacks before now no longer count toward the breaker.")
+        return
+    print(f"mode (last run): {r.get('last_mode')}  last run: {r.get('last_run_at')}")
+    state = "TRIPPED, running as shadow" if br.get("tripped") else "ok"
+    print(f"breaker: {state} ({len(br.get('rollbacks') or [])} rollbacks counted)")
+    print(f"last 14 days: {r.get('counts_14d') or 'nothing'}")
+    for x in r.get("recent") or []:
+        undone = f"  ROLLED BACK ({x['rollback_reason']})" if x.get("rolled_back_at") else ""
+        print(
+            f"  review {x['id']} [{x['candidate_id']}] {x['night']} {x['tier']} -> "
+            f"{x['verdict']} ({x['mode']}) {x.get('skill') or ''}{undone}"
+        )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list")
-    for c in ("show", "accept", "reject", "revive", "promote"):
+    sub.add_parser("report")
+    ap_cmd = sub.add_parser("autopilot")
+    ap_cmd.add_argument("action", choices=("status", "resume"))
+    for c in ("show", "accept", "reject", "revive", "promote", "revert"):
         p = sub.add_parser(c)
         p.add_argument("id", type=int)
-        if c == "reject":
+        if c in ("reject", "revert"):
             p.add_argument("reason", nargs="?", default=None)
+        if c == "revert":
+            p.add_argument(
+                "--force",
+                action="store_true",
+                help="retire an auto-created skill even though it was edited since",
+            )
         if c == "accept":
             p.add_argument("--body-file", help="apply this SKILL.md instead of the draft")
             p.add_argument("--scope", help="'global' or 'project:<name>' (overrides the default)")
@@ -265,6 +336,12 @@ def main() -> None:
         cmd_revive(args.id)
     elif args.cmd == "promote":
         cmd_promote(args.id)
+    elif args.cmd == "revert":
+        cmd_revert(args.id, args.reason, args.force)
+    elif args.cmd == "report":
+        cmd_report()
+    elif args.cmd == "autopilot":
+        cmd_autopilot(args.action)
 
 
 if __name__ == "__main__":

@@ -41,14 +41,28 @@ _ORPHAN_SWEEP_INTERVAL_S = 24 * 3600
 _ORPHAN_MIN_AGE_H = 24
 
 
+def _web_audience_batch() -> int:
+    """Unlabelled web artifacts classified per full cycle (schema 063). Small on purpose:
+    each costs up to SYNAPSE_WEB_AUDIENCE_VOTES calls, and new research arrives a few
+    pages at a time; the pre-063 backlog is scripts/web_audience_backfill.py's job."""
+    try:
+        return max(1, int(os.environ.get("SYNAPSE_WEB_AUDIENCE_BATCH", "10") or "10"))
+    except ValueError:
+        return 10
+
+
 class Poller:
     def __init__(
         self,
         db: Database,
         extraction_pipeline: ExtractionPipeline | None = None,
         worker_factory: Callable[[], tuple[Database, ExtractionPipeline]] | None = None,
+        audience_llm: Any | None = None,
     ) -> None:
         self._db = db
+        # LLM client for the web-audience classifier (ingestion/web_audience.py). None
+        # (tests, callers that don't wire it) skips the stage.
+        self._audience_llm = audience_llm
         self._extraction = extraction_pipeline
         # Per-THREAD (db, pipeline) builder for the concurrent drain path: Database
         # holds one non-autocommit connection whose commit/rollback would entangle
@@ -72,6 +86,22 @@ class Poller:
         if self._extraction is None:
             return 0
         return int(self._extraction._kg.delete_orphan_entities(_ORPHAN_MIN_AGE_H))
+
+    def label_web_audience(self) -> int:
+        """Classify a bounded batch of unlabelled web artifacts so restricted surfaces can
+        be served the work-safe ones (schema 063). A no-op before 063, without an LLM
+        client, or with ``SYNAPSE_WEB_AUDIENCE=0``. Returns the number labelled."""
+        from ingestion import web_audience
+
+        if self._audience_llm is None or not web_audience.enabled():
+            return 0
+        stats = web_audience.label_pending(
+            self._db._conn, self._audience_llm, limit=_web_audience_batch()
+        )
+        n = sum(stats.labelled.values())
+        if n:
+            logger.info(stats.line())
+        return n
 
     def embed_pending(self, batch_size: int = 96) -> int:
         """Embed unembedded episodes and chunks.
@@ -415,6 +445,13 @@ class Poller:
                         self.embed_pending()
                     except Exception as e:
                         logger.error("Embed pending failed: %s", e, exc_info=True)
+                    try:
+                        self.label_web_audience()
+                    except Exception as e:
+                        # Includes provider/transport errors: the batch's remaining
+                        # rows stay unlabelled (never served restricted) and the next
+                        # cycle retries them.
+                        logger.error("Web audience labelling failed: %s", e, exc_info=True)
                     if now_mono - last_orphan_sweep >= _ORPHAN_SWEEP_INTERVAL_S:
                         try:
                             n_orphans = self.sweep_orphan_entities()
@@ -494,4 +531,4 @@ def make_poller(
         )
         return wdb, wpipe
 
-    return Poller(db=db, extraction_pipeline=pipeline, worker_factory=_worker)
+    return Poller(db=db, extraction_pipeline=pipeline, worker_factory=_worker, audience_llm=llm)

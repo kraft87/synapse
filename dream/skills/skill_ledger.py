@@ -50,6 +50,27 @@ def queue_ready(conn) -> bool:
     return QUEUE_PROBE.ready(conn, conn.info.dsn)
 
 
+#: Schema 064 adds the autopilot's audit table (skill_auto_reviews) and the columns that say
+#: who applied a row (applied_by, auto_review_id) and which body the lane wrote
+#: (skill_registry.lane_body_hash). Until all of them exist the autopilot does not run and
+#: a human accept leaves applied_by unset.
+AUTOPILOT_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE NOT attisdropped AND ("
+    "  (attrelid = to_regclass('skills_lane.skill_gap_candidates') "
+    "     AND attname IN ('applied_by', 'auto_review_id')) "
+    "  OR (attrelid = to_regclass('skills_lane.skill_registry') AND attname = 'lane_body_hash') "
+    "  OR (attrelid = to_regclass('skills_lane.skill_auto_reviews') "
+    "     AND attname IN ('rolled_back_at', 'events'))) "
+    "HAVING count(*) = 5",
+    "schema 064 (skill_auto_reviews, applied_by, auto_review_id, lane_body_hash)",
+)
+
+
+def autopilot_ready(conn) -> bool:
+    return AUTOPILOT_PROBE.ready(conn, conn.info.dsn)
+
+
 # identity / classification knobs (Oracle-reviewed defaults)
 SESSION_JACCARD = 0.4  # derive identity: evidence-session overlap (ground truth, primary)
 SIGNATURE_JACCARD = 0.6  # derive identity: signature-token overlap (secondary)
