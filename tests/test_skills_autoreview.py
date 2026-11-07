@@ -195,3 +195,27 @@ def test_verifier_model_requires_a_non_claude_openai_compatible_stage(monkeypatc
     assert A.verifier_model() == "z-ai/some-model"
     monkeypatch.setenv("SYNAPSE_SKILLS_VERIFY_MODEL", "anthropic/claude-sonnet")
     assert A.verifier_model() is None
+
+
+def test_the_report_keeps_every_autopilot_line_with_its_command():
+    """Applied and rejected rows are undone only from the report (revert / revive N): past
+    the length cap they lose their reasons, never their line."""
+    from dream.skills import review_queue as RQ
+
+    long = "a long reason " * 12
+    auto = {
+        "applied": [{"id": i, "what": f"ap-skill{i} widen", "reason": long} for i in (1, 2, 3)],
+        "rejected": [
+            {"id": i, "what": f"new skill ap-new{i}", "reason": long} for i in range(10, 15)
+        ],
+        "rolled_back": [{"id": 20, "what": "ap-skill20 description", "reason": "dismissed"}],
+    }
+
+    text = RQ.build_report("11-07", [], [], [], auto)
+
+    assert len(text) <= RQ.REPORT_CHARS
+    assert all(f"(undo: revert {i})" in text for i in (1, 2, 3))
+    assert all(f"Reply 'revive {i}'" in text for i in range(10, 15))
+    assert "rolled back #20" in text
+    short = RQ.build_report("11-07", [], [], [], {"rejected": auto["rejected"][:1]})
+    assert "a long reason" in short  # the reasons stay when they fit

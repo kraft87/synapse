@@ -465,6 +465,135 @@ def test_new_skills_one_a_night_and_three_a_week(db, ap, llm):
     assert res["applied"] == [] and "this week" in res["capped"][0]["why"]
 
 
+def _next_night(conn):
+    """Tonight's autopilot rows become last night's (the caps count by night and week)."""
+    conn.execute(
+        "UPDATE skills_lane.skill_auto_reviews SET night = night - 1, "
+        "applied_at = applied_at - interval '1 day' WHERE skill LIKE 'ap-%%'"
+    )
+
+
+def test_a_stored_apply_is_judged_again_once_a_sibling_was_applied(db, ap, monkeypatch):
+    """Two derives for the same procedure, both judged 'apply' while neither existed. Once one
+    is applied, the other's stored judgement is stale: it is judged again against a catalog
+    that has its sibling, not applied from the memo as a duplicate skill."""
+    llm = LLM(monkeypatch)
+    prompts: list[str] = []
+
+    def reviewer(prompt):
+        prompts.append(prompt)
+        llm.n_rev += 1
+        dup = "- ap-sib-a:" in prompt or "- ap-sib-b:" in prompt
+        verdict = "reject" if dup else "accept"
+        return json.dumps({"verdict": verdict, "reason": "covered" if dup else "reusable"})
+
+    monkeypatch.setattr(A, "_reviewer_call", reviewer)
+    a, _ = _new_case(db, "ap-sib-a")
+    b, _ = _new_case(db, "ap-sib-b")
+    A.run(ap, mode="shadow")
+    assert llm.n_rev == 2 and [r[1] for r in _reviews(db, b)] == ["would_apply"]
+
+    res = A.run(ap, mode="live")
+
+    assert [x["id"] for x in res["applied"]] == [a]
+    assert llm.n_rev == 3 and "- ap-sib-a:" in prompts[-1]  # b judged again, with a installed
+    assert [r[1] for r in _reviews(db, b)] == ["would_apply", "ask"]
+    _next_night(db)
+    res = A.run(ap, mode="live")  # a later night: still not applied from the old memo
+    assert res["applied"] == [] and _reg(db, "ap-sib-b") is None
+    assert _cand_row(db, b, "status")[0] == "proposed"
+
+
+def test_a_stored_backlog_acts_at_most_the_review_cap_a_night_and_each_is_reported(
+    db, ap, monkeypatch
+):
+    """A shadow period leaves stored judgements; going live acts on at most REVIEW_CAP of
+    them a night (not all at once), and the report lists every one with its revive."""
+    llm = LLM(monkeypatch, rev="reject", ver="flag")
+    ids = [_desc_case(db, f"ap-back{i}")[0] for i in range(A.REVIEW_CAP + 2)]
+    A.run(ap, mode="shadow")
+    A.run(ap, mode="shadow")
+    assert llm.n_rev == len(ids)  # all judged, over two nights
+
+    res = A.run(ap, mode="live")
+
+    assert len(res["rejected"]) == A.REVIEW_CAP and llm.n_rev == len(ids)
+    when = datetime(2026, 11, 7, 8, 0, tzinfo=UTC)
+    text = RQ.report(ap, when, {"autopilot": res}, deliver=False)["text"]
+    assert all(f"revive {r['id']}'" in text for r in res["rejected"])
+    rest = A.run(ap, mode="live")["rejected"]
+    assert sorted(r["id"] for r in res["rejected"] + rest) == sorted(ids)
+
+
+def test_a_row_reopened_on_the_evidence_it_was_rejected_on_is_rejected_again(db, ap, monkeypatch):
+    llm = LLM(monkeypatch, rev="reject", ver="flag")
+    cid, _ = _desc_case(db, "ap-again")
+    assert [r["id"] for r in A.run(ap, mode="live")["rejected"]] == [cid]
+    # past its cooldown a re-sighting of the same session reopens it (skill_ledger)
+    db.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='proposed', reject_reason=NULL, "
+        "rejected_until=NULL WHERE id=%s",
+        (cid,),
+    )
+
+    res = A.run(ap, mode="live")
+
+    assert [r["id"] for r in res["rejected"]] == [cid] and llm.n_rev == 1  # memo, no new call
+    assert _cand_row(db, cid, "status, reject_reason") == ("rejected", "auto:review")
+    assert [r[1] for r in _reviews(db, cid)] == ["rejected", "rejected"]
+
+
+def test_an_auto_reject_is_a_snooze_that_new_evidence_ends(db, ap, monkeypatch):
+    """End to end through the ledger: no -3, the cooldown holds, a new session after it
+    reopens the row and the autopilot judges it again (the evidence hash changed)."""
+    LLM(monkeypatch, rev="reject", ver="flag")
+    cid, _ = _desc_case(db, "ap-snooze")
+    before = db.execute(
+        "SELECT score, grounded_weight FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
+    ).fetchone()
+    A.run(ap, mode="live")
+    after = db.execute(
+        "SELECT score, grounded_weight, status FROM skills_lane.skill_gap_candidates WHERE id=%s",
+        (cid,),
+    ).fetchone()
+    assert after == (*before, "rejected")  # no grounded -3, no score change
+
+    def sight(sid):
+        new = {**_under(sid), "quote": "can it restore the demo database too"}
+        return L.merge_candidate(
+            ap,
+            "retune",
+            "ap-snooze",
+            [new],
+            direction="widen",
+            target_skills=["ap-snooze"],
+            do_embed=False,
+        )
+
+    assert sight("ap-s3")["status"] == "rejected"  # inside the 30 days: the snooze holds
+    db.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET rejected_until = now() - interval '1 day' "
+        "WHERE id=%s",
+        (cid,),
+    )
+    assert sight("ap-s4")["status"] == "proposed"  # after it: new evidence reopens the row
+    llm = LLM(monkeypatch)  # the evidence changed, so it is judged again
+
+    res = A.run(ap, mode="live")
+
+    assert llm.n_rev == 1 and [x["id"] for x in res["applied"]] == [cid]
+    assert [r[1] for r in _reviews(db, cid)] == ["rejected", "applied"]
+
+
+def test_revive_takes_an_auto_rejected_row_out_of_the_lanes_hands(db, ap, monkeypatch):
+    llm = LLM(monkeypatch, rev="reject", ver="flag")
+    cid, _ = _desc_case(db, "ap-revive")
+    A.run(ap, mode="live")
+    assert _proposal_act(db.dsn_url, cid, "revive", None, lambda *a: "")["status"] == "proposed"
+    A.run(ap, mode="live")
+    assert _cand_row(db, cid, "status")[0] == "proposed" and llm.n_rev == 1  # a person's now
+
+
 # ------------------------------------------------------------------ revert
 def test_revert_retires_an_auto_created_skill_and_cools_the_candidate(db, ap, llm):
     cid, _body = _new_case(db, "ap-undo-new")

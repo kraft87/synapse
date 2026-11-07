@@ -25,9 +25,11 @@ review and is asked twice, with the evidence in both orders.
           reviewer/verifier disagreement, a verifier that could not answer.
 
 A row is judged once per (evidence_hash, draft_hash): a re-scan of the same sessions is
-not new evidence, so a reopened row is not re-judged on what it was judged on. A stored
-'apply' is re-checked against the catalog before it is acted on (a sibling applied since
-may cover it now). A row a person has acted on (accept/reject/revive) is never decided here.
+not new evidence, so a reopened row is not re-judged on what it was judged on (a stored
+reject is acted on again). A stored 'apply' is judged again when the installed catalog
+changed since (a sibling applied since may cover it now). REVIEW_CAP bounds a night: rows
+judged plus rows applied/rejected on a stored judgement. A row a person has acted on
+(accept/reject/revive) is never decided here.
 
 Rollback (reconcile, every night before the review): within ROLLBACK_DAYS of an apply,
   - a fire of the changed skill after the apply that was dismissed, or that post_fire
@@ -74,7 +76,7 @@ DEFAULT_MODE = "live"
 NIGHT_APPLY_CAP = 3
 NEW_SKILL_NIGHT_CAP = 1
 NEW_SKILL_WEEK_CAP = 3
-REVIEW_CAP = 5  # rows judged per night (1 reviewer + 2 verifier calls each)
+REVIEW_CAP = 5  # a night: rows judged (1 reviewer + 2 verifier calls) + rows acted on from memo
 ROLLBACK_DAYS = 14
 BREAKER_ROLLBACKS = 2
 MAX_NEW_SKILL_BYTES = 8192
@@ -776,6 +778,21 @@ def _record(c, cid, night, mode, eh, dh, tier, pre, j, verdict, skill) -> int:
     ).fetchone()["id"]  # fmt: skip
 
 
+def _quiet(prior: dict | None, verdict: str, mode: str, failed: bool) -> bool:
+    """A stored judgement reused to the verdict it already recorded: nothing new to record or
+    say (a fresh judgement is always recorded). A reject is never quiet: a row back in the
+    queue on the evidence + draft it was rejected on (reopened after its cooldown by a
+    re-sighting of the same sessions) is rejected again, not left in a person's queue
+    without a word."""
+    return bool(
+        prior
+        and prior["verdict"] == verdict
+        and prior["mode"] == mode
+        and not failed
+        and verdict != "rejected"
+    )
+
+
 def _recommendation(j: dict, dh: str | None, note: str) -> dict | None:
     rev = j.get("reviewer")
     if not rev:
@@ -808,6 +825,7 @@ def review_pass(c, mode: str, night=None, cap: int = REVIEW_CAP) -> dict:
     }
     catalog = [(n, r["description"] or "") for n, r in regs.items() if r["status"] == "active"]
     c.commit()
+    acted = 0  # rows acted on (applied/rejected) from a stored judgement; shares `cap`
     for row in rows:
         if human_touched(row["evidence"]):
             continue
@@ -824,15 +842,26 @@ def review_pass(c, mode: str, night=None, cap: int = REVIEW_CAP) -> dict:
             and plan["exists"]
             and (reg["lane_body_hash"] is None or reg["lane_body_hash"] != D.body_hash(reg["body"]))
         )
-        pre = {"notes": notes, "hand_written": hand, "scope": plan["scope"]}
+        target = target_skill(row) if row["kind"] == "retune" else None
+        cat_h = catalog_hash([x for x in catalog if x[0] != target])
+        pre = {"notes": notes, "hand_written": hand, "scope": plan["scope"], "catalog_hash": cat_h}
         eh, dh = evidence_hash(row["evidence"]), D.body_hash(body)
         prior = _latest_review(c, cid, eh, dh)
         c.commit()
+        j = None
         if _complete(prior):
             j = {"reviewer": prior["reviewer"], "verifier": prior["verifier"]}
-        elif out["judged"] >= cap:
-            continue
-        else:
+            stored = decide(tier, (j["reviewer"] or {}).get("verdict"), j["verifier"]["result"])
+            if (
+                stored == "apply"
+                and prior["rolled_back_at"] is None
+                and (prior["preflight"] or {}).get("catalog_hash") != cat_h
+            ):
+                j = None  # judged against another catalog: a sibling applied since may cover it
+        reused = j is not None
+        if j is None:
+            if out["judged"] + acted >= cap:
+                continue
             j = judge(row, plan["registry_body"], catalog)
             out["judged"] += 1
         rev_verdict = (j["reviewer"] or {}).get("verdict")
@@ -855,6 +884,15 @@ def review_pass(c, mode: str, night=None, cap: int = REVIEW_CAP) -> dict:
                 verdict, note = "capped", why
         if failed:
             verdict = "failed"
+        if reused and _quiet(prior, verdict, mode, failed):
+            continue
+        if reused and verdict in ("applied", "rejected"):
+            # REVIEW_CAP bounds what a night does, not only what it judges: stored judgements
+            # (a shadow period, a breaker pause) act at most `cap` a night, so the report can
+            # list every one of them.
+            if out["judged"] + acted >= cap:
+                continue
+            acted += 1
         if verdict == "applied":
             res = R.apply_candidate(
                 c,
@@ -888,8 +926,11 @@ def review_pass(c, mode: str, night=None, cap: int = REVIEW_CAP) -> dict:
                     }
                 )
                 print(f"  auto-applied cand#{cid} ({what(row)}), review {res['auto_review_id']}")
+                # later rows tonight are judged (and stored applies re-checked) against it
+                catalog = [x for x in catalog if x[0] != skill]
+                catalog.append((skill, SM.skill_description(body) or ""))
                 continue
-        if prior and prior["verdict"] == verdict and prior["mode"] == mode and not failed:
+        if reused and _quiet(prior, verdict, mode, failed):
             continue  # nothing new to record or say
         _record(c, cid, night, mode, eh, dh, tier, pre, j, verdict, skill)
         if verdict == "rejected":

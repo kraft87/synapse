@@ -368,10 +368,16 @@ def _pending_line(p: dict) -> str:
     return f"{_verdict(rec)} #{p['id']} {_what(p)} ({when}){why}"
 
 
-def _auto_lines(auto: dict | None) -> tuple[list[str], list[str]]:
-    """(header parts, body lines) for what the autopilot did tonight, applied ones first."""
+def _auto_lines(auto: dict | None, compact: bool = False) -> tuple[list[str], list[str]]:
+    """(header parts, body lines) for what the autopilot did tonight, applied ones first.
+    compact drops the reviewer's reasons (build_report's fallback when the full lines do not
+    fit): every applied and rejected item keeps its id and its undo / revive command."""
     if not auto:
         return [], []
+
+    def why(reason) -> str:
+        return "" if compact else f": {_plain(reason, 160)}"
+
     parts: list[str] = []
     lines: list[str] = []
     applied = auto.get("applied") or []
@@ -379,8 +385,7 @@ def _auto_lines(auto: dict | None) -> tuple[list[str], list[str]]:
         parts.append(f"{len(applied)} auto-applied")
     for a in applied:
         lines.append(
-            f"auto-applied #{a['id']} {a['what']} (undo: revert {a['id']}): "
-            f"{_plain(a.get('reason'), 160)}"
+            f"auto-applied #{a['id']} {a['what']} (undo: revert {a['id']}){why(a.get('reason'))}"
         )
     rolled = auto.get("rolled_back") or []
     if rolled:
@@ -404,7 +409,7 @@ def _auto_lines(auto: dict | None) -> tuple[list[str], list[str]]:
         parts.append(f"{len(rejected)} reviewer-rejected")
     for r in rejected:
         lines.append(
-            f"auto-rejected #{r['id']} {r['what']}: {_plain(r.get('reason'), 160)} "
+            f"auto-rejected #{r['id']} {r['what']}{why(r.get('reason')) or '.'} "
             f"Reply 'revive {r['id']}' to bring it back."
         )
     br = auto.get("breaker")
@@ -445,8 +450,7 @@ def build_report(
         head = f"Skills lane weekly reminder {day}: {len(pending)} pending."
     else:
         head = f"Skills lane weekly reminder {day}: nothing pending."
-    body = list(auto_lines)
-    body += [_pending_line(p) for p in new]
+    body = [_pending_line(p) for p in new]
     for r in rejected:
         body.append(f"auto-rejected #{r['id']} {_what(r)}: {_REASONS.get(r['code'], r['code'])}.")
     for x in expired:
@@ -459,15 +463,20 @@ def build_report(
     body += [_pending_line(p) for p in pending if not p["new"]]
     tail = ["Reply 'approve N', 'reject N' or 'tell me about N'."] if pending else []
 
-    def render(keep: int) -> str:
+    # The autopilot's lines are never cut: what the lane applied or rejected on its own is
+    # only undone from here (revert / revive N). Past the cap the oldest queue lines give way
+    # first, then the autopilot's lines lose their reasons.
+    def render(auto_body: list[str], keep: int) -> str:
         more = [f"+{len(body) - keep} more: skill_review.py list"] if keep < len(body) else []
-        return "\n".join([head, *body[:keep], *more, *tail])
+        return "\n".join([head, *auto_body, *body[:keep], *more, *tail])
 
     keep = len(body)
-    msg = render(keep)
+    msg = render(auto_lines, keep)
     while len(msg) > REPORT_CHARS and keep > 0:
         keep -= 1
-        msg = render(keep)
+        msg = render(auto_lines, keep)
+    if len(msg) > REPORT_CHARS:
+        msg = render(_auto_lines(auto, compact=True)[1], 0)
     return msg[:REPORT_CHARS]
 
 
