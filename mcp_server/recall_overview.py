@@ -295,10 +295,21 @@ class RecallOverviewMixin:
                 settings._SUPERSEDED_LIMIT,
             )
         )
-        f_fact_floor = (
-            _submit_ctx(ex, self._floor_facts, query, facts_internal)
-            if settings._RECALL_FACT_FLOOR > 0
-            and (len(facts_internal) > 1 or any(f.get("_cross") for f in facts_internal))
+        # The requested group's facts and the other group's extras are floored by a request
+        # each, started together: the slower one is waited on, not the two in series. Each
+        # request scores exactly the batch it always did. (One request over both would
+        # shift every score by ~1e-3, which moves near-tied facts and facts at the floor.)
+        own_facts = [f for f in facts_internal if not f.get("_cross")]
+        extra_facts = [f for f in facts_internal if f.get("_cross")]
+        floor_on = settings._RECALL_FACT_FLOOR > 0
+        f_floor_own = (
+            _submit_ctx(ex, self._floor_facts, query, own_facts)
+            if floor_on and len(own_facts) > 1
+            else None
+        )
+        f_floor_extra = (
+            _submit_ctx(ex, self._floor_facts, query, extra_facts)
+            if floor_on and extra_facts
             else None
         )
         scored, ms_rerank = f_rerank.result()
@@ -369,7 +380,11 @@ class RecallOverviewMixin:
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
         # default (adds one rerank of the served facts), so this is a no-op until enabled.
         # Its rerank was started with the second wave above, beside the episode rerank.
-        served_facts = f_fact_floor.result() if f_fact_floor is not None else facts_internal
+        served_facts = facts_internal
+        if f_floor_own is not None or f_floor_extra is not None:
+            served_facts = (f_floor_own.result() if f_floor_own is not None else own_facts) + (
+                f_floor_extra.result() if f_floor_extra is not None else extra_facts
+            )
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
         # Requested group only, on purpose: the other group's surface is a serial scan over its

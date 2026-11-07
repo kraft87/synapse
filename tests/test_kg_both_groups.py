@@ -347,7 +347,7 @@ def test_floor_keeps_the_requested_groups_backstop_and_floors_extras_alone(monke
     # Own facts all sub-floor: the keep-one backstop keeps the best OWN fact, as a
     # one-group read did, even though an extra outscores it; the sub-floor extra drops.
     assert [f["fact"] for f in r._floor_facts("q", facts)] == ["b", "x"]
-    assert r._reranker.calls == [["a", "b", "x", "y"]], "one request scores both groups"
+    assert r._reranker.calls == [["a", "b"], ["x", "y"]], "own facts reranked as before"
     # A lone own fact is not reranked (recall never floored one); extras still are.
     r._reranker.calls.clear()
     assert [f["fact"] for f in r._floor_facts("q", [facts[0], facts[3]])] == ["a"]
@@ -706,95 +706,86 @@ def test_a_failing_other_group_bm25_leg_fails_the_kg_leg_as_a_failing_search_did
 
 
 # ---------------------------------------------------------------------------
-# The fact floor: one rerank request for both groups' facts
+# The fact floor: the two groups' requests are made together, each as it always was
 # ---------------------------------------------------------------------------
 
-_FLOOR_CASES = {
-    "mixed": {"a": 0.9, "b": 0.2, "c": 0.7, "x": 0.8, "y": 0.1, "z": 0.6},
-    "own all below the floor": {"a": 0.2, "b": 0.3, "c": 0.1, "x": 0.9, "y": 0.8, "z": 0.1},
-    "extras all below the floor": {"a": 0.9, "b": 0.8, "c": 0.7, "x": 0.2, "y": 0.1, "z": 0.3},
-    "everything below the floor": {"a": 0.2, "b": 0.3, "c": 0.1, "x": 0.4, "y": 0.1, "z": 0.3},
-    "extras outrank own": {"a": 0.5, "b": 0.6, "c": 0.55, "x": 0.99, "y": 0.98, "z": 0.97},
-}
 
+class _Barrier:
+    """A reranker whose every request waits for the other group's request to arrive, so it
+    can only return when the two are in flight at once (one after the other, the first
+    waits out the timeout and the barrier breaks)."""
 
-def _facts_with_extras() -> list[dict[str, Any]]:
-    own = [{"fact": t, "_uuid": t} for t in "abc"]
-    return own + [{"fact": t, "_uuid": t, "_cross": True} for t in "xyz"]
-
-
-@pytest.mark.parametrize("case", list(_FLOOR_CASES))
-def test_one_floor_request_keeps_what_two_requests_kept(monkeypatch, case):
-    """Held to the two serial requests it replaces: each group's own floor, own order."""
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
-    scores = _FLOOR_CASES[case]
-    facts = _facts_with_extras()
-    own, cross = facts[:3], facts[3:]
-
-    r = object.__new__(Recall)
-    r._reranker = _Rerank(scores)
-    old = r._floor_by_rerank("q", own, 0.5, keep_min=1) + r._floor_by_rerank(
-        "q", cross, 0.5, keep_min=0
-    )
-    assert len(r._reranker.calls) == 2, "the oracle is the two-request version"
-
-    r._reranker = _Rerank(scores)
-    assert r._floor_facts("q", facts) == old
-    assert r._reranker.calls == [["a", "b", "c", "x", "y", "z"]]
-
-
-def test_the_floor_with_nothing_to_score_beside_the_extras_asks_for_the_extras_alone(
-    monkeypatch,
-):
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
-    r = object.__new__(Recall)
-    r._reranker = _Rerank({"a": 0.9, "x": 0.8, "y": 0.1})
-    facts = [
-        {"fact": "a", "_uuid": "a"},
-        {"fact": "x", "_uuid": "x", "_cross": True},
-        {"fact": "y", "_uuid": "y", "_cross": True},
-    ]
-    assert [f["fact"] for f in r._floor_facts("q", facts)] == ["a", "x"]
-    assert r._reranker.calls == [["x", "y"]]
-    # and no extras: the requested group's request, as ever
-    r._reranker.calls.clear()
-    r._floor_facts("q", [{"fact": "a", "_uuid": "a"}, {"fact": "x", "_uuid": "x"}])
-    assert r._reranker.calls == [["a", "x"]]
-
-
-class _Down:
-    def __init__(self) -> None:
-        self.calls = 0
+    def __init__(self, scores: dict[str, float]) -> None:
+        self.scores = scores
+        self.calls: list[list[str]] = []
+        self.threads: set[int] = set()
+        self._both = threading.Barrier(2, timeout=3.0)
 
     def rerank_scored(self, query, docs):
-        self.calls += 1
-        raise RuntimeError("rerank down")
+        self.calls.append(list(docs))
+        self.threads.add(threading.get_ident())
+        self._both.wait()
+        ranked = sorted(enumerate(docs), key=lambda x: -self.scores[x[1]])
+        return [(i, self.scores[d]) for i, d in ranked]
 
 
-@pytest.mark.parametrize("reranker", [None, _Down()])
-def test_a_floor_without_scores_keeps_every_fact_of_both_groups(monkeypatch, reranker):
-    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
-    r = object.__new__(Recall)
-    r._reranker = reranker
-    facts = _facts_with_extras()
-    assert r._floor_facts("q", facts) == facts
-    if reranker is not None:
-        assert reranker.calls == 1
-
-
-def test_a_recall_with_extras_makes_one_fact_floor_request(kg, db_url, monkeypatch):
-    """The whole path: the requested group's facts and the other group's extras go to the
-    reranker together, once per recall (two requests, one after the other, on main)."""
+def test_a_recall_with_extras_makes_both_fact_floor_requests_at_once(kg, db_url, monkeypatch):
+    """The whole path: the requested group's facts and the other group's extras are scored
+    by one request each, exactly the batches they were scored in when the two requests ran
+    one after the other, and the two are in flight together (on main the second waits for
+    the first, so a request that needs the other to arrive times out)."""
     monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
     _seed_both(kg)
     r = _engine(db_url)
-    r._reranker = _Rerank(
+    r._reranker = _Barrier(
         {"alpha beta": 0.9, "widget gizmo": 0.9, "epsilon": 0.9, "gamma delta": 0.9}
         | {"widget thing": 0.1}
     )
     out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
+    assert not any("rerank failed" in w for w in out["warnings"])
     assert _served(out) == {"v-t", "b-t", "h-t", "v-p"}, "own floor and extras floor both applied"
-    assert len(r._reranker.calls) == 1
-    assert sorted(r._reranker.calls[0]) == sorted(
-        ["alpha beta", "widget gizmo", "epsilon", "gamma delta", "widget thing"]
+    own_batch = next(b for b in r._reranker.calls if "alpha beta" in b)
+    extras_batch = next(b for b in r._reranker.calls if "widget thing" in b)
+    assert sorted(own_batch) == ["alpha beta", "epsilon", "widget gizmo"]
+    assert sorted(extras_batch) == ["gamma delta", "widget thing"]
+    assert len(r._reranker.calls) == 2
+    assert len(r._reranker.threads) == 2, "two requests, on two threads"
+
+
+def test_the_floor_requests_of_a_recall_serve_what_the_one_floor_call_serves(monkeypatch):
+    """Floored in two requests the way recall_overview does it, the facts served (and their
+    order) are what _floor_facts returns for the whole list, whichever way the scores fall."""
+    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
+    cases = {
+        "mixed": {"a": 0.9, "b": 0.2, "c": 0.7, "x": 0.8, "y": 0.1, "z": 0.6},
+        "own all below the floor": {"a": 0.2, "b": 0.3, "c": 0.1, "x": 0.9, "y": 0.8, "z": 0.1},
+        "extras all below the floor": {"a": 0.9, "b": 0.8, "c": 0.7, "x": 0.2, "y": 0.1, "z": 0.3},
+        "extras outrank own": {"a": 0.5, "b": 0.6, "c": 0.55, "x": 0.99, "y": 0.98, "z": 0.97},
+    }
+    own = [{"fact": t, "_uuid": t} for t in "abc"]
+    extras = [{"fact": t, "_uuid": t, "_cross": True} for t in "xyz"]
+    for scores in cases.values():
+        r = object.__new__(Recall)
+        r._reranker = _Rerank(scores)
+        whole = r._floor_facts("q", own + extras)
+        assert whole == r._floor_facts("q", own) + r._floor_facts("q", extras)
+
+
+def test_a_failing_floor_request_spares_only_its_own_groups_facts(kg, db_url, monkeypatch):
+    monkeypatch.setattr(recall_mod, "_RECALL_FACT_FLOOR", 0.5)
+    _seed_both(kg)
+    r = _engine(db_url)
+
+    class _ExtrasDown(_Rerank):
+        def rerank_scored(self, query, docs):
+            if "widget thing" in docs:
+                raise RuntimeError("rerank down")
+            return super().rerank_scored(query, docs)
+
+    r._reranker = _ExtrasDown(
+        {"alpha beta": 0.9, "widget gizmo": 0.1, "epsilon": 0.9, "gamma delta": 0.1}
     )
+    out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
+    # the requested group's floor ran (one fact dropped); the extras' failed and kept theirs
+    assert _served(out) == {"v-t", "h-t", "v-p", "b-p"}
+    assert sum("rerank failed" in w for w in out["warnings"]) == 1

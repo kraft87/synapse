@@ -188,25 +188,13 @@ class RecallRerankMixin:
         subfloor (facts: never blank the bucket); keep_min=0 lets it serve [] (timeline/web:
         self-gate on intent). Degrades to keeping ALL items on reranker outage/disable — a floor
         must never hard-fail recall. Callers gate on ``floor`` > 0, so this runs only when armed."""
-        scored = self._score_for_floor(query, items, text_key)
-        if scored is None:  # no score signal (rerank disabled or down): keep all
-            return items
-        return self._apply_floor(items, scored, floor, keep_min)
-
-    def _score_for_floor(
-        self, query: str, items: list[dict[str, Any]], text_key: str = "fact"
-    ) -> list[tuple[int, float]] | None:
-        """One cross-encoder request over ``items``: ``(item_index, score)`` pairs, best first.
-        ``None`` when there is no score signal (rerank disabled, or the request failed and
-        was warned about): the floor then keeps everything, because it must never hard-fail
-        recall."""
         settings = self._settings()
         reranker = self._ensure_reranker()
-        if reranker is None:  # rerank disabled — no score signal
-            return None
+        if reranker is None:  # rerank disabled — no score signal, keep all
+            return items
         texts = [(it.get(text_key) or "")[: settings._RERANK_DOC_CAP] for it in items]
         try:
-            return reranker.rerank_scored(query, texts)
+            scored = reranker.rerank_scored(query, texts)
         except Exception as e:
             logger.warning("Relevance-floor rerank failed, keeping all items: %s", e)
             detail = _err_brief(e)
@@ -215,17 +203,7 @@ class RecallRerankMixin:
                 f"relevance-floor rerank failed ({backend}: {detail}): serving all items "
                 f"unfiltered." + _config_hint(detail, backend=backend, env_prefix="SYNAPSE_RERANK")
             )
-            return None
-
-    @staticmethod
-    def _apply_floor(
-        items: list[dict[str, Any]],
-        scored: list[tuple[int, float]],
-        floor: float,
-        keep_min: int,
-    ) -> list[dict[str, Any]]:
-        """The items of ``scored`` (best first) at or above ``floor``; when none is, the
-        top ``keep_min`` of them."""
+            return items
         kept = [items[i] for i, s in scored if s >= floor]
         if not kept and keep_min > 0:
             kept = [items[i] for i, _ in scored[:keep_min]]
@@ -238,27 +216,10 @@ class RecallRerankMixin:
         Cross-group extras (``_cross``, kg_pg.search_kg) are floored on their own with no
         keep-one backstop, after the requested group's facts, which are floored exactly as
         a one-group read's were (a single fact is not reranked, as recall_overview never
-        floored one).
-
-        Both floors share ONE rerank request when both have something to score: the
-        cross-encoder scores each (query, fact) pair on its own, so one request over the
-        requested group's facts and then the extras returns the scores two requests would,
-        for one round trip instead of two in series. Each floor is then applied to its
-        own facts' scores exactly as before (keep-one backstop for the requested group,
-        none for the extras). One failure now spares both groups' facts, where each
-        request used to fail alone."""
+        floored one)."""
         settings = self._settings()
         own = [f for f in facts if not f.get("_cross")]
         cross = [f for f in facts if f.get("_cross")]
-        if len(own) > 1 and cross:
-            scored = self._score_for_floor(query, own + cross)
-            if scored is None:
-                return own + cross
-            n = len(own)
-            floor = settings._RECALL_FACT_FLOOR
-            return self._apply_floor(own, [(i, s) for i, s in scored if i < n], floor, 1) + (
-                self._apply_floor(cross, [(i - n, s) for i, s in scored if i >= n], floor, 0)
-            )
         if len(own) > 1:
             own = self._floor_by_rerank(query, own, settings._RECALL_FACT_FLOOR, keep_min=1)
         if cross:
