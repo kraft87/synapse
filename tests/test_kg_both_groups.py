@@ -15,6 +15,8 @@ extras it serves; the supersession surface and overlay stay on the requested gro
 
 from __future__ import annotations
 
+import math
+import threading
 import uuid
 from contextlib import nullcontext
 from typing import Any
@@ -23,9 +25,11 @@ import psycopg
 import pytest
 
 import mcp_server.recall as recall_mod
+import mcp_server.recall_sources as recall_sources
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
 from mcp_server.recall import Recall
+from mcp_server.recall_ranking import timed
 from tests.helpers.embed import onehot
 
 WORK = "work-proj"
@@ -413,14 +417,289 @@ def test_one_group_sends_plain_equality_with_a_scalar(allowed):
     assert not any(isinstance(v, list) and TECH in v for p in cur.params for v in p)
 
 
+def _walk_inner(sql: str) -> str:
+    """The inner subquery of a fact-vector statement: the HNSW walk itself."""
+    return sql.split(" FROM (", 1)[1].split(") sub")[0]
+
+
 def test_full_trust_list_reads_the_requested_group_with_its_one_group_statements():
     one = _statements(TECH, None)
     both = _statements([TECH, PERS], None)
-    # vector, BM25, seed/degree for the requested group: text and parameters unchanged
-    assert both.sql[:3] == one.sql[:3]
-    assert both.params[:3] == one.params[:3]
-    # then the other group's vector and BM25, and the KG extras over both groups
-    assert len(both.sql) == 8
-    assert all("group_id = ANY(%s)" in s for s in both.sql[3:])
-    assert [PERS] in both.params[3] and [PERS] in both.params[4]
-    assert all([TECH, PERS] in p for p in both.params[5:])
+    # BM25 and seed/degree for the requested group: text and parameters unchanged
+    assert both.sql[1:3] == one.sql[1:3]
+    assert both.params[1:3] == one.params[1:3]
+    # The vector legs of both groups are ONE statement: the requested group's own walk
+    # (same inner subquery, same vector, same over-fetch) with both groups let through.
+    assert _walk_inner(both.sql[0]) == _walk_inner(one.sql[0])
+    assert both.params[0][:3] == one.params[0][:3]
+    assert both.params[0][3] == [TECH, PERS]
+    # then the other group's BM25 (serial here: no concurrent leg was handed in), and the
+    # KG extras over both groups
+    assert len(both.sql) == 7
+    assert "group_id = ANY(%s)" in both.sql[3] and [PERS] in both.params[3]
+    assert all("group_id = ANY(%s)" in s for s in both.sql[4:])
+    assert all([TECH, PERS] in p for p in both.params[4:])
+
+
+def test_a_handed_in_bm25_leg_replaces_the_serial_one_and_is_read_once():
+    reads: list[int] = []
+
+    def leg() -> list:
+        reads.append(1)
+        return []
+
+    cur = _RecordingConn()
+    kg_pg.search_kg(cur, "widget q", onehot(0), "default", [TECH, PERS], [], 5, cross_bm25=leg)
+    assert reads == [1]
+    assert len(cur.sql) == 3, "walk, own BM25, seed/degree: no other-group statement"
+    assert not any("paradedb" in s and "ANY(%s)" in s for s in cur.sql)
+
+
+# ---------------------------------------------------------------------------
+# One walk, one concurrent BM25 leg: the rows are the ones the serial legs returned
+# ---------------------------------------------------------------------------
+
+_DIMS = kg_pg._EMBED_DIMS
+_OLD_VEC = (
+    "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM ("
+    "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id, "
+    "         web_artifact_id "
+    "  FROM kg_relationships "
+    "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
+    f"  ORDER BY fact_embedding::halfvec({_DIMS}) <=> %s::halfvec({_DIMS}) LIMIT %s"
+    ") sub WHERE owner_id = %s AND group_id {cmp} AND web_artifact_id IS NULL LIMIT %s"
+)
+
+
+def _graded(
+    conn,
+    uid: str,
+    group: str,
+    rank: int,
+    fact: str | None,
+    *,
+    owner: str = "default",
+    web: int | None = None,
+    t_invalid: str | None = None,
+) -> None:
+    """A fact whose distance from onehot(0) grows strictly with ``rank`` (no ties, so the
+    HNSW emission order is the one order there is)."""
+    vec = [0.0] * _DIMS
+    vec[0], vec[1] = math.cos(rank * 0.02), math.sin(rank * 0.02)
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, web_artifact_id) "
+        "VALUES (%s, %s, %s, 'ent-x', 'ent-y', 'RELATES', %s, %s::vector, '[]'::jsonb, "
+        "        '2026-01-01T00:00:00+00:00', %s, %s)",
+        (uid, owner, group, fact, kg_pg._vec_literal(vec), t_invalid, web),
+    )
+
+
+def _seed_ranked(conn) -> None:
+    """70 facts in two groups, nearest first, plus the rows each filter has to drop: another
+    owner's, a web page's, a retired one and an empty one (which still takes a LIMIT slot)."""
+    for rank in range(70):
+        group = PERS if rank % 5 in (3, 4) else TECH
+        _graded(conn, f"r{rank:02d}", group, rank, f"widget {'filler ' * rank}".strip())
+    _graded(conn, "other-owner", TECH, 1, "widget other owner", owner="someone-else")
+    _graded(conn, "web", TECH, 2, "widget from a web page", web=7)
+    _graded(conn, "retired", TECH, 3, "widget retired", t_invalid="2026-02-01T00:00:00+00:00")
+    _graded(conn, "empty", TECH, 4, "")
+    _graded(conn, "web-p", PERS, 5, "widget from a web page", web=7)
+
+
+@pytest.fixture()
+def ranked(kg, monkeypatch):
+    _seed_ranked(kg)
+    monkeypatch.setattr(kg_pg, "_OVERFETCH", 45)  # the walk's cut bites inside 70 live facts
+    return kg
+
+
+def _cur(db_url):
+    c = psycopg.connect(db_url, autocommit=True)
+    cur = c.cursor()
+    cur.execute("SET hnsw.ef_search = 200")
+    cur.execute("SET enable_seqscan = off")
+    cur.execute("SET max_parallel_workers_per_gather = 0")
+    return c, cur
+
+
+@pytest.mark.parametrize("limit", [3, 5, 12])
+def test_one_walk_split_by_group_returns_what_each_groups_own_walk_returned(ranked, db_url, limit):
+    emb = kg_pg._vec_literal(onehot(0))
+    k = kg_pg.CROSS_GROUP_EXTRAS
+    c, cur = _cur(db_url)
+    with c:
+        cur.execute(
+            _OLD_VEC.format(cmp="= %s"), (emb, kg_pg._OVERFETCH, "default", TECH, limit * 3)
+        )
+        old_own = cur.fetchall()
+        cur.execute(
+            _OLD_VEC.format(cmp="= ANY(%s)"), (emb, kg_pg._OVERFETCH, "default", [PERS], k * 3)
+        )
+        old_cross = cur.fetchall()
+        walk = kg_pg.fact_vector_walk(cur, onehot(0), "default", [TECH, PERS])
+        own, cross = kg_pg.split_walk(walk, TECH, limit * 3, [PERS], k * 3)
+        everything = kg_pg.split_walk(walk, TECH, 99, [PERS], 99)
+    assert own == old_own
+    assert cross == old_cross
+    # Not vacuous: the cross cut bites, the own cut bites for the small limits, the empty
+    # fact took its LIMIT slot in the own leg, and every dropped row stayed dropped.
+    assert len(old_cross) == k * 3
+    assert len(old_own) == min(limit * 3, len(everything[0]))
+    assert ("empty", "") in {(r[0], r[1]) for r in everything[0]}
+    assert {r[0] for r in everything[0] + everything[1]}.isdisjoint(
+        {"other-owner", "web", "retired", "web-p"}
+    )
+
+
+def _old_cross_group_facts(cur, query, query_emb, owner_id, groups, taken, k):
+    """main's ``cross_group_facts`` before the shared walk: its two statements, serial on
+    one cursor. The oracle the new path is held to."""
+    fact_by_uuid: dict[str, tuple] = {}
+    cur.execute(
+        _OLD_VEC.format(cmp="= ANY(%s)"),
+        (kg_pg._vec_literal(query_emb), kg_pg._OVERFETCH, owner_id, groups, k * 3),
+    )
+    vec_uuids: list[str] = []
+    for u, f, tv, og, sup in cur.fetchall():
+        if f:
+            fact_by_uuid.setdefault(u, (f, tv, og, sup))
+            vec_uuids.append(u)
+    safe = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in query).strip()
+    bm25_uuids: list[str] = []
+    if safe:
+        cur.execute(
+            "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
+            "FROM kg_relationships WHERE id @@@ paradedb.match('fact', %s) "
+            "  AND owner_id = %s AND group_id = ANY(%s) AND t_invalid IS NULL "
+            "  AND web_artifact_id IS NULL ORDER BY sc DESC LIMIT %s",
+            (safe, owner_id, groups, k * 3),
+        )
+        for u, f, tv, og, sup, _sc in cur.fetchall():
+            if f:
+                fact_by_uuid.setdefault(u, (f, tv, og, sup))
+                bm25_uuids.append(u)
+    fused = kg_pg._rrf_fuse([vec_uuids, bm25_uuids])
+    seen = {" ".join(t["fact"].lower().split()) for t in taken}
+    out = []
+    for u, _ in sorted(fused.items(), key=lambda kv: kv[1], reverse=True):
+        fact, t_valid, ongoing, supported = fact_by_uuid[u]
+        key = " ".join(fact.lower().split())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "fact": fact,
+                "_uuid": u,
+                "_date": t_valid,
+                "_ongoing": ongoing,
+                "_supported": supported,
+                "_cross": True,
+            }
+        )
+        if len(out) >= k:
+            break
+    return out
+
+
+@pytest.mark.parametrize("limit", [3, 12])
+@pytest.mark.parametrize("concurrent_bm25", [False, True])
+@pytest.mark.parametrize(("asked", "other"), [(TECH, PERS), (PERS, TECH)])
+def test_search_kg_serves_what_the_serial_two_walk_version_served(
+    ranked, db_url, limit, concurrent_bm25, asked, other
+):
+    """Held to main's implementation on seeded data, whichever group is asked for, with the
+    other group's BM25 leg run inline or fetched on a second connection first."""
+    k = kg_pg.CROSS_GROUP_EXTRAS
+    c, cur = _cur(db_url)
+    c2, cur2 = _cur(db_url)
+    with c, c2:
+        own, seeds = kg_pg.search_kg_postgres(cur, "widget", onehot(0), "default", asked, [], limit)
+        old = own + _old_cross_group_facts(cur, "widget", onehot(0), "default", [other], own, k)
+        leg = (
+            (lambda: kg_pg.cross_bm25_rows(cur2, "widget", "default", [other], k))
+            if concurrent_bm25
+            else None
+        )
+        got = kg_pg.search_kg(
+            cur, "widget", onehot(0), "default", [asked, other], [], limit, cross_bm25=leg
+        )
+    assert got == (old, seeds)
+    assert len([f for f in got[0] if f.get("_cross")]) == k, "the extras are there to compare"
+
+
+# ---------------------------------------------------------------------------
+# recall(): the other group's BM25 leg starts with the first wave, on its own connection
+# ---------------------------------------------------------------------------
+
+
+def _spy_submissions(r: Recall, monkeypatch) -> list[str]:
+    """The name of every leg ``r`` hands its executor, in submission order."""
+    order: list[str] = []
+    real = r._leg_executor.submit
+
+    def submit(run, fn, *args):
+        target = args[0] if fn is timed else getattr(fn, "func", fn)
+        order.append(target.__name__)
+        return real(run, fn, *args)
+
+    monkeypatch.setattr(r._leg_executor, "submit", submit)
+    return order
+
+
+def test_the_other_groups_bm25_leg_starts_first_on_a_connection_of_its_own(kg, db_url, monkeypatch):
+    _seed_both(kg)
+    r = _engine(db_url)
+    order = _spy_submissions(r, monkeypatch)
+    seen: list[tuple[str, int, Any]] = []
+    real_bm25, real_walk = recall_sources.cross_bm25_rows, kg_pg.fact_vector_walk
+
+    def bm25(cur, *a, **k):
+        seen.append(("bm25", threading.get_ident(), cur.connection))
+        return real_bm25(cur, *a, **k)
+
+    def walk(cur, *a, **k):
+        seen.append(("walk", threading.get_ident(), cur.connection))
+        return real_walk(cur, *a, **k)
+
+    monkeypatch.setattr(recall_sources, "cross_bm25_rows", bm25)
+    monkeypatch.setattr(kg_pg, "fact_vector_walk", walk)
+
+    out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
+
+    assert _served(out) == _TECH_FACTS | {"v-p", "b-p"}, "the extras are served"
+    # Submitted with the episode BM25 leg, before the embed call that gates the KG leg.
+    assert order[:2] == ["_search_bm25_episodes", "_cross_bm25_rows"]
+    assert order.index("_cross_bm25_rows") < order.index("_kg_leg")
+    # One walk and one BM25 statement for the other group, on different threads and
+    # connections: the BM25 leg never queues behind the requested group's search.
+    assert sorted(t for t, _, _ in seen) == ["bm25", "walk"]
+    (_, bm25_thread, bm25_conn), (_, walk_thread, walk_conn) = sorted(seen, key=lambda x: x[0])
+    assert bm25_thread != walk_thread
+    assert bm25_conn is not walk_conn
+
+
+@pytest.mark.parametrize("trust", [_RESTRICTED, FULL_TRUST])
+def test_no_other_group_leg_without_an_other_group(kg, db_url, monkeypatch, trust):
+    _seed_both(kg)
+    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0" if trust is FULL_TRUST else "1")
+    r = _engine(db_url)
+    order = _spy_submissions(r, monkeypatch)
+    r.recall("widget", group_id=TECH, trust=trust)
+    assert "_cross_bm25_rows" not in order
+    assert "_kg_leg" in order
+
+
+def test_a_failing_other_group_bm25_leg_fails_the_kg_leg_as_a_failing_search_did(kg, db_url):
+    _seed_both(kg)
+    r = _engine(db_url)
+
+    def boom(query, groups):
+        raise RuntimeError("bm25 down")
+
+    r._cross_bm25_rows = boom
+    out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
+    assert out["facts"] == []
+    assert any("KG facts leg failed" in w for w in out["warnings"])
