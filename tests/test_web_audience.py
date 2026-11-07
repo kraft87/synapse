@@ -181,6 +181,19 @@ def test_a_brief_is_read_whole_and_a_long_scrape_by_head_and_tail():
     assert excerpt(None) == ""
 
 
+def test_a_brief_too_long_to_read_whole_is_personal_without_a_call(monkeypatch):
+    """Past BRIEF_CHARS the excerpt would drop the middle of a brief, and every chunk of
+    it would still be served on a work-safe label. It is personal, unread."""
+    votes = _Votes()
+    long_brief = "a" * wa.BRIEF_CHARS + "\n\nprivate detail\n\n" + "z" * 1000
+    d = _classify(monkeypatch, votes, kind="research_brief", content=long_brief)
+    assert d.audience == "personal" and d.source == "classifier"
+    assert "not read whole" in d.detail and votes.prompts == []
+    # A scrape of the same length is still read (head + tail), not short-circuited.
+    votes = _Votes(_v("work-safe"), _v("work-safe"), _v("work-safe"))
+    assert _classify(monkeypatch, votes, content=long_brief).audience == "work-safe"
+
+
 def test_explicit_audience_wins_and_is_validated():
     assert derive_web_audience(None, explicit="work-safe", session_id="s") == AudienceDecision(
         "work-safe", "explicit"

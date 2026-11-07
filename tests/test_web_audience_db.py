@@ -176,6 +176,27 @@ def test_label_pending_takes_the_newest_first_and_respects_the_limit(clean, db_u
     assert [_audience(clean, i) for i in ids] == [None, "work-safe", "work-safe"]
 
 
+def test_label_pending_never_overwrites_a_label_set_while_it_classified(clean, db_url, monkeypatch):
+    """The classifier runs with no connection held, so a label can land in between (an
+    explicit --audience, a hand UPDATE, the backfill). The poller's write is guarded by
+    ``audience IS NULL`` and must not replace it, least of all with work-safe."""
+    aid = _artifact(clean, content="kubernetes notes")
+
+    class _Racing(_Judge):
+        def __call__(self, llm, **kw):
+            clean.execute("UPDATE web_artifacts SET audience = 'personal' WHERE id = %s", (aid,))
+            return super().__call__(llm, **kw)
+
+    monkeypatch.setattr(wa, "structured_call", _Racing())
+    monkeypatch.setenv("SYNAPSE_WEB_AUDIENCE_VOTES", "1")
+    db, connect = _connect(db_url)
+    try:
+        wa.label_pending(connect, object(), limit=10)
+    finally:
+        db.close()
+    assert _audience(clean, aid) == "personal"
+
+
 def test_a_transport_error_leaves_the_rest_unlabelled(clean, db_url, monkeypatch):
     monkeypatch.setattr(wa, "structured_call", _Judge(LLMHTTPError("401", 401), fail_after=1))
     monkeypatch.setenv("SYNAPSE_WEB_AUDIENCE_VOTES", "1")

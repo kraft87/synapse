@@ -61,9 +61,11 @@ SERVED_KINDS = ("research_brief", "web_scrape")
 
 #: How much of a document the classifier reads. A research brief is read whole (up to a
 #: cap far above any real one): its personal detail tends to sit in a mid-document
-#: "how this applies to the reader" section that a head+tail window would drop. A scrape
-#: is somebody else's page, so its topic shows in the title, URL and head; a long one is
-#: read as head plus tail.
+#: "how this applies to the reader" section that a head+tail window would drop. A brief
+#: longer than the cap is not read at all: it is ``personal`` with no call, because its
+#: unread middle would otherwise be served on a work-safe label (``--audience`` overrides).
+#: A scrape is somebody else's page, so its topic shows in the title, URL and head; a
+#: long one is read as head plus tail.
 BRIEF_CHARS = 60000
 SCRAPE_CHARS = 12000
 
@@ -200,8 +202,13 @@ def classify(
     the document (a research brief is cut into :data:`BRIEF_WINDOW` pieces, anything else
     is one); the first vote that does not ends the poll with ``personal``. Transport
     errors propagate (the caller leaves the row unlabelled and retries later); every
-    other failure answers ``personal``."""
+    other failure answers ``personal``. A brief over :data:`BRIEF_CHARS` is ``personal``
+    without a call: it cannot be read whole."""
     n = votes if votes is not None else votes_from_env()
+    if kind == "research_brief" and len((content or "").strip()) > BRIEF_CHARS:
+        return AudienceDecision(
+            DEFAULT_AUDIENCE, "classifier", f"brief over {BRIEF_CHARS} chars: not read whole"
+        )
     text = excerpt(content, kind)
     pieces = windows(text, BRIEF_WINDOW) if kind == "research_brief" else [text]
     for k, piece in enumerate(pieces, start=1):
