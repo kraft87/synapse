@@ -506,7 +506,6 @@ def report(
         print(f"(report: {len(pending)} pending, nothing changed tonight, reminder not due)")
         return stats
     msg = build_report(run_started.strftime("%m-%d"), pending, rejected, expired, auto)
-    stats["text"] = msg
     c = conn.cursor()
     c.execute(
         "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
@@ -515,6 +514,7 @@ def report(
     )
     conn.commit()
     if not deliver:
+        stats["text"] = msg  # the caller delivers it (and stamps it with mark_sent)
         return stats
     if not no_discord and config.DISCORD_WEBHOOK:
         try:
