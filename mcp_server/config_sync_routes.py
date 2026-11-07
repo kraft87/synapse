@@ -41,6 +41,7 @@ from psycopg.rows import dict_row
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from dream.config import identity_ready
 from ingestion import pg_pool
 from ingestion.surfaces import UNKNOWN_SURFACE, SurfaceTrust, own_surface_columns_ready
 from mcp_server.http_helpers import _iso, err, guarded_json
@@ -159,32 +160,41 @@ def _proposals_list(db_url: str, own_surface: str | None = None) -> dict:
     """The rule edits awaiting review — only 'proposed' (the dream gate graduated them past observe).
 
     ``own_surface`` limits the list to that surface's own proposals (_OWN_PROPOSAL), the
-    restricted caller's view. None is the unfiltered (full-trust / dashboard) view."""
-    sql = (
-        "SELECT id, kind, file_key, scope, summary, evidence, updated_at "
-        "FROM config_lane.config_proposals WHERE status='proposed'"
-    )
-    if own_surface:
-        sql += _OWN_PROPOSAL
-    sql += " ORDER BY updated_at DESC"
+    restricted caller's view. None is the unfiltered (full-trust / dashboard) view. Once
+    schema 065 is applied each row also carries the nightly judge's ``recommendation`` and
+    ``days_pending`` (the same two fields the skills review list has)."""
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         if not _own_ready(conn, db_url, own_surface):
             return {"proposals": []}
+        queue = (
+            ", recommendation, (now()::date - proposed_at::date) AS days_pending"
+            if identity_ready(conn)
+            else ""
+        )
+        sql = (
+            f"SELECT id, kind, file_key, scope, summary, evidence, updated_at{queue} "
+            "FROM config_lane.config_proposals WHERE status='proposed'"
+        )
+        if own_surface:
+            sql += _OWN_PROPOSAL
+        sql += " ORDER BY updated_at DESC"
         rows = conn.execute(sql, {"own": own_surface}).fetchall()
     out = []
     for r in rows:
         ev = r["evidence"] or []
-        out.append(
-            {
-                "id": r["id"],
-                "kind": r["kind"],
-                "file_key": r["file_key"],
-                "scope": r["scope"],
-                "summary": r["summary"],
-                "sessions": len({e.get("session_id") for e in ev if e.get("session_id")}),
-                "evidence_count": len(ev),
-            }
-        )
+        item = {
+            "id": r["id"],
+            "kind": r["kind"],
+            "file_key": r["file_key"],
+            "scope": r["scope"],
+            "summary": r["summary"],
+            "sessions": len({e.get("session_id") for e in ev if e.get("session_id")}),
+            "evidence_count": len(ev),
+        }
+        if "days_pending" in r:
+            item["days_pending"] = r["days_pending"]
+            item["recommendation"] = r["recommendation"]
+        out.append(item)
     return {"proposals": out}
 
 
@@ -202,16 +212,18 @@ def _proposal_owned(db_url: str, cid: int, own_surface: str) -> bool:
 
 def _proposal_detail(db_url: str, cid: int, own_surface: str | None = None) -> dict:
     """One proposal. ``own_surface`` (restricted caller) makes anything outside that surface's
-    proposals read as not found, indistinguishable from a missing id, so ids can't be probed."""
-    sql = (
-        "SELECT id, kind, file_key, scope, diff, summary, evidence, status "
-        "FROM config_lane.config_proposals WHERE id=%(id)s"
-    )
-    if own_surface:
-        sql += _OWN_PROPOSAL
+    proposals read as not found, indistinguishable from a missing id, so ids can't be probed.
+    Once schema 065 is applied it also carries the nightly judge's ``recommendation``."""
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as conn:
         if not _own_ready(conn, db_url, own_surface):
             return {"found": False}
+        queue = ", recommendation" if identity_ready(conn) else ""
+        sql = (
+            f"SELECT id, kind, file_key, scope, diff, summary, evidence, status{queue} "
+            "FROM config_lane.config_proposals WHERE id=%(id)s"
+        )
+        if own_surface:
+            sql += _OWN_PROPOSAL
         r = conn.execute(sql, {"id": cid, "own": own_surface}).fetchone()
     if not r:
         return {"found": False}

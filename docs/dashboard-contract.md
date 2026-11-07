@@ -285,8 +285,12 @@ body: {"action": "approve" | "reject", "note": "…"}
 **30-day reject cooldown.** The **skills** lane implements it (sets
 `rejected_until = now() + interval '30 days'` on reject; its own list hides cooldowned rows)
 — the dashboard reject surfaces it via the lane's act, no extra code. The **config** lane
-has **no cooldown** (`config_proposals` has no `rejected_until` column). This is a GAP,
-left to the config lane to add rather than bolted onto the dashboard.
+has no `rejected_until` column; its cooldown lives in the nightly ledger instead (schema
+065, `dream/config/nightly.py`): for `COOLDOWN_DAYS` (30) after a rejection (a person's,
+or `auto:covered`) a re-sighting of the same rule is absorbed into the rejected row's
+evidence and never opens a new proposal; `rejected` rows older than that are ignored, so a
+rule that keeps being corrected is asked about again. A lane-expired proposal
+(`reject_reason='expired'`) is not a cooldown: it reopens when a new session repeats it.
 
 **Deviations / notes.**
 - The unified list does NOT reuse the lanes' `_proposals_list` (those return only `proposed`
