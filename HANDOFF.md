@@ -3,6 +3,58 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-07 — dream→config lane: identity by meaning, a coverage gate, a queue that tends itself (plugin 0.23.1, schema 065)
+
+**What changed**
+
+- **The lane never produced a proposal** because two corrections were "the same rule" only
+  at 0.5 token overlap, and the best cross-session pair scored 0.294: 208 rows, all
+  `observe`, none with two sessions, and a long session re-scanned whole each night added
+  near-duplicates. Identity is now the cosine of the rules' embeddings against the row's
+  founding embedding (0.82 across sessions, 0.75 for a session the row already counts;
+  `CONFIG_IDENTITY_COSINE`, `CONFIG_IDENTITY_COSINE_SAME_SESSION`).
+- **Coverage gate**: before a row is proposed, one judge call asks whether the user's own
+  global rule files (`config_registry`, scope `global`) already cover it. Covered rows go to
+  `rejected` / `auto:covered`. Proposed rows are re-checked when the files change.
+- **A queue that tends itself** (the skills lane's treatment): a stored `recommendation`
+  per proposal (it rejects a rule whose quotes ask for opposite things, which embeddings
+  cannot see), a 21-day expiry (`rejected` / `expired`, reopened by a new session's
+  sighting), and a plain-text report stored in
+  `skills_lane.skill_scan_cursor.config.config_last_report` (`{at, text}`) next to the
+  skills lane's own `last_report`, also posted to `SKILLS_DISCORD_WEBHOOK` when set.
+  Proposals stay ask-only: nothing is applied without `/synapse:config-review accept`.
+- A rule rejected in the last 30 days, or accepted or applied, absorbs re-sightings instead
+  of opening a new proposal (closes the config-lane cooldown gap in
+  `docs/dashboard-contract.md`).
+- `/config/proposals` and `config_review.py list|show` carry the recommendation and the
+  days pending (plugin 0.23.1).
+
+**Order of rollout**
+
+1. Merge → the dream image. Until 065 is applied the lane probes, logs one line
+   (`schema 065 not applied; the lane idles`) and does nothing; its scan watermark does not
+   move, so the first run after 065 starts where the lane stopped. That run still scans at
+   most `CONFIG_LANE_LIMIT` x 4 sessions (120) before it moves the watermark, as the lane
+   always has, so apply 065 soon after the image to keep the backlog under that.
+2. Apply `schema/065_config_lane_identity.sql` (marked optional; four nullable columns,
+   guarded, one UPDATE that stamps `proposed_at` for rows already proposed). Apply 063 and
+   064 first if they have merged, so the version stamp stays in order.
+3. Re-cluster the existing rows (needs no schema change, so it can run before or after 2):
+   `scripts/recluster_config_proposals.py` is a read-only dry run;
+   `--apply` folds the clusters, runs the gate and copies every touched row to
+   `config_lane.config_proposals_bak_<YYYYMMDD>` first. `--restore YYYYMMDD --apply` undoes
+   it. Credentials via the environment (`SYNAPSE_DB_URL`, `VOYAGE_API_KEY`); the judge is the
+   local `claude` CLI, called stripped.
+4. Morning briefing: a separate patch to the operator's briefing script adds a "Config
+   proposals" block (it reads `config_proposals` directly, with a pre-065 fallback); it is
+   not part of this change.
+5. `synapse update` on each machine for the 0.23.1 review CLI (older clients keep working;
+   they just don't print the recommendation).
+
+**Note for restricted devices**: merged evidence spans sessions, so a restricted caller
+(`_OWN_PROPOSAL` needs every evidence session to be its own) sees fewer proposals; a full-trust
+caller is unaffected.
+
 ## 2026-11-06 — dream→skills autopilot: the lane decides the routine proposals itself (plugin 0.23.0, schema 064)
 
 **What changed**
