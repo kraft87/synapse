@@ -179,11 +179,18 @@ class RecallOverviewMixin:
         # no-op when it's unavailable). Summaries were retired (task #63): the KG owns
         # facts and the wide episode leg owns broad/needle, so no synth_documents leg.
         def _web_leg() -> list[dict[str, Any]]:
-            # Web chunks carry no project or audience provenance (research briefs are
-            # often personal), so a restricted surface is served none of them.
-            if query_emb is None or st.restricted:
+            # Restricted surface: web is filtered by SENSITIVITY, not project (schema 063).
+            # Only chunks of artifacts labelled work-safe are served, from any project;
+            # personal and unlabelled (NULL) artifacts never are. Before 063 is applied
+            # there is no label to filter on, so a restricted caller gets no web at all.
+            if query_emb is None:
                 return []
-            return self._search_web_reranked(query, query_emb)
+            audience = st.audience_filter
+            if audience is None:
+                return self._search_web_reranked(query, query_emb)
+            if not self._web_audience_ready():
+                return []
+            return self._search_web_reranked(query, query_emb, audience=audience)
 
         def _kg_leg() -> tuple[list[Any], list[Any]]:
             # Restricted surface: serve only facts whose cached provenance set

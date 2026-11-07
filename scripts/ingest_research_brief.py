@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
-Ingest a research brief as a first-class web_artifact (task #68, Phase 2).
+Ingest a research brief as a first-class web_artifact (kind='research_brief').
 
 A brief (run-research output, or any deliberately-written markdown doc) is the
-highest-quality extraction substrate in the web lane: multi-source, synthesized,
-zero chrome. Inserting it as kind='research_brief' lets it ride the existing
-chunk → embed → contextualize → KG-extract pipeline with no further code.
+highest-quality substrate in the web lane: multi-source, synthesized, zero chrome.
+The row is picked up by the web-lane cron (ARCHITECTURE.md, "How it's fed"): chunked,
+contextualized and embedded, then served by recall's web bucket. It is NOT
+KG-extracted: web-derived facts are kept off the fact legs (they scored as noise).
 
-Idempotent via tool_use_id = 'brief:<slug>:<YYYY-MM-DD>' (UNIQUE).
+Who may read it (schema 063, ``web_artifacts.audience``): ``--audience`` sets it
+explicitly and wins over every other rule. Without it the row stays unlabelled, which
+a restricted surface is never served, until the poller's classifier labels it
+(ingestion/web_audience.py). Before 063 is applied the flag is accepted and ignored.
+
+Idempotent via tool_use_id = 'brief:<slug>:<YYYY-MM-DD>' (UNIQUE). Re-running with
+``--audience`` on an already-ingested brief updates its label.
 
 Usage:
     SYNAPSE_DB_URL=postgresql://... \
         uv run python scripts/ingest_research_brief.py \
         --file ~/data/research/2026-06-10-web-ingestion.md \
-        --slug web-ingestion [--title "How RAG systems ingest web pages"]
+        --slug web-ingestion [--title "How RAG systems ingest web pages"] \
+        [--audience work-safe|personal]
 """
 
 from __future__ import annotations
@@ -26,6 +34,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import psycopg
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from ingestion.surfaces import AUDIENCES, WEB_AUDIENCE_PROBE
 
 
 def load_db_url() -> str:
@@ -47,6 +59,13 @@ def main() -> int:
     parser.add_argument("--file", required=True, help="Markdown file containing the brief.")
     parser.add_argument("--slug", required=True, help="Topic slug (kebab-case).")
     parser.add_argument("--title", default=None, help="Title (default: first markdown H1).")
+    parser.add_argument(
+        "--audience",
+        choices=AUDIENCES,
+        default=None,
+        help="Who may read it: work-safe is served to restricted surfaces, personal never "
+        "is. Default: unlabelled until the poller's classifier decides.",
+    )
     args = parser.parse_args()
 
     path = Path(args.file).expanduser()
@@ -95,13 +114,33 @@ def main() -> int:
             ),
         )
         row = cur.fetchone()
+        labelled = set_audience(conn, tool_use_id, args.audience) if args.audience else None
         conn.commit()
 
     if row:
         print(f"ingested research_brief id={row[0]} ({tool_use_id}, {len(content)} chars)")
     else:
         print(f"already ingested ({tool_use_id}); no-op")
+    if labelled is False:
+        print(
+            "warning: schema 063 (web_artifacts.audience) is not applied; "
+            f"--audience {args.audience} was not stored",
+            file=sys.stderr,
+        )
+    elif labelled:
+        print(f"audience={args.audience}")
     return 0
+
+
+def set_audience(conn: psycopg.Connection, tool_use_id: str, audience: str) -> bool:
+    """Store an explicit audience on the brief (rule 1: it overrides any earlier label).
+    False when schema 063 is not applied, so nothing could be stored."""
+    if not WEB_AUDIENCE_PROBE.ready(conn, "ingest-brief"):
+        return False
+    conn.execute(
+        "UPDATE web_artifacts SET audience = %s WHERE tool_use_id = %s", (audience, tool_use_id)
+    )
+    return True
 
 
 if __name__ == "__main__":
