@@ -620,7 +620,6 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **021 `recall_metrics`** — fire-and-forget recall telemetry, one row per `recall()` serve (overview `kind='recall'`, turns-mode `kind='episodes'`).
 - **022–023 `skills_lane`** — dream→skills candidate ledger, firing log, skill registry, scan cursor (022); ledger hardening with the grounded-signal CHECK constraint (023).
 - **024–026 skill serving + sync** — `skill_registry` body/scope/status + `skill_files` (024); `content_modified_at` for two-way sync (025); append-only `skill_history` + trigger (026).
-- **064 skills autopilot** — `skill_auto_reviews` (the audit trail and the judge-once memo of the lane's own decisions), `skill_gap_candidates.applied_by` + `auto_review_id`, `skill_registry.lane_body_hash`, and `grounded_required_to_apply` widened to "a grounded weight, or a recorded auto review".
 - **027 `skill_registry.proposal_body`** — full proposal text on the registry row.
 - **028–029 episode-validity overlay** — `kg_relationships.invalidated_by` provenance link (028) + partial GIN on superseded episode ids (029), powering the `superseded_by` annotation on served episodes.
 - **030–032 config lane** — mirrored config-file store, scope column, scan cursor.
@@ -634,6 +633,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **058 `kg_relationships` evidence currency** — `ongoing`, `last_supported_at`, `last_supported_by` ([§5.4](#54-bitemporal-edges)). No backfill: attribution is not recoverable from stored edges.
 - **059 drop `dedup_gate_shadow`** — see 040. Marked `-- schema-check: optional`: nothing reads the table, so the image can land before the drop is applied.
 - **060 `skill_registry.retired_at`** — when a skill was retired, so a retirement holds against stale publishes ([§7.6](#76-skills-serving)). Rows already retired are backfilled from `updated_at`. Marked optional: the routes probe for the column and keep their pre-060 behaviour until it exists.
+- **064 skills autopilot** — `skill_auto_reviews` (the audit trail and the judge-once memo of the lane's own decisions), `skill_gap_candidates.applied_by` + `auto_review_id`, `skill_registry.lane_body_hash`, and `grounded_required_to_apply` widened to "a grounded weight, or a recorded auto review". Marked optional: the lane probes for it and skips the autopilot until it exists.
 
 Key live tables: `episodes`, `chunks`, `extraction_queue` (status `pending|processing|done|failed`, `priority`, `claimed_at`), `kg_entities`, `kg_relationships`, `web_artifacts`, `web_chunks`, `ingestion_state`, and the `skills_lane.*` schema. `synth_documents` exists but is dormant (`memory_proposals` was dropped by 047).
 

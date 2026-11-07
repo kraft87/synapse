@@ -8,6 +8,9 @@ logged-in `claude` CLI. The dream container has none, so its nightly lane only r
     SYNAPSE_LLM_PROVIDER=openai SYNAPSE_LLM_API_KEY=... SYNAPSE_SKILLS_VERIFY_MODEL=<non-Claude> \\
       uv run python scripts/skills_autopilot.py [--notify-cmd 'discord-send.sh infra'] [--shadow]
 
+From cron, use scripts/skills_autopilot_cron.sh: it reads SYNAPSE_DB_URL and the verifier's key
+from env files at run time, so the crontab carries no password.
+
 What it does, in order: reconcile (roll back auto-applies that went wrong, repair a local edit
 a sync pulled over), then judge each proposed, drafted, untouched row (reviewer: the stripped
 claude CLI call; verifier: an independent non-Claude model, asked in both evidence orders) and

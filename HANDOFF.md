@@ -37,9 +37,13 @@ changed, what to do on each machine, what was proven, and what is still open.
    works as before.
 2. Apply `schema/064_skills_autopilot.sql` (marked optional; `scripts/apply_schema.sh`).
 3. The reviewer needs a logged-in `claude` CLI. If the dream container has none, run
-   `scripts/skills_autopilot.py` on a host that does (cron line in the PR); the nightly lane
-   then reconciles and reports only. Set `SKILLS_AUTOREVIEW_REVIEW=1` instead when the
-   container has a login.
+   `scripts/skills_autopilot.py` on a host that does, after the nightly dream (drafting
+   happens there), through `scripts/skills_autopilot_cron.sh`, which reads the database URL
+   and the verifier's key from env files so no password sits in the crontab:
+   `<min> <hour> * * * <checkout>/scripts/skills_autopilot_cron.sh <file with SYNAPSE_DB_URL>
+   <file with OPENROUTER_API_KEY> [--notify-cmd '<command that posts its last argument>']
+   >> <log> 2>&1`. The nightly lane then reconciles and reports only. Set
+   `SKILLS_AUTOREVIEW_REVIEW=1` instead when the container has a login.
 4. `SKILLS_AUTOREVIEW` defaults to `live`; `shadow` records what it would do, `off` skips.
 5. `synapse update` on each machine for the 0.23.0 review CLI (`revert`, `report`, `autopilot`).
 

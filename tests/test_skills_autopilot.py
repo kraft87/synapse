@@ -863,6 +863,10 @@ def test_a_pull_of_a_body_the_registry_already_had_is_not_a_local_edit(db, ap, l
 def test_the_report_leads_with_auto_applied_items_and_is_stored(db, ap, llm):
     _cid, _ = _new_case(db, "ap-rep")
     _desc_case(db, "ap-rep2")
+    old = _skill("ap-rep3", "Back up the demo database.")
+    _registry(db, "ap-rep3", old)
+    edit = old.replace("1. Do the thing.", "1. Do the thing.\n2. Verify it.")
+    asked = _cand(db, name="ap-rep3", body=edit, direction="extend", base=body_hash(old))
     res = A.run(ap, mode="live")
     when = datetime(2026, 11, 7, 8, 0, tzinfo=UTC)
 
@@ -871,6 +875,8 @@ def test_the_report_leads_with_auto_applied_items_and_is_stored(db, ap, llm):
     lines = rep["text"].split("\n")
     assert lines[0].startswith("Skills lane 11-07: 2 auto-applied")
     assert lines[1].startswith("auto-applied #") and "(undo: revert " in lines[1]
+    assert lines[2].startswith("auto-applied #")  # both before the queue's own lines
+    assert any(f"#{asked} " in ln for ln in lines[3:])  # the body edit waits for a person
     assert {f"(undo: revert {a['id']})" for a in res["applied"]} <= {
         "(undo: " + ln.split("(undo: ")[1].split(")")[0] + ")" for ln in lines if "(undo: " in ln
     }
