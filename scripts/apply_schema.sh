@@ -102,6 +102,7 @@ FILES=(
   060_skill_retired_at.sql
   061_episodes_project_recency_index.sql
   062_skill_review_queue.sql
+  063_web_audience.sql
   064_skills_autopilot.sql
 )
 
