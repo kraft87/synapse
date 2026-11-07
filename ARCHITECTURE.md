@@ -452,7 +452,7 @@ Wave 1 (`_episode_pool`, web, KG) fans out on the leg executor. Second-wave call
 
 ### 7.1 Tools
 
-Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it. The board is push-only — `GET /context` feeds the plugin's SessionStart hook; there is no MCP board tool (the hook already injects the block).
+Registration order is deliberate (tool-list position biases model tool choice); `tests/test_tool_surface.py` pins it. The board is push-only — `GET /context` feeds the plugin's SessionStart hook; there is no MCP board tool (the hook already injects the block). The block is capped at 80 lines / 2,000 estimated tokens, and what does not fit is cut by per-type quotas rather than a type priority: feedback, user, project and reference notes share the room 4:3:2:1 (a type with fewer notes than its share hands the slack to the others), each type ranked by how often `recall_feedback` rated its `n:` ids helpful and then by recency, and "Last 7 days" is one line per day for at most five days. A strict feedback-first drop order had left a full-trust board with no user, project or reference note for eight weeks.
 
 Six visible tools, in registration order, plus one hidden. Per-tool detail (what each parameter does, and when a model should reach for which) lives in [docs/tools.md](docs/tools.md).
 

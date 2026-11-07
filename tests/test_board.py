@@ -48,6 +48,7 @@ def _wipe(conn):
     conn.execute("DELETE FROM notes")
     conn.execute("DELETE FROM timeline_events")
     conn.execute("DELETE FROM recall_metrics")
+    conn.execute("DELETE FROM recall_feedback")
     conn.execute("DELETE FROM surfaces")
 
 
@@ -281,7 +282,7 @@ def test_line_overflow_drops_oldest_project_notes_first(conn, db_url):
     text = out["text"]
     assert out["overflow"] > 0
     assert text.count("\n") + 1 <= 80
-    assert f"(+ {out['overflow']} older notes not shown)" in text
+    assert f"(+ {out['overflow']} notes not shown)" in text
     # Oldest-updated project notes dropped first; newest survive; feedback survives.
     assert "Project note 000" not in text
     assert "Project note 089" in text
@@ -392,7 +393,7 @@ def test_overflow_line_separated_when_all_notes_dropped(conn, db_url):
     db.close()
     out = _board(db_url, None)
     assert out["n_notes"] == 0 and out["overflow"] == 1
-    assert out["text"].endswith("\n\n(+ 1 older notes not shown)")
+    assert out["text"].endswith("\n\n(+ 1 notes not shown)")
 
 
 # ---------------------------------------------------------------------------
@@ -509,9 +510,10 @@ def _audience_fixture(conn, db_url):
     )
     _episode(conn, "s-alpha", 1, "alpha")
     _episode(conn, "s-beta", 1, "beta")
-    _event(conn, "Alpha shipped a release", project="alpha", ref="aud:1")
-    _event(conn, "Beta got a new logo", project="beta", ref="aud:2")
-    _event(conn, "Unlabeled milestone", project=None, ref="aud:3")
+    # One day apiece: the board keeps a single event per day, so a shared day would hide two.
+    _event(conn, "Alpha shipped a release", project="alpha", days_ago=1, ref="aud:1")
+    _event(conn, "Beta got a new logo", project="beta", days_ago=2, ref="aud:2")
+    _event(conn, "Unlabeled milestone", project=None, days_ago=3, ref="aud:3")
     return {
         "personal": personal_note,
         "work": work_note,
@@ -628,3 +630,180 @@ def test_route_without_a_resolver_serves_unknown_whatever_surface_is_named(conn,
         assert "User keeps a personal journal" not in body["text"]
         assert "Alpha shipped a release" not in body["text"]
     assert named["text"] == bare["text"]
+
+
+# ---------------------------------------------------------------------------
+# Per-type quotas, helpful-first ranking, one timeline line per day
+# ---------------------------------------------------------------------------
+
+
+def _rate_helpful(conn, *note_ids, reports=1):
+    for _ in range(reports):
+        conn.execute(
+            "INSERT INTO recall_feedback (query, helpful) VALUES ('q', %s::jsonb)",
+            ("[" + ",".join(f'"n:{i}"' for i in note_ids) + "]",),
+        )
+
+
+def _flood(conn, db_url, *, feedback=60, user=40, project=20, reference=20):
+    """A prod-shaped board: far more notes than fit, the feedback alone enough to fill the
+    cap. Hooks are ~100 chars; updated_at descends with creation order inside each type."""
+    db = Database(db_url)
+    ids: dict[str, list[int]] = {"feedback": [], "user": [], "project": [], "reference": []}
+    for type_, n in (
+        ("feedback", feedback),
+        ("user", user),
+        ("project", project),
+        ("reference", reference),
+    ):
+        for i in range(n):
+            hook = f"{type_} note {i:03d} " + "w" * 90
+            ids[type_].append(_note(db, type=type_, hook=hook, project="alpha"))
+    db.close()
+    for group in ids.values():
+        for age, nid in enumerate(group):  # first created = newest
+            conn.execute(
+                "UPDATE notes SET updated_at = now() - make_interval(hours => %s) WHERE id = %s",
+                (age, nid),
+            )
+    return ids
+
+
+def _types_shown(conn, out):
+    rows = conn.execute("SELECT type FROM notes WHERE id = ANY(%s)", (out["note_ids"],)).fetchall()
+    shown = {"feedback": 0, "user": 0, "project": 0, "reference": 0}
+    for (t,) in rows:
+        shown[t] += 1
+    return shown
+
+
+def test_feedback_flood_no_longer_crowds_out_the_other_types(conn, db_url):
+    """The bug: 60 feedback hooks alone fill the cap, so user, project and reference notes
+    were all dropped, board after board. Every type must now be on the board, in
+    proportion to its quota."""
+    _wipe(conn)
+    _flood(conn, db_url)
+    out = _board(db_url, "alpha")
+    shown = _types_shown(conn, out)
+    assert out["overflow"] > 0 and len(out["text"]) // 4 <= 2000
+    assert all(n > 0 for n in shown.values()), shown
+    assert shown["feedback"] > shown["user"] > shown["project"] > shown["reference"], shown
+    assert shown["feedback"] < 60  # not the whole budget
+
+
+def test_unused_quota_flows_to_the_other_types(conn, db_url):
+    """No project notes on the board (project=None) and three user notes: the project
+    share goes to feedback and references, and every user note is shown."""
+    _wipe(conn)
+    ids = _flood(conn, db_url, feedback=60, user=3, project=0, reference=60)
+    out = _board(db_url, None)
+    shown = _types_shown(conn, out)
+    assert shown["user"] == 3 and shown["project"] == 0
+    assert set(ids["user"]) <= set(out["note_ids"])
+    assert shown["feedback"] > shown["reference"] > 0
+    assert shown["feedback"] + shown["reference"] + 3 == out["n_notes"]
+
+
+def test_helpful_ratings_outrank_recency_within_a_type(conn, db_url):
+    """A user note nobody has updated in a long time but that recall's raters keep marking
+    helpful is shown ahead of newer, unrated ones; two ratings beat one."""
+    _wipe(conn)
+    ids = _flood(conn, db_url)
+    oldest_user, second_oldest = ids["user"][-1], ids["user"][-2]
+    _rate_helpful(conn, oldest_user, second_oldest)
+    _rate_helpful(conn, oldest_user)  # two reports for the oldest, one for the second
+    out = _board(db_url, "alpha")
+    shown_user = [i for i in out["note_ids"] if i in set(ids["user"])]
+    assert oldest_user in shown_user and second_oldest in shown_user
+    # The rest of the user quota goes to the newest unrated notes.
+    assert set(ids["user"][: len(shown_user) - 2]) <= set(shown_user)
+
+
+def test_unrated_boards_rank_by_recency_and_keep_section_order(conn, db_url):
+    """With no ratings the kept notes of a type are its newest, and the sections still
+    render feedback -> user -> project -> reference with each one newest-first."""
+    _wipe(conn)
+    ids = _flood(conn, db_url)
+    out = _board(db_url, "alpha")
+    kept = set(out["note_ids"])
+    for group in ids.values():
+        flags = [i in kept for i in group]  # group[0] is the newest
+        assert flags == sorted(flags, reverse=True)  # a newest-first prefix, no gaps
+    assert out["note_ids"] == sorted(
+        out["note_ids"],
+        key=lambda i: (
+            next(k for k, g in enumerate(ids.values()) if i in g),
+            ids[next(t for t, g in ids.items() if i in g)].index(i),
+        ),
+    )
+
+
+def test_a_board_that_fits_is_untouched_by_ratings(conn, db_url):
+    """Nothing is dropped, so ranking cannot change what is shown or the order it is
+    shown in."""
+    _wipe(conn)
+    db = Database(db_url)
+    a = _note(db, type="user", hook="User fact A")
+    b = _note(db, type="user", hook="User fact B")
+    db.close()
+    before = _board(db_url, None)
+    _rate_helpful(conn, a, a, b)
+    after = _board(db_url, None)
+    assert before["text"] == after["text"] and after["overflow"] == 0
+
+
+def test_restricted_board_shares_the_quotas(conn, db_url):
+    """A work laptop's board is cut the same way: its work-safe feedback flood no longer
+    hides its work-safe user notes."""
+    _wipe(conn)
+    ids = _flood(conn, db_url, feedback=60, user=12, project=0, reference=30)
+    conn.execute("UPDATE notes SET audience = 'work-safe'")
+    sid = register_restricted(conn, ["alpha"])
+    out = build_board(db_url, None, sid)
+    shown = _types_shown(conn, out)
+    assert out["trust"] == "restricted" and out["overflow"] > 0
+    assert shown["user"] > 0 and shown["reference"] > 0 and shown["feedback"] > shown["user"]
+    assert len(out["text"]) // 4 <= 2000
+    assert set(out["note_ids"]) <= {i for g in ids.values() for i in g}
+
+
+def test_timeline_is_one_line_per_day_and_at_most_five_days(conn, db_url):
+    """Seven days of milestones, several on some days: the board carries each day's
+    highest-salience event, for the five newest days."""
+    _wipe(conn)
+    for days_ago in range(1, 8):
+        _event(
+            conn,
+            f"Plain event day {days_ago}",
+            salience=2,
+            days_ago=days_ago,
+            ref=f"tb:p{days_ago}",
+        )
+    _event(conn, "Big event on day two", salience=4, days_ago=2, ref="tb:big2")
+    _event(conn, "Other project same day", salience=3, days_ago=3, project="beta", ref="tb:b3")
+    text = _board(db_url, None)["text"]
+    lines = [ln for ln in text.splitlines() if re.search(r"\(t:\d+\)$", ln)]
+    assert len(lines) == 5
+    dates = [ln[2:7] for ln in lines]
+    assert dates == sorted(dates, reverse=True) and len(set(dates)) == 5
+    assert "Big event on day two" in text and "Plain event day 2" not in text
+    assert "Other project same day" in text and "Plain event day 3" not in text
+    assert "Plain event day 1" in text and "Plain event day 6" not in text
+
+
+def test_timeline_share_of_the_board_is_small(conn, db_url):
+    """Verbose milestones every day used to take about a quarter of the token budget."""
+    _wipe(conn)
+    for days_ago in range(1, 8):
+        for k in range(3):
+            _event(
+                conn,
+                f"Milestone {days_ago}-{k} " + "m" * 400,
+                salience=2,
+                days_ago=days_ago,
+                ref=f"tb:{days_ago}{k}",
+            )
+    _flood(conn, db_url)
+    text = _board(db_url, "alpha")["text"]
+    section = text.split("## Last 7 days", 1)[1]
+    assert len(section) < 0.15 * len(text)

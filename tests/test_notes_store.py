@@ -27,6 +27,7 @@ except Exception:  # pragma: no cover - environment dependent
 
 import ingestion.notes as notes_mod  # noqa: E402
 from ingestion.db import Database  # noqa: E402
+from ingestion.db_notes import note_helpful_counts  # noqa: E402
 from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
 from tests.helpers.embed import GROUP, onehot  # noqa: E402
 
@@ -151,6 +152,39 @@ def test_list_board_notes_ordering_and_project_filter(conn, db_url):
     assert [r["id"] for r in db.list_board_notes(_OWNER, None)] == [fb, usr, ref]
     db.close()
     _wipe(conn)
+
+
+def test_note_helpful_counts_counts_reports_that_rated_a_note_helpful(conn, db_url):
+    """One count per report, only for n:<id> in `helpful`: e:/f: ids, the `noise` list,
+    malformed entries and repeats inside one report do not count."""
+    conn.execute("DELETE FROM recall_feedback")
+    rows = [
+        ('["n:5", "e:5", "n:7"]', "[]"),
+        ('["n:5", "n:5"]', '["n:7"]'),  # repeat in one report = one; noise is not helpful
+        ('["n:5x", "n:", "nn:9", "n:-3", "n:99999999999999999999", "f:abc"]', "[]"),
+        ("[]", '["n:5"]'),
+    ]
+    for helpful, noise in rows:
+        conn.execute(
+            "INSERT INTO recall_feedback (query, helpful, noise) VALUES ('q', %s::jsonb, %s::jsonb)",
+            (helpful, noise),
+        )
+    try:
+        assert note_helpful_counts(conn) == {5: 2, 7: 1}
+    finally:
+        conn.execute("DELETE FROM recall_feedback")
+    assert note_helpful_counts(conn) == {}
+
+
+def test_note_helpful_counts_is_empty_without_the_feedback_table():
+    """A database that predates schema 046 ranks every note equal: the board falls back to
+    recency instead of failing."""
+
+    class NoTable:
+        def execute(self, *a, **kw):
+            raise psycopg.errors.UndefinedTable("relation recall_feedback does not exist")
+
+    assert note_helpful_counts(NoTable()) == {}
 
 
 def test_get_notes_by_ids(conn, db_url):
