@@ -213,7 +213,7 @@ def _dream_collect_proposals(
             # (schema 065) catches a row that sat in observe and went proposed tonight; before
             # 065 is applied the lane idles, and rows created tonight is the best this can count.
             try:
-                from dream.config.nightly import identity_ready
+                from dream.config import identity_ready
 
                 ccol = "proposed_at" if identity_ready(conn) else "created_at"
                 for pid, fkey in conn.execute(

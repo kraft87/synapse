@@ -41,6 +41,7 @@ from datetime import UTC, datetime
 import psycopg
 from psycopg.types.json import Json
 
+from dream.config import identity_ready
 from dream.skills import config
 from dream.skills import skill_db_source as DB
 from dream.skills import skill_ledger as L
@@ -48,7 +49,6 @@ from dream.skills import skill_measure as SM
 from dream.skills.config import db_url
 from dream.skills.review_queue import _plain
 from dream.skills.skill_measure import _extract_json
-from ingestion.schema_check import ColumnProbe
 
 LEARNED_FILE = os.environ.get("CONFIG_LEARNED_FILE", "rules/learned.md")
 PROPOSE_SESSIONS = int(
@@ -70,21 +70,6 @@ REGISTRY_CHARS = 30000  # the user's global rule files, as sent to the coverage 
 
 EXPIRED = "expired"
 COVERED = "auto:covered"
-
-#: Schema 065 adds the four columns below. The image ships before it is applied, so the lane
-#: asks this probe first and idles with one log line until all four exist.
-IDENTITY_PROBE = ColumnProbe(
-    "SELECT 1 FROM pg_attribute "
-    "WHERE attrelid = to_regclass('config_lane.config_proposals') "
-    "  AND attname IN ('embedding', 'proposed_at', 'recommendation', 'coverage') "
-    "  AND NOT attisdropped HAVING count(*) = 4",
-    "schema 065 (config_proposals.embedding, proposed_at, recommendation, coverage)",
-)
-
-
-def identity_ready(conn) -> bool:
-    return IDENTITY_PROBE.ready(conn, conn.info.dsn)
-
 
 _FIND_PROMPT = """You audit how well an AI agent follows its user's BEHAVIORAL preferences.
 Below are the USER MESSAGES from one session. Find moments where the user CORRECTED the agent's
@@ -173,21 +158,19 @@ def row_class(row: dict) -> str | None:
     return None
 
 
-def pick_match(rows: list[dict], session_id: str) -> tuple[dict, str] | None:
-    """The stored row a correction from `session_id` is the same rule as, with its class
-    (row_class), or None. `rows` carry `cos` (cosine to the row's anchor), `evidence`, `status`.
-    Best cosine wins among the rows that clear their bar; a session the row already counts is
-    held to IDENTITY_COSINE_SAME_SESSION, any other to IDENTITY_COSINE."""
+def pick_match(rows: list[dict], session_id: str | set[str]) -> tuple[dict, str] | None:
+    """The stored row a correction from `session_id` (or, for a stored row being folded in, its
+    set of sessions) is the same rule as, with its class (row_class), or None. `rows` carry
+    `cos` (cosine to the row's anchor), `evidence`, `status`. Best cosine wins among the rows
+    that clear their bar; a session the row already counts is held to
+    IDENTITY_COSINE_SAME_SESSION, any other to IDENTITY_COSINE."""
+    mine = {session_id} if isinstance(session_id, str) else set(session_id)
     best: tuple[dict, str] | None = None
     for r in rows:
         klass = row_class(r)
         if klass is None or r.get("cos") is None:
             continue
-        bar = (
-            IDENTITY_COSINE_SAME_SESSION
-            if session_id in _sessions(r["evidence"])
-            else IDENTITY_COSINE
-        )
+        bar = IDENTITY_COSINE_SAME_SESSION if mine & _sessions(r["evidence"]) else IDENTITY_COSINE
         if r["cos"] >= bar and (best is None or r["cos"] > best[0]["cos"]):
             best = (r, klass)
     return best

@@ -37,10 +37,15 @@ def cmd_list() -> None:
         print("no config proposals awaiting review.")
         return
     for r in rows:
+        age = f"  {r['days_pending']}d pending" if r.get("days_pending") is not None else ""
         print(
-            f"[{r['id']}] {r['kind']} -> {r['file_key']} ({r['scope']})  {r['sessions']} session(s)"
+            f"[{r['id']}] {r['kind']} -> {r['file_key']} ({r['scope']})  "
+            f"{r['sessions']} session(s){age}"
         )
         print(f"      {(r.get('summary') or '')[:110]}")
+        rec = r.get("recommendation")
+        if isinstance(rec, dict) and rec.get("verdict"):
+            print(f"      recommends {rec['verdict']}: {(rec.get('reason') or '')[:160]}")
 
 
 def cmd_show(cid: int) -> None:
@@ -50,6 +55,9 @@ def cmd_show(cid: int) -> None:
         return
     print(f"[{r['id']}] {r['kind']} -> {r['file_key']} ({r['scope']})  status={r['status']}")
     print(f"rule: {r.get('diff') or r.get('summary')}")
+    rec = r.get("recommendation")
+    if isinstance(rec, dict) and rec.get("verdict"):
+        print(f"recommends {rec['verdict']}: {(rec.get('reason') or '')[:240]}")
     ev = r.get("evidence") or []
     print(f"evidence ({len(ev)} correction(s)):")
     for e in ev[:20]:

@@ -367,11 +367,14 @@ def test_run_lane_end_to_end(lane, monkeypatch):
 
 
 def test_run_lane_idles_until_schema_065(lane, monkeypatch):
+    import dream.config as config_pkg
     from ingestion.schema_check import ColumnProbe
 
     lane.execute("UPDATE config_lane.config_scan_cursor SET last_scan_at = NULL")
     monkeypatch.setattr(
-        N, "IDENTITY_PROBE", ColumnProbe("SELECT 1 WHERE false", "schema 065 (test: absent)")
+        config_pkg,
+        "IDENTITY_PROBE",
+        ColumnProbe("SELECT 1 WHERE false", "schema 065 (test: absent)"),
     )
 
     def must_not_run(*a, **k):
