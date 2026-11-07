@@ -29,8 +29,12 @@ grounded_required_to_apply); this module only keeps the queue short and says wha
                 drafted proposal once per draft and stores {verdict, reason} in
                 recommendation; a changed draft is asked again.
   report        one plain-text Discord post when tonight changed the queue (a new
-                proposal, an auto-reject, an expiry), else a weekly reminder of what is
-                still pending (or that nothing is). Each item starts with its verdict.
+                proposal, an auto-reject, an expiry, anything the autopilot did), else a
+                weekly reminder of what is still pending (or that nothing is). The
+                autopilot's lines come first (auto-applied ones end with 'undo: revert N'),
+                then each item starts with its verdict. Every report that is built is also
+                stored in skill_scan_cursor.config.last_report = {at, text}: delivery is
+                whoever reads it, not this module.
 
 Everything that needs schema 062 (proposed_at, recommendation) checks skill_ledger's probe
 first and skips with one log line until the migration is applied.
@@ -51,6 +55,7 @@ from . import config
 from . import skill_doc as D
 from . import skill_ledger as L
 from . import skill_measure as SM
+from .autoreview import ROLLBACK_DAYS
 from .skill_draft import missing_phrasings, target_skill
 from .struggle_arc import NEGATIVE_LIST
 
@@ -60,6 +65,15 @@ RECOMMEND_CAP = 5  # recommendation calls per night (each is one judge call)
 REMIND_DAYS = 7  # a quiet queue still reports this often
 REPORT_CHARS = 1500
 DIFF_CHARS = 4000
+
+_ROLLBACK_REASONS = {
+    "dismissed": "the skill was dismissed after the change",
+    "post_fire_deviation": "a session deviated from the skill after the change",
+    "owner_edit": "the owner edited the change away",
+    "owner_retired": "the owner retired the new skill",
+    "skill_gone": "the skill is gone",
+    "manual": "undone by hand",
+}
 
 _REASONS = {
     "no_target": "the skill is no longer in the registry",
@@ -354,16 +368,84 @@ def _pending_line(p: dict) -> str:
     return f"{_verdict(rec)} #{p['id']} {_what(p)} ({when}){why}"
 
 
-def build_report(day: str, pending: list[dict], rejected: list, expired: list) -> str:
-    """The plain-text report, at most REPORT_CHARS. A header, then one line per item, each
-    starting with its verdict: tonight's new proposals, auto-rejects and expiries, then the
-    older pending ones; past the cap the oldest lines give way to a '+N more' line."""
+def _auto_lines(auto: dict | None, compact: bool = False) -> tuple[list[str], list[str]]:
+    """(header parts, body lines) for what the autopilot did tonight, applied ones first.
+    compact drops the reviewer's reasons (build_report's fallback when the full lines do not
+    fit): every applied and rejected item keeps its id and its undo / revive command."""
+    if not auto:
+        return [], []
+
+    def why(reason) -> str:
+        return "" if compact else f": {_plain(reason, 160)}"
+
+    parts: list[str] = []
+    lines: list[str] = []
+    applied = auto.get("applied") or []
+    if applied:
+        parts.append(f"{len(applied)} auto-applied")
+    for a in applied:
+        lines.append(
+            f"auto-applied #{a['id']} {a['what']} (undo: revert {a['id']}){why(a.get('reason'))}"
+        )
+    rolled = auto.get("rolled_back") or []
+    if rolled:
+        parts.append(f"{len(rolled)} rolled back")
+    for r in rolled:
+        lines.append(
+            f"rolled back #{r['id']} {r['what']}: {_ROLLBACK_REASONS.get(r['reason'], r['reason'])}."
+        )
+    for x in auto.get("conflicts") or []:
+        if x["what"] == "merged":
+            lines.append(
+                f"kept both #{x['id']} {x['skill']}: a local edit was pulled over, the new "
+                "description was written onto it."
+            )
+        else:
+            lines.append(
+                f"restored a local edit of {x['skill']} (#{x['id']} is back in the queue)."
+            )
+    rejected = auto.get("rejected") or []
+    if rejected:
+        parts.append(f"{len(rejected)} reviewer-rejected")
+    for r in rejected:
+        lines.append(
+            f"auto-rejected #{r['id']} {r['what']}{why(r.get('reason')) or '.'} "
+            f"Reply 'revive {r['id']}' to bring it back."
+        )
+    br = auto.get("breaker")
+    if br:
+        lines.insert(
+            0,
+            f"autopilot paused: {br['rollbacks']} rollbacks in {ROLLBACK_DAYS} days "
+            "({}); it only records what it would do until you run "
+            "'skill_review.py autopilot resume'.".format(", ".join(br["skills"])),
+        )
+    would = auto.get("would") or {}
+    if would and auto.get("effective_mode", auto.get("mode")) != "live":
+        lines.append(
+            f"autopilot (shadow): would have applied {would.get('would_apply', 0)}, "
+            f"rejected {would.get('would_reject', 0)}."
+        )
+    return parts, lines
+
+
+def build_report(
+    day: str, pending: list[dict], rejected: list, expired: list, auto: dict | None = None
+) -> str:
+    """The plain-text report, at most REPORT_CHARS. A header, then one line per item: the
+    autopilot's first (auto-applied, rolled back, paused), then each item starting with its
+    verdict: tonight's new proposals, auto-rejects and expiries, then the older pending
+    ones; past the cap the oldest lines give way to a '+N more' line."""
     new = [p for p in pending if p["new"]]
-    if new or rejected or expired:
-        parts = [f"{len(new)} new"] if new else []
+    auto_parts, auto_lines = _auto_lines(auto)
+    if new or rejected or expired or auto_parts or auto_lines:
+        parts = list(auto_parts)
+        parts += [f"{len(new)} new"] if new else []
         parts += [f"{len(rejected)} auto-rejected"] if rejected else []
         parts += [f"{len(expired)} expired"] if expired else []
-        head = f"Skills lane {day}: {', '.join(parts)}, {len(pending)} pending."
+        head = (
+            f"Skills lane {day}: {', '.join(parts) or 'autopilot notes'}, {len(pending)} pending."
+        )
     elif pending:
         head = f"Skills lane weekly reminder {day}: {len(pending)} pending."
     else:
@@ -381,15 +463,20 @@ def build_report(day: str, pending: list[dict], rejected: list, expired: list) -
     body += [_pending_line(p) for p in pending if not p["new"]]
     tail = ["Reply 'approve N', 'reject N' or 'tell me about N'."] if pending else []
 
-    def render(keep: int) -> str:
+    # The autopilot's lines are never cut: what the lane applied or rejected on its own is
+    # only undone from here (revert / revive N). Past the cap the oldest queue lines give way
+    # first, then the autopilot's lines lose their reasons.
+    def render(auto_body: list[str], keep: int) -> str:
         more = [f"+{len(body) - keep} more: skill_review.py list"] if keep < len(body) else []
-        return "\n".join([head, *body[:keep], *more, *tail])
+        return "\n".join([head, *auto_body, *body[:keep], *more, *tail])
 
     keep = len(body)
-    msg = render(keep)
+    msg = render(auto_lines, keep)
     while len(msg) > REPORT_CHARS and keep > 0:
         keep -= 1
-        msg = render(keep)
+        msg = render(auto_lines, keep)
+    if len(msg) > REPORT_CHARS:
+        msg = render(_auto_lines(auto, compact=True)[1], 0)
     return msg[:REPORT_CHARS]
 
 
@@ -401,21 +488,43 @@ def _reminder_due(cursor_config: dict, now) -> bool:
     return now - last >= timedelta(days=REMIND_DAYS)
 
 
-def report(conn, run_started, changes: dict, no_discord: bool = False) -> dict:
-    """Post the report when tonight changed the queue, or when REMIND_DAYS passed since the
-    last one. Discord when SKILLS_DISCORD_WEBHOOK is set, stdout otherwise. The last-sent
-    stamp lives in skill_scan_cursor.config['report_sent_at'] (update_cursor merges)."""
+def report(
+    conn, run_started, changes: dict, no_discord: bool = False, deliver: bool = True
+) -> dict:
+    """Build the report when tonight changed the queue (or the autopilot did something), or
+    when REMIND_DAYS passed since the last one; store it in skill_scan_cursor.config
+    ['last_report'] = {at, text}. deliver=True also posts it: Discord when
+    SKILLS_DISCORD_WEBHOOK is set, stdout otherwise, and stamps config['report_sent_at']
+    (update_cursor merges). deliver=False leaves delivery to the caller, which stamps it
+    with mark_sent. changes: auto_rejected, expired, autopilot (autoreview.run's result)."""
     ready = L.queue_ready(conn)
     pending = _pending(conn, run_started, ready)
     rejected = changes.get("auto_rejected") or []
     expired = changes.get("expired") or []
-    changed = bool(any(p["new"] for p in pending) or rejected or expired)
+    auto = changes.get("autopilot") or {}
+    auto_changed = bool(
+        any(
+            auto.get(k)
+            for k in ("applied", "rolled_back", "conflicts", "rejected", "breaker", "capped")
+        )
+    )
+    changed = bool(any(p["new"] for p in pending) or rejected or expired or auto_changed)
     due = _reminder_due(L.get_cursor(conn).get("config") or {}, run_started)
     stats = {"pending": len(pending), "sent": 0, "reminder": int(due and not changed)}
     if not changed and not due:
         print(f"(report: {len(pending)} pending, nothing changed tonight, reminder not due)")
         return stats
-    msg = build_report(run_started.strftime("%m-%d"), pending, rejected, expired)
+    msg = build_report(run_started.strftime("%m-%d"), pending, rejected, expired, auto)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
+        "updated_at=now() WHERE id=1",
+        (json.dumps({"last_report": {"at": run_started.isoformat(), "text": msg}}),),
+    )
+    conn.commit()
+    if not deliver:
+        stats["text"] = msg  # the caller delivers it (and stamps it with mark_sent)
+        return stats
     if not no_discord and config.DISCORD_WEBHOOK:
         try:
             req = urllib.request.Request(
@@ -431,6 +540,12 @@ def report(conn, run_started, changes: dict, no_discord: bool = False) -> dict:
     else:
         print(msg)
         stats["sent"] = 1
+    mark_sent(conn, run_started)
+    return stats
+
+
+def mark_sent(conn, run_started) -> None:
+    """Stamp the report as delivered (the weekly reminder counts from here)."""
     c = conn.cursor()
     c.execute(
         "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
@@ -438,4 +553,3 @@ def report(conn, run_started, changes: dict, no_discord: bool = False) -> dict:
         (json.dumps({"report_sent_at": run_started.isoformat()}),),
     )
     conn.commit()
-    return stats

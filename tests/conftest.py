@@ -56,6 +56,7 @@ _DB_FILES = {
     "test_skills_lane_v2.py",
     "test_skills_review_queue.py",
     "test_skill_accept_applies.py",
+    "test_skills_autopilot.py",
     "test_skill_retire.py",
     "test_supersede_leg.py",
     "test_self_session_facts.py",

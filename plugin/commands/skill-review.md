@@ -14,8 +14,12 @@ Steps:
      - `--force` applies even when the skill changed since the draft was made, or a new skill's name is taken. Only with the user's say-so, after showing them why accept refused.
    - reject: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/skill_review.py" reject <id> [reason]` (30-day cooldown).
    - revive: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/skill_review.py" revive <id>` puts a rejected, auto-rejected or expired proposal back in the queue (the nightly run auto-rejects proposals that can't be applied as drafted and retires ones left unanswered for 21 days).
+   - revert: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/skill_review.py" revert <id> [reason]` undoes a change the autopilot applied on its own (the report says `undo: revert N`): a new skill is retired, a description change is put back (later hand edits are kept). It refuses a new skill that was edited since unless `--force`. Use it when the user says to undo an auto-applied change.
+   - `skill_review.py report` prints the last report the nightly lane built; `skill_review.py autopilot status` shows the autopilot's mode, recent reviews and circuit breaker, and `autopilot resume` re-arms it after the breaker paused it (only with the user's say-so).
    - If accept says there is no draft yet, tell the user it re-drafts on the next nightly run, or offer to write the SKILL.md with them and pass it via `--body-file`.
 4. Summarize what changed: which skill was created or updated, its scope, and where it syncs. Never accept without the user's explicit say-so, because accept edits the live skill library.
+
+The lane's autopilot applies two routine kinds itself when an Opus reviewer and an independent verifier both pass them: a new skill that met the recurrence gate, and a description-only trigger change on an unpinned skill. It rejects what both agree is wrong (30-day cooldown, `revive` brings it back) and leaves everything else here for the user, with its recommendation.
 
 Merge proposals (MERGE) are the exception: accept only records the decision, the merge itself is done by hand.
 

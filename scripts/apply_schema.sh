@@ -103,6 +103,7 @@ FILES=(
   061_episodes_project_recency_index.sql
   062_skill_review_queue.sql
   063_web_audience.sql
+  064_skills_autopilot.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

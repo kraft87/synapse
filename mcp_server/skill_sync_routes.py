@@ -29,7 +29,10 @@ Routes (all POST):
   /skills/proposals/act {id, action, reason?, body?, scope?, force?}
                                                      -> accept (applies) | reject | revive
                                                         (a rejected/retired row back to
-                                                        proposed) | promote (no-op)
+                                                        proposed) | promote (no-op) | revert
+                                                        (undo a change the autopilot applied)
+  /skills/autopilot   {action}                       -> status | resume | report (the autopilot's
+                                                        state, breaker reset, last built report)
 
 Who is served what (schema 053/054 trust, the board's rule applied to skills): a full-trust
 device reads and writes every scope. A restricted device is served only ``project:<p>``
@@ -62,7 +65,12 @@ from psycopg.types.json import Json
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from dream.skills.skill_doc import body_hash, frontmatter_name, valid_skill_name
+from dream.skills.skill_doc import (
+    body_hash,
+    frontmatter_name,
+    replace_description,
+    valid_skill_name,
+)
 from dream.skills.skill_measure import skill_description
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
@@ -530,45 +538,51 @@ def _record_overwrite(db_url: str, p: dict, access: SkillAccess = FULL_ACCESS) -
     return {"status": "ok"}
 
 
-def _retire_skill(db_url: str, name) -> dict:
-    """Retire `name`: status='retired' stamped with retired_at, plus a skill_history row so
-    the retirement shows in the change trail. A row retired by hand (no retired_at) gets
-    stamped too, so its retirement starts to hold."""
-    if not isinstance(name, str) or not name.strip():
-        return {"status": "error", "detail": "'name' must be a non-empty string"}
-    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
-        if not _retired_at_ready(c):
-            return {"status": "error", "detail": _NO_RETIRED_AT}
-        row = c.execute(
-            "UPDATE skills_lane.skill_registry "
-            "SET status='retired', retired_at=now(), updated_at=now() "
-            "WHERE name=%s AND (status<>'retired' OR retired_at IS NULL) "
-            "RETURNING name, scope, body, content_modified_at, retired_at",
-            (name,),
+def _retire_in(c, name: str) -> dict:
+    """Retire `name` on the caller's dict-row connection, inside its transaction (no
+    commit): status='retired' stamped with retired_at, plus a skill_history row so the
+    retirement shows in the change trail. A row retired by hand (no retired_at) gets
+    stamped too, so its retirement starts to hold. Needs schema 060 (callers check)."""
+    row = c.execute(
+        "UPDATE skills_lane.skill_registry "
+        "SET status='retired', retired_at=now(), updated_at=now() "
+        "WHERE name=%s AND (status<>'retired' OR retired_at IS NULL) "
+        "RETURNING name, scope, body, content_modified_at, retired_at",
+        (name,),
+    ).fetchone()
+    if row is None:
+        prior = c.execute(
+            "SELECT retired_at FROM skills_lane.skill_registry WHERE name=%s", (name,)
         ).fetchone()
-        if row is None:
-            prior = c.execute(
-                "SELECT retired_at FROM skills_lane.skill_registry WHERE name=%s", (name,)
-            ).fetchone()
-            if prior is None:
-                return {"status": "not_found", "name": name}
-            return {
-                "status": "already_retired",
-                "name": name,
-                "retired_at": _iso(prior["retired_at"]),
-            }
-        c.execute(
-            "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
-            "VALUES (%s,%s,%s,%s,'retired')",
-            (row["name"], row["scope"], row["body"], row["content_modified_at"]),
-        )
-        c.commit()
+        if prior is None:
+            return {"status": "not_found", "name": name}
+        return {"status": "already_retired", "name": name, "retired_at": _iso(prior["retired_at"])}
+    c.execute(
+        "INSERT INTO skills_lane.skill_history (name, scope, body, content_modified_at, op) "
+        "VALUES (%s,%s,%s,%s,'retired')",
+        (row["name"], row["scope"], row["body"], row["content_modified_at"]),
+    )
     return {
         "status": "retired",
         "name": row["name"],
         "scope": row["scope"],
         "retired_at": _iso(row["retired_at"]),
     }
+
+
+def _retire_skill(db_url: str, name) -> dict:
+    """Retire `name` (see _retire_in), in its own transaction."""
+    if not isinstance(name, str) or not name.strip():
+        return {"status": "error", "detail": "'name' must be a non-empty string"}
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
+        if not _retired_at_ready(c):
+            return {"status": "error", "detail": _NO_RETIRED_AT}
+        res = _retire_in(c, name)
+        if res["status"] == "retired":
+            c.commit()
+        else:
+            c.rollback()
+    return res
 
 
 def _rescope_skill(db_url: str, name, scope) -> dict:
@@ -797,11 +811,44 @@ def _proposal_detail(db_url: str, cid: int) -> dict:
     return d
 
 
-def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool) -> dict:
-    """One transaction: lock the candidate, re-check the plan, write the registry the way a
-    publish does, and mark the candidate promoted with the grounded accept recorded."""
+def _autopilot_ready(c) -> bool:
+    """Schema 064 (skill_auto_reviews, applied_by, auto_review_id, lane_body_hash) applied."""
+    from dream.skills.skill_ledger import AUTOPILOT_PROBE
+
+    return AUTOPILOT_PROBE.ready(c, c.info.dsn)
+
+
+_REVIEW_KEYS = ("night", "mode", "evidence_hash", "draft_hash", "tier", "preflight")
+
+
+def apply_candidate(
+    c,
+    cid: int,
+    body: str | None,
+    scope: str | None,
+    force: bool,
+    *,
+    actor: str = "human",
+    review: dict | None = None,
+) -> dict:
+    """THE write behind a proposal's apply, for both actors, in one transaction: lock the
+    candidate, re-check the plan, write the registry through the publish upsert (so
+    skill_history keeps the body it replaced and two-way sync delivers the new one), mark the
+    candidate promoted.
+
+    actor='human' (the review accept): records the grounded accept, as it always did.
+    actor='auto' (dream/skills/autoreview.py): `review` carries the judgement (night, mode,
+    evidence_hash, draft_hash, tier, preflight, reviewer, verifier); its skill_auto_reviews
+    row is written in this same transaction, and the candidate gets applied_by='auto' plus
+    that row's id, which is what grounded_required_to_apply accepts in place of a grounded
+    weight. The auto path never writes a grounded entry, never forces, and only applies a
+    row still 'proposed'."""
     from dream.skills.skill_ledger import _rollup
 
+    auto = actor == "auto"
+    if auto and (review is None or force or not _autopilot_ready(c)):
+        c.rollback()
+        return {"status": "error", "detail": "auto apply needs a review, no force, schema 064"}
     row = c.execute(
         f"SELECT {_CANDIDATE_COLS} FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE",
         (cid,),
@@ -820,6 +867,14 @@ def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool)
             "reason": "already_applied",
             "detail": f"[{cid}] {row['name']} was already applied",
         }
+    if auto and row["status"] != "proposed":
+        c.rollback()
+        return {
+            "status": "refused",
+            "id": cid,
+            "reason": "not_proposed",
+            "detail": f"[{cid}] is '{row['status']}', not awaiting review",
+        }
     text = body if body is not None else (row["proposal_body"] or "")
     plan = _plan_apply(c, row, text, scope, lock=True)
     blocking = [i for i in plan["issues"] if not (force and i["force"])]
@@ -834,19 +889,65 @@ def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool)
             "issues": blocking,
         }
 
+    ready = _autopilot_ready(c)
+    new_hash = body_hash(text)
     now = c.execute("SELECT now() AS now").fetchone()["now"]
     _upsert_registry(
         c.cursor(), plan["skill"], plan["scope"], text, skill_description(text) or None, now
     )
-    ev = row["evidence"] or []
-    ev.append({"session_id": None, "class": "grounded", "signal": "accept"})
-    _js, gs, _jw, gw = _rollup(ev)
-    c.execute(
-        "UPDATE skills_lane.skill_gap_candidates SET status='promoted', proposal_body=%s, "
-        "evidence=%s::jsonb, grounded_sessions=%s, grounded_weight=%s, updated_at=now() "
-        "WHERE id=%s",
-        (text, Json(ev), gs, gw, cid),
-    )
+    history_id = None
+    if plan["exists"] and new_hash != plan["current_hash"]:
+        hist = c.execute(
+            "SELECT max(id) AS id FROM skills_lane.skill_history "
+            "WHERE name=%s AND op='superseded' AND recorded_at=now()",
+            (plan["skill"],),
+        ).fetchone()
+        history_id = hist["id"] if hist else None
+    if ready:
+        c.execute(
+            "UPDATE skills_lane.skill_registry SET lane_body_hash=%s WHERE name=%s",
+            (new_hash, plan["skill"]),
+        )
+
+    if auto:
+        rid = c.execute(
+            "INSERT INTO skills_lane.skill_auto_reviews (candidate_id, night, mode, evidence_hash, "
+            "draft_hash, tier, preflight, reviewer, verifier, verdict, skill, previous_body_hash, "
+            "applied_body_hash, history_id, applied_at) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'applied',%s,%s,%s,%s,now()) RETURNING id",
+            (
+                cid,
+                review["night"],
+                review["mode"],
+                review["evidence_hash"],
+                review.get("draft_hash"),
+                review["tier"],
+                Json(review.get("preflight") or {}),
+                Json(review.get("reviewer")),
+                Json(review.get("verifier")),
+                plan["skill"],
+                plan["current_hash"],
+                new_hash,
+                history_id,
+            ),
+        ).fetchone()["id"]
+        c.execute(
+            "UPDATE skills_lane.skill_gap_candidates SET status='promoted', proposal_body=%s, "
+            "applied_by='auto', auto_review_id=%s, updated_at=now() WHERE id=%s",
+            (text, rid, cid),
+        )
+    else:
+        ev = row["evidence"] or []
+        ev.append({"session_id": None, "class": "grounded", "signal": "accept"})
+        _js, gs, _jw, gw = _rollup(ev)
+        by = ", applied_by='human'" if ready else ""
+        c.execute(
+            "UPDATE skills_lane.skill_gap_candidates SET status='promoted', proposal_body=%s, "
+            f"evidence=%s::jsonb, grounded_sessions=%s, grounded_weight=%s{by}, updated_at=now() "
+            "WHERE id=%s",
+            (text, Json(ev), gs, gw, cid),
+        )
+        rid = None
     c.commit()
     forced = [i["code"] for i in plan["issues"] if i["force"]]
     return {
@@ -859,9 +960,190 @@ def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool)
         "created": not plan["exists"],
         "forced": forced,
         "previous_body_hash": plan["current_hash"],
-        "body_hash": body_hash(text),
+        "body_hash": new_hash,
+        "auto_review_id": rid,
+        "history_id": history_id,
         "detail": f"applied: '{plan['skill']}' ({plan['scope']}) written to the skill registry",
     }
+
+
+def _apply_accept(c, cid: int, body: str | None, scope: str | None, force: bool) -> dict:
+    """The review accept: apply_candidate by a person."""
+    return apply_candidate(c, cid, body, scope, force)
+
+
+def revert_applied(c, cid: int, *, reason: str, actor: str = "human", force: bool = False) -> dict:
+    """Undo the autopilot's apply of candidate `cid`, in one transaction.
+
+      new skill   -> retired (the usual retire: stamped, body kept in skill_history)
+      description -> the skill's previous body comes back from skill_history when nothing
+                     touched the skill since; when someone did edit it, only the description
+                     goes back to what it was and their edit stays (nothing is lost either way)
+
+    A skill changed since the apply is refused unless force, except that a description someone
+    already replaced needs no undoing. The audit row is stamped (rolled_back_at, rollback_reason)
+    and the candidate goes to 'rejected' with the 30-day cooldown: a person's revert also writes
+    the grounded reject, the lane's own rollback does not (as #229's auto-reject)."""
+    from dream.skills.skill_ledger import _rollup
+
+    if not _autopilot_ready(c):
+        c.rollback()
+        return {"status": "error", "detail": "schema 064 not applied"}
+    rev = c.execute(
+        "SELECT * FROM skills_lane.skill_auto_reviews "
+        "WHERE candidate_id=%s AND verdict='applied' ORDER BY id DESC LIMIT 1 FOR UPDATE",
+        (cid,),
+    ).fetchone()
+    if rev is None:
+        c.rollback()
+        return {
+            "status": "refused",
+            "id": cid,
+            "reason": "not_auto_applied",
+            "detail": f"[{cid}] was not applied by the autopilot",
+        }
+    if rev["rolled_back_at"] is not None:
+        c.rollback()
+        return {
+            "status": "refused",
+            "id": cid,
+            "reason": "already_reverted",
+            "detail": f"[{cid}] was already reverted",
+        }
+    skill = rev["skill"]
+    _lock_name(c, skill)
+    reg = c.execute(
+        "SELECT scope, status, COALESCE(body, '') AS body FROM skills_lane.skill_registry "
+        "WHERE name=%s FOR UPDATE",
+        (skill,),
+    ).fetchone()
+    cur_hash = body_hash(reg["body"]) if reg else None
+    changed = reg is not None and cur_hash != rev["applied_body_hash"]
+    if changed and reg["status"] != "retired" and not force and rev["tier"] == "new_skill":
+        c.rollback()
+        return {
+            "status": "refused",
+            "id": cid,
+            "reason": "edited_since",
+            "detail": f"'{skill}' was edited after the lane created it; --force retires it anyway "
+            "(its body stays in skill_history)",
+        }
+    action = "none"
+    now = c.execute("SELECT now() AS now").fetchone()["now"]
+    if reg is None or reg["status"] == "retired":
+        action = "already_gone"
+    elif rev["tier"] == "new_skill":
+        _retire_in(c, skill)
+        action = "retired"
+    else:  # description
+        prev = None
+        if rev["history_id"] is not None:
+            prev = c.execute(
+                "SELECT body FROM skills_lane.skill_history WHERE id=%s", (rev["history_id"],)
+            ).fetchone()
+        prev_body = prev["body"] if prev and prev["body"] is not None else None
+        if prev_body is None:
+            c.rollback()
+            return {
+                "status": "refused",
+                "id": cid,
+                "reason": "no_history",
+                "detail": f"the body '{skill}' had before the change is not in skill_history",
+            }
+        if not changed:
+            new_body = prev_body
+            action = "restored"
+        elif skill_description(reg["body"]) == skill_description(prev_body):
+            new_body, action = None, "description_already_gone"
+        else:
+            new_body = replace_description(reg["body"], skill_description(prev_body))
+            action = "description_restored"
+            if new_body is None:
+                c.rollback()
+                return {
+                    "status": "refused",
+                    "id": cid,
+                    "reason": "cannot_edit",
+                    "detail": f"'{skill}' was edited and its description cannot be put back "
+                    "automatically; restore it by hand from skill_history",
+                }
+        if new_body is not None:
+            _upsert_registry(
+                c.cursor(), skill, reg["scope"], new_body, skill_description(new_body) or None, now
+            )
+            c.execute(
+                "UPDATE skills_lane.skill_registry SET lane_body_hash=NULL WHERE name=%s", (skill,)
+            )
+    c.execute(
+        "UPDATE skills_lane.skill_auto_reviews SET rolled_back_at=now(), rollback_reason=%s "
+        "WHERE id=%s",
+        (reason, rev["id"]),
+    )
+    row = c.execute(
+        "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s FOR UPDATE", (cid,)
+    ).fetchone()
+    ev = row["evidence"] or []
+    if actor == "human":
+        ev.append({"session_id": None, "class": "grounded", "signal": "reject"})
+    _js, gs, _jw, gw = _rollup(ev)
+    c.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='rejected', reject_reason=%s, "
+        "rejected_until=now() + interval '30 days', evidence=%s::jsonb, "
+        "grounded_sessions=%s, grounded_weight=%s, updated_at=now() WHERE id=%s",
+        ("reverted" if actor == "human" else f"auto_rollback:{reason}", Json(ev), gs, gw, cid),
+    )
+    c.commit()
+    return {
+        "status": "reverted",
+        "id": cid,
+        "skill": skill,
+        "action": action,
+        "scope": reg["scope"] if reg else "global",
+        "review_id": rev["id"],
+        "reason": reason,
+    }
+
+
+def lane_write(c, skill: str, body: str) -> str:
+    """Write `body` as the skill's newest version through the publish upsert, on the caller's
+    dict-row connection and inside its transaction (no commit): the autopilot's conflict
+    repair. The lane owns the write, so lane_body_hash follows; machines pull it as the
+    newest edit. Returns the body hash."""
+    _lock_name(c, skill)
+    reg = c.execute(
+        "SELECT scope FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE", (skill,)
+    ).fetchone()
+    now = c.execute("SELECT now() AS now").fetchone()["now"]
+    _upsert_registry(
+        c.cursor(),
+        skill,
+        reg["scope"] if reg else "global",
+        body,
+        skill_description(body) or None,
+        now,
+    )
+    h = body_hash(body)
+    c.execute("UPDATE skills_lane.skill_registry SET lane_body_hash=%s WHERE name=%s", (h, skill))
+    return h
+
+
+def _autopilot(db_url: str, action) -> dict:
+    """status | resume | report for the autopilot (dream/skills/autoreview.py)."""
+    from dream.skills import autoreview
+
+    with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
+        if not _autopilot_ready(c):
+            return {"status": "error", "detail": "schema 064 (skills autopilot) not applied"}
+        if action == "status":
+            res = autoreview.status(c)
+        elif action == "resume":
+            res = autoreview.resume(c)
+            c.commit()
+        elif action == "report":
+            res = {"status": "ok", "last_report": autoreview.status(c)["last_report"]}
+        else:
+            return {"status": "error", "detail": f"unknown autopilot action {action!r}"}
+    return res
 
 
 def _proposal_act(
@@ -886,6 +1168,10 @@ def _proposal_act(
         ).fetchone()
         if not row:
             return {"found": False}
+
+        if action == "revert":
+            c.commit()  # close the read; the revert runs in its own locked transaction
+            return revert_applied(c, cid, reason=reason or "manual", actor="human", force=force)
 
         if action == "accept" and row["kind"] != "consolidate":
             note = ""
@@ -1121,6 +1407,13 @@ def register(
         def work(b):
             cid = b.get("id")
             return _proposal_detail(db_url, int(cid)) if cid else _proposals_list(db_url)
+
+        return await _full_only(request, work)
+
+    @mcp.custom_route("/skills/autopilot", methods=["POST"])
+    async def _autopilot_route(request: Request) -> JSONResponse:
+        def work(b):
+            return _autopilot(db_url, b.get("action") if isinstance(b, dict) else None)
 
         return await _full_only(request, work)
 
