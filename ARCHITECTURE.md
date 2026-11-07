@@ -753,6 +753,22 @@ A 2026 multi-source review of production agent-memory systems converged on exact
 
 `exp(-age_days·ln2/30)` recency multiplier (30-day half-life) and a `log1p(retrieval_count)` feedback boost are applied to the episode RRF — personal memory is strongly recency-biased ("what did we decide about X" means recently). The KG fact leg deliberately omits both (they drag relevance on facts).
 
+**KG fact leg: a reinforcement prior, not recency or feedback.** The fact leg still omits recency and retrieval feedback, but `kg_pg.search_kg_postgres` multiplies each fused RRF score by `1 + w·ln(mention_count)` before the top-12 cut (`SYNAPSE_KG_MENTION_W`, default `0.1`, `0` = off). `mention_count` (schema 019) counts how many times a fact was re-asserted across conversations; a fact stated once (79% of live facts) is the neutral value, so the prior only ever lifts reinforced facts above one-offs of similar relevance. One indexed lookup (`kg_rel_uuid`, about 6 ms for 600 candidates) over the uuids the three legs already returned: it reorders the candidates and never adds a fact no leg fetched, so scope and restricted-surface filters are untouched.
+
+Why this lever and not age: of 3,490 facts that recall feedback has rated, the helpful share is 24% at `mention_count` 1, 52% at 2, 61% at 3-4 and 75% at 5+, at every age; an age-decay fact variant tried earlier cost golden answerability (0.469 to 0.325) and was dropped, because durable personal facts are old. `retrieval_count` is not the signal (it counts pre-floor candidates and does not separate: 40% helpful at 1-2, 41% at 3-9, 27% at 10+). `last_supported_at` is set on 2% of live facts, too sparse to bench.
+
+Measured on the regression bench (real `recall()`, 50 broad + 40 KG-relational + 10 web goldens + the last 200 rated recalls, full trust; `w=0` base from the same commit; two runs of base differ in at most 6 of 300 contexts):
+
+| w | helpful served | noise served | broad / kg_rel answerability delta (ci95) | gold hit |
+|---|---|---|---|---|
+| 0 (base) | 384 | 477 | | 14 + 10 |
+| 0.05 | 388 | 463 | -0.006 (-0.017, 0.005) / +0.007 (-0.009, 0.025) | 14 + 10 |
+| **0.1** | **387** | **451** | **-0.000 (-0.014, 0.013) / +0.003 (-0.017, 0.026)** | 14 + 10 |
+| 0.15 | 383 | 445 | | 14 + 10 |
+| 0.3 | 379 | 425 | | 14 + 10 |
+
+0.1 is the largest weight that kept helpful served at or above base on every run. Above it, helpful starts to fall (0.15 and 0.3 lose 1 and 5), because RRF scores are nearly flat (rank 1 over rank 11 is about 1.16x), so a reinforced rank-11 fact overtakes rank 1 once `w·ln(mention_count)` passes about 0.16. The prior shifts the served mix, not the age: facts with `mention_count` of 3 or more are 19.5% of served facts on the rated recalls at base and 22.8% at 0.1, while the creation-month mix of served facts is unchanged.
+
 ---
 
 ## 13. Configuration
@@ -824,6 +840,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_SCHEMA_CHECK` | `1` | boot-time guard: refuse to start when the database schema is behind the code (`0` = skip) |
 | `SYNAPSE_<STAGE>_MODEL` | unset | per-stage LLM override (stages: `EXTRACTOR`, `TIMELINE`, `PREFERENCES`, `DEDUP`, `CONTRADICTION`, `EDGE_DATES`, `DREAM`, `QUERY_GRAPH`, `SKILLS`, `WEB_AUDIENCE`); falls back to `SYNAPSE_LLM_MODEL`, then the stage default — see `.env.example` |
 | `SYNAPSE_KG_OWNER_ID` | `default` | `owner_id` scope for all KG reads/writes (multi-tenant seam) |
+| `SYNAPSE_KG_MENTION_W` | `0.1` | reinforcement prior on the KG fact leg: fused score x `1 + w·ln(mention_count)` before the top-12 cut; `0` = off (plain RRF order). Measured in §12.9 |
 | `SYNAPSE_PERSONAL_SCOPE` | `1` | keep the `personal`/`technical` split in the KG and on timeline events. `0` routes every extracted entity, fact and event to the single `technical` graph and domain, drops the domain question from the timeline gate prompt, and answers `group_id="personal"` from the technical graph. For work-only deployments. Existing rows are not moved |
 
 ### Ingestion & extraction
