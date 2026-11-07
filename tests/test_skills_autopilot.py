@@ -779,3 +779,72 @@ def test_the_status_route_reads_the_run(db, ap, llm):
     st = _autopilot(db.dsn_url, "status")
     assert st["last_mode"] == "live" and st["counts_14d"] == {"applied": 1}
     assert st["recent"][0]["candidate_id"] == cid
+
+
+# ------------------------------------------------------------------ wiring
+def test_a_human_accept_still_works_before_schema_064(db, monkeypatch):
+    import mcp_server.skill_sync_routes as R
+
+    monkeypatch.setattr(R, "_autopilot_ready", lambda c: False)
+    cid, _old = _desc_case(db, "ap-pre064")
+    res = _proposal_act(db.dsn_url, cid, "accept", None, lambda *a: "")
+    assert res["status"] == "promoted"
+    status, by, rid, _r, _ev = _cand_row(db, cid)
+    assert (status, by, rid) == ("promoted", None, None)  # nothing recorded that is not there
+    assert _reg(db, "ap-pre064")[2] is None
+    refused = R.apply_candidate(db, cid, None, None, False, actor="auto", review={})
+    assert refused["status"] == "error"  # and the auto path will not run without it
+
+
+def _quiet_lane(monkeypatch):
+    """run_lane with every stage that needs sessions or a model stood down: what is left is
+    the autopilot's wiring, the review queue and the report."""
+    import dream.skills.nightly as N
+
+    monkeypatch.setenv("SYNAPSE_SKILLS_DETECTORS", "")
+    monkeypatch.setattr(N.SM, "load_skills", lambda: {})
+    monkeypatch.setattr(N.SM, "load_scopes", lambda conn: {})
+    monkeypatch.setattr(N.DB, "sessions_since", lambda *a, **k: [])
+    for name in ("consolidate_pass", "sync_usage", "run_derive", "run_retune", "capture_grounded"):
+        monkeypatch.setattr(N, name, lambda *a, **k: {})
+    monkeypatch.setattr(N.L, "regate_observe", lambda conn: {})
+    monkeypatch.setattr(N.skill_draft, "draft_pending", lambda conn: {})
+    monkeypatch.setattr(N.review_queue, "recommend", lambda conn: {})
+    return N
+
+
+def test_the_nightly_lane_reconciles_but_only_reviews_when_this_container_can(
+    db, monkeypatch, capsys
+):
+    N = _quiet_lane(monkeypatch)
+    llm = LLM(monkeypatch)
+    monkeypatch.delenv("SKILLS_AUTOREVIEW_REVIEW", raising=False)
+    monkeypatch.delenv("SKILLS_AUTOREVIEW", raising=False)  # the default mode
+    cid, _old = _desc_case(db, "ap-night")
+
+    counts = N.run_lane(no_discord=True)
+
+    assert llm.n_rev == 0 and _cand_row(db, cid, "status")[0] == "proposed"  # no reviewer here
+    assert counts["autoreview_judged"] == 0 and counts["autoreview_applied"] == 0
+
+    monkeypatch.setenv("SKILLS_AUTOREVIEW_REVIEW", "1")
+    counts = N.run_lane(no_discord=True)
+
+    assert counts["autoreview_applied"] == 1 and llm.n_rev == 1
+    assert _cand_row(db, cid, "applied_by")[0] == "auto"
+    out = capsys.readouterr().out
+    assert "auto-applied #" in out and "(undo: revert " in out  # the report, delivered to stdout
+    last = L.get_cursor(db)["config"]["last_report"]
+    assert "auto-applied #" in last["text"] and last["at"]
+
+
+def test_the_default_mode_is_live_and_off_is_respected_by_the_nightly_lane(db, monkeypatch):
+    N = _quiet_lane(monkeypatch)
+    llm = LLM(monkeypatch)
+    monkeypatch.setenv("SKILLS_AUTOREVIEW_REVIEW", "1")
+    monkeypatch.setenv("SKILLS_AUTOREVIEW", "off")
+    cid, _old = _desc_case(db, "ap-night-off")
+    counts = N.run_lane(no_discord=True)
+    assert counts["autoreview_judged"] == 0 and llm.n_rev == 0
+    assert _cand_row(db, cid, "status")[0] == "proposed"
+    assert A.DEFAULT_MODE == "live"
