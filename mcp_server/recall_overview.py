@@ -160,6 +160,15 @@ class RecallOverviewMixin:
             own,
         )
 
+        # The other KG group's fact BM25 leg is text-only too, and what it costs is a second
+        # serial scan behind the requested group's search; started here it runs under the
+        # embed call and the requested group's search, on a connection of its own, and the
+        # KG leg below picks its rows up when it needs them. It is enqueued BEFORE the KG
+        # leg, so the KG leg can only be running once this one is, and waiting on it is safe.
+        f_kg_cross = (
+            _submit_ctx(ex, self._cross_bm25_rows, query, other_groups) if other_groups else None
+        )
+
         t_emb = time.perf_counter()
         try:
             query_emb = self._ensure_embedder().embed([query], task="query")[0]
@@ -210,6 +219,7 @@ class RecallOverviewMixin:
                 session_focus or [],
                 fact_limit=settings._FACT_LIMIT,
                 **kg_scope,
+                **({"cross_bm25": f_kg_cross.result} if f_kg_cross is not None else {}),
             )
 
         f_vec = (

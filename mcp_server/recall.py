@@ -438,9 +438,12 @@ class Recall(
             max_workers=1, thread_name_prefix="recall-feedback"
         )
         # Leg executor: runs recall()'s independent search legs (summaries, episodes,
-        # web, KG) concurrently, each borrowing its own connection (_pg). Legs never
-        # submit here, so concurrent recalls queue rather than deadlock.
-        self._leg_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="recall-leg")
+        # web, KG, the other KG group's BM25) concurrently, each borrowing its own
+        # connection (_pg). Legs never submit here, so concurrent recalls queue rather than
+        # deadlock. The one wait between legs is the KG leg on the other group's BM25 leg:
+        # recall_overview enqueues the BM25 leg first and the queue is FIFO, so by the time
+        # a KG leg runs, its BM25 leg is running (it waits on nothing), never behind it.
+        self._leg_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="recall-leg")
 
     def _pg(self) -> AbstractContextManager[Any]:
         """A dict-row autocommit connection for one query or a short run of them: borrowed
