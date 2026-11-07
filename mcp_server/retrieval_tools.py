@@ -94,7 +94,7 @@ def register(
             query: Natural language search query.
             project: Optional project slug to filter results (e.g. "synapse").
             session_focus: Entity names active in current conversation for KG bias.
-            group_id: Knowledge graph scope — "technical" (default) or "personal".
+            group_id: Knowledge graph scope — "technical" (default) or "personal"; a trusted host also gets top matches from the other.
             self_session: NEVER set this yourself. The client's PreToolUse hook injects
                 the calling session's id so serving can suppress self-session domination;
                 calls without it simply skip that suppression.
