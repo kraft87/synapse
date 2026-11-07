@@ -541,8 +541,8 @@ class ExtractionEdgesMixin:
         # Capture dedup hits: a fact skipped as a pure duplicate still ASSERTED
         # the matched edge(s). Bump their mention_count + union this chunk's
         # source episodes (provenance) instead of dropping the re-assertion.
-        # Forward-only — historical dupes are already gone. The read-side ranking
-        # boost on mention_count is a later phase. A USER-attributed re-assertion
+        # Forward-only — historical dupes are already gone. Recall reads mention_count
+        # as a ranking prior on the fact leg (kg_pg._mention_prior). A USER-attributed re-assertion
         # also refreshes the edge's last_supported_at (schema 058); an assistant
         # repeat unions provenance but leaves currency untouched.
         if reinforce:
