@@ -394,7 +394,7 @@ async def health(request: Request) -> JSONResponse:
 # advertise a graph this deployment does not keep. A model told about a scope
 # that no longer exists spends a call asking for it. The sentence is swapped at
 # import, before FastMCP reads the docstring into the tool description.
-_GROUP_ID_DOC_SPLIT = 'group_id: Knowledge graph scope — "technical" (default) or "personal".'
+_GROUP_ID_DOC_SPLIT = 'group_id: Knowledge graph scope — "technical" (default) or "personal"; a trusted host also gets top matches from the other.'
 _GROUP_ID_DOC_SINGLE = (
     "group_id: Knowledge graph scope. This deployment keeps one graph;\n            leave it unset."
 )

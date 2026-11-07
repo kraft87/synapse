@@ -188,10 +188,15 @@ def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypat
     engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
     kg = [{"fact": f"fact {k}", "_uuid": k, "_date": None} for k in ("own-1", "old-1", "own-2")]
     engine._search_kg = lambda *a, **k: ([dict(f) for f in kg], [])
-    engine._surface_supersessions = lambda *a, **k: [
-        {"fact": "successor own-3", "_uuid": "own-3", "_date": None},
-        {"fact": "successor old-2", "_uuid": "old-2", "_date": None},
-    ]
+    # Answers the requested (technical) group's call; full trust also asks the other group.
+    engine._surface_supersessions = lambda emb, g, *a, **k: (
+        [
+            {"fact": "successor own-3", "_uuid": "own-3", "_date": None},
+            {"fact": "successor old-2", "_uuid": "old-2", "_date": None},
+        ]
+        if g == "technical"
+        else []
+    )
     asked: list[tuple[list[str], str]] = []
 
     def _own(uuids, session):

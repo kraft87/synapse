@@ -80,6 +80,7 @@ _DB_FILES = {
     "test_private_session_routes.py",
     "test_audience_scoping.py",
     "test_kg_source_projects.py",
+    "test_kg_both_groups.py",
     "test_surface_routes.py",
     "test_credential_trust.py",
     "test_serving_notice.py",
@@ -92,6 +93,7 @@ _DB_FILES = {
     "test_relabel_projects_db.py",
     "test_skill_trust_scoping.py",
     "test_ingest_span_collision_db.py",
+    "test_repair_numbered_entity_magnets_db.py",
 }
 
 
