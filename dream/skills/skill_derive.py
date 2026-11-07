@@ -32,11 +32,10 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import time
 from collections import defaultdict
 
-from . import config, skill_db_source, skill_measure
+from . import claude_cli, config, skill_db_source, skill_measure
 
 load_skills = skill_measure.load_skills
 parse_session = skill_measure.parse_session
@@ -179,13 +178,7 @@ def _draft_call(prompt: str) -> str:
     model = os.environ.get("SKILL_DERIVE_DRAFT_MODEL", "claude-opus-4-8")
     if model == "deepseek":
         return skill_measure._openrouter_judge(prompt)
-    r = subprocess.run(
-        ["claude", "-p", prompt, "--model", model],
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    return r.stdout
+    return claude_cli.call(prompt, model, timeout=300)
 
 
 def draft_skill(c: dict) -> str:

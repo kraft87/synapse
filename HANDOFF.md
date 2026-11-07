@@ -81,7 +81,9 @@ caller is unaffected.
   (`skill_review.py report`).
 - **The reviewer call is stripped** (`dream/skills/claude_cli.py`): no tools, settings, MCP,
   hooks, memory files or side calls, so a call carries the prompt plus about 1.6k tokens of
-  preamble instead of 16k to 76k. The calibration script makes the same call.
+  preamble instead of 16k to 76k. The calibration script makes the same call, and so does
+  every judge and drafting call of the lane (`claude_cli.call`, behind `skill_measure.run_judge`
+  and `skill_derive._draft_call`).
 
 **Order of rollout**
 

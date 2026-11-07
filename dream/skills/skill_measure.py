@@ -24,13 +24,12 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import time
 from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
-from . import config
+from . import claude_cli, config
 
 # No on-disk skill catalog server-side (the dream container has no ~/.claude/skills). The
 # catalog comes from the skill_registry table; the client's skills_sync owns disk<->registry.
@@ -409,7 +408,11 @@ def run_judge(prompt: str, model: str | None = None, timeout: int = 240) -> str:
     a "deepseek"/"openrouter" backend goes to OpenRouter, otherwise the claude CLI on
     config.JUDGE_MODEL (no API key, runs on the Max subscription; nightly volume is tiny).
     An explicit `model` overrides: "deepseek"/"openrouter" -> OpenRouter, anything else ->
-    the claude CLI with that model. `timeout` bounds the subprocess call."""
+    the claude CLI with that model. `timeout` bounds the subprocess call.
+
+    The CLI call is the stripped one (claude_cli.call: no tools, settings, MCP, hooks or side
+    calls), so a judge call carries its prompt plus ~1.6k tokens instead of ~16k+. A missing
+    CLI or a timeout still raises: the detectors count those as judge failures."""
     if model is None:
         backend = os.environ.get("SKILL_MEASURE_MODEL", config.JUDGE_BACKEND)
         if backend in ("deepseek", "openrouter"):
@@ -417,13 +420,7 @@ def run_judge(prompt: str, model: str | None = None, timeout: int = 240) -> str:
         model = config.JUDGE_MODEL
     elif model in ("deepseek", "openrouter"):
         return _openrouter_judge(prompt)
-    r = subprocess.run(
-        ["claude", "-p", prompt, "--model", model],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    return r.stdout
+    return claude_cli.call(prompt, model, timeout=timeout)
 
 
 def _run_judge(prompt: str) -> str:
