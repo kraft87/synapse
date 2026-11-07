@@ -608,26 +608,42 @@ def _old_cross_group_facts(cur, query, query_emb, owner_id, groups, taken, k):
 @pytest.mark.parametrize("concurrent_bm25", [False, True])
 @pytest.mark.parametrize(("asked", "other"), [(TECH, PERS), (PERS, TECH)])
 def test_search_kg_serves_what_the_serial_two_walk_version_served(
-    ranked, db_url, limit, concurrent_bm25, asked, other
+    ranked, db_url, monkeypatch, limit, concurrent_bm25, asked, other
 ):
     """Held to main's implementation on seeded data, whichever group is asked for, with the
     other group's BM25 leg run inline or fetched on a second connection first."""
     k = kg_pg.CROSS_GROUP_EXTRAS
     c, cur = _cur(db_url)
     c2, cur2 = _cur(db_url)
+    real = kg_pg.search_kg_postgres
+    handed: list[Any] = []
+
+    def spy(*a, **kw):
+        handed.append(kw.get("vec_rows"))
+        return real(*a, **kw)
+
     with c, c2:
-        own, seeds = kg_pg.search_kg_postgres(cur, "widget", onehot(0), "default", asked, [], limit)
+        own, seeds = real(cur, "widget", onehot(0), "default", asked, [], limit)
         old = own + _old_cross_group_facts(cur, "widget", onehot(0), "default", [other], own, k)
+        emb = kg_pg._vec_literal(onehot(0))
+        cur.execute(
+            _OLD_VEC.format(cmp="= %s"), (emb, kg_pg._OVERFETCH, "default", asked, limit * 3)
+        )
+        old_own_vec = cur.fetchall()
         leg = (
             (lambda: kg_pg.cross_bm25_rows(cur2, "widget", "default", [other], k))
             if concurrent_bm25
             else None
         )
+        monkeypatch.setattr(kg_pg, "search_kg_postgres", spy)
         got = kg_pg.search_kg(
             cur, "widget", onehot(0), "default", [asked, other], [], limit, cross_bm25=leg
         )
     assert got == (old, seeds)
     assert len([f for f in got[0] if f.get("_cross")]) == k, "the extras are there to compare"
+    # The requested group's vector rows out of the shared walk are the rows its own
+    # statement returned (its LIMIT too), not merely ones that fuse to the same serve.
+    assert handed == [old_own_vec]
 
 
 # ---------------------------------------------------------------------------
@@ -744,6 +760,8 @@ def test_a_recall_with_extras_makes_both_fact_floor_requests_at_once(kg, db_url,
     out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
     assert not any("rerank failed" in w for w in out.get("warnings", []))
     assert _served(out) == {"v-t", "b-t", "h-t", "v-p"}, "own floor and extras floor both applied"
+    ids = [f["id"].removeprefix("f:") for f in out["facts"]]
+    assert set(ids[:3]) == _TECH_FACTS and ids[3:] == ["v-p"], "own facts first, extras after"
     own_batch = next(b for b in r._reranker.calls if "alpha beta" in b)
     extras_batch = next(b for b in r._reranker.calls if "widget thing" in b)
     assert sorted(own_batch) == ["alpha beta", "epsilon", "widget gizmo"]
