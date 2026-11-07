@@ -807,3 +807,17 @@ def test_timeline_share_of_the_board_is_small(conn, db_url):
     text = _board(db_url, "alpha")["text"]
     section = text.split("## Last 7 days", 1)[1]
     assert len(section) < 0.15 * len(text)
+
+
+def test_a_busy_day_cannot_crowd_older_days_off_the_timeline(conn, db_url):
+    """Sixty qualifying events on the newest day (20 projects x the per-project-day
+    limit of three) must not push the oldest day's single event out of the pool the
+    one-per-day cut draws from."""
+    _wipe(conn)
+    for p in range(20):
+        for k in range(3):
+            _event(conn, f"Busy day {p}-{k}", days_ago=1, project=f"busy{p}", ref=f"tb:{p}-{k}")
+    _event(conn, "Quiet day five", days_ago=5, ref="tb:quiet")
+    text = _board(db_url, None)["text"]
+    assert "Quiet day five" in text
+    assert sum("Busy day" in ln for ln in text.splitlines()) == 1

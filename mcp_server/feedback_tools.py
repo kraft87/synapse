@@ -126,8 +126,10 @@ def register(
         note shaped your answer (or misled it), rate it too. A comment-only
         report is still valuable when the serving itself was the problem.
 
-        This is offline labeled data (eval goldens, reranker tuning); it never
-        changes live ranking, so honest negatives are safe and wanted. Do NOT
+        This is offline labeled data (eval goldens, reranker tuning). Recall's own
+        ranking never reads it; the one live use is the session-start board, which
+        orders notes within a type by their helpful "n:N" ratings, so a noise rating
+        changes nothing and honest negatives are safe and wanted. Do NOT
         file more than one report per recall query, do NOT rate results you
         never used, and do NOT invent ids — report only ids actually served to
         you by recall, the board, or fetch.

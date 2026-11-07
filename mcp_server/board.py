@@ -71,7 +71,7 @@ _EVENT_FACT_MAX = 160
 # pushed out the notes the board exists for. The query still reads a wide pool of events
 # (_EVENT_POOL) so one busy day cannot crowd the other days out before the per-day cut.
 _EVENT_DAYS = 5
-_EVENT_POOL = 50
+_EVENT_POOL = 300
 
 # Overflow policy: PER-TYPE QUOTAS. The board used to drop project/reference notes first,
 # then user notes, then feedback, so on a full-trust board the feedback hooks alone filled
