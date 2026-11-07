@@ -61,8 +61,8 @@ AUTOPILOT_PROBE = ColumnProbe(
     "     AND attname IN ('applied_by', 'auto_review_id')) "
     "  OR (attrelid = to_regclass('skills_lane.skill_registry') AND attname = 'lane_body_hash') "
     "  OR (attrelid = to_regclass('skills_lane.skill_auto_reviews') "
-    "     AND attname = 'rolled_back_at')) "
-    "HAVING count(*) = 4",
+    "     AND attname IN ('rolled_back_at', 'events'))) "
+    "HAVING count(*) = 5",
     "schema 064 (skill_auto_reviews, applied_by, auto_review_id, lane_body_hash)",
 )
 

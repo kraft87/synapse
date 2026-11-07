@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS skills_lane.skill_auto_reviews (
     applied_at         TIMESTAMPTZ,
     rolled_back_at     TIMESTAMPTZ,
     rollback_reason    TEXT,
+    events             JSONB NOT NULL DEFAULT '[]',  -- reconcile's notes: merged / restored local edits
     created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS skill_auto_reviews_candidate_idx

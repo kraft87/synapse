@@ -3,7 +3,7 @@
 nightly.run_lane after drafting and the #229 auto-reject/expiry; entries: run, reconcile).
 
 Policy (approved 2026-11-06). Every drafted proposal a person has not touched is read by
-an Opus REVIEWER (the lane's judge, skill_measure.run_judge) and by an independent VERIFIER
+an Opus REVIEWER (the stripped claude CLI call, claude_cli.run) and by an independent VERIFIER
 of another model family (ingestion.llm_client, stage SKILLS_VERIFY) that never sees the
 review and is asked twice, with the evidence in both orders.
 
@@ -54,12 +54,13 @@ import difflib
 import hashlib
 import json
 import os
-from datetime import timedelta
+from contextlib import contextmanager
+from datetime import UTC, date, datetime
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
-from . import config
+from . import claude_cli, config
 from . import skill_doc as D
 from . import skill_ledger as L
 from . import skill_measure as SM
@@ -128,7 +129,7 @@ def evidence_items(evidence, cap: int = EVIDENCE_CAP) -> list[str]:
     """One line per distinct sighting (quote, missing phrasing, why), newest last."""
     lines: list[str] = []
     for e in evidence or []:
-        if not isinstance(e, dict) or e.get("class") == "grounded" and not e.get("session_id"):
+        if not isinstance(e, dict) or (e.get("class") == "grounded" and not e.get("session_id")):
             continue
         bits = [str(e.get("signal") or "?")]
         for key in ("quote", "missing_phrasing", "phrasing", "why"):
@@ -368,15 +369,24 @@ def tier_for(row: dict, plan: dict, pinned: bool) -> tuple[str, list[str]]:
         if plan.get("registry_body") is not None and D.only_description_changed(
             plan["registry_body"], body
         ):
+            if len(SM.skill_description(body)) > D.MAX_DESCRIPTION:
+                return "description_unusable", ["the description is over the length cap"]
             return "description", []
         return "body_edit", ["changes the skill's body"]
     return "consolidate", ["merges are done by hand"]
 
 
 # ------------------------------------------------------------------ LLM seams
+def reviewer_model() -> str:
+    """The reviewer's model: env SKILLS_AUTOREVIEW_MODEL, else the lane's judge model."""
+    return os.environ.get("SKILLS_AUTOREVIEW_MODEL", "").strip() or config.JUDGE_MODEL
+
+
 def _reviewer_call(prompt: str) -> str:
-    """The reviewer (the lane's judge: claude CLI, config.JUDGE_MODEL). Tests stub it."""
-    return SM.run_judge(prompt)
+    """The reviewer: the stripped claude CLI call (claude_cli.run), the same one the
+    calibration script makes. Needs the CLI logged in on the machine that runs the stage
+    (see run_host; the dream container has none). Tests stub it."""
+    return claude_cli.run(prompt, reviewer_model())
 
 
 def verifier_model() -> str | None:
@@ -416,7 +426,7 @@ def judge(row: dict, registry_body: str | None, catalog) -> dict:
         rev = None
     model = verifier_model()
     orders: list[dict | None] = []
-    if model is None:
+    if model is None or rev is None:  # no independent verifier, or nothing to verify
         orders = [None, None]
     else:
         for reverse in (False, True):
@@ -427,12 +437,577 @@ def judge(row: dict, registry_body: str | None, catalog) -> dict:
                 print(f"  verifier failed for cand#{row['id']}: {e}")
                 orders.append(None)
     return {
-        "reviewer": ({**rev, "model": config.JUDGE_MODEL} if rev else None),
+        "reviewer": ({**rev, "model": reviewer_model()} if rev else None),
         "verifier": {
-            "result": combine_verifier(orders[0], orders[1])
-            if model
-            else "error",
+            "result": combine_verifier(orders[0], orders[1]) if model else "error",
             "orders": orders,
             "model": model or "unavailable",
         },
+    }
+
+
+# ================================================================== the stage
+@contextmanager
+def dict_rows(conn):
+    """`conn` with dict rows for the block (skill_sync_routes' write paths expect them)."""
+    prev = conn.row_factory
+    conn.row_factory = dict_row
+    try:
+        yield conn
+    finally:
+        conn.row_factory = prev
+
+
+def _routes():
+    """Lazy: the dream image ships mcp_server/, and importing it at module load would drag
+    the HTTP stack into every lane import (review_queue does the same)."""
+    from mcp_server import skill_sync_routes as R
+
+    return R
+
+
+_LOCK_KEY = 0x5C1A0064  # advisory lock: one autopilot run at a time (host cron and nightly)
+
+
+def _plain(text, cap: int = 240) -> str:
+    t = " ".join(str(text or "").split()).replace("\N{EM DASH}", ",").replace("\N{EN DASH}", "-")
+    return t if len(t) <= cap else t[: cap - 3].rstrip() + "..."
+
+
+def _config(c) -> dict:
+    r = c.execute("SELECT config FROM skills_lane.skill_scan_cursor WHERE id=1").fetchone()
+    return (r["config"] if r else None) or {}
+
+
+def _patch_config(c, key: str, value: dict) -> None:
+    """Merge `value` into config[key] (the cursor's JSONB parks each stage's own state)."""
+    merged = {**(_config(c).get(key) or {}), **value}
+    c.execute(
+        "UPDATE skills_lane.skill_scan_cursor SET config = COALESCE(config,'{}'::jsonb) || %s::jsonb, "
+        "updated_at=now() WHERE id=1",
+        (Json({key: merged}),),
+    )
+
+
+def _event(c, review_id: int, ev: dict) -> None:
+    c.execute(
+        "UPDATE skills_lane.skill_auto_reviews SET events = events || %s::jsonb WHERE id=%s",
+        (Json([ev]), review_id),
+    )
+
+
+# ------------------------------------------------------------------ breaker
+def breaker_state(c) -> dict:
+    """tripped when BREAKER_ROLLBACKS rollbacks (a local_edit does not count) fall in the
+    last ROLLBACK_DAYS and after the last `autopilot resume`."""
+    resumed = (_config(c).get("autopilot") or {}).get("resumed_at")
+    rows = c.execute(
+        "SELECT id, candidate_id, skill, rollback_reason FROM skills_lane.skill_auto_reviews "
+        "WHERE rolled_back_at IS NOT NULL AND rolled_back_at >= now() - make_interval(days => %s) "
+        "AND rollback_reason <> ALL(%s) "
+        "AND (%s::timestamptz IS NULL OR rolled_back_at > %s::timestamptz) ORDER BY id",
+        (ROLLBACK_DAYS, list(NEUTRAL_ROLLBACKS), resumed, resumed),
+    ).fetchall()
+    return {"tripped": len(rows) >= BREAKER_ROLLBACKS, "rollbacks": [dict(r) for r in rows]}
+
+
+def resume(c) -> dict:
+    """`skill_review.py autopilot resume`: the breaker counts afresh from now."""
+    _patch_config(c, "autopilot", {"resumed_at": datetime.now(UTC).isoformat(), "tripped": False})
+    return {"status": "resumed", **breaker_state(c)}
+
+
+def status(c) -> dict:
+    """What `skill_review.py autopilot status` shows."""
+    ap = _config(c).get("autopilot") or {}
+    recent = c.execute(
+        "SELECT r.id, r.candidate_id, r.night, r.tier, r.verdict, r.skill, r.mode, "
+        "r.rolled_back_at, r.rollback_reason, c.name AS candidate "
+        "FROM skills_lane.skill_auto_reviews r JOIN skills_lane.skill_gap_candidates c "
+        "ON c.id = r.candidate_id ORDER BY r.id DESC LIMIT 12"
+    ).fetchall()
+    counts = c.execute(
+        "SELECT verdict, count(*) AS n FROM skills_lane.skill_auto_reviews "
+        "WHERE created_at >= now() - make_interval(days => %s) GROUP BY verdict",
+        (ROLLBACK_DAYS,),
+    ).fetchall()
+    return {
+        "status": "ok",
+        "last_mode": ap.get("last_mode"),
+        "last_run_at": ap.get("last_run_at"),
+        "resumed_at": ap.get("resumed_at"),
+        "breaker": breaker_state(c),
+        "counts_14d": {r["verdict"]: r["n"] for r in counts},
+        "recent": [{**r, "night": str(r["night"])} for r in recent],
+        "last_report": _config(c).get("last_report"),
+    }
+
+
+# ------------------------------------------------------------------ caps
+def cap_reason(c, tier: str, night) -> str | None:
+    """Why one more auto-apply is not allowed now, or None."""
+    n_night = c.execute(
+        "SELECT count(*) AS n FROM skills_lane.skill_auto_reviews "
+        "WHERE verdict='applied' AND night=%s",
+        (night,),
+    ).fetchone()["n"]
+    if n_night >= NIGHT_APPLY_CAP:
+        return f"{NIGHT_APPLY_CAP} auto-applies tonight already"
+    if tier == "new_skill":
+        n_new = c.execute(
+            "SELECT count(*) FILTER (WHERE night=%s) AS night, count(*) AS week "
+            "FROM skills_lane.skill_auto_reviews WHERE verdict='applied' AND tier='new_skill' "
+            "AND applied_at >= now() - interval '7 days'",
+            (night,),
+        ).fetchone()
+        if n_new["night"] >= NEW_SKILL_NIGHT_CAP:
+            return f"{NEW_SKILL_NIGHT_CAP} new skill tonight already"
+        if n_new["week"] >= NEW_SKILL_WEEK_CAP:
+            return f"{NEW_SKILL_WEEK_CAP} new skills this week already"
+    return None
+
+
+# ------------------------------------------------------------------ reconcile
+def _known_hashes(c, skill: str, review: dict, current: str | None) -> set[str]:
+    """Hashes of every body the registry has held (or holds): a machine pulling a body
+    the registry already had is not a local edit."""
+    known = {h for h in (review["previous_body_hash"], review["applied_body_hash"], current) if h}
+    for r in c.execute(
+        "SELECT body FROM skills_lane.skill_history WHERE name=%s AND op <> 'disk_overwrite'",
+        (skill,),
+    ).fetchall():
+        known.add(D.body_hash(r["body"] or ""))
+    return known
+
+
+def _unpublished_edit(c, review: dict, current: str | None) -> dict | None:
+    """The newest local body a pull overwrote after the apply that the registry never held
+    (the sync client records it as 'disk_overwrite' just before it overwrites), unless
+    reconcile already dealt with it."""
+    known = _known_hashes(c, review["skill"], review, current)
+    done = {e.get("hash") for e in review["events"] or [] if isinstance(e, dict)}
+    for r in c.execute(
+        "SELECT id, body, content_modified_at FROM skills_lane.skill_history "
+        "WHERE name=%s AND op='disk_overwrite' AND recorded_at >= %s ORDER BY id DESC",
+        (review["skill"], review["applied_at"]),
+    ).fetchall():
+        h = D.body_hash(r["body"] or "")
+        if r["body"] and h not in known and h not in done:
+            return {**r, "hash": h}
+    return None
+
+
+def _bad_signal(c, review: dict) -> str | None:
+    """A rollback reason when the changed skill fired after the apply and the user pushed
+    back: a dismissed fire, or a post_fire deviation/fight on a later day."""
+    skill, since = review["skill"], review["applied_at"]
+    if c.execute(
+        "SELECT 1 FROM skills_lane.skill_usage WHERE skill=%s AND fired_at > %s "
+        "AND dismissed IS TRUE LIMIT 1",
+        (skill, since),
+    ).fetchone():
+        return "dismissed"
+    day = since.date().isoformat()
+    for row in c.execute(
+        "SELECT evidence FROM skills_lane.skill_gap_candidates "
+        "WHERE kind='retune' AND source_detector='post_fire' AND (name=%s OR %s = ANY(target_skills))",
+        (skill, skill),
+    ).fetchall():
+        for e in row["evidence"] or []:
+            if (
+                isinstance(e, dict)
+                and e.get("signal") == "post_fire_deviation"
+                and str(e.get("date") or "") > day
+            ):
+                return "post_fire_deviation"
+    return None
+
+
+def _re_propose(c, review: dict) -> None:
+    """The candidate goes back to the queue for a person; the autopilot will not apply this
+    evidence + draft again (the memo sees the rolled-back review)."""
+    c.execute(
+        "UPDATE skills_lane.skill_gap_candidates SET status='proposed', applied_by=NULL, "
+        "auto_review_id=NULL, proposed_at=now(), updated_at=now() WHERE id=%s",
+        (review["candidate_id"],),
+    )
+
+
+def _repair_local_edit(c, R, review: dict, edit: dict, reg: dict) -> dict:
+    """A machine's unpublished edit was pulled over by the auto change. Neither is lost:
+    description change + local body that kept the OLD description -> the new description
+      is written onto the local body (both kept);
+    anything else -> the local body is published back as the newest version and the
+      candidate returns to the queue for a person ('local_edit', a neutral rollback)."""
+    skill, cid = review["skill"], review["candidate_id"]
+    local = edit["body"]
+    prev = c.execute(
+        "SELECT body FROM skills_lane.skill_history WHERE id=%s", (review["history_id"],)
+    ).fetchone()
+    cand = c.execute(
+        "SELECT proposal_body FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
+    ).fetchone()
+    merged = None
+    if review["tier"] == "description" and prev and cand and cand["proposal_body"]:
+        old_desc = SM.skill_description(prev["body"] or "")
+        if SM.skill_description(local) == old_desc:
+            merged = D.replace_description(local, SM.skill_description(cand["proposal_body"]))
+    if merged is not None and D.only_description_changed(local, merged):
+        R.lane_write(c, skill, merged)
+        _event(c, review["id"], {"type": "merged", "hash": edit["hash"], "history_id": edit["id"]})
+        c.commit()
+        return {"id": cid, "skill": skill, "what": "merged", "review_id": review["id"]}
+    R.lane_write(c, skill, local)
+    c.execute(
+        "UPDATE skills_lane.skill_auto_reviews SET rolled_back_at=now(), rollback_reason='local_edit' "
+        "WHERE id=%s",
+        (review["id"],),
+    )
+    _event(c, review["id"], {"type": "restored", "hash": edit["hash"], "history_id": edit["id"]})
+    _re_propose(c, review)
+    c.commit()
+    return {"id": cid, "skill": skill, "what": "restored", "review_id": review["id"]}
+
+
+def reconcile(c) -> dict:
+    """Look at every auto-apply from the last ROLLBACK_DAYS that is still standing and undo
+    what went wrong (module docstring). `c` is a dict-row connection."""
+    R = _routes()
+    out: dict = {"rolled_back": [], "conflicts": [], "checked": 0}
+    reviews = c.execute(
+        "SELECT r.*, k.name AS candidate_name, k.kind AS candidate_kind, k.direction "
+        "FROM skills_lane.skill_auto_reviews r JOIN skills_lane.skill_gap_candidates k "
+        "ON k.id = r.candidate_id WHERE r.verdict='applied' AND r.rolled_back_at IS NULL "
+        "AND r.applied_at >= now() - make_interval(days => %s) ORDER BY r.id",
+        (ROLLBACK_DAYS,),
+    ).fetchall()
+    c.commit()
+    for rv in reviews:
+        out["checked"] += 1
+        reg = c.execute(
+            "SELECT scope, status, COALESCE(body,'') AS body FROM skills_lane.skill_registry "
+            "WHERE name=%s",
+            (rv["skill"],),
+        ).fetchone()
+        c.commit()
+        cur_hash = D.body_hash(reg["body"]) if reg else None
+        reason = None
+        if reg is None or reg["status"] == "retired":
+            reason = "owner_retired" if rv["tier"] == "new_skill" else "skill_gone"
+        else:
+            edit = _unpublished_edit(c, rv, cur_hash)
+            c.commit()
+            if edit is not None:
+                item = _repair_local_edit(c, R, rv, edit, reg)
+                out["conflicts"].append({**item, "what_skill": _what_row(rv)})
+                continue
+            if rv["tier"] == "description" and cur_hash != rv["applied_body_hash"]:
+                cand = c.execute(
+                    "SELECT proposal_body FROM skills_lane.skill_gap_candidates WHERE id=%s",
+                    (rv["candidate_id"],),
+                ).fetchone()
+                c.commit()
+                kept = SM.skill_description(reg["body"]) == SM.skill_description(
+                    (cand or {}).get("proposal_body") or ""
+                )
+                if not kept:
+                    reason = "owner_edit"
+            if reason is None:
+                reason = _bad_signal(c, rv)
+                c.commit()
+        if reason is None:
+            continue
+        res = R.revert_applied(c, rv["candidate_id"], reason=reason, actor="auto")
+        if res.get("status") == "reverted":
+            print(f"  rolled back cand#{rv['candidate_id']} ({rv['skill']}): {reason}")
+            out["rolled_back"].append(
+                {
+                    "id": rv["candidate_id"],
+                    "skill": rv["skill"],
+                    "reason": reason,
+                    "action": res["action"],
+                    "what": _what_row(rv),
+                }
+            )
+        else:
+            print(f"  rollback of cand#{rv['candidate_id']} not done: {res.get('detail')}")
+    return out
+
+
+def _what_row(rv: dict) -> str:
+    if rv["tier"] == "new_skill":
+        return f"new skill {rv['skill']}"
+    return f"{rv['skill']} description"
+
+
+# ------------------------------------------------------------------ the review pass
+_PROPOSED = """
+SELECT {cols}, trigger_phrasings, signature, recommendation, source_detector
+  FROM skills_lane.skill_gap_candidates
+ WHERE status='proposed' AND kind IN ('derive','retune') AND proposal_body IS NOT NULL
+   AND (rejected_until IS NULL OR rejected_until < now())
+ ORDER BY salience DESC NULLS LAST, score DESC, id"""
+
+
+def _latest_review(c, cid: int, eh: str, dh: str | None) -> dict | None:
+    return c.execute(
+        "SELECT * FROM skills_lane.skill_auto_reviews WHERE candidate_id=%s AND evidence_hash=%s "
+        "AND draft_hash IS NOT DISTINCT FROM %s ORDER BY id DESC LIMIT 1",
+        (cid, eh, dh),
+    ).fetchone()
+
+
+def _complete(rv: dict | None) -> bool:
+    """A stored judgement worth reusing: the reviewer answered and the verifier did not error."""
+    return bool(
+        rv and rv["reviewer"] and (rv["verifier"] or {}).get("result") in ("pass", "fail", "split")
+    )
+
+
+def _record(c, cid, night, mode, eh, dh, tier, pre, j, verdict, skill) -> int:
+    return c.execute(
+        "INSERT INTO skills_lane.skill_auto_reviews (candidate_id, night, mode, evidence_hash, "
+        "draft_hash, tier, preflight, reviewer, verifier, verdict, skill) "
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        (
+            cid, night, mode, eh, dh, tier, Json(pre), Json(j.get("reviewer")),
+            Json(j.get("verifier")), verdict, skill,
+        ),
+    ).fetchone()["id"]  # fmt: skip
+
+
+def _recommendation(j: dict, dh: str | None, note: str) -> dict | None:
+    rev = j.get("reviewer")
+    if not rev:
+        return None
+    reason = _plain(rev["reason"], 200)
+    if note:
+        reason = _plain(f"{reason} ({note})", 280)
+    return {
+        "verdict": rev["verdict"],
+        "reason": reason,
+        "draft_hash": dh,
+        "model": rev.get("model"),
+        "source": "autopilot",
+    }
+
+
+def review_pass(c, mode: str, night=None, cap: int = REVIEW_CAP) -> dict:
+    """Judge (or reuse the memo of) each proposed, drafted, untouched row and act on the
+    decision per `mode` ('shadow' records only). `c` is a dict-row connection."""
+    R = _routes()
+    night = night or date.fromisoformat(SM.scan_night())
+    out: dict = {"applied": [], "rejected": [], "asked": [], "capped": [], "would": {}, "judged": 0}
+    rows = c.execute(_PROPOSED.format(cols=R._CANDIDATE_COLS)).fetchall()
+    regs = {
+        r["name"]: r
+        for r in c.execute(
+            "SELECT name, description, status, pinned, lane_body_hash, COALESCE(body,'') AS body "
+            "FROM skills_lane.skill_registry"
+        ).fetchall()
+    }
+    catalog = [(n, r["description"] or "") for n, r in regs.items() if r["status"] == "active"]
+    c.commit()
+    for row in rows:
+        if human_touched(row["evidence"]):
+            continue
+        cid, body = row["id"], row["proposal_body"]
+        plan = R._plan_apply(c, row, body, None)
+        c.commit()
+        if plan["issues"]:  # unappliable as drafted: #229's auto-reject / re-draft owns it
+            continue
+        skill = plan["skill"]
+        reg = regs.get(skill)
+        tier, notes = tier_for(row, plan, bool(reg and reg["pinned"]))
+        hand = bool(
+            reg
+            and plan["exists"]
+            and (reg["lane_body_hash"] is None or reg["lane_body_hash"] != D.body_hash(reg["body"]))
+        )
+        pre = {"notes": notes, "hand_written": hand, "scope": plan["scope"]}
+        eh, dh = evidence_hash(row["evidence"]), D.body_hash(body)
+        prior = _latest_review(c, cid, eh, dh)
+        c.commit()
+        if _complete(prior):
+            j = {"reviewer": prior["reviewer"], "verifier": prior["verifier"]}
+        elif out["judged"] >= cap:
+            continue
+        else:
+            j = judge(row, plan["registry_body"], catalog)
+            out["judged"] += 1
+        rev_verdict = (j["reviewer"] or {}).get("verdict")
+        ver = (j["verifier"] or {}).get("result", "error")
+        decision = decide(tier, rev_verdict, ver)
+        note = ""
+        if prior and prior["rolled_back_at"] is not None and decision == "apply":
+            decision, note = "ask", "rolled back before; needs a person"
+        failed = j["reviewer"] is None or ver == "error"
+        if failed:
+            decision = "ask"
+        if mode != "live":
+            verdict = {"apply": "would_apply", "reject": "would_reject"}.get(decision, "ask")
+        else:
+            verdict = {"apply": "applied", "reject": "rejected"}.get(decision, "ask")
+        if verdict == "applied":
+            why = cap_reason(c, tier, night)
+            c.commit()
+            if why:
+                verdict, note = "capped", why
+        if failed:
+            verdict = "failed"
+        if verdict == "applied":
+            res = R.apply_candidate(
+                c,
+                cid,
+                None,
+                None,
+                False,
+                actor="auto",
+                review={
+                    "night": night,
+                    "mode": mode,
+                    "evidence_hash": eh,
+                    "draft_hash": dh,
+                    "tier": tier,
+                    "preflight": pre,
+                    "reviewer": j["reviewer"],
+                    "verifier": j["verifier"],
+                },
+            )
+            if res.get("status") != "promoted":
+                verdict, note = "ask", _plain(res.get("detail") or "refused", 160)
+            else:
+                out["applied"].append(
+                    {
+                        "id": cid,
+                        "review_id": res["auto_review_id"],
+                        "skill": skill,
+                        "tier": tier,
+                        "what": what(row),
+                        "reason": _plain(j["reviewer"]["reason"], 160),
+                    }
+                )
+                print(f"  auto-applied cand#{cid} ({what(row)}), review {res['auto_review_id']}")
+                continue
+        if prior and prior["verdict"] == verdict and prior["mode"] == mode and not failed:
+            continue  # nothing new to record or say
+        _record(c, cid, night, mode, eh, dh, tier, pre, j, verdict, skill)
+        if verdict == "rejected":
+            c.execute(
+                "UPDATE skills_lane.skill_gap_candidates SET status='rejected', "
+                "reject_reason='auto:review', "
+                "rejected_until=now() + make_interval(days => %s), updated_at=now() "
+                "WHERE id=%s AND status='proposed'",
+                (COOLDOWN_DAYS, cid),
+            )
+            out["rejected"].append(
+                {"id": cid, "what": what(row), "reason": _plain(j["reviewer"]["reason"], 160)}
+            )
+            print(f"  auto-rejected cand#{cid} ({what(row)})")
+        elif (
+            verdict in ("ask", "capped")
+            and mode == "live"
+            and L.queue_ready(c.connection if hasattr(c, "connection") else c)
+        ):
+            rec = _recommendation(j, dh, note or _ask_note(tier, hand, rev_verdict, ver, j))
+            if rec:
+                c.execute(
+                    "UPDATE skills_lane.skill_gap_candidates SET recommendation = %s::jsonb || "
+                    "jsonb_build_object('at', now()) WHERE id=%s AND status='proposed'",
+                    (Json(rec), cid),
+                )
+            out["asked"].append(cid)
+            if verdict == "capped":
+                out["capped"].append({"id": cid, "what": what(row), "why": note})
+        elif verdict in ("would_apply", "would_reject"):
+            out["would"][verdict] = out["would"].get(verdict, 0) + 1
+        c.commit()
+    return out
+
+
+def _ask_note(tier: str, hand: bool, rev: str | None, ver: str, j: dict) -> str:
+    """Why this one is not decided by the lane, in plain words (appended to the reason)."""
+    if tier == "body_edit":
+        return "a body edit to a hand-written skill" if hand else "a body edit"
+    if tier == "pinned":
+        return "the skill is pinned"
+    if tier != "new_skill" and tier != "description":
+        return tier.replace("_", " ")
+    if rev == "accept" and ver in ("fail", "split"):
+        return f"verifier disagrees: {verifier_flags((j.get('verifier') or {}).get('orders', [None])[0])}"
+    if rev == "reject" and ver != "fail":
+        return "the verifier did not confirm the rejection"
+    return ""
+
+
+# ------------------------------------------------------------------ entry
+def run(conn, run_started=None, *, review: bool = True, mode: str | None = None) -> dict:
+    """One autopilot pass: reconcile what it applied before, then (review=True) judge and act
+    on the proposed queue. `conn` is a plain psycopg connection. Returns the pass's items
+    (the report's auto lines) and counts."""
+    mode = mode or current_mode()
+    out: dict = {
+        "mode": mode, "applied": [], "rejected": [], "asked": [], "capped": [], "would": {},
+        "rolled_back": [], "conflicts": [], "breaker": None, "judged": 0, "ran": False,
+    }  # fmt: skip
+    if mode == "off":
+        return out
+    if not L.autopilot_ready(conn):
+        print("(autoreview: schema 064 not applied; skipping)")
+        out["skipped"] = "schema 064"
+        return out
+    with dict_rows(conn) as c:
+        if not c.execute("SELECT pg_try_advisory_lock(%s) AS ok", (_LOCK_KEY,)).fetchone()["ok"]:
+            c.commit()
+            print("(autoreview: another run holds the lock; skipping)")
+            out["skipped"] = "locked"
+            return out
+        try:
+            c.commit()
+            rec = reconcile(c)
+            out["rolled_back"], out["conflicts"] = rec["rolled_back"], rec["conflicts"]
+            br = breaker_state(c)
+            effective = mode
+            if br["tripped"] and mode == "live":
+                effective = "shadow"
+                out["breaker"] = {
+                    "rollbacks": len(br["rollbacks"]),
+                    "skills": [r["skill"] for r in br["rollbacks"]],
+                }
+                print("(autoreview: circuit breaker tripped; running as shadow)")
+            _patch_config(
+                c,
+                "autopilot",
+                {
+                    "last_mode": effective,
+                    "configured_mode": mode,
+                    "last_run_at": datetime.now(UTC).isoformat(),
+                    "tripped": br["tripped"],
+                },
+            )
+            c.commit()
+            if review:
+                out.update({k: v for k, v in review_pass(c, effective).items()})
+            out["ran"] = True
+            out["effective_mode"] = effective
+        finally:
+            c.rollback()
+            c.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
+            c.commit()
+    return out
+
+
+def flat_counts(res: dict) -> dict:
+    """The run's counts as flat ints (dream_runs.counts, prefixed autoreview_)."""
+    return {
+        "applied": len(res.get("applied") or []),
+        "rejected": len(res.get("rejected") or []),
+        "asked": len(res.get("asked") or []),
+        "capped": len(res.get("capped") or []),
+        "rolled_back": len(res.get("rolled_back") or []),
+        "conflicts": len(res.get("conflicts") or []),
+        "judged": res.get("judged", 0),
+        "would_apply": (res.get("would") or {}).get("would_apply", 0),
+        "would_reject": (res.get("would") or {}).get("would_reject", 0),
+        "breaker": 1 if res.get("breaker") else 0,
     }

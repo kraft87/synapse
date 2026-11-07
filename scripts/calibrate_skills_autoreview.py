@@ -33,18 +33,17 @@ autopilot would have APPLIED (the go-live gate requires 0).
 from __future__ import annotations
 
 import argparse
-import os
-import subprocess
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from dream.skills import autoreview as A  # noqa: E402
-from dream.skills import skill_measure as SM  # noqa: E402
-from dream.skills.skill_draft import missing_phrasings  # noqa: E402
+from dream.skills import autoreview as A
+from dream.skills import skill_measure as SM
+from dream.skills.skill_draft import missing_phrasings
 
 DUMP_SQL = """
 SELECT json_build_object(
@@ -194,33 +193,11 @@ def preflight(row: dict, world: World, t: datetime) -> tuple[str | None, str, di
     return None, tier, v
 
 
-def isolated_reviewer(cwd: Path):
-    """The reviewer through the claude CLI the way the dream container runs it: no user
-    CLAUDE.md, memory, settings, hooks or plugins (a workstation's would steer the verdict
-    and ingest the prompts), and no transcript left behind."""
-    from dream.skills import config
-
-    env = {**os.environ, "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}
-
-    def call(prompt: str) -> str:
-        r = subprocess.run(
-            ["claude", "-p", prompt, "--model", config.JUDGE_MODEL,
-             "--setting-sources", "project", "--no-session-persistence"],
-            capture_output=True, text=True, timeout=300, env=env, cwd=cwd,
-        )  # fmt: skip
-        return r.stdout
-
-    return call
-
-
-def run(dump_path: str, out_dir: str, only: set[int] | None, isolated: bool = True) -> None:
+def run(dump_path: str, out_dir: str, only: set[int] | None) -> None:
     dump = json.loads(Path(dump_path).read_text())
     world = World(dump)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    if isolated:
-        (out / "cli-cwd").mkdir(exist_ok=True)
-        A._reviewer_call = isolated_reviewer(out / "cli-cwd")
     res_path = out / "results.jsonl"
     done = {}
     if res_path.exists():
@@ -238,7 +215,9 @@ def run(dump_path: str, out_dir: str, only: set[int] | None, isolated: bool = Tr
         t = decision_time(row, world)
         r = {**row, "evidence": evidence_at(row["evidence"], t), "proposal_body": None}
         code, tier, v = preflight(r, world, t)
-        exclude = {row["name"]} if row["kind"] == "derive" and row["status"] == "promoted" else set()
+        exclude = (
+            {row["name"]} if row["kind"] == "derive" and row["status"] == "promoted" else set()
+        )
         catalog = world.catalog_at(t, exclude)
         rec = {
             "id": row["id"],
@@ -285,23 +264,27 @@ def summarize(rows: list[dict]) -> None:
         if (r["final"], r["human"]) in (("apply", "accept"), ("reject", "reject"))
     ]
     asks = [r for r in decided if r["final"] == "ask"]
-    rev_agree = [
-        r
-        for r in decided
-        if (r.get("reviewer") or {}).get("verdict") == r["human"]
-    ]
+    rev_agree = [r for r in decided if (r.get("reviewer") or {}).get("verdict") == r["human"]]
     judged = [r for r in decided if r.get("judged")]
     print("\n== calibration ==")
-    print(f"decided rows: {len(decided)}  (accepted {sum(r['human'] == 'accept' for r in decided)},"
-          f" rejected {sum(r['human'] == 'reject' for r in decided)})")
-    print(f"HEADLINE rejected by a person but auto-APPLIED: {len(applied_rejected)} "
-          f"{[r['id'] for r in applied_rejected]}")
-    print(f"accepted by a person but auto-REJECTED: {len(rejected_accepted)} "
-          f"{[r['id'] for r in rejected_accepted]}")
+    print(
+        f"decided rows: {len(decided)}  (accepted {sum(r['human'] == 'accept' for r in decided)},"
+        f" rejected {sum(r['human'] == 'reject' for r in decided)})"
+    )
+    print(
+        f"HEADLINE rejected by a person but auto-APPLIED: {len(applied_rejected)} "
+        f"{[r['id'] for r in applied_rejected]}"
+    )
+    print(
+        f"accepted by a person but auto-REJECTED: {len(rejected_accepted)} "
+        f"{[r['id'] for r in rejected_accepted]}"
+    )
     print(f"autopilot acted and agreed: {len(agree)}/{len(decided)}; asked: {len(asks)}")
     print(f"reviewer verdict = person's: {len(rev_agree)}/{len(judged)} judged")
-    print(f"  of those, by #229's deterministic preflight: "
-          f"{[r['id'] for r in rejected_accepted if r.get('preflight')]}")
+    print(
+        f"  of those, by #229's deterministic preflight: "
+        f"{[r['id'] for r in rejected_accepted if r.get('preflight')]}"
+    )
     by = {}
     for r in decided:
         via = f"pre:{r['preflight']}" if r.get("preflight") else "llm"
@@ -321,7 +304,7 @@ def main() -> None:
     ap.add_argument("--only", help="comma-separated candidate ids")
     ap.add_argument("--summary", action="store_true", help="summarize results.jsonl only")
     ap.add_argument(
-        "--plain-cli", action="store_true", help="call the reviewer exactly as the lane does"
+        "--model", help="reviewer model (default: SKILLS_AUTOREVIEW_MODEL or the lane's)"
     )
     a = ap.parse_args()
     if a.summary:
@@ -329,7 +312,9 @@ def main() -> None:
         summarize(rows)
         return
     only = {int(x) for x in a.only.split(",")} if a.only else None
-    run(a.dump, a.out, only, isolated=not a.plain_cli)
+    if a.model:
+        os.environ["SKILLS_AUTOREVIEW_MODEL"] = a.model
+    run(a.dump, a.out, only)
 
 
 if __name__ == "__main__":
