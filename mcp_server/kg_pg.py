@@ -64,12 +64,13 @@ _OVERFETCH = 200
 # Facts a full-trust recall may add from the group it did not ask for, after the
 # requested group's own (see search_kg). recall_overview serves _FACT_LIMIT + this.
 CROSS_GROUP_EXTRAS = 4
-# Reinforcement prior on the fused fact score (SYNAPSE_KG_MENTION_W, default 0 = off): every
+# Reinforcement prior on the fused fact score (SYNAPSE_KG_MENTION_W, default 0.1; 0 = off): every
 # fused RRF score is multiplied by ``1 + w * ln(mention_count)`` before the top-``limit`` cut,
 # so a fact the owner re-asserted across conversations outranks a one-off of the same
 # relevance. mention_count counts re-assertions (schema 019); 1 (a fact stated once) is the
-# neutral value. See :func:`_mention_prior`.
-_MENTION_W = float(os.getenv("SYNAPSE_KG_MENTION_W", "0") or "0")
+# neutral value. 0.1 is the largest weight that kept every recall bench criterion (ARCHITECTURE
+# section 12.9). See :func:`_mention_prior`.
+_MENTION_W = float(os.getenv("SYNAPSE_KG_MENTION_W", "0.1") or "0.1")
 
 
 def read_groups(group_id: str, restricted: bool) -> str | list[str]:

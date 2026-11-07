@@ -1,10 +1,10 @@
 """The mention_count reinforcement prior on the fused KG fact score (kg_pg._mention_prior).
 
 The fact leg fuses vector, BM25 and hop lists by RRF and cuts to the top ``limit``. With
-``SYNAPSE_KG_MENTION_W`` > 0 every fused score is first multiplied by
+``SYNAPSE_KG_MENTION_W`` > 0 (default 0.1) every fused score is first multiplied by
 ``1 + w * ln(mention_count)``, so a fact re-asserted across conversations (mention_count > 1,
 schema 019) can displace a one-off of similar relevance in the cut. Sections:
-  * the multiplier arithmetic, and that off (the default) sends no extra statement
+  * the multiplier arithmetic, and that off (weight 0) sends no extra statement
   * the cut: a reinforced fact of lower rank takes the slot only with the prior on
   * the prior reorders what the legs returned and never widens it, including restricted callers
   * the knob parses from the environment
@@ -142,11 +142,18 @@ def _two(conn) -> None:
     _fact(conn, "reinforced", ep, theta=0.3, mentions=6)
 
 
-def test_off_by_default_serves_plain_rrf_order(kg, db_url, monkeypatch):
+def test_weight_zero_serves_plain_rrf_order(kg, db_url, monkeypatch):
     _two(kg)
     monkeypatch.setattr(kg_pg, "_MENTION_W", 0.0)
     assert _search(db_url, 2) == ["fresh", "reinforced"]
     assert _search(db_url, 1) == ["fresh"]
+
+
+def test_default_weight_lets_the_reinforced_fact_outrank_the_one_off(kg, db_url):
+    # No monkeypatch: the shipped default (0.1) must already reorder, or the prior is dead.
+    _two(kg)
+    assert kg_pg._MENTION_W == 0.1
+    assert _search(db_url, 1) == ["reinforced"]
 
 
 def test_prior_lets_the_reinforced_fact_take_the_only_slot(kg, db_url, monkeypatch):
@@ -242,7 +249,9 @@ def test_recall_serves_the_reinforced_fact_past_the_cut(kg, db_url, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("env", "want"), [(None, "0.0"), ("", "0.0"), ("0.3", "0.3")])
+@pytest.mark.parametrize(
+    ("env", "want"), [(None, "0.1"), ("", "0.1"), ("0", "0.0"), ("0.3", "0.3")]
+)
 def test_weight_is_read_from_the_environment(env, want, monkeypatch):
     monkeypatch.delenv("SYNAPSE_KG_MENTION_W", raising=False)
     if env is not None:
