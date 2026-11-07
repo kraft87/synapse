@@ -68,9 +68,9 @@ from .skill_draft import missing_phrasings, target_skill
 from .struggle_arc import NEGATIVE_LIST
 
 MODES = ("off", "shadow", "live")
-#: The calibration gate decides this (see the PR that introduced the stage): 'live' only
-#: when no proposal a person rejected would have been applied.
-DEFAULT_MODE = "shadow"
+#: The calibration gate decided this: 'live' because, over every proposal a person decided,
+#: none that a person rejected would have been applied (scripts/calibrate_skills_autoreview.py).
+DEFAULT_MODE = "live"
 NIGHT_APPLY_CAP = 3
 NEW_SKILL_NIGHT_CAP = 1
 NEW_SKILL_WEEK_CAP = 3
@@ -904,11 +904,7 @@ def review_pass(c, mode: str, night=None, cap: int = REVIEW_CAP) -> dict:
                 {"id": cid, "what": what(row), "reason": _plain(j["reviewer"]["reason"], 160)}
             )
             print(f"  auto-rejected cand#{cid} ({what(row)})")
-        elif (
-            verdict in ("ask", "capped")
-            and mode == "live"
-            and L.queue_ready(c.connection if hasattr(c, "connection") else c)
-        ):
+        elif verdict in ("ask", "capped") and mode == "live" and L.queue_ready(c):
             rec = _recommendation(j, dh, note or _ask_note(tier, hand, rev_verdict, ver, j))
             if rec:
                 c.execute(
@@ -994,6 +990,14 @@ def run(conn, run_started=None, *, review: bool = True, mode: str | None = None)
             c.rollback()
             c.execute("SELECT pg_advisory_unlock(%s)", (_LOCK_KEY,))
             c.commit()
+    return out
+
+
+def reconcile_once(conn) -> dict:
+    """reconcile() on a plain connection (the nightly's, the tests'): dict rows for the block."""
+    with dict_rows(conn) as c:
+        out = reconcile(c)
+        c.commit()
     return out
 
 
