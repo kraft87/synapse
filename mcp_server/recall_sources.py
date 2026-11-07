@@ -10,7 +10,7 @@ from typing import Any
 import psycopg
 from psycopg.rows import tuple_row
 
-from mcp_server.kg_pg import _vec_literal, scope_predicate, search_kg_postgres
+from mcp_server.kg_pg import _vec_literal, group_sql, scope_predicate, search_kg
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_ranking import merge_rrf as _merge_rrf
 from mcp_server.recall_settings import _SUP_LIMIT
@@ -268,7 +268,7 @@ class RecallSourcesMixin:
         self,
         query: str,
         query_emb: list[float],
-        group_id: str,
+        group_id: str | list[str],
         session_focus: list[str],
         fact_limit: int,
         allowed_projects: list[str] | None = None,
@@ -279,6 +279,7 @@ class RecallSourcesMixin:
         provenance lies inside it are served (schema 056, ``kg_pg.scope_predicate``).
         Without schema 056 the restricted leg returns nothing and logs one warning. It
         never adds a response warning, matching the pre-056 skip. ``None`` = full trust.
+        ``group_id``: one group or a list (``kg_pg.read_groups``; ``kg_pg.search_kg``).
 
         Runs inside one transaction so the planner GUCs are SET LOCAL — scoped
         to this query, not the thread-local connection that other legs may
@@ -298,7 +299,7 @@ class RecallSourcesMixin:
                     cur = conn.cursor(row_factory=tuple_row)
                     cur.execute("SET LOCAL enable_seqscan = off")
                     cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
-                    return search_kg_postgres(
+                    return search_kg(
                         cur,
                         query,
                         query_emb,
@@ -341,7 +342,7 @@ class RecallSourcesMixin:
 
     def _fetch_superseded_pairs_pg(
         self,
-        group_id: str,
+        group_id: str | list[str],
         active_edge_uuids: list[str],
         cap: int,
         allowed_projects: list[str] | None = None,
@@ -386,7 +387,7 @@ class RecallSourcesMixin:
                     JOIN kg_relationships o
                       ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
                      AND o.owner_id = a.owner_id AND o.group_id = a.group_id
-                    WHERE a.owner_id = %s AND a.group_id = %s
+                    WHERE a.owner_id = %s AND {group_sql(group_id, "a.group_id")}
                       AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                       AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid AND o.web_artifact_id IS NULL
                       AND ((o.invalidated_by = a.uuid
@@ -432,7 +433,7 @@ class RecallSourcesMixin:
     def _episode_supersessions(
         self,
         episode_ids: list[int],
-        group_id: str,
+        group_id: str | list[str],
         cap: int = 6,
         allowed_projects: list[str] | None = None,
         self_session: str | None = None,
@@ -482,7 +483,7 @@ class RecallSourcesMixin:
                     "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                     f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
-                    "  AND p.owner_id = %s AND p.group_id = %s AND n.t_invalid IS NULL "
+                    f"  AND p.owner_id = %s AND {group_sql(group_id, 'p.group_id')} AND n.t_invalid IS NULL "
                     "  AND n.web_artifact_id IS NULL "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}"
@@ -521,7 +522,7 @@ class RecallSourcesMixin:
     def _surface_supersessions(
         self,
         query_emb: list[float] | None,
-        group_id: str,
+        group_id: str | list[str],
         served_uuids: set[str],
         cap: int = _SUP_LIMIT,
         allowed_projects: list[str] | None = None,
@@ -558,7 +559,7 @@ class RecallSourcesMixin:
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
                     "  AND n.web_artifact_id IS NULL "
                     "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
-                    "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND p.group_id = %s "
+                    f"  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND {group_sql(group_id, 'p.group_id')} "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}"
                     f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",

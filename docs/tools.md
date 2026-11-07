@@ -18,8 +18,9 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   (`user` / `assistant` / `mixed`) and a date, so a caller can weight a human-stated fact
   over the agent's own past output. Every served item carries an id (`e:N` episode, `n:N`
   note, `f:<uuid>` fact, `w:N` web); only `e:` and `n:` are fetchable, the
-  rest are feedback-only. `group_id` scopes the knowledge graph to `technical` (default) or
-  `personal`.
+  rest are feedback-only. `group_id` (`technical` default, or `personal`) is the knowledge
+  graph a restricted host is served. A trusted host is served that graph's facts as before
+  plus up to four matching facts from the other one.
 - **`recall_full_turns(query, project=None, limit=5, session_id=None)`**: the drill-down and
   retry sibling. `recall()` serves compressed ~1400-char passage slices; this serves whole
   turns and nothing else, ranked by relevance plus recency. It is the right call for exact
