@@ -10,10 +10,14 @@ note ids or overflow differ between the two. Read-only: the board is pure SELECT
 
 With no ``--project``, it benchmarks the all-projects board plus every project on the
 banner's most-recent list. The two versions alternate build by build, so drift in
-database load lands on both. ``--pool`` adds a third column: the working tree's build
-again with the server's connection pool (ingestion/pg_pool) open, so it borrows
-connections instead of opening one per read. The before and after columns always run
-with no pool open.
+database load lands on both. ``--pool`` adds the same two builds again with the server's
+connection pool (ingestion/pg_pool) open, so they borrow connections instead of opening
+one per read, as the server does: columns ``before+pool`` and ``after+pool``. The plain
+before and after columns always run with no pool open.
+
+A change meant to alter what the board serves differs from ``--ref`` on purpose;
+``--allow-diff`` reports those boards (the "OUTPUT DIFFERS" marker) without failing the
+run, so the timings can still be read as a latency check.
 """
 
 from __future__ import annotations
@@ -68,6 +72,9 @@ def main() -> int:
     ap.add_argument("--reps", type=int, default=15)
     ap.add_argument("--project", action="append", help="repeatable; default: all + banner")
     ap.add_argument("--pool", action="store_true", help="also time the build with a pool open")
+    ap.add_argument(
+        "--allow-diff", action="store_true", help="a changed board is reported, not a failure"
+    )
     args = ap.parse_args()
 
     before = board_at_ref(args.ref)
@@ -78,7 +85,8 @@ def main() -> int:
         projects = [None, *names]
 
     mismatches = 0
-    labels = ["before", "after", *(["after+pool"] if args.pool else [])]
+    changed = 0
+    labels = ["before", "after", *(["before+pool", "after+pool"] if args.pool else [])]
     print(f"before = {args.ref}, after = working tree, {args.reps} builds each, median ms")
     print(
         f"{'project':<24} {'notes':>5} {'drop':>5}"
@@ -96,27 +104,36 @@ def main() -> int:
             try:
                 pg_pool._POOLS[args.db_url].wait(timeout=10)
                 for _ in range(args.reps):
-                    outs["after+pool"], wall, cpu = timed_build(
-                        work_tree_board, args.db_url, project
-                    )
-                    stats["after+pool"].append((wall, cpu))
+                    for label, mod in (("before+pool", before), ("after+pool", work_tree_board)):
+                        outs[label], wall, cpu = timed_build(mod, args.db_url, project)
+                        stats[label].append((wall, cpu))
             finally:
                 pg_pool.close_pool(args.db_url)
         same = all(
-            outs[lb][k] == outs["before"][k]
+            outs[lb][k] == outs["before" if lb.startswith("before") else "after"][k]
             for lb in labels
             for k in ("text", "note_ids", "overflow")
         )
-        mismatches += not same
+        differs = any(
+            outs["after"][k] != outs["before"][k] for k in ("text", "note_ids", "overflow")
+        )
+        changed += differs
+        mismatches += (not same) or (differs and not args.allow_diff)
 
         after = outs["after"]
         print(
             f"{(project or '(all)')[:24]:<24} {after['n_notes'] + after['overflow']:>5} "
             f"{after['overflow']:>5}"
             + "".join(f"  {median_ms(stats[lb]):>20}" for lb in labels)
-            + ("" if same else "  OUTPUT DIFFERS")
+            + ("" if not differs else "  OUTPUT DIFFERS")
+            + ("" if same else "  POOLED BUILD DIFFERS FROM UNPOOLED")
         )
-    print("identical output on every board" if not mismatches else f"{mismatches} boards differ")
+    if mismatches:
+        print(f"{mismatches} boards differ")
+    elif changed:
+        print(f"{changed} of {len(projects)} boards differ from {args.ref} (--allow-diff)")
+    else:
+        print("identical output on every board")
     return 1 if mismatches else 0
 
 

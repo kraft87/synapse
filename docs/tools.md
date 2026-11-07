@@ -51,7 +51,8 @@ already has (the Hermes pattern — when injection covers the read, ship no read
 - **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, project=None)`**
   reports retrieval quality after a recall whose results you used: which served ids were
   load-bearing, which were noise, and what was missing. It writes one row of offline labeled data for eval
-  goldens and reranker tuning, and is deliberately not wired into live ranking.
+  goldens and reranker tuning; recall's ranking never reads it, and the only live use is the
+  session-start board, which orders notes within a type by their helpful `n:` ratings.
 
 Two parameters exist on several of these that a caller should never set. `self_session` is
 injected by the plugin's PreToolUse hook so serving can suppress the calling session's own
