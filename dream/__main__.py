@@ -84,15 +84,21 @@ def run_once() -> None:
 
             res = run_config_lane(limit=int(os.environ.get("CONFIG_LANE_LIMIT", "30")))
             run_stages["config"] = {"ran": True, "ok": True}
-            # The config lane returns {"sessions", "found", "proposed"} — the ONLY counts a
-            # lane exposes cheaply today. Record what it gives; leave the rest absent.
+            # The lane's flat counts (sessions, found, proposed, covered, expired, recommended,
+            # digest_sent). The first three keep the names the dashboard reads; the rest are
+            # prefixed config_. A lane waiting for schema 065 returns only {"skipped": ...}.
             if isinstance(res, dict):
+                if res.get("skipped"):
+                    run_stages["config"] = {"ran": True, "ok": True, "skipped": res["skipped"]}
                 if res.get("sessions") is not None:
                     counts["config_sessions_scanned"] = res["sessions"]
                 if res.get("found") is not None:
                     counts["config_corrections_found"] = res["found"]
                 if res.get("proposed") is not None:
                     counts["config_proposals"] = res["proposed"]
+                for k in ("covered", "expired", "recommended", "digest_sent"):
+                    if res.get(k) is not None:
+                        counts[f"config_{k}"] = res[k]
         except Exception as e:
             logger.error("dream→config lane failed: %s", e, exc_info=True)
             run_stages["config"] = {"ran": True, "ok": False}
@@ -203,18 +209,23 @@ def _dream_collect_proposals(
                 ).fetchone()[0]
             except Exception as e:  # pragma: no cover - lane may be absent
                 logger.debug("dream_runs skills sample skipped: %s", e)
-            # config lane — status 'proposed', created since the run began.
+            # config lane — status 'proposed', raised since the run began: proposed_at
+            # (schema 065) catches a row that sat in observe and went proposed tonight; before
+            # 065 is applied the lane idles, and rows created tonight is the best this can count.
             try:
+                from dream.config.nightly import identity_ready
+
+                ccol = "proposed_at" if identity_ready(conn) else "created_at"
                 for pid, fkey in conn.execute(
                     "SELECT id, file_key FROM config_lane.config_proposals "
-                    "WHERE status = 'proposed' AND created_at >= %s "
-                    "ORDER BY created_at DESC LIMIT %s",
+                    f"WHERE status = 'proposed' AND {ccol} >= %s "
+                    f"ORDER BY {ccol} DESC LIMIT %s",
                     (since, _SAMPLE_CAP),
                 ).fetchall():
                     proposals.append({"id": f"config:{pid}", "kind": "config-edit", "name": fkey})
                 total += conn.execute(
                     "SELECT count(*) FROM config_lane.config_proposals "
-                    "WHERE status = 'proposed' AND created_at >= %s",
+                    f"WHERE status = 'proposed' AND {ccol} >= %s",
                     (since,),
                 ).fetchone()[0]
             except Exception as e:  # pragma: no cover - lane may be absent
