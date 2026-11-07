@@ -126,6 +126,49 @@ def test_the_prompt_carries_the_document(monkeypatch):
     assert "kind: research_brief" in p and "title: T1" in p and "url: U1" in p and "BODY" in p
 
 
+def test_windows_cut_on_paragraphs_and_cap_every_piece():
+    assert wa.windows("short", 100) == ["short"]
+    paras = ["p" * 40, "q" * 40, "r" * 40]
+    pieces = wa.windows("\n\n".join(paras), 90)
+    assert pieces == ["p" * 40 + "\n\n" + "q" * 40, "r" * 40]
+    giant = wa.windows("g" * 250, 100)
+    assert [len(x) for x in giant] == [100, 100, 50]
+    assert all(len(x) <= 100 for x in wa.windows("\n\n".join(["x" * 30] * 20), 100))
+    assert "".join(wa.windows("\n\n".join(paras), 90)).replace("\n", "") == "".join(paras)
+
+
+def test_a_brief_is_judged_window_by_window(monkeypatch):
+    # The private reference sits in the last of three windows. One call over the whole
+    # brief could read past it; every window is voted on separately, so it cannot.
+    monkeypatch.setattr(wa, "BRIEF_WINDOW", 100)
+    body = "\n\n".join(["a" * 80, "b" * 80, "c" * 80])
+    clean = [_v("work-safe")] * 6
+    votes = _Votes(*clean, _v("work-safe"), _v("personal", "a parent"))
+    d = _classify(monkeypatch, votes, kind="research_brief", content=body)
+    assert d.audience == "personal" and d.detail.startswith("part 3/3 vote 2:")
+    assert len(votes.prompts) == 8
+    assert "part: 3 of 3" in votes.prompts[-1] and "c" * 80 in votes.prompts[-1]
+    assert "a" * 80 not in votes.prompts[-1]
+
+
+def test_a_brief_is_work_safe_only_when_every_window_is_clean(monkeypatch):
+    monkeypatch.setattr(wa, "BRIEF_WINDOW", 100)
+    body = "\n\n".join(["a" * 80, "b" * 80])
+    votes = _Votes(*[_v("work-safe")] * 6)
+    d = _classify(monkeypatch, votes, kind="research_brief", content=body)
+    assert d == AudienceDecision("work-safe", "classifier", "3/3 votes x 2 parts")
+
+
+def test_a_scrape_and_a_short_brief_stay_one_window(monkeypatch):
+    monkeypatch.setattr(wa, "BRIEF_WINDOW", 100)
+    votes = _Votes(_v("work-safe"), _v("work-safe"), _v("work-safe"))
+    d = _classify(monkeypatch, votes, kind="web_scrape", content="a" * 500)
+    assert d.detail == "3/3 votes" and "part:" not in votes.prompts[0]
+    votes = _Votes(_v("work-safe"))
+    d = _classify(monkeypatch, votes, n=1, kind="research_brief", content="a" * 90)
+    assert d.detail == "1/1 votes" and "part:" not in votes.prompts[0]
+
+
 def test_a_brief_is_read_whole_and_a_long_scrape_by_head_and_tail():
     mid = "MIDDLE-SECTION"
     long_doc = "a" * 20000 + mid + "z" * 20000

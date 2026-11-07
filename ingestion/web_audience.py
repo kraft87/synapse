@@ -67,6 +67,14 @@ SERVED_KINDS = ("research_brief", "web_scrape")
 BRIEF_CHARS = 60000
 SCRAPE_CHARS = 12000
 
+#: A research brief is judged in windows of at most this many characters, every window by
+#: its own votes. One call over a whole brief reads for a topic and can miss a single
+#: private reference buried in a long document (a measured case: the same call flipped
+#: between work-safe and personal from run to run, so even unanimous votes sometimes let
+#: it through). A short window leaves the reference nowhere to hide. Scrapes are other
+#: people's pages, whose topic shows in the head, and stay a single window.
+BRIEF_WINDOW = 4000
+
 #: Independent classifier calls per artifact (``SYNAPSE_WEB_AUDIENCE_VOTES``). The model
 #: is sampled, so one call on a borderline document can come back either way; requiring
 #: every vote to be a clean work-safe turns a per-call slip into a miss only when it
@@ -126,7 +134,7 @@ Leave it empty only when there is none.
 DOCUMENT
 kind: {kind}
 title: {title}
-url: {url}
+url: {url}{part}
 ---
 {text}
 ---"""
@@ -142,6 +150,31 @@ def excerpt(content: str | None, kind: str | None = None) -> str:
     head, tail = limit * 3 // 4, limit // 4
     omitted = len(text) - head - tail
     return f"{text[:head]}\n\n[... {omitted} characters omitted ...]\n\n{text[-tail:]}"
+
+
+def windows(text: str, size: int) -> list[str]:
+    """``text`` cut into pieces of at most ``size`` characters, on paragraph breaks where
+    it can (a paragraph longer than ``size`` is cut mid-way). One piece for short text."""
+    if len(text) <= size:
+        return [text]
+    parts: list[str] = []
+    cur = ""
+    for para in text.split("\n\n"):
+        while len(para) > size:
+            if cur:
+                parts.append(cur)
+                cur = ""
+            parts.append(para[:size])
+            para = para[size:]
+        joined = f"{cur}\n\n{para}" if cur else para
+        if len(joined) <= size:
+            cur = joined
+        else:
+            parts.append(cur)
+            cur = para
+    if cur:
+        parts.append(cur)
+    return parts
 
 
 def votes_from_env() -> int:
@@ -163,36 +196,52 @@ def classify(
     votes: int | None = None,
 ) -> AudienceDecision:
     """Rule 3: the conservative classifier. ``work-safe`` only when every one of ``votes``
-    independent calls answers work-safe and names no personal signal; the first vote that
-    does not ends the poll with ``personal``. Transport errors propagate (the caller
-    leaves the row unlabelled and retries later); every other failure answers
-    ``personal``."""
+    independent calls answers work-safe and names no personal signal, on every window of
+    the document (a research brief is cut into :data:`BRIEF_WINDOW` pieces, anything else
+    is one); the first vote that does not ends the poll with ``personal``. Transport
+    errors propagate (the caller leaves the row unlabelled and retries later); every
+    other failure answers ``personal``."""
     n = votes if votes is not None else votes_from_env()
-    prompt = PROMPT.format(
-        kind=kind or "-",
-        title=(title or "-").strip(),
-        url=url or "-",
-        text=excerpt(content, kind),
-    )
-    for i in range(1, max(1, n) + 1):
-        try:
-            verdict = structured_call(
-                llm,
-                output_model=WebAudienceVerdict,
-                base_prompt=prompt,
-                model=model or stage_model(STAGE),
-                max_tokens=400,
-                max_attempts=2,
-            )
-        except LLM_TRANSPORT_ERRORS:
-            raise
-        except Exception as e:
-            return AudienceDecision(DEFAULT_AUDIENCE, "classifier-fallback", f"error: {e}"[:200])
-        signals = [s.strip() for s in verdict.personal_signals if s and s.strip()]
-        if verdict.verdict != "work-safe" or signals:
-            detail = "; ".join(signals) or verdict.verdict
-            return AudienceDecision(DEFAULT_AUDIENCE, "classifier", f"vote {i}: {detail}"[:300])
-    return AudienceDecision(RESTRICTED_AUDIENCE, "classifier", f"{n}/{n} votes")
+    text = excerpt(content, kind)
+    pieces = windows(text, BRIEF_WINDOW) if kind == "research_brief" else [text]
+    for k, piece in enumerate(pieces, start=1):
+        part = (
+            ""
+            if len(pieces) == 1
+            else f"\npart: {k} of {len(pieces)} of one longer document; judge this part"
+        )
+        prompt = PROMPT.format(
+            kind=kind or "-",
+            title=(title or "-").strip(),
+            url=url or "-",
+            part=part,
+            text=piece,
+        )
+        for i in range(1, max(1, n) + 1):
+            try:
+                verdict = structured_call(
+                    llm,
+                    output_model=WebAudienceVerdict,
+                    base_prompt=prompt,
+                    model=model or stage_model(STAGE),
+                    max_tokens=400,
+                    max_attempts=2,
+                )
+            except LLM_TRANSPORT_ERRORS:
+                raise
+            except Exception as e:
+                return AudienceDecision(
+                    DEFAULT_AUDIENCE, "classifier-fallback", f"error: {e}"[:200]
+                )
+            signals = [s.strip() for s in verdict.personal_signals if s and s.strip()]
+            if verdict.verdict != "work-safe" or signals:
+                detail = "; ".join(signals) or verdict.verdict
+                where = f"part {k}/{len(pieces)} " if len(pieces) > 1 else ""
+                return AudienceDecision(
+                    DEFAULT_AUDIENCE, "classifier", f"{where}vote {i}: {detail}"[:300]
+                )
+    spread = f" x {len(pieces)} parts" if len(pieces) > 1 else ""
+    return AudienceDecision(RESTRICTED_AUDIENCE, "classifier", f"{n}/{n} votes{spread}")
 
 
 _OWN_SURFACE_SQL = """
