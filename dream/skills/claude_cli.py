@@ -1,7 +1,10 @@
 # mypy: ignore-errors
-"""The one stripped `claude -p` call the skills autopilot's reviewer makes, live and in the
-calibration alike (scripts/calibrate_skills_autoreview.py), so the gate measures exactly what
-runs.
+"""The one stripped `claude -p` call of the skills lane: the autopilot's reviewer (live and in
+the calibration, scripts/calibrate_skills_autoreview.py, so the gate measures exactly what
+runs) and every judge and drafting call the lane makes (skill_measure.run_judge for
+recommend, post_fire, struggle_arc, derive, retune, the procedure miner and the config lane;
+skill_derive._draft_call for the drafts), so the dream container pays for the prompt and not
+for 16k tokens of tool definitions on each of them.
 
 A default `claude -p` loads ~16k tokens of tool definitions and makes a ~5.5k side call; with
 only `--tools ""` it can still pull in the claude.ai connector schemas (~76k). This call
@@ -54,23 +57,30 @@ def env() -> dict[str, str]:
     return {**os.environ, **STRIP_ENV}
 
 
+def call(prompt: str, model: str, *, timeout: int = 300, cwd: str | None = None) -> str:
+    """The model's text answer (the CLI's stdout, whatever its exit status). Raises
+    OSError / subprocess.TimeoutExpired like a bare subprocess.run, for callers that count a
+    failed call (the lane's judges). cwd defaults to a fresh empty directory so no project
+    files are in reach."""
+    with tempfile.TemporaryDirectory(prefix="synapse-review-") as scratch:
+        r = subprocess.run(
+            argv(prompt, model),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env(),
+            cwd=cwd or scratch,
+        )
+    return r.stdout or ""
+
+
 def run(prompt: str, model: str, *, timeout: int = 300, cwd: str | None = None) -> str:
-    """The model's text answer ('' when the CLI is missing, not logged in, or times out).
-    cwd defaults to a fresh empty directory so no project files are in reach."""
+    """The model's text answer ('' when the CLI is missing, not logged in, or times out)."""
     try:
-        with tempfile.TemporaryDirectory(prefix="synapse-review-") as scratch:
-            r = subprocess.run(
-                argv(prompt, model),
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env(),
-                cwd=cwd or scratch,
-            )
+        return call(prompt, model, timeout=timeout, cwd=cwd)
     except (OSError, subprocess.SubprocessError) as e:
         print(f"  claude cli unavailable: {e}")
         return ""
-    return r.stdout or ""
 
 
 def run_with_usage(prompt: str, model: str, *, timeout: int = 300) -> dict:
