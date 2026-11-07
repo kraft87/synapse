@@ -25,7 +25,7 @@ import psycopg
 import pytest
 
 import mcp_server.recall as recall_mod
-import mcp_server.recall_kg as recall_kg
+import mcp_server.recall_sources as recall_sources
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
 from mcp_server.recall import Recall
@@ -654,7 +654,7 @@ def test_the_other_groups_bm25_leg_starts_first_on_a_connection_of_its_own(kg, d
     r = _engine(db_url)
     order = _spy_submissions(r, monkeypatch)
     seen: list[tuple[str, int, Any]] = []
-    real_bm25, real_walk = recall_kg.cross_bm25_rows, kg_pg.fact_vector_walk
+    real_bm25, real_walk = recall_sources.cross_bm25_rows, kg_pg.fact_vector_walk
 
     def bm25(cur, *a, **k):
         seen.append(("bm25", threading.get_ident(), cur.connection))
@@ -664,7 +664,7 @@ def test_the_other_groups_bm25_leg_starts_first_on_a_connection_of_its_own(kg, d
         seen.append(("walk", threading.get_ident(), cur.connection))
         return real_walk(cur, *a, **k)
 
-    monkeypatch.setattr(recall_kg, "cross_bm25_rows", bm25)
+    monkeypatch.setattr(recall_sources, "cross_bm25_rows", bm25)
     monkeypatch.setattr(kg_pg, "fact_vector_walk", walk)
 
     out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
@@ -742,7 +742,7 @@ def test_a_recall_with_extras_makes_both_fact_floor_requests_at_once(kg, db_url,
         | {"widget thing": 0.1}
     )
     out = r.recall("widget", group_id=TECH, trust=FULL_TRUST)
-    assert not any("rerank failed" in w for w in out["warnings"])
+    assert not any("rerank failed" in w for w in out.get("warnings", []))
     assert _served(out) == {"v-t", "b-t", "h-t", "v-p"}, "own floor and extras floor both applied"
     own_batch = next(b for b in r._reranker.calls if "alpha beta" in b)
     extras_batch = next(b for b in r._reranker.calls if "widget thing" in b)

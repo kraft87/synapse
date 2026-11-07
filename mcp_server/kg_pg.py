@@ -141,7 +141,7 @@ def search_kg_postgres(
     and returns no seed entities: an entity's name and summary are distilled from ALL
     its facts, so nothing proves them confined to the allowlist. ``None`` (full trust)
     executes exactly the statements it always did. Requires schema 056; the caller owns
-    the column-missing fallback (recall_kg._search_kg).
+    the column-missing fallback (recall_sources._search_kg).
 
     ``vec_rows`` (full trust only) is step 1's result already in hand: this group's first
     ``limit * 3`` rows of a shared fact-vector walk (:func:`fact_vector_walk`,
@@ -415,7 +415,7 @@ def cross_bm25_rows(
 ) -> list[FactRow]:
     """The other groups' BM25 leg: up to ``k * 3`` live non-web facts of ``groups`` matching
     ``query``, best score first. Needs nothing but the query text, so a caller can run it
-    on its own connection while the requested group is searched (recall_kg).
+    on its own connection while the requested group is searched (recall_sources).
 
     A caller that does so must give the connection the planner GUCs :func:`search_kg`
     documents; on a tie in score the ParadeDB scan's row order follows the plan.

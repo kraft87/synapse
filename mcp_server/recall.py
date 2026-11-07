@@ -42,7 +42,6 @@ from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.recall_episode_search import RecallEpisodeSearchMixin
 from mcp_server.recall_episodes import RecallEpisodesMixin
 from mcp_server.recall_fetch import RecallFetchMixin
-from mcp_server.recall_kg import RecallKGMixin
 from mcp_server.recall_metrics import RecallMetricsMixin
 from mcp_server.recall_overview import RecallOverviewMixin
 from mcp_server.recall_passages import RecallPassagesMixin
@@ -362,7 +361,6 @@ class Recall(
     RecallPassagesMixin,
     RecallSourcesMixin,
     RecallWebMixin,
-    RecallKGMixin,
     RecallOverviewMixin,
     RecallEpisodesMixin,
     RecallFetchMixin,
