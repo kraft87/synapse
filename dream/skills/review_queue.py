@@ -379,8 +379,8 @@ def _auto_lines(auto: dict | None) -> tuple[list[str], list[str]]:
         parts.append(f"{len(applied)} auto-applied")
     for a in applied:
         lines.append(
-            f"auto-applied #{a['id']} {a['what']}: {_plain(a.get('reason'), 160)} "
-            f"undo: revert {a['id']}"
+            f"auto-applied #{a['id']} {a['what']} (undo: revert {a['id']}): "
+            f"{_plain(a.get('reason'), 160)}"
         )
     rolled = auto.get("rolled_back") or []
     if rolled:

@@ -741,9 +741,9 @@ def test_the_report_leads_with_auto_applied_items_and_is_stored(db, ap, llm):
 
     lines = rep["text"].split("\n")
     assert lines[0].startswith("Skills lane 11-07: 2 auto-applied")
-    assert lines[1].startswith("auto-applied #") and "undo: revert " in lines[1]
-    assert {f"revert {a['id']}" for a in res["applied"]} <= {
-        ln.split("undo: ")[1] for ln in lines if "undo: " in ln
+    assert lines[1].startswith("auto-applied #") and "(undo: revert " in lines[1]
+    assert {f"(undo: revert {a['id']})" for a in res["applied"]} <= {
+        "(undo: " + ln.split("(undo: ")[1].split(")")[0] + ")" for ln in lines if "(undo: " in ln
     }
     assert len(rep["text"]) <= RQ.REPORT_CHARS
     stored = L.get_cursor(ap)["config"]["last_report"]
