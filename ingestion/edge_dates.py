@@ -28,13 +28,16 @@ logger = logging.getLogger(__name__)
 # facts ("config_loader.py defines EligibilityConfig class") for which the
 # LLM just echoes valid_at=REFERENCE_TIME, invalid_at=null.
 #
-# Safety: ``extract_batch`` defaults reference_time to now(), and the
-# extractor's fallback for a (None, None) result is ALSO now()
-# (``valid_at_ts = t_valid_pre or now``). So for an ongoing/present-tense
-# fact the LLM's answer (valid_at=now, invalid_at=null) is bit-identical to
-# skipping the call and letting the now() fallback fill in. Only facts whose
-# TEXT carries a resolvable date / offset / validity-flip can produce a
-# different answer — those still go to the LLM.
+# Safety: the write path (``_stage7_write_edges``) resolves a (None, None)
+# result to the source's own date: ``t_valid_pre or default_valid_at or now``.
+# For a conversation fact ``default_valid_at`` is the segment timestamp, and
+# the ``reference_time`` the caller passes is that same instant; ``now()`` is
+# only the last resort, when the source carries no date (``extract_batch``
+# itself defaults reference_time to now() only when none is passed). So for an
+# ongoing/present-tense fact the LLM's answer (valid_at=reference_time,
+# invalid_at=null) is the same as skipping the call and letting the fallback
+# fill in. Only facts whose TEXT carries a resolvable date / offset /
+# validity-flip can produce a different answer — those still go to the LLM.
 #
 # Bias is toward sending to the LLM: a false positive (non-temporal fact
 # sent anyway) just wastes tokens (status quo); a false negative (temporal
@@ -86,8 +89,8 @@ class EdgeDateExtractor:
     """LLM-backed bi-temporal date extractor for fact edges.
 
     Stateless; safe to share one instance across all writes. Never raises —
-    on any failure ``extract`` returns ``(None, None)`` so the caller falls
-    back to ``datetime.now(UTC)`` for ``t_valid``.
+    on any failure ``extract`` returns ``(None, None)`` and the caller uses the
+    source's own date for ``t_valid`` (``now()`` only if the source has none).
     """
 
     def __init__(self, llm_client: Any, *, model: str = _DEFAULT_MODEL) -> None:
@@ -108,7 +111,7 @@ class EdgeDateExtractor:
             return (None, None)
         if self._llm is None:
             return (None, None)
-        # Non-temporal facts resolve to the caller's now() fallback anyway —
+        # Non-temporal facts resolve to the caller's source-date fallback anyway —
         # skip the LLM. See _TEMPORAL_RE.
         if not _has_temporal_markers(fact):
             return (None, None)
@@ -154,7 +157,7 @@ class EdgeDateExtractor:
         n = len(facts)
         out: list[tuple[str | None, str | None]] = [(None, None)] * n
         # Build the indexed item list, skipping blanks AND facts with no
-        # temporal markers. The latter resolve to (now(), null) via the
+        # temporal markers. The latter resolve to (source date, null) via the
         # caller's fallback, identical to what the LLM would return — so
         # they never need an LLM call. See _TEMPORAL_RE for the safety
         # argument.

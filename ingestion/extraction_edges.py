@@ -338,6 +338,7 @@ class ExtractionEdgesMixin:
         reference_time: str | None = None,
         reinforce: dict[int, list[str]] | None = None,
         before_write: Callable[[list[list[str]]], None] | None = None,
+        queue_id: int | None = None,
     ) -> None:
         """Write fact edges, skipping duplicates and invalidating contradictions.
 
@@ -351,13 +352,17 @@ class ExtractionEdgesMixin:
         ``skip_indices`` and ``reinforce`` and remap ``uuid_map``; everything below reads
         them after it. The extractor runs Stage 6c and the new-entity writes there, so an
         edge another worker writes while this batch waits on those LLM calls is still seen.
+
+        ``queue_id`` is the extraction-queue row being processed. It only labels the
+        warning logged when conversation facts are written with a ``now()`` valid-from.
         """
         # Pre-extract (valid_at, invalid_at) for ALL facts in ONE LLM call
         # (PR #89). Previously create_edge fired EdgeDateExtractor.extract
         # once per fact — at ~30s/call on N=26 facts that was ~13 min of
         # serial LLM work per summary. Batching collapses it to one call.
-        # On failure the helper returns (None, None) per fact; create_edge
-        # then falls back to now() for valid_at exactly as before.
+        # On failure the helper returns (None, None) per fact; valid-from then
+        # falls back to the source's own date (default_valid_at) and only then
+        # to now(), as resolved below.
         eligible_facts: list[str] = []
         eligible_srcs: list[str] = []
         eligible_tgts: list[str] = []
@@ -429,11 +434,38 @@ class ExtractionEdgesMixin:
         # Effective valid-from per fact, decided ONCE and shared by the CREATE rows below
         # and by every invalidation the fact causes. Date precedence: explicit date in
         # the fact text > source-segment / source-page date > extraction time.
+        import logfire
+
         now = datetime.now(UTC).isoformat()
         valid_at_by_idx: dict[int, str] = {}
-        for idx in range(len(facts)):
-            t_valid_pre, _ = batched_dates[idx] if idx < len(batched_dates) else (None, None)
-            valid_at_by_idx[idx] = t_valid_pre or default_valid_at or now
+        now_fallback = 0
+        with logfire.span("stage7_resolve_valid_at {n}", n=len(facts)) as valid_at_span:
+            for idx in range(len(facts)):
+                t_valid_pre, _ = batched_dates[idx] if idx < len(batched_dates) else (None, None)
+                valid_at_by_idx[idx] = t_valid_pre or default_valid_at or now
+                # A conversation fact (no web artifact) that is written with neither an
+                # in-text date nor a segment date is stamped with the write clock. That is
+                # nearly right for live ingestion and a wrong date for anything else, and
+                # the lookups that feed default_valid_at fail soft, so count it.
+                if (
+                    web_artifact_id is None
+                    and not (t_valid_pre or default_valid_at)
+                    and idx in new_uuid_by_idx
+                ):
+                    now_fallback += 1
+            valid_at_span.set_attribute("now_fallback", now_fallback)
+        if now_fallback:
+            # Counts and ids only: never the fact text or any conversation content.
+            # last_supported_at (below) falls back the same way for a user-stated fact.
+            logger.warning(
+                "stage7: %d of %d fact(s) written with t_valid=now() "
+                "(no in-text date, no segment date) group=%s queue_id=%s source_episodes=%d",
+                now_fallback,
+                len(facts),
+                group_id,
+                queue_id,
+                len(episode_ids),
+            )
 
         # Every old edge a new fact retires is invalidated AS OF that fact's evidenced
         # valid-from (the correction's own date, else the conversation time it was said

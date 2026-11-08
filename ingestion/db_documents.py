@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, cast
 
 import orjson
 
 from ingestion.db_connection import DatabaseConnection
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentStore(DatabaseConnection):
@@ -238,6 +241,14 @@ class DocumentStore(DatabaseConnection):
                 (session_id, content),
             ).fetchone()
         if not row or row["episode_ids"] is None:
+            # The caller then has no segment date, so its facts are dated from their own
+            # text or the write clock. Say so: session id and content length only.
+            logger.warning(
+                "get_chunk_episode_ids: %s for session_id=%s (content_len=%d)",
+                "no chunk matches" if not row else "chunk has no episode_ids",
+                session_id,
+                len(content),
+            )
             return []
         raw = row["episode_ids"]
         if isinstance(raw, str):
