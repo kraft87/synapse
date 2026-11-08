@@ -218,12 +218,26 @@ _WEB_RERANK_POOL = int(os.getenv("SYNAPSE_RECALL_WEB_POOL", "60") or "60")  # fu
 # Absolute cross-encoder floor on the WEB bucket (2026-07-24). Web chunks are external and topical,
 # so an off-topic embedding/token collision scores genuinely low under the cross-encoder even when
 # the bi-encoder/BM25 ranked it high on surface tokens. UNLIKE the fact floor there is NO keep->=1
-# backstop: the bucket may serve ZERO, which SELF-GATES web on intent — it surfaces only when a
-# scraped page is genuinely on-query. Validated on 42 feedback-labeled web ids: all 41 noise scored
-# <=0.559 and the lone helpful id 0.914, so 0.60 gave 100% noise suppression at 100% helpful
-# retention, collapsing web from 3.0 to ~0.07 chunks/query (n_helpful=1 — revisit as labels grow).
-# 0 disables the floor (still fuses BM25+vector and reranks, just serves the top-_WEB_LIMIT).
-_WEB_FLOOR = float(os.getenv("SYNAPSE_RECALL_WEB_FLOOR", "0.60") or "0.60")
+# backstop: the bucket may serve ZERO, which SELF-GATES web on intent: it surfaces only when a
+# scraped page is genuinely on-query. 0 disables the floor (still fuses BM25+vector and reranks,
+# just serves the top-_WEB_LIMIT).
+# Calibration history. 0.60 (2026-07-24, rerank-2.5-lite): 42 feedback-labeled web ids, 41 noise all
+# <=0.559, 1 helpful at 0.914. Re-measured 2026-11-07 under rerank-3-lite (the default since
+# 2026-10-03; its scale barely moved vs 2.5-lite on the rated pairs: mean +0.008, p10 -0.04,
+# p90 +0.07) on all 148 rated (query, web id) pairs (135 chunks, 13 helpful / 135 noise). Scores
+# after the floor shipped are censored (a chunk could only be rated if it scored >=0.60), so those
+# rows measure what RAISING the floor does, not what lowering it would. Post-floor era (the
+# population that cleared 0.60): helpful n=12 median 0.689, noise n=94 median 0.641, AUC 0.69, and
+# the band [0.60,0.63) held 0 helpful in 28 noise. 0.63 suppresses 80 of 135 noise ids (52 at
+# 0.60) and keeps 12 of 13 helpful (the same 12 as 0.60); the one helpful it loses (0.575) is
+# already lost at 0.60. Held-out: floors fixed on the older half of the labels (0.63) still
+# suppressed 33 of 67 noise ids on the newer half while keeping 6 of 7 helpful, 0.60 suppressed 9.
+# Web golden set: 10 of 10 gold hits at every floor up to 0.65 (the weakest golden's best chunk
+# scores 0.652, the other nine >=0.78), so 0.63 costs no gold; web chunks per query on the
+# last-200 labelled recalls fall from 0.45 to 0.33. Noise reaches 0.88, so no floor separates
+# the classes cleanly; 0.63 is the last floor that keeps all 12 (0.64 loses a second helpful id,
+# 0.65 sits 0.002 under the weakest golden). Revisit as labels grow and on any reranker change.
+_WEB_FLOOR = float(os.getenv("SYNAPSE_RECALL_WEB_FLOOR", "0.63") or "0.63")
 
 # Notes leg (2026-08-05). The board injects ~39 hooks a session; every other live note
 # (414 at ship time, growing ~17/day) was unreachable by search — hook embeddings have
@@ -262,7 +276,7 @@ _EPISODE_CUTOFF_MAX_K = int(os.getenv("SYNAPSE_EPISODE_CUTOFF_MAX_K", "8") or "8
 # sixth, reuse the right shape rather than copy-pasting:
 #   PER-ITEM rerank floors (drop individual served items below a score) — share _floor_by_rerank:
 #     • FACTS    _RECALL_FACT_FLOOR (below, default 0/off, keep_min=1 — never blanks)
-#     • WEB      _WEB_FLOOR         (line ~297, 0.60) — applied inline in _search_web_reranked on
+#     • WEB      _WEB_FLOOR         (line ~297, 0.63) — applied inline in _search_web_reranked on
 #                                    the pool it ALREADY reranked for ordering, so it does not call
 #                                    _floor_by_rerank (that would double-rerank); same idea, keep_min=0.
 #   WHOLE-BUCKET abstention gate (drop the bucket when its TOP score is weak, not per item):

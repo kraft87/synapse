@@ -5,6 +5,9 @@ backstop: an all-subfloor result serves [], which self-gates web on intent."""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import mcp_server.recall as recall_mod
 from mcp_server.recall import Recall
 
@@ -80,5 +83,51 @@ def test_web_floor_disabled_serves_topk(monkeypatch):
 
 
 def test_web_floor_default_on():
-    # validated 2026-07-24 (100% noise suppression at 100% helpful retention) -> shipped ON
-    assert recall_mod._WEB_FLOOR == 0.60
+    # 0.60 on 2026-07-24 (rerank-2.5-lite), raised to 0.63 on 2026-11-07 (rerank-3-lite: the
+    # [0.60,0.63) band held 0 helpful in 28 noise; 80 of 135 rated noise ids suppressed vs 52,
+    # same 12 of 13 helpful kept, web golden 10/10). See the calibration note on _WEB_FLOOR.
+    assert recall_mod._WEB_FLOOR == 0.63
+
+
+def test_web_floor_env_override_and_default() -> None:
+    # SYNAPSE_RECALL_WEB_FLOOR stays an override; unset or empty falls back to the 0.63 default.
+    # Fresh interpreter so reloading the module cannot leak into the other tests. -I drops the cwd
+    # from sys.path, so the tree under test is put first explicitly: otherwise a worktree sharing
+    # a venv imports the editable-installed checkout instead, and the file check below catches it.
+    import subprocess
+    import sys
+
+    root = Path(recall_mod.__file__).resolve().parent.parent
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import mcp_server.recall as r; "
+        "print(r.__file__); print(r._WEB_FLOOR)"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "SYNAPSE_RECALL_WEB_FLOOR"}
+
+    def floor(**extra: str) -> float:
+        out = subprocess.run(
+            [sys.executable, "-I", "-c", code, str(root)],
+            env={**env, **extra},
+            capture_output=True,
+            text=True,
+            check=True,
+            cwd=str(root),
+        )
+        mod_file, value = out.stdout.strip().splitlines()[-2:]
+        assert Path(mod_file).resolve().is_relative_to(root)
+        return float(value)
+
+    assert floor() == 0.63
+    assert floor(SYNAPSE_RECALL_WEB_FLOOR="") == 0.63
+    assert floor(SYNAPSE_RECALL_WEB_FLOOR="0.5") == 0.5
+
+
+def test_web_floor_boundary_063() -> None:
+    # the knee: the [0.60,0.63) band is dropped, a chunk exactly at 0.63 is served
+    r = _bare()
+    _wire(
+        r,
+        _chunks([(0, 10), (1, 11), (2, 12), (3, 13)]),
+        [(0, 0.80), (1, 0.63), (2, 0.629), (3, 0.605)],
+    )
+    assert [c["id"] for c in r._search_web_reranked("q", [0.0])] == ["w:0", "w:1"]
