@@ -129,6 +129,22 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
     # Stage methods
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _warn_episode_lookup_failed(lookup: str, item: dict[str, Any], exc: Exception) -> None:
+        """Log a swallowed source-episode lookup failure (ids and the error only).
+
+        The caller carries on with no source episodes: no segment date and no edge
+        lineage, so the item's facts are dated from the fact text or, failing that,
+        the write clock. Never log the item's content."""
+        logger.warning(
+            "%s failed for queue_id=%s content_type=%s; continuing without source episodes: %s: %s",
+            lookup,
+            item.get("id"),
+            item.get("content_type"),
+            type(exc).__name__,
+            exc,
+        )
+
     def process_item(self, item: dict[str, Any]) -> None:
         """Process one extraction queue item. Raises on failure (caller handles retry).
 
@@ -159,13 +175,15 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # episodes they were derived from.
             try:
                 episode_ids = self._db.get_synth_document_source_ids(session_id, content)
-            except Exception:
+            except Exception as exc:
+                self._warn_episode_lookup_failed("get_synth_document_source_ids", item, exc)
                 episode_ids = []
         elif content_type == "chunk" and session_id:
             # Chunks -> the window the chunk was built from (task #63).
             try:
                 episode_ids = self._db.get_chunk_episode_ids(session_id, content)
-            except Exception:
+            except Exception as exc:
+                self._warn_episode_lookup_failed("get_chunk_episode_ids", item, exc)
                 episode_ids = []
         # Episodes emit no facts and skip Stage 3, so their segment date is never
         # consumed — skip the lookup for them to keep the per-turn hot path lean.
@@ -406,6 +424,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                 default_valid_at=default_valid_at,
                 reference_time=reference_time,
                 new_nodes=new_nodes.get(grp),
+                queue_id=item.get("id"),
             )
 
     def _process_facts_for_group(
@@ -418,6 +437,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         default_valid_at: str | None = None,
         reference_time: str | None = None,
         new_nodes: PendingNodes | None = None,
+        queue_id: int | None = None,
     ) -> None:
         """Stage 6 + 7 for one group's facts (extracted from process_item to keep it readable).
 
@@ -524,4 +544,5 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     reference_time=reference_time,
                     reinforce=reinforce,
                     before_write=recheck_then_write_new_nodes,
+                    queue_id=queue_id,
                 )
