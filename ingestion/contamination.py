@@ -57,7 +57,7 @@ def is_transcript_contamination(content: str | None) -> bool:
 # "[user] <prompt>". Dev conversations that merely QUOTE these prompts start
 # with prose or [context] blocks and keep flowing in.
 _HARNESS_PREFIXES = (
-    # ingestion/extraction_llm.py::_EXTRACTION_PROMPT (current opening, since #185;
+    # ingestion/extraction_llm.py::_EXTRACTION_PROMPT (current opening;
     # tests/test_contamination.py pins it to the real prompt) and the wording it
     # replaced, kept because old-format transcripts may still exist
     "These facts are the ONLY memory the system keeps from this conversation",
