@@ -819,6 +819,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 | `SYNAPSE_EPISODE_CUTOFF_TAU` | `0` (off) | adaptive variable-k serving for `recall(mode="turns")`: serve turns scoring ≥ tau×top_score |
 | `SYNAPSE_EPISODE_CUTOFF_MIN_K` / `_MAX_K` | `3` / `8` | clamp bounds for the adaptive-k window |
 | `SYNAPSE_RECALL_FACT_FLOOR` | `0` (off) | absolute cross-encoder relevance floor on served KG facts |
+| `SYNAPSE_RECALL_WEB_FLOOR` | `0.63` | absolute cross-encoder floor on the web bucket: chunks scoring below it are dropped and, unlike the fact floor, the bucket can serve nothing (`0` disables). Calibrated on rated web chunks under the default `rerank-3-lite` (2026-11-07; 0.60 before that, under `rerank-2.5-lite`); re-measure if you change `SYNAPSE_RERANK_MODEL` |
 | `SYNAPSE_RECALL_FLOOR` | `0` (off) | abstention floor on the raw (pre-recency) rerank top score: strictly below it, recall serves no episodes for that call instead of the least-bad ones, and `recall_metrics.served_ids` gains `would_abstain`/`floor` markers. The threshold belongs to the reranker (scores are not comparable across models), so each `examples/env` preset sets it: `0.60` for the default `rerank-3-lite` (`0.58` if you roll back to `rerank-2.5-lite`), `0` for the bundled local reranker |
 | `SYNAPSE_RECALL_FLOOR_ENFORCE` | `1` | `0` keeps the telemetry markers but never withholds episodes |
 | `SYNAPSE_RECALL_FLOOR_KEEP_MIN` | `0` | when the floor fires, serve this many top passages instead of none |
