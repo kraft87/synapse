@@ -8,7 +8,9 @@ and are skipped in CI.
 
 from __future__ import annotations
 
+import logging
 import math
+from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -21,6 +23,7 @@ from ingestion.extractor import (
     ExtractionPipeline,
     LLMExtractor,
     _cosine_similarity,
+    _partition_facts_by_group,
 )
 from ingestion.models import (
     CombinedExtraction,
@@ -1468,6 +1471,187 @@ class TestProcessItemOrphanPrefilter:
 
         pipe._stage4_resolve.assert_not_called()
         pipe._stage5_write_nodes.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# process_item — group partition drops, counted by cause
+# ---------------------------------------------------------------------------
+
+
+def _fact(source: str, target: str) -> ExtractedFact:
+    return ExtractedFact(
+        source=source, target=target, relationship="RELATES_TO", fact=f"{source} {target}"
+    )
+
+
+class TestPartitionFactsByGroup:
+    """The pure partition behind ``process_item``'s group routing."""
+
+    def test_keeps_same_group_and_counts_each_drop_cause(self):
+        groups = {"Alice": "technical", "Postgres": "technical", "Bob": "personal"}
+        kept = _fact("Alice", "Postgres")
+        cross = _fact("Alice", "Bob")
+        no_target = _fact("Alice", "ghost")
+        no_source = _fact("ghost", "Bob")
+
+        by_group, cross_n, unresolved_n = _partition_facts_by_group(
+            [kept, cross, no_target, no_source], groups, ("technical", "personal")
+        )
+
+        assert by_group == {"technical": [kept], "personal": []}
+        assert (cross_n, unresolved_n) == (1, 2)
+
+    def test_endpoint_matching_is_exact_name(self):
+        # james vs a declared James: no group for the spelling the fact used.
+        _, cross_n, unresolved_n = _partition_facts_by_group(
+            [_fact("Alice", "james")], {"Alice": "technical", "James": "technical"}, ("technical",)
+        )
+        assert (cross_n, unresolved_n) == (0, 1)
+
+    def test_fact_failing_both_causes_counts_once_as_unresolved(self):
+        _, cross_n, unresolved_n = _partition_facts_by_group(
+            [_fact("ghost", "Bob")], {"Bob": "personal"}, ("technical",)
+        )
+        assert (cross_n, unresolved_n) == (0, 1)
+
+    def test_same_group_that_is_not_active_is_cross_group(self):
+        by_group, cross_n, unresolved_n = _partition_facts_by_group(
+            [_fact("Alice", "Bob")], {"Alice": "personal", "Bob": "personal"}, ("technical",)
+        )
+        assert by_group == {"technical": []}
+        assert (cross_n, unresolved_n) == (1, 0)
+
+    def test_no_drops(self):
+        fact = _fact("Alice", "Postgres")
+        by_group, cross_n, unresolved_n = _partition_facts_by_group(
+            [fact], {"Alice": "technical", "Postgres": "technical"}, ("technical",)
+        )
+        assert by_group == {"technical": [fact]}
+        assert (cross_n, unresolved_n) == (0, 0)
+
+
+class TestProcessItemGroupPartitionDrops:
+    """``process_item`` reports the facts the group partition drops, by cause."""
+
+    _LOG = "ingestion.extractor"
+
+    def _run(
+        self, entities: list[ExtractedEntity], facts: list[ExtractedFact]
+    ) -> ExtractionPipeline:
+        embedder = MagicMock()
+        embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
+        db = MagicMock()
+        db.get_session_episodes.return_value = []
+        db.get_synth_document_source_ids.return_value = []
+        pipe = ExtractionPipeline(
+            db=db,
+            llm_client=MagicMock(),
+            embedder=embedder,
+            kg_client=_mock_falkordb(similar_nodes=[]),
+        )
+        pipe._stage2_deterministic = MagicMock(return_value=[])
+        pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=entities, facts=facts))
+        pipe._stage4_resolve = MagicMock(
+            side_effect=lambda ents, group_id, deduper=None: {e.name: f"new:{e.name}" for e in ents}
+        )
+        pipe._stage5_write_nodes = MagicMock()
+        pipe._process_facts_for_group = MagicMock()
+        pipe.process_item(
+            {
+                "content_type": "summary",
+                "content": "irrelevant",
+                "project": "synapse",
+                "session_id": "s1",
+            }
+        )
+        return pipe
+
+    def _by_group_classifier(self, monkeypatch):
+        # Alice is classified into the personal group, everything else technical.
+        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
+        monkeypatch.setattr(
+            "ingestion.extractor._classify_entity_group",
+            lambda name, summary, default: "personal" if name == "Alice" else "technical",
+        )
+
+    def test_case_mismatched_endpoint_is_counted_unresolved_and_not_written(self, caplog):
+        # Declared "James", fact says "james": the orphan filter prunes James (no fact
+        # names it exactly) and "james" never gets a group. Current behaviour, pinned.
+        with caplog.at_level(logging.INFO, logger=self._LOG):
+            pipe = self._run([_entity("Alice"), _entity("James")], [_fact("Alice", "james")])
+
+        pipe._process_facts_for_group.assert_not_called()
+        assert (
+            "Group partition dropped facts: cross_group=0 endpoint_unresolved=1 (of 1)"
+            in caplog.messages
+        )
+
+    def test_facts_across_groups_are_counted_cross_group(self, monkeypatch, caplog):
+        self._by_group_classifier(monkeypatch)
+        kept = _fact("Postgres", "Redis")
+        with caplog.at_level(logging.INFO, logger=self._LOG):
+            pipe = self._run(
+                [_entity("Alice"), _entity("Postgres"), _entity("Redis")],
+                [_fact("Alice", "Postgres"), kept],
+            )
+
+        # Only the same-group fact reaches the writer.
+        pipe._process_facts_for_group.assert_called_once()
+        args = pipe._process_facts_for_group.call_args.args
+        assert args[0] == [kept]
+        assert args[3] == "technical"
+        assert (
+            "Group partition dropped facts: cross_group=1 endpoint_unresolved=0 (of 2)"
+            in caplog.messages
+        )
+
+    def test_both_causes_in_one_line(self, monkeypatch, caplog):
+        self._by_group_classifier(monkeypatch)
+        with caplog.at_level(logging.INFO, logger=self._LOG):
+            self._run(
+                [_entity("Alice"), _entity("Postgres")],
+                [_fact("Alice", "Postgres"), _fact("Postgres", "redis")],
+            )
+
+        assert (
+            "Group partition dropped facts: cross_group=1 endpoint_unresolved=1 (of 2)"
+            in caplog.messages
+        )
+
+    def test_nothing_dropped_logs_nothing(self, caplog):
+        with caplog.at_level(logging.INFO, logger=self._LOG):
+            pipe = self._run([_entity("Postgres"), _entity("Redis")], [_fact("Postgres", "Redis")])
+
+        pipe._process_facts_for_group.assert_called_once()
+        assert not [m for m in caplog.messages if "Group partition dropped" in m]
+
+    def test_counts_are_exposed_on_span_attributes(self, monkeypatch):
+        import logfire
+
+        self._by_group_classifier(monkeypatch)
+        spans: dict[str, dict[str, object]] = {}
+
+        class _Span:
+            def __init__(self, attrs: dict[str, object]) -> None:
+                self._attrs = attrs
+
+            def set_attribute(self, key, value):
+                self._attrs[key] = value
+
+        @contextmanager
+        def _span(name, **attrs):
+            yield _Span(spans.setdefault(name, {}))
+
+        monkeypatch.setattr(logfire, "span", _span)
+        self._run(
+            [_entity("Alice"), _entity("Postgres")],
+            [_fact("Alice", "Postgres"), _fact("Postgres", "redis")],
+        )
+
+        assert spans["group_partition {n} facts"] == {
+            "facts_dropped_cross_group": 1,
+            "facts_dropped_endpoint_unresolved": 1,
+        }
 
 
 # ---------------------------------------------------------------------------
