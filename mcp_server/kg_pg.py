@@ -108,9 +108,19 @@ def scope_predicate(alias: str = "") -> str:
 
 
 def _rrf_fuse(lists: list[list[str]], k: int = _RRF_K) -> dict[str, float]:
+    """RRF over ranked uuid lists: each list credits a uuid ONCE, at its first (best) rank.
+
+    A list can name a uuid twice: the 1-hop leg returns a fact once per seed it touches,
+    so an edge between two seeds sat at (say) hop ranks 4 and 6 and was credited for both.
+    Later repeats are skipped in place, so every other uuid keeps the rank it had.
+    """
     scores: dict[str, float] = {}
     for lst in lists:
+        seen: set[str] = set()
         for rank, uuid_ in enumerate(lst):
+            if uuid_ in seen:
+                continue
+            seen.add(uuid_)
             scores[uuid_] = scores.get(uuid_, 0.0) + 1.0 / (k + rank + 1)
     return scores
 
