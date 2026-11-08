@@ -89,32 +89,40 @@ def test_web_floor_default_on():
     assert recall_mod._WEB_FLOOR == 0.63
 
 
-def test_web_floor_env_override_and_default():
+def test_web_floor_env_override_and_default() -> None:
     # SYNAPSE_RECALL_WEB_FLOOR stays an override; unset or empty falls back to the 0.63 default.
-    # Fresh interpreter so reloading the module cannot leak into the other tests.
+    # Fresh interpreter so reloading the module cannot leak into the other tests. -I drops the cwd
+    # from sys.path, so the tree under test is put first explicitly: otherwise a worktree sharing
+    # a venv imports the editable-installed checkout instead, and the file check below catches it.
     import subprocess
     import sys
 
-    code = "import mcp_server.recall as r; print(r._WEB_FLOOR)"
+    root = Path(recall_mod.__file__).resolve().parent.parent
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); import mcp_server.recall as r; "
+        "print(r.__file__); print(r._WEB_FLOOR)"
+    )
     env = {k: v for k, v in os.environ.items() if k != "SYNAPSE_RECALL_WEB_FLOOR"}
 
     def floor(**extra: str) -> float:
         out = subprocess.run(
-            [sys.executable, "-I", "-c", code],
+            [sys.executable, "-I", "-c", code, str(root)],
             env={**env, **extra},
             capture_output=True,
             text=True,
             check=True,
-            cwd=str(Path(recall_mod.__file__).resolve().parent.parent),
+            cwd=str(root),
         )
-        return float(out.stdout.strip().splitlines()[-1])
+        mod_file, value = out.stdout.strip().splitlines()[-2:]
+        assert Path(mod_file).resolve().is_relative_to(root)
+        return float(value)
 
     assert floor() == 0.63
     assert floor(SYNAPSE_RECALL_WEB_FLOOR="") == 0.63
     assert floor(SYNAPSE_RECALL_WEB_FLOOR="0.5") == 0.5
 
 
-def test_web_floor_boundary_063():
+def test_web_floor_boundary_063() -> None:
     # the knee: the [0.60,0.63) band is dropped, a chunk exactly at 0.63 is served
     r = _bare()
     _wire(
