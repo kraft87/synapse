@@ -54,6 +54,33 @@ from ingestion.localtime import local_date, local_iso
 logger = logging.getLogger(__name__)
 
 
+def _partition_facts_by_group(
+    facts: list[ExtractedFact], entity_groups: dict[str, str], groups: tuple[str, ...]
+) -> tuple[dict[str, list[ExtractedFact]], int, int]:
+    """Split ``facts`` by the group both endpoints share.
+
+    Returns ``(facts_by_group, cross_group, endpoint_unresolved)``. A fact is kept only
+    when source and target both have a group, the same one, and it is an active group.
+    The two drop causes are counted apart: ``endpoint_unresolved`` is an endpoint with no
+    group at all (``entity_groups`` is keyed by EXACT name, so ``james`` finds nothing
+    against a declared ``James``); ``cross_group`` is both endpoints grouped but differently,
+    or in a group that is not active. A fact failing both counts as unresolved.
+    """
+    facts_by_group: dict[str, list[ExtractedFact]] = {g: [] for g in groups}
+    cross_group = 0
+    endpoint_unresolved = 0
+    for fact in facts:
+        src_grp = entity_groups.get(fact.source)
+        tgt_grp = entity_groups.get(fact.target)
+        if not src_grp or not tgt_grp:
+            endpoint_unresolved += 1
+        elif src_grp == tgt_grp and src_grp in facts_by_group:
+            facts_by_group[src_grp].append(fact)
+        else:
+            cross_group += 1
+    return facts_by_group, cross_group, endpoint_unresolved
+
+
 class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
     """Orchestrates the full extraction pipeline for a single queue item."""
 
@@ -368,19 +395,27 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         if not llm_result.facts:
             return
 
-        # Partition facts by the group of their (source, target) entity pair. Drop
-        # cross-group facts — they imply the regex misclassified one endpoint.
-        facts_by_group: dict[str, list[ExtractedFact]] = {g: [] for g in active_groups()}
-        cross_group_dropped = 0
-        for fact in llm_result.facts:
-            src_grp = entity_groups.get(fact.source)
-            tgt_grp = entity_groups.get(fact.target)
-            if src_grp and tgt_grp and src_grp == tgt_grp and src_grp in facts_by_group:
-                facts_by_group[src_grp].append(fact)
-            else:
-                cross_group_dropped += 1
-        if cross_group_dropped:
-            logger.debug("Dropped %d cross-group facts (entities span groups)", cross_group_dropped)
+        # Partition facts by the group of their (source, target) entity pair. Two causes
+        # drop a fact here, counted apart: a cross-group fact (both endpoints grouped,
+        # differently) implies the regex misclassified one endpoint; an unresolved endpoint
+        # (no group at all) means the fact names an entity by a spelling that is not an
+        # exact declared name -- the orphan filter and this partition both key on EXACT
+        # names, so ``james`` finds nothing against a declared ``James``.
+        import logfire
+
+        with logfire.span("group_partition {n} facts", n=len(llm_result.facts)) as part_span:
+            facts_by_group, cross_group_dropped, unresolved_dropped = _partition_facts_by_group(
+                llm_result.facts, entity_groups, active_groups()
+            )
+            part_span.set_attribute("facts_dropped_cross_group", cross_group_dropped)
+            part_span.set_attribute("facts_dropped_endpoint_unresolved", unresolved_dropped)
+        if cross_group_dropped or unresolved_dropped:
+            logger.info(
+                "Group partition dropped facts: cross_group=%d endpoint_unresolved=%d (of %d)",
+                cross_group_dropped,
+                unresolved_dropped,
+                len(llm_result.facts),
+            )
 
         # Web provenance → edge attrs: the artifact id rides every created edge
         # (kg_shadow mirror column), and the page's published/fetched date is the

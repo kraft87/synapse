@@ -3,7 +3,12 @@ the operator's dev conversations about the legal-transcription domain."""
 
 from __future__ import annotations
 
-from ingestion.contamination import is_harness_call, is_transcript_contamination
+from ingestion.contamination import (
+    _HARNESS_PREFIXES,
+    is_harness_call,
+    is_transcript_contamination,
+)
+from ingestion.extraction_llm import _EXTRACTION_PROMPT, _WEB_EXTRACTION_PROMPT
 
 
 def test_flags_agent_processing_prompts():
@@ -62,6 +67,12 @@ def test_flags_recall_benchmark_judge_call():
 
 
 def test_flags_extraction_and_judge_calls():
+    # The current extraction prompt's opening.
+    assert is_harness_call(
+        "[user] These facts are the ONLY memory the system keeps from this conversation "
+        "— anything you do not capture here is forgotten.\n\n[assistant] {}"
+    )
+    # The opening it replaced: old-format transcripts may still exist.
     assert is_harness_call(
         "[user] Given the session summary and pre-identified entities below, extract any "
         "additional entities and the relationships between all entities.\n\n[assistant] {}"
@@ -78,6 +89,15 @@ def test_flags_extraction_and_judge_calls():
         "[user] Below are candidate facts extracted for a long-term knowledge graph. "
         "Rate EACH:\n1. ...\n\n[assistant] [1, 0]"
     )
+
+
+def test_prefixes_track_the_real_extraction_prompts():
+    # The backstop silently stopped recognising extraction calls when the prompt's
+    # opening was reworded; pin it to the live prompt text so the next rewording fails here.
+    assert _EXTRACTION_PROMPT.startswith(_HARNESS_PREFIXES)
+    assert _WEB_EXTRACTION_PROMPT.startswith(_HARNESS_PREFIXES)
+    assert is_harness_call("[user] " + _EXTRACTION_PROMPT[:200])
+    assert is_harness_call("[user] " + _WEB_EXTRACTION_PROMPT[:200])
 
 
 def test_flags_entity_pipeline_calls():
