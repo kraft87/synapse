@@ -174,6 +174,22 @@ class TestNowFallbackWarning:
         assert seen["span"] == "stage7_resolve_valid_at {n}"
         assert seen["now_fallback"] == 1
 
+    def test_queue_id_reaches_the_warning_through_the_group_path(self, caplog):
+        # process_item hands the queue id to _process_facts_for_group, which must pass it
+        # on to Stage 7; the unit tests above call Stage 7 directly and would not notice.
+        facts = [_fact(0)]
+        pipe = _pipe(1)
+        pipe._embedder = MagicMock()
+        pipe._embedder.embed.side_effect = lambda texts, task=None: [[0.0, 0.0, 1.0] for _ in texts]
+        pipe._stage6a_embedding_filter = MagicMock(return_value={})
+        pipe._stage6b_batch_confirm = MagicMock(return_value=(set(), {}, {}, True))
+        pipe._kg.nearest_live_edges.side_effect = lambda embs, *a, **k: [[] for _ in embs]
+        with caplog.at_level(logging.WARNING, logger="ingestion.extraction_edges"):
+            pipe._process_facts_for_group(facts, _uuid_map(facts), [], "g", queue_id=99)
+        (rec,) = _fallback_records(caplog)
+        assert "queue_id=99" in rec.getMessage()
+        assert len(_rows(pipe)) == 1
+
 
 # ---------------------------------------------------------------------------
 # process_item: a source-episode lookup that raises is logged, then ignored as before
