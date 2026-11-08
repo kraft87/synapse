@@ -10,7 +10,7 @@ Retrieval mirrors ``_search_kg`` exactly:
   1. fact-embedding vector KNN over live edges (partial HNSW: t_invalid IS NULL)
   2. fact BM25 over edge text (ParadeDB)
   3. entity-seed vector KNN + live-degree gate + session-focus bonus -> top 8 seeds
-  4. 1-hop traversal from each seed (per-seed LIMIT 8)
+  4. 1-hop traversal from each seed (per-seed LIMIT 8, the 8 edges nearest the query)
   5. RRF fuse [vec, bm25, hop], take top ``limit``
 
 Every leg, and the seed degree gate, skips facts extracted from web pages
@@ -307,20 +307,39 @@ def search_kg_postgres(
         [] if restricted else [{"uuid": u, "name": n, "summary": s} for _, u, n, s in connected]
     )
 
-    # 4 — 1-hop traversal facts from the seeds (per-seed LIMIT 8, undirected).
+    # 4 — 1-hop traversal facts from the seeds (per-seed LIMIT 8, undirected, the 8 edges
+    # nearest the query).
     hop_uuids: list[str] = []
     for sd in seed_uuids:
         cur.execute(
-            # ORDER BY t_valid DESC (2026-08-07): an unordered LIMIT 8 was fine when every
-            # entity had a handful of edges, but a supernode seed (the User node, live
-            # degree ~3.4k and growing with event facts) turned it into 8 arbitrary edges.
-            # Recency is the least-wrong single ordering for a "what about X" hop sample.
-            "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM kg_relationships "
-            "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-            "  AND web_artifact_id IS NULL AND (src_uuid = %s OR tgt_uuid = %s) "
+            # The 8 are the seed's edges whose fact embedding is nearest the query (exact cosine).
+            # They were the 8 newest (2026-08-07), and arbitrary before that, so a supernode
+            # seed (the User node, live degree in the thousands) offered the same 8 edges
+            # whatever was asked, and hop-only facts rarely cleared the fact floor. The
+            # MATERIALIZED fence is defensive, not required: the only HNSW index (kg_rel_hnsw)
+            # is on fact_embedding::halfvec and partial on live, embedded edges, so no index
+            # can serve this ORDER BY today; the fence keeps a future one from cutting the
+            # filtered set short. An edge with no embedding stays eligible and ranks after
+            # every embedded one. Equal distances and those edges fall to t_valid DESC, which
+            # puts a NULL valid-from first, as the old query did.
+            # Cost is one distance per live edge of the seed, on the stored full-precision
+            # vector (the halfvec cast the HNSW legs need is about 3x slower here, because it
+            # converts every row). Every candidate's 2048-d vector is an out-of-line TOAST
+            # read the HNSW legs never warm, so a cold seed pays for it: a read-only EXPLAIN
+            # ANALYZE on prod put the highest-degree seed (2,606 live edges) at 25 ms warm,
+            # against 4 ms warm / 13 ms cold for the old recency statement, and a 1,625-edge
+            # seed at 383 ms cold, then 37 ms. Only 25 of 45.8k entities have more than 128
+            # live edges (median 2).
+            "WITH cand AS MATERIALIZED ("
+            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, "
+            "         fact_embedding <=> %s::vector AS dist "
+            "  FROM kg_relationships "
+            "  WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+            "    AND web_artifact_id IS NULL AND (src_uuid = %s OR tgt_uuid = %s) "
             f"{scope_sql}"
-            "ORDER BY t_valid DESC LIMIT 8",
-            (owner_id, group_id, sd, sd, *scope_args),
+            ") SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM cand "
+            "ORDER BY dist ASC NULLS LAST, t_valid DESC LIMIT 8",
+            (emb_s, owner_id, group_id, sd, sd, *scope_args),
         )
         for u, f, tv, og, sup in cur.fetchall():
             if u and f:
@@ -460,9 +479,9 @@ def cross_group_facts(
     for: the fact-vector over-fetch and BM25 legs, RRF-fused, skipping any text already in
     ``taken``. Same row shape as :func:`search_kg_postgres`, each marked ``_cross``.
 
-    No seed/hop leg: its facts are query-blind recency samples, and the other group's
-    copy of the owner identity node (thousands of live edges) would spend them. Full
-    trust only: no provenance predicate.
+    No seed/hop leg: the other group's copy of the owner identity node (thousands of
+    live edges) would spend the extras on one seed's hop sample. Full trust only: no
+    provenance predicate.
 
     ``vec_rows`` / ``bm25_rows`` are a leg's rows already fetched (:func:`split_walk`, the
     shared walk; :func:`cross_bm25_rows`, run concurrently); a leg not given is run on

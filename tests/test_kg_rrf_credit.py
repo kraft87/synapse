@@ -57,14 +57,16 @@ class _ScriptedCursor:
         self._rows: list[tuple[Any, ...]] = []
 
     def execute(self, sql: str, params: Any = None) -> _ScriptedCursor:
-        if "FROM kg_relationships" in sql and "fact_embedding" in sql:
+        if "src_uuid = %s OR tgt_uuid = %s" in sql:
+            # the hop statement also reads fact_embedding (its distance), so it is matched
+            # first; params = (query embedding, owner, group, seed, seed)
+            self._rows = self._hops[params[3]]
+        elif "FROM kg_relationships" in sql and "fact_embedding" in sql:
             self._rows = self._vec
         elif "paradedb" in sql:
             self._rows = []
         elif "WITH seeds" in sql:
             self._rows = self._seeds
-        elif "src_uuid = %s OR tgt_uuid = %s" in sql:
-            self._rows = self._hops[params[2]]
         else:  # pragma: no cover - a statement the scripted legs do not cover
             raise AssertionError(sql)
         return self
