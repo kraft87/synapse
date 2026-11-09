@@ -402,3 +402,19 @@ def test_a_rerun_of_066_never_moves_the_cutover_and_reseeds_the_personal_pile(kg
     assert kg_rows.execute(_CUTOVER_SQL).fetchone() == stamp
     rows = kg_rows.execute("SELECT uuid, audience, label_version FROM kg_relationships").fetchall()
     assert dict((u, (a, v)) for u, a, v in rows) == {"t1": (None, None), "p1": ("personal", 0)}
+
+
+def test_066_leaves_statistics_on_the_label_column(kg_rows, db_url):
+    """The seed touches too few rows for autovacuum to analyze the column, so the file does."""
+    _fact(kg_rows, "p1", "personal")
+    _fact(kg_rows, "t1", "technical")
+    kg_rows.execute("UPDATE kg_relationships SET audience = NULL, label_version = NULL")
+    kg_rows.execute("ANALYZE kg_relationships")
+    kg_rows.execute("UPDATE kg_relationships SET audience = 'work-safe' WHERE uuid = 't1'")
+    _apply_066(db_url)
+    stat = kg_rows.execute(
+        "SELECT n_distinct, null_frac FROM pg_stats "
+        "WHERE tablename = 'kg_relationships' AND attname = 'audience'"
+    ).fetchone()
+    # t1 is work-safe and p1 was re-seeded personal: no NULLs left, and the stats say so
+    assert stat is not None and stat[1] == 0

@@ -12,7 +12,9 @@
 --                                   this file (the personal-pile seed and its insert
 --                                   trigger); 1+ = ingestion/fact_audience.LABEL_VERSION,
 --                                   the prompt that produced it.
---   kg_relationships.label_model    the model id that produced a version >= 1 label.
+--   kg_relationships.label_model    the model id that produced a version >= 1 label;
+--                                   'error:<model id>' marks a 'personal' fallback written
+--                                   for a fact the labeller could not get a verdict on.
 --   kg_entities.is_self             the install owner's own entity: never a hop seed.
 --                                   At most one per (owner_id, group_id). Set only by
 --                                   `synapse-admin owner set <uuid>`, never by name.
@@ -32,6 +34,12 @@
 -- schema-check: optional
 -- Every statement is guarded, so a re-run is a no-op; the cutover is stamped once and
 -- never moved. Runs under psql autocommit (apply_schema.sh), not -1.
+--
+-- Apply with the poller paused. The personal-pile seed below is one UPDATE over every
+-- fact in that group, live and retired (the 056 backfill measured about 12 ms a row,
+-- because each row's update writes to every index), and it holds those rows' locks until
+-- it finishes: nothing else writes the personal group but the poller, so pausing it also
+-- closes the window between the cutover stamp and the first labelled row.
 
 ALTER TABLE kg_relationships
     ADD COLUMN IF NOT EXISTS audience      TEXT,
@@ -87,3 +95,8 @@ ALTER TABLE kg_entities ADD COLUMN IF NOT EXISTS is_self BOOLEAN NOT NULL DEFAUL
 -- piles flags the owner's node in each.
 CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_one_self
     ON kg_entities (owner_id, group_id) WHERE is_self;
+
+-- The seed touches too few rows to trigger autovacuum's analyze, so without this `audience`
+-- has no statistics until the labeller has written many rows, and the planner guesses
+-- `audience IS NULL` at its default selectivity.
+ANALYZE kg_relationships (audience);
