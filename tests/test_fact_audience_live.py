@@ -22,8 +22,8 @@ from ingestion.llm_client import create_llm_client
 pytestmark = pytest.mark.integration
 
 PRIVATE_FACTS = [
-    "User suspects the team lead will blame him if the vendor query he did not write breaks in production",
-    "User moved the ticket to Blocked so the delay shows against the other team",
+    "User thinks the lab manager will hold them responsible if the calibration script another analyst wrote gives bad readings",
+    "User set the sample batch to On Hold in the LIMS so the late results look like the receiving lab's fault",
     "The CI runner kept timing out the day the user was off sick with the flu",
     "User's migraine medication makes late on-call debugging harder, per the runbook notes",
     "The project's assistant instructions file notes the user has a hearing impairment, so call summaries are to be written",
