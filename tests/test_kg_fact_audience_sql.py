@@ -68,9 +68,16 @@ def test_the_pre_066_predicate_is_the_provenance_rule_byte_for_byte():
 
 def test_the_default_predicate_adds_the_label_rule_to_the_provenance_rule():
     pred = kg_pg.scope_predicate()
-    assert pred.startswith(_PRE_066 + " AND (audience = 'work-safe' OR (audience IS NULL AND ")
+    assert pred.startswith(_PRE_066 + " AND coalesce(audience, CASE WHEN id <= ")
+    assert pred.endswith(" THEN 'work-safe' END) = 'work-safe'")
     assert "synapse_meta" in pred and kg_pg.FACT_AUDIENCE_CUTOVER_KEY in pred
     assert pred.count("%s") == 1, "the allowlist stays the only bound parameter"
+
+
+def test_the_label_rule_is_one_expression_with_no_or():
+    """pg_search expands a WHERE-level OR into "match everything" sub-queries inside the
+    BM25 scan: 38x the pages on prod and a score bonus for one branch (see scope_predicate)."""
+    assert not re.search(r"\bOR\b", kg_pg.scope_predicate(), re.IGNORECASE)
 
 
 @pytest.mark.parametrize("alias", ["", "o", "n"])
@@ -102,11 +109,12 @@ def test_every_restricted_statement_carries_the_label_rule():
     _search(cur, allowed=ALLOWED)
     # vector, BM25, seed/degree (the recorder returns no seeds, so there is no hop query)
     assert len(cur.sql) == 3
+    rule = "THEN 'work-safe' END) = 'work-safe'"
     for sql in cur.sql:
-        assert "audience = 'work-safe'" in sql and "synapse_meta" in sql, sql
+        assert rule in sql and "synapse_meta" in sql, sql
         assert "source_projects <@ %s::text[]" in sql
     # the degree gate counts both arms of its UNION, each filtered
-    assert cur.sql[2].count("audience = 'work-safe'") == 2
+    assert cur.sql[2].count(rule) == 2
 
 
 def test_the_arguments_do_not_change_with_the_label_rule():
