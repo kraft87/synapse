@@ -67,7 +67,8 @@ def _link_close_sql(old: str, new: str, dims: int) -> str:
 
 class RecallSourcesMixin:
     # Schema-056 probe state (per engine). Plain attributes: the leg threads race only to
-    # write the same answer, and the worst case is one extra probe.
+    # write the same answer, and the worst case is one extra probe each. Only an answer
+    # stamps the time: a thread that arrives while another's probe is in flight probes too.
     _kg_scope_ok: bool = False
     _kg_scope_probed_at: float | None = None
     _kg_scope_warned: bool = False
@@ -77,13 +78,15 @@ class RecallSourcesMixin:
 
         Fail-closed: a probe error or a missing column answers False, and the restricted
         caller is served no facts. Full-trust paths never call this. They do not read
-        the column, so its absence cannot break them."""
+        the column, so its absence cannot break them. Only a missing column is cached (for
+        _KG_SCOPE_REPROBE_S); an error is not, so the next call probes again, as
+        ``ColumnProbe.check`` does. Stamping before the probe had a concurrent caller read
+        "probed just now, not ready" and serve no facts while the first probe ran."""
         if self._kg_scope_ok:
             return True
         last = self._kg_scope_probed_at
         if last is not None and time.monotonic() - last < _KG_SCOPE_REPROBE_S:
             return False
-        self._kg_scope_probed_at = time.monotonic()
         try:
             with self._pg() as pg:
                 row = pg.execute(_KG_SCOPE_PROBE_SQL).fetchone()
