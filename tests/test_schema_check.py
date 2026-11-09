@@ -5,7 +5,9 @@ written by scripts/apply_schema.sh, which CI exercises when provisioning
 the ephemeral test database.
 """
 
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -155,3 +157,62 @@ def test_no_schema_dir_fails_open(tmp_path, monkeypatch):
         schema_check, "applied_schema_version", lambda url: pytest.fail("should not query")
     )
     check_schema_version("postgresql://x", schema_dir=tmp_path / "nope")
+
+
+# ---------------------------------------------------------------------------
+# ColumnProbe: a probe that fails is not an answer
+# ---------------------------------------------------------------------------
+
+
+class _ProbeConn:
+    """A connection whose probe finds a row (``row``) or raises (``fail``)."""
+
+    def __init__(self, row: object = (1,), fail: BaseException | None = None) -> None:
+        self.row, self.fail, self.probes = row, fail, 0
+
+    def transaction(self):
+        return nullcontext()
+
+    def execute(self, sql):
+        self.probes += 1
+        if self.fail is not None:
+            raise self.fail
+        return SimpleNamespace(fetchone=lambda: self.row)
+
+
+@pytest.fixture()
+def clock(monkeypatch):
+    now = [1000.0]
+    monkeypatch.setattr(schema_check.time, "monotonic", lambda: now[0])
+    return now
+
+
+def test_check_tells_applied_absent_and_could_not_tell_apart(clock):
+    probe = schema_check.ColumnProbe("SELECT 1", "a migration")
+    assert probe.check(_ProbeConn(), "applied") is True
+    assert probe.check(_ProbeConn(row=None), "absent") is False
+    assert probe.check(_ProbeConn(fail=RuntimeError("blip")), "errored") is None
+    assert probe.ready(_ProbeConn(fail=RuntimeError("blip")), "errored-too") is False
+
+
+def test_a_failed_probe_is_not_cached_so_the_next_call_probes_again(clock):
+    """The probe that failed said nothing about the database: it must not stand in for a
+    negative answer for the whole re-probe window."""
+    probe = schema_check.ColumnProbe("SELECT 1", "a migration")
+    broken = _ProbeConn(fail=RuntimeError("stale connection"))
+    assert probe.check(broken, "k") is None
+    assert probe.cached("k") is None
+    healthy = _ProbeConn()
+    assert probe.check(healthy, "k") is True
+    assert healthy.probes == 1
+    assert probe.ready(healthy, "k") is True
+
+
+def test_a_negative_answer_still_holds_for_the_re_probe_window(clock):
+    probe = schema_check.ColumnProbe("SELECT 1", "a migration", reprobe_s=60.0)
+    absent = _ProbeConn(row=None)
+    assert probe.check(absent, "k") is False
+    clock[0] += 30
+    assert probe.check(_ProbeConn(), "k") is False, "inside the window: no re-probe"
+    clock[0] += 31
+    assert probe.check(_ProbeConn(), "k") is True

@@ -51,6 +51,12 @@ def _web_audience_batch() -> int:
         return 10
 
 
+# After a stop (a usage limit, or classifier calls that keep failing) the fact-audience stage
+# sits out this long: the extraction drain has its own backoff (run_loop) and draws on the
+# same quota and backend.
+_FACT_AUDIENCE_PAUSE_S = 1800
+
+
 class Poller:
     def __init__(
         self,
@@ -63,6 +69,8 @@ class Poller:
         # LLM client for the web-audience classifier (ingestion/web_audience.py). None
         # (tests, callers that don't wire it) skips the stage.
         self._audience_llm = audience_llm
+        # time.monotonic() before which the fact-audience stage stays idle (a usage-limit stop).
+        self._fact_audience_paused_until = 0.0
         self._extraction = extraction_pipeline
         # Per-THREAD (db, pipeline) builder for the concurrent drain path: Database
         # holds one non-autocommit connection whose commit/rollback would entangle
@@ -100,6 +108,32 @@ class Poller:
         )
         n = sum(stats.labelled.values())
         if n:
+            logger.info(stats.line())
+        return n
+
+    def label_fact_audience(self) -> int:
+        """Label a bounded batch of unlabelled KG facts work-safe or personal, so restricted
+        surfaces can be served the work-safe ones (schema 066). A no-op before 066, while no
+        restricted device can be served facts, without an LLM client, with
+        ``SYNAPSE_FACT_AUDIENCE=0``, or for a while after a stop (a usage limit, or classifier
+        calls that keep failing). Returns the number labelled."""
+        from ingestion import fact_audience
+
+        if self._audience_llm is None or not fact_audience.enabled():
+            return 0
+        if time.monotonic() < self._fact_audience_paused_until:
+            return 0
+        stats = fact_audience.label_pending(
+            self._db._conn,
+            self._audience_llm,
+            batch=fact_audience.batch_from_env(),
+            calls=fact_audience.calls_from_env(),
+        )
+        if stats.stopped:
+            self._fact_audience_paused_until = time.monotonic() + _FACT_AUDIENCE_PAUSE_S
+            logger.warning("%s; pausing the stage %ds", stats.line(), _FACT_AUDIENCE_PAUSE_S)
+        n = sum(stats.labelled.values())
+        if n and not stats.stopped:
             logger.info(stats.line())
         return n
 
@@ -402,9 +436,11 @@ class Poller:
         released = self._db.release_stale_claims()
         if released:
             logger.info("Released %d stale 'processing' claims back to pending", released)
-        last_full_cycle = 0.0
+        # -inf, not 0.0: time.monotonic() counts from boot, so 0.0 skipped the first full
+        # cycle (and the first orphan sweep) on a host up less than one interval (one day).
+        last_full_cycle = float("-inf")
         last_stale_sweep = time.monotonic()  # just swept above; next sweep one interval out
-        last_orphan_sweep = 0.0  # first full cycle sweeps, then daily
+        last_orphan_sweep = float("-inf")  # first full cycle sweeps, then daily
         # Small batches on purpose: a worker holds claimed rows in 'processing' for the
         # whole batch (~per-item time each, serial), so a LARGE batch (a) makes the priority
         # lane laggy — a worker won't re-check for new high-priority ingest until its batch
@@ -452,6 +488,13 @@ class Poller:
                         # rows stay unlabelled (never served restricted) and the next
                         # cycle retries them.
                         logger.error("Web audience labelling failed: %s", e, exc_info=True)
+                    try:
+                        self.label_fact_audience()
+                    except Exception as e:
+                        # Same as above: a transport failure leaves the facts unlabelled
+                        # (restricted callers are served only labelled ones, plus the facts
+                        # older than 066) and the next cycle retries them.
+                        logger.error("Fact audience labelling failed: %s", e, exc_info=True)
                     if now_mono - last_orphan_sweep >= _ORPHAN_SWEEP_INTERVAL_S:
                         try:
                             n_orphans = self.sweep_orphan_entities()

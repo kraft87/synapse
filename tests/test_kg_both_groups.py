@@ -26,7 +26,7 @@ import pytest
 
 import mcp_server.recall as recall_mod
 import mcp_server.recall_sources as recall_sources
-from ingestion.surfaces import FULL_TRUST, SurfaceTrust
+from ingestion.surfaces import FACT_AUDIENCE_PROBE, FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
 from mcp_server.recall import Recall
 from mcp_server.recall_ranking import timed
@@ -67,12 +67,13 @@ def _fact(
     tgt: str = "ent-y",
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
+    audience: str | None = "work-safe",
 ) -> None:
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by) "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00', %s, %s)",
+        "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
         (
             uid,
             group,
@@ -83,6 +84,7 @@ def _fact(
             f"[{ep}]",
             t_invalid,
             invalidated_by,
+            audience,
         ),
     )
 
@@ -401,6 +403,10 @@ def _statements(group: str | list[str], allowed: list[str] | None) -> _Recording
     r = Recall("postgresql://unused/none", "")
     r._pg = lambda: nullcontext(cur)
     r._kg_scope_ready = lambda: True
+    # The recording stand-in cannot answer the 066 probe (and a probe that cannot tell fails
+    # a restricted read closed): say the label columns are absent, so these are the
+    # pre-066 statements this file is about.
+    FACT_AUDIENCE_PROBE.missing(r._db_url)
     scope = {} if allowed is None else {"allowed_projects": allowed}
     r._fetch_superseded_pairs_pg(group, ["u1"], 2, **scope)
     r._surface_supersessions(onehot(0), group, set(), **scope)

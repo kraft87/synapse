@@ -41,6 +41,7 @@ from ingestion import pg_pool
 from ingestion.surfaces import SurfaceTrust, lookup_surface
 from mcp_server.recall_episode_search import RecallEpisodeSearchMixin
 from mcp_server.recall_episodes import RecallEpisodesMixin
+from mcp_server.recall_fact_audience import RecallFactAudienceMixin
 from mcp_server.recall_fetch import RecallFetchMixin
 from mcp_server.recall_metrics import RecallMetricsMixin
 from mcp_server.recall_overview import RecallOverviewMixin
@@ -374,6 +375,7 @@ class Recall(
     RecallRerankMixin,
     RecallPassagesMixin,
     RecallSourcesMixin,
+    RecallFactAudienceMixin,
     RecallWebMixin,
     RecallOverviewMixin,
     RecallEpisodesMixin,

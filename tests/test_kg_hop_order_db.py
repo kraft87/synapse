@@ -66,10 +66,20 @@ def _seed_entity(conn) -> None:
     )
 
 
-def _edge(conn, uid: str, ep: int, *, rank: int | None, day: int, seed_is_src: bool) -> None:
+def _edge(
+    conn,
+    uid: str,
+    ep: int,
+    *,
+    rank: int | None,
+    day: int,
+    seed_is_src: bool,
+    audience: str | None = "work-safe",
+) -> None:
     """One live edge of the seed. Its distance from onehot(0) grows strictly with ``rank``
     (``None``: no embedding). ``day`` is its valid-from, so recency can be set against
-    distance. The seed is the edge's source or its target (the hop is undirected)."""
+    distance. The seed is the edge's source or its target (the hop is undirected).
+    ``audience`` (schema 066) is work-safe, so only provenance decides a restricted read."""
     vec = None
     if rank is not None:
         v = [0.0] * len(onehot(0))
@@ -78,10 +88,10 @@ def _edge(conn, uid: str, ep: int, *, rank: int | None, day: int, seed_is_src: b
     src, tgt = (SEED, f"far-{uid}") if seed_is_src else (f"far-{uid}", SEED)
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid) "
+        "  fact, fact_embedding, episodes, t_valid, audience) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00'::timestamptz + make_interval(days => %s))",
-        (uid, GROUP, src, tgt, f"fact {uid}", vec, f"[{ep}]", day),
+        "        '2026-01-01T00:00:00+00:00'::timestamptz + make_interval(days => %s), %s)",
+        (uid, GROUP, src, tgt, f"fact {uid}", vec, f"[{ep}]", day, audience),
     )
 
 

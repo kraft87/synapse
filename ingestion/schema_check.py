@@ -189,25 +189,32 @@ class ColumnProbe:
         self._probed_at: dict[str, float] = {}
         self._warned: set[str] = set()
 
-    def ready(self, conn: Any, key: str = "") -> bool:
-        """True when the migration's columns exist on ``conn``'s database."""
+    def check(self, conn: Any, key: str = "") -> bool | None:
+        """Like :meth:`ready`, but tells "absent" from "could not tell": True (applied),
+        False (absent, or not yet due a re-probe), or None when the probe itself failed.
+        A failure is not cached, so the next call probes again. A caller whose fallback
+        is looser than the migration's rule uses this and fails closed on None."""
         if self._ok.get(key):
             return True
         last = self._probed_at.get(key)
         if last is not None and time.monotonic() - last < self.reprobe_s:
             return False
-        self._probed_at[key] = time.monotonic()
         try:
             with conn.transaction():
                 row = conn.execute(self._sql).fetchone()
         except Exception as e:
-            logger.warning("%s probe failed (%s); treating it as not applied", self._what, e)
-            return False
+            logger.warning("%s probe failed (%s); could not tell if it is applied", self._what, e)
+            return None
         if row is None:
             self.missing(key)
             return False
         self._ok[key] = True
         return True
+
+    def ready(self, conn: Any, key: str = "") -> bool:
+        """True when the migration's columns exist on ``conn``'s database. A probe failure
+        answers False (and is not cached): use :meth:`check` to tell it from absence."""
+        return self.check(conn, key) is True
 
     def cached(self, key: str = "") -> bool | None:
         """The cached answer for ``key`` without touching the database: True (applied),

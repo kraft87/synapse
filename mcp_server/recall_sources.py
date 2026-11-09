@@ -11,15 +11,16 @@ from typing import Any
 import psycopg
 from psycopg.rows import tuple_row
 
+from ingestion.surfaces import FACT_AUDIENCE_PROBE
 from mcp_server.kg_pg import (
     CROSS_GROUP_EXTRAS,
     FactRow,
     _vec_literal,
     cross_bm25_rows,
     group_sql,
-    scope_predicate,
     search_kg,
 )
+from mcp_server.recall_fact_audience import FACT_AUDIENCE_COLUMNS, FactAudienceUnknown
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
@@ -119,12 +120,23 @@ class RecallSourcesMixin:
         return not allowed_projects or not self._kg_scope_ready()
 
     def _kg_scope_error(self, allowed_projects: list[str] | None, e: Exception) -> bool:
-        """True when ``e`` is the restricted predicate hitting a missing column (056 rolled
-        back, or dropped after the probe cached it). The caller then returns empty."""
-        if allowed_projects is not None and isinstance(e, psycopg.errors.UndefinedColumn):
-            self._kg_scope_missing(e)
+        """True when ``e`` is the restricted predicate failing closed: a missing column (056
+        or 066 rolled back, or dropped after the probe cached it) or a 066 probe that could
+        not tell. The caller then returns empty. A 066 loss falls back to the
+        provenance-only rule once the probe's TTL lapses; a failure of the probe does not
+        touch its cache, and nor does a missing column that is not the label's."""
+        if allowed_projects is None:
+            return False
+        if isinstance(e, psycopg.errors.UndefinedColumn):
+            # str(e) quotes the statement, which names source_projects whichever column is
+            # missing; the primary message names only the missing one.
+            msg = e.diag.message_primary or str(e)
+            if "source_projects" in msg:
+                self._kg_scope_missing(e)
+            elif any(col in msg for col in FACT_AUDIENCE_COLUMNS):
+                FACT_AUDIENCE_PROBE.missing(self._db_url, e)
             return True
-        return False
+        return isinstance(e, FactAudienceUnknown)
 
     def _search_notes(
         self,
@@ -197,6 +209,10 @@ class RecallSourcesMixin:
         provenance lies inside it are served (schema 056, ``kg_pg.scope_predicate``).
         Without schema 056 the restricted leg returns nothing and logs one warning. It
         never adds a response warning, matching the pre-056 skip. ``None`` = full trust.
+        Schema 066 adds the label rule to the restricted predicate and excludes the flagged
+        owner entity from the hop seeds (every caller); without it both are skipped, so a
+        restricted read serves the provenance-only facts and full trust sends today's SQL.
+        A restricted read whose 066 probe could not tell serves nothing (``_fact_audience_on``).
         ``group_id``: one group or a list (``kg_pg.read_groups``; ``kg_pg.search_kg``).
         ``cross_bm25``: the other group's BM25 rows when a caller is already fetching them
         on another connection (:meth:`_cross_bm25_rows`); it is called once, after the
@@ -221,6 +237,7 @@ class RecallSourcesMixin:
                     cur = conn.cursor(row_factory=tuple_row)
                     cur.execute("SET LOCAL enable_seqscan = off")
                     cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                    audience_on = self._fact_audience_on(conn, allowed_projects is not None)
                     return search_kg(
                         cur,
                         query,
@@ -231,6 +248,8 @@ class RecallSourcesMixin:
                         fact_limit,
                         allowed_projects=allowed_projects,
                         cross_bm25=cross_bm25,
+                        fact_audience=audience_on,
+                        exclude_seeds=self._owner_seed_uuids(conn) if audience_on else (),
                     )
         except Exception as e:
             if self._kg_scope_error(allowed_projects, e):
@@ -310,13 +329,16 @@ class RecallSourcesMixin:
             return []
         if self._kg_scope_blocked(allowed_projects):
             return []
-        scope_sql = ""
         scope_args: tuple[Any, ...] = ()
         if allowed_projects is not None:
-            scope_sql = f" AND {scope_predicate('a')} AND {scope_predicate('o')}"
             scope_args = (allowed_projects, allowed_projects)
         try:
             with self._pg() as conn:
+                scope_sql = (
+                    f" AND {self._scope_predicates(conn, ('a', 'o'))}"
+                    if allowed_projects is not None
+                    else ""
+                )
                 rows = conn.execute(
                     f"""
                     SELECT DISTINCT ON (a.uuid) a.uuid AS uid, a.fact AS now_fact,
@@ -398,13 +420,12 @@ class RecallSourcesMixin:
             return {}
         if self._kg_scope_blocked(allowed_projects):
             return {}
-        scope_sql = ""
         scope_args: list[Any] = []
         if allowed_projects is not None:
-            scope_sql = f"AND {scope_predicate('p')} AND {scope_predicate('n')} "
             scope_args = [allowed_projects, allowed_projects]
+        self_sql = ""
         if self_session:
-            scope_sql += f"AND NOT {_self_only_sql('n')} "
+            self_sql = f"AND NOT {_self_only_sql('n')} "
             scope_args.append(self_session)
         ors = " OR ".join(["p.episodes @> %s::jsonb"] * len(episode_ids))
         params: list[Any] = [
@@ -417,6 +438,11 @@ class RecallSourcesMixin:
         ]
         try:
             with self._pg() as conn:
+                scope_sql = (
+                    f"AND {self._scope_predicates(conn, ('p', 'n'))} "
+                    if allowed_projects is not None
+                    else ""
+                )
                 rows = conn.execute(
                     "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
@@ -424,7 +450,7 @@ class RecallSourcesMixin:
                     f"  AND p.owner_id = %s AND {group_sql(group_id, 'p.group_id')} AND n.t_invalid IS NULL "
                     "  AND n.web_artifact_id IS NULL "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
-                    f"{scope_sql}"
+                    f"{scope_sql}{self_sql}"
                     "LIMIT %s",
                     params,
                 ).fetchall()
@@ -482,14 +508,17 @@ class RecallSourcesMixin:
             return []
         if self._kg_scope_blocked(allowed_projects):
             return []
-        scope_sql = ""
         scope_args: tuple[Any, ...] = ()
         if allowed_projects is not None:
-            scope_sql = f"  AND {scope_predicate('p')} AND {scope_predicate('n')} "
             scope_args = (allowed_projects, allowed_projects)
         vec = _vec_literal(query_emb)
         try:
             with self._pg() as conn:
+                scope_sql = (
+                    f"  AND {self._scope_predicates(conn, ('p', 'n'))} "
+                    if allowed_projects is not None
+                    else ""
+                )
                 rows = conn.execute(
                     "SELECT n.uuid, n.fact, n.t_valid, n.ongoing, n.last_supported_at, "
                     f"  (p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS})) AS d "

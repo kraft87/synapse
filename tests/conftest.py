@@ -85,6 +85,9 @@ _DB_FILES = {
     "test_kg_source_projects.py",
     "test_kg_both_groups.py",
     "test_kg_hop_order_db.py",
+    "test_kg_fact_audience_db.py",
+    "test_fact_audience_db.py",
+    "test_kg_owner_cli.py",
     "test_surface_routes.py",
     "test_credential_trust.py",
     "test_serving_notice.py",
@@ -195,6 +198,18 @@ def _reset_allowlist_variant_cache():
     surfaces._variant_cache.clear()
     yield
     surfaces._variant_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_fact_audience_probe():
+    """The schema-066 probe caches its answer per database URL for the process. Tests
+    drop the columns in a rolled-back transaction, and the fact-audience tests apply or
+    remove them under a running engine, so no test may inherit another's cached answer."""
+    from ingestion.surfaces import FACT_AUDIENCE_PROBE
+
+    FACT_AUDIENCE_PROBE.reset()
+    yield
+    FACT_AUDIENCE_PROBE.reset()
 
 
 @pytest.fixture(autouse=True)

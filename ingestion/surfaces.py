@@ -188,6 +188,22 @@ WEB_AUDIENCE_PROBE = ColumnProbe(
 )
 
 
+#: Schema 066 adds kg_relationships.audience / label_version / label_model and
+#: kg_entities.is_self. Restricted KG serving, the owner-seed exclusion, the poller's
+#: fact labeller and `synapse-admin owner` ask this first; until all four exist,
+#: restricted callers get the provenance-only rule (056) and nothing is excluded or
+#: labelled.
+FACT_AUDIENCE_PROBE = ColumnProbe(
+    "SELECT 1 FROM pg_attribute "
+    "WHERE NOT attisdropped AND ("
+    "  (attrelid = to_regclass('kg_relationships') "
+    "   AND attname IN ('audience', 'label_version', 'label_model')) "
+    "  OR (attrelid = to_regclass('kg_entities') AND attname = 'is_self')) "
+    "HAVING count(*) = 4",
+    "schema 066 (kg_relationships.audience, kg_entities.is_self)",
+)
+
+
 def own_surface_columns_ready(conn: Any, key: str = "") -> bool:
     """True when schema 057's provenance columns exist on ``conn``'s database."""
     return OWN_SURFACE_PROBE.ready(conn, key)

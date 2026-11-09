@@ -83,14 +83,18 @@ def _fact(
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
     web_artifact_id: int | None = None,
+    audience: str | None = "work-safe",
 ) -> None:
     """Insert one edge. ``episodes`` is passed as raw JSON text (or None) so malformed
-    shapes can be written exactly as a careless writer would."""
+    shapes can be written exactly as a careless writer would. ``audience`` (schema 066)
+    defaults to work-safe, so these provenance tests are decided by provenance alone;
+    test_kg_fact_audience_db.py is the one that varies the label."""
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, web_artifact_id) "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, web_artifact_id, "
+        "  audience) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
+        "        '2026-01-01T00:00:00+00:00', %s, %s, %s, %s)",
         (
             uid,
             GROUP,
@@ -102,6 +106,7 @@ def _fact(
             t_invalid,
             invalidated_by,
             web_artifact_id,
+            audience,
         ),
     )
 
