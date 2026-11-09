@@ -26,7 +26,7 @@ import pytest
 
 import mcp_server.recall as recall_mod
 import mcp_server.recall_sources as recall_sources
-from ingestion.surfaces import FULL_TRUST, SurfaceTrust
+from ingestion.surfaces import FACT_AUDIENCE_PROBE, FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
 from mcp_server.recall import Recall
 from mcp_server.recall_ranking import timed
@@ -403,6 +403,10 @@ def _statements(group: str | list[str], allowed: list[str] | None) -> _Recording
     r = Recall("postgresql://unused/none", "")
     r._pg = lambda: nullcontext(cur)
     r._kg_scope_ready = lambda: True
+    # The recording stand-in cannot answer the 066 probe (and a probe that cannot tell fails
+    # a restricted read closed): say the label columns are absent, so these are the
+    # pre-066 statements this file is about.
+    FACT_AUDIENCE_PROBE.missing(r._db_url)
     scope = {} if allowed is None else {"allowed_projects": allowed}
     r._fetch_superseded_pairs_pg(group, ["u1"], 2, **scope)
     r._surface_supersessions(onehot(0), group, set(), **scope)

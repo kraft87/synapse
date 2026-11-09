@@ -18,9 +18,9 @@ from mcp_server.kg_pg import (
     _vec_literal,
     cross_bm25_rows,
     group_sql,
-    scope_predicate,
     search_kg,
 )
+from mcp_server.recall_fact_audience import FACT_AUDIENCE_COLUMNS, FactAudienceUnknown
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_settings import _SUP_LIMIT
 from mcp_server.recall_warnings import error_brief as _err_brief
@@ -39,9 +39,6 @@ _KG_SCOPE_PROBE_SQL = (
     "WHERE attrelid = to_regclass('kg_relationships') "
     "  AND attname = 'source_projects' AND NOT attisdropped"
 )
-# The flagged owner entities (schema 066) are re-read at most this often, so `synapse-admin
-# owner set` takes effect on a running server within a minute.
-_OWNER_SEEDS_TTL_S = 60.0
 
 
 def _self_only_sql(alias: str) -> str:
@@ -74,9 +71,6 @@ class RecallSourcesMixin:
     _kg_scope_ok: bool = False
     _kg_scope_probed_at: float | None = None
     _kg_scope_warned: bool = False
-    # The owner's flagged entity uuids (schema 066), read at most every _OWNER_SEEDS_TTL_S.
-    _owner_seeds: tuple[str, ...] = ()
-    _owner_seeds_at: float | None = None
 
     def _kg_scope_ready(self) -> bool:
         """True when restricted KG serving can run, i.e. schema 056 is applied.
@@ -126,50 +120,23 @@ class RecallSourcesMixin:
         return not allowed_projects or not self._kg_scope_ready()
 
     def _kg_scope_error(self, allowed_projects: list[str] | None, e: Exception) -> bool:
-        """True when ``e`` is the restricted predicate hitting a missing column (056 or 066
-        rolled back, or dropped after the probe cached it). The caller then returns empty;
-        a 066 loss falls back to the provenance-only rule once the probe's TTL lapses."""
-        if allowed_projects is not None and isinstance(e, psycopg.errors.UndefinedColumn):
+        """True when ``e`` is the restricted predicate failing closed: a missing column (056
+        or 066 rolled back, or dropped after the probe cached it) or a 066 probe that could
+        not tell. The caller then returns empty. A 066 loss falls back to the
+        provenance-only rule once the probe's TTL lapses; a failure of the probe does not
+        touch its cache, and nor does a missing column that is not the label's."""
+        if allowed_projects is None:
+            return False
+        if isinstance(e, psycopg.errors.UndefinedColumn):
             # str(e) quotes the statement, which names source_projects whichever column is
             # missing; the primary message names only the missing one.
-            if "source_projects" in (e.diag.message_primary or str(e)):
+            msg = e.diag.message_primary or str(e)
+            if "source_projects" in msg:
                 self._kg_scope_missing(e)
-            else:
+            elif any(col in msg for col in FACT_AUDIENCE_COLUMNS):
                 FACT_AUDIENCE_PROBE.missing(self._db_url, e)
             return True
-        return False
-
-    def _fact_audience_on(self, conn: Any) -> bool:
-        """True when schema 066 is applied on ``conn``'s database: restricted reads then add
-        the label rule and every read excludes the flagged owner entity as a hop seed.
-        Without it both stay as before 066."""
-        return FACT_AUDIENCE_PROBE.ready(conn, self._db_url)
-
-    def _owner_seed_uuids(self, conn: Any) -> list[str]:
-        """The install owner's flagged entity uuids (``kg_entities.is_self``, schema 066),
-        cached for :data:`_OWNER_SEEDS_TTL_S`. Call it only when 066 is applied. Fails open:
-        a lookup error excludes nothing, today's behaviour, and is not cached."""
-        at = self._owner_seeds_at
-        if at is not None and time.monotonic() - at < _OWNER_SEEDS_TTL_S:
-            return list(self._owner_seeds)
-        try:
-            with conn.transaction():
-                rows = conn.execute(
-                    "SELECT uuid FROM kg_entities WHERE owner_id = %s AND is_self",
-                    (self._settings()._KG_OWNER,),
-                ).fetchall()
-        except Exception as e:
-            logger.debug("owner entity lookup failed: %s", e)
-            return []
-        self._owner_seeds = tuple(r["uuid"] for r in rows)
-        self._owner_seeds_at = time.monotonic()
-        return list(self._owner_seeds)
-
-    def _scope_predicates(self, conn: Any, aliases: tuple[str, ...]) -> str:
-        """:func:`scope_predicate` for each of ``aliases``, ANDed: the restricted rule over
-        both sides of a supersession pair (056, plus 066's label where the database has it)."""
-        aud = self._fact_audience_on(conn)
-        return " AND ".join(scope_predicate(a, fact_audience=aud) for a in aliases)
+        return isinstance(e, FactAudienceUnknown)
 
     def _search_notes(
         self,
@@ -245,6 +212,7 @@ class RecallSourcesMixin:
         Schema 066 adds the label rule to the restricted predicate and excludes the flagged
         owner entity from the hop seeds (every caller); without it both are skipped, so a
         restricted read serves the provenance-only facts and full trust sends today's SQL.
+        A restricted read whose 066 probe could not tell serves nothing (``_fact_audience_on``).
         ``group_id``: one group or a list (``kg_pg.read_groups``; ``kg_pg.search_kg``).
         ``cross_bm25``: the other group's BM25 rows when a caller is already fetching them
         on another connection (:meth:`_cross_bm25_rows`); it is called once, after the
@@ -269,7 +237,7 @@ class RecallSourcesMixin:
                     cur = conn.cursor(row_factory=tuple_row)
                     cur.execute("SET LOCAL enable_seqscan = off")
                     cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
-                    audience_on = self._fact_audience_on(conn)
+                    audience_on = self._fact_audience_on(conn, allowed_projects is not None)
                     return search_kg(
                         cur,
                         query,

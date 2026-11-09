@@ -28,7 +28,7 @@ from psycopg.rows import dict_row
 
 from ingestion.surfaces import FACT_AUDIENCE_PROBE, SurfaceTrust
 from mcp_server import kg_pg
-from mcp_server import recall_sources as recall_sources_mod
+from mcp_server import recall_fact_audience as recall_fa_mod
 from mcp_server.recall import Recall
 from mcp_server.recall_warnings import warn_sink
 from tests.helpers.embed import GROUP, onehot
@@ -513,12 +513,12 @@ def test_each_groups_flagged_owner_is_excluded_in_its_own_read(kg, db_url):
 
 def test_the_flagged_set_is_cached_for_its_ttl(kg, db_url, monkeypatch):
     _owner_world(kg)
-    monkeypatch.setattr(recall_sources_mod, "_OWNER_SEEDS_TTL_S", 3600.0)
+    monkeypatch.setattr(recall_fa_mod, "_OWNER_SEEDS_TTL_S", 3600.0)
     r = Recall(db_url, "")
     assert f"hop-own-{GROUP}" in _read(r)
     _flag(kg, f"own-{GROUP}")
     assert f"hop-own-{GROUP}" in _read(r), "inside the TTL the engine keeps the set it read"
-    monkeypatch.setattr(recall_sources_mod, "_OWNER_SEEDS_TTL_S", 0.0)
+    monkeypatch.setattr(recall_fa_mod, "_OWNER_SEEDS_TTL_S", 0.0)
     assert f"hop-own-{GROUP}" not in _read(r)
     kg.execute("UPDATE kg_entities SET is_self = false")
     assert f"hop-own-{GROUP}" in _read(r), "a cleared flag is honoured on the next read"
@@ -669,6 +669,61 @@ def test_a_056_loss_is_told_apart_from_a_066_loss(db_url, caplog):
         assert r._kg_scope_probed_at is not None
         assert not r._kg_scope_error(None, e066), "full trust never names these columns"
         assert not r._kg_scope_error(allowed, ValueError("x"))
+
+
+@pytest.fixture()
+def broken_probe(monkeypatch):
+    """The 066 probe raises (a stale pooled connection, a statement timeout) on a database
+    that HAS the columns. The returned ``heal()`` puts the real statement back."""
+    real = FACT_AUDIENCE_PROBE._sql
+    monkeypatch.setattr(FACT_AUDIENCE_PROBE, "_sql", "SELECT 1 FROM a_table_that_is_not_there")
+    return lambda: monkeypatch.setattr(FACT_AUDIENCE_PROBE, "_sql", real)
+
+
+def test_a_probe_error_on_a_066_database_serves_a_restricted_read_nothing_then_recovers(
+    kg, cutover, db_url, broken_probe
+):
+    """The probe could not tell, which is not "the columns are absent": falling back to the
+    provenance-only rule would serve a personal fact and a post-cutover unlabelled one on
+    every restricted path. Each fails closed, full trust is untouched, and the failure is
+    not cached, so the next read (no TTL wait) is on the label rule again."""
+    _seed_label_matrix(kg, cutover)
+    ep = _ep(kg)
+    _pair(kg, "ok", now="work-safe", old="work-safe", ep=ep)
+    _pair(kg, "pers", now="personal", old="personal", ep=ep)
+    _pair(kg, "new", now=None, old=None, ep=ep)
+    r = Recall(db_url, "")
+    sink: list[str] = []
+    with warn_sink(sink):
+        blind = _every_path(r, ep)
+        facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
+        assert blind == {"kg": set(), "pairs": [], "surface": set(), "overlay": {}}
+        assert _uuids(facts) == EVERY, "full trust never asks the label question"
+        assert FACT_AUDIENCE_PROBE.cached(r._db_url) is None, "a failed probe is not cached"
+        broken_probe()
+        healed = _every_path(r, ep)
+    assert healed["kg"] == SERVED
+    assert healed["pairs"] == ["f:o-ok"]
+    assert healed["surface"] == {"n-ok"}
+    assert healed["overlay"] == {ep: ["now ok"]}
+    assert sink == []
+
+
+def test_an_unrelated_missing_column_fails_the_call_closed_and_leaves_the_probes_alone(
+    db_url,
+):
+    """The routing reads the column the error names, not the statement it quotes: this
+    statement mentions ``audience`` but the missing column is another."""
+    with psycopg.connect(db_url) as c:
+        with pytest.raises(psycopg.errors.UndefinedColumn) as raised:
+            c.execute("SELECT audience, shoe_size FROM kg_relationships")
+        c.rollback()
+    e = raised.value
+    assert "audience" in str(e) and "shoe_size" in (e.diag.message_primary or "")
+    r = Recall(db_url, "")
+    assert r._kg_scope_error([WORK], e), "that statement is failed closed all the same"
+    assert FACT_AUDIENCE_PROBE.cached(r._db_url) is None
+    assert r._kg_scope_probed_at is None
 
 
 def test_the_probe_sees_all_four_columns(db_url):
