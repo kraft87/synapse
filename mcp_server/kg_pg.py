@@ -34,7 +34,7 @@ Restricted surfaces (schema 053/054) pass ``allowed_projects``; every leg then s
 only facts whose cached provenance set (schema 056, ``source_projects``) is known,
 non-empty and inside the allowlist and, with schema 066, only facts labelled work-safe or
 unlabelled and older than 066 — see :func:`scope_predicate`. ``None`` is full trust and
-runs the original SQL unchanged. The install owner's flagged entity (schema 066) is never
+adds no predicate to any statement. The install owner's flagged entity (schema 066) is never
 a hop seed, for any caller.
 
 Full trust also reads the KG group it did not ask for (:func:`search_kg`), as a
@@ -47,6 +47,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from ingestion.bm25_sql import bm25_filter
 from ingestion.embedding import embed_dims
 from ingestion.scope import active_groups
 
@@ -185,7 +186,7 @@ def search_kg_postgres(
     :func:`scope_predicate` to every fact-returning leg and to the seed degree gate,
     and returns no seed entities: an entity's name and summary are distilled from ALL
     its facts, so nothing proves them confined to the allowlist. ``None`` (full trust)
-    executes exactly the statements it always did. Requires schema 056; the caller owns
+    adds nothing to any statement. Requires schema 056; the caller owns
     the column-missing fallback (recall_sources._search_kg).
 
     ``fact_audience`` (restricted only) adds schema 066's label rule to the predicate
@@ -267,17 +268,25 @@ def search_kg_postgres(
 
     # 2 — BM25 full-text over fact text (ParadeDB). Same alnum/space sanitize as
     # recall._search_kg so identifiers/error strings survive. t_invalid filtered
-    # in the WHERE (before LIMIT), matching the FalkorDB fulltext leg.
+    # in the WHERE (before LIMIT), matching the FalkorDB fulltext leg. The filter is one
+    # expression (bm25_filter): pg_search checks each WHERE conjunct as its own pass over
+    # the hits, so the restricted predicate rides inside it rather than as scope_sql.
     safe = "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
     bm25_uuids: list[str] = []
     if safe:
+        bm25_where = [
+            "owner_id = %s",
+            "group_id = %s",
+            "t_invalid IS NULL",
+            "web_artifact_id IS NULL",
+        ]
+        if restricted:
+            bm25_where.append(scope_predicate(fact_audience=fact_audience))
         cur.execute(
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
             "FROM kg_relationships "
-            "WHERE id @@@ paradedb.match('fact', %s) "
-            "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
-            "  AND web_artifact_id IS NULL "
-            f"{scope_sql}"
+            "WHERE id @@@ paradedb.match('fact', %s)"
+            f"{bm25_filter(bm25_where)} "
             "ORDER BY sc DESC LIMIT %s",
             (safe, owner_id, group_id, *scope_args, limit * 3),
         )
@@ -503,12 +512,11 @@ def cross_bm25_rows(
     safe = _safe_query(query)
     if k <= 0 or not groups or not safe:
         return []
+    where = ["owner_id = %s", "group_id = ANY(%s)", "t_invalid IS NULL", "web_artifact_id IS NULL"]
     cur.execute(
         "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
         "FROM kg_relationships "
-        "WHERE id @@@ paradedb.match('fact', %s) "
-        "  AND owner_id = %s AND group_id = ANY(%s) AND t_invalid IS NULL "
-        "  AND web_artifact_id IS NULL "
+        f"WHERE id @@@ paradedb.match('fact', %s){bm25_filter(where)} "
         "ORDER BY sc DESC LIMIT %s",
         (safe, owner_id, groups, k * 3),
     )

@@ -44,6 +44,7 @@ from typing import Any
 
 import orjson
 
+from ingestion.bm25_sql import bm25_filter
 from ingestion.embedding import embed_dims
 
 logger = logging.getLogger(__name__)
@@ -310,8 +311,8 @@ class KGPostgresReader:
         cur = conn.execute(
             f"SELECT uuid, fact, valid_at, paradedb.score(id) AS sc, {dist_sql} AS dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
             "FROM kg_relationships "
-            "WHERE id @@@ paradedb.match('fact', %s) "
-            "  AND owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+            "WHERE id @@@ paradedb.match('fact', %s)"
+            f"{bm25_filter(['owner_id = %s', 'group_id = %s', 't_invalid IS NULL'])} "
             "ORDER BY sc DESC LIMIT %s",
             args,
         )
