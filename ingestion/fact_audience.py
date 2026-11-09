@@ -18,19 +18,31 @@ The poller's maintenance cycle runs :func:`label_pending`, a clone of
   live fact; (3) retired facts. Retired facts matter because the supersession legs need both
   sides of a pair to pass the rule, and serve the retired side's text.
 * **Batched.** Many facts per call, one line each, on :func:`stage_model` ``FACT_AUDIENCE``.
-  The reply is a list of labels in input order; a reply that does not validate is split in
-  halves and retried, so one bad reply neither mislabels a whole batch nor blocks the queue.
+  The reply is a list of labels in input order, and it counts only if it names every line
+  exactly once: a line the model skipped would shift every later label onto the wrong fact,
+  so a reply that is short, repeats a number or does not validate is split in halves and
+  retried, down to single facts. One bad reply neither mislabels a batch nor blocks the queue.
+* **A dead backend labels nothing.** Any other failure of a call (a spawn or connection
+  error, a 4xx, an empty completion) is split the same way, because one fact's content can
+  cause it. A fact that still fails alone is written ``personal`` with ``label_model``
+  ``error:<model>`` (so it can be found and relabelled), but only once a later call in the
+  same cycle has succeeded: a run of failures with none after it is the backend's, and ends
+  the cycle with those rows still NULL.
 * **Phase 1 is one vote.** ``work-safe`` is any single call that names the fact work-safe and
   nothing else; the provenance rule still gates, so this is a cut, not the only wall. Each
   label is stamped with :data:`LABEL_VERSION` and the model, so a later phase can ask for
-  unanimous votes, or relabel a version, without a migration.
+  unanimous votes, or relabel a version, without a migration. One vote is the weak point
+  for private thoughts about the user's own employer written in technical words: on a
+  held-out sample at batch 50 one call on the default stage model caught them about half
+  the time (health mentions every time), one call on a stronger model every time.
+  ``SYNAPSE_FACT_AUDIENCE_MODEL`` is the dial; a missed fact is exactly as visible as it
+  was before 066.
 
 NULL means "not labelled yet". The write never replaces a label (``audience IS NULL``): a
 concurrent labeller, the personal-pile trigger or a human decision wins. Facts written to the
 personal group are labelled ``personal`` at insert by the schema, so this stage never sees
-them. A transport failure leaves the rows NULL for the next cycle; a usage-limit stop ends
-the cycle quietly (what was written stays written) and the poller sits the stage out for a
-while.
+them. A usage-limit stop, or a backend that keeps failing, ends the cycle quietly (what was
+written stays written, the rest stays NULL) and the poller sits the stage out for a while.
 """
 
 from __future__ import annotations
@@ -45,12 +57,7 @@ from typing import Any, Literal
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
-from ingestion.llm_client import (
-    LLM_TRANSPORT_ERRORS,
-    UsageLimitError,
-    stage_model,
-    structured_call,
-)
+from ingestion.llm_client import UsageLimitError, stage_model, structured_call
 from ingestion.surfaces import DEFAULT_AUDIENCE, FACT_AUDIENCE_PROBE, RESTRICTED_AUDIENCE
 
 logger = logging.getLogger(__name__)
@@ -77,6 +84,10 @@ DEFAULT_CALLS = 2
 
 #: A fact is one sentence; the cap only guards a malformed row from swamping a batch.
 FACT_CHARS = 1000
+
+#: ``label_model`` prefix of a ``personal`` fallback written for a fact no verdict could be
+#: had for (schema 066): ``error:<model>``.
+ERROR_MODEL_PREFIX = "error:"
 
 Connect = Callable[[], AbstractContextManager[Any]]
 
@@ -120,13 +131,16 @@ holiday plans" | "User's mother uses the tablet app the user set up to read the 
 P3. Career moves, as opposed to the work itself. Job searching, applications, recruiters, \
 interviews with any employer (including technical interviews and coding tests), offers, \
 salary or pay, raises, performance reviews, promotion cases, plans to leave a job, \
-opinions or complaints about their own employer, manager or colleagues, a resume or \
+opinions or complaints about their own employer, manager or colleagues, private worries, \
+suspicions or tactics about how their own work, mistakes or delays will look to their \
+employer or manager (who will be blamed, how to steer the blame), a resume or \
 portfolio, paid work outside their main job (freelancing, a side business), facts that \
 size up any organisation as a place to work (its pay, on-call duties, work arrangements, \
 culture, hiring process, job postings, employee ratings), and facts about the job market \
 (which roles or skills are in demand, typical pay, hiring trends).
   "User has a panel interview at another clinic on Thursday" | "User's resume lists five \
 years of litigation support" | "User feels her department head ignores her ideas" | \
+"User is quietly logging which teammate caused each missed deadline" | \
 "Northgate Bank's analyst roles require a take-home case study" | "Hospitals in the region \
 are short of night-shift pharmacists"
 
@@ -210,8 +224,36 @@ class FactAudienceReply(BaseModel):
 @dataclass(frozen=True)
 class FactVerdict:
     audience: str
-    #: model | missing (the reply skipped the fact) | error (a single fact whose call failed)
+    #: model | error (a single fact no call could label: ``personal`` by default)
     source: str = "model"
+
+
+class ClassifierDown(Exception):
+    """A run of classifier calls all failed: the backend, not one fact's content, is the
+    problem. The cycle stops with nothing written for the chunk in hand."""
+
+
+@dataclass
+class CycleHealth:
+    """What one cycle's classifier calls have shown about the backend. A call is a success
+    when its reply lines up with the facts (:func:`_names_each_line_once`); anything else,
+    an exception or a reply that does not, is a failure."""
+
+    #: Failures in a row that end the cycle. Isolating one fact in a batch of N takes about
+    #: log2(N) failing calls down the split, so this sits just above that; a backend that
+    #: is down fails every call and reaches it.
+    limit: int
+    streak: int = 0
+    #: Successful calls so far.
+    answered: int = 0
+    #: Each single fact that failed alone, with the success count at that moment. A fallback
+    #: is only trusted once a call has succeeded since: then the failure was the fact's, not
+    #: the backend's.
+    failed_at: dict[int, int] = field(default_factory=dict)
+
+
+def _fail_limit(batch: int) -> int:
+    return max(1, batch).bit_length() + 2
 
 
 def to_audience(labels: Sequence[str]) -> str:
@@ -228,17 +270,32 @@ def render(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def _names_each_line_once(reply: FactAudienceReply, n: int) -> bool:
+    """True when the reply's numbers are exactly 1..``n``, each once. Anything else cannot
+    be trusted to line up with the facts: the model echoes only ``n``, so a skipped or
+    repeated number is the one sign that later labels belong to different facts."""
+    return sorted(e.n for e in reply.facts) == list(range(1, n + 1))
+
+
 def classify_batch(
-    llm: Any, rows: list[dict[str, Any]], *, model: str | None = None
+    llm: Any,
+    rows: list[dict[str, Any]],
+    *,
+    model: str | None = None,
+    health: CycleHealth | None = None,
 ) -> dict[int, FactVerdict]:
-    """Verdicts for ``rows`` (``id`` and ``fact``), by row id. Transport errors propagate (a
-    usage limit included: the caller stops there). A reply that never validates is split in
-    halves and each half classified on its own, down to single facts, so one bad reply costs
-    a few calls, not 50 labels; a single fact that still fails is ``personal``. A fact the
-    reply skips, and an entry whose ``n`` is out of range or repeated, is ``personal`` or
-    ignored respectively: nothing is guessed."""
+    """Verdicts for ``rows`` (``id`` and ``fact``), by row id. A usage limit propagates (the
+    caller stops there). A call that fails, or a reply that does not validate or does not
+    name each line exactly once (:func:`_names_each_line_once`), is split in halves and each
+    half classified on its own, down to single facts, so one bad reply or one fact that
+    breaks a call costs a few calls, not 50 labels; a single fact that still fails is
+    ``personal`` (source ``error``). ``health`` carries the cycle's failure streak: when
+    :class:`ClassifierDown` is raised the backend is failing and nothing is returned."""
     if not rows:
         return {}
+    health = health or CycleHealth(_fail_limit(len(rows)))
+    why = "reply did not name each fact once"
+    reply: FactAudienceReply | None
     try:
         reply = structured_call(
             llm,
@@ -248,25 +305,34 @@ def classify_batch(
             max_tokens=4096,
             max_attempts=2,
         )
-    except LLM_TRANSPORT_ERRORS:
+    except UsageLimitError:
         raise
     except Exception as e:
-        if len(rows) == 1:
-            logger.warning("fact %s did not classify (%s): personal", rows[0]["id"], str(e)[:120])
-            return {rows[0]["id"]: FactVerdict(DEFAULT_AUDIENCE, "error")}
-        half = len(rows) // 2
-        return {
-            **classify_batch(llm, rows[:half], model=model),
-            **classify_batch(llm, rows[half:], model=model),
-        }
-    out: dict[int, FactVerdict] = {}
-    for entry in reply.facts:
-        if not 1 <= entry.n <= len(rows) or rows[entry.n - 1]["id"] in out:
-            continue
-        out[rows[entry.n - 1]["id"]] = FactVerdict(to_audience(entry.labels))
-    for r in rows:
-        out.setdefault(r["id"], FactVerdict(DEFAULT_AUDIENCE, "missing"))
-    return out
+        reply, why = None, f"call failed ({str(e)[:120]})"
+    if reply is not None and _names_each_line_once(reply, len(rows)):
+        health.streak = 0
+        health.answered += 1
+        return {rows[e.n - 1]["id"]: FactVerdict(to_audience(e.labels)) for e in reply.facts}
+    health.streak += 1
+    if health.streak >= health.limit:
+        raise ClassifierDown(f"{health.streak} classifier calls in a row failed: {why}")
+    return _split(llm, rows, model, health, why)
+
+
+def _split(
+    llm: Any, rows: list[dict[str, Any]], model: str | None, health: CycleHealth, why: str
+) -> dict[int, FactVerdict]:
+    """The verdicts for ``rows`` after a call over them failed: each half on its own, or,
+    for one fact, ``personal``."""
+    if len(rows) == 1:
+        logger.warning("fact %s did not classify (%s): personal", rows[0]["id"], why)
+        health.failed_at[rows[0]["id"]] = health.answered
+        return {rows[0]["id"]: FactVerdict(DEFAULT_AUDIENCE, "error")}
+    half = len(rows) // 2
+    return {
+        **classify_batch(llm, rows[:half], model=model, health=health),
+        **classify_batch(llm, rows[half:], model=model, health=health),
+    }
 
 
 # Every restricted device that can be served KG facts: the same rule as
@@ -314,8 +380,8 @@ LIMIT %s
 # the update can be a heap-only tuple.
 _SET_SQL = """
 UPDATE kg_relationships r
-   SET audience = v.audience, label_version = %s, label_model = %s
-  FROM unnest(%s::bigint[], %s::text[]) AS v(id, audience)
+   SET audience = v.audience, label_version = %s, label_model = v.model
+  FROM unnest(%s::bigint[], %s::text[], %s::text[]) AS v(id, audience, model)
  WHERE r.id = v.id AND r.audience IS NULL
 """
 
@@ -383,6 +449,28 @@ def pending(conn: Any, limit: int, reachable: list[str]) -> list[dict[str, Any]]
     return rows
 
 
+def write_labels(connect: Connect, verdicts: dict[int, FactVerdict], stamp: str) -> None:
+    """Commit ``verdicts`` (fact id to verdict) in one statement. A model verdict carries
+    ``stamp`` as its ``label_model``; an ``error`` fallback carries
+    :data:`ERROR_MODEL_PREFIX` + ``stamp``, so the two can be told apart afterwards."""
+    if not verdicts:
+        return
+    ids = list(verdicts)
+    with connect() as conn:
+        conn.execute(
+            _SET_SQL,
+            (
+                LABEL_VERSION,
+                ids,
+                [verdicts[i].audience for i in ids],
+                [
+                    stamp if verdicts[i].source == "model" else ERROR_MODEL_PREFIX + stamp
+                    for i in ids
+                ],
+            ),
+        )
+
+
 def label_pending(
     connect: Connect,
     llm: Any,
@@ -393,9 +481,14 @@ def label_pending(
     key: str = "",
 ) -> LabelStats:
     """Label up to ``batch * calls`` unlabelled facts, ``batch`` per classifier call. Each
-    call runs with no connection held, and each call's labels are committed together. A
-    usage limit ends the cycle with what was written kept (``stats.stopped``); any other
-    transport error stops it and propagates, and the rest stays NULL for the next cycle."""
+    call runs with no connection held, and each call's labels are committed together.
+
+    A usage limit, or a backend that fails call after call (:class:`ClassifierDown`), ends
+    the cycle with what was written kept and the rest NULL (``stats.stopped``; the poller
+    sits the stage out for a while). A fact no call could label (``personal``, source
+    ``error``) is held back to the cycle's end and written only if a call succeeded after it
+    failed: one fact that breaks calls on its own must not block the queue, but a backend
+    that went away must not label anything."""
     stats = LabelStats()
     with connect() as conn:
         if not FACT_AUDIENCE_PROBE.ready(conn, key):
@@ -407,23 +500,27 @@ def label_pending(
             return stats
         rows = pending(conn, batch * calls, reachable)
     stamp = model or stage_model(STAGE)
+    health = CycleHealth(limit=_fail_limit(batch))
+    fallbacks: dict[int, FactVerdict] = {}
     for i in range(0, len(rows), batch):
-        chunk = rows[i : i + batch]
         try:
-            verdicts = classify_batch(llm, chunk, model=stamp)
+            verdicts = classify_batch(llm, rows[i : i + batch], model=stamp, health=health)
         except UsageLimitError:
             stats.stopped = "usage limit"
             return stats
-        with connect() as conn:
-            conn.execute(
-                _SET_SQL,
-                (
-                    LABEL_VERSION,
-                    stamp,
-                    list(verdicts),
-                    [v.audience for v in verdicts.values()],
-                ),
-            )
-        for v in verdicts.values():
+        except ClassifierDown as e:
+            logger.warning("fact audience: %s", e)
+            stats.stopped = "classifier failing"
+            return stats
+        answered = {k: v for k, v in verdicts.items() if v.source == "model"}
+        fallbacks.update({k: v for k, v in verdicts.items() if v.source != "model"})
+        write_labels(connect, answered, stamp)
+        for v in answered.values():
             stats.add(v)
+    trusted = {k: v for k, v in fallbacks.items() if health.answered > health.failed_at[k]}
+    write_labels(connect, trusted, stamp)
+    for v in trusted.values():
+        stats.add(v)
+    if len(trusted) < len(fallbacks):
+        stats.stopped = "classifier failing"
     return stats

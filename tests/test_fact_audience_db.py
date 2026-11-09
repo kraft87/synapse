@@ -3,8 +3,9 @@
 Covers the parts that write: which facts are picked and in what order, that a label is only
 ever written where the fact is still unlabelled, the version and model stamps, the stop
 conditions, and the poller's stage. The invariants: nothing is labelled before 066 or while
-no restricted device could be served the facts, the personal pile is never touched, and a
-transport failure leaves the rest NULL for the next cycle.
+no restricted device could be served the facts, the personal pile is never touched, a backend
+that fails leaves the rest NULL for the next cycle, and one fact that breaks calls on its own
+neither blocks the queue nor stands in for a dead backend.
 """
 
 from __future__ import annotations
@@ -345,15 +346,96 @@ def test_a_usage_limit_stops_the_cycle_quietly_and_keeps_what_was_written(
     assert [_audience(restricted, i) for i in ids] == [None, None, "work-safe", "work-safe"]
 
 
-def test_another_transport_error_propagates_and_keeps_what_was_written(
+def test_a_backend_that_dies_mid_cycle_keeps_what_was_written_and_stops(
     restricted, db_url, monkeypatch
 ):
     ep = _ep(restricted)
     ids = [_fact(restricted, f"fact {i}", ep=ep) for i in range(4)]
     monkeypatch.setattr(fa, "structured_call", _Judge(LLMHTTPError("401", 401), fail_after=1))
-    with pytest.raises(LLMHTTPError):
-        _run(db_url, batch=2, calls=2)
+    stats = _run(db_url, batch=2, calls=2)
+    assert stats.stopped == "classifier failing"
+    # the first call labelled the two newest; the second chunk's failures proved nothing, so
+    # its facts are NULL (not a stored guess) for the next cycle
     assert [_audience(restricted, i) for i in ids] == [None, None, "work-safe", "work-safe"]
+    assert restricted.execute(
+        "SELECT count(*) FROM kg_relationships WHERE label_model LIKE %s",
+        (fa.ERROR_MODEL_PREFIX + "%",),
+    ).fetchone() == (0,)
+
+
+def test_a_dead_backend_labels_nothing_and_stops_after_a_bounded_number_of_calls(
+    restricted, db_url, monkeypatch
+):
+    """The default backend raises a bare RuntimeError once the CLI's own retries are spent:
+    that is not a verdict on any fact. 60 facts, two chunks, and not one is written."""
+    ep = _ep(restricted)
+    ids = [_fact(restricted, f"fact {i}", ep=ep) for i in range(60)]
+    dead = _Judge(RuntimeError("agent_call(fact_audience): failed after retries: spawn"))
+    monkeypatch.setattr(fa, "structured_call", dead)
+    stats = _run(db_url, batch=50, calls=2)
+    assert stats.stopped == "classifier failing" and stats.labelled == {}
+    assert dead.calls == fa._fail_limit(50)
+    assert all(_label(restricted, i) == (None, None, None) for i in ids)
+
+
+class _Poison(_Judge):
+    """Fails any call whose prompt shows the fact POISON; honest otherwise."""
+
+    def __init__(self, err: BaseException) -> None:
+        super().__init__()
+        self.err = err
+
+    def __call__(self, llm, **kw):
+        if "POISON" in kw["base_prompt"].split("Facts, one per line", 1)[1]:
+            self.calls += 1
+            raise self.err
+        return super().__call__(llm, **kw)
+
+
+def test_one_fact_that_breaks_calls_is_stamped_as_a_fallback_and_the_queue_moves_on(
+    restricted, db_url, monkeypatch
+):
+    """A provider that refuses one fact's content must not wedge the newest slice for good.
+    The fact is isolated by splitting, stored ``personal`` (never served restricted) with an
+    ``error:`` model stamp that finds it again, and the next cycle has nothing pending."""
+    monkeypatch.setenv("SYNAPSE_FACT_AUDIENCE_MODEL", "stage-model")
+    ep = _ep(restricted)
+    ids = [_fact(restricted, f"fact {i}", ep=ep) for i in range(4)]
+    poison = _fact(restricted, "POISON fact", ep=ep)  # the newest: first in the slice
+    monkeypatch.setattr(fa, "structured_call", _Poison(LLMHTTPError("400 refused", 400)))
+    stats = _run(db_url, batch=5, calls=1)
+    assert not stats.stopped
+    assert stats.labelled == {"work-safe": 4, "personal/error": 1}
+    assert _label(restricted, poison) == (
+        "personal",
+        fa.LABEL_VERSION,
+        "error:stage-model",
+    )
+    assert all(_label(restricted, i) == ("work-safe", 1, "stage-model") for i in ids)
+    assert _run(db_url).line() == "fact audience: labelled 0 (none pending)"
+
+
+def test_a_fact_that_fails_last_in_the_cycle_waits_and_is_settled_by_the_next_one(
+    restricted, db_url, monkeypatch
+):
+    """Nothing succeeded after it, so the failure could be the backend's: it stays NULL this
+    cycle. The next cycle's slice starts at it, and the calls after it do succeed."""
+    ep = _ep(restricted)
+    ids = [_fact(restricted, "POISON fact" if i == 2 else f"fact {i}", ep=ep) for i in range(5)]
+    monkeypatch.setattr(fa, "structured_call", _Poison(LLMHTTPError("400 refused", 400)))
+    first = _run(db_url, batch=3, calls=1)  # the newest three: ids[4], ids[3], ids[2]
+    assert first.stopped == "classifier failing"
+    assert [_audience(restricted, i) for i in ids] == [None, None, None, "work-safe", "work-safe"]
+    second = _run(db_url, batch=3, calls=1)  # ids[2] (first now), ids[1], ids[0]
+    assert not second.stopped
+    assert [_audience(restricted, i) for i in ids] == [
+        "work-safe",
+        "work-safe",
+        "personal",
+        "work-safe",
+        "work-safe",
+    ]
+    assert _label(restricted, ids[2])[2].startswith(fa.ERROR_MODEL_PREFIX)
 
 
 # ---------------------------------------------------------------------------

@@ -51,8 +51,9 @@ def _web_audience_batch() -> int:
         return 10
 
 
-# After a usage-limit stop the fact-audience stage sits out this long: the extraction drain
-# has its own backoff (run_loop) and draws on the same quota.
+# After a stop (a usage limit, or classifier calls that keep failing) the fact-audience stage
+# sits out this long: the extraction drain has its own backoff (run_loop) and draws on the
+# same quota and backend.
 _FACT_AUDIENCE_PAUSE_S = 1800
 
 
@@ -114,8 +115,8 @@ class Poller:
         """Label a bounded batch of unlabelled KG facts work-safe or personal, so restricted
         surfaces can be served the work-safe ones (schema 066). A no-op before 066, while no
         restricted device can be served facts, without an LLM client, with
-        ``SYNAPSE_FACT_AUDIENCE=0``, or for a while after a usage-limit stop. Returns the
-        number labelled."""
+        ``SYNAPSE_FACT_AUDIENCE=0``, or for a while after a stop (a usage limit, or classifier
+        calls that keep failing). Returns the number labelled."""
         from ingestion import fact_audience
 
         if self._audience_llm is None or not fact_audience.enabled():

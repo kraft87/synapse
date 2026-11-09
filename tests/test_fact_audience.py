@@ -12,6 +12,7 @@ import re
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from ingestion import fact_audience as fa
@@ -34,12 +35,14 @@ def _lines(prompt: str) -> list[str]:
 
 class _Judge:
     """Stands in for ``structured_call``: private when a fact says SECRET, else work-safe.
-    ``raise_for`` maps a prompt to an exception (or None) so a reply can fail by content."""
+    ``raise_for`` maps a prompt to an exception (or None) so a reply can fail by content;
+    ``reply_for`` maps a prompt's fact lines to a scripted reply (or None for the honest one)."""
 
-    def __init__(self, raise_for=None, reply=None) -> None:
+    def __init__(self, raise_for=None, reply=None, reply_for=None) -> None:
         self.prompts: list[str] = []
         self.raise_for = raise_for
         self.reply = reply
+        self.reply_for = reply_for
 
     def __call__(self, llm, **kw):
         assert kw["output_model"] is fa.FactAudienceReply
@@ -50,6 +53,10 @@ class _Judge:
                 raise err
         if self.reply is not None:
             return self.reply
+        if self.reply_for is not None:
+            made = self.reply_for(_lines(kw["base_prompt"]))
+            if made is not None:
+                return made
         facts = [
             fa.FactLabel(n=i, labels=[PRIVATE if "SECRET" in line else SAFE])
             for i, line in enumerate(_lines(kw["base_prompt"]), start=1)
@@ -148,23 +155,68 @@ def test_every_fact_is_labelled_from_its_own_line(judge):
     assert judge.calls == 1 and all(v.source == "model" for v in out.values())
 
 
-def test_an_entry_out_of_range_or_repeated_is_ignored_and_a_skipped_fact_is_personal(
-    monkeypatch,
-):
-    reply = fa.FactAudienceReply(
-        facts=[
-            fa.FactLabel(n=1, labels=[SAFE]),
-            fa.FactLabel(n=1, labels=[PRIVATE]),  # a repeat: the first stands
-            fa.FactLabel(n=0, labels=[SAFE]),
-            fa.FactLabel(n=9, labels=[SAFE]),
-            fa.FactLabel(n=3, labels=[SAFE]),
-        ]
-    )
-    monkeypatch.setattr(fa, "structured_call", _Judge(reply=reply))
-    out = fa.classify_batch(object(), _rows("one", "two", "three"))
-    assert out[100] == fa.FactVerdict("work-safe")
-    assert out[101] == fa.FactVerdict("personal", "missing")
-    assert out[102] == fa.FactVerdict("work-safe")
+def _entries(*pairs: tuple[int, str]) -> fa.FactAudienceReply:
+    return fa.FactAudienceReply(facts=[fa.FactLabel(n=n, labels=[lab]) for n, lab in pairs])
+
+
+def _wrong_when_long(wrong):
+    """A reply script that is honest for one or two lines and ``wrong(lines)`` above that."""
+    return lambda lines: wrong(lines) if len(lines) > 2 else None
+
+
+@pytest.mark.parametrize(
+    "wrong",
+    [
+        # the model drops line 1 and keeps counting: every later label shifts onto another fact
+        lambda lines: _entries(*((i, SAFE) for i in range(1, len(lines)))),
+        # one number repeated, the second entry private: not "the first one stands"
+        lambda lines: _entries(
+            (1, SAFE), (1, PRIVATE), *((i, SAFE) for i in range(3, len(lines) + 1))
+        ),
+        # an extra entry past the end
+        lambda lines: _entries(*((i, SAFE) for i in range(1, len(lines) + 2))),
+        # numbers that are not 1..n, though there are n of them
+        lambda lines: _entries(*((i, SAFE) for i in range(2, len(lines) + 2))),
+        # nothing at all
+        lambda lines: _entries(),
+    ],
+    ids=["short", "repeat", "extra", "shifted", "empty"],
+)
+def test_a_reply_that_does_not_name_each_line_once_is_split_not_trusted(monkeypatch, wrong):
+    """The model echoes only the line number, so a reply that skips, repeats or invents one
+    cannot be told from one whose later labels belong to other facts. It is never read: the
+    batch is split and each half asked again, so a private fact is not stored work-safe."""
+    j = _Judge(reply_for=_wrong_when_long(wrong))
+    monkeypatch.setattr(fa, "structured_call", j)
+    rows = _rows("SECRET one", "plain two", "plain three", "plain four")
+    out = fa.classify_batch(object(), rows)
+    assert {i: v.audience for i, v in out.items()} == {
+        100: "personal",
+        101: "work-safe",
+        102: "work-safe",
+        103: "work-safe",
+    }
+    assert all(v.source == "model" for v in out.values())
+    assert j.calls == 3, "the batch, then its two halves"
+
+
+def test_a_repeated_number_with_conflicting_labels_never_stores_the_first_one(monkeypatch):
+    """Work-safe first, private second, for the same line: not resolved by order. Asked
+    alone, the fact gets its own answer."""
+    reply = _entries((1, SAFE), (1, PRIVATE))
+    j = _Judge(reply_for=lambda lines: reply if len(lines) == 2 else None)
+    monkeypatch.setattr(fa, "structured_call", j)
+    out = fa.classify_batch(object(), _rows("a SECRET fact", "a plain fact"))
+    assert out[100] == fa.FactVerdict("personal")
+    assert out[101] == fa.FactVerdict("work-safe")
+
+
+def test_one_fact_whose_reply_never_lines_up_is_personal_and_costs_one_call(monkeypatch):
+    j = _Judge(reply=_entries((2, SAFE)))
+    monkeypatch.setattr(fa, "structured_call", j)
+    out = fa.classify_batch(object(), _rows("only"))
+    assert out == {100: fa.FactVerdict("personal", "error")}
+    assert j.calls == 1
 
 
 def test_a_reply_that_never_validates_is_split_until_only_the_bad_fact_fails(monkeypatch):
@@ -191,19 +243,73 @@ def test_one_failing_single_fact_is_personal_not_an_exception(monkeypatch):
     assert out == {100: fa.FactVerdict("personal", "error")}
 
 
-@pytest.mark.parametrize("err", [LLMHTTPError("down", 503), UsageLimitError("limit")])
-def test_a_transport_error_propagates_at_any_depth(monkeypatch, err):
-    """Even after a split: a single fact's call that hits the wire failure is not a verdict."""
+def test_a_usage_limit_propagates_at_any_depth(monkeypatch):
+    """Even after a split: a single fact's call that hits the limit is not a verdict."""
 
     def fails_alone(prompt):
         lines = _lines(prompt)
         if len(lines) > 1:
             return MalformedResponseError("not json", "x")
-        return err if "bad" in lines[0] else None
+        return UsageLimitError("limit") if "bad" in lines[0] else None
 
     monkeypatch.setattr(fa, "structured_call", _Judge(raise_for=fails_alone))
-    with pytest.raises(type(err)):
+    with pytest.raises(UsageLimitError):
         fa.classify_batch(object(), _rows("good one", "bad one"))
+
+
+#: What a dead backend raises. The first is what the Claude CLI path raises once its own
+#: retries are spent (``agent_call``), which no transport-error tuple names.
+_DEAD_BACKEND = [
+    RuntimeError("agent_call(fact_audience): failed after retries: spawn failed"),
+    LLMHTTPError("down", 503),
+    httpx.ConnectError("refused"),
+    ValueError("anything else"),
+]
+
+
+@pytest.mark.parametrize("err", _DEAD_BACKEND, ids=lambda e: type(e).__name__)
+def test_a_backend_that_fails_every_call_ends_the_cycle_after_a_bounded_number_of_calls(
+    monkeypatch, err
+):
+    """Not 99 failed calls and fifty ``personal`` verdicts: a run of failures stops the
+    batch, and no verdict is returned."""
+    j = _Judge(raise_for=lambda prompt: err)
+    monkeypatch.setattr(fa, "structured_call", j)
+    with pytest.raises(fa.ClassifierDown):
+        fa.classify_batch(object(), _rows(*(f"fact {i}" for i in range(50))))
+    assert j.calls == fa._fail_limit(50) == 8
+
+
+def test_the_failure_limit_clears_the_split_depth_for_every_batch_size():
+    """One bad fact costs about log2(N) failing calls in a row: the limit must sit above
+    that for any batch the knob allows, or a single poison fact would read as a dead
+    backend."""
+    for n in range(1, fa.MAX_BATCH + 1):
+        depth = 1
+        size = n
+        while size > 1:
+            size = (size + 1) // 2  # the larger half
+            depth += 1
+        assert fa._fail_limit(n) > depth, n
+
+
+@pytest.mark.parametrize("batch", [2, 3, 7, 50, 64, 200])
+@pytest.mark.parametrize("where", ["first", "middle", "last"])
+@pytest.mark.parametrize("err", [LLMHTTPError("moderation says no", 400), RuntimeError("boom")])
+def test_one_fact_that_breaks_a_call_on_its_own_is_isolated_and_the_rest_are_labelled(
+    monkeypatch, batch, where, err
+):
+    """A fact the provider refuses (a non-transient 4xx, an empty completion) must not stop
+    the others being labelled, wherever it sits and however large the batch."""
+    at = {"first": 0, "middle": batch // 2, "last": batch - 1}[where]
+    texts = [f"plain fact {i}" for i in range(batch)]
+    texts[at] = "POISON fact"
+    j = _Judge(raise_for=lambda prompt: err if "POISON" in prompt else None)
+    monkeypatch.setattr(fa, "structured_call", j)
+    out = fa.classify_batch(object(), _rows(*texts), health=fa.CycleHealth(fa._fail_limit(batch)))
+    assert out[100 + at] == fa.FactVerdict("personal", "error")
+    assert all(v == fa.FactVerdict("work-safe") for i, v in out.items() if i != 100 + at)
+    assert len(out) == batch
 
 
 def test_no_rows_is_no_call(judge):
@@ -274,12 +380,10 @@ def test_the_stats_line_names_what_was_labelled_skipped_or_stopped():
         fa.FactVerdict("work-safe"),
         fa.FactVerdict("personal"),
         fa.FactVerdict("personal"),
-        fa.FactVerdict("personal", "missing"),
+        fa.FactVerdict("personal", "error"),
     ):
         stats.add(v)
-    assert stats.line() == (
-        "fact audience: labelled 4 (personal=2, personal/missing=1, work-safe=1)"
-    )
+    assert stats.line() == ("fact audience: labelled 4 (personal=2, personal/error=1, work-safe=1)")
     stats.stopped = "usage limit"
     assert stats.line() == "fact audience: stopped: usage limit after 4"
     assert fa.LabelStats(skipped="schema 066 not applied").line() == (
@@ -329,8 +433,9 @@ def test_the_poller_stage_runs_with_the_env_sizes_and_reports_the_count(label_ca
     assert label_calls == [{"batch": 25, "calls": 3}]
 
 
-def test_a_usage_limit_stop_pauses_the_stage(monkeypatch):
-    stats = fa.LabelStats(stopped="usage limit", labelled={"work-safe": 2})
+@pytest.mark.parametrize("reason", ["usage limit", "classifier failing"])
+def test_a_stop_pauses_the_stage(monkeypatch, reason):
+    stats = fa.LabelStats(stopped=reason, labelled={"work-safe": 2})
     calls: list[int] = []
     monkeypatch.setattr(fa, "label_pending", lambda *a, **k: calls.append(1) or stats)
     now = [1000.0]
@@ -344,3 +449,70 @@ def test_a_usage_limit_stop_pauses_the_stage(monkeypatch):
     now[0] += 2
     assert p.label_fact_audience() == 2, "the pause lapsed"
     assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# The stage inside the maintenance loop
+# ---------------------------------------------------------------------------
+
+_FULL_CYCLE = [
+    "rebuild_pending_chunks",
+    "embed_pending",
+    "label_web_audience",
+    "label_fact_audience",
+    "sweep_orphan_entities",
+]
+
+
+def _loop_poller(monkeypatch, calls: list[str], fact_error: BaseException | None = None) -> Poller:
+    """A poller whose every stage records its call; the drain asks the loop to stop, so
+    ``run_loop`` makes exactly one pass."""
+    monkeypatch.setattr("signal.signal", lambda *a, **k: None)
+    p = Poller(db=SimpleNamespace(release_stale_claims=lambda: 0), audience_llm=_LLM)  # type: ignore[arg-type]
+
+    def stage(name: str, err: BaseException | None = None):
+        def _run(*a: Any, **k: Any) -> int:
+            calls.append(name)
+            if err is not None:
+                raise err
+            return 0
+
+        return _run
+
+    for name in _FULL_CYCLE:
+        monkeypatch.setattr(
+            p, name, stage(name, fact_error if name == "label_fact_audience" else None)
+        )
+
+    def drain(batch_limit: int) -> int:
+        calls.append("drain")
+        p.request_stop()
+        return 0
+
+    monkeypatch.setattr(p, "drain_extraction_queue", drain)
+    return p
+
+
+def test_a_full_cycle_runs_the_fact_stage_once_between_the_web_stage_and_the_sweep(monkeypatch):
+    monkeypatch.delenv("SYNAPSE_DRAIN_ONLY", raising=False)
+    calls: list[str] = []
+    _loop_poller(monkeypatch, calls).run_loop(interval_seconds=300)
+    assert calls == [*_FULL_CYCLE, "drain"]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes"])
+def test_a_drain_only_replica_never_runs_the_labelling_stages(monkeypatch, value):
+    """Only the master labels: a scaled-out drain worker is an extraction-queue worker
+    and nothing else."""
+    monkeypatch.setenv("SYNAPSE_DRAIN_ONLY", value)
+    calls: list[str] = []
+    _loop_poller(monkeypatch, calls).run_loop(interval_seconds=300)
+    assert calls == ["drain"]
+
+
+def test_a_failing_fact_stage_does_not_stop_the_sweep_or_the_drain(monkeypatch):
+    monkeypatch.delenv("SYNAPSE_DRAIN_ONLY", raising=False)
+    calls: list[str] = []
+    p = _loop_poller(monkeypatch, calls, fact_error=RuntimeError("the classifier fell over"))
+    p.run_loop(interval_seconds=300)
+    assert calls == [*_FULL_CYCLE, "drain"]
