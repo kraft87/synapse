@@ -112,10 +112,19 @@ def scope_predicate(alias: str = "", *, fact_audience: bool = True) -> str:
     Sensitivity (066, ``fact_audience``): AND the fact is labelled ``work-safe``, or is
     unlabelled and existed before 066 ran (``id`` at or below the cutover 066 stamped in
     ``synapse_meta``). A ``personal`` fact is never servable; neither is an unlabelled
-    one written since, nor any unlabelled one when the stamp is missing. The cutover is
-    read by an uncorrelated subquery (one InitPlan per statement), which keeps the
-    ParadeDB BM25 TopN pushdown. ``fact_audience=False`` is the pre-066 rule, for a
-    database without the columns (``recall_sources`` decides, by probe).
+    one written since, nor any unlabelled one when the stamp is missing (the comparison
+    is NULL, so the row is filtered). The cutover is read by an uncorrelated subquery (an
+    InitPlan, run once per copy of the rule in a statement). ``fact_audience=False`` is the
+    pre-066 rule, for a database without the columns (``recall_sources`` decides, by probe).
+
+    The rule is ONE expression, not ``audience = 'work-safe' OR (audience IS NULL AND id
+    <= cutover)``: pg_search turns a WHERE-level OR into a Tantivy boolean of "match
+    everything" sub-queries, one per clause of the BM25 scan. On prod pg_search 0.23.2
+    (2026-11-09) the OR read 38x the pages (441ms against 32ms) and added score to the
+    unlabelled branch, so legacy facts outranked work-safe ones and the top-K moved. As
+    one expression it is a single filter over the match's own hits, like the provenance
+    rule. Shapes pg_search 0.23.2 rejects with "Unsupported query shape":
+    ``coalesce(<boolean OR>, false)`` and ``CASE ... THEN <boolean>``.
 
     One ``%s`` placeholder either way: the allowlist as a list.
     """
@@ -125,8 +134,9 @@ def scope_predicate(alias: str = "", *, fact_audience: bool = True) -> str:
     if not fact_audience:
         return rule
     return (
-        f"{rule} AND ({p}audience = 'work-safe' OR ({p}audience IS NULL AND {p}id <= "
-        f"(SELECT value::bigint FROM synapse_meta WHERE key = '{FACT_AUDIENCE_CUTOVER_KEY}')))"
+        f"{rule} AND coalesce({p}audience, CASE WHEN {p}id <= "
+        f"(SELECT value::bigint FROM synapse_meta WHERE key = '{FACT_AUDIENCE_CUTOVER_KEY}') "
+        "THEN 'work-safe' END) = 'work-safe'"
     )
 
 

@@ -402,7 +402,7 @@ def test_a_restricted_request_for_the_personal_group_is_served_nothing(kg, db_ur
 
 def test_the_restricted_bm25_statement_still_runs_as_a_paradedb_topk_scan(kg, cutover, db_url):
     """The cutover rides in as an InitPlan, so the ParadeDB TopN pushdown survives the
-    OR: the label rule becomes filters inside the Tantivy query and the scan stays TopK.
+    label rule: it becomes a filter inside the Tantivy query and the scan stays TopK.
     The 056-only statement is the control, so a pg_search build that prints plans
     differently skips here rather than passing on nothing."""
     _seed_label_matrix(kg, cutover)
@@ -447,6 +447,93 @@ def test_the_restricted_bm25_statement_still_runs_as_a_paradedb_topk_scan(kg, cu
     plan = _plan(True)
     assert "kg_rel_bm25" in plan and "TopK" in plan, plan
     assert "InitPlan" in plan, "the cutover is read once per statement"
+
+
+def _bm25_leg(db_url: str, *, audience: bool, limit: int) -> tuple[list[str], str]:
+    """The restricted BM25 statement search_kg_postgres sends, run under the planner settings
+    recall_sources gives it: its fact uuids best first, and its plan with the Tantivy query."""
+    seen: list[tuple[str, Any]] = []
+
+    class _Rec:
+        def __init__(self, cur):
+            self._cur = cur
+
+        def execute(self, sql, params=None):
+            seen.append((sql, params))
+            self._cur.execute(sql, params)
+            return self
+
+        def fetchall(self):
+            return self._cur.fetchall()
+
+    with psycopg.connect(db_url, autocommit=True) as c, c.cursor() as cur:
+        cur.execute("SET enable_seqscan = off")
+        cur.execute("SET max_parallel_workers_per_gather = 0")
+        kg_pg.search_kg_postgres(
+            _Rec(cur),
+            "widget",
+            onehot(0),
+            "default",
+            GROUP,
+            [],
+            limit,
+            [WORK],
+            fact_audience=audience,
+        )
+        (sql, params), *_ = [s for s in seen if "paradedb.match" in s[0]]
+        uuids = [r[0] for r in c.execute(sql, params).fetchall()]
+        plan = "\n".join(r[0] for r in c.execute("EXPLAIN (VERBOSE, COSTS OFF) " + sql, params))
+    return uuids, plan
+
+
+def test_a_label_rule_every_fact_passes_leaves_the_bm25_ranking_as_it_was(kg, cutover, db_url):
+    """When every matching fact is work-safe or legacy, the label rule must change nothing:
+    the same facts in the same order as the 056-only statement. (The leg only ranks; RRF
+    never reads a BM25 score.)
+
+    pg_search turns a WHERE-level OR into a Tantivy boolean of "match everything"
+    sub-queries, one per clause of the scan; on prod (0.23.2, 2026-11-09) that read 38x the
+    pages (441ms against 32ms) and scored the unlabelled branch higher, so legacy facts
+    outranked work-safe ones. One expression stays a single filter on the match's hits."""
+    ep = _ep(kg)
+    for i in range(30):  # legacy: unlabelled, written before the cutover; one length each
+        _fact(kg, f"old-{i}", "widget" + " gear" * i, ep, audience=None)
+    cutover(_max_id(kg))
+    for i in range(30):
+        _fact(kg, f"safe-{i}", "widget widget" + " cog" * i, ep, audience="work-safe")
+    control, control_plan = _bm25_leg(db_url, audience=False, limit=5)
+    rows, plan = _bm25_leg(db_url, audience=True, limit=5)
+    assert len(control) == 15
+    assert rows == control
+    if "kg_rel_bm25" not in control_plan or "TopK" not in control_plan:
+        pytest.skip("this pg_search build does not print a TopK ParadeDB scan for the control")
+    assert "kg_rel_bm25" in plan and "TopK" in plan, plan
+    assert '"indexed_query":"all"' not in plan.replace(" ", ""), plan
+
+
+def test_the_bm25_leg_drops_personal_and_new_unlabelled_facts_before_the_top_k(kg, cutover, db_url):
+    """The rule filters inside the scan, so a personal or new unlabelled fact that would rank
+    first does not take a top-K slot from a servable one."""
+    ep = _ep(kg)
+    _fact(kg, "legacy", "widget legacy", ep, audience=None)
+    cutover(_max_id(kg))
+    for i in range(10):
+        _fact(kg, f"pers-{i}", "widget widget widget widget personal", ep, audience="personal")
+        _fact(kg, f"new-{i}", "widget widget widget widget fresh", ep, audience=None)
+    _fact(kg, "safe", "widget safe", ep, audience="work-safe")
+    rows, _ = _bm25_leg(db_url, audience=True, limit=1)
+    assert set(rows) == {"legacy", "safe"}
+
+
+def test_a_legacy_fact_relabelled_personal_drops_out_of_every_leg(kg, cutover, db_url):
+    """Prod labels a legacy fact by UPDATE (the poller stage, and 066's own seeding), not at
+    insert: the rule must read the row's current label, on every leg."""
+    _seed_label_matrix(kg, cutover)
+    before = _restricted_kg(_recall_engine(db_url))
+    kg.execute("UPDATE kg_relationships SET audience = 'personal' WHERE uuid LIKE '%-legacy'")
+    after = _restricted_kg(_recall_engine(db_url))
+    assert {f"{leg}-legacy" for leg in LEGS} <= before
+    assert after == before - {f"{leg}-legacy" for leg in LEGS}
 
 
 # ---------------------------------------------------------------------------
