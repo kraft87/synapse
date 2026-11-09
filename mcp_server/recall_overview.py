@@ -204,7 +204,8 @@ class RecallOverviewMixin:
         def _kg_leg() -> tuple[list[Any], list[Any]]:
             # Restricted surface: serve only facts whose cached provenance set
             # (kg_relationships.source_projects, schema 056) is known, non-empty and a
-            # subset of the allowlist. Mixed or unknown provenance is never served. With
+            # subset of the allowlist, and (schema 066) is labelled work-safe or
+            # predates 066 unlabelled. Mixed or unknown provenance is never served. With
             # an empty allowlist, or before 056 is applied, the leg serves nothing,
             # exactly the pre-056 skip (see _search_kg / _kg_scope_ready).
             if query_emb is None:

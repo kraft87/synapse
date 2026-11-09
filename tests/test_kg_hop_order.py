@@ -39,10 +39,20 @@ class _RecordingCursor:
         return [(s, p) for s, p in self.statements if "src_uuid = %s OR tgt_uuid = %s" in s]
 
 
-def _run(allowed_projects: list[str] | None = None) -> _RecordingCursor:
+def _run(
+    allowed_projects: list[str] | None = None, *, fact_audience: bool = True
+) -> _RecordingCursor:
     cur = _RecordingCursor()
     kg_pg.search_kg_postgres(
-        cur, "", QUERY_EMB, OWNER, GROUP, [], 5, allowed_projects=allowed_projects
+        cur,
+        "",
+        QUERY_EMB,
+        OWNER,
+        GROUP,
+        [],
+        5,
+        allowed_projects=allowed_projects,
+        fact_audience=fact_audience,
     )
     return cur
 
@@ -87,6 +97,16 @@ def test_a_restricted_caller_filters_inside_the_fence_and_passes_the_allowlist()
         assert params[-1] == allowed
         assert params[:3] == (kg_pg._vec_literal(QUERY_EMB), OWNER, GROUP)
     assert [p[3] for _, p in hops] == ["s1", "s2"]
+
+
+def test_the_hop_fence_carries_the_provenance_rule_alone_before_schema_066():
+    hops = _run(["work-proj"], fact_audience=False).hops()
+    assert len(hops) == 2
+    for sql, params in hops:
+        fence = sql.split(") SELECT ", 1)[0]
+        assert kg_pg.scope_predicate(fact_audience=False) in fence
+        assert "audience" not in sql
+        assert sql.count("%s") == len(params)
 
 
 def test_full_trust_hop_statement_carries_no_scope_predicate():

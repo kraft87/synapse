@@ -67,12 +67,13 @@ def _fact(
     tgt: str = "ent-y",
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
+    audience: str | None = "work-safe",
 ) -> None:
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by) "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00', %s, %s)",
+        "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
         (
             uid,
             group,
@@ -83,6 +84,7 @@ def _fact(
             f"[{ep}]",
             t_invalid,
             invalidated_by,
+            audience,
         ),
     )
 

@@ -3,6 +3,8 @@ Schema smoke tests. Run against a live synapse_test database.
 All tests should pass once scripts/apply_schema.sh has been applied.
 """
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import psycopg
@@ -286,3 +288,117 @@ def test_surfaces_defaults_to_restricted_with_an_empty_allowlist(conn):
             "INSERT INTO surfaces (surface_id, trust) VALUES ('bad-trust-host', 'partial')"
         )
     conn.execute("DELETE FROM surfaces WHERE surface_id LIKE '%-host'")
+
+
+# ---------------------------------------------------------------------------
+# 066 — fact audience
+# ---------------------------------------------------------------------------
+
+_SCHEMA_DIR = Path(__file__).resolve().parent.parent / "schema"
+_SCHEMA_066 = _SCHEMA_DIR / "066_kg_fact_audience.sql"
+_CUTOVER_SQL = "SELECT value FROM synapse_meta WHERE key = 'fact_audience_legacy_max_id'"
+
+
+@pytest.fixture()
+def kg_rows(conn):
+    """A clean KG slate for the test, and again afterwards."""
+    conn.execute("TRUNCATE kg_relationships, kg_entities RESTART IDENTITY CASCADE")
+    yield conn
+    conn.execute("TRUNCATE kg_relationships, kg_entities RESTART IDENTITY CASCADE")
+
+
+def _fact(conn, uid: str, group: str, audience: str | None = None):
+    return conn.execute(
+        "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, audience) "
+        "VALUES (%s, %s, 'a', 'b', 'f', %s) RETURNING audience, label_version",
+        (uid, group, audience),
+    ).fetchone()
+
+
+def _entity(conn, uid: str, group: str, *, owner: str = "default", flag: bool = False) -> None:
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, is_self) "
+        "VALUES (%s, %s, %s, 'n', %s)",
+        (uid, owner, group, flag),
+    )
+
+
+def test_fact_audience_columns_exist_with_the_documented_types(conn):
+    cols = dict(
+        conn.execute(
+            "SELECT table_name || '.' || column_name, data_type || ' ' || is_nullable "
+            "FROM information_schema.columns "
+            "WHERE (table_name = 'kg_relationships' "
+            "       AND column_name IN ('audience', 'label_version', 'label_model')) "
+            "   OR (table_name = 'kg_entities' AND column_name = 'is_self')"
+        ).fetchall()
+    )
+    assert cols == {
+        "kg_relationships.audience": "text YES",
+        "kg_relationships.label_version": "smallint YES",
+        "kg_relationships.label_model": "text YES",
+        "kg_entities.is_self": "boolean NO",
+    }
+
+
+def test_the_audience_vocabulary_is_the_notes_one(kg_rows):
+    _fact(kg_rows, "w", "technical", "work-safe")
+    _fact(kg_rows, "p", "technical", "personal")
+    assert _fact(kg_rows, "n", "technical") == (None, None)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        _fact(kg_rows, "bad", "technical", "private")
+
+
+def test_the_cutover_is_stamped_as_a_row_id(conn):
+    row = conn.execute(_CUTOVER_SQL).fetchone()
+    assert row is not None and row[0].isdigit()
+
+
+def test_a_fact_inserted_into_the_personal_group_is_personal_on_insert(kg_rows):
+    assert _fact(kg_rows, "p1", "personal") == ("personal", 0)
+    assert _fact(kg_rows, "t1", "technical") == (None, None)
+    # an explicit label is kept: only a missing one is filled in
+    assert _fact(kg_rows, "p2", "personal", "work-safe") == ("work-safe", None)
+
+
+def test_the_owner_flag_defaults_off_and_is_unique_per_owner_and_group(kg_rows):
+    _entity(kg_rows, "e0", "technical")
+    assert kg_rows.execute("SELECT is_self FROM kg_entities WHERE uuid = 'e0'").fetchone() == (
+        False,
+    )
+    _entity(kg_rows, "e1", "technical", flag=True)
+    _entity(kg_rows, "e2", "personal", flag=True)  # one per group
+    _entity(kg_rows, "e3", "technical", owner="someone-else", flag=True)  # one per owner
+    _entity(kg_rows, "e4", "technical")  # unflagged rows are not limited
+    with pytest.raises(psycopg.errors.UniqueViolation):
+        _entity(kg_rows, "e5", "technical", flag=True)
+
+
+def test_066_is_optional_and_registered():
+    from ingestion.schema_check import is_optional_migration
+
+    assert is_optional_migration(_SCHEMA_066)
+    script = (_SCHEMA_DIR.parent / "scripts" / "apply_schema.sh").read_text()
+    assert _SCHEMA_066.name in script
+
+
+def _apply_066(db_url: str) -> None:
+    if shutil.which("psql") is None:  # pragma: no cover - CI installs the client
+        pytest.skip("psql not installed")
+    subprocess.run(
+        ["psql", db_url, "-q", "-v", "ON_ERROR_STOP=1", "-f", str(_SCHEMA_066)],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_a_rerun_of_066_never_moves_the_cutover_and_reseeds_the_personal_pile(kg_rows, db_url):
+    stamp = kg_rows.execute(_CUTOVER_SQL).fetchone()
+    _fact(kg_rows, "t1", "technical")
+    _fact(kg_rows, "p1", "personal")
+    kg_rows.execute("UPDATE kg_relationships SET audience = NULL, label_version = NULL")
+    _apply_066(db_url)
+    _apply_066(db_url)
+    assert kg_rows.execute(_CUTOVER_SQL).fetchone() == stamp
+    rows = kg_rows.execute("SELECT uuid, audience, label_version FROM kg_relationships").fetchall()
+    assert dict((u, (a, v)) for u, a, v in rows) == {"t1": (None, None), "p1": ("personal", 0)}

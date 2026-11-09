@@ -32,8 +32,10 @@ not needed while there is one real owner + throwaway DBs for isolated runs.)
 
 Restricted surfaces (schema 053/054) pass ``allowed_projects``; every leg then serves
 only facts whose cached provenance set (schema 056, ``source_projects``) is known,
-non-empty and inside the allowlist — see :func:`scope_predicate`. ``None`` is full trust
-and runs the original SQL unchanged.
+non-empty and inside the allowlist and, with schema 066, only facts labelled work-safe or
+unlabelled and older than 066 — see :func:`scope_predicate`. ``None`` is full trust and
+runs the original SQL unchanged. The install owner's flagged entity (schema 066) is never
+a hop seed, for any caller.
 
 Full trust also reads the KG group it did not ask for (:func:`search_kg`), as a
 superset: the requested group's facts exactly as a one-group read serves them, then a
@@ -42,7 +44,7 @@ few vector/BM25 matches from the other group.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from ingestion.embedding import embed_dims
@@ -94,17 +96,38 @@ def group_sql(group_id: str | list[str], col: str = "group_id") -> str:
     return f"{col} = %s" if isinstance(group_id, str) else f"{col} = ANY(%s)"
 
 
-def scope_predicate(alias: str = "") -> str:
-    """The restricted-surface serving rule over ``kg_relationships`` (schema 056).
+#: synapse_meta key schema 066 stamps once: the highest kg_relationships.id when 066 ran.
+FACT_AUDIENCE_CUTOVER_KEY = "fact_audience_legacy_max_id"
 
-    A fact is servable to a restricted caller iff its source-project set is KNOWN
-    (``source_projects`` is NULL whenever any source episode is missing, has no project,
-    or the fact has no episode provenance at all), NON-EMPTY, and a SUBSET of the
-    caller's allowlist — so a fact with even one source outside the allowlist (mixed
-    provenance) is never served. One ``%s`` placeholder: the allowlist as a list.
+
+def scope_predicate(alias: str = "", *, fact_audience: bool = True) -> str:
+    """The restricted-surface serving rule over ``kg_relationships`` (schema 056, 066).
+
+    Provenance (056): a fact is servable to a restricted caller iff its source-project
+    set is KNOWN (``source_projects`` is NULL whenever any source episode is missing, has
+    no project, or the fact has no episode provenance at all), NON-EMPTY, and a SUBSET of
+    the caller's allowlist, so a fact with even one source outside the allowlist (mixed
+    provenance) is never served.
+
+    Sensitivity (066, ``fact_audience``): AND the fact is labelled ``work-safe``, or is
+    unlabelled and existed before 066 ran (``id`` at or below the cutover 066 stamped in
+    ``synapse_meta``). A ``personal`` fact is never servable; neither is an unlabelled
+    one written since, nor any unlabelled one when the stamp is missing. The cutover is
+    read by an uncorrelated subquery (one InitPlan per statement), which keeps the
+    ParadeDB BM25 TopN pushdown. ``fact_audience=False`` is the pre-066 rule, for a
+    database without the columns (``recall_sources`` decides, by probe).
+
+    One ``%s`` placeholder either way: the allowlist as a list.
     """
-    col = f"{alias}.source_projects" if alias else "source_projects"
-    return f"{col} IS NOT NULL AND cardinality({col}) > 0 AND {col} <@ %s::text[]"
+    p = f"{alias}." if alias else ""
+    col = f"{p}source_projects"
+    rule = f"{col} IS NOT NULL AND cardinality({col}) > 0 AND {col} <@ %s::text[]"
+    if not fact_audience:
+        return rule
+    return (
+        f"{rule} AND ({p}audience = 'work-safe' OR ({p}audience IS NULL AND {p}id <= "
+        f"(SELECT value::bigint FROM synapse_meta WHERE key = '{FACT_AUDIENCE_CUTOVER_KEY}')))"
+    )
 
 
 def _rrf_fuse(lists: list[list[str]], k: int = _RRF_K) -> dict[str, float]:
@@ -139,6 +162,8 @@ def search_kg_postgres(
     limit: int,
     allowed_projects: list[str] | None = None,
     vec_rows: list[FactRow] | None = None,
+    fact_audience: bool = True,
+    exclude_seeds: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Mirror of recall._search_kg over the Postgres KG mirror.
 
@@ -153,6 +178,17 @@ def search_kg_postgres(
     executes exactly the statements it always did. Requires schema 056; the caller owns
     the column-missing fallback (recall_sources._search_kg).
 
+    ``fact_audience`` (restricted only) adds schema 066's label rule to the predicate
+    (:func:`scope_predicate`). It defaults on, so a caller that forgets it fails closed:
+    on a database without 066 the statement raises UndefinedColumn and the restricted
+    handler serves nothing. ``recall_sources`` passes False for such a database, by probe.
+
+    ``exclude_seeds`` are the install owner's own entity uuids (schema 066, ``is_self``):
+    never a hop seed, for any caller. Facts about the owner are still served by the vector
+    and BM25 legs; the hop never starts from the owner node, whose thousands of edges
+    would spend the hop leg on one seed. Empty (no flagged owner, or no schema 066) sends
+    the seed statement exactly as before.
+
     ``vec_rows`` (full trust only) is step 1's result already in hand: this group's first
     ``limit * 3`` rows of a shared fact-vector walk (:func:`fact_vector_walk`,
     :func:`split_walk`), so the statement is not sent a second time for the other group.
@@ -160,8 +196,11 @@ def search_kg_postgres(
     restricted = allowed_projects is not None
     # Spliced into the full-trust statements as "" so their text is unchanged; a
     # restricted call appends the predicate and its one bound allowlist parameter.
-    scope_sql = f"  AND {scope_predicate()} " if restricted else ""
+    scope_sql = f"  AND {scope_predicate(fact_audience=fact_audience)} " if restricted else ""
     scope_args: tuple[Any, ...] = (allowed_projects,) if restricted else ()
+    # Likewise "" with no flagged owner: the seed statement then reads as it always did.
+    owner_sql = "  AND uuid <> ALL(%s::text[]) " if exclude_seeds else ""
+    owner_args: tuple[Any, ...] = (list(exclude_seeds),) if exclude_seeds else ()
     emb_s = _vec_literal(query_emb)
     # uuid -> (fact text, t_valid, ongoing, last_supported_at). t_valid = when the fact became
     # true (bitemporal valid-from), surfaced as the fact's "as-of" date; ongoing +
@@ -203,7 +242,7 @@ def search_kg_postgres(
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
             "    AND owner_id = %s AND group_id = %s AND web_artifact_id IS NULL "
-            f"   AND {scope_predicate()}"
+            f"   AND {scope_predicate(fact_audience=fact_audience)}"
             ") SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM cand "
             "ORDER BY dist LIMIT %s",
             (emb_s, owner_id, group_id, allowed_projects, limit * 3),
@@ -260,6 +299,7 @@ def search_kg_postgres(
         "    FROM kg_entities WHERE embedding IS NOT NULL "
         f"    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
         "  ) e WHERE owner_id = %s AND group_id = %s "
+        f"{owner_sql}"
         "  ORDER BY dist LIMIT 25"
         "), deg AS ("
         "  SELECT u, count(*) AS d FROM ("
@@ -284,6 +324,7 @@ def search_kg_postgres(
             _OVERFETCH,
             owner_id,
             group_id,
+            *owner_args,
             owner_id,
             group_id,
             *scope_args,
@@ -538,6 +579,8 @@ def search_kg(
     limit: int,
     allowed_projects: list[str] | None = None,
     cross_bm25: Callable[[], list[FactRow]] | None = None,
+    fact_audience: bool = True,
+    exclude_seeds: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """:func:`search_kg_postgres` over the group spec :func:`read_groups` returns.
 
@@ -554,22 +597,53 @@ def search_kg(
     running on another connection already) and is called once, after the requested group
     is read; without it the leg runs on ``cur``. Nothing served changes: each leg returns
     the rows its own statement did.
+
+    ``fact_audience`` and ``exclude_seeds`` go to every :func:`search_kg_postgres` call. The
+    cross-group functions take neither: they serve full trust only (a restricted caller
+    returns above, and :func:`read_groups` gives it one group) and have no hop leg.
     """
     if isinstance(group_id, str):
         return search_kg_postgres(
-            cur, query, query_emb, owner_id, group_id, session_focus, limit, allowed_projects
+            cur,
+            query,
+            query_emb,
+            owner_id,
+            group_id,
+            session_focus,
+            limit,
+            allowed_projects,
+            fact_audience=fact_audience,
+            exclude_seeds=exclude_seeds,
         )
     own_group, cross_groups = group_id[0], group_id[1:]
     if allowed_projects is not None:
         return search_kg_postgres(
-            cur, query, query_emb, owner_id, own_group, session_focus, limit, allowed_projects
+            cur,
+            query,
+            query_emb,
+            owner_id,
+            own_group,
+            session_focus,
+            limit,
+            allowed_projects,
+            fact_audience=fact_audience,
+            exclude_seeds=exclude_seeds,
         )
     walk = fact_vector_walk(cur, query_emb, owner_id, group_id)
     own_vec, cross_vec = split_walk(
         walk, own_group, limit * 3, cross_groups, CROSS_GROUP_EXTRAS * 3
     )
     facts, seeds = search_kg_postgres(
-        cur, query, query_emb, owner_id, own_group, session_focus, limit, vec_rows=own_vec
+        cur,
+        query,
+        query_emb,
+        owner_id,
+        own_group,
+        session_focus,
+        limit,
+        vec_rows=own_vec,
+        fact_audience=fact_audience,
+        exclude_seeds=exclude_seeds,
     )
     facts += cross_group_facts(
         cur,
