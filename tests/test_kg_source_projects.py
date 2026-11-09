@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -718,6 +719,60 @@ def test_applying_056_under_a_running_engine_takes_effect_without_a_restart(
     assert r._kg_scope_ready() is True
     facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
     assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}
+
+
+class _ProbeConn:
+    """The 056 probe's connection: answers a row, after ``hold`` the first time if set,
+    or raises ``fail`` once."""
+
+    def __init__(self, hold: Any = None, fail: Exception | None = None) -> None:
+        self.calls = 0
+        self.inside = threading.Event()
+        self.hold = hold
+        self.fail = fail
+
+    def execute(self, _sql: str) -> Any:
+        self.calls += 1
+        if self.fail is not None:
+            err, self.fail = self.fail, None
+            raise err
+        if self.calls == 1 and self.hold is not None:
+            self.inside.set()
+            assert self.hold.wait(5), "the first probe was never released"
+        return self
+
+    def fetchone(self) -> tuple[int]:
+        return (1,)
+
+
+def test_a_caller_arriving_during_the_first_probe_is_not_told_the_column_is_missing():
+    """A restricted recall's legs reach the probe together on a fresh engine. One that
+    arrives while another's probe is in flight probes too: it must not read the first
+    probe's start as a recent "not ready" and serve no facts."""
+    release = threading.Event()
+    conn = _ProbeConn(hold=release)
+    r = _recall_engine("postgresql://unused/none")
+    r._pg = lambda: nullcontext(conn)
+    with ThreadPoolExecutor(max_workers=1) as ex:
+        first = ex.submit(r._kg_scope_ready)
+        assert conn.inside.wait(5)
+        try:
+            assert r._kg_scope_ready() is True
+        finally:
+            release.set()
+        assert first.result(5) is True
+    assert conn.calls == 2
+
+
+def test_a_failed_probe_is_not_cached():
+    """Only a missing column waits out the reprobe interval; an error probes again on the
+    next call, as ColumnProbe.check does."""
+    conn = _ProbeConn(fail=psycopg.OperationalError("connection lost"))
+    r = _recall_engine("postgresql://unused/none")
+    r._pg = lambda: nullcontext(conn)
+    assert r._kg_scope_ready() is False
+    assert r._kg_scope_ready() is True
+    assert conn.calls == 2
 
 
 def test_schema_056_is_registered_for_apply_schema():
