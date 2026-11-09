@@ -436,9 +436,11 @@ class Poller:
         released = self._db.release_stale_claims()
         if released:
             logger.info("Released %d stale 'processing' claims back to pending", released)
-        last_full_cycle = 0.0
+        # -inf, not 0.0: time.monotonic() counts from boot, so 0.0 skipped the first full
+        # cycle (and the first orphan sweep) on a host up less than one interval (one day).
+        last_full_cycle = float("-inf")
         last_stale_sweep = time.monotonic()  # just swept above; next sweep one interval out
-        last_orphan_sweep = 0.0  # first full cycle sweeps, then daily
+        last_orphan_sweep = float("-inf")  # first full cycle sweeps, then daily
         # Small batches on purpose: a worker holds claimed rows in 'processing' for the
         # whole batch (~per-item time each, serial), so a LARGE batch (a) makes the priority
         # lane laggy — a worker won't re-check for new high-priority ingest until its batch

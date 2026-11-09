@@ -500,6 +500,16 @@ def test_a_full_cycle_runs_the_fact_stage_once_between_the_web_stage_and_the_swe
     assert calls == [*_FULL_CYCLE, "drain"]
 
 
+def test_the_first_full_cycle_runs_on_a_host_booted_moments_ago(monkeypatch):
+    """time.monotonic() counts from boot: a fresh host (a CI runner, a rebooted VM) still
+    gets its first full cycle and orphan sweep at once, not one interval or a day later."""
+    monkeypatch.delenv("SYNAPSE_DRAIN_ONLY", raising=False)
+    monkeypatch.setattr("ingestion.poller.time.monotonic", lambda: 5.0)
+    calls: list[str] = []
+    _loop_poller(monkeypatch, calls).run_loop(interval_seconds=300)
+    assert calls == [*_FULL_CYCLE, "drain"]
+
+
 @pytest.mark.parametrize("value", ["1", "true", "yes"])
 def test_a_drain_only_replica_never_runs_the_labelling_stages(monkeypatch, value):
     """Only the master labels: a scaled-out drain worker is an extraction-queue worker
