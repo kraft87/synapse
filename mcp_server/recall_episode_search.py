@@ -6,6 +6,7 @@ import logging
 from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING, Any
 
+from ingestion.bm25_sql import bm25_filter
 from ingestion.surfaces import (
     OWN_SURFACE_PROBE,
     SurfaceTrust,
@@ -82,7 +83,7 @@ class RecallEpisodeSearchMixin:
             return []
         ts = self._ts_col(table)
         extra = self._extra_cols(table)
-        where = ["id @@@ paradedb.match('content', %s)"]
+        where: list[str] = []  # one heap filter after the match (bm25_filter)
         params: list[Any] = [query]
         if project:
             where.append("project = %s")
@@ -106,7 +107,7 @@ class RecallEpisodeSearchMixin:
                            {ts} AS created_at{extra},
                            paradedb.score(id) AS bm25_score
                     FROM {table}
-                    WHERE {" AND ".join(where)}
+                    WHERE id @@@ paradedb.match('content', %s){bm25_filter(where)}
                     ORDER BY bm25_score DESC LIMIT %s
                     """,
                     (*params, limit),

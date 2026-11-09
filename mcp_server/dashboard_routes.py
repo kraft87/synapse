@@ -53,6 +53,7 @@ from starlette.responses import (
 )
 
 from ingestion import pg_pool
+from ingestion.bm25_sql import bm25_filter
 
 # Phase 2b: the two proposal lanes own their state transitions + side effects; the
 # dashboard REUSES their _proposal_act / _proposal_detail rather than reimplementing
@@ -948,11 +949,11 @@ def _search(
         if source is not None:
             ep_filt.append("COALESCE(NULLIF(source, ''), 'untagged') = %s")
             ep_p.append(source)
-        ep_and = "".join(f" AND {c}" for c in ep_filt)
+        ep_and = bm25_filter(ep_filt)
 
         f_and, f_p = "", []
         if group_id is not None:
-            f_and, f_p = " AND group_id = %s", [group_id]
+            f_and, f_p = bm25_filter(["group_id = %s"]), [group_id]
 
         ev_filt, ev_p = [], []
         if project is not None:
@@ -961,7 +962,7 @@ def _search(
         if group_id is not None:
             ev_filt.append("domain = %s")
             ev_p.append(group_id)
-        ev_and = "".join(f" AND {c}" for c in ev_filt)
+        ev_and = bm25_filter(ev_filt)
 
         en_and, en_p = "", []
         if group_id is not None:

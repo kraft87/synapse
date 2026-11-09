@@ -86,6 +86,7 @@ _DB_FILES = {
     "test_kg_both_groups.py",
     "test_kg_hop_order_db.py",
     "test_kg_fact_audience_db.py",
+    "test_bm25_filter_db.py",
     "test_fact_audience_db.py",
     "test_kg_owner_cli.py",
     "test_surface_routes.py",
