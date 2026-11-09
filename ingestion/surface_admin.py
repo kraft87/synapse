@@ -7,10 +7,20 @@ Installed as the ``synapse-admin`` console script, so it is on PATH inside the i
     docker compose exec mcp-server synapse-admin list
     docker compose exec mcp-server synapse-admin mint <label> [--full] [--projects a,b]
     docker compose exec mcp-server synapse-admin revoke <surface_id>
+    docker compose exec mcp-server synapse-admin owner list
+    docker compose exec mcp-server synapse-admin owner set <entity-uuid> [--apply]
+    docker compose exec mcp-server synapse-admin owner clear <entity-uuid> [--apply]
 
 It lives in the package (not ``scripts/``) precisely so it ships in the runtime image:
 the Dockerfile copies ingestion/, mcp_server/, dream/ and schema/, and nothing else.
 ``scripts/surface_admin.py`` is a thin shim over this module for host-side use.
+
+**Owner** flags the install owner's own KG entity (schema 066), which recall never uses as a
+hop seed (:mod:`ingestion.kg_owner`). It is here because this is the one admin CLI that ships
+in the image, and the flag is set by uuid only: ``owner list`` shows the flagged rows and the
+highest-degree entities per group (the owner's node is the one with thousands of edges), and
+``set`` and ``clear`` are dry runs until ``--apply``. There is no way to name or search for an
+entity, on purpose.
 
 **Bootstrap** is the ordinary first step of a fresh install. Every other path to a
 device credential needs something already working: enrollment needs an identity provider
@@ -43,6 +53,10 @@ import os
 import sys
 from typing import Any
 
+import psycopg
+from psycopg.rows import dict_row
+
+from ingestion import kg_owner
 from ingestion.surfaces import (
     list_surfaces,
     mint_surface,
@@ -79,6 +93,33 @@ def _print_token(out: dict[str, Any], *, bootstrap: bool = False) -> None:
         )
 
 
+def _owner(args: argparse.Namespace) -> int:
+    """``owner list | set | clear``: the exit code is :mod:`ingestion.kg_owner`'s."""
+    with psycopg.connect(args.db_url, autocommit=True, row_factory=dict_row) as conn:
+        if args.owner_cmd == "list":
+            if not kg_owner.ready(conn, args.db_url):
+                print(kg_owner.NOT_APPLIED, file=sys.stderr)
+                return 2
+            rows = kg_owner.flagged(conn)
+            print("flagged (never a hop seed):" if rows else "no entity is flagged")
+            for r in rows:
+                print(
+                    f"  {r['uuid']}  group={r['group_id']}  edges={r['live_degree']}  {r['name']}"
+                )
+            print("highest live degree per group (the owner's own node has the most edges):")
+            for r in kg_owner.candidates(conn):
+                flag = "  [flagged]" if r["is_self"] else ""
+                print(
+                    f"  {r['uuid']}  group={r['group_id']}  edges={r['live_degree']}  "
+                    f"{r['name']}{flag}"
+                )
+            return 0
+        act = kg_owner.set_owner if args.owner_cmd == "set" else kg_owner.clear_owner
+        code, msg = act(conn, args.uuid, apply=args.apply, key=args.db_url)
+        print(msg, file=sys.stderr if code else sys.stdout)
+        return code
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         prog="synapse-admin",
@@ -100,6 +141,14 @@ def main(argv: list[str] | None = None) -> int:
 
     ap_rev = sub.add_parser("revoke")
     ap_rev.add_argument("surface_id")
+
+    ap_owner = sub.add_parser("owner", help="flag the install owner's own KG entity (by uuid)")
+    owner_sub = ap_owner.add_subparsers(dest="owner_cmd", required=True)
+    owner_sub.add_parser("list")
+    for name in ("set", "clear"):
+        ap_act = owner_sub.add_parser(name)
+        ap_act.add_argument("uuid")
+        ap_act.add_argument("--apply", action="store_true", help="write it (default: dry run)")
 
     args = ap.parse_args(argv)
     if not args.db_url:
@@ -133,6 +182,9 @@ def main(argv: list[str] | None = None) -> int:
         # admin routes, so a restricted bootstrap would leave you exactly as stuck.
         _print_token(mint_surface(args.db_url, args.label, "full", []), bootstrap=True)
         return 0
+
+    if args.cmd == "owner":
+        return _owner(args)
 
     if args.cmd == "revoke":
         n = revoke_surface(args.db_url, args.surface_id)

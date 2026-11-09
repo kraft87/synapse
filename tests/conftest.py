@@ -87,6 +87,7 @@ _DB_FILES = {
     "test_kg_hop_order_db.py",
     "test_kg_fact_audience_db.py",
     "test_fact_audience_db.py",
+    "test_kg_owner_cli.py",
     "test_surface_routes.py",
     "test_credential_trust.py",
     "test_serving_notice.py",
