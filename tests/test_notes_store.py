@@ -30,7 +30,7 @@ from ingestion.db import Database  # noqa: E402
 from ingestion.db_connection import _EMBED_DIMS, _vector_literal  # noqa: E402
 from ingestion.db_notes import note_helpful_counts  # noqa: E402
 from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-from tests.helpers.embed import onehot  # noqa: E402
+from tests.helpers.embed import OneHotEmbedder, onehot  # noqa: E402
 
 
 def _wipe(conn):
@@ -96,6 +96,67 @@ def test_supersede_retires_old_and_links_lineage(conn, db_url):
     assert row[0] == new  # lineage FK points at the replacement
     live_ids = {h["id"] for h in db.find_live_notes(_OWNER, onehot(5), limit=5)}
     assert new in live_ids and old not in live_ids
+    db.close()
+    _wipe(conn)
+
+
+def _text_and_tier(conn, note_id):
+    return conn.execute(
+        "SELECT hook, body, audience, superseded_by FROM notes WHERE id = %s", (note_id,)
+    ).fetchone()
+
+
+def test_update_with_if_audience_changes_only_a_live_note_still_in_that_tier(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    nid = _insert(db, hook="Old hook", body="Old body.", slot=3, audience="work-safe")
+    new = {"hook": "New hook", "body": "New body.", "embedding": onehot(4), "embed_model": "t2"}
+
+    # The note is not in the tier the caller read it in: nothing changes.
+    assert db.update_note(nid, if_audience="personal", **new) is False
+    assert _text_and_tier(conn, nid) == ("Old hook", "Old body.", "work-safe", None)
+
+    # In that tier: the row changes, and an explicit audience still moves it.
+    assert db.update_note(nid, if_audience="work-safe", **new) is True
+    assert _text_and_tier(conn, nid) == ("New hook", "New body.", "work-safe", None)
+    assert db.update_note(nid, audience="personal", if_audience="work-safe", **new) is True
+    assert _text_and_tier(conn, nid)[2] == "personal"
+
+    # A retired note is refused even in the right tier, and its text stays.
+    successor = _insert(db, hook="Successor", slot=5, audience="personal")
+    db.supersede_note(nid, successor)
+    assert db.update_note(nid, if_audience="personal", **{**new, "hook": "Later hook"}) is False
+    assert _text_and_tier(conn, nid) == ("New hook", "New body.", "personal", successor)
+
+    # Without the keyword the statement is the plain id write, whatever the tier.
+    assert db.update_note(nid, **{**new, "hook": "Plain hook"}) is True
+    assert _text_and_tier(conn, nid)[0] == "Plain hook"
+    assert db.update_note(999_999_999, **new) is False  # no such row
+    db.close()
+    _wipe(conn)
+
+
+def test_supersede_with_if_audience_retires_only_a_live_note_still_in_that_tier(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    old = _insert(db, hook="Old", slot=6, audience="work-safe")
+    first = _insert(db, hook="First successor", slot=7, audience="personal")
+    second = _insert(db, hook="Second successor", slot=8, audience="personal")
+
+    assert db.supersede_note(old, first, if_audience="personal") is False
+    assert _text_and_tier(conn, old)[3] is None  # still live
+
+    assert db.supersede_note(old, first, if_audience="work-safe") is True
+    assert _text_and_tier(conn, old)[3] == first
+
+    # A retired note is never re-pointed, with the tier right, wrong or not asked for.
+    for kw in ({"if_audience": "work-safe"}, {"if_audience": "personal"}, {}):
+        assert db.supersede_note(old, second, **kw) is False
+        assert _text_and_tier(conn, old)[3] == first
+
+    # Without the keyword a live note is retired whatever its tier.
+    assert db.supersede_note(second, first) is True
+    assert _text_and_tier(conn, second)[3] == first
     db.close()
     _wipe(conn)
 
@@ -251,11 +312,15 @@ class _NotesDB:
         self._next_id += 1
         return self._next_id
 
-    def update_note(self, note_id, *, hook, body, embedding, embed_model, audience=None):
+    def update_note(
+        self, note_id, *, hook, body, embedding, embed_model, audience=None, if_audience=None
+    ):
         self.updated.append({"note_id": note_id, "hook": hook, "body": body, "audience": audience})
+        return True
 
-    def supersede_note(self, old_id, new_id):
+    def supersede_note(self, old_id, new_id, *, if_audience=None):
         self.superseded.append((old_id, new_id))
+        return True
 
     def restricted_surface_projects(self):
         """No registered restricted surface -> audience derivation falls to 'personal'.
@@ -284,6 +349,7 @@ def _cand(sim: float, type: str = "user", note_id: int = 42) -> dict:
         "body": "Existing body.",
         "type": type,
         "project": None,
+        "audience": "personal",
         "sim": sim,
     }
 
@@ -325,6 +391,29 @@ def test_reconcile_creates_when_no_candidates(monkeypatch):
     assert db.inserted[0]["source_ref"] == "ep:9"
     assert "group_id" not in db.inserted[0]  # the column default decides
     assert llm_calls == []  # no candidate -> no confirm call
+
+
+def test_reconcile_for_a_caller_that_is_not_known_never_looks_for_a_match(monkeypatch):
+    """Not a registered device or identity: no tier is searched (the spy sees no KNN call),
+    no judge is asked, and the note is stored with its embedding at the derived tier."""
+    llm_calls: list[dict] = []
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: llm_calls.append(k))
+    db = _NotesDB([_cand(0.99)])
+    result = reconcile_note(
+        db,
+        _StubEmb(),
+        object(),
+        hook="User prefers light mode",
+        body="New body.",
+        type="user",
+        project=None,
+        source_ref="ep:9",
+        caller_known=False,
+    )
+    assert result == {"outcome": "created", "note_id": 501, "prev_id": None, "audience": "personal"}
+    assert db.knn_calls == 0 and llm_calls == []
+    assert db.updated == [] and db.superseded == []
+    assert len(db.inserted) == 1 and db.inserted[0]["embedding"] is not None
 
 
 def test_reconcile_creates_below_threshold(monkeypatch):
@@ -444,18 +533,6 @@ def test_reconcile_rejects_invalid_type():
 # ---------------------------------------------------------------------------
 
 
-class _OneHotEmb:
-    """Embeds every text to one slot, so a note seeded in that slot is an exact match."""
-
-    model_name = "test"
-
-    def __init__(self, slot):
-        self._slot = slot
-
-    def embed(self, texts, task):
-        return [onehot(self._slot) for _ in texts]
-
-
 def _seed_note(conn, *, group_id, slot):
     return conn.execute(
         "INSERT INTO notes (owner_id, group_id, type, hook, body, embedding, embed_model) "
@@ -468,7 +545,7 @@ def _seed_note(conn, *, group_id, slot):
 def _write_note(db, slot, project):
     return reconcile_note(
         db,
-        _OneHotEmb(slot),
+        OneHotEmbedder(slot),
         object(),
         hook="User prefers light mode",
         body="New body.",

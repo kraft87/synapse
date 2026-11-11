@@ -48,6 +48,12 @@ Reconciling a write against the live notes works one tier at a time. A write nev
 a live note of another tier, and a restricted caller never sees, edits or retires a
 personal note:
 
+- Only a registered caller's write can match, edit or retire an existing note. A caller
+  whose credential is not a registered device or identity (the shared root token, an
+  unregistered OAuth identity, no token) is restricted for reads, so its write looks at no
+  note: no tier is searched, no judge is called, and the note is stored at its derived
+  tier. The answer is "created" whether or not a similar note exists, so it cannot be used
+  to find out that one does. The nightly lane merges same-tier duplicates later.
 - A restricted caller is matched against `work-safe` notes only, in SQL, whatever
   `audience` it passed. The personal tier is never queried for it.
 - A full-trust caller is matched in the tier its write will be stored under, then in the
@@ -57,13 +63,18 @@ personal note:
   updates the note in place and moves it. An LLM outage or `SYNAPSE_NOTES_CONFIRM=0`
   counts as a restatement.
 - A restatement within a tier keeps the stored `audience`.
+- The edit or retirement that follows the confirm call applies only if the note is still
+  live and still in the tier it was read in. If another write moved or retired it in the
+  meantime, the note is left as it is and the new note is created instead.
 - The nightly notes lane follows the same rule. A DUPLICATE verdict on two notes of
   different tiers is not applied (neither is retired, the pair is memoised, and the
   curation row says `kept: other tier`), so it cannot undo the twin a restatement made. A
   CORRECTION is applied whatever the tiers, as a contradiction is at write time.
 
-The dream notes judge (retype / re-project / supersede) preserves `audience` on update,
-and re-derives it by rule 3 if it changes a note's `project`.
+The dream notes judge (retype / re-project / supersede) never changes `audience`. A
+retype moves a note's type and project only, so the project a model picks cannot change
+who can read the note. A tier moves only by an explicit write (an `audience` argument or
+the backfill script).
 
 ### 2. Timeline
 

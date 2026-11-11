@@ -9,7 +9,10 @@ single write path — the remember() rework and the seed importer both call
 Reconciliation, keyed on cosine similarity of the new HOOK to the live notes of ONE
 tier at a time (``notes.audience``: 'personal' or 'work-safe'). The rule across tiers:
 a write never edits a live note of another tier, and a restricted caller never sees,
-edits or retires a personal note. Which tier is searched:
+edits or retires a personal note. Only a REGISTERED caller's write can match, edit or
+retire an existing note at all. Which tier is searched:
+  - a caller that is not a registered device or identity looks at nothing: its note is
+    always inserted;
   - a REGISTERED restricted caller looks only at work-safe notes, whatever ``audience``
     it passed (the personal tier is never queried for it);
   - a full-trust caller looks first in the tier its write will be stored under, then in
@@ -26,6 +29,9 @@ A candidate is the top hit of a tier when its sim >= SYNAPSE_NOTES_SIM_MATCH (de
     tier, so the same wording can hold a twin in each tier; only an explicit
     ``audience`` argument updates the other-tier note in place and moves it to that tier
   - no candidate in either tier -> INSERT a new live note.
+The confirm call takes seconds, so the update or retirement that follows is conditioned
+on the candidate still being live and still in the tier it was read in. If another write
+moved or retired it meanwhile, it is left as it is and the new note is inserted instead.
 
 Fail-open, always toward "same": the kill switch (SYNAPSE_NOTES_CONFIRM=0) and any
 LLM failure both collapse the confirm to "same" — an over-eager update loses a
@@ -151,6 +157,7 @@ def reconcile_note(
     source_ref: str | None,
     audience: str | None = None,
     caller_restricted: bool = False,
+    caller_known: bool = True,
 ) -> dict[str, Any]:
     """Write one explicit note, reconciling against the live set.
 
@@ -166,9 +173,19 @@ def reconcile_note(
     ``audience`` is the explicit override (precedence 1); ``caller_restricted`` says the
     write came from a REGISTERED restricted surface (precedence 2); everything else
     falls to the project rule in :func:`ingestion.surfaces.derive_audience`.
+    ``caller_known`` is False for a credential that is not a registered device or identity
+    (the shared root token, an unregistered OAuth identity, no token).
 
     A write never edits a live note of another tier, and a restricted caller never sees,
-    edits or retires a personal note:
+    edits or retires a personal note.
+
+    Only a registered caller's write can match, edit or retire an existing note. A caller
+    that is not known is restricted for reads but has no tier of its own to write in, so
+    letting it match would let it overwrite or retire a personal note and learn from the
+    outcome that one exists. Its note is embedded and stored at its derived tier without a
+    lookup or a judge call, and the outcome is "created" whether or not a similar note
+    exists. The nightly lane merges same-tier duplicates later, so the cost is a
+    short-lived twin.
 
     * A restricted caller matches only work-safe notes, whatever ``audience`` it passed.
     * A full-trust caller matches in the tier its write will be stored under first. If
@@ -178,6 +195,10 @@ def reconcile_note(
       in place and moved to the tier asked for only when ``audience`` was given.
     * A restatement within a tier preserves the note's stored tier. Reclassification is
       an explicit act, never a side effect of rephrasing.
+    * The edit or retirement that follows the confirm call requires the note to still be
+      live and in the tier it was read in. If it is not (another write moved or retired
+      it meanwhile), nothing of that note changes and the new note is created in its own
+      tier.
     """
     if type not in _VALID_TYPES:
         raise ValueError(f"invalid note type {type!r} — expected one of {_VALID_TYPES}")
@@ -201,11 +222,12 @@ def reconcile_note(
             logger.warning("note embed failed (%s); storing with NULL embedding, dedup skipped", e)
             vec, embed_model = None, None
 
-    # `top` is the note this write may restate or contradict. A restricted caller sees
-    # only the restricted tier; a full-trust one tries its own tier, then the other.
+    # `top` is the note this write may restate or contradict. A caller that is not known
+    # looks at nothing; a restricted one sees only the restricted tier; a full-trust one
+    # tries its own tier, then the other.
     top: dict[str, Any] | None = None
     other_tier = False
-    if vec is not None:
+    if vec is not None and caller_known:
         if caller_restricted:
             top = _live_match(db, vec, type, RESTRICTED_AUDIENCE)
         else:
@@ -229,15 +251,13 @@ def reconcile_note(
             )
         )
 
+    def _created(new_id: int) -> dict[str, Any]:
+        return {"outcome": "created", "note_id": new_id, "prev_id": None, "audience": new_audience}
+
     if top is None:
         new_id = _insert()
         logger.info("note created (#%s, %s, %s): %s", new_id, type, new_audience, hook[:80])
-        return {
-            "outcome": "created",
-            "note_id": new_id,
-            "prev_id": None,
-            "audience": new_audience,
-        }
+        return _created(new_id)
 
     relation = _confirm_relation(llm, top, hook, body)
     if relation == "contradicts":
@@ -245,7 +265,18 @@ def reconcile_note(
         # inheriting the retired note's: inheriting would let a personal statement
         # arrive work-safe just because it reversed a work-safe one.
         new_id = _insert()
-        db.supersede_note(top["id"], new_id)
+        if not db.supersede_note(top["id"], new_id, if_audience=top["audience"]):
+            # The old note was retired or moved to another tier while the confirm call
+            # ran, so it is not this write's to retire. The new note stands on its own.
+            logger.info(
+                "note created (#%s, %s, %s); #%s changed under the write, not superseded: %s",
+                new_id,
+                type,
+                new_audience,
+                top["id"],
+                hook[:80],
+            )
+            return _created(new_id)
         logger.info("note superseded #%s -> #%s: %s", top["id"], new_id, hook[:80])
         return {
             "outcome": "superseded",
@@ -268,22 +299,30 @@ def reconcile_note(
             top["id"],
             hook[:80],
         )
-        return {
-            "outcome": "created",
-            "note_id": new_id,
-            "prev_id": None,
-            "audience": new_audience,
-        }
+        return _created(new_id)
 
     # Restatement: pass the tier ONLY when it was explicitly given. `audience=None`
     # reaches update_note as COALESCE(NULL, audience) — the stored tier survives.
-    db.update_note(
+    if not db.update_note(
         top["id"],
         hook=hook,
         body=body,
         embedding=vec,
         embed_model=embed_model,
         audience=audience,
-    )
+        if_audience=top["audience"],
+    ):
+        # The note was retired or moved to another tier while the confirm call ran;
+        # writing into it now would put this text under a label it was not written for.
+        new_id = _insert()
+        logger.info(
+            "note created (#%s, %s, %s); #%s changed under the write, not updated: %s",
+            new_id,
+            type,
+            new_audience,
+            top["id"],
+            hook[:80],
+        )
+        return _created(new_id)
     logger.info("note updated (#%s): %s", top["id"], hook[:80])
     return {"outcome": "updated", "note_id": top["id"], "prev_id": None, "audience": audience}

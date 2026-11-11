@@ -16,3 +16,15 @@ def onehot(slot: int) -> list[float]:
     v = [0.0] * _DIMS
     v[slot % _DIMS] = 1.0
     return v
+
+
+class OneHotEmbedder:
+    """Embeds every text to one slot, so a note seeded on that slot is an exact match."""
+
+    model_name = "test"
+
+    def __init__(self, slot: int) -> None:
+        self._slot = slot
+
+    def embed(self, texts: list[str], task: str) -> list[list[float]]:
+        return [onehot(self._slot) for _ in texts]

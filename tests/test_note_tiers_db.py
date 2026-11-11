@@ -31,7 +31,7 @@ except Exception:  # pragma: no cover - environment dependent
 import ingestion.notes as notes_mod  # noqa: E402
 from ingestion.db import Database  # noqa: E402
 from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-from tests.helpers.embed import onehot  # noqa: E402
+from tests.helpers.embed import OneHotEmbedder, onehot  # noqa: E402
 from tests.helpers.surfaces import clear_surfaces, register_restricted  # noqa: E402
 
 _OLD_HOOK = "User likes terse status updates"
@@ -41,18 +41,6 @@ _NEW_BODY = "Two-line updates; the hobby budget is tracked separately."
 _NEWER_HOOK = "User likes terse status updates and has moved the hobby budget to a new tool"
 _NEWER_BODY = "Two-line updates; the hobby budget now lives in a new tool."
 _SLOT = 40
-
-
-class _OneHotEmb:
-    """Embeds every text to one slot, so a note seeded on that slot is an exact match."""
-
-    model_name = "test"
-
-    def __init__(self, slot):
-        self._slot = slot
-
-    def embed(self, texts, task):
-        return [onehot(self._slot) for _ in texts]
 
 
 @pytest.fixture()
@@ -69,14 +57,17 @@ def tiers(conn, db_url):
 
 @pytest.fixture()
 def confirm(monkeypatch):
-    """Set what the relation confirm answers; returns the list of its calls."""
+    """Set what the relation confirm answers; returns the list of its calls. ``during`` runs
+    inside the call, which is where another writer can change a note the write has read."""
     calls: list[dict] = []
 
-    def _answer(relation):
+    def _answer(relation, during=None):
         calls.clear()
 
         def _fake(*a, **k):
             calls.append(k)
+            if during is not None:
+                during()
             if isinstance(relation, Exception):
                 raise relation
             return relation
@@ -104,7 +95,7 @@ def _seed(db, *, audience, hook=_OLD_HOOK, body=_OLD_BODY, type="user", slot=_SL
 def _write(db, *, hook=_NEW_HOOK, body=_NEW_BODY, type="user", slot=_SLOT, **kw):
     kw.setdefault("project", None)
     return reconcile_note(
-        db, _OneHotEmb(slot), object(), hook=hook, body=body, type=type, source_ref="ep:1", **kw
+        db, OneHotEmbedder(slot), object(), hook=hook, body=body, type=type, source_ref="ep:1", **kw
     )
 
 
@@ -256,3 +247,53 @@ def test_restricted_write_restating_a_work_safe_note_updates_it(conn, tiers, con
     assert res == {"outcome": "updated", "note_id": work, "prev_id": None, "audience": None}
     assert _row(conn, work) == (_NEW_HOOK, _NEW_BODY, "work-safe", None)
     assert _row(conn, personal) == (_OLD_HOOK, _OLD_BODY, "personal", None)
+
+
+# ---------------------------------------------------------------------------
+# The note can change between the read and the write
+# ---------------------------------------------------------------------------
+
+
+def _set_audience(conn, note_id, audience):
+    conn.execute("UPDATE notes SET audience = %s WHERE id = %s", (audience, note_id))
+
+
+def test_a_restatement_never_lands_on_a_note_that_turned_personal_meanwhile(conn, tiers, confirm):
+    """A restricted write read a work-safe note; while the confirm call ran, another write
+    made it personal. The restatement must not overwrite that personal text."""
+    work = _seed(tiers, audience="work-safe")
+    confirm("same", during=lambda: _set_audience(conn, work, "personal"))
+    res = _write(tiers, caller_restricted=True)
+    assert res["outcome"] == "created" and res["note_id"] != work
+    assert res["audience"] == "work-safe" and res["prev_id"] is None
+    assert _row(conn, work) == (_OLD_HOOK, _OLD_BODY, "personal", None)
+    assert _row(conn, res["note_id"]) == (_NEW_HOOK, _NEW_BODY, "work-safe", None)
+    assert _count_containing(conn, "personal", "hobby budget") == 0
+
+
+def test_a_contradiction_never_retires_a_note_that_turned_personal_meanwhile(conn, tiers, confirm):
+    work = _seed(tiers, audience="work-safe")
+    confirm("contradicts", during=lambda: _set_audience(conn, work, "personal"))
+    res = _write(tiers, caller_restricted=True)
+    assert res["outcome"] == "created" and res["note_id"] != work
+    assert res["audience"] == "work-safe" and res["prev_id"] is None
+    assert _row(conn, work) == (_OLD_HOOK, _OLD_BODY, "personal", None)  # still live
+    assert _row(conn, res["note_id"]) == (_NEW_HOOK, _NEW_BODY, "work-safe", None)
+    assert [n for n, _, _ in _live(conn)] == [work, res["note_id"]]
+
+
+def test_a_restatement_never_lands_on_a_note_retired_meanwhile(conn, tiers, confirm):
+    old = _seed(tiers, audience="personal")
+    successor = _seed(
+        tiers, audience="personal", hook="Unrelated", body="Unrelated.", slot=_SLOT + 1
+    )
+    confirm(
+        "same",
+        during=lambda: conn.execute(
+            "UPDATE notes SET superseded_by = %s WHERE id = %s", (successor, old)
+        ),
+    )
+    res = _write(tiers)
+    assert res["outcome"] == "created" and res["note_id"] not in (old, successor)
+    assert _row(conn, old) == (_OLD_HOOK, _OLD_BODY, "personal", successor)
+    assert _row(conn, res["note_id"]) == (_NEW_HOOK, _NEW_BODY, "personal", None)

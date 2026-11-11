@@ -76,6 +76,13 @@ def env(monkeypatch, conn, db_url):
     monkeypatch.setattr(server, "_recall_engine", engine)
     monkeypatch.setattr(server, "_notes_deps", lambda: (emb, object()))
     monkeypatch.setattr(notes_mod, "parse_with_retry", _fake_parse)
+    # The caller is a registered full-trust device: only a registered caller's write is
+    # matched against the live notes (an unknown caller's is always a new note).
+    device = SimpleNamespace(
+        client_id=server._DEVICE_CLIENT_ID,
+        claims={"kind": "device", "surface_id": "dev-full", "trust": "full"},
+    )
+    monkeypatch.setattr(server, "get_access_token", lambda: device)
 
     db = Database(db_url)
     yield SimpleNamespace(

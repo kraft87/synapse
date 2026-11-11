@@ -34,6 +34,7 @@ from dream.notes.nightly import run_lane  # noqa: E402
 from ingestion.db import Database  # noqa: E402
 from ingestion.embedding import embed_dims  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
+from tests.helpers.surfaces import clear_surfaces, register_restricted  # noqa: E402
 
 _DIMS = embed_dims()
 
@@ -72,13 +73,17 @@ def _insert(
     )
 
 
-def _stub_llm(monkeypatch, pair_verdicts=(), scope_verdicts=()):
-    """Stub the judge; returns the list of judge calls it has served."""
+def _stub_llm(monkeypatch, pair_verdicts=(), scope_verdicts=(), on_pair=None):
+    """Stub the judge; returns the list of judge calls it has served. ``on_pair`` runs
+    inside each pair call, which is where another writer can change a note the lane has
+    already read."""
     pairs, scopes, calls = list(pair_verdicts), list(scope_verdicts), []
 
     def _fake(llm, *, base_prompt, parser, model, max_tokens):
         calls.append(parser.__name__)
         if parser is lane.parse_pair_verdict:
+            if on_pair is not None:
+                on_pair()
             return pairs.pop(0)
         return scopes.pop(0)
 
@@ -440,3 +445,79 @@ def test_lane_retype_applies_only_for_an_existing_slug(conn, db_url, monkeypatch
     assert known  # the pre-existing project note is untouched
     db.close()
     _wipe(conn)
+
+
+def test_lane_leaves_a_pair_alone_when_the_loser_changed_tier_during_the_judge_calls(
+    conn, db_url, monkeypatch
+):
+    """The loser was personal when the lane read it and work-safe by the time the lane
+    retires it. The retirement is refused, recorded as not applied, and spends none of
+    the apply budget: with a budget of one, the pair behind it is still merged."""
+    _wipe(conn)
+    db = Database(db_url)
+    a = _insert(db, hook="Backups run nightly at 02:00", degrees=0)
+    b = _insert(db, hook="The nightly backup job fires at 02:00", degrees=10)
+    c = _insert(db, hook="Logs rotate weekly", degrees=100)
+    d = _insert(db, hook="Log rotation happens every week", degrees=130)
+    _stub_llm(
+        monkeypatch,
+        pair_verdicts=[_DUP] * 4,
+        on_pair=lambda: conn.execute("UPDATE notes SET audience = 'work-safe' WHERE id = %s", (a,)),
+    )
+    res = run_lane(db=db, llm=object(), max_retype_judge=0, max_apply=1)
+    assert res["counts"]["pairs_judged"] == 2 and res["counts"]["applied_supersede"] == 1
+    assert res["samples"] == [f"n:{c} -> superseded by n:{d} (duplicate)"]
+    live = conn.execute(
+        "SELECT id FROM notes WHERE superseded_by IS NULL AND id = ANY(%s) ORDER BY id",
+        ([a, b, c, d],),
+    ).fetchall()
+    assert live == [(a,), (b,), (d,)]
+    rows = conn.execute(
+        "SELECT note_a, verdict, applied, detail FROM notes_curation ORDER BY note_a"
+    ).fetchall()
+    assert [r[:3] for r in rows] == [(a, "DUPLICATE", False), (c, "DUPLICATE", True)]
+    assert rows[0][3]["kept"] == "changed during the run"
+    db.close()
+    _wipe(conn)
+
+
+def test_lane_retype_never_changes_a_notes_tier(conn, db_url, monkeypatch):
+    """The scope judge decides which project a note is filed under, never who can read it.
+    A personal note filed under a project a restricted device reads stays personal, and a
+    work-safe note filed under a project on no allowlist stays work-safe."""
+    _wipe(conn)
+    clear_surfaces(conn)
+    register_restricted(conn, ["alpha"])
+    db = Database(db_url)
+    try:
+        # A slug must already exist in the store for a retype to apply.
+        _insert(db, hook="Alpha uses a queue", type="project", project="alpha", degrees=0)
+        _insert(db, hook="Gamma uses a cache", type="project", project="gamma", degrees=90)
+        personal = _insert(
+            db, hook="User prefers terse commit messages", degrees=180, audience="personal"
+        )
+        work = _insert(
+            db, hook="User reviews diffs before merging", degrees=270, audience="work-safe"
+        )
+        _stub_llm(
+            monkeypatch,
+            scope_verdicts=[
+                {"scope": "PROJECT", "project": "alpha"},
+                {"scope": "PROJECT", "project": "gamma"},
+            ],
+        )
+        res = run_lane(db=db, llm=object(), max_judge=0)
+        assert res["counts"]["applied_retype"] == 2
+        got = {
+            r[0]: r[1:]
+            for r in conn.execute(
+                "SELECT id, type, project, audience FROM notes WHERE id = ANY(%s)",
+                ([personal, work],),
+            ).fetchall()
+        }
+        assert got[personal] == ("project", "alpha", "personal")
+        assert got[work] == ("project", "gamma", "work-safe")
+    finally:
+        db.close()
+        clear_surfaces(conn)
+        _wipe(conn)

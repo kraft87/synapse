@@ -51,6 +51,7 @@ from ingestion.surfaces import (  # noqa: E402
 )
 from mcp_server import server  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
+from tests.helpers.embed import OneHotEmbedder, onehot  # noqa: E402
 from tests.helpers.surfaces import (  # noqa: E402
     clear_surfaces,
     register_full,
@@ -70,7 +71,7 @@ def clean(conn):
     _wipe()
 
 
-def _note(db_url, hook, *, audience="personal", type="user", project=None):
+def _note(db_url, hook, *, audience="personal", type="user", project=None, embedding=None):
     db = Database(db_url)
     try:
         return db.insert_note(
@@ -79,8 +80,8 @@ def _note(db_url, hook, *, audience="personal", type="user", project=None):
             type=type,
             hook=hook,
             body=f"Body of: {hook}",
-            embedding=None,
-            embed_model=None,
+            embedding=embedding,
+            embed_model="test" if embedding is not None else None,
             source_ref=None,
             audience=audience,
         )
@@ -585,9 +586,10 @@ class _StubDB:
 
     def update_note(self, note_id, **kw):
         self.updates.append({"note_id": note_id, **kw})
+        return True
 
-    def supersede_note(self, old_id, new_id):
-        pass
+    def supersede_note(self, old_id, new_id, *, if_audience=None):
+        return True
 
     def restricted_surface_projects(self):
         return []
@@ -939,3 +941,49 @@ def test_restricted_project_union_ignores_revoked_devices(clean, db_url):
         assert restricted_project_union(db) == {"alpha"}
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("token", [_RootToken, lambda: None], ids=["root-token", "no-token"])
+@pytest.mark.parametrize("asked", [None, "work-safe"], ids=["no-audience", "audience-work-safe"])
+def test_an_unknown_caller_never_matches_an_existing_note(
+    remember_env, db_url, monkeypatch, token, asked
+):
+    """An unknown caller is restricted for reads, so its write must not be able to edit,
+    retire or move a personal note, nor tell by its answer that one exists. The embedder
+    puts the write exactly on the personal note and the judge would say "same", so a
+    lookup would show: the answer must be the one an empty store gives, with no lookup."""
+    judge_calls: list[dict] = []
+    monkeypatch.setattr(
+        notes_mod, "parse_with_retry", lambda *a, **k: judge_calls.append(k) or "same"
+    )
+    monkeypatch.setattr(server, "_notes_deps", lambda: (OneHotEmbedder(40), object()))
+    monkeypatch.setattr(server, "get_access_token", token)
+    assert server._caller_trust() == UNKNOWN_SURFACE
+    hook = "User keeps a private reading log"
+    write = {"hook": hook, "body": f"Body of: {hook}", "type": "user"}
+    if asked:
+        write["audience"] = asked
+
+    control = _remember(**write)  # nothing similar stored yet
+    remember_env.execute("DELETE FROM notes")
+    personal = _note(db_url, hook, audience="personal", embedding=onehot(40))
+    untouched = remember_env.execute(
+        "SELECT hook, body, audience, superseded_by, updated_at FROM notes WHERE id = %s",
+        (personal,),
+    ).fetchone()
+
+    out = _remember(**write)
+    assert out["outcome"] == "created" and out["note_id"] != personal
+    assert set(out) == set(control) and out["audience"] == control["audience"]
+    assert out["outcome"] == control["outcome"]
+    assert judge_calls == []
+    assert (
+        remember_env.execute(
+            "SELECT hook, body, audience, superseded_by, updated_at FROM notes WHERE id = %s",
+            (personal,),
+        ).fetchone()
+        == untouched
+    )
+    assert untouched[2] == "personal" and untouched[3] is None
+    live = remember_env.execute("SELECT id FROM notes WHERE superseded_by IS NULL ORDER BY id")
+    assert [r[0] for r in live.fetchall()] == [personal, out["note_id"]]

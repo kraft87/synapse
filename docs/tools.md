@@ -54,7 +54,9 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   current instead of accumulating duplicates. A restatement never edits a note of the
   other audience tier (personal or work-safe): it is stored as a note of its own. A
   restricted caller is only ever matched against work-safe notes, and only an explicit
-  `audience` moves an existing note.
+  `audience` moves an existing note. A caller whose credential is not a registered device
+  or identity (for example the shared root token) is never matched at all: its note is
+  always stored as a new one.
 - **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, project=None)`**
   reports retrieval quality after a recall whose results you used: which served ids were
   load-bearing, which were noise, and what was missing. It writes one row of offline labeled data for eval
