@@ -103,6 +103,7 @@ _DB_FILES = {
     "test_ingest_span_collision_db.py",
     "test_web_audience_db.py",
     "test_repair_numbered_entity_magnets_db.py",
+    "test_pile_merge_067_db.py",
 }
 
 

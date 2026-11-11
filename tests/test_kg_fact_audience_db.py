@@ -6,7 +6,7 @@ The statements are in test_kg_fact_audience_sql.py; what they do to rows is here
 
   * every restricted leg: vector, BM25, the seed degree gate, the hop, the superseded
     pairs, the supersession surface and the episode overlay
-  * the personal pile's rows are personal on insert (trigger), whatever provenance says
+  * a fact regrouped out of the personal pile keeps its personal v0 label, whatever provenance says
   * a missing cutover stamp fails closed; the BM25 TopK pushdown survives the clause
   * the owner's flagged entity is never a hop seed, for any caller, and its facts are
     still served by the other legs
@@ -35,7 +35,7 @@ from tests.helpers.embed import GROUP, onehot
 from tests.helpers.surfaces import clear_surfaces, register_full, register_restricted
 
 WORK = "work-proj"
-PERS = "personal"  # the second KG group; its rows are personal on insert (schema 066)
+PERS = "personal"  # the second KG group: 067 empties it, the read paths still take it by name
 LEGS = ("v", "b", "h")  # vector, BM25, hop
 
 
@@ -98,12 +98,14 @@ def _fact(
     group: str = GROUP,
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
+    label_version: int | None = None,
 ) -> None:
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience) "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience, "
+        "  label_version) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
+        "        '2026-01-01T00:00:00+00:00', %s, %s, %s, %s)",
         (
             uid,
             group,
@@ -115,6 +117,7 @@ def _fact(
             t_invalid,
             invalidated_by,
             audience,
+            label_version,
         ),
     )
 
@@ -373,25 +376,25 @@ def test_the_episode_overlay_needs_both_edges_to_pass_the_label_rule(kg, cutover
 
 
 # ---------------------------------------------------------------------------
-# The personal pile
+# Facts regrouped out of the personal pile
 # ---------------------------------------------------------------------------
 
 
-def test_a_restricted_request_for_the_personal_group_is_served_nothing(kg, db_url):
-    """Facts still written to the personal group are personal on insert (a trigger), so
-    naming that group is no way round the label, whatever their provenance says."""
+def test_a_regrouped_fact_keeps_personal_v0_and_is_served_a_restricted_request_nothing(kg, db_url):
+    """067 moves every personal-pile fact into the one group and keeps its 'personal' label (it
+    was stamped on insert until then), so naming no pile at all is still no way round the
+    label, whatever the fact's provenance says."""
     ep = _ep(kg)
-    _entity(kg, "p-seed", "PSeed", 0, PERS)
-    _fact(kg, "p-vec", "alpha", ep, audience=None, emb=0, group=PERS)
-    _fact(kg, "p-bm25", "widget thing", ep, audience=None, group=PERS)
-    _fact(kg, "p-hop", "epsilon", ep, audience=None, src="p-seed", group=PERS)
+    _entity(kg, "p-seed", "PSeed", 0)
+    _fact(kg, "p-vec", "alpha", ep, audience="personal", label_version=0, emb=0)
+    _fact(kg, "p-bm25", "widget thing", ep, audience="personal", label_version=0)
+    _fact(kg, "p-hop", "epsilon", ep, audience="personal", label_version=0, src="p-seed")
     assert kg.execute(
-        "SELECT DISTINCT audience, label_version FROM kg_relationships WHERE group_id = %s",
-        (PERS,),
-    ).fetchall() == [("personal", 0)]
+        "SELECT DISTINCT group_id, audience, label_version FROM kg_relationships"
+    ).fetchall() == [(GROUP, "personal", 0)]
     r = Recall(db_url, "")
-    assert _restricted_kg(r, PERS) == set()
-    facts, _ = r._search_kg("widget", onehot(0), PERS, [], 20)
+    assert _restricted_kg(r) == set()
+    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
     assert _uuids(facts) == {"p-vec", "p-bm25", "p-hop"}
 
 

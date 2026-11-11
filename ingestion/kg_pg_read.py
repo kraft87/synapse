@@ -63,6 +63,24 @@ _OVERFETCH = 200
 # scope, so a short pool is enough and keeps the per-fact heap fetches cheap.
 _RESTATED_OVERFETCH = 32
 
+#: Which entity answers when several rows share a name: the owner's flagged entity, then the
+#: oldest. The id never changes, so the SQL lookup below, the in-memory name index
+#: (``load_entities``, read by ``dedup``) and the one-memory merge (schema/067,
+#: scripts/pile_merge.py) pick the same row for a name that exists twice. That holds for every
+#: row whose stored normalized_name is empty or is the normalized name; a row stored under some
+#: other key is found under that key by the lookup and under its name by the index.
+SURVIVOR_ORDER = "is_self DESC, id"
+
+
+#: The name lookup, one statement: a stored-name match, or an old row with no stored name matched
+#: by lower(trim(name)); ranked together. Both arms are index conditions on ``normalized_name``.
+_ENTITY_BY_NAME_SQL = (
+    "SELECT uuid FROM kg_entities WHERE owner_id = %s AND group_id = %s "
+    "AND (normalized_name = %s "
+    "     OR ((normalized_name IS NULL OR normalized_name = '') AND lower(trim(name)) = %s)) "
+    "ORDER BY " + SURVIVOR_ORDER + " LIMIT 1"  # nosec B608 - a module constant
+)
+
 
 def _vec_literal(emb: list[float]) -> str:
     return "[" + ",".join(map(str, emb)) + "]"
@@ -147,23 +165,18 @@ class KGPostgresReader:
             return [{"uuid": u, "name": n, "score": float(d)} for u, n, d in cur.fetchall()]
 
     def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
-        """Exact normalized-name lookup (NodeDeduper short-circuit)."""
+        """Exact normalized-name lookup (NodeDeduper short-circuit).
+
+        One ranked match on the row's key: its stored ``normalized_name``, or lower(trim(name))
+        for a row written before that column existed (empty). Not a stored-name lookup with a
+        fallback behind it: a fallback is reached only when the first step finds nothing, so a
+        name held by an old row and a newer one would resolve to the newer, while the merge
+        (schema/067) keeps the oldest. The empty-name arm is a few dozen rows, so the btree on
+        ``normalized_name`` still answers the lookup."""
+        if not normalized:
+            return None
         conn = self._connection()
-        cur = conn.execute(
-            "SELECT uuid FROM kg_entities "
-            "WHERE owner_id = %s AND group_id = %s AND normalized_name = %s LIMIT 1",
-            (OWNER, group_id, normalized),
-        )
-        row = cur.fetchone()
-        if row:
-            return str(row[0])
-        # Pre-migration nodes without the property: compute on the fly (rare;
-        # mirrors the FalkorDB fallback).
-        cur = conn.execute(
-            "SELECT uuid FROM kg_entities "
-            "WHERE owner_id = %s AND group_id = %s AND lower(trim(name)) = %s LIMIT 1",
-            (OWNER, group_id, normalized),
-        )
+        cur = conn.execute(_ENTITY_BY_NAME_SQL, (OWNER, group_id, normalized, normalized))
         row = cur.fetchone()
         return str(row[0]) if row else None
 
@@ -178,11 +191,15 @@ class KGPostgresReader:
         return {str(sub): str(sup) for sub, sup in cur.fetchall()}
 
     def load_entities(self, group_id: str) -> list[tuple[str, str, str, str | None]]:
-        """(uuid, name, summary, entity_supertype) for every entity in the group (LSH hydrate)."""
+        """(uuid, name, summary, entity_supertype) for every entity in the group (LSH hydrate).
+
+        In ``SURVIVOR_ORDER``: the caller's name index keeps the first row it sees for a name
+        (``dict.setdefault``), so it must be the row ``entity_uuid_by_normalized_name`` returns."""
         conn = self._connection()
         cur = conn.execute(
             "SELECT uuid, COALESCE(name, ''), COALESCE(summary, ''), entity_supertype "
-            "FROM kg_entities WHERE owner_id = %s AND group_id = %s",
+            "FROM kg_entities WHERE owner_id = %s AND group_id = %s "
+            "ORDER BY " + SURVIVOR_ORDER,  # nosec B608 - a module constant
             (OWNER, group_id),
         )
         return [(str(u), n, s, st) for u, n, s, st in cur.fetchall()]
