@@ -83,7 +83,9 @@ class _FakeKGClient:
         return self._graph_obj._exact_match.get(normalized)
 
     def load_entities(self) -> list[tuple[str, ...]]:
-        return list(self._graph_obj._entities)
+        # The reader's rows are (uuid, name, summary, supertype, stored normalized_name); the
+        # tests preset (uuid, name, summary[, supertype]) and every row is an old one.
+        return [(*e, *(None,) * (4 - len(e)), "") for e in self._graph_obj._entities]
 
     def load_type_map(self) -> dict[str, str]:
         return dict(self._graph_obj._type_map)

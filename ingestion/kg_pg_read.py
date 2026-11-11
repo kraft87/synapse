@@ -66,9 +66,8 @@ _RESTATED_OVERFETCH = 32
 #: Which entity answers when several rows share a name: the owner's flagged entity, then the
 #: oldest. The id never changes, so the SQL lookup below, the in-memory name index
 #: (``load_entities``, read by ``dedup``) and the one-memory merge (schema/067,
-#: scripts/pile_merge.py) pick the same row for a name that exists twice. That holds for every
-#: row whose stored normalized_name is empty or is the normalized name; a row stored under some
-#: other key is found under that key by the lookup and under its name by the index.
+#: scripts/pile_merge.py) pick the same row for a name that exists twice. All three key a row
+#: the same way: by its stored normalized_name, or by lower(trim(name)) when that is empty.
 SURVIVOR_ORDER = "is_self DESC, id"
 
 
@@ -190,19 +189,22 @@ class KGPostgresReader:
         cur = conn.execute("SELECT subtype, supertype FROM kg_entity_types")
         return {str(sub): str(sup) for sub, sup in cur.fetchall()}
 
-    def load_entities(self) -> list[tuple[str, str, str, str | None]]:
-        """(uuid, name, summary, entity_supertype) for every entity of the owner (LSH hydrate).
+    def load_entities(self) -> list[tuple[str, str, str, str | None, str]]:
+        """(uuid, name, summary, entity_supertype, normalized_name) for every entity of the owner
+        (LSH hydrate). The stored normalized_name is '' for a row written before the column.
 
-        In ``SURVIVOR_ORDER``: the caller's name index keeps the first row it sees for a name
-        (``dict.setdefault``), so it must be the row ``entity_uuid_by_normalized_name`` returns."""
+        In ``SURVIVOR_ORDER``: the caller's name index keeps the first row it sees for a key
+        (``dict.setdefault``), so it must be the row ``entity_uuid_by_normalized_name`` returns.
+        The key is the stored normalized_name, or lower(trim(name)) when that is empty."""
         conn = self._connection()
         cur = conn.execute(
-            "SELECT uuid, COALESCE(name, ''), COALESCE(summary, ''), entity_supertype "
+            "SELECT uuid, COALESCE(name, ''), COALESCE(summary, ''), entity_supertype, "
+            "COALESCE(normalized_name, '') "
             "FROM kg_entities WHERE owner_id = %s "
             "ORDER BY " + SURVIVOR_ORDER,  # nosec B608 - a module constant
             (OWNER,),
         )
-        return [(str(u), n, s, st) for u, n, s, st in cur.fetchall()]
+        return [(str(u), n, s, st, nn) for u, n, s, st, nn in cur.fetchall()]
 
     # -- edge reads ------------------------------------------------------
 

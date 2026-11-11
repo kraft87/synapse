@@ -322,8 +322,9 @@ class _MemoryIndex:
     plain dicts and aren't safe to interleave). The lookup dicts are only
     touched with single get/set ops, which the GIL already makes atomic.
 
-    ``uuid_by_normalized_name`` keeps the first row it sees for a name, and the rows
-    arrive in ``SURVIVOR_ORDER``: the entity the SQL name lookup returns.
+    ``uuid_by_normalized_name`` keeps the first row it sees for a key (the stored
+    normalized_name, else lower(trim(name))), and the rows arrive in ``SURVIVOR_ORDER``: the
+    entity the SQL name lookup returns.
     """
 
     def __init__(self, lsh: Any) -> None:
@@ -694,13 +695,18 @@ class NodeDeduper:
             node_uuid = row[0]
             name = row[1] or ""
             summary = row[2] or ""
-            idx.supertype_by_uuid[node_uuid] = row[3] if len(row) > 3 else None
-            normalized = _normalize_name(name)
-            if not normalized:
+            idx.supertype_by_uuid[node_uuid] = row[3]
+            # A row's key is the one the SQL lookup and the one-memory merge use: its stored
+            # normalized_name, else lower(trim(name)) for a row written before that column (SQL
+            # trim() takes spaces only). Not _normalize_name(name), which also strips punctuation
+            # and inner spaces and would send a legacy row's name to another row than the lookup.
+            key = row[4] or name.strip(" ").lower()
+            if key:
+                idx.uuid_by_normalized_name.setdefault(key, node_uuid)
+            if not _normalize_name(name):
                 continue
             idx.name_by_uuid[node_uuid] = name
             idx.summary_by_uuid[node_uuid] = summary
-            idx.uuid_by_normalized_name.setdefault(normalized, node_uuid)
             shingles = _shingles(_normalize_for_fuzzy(name))
             if not shingles:
                 continue

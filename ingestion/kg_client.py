@@ -206,9 +206,10 @@ class KGClient:
         result: str | None = self._reader.entity_uuid_by_normalized_name(normalized)
         return result
 
-    def load_entities(self) -> list[tuple[str, str, str, str | None]]:
-        """(uuid, name, summary, entity_supertype) for every entity of the owner (LSH hydrate)."""
-        result: list[tuple[str, str, str, str | None]] = self._reader.load_entities()
+    def load_entities(self) -> list[tuple[str, str, str, str | None, str]]:
+        """(uuid, name, summary, entity_supertype, normalized_name) for every entity of the owner
+        (LSH hydrate)."""
+        result: list[tuple[str, str, str, str | None, str]] = self._reader.load_entities()
         return result
 
     def load_type_map(self) -> dict[str, str]:

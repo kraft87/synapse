@@ -106,10 +106,13 @@ class TestEntityReads:
 
     def test_load_entities_scoped_tuples(self, kg_tables):
         rows = kg_tables.load_entities()
-        by_uuid = {u: (n, s) for u, n, s, _supertype in rows}
+        by_uuid = {u: (n, s) for u, n, s, _supertype, _normalized in rows}
         assert set(by_uuid) == {"e-syn", "e-fdb", "e-old", "e-legacy"}
         assert by_uuid["e-syn"] == ("Synapse", "memory layer")
         assert by_uuid["e-old"] == ("  Voyage AI ", "")  # NULLs coalesced
+        stored = {u: normalized for u, _n, _s, _supertype, normalized in rows}
+        assert stored["e-syn"] == "synapse"
+        assert stored["e-old"] == ""  # no stored name: the index keys it by lower(trim(name))
 
 
 class TestEdgeReads:
@@ -264,3 +267,19 @@ class TestNameResolutionParity:
 
         assert {n: reader.entity_uuid_by_normalized_name(n) for n in expected} == expected
         assert {n: index.uuid_by_normalized_name[n] for n in expected} == expected
+
+    def test_a_legacy_row_is_keyed_by_its_trimmed_name_in_both(self, conn, monkeypatch, db_url):
+        """A row with no stored normalized_name answers to lower(trim(name)), punctuation and
+        inner spaces included. The older legacy row must not take the plain name from the modern
+        row that stores it, in the index any more than in the lookup."""
+        monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+        conn.execute("TRUNCATE kg_entities, kg_relationships RESTART IDENTITY CASCADE")
+        self._entity(conn, "t-legacy", " Foo  Bar. ", GROUP, norm="")  # the older row
+        self._entity(conn, "t-plain", "Foo Bar", GROUP)
+        expected = {"foo bar": "t-plain", "foo  bar.": "t-legacy"}
+
+        reader = KGPostgresReader()
+        index = dedup.NodeDeduper(reader)._build_index()
+
+        assert {n: reader.entity_uuid_by_normalized_name(n) for n in expected} == expected
+        assert {n: index.uuid_by_normalized_name.get(n) for n in expected} == expected
