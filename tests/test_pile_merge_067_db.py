@@ -500,7 +500,7 @@ def test_a_duplicate_pair_keeps_both_uuids_and_a_feedback_reference_still_resolv
 def test_an_invalidated_by_chain_survives_and_the_superseded_pair_is_still_returned(merged, db_url):
     assert fact_row(merged, "f-old-p")["invalidated_by"] == "f-new-p"
     assert fact_row(merged, "f-old-p")["t_invalid"] is not None
-    pairs = Recall(db_url, "")._fetch_superseded_pairs_pg("technical", ["f-new-p"], 10)
+    pairs = Recall(db_url, "")._fetch_superseded_pairs_pg(["f-new-p"], 10)
     assert [p["id"] for p in pairs] == ["f:f-old-p"]
 
 

@@ -1,7 +1,7 @@
 """Postgres read-port of the KG retrieval leg (mcp_server/recall.py::_search_kg).
 
 Queries the ``kg_entities`` / ``kg_relationships`` tables (schema/017) that the
-extraction pipeline writes (the canonical KG store since #67 PR 3), scoped by ``owner_id`` + ``group_id``.
+extraction pipeline writes (the canonical KG store since #67 PR 3), scoped by ``owner_id``.
 Returns the same ``(facts, seed_entities)`` shape ``recall._search_kg`` returns, so
 it can be wired into recall behind a shadow-read flag and, eventually, become the
 source of truth.
@@ -24,7 +24,7 @@ The caller's cursor MUST have these session GUCs set (see parity_kg_read.py):
   - ``max_parallel_workers_per_gather = 0``} an equality filter is also present --
 the planner picks a bitmap/parallel-seq-scan on the owner_id btree and sorts 47K
 rows (~1.6s) instead. The fact-vector leg sidesteps this by over-fetching the
-GLOBAL live-fact HNSW on the BARE partial-index predicate (no owner/group -> stays
+GLOBAL live-fact HNSW on the BARE partial-index predicate (no owner -> stays
 on HNSW), then filtering the tenant scope on that small candidate set. The two
 GUCs force the planner onto the index. (The long-term multi-tenant-at-scale answer
 is LIST partitioning by owner_id so partition pruning removes the filter entirely;
@@ -37,19 +37,18 @@ unlabelled and older than 066 — see :func:`scope_predicate`. ``None`` is full 
 adds no predicate to any statement. The install owner's flagged entity (schema 066) is never
 a hop seed, for any caller.
 
-Full trust also reads the KG group it did not ask for (:func:`search_kg`), as a
-superset: the requested group's facts exactly as a one-group read serves them, then a
-few vector/BM25 matches from the other group.
+The graph is one memory per owner. Rows written before schema 067 carry a legacy
+``group_id`` (``technical`` or ``personal``); no statement here reads it, so a recall ranks
+one list over every row the owner has.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 from ingestion.bm25_sql import bm25_filter
 from ingestion.embedding import embed_dims
-from ingestion.scope import active_groups
 
 # Embedding width for the halfvec casts below — must match the provisioned schema
 # (and its HNSW index expressions) verbatim. Default 2048 (Voyage prod, unchanged).
@@ -58,43 +57,13 @@ _EMBED_DIMS = embed_dims()
 # RRF constant matches recall._rrf_fuse / bench_pg_kg (k=60, 1-indexed rank).
 _RRF_K = 60
 # Fact-vector over-fetch pool: how many global-nearest live facts to pull before
-# applying the owner/group/web filter. For the technical group the outer LIMIT
-# (limit*3) is what bites: across 20 real queries (2026-11-06) the fewest in-group,
-# non-web survivors of the 200 was 46. The small personal group can under-fill with or
-# without the web filter (3 of 20 personal queries kept fewer than 36).
+# applying the owner/web filter. The outer LIMIT (limit*3) is what bites: across 20 real
+# queries (2026-11-06) the fewest in-scope, non-web survivors of the 200 was 46.
 _OVERFETCH = 200
-# Facts a full-trust recall may add from the group it did not ask for, after the
-# requested group's own (see search_kg). recall_overview serves _FACT_LIMIT + this.
-CROSS_GROUP_EXTRAS = 4
 
 # One fact-leg row: (uuid, fact, t_valid, ongoing, last_supported_at), the columns every
 # fact-returning statement here selects, in that order.
 FactRow = tuple[Any, ...]
-
-
-def read_groups(group_id: str, restricted: bool) -> str | list[str]:
-    """The KG group(s) a recall reads: the requested group alone (a plain string) for a
-    restricted caller; for full trust a list, the requested group first.
-
-    The extractor routes each fact into ``technical`` or ``personal`` by a name regex, so
-    the owner's facts on one topic sit in both graphs, and reading only the requested one
-    missed the other half: 48% of personal-group recalls over the 60 days to 2026-11-06
-    served exactly one fact, against 6% of technical ones. The group is not a trust
-    boundary (a restricted surface is scoped by fact provenance, schema 056), so full
-    trust reads every group the deployment keeps (:func:`ingestion.scope.active_groups`:
-    with the personal scope off that is one, and the plain string comes back as before).
-    """
-    if restricted:
-        return group_id
-    groups = [group_id, *(g for g in active_groups() if g != group_id)]
-    return groups if len(groups) > 1 else group_id
-
-
-def group_sql(group_id: str | list[str], col: str = "group_id") -> str:
-    """``col`` filtered to ``group_id``, one ``%s`` bound to it as given: equality for one
-    group (a string: the statement every single-group read always sent), ``= ANY`` for a
-    list (:func:`read_groups`)."""
-    return f"{col} = %s" if isinstance(group_id, str) else f"{col} = ANY(%s)"
 
 
 #: synapse_meta key schema 066 stamps once: the highest kg_relationships.id when 066 ran.
@@ -168,11 +137,9 @@ def search_kg_postgres(
     query: str,
     query_emb: list[float],
     owner_id: str,
-    group_id: str,
     session_focus: list[str],
     limit: int,
     allowed_projects: list[str] | None = None,
-    vec_rows: list[FactRow] | None = None,
     fact_audience: bool = True,
     exclude_seeds: Sequence[str] = (),
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -199,10 +166,6 @@ def search_kg_postgres(
     and BM25 legs; the hop never starts from the owner node, whose thousands of edges
     would spend the hop leg on one seed. Empty (no flagged owner, or no schema 066) sends
     the seed statement exactly as before.
-
-    ``vec_rows`` (full trust only) is step 1's result already in hand: this group's first
-    ``limit * 3`` rows of a shared fact-vector walk (:func:`fact_vector_walk`,
-    :func:`split_walk`), so the statement is not sent a second time for the other group.
     """
     restricted = allowed_projects is not None
     # Spliced into the full-trust statements as "" so their text is unchanged; a
@@ -222,22 +185,20 @@ def search_kg_postgres(
     fact_by_uuid: dict[str, tuple[str, Any, Any, Any]] = {}
 
     # 1 — fact-embedding vector KNN. Over-fetch the GLOBAL live-fact HNSW on the bare
-    # partial-index predicate (no owner/group -> the planner keeps the kg_rel_hnsw
+    # partial-index predicate (no owner -> the planner keeps the kg_rel_hnsw
     # index instead of falling back to a 47K-row bitmap+sort), then filter the tenant
     # scope on the small candidate set. See module docstring for the required GUCs.
     vec_fetched: list[FactRow]
-    if vec_rows is not None and not restricted:
-        vec_fetched = vec_rows
-    elif not restricted:
+    if not restricted:
         cur.execute(
             "SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM ("
-            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id, "
+            "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, "
             "         web_artifact_id "
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
             f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
-            ") sub WHERE owner_id = %s AND group_id = %s AND web_artifact_id IS NULL LIMIT %s",
-            (emb_s, _OVERFETCH, owner_id, group_id, limit * 3),
+            ") sub WHERE owner_id = %s AND web_artifact_id IS NULL LIMIT %s",
+            (emb_s, _OVERFETCH, owner_id, limit * 3),
         )
         vec_fetched = cur.fetchall()
     else:
@@ -252,11 +213,11 @@ def search_kg_postgres(
             f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
             "  FROM kg_relationships "
             "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
-            "    AND owner_id = %s AND group_id = %s AND web_artifact_id IS NULL "
+            "    AND owner_id = %s AND web_artifact_id IS NULL "
             f"   AND {scope_predicate(fact_audience=fact_audience)}"
             ") SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM cand "
             "ORDER BY dist LIMIT %s",
-            (emb_s, owner_id, group_id, allowed_projects, limit * 3),
+            (emb_s, owner_id, allowed_projects, limit * 3),
         )
         vec_fetched = cur.fetchall()
     vec_uuids: list[str] = []
@@ -274,12 +235,7 @@ def search_kg_postgres(
     safe = "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
     bm25_uuids: list[str] = []
     if safe:
-        bm25_where = [
-            "owner_id = %s",
-            "group_id = %s",
-            "t_invalid IS NULL",
-            "web_artifact_id IS NULL",
-        ]
+        bm25_where = ["owner_id = %s", "t_invalid IS NULL", "web_artifact_id IS NULL"]
         if restricted:
             bm25_where.append(scope_predicate(fact_audience=fact_audience))
         cur.execute(
@@ -288,7 +244,7 @@ def search_kg_postgres(
             "WHERE id @@@ paradedb.match('fact', %s)"
             f"{bm25_filter(bm25_where)} "
             "ORDER BY sc DESC LIMIT %s",
-            (safe, owner_id, group_id, *scope_args, limit * 3),
+            (safe, owner_id, *scope_args, limit * 3),
         )
         for u, f, tv, og, sup, _sc in cur.fetchall():
             if not f:
@@ -298,7 +254,7 @@ def search_kg_postgres(
 
     # 3 — entity seed vector KNN (top 25) + live-degree gate + focus bonus -> top 8.
     # The seed KNN uses the SAME bare-predicate over-fetch trick as the fact leg
-    # (step 1): an owner/group equality filter directly alongside the vector ORDER BY
+    # (step 1): an owner equality filter directly alongside the vector ORDER BY
     # makes the planner pick a Bitmap Heap Scan on kg_entities_owner and sort EVERY
     # in-scope entity (~1.25s once the graph passed ~36K entities — measured
     # 2026-06-20, the entity HNSW was never used). enable_seqscan=off does NOT prevent
@@ -313,23 +269,23 @@ def search_kg_postgres(
     cur.execute(
         "WITH seeds AS ("
         "  SELECT uuid, name, summary, dist FROM ("
-        "    SELECT uuid, name, summary, owner_id, group_id, "
+        "    SELECT uuid, name, summary, owner_id, "
         f"           embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
         "    FROM kg_entities WHERE embedding IS NOT NULL "
         f"    ORDER BY embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
-        "  ) e WHERE owner_id = %s AND group_id = %s "
+        "  ) e WHERE owner_id = %s "
         f"{owner_sql}"
         "  ORDER BY dist LIMIT 25"
         "), deg AS ("
         "  SELECT u, count(*) AS d FROM ("
         "    SELECT src_uuid AS u FROM kg_relationships "
-        "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        "      WHERE owner_id = %s AND t_invalid IS NULL "
         "        AND web_artifact_id IS NULL "
         f"{scope_sql}"
         "        AND src_uuid IN (SELECT uuid FROM seeds) "
         "    UNION ALL "
         "    SELECT tgt_uuid AS u FROM kg_relationships "
-        "      WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+        "      WHERE owner_id = %s AND t_invalid IS NULL "
         "        AND web_artifact_id IS NULL "
         f"{scope_sql}"
         "        AND tgt_uuid IN (SELECT uuid FROM seeds) "
@@ -342,13 +298,10 @@ def search_kg_postgres(
             emb_s,
             _OVERFETCH,
             owner_id,
-            group_id,
             *owner_args,
             owner_id,
-            group_id,
             *scope_args,
             owner_id,
-            group_id,
             *scope_args,
         ),
     )
@@ -394,12 +347,12 @@ def search_kg_postgres(
             "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, "
             "         fact_embedding <=> %s::vector AS dist "
             "  FROM kg_relationships "
-            "  WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+            "  WHERE owner_id = %s AND t_invalid IS NULL "
             "    AND web_artifact_id IS NULL AND (src_uuid = %s OR tgt_uuid = %s) "
             f"{scope_sql}"
             ") SELECT uuid, fact, t_valid, ongoing, last_supported_at FROM cand "
             "ORDER BY dist ASC NULLS LAST, t_valid DESC LIMIT 8",
-            (emb_s, owner_id, group_id, sd, sd, *scope_args),
+            (emb_s, owner_id, sd, sd, *scope_args),
         )
         for u, f, tv, og, sup in cur.fetchall():
             if u and f:
@@ -433,245 +386,3 @@ def search_kg_postgres(
         if len(results) >= limit:
             break
     return results, seed_entities
-
-
-def _safe_query(query: str) -> str:
-    """``query`` with every non-alphanumeric, non-space character blanked: the BM25 leg's
-    text, so identifiers and error strings survive (same rule as ``recall._search_kg``)."""
-    return "".join(c if (c.isalnum() or c.isspace()) else " " for c in query).strip()
-
-
-def fact_vector_walk(
-    cur: Any, query_emb: list[float], owner_id: str, groups: list[str]
-) -> list[FactRow]:
-    """ONE walk of the global live-fact HNSW for every group in ``groups`` (step 1 of
-    :func:`search_kg_postgres`, un-limited): the :data:`_OVERFETCH` nearest live facts,
-    kept when they are this owner's, in one of ``groups`` and not from a web page, in
-    distance order. Rows are :data:`FactRow` plus a trailing ``group_id``; hand them to
-    :func:`split_walk`.
-
-    The statement is the one each group's own fact-vector leg sent (same inner subquery,
-    same filter-only outer, no ORDER BY outside it) with the group test widened to the
-    list and the group selected. Two legs used to walk the same index for the same
-    vector, once per group, back to back (~0.2s each on prod).
-    """
-    cur.execute(
-        "SELECT uuid, fact, t_valid, ongoing, last_supported_at, group_id FROM ("
-        "  SELECT uuid, fact, t_valid, ongoing, last_supported_at, owner_id, group_id, "
-        "         web_artifact_id "
-        "  FROM kg_relationships "
-        "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
-        f"  ORDER BY fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) LIMIT %s"
-        ") sub WHERE owner_id = %s AND group_id = ANY(%s) AND web_artifact_id IS NULL",
-        (_vec_literal(query_emb), _OVERFETCH, owner_id, groups),
-    )
-    return cur.fetchall()
-
-
-def split_walk(
-    walk: list[FactRow], own_group: str, own_n: int, cross_groups: list[str], cross_n: int
-) -> tuple[list[FactRow], list[FactRow]]:
-    """The two fact-vector legs' rows out of one :func:`fact_vector_walk`: the first
-    ``own_n`` rows of ``own_group`` and the first ``cross_n`` rows of ``cross_groups``, each
-    in walk order, as :data:`FactRow`. This is what each leg's own ``LIMIT`` returned. The
-    cut is on the raw rows, before any empty-fact skip, because the SQL ``LIMIT`` counted
-    those rows too."""
-    own: list[FactRow] = []
-    cross: list[FactRow] = []
-    for row in walk:
-        group = row[5]
-        if group == own_group:
-            if len(own) < own_n:
-                own.append(row[:5])
-        elif group in cross_groups and len(cross) < cross_n:
-            cross.append(row[:5])
-        if len(own) >= own_n and len(cross) >= cross_n:
-            break
-    return own, cross
-
-
-def cross_vec_rows(
-    cur: Any, query_emb: list[float], owner_id: str, groups: list[str], k: int
-) -> list[FactRow]:
-    """The other groups' fact-vector leg on its own: the first ``k * 3`` survivors of one
-    walk. :func:`search_kg` takes these from the shared walk instead."""
-    walk = fact_vector_walk(cur, query_emb, owner_id, groups)
-    return split_walk(walk, "", 0, groups, k * 3)[1]
-
-
-def cross_bm25_rows(
-    cur: Any, query: str, owner_id: str, groups: list[str], k: int
-) -> list[FactRow]:
-    """The other groups' BM25 leg: up to ``k * 3`` live non-web facts of ``groups`` matching
-    ``query``, best score first. Needs nothing but the query text, so a caller can run it
-    on its own connection while the requested group is searched (recall_sources).
-
-    A caller that does so must give the connection the planner GUCs :func:`search_kg`
-    documents; on a tie in score the ParadeDB scan's row order follows the plan.
-    """
-    safe = _safe_query(query)
-    if k <= 0 or not groups or not safe:
-        return []
-    where = ["owner_id = %s", "group_id = ANY(%s)", "t_invalid IS NULL", "web_artifact_id IS NULL"]
-    cur.execute(
-        "SELECT uuid, fact, t_valid, ongoing, last_supported_at, paradedb.score(id) AS sc "
-        "FROM kg_relationships "
-        f"WHERE id @@@ paradedb.match('fact', %s){bm25_filter(where)} "
-        "ORDER BY sc DESC LIMIT %s",
-        (safe, owner_id, groups, k * 3),
-    )
-    return [row[:5] for row in cur.fetchall()]
-
-
-def cross_group_facts(
-    cur: Any,
-    query: str,
-    query_emb: list[float],
-    owner_id: str,
-    groups: list[str],
-    taken: list[dict[str, Any]],
-    k: int,
-    vec_rows: list[FactRow] | None = None,
-    bm25_rows: list[FactRow] | None = None,
-) -> list[dict[str, Any]]:
-    """Up to ``k`` live facts from ``groups``, the groups a full-trust recall did not ask
-    for: the fact-vector over-fetch and BM25 legs, RRF-fused, skipping any text already in
-    ``taken``. Same row shape as :func:`search_kg_postgres`, each marked ``_cross``.
-
-    No seed/hop leg: the other group's copy of the owner identity node (thousands of
-    live edges) would spend the extras on one seed's hop sample. Full trust only: no
-    provenance predicate.
-
-    ``vec_rows`` / ``bm25_rows`` are a leg's rows already fetched (:func:`split_walk`, the
-    shared walk; :func:`cross_bm25_rows`, run concurrently); a leg not given is run on
-    ``cur``, so a call without them is the same two statements as ever.
-    """
-    if k <= 0 or not groups:
-        return []
-    if vec_rows is None:
-        vec_rows = cross_vec_rows(cur, query_emb, owner_id, groups, k)
-    if bm25_rows is None:
-        bm25_rows = cross_bm25_rows(cur, query, owner_id, groups, k)
-    fact_by_uuid: dict[str, tuple[str, Any, Any, Any]] = {}
-    vec_uuids: list[str] = []
-    for u, f, tv, og, sup in vec_rows:
-        if f:
-            fact_by_uuid.setdefault(u, (f, tv, og, sup))
-            vec_uuids.append(u)
-    bm25_uuids: list[str] = []
-    for u, f, tv, og, sup in bm25_rows:
-        if f:
-            fact_by_uuid.setdefault(u, (f, tv, og, sup))
-            bm25_uuids.append(u)
-    fused = _rrf_fuse([vec_uuids, bm25_uuids])
-    seen_text = {" ".join(t["fact"].lower().split()) for t in taken}
-    out: list[dict[str, Any]] = []
-    for u, _ in sorted(fused.items(), key=lambda kv: kv[1], reverse=True):
-        fact, t_valid, ongoing, supported = fact_by_uuid[u]
-        text_key = " ".join(fact.lower().split())
-        if text_key in seen_text:
-            continue
-        seen_text.add(text_key)
-        out.append(
-            {
-                "fact": fact,
-                "_uuid": u,
-                "_date": t_valid,
-                "_ongoing": ongoing,
-                "_supported": supported,
-                "_cross": True,
-            }
-        )
-        if len(out) >= k:
-            break
-    return out
-
-
-def search_kg(
-    cur: Any,
-    query: str,
-    query_emb: list[float],
-    owner_id: str,
-    group_id: str | list[str],
-    session_focus: list[str],
-    limit: int,
-    allowed_projects: list[str] | None = None,
-    cross_bm25: Callable[[], list[FactRow]] | None = None,
-    fact_audience: bool = True,
-    exclude_seeds: Sequence[str] = (),
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """:func:`search_kg_postgres` over the group spec :func:`read_groups` returns.
-
-    A string is one group, read exactly as it always was. A list (full trust) reads its
-    first, requested, group exactly as a one-group read would, with every leg, then
-    appends up to :data:`CROSS_GROUP_EXTRAS` facts from the rest (:func:`cross_group_facts`).
-    The extras never compete for the requested group's ``limit`` slots: letting them
-    compete (one fused top-12 over both groups) served 14 fewer of the 352 rated-helpful
-    items on the 200 most recent rated recalls, a regression the bench rejects.
-
-    The requested group's fact-vector leg and the extras' are one walk of the HNSW
-    (:func:`fact_vector_walk`), split by group, and the extras' BM25 leg is a call away:
-    ``cross_bm25`` returns its rows (:func:`cross_bm25_rows`, which the caller may be
-    running on another connection already) and is called once, after the requested group
-    is read; without it the leg runs on ``cur``. Nothing served changes: each leg returns
-    the rows its own statement did.
-
-    ``fact_audience`` and ``exclude_seeds`` go to every :func:`search_kg_postgres` call. The
-    cross-group functions take neither: they serve full trust only (a restricted caller
-    returns above, and :func:`read_groups` gives it one group) and have no hop leg.
-    """
-    if isinstance(group_id, str):
-        return search_kg_postgres(
-            cur,
-            query,
-            query_emb,
-            owner_id,
-            group_id,
-            session_focus,
-            limit,
-            allowed_projects,
-            fact_audience=fact_audience,
-            exclude_seeds=exclude_seeds,
-        )
-    own_group, cross_groups = group_id[0], group_id[1:]
-    if allowed_projects is not None:
-        return search_kg_postgres(
-            cur,
-            query,
-            query_emb,
-            owner_id,
-            own_group,
-            session_focus,
-            limit,
-            allowed_projects,
-            fact_audience=fact_audience,
-            exclude_seeds=exclude_seeds,
-        )
-    walk = fact_vector_walk(cur, query_emb, owner_id, group_id)
-    own_vec, cross_vec = split_walk(
-        walk, own_group, limit * 3, cross_groups, CROSS_GROUP_EXTRAS * 3
-    )
-    facts, seeds = search_kg_postgres(
-        cur,
-        query,
-        query_emb,
-        owner_id,
-        own_group,
-        session_focus,
-        limit,
-        vec_rows=own_vec,
-        fact_audience=fact_audience,
-        exclude_seeds=exclude_seeds,
-    )
-    facts += cross_group_facts(
-        cur,
-        query,
-        query_emb,
-        owner_id,
-        cross_groups,
-        facts,
-        CROSS_GROUP_EXTRAS,
-        vec_rows=cross_vec,
-        bm25_rows=cross_bm25() if cross_bm25 is not None else None,
-    )
-    return facts, seeds

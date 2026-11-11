@@ -35,7 +35,7 @@ from tests.helpers.embed import GROUP, onehot
 from tests.helpers.surfaces import clear_surfaces, register_full, register_restricted
 
 WORK = "work-proj"
-PERS = "personal"  # the second KG group: 067 empties it, the read paths still take it by name
+PERS = "personal"  # the legacy second pile: rows written before 067 still carry it, no read looks
 LEGS = ("v", "b", "h")  # vector, BM25, hop
 
 
@@ -166,8 +166,8 @@ def _engine_on(tx) -> Recall:
     return r
 
 
-def _restricted_kg(r: Recall, group: str = GROUP, **kw: Any) -> set[str]:
-    facts, seeds = r._search_kg("widget", onehot(0), group, [], 20, allowed_projects=[WORK], **kw)
+def _restricted_kg(r: Recall, **kw: Any) -> set[str]:
+    facts, seeds = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK], **kw)
     assert seeds == []
     return _uuids(facts)
 
@@ -218,13 +218,13 @@ def test_a_restricted_read_serves_work_safe_and_legacy_unlabelled_facts_on_every
     r = Recall(db_url, "")
     assert _restricted_kg(r) == SERVED
     # one allowed project more changes nothing: only the label decides here
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK, "other"])
+    facts, _ = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK, "other"])
     assert _uuids(facts) == SERVED
 
 
 def test_full_trust_serves_every_label(kg, cutover, db_url):
     _seed_label_matrix(kg, cutover)
-    facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == EVERY
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
 
@@ -297,7 +297,7 @@ def test_a_seed_counts_only_the_edges_a_restricted_caller_may_be_served(
     def _hops(allowed: list[str] | None) -> int:
         executed.clear()
         with psycopg.connect(db_url) as c, c.cursor() as cur:
-            kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", GROUP, [], 5, allowed)
+            kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 5, allowed)
         return sum("src_uuid = %s OR tgt_uuid = %s" in s for s in executed)
 
     assert _hops([WORK]) == (1 if is_seed else 0)
@@ -351,27 +351,27 @@ NOW = ["n-ok", "n-displaced", "n-legacy", "n-served-new"]
 def test_superseded_pairs_need_both_sides_to_pass_the_label_rule(kg, cutover, db_url):
     _seed_pairs(kg, cutover)
     r = Recall(db_url, "")
-    scoped = r._fetch_superseded_pairs_pg(GROUP, NOW, 10, allowed_projects=[WORK])
+    scoped = r._fetch_superseded_pairs_pg(NOW, 10, allowed_projects=[WORK])
     assert [p["id"] for p in scoped] == ["f:o-ok", "f:o-legacy"]
-    full = r._fetch_superseded_pairs_pg(GROUP, NOW, 10)
+    full = r._fetch_superseded_pairs_pg(NOW, 10)
     assert [p["id"] for p in full] == ["f:o-ok", "f:o-displaced", "f:o-legacy", "f:o-served-new"]
 
 
 def test_the_supersession_surface_needs_both_edges_to_pass_the_label_rule(kg, cutover, db_url):
     _seed_pairs(kg, cutover)
     r = Recall(db_url, "")
-    scoped = r._surface_supersessions(onehot(1), GROUP, set(), cap=10, allowed_projects=[WORK])
+    scoped = r._surface_supersessions(onehot(1), set(), cap=10, allowed_projects=[WORK])
     assert _uuids(scoped) == {"n-ok", "n-legacy"}
-    full = r._surface_supersessions(onehot(1), GROUP, set(), cap=10)
+    full = r._surface_supersessions(onehot(1), set(), cap=10)
     assert _uuids(full) == set(NOW)
 
 
 def test_the_episode_overlay_needs_both_edges_to_pass_the_label_rule(kg, cutover, db_url):
     ep = _seed_pairs(kg, cutover)
     r = Recall(db_url, "")
-    scoped = r._episode_supersessions([ep], GROUP, allowed_projects=[WORK])
+    scoped = r._episode_supersessions([ep], allowed_projects=[WORK])
     assert sorted(scoped[ep]) == ["now legacy", "now ok"]
-    full = r._episode_supersessions([ep], GROUP)
+    full = r._episode_supersessions([ep])
     assert sorted(full[ep]) == ["now displaced", "now legacy", "now ok", "now served-new"]
 
 
@@ -394,7 +394,7 @@ def test_a_regrouped_fact_keeps_personal_v0_and_is_served_a_restricted_request_n
     ).fetchall() == [(GROUP, "personal", 0)]
     r = Recall(db_url, "")
     assert _restricted_kg(r) == set()
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, _ = r._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == {"p-vec", "p-bm25", "p-hop"}
 
 
@@ -435,7 +435,6 @@ def test_the_restricted_bm25_statement_still_runs_as_a_paradedb_topk_scan(kg, cu
                 "widget",
                 onehot(0),
                 "default",
-                GROUP,
                 [],
                 5,
                 [WORK],
@@ -477,7 +476,6 @@ def _bm25_leg(db_url: str, *, audience: bool, limit: int) -> tuple[list[str], st
             "widget",
             onehot(0),
             "default",
-            GROUP,
             [],
             limit,
             [WORK],
@@ -552,18 +550,18 @@ def _owner_world(conn, group: str = GROUP) -> None:
     _entity(conn, own, "Owner", 0, group)
     _entity(conn, other, "Other", 0, group)
     kw: dict[str, Any] = {"audience": "work-safe", "group": group}
-    _fact(conn, f"hop-own-{group}", "zeta", ep, src=own, **kw)
-    _fact(conn, f"hop-oth-{group}", "eta", ep, src=other, **kw)
-    _fact(conn, f"vec-own-{group}", "alpha beta", ep, emb=0, src=own, **kw)
-    _fact(conn, f"bm-own-{group}", "widget gizmo", ep, src=own, **kw)
+    _fact(conn, f"hop-own-{group}", f"zeta {group}", ep, src=own, **kw)
+    _fact(conn, f"hop-oth-{group}", f"eta {group}", ep, src=other, **kw)
+    _fact(conn, f"vec-own-{group}", f"alpha beta {group}", ep, emb=0, src=own, **kw)
+    _fact(conn, f"bm-own-{group}", f"widget gizmo {group}", ep, src=own, **kw)
 
 
 def _flag(conn, uid: str) -> None:
     conn.execute("UPDATE kg_entities SET is_self = true WHERE uuid = %s", (uid,))
 
 
-def _read(r: Recall, group: str = GROUP, allowed: list[str] | None = None) -> set[str]:
-    facts, _ = r._search_kg("widget", onehot(0), group, [], 20, allowed_projects=allowed)
+def _read(r: Recall, allowed: list[str] | None = None) -> set[str]:
+    facts, _ = r._search_kg("widget", onehot(0), [], 20, allowed_projects=allowed)
     return _uuids(facts)
 
 
@@ -586,19 +584,19 @@ def test_a_cleared_flag_leaves_the_read_as_it_was(kg, db_url):
     assert _read(Recall(db_url, "")) == before
 
 
-def test_each_groups_flagged_owner_is_excluded_in_its_own_read(kg, db_url):
-    """Until the piles merge the owner has a node in each group, and flags both."""
+def test_every_flagged_owner_row_is_excluded_as_a_seed(kg, db_url):
+    """Rows from before 067 can leave the owner a node in each legacy group, both flagged:
+    neither is a hop seed, and the other entities' facts in either group still serve."""
     _owner_world(kg, GROUP)
     _owner_world(kg, PERS)
     _flag(kg, f"own-{GROUP}")
-    r = Recall(db_url, "")
-    assert f"hop-own-{GROUP}" not in _read(r, GROUP)
-    assert f"hop-own-{PERS}" in _read(r, PERS)
+    served = _read(Recall(db_url, ""))
+    assert f"hop-own-{GROUP}" not in served
+    assert f"hop-own-{PERS}" in served
     _flag(kg, f"own-{PERS}")
-    r = Recall(db_url, "")
-    assert f"hop-own-{GROUP}" not in _read(r, GROUP)
-    assert f"hop-own-{PERS}" not in _read(r, PERS)
-    assert f"hop-oth-{PERS}" in _read(r, PERS)
+    served = _read(Recall(db_url, ""))
+    assert f"hop-own-{GROUP}" not in served and f"hop-own-{PERS}" not in served
+    assert {f"hop-oth-{GROUP}", f"hop-oth-{PERS}"} <= served
 
 
 def test_the_flagged_set_is_cached_for_its_ttl(kg, db_url, monkeypatch):
@@ -658,9 +656,9 @@ def _every_path(r: Recall, ep: int) -> dict[str, Any]:
     allowed = [WORK]
     return {
         "kg": _restricted_kg(r),
-        "pairs": [p["id"] for p in r._fetch_superseded_pairs_pg(GROUP, PRE_066_PAIRS, 10, allowed)],
-        "surface": _uuids(r._surface_supersessions(onehot(1), GROUP, set(), 10, allowed)),
-        "overlay": r._episode_supersessions([ep], GROUP, allowed_projects=allowed),
+        "pairs": [p["id"] for p in r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10, allowed)],
+        "surface": _uuids(r._surface_supersessions(onehot(1), set(), 10, allowed)),
+        "overlay": r._episode_supersessions([ep], allowed_projects=allowed),
     }
 
 
@@ -709,10 +707,10 @@ def test_before_066_recall_serves_the_provenance_only_facts(no_066):
 def test_before_066_full_trust_is_unchanged(no_066):
     tx, _ep_id = no_066
     r = _engine_on(tx)
-    facts, seeds = r._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, seeds = r._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == EVERY
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
-    assert len(r._fetch_superseded_pairs_pg(GROUP, PRE_066_PAIRS, 10)) == 3
+    assert len(r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10)) == 3
     assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
 
 
@@ -728,7 +726,7 @@ def test_the_schema_rolled_back_under_a_positive_probe_fails_closed_once(no_066,
         assert _restricted_kg(r) == set()
         assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
         assert _restricted_kg(r) == EVERY
-        assert r._fetch_superseded_pairs_pg(GROUP, PRE_066_PAIRS, 10, [WORK])
+        assert r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10, [WORK])
         monkeypatch.setattr(FACT_AUDIENCE_PROBE, "reprobe_s", 0.0)
         assert _restricted_kg(r) == EVERY
     assert sink == []
@@ -786,7 +784,7 @@ def test_a_probe_error_on_a_066_database_serves_a_restricted_read_nothing_then_r
     sink: list[str] = []
     with warn_sink(sink):
         blind = _every_path(r, ep)
-        facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
+        facts, _ = r._search_kg("widget", onehot(0), [], 20)
         assert blind == {"kg": set(), "pairs": [], "surface": set(), "overlay": {}}
         assert _uuids(facts) == EVERY, "full trust never asks the label question"
         assert FACT_AUDIENCE_PROBE.cached(r._db_url) is None, "a failed probe is not cached"

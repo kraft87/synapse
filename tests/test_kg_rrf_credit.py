@@ -59,8 +59,8 @@ class _ScriptedCursor:
     def execute(self, sql: str, params: Any = None) -> _ScriptedCursor:
         if "src_uuid = %s OR tgt_uuid = %s" in sql:
             # the hop statement also reads fact_embedding (its distance), so it is matched
-            # first; params = (query embedding, owner, group, seed, seed)
-            self._rows = self._hops[params[3]]
+            # first; params = (query embedding, owner, seed, seed)
+            self._rows = self._hops[params[2]]
         elif "FROM kg_relationships" in sql and "fact_embedding" in sql:
             self._rows = self._vec
         elif "paradedb" in sql:
@@ -91,7 +91,7 @@ def test_a_fact_between_two_seeds_gets_the_hop_credit_of_one_occurrence():
             "s2": [_row("x2"), _row("link")],
         },
     )
-    facts, seeds = kg_pg.search_kg_postgres(cur, "", [0.0], "owner", "grp", [], limit=1)
+    facts, seeds = kg_pg.search_kg_postgres(cur, "", [0.0], "owner", [], limit=1)
     assert [s["uuid"] for s in seeds] == ["s1", "s2"]
     assert [f["_uuid"] for f in facts] == ["lead"]
 
@@ -106,5 +106,5 @@ def test_the_fact_between_two_seeds_still_ranks_by_its_best_hop_rank():
             "s2": [_row("x2"), _row("link")],
         },
     )
-    facts, _ = kg_pg.search_kg_postgres(cur, "", [0.0], "owner", "grp", [], limit=4)
+    facts, _ = kg_pg.search_kg_postgres(cur, "", [0.0], "owner", [], limit=4)
     assert [f["_uuid"] for f in facts] == ["link", "x1", "x2"]

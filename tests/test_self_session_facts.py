@@ -90,8 +90,6 @@ def test_episode_overlay_skips_successors_from_the_calling_session(conn, db_url)
     _superseded(conn, f"{tag}-p2", f"{tag}-n-theirs", f"[{old_ep}]", f"[{theirs}]")
 
     r = Recall(db_url, "")
-    everyone = r._episode_supersessions([old_ep], GROUP)
+    everyone = r._episode_supersessions([old_ep])
     assert sorted(everyone[old_ep]) == [f"now {tag}-n-mine", f"now {tag}-n-theirs"]
-    assert r._episode_supersessions([old_ep], GROUP, self_session=me) == {
-        old_ep: [f"now {tag}-n-theirs"]
-    }
+    assert r._episode_supersessions([old_ep], self_session=me) == {old_ep: [f"now {tag}-n-theirs"]}

@@ -163,7 +163,7 @@ def _engine(db_url, monkeypatch, notes_rows=None):
     ]
     r._search_web_reranked = lambda q, emb, **_k: []
     r._search_kg = lambda *a, **k: ([], [])
-    r._fetch_superseded_pairs_pg = lambda gid, uuids, cap, allowed_projects=None: []
+    r._fetch_superseded_pairs_pg = lambda uuids, cap, allowed_projects=None: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
     r._increment_retrieval_counts = lambda ids: None

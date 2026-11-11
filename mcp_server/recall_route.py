@@ -11,7 +11,6 @@ from fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust, own_surface_served
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.http_helpers import err, unauthorized
@@ -37,8 +36,9 @@ def register(
         (loaded embedder + pooled PG connections + warm HNSW cache) so a per-turn hook
         stays fast instead of cold-starting the pipeline each call.
 
-        Body: {"query": str, "project"?: str, "group_id"?: str, "write_feedback"?: bool,
-               "source"?: str, "debug"?: bool}.
+        Body: {"query": str, "project"?: str, "write_feedback"?: bool,
+               "source"?: str, "debug"?: bool}. A ``group_id`` field from an older caller is
+        ignored.
         The caller gets the same enforcement the MCP tools do, resolved from the bearer: a
         DEVICE token names its own surface, and the root token resolves to unknown
         (restricted, empty allowlist). A ``surface`` body field is ignored. Holding a
@@ -67,7 +67,6 @@ def register(
         if not query:
             return err("missing 'query'", 400)
         project = body.get("project") or None
-        group_id = coerce_group(body.get("group_id")) or "technical"
         write_feedback = bool(body.get("write_feedback", False))
         source = body.get("source") or "http"
         debug = bool(body.get("debug", False))
@@ -80,7 +79,6 @@ def register(
             result = engine.recall(
                 query=query,
                 project=project,
-                group_id=group_id,
                 write_feedback=write_feedback,
                 source=source,
                 debug=debug,
@@ -92,7 +90,7 @@ def register(
             return result, serving_notice(trust, own)
 
         try:
-            with logfire.span("http.recall {query!r}", query=query[:80], group_id=group_id):
+            with logfire.span("http.recall {query!r}", query=query[:80]):
                 out, notice = await run_in_threadpool(_work)
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("http recall failed")

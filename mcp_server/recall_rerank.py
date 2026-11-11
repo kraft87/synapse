@@ -212,19 +212,10 @@ class RecallRerankMixin:
     def _floor_facts(self, query: str, facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Fact relevance gate (_RECALL_FACT_FLOOR): drop off-topic facts, keep >=1 so the bucket
         is never blanked. Thin wrapper over _floor_by_rerank; caller gates on the floor > 0.
-
-        Cross-group extras (``_cross``, kg_pg.search_kg) are floored on their own with no
-        keep-one backstop, after the requested group's facts, which are floored exactly as
-        a one-group read's were (a single fact is not reranked, as recall_overview never
-        floored one)."""
-        settings = self._settings()
-        own = [f for f in facts if not f.get("_cross")]
-        cross = [f for f in facts if f.get("_cross")]
-        if len(own) > 1:
-            own = self._floor_by_rerank(query, own, settings._RECALL_FACT_FLOOR, keep_min=1)
-        if cross:
-            own += self._floor_by_rerank(query, cross, settings._RECALL_FACT_FLOOR, keep_min=0)
-        return own
+        A single fact is not reranked, as recall_overview never floored one."""
+        if len(facts) <= 1:
+            return facts
+        return self._floor_by_rerank(query, facts, self._settings()._RECALL_FACT_FLOOR, keep_min=1)
 
     def _select_episodes(
         self, query: str, pool: list[dict[str, Any]], limit: int

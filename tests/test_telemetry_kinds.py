@@ -128,7 +128,8 @@ def test_recall_kind_row_shape(conn, db_url, monkeypatch, full_surface):
     )
     assert row is not None, "recall() emitted no kind='recall' telemetry row"
     source, query, group_id, ms_total, top, emb_ok, n_eps, chars, est_tokens, served = row
-    assert source == "mcp-tool" and query == q and group_id == "technical"
+    assert source == "mcp-tool" and query == q
+    assert group_id is None, "the pile label is no longer recorded"
     assert ms_total is not None and ms_total >= 0
     assert top == pytest.approx(0.91)  # scores exist -> the raw pre-recency top is recorded
     assert emb_ok is True
@@ -188,15 +189,10 @@ def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypat
     engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
     kg = [{"fact": f"fact {k}", "_uuid": k, "_date": None} for k in ("own-1", "old-1", "own-2")]
     engine._search_kg = lambda *a, **k: ([dict(f) for f in kg], [])
-    # Answers the requested (technical) group's call; full trust also asks the other group.
-    engine._surface_supersessions = lambda emb, g, *a, **k: (
-        [
-            {"fact": "successor own-3", "_uuid": "own-3", "_date": None},
-            {"fact": "successor old-2", "_uuid": "old-2", "_date": None},
-        ]
-        if g == "technical"
-        else []
-    )
+    engine._surface_supersessions = lambda emb, *a, **k: [
+        {"fact": "successor own-3", "_uuid": "own-3", "_date": None},
+        {"fact": "successor old-2", "_uuid": "old-2", "_date": None},
+    ]
     asked: list[tuple[list[str], str]] = []
 
     def _own(uuids, session):
@@ -205,7 +201,7 @@ def test_recall_kind_self_excludes_calling_session_facts(conn, db_url, monkeypat
 
     engine._self_session_facts = _own
     bumped: list[list[str]] = []
-    engine._increment_fact_retrieval_counts = lambda uuids, gid: bumped.append(list(uuids))
+    engine._increment_fact_retrieval_counts = lambda uuids: bumped.append(list(uuids))
     mark = _watermark(conn)
     out = engine.recall(q, source="mcp-tool", surface=full_surface, self_session="MY-SESSION")
     assert [f["id"] for f in out["facts"]] == ["f:old-1", "f:old-2"]
@@ -411,7 +407,7 @@ def test_overlay_gets_the_served_passage_text(conn, db_url, monkeypatch, full_su
     monkeypatch.setattr(recall_mod, "_RECALL_FLOOR", 0.58)
     engine = _wired(db_url, [0.91, 0.80, 0.60, 0.59])
     seen: list[dict] = []
-    engine._episode_supersessions = lambda ids, g, **k: seen.append({"ids": ids, **k}) or {}
+    engine._episode_supersessions = lambda ids, **k: seen.append({"ids": ids, **k}) or {}
     out = engine.recall("overlay text", source="mcp-tool", surface=full_surface)
     served = {int(it["id"][2:]): it["content"] for it in out["episodes"]}
     assert seen and seen[0]["ids"] == list(served)
