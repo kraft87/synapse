@@ -37,9 +37,11 @@ changed, what to do on each machine, what was proven, and what is still open.
 3. Apply 067 by itself, before the release: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 <
    schema/067_kg_one_memory.sql`. It runs two transactions of its own, so never inside
    `BEGIN` and never with `-1`. A re-run is safe and does nothing when nothing is left.
-4. `python scripts/pile_merge.py --health` must exit 0. Its `reported_not_checked` block (the
-   survivors that left `technical`, the fact count against the one before the merge) is for
-   reading; it never fails the run.
+4. `python scripts/pile_merge.py --health --just-merged` must exit 0 (pollers still stopped,
+   no dashboard deletes since step 3). The flag makes two more checks fail the run: no
+   survivor has left `technical`, and the fact count equals the one before the merge. Without
+   the flag (later, once the graph has moved on) those two sit in the `reported_not_checked`
+   block, for reading; they never fail the run.
 5. Deploy the release, then start the pollers. If a poller ran the old image after step 3,
    it may have written a personal row, or a folded uuid again: apply 067 once more, check
    with `--health`, and restart the pollers (a poller keeps a deleted uuid in its name index

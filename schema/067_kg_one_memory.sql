@@ -47,43 +47,62 @@
 --      are never blocked; writers wait) and nothing stronger on any live table: no DROP
 --      TRIGGER, no ALTER TABLE. It builds the three owner-only btrees the code without a
 --      group predicate needs, under that same lock. Applied with the pollers stopped it
---      takes minutes; with nothing to merge (a fresh install, a re-run) it returns at
---      once, takes no table lock and writes no ledger row. A folded uuid that a writer
---      wrote again after its survivor was deleted is not something to merge: it counts as
---      nothing. (pm_ghost's other conditions, a flagged entity or a survivor a later run
---      folded too, are only tested under the lock; a row they reject takes it once, finds
---      nothing to do and returns.) A re-run with only notes or preferences left flips them
---      under row locks and leaves the KG tables alone.
+--      takes minutes. With nothing to merge (a fresh install, a re-run) it returns before
+--      it takes a lock stronger than the ACCESS SHARE of its own reads, and writes no
+--      ledger row; the indexes are then built only where one is missing, which a fresh
+--      install does on its empty tables under SHARE, and a database that has them does not
+--      do at all. A folded uuid that a writer wrote again after its survivor was deleted
+--      is not something to merge: it counts as nothing. (pm_ghost's other conditions, a
+--      flagged entity, another owner, a survivor a later run folded too, a returned uuid
+--      in a third group, are only tested under the lock; while a row they reject exists,
+--      every re-run takes it, finds nothing to do and returns.) A re-run with only notes
+--      or preferences left flips them under row locks and leaves the KG tables alone.
 --   B  the tail. SET DEFAULT 'technical' on the four group_id columns (the code stops
---      naming it), DROP the 066 insert trigger and its function, and stamp 067. What is
---      still to do is read from the catalog first, so a re-run of a finished file takes no
---      lock. Until the stamp is 067 it takes SHARE ROW EXCLUSIVE on the two KG tables
---      while it checks the merge is complete (no personal row left, the three indexes
---      valid, 066 applied), and keeps it to the commit, through every sleep below: writers
---      wait for the whole of B, readers never wait for that lock. Then one LOCK TABLE ...
---      ACCESS EXCLUSIVE NOWAIT names every table it changes. NOWAIT never queues, so no
---      reader waits behind a pending request, and what the lock lets B do (the defaults,
---      the trigger, the stamp) is a few catalog changes before the commit. An attempt is
---      refused while another transaction holds any lock on one of those tables, and B then
---      sleeps a second and tries again, 60 times (the settings synapse.pm067_lock_attempts
---      and synapse.pm067_lock_pause, in seconds, change both). The 60th refusal fails the
---      run. A database that never has a moment without a reader does that; so does a writer
---      that took a lock before B started (SELECT ... FOR UPDATE, as the dashboard's fact and
---      episode deletes do) and now waits for a write lock B's SHARE ROW EXCLUSIVE withholds:
---      the writer waits for B, and B's attempts are refused until the writer is done. Then B
---      rolls back, the writer goes on, the stamp stays at 066, a build that requires 067
---      still refuses to start, and re-running the file finishes. A writer that holds nothing
---      yet and only queues behind B's SHARE ROW EXCLUSIVE does not refuse an attempt. B sets
---      statement_timeout to 0, because that loop is one long statement; A does too.
+--      naming it), DROP the 066 insert trigger and its function, and stamp 067. It checks
+--      its two settings (below) and reads what is still to do from the catalog first, so a
+--      re-run of a finished file takes no lock on the four tables. It reads the stamp row
+--      FOR UPDATE, so an undo that is writing the stamp at that moment is waited for and
+--      read, not stamped over. Until the stamp is 067 it takes SHARE ROW EXCLUSIVE on the
+--      two KG tables while it checks the merge is complete (no personal row left, the three
+--      indexes valid, 066 applied), and keeps it to the commit, through every sleep below:
+--      writers wait for the whole of B, readers never wait for that lock. Then one LOCK
+--      TABLE ... ACCESS EXCLUSIVE NOWAIT names every table it changes. NOWAIT never queues,
+--      so no reader waits behind a pending request, and what the lock lets B do (the
+--      defaults, the trigger, the stamp) is a few catalog changes before the commit. An
+--      attempt is refused while another transaction holds any lock on one of those tables,
+--      and B then sleeps a second and tries again, 60 times. The settings
+--      synapse.pm067_lock_attempts (a whole number from 1 to 3600) and
+--      synapse.pm067_lock_pause (seconds, from 0 to 60) change both; a value outside those
+--      ranges, or not a number, stops B before it takes a lock. The 60th refusal fails the
+--      run ("could not obtain lock"). A database that never has a moment without a reader
+--      does that; so does a writer that locks a row of one of those tables (SELECT ... FOR
+--      UPDATE, as the dashboard's fact and episode deletes do) before B's ACCESS EXCLUSIVE
+--      is granted, B's sleeps included, and then waits for a write lock B's SHARE ROW
+--      EXCLUSIVE withholds: that writer cannot finish while B holds its lock, so every
+--      remaining attempt is refused until B gives up. Then B rolls back, the writer goes on,
+--      the stamp stays at 066, a build that requires 067 still refuses to start, and
+--      re-running the file finishes. A writer that holds nothing yet and only queues behind
+--      B's SHARE ROW EXCLUSIVE does not refuse an attempt. B sets statement_timeout to 0,
+--      because that loop is one long statement; A does too. After the loop B checks the
+--      catalog that the defaults are set and the trigger is gone, and fails if not.
 --      The stamp is the last statement: if B fails, the merged data stays, the stamp stays
 --      at 066, and a build that requires 067 still refuses to start. Re-run the file.
--- Apply with the pollers stopped: they are the writers that add graph rows for long. Two
--- more exist while they are stopped, and both wait for the SHARE ROW EXCLUSIVE locks above
--- like any writer: the recall fact-count bump (one UPDATE of kg_relationships) and the
--- dashboard's fact and episode deletes (a SELECT ... FOR UPDATE, then writes, in one
--- transaction). A poller that wrote personal rows in between, or wrote a folded uuid again,
--- is folded by a re-run, under a new run; restart the pollers after it, because a poller
--- keeps a deleted uuid in its name index for up to 900 s and would write it again.
+--
+-- OPERATOR NOTES. Apply with the pollers stopped, which are the writers that add graph rows
+-- for long, and with no dashboard fact or episode deletes while the migration runs. A
+-- delete there takes its rows FOR UPDATE, which the SHARE ROW EXCLUSIVE locks above let
+-- through, and then waits for those locks at its UPDATE or DELETE. If A then re-points or
+-- stamps one of the same rows, A waits for the delete's row lock and the two wait for each
+-- other; B's attempts are refused for as long as the delete is open (see above). Two
+-- symptoms, both safe: "deadlock detected" in A (the server aborts one of the two, usually
+-- the migration), and "could not obtain lock" in B after its last attempt. Neither one
+-- stamps anything, so the stamp stays at 066 and a build that requires 067 still refuses
+-- to start: re-run the file. The other writer that lives while the pollers are stopped is
+-- the recall fact-count bump (one UPDATE of kg_relationships); it holds nothing before it
+-- waits, so it queues behind the locks above and refuses no attempt. A poller that wrote
+-- personal rows in between, or wrote a folded uuid again, is folded by a re-run, under a
+-- new run; restart the pollers after it, because a poller keeps a deleted uuid in its name
+-- index for up to 900 s and would write it again.
 --
 -- UNDO. Every run is written to kg_pile_merge_067_* in the same transaction: the before
 -- image of each row it changes (full rows, so a deleted twin can be re-created), the twin
@@ -150,11 +169,11 @@ BEGIN
             AND to_regclass('public.kg_pile_merge_067_runs') IS NOT NULL;
 
     -- Nothing to merge anywhere: a fresh install, CI, a re-run on a merged database. No
-    -- lock, no ledger table, no run row. A folded uuid written again is work only while its
-    -- survivor is in technical; with the survivor gone there is nothing to fold it into
-    -- (pm_ghost below needs the same). This asks for less than pm_ghost does (not the flag,
-    -- the owner or the chain of runs), so it can say yes to a row pm_ghost then rejects; the
-    -- check under the lock settles that.
+    -- lock beyond these reads, no ledger table, no run row. A folded uuid written again is
+    -- work only while its survivor is in technical; with the survivor gone there is nothing
+    -- to fold it into (pm_ghost below needs the same). This asks for less than pm_ghost does
+    -- (not the flag, the owner, the group of the returned uuid or the chain of runs), so it
+    -- can say yes to a row pm_ghost then rejects; the check under the lock settles that.
     v_kg := EXISTS (SELECT 1 FROM kg_entities WHERE group_id = 'personal')
          OR EXISTS (SELECT 1 FROM kg_relationships WHERE group_id = 'personal');
     IF NOT v_kg AND v_ledger THEN
@@ -719,17 +738,40 @@ SET LOCAL statement_timeout = 0;
 
 DO $pm$
 DECLARE
-    attempt  int;
-    tries    int    := COALESCE(NULLIF(current_setting('synapse.pm067_lock_attempts', true), ''), '60')::int;
-    pause_s  float8 := COALESCE(NULLIF(current_setting('synapse.pm067_lock_pause', true), ''), '1')::float8;
-    t        text;
-    need     text[] := '{}';
-    trg      boolean;
-    stamped  text;
-    bad      text;
+    attempt   int;
+    raw_tries text   := COALESCE(NULLIF(current_setting('synapse.pm067_lock_attempts', true), ''), '60');
+    raw_pause text   := COALESCE(NULLIF(current_setting('synapse.pm067_lock_pause', true), ''), '1');
+    tries     int;
+    pause_s   float8;
+    t         text;
+    need      text[] := '{}';
+    trg       boolean;
+    stamped   text;
+    bad       text;
 BEGIN
-    -- What is still to change, from the catalog alone: no lock on a user table is taken to
-    -- find out, so a re-run of a finished file takes none.
+    -- The two retry settings, before any lock. A count of 0 or less would skip the loop
+    -- without an error, and a huge count or an endless pause would keep SHARE ROW EXCLUSIVE
+    -- for as long as the loop runs (statement_timeout is 0 here); neither may reach it.
+    -- NaN and Infinity fall outside BETWEEN; text that is no number fails its cast.
+    BEGIN
+        tries := raw_tries::int;
+    EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+        tries := NULL;
+    END;
+    IF tries IS NULL OR tries NOT BETWEEN 1 AND 3600 THEN
+        RAISE EXCEPTION '067: synapse.pm067_lock_attempts is "%", outside the allowed range: a whole number from 1 to 3600', raw_tries;
+    END IF;
+    BEGIN
+        pause_s := raw_pause::float8;
+    EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+        pause_s := NULL;
+    END;
+    IF pause_s IS NULL OR pause_s NOT BETWEEN 0 AND 60 THEN
+        RAISE EXCEPTION '067: synapse.pm067_lock_pause is "%", outside the allowed range: seconds from 0 to 60', raw_pause;
+    END IF;
+
+    -- What is still to change, from the catalog alone: no lock on the four tables it
+    -- changes is taken to find out, so a re-run of a finished file takes none.
     FOREACH t IN ARRAY ARRAY['kg_entities', 'kg_relationships', 'notes', 'preferences'] LOOP
         IF NOT EXISTS (
             SELECT 1
@@ -744,7 +786,9 @@ BEGIN
     trg := EXISTS (SELECT 1 FROM pg_trigger
                     WHERE tgrelid = 'public.kg_relationships'::regclass
                       AND tgname = 'kg_rel_personal_audience' AND NOT tgisinternal);
-    SELECT value INTO stamped FROM synapse_meta WHERE key = 'schema_version';
+    -- FOR UPDATE: an undo writes the stamp last and commits after it. B must not read a
+    -- stamp that is about to go down and write 067 over it once that commits.
+    SELECT value INTO stamped FROM synapse_meta WHERE key = 'schema_version' FOR UPDATE;
 
     -- Stamp 067 only on a merged graph and a finished merge transaction. A client that
     -- ignored ON_ERROR_STOP would otherwise run this transaction after a failed one and
@@ -811,6 +855,26 @@ BEGIN
                 PERFORM pg_sleep(pause_s);
             END;
         END LOOP;
+    END IF;
+
+    -- The loop ends by finishing its changes or by raising; say from the catalog that it
+    -- did, so the stamp below can never follow a tail that did not run.
+    SELECT string_agg(x, ', ') INTO bad
+      FROM unnest(ARRAY['kg_entities', 'kg_relationships', 'notes', 'preferences']) AS x
+     WHERE NOT EXISTS (
+        SELECT 1
+          FROM pg_attrdef d
+          JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum
+         WHERE d.adrelid = ('public.' || x)::regclass
+           AND a.attname = 'group_id'
+           AND pg_get_expr(d.adbin, d.adrelid) = '''technical''::text');
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION '067: group_id has no ''technical'' default on % (the tail did not finish); apply this file again', bad;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_trigger
+                WHERE tgrelid = 'public.kg_relationships'::regclass
+                  AND tgname = 'kg_rel_personal_audience' AND NOT tgisinternal) THEN
+        RAISE EXCEPTION '067: the 066 insert trigger is still in place (the tail did not finish); apply this file again';
     END IF;
 END
 $pm$;

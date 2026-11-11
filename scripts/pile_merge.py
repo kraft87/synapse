@@ -15,7 +15,13 @@ script is its companion; it never prints fact text or entity names, only counts 
                 connection, so the numbers are the ones an apply would record in
                 kg_pile_merge_067_runs.counts (a run that finds only notes or preferences
                 left records just their counts).
-    --health    After an apply: exits non-zero on any failed check (see ``health``).
+    --health [--just-merged]
+                After an apply: exits non-zero on any failed check (see ``health``). With
+                --just-merged, for the check right after the merge, two more must hold: no
+                survivor has left 'technical', and the fact count equals the one before the
+                merge. Both are exact only while nothing else writes to the graph (the
+                pollers are stopped, no dashboard fact or episode delete has run), so leave
+                the flag off once they have; they are then reported and never fail the run.
     --undo [--run N|all] [--apply]
                 Reverse the recorded runs from their before images. Revert the code first: a
                 build that requires 067 exits on a database stamped 066, which is what a
@@ -80,6 +86,9 @@ RETIRED_RESTORES = (
 )
 INDEXES = ("kg_rel_pair_any", "kg_rel_tgt_any", "kg_entities_norm_any")
 KG_TABLES = ("kg_entities", "kg_relationships", "notes", "preferences")
+#: The two checks ``--health --just-merged`` adds (otherwise these figures are only reported).
+_JM_SURVIVORS = "no survivor has left technical"
+_JM_FACTS = "fact count equals the count before the merge"
 #: Uuids per drift list in the printed output; the counts are always printed in full.
 _LIST_CAP = 200
 #: What an undo counts and what it reports as drift, listed so a run that finds nothing
@@ -200,13 +209,14 @@ def preview(conn: Any) -> dict[str, Any]:
 # ---------------------------------------------------------------------- health
 
 
-def health(conn: Any) -> dict[str, Any]:
+def health(conn: Any, *, just_merged: bool = False) -> dict[str, Any]:
     """Every check, with its numbers. ``ok`` is false if any check fails.
 
     * no 'personal' row in kg_entities, kg_relationships, notes or preferences;
     * for the runs not undone: every folded entity is gone (a failure is a folded uuid that a
       writer minted again after the run; the report says which of them applying 067 again
-      folds, and which it leaves alone because the survivor is gone), no edge references
+      folds, and which it leaves alone: 067 folds a returned uuid only into a live technical
+      survivor of the same owner, and not a flagged entity), no edge references
       one, no more edges with a missing endpoint than before the first run that merged
       knowledge-graph rows, no more dangling invalidated_by than before that run;
     * at most one flagged (is_self) entity per owner;
@@ -216,8 +226,11 @@ def health(conn: Any) -> dict[str, Any]:
     Reported under ``reported_not_checked``, never failing ``ok``: the survivors that are no
     longer in 'technical', and the fact count against the one before the first run. Both
     move for good once the graph does: an episode delete removes facts, and the orphan sweep
-    removes a survivor whose edges went with them. Also reported: live same-pair, same-text
-    fact duplicates among the merged facts.
+    removes a survivor whose edges went with them. With ``just_merged`` they are checks
+    instead: no survivor has left 'technical' and the fact count equals the one before the
+    first run, which holds exactly only right after the merge, with the pollers stopped and
+    no delete made through the dashboard (the merge itself deletes no fact). Also reported:
+    live same-pair, same-text fact duplicates among the merged facts.
     """
     checks: dict[str, dict[str, Any]] = {}
 
@@ -228,7 +241,10 @@ def health(conn: Any) -> dict[str, Any]:
         t: conn.execute(f"SELECT count(*) FROM {t} WHERE group_id = 'personal'").fetchone()[0]  # nosec B608
         for t in KG_TABLES
     }
-    check("no personal rows", not any(personal.values()), personal=personal)
+    detail: dict[str, Any] = {"personal": personal}
+    if any(personal.values()):
+        detail["remedy"] = "apply 067 again, then restart the pollers"
+    check("no personal rows", not any(personal.values()), **detail)
 
     multi = [
         r[0]
@@ -296,23 +312,28 @@ def health(conn: Any) -> dict[str, Any]:
             "WHERE m.run_id = ANY(%s)",
             (ids,),
         ).fetchall()
-        # 067 folds a returned uuid into its survivor only while the survivor is in
-        # 'technical': the ghost text it runs says which ones, so this cannot drift from it.
+        # 067 folds a returned uuid into its survivor only in the cases the ghost text it
+        # runs accepts, so this cannot drift from it. A returned uuid that is still 'personal'
+        # and not accepted is not listed here: a re-run regroups it (or folds it into a
+        # same-name twin), and the "no personal rows" check says to apply again.
         foldable = {uuid for _owner, uuid, _survivor in conn.execute(shared_sql()["ghost"])}
-        again = [u for u, g in present if u in foldable or g == "personal"]
+        again = [u for u, _g in present if u in foldable]
         stranded = [u for u, g in present if u not in foldable and g != "personal"]
         gone_detail: dict[str, Any] = {"still_present": _capped([u for u, _ in present])}
         remedy = []
+        if again or any(g == "personal" and u not in foldable for u, g in present):
+            remedy.append("apply 067 again, then restart the pollers")
         if again:
             gone_detail["apply_again_folds"] = _capped(again)
-            remedy.append("apply 067 again, then restart the pollers")
         if stranded:
             gone_detail["apply_again_leaves_alone"] = _capped(stranded)
             remedy.append(
                 "applying 067 again leaves the uuids in apply_again_leaves_alone as they are: it "
-                "folds a returned uuid only into a survivor that is still in 'technical'. Undo "
-                "the run (--undo) if the merge is to be reversed; otherwise each is an ordinary "
-                "entity now, and can be removed"
+                "folds a returned uuid only into a live technical survivor of the same owner, and "
+                "never a flagged entity. Undo the run (--undo) if the merge is to be reversed; "
+                "otherwise each is an ordinary entity now: remove it together with its edges, or "
+                "re-point the edges first (a removal that leaves edges behind fails the check of "
+                "edges with a missing endpoint)"
             )
         if remedy:
             gone_detail["remedy"] = "; ".join(remedy)
@@ -332,7 +353,10 @@ def health(conn: Any) -> dict[str, Any]:
                 (ids,),
             ).fetchall()
         ]
-        reported["survivors_no_longer_in_technical"] = _capped(gone)
+        if just_merged:
+            check(_JM_SURVIVORS, not gone, **_capped(gone))
+        else:
+            reported["survivors_no_longer_in_technical"] = _capped(gone)
         if first is not None:
             missing = conn.execute(
                 "SELECT count(*) FROM kg_relationships r WHERE NOT EXISTS (SELECT 1 FROM kg_entities e WHERE e.uuid = r.src_uuid) "
@@ -345,10 +369,14 @@ def health(conn: Any) -> dict[str, Any]:
                 now=missing,
                 before_merge=base,
             )
-            reported["fact_count"] = {
+            facts = {
                 "now": conn.execute("SELECT count(*) FROM kg_relationships").fetchone()[0],
                 "before_merge": first.get("facts_total"),
             }
+            if just_merged:
+                check(_JM_FACTS, facts["now"] == facts["before_merge"], **facts)
+            else:
+                reported["fact_count"] = facts
             dangling = conn.execute(
                 "SELECT count(*) FROM kg_relationships r WHERE r.invalidated_by IS NOT NULL "
                 "AND NOT EXISTS (SELECT 1 FROM kg_relationships o WHERE o.uuid = r.invalidated_by)"
@@ -480,7 +508,15 @@ def _undo_run(
         ],
     )
     # Edges the merge never touched (written since, or already across the two groups) that
-    # point at an entity about to move back: they stay in 'technical' beside it.
+    # point at an entity about to move back: they stay in 'technical' beside it. One EXISTS
+    # per end, each with the owner, so the owner-only indexes (kg_rel_pair_any leads with
+    # owner and source, kg_rel_tgt_any with owner and target) serve them: an OR over both
+    # ends, with no owner, scans every edge once per regrouped entity.
+    never_touched = (
+        "EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
+        "AND r.{end}_uuid = e.uuid AND r.group_id <> 'personal' "
+        "AND r.uuid NOT IN (SELECT uuid FROM _u_fb))"
+    )
     report(
         "regrouped entity moved back has edges the merge never touched",
         [
@@ -489,9 +525,7 @@ def _undo_run(
                 "SELECT DISTINCT e.uuid FROM kg_entities e JOIN _u_before b ON b.uuid = e.uuid "
                 "WHERE b.group_id = 'personal' AND e.group_id = 'technical' "
                 "AND b.uuid NOT IN (SELECT loser_uuid FROM _u_map) "
-                "AND EXISTS (SELECT 1 FROM kg_relationships r "
-                "WHERE (r.src_uuid = e.uuid OR r.tgt_uuid = e.uuid) AND r.group_id <> 'personal' "
-                "AND r.uuid NOT IN (SELECT uuid FROM _u_fb))"
+                f"AND ({never_touched.format(end='src')} OR {never_touched.format(end='tgt')})"
             )
         ],
     )
@@ -595,8 +629,11 @@ def undo(conn: Any, *, run: str, write: bool) -> dict[str, Any]:
 
     The open runs are read after SHARE ROW EXCLUSIVE is taken on the two KG tables, which
     conflicts with itself: a 067 apply that was running has committed its run by then, and
-    one that starts later waits for this transaction. A dry run takes the same lock and runs
-    every statement before it rolls back, so it holds writers for as long as a real undo.
+    an apply that has graph rows to merge and starts later waits for this transaction. One
+    with none returns without that lock; its tail reads the stamp row FOR UPDATE, so it waits
+    for this transaction's stamp write, or this one waits for it. A dry run takes the same
+    lock and runs every statement before it rolls back, so it holds writers for as long as a
+    real undo.
     Refuses, with nothing changed, when the stamp is above 067: the stamp this writes is
     066, below the objects of a later migration."""
     import psycopg
@@ -611,6 +648,9 @@ def undo(conn: Any, *, run: str, write: bool) -> dict[str, Any]:
     try:
         with conn.transaction():
             conn.execute("SET LOCAL lock_timeout = '15s'")
+            # A statement_timeout set on the role must not cut off a statement that scans the
+            # graph (067 sets it to 0 for its own transactions the same way).
+            conn.execute("SET LOCAL statement_timeout = 0")
             conn.execute("LOCK TABLE kg_entities, kg_relationships IN SHARE ROW EXCLUSIVE MODE")
 
             row = conn.execute(
@@ -780,6 +820,28 @@ def exclude(conn: Any, pairs: list[tuple[str, str]], *, write: bool) -> dict[str
 # ------------------------------------------------------------------------ main
 
 
+def _just_merged_failures(report: dict[str, Any]) -> list[tuple[str, str]]:
+    """The failed checks that ``--just-merged`` adds, each with a line saying why."""
+    out: list[tuple[str, str]] = []
+    survivors = report["checks"].get(_JM_SURVIVORS)
+    if survivors and not survivors["ok"]:
+        out.append(
+            (
+                _JM_SURVIVORS,
+                f"survivors_no_longer_in_technical.count is {survivors['count']}, not 0",
+            )
+        )
+    facts = report["checks"].get(_JM_FACTS)
+    if facts and not facts["ok"]:
+        out.append(
+            (
+                _JM_FACTS,
+                f"fact_count.now is {facts['now']}, before_merge is {facts['before_merge']}",
+            )
+        )
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--db-url", default=os.environ.get("SYNAPSE_DB_URL", ""))
@@ -799,18 +861,28 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--exclude", metavar="FILE", help="list personal twins 067 must not fold")
     ap.add_argument("--run", default="all", help="with --undo: a run id, or 'all' (default)")
     ap.add_argument("--apply", action="store_true", help="with --undo / --exclude: write")
+    ap.add_argument(
+        "--just-merged",
+        action="store_true",
+        help="with --health, right after the merge with the pollers stopped: also fail unless no "
+        "survivor has left technical and the fact count equals the one before the merge",
+    )
     args = ap.parse_args(argv)
     if not args.db_url:
         ap.error("no DSN: pass --db-url or set SYNAPSE_DB_URL")
     if args.run != "all" and not args.run.isdigit():
         ap.error("--run takes a run id or 'all'")
+    if args.just_merged and not args.health:
+        ap.error("--just-merged goes with --health")
 
     if args.preview:
         print(json.dumps(preview(_connect(args.db_url, read_only=True)), indent=1, sort_keys=True))
         return 0
     if args.health:
-        report = health(_connect(args.db_url, read_only=True))
+        report = health(_connect(args.db_url, read_only=True), just_merged=args.just_merged)
         print(json.dumps(report, indent=1, sort_keys=True))
+        for name, why in _just_merged_failures(report):
+            print(f"--just-merged: {name}: {why}", file=sys.stderr)
         return 0 if report["ok"] else 1
     if args.undo:
         print(

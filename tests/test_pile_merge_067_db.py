@@ -881,6 +881,88 @@ def test_health_names_undo_not_a_rerun_for_a_returned_uuid_whose_survivor_is_gon
     assert "apply 067 again, then restart the pollers" in gone["remedy"]
 
 
+def test_health_does_not_say_a_rerun_folds_a_returned_personal_uuid_it_would_only_regroup(
+    merged, db_url
+):
+    """The survivor is gone, so the ghost rule rejects the uuid; the name rule has no twin for
+    it either. A re-run regroups it, which is not a fold, and afterwards it is a stranded
+    uuid like any other."""
+    merged.execute(
+        "DELETE FROM kg_relationships WHERE src_uuid = 't-delta' OR tgt_uuid = 't-delta'"
+    )
+    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-delta'")
+    ent(merged, "p-delta", "Delta Again", group="personal")
+    report = pm.health(pm._connect(db_url, read_only=True))
+    gone = report["checks"]["every folded entity is gone"]
+    assert gone["ok"] is False and gone["still_present"]["uuids"] == ["p-delta"]
+    assert "apply_again_folds" not in gone and "apply_again_leaves_alone" not in gone
+    assert "apply 067 again, then restart the pollers" in gone["remedy"]
+    personal = report["checks"]["no personal rows"]
+    assert personal["ok"] is False and "apply 067 again" in personal["remedy"]
+    merge(db_url)
+    assert fold_map(merged, 2) == {}  # regrouped, not folded
+    assert ent_row(merged, "p-delta")["group_id"] == "technical"
+    gone = pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"]
+    assert gone["apply_again_leaves_alone"]["uuids"] == ["p-delta"]
+    assert "apply_again_folds" not in gone
+
+
+def test_health_just_merged_fails_on_a_lost_fact_or_a_survivor_and_says_which(
+    merged, db_url, capsys
+):
+    """Right after the merge nothing deletes a fact or a survivor, so both figures must hold
+    exactly. Without the flag the same graph is green and the numbers are only reported."""
+    before = run_counts(merged)["facts_total"]
+    assert pm.main(["--health", "--just-merged", "--db-url", db_url]) == 0
+    cap = capsys.readouterr()
+    report = json.loads(cap.out)
+    assert cap.err == "" and report["ok"] is True
+    assert report["checks"][pm._JM_FACTS] == {"ok": True, "now": before, "before_merge": before}
+    assert report["checks"][pm._JM_SURVIVORS] == {"ok": True, "count": 0, "uuids": []}
+    assert report["reported_not_checked"] == {}  # they are checks now
+
+    merged.execute("DELETE FROM kg_relationships WHERE uuid = 'f-old-p'")
+    assert pm.main(["--health", "--db-url", db_url]) == 0  # an episode delete later on: fine
+    capsys.readouterr()
+    assert pm.main(["--health", "--just-merged", "--db-url", db_url]) == 1
+    cap = capsys.readouterr()
+    report = json.loads(cap.out)
+    assert report["ok"] is False
+    assert report["checks"][pm._JM_FACTS] == {
+        "ok": False,
+        "now": before - 1,
+        "before_merge": before,
+    }
+    assert report["checks"][pm._JM_SURVIVORS]["ok"] is True
+    assert f"fact_count.now is {before - 1}, before_merge is {before}" in cap.err
+    assert "survivors_no_longer_in_technical" not in cap.err
+
+    merged.execute(
+        "DELETE FROM kg_relationships WHERE src_uuid = 't-omega' OR tgt_uuid = 't-omega'"
+    )
+    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-omega'")
+    assert pm.main(["--health", "--db-url", db_url]) == 0
+    capsys.readouterr()
+    assert pm.main(["--health", "--just-merged", "--db-url", db_url]) == 1
+    cap = capsys.readouterr()
+    survivors = json.loads(cap.out)["checks"][pm._JM_SURVIVORS]
+    assert survivors == {"ok": False, "count": 1, "uuids": ["t-omega"]}
+    assert "survivors_no_longer_in_technical.count is 1, not 0" in cap.err
+
+
+def test_health_just_merged_adds_no_fact_count_check_when_the_run_only_flipped_notes(piles, db_url):
+    _note(piles, "late-note", "personal")
+    merge(db_url)
+    assert "facts_total" not in run_counts(piles, 1)
+    report = pm.health(pm._connect(db_url, read_only=True), just_merged=True)
+    assert report["ok"] is True and pm._JM_FACTS not in report["checks"]
+
+
+def test_just_merged_belongs_to_health(db_url):
+    with pytest.raises(SystemExit):
+        pm.main(["--preview", "--just-merged", "--db-url", db_url])
+
+
 def _undo(db_url: str, *, run: str = "all", write: bool = True) -> dict[str, Any]:
     return pm.undo(pm._connect(db_url, read_only=False), run=run, write=write)
 
@@ -1129,6 +1211,36 @@ def test_undo_reports_a_regrouped_entity_that_got_edges_since_and_still_moves_it
     assert out["drift"][key] == {"count": 1, "uuids": ["p-eps"]}
     assert ent_row(merged, "p-eps")["group_id"] == "personal"  # moved back all the same
     assert fact_row(merged, "f-since")["group_id"] == "technical"  # and the edge is left alone
+
+
+def test_undo_reports_a_regrouped_entity_that_got_an_edge_pointing_at_it_since(merged, db_url):
+    fact(merged, "f-since", "technical", "t-delta", "p-eps", "written after the merge")
+    out = _undo(db_url)
+    key = "regrouped entity moved back has edges the merge never touched"
+    assert out["drift"][key] == {"count": 1, "uuids": ["p-eps"]}
+    assert ent_row(merged, "p-eps")["group_id"] == "personal"
+
+
+def test_undo_is_not_cut_off_by_a_statement_timeout_set_on_the_role(merged, db_url):
+    """A writer holds the undo's lock request for longer than the session's timeout; the undo
+    sets statement_timeout to 0 for its own transaction, as 067 does, and goes on to finish."""
+    writer = psycopg.connect(db_url)
+    writer.execute("LOCK TABLE kg_relationships IN ROW EXCLUSIVE MODE")
+    probe = psycopg.connect(db_url, autocommit=True)
+    conn = pm._connect(db_url, read_only=False)
+    conn.execute("SET statement_timeout = '300ms'")
+    try:
+        t, box = _in_thread(lambda: pm.undo(conn, run="all", write=False))
+        _wait_until_blocked_by(probe, writer.info.backend_pid)
+        time.sleep(1)
+        writer.rollback()
+        t.join(30)
+    finally:
+        writer.close()
+        probe.close()
+        conn.close()
+    assert "error" not in box, box
+    assert box["result"]["runs"] == [1]
 
 
 def test_undo_re_creates_an_entity_into_a_column_a_later_migration_made_not_null(seeded, db_url):
@@ -1395,8 +1507,10 @@ def test_the_tail_retries_a_refused_lock_without_holding_one_or_blocking_a_reade
     ACCESS EXCLUSIVE already held on kg_entities (every other reader of kg_entities would wait
     behind that, and so would a reader that then asks for it: a deadlock the tail would lose);
     it sleeps between attempts, and the next attempt after the reader is gone completes.
-    The session's statement_timeout (300 ms) is shorter than that sleep: the tail runs its
-    retry loop as one statement and must be immune to it."""
+    The session's statement_timeout (750 ms) is shorter than that sleep: the tail runs its
+    retry loop as one statement and must be immune to it. It also covers the statements
+    outside the tail's own SET LOCALs (the BEGINs, the COMMITs, the trailing ANALYZEs), so it
+    stays well above what those take on a loaded machine."""
     blocker = psycopg.connect(db_url)
     blocker.execute("LOCK TABLE kg_relationships IN ACCESS SHARE MODE")
     probe = psycopg.connect(db_url, autocommit=True)
@@ -1409,7 +1523,7 @@ def test_the_tail_retries_a_refused_lock_without_holding_one_or_blocking_a_reade
             env={
                 **os.environ,
                 "PGAPPNAME": "pm067-retry",
-                "PGOPTIONS": "-c statement_timeout=300ms",
+                "PGOPTIONS": "-c statement_timeout=750ms",
             },
             text=True,
         )
@@ -1477,7 +1591,8 @@ def test_the_tail_gives_up_loudly_on_a_writer_that_holds_a_lock_and_waits_for_th
     as the dashboard's fact and episode deletes do) and then writes waits for the SHARE ROW
     EXCLUSIVE the tail holds; its ROW SHARE refuses every ACCESS EXCLUSIVE attempt. The tail
     stops after its attempts and rolls back, the stamp stays 066 and the trigger stays, the
-    writer goes on, and a plain re-run finishes."""
+    writer goes on, and a plain re-run finishes. The attempts cost 60 x 0.2 s, so the writer has
+    12 s to queue before the tail gives up, on a slow machine too."""
     fact(piles, "f-w", "technical", "a", "b")
     writer = psycopg.connect(db_url)
     probe = psycopg.connect(db_url, autocommit=True)
@@ -1488,7 +1603,7 @@ def test_the_tail_gives_up_loudly_on_a_writer_that_holds_a_lock_and_waits_for_th
             db_url,
             "pm067-exhaust",
             "synapse.pm067_lock_attempts=60",
-            "synapse.pm067_lock_pause=0.05",
+            "synapse.pm067_lock_pause=0.2",
         )
         tail = _wait_for_table_lock(
             probe, "pm067-exhaust", "kg_relationships", "ShareRowExclusiveLock"
@@ -1537,7 +1652,7 @@ def test_a_writer_that_only_queues_behind_the_tail_does_not_refuse_its_attempts(
             db_url,
             "pm067-queued",
             "synapse.pm067_lock_attempts=60",
-            "synapse.pm067_lock_pause=0.05",
+            "synapse.pm067_lock_pause=0.2",
         )
         tail = _wait_for_table_lock(
             probe, "pm067-queued", "kg_relationships", "ShareRowExclusiveLock"
@@ -1562,6 +1677,123 @@ def test_a_writer_that_only_queues_behind_the_tail_does_not_refuse_its_attempts(
     assert proc.returncode == 0, err
     assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
     assert one(piles, "SELECT retrieval_count FROM kg_relationships WHERE uuid = 'f-w'") == 1
+
+
+def _run_file(db_url: str, app: str, *settings: str) -> subprocess.CompletedProcess:
+    proc = _start_file(db_url, app, *settings)
+    out, err = proc.communicate(timeout=60)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, out, err)
+
+
+def test_a_retry_setting_outside_its_range_stops_the_tail_before_a_lock_and_stamps_nothing(
+    piles, db_url
+):
+    """0 or less would run no attempt and a huge count or an endless pause would hold the
+    tail's lock for hours; neither may start, and the message names the setting and its
+    range. A count that does not fit an int, and text that is no number, say the same."""
+    bad = [
+        ("synapse.pm067_lock_attempts", "0", "1 to 3600"),
+        ("synapse.pm067_lock_attempts", "-5", "1 to 3600"),
+        ("synapse.pm067_lock_attempts", "100000", "1 to 3600"),
+        ("synapse.pm067_lock_attempts", "99999999999", "1 to 3600"),
+        ("synapse.pm067_lock_attempts", "2.5", "1 to 3600"),
+        ("synapse.pm067_lock_attempts", "many", "1 to 3600"),
+        ("synapse.pm067_lock_pause", "Infinity", "0 to 60"),
+        ("synapse.pm067_lock_pause", "NaN", "0 to 60"),
+        ("synapse.pm067_lock_pause", "-1", "0 to 60"),
+        ("synapse.pm067_lock_pause", "61", "0 to 60"),
+        ("synapse.pm067_lock_pause", "soon", "0 to 60"),
+    ]
+    for name, value, rng in bad:
+        res = _run_file(db_url, "pm067-badsetting", f"{name}={value}")
+        assert res.returncode != 0, (name, value)
+        assert name in res.stderr and rng in res.stderr, (name, value, res.stderr)
+        assert "could not obtain lock" not in res.stderr
+        assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
+        assert (
+            one(piles, "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'")
+            == 1
+        ), (name, value)
+    merge(db_url)  # the defaults still finish the file
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
+
+
+def test_the_ends_of_the_allowed_retry_ranges_are_accepted(piles, db_url):
+    for attempts, pause in (("1", "0"), ("3600", "60")):
+        _to_066(piles, db_url)
+        res = _run_file(
+            db_url,
+            "pm067-edges",
+            f"synapse.pm067_lock_attempts={attempts}",
+            f"synapse.pm067_lock_pause={pause}",
+        )
+        assert res.returncode == 0, res.stderr
+        assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
+
+
+def test_the_tail_does_not_stamp_when_its_loop_left_the_catalog_unchanged(piles, db_url):
+    """The range check keeps the loop from being skipped; this is the guard after it. With the
+    loop cut to no attempts, a database whose trigger is gone and whose defaults are missing
+    (nothing the loop did, no ACCESS EXCLUSIVE taken) must fail, not be stamped 067."""
+    skipped = _txn("b").replace("FOR attempt IN 1..tries LOOP", "FOR attempt IN 1..0 LOOP")
+    assert skipped != _txn("b")
+    _commit_a(db_url)
+    with psycopg.connect(db_url, autocommit=True) as a:
+        a.execute("DROP TRIGGER kg_rel_personal_audience ON kg_relationships")
+        a.execute("DROP FUNCTION kg_relationships_personal_audience_trg()")
+        a.execute("BEGIN")
+        with pytest.raises(psycopg.errors.RaiseException, match="no 'technical' default on"):
+            a.execute(skipped)
+        a.execute("ROLLBACK")
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
+    with psycopg.connect(db_url, autocommit=True) as a:
+        a.execute("BEGIN")
+        a.execute(_txn("b"))  # the real loop does the work
+        a.execute("COMMIT")
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
+
+
+def test_the_tail_does_not_stamp_when_the_066_trigger_is_still_in_place(piles, db_url):
+    skipped = _txn("b").replace("FOR attempt IN 1..tries LOOP", "FOR attempt IN 1..0 LOOP")
+    assert skipped != _txn("b")
+    _commit_a(db_url)
+    with psycopg.connect(db_url, autocommit=True) as a:
+        for t in KG_TABLES:
+            a.execute(f"ALTER TABLE {t} ALTER COLUMN group_id SET DEFAULT 'technical'")
+        a.execute("BEGIN")
+        with pytest.raises(psycopg.errors.RaiseException, match="trigger is still in place"):
+            a.execute(skipped)
+        a.execute("ROLLBACK")
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
+
+
+def test_the_tail_waits_for_a_stamp_an_undo_has_written_and_reads_it_after_the_commit(
+    merged, db_url
+):
+    """An undo writes 066 as its last statement and commits after it. A tail that read the 067
+    before that commit would find nothing to change and write 067 over the undone data."""
+    undo = psycopg.connect(db_url)
+    probe = psycopg.connect(db_url, autocommit=True)
+    try:
+        undo.execute("UPDATE synapse_meta SET value = '066' WHERE key = 'schema_version'")
+        ent(undo, "p-back", "Back", group="personal")  # what the undo put back, uncommitted
+
+        def tail() -> None:
+            with psycopg.connect(db_url, autocommit=True) as b:
+                b.execute("BEGIN")
+                b.execute(_txn("b"))
+                b.execute("COMMIT")
+
+        t, box = _in_thread(tail)
+        _wait_until_blocked_by(probe, undo.info.backend_pid)
+        undo.commit()
+        t.join(30)
+    finally:
+        undo.close()
+        probe.close()
+    assert isinstance(box.get("error"), psycopg.errors.RaiseException), box
+    assert "personal rows are still" in str(box["error"])
+    assert one(merged, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
 
 
 def test_the_tail_refuses_to_stamp_a_database_whose_merge_transaction_did_not_finish(piles, db_url):

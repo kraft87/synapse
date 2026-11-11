@@ -275,16 +275,20 @@ two transactions of its own, so apply it by itself and never wrap it in `BEGIN` 
    It takes minutes on a large graph (graph writers wait while it runs; the merge itself
    does not block readers) and does nothing when there is nothing left to merge, so a
    re-run is safe.
-4. Check: `python scripts/pile_merge.py --health` prints a JSON report and exits non-zero if
-   any entry under `checks` fails: no personal rows left, every folded entity gone and no
-   edge on one, no new edge with a missing endpoint or a dangling `invalidated_by`, at most
-   one flagged owner entity per owner, the 066 insert trigger gone, `group_id` defaulting to
-   `technical`, the three owner-only indexes valid, the stamp at 067. A folded uuid that a
-   poller wrote again names its remedy (apply 067 again, then restart the pollers). The
-   `reported_not_checked` block holds two numbers that never fail the run, because they move
-   for good once the graph changes: the survivors that are no longer in `technical`, and the
-   fact count against the count before the merge (an episode delete lowers it). Read them;
-   do not gate on them.
+4. Check, right after the merge: `python scripts/pile_merge.py --health --just-merged`
+   prints a JSON report and exits non-zero if any entry under `checks` fails: no personal
+   rows left, every folded entity gone and no edge on one, no new edge with a missing
+   endpoint or a dangling `invalidated_by`, at most one flagged owner entity per owner, the
+   066 insert trigger gone, `group_id` defaulting to `technical`, the three owner-only
+   indexes valid, the stamp at 067. `--just-merged` adds two checks that are exact only
+   while the pollers are stopped and no dashboard fact or episode delete has run: no
+   survivor has left `technical`, and the fact count equals the count before the merge. A
+   line on stderr says which of the two failed. A folded uuid that a poller wrote again
+   names its remedy (apply 067 again, then restart the pollers). Once the graph has moved on
+   (the pollers run, an episode is deleted) leave the flag off: the same two numbers then sit
+   in the `reported_not_checked` block and never fail the run, because they move for good
+   when the graph changes (an episode delete lowers the fact count). Read them; do not gate
+   on them.
 5. Deploy the release and start the pollers.
 
 To go back: revert the code first (a build that requires 067 exits on a database stamped
