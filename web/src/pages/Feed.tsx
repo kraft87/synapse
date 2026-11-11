@@ -33,7 +33,7 @@ function Skeletons() {
 
 export function Feed() {
   const s = useStore();
-  const { project, group, source, setOnline, setQueueDepth } = s;
+  const { project, source, setOnline, setQueueDepth } = s;
   const [items, setItems] = useState<FeedItem[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -43,7 +43,7 @@ export function Feed() {
   const itemsRef = useRef<FeedItem[]>([]);
   itemsRef.current = items;
 
-  const filters = { project, group_id: group, source };
+  const filters = { project, source };
 
   const load = () => {
     setLoading(true); setError(false);
@@ -86,7 +86,7 @@ export function Feed() {
     };
 
     const prepend = (item: FeedItem) => {
-      if (!feedItemPassesFilter(item, { project, group, source })) return; // filtered out -> drop
+      if (!feedItemPassesFilter(item, { project, source })) return; // filtered out -> drop
       const k = keyOf(item);
       setItems((prev) => (prev.some((it) => keyOf(it) === k) ? prev : [item, ...prev]));
       setFresh(new Set([k]));
@@ -106,7 +106,7 @@ export function Feed() {
       if (pollTimer != null) clearInterval(pollTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project, group, source]);
+  }, [project, source]);
 
   const loadMore = () => {
     if (!cursor || loadingMore) return;
@@ -122,7 +122,7 @@ export function Feed() {
       .finally(() => setLoadingMore(false));
   };
 
-  const filtersActive = group !== 'all' || project !== 'all' || source !== 'all';
+  const filtersActive = project !== 'all' || source !== 'all';
   const empty = !loading && items.length === 0;
 
   return (
@@ -144,7 +144,7 @@ export function Feed() {
         filtersActive ? (
           <EmptyState title="no items match the current filters">
             <button className="linkbtn" style={{ border: 'none', background: 'none', color: 'var(--acc)', cursor: 'pointer', fontSize: '13px', textDecoration: 'underline', textUnderlineOffset: '3px' }}
-              onClick={() => { s.setGroup('all'); s.setProject('all'); s.setSource('all'); }}>reset filters</button>
+              onClick={() => { s.setProject('all'); s.setSource('all'); }}>reset filters</button>
           </EmptyState>
         ) : (
           <EmptyState title="no memories yet — connect an ingestion source" subtitle="claude-code · cursor · claude-ai · transcribe-ai" />

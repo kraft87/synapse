@@ -14,14 +14,14 @@ const NAV: { key: Page; label: string }[] = [
 ];
 
 // Which filters apply on which page (spec §1 table). true = applies.
-const SCOPE: Record<Page, { group: boolean; project: boolean; source: boolean }> = {
-  feed: { group: true, project: true, source: true },
-  search: { group: true, project: true, source: true },
-  recall: { group: true, project: true, source: false },
-  timeline: { group: true, project: false, source: false },
-  graph: { group: false, project: false, source: false },
-  metrics: { group: false, project: false, source: false },
-  review: { group: false, project: false, source: false },
+const SCOPE: Record<Page, { project: boolean; source: boolean }> = {
+  feed: { project: true, source: true },
+  search: { project: true, source: true },
+  recall: { project: true, source: false },
+  timeline: { project: false, source: false },
+  graph: { project: false, source: false },
+  metrics: { project: false, source: false },
+  review: { project: false, source: false },
 };
 
 const selStyle: CSSProperties = {
@@ -47,11 +47,6 @@ export function Header() {
     const q = omni.trim();
     if (q) { s.setSearchQuery(q); s.setPage('search'); }
   };
-
-  const grpBtn = (g: 'technical' | 'personal'): CSSProperties => ({
-    border: 'none', cursor: 'pointer', padding: '5px 10px', fontSize: '12.5px', fontFamily: 'var(--font-data)',
-    background: s.group === g ? 'var(--acc-bg)' : 'var(--bg2)', color: s.group === g ? 'var(--acc)' : 'var(--txt2)',
-  });
 
   return (
     <header style={{
@@ -97,10 +92,6 @@ export function Header() {
 
       {/* filter cluster */}
       <div className="hdr-filters" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-        <div title={dimTitle(scope.group)} style={{ display: 'flex', border: '1px solid var(--line2)', borderRadius: '6px', overflow: 'hidden', ...dim(scope.group) }}>
-          <button onClick={() => s.setGroup(s.group === 'technical' ? 'all' : 'technical')} style={grpBtn('technical')}>technical</button>
-          <button onClick={() => s.setGroup(s.group === 'personal' ? 'all' : 'personal')} style={{ ...grpBtn('personal'), borderLeft: '1px solid var(--line2)' }}>personal</button>
-        </div>
         <select title={dimTitle(scope.project)} value={s.project} onChange={(e) => s.setProject(e.target.value)} style={{ ...selStyle, ...dim(scope.project) }}>
           <option value="all">all projects</option>
           {s.catalog?.projects.map((p) => <option key={p.name} value={p.name}>{p.name}</option>)}

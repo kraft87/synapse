@@ -207,9 +207,11 @@ def test_the_extraction_candidate_leg(corpus, sent, db_url, monkeypatch):
 @pytest.mark.parametrize("project", ["p", "untagged"])
 def test_the_dashboard_search(corpus, sent, db_url, type_, project):
     """Its three counts and the requested tab's hits; 'untagged' is a NULL or empty project."""
-    out = dashboard_routes._search(db_url, "widget", type_, 0, 10, project, GROUP, "s")
+    out = dashboard_routes._search(db_url, "widget", type_, 0, 10, project, "s")
     assert out["hits"]
-    _check(db_url, sent, 4)
+    # The fact and entity statements carry no filter, so there is nothing in them to fold.
+    sent[:] = [s for s in sent if "FROM kg_relationships" not in s[0]]
+    _check(db_url, sent, 2 if type_ == "facts" else 3)
 
 
 def test_a_filter_that_is_null_or_false_drops_the_row_as_the_plain_where_does(conn):
