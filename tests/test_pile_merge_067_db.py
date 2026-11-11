@@ -677,6 +677,8 @@ def test_a_folded_uuid_written_again_as_technical_is_folded_by_a_rerun(merged, d
 def test_a_ghost_whose_survivor_is_gone_is_left_alone_and_makes_no_run(merged, db_url):
     merged.execute("DELETE FROM kg_entities WHERE uuid = 't-alpha'")
     ent(merged, "p-alpha", "Alpha Again")
+    # nothing for the merge to fold, so the re-run returns before it takes any table lock
+    assert {m for _, m in _locks_while_open(db_url, _txn("a"))} <= {"AccessShareLock"}
     merge(db_url)
     assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs") == 1
     assert ent_row(merged, "p-alpha")["group_id"] == "technical"
@@ -827,8 +829,90 @@ def test_health_fails_on_a_missing_index_and_on_a_folded_entity_that_came_back(m
     )
 
 
+def test_health_stays_green_when_a_fact_is_deleted_after_the_merge_and_shows_the_counts(
+    merged, db_url
+):
+    """An episode delete removes facts for good: the count falls below the one recorded before
+    the merge, and that is the graph moving on, not damage."""
+    before = run_counts(merged)["facts_total"]
+    merged.execute("DELETE FROM kg_relationships WHERE uuid = 'f-old-p'")
+    report = pm.health(pm._connect(db_url, read_only=True))
+    assert report["ok"] is True
+    assert report["reported_not_checked"]["fact_count"] == {
+        "now": before - 1,
+        "before_merge": before,
+    }
+
+
+def test_health_stays_green_when_a_survivor_is_swept_after_the_merge_and_lists_it(merged, db_url):
+    """A survivor whose edges all went with deleted episodes is removed by the orphan sweep."""
+    assert fold_map(merged)["p-omega"][0] == "t-omega"
+    merged.execute(
+        "DELETE FROM kg_relationships WHERE src_uuid = 't-omega' OR tgt_uuid = 't-omega'"
+    )
+    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-omega'")
+    report = pm.health(pm._connect(db_url, read_only=True))
+    assert report["ok"] is True
+    assert report["reported_not_checked"]["survivors_no_longer_in_technical"] == {
+        "count": 1,
+        "uuids": ["t-omega"],
+    }
+
+
+def test_health_names_undo_not_a_rerun_for_a_returned_uuid_whose_survivor_is_gone(merged, db_url):
+    merged.execute(
+        "DELETE FROM kg_relationships WHERE src_uuid = 't-delta' OR tgt_uuid = 't-delta'"
+    )
+    merged.execute("DELETE FROM kg_entities WHERE uuid = 't-delta'")
+    ent(merged, "p-delta", "Delta Again")  # a stale name index wrote the folded uuid again
+    gone = pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"]
+    assert gone["ok"] is False and gone["still_present"]["uuids"] == ["p-delta"]
+    assert gone["apply_again_leaves_alone"]["uuids"] == ["p-delta"]
+    assert "apply_again_folds" not in gone
+    assert "apply 067 again" not in gone["remedy"] and "--undo" in gone["remedy"]
+    merge(db_url)  # and a re-run indeed leaves it alone
+    assert one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs") == 1
+    assert ent_row(merged, "p-delta")["group_id"] == "technical"
+    # one whose survivor is alive is still the re-run's work, and keeps its remedy
+    ent(merged, "p-alpha", "Alpha Again")
+    gone = pm.health(pm._connect(db_url, read_only=True))["checks"]["every folded entity is gone"]
+    assert gone["apply_again_folds"]["uuids"] == ["p-alpha"]
+    assert gone["apply_again_leaves_alone"]["uuids"] == ["p-delta"]
+    assert "apply 067 again, then restart the pollers" in gone["remedy"]
+
+
 def _undo(db_url: str, *, run: str = "all", write: bool = True) -> dict[str, Any]:
     return pm.undo(pm._connect(db_url, read_only=False), run=run, write=write)
+
+
+def _in_thread(fn) -> tuple[threading.Thread, dict[str, Any]]:
+    """Run ``fn`` on a thread; its result or exception lands in the returned dict."""
+    box: dict[str, Any] = {}
+
+    def go() -> None:
+        try:
+            box["result"] = fn()
+        except BaseException as e:  # handed to the test thread
+            box["error"] = e
+
+    t = threading.Thread(target=go)
+    t.start()
+    return t, box
+
+
+def _wait_until_blocked_by(probe, pid: int, *, seconds: float = 20) -> None:
+    """Wait until some backend is waiting for a lock that backend ``pid`` holds."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        n = one(
+            probe,
+            "SELECT count(*) FROM pg_stat_activity WHERE %s = ANY(pg_blocking_pids(pid))",
+            pid,
+        )
+        if n:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"nothing waits for a lock held by backend {pid}")
 
 
 def test_undo_restores_the_exact_rows_the_trigger_and_the_066_stamp(seeded, db_url):
@@ -981,6 +1065,70 @@ def test_undo_all_keeps_what_was_written_to_a_survivor_between_two_runs(merged, 
     assert ent_row(merged, "t-alpha")["summary"] == "written by the new image"
     assert out["drift"]["survivor edited since the merge"]["uuids"] == ["t-alpha"]
     assert ent_row(merged, "p-alpha")["group_id"] == "personal"  # everything else went back
+
+
+def test_undo_refuses_when_a_later_migration_has_raised_the_stamp_and_changes_nothing(
+    merged, db_url
+):
+    """A full undo stamps 066; with 068 applied that would put the version below 068's objects."""
+    merged.execute("UPDATE synapse_meta SET value = '068' WHERE key = 'schema_version'")
+    try:
+        before = table_md5(merged)
+        for write in (False, True):
+            with pytest.raises(SystemExit, match="above 067"):
+                _undo(db_url, write=write)
+        assert table_md5(merged) == before
+        assert one(merged, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "068"
+        assert (
+            one(merged, "SELECT count(*) FROM kg_pile_merge_067_runs WHERE undone_at IS NOT NULL")
+            == 0
+        )
+        assert (
+            one(merged, "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'")
+            == 0
+        )  # the 066 trigger was not put back either
+    finally:
+        # 067's own stamp never moves down, so the fixture's re-apply would leave 068 behind
+        merged.execute("UPDATE synapse_meta SET value = '067' WHERE key = 'schema_version'")
+
+
+def test_undo_reads_the_open_runs_only_after_it_has_the_lock(merged, db_url):
+    """An apply that holds the lock when undo starts has committed its run by the time undo
+    reads the runs, so undo takes that run too instead of stamping 066 over it."""
+    apply_ = psycopg.connect(db_url)
+    probe = psycopg.connect(db_url, autocommit=True)
+    try:
+        apply_.execute("LOCK TABLE kg_entities, kg_relationships IN SHARE ROW EXCLUSIVE MODE")
+        apply_.execute(
+            "INSERT INTO kg_pile_merge_067_runs (schema_version_before, counts) VALUES ('066', '{}')"
+        )
+        t, box = _in_thread(lambda: _undo(db_url, write=False))
+        _wait_until_blocked_by(probe, apply_.info.backend_pid)
+        apply_.commit()
+        t.join(30)
+    finally:
+        apply_.close()
+        probe.close()
+    assert "error" not in box, box
+    assert box["result"]["runs"] == [1, 2]
+
+
+def test_the_undo_help_says_a_dry_run_holds_writers_off_too(capsys):
+    with pytest.raises(SystemExit):
+        pm.main(["--help"])
+    assert "stop the pollers first" in " ".join(capsys.readouterr().out.split())
+    assert "with the pollers stopped too" in " ".join(pm.__doc__.split())
+
+
+def test_undo_reports_a_regrouped_entity_that_got_edges_since_and_still_moves_it_back(
+    merged, db_url
+):
+    fact(merged, "f-since", "technical", "p-eps", "t-delta", "written after the merge")
+    out = _undo(db_url)
+    key = "regrouped entity moved back has edges the merge never touched"
+    assert out["drift"][key] == {"count": 1, "uuids": ["p-eps"]}
+    assert ent_row(merged, "p-eps")["group_id"] == "personal"  # moved back all the same
+    assert fact_row(merged, "f-since")["group_id"] == "technical"  # and the edge is left alone
 
 
 def test_undo_re_creates_an_entity_into_a_column_a_later_migration_made_not_null(seeded, db_url):
@@ -1246,7 +1394,9 @@ def test_the_tail_retries_a_refused_lock_without_holding_one_or_blocking_a_reade
     """A reader holds ACCESS SHARE on kg_relationships. The tail must not queue for it with
     ACCESS EXCLUSIVE already held on kg_entities (every other reader of kg_entities would wait
     behind that, and so would a reader that then asks for it: a deadlock the tail would lose);
-    it sleeps between attempts, and the next attempt after the reader is gone completes."""
+    it sleeps between attempts, and the next attempt after the reader is gone completes.
+    The session's statement_timeout (300 ms) is shorter than that sleep: the tail runs its
+    retry loop as one statement and must be immune to it."""
     blocker = psycopg.connect(db_url)
     blocker.execute("LOCK TABLE kg_relationships IN ACCESS SHARE MODE")
     probe = psycopg.connect(db_url, autocommit=True)
@@ -1256,7 +1406,11 @@ def test_the_tail_retries_a_refused_lock_without_holding_one_or_blocking_a_reade
             stdin=f,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            env={**os.environ, "PGAPPNAME": "pm067-retry"},
+            env={
+                **os.environ,
+                "PGAPPNAME": "pm067-retry",
+                "PGOPTIONS": "-c statement_timeout=300ms",
+            },
             text=True,
         )
         try:
@@ -1278,6 +1432,136 @@ def test_the_tail_retries_a_refused_lock_without_holding_one_or_blocking_a_reade
     assert (
         one(piles, "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'") == 0
     )
+
+
+def _start_file(db_url: str, app: str, *settings: str) -> subprocess.Popen:
+    """The whole file through psql, as an apply runs it, with ``settings`` (name=value) given to
+    the session; ``synapse.pm067_lock_attempts`` and ``..._lock_pause`` shorten the tail's loop."""
+    with _SQL_067.open() as f:
+        return subprocess.Popen(
+            ["psql", db_url, "-q", "-v", "ON_ERROR_STOP=1"],
+            stdin=f,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "PGAPPNAME": app,
+                "PGOPTIONS": " ".join(f"-c {x}" for x in settings),
+            },
+            text=True,
+        )
+
+
+def _wait_for_table_lock(probe, app: str, table: str, mode: str, *, seconds: float = 20) -> int:
+    """Wait until backend ``app`` holds ``mode`` on ``table``; return its pid."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        pid = one(
+            probe,
+            "SELECT a.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid "
+            "WHERE a.application_name = %s AND l.relation = %s::regclass AND l.mode = %s AND l.granted",
+            app,
+            table,
+            mode,
+        )
+        if pid:
+            return pid
+        time.sleep(0.02)
+    pytest.fail(f"{app} never held {mode} on {table}")
+
+
+def test_the_tail_gives_up_loudly_on_a_writer_that_holds_a_lock_and_waits_for_the_tails(
+    piles, db_url
+):
+    """A transaction that has locked a row with SELECT ... FOR UPDATE (ROW SHARE on the table,
+    as the dashboard's fact and episode deletes do) and then writes waits for the SHARE ROW
+    EXCLUSIVE the tail holds; its ROW SHARE refuses every ACCESS EXCLUSIVE attempt. The tail
+    stops after its attempts and rolls back, the stamp stays 066 and the trigger stays, the
+    writer goes on, and a plain re-run finishes."""
+    fact(piles, "f-w", "technical", "a", "b")
+    writer = psycopg.connect(db_url)
+    probe = psycopg.connect(db_url, autocommit=True)
+    proc = None
+    try:
+        writer.execute("SELECT 1 FROM kg_relationships WHERE uuid = 'f-w' FOR UPDATE")
+        proc = _start_file(
+            db_url,
+            "pm067-exhaust",
+            "synapse.pm067_lock_attempts=60",
+            "synapse.pm067_lock_pause=0.05",
+        )
+        tail = _wait_for_table_lock(
+            probe, "pm067-exhaust", "kg_relationships", "ShareRowExclusiveLock"
+        )
+        t, box = _in_thread(
+            lambda: writer.execute(
+                "UPDATE kg_relationships SET retrieval_count = retrieval_count + 1 WHERE uuid = 'f-w'"
+            )
+        )
+        _wait_until_blocked_by(probe, tail)  # the writer waits for the tail's lock
+        _, err = proc.communicate(timeout=60)
+        t.join(30)
+        assert "error" not in box, box
+        writer.commit()
+    finally:
+        writer.close()
+        probe.close()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+    assert proc.returncode != 0 and "could not obtain lock" in err
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "066"
+    assert (
+        one(piles, "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'") == 1
+    )
+    assert one(piles, "SELECT retrieval_count FROM kg_relationships WHERE uuid = 'f-w'") == 1
+    merge(db_url)
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
+    assert (
+        one(piles, "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'") == 0
+    )
+
+
+def test_a_writer_that_only_queues_behind_the_tail_does_not_refuse_its_attempts(piles, db_url):
+    """The other writer: one that holds nothing yet, such as the recall fact-count bump, and
+    queues for ROW EXCLUSIVE behind the tail's SHARE ROW EXCLUSIVE. Being queued does not make
+    an ACCESS EXCLUSIVE NOWAIT attempt fail: once the reader is gone the next attempt
+    completes, and the writer then goes through."""
+    fact(piles, "f-w", "technical", "a", "b")
+    blocker = psycopg.connect(db_url)
+    blocker.execute("LOCK TABLE kg_relationships IN ACCESS SHARE MODE")
+    writer = psycopg.connect(db_url)
+    probe = psycopg.connect(db_url, autocommit=True)
+    proc = None
+    try:
+        proc = _start_file(
+            db_url,
+            "pm067-queued",
+            "synapse.pm067_lock_attempts=60",
+            "synapse.pm067_lock_pause=0.05",
+        )
+        tail = _wait_for_table_lock(
+            probe, "pm067-queued", "kg_relationships", "ShareRowExclusiveLock"
+        )
+        t, box = _in_thread(
+            lambda: writer.execute(
+                "UPDATE kg_relationships SET retrieval_count = retrieval_count + 1 WHERE uuid = 'f-w'"
+            )
+        )
+        _wait_until_blocked_by(probe, tail)  # queued, while the tail is refused by the reader
+        blocker.rollback()
+        _, err = proc.communicate(timeout=60)
+        t.join(30)
+        assert "error" not in box, box
+        writer.commit()
+    finally:
+        blocker.close()
+        writer.close()
+        probe.close()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 0, err
+    assert one(piles, "SELECT value FROM synapse_meta WHERE key = 'schema_version'") == "067"
+    assert one(piles, "SELECT retrieval_count FROM kg_relationships WHERE uuid = 'f-w'") == 1
 
 
 def test_the_tail_refuses_to_stamp_a_database_whose_merge_transaction_did_not_finish(piles, db_url):

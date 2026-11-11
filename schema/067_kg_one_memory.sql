@@ -47,25 +47,43 @@
 --      are never blocked; writers wait) and nothing stronger on any live table: no DROP
 --      TRIGGER, no ALTER TABLE. It builds the three owner-only btrees the code without a
 --      group predicate needs, under that same lock. Applied with the pollers stopped it
---      takes minutes; with nothing personal left (a fresh install, a re-run) it returns at
---      once, takes no table lock and writes no ledger row. A re-run with only notes or
---      preferences left flips them under row locks and leaves the KG tables alone.
+--      takes minutes; with nothing to merge (a fresh install, a re-run) it returns at
+--      once, takes no table lock and writes no ledger row. A folded uuid that a writer
+--      wrote again after its survivor was deleted is not something to merge: it counts as
+--      nothing. (pm_ghost's other conditions, a flagged entity or a survivor a later run
+--      folded too, are only tested under the lock; a row they reject takes it once, finds
+--      nothing to do and returns.) A re-run with only notes or preferences left flips them
+--      under row locks and leaves the KG tables alone.
 --   B  the tail. SET DEFAULT 'technical' on the four group_id columns (the code stops
 --      naming it), DROP the 066 insert trigger and its function, and stamp 067. What is
---      still to do is read from the catalog first, so a re-run takes no lock. Until the
---      stamp is 067 it holds SHARE ROW EXCLUSIVE on the two KG tables (writers wait,
---      readers do not) while it checks the merge is complete: no personal row left, the
---      three indexes valid, 066 applied. Then one LOCK TABLE ... ACCESS EXCLUSIVE NOWAIT
---      names every table it changes: it never waits for a lock, so no reader queues behind
---      it and no lock is held across a wait; a refused attempt is retried a second later,
---      60 times (a database that never has a moment without a reader fails the run, safely:
---      re-run the file).
+--      still to do is read from the catalog first, so a re-run of a finished file takes no
+--      lock. Until the stamp is 067 it takes SHARE ROW EXCLUSIVE on the two KG tables
+--      while it checks the merge is complete (no personal row left, the three indexes
+--      valid, 066 applied), and keeps it to the commit, through every sleep below: writers
+--      wait for the whole of B, readers never wait for that lock. Then one LOCK TABLE ...
+--      ACCESS EXCLUSIVE NOWAIT names every table it changes. NOWAIT never queues, so no
+--      reader waits behind a pending request, and what the lock lets B do (the defaults,
+--      the trigger, the stamp) is a few catalog changes before the commit. An attempt is
+--      refused while another transaction holds any lock on one of those tables, and B then
+--      sleeps a second and tries again, 60 times (the settings synapse.pm067_lock_attempts
+--      and synapse.pm067_lock_pause, in seconds, change both). The 60th refusal fails the
+--      run. A database that never has a moment without a reader does that; so does a writer
+--      that took a lock before B started (SELECT ... FOR UPDATE, as the dashboard's fact and
+--      episode deletes do) and now waits for a write lock B's SHARE ROW EXCLUSIVE withholds:
+--      the writer waits for B, and B's attempts are refused until the writer is done. Then B
+--      rolls back, the writer goes on, the stamp stays at 066, a build that requires 067
+--      still refuses to start, and re-running the file finishes. A writer that holds nothing
+--      yet and only queues behind B's SHARE ROW EXCLUSIVE does not refuse an attempt. B sets
+--      statement_timeout to 0, because that loop is one long statement; A does too.
 --      The stamp is the last statement: if B fails, the merged data stays, the stamp stays
 --      at 066, and a build that requires 067 still refuses to start. Re-run the file.
--- Apply with the pollers stopped (the poller is the only writer of personal rows). A
--- poller that wrote personal rows in between, or wrote a folded uuid again, is folded by a
--- re-run, under a new run; restart the pollers after it, because a poller keeps a deleted
--- uuid in its name index for up to 900 s and would write it again.
+-- Apply with the pollers stopped: they are the writers that add graph rows for long. Two
+-- more exist while they are stopped, and both wait for the SHARE ROW EXCLUSIVE locks above
+-- like any writer: the recall fact-count bump (one UPDATE of kg_relationships) and the
+-- dashboard's fact and episode deletes (a SELECT ... FOR UPDATE, then writes, in one
+-- transaction). A poller that wrote personal rows in between, or wrote a folded uuid again,
+-- is folded by a re-run, under a new run; restart the pollers after it, because a poller
+-- keeps a deleted uuid in its name index for up to 900 s and would write it again.
 --
 -- UNDO. Every run is written to kg_pile_merge_067_* in the same transaction: the before
 -- image of each row it changes (full rows, so a deleted twin can be re-created), the twin
@@ -132,15 +150,19 @@ BEGIN
             AND to_regclass('public.kg_pile_merge_067_runs') IS NOT NULL;
 
     -- Nothing to merge anywhere: a fresh install, CI, a re-run on a merged database. No
-    -- lock, no ledger table, no run row. (v_kg may be a false alarm for a ghost whose
-    -- survivor is gone; the check under the lock settles it.)
+    -- lock, no ledger table, no run row. A folded uuid written again is work only while its
+    -- survivor is in technical; with the survivor gone there is nothing to fold it into
+    -- (pm_ghost below needs the same). This asks for less than pm_ghost does (not the flag,
+    -- the owner or the chain of runs), so it can say yes to a row pm_ghost then rejects; the
+    -- check under the lock settles that.
     v_kg := EXISTS (SELECT 1 FROM kg_entities WHERE group_id = 'personal')
          OR EXISTS (SELECT 1 FROM kg_relationships WHERE group_id = 'personal');
     IF NOT v_kg AND v_ledger THEN
         v_kg := EXISTS (SELECT 1
                           FROM kg_pile_merge_067_entity_map m
                           JOIN kg_pile_merge_067_runs r ON r.run_id = m.run_id AND r.undone_at IS NULL
-                          JOIN kg_entities e ON e.uuid = m.loser_uuid);
+                          JOIN kg_entities e ON e.uuid = m.loser_uuid
+                          JOIN kg_entities s ON s.uuid = m.survivor_uuid AND s.group_id = 'technical');
     END IF;
     v_np := EXISTS (SELECT 1 FROM notes WHERE group_id = 'personal')
          OR EXISTS (SELECT 1 FROM preferences WHERE group_id = 'personal');
@@ -691,10 +713,15 @@ COMMIT;
 BEGIN;
 -- txn-b:begin
 SET LOCAL lock_timeout = '15s';
+-- The retry loop below is one statement that sleeps by design; a statement_timeout set on
+-- the role must not cut it off.
+SET LOCAL statement_timeout = 0;
 
 DO $pm$
 DECLARE
     attempt  int;
+    tries    int    := COALESCE(NULLIF(current_setting('synapse.pm067_lock_attempts', true), ''), '60')::int;
+    pause_s  float8 := COALESCE(NULLIF(current_setting('synapse.pm067_lock_pause', true), ''), '1')::float8;
     t        text;
     need     text[] := '{}';
     trg      boolean;
@@ -723,7 +750,7 @@ BEGIN
     -- ignored ON_ERROR_STOP would otherwise run this transaction after a failed one and
     -- stamp a database that still has a pile or lacks the indexes. The scans below read
     -- both KG tables in full, so they run under SHARE ROW EXCLUSIVE, which keeps writers
-    -- out until the stamp commits and never makes a reader wait.
+    -- out until the commit (the retry sleeps below included) and never makes a reader wait.
     IF stamped IS NULL OR stamped < '067' THEN
         LOCK TABLE kg_entities, kg_relationships IN SHARE ROW EXCLUSIVE MODE;
         IF EXISTS (SELECT 1 FROM kg_entities WHERE group_id = 'personal')
@@ -748,13 +775,15 @@ BEGIN
 
     -- ACCESS EXCLUSIVE: SET DEFAULT and DROP TRIGGER both take it. One statement names every
     -- table this run changes and NOWAIT never queues, so a pending request cannot make a
-    -- reader wait behind it, and nothing is held across a wait. A refused attempt (a
-    -- subtransaction) gives back whatever it got and the next one starts clean.
+    -- reader wait behind it. A refused attempt (a subtransaction) gives back whatever it got
+    -- and the next one starts clean. What stays held across the sleeps is the SHARE ROW
+    -- EXCLUSIVE above (only while the stamp was still below 067): writers wait for it, and a
+    -- writer that already holds a lock on one of these tables refuses every attempt.
     IF trg AND NOT 'kg_relationships' = ANY (need) THEN
         need := need || 'kg_relationships'::text;
     END IF;
     IF cardinality(need) > 0 THEN
-        FOR attempt IN 1..60 LOOP
+        FOR attempt IN 1..tries LOOP
             BEGIN
                 EXECUTE 'LOCK TABLE ' || (SELECT string_agg(format('public.%I', x), ', ')
                                             FROM unnest(need) AS x)
@@ -776,10 +805,10 @@ BEGIN
                 END IF;
                 EXIT;
             EXCEPTION WHEN lock_not_available OR deadlock_detected THEN
-                IF attempt = 60 THEN
+                IF attempt = tries THEN
                     RAISE;
                 END IF;
-                PERFORM pg_sleep(1);
+                PERFORM pg_sleep(pause_s);
             END;
         END LOOP;
     END IF;
