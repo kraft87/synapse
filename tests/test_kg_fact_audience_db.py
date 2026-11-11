@@ -10,8 +10,9 @@ The statements are in test_kg_fact_audience_sql.py; what they do to rows is here
   * a missing cutover stamp fails closed; the BM25 TopK pushdown survives the clause
   * the owner's flagged entity is never a hop seed, for any caller, and its facts are
     still served by the other legs
-  * a database without 066 behaves exactly as before it, with no errors and no warnings;
-    the schema applied under a running engine takes effect without a restart
+  * a database without 066 serves a restricted read nothing, on every leg, and full trust
+    exactly what it did before, with no errors and no warnings; the schema applied under a
+    running engine takes effect without a restart
 """
 
 from __future__ import annotations
@@ -650,6 +651,7 @@ def no_066(kg, cutover, db_url):
 
 
 PRE_066_PAIRS = ["n-ok", "n-pers", "n-new"]
+NOTHING: dict[str, Any] = {"kg": set(), "pairs": [], "surface": set(), "overlay": {}}
 
 
 def _every_path(r: Recall, ep: int) -> dict[str, Any]:
@@ -662,29 +664,26 @@ def _every_path(r: Recall, ep: int) -> dict[str, Any]:
     }
 
 
-def test_before_066_restricted_reads_serve_the_provenance_only_facts(no_066, db_url, caplog):
-    """Prod's state until the schema is applied: no label to filter on, so a restricted
-    caller is served what it was served before 066, which is every fact whose provenance
-    is inside the allowlist. No error, no response warning, one log line."""
+def test_before_066_restricted_reads_serve_nothing(no_066, db_url, caplog):
+    """Without the label the only rule left is provenance, which cannot tell a personal fact
+    from a work one, so a restricted caller is served no fact on any path. No error, no
+    response warning, one log line."""
     tx, ep = no_066
     r = _engine_on(tx)
     sink: list[str] = []
     with caplog.at_level(logging.INFO), warn_sink(sink):
         got = _every_path(r, ep)
         again = _every_path(r, ep)
-    assert got == again
-    assert got["kg"] == EVERY
-    assert got["pairs"] == ["f:o-ok", "f:o-pers", "f:o-new"]
-    assert got["surface"] == {"n-ok", "n-pers", "n-new"}
-    assert sorted(got["overlay"][ep]) == ["now new", "now ok", "now pers"]
+    assert got == again == NOTHING
     assert sink == []
     lines = [m for m in caplog.messages if "schema 066" in m]
     assert len(lines) == 1, lines
     assert all(rec.levelno <= logging.WARNING for rec in caplog.records)
 
 
-def test_before_066_the_label_rule_would_have_served_less(no_066):
-    """The control for the test above: with the columns the same data is served less."""
+def test_before_066_the_label_rule_serves_what_the_missing_columns_withhold(no_066):
+    """The control for the test above: with the columns the same data is served by the
+    label rule, so it is the missing columns that withhold it."""
     tx, ep = no_066
     tx.rollback()
     got = _every_path(_engine_on(tx), ep)
@@ -692,7 +691,7 @@ def test_before_066_the_label_rule_would_have_served_less(no_066):
     assert got["pairs"] == ["f:o-ok"]
 
 
-def test_before_066_recall_serves_the_provenance_only_facts(no_066):
+def test_before_066_restricted_recall_serves_no_facts(no_066):
     tx, _ep_id = no_066
     restricted = SurfaceTrust(
         surface_id="dev-restricted", trust="restricted", allowed_projects=(WORK,), known=True
@@ -700,7 +699,7 @@ def test_before_066_recall_serves_the_provenance_only_facts(no_066):
     sink: list[str] = []
     with warn_sink(sink):
         out = _engine_on(tx).recall("widget", trust=restricted)
-    assert {f["id"].removeprefix("f:") for f in out["facts"]} == EVERY
+    assert out["facts"] == []
     assert "warnings" not in out and sink == []
 
 
@@ -717,7 +716,7 @@ def test_before_066_full_trust_is_unchanged(no_066):
 def test_the_schema_rolled_back_under_a_positive_probe_fails_closed_once(no_066, monkeypatch):
     """The probe said yes, then the columns went away: that call serves nothing (the
     statement names a missing column), the probe flips to missing, and every later call
-    serves the provenance-only rule. A re-probe still finds them gone."""
+    serves nothing too. A re-probe still finds them gone."""
     tx, _ep_id = no_066
     r = _engine_on(tx)
     FACT_AUDIENCE_PROBE._ok[r._db_url] = True
@@ -725,19 +724,19 @@ def test_the_schema_rolled_back_under_a_positive_probe_fails_closed_once(no_066,
     with warn_sink(sink):
         assert _restricted_kg(r) == set()
         assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
-        assert _restricted_kg(r) == EVERY
-        assert r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10, [WORK])
+        assert _restricted_kg(r) == set()
+        assert r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10, [WORK]) == []
         monkeypatch.setattr(FACT_AUDIENCE_PROBE, "reprobe_s", 0.0)
-        assert _restricted_kg(r) == EVERY
+        assert _restricted_kg(r) == set()
     assert sink == []
 
 
 def test_applying_066_under_a_running_engine_takes_effect_without_a_restart(no_066, monkeypatch):
     tx, _ep_id = no_066
     r = _engine_on(tx)
-    assert _restricted_kg(r) == EVERY
+    assert _restricted_kg(r) == set()
     tx.rollback()  # the migration lands: the columns are there again
-    assert _restricted_kg(r) == EVERY, "a negative probe is trusted until its TTL lapses"
+    assert _restricted_kg(r) == set(), "a negative probe is trusted until its TTL lapses"
     monkeypatch.setattr(FACT_AUDIENCE_PROBE, "reprobe_s", 0.0)
     assert _restricted_kg(r) == SERVED
     assert FACT_AUDIENCE_PROBE.cached(r._db_url) is True
@@ -785,7 +784,7 @@ def test_a_probe_error_on_a_066_database_serves_a_restricted_read_nothing_then_r
     with warn_sink(sink):
         blind = _every_path(r, ep)
         facts, _ = r._search_kg("widget", onehot(0), [], 20)
-        assert blind == {"kg": set(), "pairs": [], "surface": set(), "overlay": {}}
+        assert blind == NOTHING
         assert _uuids(facts) == EVERY, "full trust never asks the label question"
         assert FACT_AUDIENCE_PROBE.cached(r._db_url) is None, "a failed probe is not cached"
         broken_probe()
@@ -795,6 +794,34 @@ def test_a_probe_error_on_a_066_database_serves_a_restricted_read_nothing_then_r
     assert healed["surface"] == {"n-ok"}
     assert healed["overlay"] == {ep: ["now ok"]}
     assert sink == []
+
+
+def test_a_probe_that_says_no_serves_a_restricted_read_nothing_and_full_trust_everything(
+    kg, cutover, db_url
+):
+    """The columns are there, but the probe's answer is "not applied": a restricted read
+    must not fall back to the provenance-only rule, which would serve the personal and the
+    post-cutover unlabelled facts too. Full trust never asks, so it is served as before."""
+    _seed_label_matrix(kg, cutover)
+    ep = _ep(kg)
+    _pair(kg, "ok", now="work-safe", old="work-safe", ep=ep)
+    _pair(kg, "pers", now="personal", old="personal", ep=ep)
+    r = _recall_engine(db_url)
+    FACT_AUDIENCE_PROBE.missing(r._db_url)
+    restricted = register_restricted(kg, [WORK])
+    full = register_full(kg)
+    sink: list[str] = []
+    with warn_sink(sink):
+        assert _every_path(r, ep) == NOTHING
+        out = r.recall("widget", surface=restricted)
+        facts, seeds = r._search_kg("widget", onehot(0), [], 20)
+        out_full = r.recall("widget", surface=full)
+    assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
+    assert out["facts"] == []
+    assert sink == []
+    assert _uuids(facts) == EVERY
+    assert [s["uuid"] for s in seeds] == ["seed-ent"]
+    assert EVERY <= {f["id"].removeprefix("f:") for f in out_full["facts"]}
 
 
 def test_an_unrelated_missing_column_fails_the_call_closed_and_leaves_the_probes_alone(
