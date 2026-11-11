@@ -249,7 +249,7 @@ class _RecDB:
         self.merged: list[tuple[int, str, str]] = []
         self._next_id = 100
 
-    def find_live_preferences(self, owner_id, embedding, limit=5):
+    def find_live_preferences(self, owner_id, embedding, limit=5, same_readers=None):
         return self._candidates
 
     def insert_preference(self, **kw):

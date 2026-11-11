@@ -213,9 +213,15 @@ project included, so an unknown caller serves *nothing* rather than everything.
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
 - **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**: project
-  allowlist only (a merged preference's text has no per-turn provenance, so a merge never
-  folds in text from a project outside an allowlist that holds the stored preference's
-  project, checked per approved restricted device). **`/config/*`**:
+  allowlist only. A preference has no tier and its merged text has no per-turn provenance,
+  so a new preference is matched only against live preferences with the same readers: for
+  every approved restricted device, both projects on its allowlist or both off it
+  (case-insensitive, a missing project on no list; if the lists cannot be read, the same
+  project only). A row with other readers is never re-asserted, merged into or retired by
+  the write, and the judge never sees its text; the new item is stored as its own row. The
+  check is made at write time: adding a project to a device's allowlist shows that device
+  the project's preferences as they stand, including wording merged in earlier from other
+  projects that had the same readers at the time. **`/config/*`**:
   a restricted device reads and writes only its own mirror, and sees only proposals whose
   every evidence session consists solely of its own turns. All resolved from the bearer;
   the root token and unknown callers get nothing.
