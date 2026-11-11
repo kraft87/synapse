@@ -206,27 +206,15 @@ minutes, up to 5 attempts, so fixing the configuration is enough: those turns pi
 facts on a later cycle rather than staying graph-less. Episodes are unaffected throughout,
 stored and recallable even when extraction fails.
 
-## Personal scope (optional)
+## One memory per owner
 
-Synapse keeps two knowledge graphs: `technical` (the default, and what `recall()` searches
-unless told otherwise) and `personal` (family, health, job search, anything about the
-owner's life rather than their work). Extraction routes each entity and timeline event to
-one of them by name patterns and by the `SYNAPSE_PERSONAL_PROJECTS` list.
-
-If nobody will ever talk to this server about their life, turn the split off:
-
-```
-SYNAPSE_PERSONAL_SCOPE=0
-```
-
-Everything then lands in the single technical graph, and a recall that asks for the
-personal scope is answered from it. Work-only deployments should set this: with the split
-on, a technical entity that happens to match a personal word ("sleep" in a retry loop,
-"book" in a domain model) lands in the graph the default search never reads. The switch
-changes routing from now on; rows already written keep their group.
-
-This is a different "personal" from the machine role in step 4. The role says what a
-machine may be served. The scope says which graph a fact is written to.
+Synapse keeps one knowledge graph per owner: there is no separate "personal" graph and no
+setting that splits it, so a work-only install and a mixed one are configured the same way.
+What a machine is served is decided by its role from step 4 (`personal` is full trust,
+`work` is restricted) together with two facts about each row: its audience label and where it
+came from. A restricted machine is served only facts whose source sessions sit inside its
+project allowlist and that pass the audience-label rule, and only `work-safe` notes
+([docs/auth.md](auth.md#what-a-restricted-machine-is-served)).
 
 ## Local inference (no external accounts)
 
@@ -267,6 +255,36 @@ failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, rest
 `SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
 `-- schema-check: optional` boots with a warning: the code shipped with them runs without
 them and keeps its old behaviour until they are applied.
+
+**Schema 067, one memory.** The release that makes the graph one memory per owner requires
+schema 067, which merges the old `personal` group into `technical` and folds a personal
+entity into its same-name technical twin. Its services refuse to start on a database that
+has not applied it, so on a database that holds data apply 067 first and deploy the release
+after (an older image on a database that already has 067 only logs a warning). The file runs
+two transactions of its own, so apply it by itself and never wrap it in `BEGIN` or pass
+`-1`. It needs 066 applied first.
+
+1. Stop the pollers (`docker compose stop poller poller-drain`), so nothing writes graph
+   rows during the merge.
+2. Preview, read-only. It prints counts, never fact text or entity names. The script runs
+   from a checkout of this repository, in its Python environment (the image does not ship
+   `scripts/`), and takes the database from `--db-url` or `$SYNAPSE_DB_URL`:
+   `python scripts/pile_merge.py --preview`
+3. Apply: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
+   It takes minutes on a large graph (graph writers wait while it runs; the merge itself
+   does not block readers) and does nothing when there is nothing left to merge, so a
+   re-run is safe.
+4. Check: `python scripts/pile_merge.py --health` exits non-zero if any check fails (no
+   personal rows left, no edge on a folded entity, at most one flagged owner entity per owner,
+   the three owner-only indexes valid, the stamp at 067).
+5. Deploy the release and start the pollers.
+
+To go back: revert the code first (a build that requires 067 exits on a database stamped
+066), then `python scripts/pile_merge.py --undo` for a dry run and `--undo --apply` to write
+it. Undo restores the folded entities and the groups from the before-images the merge
+recorded; a row changed since the merge is reported and left alone. `--exclude FILE` lists
+personal twins that 067 must not fold; read `python scripts/pile_merge.py --help` before
+using it. A fresh install needs none of this: its first boot applies 067 with nothing to merge.
 
 Clients follow the server: `synapse update` on each machine fetches the client version the
 server now serves (the same `/install`), updates the Claude Code plugin, and keeps Codex's

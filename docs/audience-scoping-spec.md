@@ -53,7 +53,20 @@ and re-derives it by rule 3 if it changes a note's `project`.
 IN ('personal','technical')` (038), which fails open (NULL) — adding a second
 overlapping label with opposite fail semantics invites drift. Instead: the board's
 last-7-days digest for a restricted surface filters events by the surface's project
-allowlist, excluding NULL project (fail-closed).
+allowlist, excluding NULL project (fail-closed). `domain` is only a tag on the event; no
+serving rule reads it.
+
+### 2b. Knowledge-graph facts: one memory, a label on each fact
+
+The knowledge graph is one memory per owner. No graph partition is a trust boundary, and no
+serving path reads the `group_id` column (schema 067 merged the former personal and
+technical groups). What a restricted surface may be served is decided per fact by two
+things: the fact's provenance (below) and its audience label, `kg_relationships.audience`
+(schema 066), which uses the same two tiers as notes: `personal` or `work-safe`, NULL until
+labelled. A `personal` fact is never served on a restricted surface, and a fact labelled
+after 066 is served only once it is `work-safe`; a fact from before 066 that was never
+labelled follows its provenance alone. A restricted read serves no facts unless the label
+exists, so a database without 066 never falls back to provenance alone.
 
 ### 3. Trust — a surface is a CREDENTIAL, not a hostname (schema 054)
 
@@ -175,7 +188,8 @@ project included, so an unknown caller serves *nothing* rather than everything.
   `kg_relationships.source_projects` (the distinct projects of its source episodes,
   trigger-maintained) is known, non-empty, and a subset of `allowed_projects`. Unknown (a
   missing or project-less source episode, or no episode provenance) and mixed provenance
-  are never served. Before 056 is applied, no facts.
+  are never served, and the fact must also pass the audience label rule (see 2b). Before
+  056 is applied, no facts.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
@@ -220,8 +234,8 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 - No retroactive classification of 40k+ episodes. Project allowlist is the episode
   boundary; accept the coarseness.
 - No client-side filtering. The plugin never sees what it isn't served.
-- No KG fact whose provenance is unknown or mixed on restricted surfaces (see above),
-  and no entity summaries there at all.
+- No KG fact whose provenance is unknown or mixed, or whose label is not `work-safe`, on
+  restricted surfaces (see above), and no entity summaries there at all.
 - No device-token expiry or rotation schedule. Revocation is manual and immediate; a
   TTL would add a renewal path (and a renewal credential) for no threat this model has.
 - No enrollment without an identity provider. A bearer-only deployment has no identity

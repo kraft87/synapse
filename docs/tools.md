@@ -12,15 +12,17 @@ The board is deliberately NOT a tool: the plugin's SessionStart hook injects it 
 `GET /context`, and a listed board tool would invite a double-inject of a block the model
 already has (the Hermes pattern — when injection covers the read, ship no read tool).
 
-- **`recall(query, project=None, session_focus=None, group_id="technical")`**: the primary
+- **`recall(query, project=None, session_focus=None)`**: the primary
   retrieval tool. Reranked episode passages blended with knowledge-graph facts, captured
   web research, and fact history. Served passages carry a `role` label
   (`user` / `assistant` / `mixed`) and a date, so a caller can weight a human-stated fact
   over the agent's own past output. Every served item carries an id (`e:N` episode, `n:N`
   note, `f:<uuid>` fact, `w:N` web); only `e:` and `n:` are fetchable, the
-  rest are feedback-only. `group_id` (`technical` default, or `personal`) is the knowledge
-  graph a restricted host is served. A trusted host is served that graph's facts as before
-  plus up to four matching facts from the other one.
+  rest are feedback-only. Facts come from one memory per owner, ranked in a single list. A
+  restricted host is served only facts whose source sessions sit inside its project
+  allowlist and that pass the audience-label rule
+  ([docs/auth.md](auth.md#what-a-restricted-machine-is-served)). The tool takes no group: a client that still sends `group_id` is accepted and the argument is
+  ignored.
 - **`recall_full_turns(query, project=None, limit=5, session_id=None)`**: the drill-down and
   retry sibling. `recall()` serves compressed ~1400-char passage slices; this serves whole
   turns and nothing else, ranked by relevance plus recency. It is the right call for exact
