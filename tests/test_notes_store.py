@@ -63,7 +63,7 @@ def test_insert_and_cosine_knn(conn, db_url):
     assert hits[0]["id"] == a
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-3)
-    assert set(hits[0]) == {"id", "hook", "body", "type", "project", "sim"}
+    assert set(hits[0]) == {"id", "hook", "body", "type", "project", "audience", "sim"}
     db.close()
     _wipe(conn)
 
@@ -242,7 +242,7 @@ class _NotesDB:
         self.superseded: list[tuple[int, int]] = []
         self._next_id = 500
 
-    def find_live_notes(self, owner_id, embedding, limit=5):
+    def find_live_notes(self, owner_id, embedding, limit=5, audience=None):
         self.knn_calls += 1
         return self._candidates
 

@@ -51,7 +51,10 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   knowledge-graph extraction. Notes land in a dedicated store that is reconciled on write: a
   new note that restates an existing one updates it in place, and one that contradicts it
   supersedes the old note while keeping the lineage — so the curated set stays small and
-  current instead of accumulating duplicates.
+  current instead of accumulating duplicates. A restatement never edits a note of the
+  other audience tier (personal or work-safe): it is stored as a note of its own. A
+  restricted caller is only ever matched against work-safe notes, and only an explicit
+  `audience` moves an existing note.
 - **`recall_feedback(query, helpful=None, noise=None, missing=None, found_via=None, comment=None, project=None)`**
   reports retrieval quality after a recall whose results you used: which served ids were
   load-bearing, which were noise, and what was missing. It writes one row of offline labeled data for eval

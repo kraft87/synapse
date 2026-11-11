@@ -556,15 +556,17 @@ def test_remember_rejects_an_invalid_audience_before_writing(remember_env):
 
 
 class _StubDB:
-    """reconcile_note's collaborators, stubbed: one high-similarity candidate so the
-    restatement path runs, and no restricted surfaces so derivation says 'personal'."""
+    """reconcile_note's collaborators, stubbed: one high-similarity PERSONAL candidate so
+    the restatement path runs, and no restricted surfaces so derivation says 'personal'."""
 
     def __init__(self, candidate_type="user"):
         self.updates: list[dict] = []
         self.inserts: list[dict] = []
         self._candidate_type = candidate_type
 
-    def find_live_notes(self, owner_id, embedding, limit=5):
+    def find_live_notes(self, owner_id, embedding, limit=5, audience=None):
+        if audience not in (None, "personal"):
+            return []
         return [
             {
                 "id": 42,
@@ -572,6 +574,7 @@ class _StubDB:
                 "body": "Existing.",
                 "type": self._candidate_type,
                 "project": None,
+                "audience": "personal",
                 "sim": 0.95,
             }
         ]
@@ -599,8 +602,8 @@ class _Emb8:
 
 def test_restatement_preserves_the_stored_audience(monkeypatch):
     """Rephrasing a note is not reclassifying it. update_note gets audience=None, which
-    COALESCEs to the stored value — so a work-safe note stays work-safe through an
-    update that has no idea what tier it was on."""
+    COALESCEs to the stored value — so a note keeps its tier through an update that has
+    no idea what tier it was on."""
     monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
     db = _StubDB()
     res = reconcile_note(
@@ -618,7 +621,8 @@ def test_restatement_preserves_the_stored_audience(monkeypatch):
 
 
 def test_restatement_with_an_explicit_audience_does_reclassify(monkeypatch):
-    """The one way an existing note moves tier: someone said so."""
+    """The one way an existing note moves tier: someone said so. The match is the
+    personal note, found in the tier other than the one the write is stored under."""
     monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
     db = _StubDB()
     res = reconcile_note(

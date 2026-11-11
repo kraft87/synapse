@@ -266,6 +266,9 @@ class _RecDB:
     def merge_preference_text(self, pref_id, pref, embedding, embed_model):
         self.merged.append((pref_id, pref, embed_model))
 
+    def restricted_surface_allowlists(self):
+        return []  # no registered restricted device: a merge crosses no allowlist
+
 
 class _StubEmb:
     model_name = "voyage-4-large"

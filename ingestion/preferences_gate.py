@@ -20,6 +20,10 @@ Reconciliation (write-time), keyed on cosine similarity to the live set:
   - _SUPERSEDE_SIM.._REASSERT_SIM otherwise → CONFIRM: one cheap LLM call decides
     restatement (→ re-assert) vs distinct (→ insert); any failure falls back to insert
   - else                          → INSERT a new live preference
+A CONFIRM that folds new detail into the stored text (a merge) is held to one more rule: it
+may not make text readable by a device that could not read the project it came from. If the
+stored preference's project is on a restricted device's allowlist, the new item's project
+must be on it too, else the old text stays and the restatement is only counted.
 The pure decision lives in ``decide_pref_action`` so it's unit-testable without a DB; the
 gray-band LLM confirm is the same shape ``notes.reconcile_note`` and the entity deduper use
 (structural rules outside the band, a judgement call inside it).
@@ -192,6 +196,14 @@ def decide_pref_action(new_polarity: str, candidates: list[dict[str, Any]]) -> d
     return {"action": "insert", "target_id": None}
 
 
+def _candidate_project(candidates: list[dict[str, Any]], target_id: Any) -> str | None:
+    """The project of the candidate the decision targeted (None when it has none)."""
+    for c in candidates:
+        if c.get("id") == target_id:
+            return c.get("project")
+    return None
+
+
 def _candidate_text(candidates: list[dict[str, Any]], target_id: Any) -> str:
     """The stored pref text of the candidate the decision targeted, or "" if the row
     carried none (an empty string routes the caller to a plain insert)."""
@@ -285,6 +297,27 @@ class PreferencesGate:
         )
         return verdict
 
+    def _merge_allowed(self, target_project: str | None, new_project: str | None) -> bool:
+        """May the stored text of a preference from ``target_project`` take in detail
+        from ``new_project``? A restricted device is served a preference when its project
+        is on that device's allowlist (and no other way), so the merged text may reach
+        every device that reads the target's project: each of those must also read the
+        new item's project. Compared case-insensitively, as derive_audience does; a missing
+        project is on no allowlist. False when the allowlists cannot be read, so an
+        outage keeps the old text."""
+        try:
+            allowlists = self._db.restricted_surface_allowlists()
+        except Exception as e:
+            logger.warning("restricted allowlists unreadable (%s); preference merge skipped", e)
+            return False
+        target = target_project.lower() if target_project else None
+        new = new_project.lower() if new_project else None
+        for allowed in allowlists:
+            names = {p.lower() for p in allowed}
+            if target in names and new not in names:
+                return False
+        return True
+
     def _merge_into(self, pref_id: int, updated_pref: str) -> bool:
         """Replace the stored anchor text of ``pref_id`` with the judge's merged text,
         re-embedded so the dedup KNN keeps comparing like-with-like, counting the
@@ -323,6 +356,9 @@ class PreferencesGate:
                 if (
                     isinstance(upd, str)
                     and _valid_merged_pref(upd, existing)
+                    and self._merge_allowed(
+                        _candidate_project(candidates, action["target_id"]), project
+                    )
                     and self._merge_into(action["target_id"], upd)
                 ):
                     return  # merge already counted the re-assertion

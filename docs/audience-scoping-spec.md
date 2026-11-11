@@ -44,6 +44,20 @@ Write-time tagging at the single chokepoint, `ingestion/notes.py:reconcile_note`
    restricted surfaces' `allowed_projects`, else `personal`. This keeps the work board
    from decaying to empty without inventing new classification machinery.
 
+Reconciling a write against the live notes works one tier at a time. A write never edits
+a live note of another tier, and a restricted caller never sees, edits or retires a
+personal note:
+
+- A restricted caller is matched against `work-safe` notes only, in SQL, whatever
+  `audience` it passed. The personal tier is never queried for it.
+- A full-trust caller is matched in the tier its write will be stored under, then in the
+  other tier. In the other tier, a contradiction retires the note and the new note takes
+  its own tier; a restatement leaves the note alone and creates the new note in its own
+  tier (so the same wording can have a twin in each tier); only an explicit `audience`
+  updates the note in place and moves it. An LLM outage or `SYNAPSE_NOTES_CONFIRM=0`
+  counts as a restatement.
+- A restatement within a tier keeps the stored `audience`.
+
 The dream notes judge (retype / re-project / supersede) preserves `audience` on update,
 and re-derives it by rule 3 if it changes a note's `project`.
 
@@ -195,7 +209,9 @@ project included, so an unknown caller serves *nothing* rather than everything.
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
 - **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**: project
-  allowlist only (a merged preference's text has no per-turn provenance). **`/config/*`**:
+  allowlist only (a merged preference's text has no per-turn provenance, so a merge never
+  folds in text from a project outside an allowlist that holds the stored preference's
+  project, checked per approved restricted device). **`/config/*`**:
   a restricted device reads and writes only its own mirror, and sees only proposals whose
   every evidence session consists solely of its own turns. All resolved from the bearer;
   the root token and unknown callers get nothing.

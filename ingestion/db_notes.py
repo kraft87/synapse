@@ -11,20 +11,33 @@ from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_lit
 
 class NoteStore(DatabaseConnection):
     def find_live_notes(
-        self, owner_id: str, embedding: list[float], limit: int = 5
+        self,
+        owner_id: str,
+        embedding: list[float],
+        limit: int = 5,
+        audience: str | None = None,
     ) -> list[dict[str, Any]]:
         """Live notes for one owner, nearest to ``embedding`` by cosine (over the
-        HOOK — the embed target). Returns ``[{id, hook, body, type, project, sim}]`` in
-        DESCENDING similarity. The reconcile path's dedup/supersession decision reads this."""
+        HOOK — the embed target). Returns ``[{id, hook, body, type, project, audience,
+        sim}]`` in DESCENDING similarity. The reconcile path's dedup/supersession
+        decision reads this.
+
+        ``audience`` narrows to one tier IN SQL, so a caller that may not see the other
+        tier never receives a row of it, not even to discard. None reads both."""
         vlit = _vector_literal(embedding)
+        clauses = ["owner_id = %s", "superseded_by IS NULL", "embedding IS NOT NULL"]
+        params: list[Any] = [vlit, owner_id]
+        if audience is not None:
+            clauses.append("audience = %s")
+            params.append(audience)
         with self._conn() as conn:
             rows = conn.execute(
-                f"SELECT id, hook, body, type, project, 1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
+                f"SELECT id, hook, body, type, project, audience, "  # nosec B608 — _EMBED_DIMS is a validated int; the WHERE clauses are literals with bound params
+                f"1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "
                 "FROM notes "
-                "WHERE owner_id = %s AND superseded_by IS NULL "
-                "AND embedding IS NOT NULL "
+                f"WHERE {' AND '.join(clauses)} "
                 f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
-                (vlit, owner_id, vlit, limit),
+                (*params, vlit, limit),
             ).fetchall()
         return [
             {
@@ -33,6 +46,7 @@ class NoteStore(DatabaseConnection):
                 "body": r["body"],
                 "type": r["type"],
                 "project": r["project"],
+                "audience": r["audience"],
                 "sim": float(r["sim"]),
             }
             for r in rows
@@ -206,6 +220,20 @@ class NoteStore(DatabaseConnection):
                 "WHERE trust = 'restricted' AND status = 'approved'"
             ).fetchall()
         return [cast(str, r["project"]) for r in rows if r["project"]]
+
+    def restricted_surface_allowlists(self) -> list[list[str]]:
+        """The project allowlist of each approved restricted surface, one list per
+        surface (same rows as :meth:`restricted_surface_projects`, which flattens them).
+
+        The union cannot answer "may a device that reads project A also read project B":
+        that needs each device's own list. The preference merge asks it. Raises on a
+        database error; the caller treats an unreadable answer as "no"."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT allowed_projects FROM surfaces "
+                "WHERE trust = 'restricted' AND status = 'approved'"
+            ).fetchall()
+        return [[cast(str, p) for p in (r["allowed_projects"] or []) if p] for r in rows]
 
     def find_note_by_source_ref(self, source_ref: str) -> dict[str, Any] | None:
         """Newest note carrying this provenance ref, live or retired — the seed
