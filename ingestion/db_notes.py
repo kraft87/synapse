@@ -268,13 +268,16 @@ class NoteStore(DatabaseConnection):
         share little hook wording); the LLM judge downstream is the precision layer.
 
         Returns ``[{a: {...}, b: {...}, sim: float}]`` where each side carries
-        ``id, hook, body, type, project, updated_at``."""
+        ``id, hook, body, type, project, audience, updated_at``. Pairs are not filtered by
+        tier: the lane decides what a cross-tier pair may do."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT a.id AS a_id, a.hook AS a_hook, a.body AS a_body, a.type AS a_type, "
-                "       a.project AS a_project, a.updated_at AS a_updated_at, "
+                "       a.project AS a_project, a.audience AS a_audience, "
+                "       a.updated_at AS a_updated_at, "
                 "       b.id AS b_id, b.hook AS b_hook, b.body AS b_body, b.type AS b_type, "
-                "       b.project AS b_project, b.updated_at AS b_updated_at, "
+                "       b.project AS b_project, b.audience AS b_audience, "
+                "       b.updated_at AS b_updated_at, "
                 "       1 - (a.embedding <=> b.embedding) AS sim "
                 "FROM notes a "
                 "JOIN notes b ON b.owner_id = a.owner_id AND b.id > a.id "
@@ -290,9 +293,9 @@ class NoteStore(DatabaseConnection):
             ).fetchall()
         return [
             {
-                "a": {k: r[f"a_{k}"] for k in ("id", "hook", "body", "type", "project")}
+                "a": {k: r[f"a_{k}"] for k in ("id", "hook", "body", "type", "project", "audience")}
                 | {"updated_at": r["a_updated_at"]},
-                "b": {k: r[f"b_{k}"] for k in ("id", "hook", "body", "type", "project")}
+                "b": {k: r[f"b_{k}"] for k in ("id", "hook", "body", "type", "project", "audience")}
                 | {"updated_at": r["b_updated_at"]},
                 "sim": float(r["sim"]),
             }

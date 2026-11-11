@@ -24,13 +24,16 @@ from ingestion.llm_client import MalformedResponseError
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def _note(note_id: int, *, type="user", project=None, days=0, hook=None, body="Body."):
+def _note(
+    note_id: int, *, type="user", project=None, days=0, hook=None, body="Body.", audience="personal"
+):
     return {
         "id": note_id,
         "hook": hook or f"Example note {note_id}",
         "body": body,
         "type": type,
         "project": project,
+        "audience": audience,
         "updated_at": _T0 + timedelta(days=days),
     }
 
@@ -270,6 +273,26 @@ def test_pair_merge_records_audit_and_sample(monkeypatch):
     assert row["verdict"] == "DUPLICATE" and row["applied"] is True
     assert row["detail"]["sim"] == 0.94 and row["detail"]["reason"] == "consensus"
     assert len(row["detail"]["orders"]) == 2  # both judgements kept for the audit trail
+
+
+def test_a_cross_tier_duplicate_is_memoized_without_spending_the_apply_budget(monkeypatch):
+    """The first pair spans two tiers, so neither note is retired and nothing is counted;
+    the budget of one is still there for the same-tier pair behind it."""
+    _stub_llm(monkeypatch, pair_verdicts=[_DUP, _DUP, _DUP, _DUP])
+    db = _FakeDB(
+        pairs=[
+            (_note(1, audience="work-safe"), _note(2, days=1), 0.95),
+            (_note(3), _note(4, days=1), 0.94),
+        ]
+    )
+    res = run_lane(db=db, llm=object(), max_apply=1)
+    assert db.superseded == [(3, 4)]
+    assert res["counts"]["applied_supersede"] == 1 and res["counts"]["pairs_judged"] == 2
+    assert res["samples"] == ["n:3 -> superseded by n:4 (duplicate)"]
+    kept, applied = db.curation
+    assert kept["verdict"] == "DUPLICATE" and kept["applied"] is False
+    assert kept["detail"]["kept"] == "other tier"
+    assert applied["applied"] is True and "kept" not in applied["detail"]
 
 
 def test_distinct_pair_is_memoized_but_not_applied(monkeypatch):

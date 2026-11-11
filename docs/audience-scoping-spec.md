@@ -57,6 +57,10 @@ personal note:
   updates the note in place and moves it. An LLM outage or `SYNAPSE_NOTES_CONFIRM=0`
   counts as a restatement.
 - A restatement within a tier keeps the stored `audience`.
+- The nightly notes lane follows the same rule. A DUPLICATE verdict on two notes of
+  different tiers is not applied (neither is retired, the pair is memoised, and the
+  curation row says `kept: other tier`), so it cannot undo the twin a restatement made. A
+  CORRECTION is applied whatever the tiers, as a contradiction is at write time.
 
 The dream notes judge (retype / re-project / supersede) preserves `audience` on update,
 and re-derives it by rule 3 if it changes a note's `project`.
