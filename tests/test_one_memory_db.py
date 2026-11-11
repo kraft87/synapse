@@ -25,6 +25,7 @@ import mcp_server.recall as recall_mod
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
 from mcp_server import kg_pg
 from mcp_server.recall import Recall
+from mcp_server.recall_settings import _SUP_LIMIT
 from tests.helpers.embed import onehot
 
 WORK = "work-proj"
@@ -296,6 +297,124 @@ def test_full_trust_pairs_surface_and_overlay_ignore_the_legacy_value(
     assert pairs == ["f:old"]
     assert surface == {"now"}
     assert overlay == {ep: ["gadget runs on postgres"]}
+
+
+def test_a_successor_repeating_a_served_fact_text_is_served_once(kg, db_url):
+    """The ranked list serves a text once however many rows carry it. The same sentence is
+    live in both legacy values here: one is reached by the ranked list, the other as the
+    successor of a retired fact, and the surface must not serve it a second time."""
+    ep = _ep(kg)
+    _fact(kg, "live-t", TECH, "widget runs on postgres", ep, emb=0, src="s1", tgt="t1")
+    _fact(kg, "live-p", PERS, "widget runs on postgres", ep, src="s2", tgt="t2")
+    _fact(
+        kg,
+        "old-p",
+        PERS,
+        "widget runs on sqlite",
+        ep,
+        emb=0,
+        src="s2",
+        tgt="t2",
+        t_invalid=_INVALID,
+        invalidated_by="live-p",
+    )
+    out = _engine(db_url).recall("widget", trust=FULL_TRUST)
+    assert [f["fact"] for f in out["facts"]] == ["widget runs on postgres"]
+    assert _served(out) == {"live-t"}
+
+
+def test_successors_repeating_each_other_take_one_surface_slot(kg, db_url):
+    """Two retired facts point at successors with the same text: the text is served once and
+    the freed slot goes to the next successor in line, not to the repeat."""
+    ep = _ep(kg)
+    texts = ["gadget runs on postgres", "gadget runs on postgres"]
+    texts += [f"gizmo {i} runs on mysql" for i in range(_SUP_LIMIT)]
+    for i, text in enumerate(texts):
+        # nearer the query for a smaller i, all inside the surface's distance gate
+        w = 1.0 - 0.05 * i
+        _fact(kg, f"now-{i}", LEGACY[i % 2], text, ep, src=f"s{i}", tgt="t")
+        _fact(
+            kg,
+            f"old-{i}",
+            LEGACY[i % 2],
+            f"widget {i} runs on sqlite",
+            ep,
+            src=f"s{i}",
+            tgt="t",
+            t_invalid=_INVALID,
+            invalidated_by=f"now-{i}",
+        )
+        tilted = onehot(0)
+        tilted[0], tilted[1] = w, (1.0 - w * w) ** 0.5
+        kg.execute(
+            "UPDATE kg_relationships SET fact_embedding = %s::vector WHERE uuid = %s",
+            (kg_pg._vec_literal(tilted), f"old-{i}"),
+        )
+    out = _engine(db_url).recall("widget", trust=FULL_TRUST)
+    assert [f["fact"] for f in out["facts"]] == [texts[0], *texts[2 : _SUP_LIMIT + 1]]
+
+
+def _many_retired(conn, ep: int, n: int, personal_from: int | None = None) -> None:
+    """``n`` retired facts citing one episode, each with its live successor, alternating
+    between the legacy values. Retired in index order, the oldest first, so reading the rows in
+    storage order keeps the wrong ones. From ``personal_from`` on, both sides are personal."""
+    for i in range(n):
+        audience = "personal" if personal_from is not None and i >= personal_from else "work-safe"
+        group = LEGACY[i % 2]
+        _fact(
+            conn,
+            f"now-{i}",
+            group,
+            f"gadget {i} runs on postgres",
+            ep,
+            src=f"s{i}",
+            audience=audience,
+        )
+        _fact(
+            conn,
+            f"old-{i}",
+            group,
+            f"widget {i} runs on sqlite",
+            ep,
+            src=f"s{i}",
+            t_invalid=f"2026-02-{i + 1:02d}T00:00:00+00:00",
+            invalidated_by=f"now-{i}",
+            audience=audience,
+        )
+
+
+def _gadgets(*indexes: int) -> list[str]:
+    return [f"gadget {i} runs on postgres" for i in indexes]
+
+
+@pytest.mark.parametrize("with_served_text", [False, True])
+def test_the_overlay_keeps_the_most_recently_retired_links_under_its_limit(
+    kg, db_url, with_served_text
+):
+    """More facts cite the episode than the lookup fetches, in both legacy values: the rows
+    that survive the fetch limit are the most recently retired, not whichever the plan reads."""
+    ep = _ep(kg)
+    cap = 2
+    n = cap * (4 if with_served_text else 1) + 4
+    _many_retired(kg, ep, n)
+    served_text = {ep: " ".join(f"widget {i} runs on sqlite" for i in range(n))}
+    overlay = Recall(db_url, "")._episode_supersessions(
+        [ep], cap=cap, served_text=served_text if with_served_text else None
+    )
+    assert overlay == {ep: _gadgets(n - 1, n - 2)}
+
+
+def test_a_restricted_overlay_keeps_the_most_recent_links_that_pass_the_label_rule(kg, db_url):
+    """The label rule filters before the order and the limit: the newest links here are
+    personal, so a restricted read keeps the newest work-safe ones and a full read the newest."""
+    ep = _ep(kg)
+    n = 12
+    _many_retired(kg, ep, n, personal_from=n - 3)
+    r = Recall(db_url, "")
+    assert r._episode_supersessions([ep], cap=2) == {ep: _gadgets(n - 1, n - 2)}
+    assert r._episode_supersessions([ep], cap=2, allowed_projects=[WORK]) == {
+        ep: _gadgets(n - 4, n - 5)
+    }
 
 
 # ---------------------------------------------------------------------------

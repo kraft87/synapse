@@ -347,6 +347,7 @@ class RecallOverviewMixin:
             else self._surface_supersessions(
                 query_emb,
                 {f.get("_uuid") for f in served_facts if f.get("_uuid")},
+                served_fact_texts=[f["fact"] for f in served_facts],
                 **kg_scope,
             )
         )

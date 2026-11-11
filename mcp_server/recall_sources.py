@@ -5,13 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Iterable
 from typing import Any
 
 import psycopg
 from psycopg.rows import tuple_row
 
 from ingestion.surfaces import FACT_AUDIENCE_PROBE
-from mcp_server.kg_pg import _vec_literal, search_kg_postgres
+from mcp_server.kg_pg import _vec_literal, fact_text_key, search_kg_postgres
 from mcp_server.recall_fact_audience import FACT_AUDIENCE_COLUMNS, FactAudienceUnknown
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_settings import _SUP_LIMIT
@@ -385,7 +386,10 @@ class RecallSourcesMixin:
         overlay half of self-exclusion (see ``_self_session_facts``).
 
         ``served_text`` (episode id -> the text actually served for it) keeps a successor
-        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``)."""
+        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``).
+
+        The lookup reads the most recently retired edges first (ties by uuid), so the rows
+        kept under the limit do not depend on the plan."""
         settings = self._settings()
         if not episode_ids:
             return {}
@@ -421,6 +425,7 @@ class RecallSourcesMixin:
                     "  AND n.web_artifact_id IS NULL "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}{self_sql}"
+                    "ORDER BY p.t_invalid DESC NULLS LAST, p.uuid "
                     "LIMIT %s",
                     params,
                 ).fetchall()
@@ -459,6 +464,7 @@ class RecallSourcesMixin:
         served_uuids: set[str],
         cap: int = _SUP_LIMIT,
         allowed_projects: list[str] | None = None,
+        served_fact_texts: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         """A query that matches a now-INVALID fact should still return the CURRENT answer.
 
@@ -469,6 +475,10 @@ class RecallSourcesMixin:
         itself. Shape matches the KG fact leg ({fact, _uuid, _date, _ongoing, _supported}) so it
         flows through fact serving.
         Fail-open — a lookup error just yields no extras.
+
+        ``served_fact_texts`` are the texts already served. The fact leg serves a text once however
+        many rows carry it, so a successor repeating a served text, or an earlier successor's,
+        is skipped and the next candidate takes its slot.
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
         and its served successor to pass the schema-056 provenance rule."""
@@ -514,22 +524,28 @@ class RecallSourcesMixin:
             logger.warning("supersession surface failed: %s", e)
             return []
         out: list[dict[str, Any]] = []
+        seen_text = {fact_text_key(t) for t in served_fact_texts}
         for r in rows:
             d = r.get("d")
             if d is None or d > settings._SUP_MAX_DIST:
                 continue
             u, fact = r.get("uuid"), r.get("fact")
-            if u and fact and u not in served_uuids:
-                out.append(
-                    {
-                        "fact": fact,
-                        "_uuid": u,
-                        "_date": r.get("t_valid"),
-                        "_ongoing": r.get("ongoing"),
-                        "_supported": r.get("last_supported_at"),
-                    }
-                )
-                served_uuids.add(u)
-                if len(out) >= cap:
-                    break
+            if not (u and fact) or u in served_uuids:
+                continue
+            text_key = fact_text_key(fact)
+            if text_key in seen_text:
+                continue
+            seen_text.add(text_key)
+            out.append(
+                {
+                    "fact": fact,
+                    "_uuid": u,
+                    "_date": r.get("t_valid"),
+                    "_ongoing": r.get("ongoing"),
+                    "_supported": r.get("last_supported_at"),
+                }
+            )
+            served_uuids.add(u)
+            if len(out) >= cap:
+                break
         return out

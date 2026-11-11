@@ -71,7 +71,7 @@ def _wire_stubs(r: Recall) -> None:
     # full-episode fallback anymore, so the episode bucket is omitted — these tests assert
     # on the debug envelope + est_tokens self-consistency, not on episode presence.
     r._compact_to_passages = lambda q, eps, n, **_k: []  # type: ignore[method-assign]
-    r._surface_supersessions = lambda emb, served, cap=None: []  # type: ignore[method-assign]
+    r._surface_supersessions = lambda emb, served, cap=None, **_k: []  # type: ignore[method-assign]
     r._episode_supersessions = lambda ids, cap=6, **k: {}  # type: ignore[method-assign]
     r._record_metrics = lambda m: None  # type: ignore[method-assign]  # no background DB write
 

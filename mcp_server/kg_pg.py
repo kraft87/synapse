@@ -135,6 +135,11 @@ def _vec_literal(emb: list[float]) -> str:
     return "[" + ",".join(map(str, emb)) + "]"
 
 
+def fact_text_key(fact: str) -> str:
+    """The key under which two facts count as the same text: case and spacing do not matter."""
+    return " ".join(fact.lower().split())
+
+
 def search_kg_postgres(
     cur: Any,
     query: str,
@@ -375,7 +380,7 @@ def search_kg_postgres(
         if u not in fact_by_uuid:
             continue
         fact, t_valid, ongoing, supported = fact_by_uuid[u]
-        text_key = " ".join(fact.lower().split())
+        text_key = fact_text_key(fact)
         if text_key in seen_text:
             continue
         seen_text.add(text_key)
