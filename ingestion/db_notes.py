@@ -11,9 +11,9 @@ from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_lit
 
 class NoteStore(DatabaseConnection):
     def find_live_notes(
-        self, owner_id: str, group_id: str, embedding: list[float], limit: int = 5
+        self, owner_id: str, embedding: list[float], limit: int = 5
     ) -> list[dict[str, Any]]:
-        """Live notes for one owner/group, nearest to ``embedding`` by cosine (over the
+        """Live notes for one owner, nearest to ``embedding`` by cosine (over the
         HOOK — the embed target). Returns ``[{id, hook, body, type, project, sim}]`` in
         DESCENDING similarity. The reconcile path's dedup/supersession decision reads this."""
         vlit = _vector_literal(embedding)
@@ -21,10 +21,10 @@ class NoteStore(DatabaseConnection):
             rows = conn.execute(
                 f"SELECT id, hook, body, type, project, 1 - (embedding <=> %s::halfvec({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "FROM notes "
-                "WHERE owner_id = %s AND group_id = %s AND superseded_by IS NULL "
+                "WHERE owner_id = %s AND superseded_by IS NULL "
                 "AND embedding IS NOT NULL "
                 f"ORDER BY embedding <=> %s::halfvec({_EMBED_DIMS}) ASC LIMIT %s",
-                (vlit, owner_id, group_id, vlit, limit),
+                (vlit, owner_id, vlit, limit),
             ).fetchall()
         return [
             {
@@ -48,9 +48,8 @@ class NoteStore(DatabaseConnection):
     ) -> list[dict[str, Any]]:
         """Live notes nearest to ``embedding`` (hook KNN), scoped like the board: global
         types (user/feedback/reference) always in, project notes only for the caller's
-        project (``project = NULL`` matches global types only). No group filter — notes
-        span groups and the board doesn't filter either. recall()'s notes leg reads this;
-        ``find_live_notes`` (above) stays the reconcile path's owner/group-exact probe.
+        project (``project = NULL`` matches global types only). recall()'s notes leg reads
+        this; ``find_live_notes`` (above) stays the reconcile path's owner-exact probe.
 
         ``audience`` (schema 053) narrows to one tier — recall passes 'work-safe' for a
         restricted surface, None for a full-trust one. Filtering here rather than after
@@ -82,7 +81,6 @@ class NoteStore(DatabaseConnection):
         self,
         *,
         owner_id: str,
-        group_id: str,
         project: str | None,
         type: str,
         hook: str,
@@ -102,13 +100,12 @@ class NoteStore(DatabaseConnection):
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO notes "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "(owner_id, group_id, project, type, hook, body, embedding, embed_model, "
+                "(owner_id, project, type, hook, body, embedding, embed_model, "
                 " source_ref, audience) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s::halfvec({_EMBED_DIMS}),%s,%s,"
+                f"VALUES (%s,%s,%s,%s,%s,%s::halfvec({_EMBED_DIMS}),%s,%s,"
                 "COALESCE(%s,'personal')) RETURNING id",
                 (
                     owner_id,
-                    group_id,
                     project,
                     type,
                     hook,

@@ -35,7 +35,6 @@ import os
 from typing import Any, cast
 
 from ingestion.llm_client import MalformedResponseError, parse_with_retry, stage_model
-from ingestion.preferences_gate import _group_for
 from ingestion.surfaces import derive_audience
 
 logger = logging.getLogger(__name__)
@@ -165,17 +164,14 @@ def reconcile_note(
             logger.warning("note embed failed (%s); storing with NULL embedding, dedup skipped", e)
             vec, embed_model = None, None
 
-    group_id = _group_for(project)
-
     candidates: list[dict[str, Any]] = []
     if vec is not None:
-        candidates = db.find_live_notes(_OWNER, group_id, vec, limit=5)
+        candidates = db.find_live_notes(_OWNER, vec, limit=5)
     top = candidates[0] if candidates else None
 
     if top is None or top["sim"] < _sim_match_threshold() or top["type"] != type:
         new_id = db.insert_note(
             owner_id=_OWNER,
-            group_id=group_id,
             project=project,
             type=type,
             hook=hook,
@@ -200,7 +196,6 @@ def reconcile_note(
         # arrive work-safe just because it reversed a work-safe one.
         new_id = db.insert_note(
             owner_id=_OWNER,
-            group_id=group_id,
             project=project,
             type=type,
             hook=hook,

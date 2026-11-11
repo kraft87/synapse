@@ -201,17 +201,6 @@ def _candidate_text(candidates: list[dict[str, Any]], target_id: Any) -> str:
     return ""
 
 
-def _group_for(project: str | None) -> str:
-    """Group routing derived from the project tag — same axis as the KG. Imported lazily
-    to avoid an import cycle (the extractor imports this gate)."""
-    try:
-        from ingestion.extractor import _default_group_for_project
-
-        return _default_group_for_project(project)
-    except Exception:
-        return "technical"
-
-
 class PreferencesGate:
     """One gate call per episode-type extraction item; reconciles preferences rows."""
 
@@ -264,10 +253,9 @@ class PreferencesGate:
             return
 
         project = item.get("project")
-        group_id = _group_for(project)
         source_ref = f"ep:{episode_id}"
         for p in prefs:
-            self._store_one(p, project, group_id, source_ref)
+            self._store_one(p, project, source_ref)
 
     def _confirm_duplicate(self, new_pref: str, existing_pref: str) -> dict[str, Any]:
         """One small LLM call: is ``new_pref`` the same standing preference as
@@ -313,14 +301,12 @@ class PreferencesGate:
         logger.info("preference #%s text merged: %s", pref_id, updated_pref[:80])
         return True
 
-    def _store_one(
-        self, p: dict[str, Any], project: str | None, group_id: str, source_ref: str
-    ) -> None:
+    def _store_one(self, p: dict[str, Any], project: str | None, source_ref: str) -> None:
         # Embed the BARE pref text (no metadata prefix): the recall serving leg ranks live
         # prefs against the plain query embedding, so the store must share that space, and
         # the gate's own dedup KNN then compares like-with-like.
         vec = self._embedder.embed([p["pref"]], task="document")[0]
-        candidates = self._db.find_live_preferences(_OWNER, group_id, vec, limit=5)
+        candidates = self._db.find_live_preferences(_OWNER, vec, limit=5)
         action = decide_pref_action(p["polarity"], candidates)
         embed_model = getattr(self._embedder, "model_name", None) or "voyage-4-large"
 
@@ -351,7 +337,6 @@ class PreferencesGate:
 
         new_id = self._db.insert_preference(
             owner_id=_OWNER,
-            group_id=group_id,
             project=project,
             pref=p["pref"],
             polarity=p["polarity"],

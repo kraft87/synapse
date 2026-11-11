@@ -9,7 +9,7 @@ Route (GET):
   /preferences/top?limit=8  -> {"status": "ok", "items": [{pref, polarity, assert_count, since}]}
 
 Ranked by (assert_count DESC, last_asserted DESC): the strongest, most-recently-reasserted
-preferences first. Across ALL groups for the owner — a standing preference ("never use
+preferences first. Across every project for the owner — a standing preference ("never use
 tables") shapes every session, not just its originating project's.
 
 Scoped by the caller's BEARER, like the board digest (schema 053/054): full trust is

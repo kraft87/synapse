@@ -378,7 +378,6 @@ def test_board_kind_row_shape(conn, db_url, full_surface):
     db = Database(db_url)
     nid = db.insert_note(
         owner_id=_OWNER,
-        group_id="technical",
         project=None,
         type="user",
         hook="Board telemetry shape pin",

@@ -110,7 +110,6 @@ def lane(conn, db_url, monkeypatch):
         for hook, audience in ((_PERSONAL, "personal"), (_WORK_SAFE, "work-safe")):
             db.insert_note(
                 owner_id=_OWNER,
-                group_id="technical",
                 project=None,
                 type="user",
                 hook=hook,

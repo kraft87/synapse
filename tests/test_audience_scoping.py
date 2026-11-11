@@ -75,7 +75,6 @@ def _note(db_url, hook, *, audience="personal", type="user", project=None):
     try:
         return db.insert_note(
             owner_id=_OWNER,
-            group_id="technical",
             project=project,
             type=type,
             hook=hook,
@@ -565,7 +564,7 @@ class _StubDB:
         self.inserts: list[dict] = []
         self._candidate_type = candidate_type
 
-    def find_live_notes(self, owner_id, group_id, embedding, limit=5):
+    def find_live_notes(self, owner_id, embedding, limit=5):
         return [
             {
                 "id": 42,

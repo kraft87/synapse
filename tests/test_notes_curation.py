@@ -34,7 +34,6 @@ from dream.notes.nightly import run_lane  # noqa: E402
 from ingestion.db import Database  # noqa: E402
 from ingestion.embedding import embed_dims  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
-from tests.helpers.embed import GROUP  # noqa: E402
 
 _DIMS = embed_dims()
 
@@ -60,7 +59,6 @@ def _wipe(conn):
 def _insert(db, *, hook, type="user", project=None, degrees=0.0, body="Example body."):
     return db.insert_note(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=project,
         type=type,
         hook=hook,
@@ -118,7 +116,6 @@ def test_pair_candidates_skip_superseded_and_null_embedding(conn, db_url):
     b = _insert(db, hook="Alpha restated", degrees=10)
     db.insert_note(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=None,
         type="user",
         hook="Keyless note",

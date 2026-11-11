@@ -29,7 +29,6 @@ from starlette.testclient import TestClient  # noqa: E402
 from ingestion.db import Database  # noqa: E402
 from ingestion.surfaces import FULL_TRUST  # noqa: E402
 from mcp_server.board import _OWNER, build_board, record_board_metrics, register  # noqa: E402
-from tests.helpers.embed import GROUP  # noqa: E402
 from tests.helpers.surfaces import register_full, register_restricted  # noqa: E402
 
 
@@ -56,7 +55,6 @@ def _note(db, *, type="user", hook="User prefers X", project=None):
     """Board tests never exercise the KNN, so notes land with NULL embedding."""
     return db.insert_note(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=project,
         type=type,
         hook=hook,

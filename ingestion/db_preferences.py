@@ -7,9 +7,9 @@ from ingestion.db_connection import _EMBED_DIMS, DatabaseConnection, _vector_lit
 
 class PreferenceStore(DatabaseConnection):
     def find_live_preferences(
-        self, owner_id: str, group_id: str, embedding: list[float], limit: int = 5
+        self, owner_id: str, embedding: list[float], limit: int = 5
     ) -> list[dict[str, Any]]:
-        """Live preferences for one owner/group, nearest to ``embedding`` by cosine.
+        """Live preferences for one owner, nearest to ``embedding`` by cosine.
         Returns ``[{id, pref, polarity, sim}]`` in DESCENDING similarity (sim = 1 -
         cosine_distance in [0, 2]). The gate's dedup/supersession decision reads this."""
         vlit = _vector_literal(embedding)
@@ -17,10 +17,10 @@ class PreferenceStore(DatabaseConnection):
             rows = conn.execute(
                 f"SELECT id, pref, polarity, 1 - (embedding <=> %s::vector({_EMBED_DIMS})) AS sim "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
                 "FROM preferences "
-                "WHERE owner_id = %s AND group_id = %s AND t_invalid IS NULL "
+                "WHERE owner_id = %s AND t_invalid IS NULL "
                 "AND embedding IS NOT NULL "
                 f"ORDER BY embedding <=> %s::vector({_EMBED_DIMS}) ASC LIMIT %s",
-                (vlit, owner_id, group_id, vlit, limit),
+                (vlit, owner_id, vlit, limit),
             ).fetchall()
         return [
             {"id": r["id"], "pref": r["pref"], "polarity": r["polarity"], "sim": float(r["sim"])}
@@ -31,7 +31,6 @@ class PreferenceStore(DatabaseConnection):
         self,
         *,
         owner_id: str,
-        group_id: str,
         project: str | None,
         pref: str,
         polarity: str,
@@ -44,11 +43,10 @@ class PreferenceStore(DatabaseConnection):
         with self._conn() as conn:
             row = conn.execute(
                 "INSERT INTO preferences "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "(owner_id, group_id, project, pref, polarity, embedding, embed_model, source_ref) "
-                f"VALUES (%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s) RETURNING id",
+                "(owner_id, project, pref, polarity, embedding, embed_model, source_ref) "
+                f"VALUES (%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s) RETURNING id",
                 (
                     owner_id,
-                    group_id,
                     project,
                     pref,
                     polarity,
@@ -97,7 +95,7 @@ class PreferenceStore(DatabaseConnection):
 
     def top_preferences(self, owner_id: str, limit: int = 8) -> list[dict[str, Any]]:
         """Live preferences for the session-start block: strongest first — most-reasserted,
-        then most-recent. Across ALL groups (a standing preference shapes every session)."""
+        then most-recent. Across every project (a standing preference shapes every session)."""
         with self._conn() as conn:
             rows = conn.execute(
                 "SELECT pref, polarity, assert_count, left(first_seen::text, 10) AS since "

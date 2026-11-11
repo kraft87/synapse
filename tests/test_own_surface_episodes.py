@@ -705,7 +705,6 @@ def route_corpus(clean, db_url):
             _timeline_event(db, key, project, ep)
             db.insert_preference(
                 owner_id="default",
-                group_id="technical",
                 project=project,
                 pref=f"{key} pref",
                 polarity="like",

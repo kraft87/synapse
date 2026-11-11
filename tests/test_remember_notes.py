@@ -33,9 +33,7 @@ from ingestion.db import Database  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
 from mcp_server import server  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
-
-# GROUP ("technical") is where _group_for(None) routes project-less notes.
+from tests.helpers.embed import onehot  # noqa: E402
 
 
 class _SlotEmb:
@@ -89,7 +87,6 @@ def env(monkeypatch, conn, db_url):
 def _seed_note(env, *, hook="User prefers dark mode", type="user", slot=1, project=None) -> int:
     return env.db.insert_note(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=project,
         type=type,
         hook=hook,

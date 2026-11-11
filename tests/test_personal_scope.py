@@ -1,8 +1,7 @@
 """The personal-scope switch (SYNAPSE_PERSONAL_SCOPE, ingestion/scope.py).
 
-Four points read the switch: the extractor's group routing, the timeline gate's
-prompt + stored domain, the recall tool's group_id, and the timeline ingest
-route. Each is pinned here in both positions, because "off" has to be off
+Two points read the switch: the extractor's group routing and the recall tool's
+group_id. Each is pinned here in both positions, because "off" has to be off
 everywhere or a work-only deployment still ends up with writes in a graph its
 reads never touch.
 
@@ -92,16 +91,6 @@ def test_classify_entity_group_respects_switch(monkeypatch):
     assert _classify_entity_group("Postgres", None, "personal") == "technical"
 
 
-def test_notes_group_routing_follows_switch(monkeypatch):
-    """The notes/preferences lanes derive their group from the same helper."""
-    from ingestion.preferences_gate import _group_for
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    assert _group_for("jobs") == "personal"
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    assert _group_for("jobs") == "technical"
-
-
 def _entity(name: str) -> ExtractedEntity:
     return ExtractedEntity(name=name, type="Tool", summary="")
 
@@ -169,98 +158,7 @@ def test_process_item_routes_everything_technical_when_scope_off(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Timeline gate: prompt + stored domain
-# ---------------------------------------------------------------------------
-
-
-def test_gate_prompt_asks_for_domain_when_scope_on(monkeypatch):
-    from ingestion.timeline_gate import GATE_PROMPT, gate_prompt
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    p = gate_prompt()
-    assert p == GATE_PROMPT
-    assert 'domain: "personal"' in p
-    assert '"domain": "personal"|"technical"' in p
-
-
-def test_gate_prompt_drops_domain_when_scope_off(monkeypatch):
-    from ingestion.timeline_gate import gate_prompt
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    p = gate_prompt()
-    assert "domain" not in p
-    # The rest of the prompt is untouched: same framing, same output contract.
-    assert "QUOTED MATERIAL" in p
-    assert 'Output ONLY JSON: {"events"' in p
-    assert '"event_type": "decision"|"action"|"finding"|"milestone", "date"' in p
-
-
-class _RecordingDb:
-    def __init__(self) -> None:
-        self.inserted: list[dict] = []
-
-    def get_episodes_valid_at(self, ids):
-        return "2026-09-04T10:00:00+00:00"
-
-    def timeline_ident_exists(self, *a, **k):
-        return False
-
-    def insert_timeline_event(self, **kw):
-        self.inserted.append(kw)
-        return 1
-
-
-class _StubEmb:
-    model_name = "stub"
-
-    def embed(self, texts, task=None):
-        return [[0.1, 0.2, 0.3] for _ in texts]
-
-
-def _gate_with(monkeypatch, domain):
-    import ingestion.timeline_gate as tg
-    from ingestion.llm_schemas import TimelineGateEvents
-
-    monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
-    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "0")
-    db = _RecordingDb()
-    g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
-    monkeypatch.setattr(
-        tg,
-        "structured_call",
-        lambda *a, **k: TimelineGateEvents.model_validate(
-            {
-                "events": [
-                    {
-                        "event": "booked a dentist appointment",
-                        "salience": 1,
-                        "event_type": "action",
-                        "domain": domain,
-                        "date": None,
-                    }
-                ]
-            }
-        ),
-    )
-    g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "neuron"})
-    return db.inserted
-
-
-def test_gate_stores_model_domain_when_scope_on(monkeypatch):
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    assert _gate_with(monkeypatch, "personal")[0]["domain"] == "personal"
-
-
-def test_gate_stores_technical_when_scope_off(monkeypatch):
-    """Deterministic stored value: even a model that volunteers "personal"
-    (an old prompt cached, a stray few-shot) writes technical."""
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    assert _gate_with(monkeypatch, "personal")[0]["domain"] == "technical"
-    assert _gate_with(monkeypatch, None)[0]["domain"] == "technical"
-
-
-# ---------------------------------------------------------------------------
-# Read side: recall + the timeline ingest route
+# Read side: the recall tool
 # ---------------------------------------------------------------------------
 
 
@@ -313,24 +211,3 @@ def test_recall_tool_docstring_hides_personal_scope(monkeypatch):
     stripped = srv._scope_doc(_fn).__doc__ or ""
     assert srv._GROUP_ID_DOC_SPLIT not in stripped
     assert "personal" not in stripped
-
-
-def test_timeline_ingest_domain(monkeypatch):
-    """The push route's own git-vs-explicit logic is unchanged; only a personal
-    label collapses when the scope is off."""
-    from mcp_server.timeline_routes import _event_domain
-
-    git = {"source": "git:synapse", "domain": None}
-    personal = {"source": "chat", "domain": "personal"}
-    unlabeled = {"source": "chat", "domain": None}
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    assert _event_domain(git) == "technical"
-    assert _event_domain(personal) == "personal"
-    assert _event_domain(unlabeled) is None
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    assert _event_domain(git) == "technical"
-    assert _event_domain(personal) == "technical"
-    # Unlabeled still fails open at read: the switch does not invent a label.
-    assert _event_domain(unlabeled) is None

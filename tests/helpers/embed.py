@@ -1,6 +1,6 @@
 """Shared embedding test scaffolding: a deterministic one-hot vector builder and
-the default test group id, used across the notes / preferences / board / KG
-DB-backed tests to assert KNN ordering without a real embedder."""
+the default test group id, used across the notes / preferences / KG DB-backed
+tests to assert KNN ordering without a real embedder."""
 
 from __future__ import annotations
 
