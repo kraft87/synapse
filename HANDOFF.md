@@ -14,13 +14,16 @@ changed, what to do on each machine, what was proven, and what is still open.
   the provenance of its source episodes, never by a group. `domain` survives only as a tag on
   timeline events.
 - **`recall` takes no `group_id`.** A client that still sends one is accepted and the
-  argument is ignored (the server logs one line); `tools/list` no longer shows it. `POST
-  /recall` ignores the body field too.
+  argument is ignored (the server writes one log line per call that carries it); `tools/list`
+  no longer shows it. `POST /recall` ignores the body field too, without a log line.
 - **`SYNAPSE_PERSONAL_SCOPE` and `SYNAPSE_PERSONAL_PROJECTS` are gone.** Remove them from your
   `.env`; nothing reads them. `SYNAPSE_OWNER_NAME` and `SYNAPSE_OWNER_ALIASES` stay.
-- **A restricted read needs the label.** Without schema 066 (reachable only with
-  `SYNAPSE_SCHEMA_CHECK=0`) a restricted device is served no facts; the provenance-only
-  fallback is gone.
+- **A restricted read needs the label.** Without schema 066 a restricted device is served no
+  facts; the provenance-only fallback is gone. The boot guard keeps a service from starting
+  on a database without 066 unless it is switched off (`SYNAPSE_SCHEMA_CHECK=0`) or could not
+  reach the database at that moment (it logs a warning and does not look again). A new fact
+  is written unlabelled, so a restricted device is not served it until the labeller has
+  marked it `work-safe`.
 - **Schema 067** is required: it merges the existing `personal` rows into `technical`, folds a
   personal entity into its same-name technical twin, builds three owner-only indexes, gives
   `group_id` a `'technical'` default on the four tables that carry it, drops the 066 insert
@@ -29,11 +32,14 @@ changed, what to do on each machine, what was proven, and what is still open.
 **Order of rollout**
 
 1. Stop the pollers (`docker compose stop poller poller-drain`).
-2. `python scripts/pile_merge.py --preview` (read-only; counts only). Read the numbers.
+2. `python scripts/pile_merge.py --preview` (read-only; counts and uuids, no text). Read the
+   numbers.
 3. Apply 067 by itself, before the release: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 <
    schema/067_kg_one_memory.sql`. It runs two transactions of its own, so never inside
    `BEGIN` and never with `-1`. A re-run is safe and does nothing when nothing is left.
-4. `python scripts/pile_merge.py --health` must exit 0.
+4. `python scripts/pile_merge.py --health` must exit 0. Its `reported_not_checked` block (the
+   survivors that left `technical`, the fact count against the one before the merge) is for
+   reading; it never fails the run.
 5. Deploy the release, then start the pollers. If a poller ran the old image after step 3,
    it may have written a personal row, or a folded uuid again: apply 067 once more, check
    with `--health`, and restart the pollers (a poller keeps a deleted uuid in its name index

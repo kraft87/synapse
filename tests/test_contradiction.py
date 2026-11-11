@@ -7,8 +7,8 @@ FalkorDB.
 Five cases mirror the spec:
   1. No candidates returned by the pair filter -- short-circuit empty list.
   2. Vector similarity below threshold -- never calls the LLM.
-  3. LLM confirms contradiction -- detector returns the UUID; create_edge
-     invalidates the old edge before the new one is written.
+  3. LLM confirms contradiction -- detector returns the UUID (Stage 7 then retires
+     the old edge before it writes the new one; test_stage7_lineage.py).
   4. LLM returns empty contradicted_facts -- no UUIDs returned.
   5. Already-invalidated edge is NOT a candidate (find_edges_by_pair only
      returns live edges, so the detector never sees them).
@@ -324,13 +324,6 @@ class TestTolerantJSONParse:
         text = "I could not determine if these contradict."
         result = self._detector_with_candidate(text).detect_contradictions(_fact(), "s", "t")
         assert result == []
-
-
-# ---------------------------------------------------------------------------
-# create_edge integration: contradiction sets t_invalid on the OLD edge
-# and still writes the new edge. Pure-unit -- uses a KGClient with a mocked
-# writer that records the mutation calls instead of hitting a real DB.
-# ---------------------------------------------------------------------------
 
 
 class TestDetectContradictionsBatch:

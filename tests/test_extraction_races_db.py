@@ -16,6 +16,9 @@ texts that share a slot are identical vectors.
 3. The old personal/technical split. Names the old classifier sent to different piles
    still get their fact written, and rows still carrying group_id 'personal' (the data
    is merged once, by schema 067) are found by every lookup the write path makes.
+4. What the write path leaves for the labeller. A new fact carries no audience label, so a
+   restricted device is not served it until the labeller has judged it, even when its
+   provenance lies inside the device's allowlist.
 
 Only symbols that predate the fix are imported, so the file also runs against the
 pre-fix pipeline (where every reproduction fails on its assertion).
@@ -35,7 +38,10 @@ from ingestion.extractor import ExtractionPipeline
 from ingestion.kg_client import KGClient
 from ingestion.kg_pg_write import _vec
 from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
+from ingestion.surfaces import FULL_TRUST, SurfaceTrust
+from mcp_server import kg_pg
 from tests.helpers.embed import onehot
+from tests.test_kg_fact_audience_db import _recall_engine
 
 SEG = "2026-09-01T12:00:00+00:00"
 ITEM = {"content_type": "chunk", "content": "window", "project": None, "session_id": "s1"}
@@ -358,8 +364,12 @@ _HOSTS = _fact("Harbor hosts the build cache", "Harbor", "Cache")
 
 
 def test_fact_across_old_piles_is_written(graph):
-    # The two names sat in different piles under the old name classifier; there is one
-    # memory now, so the fact between them is written like any other.
+    """The two names sat in different piles under the old name classifier, which dropped
+    a fact between them; there is one memory now, so it is written like any other.
+
+    A regression guard on the outcome only. It sets nothing that selected the old routing (the
+    personal-scope switch defaulted to on and is not touched here), so whether it failed on the
+    old code depended on the environment. Do not read it as proof that the routing is gone."""
     across = _fact(
         "A dentist appointment is booked after the Postgres upgrade",
         "dentist appointment",
@@ -433,3 +443,80 @@ def test_contradiction_search_retires_a_fact_left_in_the_personal_group(graph):
     assert retired_at is not None and superseder == new_uuid
     assert new_src == "p-harbor"
     assert [e[0] for e in _live_edges(graph)] == [newer.fact]
+
+
+# ---------------------------------------------------------------------------------------
+# 4. A new fact is unlabelled, so a restricted device is not served it
+# ---------------------------------------------------------------------------------------
+#
+# The restricted serving rule needs a fact labelled work-safe (or unlabelled and older than
+# the cutover stamp schema 066 wrote). Nothing on the write path labels a fact, and that is
+# what keeps a fact from a personal conversation away from a work device until the labeller
+# has judged it. The read-side tests seed their rows by hand, so they cannot see a write path
+# that starts stamping a label, by an explicit value or by a column default; this one runs
+# the real write.
+
+HOBBY = "gadget-hobby"  # a project the restricted device below is allowed to read
+RESTRICTED = SurfaceTrust(trust="restricted", allowed_projects=(HOBBY,), known=True)
+
+
+@pytest.fixture()
+def hobby_episodes(graph):
+    ids = [
+        graph.execute(
+            "INSERT INTO episodes (session_id, sequence, project, content) "
+            "VALUES ('hobby-session', %s, %s, 'a turn') RETURNING id",
+            (n, HOBBY),
+        ).fetchone()[0]
+        for n in (1, 2)
+    ]
+    yield ids
+    graph.execute("DELETE FROM episodes WHERE id = ANY(%s)", (ids,))
+
+
+def test_a_new_fact_stays_hidden_from_a_restricted_device_until_it_is_labelled(
+    graph, hobby_episodes, db_url
+):
+    fact = _fact("A widget is kept in the gadget cabinet", "Widget", "Cabinet")
+    pipe = _pipeline(_Embedder({fact.fact: 0}), [fact], hobby_episodes)
+
+    pipe.process_item({**ITEM, "project": HOBBY})
+
+    fact_uuid, fact_id, audience, version, model, sources = graph.execute(
+        "SELECT uuid, id, audience, label_version, label_model, source_projects "
+        "FROM kg_relationships WHERE fact = %s",
+        (fact.fact,),
+    ).fetchone()
+    cutover = int(
+        graph.execute(
+            "SELECT value FROM synapse_meta WHERE key = %s", (kg_pg.FACT_AUDIENCE_CUTOVER_KEY,)
+        ).fetchone()[0]
+    )
+    assert (audience, version, model) == (None, None, None), "the write path labels nothing"
+    assert fact_id > cutover, "so the legacy clause that serves unlabelled facts cannot apply"
+    assert sources == [HOBBY], "provenance alone would serve it: it sits inside the allowlist"
+
+    engine = _recall_engine(db_url)
+
+    def search(allowed: list[str] | None) -> set[str]:
+        facts, _ = engine._search_kg("widget", onehot(0), [], 20, allowed_projects=allowed)
+        return {f["_uuid"] for f in facts}
+
+    def recall(trust: SurfaceTrust) -> set[str]:
+        out = engine.recall("widget", trust=trust)
+        return {f["id"].removeprefix("f:") for f in out.get("facts") or []}
+
+    assert search([HOBBY]) == set()
+    assert recall(RESTRICTED) == set()
+    # the fact is there for the read that needs no label
+    assert search(None) == {fact_uuid}
+    assert recall(FULL_TRUST) == {fact_uuid}
+
+    # the same restricted reads serve it once the label is the only thing that changed
+    graph.execute(
+        "UPDATE kg_relationships SET audience = 'work-safe', label_version = 1, "
+        "label_model = 'hand' WHERE uuid = %s",
+        (fact_uuid,),
+    )
+    assert search([HOBBY]) == {fact_uuid}
+    assert recall(RESTRICTED) == {fact_uuid}

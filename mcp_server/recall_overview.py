@@ -67,11 +67,13 @@ class RecallOverviewMixin:
         surface, the episodes it ingested itself: schema 057 ``surface_id``), notes to
         ``audience='work-safe'``, and KG facts to those whose provenance is known and
         lies wholly inside the allowlist (schema 056 ``source_projects``: every source
-        episode exists, has a project, and that project is allowed). The same rule
-        covers every KG-derived extra (superseded pairs, the supersession surface, the
-        episode-validity overlay). An empty allowlist, or a database without schema 056,
-        serves no facts at all. Bare calls with no surface therefore serve a narrow
-        result on purpose; that is the design, not a regression.
+        episode exists, has a project, and that project is allowed) and that are
+        labelled ``work-safe`` (schema 066; an unlabelled fact older than 066 counts as
+        labelled). The same rule covers every KG-derived extra (superseded pairs, the
+        supersession surface, the episode-validity overlay). An empty allowlist, or a
+        database without schema 056 or 066, serves no facts at all. Bare calls with no
+        surface therefore serve a narrow result on purpose; that is the design, not a
+        regression.
 
         A ``warnings`` list is attached when a leg degraded (embedding or rerank
         backend down, KG or notes leg errored). The key is ABSENT on a healthy call,

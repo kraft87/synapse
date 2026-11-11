@@ -53,8 +53,8 @@ and re-derives it by rule 3 if it changes a note's `project`.
 IN ('personal','technical')` (038), which fails open (NULL) — adding a second
 overlapping label with opposite fail semantics invites drift. Instead: the board's
 last-7-days digest for a restricted surface filters events by the surface's project
-allowlist, excluding NULL project (fail-closed). `domain` is only a tag on the event; no
-serving rule reads it.
+allowlist, excluding NULL project (fail-closed). `domain` is only a tag on the event: no
+serving rule reads it (the dashboard's Timeline page filters on it, as an operator view).
 
 ### 2b. Knowledge-graph facts: one memory, a label on each fact
 
@@ -63,10 +63,11 @@ serving path reads the `group_id` column (schema 067 merged the former personal 
 technical groups). What a restricted surface may be served is decided per fact by two
 things: the fact's provenance (below) and its audience label, `kg_relationships.audience`
 (schema 066), which uses the same two tiers as notes: `personal` or `work-safe`, NULL until
-labelled. A `personal` fact is never served on a restricted surface, and a fact labelled
-after 066 is served only once it is `work-safe`; a fact from before 066 that was never
-labelled follows its provenance alone. A restricted read serves no facts unless the label
-exists, so a database without 066 never falls back to provenance alone.
+labelled. A `personal` fact is never served on a restricted surface. A fact written after
+066 is born unlabelled (extraction writes no label) and is served only once the labeller has
+marked it `work-safe`; a fact from before 066 that was never labelled follows its provenance
+alone. A restricted read serves no facts unless the label exists, so a database without 066
+never falls back to provenance alone.
 
 ### 3. Trust — a surface is a CREDENTIAL, not a hostname (schema 054)
 

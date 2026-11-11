@@ -85,7 +85,10 @@ def scope_predicate(alias: str = "", *, fact_audience: bool = True) -> str:
     one written since, nor any unlabelled one when the stamp is missing (the comparison
     is NULL, so the row is filtered). The cutover is read by an uncorrelated subquery (an
     InitPlan, run once per copy of the rule in a statement). ``fact_audience=False`` is the
-    pre-066 rule, for a database without the columns (``recall_sources`` decides, by probe).
+    provenance-only rule (056) as a statement shape. A restricted read never gets it:
+    ``recall_sources`` raises ``FactAudienceUnknown`` when the probe is not True, and that read
+    is served nothing. Only full trust passes it (on a database without 066), and full trust
+    builds no predicate, so there the flag changes nothing.
 
     The rule is ONE expression, not ``audience = 'work-safe' OR (audience IS NULL AND id
     <= cutover)``: pg_search turns a WHERE-level OR into a Tantivy boolean of "match
@@ -159,7 +162,9 @@ def search_kg_postgres(
     ``fact_audience`` (restricted only) adds schema 066's label rule to the predicate
     (:func:`scope_predicate`). It defaults on, so a caller that forgets it fails closed:
     on a database without 066 the statement raises UndefinedColumn and the restricted
-    handler serves nothing. ``recall_sources`` passes False for such a database, by probe.
+    handler serves nothing. A restricted read whose 066 probe is not True never reaches this
+    function (``FactAudienceUnknown``, served nothing); full trust on a database without 066
+    passes False, which changes nothing because full trust builds no predicate.
 
     ``exclude_seeds`` are the install owner's own entity uuids (schema 066, ``is_self``):
     never a hop seed, for any caller. Facts about the owner are still served by the vector

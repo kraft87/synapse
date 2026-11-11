@@ -438,6 +438,9 @@ class TestDeleteOrphanEntities:
         assert kg_writer.delete_orphan_entities(24) == 0  # idempotent
 
     def test_an_entity_whose_only_edge_is_in_the_other_legacy_group_stays(self, kg_writer, conn):
+        """A regression guard on the outcome only. The orphan sweep's candidate list already
+        counted an edge in any group, so this passes on the code before one-memory too and is
+        not evidence that the group scoping was removed."""
         self._entity(conn, "legacy", age_hours=48, group="personal")
         self._entity(conn, "linked", age_hours=48)
         self._edge(conn, "r1", "legacy", "linked", group=GROUP)

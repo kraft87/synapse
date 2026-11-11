@@ -33,7 +33,8 @@ Response:
 ```
 Projects/sources aggregated from episodes (NULL project or source → name "untagged").
 `domains` = distinct timeline_events.domain values (the only surface that still carries a
-domain tag). Cached in-process ~5 min.
+domain tag). Cached in-process ~5 min. The web app does not read it: the Timeline page's
+domain control is a fixed all / technical / personal list.
 
 ### GET /dash/api/feed?cursor&limit=30&project&source
 Reverse-chronological merge of episodes + KG facts + timeline events, keyset-paged.
@@ -134,7 +135,8 @@ Phase 2 adds the Recall debugging page. It reuses the existing `POST /recall` ro
 ### POST /recall — `debug` flag
 
 `POST /recall` already accepts `{query, write_feedback?, source?}` (machine-token
-gated, same bearer as `/dash/api/*`). Phase 2 adds two body fields:
+gated, same bearer as `/dash/api/*`; a `group_id` field from an older caller is ignored, as
+on the MCP tool). Phase 2 adds two body fields:
 
 - `project?` (string) — scopes the episode legs, same as the MCP `recall(project=…)` arg.
 - `debug?` (bool, default false) — when true the response gains a `debug` envelope.
@@ -469,7 +471,9 @@ fail-soft. No new migration — these read existing tables.
 - `limit` ≤ 200 (default 50). `sal` maps salience `0/1/2 → 0.3/0.6/0.9` (the feed mapping); the
   salience type ramp reads `sal`. `episode_id` is the resolved `ep:N` `source_ref` (git SHAs → null).
 - `type` filters `event_type` (see honesty note). `domain` filters the `domain` column (schema 038);
-  a `group_id` param is ignored.
+  a `group_id` param is ignored. The Timeline page's Events tab sends it from a three-way
+  control (all, technical, personal); `all` sends no `domain`, and an event with no domain
+  label (NULL) appears only there. There is no header-level group or domain filter any more.
 - `before` is the keyset cursor: a **bare ISO timestamp** (the jump-to-date case → strict
   `t_valid < ts`) OR a compound **`ts|id`** (a prior `next_before` → the full `(t_valid, id)`
   keyset, so ties on `t_valid` never drop or duplicate a row). `next_before` is set whenever a

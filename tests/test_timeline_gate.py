@@ -182,17 +182,11 @@ def _gated(monkeypatch, event, exists):
     return db.inserted
 
 
-@pytest.mark.parametrize("scope", [None, "1", "0"])
 @pytest.mark.parametrize("domain", ["personal", "technical"])
-def test_gate_always_asks_for_and_stores_the_domain(monkeypatch, scope, domain):
-    """The domain rule rides every prompt and the model's label is what gets stored,
-    whatever the personal-scope env var says."""
+def test_gate_always_asks_for_and_stores_the_domain(monkeypatch, domain):
+    """The domain rule rides every prompt and the model's label is what gets stored."""
     import ingestion.timeline_gate as tg
 
-    if scope is None:
-        monkeypatch.delenv("SYNAPSE_PERSONAL_SCOPE", raising=False)
-    else:
-        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", scope)
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
     monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "0")
     db = _Rec(exists=False)

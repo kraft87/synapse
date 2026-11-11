@@ -3,8 +3,9 @@
 The storage layer underneath is covered by test_kg_pg_write.py /
 test_kg_pg_read.py (DB-backed); this file covers the module-level rrf_merge
 fusion plus the batch-path orchestration (self-invalidation of pre-bookended
-facts). create_edge's detector/edge-date orchestration is covered in
-test_contradiction.py::TestCreateEdgeBiTemporal.
+facts). The detector and edge-date orchestration around them (an old fact retired before
+the new one is written, valid-from dates, superseder links) is covered in
+test_stage7_lineage.py.
 """
 
 from __future__ import annotations

@@ -7,8 +7,6 @@ and per-field storage (project / salience / t_valid land as sent).
 
 from __future__ import annotations
 
-import pytest
-
 from mcp_server.timeline_routes import _event_domain, _ingest_events
 
 SRC = "test-evt"
@@ -128,12 +126,7 @@ def test_recent_events_per_project_day_cap(conn, db_url):
     _wipe(conn)
 
 
-@pytest.mark.parametrize("scope", [None, "1", "0"])
-def test_event_domain_ignores_the_personal_scope_switch(monkeypatch, scope):
-    if scope is None:
-        monkeypatch.delenv("SYNAPSE_PERSONAL_SCOPE", raising=False)
-    else:
-        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", scope)
+def test_event_domain_follows_the_pushed_label():
     # Git events are technical by construction; an explicit label is kept as pushed;
     # anything else stays unlabeled and fails open at read.
     assert _event_domain({"source": "git:demo", "domain": None}) == "technical"

@@ -21,8 +21,10 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   rest are feedback-only. Facts come from one memory per owner, ranked in a single list. A
   restricted host is served only facts whose source sessions sit inside its project
   allowlist and that pass the audience-label rule
-  ([docs/auth.md](auth.md#what-a-restricted-machine-is-served)). The tool takes no group: a client that still sends `group_id` is accepted and the argument is
-  ignored.
+  ([docs/auth.md](auth.md#what-a-restricted-machine-is-served)). The tool takes no group: a
+  client that still sends `group_id` is accepted and the argument is ignored (the server writes
+  one log line per call that carries it, and `tools/list` does not show it). `POST /recall`
+  ignores a `group_id` body field too.
 - **`recall_full_turns(query, project=None, limit=5, session_id=None)`**: the drill-down and
   retry sibling. `recall()` serves compressed ~1400-char passage slices; this serves whole
   turns and nothing else, ranked by relevance plus recency. It is the right call for exact

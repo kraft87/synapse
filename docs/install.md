@@ -266,25 +266,35 @@ two transactions of its own, so apply it by itself and never wrap it in `BEGIN` 
 
 1. Stop the pollers (`docker compose stop poller poller-drain`), so nothing writes graph
    rows during the merge.
-2. Preview, read-only. It prints counts, never fact text or entity names. The script runs
-   from a checkout of this repository, in its Python environment (the image does not ship
-   `scripts/`), and takes the database from `--db-url` or `$SYNAPSE_DB_URL`:
+2. Preview, read-only. It prints counts (and uuids where it lists entities), never fact text
+   or entity names. The script runs from a checkout of this repository, in its Python
+   environment (the image does not ship `scripts/`), and takes the database from `--db-url`
+   or `$SYNAPSE_DB_URL`:
    `python scripts/pile_merge.py --preview`
 3. Apply: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
    It takes minutes on a large graph (graph writers wait while it runs; the merge itself
    does not block readers) and does nothing when there is nothing left to merge, so a
    re-run is safe.
-4. Check: `python scripts/pile_merge.py --health` exits non-zero if any check fails (no
-   personal rows left, no edge on a folded entity, at most one flagged owner entity per owner,
-   the three owner-only indexes valid, the stamp at 067).
+4. Check: `python scripts/pile_merge.py --health` prints a JSON report and exits non-zero if
+   any entry under `checks` fails: no personal rows left, every folded entity gone and no
+   edge on one, no new edge with a missing endpoint or a dangling `invalidated_by`, at most
+   one flagged owner entity per owner, the 066 insert trigger gone, `group_id` defaulting to
+   `technical`, the three owner-only indexes valid, the stamp at 067. A folded uuid that a
+   poller wrote again names its remedy (apply 067 again, then restart the pollers). The
+   `reported_not_checked` block holds two numbers that never fail the run, because they move
+   for good once the graph changes: the survivors that are no longer in `technical`, and the
+   fact count against the count before the merge (an episode delete lowers it). Read them;
+   do not gate on them.
 5. Deploy the release and start the pollers.
 
 To go back: revert the code first (a build that requires 067 exits on a database stamped
-066), then `python scripts/pile_merge.py --undo` for a dry run and `--undo --apply` to write
-it. Undo restores the folded entities and the groups from the before-images the merge
-recorded; a row changed since the merge is reported and left alone. `--exclude FILE` lists
-personal twins that 067 must not fold; read `python scripts/pile_merge.py --help` before
-using it. A fresh install needs none of this: its first boot applies 067 with nothing to merge.
+066), stop the pollers (even the dry run holds writers off the graph tables while it runs),
+then `python scripts/pile_merge.py --undo` for a dry run and `--undo --apply` to write it.
+Undo restores the folded entities and the groups from the before-images the merge recorded;
+a row changed since the merge is reported and left alone. It refuses, changing nothing, once
+a later migration has been applied. `--exclude FILE` lists personal twins that 067 must not
+fold (a dry run unless `--apply`); read `python scripts/pile_merge.py --help` before using
+it. A fresh install needs none of this: its first boot applies 067 with nothing to merge.
 
 Clients follow the server: `synapse update` on each machine fetches the client version the
 server now serves (the same `/install`), updates the Claude Code plugin, and keeps Codex's

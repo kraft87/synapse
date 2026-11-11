@@ -82,6 +82,21 @@ class TestSupersederLink:
         assert sup == rows[0]["edge_uuid"]  # the link recall's successor lookup needs
         assert items == [("old-1", SEG)]  # retired as of the conversation, not the write clock
 
+    def test_the_old_edge_is_retired_before_the_new_one_is_written(self):
+        # A crash between the two writes then leaves the old fact retired (its successor link
+        # naming an edge that never landed), not two contradicting facts both live.
+        facts = [_fact(0, attribution="user")]
+        pipe = _pipe(1)
+        pipe._stage7_write_edges(
+            facts, _uuid_map(facts), [41, 42], set(), {0: ["old-1"]}, default_valid_at=SEG
+        )
+        writes = [
+            c[0]
+            for c in pipe._kg.mock_calls
+            if c[0] in ("invalidate_edges_batch", "create_edges_batch")
+        ]
+        assert writes == ["invalidate_edges_batch", "create_edges_batch"]
+
     def test_skipped_duplicate_links_to_the_confirmed_existing_edge(self):
         # Drop-in replacement: "now uses X" is a pure duplicate of the live X edge (skip the
         # write, reinforce it) while retiring the Y edge -> Y's superseder is the X edge.

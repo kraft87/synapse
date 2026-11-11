@@ -116,10 +116,11 @@ class RecallSourcesMixin:
 
     def _kg_scope_error(self, allowed_projects: list[str] | None, e: Exception) -> bool:
         """True when ``e`` is the restricted predicate failing closed: a missing column (056
-        or 066 rolled back, or dropped after the probe cached it) or a 066 probe that could
-        not tell. The caller then returns empty. A 066 loss falls back to the
-        provenance-only rule once the probe's TTL lapses; a failure of the probe does not
-        touch its cache, and nor does a missing column that is not the label's."""
+        or 066 rolled back, or dropped after the probe cached it) or a 066 probe that did not
+        say yes. The caller then returns empty. A missing 066 column is recorded on the probe,
+        which asks again once its TTL lapses; until it says yes a restricted read is served
+        nothing. A failure of the probe does not touch its cache, and nor does a missing
+        column that is not the label's."""
         if allowed_projects is None:
             return False
         if isinstance(e, psycopg.errors.UndefinedColumn):
@@ -203,9 +204,11 @@ class RecallSourcesMixin:
         Without schema 056 the restricted leg returns nothing and logs one warning. It
         never adds a response warning, matching the pre-056 skip. ``None`` = full trust.
         Schema 066 adds the label rule to the restricted predicate and excludes the flagged
-        owner entity from the hop seeds (every caller); without it both are skipped, so a
-        restricted read serves the provenance-only facts and full trust sends today's SQL.
-        A restricted read whose 066 probe could not tell serves nothing (``_fact_audience_on``).
+        owner entity from the hop seeds (every caller). A restricted read is served facts only
+        when the probe says 066 is applied: without the label, or with a probe that could not
+        tell, it serves nothing (``_fact_audience_on``), because provenance alone cannot tell
+        a personal fact from a work one in one memory. Full trust never asks; without 066 it
+        sends today's SQL and no seed is excluded.
 
         Runs inside one transaction so the planner GUCs are SET LOCAL — scoped
         to this query, not the thread-local connection that other legs may
