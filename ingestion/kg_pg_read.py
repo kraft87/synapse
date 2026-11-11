@@ -10,7 +10,7 @@ The extraction pipeline reads the graph in six places while writing it:
   - stage 6c restatement recheck   -> ``nearest_live_edges``
 
 This module serves all of them from the ``kg_entities`` / ``kg_relationships``
-tables (schema/017), scoped by ``owner_id`` + ``group_id``, via
+tables (schema/017), scoped by ``owner_id``, via
 ``kg_client.KGClient``. FalkorDB was decommissioned in #67 PR 3, so the
 ``SYNAPSE_KG_READ`` dispatch/fallback seam from PRs #128/#129 is gone: a read
 failure raises and the extraction queue item retries.
@@ -29,8 +29,8 @@ semantics — see ab_kg_pg_quality.py), so this leg is strictly additive to the
 candidate pool.
 
 Vector KNN uses the same planner discipline as ``mcp_server/kg_pg.py``: over-fetch
-the GLOBAL HNSW on the bare partial-index predicate (owner/group equality filters
-push the planner off the index onto a bitmap+sort), then filter tenant scope on the
+the GLOBAL HNSW on the bare partial-index predicate (an owner equality filter
+pushes the planner off the index onto a bitmap+sort), then filter tenant scope on the
 small candidate set. The connection is lazy + autocommit, mirroring
 ``kg_shadow.PgKgShadowWriter``; per-statement ``hnsw.ef_search`` is set via
 ``SET LOCAL`` inside a transaction block.
@@ -75,7 +75,7 @@ SURVIVOR_ORDER = "is_self DESC, id"
 #: The name lookup, one statement: a stored-name match, or an old row with no stored name matched
 #: by lower(trim(name)); ranked together. Both arms are index conditions on ``normalized_name``.
 _ENTITY_BY_NAME_SQL = (
-    "SELECT uuid FROM kg_entities WHERE owner_id = %s AND group_id = %s "
+    "SELECT uuid FROM kg_entities WHERE owner_id = %s "
     "AND (normalized_name = %s "
     "     OR ((normalized_name IS NULL OR normalized_name = '') AND lower(trim(name)) = %s)) "
     "ORDER BY " + SURVIVOR_ORDER + " LIMIT 1"  # nosec B608 - a module constant
@@ -140,7 +140,7 @@ class KGPostgresReader:
     # -- entity reads ----------------------------------------------------
 
     def find_similar_nodes(
-        self, query_embedding: list[float], group_id: str, limit: int = 20
+        self, query_embedding: list[float], limit: int = 20
     ) -> list[dict[str, Any]]:
         """Top-k entities by embedding distance. Mirrors FalkorDB's shape."""
         conn = self._connection()
@@ -155,16 +155,16 @@ class KGPostgresReader:
             cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
                 "SELECT uuid, name, dist FROM ("  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "  SELECT uuid, name, owner_id, group_id, "
+                "  SELECT uuid, name, owner_id, "
                 f"         embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
                 "  FROM kg_entities WHERE embedding IS NOT NULL "
                 "  ORDER BY dist LIMIT %s"
-                ") sub WHERE owner_id = %s AND group_id = %s LIMIT %s",
-                (emb_s, _OVERFETCH, OWNER, group_id, limit),
+                ") sub WHERE owner_id = %s LIMIT %s",
+                (emb_s, _OVERFETCH, OWNER, limit),
             )
             return [{"uuid": u, "name": n, "score": float(d)} for u, n, d in cur.fetchall()]
 
-    def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
+    def entity_uuid_by_normalized_name(self, normalized: str) -> str | None:
         """Exact normalized-name lookup (NodeDeduper short-circuit).
 
         One ranked match on the row's key: its stored ``normalized_name``, or lower(trim(name))
@@ -176,7 +176,7 @@ class KGPostgresReader:
         if not normalized:
             return None
         conn = self._connection()
-        cur = conn.execute(_ENTITY_BY_NAME_SQL, (OWNER, group_id, normalized, normalized))
+        cur = conn.execute(_ENTITY_BY_NAME_SQL, (OWNER, normalized, normalized))
         row = cur.fetchone()
         return str(row[0]) if row else None
 
@@ -190,17 +190,17 @@ class KGPostgresReader:
         cur = conn.execute("SELECT subtype, supertype FROM kg_entity_types")
         return {str(sub): str(sup) for sub, sup in cur.fetchall()}
 
-    def load_entities(self, group_id: str) -> list[tuple[str, str, str, str | None]]:
-        """(uuid, name, summary, entity_supertype) for every entity in the group (LSH hydrate).
+    def load_entities(self) -> list[tuple[str, str, str, str | None]]:
+        """(uuid, name, summary, entity_supertype) for every entity of the owner (LSH hydrate).
 
         In ``SURVIVOR_ORDER``: the caller's name index keeps the first row it sees for a name
         (``dict.setdefault``), so it must be the row ``entity_uuid_by_normalized_name`` returns."""
         conn = self._connection()
         cur = conn.execute(
             "SELECT uuid, COALESCE(name, ''), COALESCE(summary, ''), entity_supertype "
-            "FROM kg_entities WHERE owner_id = %s AND group_id = %s "
+            "FROM kg_entities WHERE owner_id = %s "
             "ORDER BY " + SURVIVOR_ORDER,  # nosec B608 - a module constant
-            (OWNER, group_id),
+            (OWNER,),
         )
         return [(str(u), n, s, st) for u, n, s, st in cur.fetchall()]
 
@@ -209,7 +209,6 @@ class KGPostgresReader:
     def find_similar_edges(
         self,
         fact_embedding: list[float],
-        group_id: str,
         distance_threshold: float = 0.20,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
@@ -226,13 +225,13 @@ class KGPostgresReader:
             cur.execute("SET LOCAL enable_seqscan = off")
             cur.execute(
                 "SELECT uuid, fact, valid_at, dist FROM ("  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "  SELECT uuid, fact, valid_at, owner_id, group_id, "
+                "  SELECT uuid, fact, valid_at, owner_id, "
                 f"         fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS}) AS dist "
                 "  FROM kg_relationships "
                 "  WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
                 "  ORDER BY dist LIMIT %s"
-                ") sub WHERE owner_id = %s AND group_id = %s AND dist <= %s LIMIT %s",
-                (emb_s, _OVERFETCH, OWNER, group_id, distance_threshold, limit),
+                ") sub WHERE owner_id = %s AND dist <= %s LIMIT %s",
+                (emb_s, _OVERFETCH, OWNER, distance_threshold, limit),
             )
             return [
                 {"uuid": u, "fact": f, "valid_at": _iso(v), "score": float(d)}
@@ -242,11 +241,10 @@ class KGPostgresReader:
     def nearest_live_edges(
         self,
         fact_embeddings: list[list[float]],
-        group_id: str,
         max_distance: float,
         limit: int,
     ) -> list[list[dict[str, Any]]]:
-        """Per embedding, up to ``limit`` live edges of the group within ``max_distance``
+        """Per embedding, up to ``limit`` live edges of the owner within ``max_distance``
         (cosine), nearest first. Parallel to ``fact_embeddings``.
 
         One statement for the whole batch: ``unnest`` feeds each embedding into a LATERAL
@@ -265,19 +263,18 @@ class KGPostgresReader:
                 "FROM unnest(%s::text[]) WITH ORDINALITY AS q(emb, i) "
                 "CROSS JOIN LATERAL ("
                 "  SELECT uuid, fact, dist FROM ("
-                "    SELECT uuid, fact, owner_id, group_id, "
+                "    SELECT uuid, fact, owner_id, "
                 f"           fact_embedding::halfvec({_EMBED_DIMS}) <=> q.emb::halfvec({_EMBED_DIMS}) AS dist "
                 "    FROM kg_relationships "
                 "    WHERE t_invalid IS NULL AND fact_embedding IS NOT NULL "
                 "    ORDER BY dist LIMIT %s"
-                "  ) c WHERE owner_id = %s AND group_id = %s AND dist <= %s "
+                "  ) c WHERE owner_id = %s AND dist <= %s "
                 "  ORDER BY dist LIMIT %s"
                 ") n ORDER BY q.i, n.dist",
                 (
                     [_vec_literal(e) for e in fact_embeddings],
                     _RESTATED_OVERFETCH,
                     OWNER,
-                    group_id,
                     max_distance,
                     limit,
                 ),
@@ -287,16 +284,14 @@ class KGPostgresReader:
                 out[i - 1].append({"uuid": u, "fact": f, "score": float(d)})
             return out
 
-    def find_edges_by_pair(
-        self, source_uuid: str, target_uuid: str, group_id: str
-    ) -> list[dict[str, Any]]:
+    def find_edges_by_pair(self, source_uuid: str, target_uuid: str) -> list[dict[str, Any]]:
         """Live edges between a source/target pair (contradiction candidates)."""
         conn = self._connection()
         cur = conn.execute(
             "SELECT uuid, fact, valid_at, fact_embedding::text FROM kg_relationships "
-            "WHERE owner_id = %s AND group_id = %s "
+            "WHERE owner_id = %s "
             "  AND src_uuid = %s AND tgt_uuid = %s AND t_invalid IS NULL",
-            (OWNER, group_id, source_uuid, target_uuid),
+            (OWNER, source_uuid, target_uuid),
         )
         return [
             {"uuid": u, "fact": f, "valid_at": _iso(v), "fact_embedding": _emb_list(e)}
@@ -306,7 +301,6 @@ class KGPostgresReader:
     def find_edges_by_fulltext(
         self,
         query: str,
-        group_id: str,
         limit: int = 20,
         fact_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
@@ -321,15 +315,15 @@ class KGPostgresReader:
         conn = self._connection()
         args: tuple[Any, ...]
         if fact_embedding is None:
-            dist_sql, args = "NULL", (safe, OWNER, group_id, limit)
+            dist_sql, args = "NULL", (safe, OWNER, limit)
         else:
             dist_sql = f"fact_embedding::halfvec({_EMBED_DIMS}) <=> %s::halfvec({_EMBED_DIMS})"
-            args = (_vec_literal(fact_embedding), safe, OWNER, group_id, limit)
+            args = (_vec_literal(fact_embedding), safe, OWNER, limit)
         cur = conn.execute(
             f"SELECT uuid, fact, valid_at, paradedb.score(id) AS sc, {dist_sql} AS dist "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
             "FROM kg_relationships "
             "WHERE id @@@ paradedb.match('fact', %s)"
-            f"{bm25_filter(['owner_id = %s', 'group_id = %s', 't_invalid IS NULL'])} "
+            f"{bm25_filter(['owner_id = %s', 't_invalid IS NULL'])} "
             "ORDER BY sc DESC LIMIT %s",
             args,
         )

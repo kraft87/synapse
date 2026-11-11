@@ -1,9 +1,8 @@
 """The personal-scope switch (SYNAPSE_PERSONAL_SCOPE, ingestion/scope.py).
 
-Two points read the switch: the extractor's group routing and the recall tool's
-group_id. Each is pinned here in both positions, because "off" has to be off
-everywhere or a work-only deployment still ends up with writes in a graph its
-reads never touch.
+The recall tool's group_id reads the switch. It is pinned here in both positions,
+because "off" has to be off everywhere or a work-only deployment still asks for a
+graph it does not keep.
 
 Pure unit tests: no DB, no LLM. Every case sets the env var with monkeypatch, so
 the switch must be read per call, not frozen into a module-level constant.
@@ -11,11 +10,8 @@ the switch must be read per call, not frozen into a module-level constant.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import pytest
 
-from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
 from ingestion.scope import active_groups, coerce_group, personal_scope_enabled
 
 # ---------------------------------------------------------------------------
@@ -57,104 +53,6 @@ def test_coerce_group(monkeypatch):
     assert coerce_group(None) is None
     # Unknown values pass through; validating them belongs to the caller.
     assert coerce_group("something-else") == "something-else"
-
-
-# ---------------------------------------------------------------------------
-# Extractor routing
-# ---------------------------------------------------------------------------
-
-
-def test_default_group_for_project_respects_switch(monkeypatch):
-    from ingestion.extractor import _default_group_for_project
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    assert _default_group_for_project("jobs") == "personal"
-    assert _default_group_for_project("synapse") == "technical"
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    assert _default_group_for_project("jobs") == "technical"
-    assert _default_group_for_project("personal") == "technical"
-    assert _default_group_for_project(None) == "technical"
-
-
-def test_classify_entity_group_respects_switch(monkeypatch):
-    from ingestion.extractor import _classify_entity_group
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    assert _classify_entity_group("dentist appointment", None, "technical") == "personal"
-    assert _classify_entity_group("Postgres", None, "personal") == "technical"
-
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    # The personal regex never runs: "dentist appointment" would otherwise land
-    # in a graph the default group_id="technical" search never reads.
-    assert _classify_entity_group("dentist appointment", None, "technical") == "technical"
-    assert _classify_entity_group("Postgres", None, "personal") == "technical"
-
-
-def _entity(name: str) -> ExtractedEntity:
-    return ExtractedEntity(name=name, type="Tool", summary="")
-
-
-def _pipeline():
-    from ingestion.extractor import ExtractionPipeline
-
-    embedder = MagicMock()
-    embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
-    db = MagicMock()
-    db.get_session_episodes.return_value = []
-    db.get_synth_document_source_ids.return_value = []
-    kg = MagicMock()
-    kg.find_similar_nodes.return_value = []
-    return ExtractionPipeline(db=db, llm_client=MagicMock(), embedder=embedder, kg_client=kg)
-
-
-def _run_item(pipe, project: str):
-    """Drive process_item with one personal-flavored fact; return the groups used."""
-    entities = [_entity("dentist appointment"), _entity("calendar")]
-    facts = [
-        ExtractedFact(
-            source="dentist appointment",
-            target="calendar",
-            relationship="BOOKED_IN",
-            fact="the dentist appointment was booked in the calendar",
-        )
-    ]
-    pipe._stage2_deterministic = MagicMock(return_value=[])
-    pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=entities, facts=facts))
-    pipe._stage4_resolve = MagicMock(
-        side_effect=lambda ents, group_id, deduper=None: {e.name: f"new:{e.name}" for e in ents}
-    )
-    pipe._stage5_write_nodes = MagicMock()
-    pipe._process_facts_for_group = MagicMock()
-    pipe._deduper_for = MagicMock(return_value=MagicMock())
-
-    pipe.process_item(
-        {
-            "content_type": "summary",
-            "content": "booked the dentist appointment",
-            "project": project,
-            "session_id": "s1",
-        }
-    )
-    resolve_groups = {c.args[1] for c in pipe._stage4_resolve.call_args_list}
-    fact_groups = {c.args[3] for c in pipe._process_facts_for_group.call_args_list}
-    return resolve_groups, fact_groups
-
-
-def test_process_item_splits_groups_when_scope_on(monkeypatch):
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-    resolve_groups, fact_groups = _run_item(_pipeline(), project="jobs")
-    assert resolve_groups == {"personal"}
-    assert fact_groups == {"personal"}
-
-
-def test_process_item_routes_everything_technical_when_scope_off(monkeypatch):
-    """Same item, scope off: the personal bucket is empty and nothing is written
-    to a graph the default read never opens."""
-    monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "0")
-    resolve_groups, fact_groups = _run_item(_pipeline(), project="jobs")
-    assert resolve_groups == {"technical"}
-    assert fact_groups == {"technical"}
 
 
 # ---------------------------------------------------------------------------

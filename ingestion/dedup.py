@@ -2,7 +2,7 @@
 
 Ports Graphiti's 4-strategy node dedup (``graphiti_core/utils/maintenance/
 dedup_helpers.py`` + ``node_operations.resolve_extracted_nodes``) into a
-single ``NodeDeduper`` class scoped to one KG group at a time.
+single ``NodeDeduper`` class over the owner's whole memory.
 
 The strategies, tried in order, return the first match:
 
@@ -47,6 +47,8 @@ import threading
 import time
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any, cast
+
+from ingestion.kg_pg_read import OWNER as _OWNER
 
 if TYPE_CHECKING:
     from ingestion.kg_client import KGClient
@@ -307,18 +309,21 @@ def _jaccard(a: set[str], b: set[str]) -> float:
 # ---------------------------------------------------------------------------
 
 
-class _GroupIndex:
-    """The hydrated per-group dedup index — the expensive, shareable part.
+class _MemoryIndex:
+    """The hydrated dedup index of one owner's memory — the expensive, shareable part.
 
-    One instance per group_id per PROCESS, held in ``_INDEX_CACHE`` and
+    One instance per owner per PROCESS, held in ``_INDEX_CACHE`` and
     shared by every NodeDeduper (and thus every drain worker thread). At
-    ~48K technical-group entities the index measures ~280MB — per-thread
-    copies of it are what drove the pollers into their 1GiB memcg caps
-    (OOM-kills every 10-40 min under load, chronic since late July).
+    ~48K entities the index measures ~280MB — per-thread copies of it are
+    what drove the pollers into their 1GiB memcg caps (OOM-kills every
+    10-40 min under load, chronic since late July).
 
     ``lock`` guards the datasketch LSH (its insert/query mutate/iterate
     plain dicts and aren't safe to interleave). The lookup dicts are only
     touched with single get/set ops, which the GIL already makes atomic.
+
+    ``uuid_by_normalized_name`` keeps the first row it sees for a name, and the rows
+    arrive in ``SURVIVOR_ORDER``: the entity the SQL name lookup returns.
     """
 
     def __init__(self, lsh: Any) -> None:
@@ -334,9 +339,9 @@ class _GroupIndex:
 
 # Process-wide index cache. TTL (SYNAPSE_DEDUP_CACHE_TTL_SECONDS, default
 # 900) bounds staleness from OTHER processes' writes — same-process writes
-# land immediately via ``register``. Per-group build locks keep a rebuild
-# of 'technical' (seconds) from blocking a thread that needs 'personal'.
-_INDEX_CACHE: dict[str, _GroupIndex] = {}
+# land immediately via ``register``. Build locks are per owner, so a rebuild
+# blocks only the threads that need that owner's index.
+_INDEX_CACHE: dict[str, _MemoryIndex] = {}
 _INDEX_BUILD_LOCKS: dict[str, threading.Lock] = {}
 _INDEX_CACHE_GUARD = threading.Lock()
 
@@ -349,19 +354,19 @@ def _index_ttl() -> float:
 
 
 def _index_cache_reset() -> None:
-    """Drop all cached group indexes (tests)."""
+    """Drop all cached indexes (tests)."""
     with _INDEX_CACHE_GUARD:
         _INDEX_CACHE.clear()
         _INDEX_BUILD_LOCKS.clear()
 
 
 class NodeDeduper:
-    """Per-group write-time entity deduplicator.
+    """Write-time entity deduplicator.
 
     Instances are thin and thread-affine: they hold the calling thread's
     KG/LLM clients (DB connections must not cross threads) plus config.
-    The expensive hydrated index is NOT per-instance — every deduper for a
-    group shares one process-wide ``_GroupIndex``, built lazily on first
+    The expensive hydrated index is NOT per-instance — every deduper
+    shares one process-wide ``_MemoryIndex``, built lazily on first
     fuzzy lookup and rebuilt on TTL expiry by whichever caller trips it.
     ``register`` updates the shared index when the caller decides to
     INSERT (i.e. find_or_none returned None) so later calls from ANY
@@ -378,7 +383,6 @@ class NodeDeduper:
     def __init__(
         self,
         kg_client: KGClient,
-        group_id: str,
         llm_client: Any | None = None,
         *,
         llm_model: str | None = None,
@@ -388,7 +392,6 @@ class NodeDeduper:
         from ingestion.llm_client import stage_model
 
         self._kg = kg_client
-        self._group_id = group_id
         self._llm = llm_client
         self._llm_model = llm_model or stage_model("DEDUP", _DEFAULT_LLM_MODEL)
         self._lsh_threshold = lsh_threshold
@@ -616,46 +619,46 @@ class NodeDeduper:
                 return in_mem
 
         try:
-            return self._kg.entity_uuid_by_normalized_name(normalized, self._group_id)
+            return self._kg.entity_uuid_by_normalized_name(normalized)
         except Exception:
             return None
 
-    def _peek_index(self) -> _GroupIndex | None:
-        """The group's shared index if already built, else None (never builds)."""
+    def _peek_index(self) -> _MemoryIndex | None:
+        """The shared index if already built, else None (never builds)."""
         with _INDEX_CACHE_GUARD:
-            return _INDEX_CACHE.get(self._group_id)
+            return _INDEX_CACHE.get(_OWNER)
 
-    def _index(self) -> _GroupIndex:
-        """The group's shared index, building or TTL-rebuilding it if needed.
+    def _index(self) -> _MemoryIndex:
+        """The shared index, building or TTL-rebuilding it if needed.
 
         Lazy because building the LSH costs O(N) MinHash inserts; shared
         because at ~48K entities the built index is ~280MB — one copy per
         process, not per worker thread. The builder thread pays the build
         with its OWN kg_client (connections are thread-affine); waiters
-        block on the per-group build lock and get the finished index.
+        block on the build lock and get the finished index.
         Threads mid-item keep their reference to a just-expired index —
         staleness stays bounded by TTL + one item.
         """
         ttl = _index_ttl()
         with _INDEX_CACHE_GUARD:
-            idx = _INDEX_CACHE.get(self._group_id)
+            idx = _INDEX_CACHE.get(_OWNER)
             if idx is not None and time.monotonic() - idx.built_at <= ttl:
                 return idx
-            build_lock = _INDEX_BUILD_LOCKS.setdefault(self._group_id, threading.Lock())
+            build_lock = _INDEX_BUILD_LOCKS.setdefault(_OWNER, threading.Lock())
         with build_lock:
             # Double-check: another thread may have finished the (re)build
             # while we waited on the lock.
             with _INDEX_CACHE_GUARD:
-                idx = _INDEX_CACHE.get(self._group_id)
+                idx = _INDEX_CACHE.get(_OWNER)
                 if idx is not None and time.monotonic() - idx.built_at <= ttl:
                     return idx
             idx = self._build_index()
             with _INDEX_CACHE_GUARD:
-                _INDEX_CACHE[self._group_id] = idx
+                _INDEX_CACHE[_OWNER] = idx
             return idx
 
-    def _build_index(self) -> _GroupIndex:
-        """Hydrate a fresh _GroupIndex from every Entity in the group.
+    def _build_index(self) -> _MemoryIndex:
+        """Hydrate a fresh _MemoryIndex from every entity of the owner.
 
         Shingle sets are NOT retained — they exist only long enough to
         compute each MinHash (storing them cost ~87MB at 48K entities);
@@ -669,15 +672,15 @@ class NodeDeduper:
             # No numpy → skip fuzzy strategy. Exact-name short-circuit
             # still works.
             logger.warning("dedup: numpy unavailable (%s); skipping LSH", exc)
-            return _GroupIndex(_NullLSH())
+            return _MemoryIndex(_NullLSH())
 
         try:
-            rows = self._kg.load_entities(self._group_id)
+            rows = self._kg.load_entities()
         except Exception as exc:
             logger.warning("dedup: failed to load entities for LSH (%s); skipping", exc)
-            return _GroupIndex(_NullLSH())
+            return _MemoryIndex(_NullLSH())
 
-        idx = _GroupIndex(lsh)
+        idx = _MemoryIndex(lsh)
 
         # Taxonomy map for the type-compatibility gate (empty if unseeded -> gate no-ops).
         if _TYPE_GATE_ON:
@@ -709,14 +712,13 @@ class NodeDeduper:
                 logger.debug("dedup: skipping %s in LSH (%s)", node_uuid[:8], exc)
         lsh.finalize()
         logger.info(
-            "dedup: LSH built for %s — %d entities in %.1fs",
-            self._group_id,
+            "dedup: LSH built — %d entities in %.1fs",
             len(rows),
             time.monotonic() - build_start,
         )
         return idx
 
-    def _lsh_candidates(self, normalized: str, idx: _GroupIndex) -> list[tuple[str, float]]:
+    def _lsh_candidates(self, normalized: str, idx: _MemoryIndex) -> list[tuple[str, float]]:
         """Return [(uuid, jaccard), ...] sorted by descending Jaccard.
 
         LSH returns an approximate candidate set; we recompute exact

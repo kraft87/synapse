@@ -5,11 +5,9 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from ingestion.models import (
-    ExtractedEntity,
     ExtractedFact,
     ExtractionResult,
 )
-from ingestion.scope import active_groups
 
 if TYPE_CHECKING:
     from ingestion.embedding import EmbeddingModel
@@ -23,25 +21,14 @@ from ingestion.extraction_policy import _CONTRADICTION_PROMPT as _CONTRADICTION_
 from ingestion.extraction_policy import _ERROR_RE as _ERROR_RE
 from ingestion.extraction_policy import _FILE_PATH_RE as _FILE_PATH_RE
 from ingestion.extraction_policy import _KNOWN_TOOLS as _KNOWN_TOOLS
-from ingestion.extraction_policy import _OWNER as _OWNER
-from ingestion.extraction_policy import _OWNER_POSSESSIVE as _OWNER_POSSESSIVE
-from ingestion.extraction_policy import _PERSONAL_NAME_PATTERN as _PERSONAL_NAME_PATTERN
-from ingestion.extraction_policy import _PERSONAL_PROJECTS as _PERSONAL_PROJECTS
 from ingestion.extraction_policy import _SATURATION_MAX_ROUNDS as _SATURATION_MAX_ROUNDS
 from ingestion.extraction_policy import _SATURATION_MIN as _SATURATION_MIN
 from ingestion.extraction_policy import _SEMANTIC_POOL_LIMIT as _SEMANTIC_POOL_LIMIT
-from ingestion.extraction_policy import _TECHNICAL_NAME_PATTERN as _TECHNICAL_NAME_PATTERN
 from ingestion.extraction_policy import _URL_RE as _URL_RE
 from ingestion.extraction_policy import (
     _apply_canonical_aliases as _apply_canonical_aliases,
 )
-from ingestion.extraction_policy import (
-    _classify_entity_group as _classify_entity_group,
-)
 from ingestion.extraction_policy import _cosine_similarity as _cosine_similarity
-from ingestion.extraction_policy import (
-    _default_group_for_project as _default_group_for_project,
-)
 from ingestion.extraction_policy import (
     build_batch_resolution_prompt as build_batch_resolution_prompt,
 )
@@ -54,31 +41,17 @@ from ingestion.localtime import local_date, local_iso
 logger = logging.getLogger(__name__)
 
 
-def _partition_facts_by_group(
-    facts: list[ExtractedFact], entity_groups: dict[str, str], groups: tuple[str, ...]
-) -> tuple[dict[str, list[ExtractedFact]], int, int]:
-    """Split ``facts`` by the group both endpoints share.
+def _drop_unresolved_endpoints(
+    facts: list[ExtractedFact], uuid_map: dict[str, str]
+) -> tuple[list[ExtractedFact], int]:
+    """Keep the facts whose source and target both resolved to an entity.
 
-    Returns ``(facts_by_group, cross_group, endpoint_unresolved)``. A fact is kept only
-    when source and target both have a group, the same one, and it is an active group.
-    The two drop causes are counted apart: ``endpoint_unresolved`` is an endpoint with no
-    group at all (``entity_groups`` is keyed by EXACT name, so ``james`` finds nothing
-    against a declared ``James``); ``cross_group`` is both endpoints grouped but differently,
-    or in a group that is not active. A fact failing both counts as unresolved.
+    Returns ``(kept, endpoint_unresolved)``. ``uuid_map`` is keyed by EXACT entity name, so a
+    fact that names an entity by a spelling that is not a declared name (``james`` against
+    a declared ``James``) has no endpoint to attach to and is dropped, and counted.
     """
-    facts_by_group: dict[str, list[ExtractedFact]] = {g: [] for g in groups}
-    cross_group = 0
-    endpoint_unresolved = 0
-    for fact in facts:
-        src_grp = entity_groups.get(fact.source)
-        tgt_grp = entity_groups.get(fact.target)
-        if not src_grp or not tgt_grp:
-            endpoint_unresolved += 1
-        elif src_grp == tgt_grp and src_grp in facts_by_group:
-            facts_by_group[src_grp].append(fact)
-        else:
-            cross_group += 1
-    return facts_by_group, cross_group, endpoint_unresolved
+    kept = [f for f in facts if uuid_map.get(f.source) and uuid_map.get(f.target)]
+    return kept, len(facts) - len(kept)
 
 
 class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
@@ -109,7 +82,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         self._kg = kg_client
         self._embedder = embedder
         # Phase 3: writer-side bi-temporal contradiction safety net. Runs
-        # immediately before create_edge writes, layered on top of Stage 6's
+        # immediately before Stage 7 writes edges, layered on top of Stage 6's
         # extractor-level contradiction prompt -- catches edges written via
         # paths that bypass Stage 6 (dream pipeline, manual writes, future
         # ingestion sources) AND any same-pair contradictions Stage 6's
@@ -123,17 +96,17 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         # Phase 4: LLM-driven temporal-bounds extractor (Graphiti verbatim
         # `extract_timestamps`). Reads valid_at / invalid_at out of the
         # fact text itself when the caller doesn't pre-supply t_valid.
-        # Best-effort: failures fall back to now() inside create_edge so
+        # Best-effort: failures fall back to now() inside Stage 7 so
         # the write path is never blocked by date extraction.
         self._edge_date_extractor = EdgeDateExtractor(
             llm_client=llm_client,
             model=stage_model("EDGE_DATES", base),
         )
-        # Per-group NodeDeduper cache. Dedupers are thin shells over a
-        # process-shared hydrated index (see ingestion.dedup._GroupIndex),
+        # NodeDeduper cache. The deduper is a thin shell over a
+        # process-shared hydrated index (see ingestion.dedup._MemoryIndex),
         # so this cache only avoids re-constructing the shell per item;
         # index build/TTL policy lives in the dedup module.
-        self._dedupers: dict[str, Any] = {}
+        self._deduper: Any | None = None
         # Timeline chat gate (schema 033): per-turn "did something happen?" check on
         # episode-type items -> naked dated events in timeline_events. Fail-soft and
         # env-gated (SYNAPSE_TIMELINE_GATE=0); orthogonal to KG extraction.
@@ -175,18 +148,13 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
     def process_item(self, item: dict[str, Any]) -> None:
         """Process one extraction queue item. Raises on failure (caller handles retry).
 
-        Group routing: each entity is assigned to either the technical or personal
-        graph via _classify_entity_group (project tag → item default, then per-entity
-        regex override), or to technical alone when the personal scope is off. Entities are partitioned by group and resolved/written
-        independently against their target graph. Edges are only written when both
-        endpoints landed in the same group; cross-group facts are dropped (rare —
-        a sign of borderline content the regex misclassified).
+        Every entity is resolved against the owner's whole memory in one pass, and a
+        fact is written whenever both of its endpoints resolved.
         """
         content_type: str = item["content_type"]
         content: str = item["content"]
         project: str | None = item.get("project")
         session_id: str | None = item.get("session_id")
-        default_group = _default_group_for_project(project)
         web_provenance: dict[str, Any] | None = None
 
         # Segment date (conversation time, NOT ingest wall-clock) = the source
@@ -271,15 +239,14 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
 
         # Task #49: canonicalize identity aliases (User / full-name spellings -> owner hub)
         # before any filtering or resolution, so every downstream consumer
-        # (orphan filter, group classification, embeddings, uuid_map, edges)
-        # sees only the canonical name.
+        # (orphan filter, embeddings, uuid_map, edges) sees only the canonical name.
         all_entities = _apply_canonical_aliases(all_entities, llm_result.facts)
 
         # --- Pre-resolve orphan filter --------------------------------------
         # Only entities that appear as the source or target of an extracted
         # fact can be written at all: an existing one is updated in Stage 5
         # below, a new one only when Stage 7 will create a fact linking it
-        # (_stage5_write_new_nodes, per group, right before Stage 7 writes). But the
+        # (_stage5_write_new_nodes, right before Stage 7 writes). But the
         # deterministic extractor emits hundreds-to-thousands of entity
         # mentions per summary (file paths, URLs, identifiers): on a real
         # corpus summary that's ~1300 entities backing only ~6-12 facts.
@@ -299,53 +266,39 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         }
         all_entities = [e for e in all_entities if e.name in referenced_names]
 
-        # Per-entity group classification (regex-based override of item default)
-        entity_groups: dict[str, str] = {
-            e.name: _classify_entity_group(e.name, e.summary, default_group) for e in all_entities
-        }
-
-        # Pre-embed all entity names once (re-used per-group below)
+        # Pre-embed all entity names once
         entity_embeddings: dict[str, list[float]] = {}
         if all_entities:
             names = [e.name for e in all_entities]
             embs = self._embedder.embed(names, task="entity")
             entity_embeddings = dict(zip(names, embs, strict=True))
 
-        # Resolve nodes separately per group, defer the write until after the
-        # orphan-drop pass below. Resolving (Stage 4) first is safe — it only
-        # reads from the graph. Writing (Stage 5) is what we need to gate.
+        # Resolve nodes, defer the write until after the orphan-drop pass below.
+        # Resolving (Stage 4) first is safe — it only reads from the graph. Writing
+        # (Stage 5) is what we need to gate.
         #
-        # Per-group ``NodeDeduper`` instances are cached on the Extractor
-        # (``_deduper_for``) so the LSH index — an O(all entities) MinHash
-        # build — is constructed once per worker and reused across items.
-        # ``register`` keeps the in-memory index in sync after Stage 5
-        # writes each new node, so repeat names dedupe against
-        # freshly-inserted nodes both within an item and across items, and
-        # the same-name guard in ``_stage5_write_nodes`` re-checks the name
-        # right before each insert.
-        from ingestion.dedup import NodeDeduper
-
+        # The ``NodeDeduper`` is cached on the Extractor (``_deduper_for``) so the
+        # LSH index — an O(all entities) MinHash build — is constructed once per
+        # worker and reused across items. ``register`` keeps the in-memory index in
+        # sync after Stage 5 writes each new node, so repeat names dedupe against
+        # freshly-inserted nodes both within an item and across items, and the
+        # same-name guard in ``_stage5_write_nodes`` re-checks the name right before
+        # each insert.
         uuid_map: dict[str, str] = {}
-        grp_entities_map: dict[str, list[ExtractedEntity]] = {}
-        dedupers: dict[str, NodeDeduper] = {}
-        for grp in active_groups():
-            grp_entities = [e for e in all_entities if entity_groups[e.name] == grp]
-            if not grp_entities:
-                continue
-            dedupers[grp] = self._deduper_for(grp)
-            grp_uuid_map = self._stage4_resolve(grp_entities, grp, deduper=dedupers[grp])
-            uuid_map.update(grp_uuid_map)
-            grp_entities_map[grp] = grp_entities
+        deduper = None
+        if all_entities:
+            deduper = self._deduper_for()
+            uuid_map = self._stage4_resolve(all_entities, deduper=deduper)
 
         # --- Orphan-drop: skip writes for entities no fact references ---
         # Mirrors Graphiti's combined_extraction.py:280-295. Before we burn a
         # graph write per entity, check that the LLM extractor actually
         # produced a fact referencing it. Without this filter the
         # deterministic extractor + LLM extractor produce ~92% zero-edge
-        # orphan nodes. A referenced fact can still be dropped later (cross-group,
-        # same-batch twin, 6b/6c duplicate, unresolved endpoint), which used to
+        # orphan nodes. A referenced fact can still be dropped later (same-batch
+        # twin, 6b/6c duplicate, unresolved endpoint), which used to
         # leave a third of the fresh entities edge-less: so NEW entities are held
-        # back here and written per group right before Stage 7 writes edges, only
+        # back here and written right before Stage 7 writes edges, only
         # for the facts it creates. Poller.sweep_orphan_entities stays as the daily safety net
         # (edges deleted with their episode, a crash between the two writes).
         referenced_uuids: set[str] = set()
@@ -359,30 +312,20 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
 
         # Stage 5 — only entities whose resolved UUID shows up as the source or
         # target of some fact in the same response. EXISTING ones get their
-        # summary-merge update now; NEW ones wait in ``new_nodes`` for their group's
-        # Stage 7 write decision.
-        orphan_count = 0
-        new_nodes: dict[str, PendingNodes] = {}
-        for grp, grp_entities in grp_entities_map.items():
-            grp_uuid_map = {e.name: uuid_map[e.name] for e in grp_entities if e.name in uuid_map}
-            kept_entities = [
-                e
-                for e in grp_entities
-                if grp_uuid_map.get(e.name, "").removeprefix("new:") in referenced_uuids
-            ]
-            orphan_count += len(grp_entities) - len(kept_entities)
-            fresh = [e for e in kept_entities if grp_uuid_map[e.name].startswith("new:")]
-            new_nodes[grp] = PendingNodes(fresh, project, entity_embeddings, dedupers.get(grp))
-            existing = [e for e in kept_entities if e not in fresh]
-            if not existing:
-                continue
+        # summary-merge update now; NEW ones wait in ``new_nodes`` for the Stage 7
+        # write decision.
+        kept_entities = [
+            e
+            for e in all_entities
+            if uuid_map.get(e.name, "").removeprefix("new:") in referenced_uuids
+        ]
+        orphan_count = len(all_entities) - len(kept_entities)
+        fresh = [e for e in kept_entities if uuid_map[e.name].startswith("new:")]
+        new_nodes = PendingNodes(fresh, project, entity_embeddings, deduper)
+        existing = [e for e in kept_entities if e not in fresh]
+        if existing:
             self._stage5_write_nodes(
-                existing,
-                grp_uuid_map,
-                project,
-                grp,
-                entity_embeddings,
-                deduper=dedupers.get(grp),
+                existing, uuid_map, project, entity_embeddings, deduper=deduper
             )
 
         if orphan_count:
@@ -395,24 +338,17 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
         if not llm_result.facts:
             return
 
-        # Partition facts by the group of their (source, target) entity pair. Two causes
-        # drop a fact here, counted apart: a cross-group fact (both endpoints grouped,
-        # differently) implies the regex misclassified one endpoint; an unresolved endpoint
-        # (no group at all) means the fact names an entity by a spelling that is not an
-        # exact declared name -- the orphan filter and this partition both key on EXACT
-        # names, so ``james`` finds nothing against a declared ``James``.
+        # A fact names its endpoints by entity name, and the orphan filter and the uuid map
+        # both key on EXACT names, so a fact naming an entity by a spelling that is not a
+        # declared name (``james`` against a declared ``James``) has no endpoint to write.
         import logfire
 
-        with logfire.span("group_partition {n} facts", n=len(llm_result.facts)) as part_span:
-            facts_by_group, cross_group_dropped, unresolved_dropped = _partition_facts_by_group(
-                llm_result.facts, entity_groups, active_groups()
-            )
-            part_span.set_attribute("facts_dropped_cross_group", cross_group_dropped)
-            part_span.set_attribute("facts_dropped_endpoint_unresolved", unresolved_dropped)
-        if cross_group_dropped or unresolved_dropped:
+        with logfire.span("drop_unresolved_endpoints {n} facts", n=len(llm_result.facts)) as span:
+            facts, unresolved_dropped = _drop_unresolved_endpoints(llm_result.facts, uuid_map)
+            span.set_attribute("facts_dropped_endpoint_unresolved", unresolved_dropped)
+        if unresolved_dropped:
             logger.info(
-                "Group partition dropped facts: cross_group=%d endpoint_unresolved=%d (of %d)",
-                cross_group_dropped,
+                "Facts dropped: endpoint_unresolved=%d (of %d)",
                 unresolved_dropped,
                 len(llm_result.facts),
             )
@@ -442,49 +378,40 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # the local day the session date names, not the UTC one.
             reference_time = local_iso(segment_valid_at) if segment_valid_at else None
 
-        # Stage 6 + 7 run separately per group — same code path, different graph.
-        # reference_time is the relative-date anchor (the segment timestamp), so
-        # "last week" resolves against the conversation, not ingest.
-        # A group with no facts left (all cross-group) writes none of its new entities.
-        for grp in active_groups():
-            grp_facts = facts_by_group[grp]
-            if not grp_facts:
-                continue
-            self._process_facts_for_group(
-                grp_facts,
-                uuid_map,
-                episode_ids,
-                grp,
-                web_artifact_id=web_artifact_id,
-                default_valid_at=default_valid_at,
-                reference_time=reference_time,
-                new_nodes=new_nodes.get(grp),
-                queue_id=item.get("id"),
-            )
+        # Stage 6 + 7 — reference_time is the relative-date anchor (the segment
+        # timestamp), so "last week" resolves against the conversation, not ingest.
+        # With no facts left, none of the new entities is written.
+        if not facts:
+            return
+        self._process_facts(
+            facts,
+            uuid_map,
+            episode_ids,
+            web_artifact_id=web_artifact_id,
+            default_valid_at=default_valid_at,
+            reference_time=reference_time,
+            new_nodes=new_nodes,
+            queue_id=item.get("id"),
+        )
 
-    def _process_facts_for_group(
+    def _process_facts(
         self,
         facts: list[ExtractedFact],
         uuid_map: dict[str, str],
         episode_ids: list[int],
-        group_id: str,
         web_artifact_id: int | None = None,
         default_valid_at: str | None = None,
         reference_time: str | None = None,
         new_nodes: PendingNodes | None = None,
         queue_id: int | None = None,
     ) -> None:
-        """Stage 6 + 7 for one group's facts (extracted from process_item to keep it readable).
+        """Stage 6 + 7 for the item's facts (extracted from process_item to keep it readable).
 
-        ``new_nodes`` are the group's entities Stage 4 resolved as new; only those a fact
+        ``new_nodes`` are the entities Stage 4 resolved as new; only those a fact
         Stage 7 creates links are written, right before its edges."""
         import logfire
 
-        with logfire.span(
-            "process_facts_for_group {group_id} ({facts_n} facts)",
-            group_id=group_id,
-            facts_n=len(facts),
-        ):
+        with logfire.span("process_facts ({facts_n} facts)", facts_n=len(facts)):
             # Embed the fact texts once: the twin pass, Stage 6a retrieval and the
             # Stage 7 write all use these (6a used to embed the same texts again).
             with logfire.span("voyage_embed_facts {n}", n=len(facts)):
@@ -501,12 +428,12 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                 )
                 twin_span.set_attribute("collapsed", twins)
             if twins:
-                logger.info("Collapsed %d same-batch twin fact(s) in group %s", twins, group_id)
+                logger.info("Collapsed %d same-batch twin fact(s)", twins)
 
             # Stage 6a: find contradiction candidates (no LLM)
             with logfire.span("stage6a_embedding_filter"):
                 candidates_map = self._stage6a_embedding_filter(
-                    facts, uuid_map, group_id, fact_embeddings_list
+                    facts, uuid_map, fact_embeddings_list
                 )
 
             # Stage 6b: ONE batched LLM call for every fact with candidates,
@@ -530,7 +457,7 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             if llm_ok and invalidate:
                 with logfire.span("stage6b_saturation_rounds") as sat_span:
                     extra = self._stage6b_saturation_rounds(
-                        facts, candidates_map, invalidate, fact_embeddings_list, group_id
+                        facts, candidates_map, invalidate, fact_embeddings_list
                     )
                     sat_span.set_attribute("extra_invalidated", extra)
 
@@ -546,7 +473,6 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                         facts,
                         fact_embeddings_list,
                         uuid_map,
-                        group_id,
                         self._kg,
                         skip_indices,
                         invalidate,
@@ -555,14 +481,10 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     )
                     recheck_span.set_attribute("restated", restated)
                 if restated:
-                    logger.info(
-                        "Stage 6c: %d fact(s) restate a live edge in %s", restated, group_id
-                    )
+                    logger.info("Stage 6c: %d fact(s) restate a live edge", restated)
                 if new_nodes is not None and new_nodes.entities:
                     with logfire.span("stage5_write_new_nodes"):
-                        self._stage5_write_new_nodes(
-                            facts, uuid_map, skip_indices, group_id, new_nodes
-                        )
+                        self._stage5_write_new_nodes(facts, uuid_map, skip_indices, new_nodes)
 
             # Stage 7: write edges
             with logfire.span("stage7_write_edges {n}", n=len(facts)):
@@ -570,7 +492,6 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
                     facts,
                     uuid_map,
                     episode_ids,
-                    group_id,
                     skip_indices,
                     invalidate,
                     fact_embeddings_list,

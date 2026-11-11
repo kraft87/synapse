@@ -207,7 +207,7 @@ def test_the_episode_leg(corpus, sent, db_url, kw):
 
 def test_the_extraction_candidate_leg(corpus, sent, db_url, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
-    assert KGPostgresReader().find_edges_by_fulltext("widget", GROUP)
+    assert KGPostgresReader().find_edges_by_fulltext("widget")
     _check(db_url, sent, 1)
 
 

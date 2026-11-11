@@ -72,7 +72,7 @@ class TestSupersederLink:
         facts = [_fact(0, attribution="user")]
         pipe = _pipe(1)
         pipe._stage7_write_edges(
-            facts, _uuid_map(facts), [41, 42], "g", set(), {0: ["old-1"]}, default_valid_at=SEG
+            facts, _uuid_map(facts), [41, 42], set(), {0: ["old-1"]}, default_valid_at=SEG
         )
         rows = _created(pipe)
         assert len(rows) == 1
@@ -91,7 +91,6 @@ class TestSupersederLink:
             facts,
             _uuid_map(facts),
             [7],
-            "g",
             {0},
             {0: ["old-y"]},
             default_valid_at=SEG,
@@ -103,7 +102,7 @@ class TestSupersederLink:
     def test_unresolved_endpoints_still_retire_without_a_link(self):
         facts = [_fact(0)]
         pipe = _pipe(1)
-        pipe._stage7_write_edges(facts, {}, [1], "g", set(), {0: ["old-1"]}, default_valid_at=SEG)
+        pipe._stage7_write_edges(facts, {}, [1], set(), {0: ["old-1"]}, default_valid_at=SEG)
         assert _created(pipe) == []
         assert _invalidations(pipe) == [([("old-1", SEG)], None)]
 
@@ -112,7 +111,7 @@ class TestSupersederLink:
         pipe = _pipe(1, dates=[("2026-03-15T00:00:00Z", None)])
         pipe._contradiction_detector.detect_contradictions_batch.return_value = [["old-pair"]]
         pipe._stage7_write_edges(
-            facts, _uuid_map(facts), [1], "g", set(), {0: ["old-sem"]}, default_valid_at=SEG
+            facts, _uuid_map(facts), [1], set(), {0: ["old-sem"]}, default_valid_at=SEG
         )
         rows = _created(pipe)
         inv = _invalidations(pipe)
@@ -133,7 +132,6 @@ class TestSupersederLink:
             facts,
             _uuid_map(facts),
             [1],
-            "g",
             set(),
             {0: ["old-1"], 1: ["old-1"]},
             default_valid_at=SEG,
@@ -160,7 +158,7 @@ class TestEvidenceMetadata:
         facts = [_fact(0, attribution=attribution, ongoing=ongoing)]
         pipe = _pipe(1, dates=[("2019-01-01T00:00:00Z", None)])
         pipe._stage7_write_edges(
-            facts, _uuid_map(facts), [10, 12, 11], "g", set(), {}, default_valid_at=SEG
+            facts, _uuid_map(facts), [10, 12, 11], set(), {}, default_valid_at=SEG
         )
         (row,) = _created(pipe)
         assert row["ongoing"] is ongoing
@@ -180,7 +178,6 @@ class TestEvidenceMetadata:
             facts,
             _uuid_map(facts),
             [5, 6],
-            "g",
             {0, 1},
             {},
             default_valid_at=SEG,
@@ -194,7 +191,7 @@ class TestEvidenceMetadata:
     def test_no_segment_timestamp_falls_back_to_now_for_support(self):
         facts = [_fact(0, attribution="user")]
         pipe = _pipe(1)
-        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {})
+        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], set(), {})
         (row,) = _created(pipe)
         assert row["last_supported_at"] == row["t_created"]
 
@@ -206,7 +203,7 @@ class TestNeverBornInvalid:
         # true; it must be written LIVE, not already-retired with no successor link.
         facts = [_fact(0, attribution="user")]
         pipe = _pipe(1, dates=[("2026-08-29T00:00:00Z", "2026-08-29T00:00:00Z")])
-        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {}, default_valid_at=SEG)
+        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], set(), {}, default_valid_at=SEG)
         (row,) = _created(pipe)
         assert row["t_valid"] == "2026-08-29T00:00:00Z"
         assert row["t_invalid"] is None
@@ -217,6 +214,6 @@ class TestNeverBornInvalid:
         # interval, not a fact that stopped being true.
         facts = [_fact(0)]
         pipe = _pipe(1, dates=[("2026-08-01T00:00:00Z", "2026-09-01T00:00:00Z")])
-        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], "g", set(), {})
+        pipe._stage7_write_edges(facts, _uuid_map(facts), [1], set(), {})
         (row,) = _created(pipe)
         assert row["t_invalid"] is None

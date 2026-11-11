@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from typing import TYPE_CHECKING, Any
 
@@ -10,106 +9,11 @@ from ingestion.models import (
     ExtractedEntity,
     ExtractedFact,
 )
-from ingestion.scope import personal_scope_enabled
 
 if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Group routing (technical vs personal)
-# ---------------------------------------------------------------------------
-#
-# Replaces the prior hardcoded `group_id = "technical"`. Entities and edges are
-# routed per-item via project tag, then per-entity overridden by content
-# heuristics. Patterns mirror scripts/survey_cross_graph_leaks.py — same
-# regexes that identified the post-hoc leakers — so the writer-side classifier
-# matches the cleanup-side classifier.
-
-# The whole split is off when SYNAPSE_PERSONAL_SCOPE=0 (ingestion/scope.py): every
-# item and entity below routes to "technical" and the personal graph is never
-# written. Work-only deployments want that: a technical entity tripping the
-# personal regex lands in a graph the default search never reads.
-
-# Projects whose extraction items default to the personal graph. Deployment-
-# specific slugs (e.g. a project named after the owner) are config, not code:
-# SYNAPSE_PERSONAL_PROJECTS adds comma-separated slugs (issue #41).
-_PERSONAL_PROJECTS: frozenset[str] = frozenset({"jobs", "personal", "email-templates"}) | frozenset(
-    s.strip().lower()
-    for s in (os.environ.get("SYNAPSE_PERSONAL_PROJECTS") or "").split(",")
-    if s.strip()
-)
-
-# Owner-name possessive ("<name>'s ...") routes content to the personal graph.
-# Derived from SYNAPSE_OWNER_NAME; skipped for the generic default "User" —
-# "user's" is everywhere in technical text and would over-route.
-_OWNER = (os.environ.get("SYNAPSE_OWNER_NAME") or "User").strip() or "User"
-_OWNER_POSSESSIVE = f"{re.escape(_OWNER.lower())}'?s|" if _OWNER.lower() != "user" else ""
-
-_PERSONAL_NAME_PATTERN = re.compile(
-    r"\b("
-    + _OWNER_POSSESSIVE
-    + r"family|sister|brother|mom|mother|dad|father|parent|cousin|uncle|aunt|nephew|niece|"
-    r"girlfriend|boyfriend|ex[- ]girlfriend|ex[- ]boyfriend|wife|husband|partner|spouse|dating|dated|"
-    r"friend|friends|cottage|vacation|holiday|birthday|wedding|"
-    r"doctor|dentist|appointment|medication|drinking|gym|exercise|sleep|diet|insurance|"
-    r"book|novel|movie|film|tv show|chess\.com|"
-    r"recruiter|hiring|interview|applied to|job posting|job position|role at|engineer at|"
-    r"job opportunity|job offer"
-    r")\b",
-    re.IGNORECASE,
-)
-
-_TECHNICAL_NAME_PATTERN = re.compile(
-    r"\b("
-    r"python|javascript|typescript|rust|golang|kotlin|java|"
-    r"docker|kubernetes|k8s|postgres|postgresql|pgvector|falkordb|redis|"
-    r"mongodb|cassandra|elasticsearch|kafka|"
-    r"react|django|flask|fastapi|nextjs|svelte|"
-    r"aws|azure|gcp|terraform|ansible|helm|"
-    r"async|asyncio|threading|semaphore|mutex|coroutine|"
-    r"\.py|\.js|\.ts|\.yaml|\.toml|\.sql|\.json"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _default_group_for_project(project: str | None) -> str:
-    """Item-level default group derived from project tag.
-
-    With the personal scope off (SYNAPSE_PERSONAL_SCOPE=0) the project list is
-    never consulted: there is one graph, so every item defaults to technical.
-    """
-    if not personal_scope_enabled():
-        return "technical"
-    if project and project.lower() in _PERSONAL_PROJECTS:
-        return "personal"
-    return "technical"
-
-
-def _classify_entity_group(name: str, summary: str | None, default_group: str) -> str:
-    """Per-entity override of the item-level default group.
-
-    A personal-flavored entity name (family, dating, health, job-search) lands
-    in personal even when the surrounding session is technical — and vice
-    versa for clearly-technical names that surface in personal sessions.
-    Borderline cases stay with the default. Matches the cleanup-pass regex
-    in scripts/survey_cross_graph_leaks.py so writer and survey agree.
-
-    With the personal scope off (SYNAPSE_PERSONAL_SCOPE=0) neither pattern runs:
-    a technical entity that trips the personal regex would otherwise land in a
-    graph nothing reads.
-    """
-    if not personal_scope_enabled():
-        return "technical"
-    text = f"{name}\n{summary or ''}"
-    if _PERSONAL_NAME_PATTERN.search(text):
-        return "personal"
-    if _TECHNICAL_NAME_PATTERN.search(text):
-        return "technical"
-    return default_group
 
 
 # ---------------------------------------------------------------------------

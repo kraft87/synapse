@@ -180,10 +180,10 @@ def full_surface(conn):
 
 @pytest.fixture(autouse=True)
 def _reset_dedup_index_cache():
-    """The dedup module caches hydrated group indexes process-wide (one shared
-    copy per group instead of one per worker thread). Tests build indexes from
-    per-test fake KG clients under the same group ids, so the cache must be
-    dropped between tests or one test's entities leak into the next."""
+    """The dedup module caches the hydrated entity index process-wide (one shared
+    copy instead of one per worker thread). Tests build indexes from per-test
+    fake KG clients under the same owner, so the cache must be dropped between
+    tests or one test's entities leak into the next."""
     from ingestion import dedup
 
     dedup._index_cache_reset()

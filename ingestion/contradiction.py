@@ -1,8 +1,8 @@
 """Write-time contradiction detector for the bi-temporal edge model.
 
 Phase 3 of the Graphiti -> Synapse port. Provides ``ContradictionDetector``,
-the safety net that runs immediately before ``KGClient.create_edge``
-writes a RELATES_TO edge to the graph. When it confirms that an incoming
+the safety net that runs immediately before Stage 7 writes a RELATES_TO edge
+to the graph. When it confirms that an incoming
 fact contradicts one or more *live* (``t_invalid IS NULL``) existing edges,
 those edges have their ``t_invalid`` set instead of being deleted -- the
 bi-temporal model is additive-only and preserves audit history.
@@ -24,8 +24,7 @@ the writer-side hook):
    maintained by the caller) so the LLM cannot hallucinate UUID strings.
 
 The detector does NOT write to the graph. ``detect_contradictions`` only
-returns the UUIDs to invalidate; the caller (``KGClient.create_edge``)
-calls ``invalidate_edge`` on each.
+returns the UUIDs to invalidate; the caller (Stage 7) invalidates each.
 
 This is deliberately decoupled from the extractor's Stage 6 contradiction
 prompt: Stage 6 sees a much richer candidate pool (BM25 + vector RRF over
@@ -83,9 +82,8 @@ def _cosine(a: list[float], b: list[float]) -> float:
 class ContradictionDetector:
     """Writer-side bi-temporal contradiction safety net.
 
-    Instantiate once per ingestion process and pass to ``KGClient.create_edge``
-    via its ``detector`` kwarg. The detector is stateless -- all state lives in
-    Postgres -- so a single instance is shared across all groups/writes.
+    Instantiate once per ingestion process. The detector is stateless -- all
+    state lives in Postgres -- so a single instance is shared across all writes.
     """
 
     def __init__(
@@ -110,7 +108,6 @@ class ContradictionDetector:
         new_fact: ExtractedFact,
         source_uuid: str,
         target_uuid: str,
-        group_id: str,
         *,
         fact_embedding: list[float] | None = None,
     ) -> list[str]:
@@ -128,7 +125,7 @@ class ContradictionDetector:
             # Step 1: structural filter -- live edges sharing the same pair.
             # ``find_edges_by_pair`` filters on ``t_invalid IS NULL`` so
             # already-retired edges can't re-enter the candidate pool.
-            candidates = self._kg.find_edges_by_pair(source_uuid, target_uuid, group_id)
+            candidates = self._kg.find_edges_by_pair(source_uuid, target_uuid)
             if not candidates:
                 return []
 
@@ -189,9 +186,8 @@ class ContradictionDetector:
         except Exception as exc:
             # Never let a detector failure block the write. Log and return [].
             logger.warning(
-                "ContradictionDetector failed for fact=%r group=%s: %s",
+                "ContradictionDetector failed for fact=%r: %s",
                 new_fact.fact[:80],
-                group_id,
                 exc,
             )
             return []
@@ -201,7 +197,6 @@ class ContradictionDetector:
         new_facts: list[ExtractedFact],
         source_uuids: list[str],
         target_uuids: list[str],
-        group_id: str,
         *,
         fact_embeddings: list[list[float] | None] | None = None,
     ) -> list[list[str]]:
@@ -225,7 +220,7 @@ class ContradictionDetector:
 
         ``fact_embeddings`` is parallel to ``new_facts``; ``None`` slots
         embed on-demand. The extractor already embeds fact texts in
-        batch (see ``_process_facts_for_group``), so pass them through.
+        batch (see ``_process_facts``), so pass them through.
         """
         n = len(new_facts)
         out: list[list[str]] = [[] for _ in range(n)]
@@ -249,7 +244,7 @@ class ContradictionDetector:
             ):
                 if not src or not tgt:
                     continue
-                candidates = self._kg.find_edges_by_pair(src, tgt, group_id)
+                candidates = self._kg.find_edges_by_pair(src, tgt)
                 if not candidates:
                     continue
                 emb = embs[i]
@@ -281,8 +276,7 @@ class ContradictionDetector:
                 )
         except Exception as exc:
             logger.warning(
-                "ContradictionDetector.batch pre-LLM filter failed group=%s: %s",
-                group_id,
+                "ContradictionDetector.batch pre-LLM filter failed: %s",
                 exc,
             )
             return out
@@ -307,8 +301,7 @@ class ContradictionDetector:
             )
         except Exception as exc:
             logger.warning(
-                "ContradictionDetector.batch LLM call failed group=%s n=%d: %s",
-                group_id,
+                "ContradictionDetector.batch LLM call failed n=%d: %s",
                 len(items_for_prompt),
                 exc,
             )

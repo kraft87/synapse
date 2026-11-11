@@ -76,8 +76,8 @@ class TestCreateEdgesBatch:
     def test_returns_uuids_in_input_order(self):
         client, writer = _client_with_mock_writer()
         rows = [self._row("r-1"), self._row("r-2")]
-        assert client.create_edges_batch(rows, "technical") == ["r-1", "r-2"]
-        writer.create_edges.assert_called_once_with(rows, "technical")
+        assert client.create_edges_batch(rows) == ["r-1", "r-2"]
+        writer.create_edges.assert_called_once_with(rows)
         writer.invalidate_edges.assert_not_called()
 
     def test_pre_bookended_facts_self_invalidate(self):
@@ -88,19 +88,18 @@ class TestCreateEdgesBatch:
             self._row("r-1"),
             self._row("r-2", t_invalid="2022-01-01T00:00:00+00:00"),
         ]
-        client.create_edges_batch(rows, "technical")
-        (items, group) = writer.invalidate_edges.call_args.args
-        assert group == "technical"
+        client.create_edges_batch(rows)
+        (items,) = writer.invalidate_edges.call_args.args
         assert items == [("r-2", "2022-01-01T00:00:00+00:00")]
 
     def test_empty_rows_short_circuits(self):
         client, writer = _client_with_mock_writer()
-        assert client.create_edges_batch([], "technical") == []
+        assert client.create_edges_batch([]) == []
         writer.create_edges.assert_not_called()
 
     def test_invalidate_edges_batch_fills_now_for_none(self):
         client, writer = _client_with_mock_writer()
-        client.invalidate_edges_batch([("r-1", None), ("r-2", "2026-01-01T00:00:00+00:00")], "g")
-        (items, _group) = writer.invalidate_edges.call_args.args
+        client.invalidate_edges_batch([("r-1", None), ("r-2", "2026-01-01T00:00:00+00:00")])
+        (items,) = writer.invalidate_edges.call_args.args
         assert items[1] == ("r-2", "2026-01-01T00:00:00+00:00")
         assert items[0][0] == "r-1" and "T" in items[0][1]  # now() filled in

@@ -11,8 +11,11 @@ texts that share a slot are identical vectors.
    the pair. Pinned: one live edge, mention_count 2, the union of both batches' episodes.
 2. Edge-less entities. Stage 5 wrote every new entity a fact named before Stage 6/7 decided
    which facts get written, so an entity whose only fact was then dropped (6b duplicate,
-   6c restatement, same-batch twin, cross-group) was left with no edge. And two workers
-   that resolved the same new name both inserted it.
+   6c restatement, same-batch twin) was left with no edge. And two workers that resolved
+   the same new name both inserted it.
+3. The old personal/technical split. Names the old classifier sent to different piles
+   still get their fact written, and rows still carrying group_id 'personal' (the data
+   is merged once, by schema 067) are found by every lookup the write path makes.
 
 Only symbols that predate the fix are imported, so the file also runs against the
 pre-fix pipeline (where every reproduction fails on its assertion).
@@ -27,10 +30,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import ingestion.extractor as extractor_mod
 from ingestion.dedup import _index_cache_reset
 from ingestion.extractor import ExtractionPipeline
 from ingestion.kg_client import KGClient
+from ingestion.kg_pg_write import _vec
 from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
 from tests.helpers.embed import onehot
 
@@ -294,21 +297,6 @@ class TestNoEntityWithoutAWrittenFact:
         assert {"Lantern", "Calendar", "Meadow", "Backup"} <= set(_entity_names(graph))
         assert _edgeless(graph) == []
 
-    def test_cross_group_fact(self, graph, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-        monkeypatch.setattr(
-            extractor_mod,
-            "_classify_entity_group",
-            lambda name, summary, default: "personal" if name == "Pebble" else default,
-        )
-        cross = _fact("Pebble is moored at the harbor", "Pebble", "Harbor")
-
-        _pipeline(_Embedder(), [cross, _CONTROL], WINDOW_A).process_item(dict(ITEM))
-
-        assert [e[0] for e in _live_edges(graph)] == [_CONTROL.fact]
-        assert _entity_names(graph) == ["Backup", "Meadow"]
-        assert _edgeless(graph) == []
-
 
 # ---------------------------------------------------------------------------------------
 # Same new name resolved by two workers at once
@@ -338,3 +326,110 @@ def test_same_new_name_from_parallel_workers_is_one_entity(graph, before_b):
     assert sorted(e[0] for e in edges) == sorted([fact_a.fact, fact_b.fact])
     assert {e[1] for e in edges} == {harbors[0][0]}
     assert _edgeless(graph) == []
+
+
+# ---------------------------------------------------------------------------------------
+# 3. Rows written under the old personal/technical split
+# ---------------------------------------------------------------------------------------
+#
+# Until the one-time merge, pre-existing rows may still carry group_id 'personal'. The
+# write path must resolve a mention onto such a row, not mint a twin beside it.
+
+
+def _seed_entity(conn, uuid: str, name: str, *, group: str = "personal", slot: int | None = None):
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, entity_type, "
+        "summary, embedding, created_at, t_created, valid_at, t_valid) "
+        "VALUES (%s, 'default', %s, %s, %s, 'Concept', '', %s::vector, now(), now(), now(), now())",
+        (uuid, group, name, name.lower(), None if slot is None else _vec(onehot(slot))),
+    )
+
+
+def _seed_edge(conn, uuid: str, src: str, tgt: str, fact: str, slot: int, group: str = "personal"):
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "fact_embedding, created_at, t_created, valid_at, t_valid) "
+        "VALUES (%s, 'default', %s, %s, %s, 'R', %s, %s::vector, now(), now(), now(), now())",
+        (uuid, group, src, tgt, fact, _vec(onehot(slot))),
+    )
+
+
+_HOSTS = _fact("Harbor hosts the build cache", "Harbor", "Cache")
+
+
+def test_fact_across_old_piles_is_written(graph):
+    # The two names sat in different piles under the old name classifier; there is one
+    # memory now, so the fact between them is written like any other.
+    across = _fact(
+        "A dentist appointment is booked after the Postgres upgrade",
+        "dentist appointment",
+        "Postgres",
+    )
+
+    _pipeline(_Embedder(), [across, _CONTROL], WINDOW_A).process_item(dict(ITEM))
+
+    assert sorted(e[0] for e in _live_edges(graph)) == sorted([across.fact, _CONTROL.fact])
+    assert {"dentist appointment", "Postgres"} <= set(_entity_names(graph))
+    assert _edgeless(graph) == []
+
+
+def test_exact_name_resolves_onto_an_entity_left_in_the_personal_group(graph):
+    _seed_entity(graph, "p-harbor", "Harbor")
+
+    _pipeline(_Embedder(), [_HOSTS], WINDOW_A).process_item(dict(ITEM))
+
+    assert _entity_names(graph) == ["Cache", "Harbor"]
+    assert [e[1] for e in _live_edges(graph)] == ["p-harbor"]
+
+
+def test_same_name_guard_finds_an_entity_written_to_the_personal_group_meanwhile(graph):
+    pipe = _pipeline(_Embedder(), [_HOSTS], WINDOW_A)
+    resolve = pipe._stage4_resolve
+
+    def resolve_then_another_worker_writes(*args: Any, **kwargs: Any) -> Any:
+        resolved = resolve(*args, **kwargs)
+        _seed_entity(graph, "p-harbor", "Harbor")  # after Stage 4 said "new", before Stage 5
+        return resolved
+
+    pipe._stage4_resolve = resolve_then_another_worker_writes  # type: ignore[method-assign]
+    pipe.process_item(dict(ITEM))
+
+    assert _entity_names(graph) == ["Cache", "Harbor"]
+    assert [e[1] for e in _live_edges(graph)] == ["p-harbor"]
+
+
+def test_vector_match_resolves_onto_an_entity_left_in_the_personal_group(graph):
+    _seed_entity(graph, "p-zephyr", "Zephyr", slot=5)
+    fact = _fact("Gale hosts the build cache", "Gale", "Cache")
+
+    # "Gale" is short, so it skips fuzzy matching and goes to the vector search; its
+    # embedding is the stored entity's, which is how the old row is found.
+    _pipeline(_Embedder({"Gale": 5}), [fact], WINDOW_A).process_item(dict(ITEM))
+
+    assert _entity_names(graph) == ["Cache", "Zephyr"]
+    assert [e[1] for e in _live_edges(graph)] == ["p-zephyr"]
+
+
+def test_contradiction_search_retires_a_fact_left_in_the_personal_group(graph):
+    _seed_entity(graph, "p-harbor", "Harbor")
+    _seed_entity(graph, "p-shore", "Shore")
+    _seed_edge(graph, "p-edge", "p-harbor", "p-shore", "Harbor is on the north shore", slot=7)
+    newer = _fact("Harbor is on the south shore", "Harbor", "Shore")
+
+    def judge_retires_every_candidate(facts, candidates_map):
+        retired = {i: [c["uuid"] for c in pair + sem] for i, (pair, sem) in candidates_map.items()}
+        return set(), retired, {}, True
+
+    _pipeline(
+        _Embedder({newer.fact: 7}), [newer], WINDOW_A, judge=judge_retires_every_candidate
+    ).process_item(dict(ITEM))
+
+    retired_at, superseder = graph.execute(
+        "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = 'p-edge'"
+    ).fetchone()
+    new_uuid, new_src = graph.execute(
+        "SELECT uuid, src_uuid FROM kg_relationships WHERE fact = %s", (newer.fact,)
+    ).fetchone()
+    assert retired_at is not None and superseder == new_uuid
+    assert new_src == "p-harbor"
+    assert [e[0] for e in _live_edges(graph)] == [newer.fact]

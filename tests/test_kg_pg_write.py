@@ -51,7 +51,6 @@ class TestHelpers:
                 normalized_name="n",
                 entity_type="",
                 summary="",
-                group_id=GROUP,
                 project=None,
                 created_at=None,
                 valid_at=None,
@@ -69,7 +68,6 @@ class TestUpsertNode:
             normalized_name="name\x00x",
             entity_type="Tool",
             summary="sum\x00mary",
-            group_id=GROUP,
             project=None,
             created_at=None,
             valid_at=None,
@@ -87,7 +85,6 @@ class TestUpsertNode:
             normalized_name="synapse",
             entity_type="Tool",
             summary="memory layer",
-            group_id=GROUP,
             project="synapse",
             created_at="2026-06-01T00:00:00+00:00",
             valid_at="2026-06-01T00:00:00+00:00",
@@ -109,7 +106,6 @@ class TestUpsertNode:
             normalized_name="synapse",
             entity_type="SHOULD-NOT-CHANGE",
             summary="memory layer, longer",
-            group_id=GROUP,
             project="synapse",
             created_at="2026-06-09T00:00:00+00:00",
             valid_at="2026-06-09T00:00:00+00:00",
@@ -133,7 +129,6 @@ class TestUpsertNode:
             normalized_name=normalized,
             entity_type="PullRequest",
             summary=summary,
-            group_id=GROUP,
             project="synapse",
             created_at=None,
             valid_at=None,
@@ -179,7 +174,7 @@ class TestCreateEdges:
         return make_edge_row(uuid, **over)
 
     def test_nul_bytes_stripped_from_fact(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-nul", fact="a\x00fact")], GROUP)
+        kg_writer.create_edges([self._row("r-nul", fact="a\x00fact")])
         row = conn.execute("SELECT fact FROM kg_relationships WHERE uuid = 'r-nul'").fetchone()
         assert row == ("afact",)
 
@@ -189,7 +184,6 @@ class TestCreateEdges:
                 self._row("r-1"),
                 self._row("r-2", emb=None, web_artifact_id=42),
             ],
-            GROUP,
         )
         rows = conn.execute(
             "SELECT uuid, owner_id, group_id, src_uuid, tgt_uuid, fact, episodes, "
@@ -205,15 +199,14 @@ class TestCreateEdges:
         assert r2[9] == 42  # web-lane provenance
 
     def test_recreate_is_retry_noop(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-1")], GROUP)
-        kg_writer.create_edges([self._row("r-1", fact="DIFFERENT fact")], GROUP)
+        kg_writer.create_edges([self._row("r-1")])
+        kg_writer.create_edges([self._row("r-1", fact="DIFFERENT fact")])
         rows = conn.execute("SELECT fact FROM kg_relationships WHERE uuid = 'r-1'").fetchall()
         assert rows == [("fact for r-1",)]  # original wins; conflict is a no-op
 
     def test_garbage_valid_at_falls_back_to_created(self, kg_writer, conn):
         kg_writer.create_edges(
             [self._row("r-1", valid_at="-4599999974-05-27T00:00:00Z", t_valid=None)],
-            GROUP,
         )
         row = conn.execute(
             "SELECT valid_at, created_at FROM kg_relationships WHERE uuid = 'r-1'"
@@ -221,7 +214,7 @@ class TestCreateEdges:
         assert row[0] == row[1]  # nulled garbage falls back to created_at
 
     def test_empty_rows_is_noop(self, kg_writer):
-        kg_writer.create_edges([], GROUP)  # must not raise or connect
+        kg_writer.create_edges([])  # must not raise or connect
 
 
 class TestInvalidateEdges:
@@ -249,9 +242,8 @@ class TestInvalidateEdges:
                     "valid_at": "2026-06-01T00:00:00+00:00",
                 },
             ],
-            GROUP,
         )
-        kg_writer.invalidate_edges([("r-1", "2026-06-05T00:00:00+00:00"), ("r-2", None)], GROUP)
+        kg_writer.invalidate_edges([("r-1", "2026-06-05T00:00:00+00:00"), ("r-2", None)])
         rows = conn.execute(
             "SELECT uuid, t_invalid, invalid_at FROM kg_relationships ORDER BY uuid"
         ).fetchall()
@@ -274,15 +266,14 @@ class TestInvalidateEdges:
                     "valid_at": "2026-06-01T00:00:00+00:00",
                 },
             ],
-            GROUP,
         )
-        kg_writer.invalidate_edges([("old-1", None)], GROUP, invalidated_by="new-1")
+        kg_writer.invalidate_edges([("old-1", None)], invalidated_by="new-1")
         (by,) = conn.execute(
             "SELECT invalidated_by FROM kg_relationships WHERE uuid = 'old-1'"
         ).fetchone()
         assert by == "new-1"
         # COALESCE preserves it when a later invalidate passes None (idempotent re-invalidation).
-        kg_writer.invalidate_edges([("old-1", None)], GROUP)
+        kg_writer.invalidate_edges([("old-1", None)])
         (by2,) = conn.execute(
             "SELECT invalidated_by FROM kg_relationships WHERE uuid = 'old-1'"
         ).fetchone()
@@ -292,7 +283,7 @@ class TestInvalidateEdges:
     def test_missing_edge_is_zero_row_update(self, kg_writer):
         # An edge that was never created yields a 0-row UPDATE, not an error
         # (idempotent retries can re-invalidate after a partial failure).
-        kg_writer.invalidate_edges([("never-existed", None)], GROUP)
+        kg_writer.invalidate_edges([("never-existed", None)])
 
 
 class TestReinforceEdges:
@@ -302,8 +293,8 @@ class TestReinforceEdges:
         return make_edge_row(uuid, drop=("t_created", "t_valid", "emb"), **over)
 
     def test_bumps_count_and_unions_episodes(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-1")], GROUP)  # episodes [1,2], mention_count default 1
-        kg_writer.reinforce_edges([("r-1", [2, 3])], GROUP)
+        kg_writer.create_edges([self._row("r-1")])  # episodes [1,2], mention_count default 1
+        kg_writer.reinforce_edges([("r-1", [2, 3])])
         cnt, eps = conn.execute(
             "SELECT mention_count, episodes FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
@@ -311,8 +302,8 @@ class TestReinforceEdges:
         assert set(eps) == {1, 2, 3}  # new episode unioned, deduped
 
     def test_idempotent_when_episodes_already_present(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-1")], GROUP)  # episodes [1,2]
-        kg_writer.reinforce_edges([("r-1", [1, 2])], GROUP)  # nothing new
+        kg_writer.create_edges([self._row("r-1")])  # episodes [1,2]
+        kg_writer.reinforce_edges([("r-1", [1, 2])])  # nothing new
         cnt, eps = conn.execute(
             "SELECT mention_count, episodes FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
@@ -320,15 +311,15 @@ class TestReinforceEdges:
         assert set(eps) == {1, 2}
 
     def test_empty_episode_list_is_per_item_noop(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-1")], GROUP)
-        kg_writer.reinforce_edges([("r-1", [])], GROUP)
+        kg_writer.create_edges([self._row("r-1")])
+        kg_writer.reinforce_edges([("r-1", [])])
         cnt = conn.execute(
             "SELECT mention_count FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()[0]
         assert cnt == 1
 
     def test_empty_items_is_noop(self, kg_writer):
-        kg_writer.reinforce_edges([], GROUP)  # must not raise or connect
+        kg_writer.reinforce_edges([])  # must not raise or connect
 
 
 class TestEvidenceCurrency:
@@ -349,7 +340,6 @@ class TestEvidenceCurrency:
                 ),
                 self._row("r-2"),  # legacy caller: nothing supplied -> NULLs (unknown)
             ],
-            GROUP,
         )
         rows = conn.execute(
             "SELECT uuid, ongoing, last_supported_at, last_supported_by "
@@ -363,26 +353,25 @@ class TestEvidenceCurrency:
     def test_reinforce_refreshes_support_forward_only_on_new_provenance(self, kg_writer, conn):
         kg_writer.create_edges(
             [self._row("r-1", last_supported_at="2026-06-01T00:00:00+00:00", last_supported_by=2)],
-            GROUP,
         )  # episodes [1,2]
         # (a) assistant restatement (no support) with new provenance: count bumps, support stays
-        kg_writer.reinforce_edges([("r-1", [3], None, None)], GROUP)
+        kg_writer.reinforce_edges([("r-1", [3], None, None)])
         cnt, sup, by = conn.execute(
             "SELECT mention_count, last_supported_at, last_supported_by FROM kg_relationships "
             "WHERE uuid = 'r-1'"
         ).fetchone()
         assert cnt == 2 and str(sup).startswith("2026-06-01") and by == 2
         # (b) user restatement, newer, new provenance: support moves forward
-        kg_writer.reinforce_edges([("r-1", [4], "2026-08-01T00:00:00+00:00", 4)], GROUP)
+        kg_writer.reinforce_edges([("r-1", [4], "2026-08-01T00:00:00+00:00", 4)])
         cnt, sup, by = conn.execute(
             "SELECT mention_count, last_supported_at, last_supported_by FROM kg_relationships "
             "WHERE uuid = 'r-1'"
         ).fetchone()
         assert cnt == 3 and str(sup).startswith("2026-08-01") and by == 4
         # (c) a replayed chunk (provenance already present) refreshes nothing, even as user
-        kg_writer.reinforce_edges([("r-1", [4], "2026-09-01T00:00:00+00:00", 4)], GROUP)
+        kg_writer.reinforce_edges([("r-1", [4], "2026-09-01T00:00:00+00:00", 4)])
         # (d) an OLDER user statement (backfilled transcript) never moves support backward
-        kg_writer.reinforce_edges([("r-1", [5], "2026-01-01T00:00:00+00:00", 5)], GROUP)
+        kg_writer.reinforce_edges([("r-1", [5], "2026-01-01T00:00:00+00:00", 5)])
         cnt, sup, by = conn.execute(
             "SELECT mention_count, last_supported_at, last_supported_by FROM kg_relationships "
             "WHERE uuid = 'r-1'"
@@ -390,8 +379,8 @@ class TestEvidenceCurrency:
         assert cnt == 4 and str(sup).startswith("2026-08-01") and by == 4
 
     def test_reinforce_sets_support_when_never_confirmed(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-1")], GROUP)  # last_supported_at NULL
-        kg_writer.reinforce_edges([("r-1", [9], "2026-07-01T00:00:00+00:00", 9)], GROUP)
+        kg_writer.create_edges([self._row("r-1")])  # last_supported_at NULL
+        kg_writer.reinforce_edges([("r-1", [9], "2026-07-01T00:00:00+00:00", 9)])
         sup, by = conn.execute(
             "SELECT last_supported_at, last_supported_by FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
@@ -400,21 +389,17 @@ class TestEvidenceCurrency:
     def test_invalidate_clamps_to_the_edge_own_valid_from(self, kg_writer, conn):
         # Stale edge became live 2026-06-01; the correction is dated 2026-03-01 (the user said
         # "stopped in March") -> retired as of 2026-06-01, never a negative lifetime.
-        kg_writer.create_edges([self._row("r-1")], GROUP)  # t_valid 2026-06-01
-        kg_writer.invalidate_edges(
-            [("r-1", "2026-03-01T00:00:00+00:00")], GROUP, invalidated_by="n"
-        )
+        kg_writer.create_edges([self._row("r-1")])  # t_valid 2026-06-01
+        kg_writer.invalidate_edges([("r-1", "2026-03-01T00:00:00+00:00")], invalidated_by="n")
         t_inv, inv, by = conn.execute(
             "SELECT t_invalid, invalid_at, invalidated_by FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
         assert str(t_inv).startswith("2026-06-01") and t_inv == inv and by == "n"
 
     def test_invalidate_keeps_the_earlier_retirement(self, kg_writer, conn):
-        kg_writer.create_edges([self._row("r-1")], GROUP)
-        kg_writer.invalidate_edges([("r-1", "2026-07-01T00:00:00+00:00")], GROUP)
-        kg_writer.invalidate_edges(
-            [("r-1", "2026-09-01T00:00:00+00:00")], GROUP, invalidated_by="n"
-        )
+        kg_writer.create_edges([self._row("r-1")])
+        kg_writer.invalidate_edges([("r-1", "2026-07-01T00:00:00+00:00")])
+        kg_writer.invalidate_edges([("r-1", "2026-09-01T00:00:00+00:00")], invalidated_by="n")
         t_inv, by = conn.execute(
             "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = 'r-1'"
         ).fetchone()
@@ -445,9 +430,17 @@ class TestDeleteOrphanEntities:
         self._edge(conn, "r1", "src", "other", group="personal")
         self._edge(conn, "r2", "other", "tgt", group="personal")
         self._edge(conn, "r3", "retired-only", "other", retired=True, group="personal")
-        # an edge in another group still counts (a few edges cross groups on prod)
+        # an edge in either legacy group counts, whichever group the entity sits in
         self._edge(conn, "r4", "other", "cross-group", group="personal")
         assert kg_writer.delete_orphan_entities(24) == 1
         left = {r[0] for r in conn.execute("SELECT uuid FROM kg_entities").fetchall()}
         assert left == {"src", "tgt", "retired-only", "cross-group", "orphan-new", "other"}
         assert kg_writer.delete_orphan_entities(24) == 0  # idempotent
+
+    def test_an_entity_whose_only_edge_is_in_the_other_legacy_group_stays(self, kg_writer, conn):
+        self._entity(conn, "legacy", age_hours=48, group="personal")
+        self._entity(conn, "linked", age_hours=48)
+        self._edge(conn, "r1", "legacy", "linked", group=GROUP)
+        assert kg_writer.delete_orphan_entities(24) == 0
+        left = {r[0] for r in conn.execute("SELECT uuid FROM kg_entities").fetchall()}
+        assert left == {"legacy", "linked"}

@@ -23,7 +23,7 @@ from ingestion.extractor import (
     ExtractionPipeline,
     LLMExtractor,
     _cosine_similarity,
-    _partition_facts_by_group,
+    _drop_unresolved_endpoints,
 )
 from ingestion.models import (
     CombinedExtraction,
@@ -714,7 +714,7 @@ class TestEntityResolver:
         resolver = EntityResolver(embedder=embedder, llm_client=None)
         entities = [_entity("FalkorDB")]
         falkordb = _mock_falkordb(similar_nodes=[])
-        mapping = resolver.resolve(entities, kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve(entities, kg_client=falkordb)
         assert "FalkorDB" in mapping
         assert mapping["FalkorDB"].startswith("new:")
 
@@ -726,7 +726,7 @@ class TestEntityResolver:
             similar_nodes=[{"uuid": "abc123", "name": "PostgreSQL", "score": 0.8}]
         )
         resolver = EntityResolver(embedder=embedder, llm_client=None, similarity_threshold=0.85)
-        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb)
         assert mapping["FalkorDB"].startswith("new:")
 
     def test_similar_node_triggers_llm_confirm_merge(self):
@@ -746,7 +746,7 @@ class TestEntityResolver:
         resolver = EntityResolver(
             embedder=embedder, llm_client=llm_client, similarity_threshold=0.85
         )
-        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb)
         assert mapping["FalkorDB"] == "abc123"
 
     def test_similar_node_llm_denies_no_merge(self):
@@ -766,7 +766,7 @@ class TestEntityResolver:
         resolver = EntityResolver(
             embedder=embedder, llm_client=llm_client, similarity_threshold=0.85
         )
-        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb)
         assert mapping["FalkorDB"].startswith("new:")
 
     def test_autoconfirm_skips_llm(self):
@@ -789,7 +789,7 @@ class TestEntityResolver:
             similarity_threshold=0.85,
             autoconfirm_threshold=0.95,
         )
-        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("FalkorDB")], kg_client=falkordb)
         assert mapping["FalkorDB"] == "abc123"
         llm_client.messages.create.assert_not_called()
 
@@ -800,7 +800,7 @@ class TestEntityResolver:
         falkordb = _mock_falkordb(similar_nodes=[])
         resolver = EntityResolver(embedder=embedder, llm_client=None)
         entities = [_entity("Synapse"), _entity("FalkorDB")]
-        mapping = resolver.resolve(entities, kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve(entities, kg_client=falkordb)
         assert "Synapse" in mapping
         assert "FalkorDB" in mapping
         assert mapping["Synapse"] != mapping["FalkorDB"]
@@ -827,9 +827,7 @@ class TestEntityResolver:
         resolver = EntityResolver(
             embedder=embedder, llm_client=llm_client, similarity_threshold=0.85
         )
-        mapping = resolver.resolve(
-            [_entity("Alpha"), _entity("Beta")], kg_client=falkordb, group_id="technical"
-        )
+        mapping = resolver.resolve([_entity("Alpha"), _entity("Beta")], kg_client=falkordb)
         assert llm_client.messages.create.call_count == 1  # ONE batched call
         assert mapping["Alpha"] == "cand0"
         assert mapping["Beta"].startswith("new:")
@@ -856,7 +854,7 @@ class TestEntityResolver:
             embedder=embedder, llm_client=llm_client, similarity_threshold=0.85
         )
         with pytest.raises(LLMUnavailableError):
-            resolver.resolve([_entity("Gamma")], kg_client=falkordb, group_id="technical")
+            resolver.resolve([_entity("Gamma")], kg_client=falkordb)
 
     def test_batch_confirm_no_llm_trusts_top_candidate(self):
         # With no LLM client, a confirm-band match trusts the top candidate
@@ -866,7 +864,7 @@ class TestEntityResolver:
             similar_nodes=[{"uuid": "cand0", "name": "Candidate", "score": 0.12}]
         )
         resolver = EntityResolver(embedder=embedder, llm_client=None, similarity_threshold=0.85)
-        mapping = resolver.resolve([_entity("Delta")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("Delta")], kg_client=falkordb)
         assert mapping["Delta"] == "cand0"
 
     def _no_llm(self) -> MagicMock:
@@ -884,7 +882,7 @@ class TestEntityResolver:
         )
         llm_client = self._no_llm()
         resolver = EntityResolver(embedder=embedder, llm_client=llm_client)
-        mapping = resolver.resolve([_entity("PR #290")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("PR #290")], kg_client=falkordb)
         assert mapping["PR #290"].startswith("new:")
         llm_client.messages.create.assert_not_called()
 
@@ -894,9 +892,7 @@ class TestEntityResolver:
             similar_nodes=[{"uuid": "u290", "name": "PR #290", "score": 0.03}]
         )
         resolver = EntityResolver(embedder=embedder, llm_client=self._no_llm())
-        mapping = resolver.resolve(
-            [_entity("pull request 290")], kg_client=falkordb, group_id="technical"
-        )
+        mapping = resolver.resolve([_entity("pull request 290")], kg_client=falkordb)
         assert mapping["pull request 290"] == "u290"
 
     def test_conflicting_top_candidate_falls_through_to_the_next(self):
@@ -908,7 +904,7 @@ class TestEntityResolver:
             ]
         )
         resolver = EntityResolver(embedder=embedder, llm_client=self._no_llm())
-        mapping = resolver.resolve([_entity("PR #290")], kg_client=falkordb, group_id="technical")
+        mapping = resolver.resolve([_entity("PR #290")], kg_client=falkordb)
         assert mapping["PR #290"] == "u290"
 
 
@@ -1253,7 +1249,7 @@ class TestStage6bSaturationRounds:
         candidates_map = {0: ([], round1_pool)}
 
         extra = pipe._stage6b_saturation_rounds(
-            self._fact(), candidates_map, invalidate, [[0.1, 0.2]], "technical"
+            self._fact(), candidates_map, invalidate, [[0.1, 0.2]]
         )
 
         # Continuation pool was the unseen tail only; 3 fresh contradictions
@@ -1271,7 +1267,7 @@ class TestStage6bSaturationRounds:
         pipe, client = self._pipeline([], self._edges("s", 8))
         invalidate = {0: ["s0", "s1"]}  # 2 < _SATURATION_MIN
         extra = pipe._stage6b_saturation_rounds(
-            self._fact(), {0: ([], self._edges("s", 8))}, invalidate, [[0.1, 0.2]], "technical"
+            self._fact(), {0: ([], self._edges("s", 8))}, invalidate, [[0.1, 0.2]]
         )
         assert extra == 0
         assert invalidate == {0: ["s0", "s1"]}
@@ -1294,7 +1290,7 @@ class TestStage6bSaturationRounds:
         invalidate = {0: [f"s{i}" for i in range(6)]}
 
         extra = pipe._stage6b_saturation_rounds(
-            self._fact(), {0: ([], round1_pool)}, invalidate, [[0.1, 0.2]], "technical"
+            self._fact(), {0: ([], round1_pool)}, invalidate, [[0.1, 0.2]]
         )
 
         assert extra == 4
@@ -1305,7 +1301,7 @@ class TestStage6bSaturationRounds:
         pipe._kg.find_similar_edges.side_effect = RuntimeError("db down")
         invalidate = {0: [f"s{i}" for i in range(5)]}
         extra = pipe._stage6b_saturation_rounds(
-            self._fact(), {0: ([], self._edges("s", 8))}, invalidate, [[0.1, 0.2]], "technical"
+            self._fact(), {0: ([], self._edges("s", 8))}, invalidate, [[0.1, 0.2]]
         )
         assert extra == 0  # never raises, invalidate keeps round-1 verdicts
         assert invalidate[0] == [f"s{i}" for i in range(5)]
@@ -1428,14 +1424,14 @@ class TestProcessItemOrphanPrefilter:
 
         seen: set[str] = set()
 
-        def _fake_resolve(entities, group_id, deduper=None):
+        def _fake_resolve(entities, deduper=None):
             for e in entities:
                 seen.add(e.name)
             return {e.name: f"new:{e.name}" for e in entities}
 
         pipe._stage4_resolve = MagicMock(side_effect=_fake_resolve)
         pipe._stage5_write_nodes = MagicMock()
-        pipe._process_facts_for_group = MagicMock()
+        pipe._process_facts = MagicMock()
 
         pipe.process_item(
             {
@@ -1474,7 +1470,7 @@ class TestProcessItemOrphanPrefilter:
 
 
 # ---------------------------------------------------------------------------
-# process_item — group partition drops, counted by cause
+# process_item — facts with an unresolved endpoint are dropped and counted
 # ---------------------------------------------------------------------------
 
 
@@ -1484,54 +1480,35 @@ def _fact(source: str, target: str) -> ExtractedFact:
     )
 
 
-class TestPartitionFactsByGroup:
-    """The pure partition behind ``process_item``'s group routing."""
+class TestDropUnresolvedEndpoints:
+    """The pure filter behind ``process_item``'s unresolved-endpoint drop."""
 
-    def test_keeps_same_group_and_counts_each_drop_cause(self):
-        groups = {"Alice": "technical", "Postgres": "technical", "Bob": "personal"}
+    def test_keeps_resolved_facts_and_counts_the_rest(self):
+        uuids = {"Alice": "u1", "Postgres": "u2", "Bob": "u3"}
         kept = _fact("Alice", "Postgres")
-        cross = _fact("Alice", "Bob")
         no_target = _fact("Alice", "ghost")
         no_source = _fact("ghost", "Bob")
 
-        by_group, cross_n, unresolved_n = _partition_facts_by_group(
-            [kept, cross, no_target, no_source], groups, ("technical", "personal")
-        )
+        facts, unresolved_n = _drop_unresolved_endpoints([kept, no_target, no_source], uuids)
 
-        assert by_group == {"technical": [kept], "personal": []}
-        assert (cross_n, unresolved_n) == (1, 2)
+        assert facts == [kept]
+        assert unresolved_n == 2
 
     def test_endpoint_matching_is_exact_name(self):
-        # james vs a declared James: no group for the spelling the fact used.
-        _, cross_n, unresolved_n = _partition_facts_by_group(
-            [_fact("Alice", "james")], {"Alice": "technical", "James": "technical"}, ("technical",)
+        # james vs a declared James: no entity for the spelling the fact used.
+        facts, unresolved_n = _drop_unresolved_endpoints(
+            [_fact("Alice", "james")], {"Alice": "u1", "James": "u2"}
         )
-        assert (cross_n, unresolved_n) == (0, 1)
-
-    def test_fact_failing_both_causes_counts_once_as_unresolved(self):
-        _, cross_n, unresolved_n = _partition_facts_by_group(
-            [_fact("ghost", "Bob")], {"Bob": "personal"}, ("technical",)
-        )
-        assert (cross_n, unresolved_n) == (0, 1)
-
-    def test_same_group_that_is_not_active_is_cross_group(self):
-        by_group, cross_n, unresolved_n = _partition_facts_by_group(
-            [_fact("Alice", "Bob")], {"Alice": "personal", "Bob": "personal"}, ("technical",)
-        )
-        assert by_group == {"technical": []}
-        assert (cross_n, unresolved_n) == (1, 0)
+        assert (facts, unresolved_n) == ([], 1)
 
     def test_no_drops(self):
         fact = _fact("Alice", "Postgres")
-        by_group, cross_n, unresolved_n = _partition_facts_by_group(
-            [fact], {"Alice": "technical", "Postgres": "technical"}, ("technical",)
-        )
-        assert by_group == {"technical": [fact]}
-        assert (cross_n, unresolved_n) == (0, 0)
+        facts, unresolved_n = _drop_unresolved_endpoints([fact], {"Alice": "u1", "Postgres": "u2"})
+        assert (facts, unresolved_n) == ([fact], 0)
 
 
-class TestProcessItemGroupPartitionDrops:
-    """``process_item`` reports the facts the group partition drops, by cause."""
+class TestProcessItemEndpointDrops:
+    """``process_item`` reports the facts dropped for an unresolved endpoint."""
 
     _LOG = "ingestion.extractor"
 
@@ -1552,10 +1529,10 @@ class TestProcessItemGroupPartitionDrops:
         pipe._stage2_deterministic = MagicMock(return_value=[])
         pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=entities, facts=facts))
         pipe._stage4_resolve = MagicMock(
-            side_effect=lambda ents, group_id, deduper=None: {e.name: f"new:{e.name}" for e in ents}
+            side_effect=lambda ents, deduper=None: {e.name: f"new:{e.name}" for e in ents}
         )
         pipe._stage5_write_nodes = MagicMock()
-        pipe._process_facts_for_group = MagicMock()
+        pipe._process_facts = MagicMock()
         pipe.process_item(
             {
                 "content_type": "summary",
@@ -1566,69 +1543,37 @@ class TestProcessItemGroupPartitionDrops:
         )
         return pipe
 
-    def _by_group_classifier(self, monkeypatch):
-        # Alice is classified into the personal group, everything else technical.
-        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-        monkeypatch.setattr(
-            "ingestion.extractor._classify_entity_group",
-            lambda name, summary, default: "personal" if name == "Alice" else "technical",
-        )
-
     def test_case_mismatched_endpoint_is_counted_unresolved_and_not_written(self, caplog):
         # Declared "James", fact says "james": the orphan filter prunes James (no fact
-        # names it exactly) and "james" never gets a group. Current behaviour, pinned.
+        # names it exactly) and "james" never resolves. Current behaviour, pinned.
         with caplog.at_level(logging.INFO, logger=self._LOG):
             pipe = self._run([_entity("Alice"), _entity("James")], [_fact("Alice", "james")])
 
-        pipe._process_facts_for_group.assert_not_called()
-        assert (
-            "Group partition dropped facts: cross_group=0 endpoint_unresolved=1 (of 1)"
-            in caplog.messages
-        )
+        pipe._process_facts.assert_not_called()
+        assert "Facts dropped: endpoint_unresolved=1 (of 1)" in caplog.messages
 
-    def test_facts_across_groups_are_counted_cross_group(self, monkeypatch, caplog):
-        self._by_group_classifier(monkeypatch)
-        kept = _fact("Postgres", "Redis")
+    def test_resolved_facts_reach_the_writer_and_unresolved_ones_are_logged(self, caplog):
+        kept = _fact("Alice", "Postgres")
         with caplog.at_level(logging.INFO, logger=self._LOG):
             pipe = self._run(
-                [_entity("Alice"), _entity("Postgres"), _entity("Redis")],
-                [_fact("Alice", "Postgres"), kept],
-            )
-
-        # Only the same-group fact reaches the writer.
-        pipe._process_facts_for_group.assert_called_once()
-        args = pipe._process_facts_for_group.call_args.args
-        assert args[0] == [kept]
-        assert args[3] == "technical"
-        assert (
-            "Group partition dropped facts: cross_group=1 endpoint_unresolved=0 (of 2)"
-            in caplog.messages
-        )
-
-    def test_both_causes_in_one_line(self, monkeypatch, caplog):
-        self._by_group_classifier(monkeypatch)
-        with caplog.at_level(logging.INFO, logger=self._LOG):
-            self._run(
                 [_entity("Alice"), _entity("Postgres")],
-                [_fact("Alice", "Postgres"), _fact("Postgres", "redis")],
+                [kept, _fact("Postgres", "redis")],
             )
 
-        assert (
-            "Group partition dropped facts: cross_group=1 endpoint_unresolved=1 (of 2)"
-            in caplog.messages
-        )
+        pipe._process_facts.assert_called_once()
+        assert pipe._process_facts.call_args.args[0] == [kept]
+        assert "Facts dropped: endpoint_unresolved=1 (of 2)" in caplog.messages
 
     def test_nothing_dropped_logs_nothing(self, caplog):
         with caplog.at_level(logging.INFO, logger=self._LOG):
             pipe = self._run([_entity("Postgres"), _entity("Redis")], [_fact("Postgres", "Redis")])
 
-        pipe._process_facts_for_group.assert_called_once()
-        assert not [m for m in caplog.messages if "Group partition dropped" in m]
+        pipe._process_facts.assert_called_once()
+        assert not [m for m in caplog.messages if "Facts dropped" in m]
 
-    def test_counts_are_exposed_on_span_attributes(self, monkeypatch):
+    def test_count_is_exposed_on_a_span_attribute(self, monkeypatch):
         import logfire
 
-        self._by_group_classifier(monkeypatch)
         spans: dict[str, dict[str, object]] = {}
 
         class _Span:
@@ -1648,9 +1593,8 @@ class TestProcessItemGroupPartitionDrops:
             [_fact("Alice", "Postgres"), _fact("Postgres", "redis")],
         )
 
-        assert spans["group_partition {n} facts"] == {
-            "facts_dropped_cross_group": 1,
-            "facts_dropped_endpoint_unresolved": 1,
+        assert spans["drop_unresolved_endpoints {n} facts"] == {
+            "facts_dropped_endpoint_unresolved": 1
         }
 
 
@@ -1682,7 +1626,7 @@ class TestStage6aCandidateLimit:
         fact = ExtractedFact(source="A", target="B", relationship="USES", fact="A uses B")
 
         with patch("ingestion.extraction_edges.rrf_merge", return_value=[]) as mock_rrf:
-            pipe._stage6a_embedding_filter([fact], {"A": "ua", "B": "ub"}, "technical")
+            pipe._stage6a_embedding_filter([fact], {"A": "ua", "B": "ub"})
 
         assert falkordb.find_similar_edges.call_args.kwargs["limit"] == _SEMANTIC_POOL_LIMIT * 2
         assert falkordb.find_edges_by_fulltext.call_args.kwargs["limit"] == _SEMANTIC_POOL_LIMIT * 2
@@ -1715,7 +1659,7 @@ class TestBM25CandidateFloor:
         ]
         pipe = self._pipe(hits)
         fact = ExtractedFact(source="A", target="B", relationship="R", fact="PR 12 is merged")
-        pools = pipe._stage6a_embedding_filter([fact], {"A": "ua", "B": "ub"}, "technical")
+        pools = pipe._stage6a_embedding_filter([fact], {"A": "ua", "B": "ub"})
         _, semantic = pools[0]
         assert [c["uuid"] for c in semantic] == ["close"]
         kwargs = pipe._kg.find_edges_by_fulltext.call_args.kwargs
@@ -1741,7 +1685,7 @@ class TestBM25CandidateFloor:
         invalidate = {0: ["u1", "u2", "u3", "u4"]}
         candidates = {0: ([], [{"uuid": u, "fact": "x"} for u in invalidate[0]])}
         extra = pipe._stage6b_saturation_rounds(
-            [fact], candidates, invalidate, [[1.0, 0.0, 0.0, 0.0]], "technical"
+            [fact], candidates, invalidate, [[1.0, 0.0, 0.0, 0.0]]
         )
         assert extra == 0
         pipe._stage6b_batch_confirm.assert_not_called()  # nothing on-topic left to judge
@@ -1860,40 +1804,31 @@ class TestDeduperCache:
             kg_client=_mock_falkordb(similar_nodes=[]),
         )
 
-    def test_same_group_reuses_instance(self):
+    def test_reuses_instance(self):
         pipe = self._pipeline()
-        assert pipe._deduper_for("technical") is pipe._deduper_for("technical")
-
-    def test_groups_get_distinct_dedupers(self):
-        pipe = self._pipeline()
-        assert pipe._deduper_for("technical") is not pipe._deduper_for("personal")
+        assert pipe._deduper_for() is pipe._deduper_for()
 
     def test_ttl_expiry_rebuilds_shared_index_not_shell(self, monkeypatch):
         monkeypatch.setenv("SYNAPSE_DEDUP_CACHE_TTL_SECONDS", "300")
         pipe = self._pipeline()
-        deduper = pipe._deduper_for("technical")
+        deduper = pipe._deduper_for()
         first_idx = deduper._index()
         # Age the shared index past the TTL; next call must build fresh,
         # while the deduper shell itself is reused.
         first_idx.built_at -= 301
         assert deduper._index() is not first_idx
-        assert pipe._deduper_for("technical") is deduper
+        assert pipe._deduper_for() is deduper
 
     def test_index_shared_across_deduper_instances(self):
         # Two pipelines (as two worker threads would have) share one hydrated
-        # index per group — the per-thread copies were the poller OOM source.
+        # index — the per-thread copies were the poller OOM source.
         pipe_a, pipe_b = self._pipeline(), self._pipeline()
-        ded_a = pipe_a._deduper_for("technical")
-        ded_b = pipe_b._deduper_for("technical")
+        ded_a = pipe_a._deduper_for()
+        ded_b = pipe_b._deduper_for()
         assert ded_a is not ded_b
         assert ded_a._index() is ded_b._index()
 
     def test_register_visible_across_instances(self):
         pipe_a, pipe_b = self._pipeline(), self._pipeline()
-        pipe_a._deduper_for("technical").register(
-            "Shared Register Probe", "uuid-shared-probe", summary="s"
-        )
-        assert (
-            pipe_b._deduper_for("technical").find_or_none("shared register probe")
-            == "uuid-shared-probe"
-        )
+        pipe_a._deduper_for().register("Shared Register Probe", "uuid-shared-probe", summary="s")
+        assert pipe_b._deduper_for().find_or_none("shared register probe") == "uuid-shared-probe"

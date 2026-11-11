@@ -169,11 +169,10 @@ def test_extractor_insert_then_reinforce_with_a_foreign_source_goes_mixed(kg):
                     "episodes": [w],
                     "created_at": "2026-01-01T00:00:00+00:00",
                 }
-            ],
-            GROUP,
+            ]
         )
         assert _sp(kg, "ext-1") == [WORK]
-        writer.reinforce_edges([("ext-1", [p])], GROUP)
+        writer.reinforce_edges([("ext-1", [p])])
     finally:
         writer._reset()
     assert _sp(kg, "ext-1") == sorted([WORK, PERSONAL])

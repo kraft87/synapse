@@ -1029,8 +1029,8 @@ def test_write_time_resolution_returns_the_row_the_merge_kept(merged, db_url, mo
 
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
     reader = KGPostgresReader()
-    assert reader.entity_uuid_by_normalized_name("gamma", "technical") == "t-gamma1"
-    deduper = dedup.NodeDeduper(reader, "technical")
+    assert reader.entity_uuid_by_normalized_name("gamma") == "t-gamma1"
+    deduper = dedup.NodeDeduper(reader)
     idx = deduper._build_index()
     assert idx.uuid_by_normalized_name["gamma"] == "t-gamma1"
     assert idx.uuid_by_normalized_name["alpha"] == "t-alpha"
@@ -1051,12 +1051,9 @@ def test_the_name_lookup_ranks_an_old_row_with_no_stored_name_among_the_stored_o
     assert fold_map(piles) == {"p-omega": ("t-old", "name")}
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
     reader = KGPostgresReader()
-    assert reader.entity_uuid_by_normalized_name("omega", "technical") == "t-old"
-    assert (
-        dedup.NodeDeduper(reader, "technical")._build_index().uuid_by_normalized_name["omega"]
-        == "t-old"
-    )
-    assert reader.entity_uuid_by_normalized_name("", "technical") is None
+    assert reader.entity_uuid_by_normalized_name("omega") == "t-old"
+    assert dedup.NodeDeduper(reader)._build_index().uuid_by_normalized_name["omega"] == "t-old"
+    assert reader.entity_uuid_by_normalized_name("") is None
 
 
 def test_the_name_lookup_does_not_take_a_row_stored_under_another_key_for_a_name_match(
@@ -1068,7 +1065,7 @@ def test_the_name_lookup_does_not_take_a_row_stored_under_another_key_for_a_name
     merge(db_url)
     assert fold_map(piles) == {"p-omega": ("t-blank", "name")}
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
-    assert KGPostgresReader().entity_uuid_by_normalized_name("omega", "technical") == "t-blank"
+    assert KGPostgresReader().entity_uuid_by_normalized_name("omega") == "t-blank"
 
 
 def test_the_name_lookup_is_answered_from_the_normalized_name_index(piles):
@@ -1083,7 +1080,7 @@ def test_the_name_lookup_is_answered_from_the_normalized_name_index(piles):
             r[0]
             for r in piles.execute(
                 "EXPLAIN (COSTS OFF) " + kg_pg_read._ENTITY_BY_NAME_SQL,
-                (OWNER, "technical", "alpha", "alpha"),
+                (OWNER, "alpha", "alpha"),
             )
         )
     finally:
@@ -1534,7 +1531,7 @@ def test_a_listed_entity_with_a_lower_id_than_its_twin_is_reported_as_first_for_
     merge(db_url)
     assert fold_map(piles) == {}
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
-    assert KGPostgresReader().entity_uuid_by_normalized_name("jordan", "technical") == "p-first"
+    assert KGPostgresReader().entity_uuid_by_normalized_name("jordan") == "p-first"
 
 
 def test_a_listed_twin_that_is_newer_than_its_twin_is_not_reported_as_first(

@@ -5,7 +5,7 @@ graph exclusively through this class: mutations go through
 ``kg_pg_write.KGPostgresWriter`` (strict — a failed write fails the extraction
 item so the queue retries it), reads through ``kg_pg_read.KGPostgresReader``.
 Both target the ``kg_entities`` / ``kg_relationships`` tables (schema/017),
-scoped by ``owner_id`` + ``group_id``.
+scoped by ``owner_id``.
 
 The ``SYNAPSE_KG_READ`` / ``SYNAPSE_KG_DUAL_WRITE`` env seams from PRs #128/#129
 are gone: with FalkorDB decommissioned there is nothing to dispatch to or fall
@@ -21,7 +21,6 @@ self-invalidation pass for facts that arrive already bookended ("from 2020 to
 from __future__ import annotations
 
 import logging
-import uuid
 from datetime import UTC, datetime
 from typing import Any
 
@@ -78,7 +77,6 @@ class KGClient:
         name: str,
         entity_type: str,
         summary: str,
-        group_id: str,
         project: str | None = None,
         embedding: list[float] | None = None,
         supertype: str | None = None,
@@ -100,7 +98,6 @@ class KGClient:
             normalized_name=_normalize_name(name),
             entity_type=entity_type,
             summary=summary,
-            group_id=group_id,
             project=project,
             created_at=now,
             valid_at=now,
@@ -113,145 +110,9 @@ class KGClient:
     # Edge operations
     # ------------------------------------------------------------------
 
-    def create_edge(
-        self,
-        source_uuid: str,
-        target_uuid: str,
-        relationship: str,
-        fact: str,
-        episode_ids: list[int],
-        group_id: str,
-        fact_embedding: list[float] | None = None,
-        *,
-        t_valid: str | None = None,
-        t_invalid: str | None = None,
-        detector: Any | None = None,
-        extracted_fact: Any | None = None,
-        edge_date_extractor: Any | None = None,
-        reference_time: str | None = None,
-    ) -> str:
-        """Create a relationship edge. Returns the new edge UUID.
-
-        Bi-temporal model (Phase 3):
-        - ``t_created`` (== ``created_at``) -- when the edge was written. Set
-          on every create. Never updated.
-        - ``t_valid``   (== ``valid_at``)   -- when the fact began being true.
-          Defaults to now() when the caller does not pass an explicit value;
-          callers extracting an LLM-supplied valid date should pass it via
-          ``t_valid``.
-        - ``t_invalid`` (== ``invalid_at``) -- when the fact stopped being
-          true. NULL on create; set later via ``invalidate_edge`` when a
-          contradiction is confirmed.
-        - ``t_expired`` -- soft-delete marker for facts the system decides
-          are no longer relevant even if not contradicted. NULL on create;
-          populated by future selective-forgetting work in the dream
-          pipeline.
-
-        When ``detector`` is supplied, the bi-temporal contradiction safety
-        net runs BEFORE the create: any live edge it confirms the new fact
-        contradicts has its ``t_invalid`` set in-place. The new edge is then
-        always written -- contradictions invalidate the *old* edge, never
-        block the new one.
-
-        ``edge_date_extractor`` (Phase 4) is an optional
-        ``EdgeDateExtractor`` that runs only when ``t_valid`` was NOT
-        supplied by the caller. It pulls ``valid_at`` and ``invalid_at``
-        from the fact text itself using the verbatim Graphiti
-        ``extract_edge_dates`` prompt. Failures (LLM error, malformed JSON,
-        empty result) fall through silently to the legacy "now()" default
-        so a write is never blocked by date extraction.
-        """
-        now = datetime.now(UTC).isoformat()
-        edge_uuid = str(uuid.uuid4())
-
-        # Phase 4 bi-temporal enrichment. When the caller pre-computed
-        # ``t_valid`` / ``t_invalid`` via a batched extractor (PR #38) we
-        # use those and skip the per-fact LLM call entirely. Otherwise fall
-        # back to the per-fact ``edge_date_extractor`` (best-effort: both
-        # fields fall back to None on failure and we then use now() for
-        # valid_at — legacy behavior preserved).
-        invalid_at_ts: str | None = t_invalid
-        if t_valid is None and edge_date_extractor is not None:
-            try:
-                v, i = edge_date_extractor.extract(fact, reference_time=reference_time)
-            except Exception:
-                v, i = (None, None)
-            if v:
-                t_valid = v
-            if i and invalid_at_ts is None:
-                invalid_at_ts = i
-
-        valid_at_ts = t_valid or now
-
-        # Bi-temporal safety net: invalidate confirmed-contradicted live
-        # edges BEFORE writing the new one. Detector failures never block
-        # the write -- the detector swallows exceptions and returns [].
-        if detector is not None and extracted_fact is not None:
-            contradicted_uuids = detector.detect_contradictions(
-                extracted_fact,
-                source_uuid,
-                target_uuid,
-                group_id,
-                fact_embedding=fact_embedding,
-            )
-            for old_uuid in contradicted_uuids:
-                # Record the superseder: edge_uuid is the new edge that contradicted old_uuid.
-                self.invalidate_edge(old_uuid, group_id, by_uuid=edge_uuid)
-
-        self._writer.create_edges(
-            [
-                {
-                    "src": source_uuid,
-                    "tgt": target_uuid,
-                    "edge_uuid": edge_uuid,
-                    "name": relationship,
-                    "fact": fact,
-                    "episodes": episode_ids,
-                    "created_at": now,
-                    "t_created": now,
-                    "valid_at": valid_at_ts,
-                    "t_valid": valid_at_ts,
-                    "emb": fact_embedding,
-                }
-            ],
-            group_id,
-        )
-
-        # Phase 4: if the edge-date extractor came back with an explicit
-        # invalid_at, mark the edge as already-invalidated. The fact was
-        # ALREADY contradicted at write time (e.g. "a person worked at X from
-        # 2020 to 2022") — preserve that lifecycle bookend immediately
-        # rather than wait for a future contradiction to flip it.
-        if invalid_at_ts:
-            self.invalidate_edge(edge_uuid, group_id, invalid_at=invalid_at_ts)
-
-        return edge_uuid
-
-    def invalidate_edge(
-        self,
-        edge_uuid: str,
-        group_id: str,
-        invalid_at: str | None = None,
-        by_uuid: str | None = None,
-    ) -> None:
-        """Set invalid_at on an edge (marks it as contradicted/superseded).
-
-        Bi-temporal (Phase 3): writes BOTH the legacy ``invalid_at`` AND the
-        canonical ``t_invalid`` so existing readers and the future t_*-only
-        readers both see the invalidation. Edges are NEVER deleted -- this
-        is the only mutation on the bi-temporal lifecycle (apart from the
-        future ``t_expired`` soft-delete marker).
-
-        ``by_uuid`` records the superseding edge (schema 028); set only by the
-        contradiction path, where the new edge that killed this one is known.
-        """
-        ts = invalid_at or datetime.now(UTC).isoformat()
-        self._writer.invalidate_edges([(edge_uuid, ts)], group_id, invalidated_by=by_uuid)
-
     def invalidate_edges_batch(
         self,
         items: list[tuple[str, str | None]],
-        group_id: str,
         invalidated_by: str | None = None,
     ) -> None:
         """Batch-invalidate edges in a single writer round-trip.
@@ -268,13 +129,12 @@ class KGClient:
             return
         now = datetime.now(UTC).isoformat()
         self._writer.invalidate_edges(
-            [(u, ts or now) for u, ts in items], group_id, invalidated_by=invalidated_by
+            [(u, ts or now) for u, ts in items], invalidated_by=invalidated_by
         )
 
     def create_edges_batch(
         self,
         rows: list[dict[str, Any]],
-        group_id: str,
     ) -> list[str]:
         """Batch-create relationship edges in one writer round-trip.
 
@@ -298,20 +158,18 @@ class KGClient:
         """
         if not rows:
             return []
-        self._writer.create_edges(rows, group_id)
+        self._writer.create_edges(rows)
 
-        # Apply any pre-known invalidations in one more round-trip. This
-        # collapses the create_edge() per-fact "edge was already contradicted
-        # at write time" pattern into the batched path.
+        # Apply any pre-known invalidations in one more round-trip.
         self_invalidations: list[tuple[str, str | None]] = [
             (r["edge_uuid"], r.get("t_invalid")) for r in rows if r.get("t_invalid")
         ]
         if self_invalidations:
-            self.invalidate_edges_batch(self_invalidations, group_id)
+            self.invalidate_edges_batch(self_invalidations)
 
         return [r["edge_uuid"] for r in rows]
 
-    def reinforce_edges(self, items: list[tuple[Any, ...]], group_id: str) -> None:
+    def reinforce_edges(self, items: list[tuple[Any, ...]]) -> None:
         """Capture dedup hits: bump ``mention_count`` + union source episodes on
         each existing edge a newly-extracted duplicate fact matched. ``items`` is
         a list of ``(edge_uuid, source_episode_ids)`` or, with schema-058 support
@@ -320,7 +178,7 @@ class KGClient:
         the edge's ``last_supported_at``. Empty list is a no-op."""
         if not items:
             return
-        self._writer.reinforce_edges(items, group_id)
+        self._writer.reinforce_edges(items)
 
     def delete_orphan_entities(self, min_age_hours: int = 24) -> int:
         """Delete edge-less entities older than ``min_age_hours``; returns the count."""
@@ -333,27 +191,24 @@ class KGClient:
     def find_similar_nodes(
         self,
         query_embedding: list[float],
-        group_id: str,
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Return top-k nodes by embedding similarity. Score is cosine distance (0=identical)."""
-        hits: list[dict[str, Any]] = self._reader.find_similar_nodes(
-            query_embedding, group_id, limit=limit
-        )
+        hits: list[dict[str, Any]] = self._reader.find_similar_nodes(query_embedding, limit=limit)
         return hits
 
-    def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
+    def entity_uuid_by_normalized_name(self, normalized: str) -> str | None:
         """Exact normalized-name entity lookup (NodeDeduper short-circuit).
 
         Falls back to a lower(trim(name)) equality check for pre-migration
         rows that lack the indexed property.
         """
-        result: str | None = self._reader.entity_uuid_by_normalized_name(normalized, group_id)
+        result: str | None = self._reader.entity_uuid_by_normalized_name(normalized)
         return result
 
-    def load_entities(self, group_id: str) -> list[tuple[str, str, str, str | None]]:
-        """(uuid, name, summary, entity_supertype) for every entity in the group (LSH hydrate)."""
-        result: list[tuple[str, str, str, str | None]] = self._reader.load_entities(group_id)
+    def load_entities(self) -> list[tuple[str, str, str, str | None]]:
+        """(uuid, name, summary, entity_supertype) for every entity of the owner (LSH hydrate)."""
+        result: list[tuple[str, str, str, str | None]] = self._reader.load_entities()
         return result
 
     def load_type_map(self) -> dict[str, str]:
@@ -364,7 +219,6 @@ class KGClient:
     def find_similar_edges(
         self,
         fact_embedding: list[float],
-        group_id: str,
         distance_threshold: float = 0.20,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
@@ -373,21 +227,20 @@ class KGClient:
         distance_threshold=0.20 corresponds to cosine similarity >= 0.80.
         """
         hits: list[dict[str, Any]] = self._reader.find_similar_edges(
-            fact_embedding, group_id, distance_threshold=distance_threshold, limit=limit
+            fact_embedding, distance_threshold=distance_threshold, limit=limit
         )
         return hits
 
     def nearest_live_edges(
         self,
         fact_embeddings: list[list[float]],
-        group_id: str,
         max_distance: float,
         limit: int,
     ) -> list[list[dict[str, Any]]]:
         """Per embedding, its nearest live edges within ``max_distance`` (cosine
         distance), nearest first, in one round-trip (Stage 6c restatement recheck)."""
         hits: list[list[dict[str, Any]]] = self._reader.nearest_live_edges(
-            fact_embeddings, group_id, max_distance=max_distance, limit=limit
+            fact_embeddings, max_distance=max_distance, limit=limit
         )
         return hits
 
@@ -395,7 +248,6 @@ class KGClient:
         self,
         source_uuid: str,
         target_uuid: str,
-        group_id: str,
     ) -> list[dict[str, Any]]:
         """Return active edges between a specific source/target pair.
 
@@ -403,15 +255,12 @@ class KGClient:
         already-invalidated edges must NOT re-enter the candidate pool, or
         we could re-contradict an edge that was already retired.
         """
-        hits: list[dict[str, Any]] = self._reader.find_edges_by_pair(
-            source_uuid, target_uuid, group_id
-        )
+        hits: list[dict[str, Any]] = self._reader.find_edges_by_pair(source_uuid, target_uuid)
         return hits
 
     def find_edges_by_fulltext(
         self,
         query: str,
-        group_id: str,
         limit: int = 20,
         fact_embedding: list[float] | None = None,
     ) -> list[dict[str, Any]]:
@@ -422,6 +271,6 @@ class KGClient:
         ``fact_embedding`` to get each hit's cosine ``dist`` to it.
         """
         hits: list[dict[str, Any]] = self._reader.find_edges_by_fulltext(
-            query, group_id, limit=limit, fact_embedding=fact_embedding
+            query, limit=limit, fact_embedding=fact_embedding
         )
         return hits

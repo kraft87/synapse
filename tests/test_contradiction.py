@@ -57,7 +57,7 @@ class TestNoContradiction:
         embedder = _mock_embedder(_unit_vec(1.0))
 
         detector = ContradictionDetector(falkordb, embedder, llm)
-        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid", "technical")
+        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid")
 
         assert result == []
         # No LLM call when there are no candidates.
@@ -84,7 +84,7 @@ class TestSimilarityGate:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm, similarity_threshold=0.7)
-        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid", "technical")
+        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid")
 
         assert result == []
         llm.messages.create.assert_not_called()
@@ -102,7 +102,6 @@ class TestSimilarityGate:
             _fact(),
             "src-uuid",
             "tgt-uuid",
-            "technical",
             fact_embedding=_unit_vec(1.0),
         )
 
@@ -128,7 +127,7 @@ class TestLLMConfirm:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
-        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid", "technical")
+        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid")
 
         assert result == ["old-edge-uuid"]
         llm.messages.create.assert_called_once()
@@ -161,7 +160,7 @@ class TestLLMConfirm:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
-        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid", "technical")
+        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid")
 
         assert result == []
         llm.messages.create.assert_called_once()
@@ -185,7 +184,7 @@ class TestLLMConfirm:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
-        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid", "technical")
+        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid")
 
         assert result == []  # graceful degradation
 
@@ -216,13 +215,13 @@ class TestCandidatePoolLiveness:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
-        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid", "technical")
+        result = detector.detect_contradictions(_fact(), "src-uuid", "tgt-uuid")
 
         # Only the live edge UUID is returned -- invalidated edges
         # were never in the candidate pool to begin with.
         assert result == ["live-edge"]
         # And find_edges_by_pair was the only candidate-source called.
-        falkordb.find_edges_by_pair.assert_called_once_with("src-uuid", "tgt-uuid", "technical")
+        falkordb.find_edges_by_pair.assert_called_once_with("src-uuid", "tgt-uuid")
 
 
 class TestTopKCap:
@@ -249,7 +248,7 @@ class TestTopKCap:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm, top_k=3)
-        detector.detect_contradictions(_fact(), "s", "t", "technical")
+        detector.detect_contradictions(_fact(), "s", "t")
 
         # Phase 4 prompt is multi-message (system + user); concat both.
         prompt = "\n".join(m["content"] for m in llm.messages.create.call_args.kwargs["messages"])
@@ -279,7 +278,7 @@ class TestMissingEmbeddingConservative:
         embedder = _mock_embedder(new_emb)
 
         detector = ContradictionDetector(falkordb, embedder, llm)
-        result = detector.detect_contradictions(_fact(), "s", "t", "technical")
+        result = detector.detect_contradictions(_fact(), "s", "t")
 
         assert result == ["legacy-edge"]
 
@@ -308,30 +307,22 @@ class TestTolerantJSONParse:
 
     def test_trailing_prose_after_json(self):
         text = '{"contradicted_facts": [0]}\n\nThis is the explanation the model added.'
-        result = self._detector_with_candidate(text).detect_contradictions(
-            _fact(), "s", "t", "technical"
-        )
+        result = self._detector_with_candidate(text).detect_contradictions(_fact(), "s", "t")
         assert result == ["old-edge"]
 
     def test_markdown_code_fence(self):
         text = '```json\n{"contradicted_facts": [0]}\n```'
-        result = self._detector_with_candidate(text).detect_contradictions(
-            _fact(), "s", "t", "technical"
-        )
+        result = self._detector_with_candidate(text).detect_contradictions(_fact(), "s", "t")
         assert result == ["old-edge"]
 
     def test_leading_prose_before_json(self):
         text = 'Here is my analysis:\n{"contradicted_facts": [0]}'
-        result = self._detector_with_candidate(text).detect_contradictions(
-            _fact(), "s", "t", "technical"
-        )
+        result = self._detector_with_candidate(text).detect_contradictions(_fact(), "s", "t")
         assert result == ["old-edge"]
 
     def test_no_json_object_returns_empty(self):
         text = "I could not determine if these contradict."
-        result = self._detector_with_candidate(text).detect_contradictions(
-            _fact(), "s", "t", "technical"
-        )
+        result = self._detector_with_candidate(text).detect_contradictions(_fact(), "s", "t")
         assert result == []
 
 
@@ -351,7 +342,7 @@ class TestDetectContradictionsBatch:
 
     def _detector_with_pair_lookup(self, lookups: dict, llm_text: str):
         falkordb = MagicMock()
-        falkordb.find_edges_by_pair.side_effect = lambda src, tgt, g: lookups.get((src, tgt), [])
+        falkordb.find_edges_by_pair.side_effect = lambda src, tgt: lookups.get((src, tgt), [])
         llm = MagicMock()
         msg = MagicMock()
         msg.content = [MagicMock(text=llm_text)]
@@ -389,7 +380,6 @@ class TestDetectContradictionsBatch:
             facts,
             ["a", "c"],
             ["b", "d"],
-            "technical",
             fact_embeddings=[_unit_vec(1.0), _unit_vec(1.0)],
         )
         # ONE LLM call for both facts.
@@ -398,7 +388,7 @@ class TestDetectContradictionsBatch:
 
     def test_empty_input(self):
         det, llm = self._detector_with_pair_lookup({}, "{}")
-        assert det.detect_contradictions_batch([], [], [], "technical") == []
+        assert det.detect_contradictions_batch([], [], []) == []
         llm.messages.create.assert_not_called()
 
     def test_pre_llm_gate_drops_pure_novel_facts(self):
@@ -415,7 +405,6 @@ class TestDetectContradictionsBatch:
             facts,
             ["a", "c"],
             ["b", "d"],
-            "technical",
             fact_embeddings=[_unit_vec(1.0), _unit_vec(1.0)],
         )
         assert result == [[], []]
@@ -431,9 +420,7 @@ class TestDetectContradictionsBatch:
         lookups = {("a", "b"): [{"uuid": "u", "fact": "old", "fact_embedding": old_emb}]}
         facts = [ExtractedFact(source="A", target="B", relationship="USES", fact="new fact")]
         det, llm = self._detector_with_pair_lookup(lookups, "{}")
-        result = det.detect_contradictions_batch(
-            facts, ["a"], ["b"], "technical", fact_embeddings=[new_emb]
-        )
+        result = det.detect_contradictions_batch(facts, ["a"], ["b"], fact_embeddings=[new_emb])
         assert result == [[]]
         llm.messages.create.assert_not_called()
 
@@ -445,7 +432,7 @@ class TestDetectContradictionsBatch:
         llm.messages.create.side_effect = RuntimeError("upstream 500")
         facts = [ExtractedFact(source="A", target="B", relationship="USES", fact="y")]
         result = det.detect_contradictions_batch(
-            facts, ["a"], ["b"], "technical", fact_embeddings=[_unit_vec(1.0)]
+            facts, ["a"], ["b"], fact_embeddings=[_unit_vec(1.0)]
         )
         # Graceful degradation — never raise, never block writes.
         assert result == [[]]
@@ -472,156 +459,6 @@ class TestDetectContradictionsBatch:
             facts,
             ["a", "c"],
             ["b", "d"],
-            "technical",
             fact_embeddings=[_unit_vec(1.0), _unit_vec(1.0)],
         )
         assert result == [["u-ab"], []]
-
-
-class TestCreateEdgeBiTemporal:
-    def _make_client_with_fake_writer(self):
-        """Build a real KGClient whose writer is a MagicMock, so we can
-        assert on the exact mutations fired by create_edge / invalidate_edge
-        without needing a live Postgres."""
-        from ingestion.kg_client import KGClient
-
-        client = KGClient.__new__(KGClient)
-        client._writer = MagicMock()
-        client._reader = MagicMock()
-        return client, client._writer
-
-    def test_new_edge_sets_t_created_and_t_valid(self):
-        client, writer = self._make_client_with_fake_writer()
-        client.create_edge(
-            source_uuid="src",
-            target_uuid="tgt",
-            relationship="USES",
-            fact="A uses B",
-            episode_ids=[1, 2],
-            group_id="technical",
-            fact_embedding=[0.1, 0.2, 0.3],
-        )
-        writer.create_edges.assert_called_once()
-        rows, group = writer.create_edges.call_args.args
-        assert group == "technical"
-        (row,) = rows
-        # Bi-temporal params populated, legacy fields mirrored.
-        assert row["t_created"] == row["created_at"]
-        assert row["t_valid"] == row["valid_at"]
-        # And populated as ISO8601 strings, not None.
-        assert isinstance(row["t_created"], str) and "T" in row["t_created"]
-        assert row["emb"] == [0.1, 0.2, 0.3]
-        assert row["episodes"] == [1, 2]
-
-    def test_explicit_t_valid_overrides_now(self):
-        client, writer = self._make_client_with_fake_writer()
-        client.create_edge(
-            source_uuid="src",
-            target_uuid="tgt",
-            relationship="USES",
-            fact="A uses B since 2024",
-            episode_ids=[],
-            group_id="technical",
-            t_valid="2024-06-15T00:00:00+00:00",
-        )
-        (row,) = writer.create_edges.call_args.args[0]
-        # t_valid honors the caller-supplied date; valid_at mirrors.
-        assert row["t_valid"] == "2024-06-15T00:00:00+00:00"
-        assert row["valid_at"] == "2024-06-15T00:00:00+00:00"
-        # t_created is still "now" (not the caller's t_valid).
-        assert row["t_created"] != row["t_valid"]
-
-    def test_contradiction_invalidates_old_edge_before_create(self):
-        """When the detector confirms a contradiction, the OLD edge is
-        invalidated BEFORE the new edge is written. The new edge is still
-        written."""
-        client, writer = self._make_client_with_fake_writer()
-        parent = MagicMock()
-        parent.attach_mock(writer, "writer")
-
-        detector = MagicMock()
-        detector.detect_contradictions.return_value = ["old-edge-uuid"]
-
-        client.create_edge(
-            source_uuid="src",
-            target_uuid="tgt",
-            relationship="USES",
-            fact="A uses B v2",
-            episode_ids=[],
-            group_id="technical",
-            detector=detector,
-            extracted_fact=_fact(),
-        )
-
-        ops = [c[0] for c in parent.method_calls]
-        assert ops == ["writer.invalidate_edges", "writer.create_edges"]
-        (items, group) = writer.invalidate_edges.call_args_list[0].args
-        assert group == "technical"
-        assert items[0][0] == "old-edge-uuid"
-
-    def test_contradiction_records_superseder(self):
-        """The invalidated old edge records invalidated_by = the NEW edge's uuid (schema 028)."""
-        client, writer = self._make_client_with_fake_writer()
-        detector = MagicMock()
-        detector.detect_contradictions.return_value = ["old-edge-uuid"]
-
-        client.create_edge(
-            source_uuid="src",
-            target_uuid="tgt",
-            relationship="USES",
-            fact="A uses B v2",
-            episode_ids=[],
-            group_id="technical",
-            detector=detector,
-            extracted_fact=_fact(),
-        )
-
-        (row,) = writer.create_edges.call_args.args[0]
-        kwargs = writer.invalidate_edges.call_args_list[0].kwargs
-        assert kwargs.get("invalidated_by") == row["edge_uuid"]  # superseder = the new edge
-
-    def test_no_contradictions_means_no_invalidate(self):
-        client, writer = self._make_client_with_fake_writer()
-        detector = MagicMock()
-        detector.detect_contradictions.return_value = []
-
-        client.create_edge(
-            source_uuid="src",
-            target_uuid="tgt",
-            relationship="USES",
-            fact="A uses B",
-            episode_ids=[],
-            group_id="technical",
-            detector=detector,
-            extracted_fact=_fact(),
-        )
-
-        writer.invalidate_edges.assert_not_called()
-        writer.create_edges.assert_called_once()
-
-    def test_pre_known_invalid_at_bookends_new_edge(self):
-        """A fact that arrives already bookended ("from 2020 to 2022") is
-        created and immediately invalidated with the extracted date."""
-        client, writer = self._make_client_with_fake_writer()
-        client.create_edge(
-            source_uuid="src",
-            target_uuid="tgt",
-            relationship="WORKED_AT",
-            fact="Alex worked at X from 2020 to 2022",
-            episode_ids=[],
-            group_id="technical",
-            t_valid="2020-01-01T00:00:00+00:00",
-            t_invalid="2022-01-01T00:00:00+00:00",
-        )
-        (row,) = writer.create_edges.call_args.args[0]
-        (items, _group) = writer.invalidate_edges.call_args.args
-        assert items == [(row["edge_uuid"], "2022-01-01T00:00:00+00:00")]
-
-    def test_invalidate_edge_passes_iso_timestamp(self):
-        client, writer = self._make_client_with_fake_writer()
-        client.invalidate_edge("edge-1", "technical")
-        (items, group) = writer.invalidate_edges.call_args.args
-        assert group == "technical"
-        ((uuid_, ts),) = items
-        assert uuid_ == "edge-1"
-        assert isinstance(ts, str) and "T" in ts
