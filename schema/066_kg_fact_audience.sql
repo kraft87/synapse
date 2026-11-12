@@ -79,16 +79,22 @@ END
 $$;
 DROP TRIGGER IF EXISTS kg_rel_personal_audience ON kg_relationships;
 -- The trigger, the seed and the one-self index below name group_id, which 069 drops: each
--- runs only while the column exists.
+-- runs only while the column exists. The trigger needs it on all four tables, the test 067
+-- skips its work by: once 069 has begun, 067 would not drop a trigger built here, so none is
+-- built, and the function just created is dropped rather than left behind.
 DO $$
 BEGIN
-    IF EXISTS (SELECT 1 FROM pg_attribute
-                WHERE attrelid = 'kg_relationships'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+    IF (SELECT count(*) FROM pg_attribute
+         WHERE attrelid IN ('public.kg_entities'::regclass, 'public.kg_relationships'::regclass,
+                            'public.notes'::regclass, 'public.preferences'::regclass)
+           AND attname = 'group_id' AND NOT attisdropped) = 4 THEN
         CREATE TRIGGER kg_rel_personal_audience
             BEFORE INSERT ON kg_relationships
             FOR EACH ROW
             WHEN (NEW.group_id = 'personal' AND NEW.audience IS NULL)
             EXECUTE FUNCTION kg_relationships_personal_audience_trg();
+    ELSE
+        DROP FUNCTION IF EXISTS kg_relationships_personal_audience_trg();
     END IF;
 END
 $$;

@@ -464,6 +464,12 @@ def test_a_rerun_of_066_never_moves_the_cutover_and_reseeds_a_straggling_persona
         _apply_066(db_url)
         _apply_066(db_url)
         assert kg_rows.execute(_CUTOVER_SQL).fetchone() == stamp
+        assert (
+            kg_rows.execute(
+                "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'"
+            ).fetchone()[0]
+            == 1
+        )
         rows = kg_rows.execute(
             "SELECT uuid, audience, label_version FROM kg_relationships"
         ).fetchall()

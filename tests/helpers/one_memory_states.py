@@ -26,20 +26,26 @@ OLDER_FILES = ("017_kg_postgres.sql", "035_preferences.sql", "041_notes.sql")
 
 
 def psql(
-    db_url: str, path: Path, *, check: bool = True, env: dict[str, str] | None = None
+    db_url: str,
+    path: Path,
+    *,
+    check: bool = True,
+    env: dict[str, str] | None = None,
+    sql: str | None = None,
+    stop: bool = True,
 ) -> subprocess.CompletedProcess:
-    """Pipe a file to psql on stdin, the way a migration is applied to a real database.
+    """Pipe a file to psql on stdin, the way a migration is applied to a real database:
+    ``sql`` sends that text in its place, and ``stop=False`` leaves ON_ERROR_STOP unset, the
+    way a client that goes on after an error would.
 
     The result and the error name the file, never the URL: a failure's message or repr must
     not print the database credential."""
-    with path.open() as f:
-        ran = subprocess.run(
-            ["psql", db_url, "-q", "-v", "ON_ERROR_STOP=1"],
-            stdin=f,
-            capture_output=True,
-            text=True,
-            env=env,
-        )
+    args = ["psql", db_url, "-X", "-q", *(["-v", "ON_ERROR_STOP=1"] if stop else [])]
+    if sql is None:
+        with path.open() as f:
+            ran = subprocess.run(args, stdin=f, capture_output=True, text=True, env=env)
+    else:
+        ran = subprocess.run(args, input=sql, capture_output=True, text=True, env=env)
     code = ran.returncode
     if check and code:
         raise AssertionError(f"psql {path.name} exited {code}: {ran.stderr[-2000:]}")
