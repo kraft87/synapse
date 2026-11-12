@@ -8,31 +8,39 @@ uploads every finished turn to ``/ingest`` in the ``messages`` format.
 Where it is active
 ------------------
 Synapse is one person's memory, so the provider only works for a session that person
-runs on this machine. ``initialize`` decides once, from Hermes's keywords:
+runs on this machine. ``initialize`` decides, from Hermes's keywords and, for a session
+they allow, Hermes's own record of who created it (sessions.py has the rule and the
+Hermes lines it rests on):
 
-- ACTIVE: ``agent_context`` "primary" (Hermes's default when it is blank) on a local
-  surface, ``platform`` "cli" (Hermes's default), "tui", "desktop" or "acp", with no
-  chat identity. The board, the nudge, uploads and the tools all work.
-- CRON (``agent_context`` or ``platform`` "cron"): the tools work, nothing is injected
-  and nothing is uploaded. A scheduled job may need the memory; its prompts are not a
-  conversation the user had.
-- INERT, everything else: a subagent (its parent's turns carry the work), a memory
-  flush or other fork, the API server, and every messaging gateway. A chat identity
-  (``gateway_session_key``, ``chat_id``, ``chat_name``, ``chat_type``, ``thread_id``,
-  ``user_id_alt``, ``user_name``) marks a gateway session even on a platform this list
-  does not know. Nothing is injected or uploaded and a tool call returns a JSON error:
-  someone else in a group chat must not read the owner's memory through the agent, nor
-  have their messages stored as the owner's. ``user_id`` alone does not count: the TUI
-  and Desktop pass the owner's own login there.
+- ACTIVE: a primary session on a local surface ("cli", "tui", "desktop", "acp") of the
+  machine's owner. ``hermes chat`` and the TUI run their turns in the gateway daemon,
+  which passes a chat identity even for them: such a session is ACTIVE only with the
+  shape of a local session (``local-<hex>`` chat, its ``agent:<profile>:local:dm:``
+  route, ``user_id`` ``uid:<this OS user>``) and a creation receipt in
+  ``<hermes_home>/state.db`` that names the owner as its creator, an owner's chat as its
+  source (not ``--source tool``) and no Bot Chat. A session with no chat identity runs in
+  the process that created it (the stdio TUI and Desktop backend, ACP, the classic CLI)
+  and is ACTIVE as before. The board, the nudge, uploads and the tools all work.
+- CRON (``agent_context`` or ``platform`` "cron", no chat identity): the tools work,
+  nothing is injected and nothing is uploaded. A scheduled job may need the memory; its
+  prompts are not a conversation the user had.
+- INERT, everything else: every messaging platform, the API server, hosted rooms and
+  peer agents, the Bot Chat (by title or by its receipt), a subagent, a memory flush or
+  other fork, a session created by someone else or by a third-party integration, one
+  the store does not know, and any shape not listed above. Nothing is injected or
+  uploaded and a tool call returns a JSON error: someone else must not read the owner's
+  memory through the agent, nor have their messages stored as the owner's. The reason
+  is logged once per session.
 
-The Hermes lines this rests on: ``_memory_provider_init_kwargs`` in
-agent/agent_init_memory_provider.py (platform defaults to "cli"; agent_context is
-``memory_agent_context``, else "cron"/"subagent" by platform, else "primary"; the chat
-identity comes from ``_GATEWAY_IDENTITY_PARAMS`` in agent/agent_init_params.py);
-gateway/session_execution.py (a gateway passes its platform key and the chat identity);
-gateway/platforms/api_server.py ("api_server"); tui_gateway/agent_factory.py ("tui",
-"desktop"); acp_adapter/session.py ("acp"); cron/scheduler.py ("cron");
-tools/delegate_tool.py (``memory_agent_context="subagent"``).
+The session's row in the store (title, source, chat) is read again before each nudge,
+upload and tool call: a session renamed "Bot Chat" receives other agents' messages, and
+``/resume`` or compression switches the agent to another session, without a new
+instance. One that no longer passes turns the instance INERT for good. What was already
+in its system prompt (the board) cannot be taken back.
+
+The settings (URL, token) are read at each ``initialize``, so a later ``synapse login``
+reaches the next session. Environment variables are the process's own: in the gateway
+daemon, those it was started with.
 
 Uploads
 -------
@@ -45,9 +53,12 @@ counts as handled; the next successful upload drains it. Turns are remembered by
 re-sends a turn costs a request, not a duplicate. A private session (private.is_private)
 sends nothing and remembers nothing, as the Claude Code hook does.
 
-Every hook catches what it raises and logs it; nothing here raises into Hermes. Each
-instance holds its own settings, client and outbox, and every thread it starts goes
-through Hermes's ``spawn_context_thread``.
+Every hook catches what it raises and logs it; nothing here raises into Hermes. Hermes
+builds one instance per agent (plugins/memory ``register`` runs per load), so each
+session of the gateway daemon has its own: an instance holds its own settings, client,
+outbox and sent turns, its own state is guarded by one lock, and every thread it starts
+goes through Hermes's ``spawn_context_thread``. Sessions share only the outbox folder,
+which is safe across threads and processes.
 """
 
 from __future__ import annotations
@@ -67,6 +78,7 @@ from ...api import Client
 from ...outbox import Outbox, failure_warning, short_reason
 from ...settings import Settings
 from . import messages as hm
+from . import sessions as hs
 
 ACTIVE = "active"
 CRON = "cron"
@@ -82,16 +94,6 @@ FLUSH_TIMEOUT = 10.0
 #: How many complete turns a resumed session sends at most on its first upload.
 LOOKBACK = 10
 
-_LOCAL_PLATFORMS = frozenset({"cli", "tui", "desktop", "acp"})
-_CHAT_IDENTITY = (
-    "gateway_session_key",
-    "chat_id",
-    "chat_name",
-    "chat_type",
-    "thread_id",
-    "user_id_alt",
-    "user_name",
-)
 _LOCAL_ONLY = "Synapse is enabled for local sessions only (the Hermes CLI, TUI, Desktop or ACP)."
 _LOGIN = "Synapse is not signed in on this machine: run `synapse login` in a terminal."
 _ENV_LOCATION = "Hermes's .env file or your shell profile"
@@ -106,16 +108,9 @@ def _say(line: str) -> None:
 
 
 def scope(kwargs: Mapping[str, Any]) -> str:
-    """ACTIVE, CRON or INERT for ``initialize``'s keywords (see the module docstring)."""
-    if any(kwargs.get(key) for key in _CHAT_IDENTITY):
-        return INERT
-    agent_context = str(kwargs.get("agent_context") or "").strip().lower() or "primary"
-    platform = str(kwargs.get("platform") or "").strip().lower() or "cli"
-    if agent_context == CRON or platform == CRON:
-        return CRON
-    if agent_context == "primary" and platform in _LOCAL_PLATFORMS:
-        return ACTIVE
-    return INERT
+    """ACTIVE, CRON or INERT for ``initialize``'s keywords alone (sessions.from_keywords);
+    ``initialize`` also checks an ACTIVE session against Hermes's session store."""
+    return hs.from_keywords(kwargs).mode
 
 
 def _json_result(text: str) -> str:
@@ -153,6 +148,8 @@ class SynapseMemoryProvider(MemoryProvider):
         self._block = ""
         self._sent: set[str] = set()
         self._lookback: int | None = None
+        self._home: str | None = None
+        self._said: set[str] = set()
 
     # -- identity and availability -------------------------------------------------
 
@@ -184,16 +181,20 @@ class SynapseMemoryProvider(MemoryProvider):
         try:
             self._initialize(session_id, kwargs)
         except Exception:
+            self._mode = INERT  # undecided is not active: no tools for an unknown session
             _log().warning("synapse: initialize failed", exc_info=True)
 
     def _initialize(self, session_id: str, kwargs: Mapping[str, Any]) -> None:
-        mode = scope(kwargs)
+        verdict = hs.from_keywords(kwargs)
+        home = kwargs.get("hermes_home")
+        if verdict.mode == ACTIVE:
+            verdict = hs.check_session(home, str(session_id or ""), kwargs)
+        mode = verdict.mode
         settings = Settings.load()
         client = Client(settings, f"synapse-client/{__version__} hermes")
-        home = kwargs.get("hermes_home")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
         cwd = kwargs.get("cwd")
-        cwd = cwd if isinstance(cwd, str) and cwd else None
+        cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         with self._lock:
             self._mode = mode
             self._settings, self._client, self._outbox = settings, client, outbox
@@ -203,6 +204,9 @@ class SynapseMemoryProvider(MemoryProvider):
             self._lookback = LOOKBACK if kwargs.get("resumed") else None
             self._sent.clear()
             self._block = ""
+            self._home = str(home) if home else None
+        if mode == INERT:
+            self._say_once(f"synapse: off for session {self._session_id}: {verdict.reason}")
         if mode != ACTIVE:
             return
         self._block = self._session_start(settings, client, outbox)
@@ -251,6 +255,8 @@ class SynapseMemoryProvider(MemoryProvider):
         """The per-turn nudge (a timestamp and the recall/remember directive). No request."""
         if self._mode != ACTIVE or self._settings is None:
             return ""
+        if not self._still_owner():
+            return ""
         return context.prompt_nudge(self._settings, recall="recall", remember="remember")
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
@@ -258,6 +264,34 @@ class SynapseMemoryProvider(MemoryProvider):
 
     def recall_status(self) -> None:
         return None
+
+    def _say_once(self, line: str) -> None:
+        with self._lock:
+            if line in self._said:
+                return
+            self._said.add(line)
+        _say(line)
+
+    def _still_owner(self, session_id: str = "") -> bool:
+        """For an ACTIVE session, whether it is still the owner's: the session store is
+        read again (sessions.recheck), since a session renamed "Bot Chat" starts receiving
+        other agents' messages, and a switch moves the agent to another session, without
+        a new instance. A session that fails turns this instance INERT for good; a store
+        that cannot be read skips this one call. Never raises."""
+        if self._mode != ACTIVE:
+            return False
+        sid = str(session_id or self._session_id)
+        try:
+            verdict = hs.recheck(self._home, sid)
+        except Exception:
+            self._say_once("synapse: the session store could not be read; skipped this call")
+            return False
+        if verdict.mode == ACTIVE:
+            return True
+        with self._lock:
+            self._mode = INERT
+        self._say_once(f"synapse: off for session {sid}: {verdict.reason}")
+        return False
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
         model = kwargs.get("model")
@@ -329,6 +363,8 @@ class SynapseMemoryProvider(MemoryProvider):
         batch reached the server."""
         client, outbox, settings = self._client, self._outbox, self._settings
         if self._mode != ACTIVE or client is None or settings is None:
+            return False
+        if not self._still_owner(session_id):
             return False
         sid = str(session_id or self._session_id)
         if not sid or private.is_private(settings, sid, _say):
@@ -409,6 +445,8 @@ class SynapseMemoryProvider(MemoryProvider):
         """Call ``tool_name`` on the server with this session's id; always a JSON string."""
         try:
             if self._mode == INERT:
+                return _error(_LOCAL_ONLY, tool_name)
+            if self._mode == ACTIVE and not self._still_owner():
                 return _error(_LOCAL_ONLY, tool_name)
             client = self._client
             if client is None:
