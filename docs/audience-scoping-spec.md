@@ -236,6 +236,10 @@ project included, so an unknown caller serves *nothing* rather than everything.
   a restricted device reads and writes only its own mirror, and sees only proposals whose
   every evidence session consists solely of its own turns. All resolved from the bearer;
   the root token and unknown callers get nothing.
+- **Facts from a remembered item**: the extraction behind a `remember()` item reads session
+  context only from turns of the item's own project (case-insensitive; no project matches
+  only no project). The facts it writes cite only the item's own episode, so a name taken
+  from a turn in another project would sit in a fact whose provenance does not show it.
 
 ## Rollout order (schema 054)
 

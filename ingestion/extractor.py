@@ -229,7 +229,15 @@ class ExtractionPipeline(ExtractionNodesMixin, ExtractionEdgesMixin):
             # summary or manual — full pipeline
             episodes_raw: list[dict[str, Any]] = []
             if session_id:
-                episodes_raw = self._db.get_session_episodes(session_id)
+                # The facts written below cite only this item's episode, so every name in
+                # them must come from turns a reader of that episode's project may also
+                # read. A session can span projects: take context from this one's turns.
+                wanted = (project or "").lower()
+                episodes_raw = [
+                    ep
+                    for ep in self._db.get_session_episodes(session_id)
+                    if (ep.get("project") or "").lower() == wanted
+                ]
             det_entities = self._stage2_deterministic(episodes_raw)
             llm_result = self._stage3_llm(content, det_entities, session_date)
 

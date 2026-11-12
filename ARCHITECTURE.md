@@ -378,12 +378,12 @@ elif content_type == "chunk":
     det_entities = self._stage2_deterministic([{"content": content, "metadata": {}}])
     llm_result = self._stage3_llm(content, det_entities)  # full extraction on the window
 else:  # summary or manual
-    episodes_raw = self._db.get_session_episodes(session_id) if session_id else []
+    episodes_raw = [e for e in self._db.get_session_episodes(session_id) if e.project == project] if session_id else []  # own project only
     det_entities = self._stage2_deterministic(episodes_raw)
     llm_result = self._stage3_llm(content, det_entities)
 ```
 
-**Chunks are the live fact source.** Episodes get deterministic-only extraction, which produces zero facts and returns early (the old "LLM extraction only on summaries" rule is dead). The `summary`/`manual` branch remains for back-compat and the `remember()` tool, but no summaries are enqueued anymore.
+**Chunks are the live fact source.** Episodes get deterministic-only extraction, which produces zero facts and returns early (the old "LLM extraction only on summaries" rule is dead). The `summary`/`manual` branch remains for back-compat and the `remember()` tool, but no summaries are enqueued anymore. That branch takes its code-pass context only from session turns whose project equals the item's own (case-insensitive; a missing project matches only a missing project): the facts it writes cite only the item's episode, so every name in them has to come from turns a reader of that episode's project may also read.
 
 ### 5.2 Stages
 
