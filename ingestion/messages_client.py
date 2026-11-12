@@ -28,10 +28,10 @@ User text loses every <memory-context>...</memory-context> block before anything
 else: that is how a client injects recalled memory into the prompt, and it must
 never be stored as something the user said. A user row empty without it is dropped.
 
-Records are grouped into user-turn exchanges and rendered exactly as
-CodexRolloutParser does (a new group at each user row; the same [context] / [user] /
-[tool:name] / [result] / [assistant] lines and truncation), so the three parsers'
-episodes read alike. A batch that begins mid-turn yields a leading group with no
+Records are grouped into user-turn exchanges and rendered with the line rules in
+``ingestion.render``, as CodexRolloutParser does (a new group at each user row; the same
+[context] / [user] / [tool:name] / [result] / [assistant] lines and truncation), so the
+three parsers' episodes read alike. A batch that begins mid-turn yields a leading group with no
 [user] line, as it does there.
 
 Identity is the span_id, which the route dedups on: "<client>:<id>" of the group's
@@ -53,6 +53,19 @@ from typing import Any, NamedTuple
 
 from ingestion.models import Episode
 from ingestion.project_label import label_from_path
+from ingestion.render import (
+    LINE_SEP,
+    USER_CAP,
+    assistant_line,
+    context_line,
+    group_turns,
+    join_lines,
+    repeated_span,
+    result_line,
+    strip_nulls,
+    tool_line,
+    user_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,11 +106,6 @@ def valid_client(name: object) -> bool:
         and _CLIENT_RE.fullmatch(name) is not None
         and name not in RESERVED_CLIENTS
     )
-
-
-def _strip_nulls(text: str) -> str:
-    """Postgres TEXT columns reject NUL bytes — strip them defensively."""
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _content_text(content: Any) -> str:
@@ -143,7 +151,7 @@ def _tool_call_lines(tool_calls: Any) -> list[str]:
             name = "tool"
         detail = _arguments_text(spec.get("arguments"))
         if detail:
-            lines.append(f"[tool:{name}] {detail[:300]}")
+            lines.append(tool_line(name, detail))
     return lines
 
 
@@ -224,16 +232,7 @@ class MessagesParser:
 
         rows = [row for rec in records if (row := _row(rec)) is not None]
 
-        groups: list[list[_Row]] = []
-        current: list[_Row] = []
-        for row in rows:
-            if row.role == "user" and current:
-                groups.append(current)
-                current = [row]
-            else:
-                current.append(row)
-        if current:
-            groups.append(current)
+        groups = group_turns(rows, lambda row: row.role == "user")
 
         episodes: list[Episode] = []
         prev_assistant: str | None = None
@@ -256,15 +255,15 @@ class MessagesParser:
                 turn_model = row.model or turn_model
                 if row.role == "user":
                     if human_turn is None:
-                        human_turn = row.text[:3000]
-                        parts.append(f"[user] {human_turn}")
+                        human_turn = row.text[:USER_CAP]
+                        parts.append(user_line(human_turn))
                 elif row.role == "assistant":
                     if row.text:
                         assistant_turn = row.text
-                        parts.append(f"[assistant] {row.text[:3000]}")
+                        parts.append(assistant_line(row.text))
                     parts.extend(row.tool_lines)
-                elif len(row.text) > 20:
-                    parts.append(f"[result] {row.text[:500]}")
+                elif line := result_line(row.text):
+                    parts.append(line)
 
             if not parts:
                 continue
@@ -272,14 +271,13 @@ class MessagesParser:
             if last_id:
                 span_id = f"{client}:{last_id}"
             else:
-                rendered = "\n\n".join(parts).encode("utf-8", "surrogatepass")
+                rendered = LINE_SEP.join(parts).encode("utf-8", "surrogatepass")
                 span_id = f"{client}:{session_id}:{hashlib.sha256(rendered).hexdigest()[:24]}"
-            if span_id in seen_span_ids:
+            if repeated_span(seen_span_ids, span_id):
                 continue  # replayed turn — already emitted
-            seen_span_ids.add(span_id)
 
             if prev_assistant:
-                parts.insert(0, f"[context] {prev_assistant.strip()[:300]}")
+                parts.insert(0, context_line(prev_assistant))
 
             episodes.append(
                 Episode(
@@ -288,9 +286,9 @@ class MessagesParser:
                     project=project_override or label_from_path(cwd),
                     platform=client,
                     model=turn_model or model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(parts)),
+                    human_turn=strip_nulls(human_turn) if human_turn else None,
+                    assistant_turn=strip_nulls(assistant_turn) if assistant_turn else None,
+                    content=join_lines(parts),
                     span_id=span_id,
                     source="messages",
                     metadata={

@@ -1,6 +1,6 @@
 """The shared transcript line rules (ingestion/render.py), pinned.
 
-Unit tests for each rule at its exact boundary.
+Unit tests for each rule at its exact boundary, and a golden render per live parser.
 """
 
 from __future__ import annotations
@@ -164,3 +164,261 @@ class TestRepeatedSpan:
         assert repeated_span(seen, None) is False
         assert repeated_span(seen, None) is False
         assert seen == set()
+
+
+# ---------------------------------------------------------------------------------------
+# Golden renders, one per live parser. The three parsers differ on purpose in where tool
+# lines sit, how text blocks combine, what is dropped and when [context] is added; each
+# golden pins its parser's full content string so those differences stay visible.
+
+
+class TestJSONLGolden:
+    @staticmethod
+    def _rec(rtype: str, content: object, uuid: str) -> dict:
+        message: dict = {"role": rtype, "content": content}
+        if rtype == "assistant":
+            message["model"] = "model-1"
+        return {
+            "type": rtype,
+            "message": message,
+            "uuid": uuid,
+            "sessionId": "sess-g",
+            "cwd": "/home/user/dev/proj",
+            "timestamp": "2026-11-12T10:00:00Z",
+        }
+
+    def _records(self) -> list[dict]:
+        r = self._rec
+        return [
+            r("user", "list the\x00 files", "u1"),
+            # Text BEFORE the tool call in the record; jsonl still renders the tool first.
+            r(
+                "assistant",
+                [
+                    {"type": "text", "text": "Let me look."},
+                    {"type": "tool_use", "name": "Bash", "input": {"command": "  ls -la  "}},
+                ],
+                "a1",
+            ),
+            r(
+                "user",
+                [
+                    {"type": "tool_result", "content": "total 2\n-rw-r--r-- 1 u u 0 notes.txt"},
+                    {"type": "tool_result", "content": "ok"},  # 2 chars: no line
+                ],
+                "r1",
+            ),
+            # Two text blocks: jsonl keeps only the last.
+            r(
+                "assistant",
+                [{"type": "text", "text": "draft"}, {"type": "text", "text": "One file."}],
+                "a2",
+            ),
+            # Hook feedback opens a turn, but its text is not the user's.
+            r("user", "Stop hook feedback:\nCall recall_feedback.", "h1"),
+            r("assistant", [{"type": "text", "text": "Feedback sent."}], "a3"),
+            # A bounce with no reply leaves only [context]: skipped, sequence 3 used up.
+            r("user", "Stop hook feedback:\nAgain.", "h2"),
+            r("user", "thanks", "u2"),
+            r("assistant", [{"type": "text", "text": "A" * 3001}], "a4"),
+            # The same turn again (a compaction re-dump): same span id, emitted once.
+            r("user", "thanks", "u2"),
+            r("assistant", [{"type": "text", "text": "A" * 3001}], "a4"),
+            r("user", "bye", "u3"),
+        ]
+
+    def test_content(self):
+        from ingestion.jsonl_client import JSONLParser
+
+        eps = JSONLParser().parse_records(self._records(), "golden")
+        assert [e.sequence for e in eps] == [1, 2, 4, 6]
+        assert [e.span_id for e in eps] == [
+            "claude_code:a2",
+            "claude_code:a3",
+            "claude_code:a4",
+            "claude_code:u3",
+        ]
+        assert eps[0].content == (
+            "[user] list the files\n\n"
+            "[tool:Bash]   ls -la  \n\n"
+            "[assistant] Let me look.\n\n"
+            "[result] total 2\n-rw-r--r-- 1 u u 0 notes.txt\n\n"
+            "[assistant] One file."
+        )
+        assert eps[1].content == "[context] One file.\n\n[assistant] Feedback sent."
+        assert eps[2].content == (
+            "[context] Feedback sent.\n\n[user] thanks\n\n[assistant] " + "A" * 3000
+        )
+        assert eps[3].content == "[context] " + "A" * 300 + "\n\n[user] bye"
+
+    def test_turns(self):
+        from ingestion.jsonl_client import JSONLParser
+
+        eps = JSONLParser().parse_records(self._records(), "golden")
+        assert [e.human_turn for e in eps] == ["list the files", None, "thanks", "bye"]
+        assert [e.assistant_turn for e in eps] == [
+            "One file.",
+            "Feedback sent.",
+            "A" * 3001,  # the full text, not the capped line
+            None,
+        ]
+
+
+class TestCodexGolden:
+    SID = "019ffdbe-ff9a-7b41-892a-ddc6221d1a64"
+
+    @staticmethod
+    def _rec(rtype: str, payload: dict) -> dict:
+        return {"timestamp": "2026-11-12T10:00:00Z", "type": rtype, "payload": payload}
+
+    def _msg(self, role: str, texts: list[str], msg_id: str) -> dict:
+        kind = "output_text" if role == "assistant" else "input_text"
+        content = [{"type": kind, "text": t} for t in texts]
+        return self._rec(
+            "response_item", {"type": "message", "id": msg_id, "role": role, "content": content}
+        )
+
+    def _records(self) -> list[dict]:
+        item = self._rec
+        return [
+            item("session_meta", {"session_id": self.SID, "cwd": "/home/user/dev/proj"}),
+            item("turn_context", {"cwd": "/home/user/dev/proj", "model": "model-1"}),
+            self._msg("user", ["<environment_context>x</environment_context>"], "env"),
+            # Two text parts: codex joins them with a newline.
+            self._msg("user", ["run the", "tests"], "u1"),
+            item(
+                "response_item",
+                {"type": "custom_tool_call", "id": "t1", "name": "exec", "input": "  pytest -q \n"},
+            ),
+            item(
+                "response_item",
+                {
+                    "type": "custom_tool_call_output",
+                    "id": "o1",
+                    "output": "47 passed in 3.21s, all green",
+                },
+            ),
+            item("response_item", {"type": "function_call_output", "id": "o2", "output": "ok"}),
+            self._msg("assistant", ["All 47 pass.", "Nothing failed."], "a1"),
+            # A tool call after the reply renders after it: codex keeps record order.
+            item(
+                "response_item",
+                {"type": "function_call", "id": "f1", "name": "shell", "arguments": "git status"},
+            ),
+            self._msg("user", ["q" * 3001], "u2"),
+            self._msg("assistant", ["A" * 3001], "a2"),
+            # A resume re-dump of the same turn: same span id, emitted once.
+            self._msg("user", ["q" * 3001], "u2"),
+            self._msg("assistant", ["A" * 3001], "a2"),
+            self._msg("user", ["bye"], "u3"),
+        ]
+
+    def test_content(self):
+        from ingestion.codex_client import CodexRolloutParser
+
+        eps = CodexRolloutParser().parse_records(self._records(), "golden")
+        assert [e.sequence for e in eps] == [1, 2, 4]
+        assert [e.span_id for e in eps] == ["codex:f1", "codex:a2", "codex:u3"]
+        assert eps[0].content == (
+            "[user] run the\ntests\n\n"
+            "[tool:exec] pytest -q\n\n"
+            "[result] 47 passed in 3.21s, all green\n\n"
+            "[assistant] All 47 pass.\nNothing failed.\n\n"
+            "[tool:shell] git status"
+        )
+        assert eps[1].content == (
+            "[context] All 47 pass.\nNothing failed.\n\n"
+            "[user] " + "q" * 3000 + "\n\n[assistant] " + "A" * 3000
+        )
+        assert eps[2].content == "[context] " + "A" * 300 + "\n\n[user] bye"
+
+    def test_turns(self):
+        from ingestion.codex_client import CodexRolloutParser
+
+        eps = CodexRolloutParser().parse_records(self._records(), "golden")
+        assert [e.human_turn for e in eps] == ["run the\ntests", "q" * 3000, "bye"]
+        assert [e.assistant_turn for e in eps] == [
+            "All 47 pass.\nNothing failed.",
+            "A" * 3001,
+            None,
+        ]
+
+
+class TestMessagesGolden:
+    SID = "hermes-golden"
+
+    @staticmethod
+    def _records() -> list[dict]:
+        return [
+            {"role": "system", "content": "be brief"},  # not a kept role
+            {"role": "user", "id": "m1", "content": "list the files"},
+            # messages renders [assistant] BEFORE the row's tool calls.
+            {
+                "role": "assistant",
+                "id": "m2",
+                "content": "Let me look.",
+                "tool_calls": [
+                    {"id": "c1", "function": {"name": "shell", "arguments": "  ls -la  "}},
+                    {"name": "read", "arguments": {"path": "/tmp/x", "lines": 5}},
+                ],
+            },
+            {"role": "tool", "id": "m3", "content": "total 2\n-rw-r--r-- 1 u u 0 notes.txt"},
+            {"role": "tool", "id": "m4", "content": "ok"},  # 2 chars: no line
+            # Two text parts: joined with a newline.
+            {
+                "role": "assistant",
+                "id": "m5",
+                "content": [
+                    {"type": "output_text", "text": "One file:"},
+                    {"type": "text", "text": "notes.txt."},
+                ],
+            },
+            {"role": "user", "content": "thanks"},  # no ids: the span id is a hash
+            {"role": "assistant", "content": "You're welcome."},
+            # The same turn again under a different [context]: it hashes the same, because
+            # the hash covers the turn's own lines only, so it is emitted once.
+            {"role": "user", "content": "thanks"},
+            {"role": "assistant", "content": "You're welcome."},
+            {"role": "user", "content": "<memory-context>recalled</memory-context>bye"},
+        ]
+
+    @staticmethod
+    def _hash_span(own_lines: str) -> str:
+        import hashlib
+
+        digest = hashlib.sha256(own_lines.encode()).hexdigest()[:24]
+        return f"hermes:hermes-golden:{digest}"
+
+    def test_content(self):
+        from ingestion.messages_client import MessagesParser
+
+        eps = MessagesParser().parse_records(
+            self._records(), "golden", session_id=self.SID, client="hermes"
+        )
+        assert [e.sequence for e in eps] == [1, 2, 4]
+        assert [e.span_id for e in eps] == [
+            "hermes:m5",
+            self._hash_span("[user] thanks\n\n[assistant] You're welcome."),
+            self._hash_span("[user] bye"),
+        ]
+        assert eps[0].content == (
+            "[user] list the files\n\n"
+            "[assistant] Let me look.\n\n"
+            "[tool:shell] ls -la\n\n"
+            '[tool:read] {"lines": 5, "path": "/tmp/x"}\n\n'
+            "[result] total 2\n-rw-r--r-- 1 u u 0 notes.txt\n\n"
+            "[assistant] One file:\nnotes.txt."
+        )
+        assert eps[1].content == (
+            "[context] One file:\nnotes.txt.\n\n[user] thanks\n\n[assistant] You're welcome."
+        )
+        assert eps[2].content == "[context] You're welcome.\n\n[user] bye"
+
+    def test_turns(self):
+        from ingestion.messages_client import MessagesParser
+
+        eps = MessagesParser().parse_records(
+            self._records(), "golden", session_id=self.SID, client="hermes"
+        )
+        assert [e.human_turn for e in eps] == ["list the files", "thanks", "bye"]
+        assert [e.assistant_turn for e in eps] == ["One file:\nnotes.txt.", "You're welcome.", None]
