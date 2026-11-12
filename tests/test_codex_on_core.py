@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -584,3 +585,60 @@ def test_a_hung_server_does_not_hold_the_hook_process(scratch, tmp_path, server)
     assert proc.returncode == 0, proc.stderr
     assert time.monotonic() - began < 10
     assert proc.stdout == ""
+
+
+# ---------------------------------------------------------------------------
+# user_prompt_submit.py: the core's prompt nudge, with Codex's tool names
+# ---------------------------------------------------------------------------
+
+_PROMPT_HOOK = _CODEX / "hooks" / "user_prompt_submit.py"
+# The directive as Codex printed it before the move: the wording is unchanged.
+_CODEX_NUDGE = (
+    "[Synapse] IMPORTANT: the user's cross-session history is searchable — assume "
+    "it has context on any past work, project, device, or person they name. BEFORE "
+    "answering anything that references the past: synapse recall (skip only if the "
+    "answer is already in this conversation). About to say 'noted' or 'I'll "
+    "remember'? Call synapse remember FIRST, then reply."
+)
+_STAMP = re.compile(r"^\[\w{3} \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} .*\]$")
+
+
+def _prompt_context(capsys) -> str | None:
+    hook = _load("codex_prompt_hook_on_core", _PROMPT_HOOK)
+    hook.main()
+    out = _printed(capsys)
+    if out is None:
+        return None
+    assert out["hookSpecificOutput"]["hookEventName"] == "UserPromptSubmit"
+    return out["hookSpecificOutput"]["additionalContext"]
+
+
+def test_prompt_nudge_leads_with_the_time(scratch, capsys):
+    stamp, nudge = _prompt_context(capsys).split("\n")
+    assert _STAMP.match(stamp), stamp
+    assert nudge == _CODEX_NUDGE
+
+
+def test_prompt_nudge_without_the_time_is_the_old_output(scratch, monkeypatch, capsys):
+    monkeypatch.setenv("SYNAPSE_PROMPT_TIMESTAMP", "0")
+    assert _prompt_context(capsys) == _CODEX_NUDGE
+
+
+def test_prompt_nudge_off_leaves_the_time(scratch, monkeypatch, capsys):
+    monkeypatch.setenv("SYNAPSE_RECALL_NUDGE", "0")
+    assert _STAMP.match(_prompt_context(capsys))
+    monkeypatch.setenv("SYNAPSE_PROMPT_TIMESTAMP", "0")
+    assert _prompt_context(capsys) is None
+
+
+def test_prompt_hook_as_codex_runs_it(scratch):
+    proc = subprocess.run(
+        [sys.executable, str(_PROMPT_HOOK)],
+        input="{}",
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    text = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert _STAMP.match(text.split("\n")[0]) and text.endswith(_CODEX_NUDGE)
