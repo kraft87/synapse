@@ -31,8 +31,8 @@ never be stored as something the user said. A user row empty without it is dropp
 Records are grouped into user-turn exchanges and rendered with the line rules in
 ``ingestion.render``, as CodexRolloutParser does (a new group at each user row; the same
 [context] / [user] / [tool:name] / [result] / [assistant] lines and truncation), so the
-three parsers' episodes read alike. A batch that begins mid-turn yields a leading group with no
-[user] line, as it does there.
+three parsers' episodes read alike. A batch that begins mid-turn yields a leading group
+with no [user] line, as it does there.
 
 Identity is the span_id, which the route dedups on: "<client>:<id>" of the group's
 last message carrying an id, so overlapping pushes converge. A client without ids
