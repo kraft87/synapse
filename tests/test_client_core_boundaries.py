@@ -34,6 +34,8 @@ _HARNESSES = _PACKAGE / "harnesses"
 _HOST_IMPORTS = {
     _HARNESSES / "hermes" / "provider.py": frozenset({"agent.memory_provider"}),
 }
+# Data files an adapter reads from the package (the installer's templates).
+_DATA_SUFFIXES = (".py", ".json", ".tmpl")
 
 # Calls allowed at import time (module and class level, decorators): each builds an
 # immutable value or declares a type, and touches nothing outside the process.
@@ -273,7 +275,7 @@ def test_parses_as_python_3_11(path: Path) -> None:
 def test_data_files_ship_beside_the_code():
     """Non-Python files the package reads must sit inside it, so the bundle carries them."""
     for path in _PACKAGE.rglob("*"):
-        if path.is_file() and path.suffix not in (".py", ".json"):
+        if path.is_file() and path.suffix not in _DATA_SUFFIXES:
             assert path.name == "py.typed" or "__pycache__" in path.parts, path
 
 

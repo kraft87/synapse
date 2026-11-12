@@ -42,4 +42,6 @@ class Harness(Protocol):
 
 def registry() -> list[Harness]:
     """Every harness this client knows, in the order the CLI offers them."""
-    return []
+    from .hermes.install import HermesHarness
+
+    return [HermesHarness()]
