@@ -1,0 +1,46 @@
+name: Release
+
+# A new client version on main becomes a GitHub release: tag v<version> at the commit
+# that brought that client, notes = the version's HANDOFF.md entries. Machines never
+# download from here (they take the client from their server's /install); the release
+# is the record. Every decision is in scripts/release_notes.py (decision table in its
+# docstring, tested in tests/test_release_notes.py); this file checks out and calls it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugin/**"
+      - "plugin-codex/**"
+  # A missed release (or the first one): Actions > Release > Run workflow, on main.
+  # Safe to run any time: a version already released exits green.
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  release:
+    name: Release
+    # Fork guard, and main only: a dispatch from another branch would release that
+    # branch's version.
+    if: github.repository == 'kraft87/synapse' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # One run at a time, so two pushes never race for one tag; a run in progress is
+    # never cancelled (it could stop between the tag and its release). The tag itself is
+    # created atomically, so a tag that appears from elsewhere fails the run instead of
+    # being reused.
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # every v* tag and the commit it points at
+          fetch-tags: true
+          persist-credentials: false  # the token goes to gh in the step below, nowhere else
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/release_notes.py release --rev "$GITHUB_SHA"

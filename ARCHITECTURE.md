@@ -133,6 +133,8 @@ Synapse keeps three **live** document substrates plus the KG. Episodes are the s
 [assistant] final response text
 ```
 
+The line shapes, their caps and the user-turn grouping rule live in `ingestion/render.py`, which every transcript parser renders through; each parser still decides which of its records become which line, and in what order.
+
 **Why human-turn granularity, not per-API-call**: Claude Code makes 3–8 API calls per user turn (each tool result requires re-submission). A 1:1 span→episode mapping produces ~63% assistant-only fragments with no human context and weak embeddings. Grouping by the human-message boundary gives coherent units. Episodes are served directly by `recall()` (BM25 + vector, reranked) — they own both broad and needle retrieval.
 
 **Stored in**: `episodes`. Key columns: `session_id`, `sequence`, `project`, `platform`, `content`, `embedding vector(2048)`, `human_turn`, `assistant_turn`, `span_id` (dedup key), `retrieval_count`, `source`.
@@ -280,7 +282,7 @@ row the harness injected in the user's place, which is skipped. Every
 `<memory-context>...</memory-context>` block is removed from user text first, and a user
 row left empty is dropped: that is recalled memory the client put into the prompt, not
 something the user said. Turns are grouped at each user row and rendered with the Codex
-parser's labels and truncation.
+parser's labels and truncation (the shared rules in `ingestion/render.py`).
 
 **Span id.** Every parser's span ids start with the platform it stamps (`claude_code:`,
 `codex:`, `chatgpt:`, `cursor:`, `claude_ai:`); schema 068 renamed the three that used the

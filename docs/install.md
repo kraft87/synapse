@@ -310,9 +310,11 @@ when Hermes is wired. An install from before 0.20 keeps
 working with no action, reading its old Claude plugin settings; the first `synapse login`
 copies those answers into `~/.synapse/config.json`.
 
-Releases are tagged (`v0.8.1`, ...). `main` is kept releasable, but for a known-good
-build check out the latest tag; a change that needs a migration or renames an env var
-gets a release note saying so.
+Releases are tagged with the client version (`v0.24.4`, ...) and made automatically when
+a new client version lands on main; their notes are that version's HANDOFF.md entries.
+Server-only changes ship from `main` without a tag. `main` is kept releasable, but for a
+known-good build check out the latest tag; a change that needs a migration or renames an
+env var says so in its HANDOFF.md entry.
 
 ## Troubleshooting
 
