@@ -65,7 +65,7 @@ registry is picked up by all four without a change to the CLI.
 |---|---|---|---|
 | Board + preferences at session start | `SessionStart` hooks | `SessionStart` hook | `system_prompt_block()`, fetched once in `initialize()` |
 | Which sessions | every session | every session | local sessions only (below) |
-| Per-prompt recall nudge + timestamp | `UserPromptSubmit` hook | `UserPromptSubmit` hook (nudge only, no timestamp line) | `prefetch()` (returns both; no recall is run) |
+| Per-prompt recall nudge + timestamp | `UserPromptSubmit` hook | `UserPromptSubmit` hook | `prefetch()` (returns both; no recall is run) |
 | Upload a finished turn | `Stop` hook reads the session JSONL | `Stop` hook reads the rollout | `sync_turn(messages=...)` |
 | Catch up after failed uploads | `SessionStart --catchup` sweep | session-start sweep | outbox, flushed in `initialize()` and after each upload |
 | Memory tools | MCP entry in the plugin manifest | MCP entry in `config.toml` | `get_tool_schemas()` / `handle_tool_call()`, proxied to MCP `tools/call` |
@@ -196,10 +196,17 @@ own loader and drives Hermes's `MemoryManager`, in-process and with
 The core and its first adapter exist: every module in the layout above, the `Harness`
 protocol, and a registry holding Hermes (plugin 0.24.0). The CLI walks one list for
 login, install, update and status, with Claude Code and Codex wrapped as list entries
-over their old functions. Claude Code's hooks (`plugin/scripts/`) and Codex's
-(`plugin-codex/`) still carry their own configuration and HTTP code (`config.py`,
-`common.py`); moving them onto the core is the next two changes, Codex first, and their
-wiring then moves into `harnesses/` beside Hermes's.
+over their old functions.
+
+Codex's hooks (`plugin-codex/`) run on the core since plugin 0.24.4: `common.py` resolves
+with `Settings.load` and sends through `Transport`, and session start, the prompt nudge,
+the recall-feedback nudge and the Stop hook's private check come from the core. Codex
+keeps its own Stop-hook shipper (rollout cursors, catch-up sweep and retry), the
+session-id injection hook (`pre_tool_use.py`), the private-mode toggle
+(`scripts/private_mode.py`) and the skills-sync glue. Claude Code's hooks
+(`plugin/scripts/`) still carry their own configuration and HTTP code (`config.py`);
+moving them onto the core is the next change, and the two harnesses' wiring then moves
+into `harnesses/` beside Hermes's.
 
 A module moves like this: the code goes into `synapse_client/`, the old path keeps a
 few-line stub that imports it (hook commands and Codex's trusted command text never name
@@ -218,17 +225,16 @@ The core ports the hooks' behaviour and wording, with these differences:
   goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
   read as JSON or as server-sent events, up to the answer to this call.
 - **The bearer stays on its origin.** `http.Transport` sends it only to the configured
-  server (and the ingest URL's origin); the hooks' helpers send it to any absolute URL
-  they are given. A redirect carries it only within its origin, or from http to https on
-  the same host and the default ports (80 to 443, the rule the `requests` library uses).
-  The hooks open their requests through the same handler (`http.urlopen`, reached through
-  `config._urlopen` and Codex's `common._urlopen`): urllib's stock one forwards the header
-  to wherever a redirect points.
+  server (and the ingest URL's origin), and Codex's hooks send through it; Claude Code's
+  hook helpers send it to any absolute URL they are given. A redirect carries it only
+  within its origin, or from http to https on the same host and the default ports (80 to
+  443, the rule the `requests` library uses). Claude Code's hooks open their requests
+  through the same handler (`http.urlopen`, reached through `config._urlopen`): urllib's
+  stock one forwards the header to wherever a redirect points.
 - **Legacy credentials are passed in, not read.** `Settings.load` takes the old
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.
 - **Session-start order** is notice, upload warning, board, preferences in every harness.
-  Codex's hook puts preferences before the board today.
 - **Enrollment notices** take the login hint as an argument; the restricted-device
   notice has no Claude-only "paste it into /plugin" aside.
 - **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
