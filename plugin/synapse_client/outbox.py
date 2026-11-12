@@ -185,10 +185,21 @@ class Outbox:
     # -- writing -------------------------------------------------------------------
 
     def _ensure_dir(self) -> None:
-        if not self.directory.is_dir():
-            self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        """The queue's directory, and every parent it has to create, owner-only."""
+        if self.directory.is_dir():
+            return
+        missing = []
+        path = self.directory
+        while not os.path.lexists(path) and path != path.parent:
+            missing.append(path)
+            path = path.parent
+        for path in reversed(missing):
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError:
+                continue  # made meanwhile by another process; a file here fails the write
             if os.name != "nt":
-                os.chmod(self.directory, 0o700)
+                os.chmod(path, 0o700)
 
     def _write(self, path: Path, data: bytes, *, sync: bool = True) -> None:
         """``data`` to ``path`` atomically: a dot-prefixed temp file, then a rename."""
