@@ -761,6 +761,35 @@ def test_codex_ingest_stores_a_label_never_a_path(ident, conn, db_url, project, 
     assert _stored_projects(conn, sid) == ["Alpha"]
 
 
+def test_messages_ingest_stores_the_client_as_platform_and_a_label(ident, conn, db_url):
+    """A messages-format client: its name is the platform and the span-id prefix, and
+    without a project the body's cwd labels the turn. A re-post of the batch is a no-op."""
+    sid = ident.sid()
+    tag = uuid.uuid4().hex
+    body = {
+        "format": "messages",
+        "client": "hermes",
+        "session_id": sid,
+        "cwd": _WIN_ALPHA,
+        "records": [
+            {"role": "user", "id": f"u-{tag}", "content": f"q {tag}"},
+            {"role": "assistant", "id": f"a-{tag}", "content": f"a {tag}"},
+        ],
+    }
+
+    r = _post(db_url, body)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["ingested"] == 1
+    row = conn.execute(
+        "SELECT platform, project, span_id, source, metadata->>'client' "
+        "FROM episodes WHERE session_id = %s",
+        (sid,),
+    ).fetchone()
+    assert tuple(row) == ("hermes", "Alpha", f"hermes:a-{tag}", "messages", "hermes")
+    assert _post(db_url, body).json()["ingested"] == 0
+
+
 def test_a_batch_spanning_two_projects_labels_each_turn_from_its_own_cwd(ident, conn, db_url):
     """A session that moved between repositories: the client sends each cwd's label
     (cwd_projects) and the route labels every turn from its own cwd, path-cleaned."""
