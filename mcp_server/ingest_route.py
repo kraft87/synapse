@@ -43,13 +43,17 @@ def register(
 
         Any client that runs the real ``claude`` CLI fires this same hook.
         Body: {"records": [...], "project": optional, "source": optional,
-        "format": optional ("claude_code" default | "codex"), "session_id": optional}.
+        "format": optional ("claude_code" default | "codex" | "messages"), "session_id": optional}.
 
         ``format: "codex"`` parses the records as Codex CLI rollout lines via
         ``CodexRolloutParser`` instead. A pushed tail usually lacks the rollout's
         session_meta line, so the Codex hook passes ``session_id`` (from the
         rollout filename) as a fallback identity hint. Everything downstream —
         span_id dedup, private sessions, contamination guards — is shared.
+
+        ``format: "messages"`` takes OpenAI-style chat messages from a client with no
+        transcript file (``MessagesParser``). It requires ``client`` (the platform label,
+        see ``valid_client``) and ``session_id``; ``cwd`` and ``model`` are optional.
 
         Provenance (schema 057): each stored turn is stamped with the surface the BEARER
         resolves to, which is what lets a restricted device read its own uploads back.
@@ -82,8 +86,18 @@ def register(
         }
         record_format = body.get("format") or "claude_code"
         session_id_hint = body.get("session_id")
-        if record_format not in ("claude_code", "codex"):
+        if record_format not in ("claude_code", "codex", "messages"):
             return err(f"unknown format {record_format!r}", 400)
+        client = body.get("client")
+        if record_format == "messages":
+            from ingestion.messages_client import CLIENT_PATTERN, RESERVED_CLIENTS, valid_client
+
+            if not valid_client(client):
+                if isinstance(client, str) and client in RESERVED_CLIENTS:
+                    return err(f"client {client!r} is reserved for a built-in parser", 400)
+                return err(f"format 'messages' needs a 'client' matching {CLIENT_PATTERN}", 400)
+            if not isinstance(session_id_hint, str) or not session_id_hint.strip():
+                return err("format 'messages' needs a non-empty 'session_id' string", 400)
 
         def _work() -> tuple[int, int]:
             import psycopg
@@ -100,6 +114,18 @@ def register(
 
                 episodes = CodexRolloutParser().parse_records(
                     records, source_label, project_override, session_id_hint=session_id_hint
+                )
+            elif record_format == "messages":
+                from ingestion.messages_client import MessagesParser
+
+                episodes = MessagesParser().parse_records(
+                    records,
+                    source_label,
+                    project_override,
+                    session_id=session_id_hint,
+                    client=client,
+                    cwd=body.get("cwd"),
+                    model=body.get("model"),
                 )
             else:
                 episodes = JSONLParser().parse_records(
