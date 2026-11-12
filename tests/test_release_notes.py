@@ -577,6 +577,19 @@ def test_last_client_commit_skips_server_only_commits(repo):
     assert rn.last_client_commit(repo.path, repo.v100) == repo.v100
 
 
+@needs_git
+def test_last_client_commit_stays_on_mains_own_line(repo):
+    """A PR merged with a merge commit: the tag goes on the merge, not on the branch
+    commit that never stood alone on main."""
+    repo.git("checkout", "-q", "-b", "topic", repo.v101)
+    inside = repo.commit({**_client("1.0.2"), "plugin/x.py": "x\n"}, "topic")
+    repo.git("checkout", "-q", "main")
+    repo.git("merge", "-q", "--no-ff", "-m", "merge topic", "topic")
+    merge = repo.git("rev-parse", "HEAD")
+    after = repo.commit({"mcp_server/app.py": "app = 9\n"}, "server after the merge")
+    assert rn.last_client_commit(repo.path, after) == merge != inside
+
+
 # ---------------------------------------------------------------------------
 # check-pr
 # ---------------------------------------------------------------------------

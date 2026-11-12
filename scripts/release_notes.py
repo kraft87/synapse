@@ -217,10 +217,13 @@ def client_changes(repo: Path, old: str, new: str) -> list[str]:
 
 
 def last_client_commit(repo: Path, commit: str) -> str:
-    """The newest commit at or before ``commit`` that changed the client, so a release
-    made later (by hand) still points where its client first appeared. ``commit`` itself
-    when git's answer does not carry exactly the same client."""
-    found = _git(repo, "log", "-1", "--format=%H", commit, "--", *CLIENT_TREES).stdout.strip()
+    """The newest commit on ``commit``'s first-parent line (main's own history, never a
+    commit inside a merged branch) that changed the client, so a release made later (by
+    hand) still points where its client landed. ``commit`` itself when git's answer does
+    not carry exactly the same client."""
+    found = _git(
+        repo, "log", "-1", "--first-parent", "--format=%H", commit, "--", *CLIENT_TREES
+    ).stdout.strip()
     if found and not client_changes(repo, found, commit):
         return found
     return commit
