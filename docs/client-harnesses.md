@@ -53,8 +53,9 @@ server-only change leaves the version alone. The rules live in `scripts/release_
 - **A missed release** (a failed run, or a version from before the workflow): run the
   Release workflow on `main` by hand (Actions > Release > Run workflow, or
   `gh workflow run release.yml --ref main`). It releases the version main carries now and
-  exits green when that one is already out. `python3 scripts/release_notes.py notes X.Y.Z`
-  prints a version's notes.
+  exits green when that one is already out. A version main no longer carries is released
+  by hand: `gh release create vX.Y.Z --target <commit> --title vX.Y.Z --notes-file
+  <(python3 scripts/release_notes.py notes X.Y.Z)`.
 
 ## Rules for the core
 
