@@ -25,7 +25,7 @@ def _object(reply: Any, route: str) -> dict[str, Any]:
 class Client:
     """One server, one credential: ``settings.base_url`` with ``settings.token``.
 
-    ``user_agent`` names the harness and version (``synapse-hermes/0.23.1``). Send a real
+    ``user_agent`` names the harness and version (``synapse-client/0.24.0 hermes``). Send a real
     one: Cloudflare in front of a hosted server refuses urllib's default.
     """
 
