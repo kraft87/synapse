@@ -3,7 +3,7 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
-## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.4)
+## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.5)
 
 **What changed**
 
@@ -32,19 +32,26 @@ changed, what to do on each machine, what was proven, and what is still open.
 **On each machine**
 
 1. Nothing to migrate and no setting to change. The server part takes effect with the image.
-2. `synapse update` for plugin 0.24.4; until then a client sends no `self_since` and
+2. `synapse update` for plugin 0.24.5; until then a client sends no `self_since` and
    behaves as before. A server older than this release rejects the argument, so the client
    must not get ahead of its server; `synapse update` cannot, because the installer serves
    the client that matches the server it runs on.
 
 **Proven**
 
-- With no cut the SQL and its parameters are what they were, and the standard recall bench
-  (489 questions) matches the previous release within run-to-run noise.
+- With no cut the SQL and its parameters are what they were. On the standard recall bench
+  (491 questions, no cut sent) the result is identical to main's in 475, where main run
+  twice twenty minutes apart agrees with itself in 465, and every gold answer one finds
+  the other finds.
 - Replayed on 48 real recalls made after a compaction: the old path served none of the
-  session's own turns; with the cut, 28 calls served some. A pairwise judge preferred the
-  new results in 17 of the 36 calls whose results changed and the old in 12, with 7 ties;
-  the 17 are questions about the session's own earlier work.
+  session's own turns; with the cut, 20 calls served one or two, and 21 gained facts from
+  earlier in the session. A pairwise judge preferred the new results in 20 of the 30 calls
+  whose results changed and the old in 3, with 7 ties. (Before the earlier turns had a lane
+  of their own, when they competed for the same places, it was 17 and 12.)
+- In 45 of those 48 calls the other sessions' turns were identical with and without the
+  cut. The 3 that differed are the reranker's own variation, which repeats of the old path
+  alone show too: a score moves by about 0.001 between two identical calls, and two
+  passages with the same text come back in either order.
 - With the cut, both tools serve the same other-session turns, in the same order and with
   the same scores, as without it: with the reranker on, degraded, and on the score-cutoff
   path, including a pool where more own turns than the passage window holds rank first.
