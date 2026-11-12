@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import io
 import json
 import sys
 import threading
@@ -492,6 +493,183 @@ def test_hooks_json_is_unchanged():
     assert hashlib.sha256(raw).hexdigest() == (
         "b0a2f7e92bf1903f6bc907695df50a2ded3328651c5c3dc245db1d02e7e0df50"
     )
+
+
+# ---------------------------------------------------------------------------
+# Session start: board_block.py and preferences_block.py print what the core builds
+# ---------------------------------------------------------------------------
+
+_NOT_ENROLLED = (
+    "[Synapse — this machine is not enrolled]\n"
+    "No memory is being served here: since schema 054 every machine authenticates with its "
+    "own device token.\n"
+    "Run `! synapse-login` in this session (or `synapse-login` in a terminal) and approve the "
+    "sign-in on any device."
+)
+_RESTRICTED = (
+    "[Synapse — this machine is served nothing]\n"
+    "The server answered, but this caller is `restricted` with no projects: it holds no "
+    "device credential of its own (schema 054), so the board and recall come back empty.\n"
+    "Fix it either way:\n"
+    "  - Server with a sign-in configured: run `! synapse-login` in this session.\n"
+    "  - Local server, no sign-in: run\n"
+    '        docker compose exec mcp-server synapse-admin bootstrap "<label>"\n'
+    "    on the server, then run `synapse login --token` here (or paste it into\n"
+    "    /plugin > synapse > Synapse token)."
+)
+_BOARD = "[Synapse board]\n- a note"
+
+
+def _session_start(text: str, notice: str = "") -> str:
+    """The SessionStart envelope Claude Code reads, as the hooks print it."""
+    if not text:
+        return ""
+    out = '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": '
+    out += json.dumps(text) + "}"
+    if notice:
+        out += ', "systemMessage": ' + json.dumps(notice)
+    return out + "}\n"
+
+
+def _home(scratch: Path, server: _Server, *, enrolled: bool) -> None:
+    data: dict[str, Any] = {"url": server.url}
+    if enrolled:
+        data |= {"token": _DEVICE, "device": _record(server=server.url)}
+    _write_config(scratch, data)
+
+
+def _run_hook(monkeypatch, capsys, name: str, stdin: str = "{}") -> str:
+    hook = load_script(name)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(stdin))
+    hook.main()
+    return capsys.readouterr().out
+
+
+_BOARD_REPLIES: dict[str, tuple[int, Any, bool, str]] = {
+    # name -> (status, reply, enrolled, the context printed)
+    "normal": (200, {"status": "ok", "text": _BOARD, "trust": "full"}, True, _BOARD),
+    "401-not-enrolled": (401, {"detail": "no"}, False, _NOT_ENROLLED),
+    "401-enrolled": (401, {"detail": "no"}, True, ""),
+    "restricted-without-a-device-token": (
+        200,
+        {"status": "ok", "text": _BOARD, "trust": "restricted"},
+        False,
+        _RESTRICTED + "\n\n" + _BOARD,
+    ),
+    "restricted-with-a-device-token": (
+        200,
+        {"status": "ok", "text": _BOARD, "trust": "restricted"},
+        True,
+        _BOARD,
+    ),
+    "restricted-empty": (
+        200,
+        {"status": "ok", "text": "", "trust": "restricted"},
+        False,
+        _RESTRICTED,
+    ),
+    "500": (500, {"detail": "boom"}, True, ""),
+    "not-ok": (200, {"status": "error", "text": _BOARD}, True, ""),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_BOARD_REPLIES))
+def test_board_block_prints_the_board(scratch, monkeypatch, capsys, server, case):
+    status, reply, enrolled, printed = _BOARD_REPLIES[case]
+    _home(scratch, server, enrolled=enrolled)
+    server.answer("/context", reply, status=status)
+    assert _run_hook(monkeypatch, capsys, "board_block") == _session_start(printed)
+    assert [r["path"] for r in server.seen] == ["/context?project=" + scratch.parent.name]
+
+
+def test_board_block_envelope_bytes(scratch, monkeypatch, capsys, server):
+    _home(scratch, server, enrolled=True)
+    server.answer("/context", {"status": "ok", "text": "[board]"})
+    out = _run_hook(monkeypatch, capsys, "board_block", json.dumps({"cwd": str(scratch)}))
+    assert out == (
+        '{"hookSpecificOutput": {"hookEventName": "SessionStart", '
+        '"additionalContext": "[board]"}}\n'
+    )
+    assert server.seen[0]["headers"]["authorization"] == f"Bearer {_DEVICE}"
+    assert server.seen[0]["headers"]["user-agent"] == _user_agent()
+
+
+@pytest.mark.parametrize("status", [200, 500])
+def test_board_block_leads_with_the_credential_notice(scratch, monkeypatch, capsys, server, status):
+    """The notice is local: it is printed, to the user too, whatever the server says."""
+    _home(scratch, server, enrolled=True)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)
+    server.answer("/context", {"status": "ok", "text": _BOARD}, status=status)
+    out = _run_hook(monkeypatch, capsys, "board_block")
+    text = _NOTICE_ENV_SHELL + ("\n\n" + _BOARD if status == 200 else "")
+    assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
+
+
+@pytest.mark.parametrize("value", ["0", " 0"])
+def test_board_block_kill_switch(scratch, monkeypatch, capsys, server, value):
+    """SYNAPSE_BOARD=0 sends nothing; the credential notice still shows. Only exactly "0"
+    switches it off: " 0" does not, as it never has."""
+    _home(scratch, server, enrolled=True)
+    monkeypatch.setenv("SYNAPSE_BOARD", value)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)
+    server.answer("/context", {"status": "ok", "text": _BOARD})
+    out = _run_hook(monkeypatch, capsys, "board_block")
+    if value == "0":
+        assert out == _session_start(_NOTICE_ENV_SHELL, notice=_NOTICE_ENV_SHELL)
+        assert server.seen == []
+    else:
+        text = _NOTICE_ENV_SHELL + "\n\n" + _BOARD
+        assert out == _session_start(text, notice=_NOTICE_ENV_SHELL)
+
+
+def test_board_block_with_the_server_down_prints_nothing(scratch, monkeypatch, capsys):
+    _write_config(scratch, {"url": "http://127.0.0.1:9", "token": _DEVICE})
+    assert _run_hook(monkeypatch, capsys, "board_block") == ""
+
+
+_PREFERENCES = {
+    "items": [
+        {"pref": "Terse answers", "polarity": "like"},
+        {"pref": "Emoji", "polarity": "dislike"},
+        {"pref": "Full-time roles only", "polarity": "rule"},
+        {"pref": "", "polarity": "like"},
+        {"pref": "Plain text", "polarity": "neutral"},
+    ]
+}
+
+
+def test_preferences_block_prints_the_top_preferences(scratch, monkeypatch, capsys, server):
+    _home(scratch, server, enrolled=True)
+    server.answer("/preferences/top", _PREFERENCES)
+    assert _run_hook(monkeypatch, capsys, "preferences_block") == (
+        '{"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": '
+        '"[Synapse preferences]\\n  - (likes) Terse answers\\n  - (dislikes) Emoji\\n'
+        '  - (rule) Full-time roles only\\n  - (neutral) Plain text"}}\n'
+    )
+    assert [r["path"] for r in server.seen] == ["/preferences/top?limit=8"]
+    assert server.seen[0]["headers"]["authorization"] == f"Bearer {_DEVICE}"
+
+
+@pytest.mark.parametrize(
+    ("status", "reply"),
+    [(401, {"detail": "no"}), (500, {"detail": "boom"}), (200, {"items": []}), (200, {})],
+    ids=["401", "500", "none", "no-items"],
+)
+def test_preferences_block_prints_nothing_without_preferences(
+    scratch, monkeypatch, capsys, server, status, reply
+):
+    _home(scratch, server, enrolled=False)
+    server.answer("/preferences/top", reply, status=status)
+    assert _run_hook(monkeypatch, capsys, "preferences_block") == ""
+    assert len(server.seen) == 1
+
+
+def test_preferences_block_kill_switch(scratch, monkeypatch, capsys, server):
+    _home(scratch, server, enrolled=True)
+    monkeypatch.setenv("SYNAPSE_PREFS_BLOCK", "0")
+    server.answer("/preferences/top", _PREFERENCES)
+    assert _run_hook(monkeypatch, capsys, "preferences_block") == ""
+    assert server.seen == []
 
 
 # ---------------------------------------------------------------------------

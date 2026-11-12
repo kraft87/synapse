@@ -127,23 +127,27 @@ def board_parts(
     timeout: float = 10,
     *,
     login_hint: str = DEFAULT_LOGIN_HINT,
+    not_enrolled: str | None = None,
+    restricted: str | None = None,
 ) -> list[str]:
     """The board for ``project``, plus the enrollment explainer when one applies.
 
     A 401 for an unenrolled machine becomes ``not_enrolled_block``; any other HTTP error
     status yields nothing. A 200 that says ``restricted`` to an unenrolled machine gets
-    ``restricted_block`` ahead of the board text. RAISES what the client raises for an
+    ``restricted_block`` ahead of the board text. ``not_enrolled`` and ``restricted``,
+    when given, are those explainers already worded by the harness, used as they are in
+    place of the ones rendered from ``login_hint``. RAISES what the client raises for an
     unreachable server or a malformed reply (``board_part`` catches)."""
     parts: list[str] = []
     try:
         reply = client.context(project, timeout=timeout)
     except urllib.error.HTTPError as err:
         if err.code == 401 and not settings.enrolled:
-            parts.append(not_enrolled_block(login_hint))
+            parts.append(not_enrolled_block(login_hint) if not_enrolled is None else not_enrolled)
         return parts
     ok = reply.get("status") == "ok"
     if ok and reply.get("trust") == "restricted" and not settings.enrolled:
-        parts.append(restricted_block(login_hint))
+        parts.append(restricted_block(login_hint) if restricted is None else restricted)
     text = reply.get("text") if ok else None
     if text:
         parts.append(str(text))
@@ -185,13 +189,25 @@ def board_part(
     *,
     timeout: float = 10,
     login_hint: str = DEFAULT_LOGIN_HINT,
+    not_enrolled: str | None = None,
+    restricted: str | None = None,
 ) -> str:
-    """``board_parts`` joined by blank lines; "" when ``SYNAPSE_BOARD`` is "0" or
-    anything fails. Never raises."""
+    """``board_parts`` joined by blank lines (``login_hint``, ``not_enrolled`` and
+    ``restricted`` as there); "" when ``SYNAPSE_BOARD`` is "0" or anything fails. Never
+    raises."""
     if settings.flag("SYNAPSE_BOARD", "1") == "0":
         return ""
     try:
-        return "\n\n".join(board_parts(client, project, settings, timeout, login_hint=login_hint))
+        parts = board_parts(
+            client,
+            project,
+            settings,
+            timeout,
+            login_hint=login_hint,
+            not_enrolled=not_enrolled,
+            restricted=restricted,
+        )
+        return "\n\n".join(parts)
     except Exception:
         return ""
 

@@ -152,6 +152,15 @@ def _plugin_sources(*, resolving: bool = False) -> list[tuple[str, dict]]:
     return [("plugin_option", exported), ("plugin_config", saved), ("settings_falsy", falsy)]
 
 
+def live_settings() -> Settings:
+    """``SETTINGS`` with the sources its flags read as they are now (see ``_cfg``); the
+    URL, the token and the enrollment stay as resolved at import. What a hook hands the
+    client core."""
+    return SETTINGS.with_sources(
+        environ=os.environ, config=_HOME, extra_candidates=_plugin_sources()
+    )
+
+
 def _cfg(key: str, default: str = "") -> str:
     # Resolution order, env optional everywhere (Settings.flag): explicit env var, then
     # ~/.synapse/config.json (what `synapse login` / `synapse config` write, read by every
@@ -161,9 +170,7 @@ def _cfg(key: str, default: str = "") -> str:
     # stale install-prompt value must not beat what the user set since with `synapse
     # config`. Read live: the environment as it is now, and this process's view of
     # config.json, which set_home_values keeps in step with its own writes.
-    return SETTINGS.with_sources(
-        environ=os.environ, config=_HOME, extra_candidates=_plugin_sources()
-    ).flag(key, default)
+    return live_settings().flag(key, default)
 
 
 def set_home_values(changes: dict) -> dict:
