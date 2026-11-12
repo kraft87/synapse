@@ -74,14 +74,14 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any
 
-# The URL and bearer come from the shared resolver so this hook, the board and the MCP
-# header helper always agree (env, then ~/.synapse/config.json, then the Claude plugin's
-# saved options): on an enrolled machine the saved device token beats a stale env
-# SYNAPSE_INGEST_TOKEN (common._resolve_token). Stdlib-only, like this hook.
+# The URL and bearer come from the client core through common.py, so this hook, the
+# board and the MCP header helper always agree (env, then ~/.synapse/config.json, then
+# the Claude plugin's saved options): on an enrolled machine the saved device token beats
+# a stale env SYNAPSE_INGEST_TOKEN (synapse_client.credentials). Stdlib-only, like this
+# hook.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 # The failure bookkeeping is the Claude plugin's (synapse_ingest_retry), from this
 # checkout. Appended, not prepended, so nothing there can shadow a module this hook
@@ -89,7 +89,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
 import synapse_ingest_retry as retry
 import synapse_project
-from common import INGEST_URL, TOKEN, _urlopen
+from common import INGEST_URL, TOKEN, USER_AGENT
+from synapse_client.http import Transport
 from synapse_filelock import lock_exclusive
 
 
@@ -285,17 +286,11 @@ def _post(
         # Resolved the way every client labels a project (synapse_project). Without it
         # the server labels the turns from the rollout's cwd: just the folder's name.
         body["project"] = project
-    headers = {"Content-Type": "application/json", "User-Agent": "synapse-codex-hook/0.1"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    req = urllib.request.Request(
-        INGEST_URL, data=json.dumps(body).encode(), method="POST", headers=headers
-    )
-    # Through the core (common._urlopen): the bearer does not follow a redirect to
-    # another origin.
-    with _urlopen(req, timeout=TIMEOUT) as r:
-        resp: dict[str, Any] = json.loads(r.read() or b"{}")
-        return resp
+    # Through the core's Transport: the bearer goes to INGEST_URL's origin and does not
+    # follow a redirect to another.
+    transport = Transport("", TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
+    resp: dict[str, Any] = transport.post_json(INGEST_URL, body, timeout=TIMEOUT)
+    return resp
 
 
 def _ship(payload: dict[str, Any]) -> tuple[int, int]:

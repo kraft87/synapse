@@ -199,7 +199,6 @@ class Transport:
         self._origins: frozenset[Origin] = frozenset(
             origin(url) for url in (self.base_url, *token_origins) if url
         )
-        self._opener = urllib.request.build_opener(_SameOriginAuth())
 
     def __repr__(self) -> str:
         return f"Transport({self.base_url!r}, user_agent={self.user_agent!r})"
@@ -231,7 +230,9 @@ class Transport:
         req = urllib.request.Request(
             url, data=body, method=method.upper(), headers=self._headers(url, headers)
         )
-        return self._opener.open(req, timeout=self.default_timeout if timeout is None else timeout)
+        # Through this module's ``urlopen``, the one place a request is opened: the hook
+        # scripts' own helpers use it too, so a test that fakes the network patches one name.
+        return urlopen(req, timeout=self.default_timeout if timeout is None else timeout)
 
     def request_json(
         self,
