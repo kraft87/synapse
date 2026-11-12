@@ -269,9 +269,9 @@ The core ports the hooks' behaviour and wording, with these differences:
   zero; the count alone does not raise the warning. A harness whose process may exit
   mid-request (Hermes) queues each payload before its own send, `put(..., sending=s)`,
   and removes it once delivered or `keep`s it as waiting when the send fails. No drain
-  takes such a payload, nor does the cap count it, until `s` seconds have passed; after
-  that its sender is taken for dead and a drain sends it, at most once more than needed,
-  which the server's span-id dedup absorbs.
+  takes such a payload, and neither the cap nor the warning counts it, until `s` seconds
+  have passed; after that its sender is taken for dead and a drain sends it, at most
+  once more than needed, which the server's span-id dedup absorbs.
 
 ## Adding a harness
 

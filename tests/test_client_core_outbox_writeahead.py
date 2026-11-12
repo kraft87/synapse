@@ -3,9 +3,10 @@
 ``keep`` when the send failed.
 
 Such a payload must outlive its process, not the machine, so it is not synced; until its
-deadline no drain takes it and the cap does not count it, so a healthy upload is sent
-once and never drops an older payload. Past the deadline its sender died or hung, and a
-drain sends it. Temp directories only.
+deadline no drain takes it, and neither the cap nor the session-start warning counts it,
+so a healthy upload is sent once, never drops an older payload and never reads as a
+failure. Past the deadline its sender died or hung, and a drain sends it. Temp
+directories only.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import pytest
 from tests.helpers.client_core import use_core
 
 use_core()
-from synapse_client.outbox import Outbox  # noqa: E402
+from synapse_client.outbox import WARN_AFTER_FAILS, Outbox, failure_warning  # noqa: E402
 
 _PAYLOAD = {"format": "messages", "session_id": "s-1", "records": [{"role": "user"}]}
 
@@ -117,3 +118,22 @@ def test_a_payload_that_is_not_json_raises_and_leaves_nothing(tmp_path):
     with pytest.raises(TypeError):
         box.put({"x": object()}, sending=60)
     assert box.pending() == 0
+
+
+def test_payloads_still_being_sent_raise_no_upload_warning(tmp_path):
+    box = Outbox(tmp_path / "outbox")
+    for n in range(WARN_AFTER_FAILS):
+        box.put({"n": n}, sending=60)
+    assert box.pending() == WARN_AFTER_FAILS
+    assert failure_warning(box) is None  # sessions uploading at once: nothing has failed
+    box.put({"n": "waiting"}, reason="HTTP 503 Service Unavailable")
+    assert failure_warning(box) is None  # one waiting, as before
+
+
+def test_payloads_past_their_deadline_count_as_failed(tmp_path):
+    box = Outbox(tmp_path / "outbox")
+    for n in range(WARN_AFTER_FAILS):
+        box.put({"n": n}, sending=60)
+    line = failure_warning(box, now=time.time() + 61)
+    assert line is not None and line.startswith("Synapse uploads have been failing since ")
+    assert "(unknown error)" in line

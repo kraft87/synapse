@@ -17,8 +17,9 @@ there.
 
 A caller may also queue a payload for its own send (``put(..., sending=seconds)``), so
 that a process that exits mid-request leaves it queued. It is written as
-``<name>.<deadline_ns>.sending``, which no drain takes before that deadline: its caller
-then ``remove``s it once delivered, or ``keep``s it as waiting when the send failed.
+``<name>.<deadline_ns>.sending``, which no drain takes, and the session-start warning
+does not count, before that deadline: its caller then ``remove``s it once delivered, or
+``keep``s it as waiting when the send failed.
 Past the deadline its sender died or hung, and a drain puts it back as waiting; one
 still sending then sends it once more, which the server's dedup absorbs.
 
@@ -100,6 +101,12 @@ def _stamp(name: str) -> int | None:
     return int(head) if head.isdigit() else None
 
 
+def _overdue(name: str, now_ns: int) -> bool:
+    """Whether a payload being sent is past its deadline: its sender died or hung."""
+    deadline = name[: -len(_SENDING)].rpartition(".")[2]
+    return name.endswith(_SENDING) and deadline.isdigit() and now_ns > int(deadline)
+
+
 class Outbox:
     """The queue in ``directory`` (created on the first ``put``).
 
@@ -145,6 +152,16 @@ class Outbox:
         """Payloads not yet delivered: waiting, plus those a drain or their own sender
         holds right now."""
         return sum(1 for n in self._names() if n.endswith((_SUFFIX, _CLAIM, _SENDING)))
+
+    def _stuck(self, now_ns: int) -> list[int]:
+        """The enqueue times of the payloads that have not gone up: waiting, held by a
+        drain, or past their send's deadline. One still within its send has not failed."""
+        return [
+            stamp
+            for n in self._names()
+            if (n.endswith((_SUFFIX, _CLAIM)) or _overdue(n, now_ns))
+            and (stamp := _stamp(n)) is not None
+        ]
 
     def oldest_age(self, now: float | None = None) -> float | None:
         """Seconds since the oldest undelivered payload was queued; None when empty."""
@@ -303,13 +320,11 @@ class Outbox:
                         os.rename(path, self.directory / base)
                     except OSError:
                         pass
-            elif name.endswith(_SENDING) and not name.startswith("."):
-                base, _, deadline = name[: -len(_SENDING)].rpartition(".")
-                if deadline.isdigit() and now_ns > int(deadline):
-                    try:
-                        os.rename(path, self.directory / base)
-                    except OSError:
-                        pass
+            elif _overdue(name, now_ns) and not name.startswith("."):
+                try:
+                    os.rename(path, self.directory / name[: -len(_SENDING)].rpartition(".")[0])
+                except OSError:
+                    pass
             elif name.startswith(".") and name.endswith(".tmp"):
                 try:
                     if now_ns - path.stat().st_mtime_ns > limit:
@@ -403,13 +418,14 @@ def failure_warning(outbox: Outbox, now: float | None = None) -> str | None:
     Shown when at least WARN_AFTER_FAILS payloads are waiting, or the oldest has waited
     WARN_AFTER_HOURS; the same sentence as synapse_ingest_retry.failure_warning, dated
     from the oldest waiting payload, and one more naming the payloads dropped (for the
-    cap or as rejected) when there are any. Never raises."""
+    cap or as rejected) when there are any. A payload still within its own send is not
+    counted: nothing has failed. Never raises."""
     try:
         now = time.time() if now is None else now
-        count = outbox.pending()
-        age = outbox.oldest_age(now)
-        if not count or age is None:
+        stamps = outbox._stuck(int(now * 1e9))
+        if not stamps:
             return None
+        count, age = len(stamps), max(0.0, now - min(stamps) / 1e9)
         if count < WARN_AFTER_FAILS and age < WARN_AFTER_HOURS * 3600:
             return None
         when = datetime.fromtimestamp(now - age).strftime("%Y-%m-%d %H:%M")

@@ -38,6 +38,7 @@ changed, what to do on each machine, what was proven, and what is still open.
     server's span-id dedup absorbs.
   - This holds for every session and process sharing a home's outbox. It adds about
     0.2 ms per batch on Hermes's background worker.
+  - The session-start upload warning does not count a batch still within its send.
 - **The outbox's directories are owner-only**, every parent it creates included (POSIX).
 - **`synapse install hermes`** reads `memory.provider` with `hermes config get --json`.
   - A provider named "null" now counts as another external provider, not as Hermes's
@@ -56,7 +57,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 
 **Proven**
 
-- 151 new tests in six new files: `test_hermes_gateway_sessions.py` (the rule, over a
+- 153 new tests in six new files: `test_hermes_gateway_sessions.py` (the rule, over a
   `state.db` built like Hermes's), `test_hermes_failed_turns.py`,
   `test_hermes_inflight_upload.py` (a child process killed mid-request, sessions
   sharing an outbox), `test_client_core_outbox_writeahead.py`,
@@ -87,8 +88,6 @@ changed, what to do on each machine, what was proven, and what is still open.
   whose chat it is.
 - Not driven live in this change: `hermes --tui` over the daemon (it reaches the
   provider as `hermes chat` does), Desktop and ACP.
-- A session-start upload warning counts batches in flight as waiting. With several
-  uploads in flight at once, it can warn about one that is still going.
 - Hermes keeps the nudge in its stored transcript (`api_content`). The upload strips
   it; the transcript is Hermes's.
 
