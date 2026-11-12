@@ -2,13 +2,15 @@
 # mypy: ignore-errors
 """Codex ``UserPromptSubmit`` hook — per-prompt reminder to use Synapse.
 
-Port of plugin/scripts/recall_nudge.py: standing instructions at the top of a
-long context get ignored under pressure; a static ~45-token directive injected
-WITH each prompt rides recency and keeps recall/remember use consistent. Zero
-latency, zero API calls — the model still decides relevance.
+The client core's prompt nudge (synapse_client.context.prompt_nudge), as the Claude
+plugin's recall_nudge.py prints it: a wall-clock line, so remember() and timeline
+references know the moment, and a static ~45-token directive. Standing instructions at
+the top of a long context get ignored under pressure; one injected WITH each prompt
+rides recency and keeps recall/remember use consistent. Zero latency, zero API calls —
+the model still decides relevance. The tool names are the ones Codex's model sees.
 
 Codex reads the JSON envelope, not plain stdout.
-Kill switch: SYNAPSE_RECALL_NUDGE=0.
+Kill switches, each "0" to disable: SYNAPSE_PROMPT_TIMESTAMP, SYNAPSE_RECALL_NUDGE.
 """
 
 from __future__ import annotations
@@ -18,26 +20,22 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
-from common import _cfg
-
-_NUDGE = (
-    "[Synapse] IMPORTANT: the user's cross-session history is searchable — assume "
-    "it has context on any past work, project, device, or person they name. BEFORE "
-    "answering anything that references the past: synapse recall (skip only if the "
-    "answer is already in this conversation). About to say 'noted' or 'I'll "
-    "remember'? Call synapse remember FIRST, then reply."
-)
+from common import live_settings
+from synapse_client import context
 
 
 def main() -> None:
-    if _cfg("SYNAPSE_RECALL_NUDGE", "1") == "0":
+    text = context.prompt_nudge(
+        live_settings(), recall="synapse recall", remember="synapse remember"
+    )
+    if not text:
         return
     print(
         json.dumps(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "UserPromptSubmit",
-                    "additionalContext": _NUDGE,
+                    "additionalContext": text,
                 },
             }
         )

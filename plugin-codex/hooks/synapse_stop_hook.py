@@ -13,7 +13,7 @@ Design constraints, inherited from the Claude Code hook:
   * NEVER block or fail the turn. The HTTP work runs in a DETACHED child
     (start_new_session) and the parent exits 0 immediately — belt and
     suspenders on top of Codex's async hook support.
-  * No third-party deps — urllib only.
+  * No third-party deps — the standard library and the client core only.
   * Ship a byte-cursor tail, not the whole file. Cursor state lives in
     ~/.synapse/codex_cursors.json keyed by rollout path and advances only
     after a successful POST, so a failed push retries next turn. A tail that
@@ -63,6 +63,8 @@ Env:
   SYNAPSE_CODEX_CATCHUP_MAX   default 20 (rollouts per sweep; the rest defer to
                               the next session start, logged)
   SYNAPSE_PRIVATE_DIR         private markers    (default ~/.synapse/private)
+  SYNAPSE_PRIVATE_TTL_HOURS   default 12 (an older private marker no longer
+                              counts and is removed)
   SYNAPSE_CODEX_HOOK_LOG      log file           (default /tmp/synapse-codex-hook.log)
 """
 
@@ -74,14 +76,14 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any
 
-# The URL and bearer come from the shared resolver so this hook, the board and the MCP
-# header helper always agree (env, then ~/.synapse/config.json, then the Claude plugin's
-# saved options): on an enrolled machine the saved device token beats a stale env
-# SYNAPSE_INGEST_TOKEN (common._resolve_token). Stdlib-only, like this hook.
+# The URL and bearer come from the client core through common.py, so this hook, the
+# board and the MCP header helper always agree (env, then ~/.synapse/config.json, then
+# the Claude plugin's saved options): on an enrolled machine the saved device token beats
+# a stale env SYNAPSE_INGEST_TOKEN (synapse_client.credentials). Stdlib-only, like this
+# hook.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 # The failure bookkeeping is the Claude plugin's (synapse_ingest_retry), from this
 # checkout. Appended, not prepended, so nothing there can shadow a module this hook
@@ -89,7 +91,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
 import synapse_ingest_retry as retry
 import synapse_project
-from common import INGEST_URL, TOKEN, _urlopen
+from common import INGEST_URL, SETTINGS, TOKEN, USER_AGENT
+from synapse_client import private
+from synapse_client.http import Transport
 from synapse_filelock import lock_exclusive
 
 
@@ -107,7 +111,6 @@ LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log
 CURSORS_PATH = Path(
     os.path.expanduser(os.environ.get("SYNAPSE_CODEX_CURSORS", "~/.synapse/codex_cursors.json"))
 )
-PRIVATE_DIR = Path(os.path.expanduser(os.environ.get("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
 SESSIONS_ROOT = Path(os.path.expanduser("~/.codex/sessions"))
 CATCHUP_DAYS = _env_number("SYNAPSE_CODEX_CATCHUP_DAYS", "3")
 CATCHUP_MAX_FILES = _env_number("SYNAPSE_CODEX_CATCHUP_MAX", "20", int)
@@ -233,18 +236,6 @@ def failure_warning(now: float | None = None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _plain_name(session_id: str) -> bool:
-    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
-    core's rule (plugin/synapse_client/private.py), copied: the id is joined into the
-    private marker's path, and ``../x`` would test a file outside PRIVATE_DIR."""
-    seps = {"/", "\\", os.sep, os.altsep or "/"}
-    return (
-        session_id not in (".", "..")
-        and "\0" not in session_id
-        and not any(sep in session_id for sep in seps)
-    )
-
-
 def _find_rollout(session_id: str) -> Path | None:
     matches = sorted(SESSIONS_ROOT.rglob(f"rollout-*-{session_id}.jsonl"))
     return matches[-1] if matches else None
@@ -285,17 +276,11 @@ def _post(
         # Resolved the way every client labels a project (synapse_project). Without it
         # the server labels the turns from the rollout's cwd: just the folder's name.
         body["project"] = project
-    headers = {"Content-Type": "application/json", "User-Agent": "synapse-codex-hook/0.1"}
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    req = urllib.request.Request(
-        INGEST_URL, data=json.dumps(body).encode(), method="POST", headers=headers
-    )
-    # Through the core (common._urlopen): the bearer does not follow a redirect to
-    # another origin.
-    with _urlopen(req, timeout=TIMEOUT) as r:
-        resp: dict[str, Any] = json.loads(r.read() or b"{}")
-        return resp
+    # Through the core's Transport: the bearer goes to INGEST_URL's origin and does not
+    # follow a redirect to another.
+    transport = Transport("", TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
+    resp: dict[str, Any] = transport.post_json(INGEST_URL, body, timeout=TIMEOUT)
+    return resp
 
 
 def _ship(payload: dict[str, Any]) -> tuple[int, int]:
@@ -307,11 +292,12 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
     if not session_id:
         _log("skip: no session_id in hook payload")
         return (0, 0)
-    # An id that is not a plain file name names no marker private_mode.py could have
-    # written: it reads as not private, as in the Claude hook and the core.
-    if not _plain_name(session_id):
-        _log(f"private check skipped: session id is not a file name: {session_id[:80]!r}")
-    elif (PRIVATE_DIR / session_id).exists():
+    # Private mode is the client core's rule, as in the Claude hook: a marker younger
+    # than SYNAPSE_PRIVATE_TTL_HOURS (12) skips the session; an older one is removed and
+    # the session ships; a marker that cannot be read counts as private; an id that is
+    # not a plain file name names no marker private_mode.py could have written and reads
+    # as not private, with nothing touched.
+    if private.is_private(SETTINGS, session_id, _log):
         _log(f"skip: private session {session_id}")
         return (0, 0)
     path = Path(transcript) if transcript else _find_rollout(session_id)

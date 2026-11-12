@@ -45,8 +45,9 @@ def use_core() -> None:
 
 def core_http() -> ModuleType:
     """The core's ``synapse_client.http``. Every hook that sends the bearer opens its
-    request through its ``urlopen`` (config._urlopen, Codex's common._urlopen), so a test
-    that fakes the network patches that one name."""
+    request through its ``urlopen`` (config._urlopen, and the core's Transport, which
+    Codex's common.py sends through), so a test that fakes the network patches that one
+    name."""
     use_core()
     from synapse_client import http
 

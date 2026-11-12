@@ -3,6 +3,84 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — plugin-codex: the Codex hooks run on the client core (plugin 0.24.4)
+
+**What changed**
+
+- **`plugin-codex/scripts/common.py` is a thin layer over the core.**
+  - It resolves with `Settings.load`, adding what only Codex has: the Claude plugin's
+    saved options (ranked below `config.json`, as before), its pre-0.20 `device.json`,
+    and the `http://localhost:8765` default.
+  - `get_json`, `post_json` and `request_json` send through `Transport`, and so does the
+    Stop hook's upload. The bearer goes only to the configured server's origin and the
+    ingest URL's; before, the helpers sent it to any absolute URL.
+  - Requests carry `User-Agent: synapse-client/<version> codex` (was
+    `synapse-codex-plugin/0.1`, and `synapse-codex-hook/0.1` for uploads).
+- **Session start prints the core's block**: token notice, upload warning, board,
+  preferences, in that order (Codex printed preferences before the board).
+  - A machine that is not enrolled and gets a 401 sees the core's "not enrolled"
+    explainer; one served as restricted without a device token sees the restricted one.
+  - The board and preferences are fetched side by side, each request at most 10 s, while
+    the skills sync runs (at most `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT`, default 12 s).
+    15 s after the hook starts, it prints whatever has arrived. Codex kills it at 20 s.
+- **The prompt hook prints the core's nudge**, and gains the timestamp line Claude Code
+  already had (`SYNAPSE_PROMPT_TIMESTAMP=0` turns it off).
+- **One recall-feedback nudge text, in the core** (`context.recall_feedback_nudge`).
+  - Both hooks print it. It is a developer setting, off unless
+    `SYNAPSE_RECALL_FEEDBACK_NUDGE=1`; Codex's hook used to be on unless `0`.
+  - The Claude hook's output is unchanged, byte for byte (pinned). Codex keeps its own
+    check on the tool name.
+- **The Stop hook asks the core whether a session is private** (`private.is_private`).
+  - A marker older than `SYNAPSE_PRIVATE_TTL_HOURS` (default 12) is removed and the hook
+    uploads again; the server still drops sessions its private-mode row names.
+  - A marker that cannot be read counts as private.
+- `http.Transport` opens through the module's `urlopen`, so a test that fakes the network
+  patches one name for the core and the hooks.
+
+**On each machine**
+
+1. `synapse update` once the server serves 0.24.4. No hook needs re-trusting in Codex:
+   every hook path and command text is unchanged, and `install.py` writes the same blocks
+   byte for byte.
+2. What a Codex user sees change:
+   - session-start context in the order above, with the enrollment explainers when they
+     apply;
+   - a timestamp line with each prompt;
+   - session start never waits past 15 s;
+   - a private marker older than 12 hours no longer holds uploads back on the machine;
+   - one more notice case: a token in `~/.synapse/config.json` that the device token
+     overrides;
+   - the new User-Agent, in the server's logs.
+3. The recall-feedback nudge is now off in Codex. To keep it, put
+   `SYNAPSE_RECALL_FEEDBACK_NUDGE=1` in Codex's environment.
+
+**Proven**
+
+- Full non-db suite: 3781 passed, 34 skipped, 2 xfailed (3728 before, plus the 53 new
+  tests). Ruff check and format are clean.
+- New `tests/test_codex_on_core.py` (53 tests), against local fake servers:
+  - common.py keeps no HTTP or token logic of its own;
+  - the localhost default, and a device token kept from that default;
+  - the bearer kept off another origin;
+  - session start's order, explainers, kill switches, partial output on a 500, the 15 s
+    deadline, and a hook against a hung server exiting on time;
+  - the prompt nudge with and without the timestamp;
+  - the feedback nudge's rule and bytes in both hooks;
+  - the Stop hook's private check: fresh, stale, unreadable and non-plain ids.
+- `install.py` writes byte-identical hook and MCP blocks for the checkout and the managed
+  client (pinned).
+- The old and new common.py were run over 630 combinations of environment, `config.json`,
+  Claude settings and `device.json`. The URL, ingest URL, token, private dir and the two
+  settings sampled (`SYNAPSE_SKILLS_SYNC`, `SYNAPSE_BOARD`) agree in all of them. The
+  notice differs in 26, each by the core's added `config.json` line.
+
+**Open**
+
+- Not tried under a real Codex: hook trust after the update, how Codex shows the
+  `systemMessage` warning, the 20 s kill, the skills sync's time on a large folder, and
+  payloads Codex might send that the tests do not.
+- Claude Code's hooks are next onto the core.
+
 ## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
 
 **What changed**

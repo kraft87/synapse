@@ -104,9 +104,12 @@ def _load(name: str, path: Path) -> ModuleType:
     return mod
 
 
-def _codex_common(mp: pytest.MonkeyPatch) -> ModuleType:
+def _codex_common(mp: pytest.MonkeyPatch, url: str) -> ModuleType:
+    """common.py configured for the server ``url`` is on: it sends through the core's
+    Transport, which gives the bearer to the configured server's origin only."""
     sys.modules.pop("common", None)
     common = _load("common", _CODEX / "scripts" / "common.py")
+    mp.setattr(common, "BASE_URL", url.rsplit("/", 1)[0])
     mp.setattr(common, "TOKEN", _TOKEN)
     return common
 
@@ -145,8 +148,8 @@ SENDERS: dict[str, Callable[[pytest.MonkeyPatch, str], Any]] = {
     "config.post_json": lambda mp, url: _config(mp).post_json(url, {}),
     "config.get_json": lambda mp, url: _config(mp).get_json(url),
     "config.request_json": lambda mp, url: _config(mp).request_json("GET", url),
-    "codex common.post_json": lambda mp, url: _codex_common(mp).post_json(url, {}),
-    "codex common.get_json": lambda mp, url: _codex_common(mp).get_json(url),
+    "codex common.post_json": lambda mp, url: _codex_common(mp, url).post_json(url, {}),
+    "codex common.get_json": lambda mp, url: _codex_common(mp, url).get_json(url),
     "ingest_hook._post_records": _ingest_hook,
     "codex stop hook _post": _codex_stop_hook,
     "synapse_login._mcp_call_token": _login,

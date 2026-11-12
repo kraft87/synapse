@@ -8,13 +8,43 @@ the Claude Code plugin (`../plugin/`) for the per-session surface:
 | live turn ingest | `Stop` hook | `hooks/synapse_stop_hook.py` |
 | catchup sweep + failed-upload retry | SessionStart `--catchup` | spawned by `hooks/session_start.py` |
 | upload-failure warning | SessionStart `--catchup` | `hooks/session_start.py` |
-| board + preferences into context | SessionStart hooks | `hooks/session_start.py` |
+| token notice, board + preferences into context | SessionStart hooks | `hooks/session_start.py` |
 | recall/remember MCP | plugin manifest | `[mcp_servers.synapse]` + headers helper (installer) |
-| per-prompt recall nudge | UserPromptSubmit | `hooks/user_prompt_submit.py` |
+| per-prompt timestamp + recall nudge | UserPromptSubmit | `hooks/user_prompt_submit.py` |
 | self-session injection | PreToolUse | `hooks/pre_tool_use.py` |
-| recall-feedback nudge | PostToolUse | `hooks/post_tool_use.py` |
+| recall-feedback nudge (developer setting, off by default) | PostToolUse | `hooks/post_tool_use.py` |
 | private mode | marker + server row | `scripts/private_mode.py` (+ SessionEnd cleanup) |
 | skills sync (opt-in) | SessionStart `skills_sync.py` | `scripts/skills_sync.py`, run by `hooks/session_start.py` |
+
+The hooks run on the client core (`../plugin/synapse_client/`), the code every harness
+shares, so what they read, send and print matches the Claude plugin:
+
+- settings resolve in the same order from the same files (below), and requests go through
+  the core's transport;
+- session start gives the token notice, the upload warning, the board and the
+  preferences, in that order, with the same explainer when the machine is not enrolled or
+  is served as restricted;
+- each prompt gets the same timestamp line and recall/remember directive;
+- the recall-feedback nudge has the same text and the same rule: off unless
+  `SYNAPSE_RECALL_FEEDBACK_NUDGE=1`;
+- the Stop hook asks the core whether a session is private, with the same marker age
+  limit.
+
+It differs where Codex works differently:
+
+- **One session-start hook, with a deadline.** Codex runs each hook entry as its own
+  process and asks you to trust each one, so one script does the work of the Claude
+  plugin's several SessionStart hooks. Codex kills it at 20 s. The board and preferences
+  are fetched side by side (each request at most 10 s) while the skills sync runs, and 15 s
+  after the hook starts it prints whatever has arrived.
+- **The upload warning is also a Codex warning** (`systemMessage`), not only a line in the
+  model's context.
+- **Tool names.** The prompt directive names the tools as `synapse recall` and
+  `synapse remember`.
+- **The recall-feedback hook checks the tool name itself** (`recall` or
+  `recall_full_turns`), whatever the hook's matcher.
+- **Uploads read Codex rollouts**, with this hook's own cursor file and cursor rules; the
+  retry and warning rules are shared (below).
 
 Skills sync shares the Claude plugin's engine and its opt-in (`skills_sync` in
 `~/.synapse/config.json`; `synapse login` asks). It syncs Synapse's global skills two-way
@@ -46,9 +76,12 @@ a copy, the same way the skills sync shares its engine. The sweep never picks up
 a rollout the hook didn't try to upload, so history from before install still
 needs `python -m ingestion.codex_backfill`.
 
-Not ported (machine-level curation lanes, run them from Claude Code; running
-them from both hosts would double-sync): config_sync, git_feeder (board git
-feeder), and the `/synapse:skill-review` / `/synapse:config-review` commands.
+Not ported:
+
+- the remember spool: a `remember` call that fails is reported to the model, not queued;
+- the machine-level curation lanes: config_sync, git_feeder (board git feeder), and the
+  `/synapse:skill-review` / `/synapse:config-review` commands. Run them from Claude Code;
+  running them from both hosts would double-sync.
 
 ## Install
 
@@ -95,8 +128,12 @@ Codex discards its stderr, its failures go to `~/.synapse/logs/mcp_headers.log`.
 copied into `config.toml`. `codex mcp add` is not used: it can't set a headers helper, and on
 a server with OAuth it starts a browser sign-in whose token would outrank the device
 credential. Once this machine is enrolled, its device token wins over an exported
-`SYNAPSE_INGEST_TOKEN` in the hooks too, and session start prints one line naming the
-overridden variable.
+`SYNAPSE_INGEST_TOKEN` in the hooks too. Session start then prints one line for each
+source it overrode (an exported variable, a different token in `config.json`, the Claude
+plugin's saved option), or one line saying the device token is not sent because the
+configured URL is not the server that enrolled the machine. The wording is the core's, the
+same in every harness. The hooks send the bearer only to the configured server's origin
+and the ingest URL's; a redirect anywhere else drops it.
 
 That value must be this machine's own **device** token, not the shared
 `SYNAPSE_MACHINE_TOKEN`. Since schema 054 what a machine is served depends on
@@ -125,11 +162,13 @@ honored alongside `permissionDecision: "allow"`.
 | `SYNAPSE_INGEST_TOKEN` | `token` in `~/.synapse/config.json` | per-device bearer token; ignored once the machine is enrolled, and never seen by the MCP helper |
 | `SYNAPSE_HOME` | `~/.synapse` | config.json, the installed client and its shims |
 | `SYNAPSE_PRIVATE_DIR` | `~/.synapse/private` | private-mode markers |
+| `SYNAPSE_PRIVATE_TTL_HOURS` | `12` | a marker older than this is removed and the Stop hook uploads again (the server still drops sessions its private-mode row names); a marker that can't be read counts as private |
 | `SYNAPSE_CODEX_CURSORS` | `~/.synapse/codex_cursors.json` | ship cursors |
 | `SYNAPSE_CODEX_CATCHUP_DAYS` | `3` | catchup sweep window for lagging rollouts; failed uploads are retried at any age |
 | `SYNAPSE_CODEX_CATCHUP_MAX` | `20` | rollouts per sweep; the rest wait for the next session start |
 | `SYNAPSE_CODEX_HOOK_LOG` | `/tmp/synapse-codex-hook.log` | Stop-hook log, one line per upload or failure |
 | `SYNAPSE_SKILLS_SYNC` | `skills_sync` in `~/.synapse/config.json` (off) | `1` enables skills sync |
 | `SYNAPSE_CODEX_SKILLS_DIR` | `~/.agents/skills` | folder the sync scans |
-| `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT` | `12` | seconds SessionStart waits for the sync |
-| `SYNAPSE_BOARD` / `SYNAPSE_PREFS_BLOCK` / `SYNAPSE_RECALL_NUDGE` / `SYNAPSE_RECALL_FEEDBACK_NUDGE` / `SYNAPSE_CODEX_CATCHUP` | `1` | kill switches |
+| `SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT` | `12` | seconds SessionStart waits for the sync, never past the hook's 15 s deadline |
+| `SYNAPSE_BOARD` / `SYNAPSE_PREFS_BLOCK` / `SYNAPSE_PROMPT_TIMESTAMP` / `SYNAPSE_RECALL_NUDGE` / `SYNAPSE_CODEX_CATCHUP` | `1` | kill switches: `0` turns that piece off |
+| `SYNAPSE_RECALL_FEEDBACK_NUDGE` | off | developer setting: `1` adds a reminder after each recall to label the results with `recall_feedback`. The labels are offline tuning data, so leave it off unless you tune retrieval |
