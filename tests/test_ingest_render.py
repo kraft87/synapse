@@ -1,9 +1,15 @@
 """The shared transcript line rules (ingestion/render.py), pinned.
 
-Unit tests for each rule at its exact boundary, and a golden render per live parser.
+Unit tests for each rule at its exact boundary, a golden render per live parser, and a
+source guard that keeps the line prefixes out of the parser files.
 """
 
 from __future__ import annotations
+
+import ast
+from pathlib import Path
+
+import pytest
 
 from ingestion import render
 from ingestion.render import (
@@ -422,3 +428,75 @@ class TestMessagesGolden:
         )
         assert [e.human_turn for e in eps] == ["list the files", "thanks", "bye"]
         assert [e.assistant_turn for e in eps] == ["One file:\nnotes.txt.", "You're welcome.", None]
+
+
+# ---------------------------------------------------------------------------------------
+# Drift guard: the line prefixes are spelled only in ingestion/render.py.
+
+_ROOT = Path(__file__).resolve().parents[1]
+_PREFIXES = ("[user] ", "[assistant] ", "[context] ", "[result] ", "[tool:")
+_CLIENT_FILES = sorted((_ROOT / "ingestion").glob("*_client.py"))
+
+#: Literals a parser keeps on purpose, each with its reason.
+_ALLOWED = {
+    # The claude.ai export caps [user] and [assistant] at 5000, not render's 3000.
+    "claude_ai_client.py": {"[user] ", "[assistant] "},
+}
+
+
+def _docstring_nodes(tree: ast.AST) -> set[int]:
+    nodes = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
+                nodes.add(id(body[0].value))
+    return nodes
+
+
+def _prefixes_in_literals(path: Path) -> set[str]:
+    """The prefixes spelled in a string or f-string literal, docstrings excluded."""
+    tree = ast.parse(path.read_text())
+    docstrings = _docstring_nodes(tree)
+    found = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and id(node) not in docstrings
+        ):
+            found.update(p for p in _PREFIXES if p in node.value)
+    return found
+
+
+class TestDriftGuard:
+    def test_every_parser_is_guarded(self):
+        names = {p.name for p in _CLIENT_FILES}
+        assert {
+            "jsonl_client.py",
+            "codex_client.py",
+            "messages_client.py",
+            "openai_client.py",
+            "cursor_sqlite_client.py",
+            "claude_ai_client.py",
+        } <= names
+
+    @pytest.mark.parametrize("path", _CLIENT_FILES, ids=lambda p: p.name)
+    def test_no_line_prefix_literals(self, path: Path):
+        assert _prefixes_in_literals(path) == _ALLOWED.get(path.name, set())
+
+    def test_guard_reads_fstrings_and_skips_docstrings(self, tmp_path: Path):
+        src = tmp_path / "x_client.py"
+        src.write_text(
+            '"""Renders [context] and [result] lines."""\n'
+            "def f(name, t):\n"
+            '    """An [assistant] line."""\n'
+            '    return f"[tool:{name}] x", "[user] " + t\n'
+        )
+        assert _prefixes_in_literals(src) == {"[tool:", "[user] "}
+
+    @pytest.mark.parametrize("path", _CLIENT_FILES, ids=lambda p: p.name)
+    def test_no_private_strip_nulls(self, path: Path):
+        tree = ast.parse(path.read_text())
+        defs = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+        assert "_strip_nulls" not in defs
