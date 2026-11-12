@@ -3,9 +3,8 @@
 The load-bearing invariant: feeding the SAME transcript records through
 ``parse_file`` (sweep) and ``parse_records`` (push) must yield byte-identical
 episodes — same (session_id, sequence) and span_id — so the two paths converge
-idempotently against ``upsert_episode``'s ON CONFLICT (session_id, sequence)
-and the unique span_id index. If this drifts, a momentary-outage backfill would
-double-insert instead of no-op'ing.
+idempotently against the unique span_id index. If this drifts, a momentary-outage
+backfill would double-insert instead of no-op'ing.
 """
 
 from __future__ import annotations
