@@ -181,8 +181,8 @@ held it. A credential that widespread must not be able to create a new credentia
 
 | Gate | Admits | Guards |
 | --- | --- | --- |
-| client (`_machine_authorized`) | root token, or any APPROVED device token | `/ingest`, `/recall`, `/context`, skills, config, timeline, preferences, private mode, remember-spool |
-| admin (`_admin_authorized`) | APPROVED **full-trust device** token only — **never root** | `/surfaces/{mint,list,PUT,DELETE}`, all of `/dash/api/*` |
+| client (`_machine_authorized`) | root token, or any APPROVED device token | `/ingest`, `/recall`, `/context`, skills, config, timeline, preferences, private mode (`PUT`/`GET`), remember-spool |
+| admin (`_admin_authorized`) | APPROVED **full-trust device** token only — **never root** | `/surfaces/{mint,list,PUT,DELETE}`, `DELETE /private-sessions/{id}`, all of `/dash/api/*` |
 
 The dashboard had to move for the same reason: `/dash/api` serves the whole corpus
 unfiltered, so leaving it on the root token would be a bypass around the entire filter.
@@ -236,6 +236,15 @@ project included, so an unknown caller serves *nothing* rather than everything.
   a restricted device reads and writes only its own mirror, and sees only proposals whose
   every evidence session consists solely of its own turns. All resolved from the bearer;
   the root token and unknown callers get nothing.
+- **Facts from a remembered item**: the extraction behind a `remember()` item reads session
+  context only from turns of the item's own project (case-insensitive; no project matches
+  only no project). The facts it writes cite only the item's own episode, so a name taken
+  from a turn in another project would sit in a fact whose provenance does not show it.
+- **Taking a session back on the record**: `DELETE /private-sessions/{session_id}` removes
+  the row that keeps an off-the-record session from ever being ingested, so it needs the
+  admin gate: a full-trust device only. A restricted device, or a caller holding just the
+  root token, gets a 403 and the row stays. `PUT` and `GET` keep the client gate, so any
+  approved device can still take a session off the record and read the flag back.
 
 ## Rollout order (schema 054)
 

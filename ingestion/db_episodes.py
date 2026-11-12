@@ -10,15 +10,26 @@ from ingestion.models import Episode
 from ingestion.surfaces import OWN_SURFACE_PROBE, own_surface_columns_ready
 from ingestion.textsafe import strip_nul
 
-_UPSERT_COLUMNS = """
+_COLUMNS = """
     (session_id, sequence, project, platform, model,
      human_turn, assistant_turn, content, span_id, metadata, source,
-     created_at{extra_col})
-VALUES
-    (%(session_id)s, %(sequence)s, %(project)s, %(platform)s, %(model)s,
+     created_at{extra_col})"""
+
+#: Every value after session_id and sequence, in column order: shared by the rewriting
+#: and the appending statement so the two cannot drift apart.
+_VALUES = """%(project)s, %(platform)s, %(model)s,
      %(human_turn)s, %(assistant_turn)s, %(content)s,
      %(span_id)s, %(metadata)s::jsonb, %(source)s,
-     COALESCE(%(created_at)s, now()){extra_val})
+     COALESCE(%(created_at)s, now()){extra_val}"""
+
+_UPSERT_COLUMNS = (
+    _COLUMNS
+    + """
+VALUES
+    (%(session_id)s, %(sequence)s,
+     """
+    + _VALUES
+    + """)
 ON CONFLICT (session_id, sequence) DO UPDATE SET
     content        = EXCLUDED.content,
     human_turn     = EXCLUDED.human_turn,
@@ -32,9 +43,37 @@ ON CONFLICT (session_id, sequence) DO UPDATE SET
                           ELSE episodes.created_at END{extra_set}
 RETURNING id
 """
+)
+
+#: The append: the number is the session's highest plus one, read inside the INSERT. When
+#: a writer that did not take the session lock holds that number, the INSERT waits on the
+#: index, then does nothing and returns no row; the caller asks again. The other row is
+#: never touched.
+_APPEND_COLUMNS = (
+    _COLUMNS
+    + """
+SELECT %(session_id)s,
+    COALESCE((SELECT max(sequence) FROM episodes WHERE session_id = %(session_id)s), 0) + 1,
+    """
+    + _VALUES
+    + """
+ON CONFLICT (session_id, sequence) DO NOTHING
+RETURNING id, sequence
+"""
+)
+
+#: A caller that keeps losing the number to a writer outside the session lock gives up
+#: after this many tries.
+_APPEND_ATTEMPTS = 8
+
+#: Appenders to one session take turns on this transaction-scoped advisory lock (the key
+#: is the session id under this prefix), released when the attempt's transaction commits.
+_SESSION_LOCK = "SELECT pg_advisory_xact_lock(hashtext(%s))"
+_SESSION_LOCK_KEY = "episodes.session:"
 
 #: The pre-057 statement: what runs until the provenance column exists.
 _UPSERT = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(extra_col="", extra_val="", extra_set="")
+_APPEND = "INSERT INTO episodes" + _APPEND_COLUMNS.format(extra_col="", extra_val="")
 
 #: Schema 057: also writes the provenance stamp (``episodes.surface_id``). A stamp means
 #: "every byte of this row came from that surface", so on a rewrite it survives only when
@@ -49,6 +88,9 @@ _UPSERT_STAMPED = "INSERT INTO episodes" + _UPSERT_COLUMNS.format(
         ",\n    surface_id     = CASE WHEN episodes.surface_id IS NOT DISTINCT FROM"
         " EXCLUDED.surface_id\n                          THEN episodes.surface_id END"
     ),
+)
+_APPEND_STAMPED = "INSERT INTO episodes" + _APPEND_COLUMNS.format(
+    extra_col=", surface_id", extra_val=", %(surface_id)s"
 )
 
 
@@ -97,7 +139,8 @@ class EpisodeStore(DatabaseConnection):
             return False
         return row is not None
 
-    def upsert_episode(self, ep: Episode) -> int:
+    @staticmethod
+    def _episode_params(ep: Episode) -> dict[str, Any]:
         # created_at is EVENT time (when the conversation happened), not ingest
         # time: the parser fills Episode.created_at from the transcript's own
         # timestamp, and dropping it here silently re-dated every imported
@@ -108,7 +151,7 @@ class EpisodeStore(DatabaseConnection):
         # strip_nul on the text/metadata fields: TEXT columns reject NUL bytes
         # and jsonb rejects the u0000 escape, so one stray byte in a transcript
         # would fail the whole INSERT.
-        params = {
+        return {
             "session_id": ep.session_id,
             "sequence": ep.sequence,
             "project": ep.project,
@@ -123,20 +166,63 @@ class EpisodeStore(DatabaseConnection):
             "created_at": ep.created_at,
             "surface_id": ep.surface_id,
         }
+
+    def _run_episode_sql(
+        self, pre057: str, stamped: str, params: dict[str, Any], lock_session: bool = False
+    ) -> dict[str, Any] | None:
+        """One transaction, committed on return. Schema 057 names the provenance column:
+        before it is applied the statement is exactly the pre-057 one and the stamp is
+        dropped. With ``lock_session`` the transaction first takes the session's advisory
+        lock, as its own statement: the INSERT's snapshot is then taken once the lock is
+        granted, so it sees the row the previous holder committed."""
         try:
             with self._conn() as conn:
-                # Schema 057 names the provenance column; before it is applied the
-                # statement is exactly the pre-057 one and the stamp is dropped.
-                sql = _UPSERT_STAMPED if own_surface_columns_ready(conn, self._url) else _UPSERT
-                row = conn.execute(sql, params).fetchone()
+                if lock_session:
+                    conn.execute(_SESSION_LOCK, (_SESSION_LOCK_KEY + params["session_id"],))
+                sql = stamped if own_surface_columns_ready(conn, self._url) else pre057
+                return cast(dict[str, Any] | None, conn.execute(sql, params).fetchone())
         except psycopg.errors.UndefinedColumn as e:
             # 057 rolled back under a running process: note it, write the pre-057 row.
+            # The aborted transaction took the lock with it, so this one takes it again.
             OWN_SURFACE_PROBE.missing(self._url, e)
             with self._conn() as conn:
-                row = conn.execute(_UPSERT, params).fetchone()
+                if lock_session:
+                    conn.execute(_SESSION_LOCK, (_SESSION_LOCK_KEY + params["session_id"],))
+                return cast(dict[str, Any] | None, conn.execute(pre057, params).fetchone())
 
+    def upsert_episode(self, ep: Episode) -> int:
+        """Write the row at ``(ep.session_id, ep.sequence)``, replacing it if it exists.
+
+        The live writers append (:meth:`append_episode`); this is for a deliberate
+        rewrite of a known row."""
+        row = self._run_episode_sql(_UPSERT, _UPSERT_STAMPED, self._episode_params(ep))
         assert row is not None, "INSERT RETURNING id returned nothing"
         return cast(int, row["id"])
+
+    def append_episode(self, ep: Episode) -> tuple[int, int]:
+        """Add ``ep`` as the next row of its session and return ``(id, sequence)``.
+
+        ``ep.sequence`` is ignored: the number is the session's highest plus one, taken
+        inside the INSERT, so a writer never works one out from an earlier read. Appenders
+        to one session take turns: each try is one transaction that first takes a
+        per-session advisory lock and then runs the INSERT as a second statement, so the
+        INSERT sees the row the previous appender committed. The INSERT also does nothing
+        when the number is already held (it never rewrites that row) and is run again, up
+        to a bound, for a writer that does not take the lock: ``upsert_episode`` at an
+        explicit number, or an older process during a deploy. A violation of the span
+        index propagates to the caller. The caller must not hold its own ``_conn()`` block
+        across the call: every ``_conn()`` exit commits, nested ones included, so the lock
+        is released when the append's own block exits, and the caller's partial work would
+        be committed by that exit (or rolled back with the append on a span violation)."""
+        params = self._episode_params(ep)
+        for _ in range(_APPEND_ATTEMPTS):
+            row = self._run_episode_sql(_APPEND, _APPEND_STAMPED, params, lock_session=True)
+            if row is not None:
+                return cast(int, row["id"]), cast(int, row["sequence"])
+        raise RuntimeError(
+            f"append to session {ep.session_id!r} kept colliding on the sequence number "
+            f"after {_APPEND_ATTEMPTS} attempts"
+        )
 
     def get_episode(self, episode_id: int) -> dict[str, Any] | None:
         with self._conn() as conn:
@@ -151,24 +237,20 @@ class EpisodeStore(DatabaseConnection):
             ).fetchall()
         return cast(list[dict[str, Any]], result)
 
-    def get_session_span_index(self, session_id: str) -> tuple[set[str], int]:
-        """Return (stored span_ids, max sequence) for a session.
+    def get_session_span_index(self, session_id: str) -> set[str]:
+        """Return the span_ids stored for a session.
 
         Lean companion to :meth:`get_session_episodes` for the /ingest hot path.
         The push keys turns by span_id (the stable identity — a turn's last record
-        uuid) and appends new ones at ``max(sequence) + 1``, so a bounded-tail POST
-        renumbers from the DB high-water mark instead of the parser's positional
-        counter. Pulls two columns instead of full rows since that's all the dedup
-        needs.
+        uuid): one already stored is skipped, a new one is appended. Pulls one
+        column instead of full rows since that's all the dedup needs.
         """
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT span_id, sequence FROM episodes WHERE session_id = %s",
+                "SELECT span_id FROM episodes WHERE session_id = %s",
                 (session_id,),
             ).fetchall()
-        span_ids: set[str] = {r["span_id"] for r in rows if r["span_id"]}
-        max_seq = max((int(r["sequence"]) for r in rows), default=0)
-        return span_ids, max_seq
+        return {r["span_id"] for r in rows if r["span_id"]}
 
     def get_episodes_valid_at(self, episode_ids: list[int]) -> str | None:
         """Representative valid-time for a set of source episodes = MAX(created_at),

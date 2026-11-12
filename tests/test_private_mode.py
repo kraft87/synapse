@@ -9,8 +9,9 @@ Three legs, tested here without a database or a live server:
   * the SERVER chokepoint (``ingestion.private_sessions`` + ``ingestion.backfill``) —
     the predicate that drops private turns wherever a parsed turn becomes an episode,
     which is what covers the paths that bypass the hook entirely;
-  * the TOGGLE CLI (``plugin/scripts/private_mode.py``) round-tripped against a stubbed
-    HTTP endpoint — it must verify both writes and exit nonzero when either fails.
+  * the TOGGLE CLI (``plugin/scripts/private_mode.py`` and its Codex copy,
+    ``plugin-codex/scripts/private_mode.py``) round-tripped against a stubbed HTTP
+    endpoint — it must verify both writes and exit nonzero when either fails.
 
 The hooks live outside the package and run under the CLI's bare Python, so they're
 loaded by path (same as test_ingest_hook_cursor.py). The /ingest route's own drop is
@@ -35,6 +36,7 @@ _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
 _ROOT_HOOK = _REPO / "scripts" / "synapse_ingest_hook.py"
 _TOGGLE = _REPO / "plugin" / "scripts" / "private_mode.py"
+_TOGGLE_CODEX = _REPO / "plugin-codex" / "scripts" / "private_mode.py"
 
 _PLUGIN_ENV_VARS = (
     "SYNAPSE_URL",
@@ -64,12 +66,16 @@ def _isolate(monkeypatch, tmp_path) -> Path:
 
 
 def _load(path: Path, name: str) -> ModuleType:
-    sys.modules.pop("config", None)
+    # The scripts import their config layer by bare name (``config`` for the Claude plugin,
+    # ``common`` for the Codex copy) off their own directory; each load resolves it afresh.
+    for helper in ("config", "common"):
+        sys.modules.pop(helper, None)
     spec = importlib.util.spec_from_file_location(name, path)
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    sys.modules.pop("config", None)
+    for helper in ("config", "common"):
+        sys.modules.pop(helper, None)
     return mod
 
 
@@ -265,9 +271,9 @@ class _StubDB:
     def span_id_exists(self, span_id: str) -> bool:
         return False
 
-    def upsert_episode(self, ep: object) -> int:
+    def append_episode(self, ep: object) -> tuple[int, int]:
         self.written.append(ep)
-        return len(self.written)
+        return len(self.written), len(self.written)
 
     def enqueue_extraction(self, item: object) -> None:
         self.enqueued.append(item)
@@ -342,18 +348,30 @@ class _StubServer:
         self.calls: list[tuple[str, str]] = []
         self.rows: set[str] = set()
         self.lie_on_put = False  # simulate a write that silently doesn't land
+        self.ignore_delete = False  # simulate a DELETE that answers 200 but removes nothing
+        self.fail_with: dict[str, int] = {}  # method -> HTTP status to answer with instead
+        self.delete_lands_anyway = False  # a DELETE that errors after the row is already gone
+        self.drop_delete = False  # a DELETE whose connection dies before any reply
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def _reply(self) -> None:
                 sid = self.path.rsplit("/", 1)[-1]
                 outer.calls.append((self.command, sid))
-                if self.command == "PUT" and not outer.lie_on_put:
-                    outer.rows.add(sid)
-                elif self.command == "DELETE":
-                    outer.rows.discard(sid)
-                body = json.dumps({"status": "ok", "private": sid in outer.rows}).encode()
-                self.send_response(200)
+                if self.command == "DELETE" and outer.drop_delete:
+                    return  # no reply at all: the client sees the connection drop
+                status = outer.fail_with.get(self.command, 200)
+                if status != 200:
+                    if self.command == "DELETE" and outer.delete_lands_anyway:
+                        outer.rows.discard(sid)
+                    body = json.dumps({"status": "error", "detail": "refused"}).encode()
+                else:
+                    if self.command == "PUT" and not outer.lie_on_put:
+                        outer.rows.add(sid)
+                    elif self.command == "DELETE" and not outer.ignore_delete:
+                        outer.rows.discard(sid)
+                    body = json.dumps({"status": "ok", "private": sid in outer.rows}).encode()
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -381,11 +399,35 @@ def stub_server():
     s.close()
 
 
-@pytest.fixture()
-def toggle(monkeypatch, tmp_path, stub_server) -> ModuleType:
+@pytest.fixture(params=[_TOGGLE, _TOGGLE_CODEX], ids=["plugin", "plugin-codex"])
+def toggle_script(request) -> Path:
+    """Every toggle test runs against both copies of the script."""
+    return request.param
+
+
+def _load_toggle(script: Path, monkeypatch, tmp_path, url: str) -> ModuleType:
     _isolate(monkeypatch, tmp_path)
-    monkeypatch.setenv("SYNAPSE_URL", stub_server.url)
-    return _load(_TOGGLE, "private_mode_test")
+    monkeypatch.setenv("SYNAPSE_URL", url)
+    # The Codex copy reads its URL and token through plugin-codex/scripts/common.py, which
+    # looks in ~/.synapse and ~/.claude after the environment: keep both inside tmp_path.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("SYNAPSE_HOME", str(tmp_path / "synapse-home"))
+    return _load(script, f"private_mode_test_{script.parent.parent.name}")
+
+
+@pytest.fixture()
+def toggle(toggle_script, monkeypatch, tmp_path, stub_server) -> ModuleType:
+    return _load_toggle(toggle_script, monkeypatch, tmp_path, stub_server.url)
+
+
+def _assert_left_as_a_plain_off(toggle: ModuleType, err: str, sid: str) -> None:
+    """--forget removes the marker before it sends the DELETE, so every way it can fail
+    ends by saying the session is now in the state a plain `off` leaves it in."""
+    assert not (toggle.PRIVATE_DIR / sid).exists()
+    assert "The local marker was removed." in err
+    assert (
+        "same state as after a plain `off`: its turns are sent and the server discards them" in err
+    )
 
 
 def test_on_writes_marker_and_verifies_server(toggle, stub_server):
@@ -403,10 +445,10 @@ def test_on_exits_nonzero_when_the_server_write_does_not_land(toggle, stub_serve
     assert "NOT off the record" in capsys.readouterr().err
 
 
-def test_on_exits_nonzero_when_the_server_is_unreachable(monkeypatch, tmp_path, capsys):
-    _isolate(monkeypatch, tmp_path)
-    monkeypatch.setenv("SYNAPSE_URL", "http://127.0.0.1:1")  # nothing listening
-    mod = _load(_TOGGLE, "private_mode_unreachable_test")
+def test_on_exits_nonzero_when_the_server_is_unreachable(
+    toggle_script, monkeypatch, tmp_path, capsys
+):
+    mod = _load_toggle(toggle_script, monkeypatch, tmp_path, "http://127.0.0.1:1")  # no listener
     assert mod.main(["on", "s-abc"]) == 1
     err = capsys.readouterr().err
     assert "NOT off the record" in err
@@ -434,6 +476,115 @@ def test_off_forget_deletes_the_row(toggle, stub_server):
     assert toggle.main(["off", sid, "--forget"]) == 0
     assert [c[0] for c in stub_server.calls] == ["DELETE", "GET"]
     assert sid not in stub_server.rows
+
+
+def test_off_forget_refused_says_a_full_trust_device_is_needed(toggle, stub_server, capsys):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with["DELETE"] = 403
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "must be done from a full-trust device" in err
+    assert "The server row was not deleted; the session stays off the record." in err
+    assert "NOT off the record" not in err  # the row is still there: the session stays private
+    _assert_left_as_a_plain_off(toggle, err, sid)
+    assert sid in stub_server.rows
+
+
+@pytest.mark.parametrize(
+    "how", ["server_error", "delete_ignored"], ids=["delete-fails", "row-still-there"]
+)
+def test_off_forget_that_leaves_the_row_says_the_session_stays_off_the_record(
+    toggle, stub_server, capsys, how
+):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    if how == "server_error":
+        stub_server.fail_with["DELETE"] = 500
+    else:
+        stub_server.ignore_delete = True
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "The server row was not deleted; the session stays off the record." in err
+    assert "may still be applying" not in err  # the server answered: that wording is for no answer
+    assert "full-trust device" not in err
+    assert "NOT off the record" not in err
+    _assert_left_as_a_plain_off(toggle, err, sid)
+    assert sid in stub_server.rows
+
+
+def test_off_forget_whose_delete_never_gets_an_answer_does_not_say_the_row_stays(
+    toggle, stub_server, capsys
+):
+    """A dropped connection (a timeout reads the same) says nothing about whether the
+    server got the DELETE or is still working through it, so a row that is still there at
+    read-back is not yet a row that stays: the script says it may still be applying."""
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.drop_delete = True
+    capsys.readouterr()
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "the row was still present when read back" in err
+    assert "The DELETE may still be applying on the server." in err
+    assert f"private_mode.py status {sid}" in err
+    assert "stays off the record" not in err
+    assert "was not deleted" not in err
+    assert "NOT off the record" not in err
+    _assert_left_as_a_plain_off(toggle, err, sid)
+    assert [c[0] for c in stub_server.calls[-2:]] == ["DELETE", "GET"]
+    assert sid in stub_server.rows
+
+
+def test_off_forget_whose_delete_errors_after_committing_ends_on_the_success_path(
+    toggle, stub_server, capsys
+):
+    """A 5xx or a timeout can follow a delete the server already made: the read-back
+    decides, and a row that is gone is a successful --forget, not a failed one."""
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with["DELETE"] = 500
+    stub_server.delete_lands_anyway = True
+    capsys.readouterr()
+    assert toggle.main(["off", sid, "--forget"]) == 0
+    out, err = capsys.readouterr()
+    assert "marker removed, server row deleted" in out
+    assert "the DELETE reported an error" in err
+    assert "no longer lists the session as private" in err
+    assert "stays off the record" not in err
+    assert "The local marker was removed." not in err  # nothing failed
+    assert [c[0] for c in stub_server.calls[-2:]] == ["DELETE", "GET"]
+    assert sid not in stub_server.rows
+
+
+def test_off_forget_that_errors_and_cannot_read_the_row_back_claims_neither_outcome(
+    toggle, stub_server, capsys
+):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with.update({"DELETE": 500, "GET": 500})
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "could not read back the server row" in err
+    assert f"private_mode.py status {sid}" in err
+    assert "was not deleted" not in err
+    assert "stays off the record" not in err
+    _assert_left_as_a_plain_off(toggle, err, sid)
+
+
+def test_off_forget_that_cannot_read_the_row_back_claims_neither_outcome(
+    toggle, stub_server, capsys
+):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with["GET"] = 500
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "could not read back the server row" in err
+    assert f"private_mode.py status {sid}" in err
+    assert "was not deleted" not in err
+    assert "NOT off the record" not in err
+    _assert_left_as_a_plain_off(toggle, err, sid)
 
 
 def test_session_end_removes_marker_but_not_the_row(toggle, stub_server, monkeypatch):

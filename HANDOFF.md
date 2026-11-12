@@ -3,7 +3,7 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
-## 2026-11-12 — client: six defect fixes from the client parity review (plugin 0.24.1)
+## 2026-11-12 — client: six defect fixes from the client parity review (plugin 0.24.2)
 
 **What changed**
 
@@ -38,7 +38,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 
 **On each machine**
 
-1. Nothing beyond the usual update: `synapse update` once the server serves 0.24.1
+1. Nothing beyond the usual update: `synapse update` once the server serves 0.24.2
    (merge, then the image).
 
 **Proven**
@@ -66,6 +66,49 @@ changed, what to do on each machine, what was proven, and what is still open.
 - The spool and the outbox keep different 4xx rules:
   - the spool drops every 4xx except 401, 403, 408 and 429;
   - the outbox drops only 400, 413 and 422.
+
+## 2026-11-12 — guards: only a full-trust device takes a session back on the record; appends to one session take turns (plugin 0.24.1)
+
+**What changed**
+
+- **`DELETE /private-sessions/{session_id}` needs a full-trust device.** It removes the row
+  that keeps an off-the-record session from being ingested, and it sat behind the ordinary
+  client gate, so a restricted device or the root token could put back on the record a
+  session another device had taken off it. It now sits behind the admin gate: a caller that
+  clears the client gate only gets a 403 with a plain reason. `PUT` and `GET` are unchanged.
+- **`private_mode.py off --forget` says what happened** (the Claude plugin and its Codex
+  copy). A 403 says the delete must be done from a full-trust device. Any other failed
+  delete reads the flag back first: still there after an HTTP error means the session stays
+  off the record; still there after a transport error means the delete may still be
+  applying, check `status`; gone means the forget worked; unreadable means unknown. Every
+  failure also says the local marker was removed, which leaves the session where a plain
+  `off` leaves it.
+- **Appends to one session take turns.** `remember`, `/ingest` and the backfills each read
+  the session's highest sequence number and then upserted at the next one, so two writers
+  could pick the same number and the second replaced the first one's row.
+  `EpisodeStore.append_episode` takes a per-session advisory lock and takes the number
+  inside the `INSERT`; a row is never rewritten by another writer's append.
+  `upsert_episode` stays for a deliberate rewrite of a known row.
+- **A remembered item reads session context only from turns of its own project.** The
+  names handed to the extraction model came from every turn of the session, so a name from
+  another project could end up in a fact that cites only this one's episode.
+
+**On each machine**
+
+1. Nothing to migrate and no setting to change.
+2. `synapse update` for the 0.24.1 `private_mode.py` wording (older clients keep working;
+   they print the old lines). The server change takes effect with the image.
+3. To take a session back on the record, run `private_mode.py off --forget` on a full-trust
+   device.
+
+**Proven**
+
+- A restricted device's `DELETE` through the routes the server itself registers gets a 403
+  and its `PUT` lands; a full-trust device's `DELETE` removes the row.
+- A writer that loses its number appends after the winner, and many appends at once get
+  distinct numbers and keep their own rows; the tests fail
+  if the session lock is released before the `INSERT` runs or a writer goes back to
+  upserting.
 
 ## 2026-11-12 — client: Hermes gets Synapse as its memory provider; the CLI walks one harness list (plugin 0.24.0)
 
