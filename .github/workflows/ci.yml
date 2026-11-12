@@ -75,6 +75,26 @@ jobs:
           npm ci
           npm run build
 
+  # Machines update by version number, so a PR that changes the client (what /install
+  # bundles from plugin/ and plugin-codex/, Markdown included) must raise the version to
+  # one with no v<version> tag. Rules in scripts/release_notes.py, shared with
+  # release.yml, which holds the same line on main after the merge.
+  version:
+    name: Version
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the base commit and every v* tag (a shallow clone has neither)
+          fetch-tags: true
+          persist-credentials: false
+      # HEAD is the merge commit GitHub made for this PR; HEAD^1 is the base it merges into.
+      - name: A client change carries a new version
+        run: python3 scripts/release_notes.py check-pr --base HEAD^1 --head HEAD
+
   test:
     name: Pytest
     runs-on: ubuntu-latest
