@@ -31,6 +31,31 @@ plugin-codex/                    Codex hook scripts and installer
 `plugin/` keeps its name because it is the directory the Claude marketplace, the managed
 client (`~/.synapse/lib/<version>/`) and the server's `/install` bundle all copy.
 
+## Versions and releases
+
+The client version is written twice and the two must agree: `version` in
+`plugin/.claude-plugin/plugin.json` and `__version__` in `plugin/synapse_client/__init__.py`.
+Machines update by that number, so any change to a file a machine receives ships under a
+new version: every tracked file under `plugin/` and `plugin-codex/`, Markdown included
+(`plugin/commands/*.md` are slash commands, and the READMEs are in the bundle). A
+server-only change leaves the version alone. The rules live in `scripts/release_notes.py`.
+
+- **The Version check** on a pull request: when the PR changes a client file, the merged
+  version must be above the base's and have no `v<version>` tag yet. A PR that changes no
+  client file passes. It is not a required check yet, and it does not re-run when main
+  moves: if two open PRs bump to the same number, update the second after the first lands.
+- **Releases are automatic.** When the client changes on main, `release.yml` tags
+  `v<version>` at the commit that brought it and publishes a GitHub release whose notes
+  are every HANDOFF.md entry whose heading names `plugin <version>`, as in
+  `## 2026-11-12 — client: what changed (plugin 0.24.4)` (other items may share the
+  parentheses). A client change merged under an already released version fails that run:
+  bump the version in a follow-up PR.
+- **A missed release** (a failed run, or a version from before the workflow): run the
+  Release workflow on `main` by hand (Actions > Release > Run workflow, or
+  `gh workflow run release.yml --ref main`). It releases the version main carries now and
+  exits green when that one is already out. `python3 scripts/release_notes.py notes X.Y.Z`
+  prints a version's notes.
+
 ## Rules for the core
 
 1. **Standard library only**, Python 3.11+. It runs inside other programs' interpreters.
