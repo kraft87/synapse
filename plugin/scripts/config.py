@@ -15,14 +15,13 @@ Every setting resolves env var -> ~/.synapse/config.json (synapse_home.py, writt
 (CLAUDE_PLUGIN_OPTION_*, then settings.json) -> default. Env vars (all optional):
   CLAUDE_SKILLS_DIR     skills library to maintain   (default ~/.claude/skills)
   CLAUDE_PROJECTS_DIR   transcript root              (default ~/.claude/projects)
-  SYNAPSE_DATA_DIR      local state / proposal drafts (default ~/.local/share/synapse-skills)
+  SYNAPSE_DATA_DIR      local state                  (default ~/.local/share/synapse-skills)
   SYNAPSE_HOME          config.json + the installed client (default ~/.synapse)
   SYNAPSE_URL           base URL of the server       (default http://localhost:8765)
   SYNAPSE_INGEST_TOKEN  bearer token. Prefer config.json (`synapse login` writes it
                         there); once this machine is enrolled its device token wins over
                         an env value — see _resolve_ingest_token
   SYNAPSE_INGEST_URL    legacy override for /ingest  (else derived from SYNAPSE_URL)
-  SYNAPSE_RECALL_URL    legacy override for /recall  (else derived)
   SYNAPSE_MCP_URL       legacy override for /mcp     (else derived)
   SYNAPSE_SKILLS_SYNC   "1" enables the SessionStart skills sync (default OFF — opt-in)
   SYNAPSE_CONFIG_SYNC   "1" enables config-file mirroring (default OFF — opt-in)
@@ -84,7 +83,6 @@ def _path(env: str, default: str) -> Path:
 SKILLS_DIR = _path("CLAUDE_SKILLS_DIR", "~/.claude/skills")
 PROJECTS_DIR = _path("CLAUDE_PROJECTS_DIR", "~/.claude/projects")
 DATA_DIR = _path("SYNAPSE_DATA_DIR", "~/.local/share/synapse-skills")
-PROPOSALS_DIR = DATA_DIR / "proposals"
 
 # Private mode: one marker file per off-the-record session (name = session id). The Stop
 # hook stats this directory before every POST, so it lives outside DATA_DIR on a short,
@@ -241,7 +239,6 @@ def _base_url() -> str:
 BASE_URL = _base_url()
 # Legacy per-endpoint keys still win if set (existing installs); else derive from the base.
 INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
-RECALL_URL = _cfg("SYNAPSE_RECALL_URL") or BASE_URL + "/recall"
 MCP_URL = _cfg("SYNAPSE_MCP_URL") or BASE_URL + "/mcp"
 SKILLS_URL = BASE_URL + "/skills"
 # Enrollment state for this device (schema 054): which surface row this machine got and
@@ -670,8 +667,3 @@ def act(endpoint: str, cid: int, action: str, *, expect: str, **extra) -> dict |
         print(r.get("detail") or "not found")
         return None
     return r
-
-
-def ensure_dirs() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROPOSALS_DIR.mkdir(parents=True, exist_ok=True)

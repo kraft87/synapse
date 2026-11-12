@@ -316,3 +316,19 @@ class TestHookFeedback:
         eps = JSONLParser().parse_file(_write_jsonl(tmp_path, records))
         assert [e.sequence for e in eps] == [1, 3]
         assert all("blocked" not in e.content for e in eps)
+
+
+def test_a_record_with_a_null_message_does_not_fail_the_batch():
+    """`"message": null` on a user record used to raise AttributeError in the filter. Over
+    /ingest that was a 500 for the whole batch, and the hook never moves its cursor past a
+    failed POST. The record carries nothing; the turns around it parse as usual."""
+    base = {"sessionId": "s-null", "cwd": "/work/null", "timestamp": "2026-11-12T10:00:00Z"}
+    records = [
+        {**base, "type": "user", "uuid": "u1", "message": {"role": "user", "content": "a real question"}},
+        {**base, "type": "assistant", "uuid": "a1", "message": {"role": "assistant", "content": [{"type": "text", "text": "an answer"}]}},
+        {**base, "type": "user", "uuid": "u2", "message": None},
+        {**base, "type": "assistant", "uuid": "a2", "message": None},
+    ]  # fmt: skip
+    episodes = JSONLParser().parse_records(records, "hook", None)
+    assert [e.human_turn for e in episodes] == ["a real question"]
+    assert episodes[0].assistant_turn == "an answer"

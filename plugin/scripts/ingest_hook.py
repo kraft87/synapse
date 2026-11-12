@@ -185,22 +185,6 @@ def _parse_lines(lines: list[bytes]) -> list[dict[str, Any]]:
     return out
 
 
-def _select_tail(raw_lines: list[bytes]) -> tuple[list[dict[str, Any]], str]:
-    """Pick the records for a first-encounter seed: a turn-boundary-aligned tail,
-    or the full file when the tail window holds no boundary (one mega-turn).
-    Returns (records, mode). Pure (no I/O) so it's unit-testable.
-
-    Kept for the Stop path's cursor seeding: a long-lived pre-cursor session was
-    already shipped turn-by-turn by earlier hook fires, so re-parsing the whole
-    file wholesale on the first cursored run would be pure churn.
-    """
-    tail = _parse_lines(raw_lines[-TAIL_RECORDS:])
-    start = next((i for i, r in enumerate(tail) if _is_turn_start(r)), None)
-    if start is not None:
-        return tail[start:], "tail"
-    return _parse_lines(raw_lines), "full-fallback"
-
-
 # ---------------------------------------------------------------------------
 # Cursor planning (pure) + cursor store (flocked)
 # ---------------------------------------------------------------------------

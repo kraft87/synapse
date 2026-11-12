@@ -58,7 +58,7 @@ graph TD
 
 **Data flow summary**:
 
-1. A Claude Code `Stop` hook (`scripts/synapse_ingest_hook.py`) fires on every turn and POSTs a bounded **tail** of the raw session JSONL to `http://<server-host>:8765/ingest`. It runs detached and never blocks the turn. (Any other agent frontend that drives the real `claude` CLI ingests the same way.)
+1. A Claude Code `Stop` hook (`plugin/scripts/ingest_hook.py`) fires on every turn and POSTs the raw session JSONL records past its cursor for that transcript to `http://<server-host>:8765/ingest`. It runs detached and never blocks the turn; a failed POST is retried by the next `Stop` or by a catch-up sweep at session start. (Any other agent frontend that drives the real `claude` CLI ingests the same way, and the Codex plugin's `Stop` hook ships Codex rollouts the same way.)
 2. `/ingest` parses the tail, drops transcript contamination, **dedups by `span_id`**, and appends genuinely-new turns as episodes, enqueuing each for KG extraction.
 3. The **poller** (a maintenance loop, *not* an ingester) rebuilds sliding-window chunks, embeds pending episodes/chunks via Voyage AI, and drains the extraction queue.
 4. KG extraction runs on **chunks** (3–5 turn windows): Haiku extracts entities + facts, resolves entities against the Postgres KG, dedups/contradicts against existing facts, and writes bitemporal relationship edges (`kg_relationships`).
@@ -180,7 +180,7 @@ Episodes enter Synapse through exactly one live path: a Claude Code `Stop` hook 
 
 ```mermaid
 flowchart TD
-    HK[Stop hook\nsynapse_ingest_hook.py] -->|bounded TAIL of raw JSONL| ING[POST /ingest\nmcp_server/server.py]
+    HK[Stop hook\nplugin/scripts/ingest_hook.py] -->|raw JSONL past the cursor\nchunked at turn boundaries| ING[POST /ingest\nmcp_server/server.py]
     ING --> PARSE[JSONLParser\nsame parser as disk sweep]
     PARSE --> CONTAM{transcript\ncontamination?}
     CONTAM -- yes --> DROP[drop]
@@ -296,7 +296,11 @@ session hash the same, so the second is skipped.
 
 ### 4.2 The Stop hook
 
-`scripts/synapse_ingest_hook.py` fires on every turn. It ships a **bounded tail** (default `SYNAPSE_INGEST_TAIL=400` raw records), trimmed to start at a real turn boundary; if the window holds no boundary (one mega-turn) it falls back to the full file. It POSTs detached (`start_new_session=True`) and always `sys.exit(0)` — **it never blocks or fails a turn**. A disk-sweep backstop re-ingests anything a failed POST drops. Shipping a tail (not the full transcript) plus enqueue-gating on new `(session, span_id)` fixed an earlier O(turns²) re-extraction loop (#61, #105, #106).
+`plugin/scripts/ingest_hook.py` fires on every turn. The hook reads the payload, spawns a detached child (`start_new_session=True`) with `--ship <transcript_path>` and returns; it always `sys.exit(0)` — **it never blocks or fails a turn**. The child ships the transcript's records past a **per-file byte cursor**, kept in `ingest_cursors.json` under `SYNAPSE_DATA_DIR`. The cursor's offset is the start of the last turn shipped, not the end of the file: that turn may still be growing, so it goes again next time and the server skips it by `span_id` once it is complete. The cursor also records the file size at the last complete run; when the size has not changed, nothing is sent. A transcript with no cursor yet, or one whose cursor points past the end of the file (truncated or rewritten), starts on the `Stop` path at the first turn boundary in its last `SYNAPSE_INGEST_TAIL` (default 400) records, or at byte 0 when that window holds none; the catch-up sweep starts such a file at byte 0. The records are POSTed in chunks of up to `SYNAPSE_INGEST_TAIL` records (a single longer turn goes as one chunk), split only at turn boundaries, so no chunk ends mid-turn; with no boundary past the cursor, everything past it goes as one chunk and the cursor stays put. The cursor advances after each successful POST, under a file lock, and never moves backwards except after a truncation.
+
+A **failed POST** leaves the cursor where it was (a transcript with no cursor yet gets one where the failed chunk started) and marks the transcript's entry `pending`, with the time and a short reason from a fixed vocabulary (an HTTP status, a timeout, a refused connection; never the token); chunks already sent stand, and the run stops. The next `Stop` resumes from the cursor, and so does the **catch-up sweep**: a `SessionStart` hook runs `ingest_hook.py --catchup`, which spawns a detached sweep of the projects directory (a second sweep that starts while one runs exits at once). It ships every transcript that changed since its last complete upload, or was never uploaded, and was modified within `SYNAPSE_INGEST_CATCHUP_DAYS` (default 3), plus every pending or half-shipped one however old, skipping the live session's own transcript and any file modified in the last `SYNAPSE_INGEST_ACTIVE_GRACE` seconds (default 300). It takes the least recently touched files first, at most `SYNAPSE_INGEST_CATCHUP_MAX` (default 20) per session start, and the rest wait for the next one. After 3 failed POSTs in a row, or a first failure 24 hours old, with no success since, the `--catchup` hook prints one line at session start, shown to the user and to the model, saying since when uploads have been failing and why. Shipping only what lies past the cursor (not the full transcript every turn) plus enqueue-gating on new `(session, span_id)` fixed an earlier O(turns²) re-extraction loop (#61, #105, #106).
+
+Codex's `Stop` hook (`plugin-codex/hooks/synapse_stop_hook.py`) works the same way in outline: a detached child, a byte cursor that moves only after a successful POST, and the same pending marks, catch-up retries and session-start warning, from the shared `plugin/scripts/synapse_ingest_retry.py`. Its cursor file and cursor rules are its own (`plugin-codex/README.md`).
 
 **Private mode** short-circuits the hook before any POST: `private_mode.py on <session_id>` writes a marker file at `~/.synapse/private/<session_id>`, and `_ship` skips the whole transcript while that marker is live — on the Stop path and the catch-up sweep alike. Markers expire after 12h (ignored *and* deleted) and are removed by a `SessionEnd` hook, because a session id is never reused and an orphaned marker would otherwise be permanent. The check is fail-safe in one direction: a marker directory that exists but can't be read counts as private, since silently capturing a session the user believes is off the record is the unacceptable failure and a deferred turn is not (the cursor doesn't advance). The marker is only the fast local half — the durable half is the `private_sessions` row the same CLI writes over `PUT /private-sessions/{session_id}`, which is what §4.1 enforces.
 
@@ -896,7 +900,7 @@ The poller reads config via `pydantic-settings`; the MCP server reads `os.enviro
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `SYNAPSE_INGEST_TAIL` | `400` | Stop-hook tail size (raw records) |
+| `SYNAPSE_INGEST_TAIL` | `400` | client-side: records per Stop-hook POST chunk, and how far back a transcript's first Stop run looks for a turn boundary to start from |
 | `SYNAPSE_INGEST_CATCHUP_DAYS` | `3` | client-side: the SessionStart catch-up sweep ships lagging transcripts modified this recently, plus any transcript whose upload failed, however old. Never-attempted older files (pre-install history) are `synapse-import`'s job |
 | `SYNAPSE_DRAIN_ONLY` | unset | `1` → replica is a pure extraction worker (no chunk/embed cycle) |
 | `SYNAPSE_RERANK_MODEL` | `rerank-3-lite` | rerank model: for `voyage` the Voyage cross-encoder (set `rerank-2.5-lite` to roll back); for `http` the served model id |
@@ -979,13 +983,13 @@ synapse/
 │   └── __main__.py            # nightly orchestrator — runs the skills + config lanes
 │
 ├── scripts/
-│   ├── synapse_ingest_hook.py # the Stop hook (tail shipper)
 │   ├── contextualize_web_chunks.py
 │   ├── pile_merge.py          # preview, health-check and undo the schema 067 one-memory merge
 │   └── ... (eval/benchmark harnesses, gitignored goldens)
 │
 ├── plugin/                    # the Claude Code plugin (hooks, commands, dream→skills lane) + the `synapse` CLI
 │                              #   (synapse_cli.py, harness.py, synapse_home.py, mcp_headers.py, synapse_run.py)
+│   ├── scripts/ingest_hook.py # the Stop hook (ships each transcript past its cursor) + the --catchup sweep
 │   └── synapse_client/        # the client core: stdlib package every harness adapter builds on (docs/client-harnesses.md)
 ├── plugin-codex/              # the Codex hooks + installer (reuses plugin/scripts by relative path)
 │   └── README.md
