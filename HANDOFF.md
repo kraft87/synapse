@@ -15,6 +15,10 @@ changed, what to do on each machine, what was proven, and what is still open.
   compaction. With it the server hides only the session's turns from that time on, and a
   fact counts as the session's own only when every source is one of those turns. Without
   it nothing changes.
+- **Earlier own turns are added, never swapped in.** With the cut, the other sessions'
+  turns served are exactly those served without it. At most two of the session's earlier
+  turns are then added (`SYNAPSE_RECALL_SELF_PRIOR_LIMIT`, `0` = none), each only when it
+  scores at least as well as the weakest other turn served, so a list can be two longer.
 - **The client reads the compaction time from the transcript.** The Claude Code and Codex
   PreToolUse hooks add `self_since` next to `self_session`
   (`plugin/synapse_client/compaction.py`: the last `compact_boundary` line of a Claude Code
@@ -41,6 +45,9 @@ changed, what to do on each machine, what was proven, and what is still open.
   session's own turns; with the cut, 28 calls served some. A pairwise judge preferred the
   new results in 17 of the 36 calls whose results changed and the old in 12, with 7 ties;
   the 17 are questions about the session's own earlier work.
+- With the cut, both tools serve the same other-session turns, in the same order and with
+  the same scores, as without it: with the reranker on, degraded, and on the score-cutoff
+  path, including a pool where more own turns than the passage window holds rank first.
 - Each rule has a test that fails when the rule is broken: the comparison at the cut; an
   own turn with no usable time stays hidden; the session-scoped drill-down ignores the cut;
   the hooks add it only to the two tools, only for their own session, and never overwrite

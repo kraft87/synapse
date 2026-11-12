@@ -250,7 +250,7 @@ def test_session_scoped_recall_skips_self_exclusion(monkeypatch, self_since):
 
     r._episode_pool = _pool  # type: ignore[method-assign]
     r._exclude_self = _excl  # type: ignore[method-assign]
-    r._select_episodes = lambda q, pool, limit: (pool, 0, 0.0)  # type: ignore[method-assign]
+    r._select_episodes = lambda q, pool, limit, **_k: (pool, 0, 0.0)  # type: ignore[method-assign]
     r._record_metrics = lambda m: seen.setdefault("metrics", m)  # type: ignore[method-assign]
     r._increment_retrieval_counts = lambda ids: None  # type: ignore[method-assign]
 

@@ -115,15 +115,21 @@ class RecallEpisodesMixin:
         # Same self-exclusion as recall(): the caller's own turns are already in
         # its context window. Pool-level so excluded slots backfill before rerank.
         # Skipped under a session filter — the caller explicitly asked for that
-        # session's turns, including when it is its own. The cut (the caller's last
-        # compaction) serves its turns from before it again, as in recall().
+        # session's turns, including when it is its own. With the cut (the caller's
+        # last compaction) a few of its turns from before it stay in the pool as a
+        # second lane: they share the rerank call and may be added to what the other
+        # turns serve, never swapped into it (see _select_episodes).
         cut = None if session_id else self._self_cutoff(self_session, self_since)
         n_self_excluded = 0
+        own_session = None
         if self_session and not session_id:
-            pre_excl = len(pool)
-            pool = self._exclude_self(pool, self_session, since=cut)
-            n_self_excluded = pre_excl - len(pool)
-        episodes, n_echo_suppressed, rerank_top = self._select_episodes(query, pool, limit)
+            n_self_excluded = len(pool) - len(self._exclude_self(pool, self_session, since=cut))
+            prior = {id(e) for e in self._self_prior(pool, self_session, cut)}
+            pool = [e for e in pool if e.get("session_id") != self_session or id(e) in prior]
+            own_session = self_session if prior else None
+        episodes, n_echo_suppressed, rerank_top = self._select_episodes(
+            query, pool, limit, own_session=own_session
+        )
 
         # Increment feedback counts BEFORE slimming (we lose the parseable id afterwards)
         ep_ids = [

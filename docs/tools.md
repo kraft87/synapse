@@ -68,7 +68,9 @@ injected by the plugin's PreToolUse hook so serving can suppress the calling ses
 episodes. `self_since`, on `recall` and `recall_full_turns`, is the time of that session's
 last compaction, read from its transcript by the same hook: the turns before it have left
 the model's context, so only the session's turns from that time on are suppressed. Without
-it the whole session is. `surface` is deprecated and ignored: the server identifies the
+it the whole session is. Those earlier turns are added to what the call serves, never swapped
+in: two at most, and only when they score as well as the other sessions' turns already served,
+which stay exactly what they would be without the cut. `surface` is deprecated and ignored: the server identifies the
 calling device from its own credential ([docs/auth.md](auth.md)).
 
 One more tool exists but is hidden from tool listings: **`issue_machine_token()`**, the

@@ -237,7 +237,8 @@ def test_recall_kind_with_a_cut_serves_the_callers_turns_from_before_it(
         self_since="2026-11-12T09:00:00-05:00",
     )
     assert sorted(it["id"] for it in out["episodes"]) == ["e:0", "e:2", "e:3"]
-    assert cuts == [("facts", _CUT), ("overlay", _CUT)]
+    # The overlay asks for the other turns, then for the caller's own (a lookup of its own).
+    assert cuts == [("facts", _CUT), ("overlay", _CUT), ("overlay", _CUT)]
 
     row = _newest(conn, engine, "recall", "served_ids", mark)
     assert row is not None

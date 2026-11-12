@@ -213,6 +213,18 @@ _RECALL_PASSAGE_N = int(os.getenv("SYNAPSE_RECALL_PASSAGE_N", "6") or "6")  # pa
 # no full-episode/token cost (still serves _RECALL_PASSAGE_N passages, capped at _RECALL_PASSAGE_CAND).
 _RECALL_PASSAGE_SRC_K = 20  # top reranked episodes to mine passages from
 _RECALL_PASSAGE_CAND = 80  # cap on chunks fed to the passage reranker (bounds the extra call)
+# The compaction cut's second lane (2026-11-12). With self_since, the caller's own turns from
+# before its last compaction may serve again, but never in place of another session's: a few
+# ride in the same rerank call as the others, the others are chosen exactly as without them,
+# and then at most _RECALL_SELF_PRIOR_LIMIT own turns are added, each only if it scores at
+# least as well as the weakest other turn served. Letting them compete instead cost results
+# on a replay of 48 real recalls made after a compaction: own turns took slots and crowded the
+# passage window, and one own turn served often changed three to five of the others.
+# 0 turns the lane off (the session's turns before the cut are then hidden like the rest).
+_RECALL_SELF_PRIOR_LIMIT = int(os.getenv("SYNAPSE_RECALL_SELF_PRIOR_LIMIT", "2") or "2")
+# Own turns from before the cut that compete for the lane: the first ones in fused (BM25 +
+# vector) order. Bounds what the lane adds to the rerank calls.
+_RECALL_SELF_PRIOR_CANDIDATES = 5
 # BM25 fusion of the final episode order (SYNAPSE_RECALL_BM25_FUSE and its _W / _LIFT_CAP /
 # _RESERVE shapes, 2026-07-23..25) is gone: it won the exact-fact goldens but lost
 # LongMemEval-S 75.9 vs 84.8, prod ran it off from 2026-08-03, and its exact-string-miss
@@ -419,6 +431,8 @@ class Recall(
             _FACT_LIMIT=_FACT_LIMIT,
             _RECALL_EPISODE_LIMIT=_RECALL_EPISODE_LIMIT,
             _RECALL_PASSAGE_SRC_K=_RECALL_PASSAGE_SRC_K,
+            _RECALL_SELF_PRIOR_LIMIT=_RECALL_SELF_PRIOR_LIMIT,
+            _RECALL_SELF_PRIOR_CANDIDATES=_RECALL_SELF_PRIOR_CANDIDATES,
             _RECALL_FLOOR=_RECALL_FLOOR,
             _KG_OWNER=_KG_OWNER,
             _RERANK_DOC_CAP=_RERANK_DOC_CAP,
@@ -515,8 +529,9 @@ class Recall(
         (``session_id`` set, or fetch) is never excluded.
 
         ``since`` (from ``_self_cutoff``) is the caller's last compaction: turns before
-        it are gone from its context, so they serve again. An own turn without a usable
-        ``created_at`` stays hidden, since it cannot be placed before the cut.
+        it are gone from its context, so they are kept. An own turn without a usable
+        ``created_at`` stays hidden, since it cannot be placed before the cut. The serving
+        paths do not mix the kept ones back in; they go to a second lane (``_self_prior``).
         """
 
         def _keep(e: dict[str, Any]) -> bool:
@@ -528,6 +543,25 @@ class Recall(
             return (at if at.tzinfo else at.replace(tzinfo=UTC)) < since
 
         return [e for e in ranked_eps if _keep(e)]
+
+    def _self_prior(
+        self, eps: list[dict[str, Any]], self_session: str, since: datetime | None
+    ) -> list[dict[str, Any]]:
+        """The caller's turns from before its last compaction that compete for the second lane.
+
+        The first _RECALL_SELF_PRIOR_CANDIDATES of them in ``eps`` order (both tools pass
+        the fused order), or none without a cut or with the lane off. They are scored in
+        the rerank call the other turns already get, so the lane costs no extra call, and
+        are added to what serves only after the others are chosen, never in their place."""
+        settings = self._settings()
+        if since is None or settings._RECALL_SELF_PRIOR_LIMIT <= 0:
+            return []
+        own = [
+            e
+            for e in self._exclude_self(eps, self_session, since=since)
+            if e.get("session_id") == self_session
+        ]
+        return own[: settings._RECALL_SELF_PRIOR_CANDIDATES]
 
 
 __all__ = [
