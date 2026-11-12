@@ -248,13 +248,21 @@ containers and volumes.
 
 ## Upgrading
 
-First-boot init never re-runs on an existing data volume. To bring an existing database up
-to date, run [`scripts/apply_schema.sh`](../scripts/apply_schema.sh) (the single source of
-truth for migration order) against it — see the script's header for caveats.
+First-boot init never re-runs on an existing data volume.
+[`scripts/apply_schema.sh`](../scripts/apply_schema.sh) lists the migrations in order, but
+it is for an empty database: on one that already has a schema it stops at the first file
+that cannot be applied twice (001, 004 and 023 cannot). To bring an existing database up to
+date, read its stamp (`SELECT value FROM synapse_meta WHERE key = 'schema_version'`) and
+apply the files above it one at a time, in that order, each with
+`psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/<file>.sql` (`-X` so a `~/.psqlrc`
+that turns autocommit off cannot wrap a file in one transaction); for 067 and 069, the
+commands in their sections below. Files from 067 on stamp the version they bring; when the
+last file applied is older, stamp its number yourself:
+`INSERT INTO synapse_meta (key, value) VALUES ('schema_version', 'NNN') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`.
 
-Every service verifies at boot that the database schema matches the code (the script
-stamps the applied version; a mismatch refuses to start with instructions rather than
-failing mid-request). So the upgrade order is: pull, run `apply_schema.sh`, restart.
+Every service verifies at boot that the database schema matches the code (the stamp records
+the applied version; a mismatch refuses to start with instructions rather than failing
+mid-request). So the upgrade order is: pull, apply the files above the stamp, restart.
 `SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
 `-- schema-check: optional` boots with a warning: the code shipped with them runs without
 them and keeps its old behaviour until they are applied.
@@ -269,7 +277,7 @@ two transactions of its own, so apply it by itself and never wrap it in `BEGIN` 
 
 1. Stop the pollers (`docker compose stop poller poller-drain`), so nothing writes graph
    rows during the merge.
-2. Apply: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
+2. Apply: `psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
    It takes minutes on a large graph (graph writers wait while it runs; the merge itself
    does not block readers) and does nothing when there is nothing left to merge, so a
    re-run is safe. It stamps 067 only once the graph holds no personal row and no
@@ -282,8 +290,8 @@ nothing to merge.
 
 **Schema 069, the cleanup.** Optional: no service needs it, so apply it by hand to the
 running system, nothing stopped, once 067 is in place:
-`psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/069_one_memory_cleanup.sql` (under
-autocommit; never `-1`). It drops `group_id` from the knowledge graph, notes and
+`psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/069_one_memory_cleanup.sql` (under
+autocommit; never `-1`; after a failed step, run the whole file again). It drops `group_id` from the knowledge graph, notes and
 preferences, the indexes that lead with it, and the `kg_pile_merge_067_*` tables. A
 preflight refuses, changing nothing, below 067, on a row whose `group_id` is not
 `technical`, on a missing owner-only index, and on anything else that depends on the column;
@@ -358,8 +366,8 @@ env var says so in its HANDOFF.md entry.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device
   Flow" on the GitHub OAuth App; fall back to `synapse login --browser`.
-- **A service refuses to start, complaining about the schema version.** Run
-  `scripts/apply_schema.sh` against the database, then restart. See
+- **A service refuses to start, complaining about the schema version.** Apply the schema
+  files above the database's stamp, one at a time, then restart. See
   [Upgrading](#upgrading).
 
 ## Next

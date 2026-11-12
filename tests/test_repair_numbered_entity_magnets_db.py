@@ -349,17 +349,76 @@ def test_restore_puts_everything_back(kg, db_url, embedder, tmp_path, capsys):
 
 
 def test_restore_refuses_a_backup_taken_before_one_memory(kg, db_url, embedder):
-    """A backup that carries group_id was taken before 067 merged the two groups: its rows
-    name entities the merge folded away, and re-creating them would split those again."""
+    """A backup that carries group_id was taken before 069 and may predate the merge: its
+    rows may name entities the merge folded away, and re-creating them would split those
+    again."""
     _seed(kg)
     _run(db_url, "--apply", "--date", DAY)
     kg.execute(
         f"ALTER TABLE kg_magnet_repair_{DAY}_entities ADD COLUMN group_id text DEFAULT 'technical'"
     )
     after = _state(kg)
-    with pytest.raises(SystemExit, match="before one memory"):
+    with pytest.raises(SystemExit, match="taken before schema 069 and may predate the merge"):
         rm.main(["--db-url", db_url, "--restore", DAY, "--apply"])
     assert _state(kg) == after
+
+
+def test_restore_refuses_it_too_on_a_merged_database_that_still_has_the_column(
+    kg, db_url, embedder
+):
+    """At 067 or 068 kg_entities still carries group_id, and the merge has run all the same."""
+    _seed(kg)
+    _run(db_url, "--apply", "--date", DAY)
+    kg.execute(
+        f"ALTER TABLE kg_magnet_repair_{DAY}_entities ADD COLUMN group_id text DEFAULT 'technical'"
+    )
+    stamp = kg.execute("SELECT value FROM synapse_meta WHERE key = 'schema_version'").fetchone()
+    kg.execute("ALTER TABLE kg_entities ADD COLUMN group_id text DEFAULT 'technical'")
+    kg.execute("UPDATE synapse_meta SET value = '068' WHERE key = 'schema_version'")
+    try:
+        after = _state(kg)
+        with pytest.raises(SystemExit, match="taken before schema 069 and may predate the merge"):
+            rm.main(["--db-url", db_url, "--restore", DAY, "--apply"])
+        assert _state(kg) == after
+    finally:
+        kg.execute("ALTER TABLE kg_entities DROP COLUMN group_id")
+        kg.execute("UPDATE synapse_meta SET value = %s WHERE key = 'schema_version'", stamp)
+
+
+def test_a_backup_table_made_before_a_column_was_dropped_keeps_each_value_in_its_column(
+    kg, db_url, embedder
+):
+    """Backup tables made before 069 carry group_id in the middle; a later run appends to
+    them by column name, so no value lands in its neighbour's column."""
+    _seed(kg)
+    live: dict[str, dict[str, Any]] = {}
+    for table in ("kg_relationships", "kg_entities"):
+        cols = [
+            r[0]
+            for r in kg.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = %s "
+                "ORDER BY ordinal_position",
+                (table,),
+            )
+        ]
+        assert "owner_id" in cols
+        at = cols.index("owner_id") + 1
+        listed = ", ".join([*cols[:at], "NULL::text AS group_id", *cols[at:]])
+        name = f"kg_magnet_repair_{DAY}_{table[3:]}"
+        kg.execute(
+            f"CREATE TABLE {name} AS SELECT now() AS backed_up_at, {listed} "
+            f"FROM {table} WHERE false"
+        )
+        live[name] = {u: row for u, row in kg.execute(f"SELECT t.uuid, to_jsonb(t) FROM {table} t")}
+    _run(db_url, "--apply", "--date", DAY)
+    for name, before in live.items():
+        rows = kg.execute(
+            f"SELECT uuid, group_id, to_jsonb(b) - 'backed_up_at' - 'group_id' FROM {name} b"
+        ).fetchall()
+        assert rows
+        for u, group, row in rows:
+            assert (group, row) == (None, before[u])
 
 
 def test_restore_keeps_a_created_entity_that_new_facts_use(kg, db_url, embedder, capsys):

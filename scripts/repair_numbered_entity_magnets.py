@@ -578,6 +578,28 @@ def _tables(day: str) -> tuple[Any, Any, Any]:
     )
 
 
+def _columns(conn: Any, table: str) -> list[str]:
+    return [
+        r[0]
+        for r in conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = %s "
+            "ORDER BY ordinal_position",
+            (table,),
+        )
+    ]
+
+
+def _shared(conn: Any, backup: str, live: str) -> Any:
+    """The live table's columns that its backup table also has, as a column list. A backup
+    table made before a column was dropped (or added) still takes rows, each value in its
+    own column."""
+    from psycopg import sql
+
+    backed = set(_columns(conn, backup))
+    return sql.SQL(", ").join(sql.Identifier(c) for c in _columns(conn, live) if c in backed)
+
+
 def backup(conn: Any, day: str, edge_uuids: list[str], entity_uuids: list[str]) -> None:
     """Copy every row the run will touch, in one transaction, before any write."""
     from psycopg import sql
@@ -602,18 +624,18 @@ def backup(conn: Any, day: str, edge_uuids: list[str], entity_uuids: list[str]) 
                 "(uuid TEXT PRIMARY KEY, created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
             ).format(created)
         )
-        conn.execute(
-            sql.SQL(
-                "INSERT INTO {} SELECT now(), r.* FROM kg_relationships r WHERE r.uuid = ANY(%s)"
-            ).format(rel),
-            (edge_uuids,),
-        )
-        conn.execute(
-            sql.SQL(
-                "INSERT INTO {} SELECT now(), e.* FROM kg_entities e WHERE e.uuid = ANY(%s)"
-            ).format(ent),
-            (entity_uuids,),
-        )
+        for bak, name, live, uuids in (
+            (rel, f"kg_magnet_repair_{day}_relationships", "kg_relationships", edge_uuids),
+            (ent, f"kg_magnet_repair_{day}_entities", "kg_entities", entity_uuids),
+        ):
+            cols = _shared(conn, name, live)
+            conn.execute(
+                sql.SQL(
+                    "INSERT INTO {bak} (backed_up_at, {cols}) "
+                    "SELECT now(), {cols} FROM {live} WHERE uuid = ANY(%s)"
+                ).format(bak=bak, cols=cols, live=sql.Identifier(live)),
+                (uuids,),
+            )
 
 
 def _create_target(conn: Any, t: Target, embedding: list[float], created_table: Any) -> None:
@@ -738,23 +760,21 @@ def restore(conn: Any, day: str, *, write: bool) -> dict[str, int]:
     import psycopg
 
     with conn.transaction():
-        cols_sql = (
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = %s "
-            "ORDER BY ordinal_position"
-        )
-        backed = [r[0] for r in conn.execute(cols_sql, (f"kg_magnet_repair_{day}_entities",))]
+        backed = _columns(conn, f"kg_magnet_repair_{day}_entities")
         if not backed:
             raise SystemExit(f"no backup tables for {day}")
-        now_cols = {r[0] for r in conn.execute(cols_sql, ("kg_entities",))}
-        if "group_id" in backed and "group_id" not in now_cols:
-            # Taken before one memory (067 merged the two groups, 069 dropped the column):
-            # its rows name entities the merge folded into others, and re-creating them
-            # would split those entities again.
+        now_cols = set(_columns(conn, "kg_entities"))
+        stamp = conn.execute(
+            "SELECT value FROM synapse_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if "group_id" in backed and stamp and stamp[0].isdigit() and int(stamp[0]) >= 67:
+            # 067 merged the two groups; 069 dropped the column. A backup carrying it may
+            # name entities the merge folded into others, whether or not the live table
+            # still has the column, and re-creating them would split those entities again.
             raise SystemExit(
-                f"the backup tables for {day} were taken before one memory: they carry "
-                "group_id and kg_entities no longer does. Restoring them would bring back "
-                "entities the merge folded away, so this backup cannot be restored."
+                f"the backup tables for {day} were taken before schema 069 and may predate "
+                "the merge; restoring them could bring back entities the merge folded "
+                "away, so this backup cannot be restored."
             )
         cols = sql.SQL(", ").join(sql.Identifier(c) for c in backed if c in now_cols)
         cur = conn.execute(
