@@ -184,19 +184,12 @@ _CLAUDE_CASES = [
             ),
         ),
     ),
+    # An explicit null used to raise AttributeError in the server's filter and fail the
+    # whole batch; the hook never advances past a failed POST, so the transcript stuck.
     pytest.param(
         {"type": "user", "uuid": "u-case", "sessionId": "s-parity", "message": None},
         False,
         id="message-null",
-        marks=pytest.mark.xfail(
-            raises=AttributeError,
-            strict=True,
-            reason=(
-                "the hook reads `message` with `or {}` and answers False; the server's "
-                "record.get('message', {}) returns None for an explicit null and its "
-                "filter raises AttributeError"
-            ),
-        ),
     ),
 ]
 

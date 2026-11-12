@@ -30,27 +30,30 @@ changed, what to do on each machine, what was proven, and what is still open.
 **On each machine**
 
 1. Nothing beyond the usual update: `synapse update` once the server serves 0.24.3. No
-   behaviour changes.
+   behaviour changes on the client. On the server, a Claude Code transcript record with
+   `"message": null` no longer fails its whole `/ingest` batch (below).
 
 **Proven**
 
-- Full non-db suite: 3721 passed, 34 skipped, 3 xfailed. Ruff check and format are clean.
+- Full non-db suite: 3727 passed, 34 skipped, 2 xfailed. Ruff check and format are clean.
 - The new byte-for-byte tests of `bootstrap_hint()` and `restricted_block()` passed on
   the old definitions in `enroll.py`, and still pass after the switch.
 - `harness.normalize_url` and the core's `settings.normalize_url` agree on every case in
   the parity table, and their patterns and flags are equal.
-- With `--runxfail`, each of the three known differences fails at the hook's answer or
-  the server's exception, not in the test's setup.
+- With `--runxfail`, each of the two known differences fails at the hook's answer, not
+  in the test's setup.
+- The parity table found one server defect, fixed here: `JSONLParser` read a record's
+  message with `record.get("message", {})`, which is `None` for an explicit null, and
+  raised AttributeError. That returned 500 for the whole batch, and the hook never
+  advances its cursor past a failed POST. It now reads a null message as an empty one,
+  as the hook always did; the case is an ordinary test in the parity table.
 
 **Open**
 
-- The hooks and the server differ on three records. Each is an xfail in the parity
-  tests; no code changed:
+- The hooks and the server differ on two records. Each is an xfail in the parity
+  tests; no code changed for them:
   - A sidechain user record with real text: `ingest_hook._is_turn_start` treats it as a
     turn start, but the server drops sidechain records before grouping.
-  - A Claude Code record with `"message": null`: the server's
-    `JSONLParser._filter_records` raises AttributeError, and the hook answers no. Claude
-    Code is not known to write such a record.
   - A Codex user message whose only part is `output_text`: the server counts it as a
     turn, but the hook's `_is_user_boundary` reads only `input_text` and `text`.
 - `harness.normalize_url` keeps its own copy of the core's rule. `synapse update` calls

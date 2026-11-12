@@ -58,7 +58,7 @@ def _is_user_turn(record: dict[str, Any]) -> bool:
     or Claude Code slash-command machinery)."""
     if record.get("type") != "user":
         return False
-    content = record.get("message", {}).get("content")
+    content = (record.get("message") or {}).get("content")
     if isinstance(content, str):
         text = content.strip()
         return bool(text) and not _is_machinery_text(text)
@@ -221,7 +221,7 @@ class JSONLParser:
         Tool-result records and real user prompts are kept."""
         if record.get("type") != "user":
             return False
-        content = record.get("message", {}).get("content")
+        content = (record.get("message") or {}).get("content")
         if isinstance(content, str):
             return _is_machinery_text(content)
         if isinstance(content, list):
