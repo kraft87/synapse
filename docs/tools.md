@@ -63,10 +63,13 @@ already has (the Hermes pattern — when injection covers the read, ship no read
   goldens and reranker tuning; recall's ranking never reads it, and the only live use is the
   session-start board, which orders notes within a type by their helpful `n:` ratings.
 
-Two parameters exist on several of these that a caller should never set. `self_session` is
+Three parameters exist on several of these that a caller should never set. `self_session` is
 injected by the plugin's PreToolUse hook so serving can suppress the calling session's own
-episodes. `surface` is deprecated and ignored: the server identifies the calling device from
-its own credential ([docs/auth.md](auth.md)).
+episodes. `self_since`, on `recall` and `recall_full_turns`, is the time of that session's
+last compaction, read from its transcript by the same hook: the turns before it have left
+the model's context, so only the session's turns from that time on are suppressed. Without
+it the whole session is. `surface` is deprecated and ignored: the server identifies the
+calling device from its own credential ([docs/auth.md](auth.md)).
 
 One more tool exists but is hidden from tool listings: **`issue_machine_token()`**, the
 auth-gated plumbing `synapse login` calls to fetch the root bearer. It stays callable by name
@@ -96,7 +99,7 @@ are fail-soft: an unreachable server is a silent no-op.
 | `UserPromptSubmit` | `recall_nudge.py` | One static ~45-token line per prompt reminding the model to use recall/remember, plus a wall-clock timestamp so `remember()` and timeline references know the current moment. Zero latency, zero API calls. Off with `SYNAPSE_RECALL_NUDGE=0`. |
 | `PostToolUse` (recall, recall_full_turns) | `recall_feedback_nudge.py` | One line reminding the model to close the retrieval-quality loop with `recall_feedback`. Off by default: the labels only help whoever is tuning the retrieval stack. |
 | `PostToolUse` (remember) | `remember_spool.py post-tool-use` | When `remember()` comes back without a confirmed write, spools the intent locally and tells the model it is queued, not saved. |
-| `PreToolUse` (synapse tools) | `self_session_inject.py` | Injects the calling session's id so serving can exclude the session's own episodes (already in the model's context) and so feedback and remembered episodes attach to the right session. The model cannot know its own session id. |
+| `PreToolUse` (synapse tools) | `self_session_inject.py` | Injects the calling session's id so serving can exclude the session's own episodes (already in the model's context) and so feedback and remembered episodes attach to the right session. The model cannot know its own session id. On `recall` and `recall_full_turns` it also injects `self_since`, the time of the last compaction in the session's transcript, so only the turns since then are excluded. |
 
 The dream to skills lane (mines your transcripts, proposes new skills, retunes triggers,
 nominates merges) runs server-side in the `dream` container. You do not run a cron; you
