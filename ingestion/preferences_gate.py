@@ -20,6 +20,15 @@ Reconciliation (write-time), keyed on cosine similarity to the live set:
   - _SUPERSEDE_SIM.._REASSERT_SIM otherwise → CONFIRM: one cheap LLM call decides
     restatement (→ re-assert) vs distinct (→ insert); any failure falls back to insert
   - else                          → INSERT a new live preference
+Only preferences with the same readers are compared. A restricted device is
+served a preference only when its project is on that device's allowlist, so two projects have
+the same readers when, for every approved restricted surface, both are on its allowlist or
+both are off it (case-insensitive; a missing project is on no allowlist). A live preference
+with other readers is not a candidate at all: this write never re-asserts it, merges into it
+or retires it, and the judge never sees its text. The new item is stored as its own row. With
+no approved restricted surface every project has the same readers. If the allowlists cannot
+be read, only a row of the same project (case-insensitive) is a candidate. The check is made
+at write time; see ``_same_readers``.
 The pure decision lives in ``decide_pref_action`` so it's unit-testable without a DB; the
 gray-band LLM confirm is the same shape ``notes.reconcile_note`` and the entity deduper use
 (structural rules outside the band, a judgement call inside it).
@@ -35,6 +44,7 @@ import logging
 import os
 from typing import Any
 
+from ingestion.db_preferences import SameReaders
 from ingestion.llm_client import LLM_TRANSPORT_ERRORS, MalformedResponseError, parse_with_retry
 
 logger = logging.getLogger(__name__)
@@ -170,7 +180,8 @@ def _contradicts(new_polarity: str, existing_polarity: str) -> bool:
 def decide_pref_action(new_polarity: str, candidates: list[dict[str, Any]]) -> dict[str, Any]:
     """Pure reconciliation decision for one new preference against the live set.
 
-    ``candidates`` are the nearest live prefs, each ``{id, pref, polarity, sim}``,
+    ``candidates`` are the nearest live prefs with the same readers as the new item (the
+    gate's query filters the rest out), each ``{id, pref, polarity, sim}``,
     DESCENDING by ``sim`` (cosine similarity in [-1, 1]; ~1 = near-identical text). Returns
     ``{"action": "reassert"|"supersede"|"confirm"|"insert", "target_id": int|None}``.
 
@@ -199,17 +210,6 @@ def _candidate_text(candidates: list[dict[str, Any]], target_id: Any) -> str:
         if c.get("id") == target_id:
             return str(c.get("pref") or "").strip()
     return ""
-
-
-def _group_for(project: str | None) -> str:
-    """Group routing derived from the project tag — same axis as the KG. Imported lazily
-    to avoid an import cycle (the extractor imports this gate)."""
-    try:
-        from ingestion.extractor import _default_group_for_project
-
-        return _default_group_for_project(project)
-    except Exception:
-        return "technical"
 
 
 class PreferencesGate:
@@ -264,10 +264,9 @@ class PreferencesGate:
             return
 
         project = item.get("project")
-        group_id = _group_for(project)
         source_ref = f"ep:{episode_id}"
         for p in prefs:
-            self._store_one(p, project, group_id, source_ref)
+            self._store_one(p, project, source_ref)
 
     def _confirm_duplicate(self, new_pref: str, existing_pref: str) -> dict[str, Any]:
         """One small LLM call: is ``new_pref`` the same standing preference as
@@ -297,6 +296,26 @@ class PreferencesGate:
         )
         return verdict
 
+    def _same_readers(self, project: str | None) -> SameReaders:
+        """The filter that keeps only live preferences with the same readers as an item
+        from ``project``. A restricted device is served a preference when its project is on
+        that device's allowlist (and no other way), so an item may re-assert, merge into
+        or retire only a row that every restricted device reads exactly when it reads the
+        item's project; any other row could leak its existence or take in text its readers
+        never saw. Projects are compared case-insensitively, as the read side does. When the
+        allowlists cannot be read, fall back to the stricter rule: same project only."""
+        try:
+            allowlists = self._db.restricted_surface_allowlists()
+        except Exception as e:
+            logger.warning("restricted allowlists unreadable (%s); matching one project only", e)
+            return SameReaders(match_project=True, project=project or None)
+        new = project.lower() if project else None
+        surfaces = []
+        for allowed in allowlists:
+            names = tuple(sorted({p.lower() for p in allowed}))
+            surfaces.append((names, new in names))
+        return SameReaders(surfaces=tuple(surfaces))
+
     def _merge_into(self, pref_id: int, updated_pref: str) -> bool:
         """Replace the stored anchor text of ``pref_id`` with the judge's merged text,
         re-embedded so the dedup KNN keeps comparing like-with-like, counting the
@@ -313,14 +332,17 @@ class PreferencesGate:
         logger.info("preference #%s text merged: %s", pref_id, updated_pref[:80])
         return True
 
-    def _store_one(
-        self, p: dict[str, Any], project: str | None, group_id: str, source_ref: str
-    ) -> None:
+    def _store_one(self, p: dict[str, Any], project: str | None, source_ref: str) -> None:
         # Embed the BARE pref text (no metadata prefix): the recall serving leg ranks live
         # prefs against the plain query embedding, so the store must share that space, and
         # the gate's own dedup KNN then compares like-with-like.
         vec = self._embedder.embed([p["pref"]], task="document")[0]
-        candidates = self._db.find_live_preferences(_OWNER, group_id, vec, limit=5)
+        # Only same-readers rows are candidates, so everything below acts on rows this
+        # item's readers also read. The filter runs in the query: an own-class duplicate
+        # is found even when five nearer rows of another class exist.
+        candidates = self._db.find_live_preferences(
+            _OWNER, vec, limit=5, same_readers=self._same_readers(project)
+        )
         action = decide_pref_action(p["polarity"], candidates)
         embed_model = getattr(self._embedder, "model_name", None) or "voyage-4-large"
 
@@ -351,7 +373,6 @@ class PreferencesGate:
 
         new_id = self._db.insert_preference(
             owner_id=_OWNER,
-            group_id=group_id,
             project=project,
             pref=p["pref"],
             polarity=p["polarity"],

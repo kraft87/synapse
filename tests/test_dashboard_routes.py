@@ -317,14 +317,19 @@ def test_catalog_counts(clean, conn, db_url):
     _entity(conn, "e1", name="Widget", group_id="personal")
     _rel(conn, "r1", src="e1", tgt="e1", group_id="technical")
     _event(conn, source_ref="tb:c1", domain="technical")
+    _event(conn, source_ref="tb:c2", domain="technical")
+    _event(conn, source_ref="tb:c3", domain="personal")
+    _event(conn, source_ref="tb:c4", domain=None)
     with _client(db_url) as client:
         body = client.get("/dash/api/catalog", headers=_H).json()
     assert {"name": "synapse", "count": 2} in body["projects"]
     assert {"name": "untagged", "count": 1} in body["projects"]
     assert {"name": "claude-code", "count": 2} in body["sources"]
     assert {"name": "cursor", "count": 1} in body["sources"]
-    # group_ids: union of fact/entity group_id + timeline domain, plain string list.
-    assert body["group_ids"] == ["personal", "technical"]
+    # domains: the distinct timeline domains only, as a plain string list; the knowledge
+    # graph's own group_id column no longer reaches the catalog.
+    assert body["domains"] == ["personal", "technical"]
+    assert "group_ids" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -396,8 +401,8 @@ def test_feed_filters_apply_only_where_column_exists(clean, conn, db_url):
         content="cursor ep",
         created_at=_t(9),
     )
-    _rel(conn, "ft", src="x", tgt="y", fact="tech fact", group_id="technical", created_at=_t(8))
-    _rel(conn, "fp", src="x", tgt="y", fact="personal fact", group_id="personal", created_at=_t(7))
+    _rel(conn, "ft", src="x", tgt="y", fact="tech fact", created_at=_t(8))
+    _rel(conn, "fp", src="x", tgt="y", fact="personal fact", created_at=_t(7))
     et = _event(
         conn,
         fact="tech event",
@@ -416,12 +421,24 @@ def test_feed_filters_apply_only_where_column_exists(clean, conn, db_url):
     )
 
     with _client(db_url) as client:
-        # group_id filter: hits facts (group_id) + timeline (domain); episodes NOT excluded.
-        g = _feed_page(client, group_id="technical", limit=50)
-        got = {(i["type"], i["id"]) for i in g["items"]}
-        assert ("fact", "ft") in got and ("timeline_event", str(et)) in got
-        assert ("episode", str(ep_syn)) in got  # episodes lack group_id -> not excluded
-        assert ("fact", "fp") not in got and ("timeline_event", str(ep_other)) not in got
+        # No group or domain filter: a stale group_id/domain param excludes nothing, facts
+        # carry no group_id, and a timeline item exposes its domain as `domain`.
+        for stale in ({"group_id": "technical"}, {"domain": "technical"}):
+            g = _feed_page(client, limit=50, **stale)
+            got = {(i["type"], i["id"]) for i in g["items"]}
+            assert got == {
+                ("episode", str(ep_syn)),
+                ("episode", str(ep_cur)),
+                ("fact", "ft"),
+                ("fact", "fp"),
+                ("timeline_event", str(et)),
+                ("timeline_event", str(ep_other)),
+            }
+        by_id = {(i["type"], i["id"]): i for i in g["items"]}
+        assert "group_id" not in by_id[("fact", "ft")]
+        assert by_id[("timeline_event", str(et))]["domain"] == "technical"
+        assert by_id[("timeline_event", str(ep_other))]["domain"] == "personal"
+        assert "group_id" not in by_id[("timeline_event", str(et))]
 
         # project filter: hits episodes + timeline; facts lack project -> NOT excluded.
         pj = _feed_page(client, project="synapse", limit=50)
@@ -484,6 +501,7 @@ def test_episode_derived_containment_and_ep_ref(clean, conn, db_url):
         body = client.get(f"/dash/api/episode/{eid}/derived", headers=_H).json()
     fact_uuids = {f["uuid"] for f in body["facts"]}
     assert fact_uuids == {"dn", "ds"}  # both containment forms, other excluded
+    assert all("group_id" not in f for f in body["facts"])
     assert [e["id"] for e in body["timeline_events"]] == [ev]
 
 
@@ -602,6 +620,13 @@ def test_search_per_type_and_total_by_type(clean, conn, db_url):
         fa = client.get(f"/dash/api/search?q={tok}&type=facts", headers=_H).json()
         assert fa["hits"][0]["type"] == "facts" and fa["hits"][0]["id"] == "sr"
         assert fa["hits"][0]["meta"]["episode_id"] == epid  # additive deep-link field
+        assert "group_id" not in fa["hits"][0]["meta"]
+        # A group_id param is ignored: nothing in the store is narrowed by it.
+        stale = client.get(
+            f"/dash/api/search?q={tok}&type=facts&group_id=personal", headers=_H
+        ).json()
+        assert stale["hits"] == fa["hits"]
+        assert stale["total_by_type"] == fa["total_by_type"]
 
         ev = client.get(f"/dash/api/search?q={tok}&type=events", headers=_H).json()
         assert ev["hits"][0]["type"] == "events" and ev["hits"][0]["id"] == str(evid)
@@ -1609,9 +1634,12 @@ def test_timeline_type_and_domain_filters(clean, conn, db_url):
         # type chip narrows to that event_type; untyped rows drop out when a chip is active.
         only_work = client.get("/dash/api/timeline?type=work", headers=_H).json()
         assert {e["id"] for e in only_work["events"]} == {work}
-        # group_id maps to the domain column (schema 038).
-        personal = client.get("/dash/api/timeline?group_id=personal", headers=_H).json()
+        # domain filters the domain column (schema 038).
+        personal = client.get("/dash/api/timeline?domain=personal", headers=_H).json()
         assert {e["id"] for e in personal["events"]} == {life}
+        # group_id is not a filter any more: it is ignored.
+        ignored = client.get("/dash/api/timeline?group_id=personal", headers=_H).json()
+        assert {e["id"] for e in ignored["events"]} == {work, life, untyped}
         # No filter -> everything, including the untyped row.
         allrows = client.get("/dash/api/timeline", headers=_H).json()
         assert {e["id"] for e in allrows["events"]} == {work, life, untyped}

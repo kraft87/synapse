@@ -34,9 +34,19 @@ STAGES
      permissive on purpose: a correction often shares little wording with the note
      it corrects. The floor bounds cost; the judge is the precision layer.
   B. Pair judge + apply — DUPLICATE retires the older-updated note, CORRECTION
-     retires the note the model names as corrected, DISTINCT does nothing.
+     retires the note the model names as corrected, DISTINCT does nothing. A
+     DUPLICATE of two notes in different audience tiers is NOT applied (the pair is
+     memoised, marked ``kept: other tier``): remember() makes such a twin on purpose,
+     because a restatement never edits a note of the other tier, and retiring the
+     older one would take a line away from one tier's readers. A CORRECTION applies
+     whatever the tiers, as a contradiction does at write time. The retirement lands
+     only if the retired note is still live in the tier it was read in; if a write
+     moved it during the judge calls, the pair is recorded as not applied (``kept:
+     changed during the run``) and spends none of the apply budget.
   C. Retype — live global notes (user/feedback) judged for project specificity; a
-     PROJECT verdict applies only if the slug already exists in the store.
+     PROJECT verdict applies only if the slug already exists in the store. A retype
+     moves a note's type and project and never its audience tier: a model's verdict
+     must not change who can read a note, so a tier moves only by an explicit write.
 
 Kill switch: ``SYNAPSE_NOTES_LANE=0``. ENABLED BY DEFAULT.
 """
@@ -56,11 +66,6 @@ from ingestion.llm_client import (
     stage_model,
 )
 from ingestion.notes import _OWNER
-from ingestion.surfaces import (
-    DEFAULT_AUDIENCE,
-    RESTRICTED_AUDIENCE,
-    restricted_project_union,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -364,16 +369,26 @@ def run_lane(
                 continue
             res = resolve_pair(a, b, v_ab, v_ba)
             counts["pairs_judged"] += 1
-            act = res["verdict"] in ("DUPLICATE", "CORRECTION")
+            # Two notes of one wording in different tiers are a deliberate twin (see the
+            # module header), so a DUPLICATE across tiers retires neither.
+            kept_apart = res["verdict"] == "DUPLICATE" and a["audience"] != b["audience"]
+            act = res["verdict"] in ("DUPLICATE", "CORRECTION") and not kept_apart
+            tier_changed = False
             if act:
-                db.supersede_note(res["loser"], res["winner"])
-                retired.add(res["loser"])
-                applied += 1
-                counts["applied_supersede"] += 1
-                samples.append(
-                    f"n:{res['loser']} -> superseded by n:{res['winner']} "
-                    f"({res['verdict'].lower()})"
-                )
+                # The judge calls take seconds. The retirement lands only if the loser is
+                # still live and still in the tier it was read in; otherwise it is left
+                # alone and recorded as not applied.
+                loser = a if a["id"] == res["loser"] else b
+                if db.supersede_note(res["loser"], res["winner"], if_audience=loser["audience"]):
+                    retired.add(res["loser"])
+                    applied += 1
+                    counts["applied_supersede"] += 1
+                    samples.append(
+                        f"n:{res['loser']} -> superseded by n:{res['winner']} "
+                        f"({res['verdict'].lower()})"
+                    )
+                else:
+                    act, tier_changed = False, True
             db.record_curation(
                 op="pair",
                 note_a=int(a["id"]),
@@ -386,15 +401,13 @@ def run_lane(
                     "winner": res["winner"],
                     "loser": res["loser"],
                     "orders": [v_ab, v_ba],
+                    **({"kept": "other tier"} if kept_apart else {}),
+                    **({"kept": "changed during the run"} if tier_changed else {}),
                 },
             )
 
         # ---- stage C: global notes that are really about one project.
         projects: list[str] = db.known_project_slugs()
-        # Audience (schema 053) is derived from a note's PROJECT, so a retype changes the
-        # right answer. Read the restricted-surface allowlist union ONCE for the batch —
-        # it can't change mid-run, and re-deriving per note would be one query each.
-        restricted_projects = restricted_project_union(db)
         for note in db.find_retype_candidates(_OWNER, limit=cap_retype):
             if applied >= cap_apply:
                 break
@@ -414,17 +427,10 @@ def run_lane(
                 # recorded and skipped — writing it would file the note on a shelf
                 # nothing ever reads from, which is deletion with extra steps.
                 if db.project_slug_exists(slug):
-                    # Re-derive by the project rule: a note moving onto a work-readable
-                    # project becomes work-safe, one moving off it goes back to personal.
-                    # Nothing else in this lane touches audience — pair supersession keeps
-                    # each note's own tag, which IS the "preserve on update" requirement.
-                    new_audience = (
-                        RESTRICTED_AUDIENCE if slug in restricted_projects else DEFAULT_AUDIENCE
-                    )
-                    db.retype_note(
-                        int(note["id"]), type="project", project=slug, audience=new_audience
-                    )
-                    detail["audience"] = new_audience
+                    # Only the shelf changes. The note keeps its audience tier whatever
+                    # project the judge picked: a verdict from a model never decides who
+                    # can read a note, and a tier moves only by an explicit write.
+                    db.retype_note(int(note["id"]), type="project", project=slug)
                     act = True
                     applied += 1
                     counts["applied_retype"] += 1

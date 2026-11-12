@@ -190,9 +190,10 @@ WEB_AUDIENCE_PROBE = ColumnProbe(
 
 #: Schema 066 adds kg_relationships.audience / label_version / label_model and
 #: kg_entities.is_self. Restricted KG serving, the owner-seed exclusion, the poller's
-#: fact labeller and `synapse-admin owner` ask this first; until all four exist,
-#: restricted callers get the provenance-only rule (056) and nothing is excluded or
-#: labelled.
+#: fact labeller and `synapse-admin owner` ask this first; until all four exist, a
+#: restricted caller is served no KG facts (provenance alone cannot tell a personal fact
+#: from a work one in one memory), nothing is excluded or labelled, and full trust is
+#: unchanged.
 FACT_AUDIENCE_PROBE = ColumnProbe(
     "SELECT 1 FROM pg_attribute "
     "WHERE NOT attisdropped AND ("

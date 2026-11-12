@@ -220,7 +220,7 @@ class TestSurvivor:
 
 
 class TestPipelineWiring:
-    """_process_facts_for_group: one embedding call, twins never reach Stage 6 or 7."""
+    """_process_facts: one embedding call, twins never reach Stage 6 or 7."""
 
     def _pipe(self):
         pipe = ExtractionPipeline.__new__(ExtractionPipeline)
@@ -249,7 +249,7 @@ class TestPipelineWiring:
             _fact("PR #7 was merged into main", "PR #7", "main"),
         ]
         uuid_map = {n: f"u-{n}" for f in facts for n in (f.source, f.target)}
-        pipe._process_facts_for_group(facts, uuid_map, [41, 42], "technical", default_valid_at=SEG)
+        pipe._process_facts(facts, uuid_map, [41, 42], default_valid_at=SEG)
 
         pipe._embedder.embed.assert_called_once()  # Stage 6a reuses the batch embeddings
         rows = pipe._kg.create_edges_batch.call_args.args[0]

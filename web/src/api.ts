@@ -41,7 +41,7 @@ const req = <T>(path: string, init?: RequestInit, tokenOverride?: string): Promi
 export interface Catalog {
   projects: { name: string; count: number }[];
   sources: { name: string; count: number }[];
-  group_ids: string[];
+  domains: string[];
 }
 
 export type FeedType = 'episode' | 'fact' | 'timeline_event';
@@ -51,7 +51,7 @@ export interface FeedItem {
   ts: string;
   project?: string | null;
   source?: string | null;
-  group_id?: string | null;
+  domain?: string | null;
   gist: string;
   flagged: boolean;
   sal?: number;
@@ -76,7 +76,7 @@ export interface Episode {
   human_turn: string; assistant_turn: string; content: string;
 }
 export interface Derived {
-  facts: { uuid: string; fact: string; group_id: string; t_valid: string; t_invalid: string | null }[];
+  facts: { uuid: string; fact: string; t_valid: string; t_invalid: string | null }[];
   timeline_events: { id: number; fact: string; t_valid: string; salience: number }[];
 }
 export interface SessionEpisode {
@@ -137,13 +137,13 @@ const qs = (params: Record<string, string | number | undefined | null>): string 
 };
 
 // ---------- endpoints ----------
-export interface FeedParams { cursor?: string | null; project?: string; group_id?: string; source?: string; limit?: number; }
+export interface FeedParams { cursor?: string | null; project?: string; source?: string; limit?: number; }
 
 export const fetchCatalog = (tokenOverride?: string): Promise<Catalog> =>
   MOCK ? mockApi('/catalog') : req('/catalog', undefined, tokenOverride);
 
 export const fetchFeed = (p: FeedParams): Promise<Feed> =>
-  MOCK ? mockApi('/feed') : req('/feed' + qs({ cursor: p.cursor, project: p.project, group_id: p.group_id, source: p.source, limit: p.limit ?? 30 }));
+  MOCK ? mockApi('/feed') : req('/feed' + qs({ cursor: p.cursor, project: p.project, source: p.source, limit: p.limit ?? 30 }));
 
 export const fetchEpisode = (id: string): Promise<Episode> =>
   MOCK ? mockApi('/episode/' + id) : req('/episode/' + encodeURIComponent(id));
@@ -157,9 +157,9 @@ export const fetchSession = (id: string, highlight?: string | null): Promise<Ses
 export const fetchEntity = (uuid: string, mentionsOffset = 0): Promise<Entity> =>
   MOCK ? mockApi('/entity/' + uuid) : req('/entity/' + encodeURIComponent(uuid) + qs({ mentions_offset: mentionsOffset }));
 
-export interface SearchParams { q: string; type: SearchTab; offset?: number; limit?: number; project?: string; group_id?: string; source?: string; }
+export interface SearchParams { q: string; type: SearchTab; offset?: number; limit?: number; project?: string; source?: string; }
 export const fetchSearch = (p: SearchParams): Promise<SearchResult> =>
-  MOCK ? mockApi('/search?type=' + p.type) : req('/search' + qs({ q: p.q, type: p.type, offset: p.offset ?? 0, limit: p.limit ?? 20, project: p.project, group_id: p.group_id, source: p.source }));
+  MOCK ? mockApi('/search?type=' + p.type) : req('/search' + qs({ q: p.q, type: p.type, offset: p.offset ?? 0, limit: p.limit ?? 20, project: p.project, source: p.source }));
 
 export const fetchFlags = (): Promise<{ flags: FlagRow[] }> =>
   MOCK ? mockApi('/flags') : req('/flags');
@@ -268,14 +268,14 @@ export interface RecallResult {
   warnings?: string[];
   debug?: RecallDebug;
 }
-export interface RecallParams { query: string; project?: string; group_id?: string; }
+export interface RecallParams { query: string; project?: string; }
 export const postRecall = (p: RecallParams): Promise<RecallResult> =>
   MOCK ? mockRecall(p.query) : reqAt('/recall', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     // write_feedback intentionally omitted — the route defaults it false, and a debug
     // recall must never bump the retrieval-count feedback signal.
-    body: JSON.stringify({ query: p.query, project: p.project, group_id: p.group_id, debug: true, source: 'dashboard' }),
+    body: JSON.stringify({ query: p.query, project: p.project, debug: true, source: 'dashboard' }),
   });
 
 export interface RecallHistoryRow {
@@ -420,19 +420,16 @@ export function openFeedStream(handlers: StreamHandlers): StreamHandle {
 
 // Mirror the server /feed per-type filtering client-side, so a live event only prepends when
 // it passes the CURRENT filter cluster: a filter applies only to types that carry the column
-// (episodes: project+source; facts: group_id; timeline: project + group_id-from-domain).
+// (episodes: project+source; timeline: project; facts carry neither).
 export function feedItemPassesFilter(
   item: FeedItem,
-  f: { project: string; group: string; source: string },
+  f: { project: string; source: string },
 ): boolean {
   if (f.project !== 'all' && (item.type === 'episode' || item.type === 'timeline_event')) {
     if ((item.project || 'untagged') !== f.project) return false;
   }
   if (f.source !== 'all' && item.type === 'episode') {
     if ((item.source || 'untagged') !== f.source) return false;
-  }
-  if (f.group !== 'all' && (item.type === 'fact' || item.type === 'timeline_event')) {
-    if ((item.group_id || '') !== f.group) return false;
   }
   return true;
 }
@@ -490,10 +487,10 @@ export interface TimelineEvent {
   episode_id: number | null; flagged: boolean;
 }
 export interface TimelinePage { events: TimelineEvent[]; next_before: string | null; }
-export interface TimelineParams { before?: string | null; limit?: number; type?: string; group_id?: string; }
+export interface TimelineParams { before?: string | null; limit?: number; type?: string; domain?: string; }
 
 export const fetchTimeline = (p: TimelineParams): Promise<TimelinePage> =>
-  MOCK ? mockApi('/timeline') : req('/timeline' + qs({ before: p.before, limit: p.limit ?? 50, type: p.type, group_id: p.group_id }));
+  MOCK ? mockApi('/timeline') : req('/timeline' + qs({ before: p.before, limit: p.limit ?? 50, type: p.type, domain: p.domain }));
 
 export interface Preference {
   id: number; pref: string; polarity: string; first_seen: string; last_asserted: string;

@@ -169,11 +169,10 @@ def test_extractor_insert_then_reinforce_with_a_foreign_source_goes_mixed(kg):
                     "episodes": [w],
                     "created_at": "2026-01-01T00:00:00+00:00",
                 }
-            ],
-            GROUP,
+            ]
         )
         assert _sp(kg, "ext-1") == [WORK]
-        writer.reinforce_edges([("ext-1", [p])], GROUP)
+        writer.reinforce_edges([("ext-1", [p])])
     finally:
         writer._reset()
     assert _sp(kg, "ext-1") == sorted([WORK, PERSONAL])
@@ -347,20 +346,20 @@ def test_restricted_kg_leg_serves_only_fully_covered_facts(kg, db_url):
     r = Recall(db_url, "")
     sink: list[str] = []
     with warn_sink(sink):
-        facts, seeds = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
+        facts, seeds = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK])
     assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}
     assert seeds == [], "entity summaries are not provably in scope"
     assert sink == []
 
     facts2, _ = r._search_kg(
-        "widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK, WORK2, "unused-proj"]
+        "widget", onehot(0), [], 20, allowed_projects=[WORK, WORK2, "unused-proj"]
     )
     assert _uuids(facts2) == {"v-ok", "b-ok", "h-ok", "b-two"}
 
 
 def test_full_trust_kg_leg_still_serves_everything(kg, db_url):
     _seed_kg(kg)
-    facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == _ALL
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
 
@@ -375,9 +374,9 @@ def test_web_derived_facts_serve_on_no_leg(kg, db_url):
     _fact(kg, "b-page", "widget page", f"[{w}]", emb=None, web_artifact_id=7)
     _fact(kg, "h-page", "iota", f"[{w}]", emb=None, src="seed-ent", web_artifact_id=7)
     r = Recall(db_url, "")
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, _ = r._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == _ALL
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
+    facts, _ = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK])
     assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}
 
 
@@ -392,7 +391,7 @@ def test_seed_with_only_web_derived_edges_takes_no_seed_slot(kg, db_url):
     )
     _fact(kg, "page-out", "kappa", f"[{w}]", emb=None, src="page-ent", web_artifact_id=7)
     _fact(kg, "page-in", "lambda", f"[{w}]", emb=None, tgt="page-ent", web_artifact_id=7)
-    facts, seeds = Recall(db_url, "")._search_kg("q", onehot(0), GROUP, [], 5)
+    facts, seeds = Recall(db_url, "")._search_kg("q", onehot(0), [], 5)
     assert seeds == [] and facts == []
 
 
@@ -402,7 +401,7 @@ def test_identical_fact_text_serves_once(kg, db_url):
     _fact(kg, "twin-a", "Widget runs on port 8081", f"[{w}]", emb=0)
     _fact(kg, "twin-b", "widget  runs on port 8081", f"[{w}]", emb=0, src="ent-z")
     _fact(kg, "other", "Widget runs on port 9090", f"[{w}]", emb=None)  # BM25 only: ranks 3rd
-    facts, _ = Recall(db_url, "")._search_kg("widget port", onehot(0), GROUP, [], 2)
+    facts, _ = Recall(db_url, "")._search_kg("widget port", onehot(0), [], 2)
     assert len(facts) == 2
     assert len(_uuids(facts) & {"twin-a", "twin-b"}) == 1
     assert "other" in _uuids(facts)
@@ -431,7 +430,7 @@ def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
             return self._cur.fetchall()
 
     with psycopg.connect(db_url) as c, c.cursor() as cur:
-        kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", GROUP, [], 5, [WORK])
+        kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 5, [WORK])
     hop_queries = [s for s, _ in executed if "src_uuid = %s OR tgt_uuid = %s" in s]
     assert hop_queries == [], "no in-scope edge, so no seed, so no hop query"
 
@@ -485,18 +484,18 @@ def test_superseded_pairs_need_both_sides_in_scope(kg, db_url):
     _supersession_fixture(kg)
     r = Recall(db_url, "")
     uuids = ["n-ok", "n-2", "n-3"]
-    scoped = r._fetch_superseded_pairs_pg(GROUP, uuids, 10, allowed_projects=[WORK])
+    scoped = r._fetch_superseded_pairs_pg(uuids, 10, allowed_projects=[WORK])
     assert [x["id"] for x in scoped] == ["f:o-ok"]
-    full = r._fetch_superseded_pairs_pg(GROUP, uuids, 10)
+    full = r._fetch_superseded_pairs_pg(uuids, 10)
     assert [x["id"] for x in full] == ["f:o-ok", "f:o-2", "f:o-3"]
 
 
 def test_supersession_surface_needs_both_edges_in_scope(kg, db_url):
     _supersession_fixture(kg)
     r = Recall(db_url, "")
-    scoped = r._surface_supersessions(onehot(1), GROUP, set(), cap=10, allowed_projects=[WORK])
+    scoped = r._surface_supersessions(onehot(1), set(), cap=10, allowed_projects=[WORK])
     assert _uuids(scoped) == {"n-ok"}
-    assert _uuids(r._surface_supersessions(onehot(1), GROUP, set(), cap=10)) == {
+    assert _uuids(r._surface_supersessions(onehot(1), set(), cap=10)) == {
         "n-ok",
         "n-2",
         "n-3",
@@ -506,9 +505,9 @@ def test_supersession_surface_needs_both_edges_in_scope(kg, db_url):
 def test_episode_overlay_needs_both_edges_in_scope(kg, db_url):
     ids = _supersession_fixture(kg)
     r = Recall(db_url, "")
-    scoped = r._episode_supersessions([ids["w"]], GROUP, allowed_projects=[WORK])
+    scoped = r._episode_supersessions([ids["w"]], allowed_projects=[WORK])
     assert scoped == {ids["w"]: ["now ok"]}
-    full = r._episode_supersessions([ids["w"]], GROUP)
+    full = r._episode_supersessions([ids["w"]])
     assert sorted(full[ids["w"]]) == ["now ok", "now three", "now two"]
 
 
@@ -597,13 +596,13 @@ def test_full_trust_sql_never_mentions_the_provenance_column():
     """Full trust must not depend on schema 056 at all: no statement it sends reads the
     column, and the readiness probe never runs."""
     cur = _RecordingConn()
-    kg_pg.search_kg_postgres(cur, "widget q", onehot(0), "default", GROUP, ["x"], 5)
+    kg_pg.search_kg_postgres(cur, "widget q", onehot(0), "default", ["x"], 5)
     r = Recall("postgresql://unused/none", "")
     conn = _RecordingConn()
     r._pg = lambda: nullcontext(conn)
-    r._fetch_superseded_pairs_pg(GROUP, ["u1"], 2)
-    r._surface_supersessions(onehot(0), GROUP, set())
-    r._episode_supersessions([1, 2], GROUP)
+    r._fetch_superseded_pairs_pg(["u1"], 2)
+    r._surface_supersessions(onehot(0), set())
+    r._episode_supersessions([1, 2])
     statements = cur.sql + conn.sql
     assert len(statements) >= 6
     assert not any("source_projects" in s or "pg_attribute" in s for s in statements)
@@ -611,7 +610,7 @@ def test_full_trust_sql_never_mentions_the_provenance_column():
 
 def test_restricted_sql_carries_the_rule_on_every_fact_read():
     cur = _RecordingConn()
-    kg_pg.search_kg_postgres(cur, "widget q", onehot(0), "default", GROUP, [], 5, [WORK])
+    kg_pg.search_kg_postgres(cur, "widget q", onehot(0), "default", [], 5, [WORK])
     # vector, BM25, seed/degree (no seeds come back from the recorder, so no hop query)
     assert len(cur.sql) == 3
     assert all("source_projects <@ %s::text[]" in s for s in cur.sql)
@@ -654,13 +653,13 @@ def test_restricted_kg_paths_serve_nothing_without_the_column(no_column, caplog)
     allowed = [WORK]
     sink: list[str] = []
     with caplog.at_level(logging.WARNING), warn_sink(sink):
-        assert r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=allowed) == (
+        assert r._search_kg("widget", onehot(0), [], 20, allowed_projects=allowed) == (
             [],
             [],
         )
-        assert r._fetch_superseded_pairs_pg(GROUP, ["n-ok"], 5, allowed_projects=allowed) == []
-        assert r._surface_supersessions(onehot(1), GROUP, set(), allowed_projects=allowed) == []
-        assert r._episode_supersessions([ids["w"]], GROUP, allowed_projects=allowed) == {}
+        assert r._fetch_superseded_pairs_pg(["n-ok"], 5, allowed_projects=allowed) == []
+        assert r._surface_supersessions(onehot(1), set(), allowed_projects=allowed) == []
+        assert r._episode_supersessions([ids["w"]], allowed_projects=allowed) == {}
     assert sink == [], "the pre-056 restricted skip added no response warning"
     missing = [m for m in caplog.messages if "source_projects is missing" in m]
     assert len(missing) == 1, "one log warning, not one per call"
@@ -675,7 +674,7 @@ def test_a_column_lost_after_the_probe_cached_it_still_fails_closed(no_column, c
     r._kg_scope_ok = True
     sink: list[str] = []
     with caplog.at_level(logging.WARNING), warn_sink(sink):
-        out = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
+        out = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK])
     assert out == ([], [])
     assert sink == []
     assert r._kg_scope_ok is False
@@ -684,9 +683,9 @@ def test_a_column_lost_after_the_probe_cached_it_still_fails_closed(no_column, c
 def test_full_trust_keeps_working_without_the_column(no_column):
     tx, _ids = no_column
     r = _engine_on(tx)
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, _ = r._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == _ALL
-    pairs = r._fetch_superseded_pairs_pg(GROUP, ["n-ok", "n-2", "n-3"], 10)
+    pairs = r._fetch_superseded_pairs_pg(["n-ok", "n-2", "n-3"], 10)
     assert len(pairs) == 3
 
 
@@ -717,7 +716,7 @@ def test_applying_056_under_a_running_engine_takes_effect_without_a_restart(
     assert r._kg_scope_ready() is False  # inside the TTL: no re-probe yet
     monkeypatch.setattr(recall_sources_mod, "_KG_SCOPE_REPROBE_S", 0.0)
     assert r._kg_scope_ready() is True
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK])
+    facts, _ = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK])
     assert _uuids(facts) == {"v-ok", "b-ok", "h-ok"}
 
 

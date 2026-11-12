@@ -66,10 +66,10 @@ def _pipeline(valid_at: str):
     pipe._stage2_deterministic = MagicMock(return_value=[])
     pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=entities, facts=facts))
     pipe._stage4_resolve = MagicMock(
-        side_effect=lambda ents, group_id, deduper=None: {e.name: f"new:{e.name}" for e in ents}
+        side_effect=lambda ents, deduper=None: {e.name: f"new:{e.name}" for e in ents}
     )
     pipe._stage5_write_nodes = MagicMock()
-    pipe._process_facts_for_group = MagicMock()
+    pipe._process_facts = MagicMock()
     pipe._deduper_for = MagicMock(return_value=MagicMock())
     return pipe
 
@@ -85,7 +85,7 @@ def _run_chunk(valid_at: str):
         }
     )
     session_date = pipe._stage3_llm.call_args.args[2]
-    kwargs = pipe._process_facts_for_group.call_args.kwargs
+    kwargs = pipe._process_facts.call_args.kwargs
     return session_date, kwargs
 
 

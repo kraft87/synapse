@@ -13,12 +13,12 @@ const FIX: Record<string, unknown> = {
   catalog: {
     projects: [{ name: 'service-a', count: 12 }, { name: 'service-b', count: 8 }, { name: 'untagged', count: 3 }],
     sources: [{ name: 'claude-code', count: 14 }, { name: 'cursor', count: 9 }],
-    group_ids: ['technical', 'personal'],
+    domains: ['technical', 'personal'],
   },
   feed: {
     items: [
       { type: 'episode', id: '1', ts: iso(0.4), project: 'service-a', source: 'claude-code', gist: 'Example episode: wired service A to library B.', flagged: false, data: { session_id: 'sess-1', sequence: 3 } },
-      { type: 'fact', id: 'ent-edge-1', ts: iso(0.6), group_id: 'technical', gist: 'example fact: service A depends on library B', flagged: false, data: { fact: 'service A depends on library B', src_name: 'service A', tgt_name: 'library B', t_valid: iso(24), t_invalid: null, provenance_episode_id: 1 } },
+      { type: 'fact', id: 'ent-edge-1', ts: iso(0.6), gist: 'example fact: service A depends on library B', flagged: false, data: { fact: 'service A depends on library B', src_name: 'service A', tgt_name: 'library B', t_valid: iso(24), t_invalid: null, provenance_episode_id: 1 } },
       { type: 'timeline_event', id: '10', ts: iso(0.9), project: 'service-a', gist: 'example event: service A shipped v2', flagged: true, sal: 0.9, data: { fact: 'service A shipped v2', t_valid: iso(48), source: 'git:example', episode_id: 1 } },
       { type: 'episode', id: '2', ts: iso(30), project: 'service-b', source: 'cursor', gist: 'Example episode: refactored the widget cache.', flagged: false, data: { session_id: 'sess-2', sequence: 1 } },
     ],
@@ -26,7 +26,7 @@ const FIX: Record<string, unknown> = {
   },
   'episode/1': { id: 1, session_id: 'sess-1', sequence: 3, project: 'service-a', source: 'claude-code', platform: 'cli', model: 'example-model', created_at: iso(0.4), flagged: false, human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency and a smoke test.', content: trace },
   'episode/2': { id: 2, session_id: 'sess-2', sequence: 1, project: 'service-b', source: 'cursor', platform: 'ide', model: 'example-model', created_at: iso(30), flagged: false, human_turn: 'Refactor the widget cache.', assistant_turn: 'Extracted a WidgetCache class; hit rate unchanged.', content: 'user: refactor the widget cache\n\nassistant: extracted a WidgetCache class.' },
-  derived: { facts: [{ uuid: 'ent-edge-1', fact: 'service A depends on library B', group_id: 'technical', t_valid: iso(24), t_invalid: null }], timeline_events: [{ id: 10, fact: 'service A shipped v2', t_valid: iso(48), salience: 2 }] },
+  derived: { facts: [{ uuid: 'ent-edge-1', fact: 'service A depends on library B', t_valid: iso(24), t_invalid: null }], timeline_events: [{ id: 10, fact: 'service A shipped v2', t_valid: iso(48), salience: 2 }] },
   session: { session_id: 'sess-1', project: 'service-a', source: 'claude-code', highlight: 1, episodes: [{ id: 0, sequence: 1, created_at: iso(1), human_turn: 'Set up the project.', assistant_turn: 'Scaffolded service A.', content: '' }, { id: 1, sequence: 3, created_at: iso(0.4), human_turn: 'Wire service A to library B.', assistant_turn: 'Done — added the dependency.', content: trace }] },
   entity: {
     entity: { uuid: 'ent-1', name: 'service A', entity_type: 'Project', summary: 'Example service used to demonstrate the dossier surface.', degree: 4, created_at: iso(200) },

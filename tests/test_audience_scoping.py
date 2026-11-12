@@ -51,6 +51,7 @@ from ingestion.surfaces import (  # noqa: E402
 )
 from mcp_server import server  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
+from tests.helpers.embed import OneHotEmbedder, onehot  # noqa: E402
 from tests.helpers.surfaces import (  # noqa: E402
     clear_surfaces,
     register_full,
@@ -70,18 +71,17 @@ def clean(conn):
     _wipe()
 
 
-def _note(db_url, hook, *, audience="personal", type="user", project=None):
+def _note(db_url, hook, *, audience="personal", type="user", project=None, embedding=None):
     db = Database(db_url)
     try:
         return db.insert_note(
             owner_id=_OWNER,
-            group_id="technical",
             project=project,
             type=type,
             hook=hook,
             body=f"Body of: {hook}",
-            embedding=None,
-            embed_model=None,
+            embedding=embedding,
+            embed_model="test" if embedding is not None else None,
             source_ref=None,
             audience=audience,
         )
@@ -164,7 +164,7 @@ def _engine(db_url, monkeypatch, notes_rows=None):
     ]
     r._search_web_reranked = lambda q, emb, **_k: []
     r._search_kg = lambda *a, **k: ([], [])
-    r._fetch_superseded_pairs_pg = lambda gid, uuids, cap, allowed_projects=None: []
+    r._fetch_superseded_pairs_pg = lambda uuids, cap, allowed_projects=None: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
     r._increment_retrieval_counts = lambda ids: None
@@ -557,15 +557,17 @@ def test_remember_rejects_an_invalid_audience_before_writing(remember_env):
 
 
 class _StubDB:
-    """reconcile_note's collaborators, stubbed: one high-similarity candidate so the
-    restatement path runs, and no restricted surfaces so derivation says 'personal'."""
+    """reconcile_note's collaborators, stubbed: one high-similarity PERSONAL candidate so
+    the restatement path runs, and no restricted surfaces so derivation says 'personal'."""
 
     def __init__(self, candidate_type="user"):
         self.updates: list[dict] = []
         self.inserts: list[dict] = []
         self._candidate_type = candidate_type
 
-    def find_live_notes(self, owner_id, group_id, embedding, limit=5):
+    def find_live_notes(self, owner_id, embedding, limit=5, audience=None):
+        if audience not in (None, "personal"):
+            return []
         return [
             {
                 "id": 42,
@@ -573,6 +575,7 @@ class _StubDB:
                 "body": "Existing.",
                 "type": self._candidate_type,
                 "project": None,
+                "audience": "personal",
                 "sim": 0.95,
             }
         ]
@@ -583,9 +586,10 @@ class _StubDB:
 
     def update_note(self, note_id, **kw):
         self.updates.append({"note_id": note_id, **kw})
+        return True
 
-    def supersede_note(self, old_id, new_id):
-        pass
+    def supersede_note(self, old_id, new_id, *, if_audience=None):
+        return True
 
     def restricted_surface_projects(self):
         return []
@@ -600,8 +604,8 @@ class _Emb8:
 
 def test_restatement_preserves_the_stored_audience(monkeypatch):
     """Rephrasing a note is not reclassifying it. update_note gets audience=None, which
-    COALESCEs to the stored value — so a work-safe note stays work-safe through an
-    update that has no idea what tier it was on."""
+    COALESCEs to the stored value — so a note keeps its tier through an update that has
+    no idea what tier it was on."""
     monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
     db = _StubDB()
     res = reconcile_note(
@@ -619,7 +623,8 @@ def test_restatement_preserves_the_stored_audience(monkeypatch):
 
 
 def test_restatement_with_an_explicit_audience_does_reclassify(monkeypatch):
-    """The one way an existing note moves tier: someone said so."""
+    """The one way an existing note moves tier: someone said so. The match is the
+    personal note, found in the tier other than the one the write is stored under."""
     monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
     db = _StubDB()
     res = reconcile_note(
@@ -936,3 +941,49 @@ def test_restricted_project_union_ignores_revoked_devices(clean, db_url):
         assert restricted_project_union(db) == {"alpha"}
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("token", [_RootToken, lambda: None], ids=["root-token", "no-token"])
+@pytest.mark.parametrize("asked", [None, "work-safe"], ids=["no-audience", "audience-work-safe"])
+def test_an_unknown_caller_never_matches_an_existing_note(
+    remember_env, db_url, monkeypatch, token, asked
+):
+    """An unknown caller is restricted for reads, so its write must not be able to edit,
+    retire or move a personal note, nor tell by its answer that one exists. The embedder
+    puts the write exactly on the personal note and the judge would say "same", so a
+    lookup would show: the answer must be the one an empty store gives, with no lookup."""
+    judge_calls: list[dict] = []
+    monkeypatch.setattr(
+        notes_mod, "parse_with_retry", lambda *a, **k: judge_calls.append(k) or "same"
+    )
+    monkeypatch.setattr(server, "_notes_deps", lambda: (OneHotEmbedder(40), object()))
+    monkeypatch.setattr(server, "get_access_token", token)
+    assert server._caller_trust() == UNKNOWN_SURFACE
+    hook = "User keeps a private reading log"
+    write = {"hook": hook, "body": f"Body of: {hook}", "type": "user"}
+    if asked:
+        write["audience"] = asked
+
+    control = _remember(**write)  # nothing similar stored yet
+    remember_env.execute("DELETE FROM notes")
+    personal = _note(db_url, hook, audience="personal", embedding=onehot(40))
+    untouched = remember_env.execute(
+        "SELECT hook, body, audience, superseded_by, updated_at FROM notes WHERE id = %s",
+        (personal,),
+    ).fetchone()
+
+    out = _remember(**write)
+    assert out["outcome"] == "created" and out["note_id"] != personal
+    assert set(out) == set(control) and out["audience"] == control["audience"]
+    assert out["outcome"] == control["outcome"]
+    assert judge_calls == []
+    assert (
+        remember_env.execute(
+            "SELECT hook, body, audience, superseded_by, updated_at FROM notes WHERE id = %s",
+            (personal,),
+        ).fetchone()
+        == untouched
+    )
+    assert untouched[2] == "personal" and untouched[3] is None
+    live = remember_env.execute("SELECT id FROM notes WHERE superseded_by IS NULL ORDER BY id")
+    assert [r[0] for r in live.fetchall()] == [personal, out["note_id"]]

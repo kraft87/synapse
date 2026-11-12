@@ -2,10 +2,11 @@
 
 The fact label (``kg_relationships.audience``) joins the restricted serving rule, and the
 install owner's flagged entity (``kg_entities.is_self``) is kept out of the hop seeds. Both
-exist only on a database that has applied 066, so each is gated by a probe. The probe has
-three answers, and a restricted read must not guess on the third: when the probe could not
-tell, a database that DOES have the label would be served its ``personal`` facts under the
-provenance-only rule, so that read serves nothing (:class:`FactAudienceUnknown`).
+exist only on a database that has applied 066, so each is gated by a probe. A restricted
+read needs the probe to say yes: without the label the only rule left is provenance, which
+cannot tell a personal fact from a work one once every fact is in one memory, so a probe
+that says no or could not tell serves that read nothing (:class:`FactAudienceUnknown`).
+Full trust never asks the label question and is unchanged.
 """
 
 from __future__ import annotations
@@ -32,8 +33,9 @@ FACT_AUDIENCE_COLUMNS = ("audience", "label_version", "label_model")
 
 
 class FactAudienceUnknown(Exception):
-    """The 066 probe failed, so a restricted read cannot choose its rule. Raised inside a
-    restricted leg and caught by its fail-closed handler, which serves nothing."""
+    """The 066 probe did not say yes (the label is absent, or the probe could not tell), so a
+    restricted read has no rule it may serve under. Raised inside a restricted leg and caught
+    by its fail-closed handler, which serves nothing."""
 
 
 class RecallFactAudienceMixin:
@@ -50,12 +52,12 @@ class RecallFactAudienceMixin:
     def _fact_audience_on(self, conn: Any, restricted: bool) -> bool:
         """True when schema 066 is applied on ``conn``'s database: restricted reads then add
         the label rule and every read excludes the flagged owner entity as a hop seed.
-        Without it both stay as before 066. A probe that could not tell is "not applied"
-        for full trust (nothing is excluded, today's behaviour) and raises
-        :class:`FactAudienceUnknown` for a ``restricted`` read."""
+        A ``restricted`` read raises :class:`FactAudienceUnknown` unless the probe says
+        yes, whether the label is absent or the probe could not tell. Full trust gets False
+        for both (nothing is excluded, today's behaviour)."""
         state = FACT_AUDIENCE_PROBE.check(conn, self._db_url)
-        if state is None and restricted:
-            raise FactAudienceUnknown("schema 066 probe failed")
+        if restricted and state is not True:
+            raise FactAudienceUnknown("schema 066 is not confirmed applied")
         return state is True
 
     def _owner_seed_uuids(self, conn: Any) -> list[str]:
@@ -81,6 +83,6 @@ class RecallFactAudienceMixin:
     def _scope_predicates(self, conn: Any, aliases: tuple[str, ...]) -> str:
         """:func:`scope_predicate` for each of ``aliases``, ANDed: the restricted rule over
         both sides of a supersession pair (056, plus 066's label where the database has it).
-        Raises :class:`FactAudienceUnknown` when the probe could not tell."""
+        Raises :class:`FactAudienceUnknown` unless the probe says 066 is applied."""
         aud = self._fact_audience_on(conn, restricted=True)
         return " AND ".join(scope_predicate(a, fact_audience=aud) for a in aliases)

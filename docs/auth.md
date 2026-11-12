@@ -130,7 +130,7 @@ Human says nothing means personal; software says nothing means restricted.
 | Path | Notes | Episodes / timeline | KG facts |
 | --- | --- | --- | --- |
 | `GET /context` (board) | `audience='work-safe'` only | filtered to the project allowlist plus the machine's own uploads, NULL project excluded | n/a |
-| `recall` / `POST /recall` | `audience='work-safe'` only | both legs filtered to the allowlist plus own uploads | only facts whose source episodes all sit in allowlisted projects (schema 056) |
+| `recall` / `POST /recall` | `audience='work-safe'` only | both legs filtered to the allowlist plus own uploads | only facts whose source episodes all sit in allowlisted projects (schema 056) and that are labelled `work-safe` (schema 066; a fact from before 066 that was never labelled follows the allowlist alone). No facts at all while the label is absent |
 | `recall_full_turns` | n/a | same as recall | n/a |
 | `fetch(ids)` | `audience='work-safe'` only | same as recall | n/a |
 | `fetch_session` | n/a | same as recall, on the probe and both row reads | n/a |
@@ -138,6 +138,15 @@ Human says nothing means personal; software says nothing means restricted.
 | `GET /preferences/top` | n/a | preferences from allowlisted projects only | n/a |
 | `/config/*` | n/a | its own mirrored config only; proposals mined only from its own sessions | n/a |
 | `/skills/*`, `skill://` resources | n/a | only `project:<p>` skills for allowlisted projects (any case); no global skill; publish only there; no retire, scope change or review | n/a |
+
+The knowledge graph is one memory per owner, so what a restricted machine may be served is
+decided fact by fact, by the audience label and the sessions a fact came from, and never by
+which graph holds it. A fact written after schema 066 is served to a restricted machine
+only once the labeller has marked it `work-safe`; until then it is held back, however its
+sessions sit against the allowlist. Without the label (schema 066 not applied) a restricted
+machine is served no facts at all, never the allowlist rule alone. The boot guard prevents
+that state unless it is switched off (`SYNAPSE_SCHEMA_CHECK=0`) or could not reach the
+database when the service started, in which case it logs a warning and does not look again.
 
 `fetch` and `fetch_session` are filtered because ids are sequential integers: an unfiltered
 drill-down would let a restricted caller enumerate exactly what the board withholds. A session

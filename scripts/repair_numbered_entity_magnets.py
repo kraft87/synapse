@@ -21,13 +21,13 @@ Rules (``plan`` below; pinned in tests/test_repair_numbered_entity_magnets*.py):
    SAME kind (a PR entity reads "PR #N", "pull request N", ".../pull/N" and a bare "#N";
    a ticket key reads keys with the same prefix). If the fact names exactly one such
    identifier and it is not the endpoint's own number, the endpoint moves to the entity
-   named for that identifier in the same group (an exact-ID name such as "PR #218"; an
+   named for that identifier of the same owner (an exact-ID name such as "PR #218"; an
    existing "PR 218" or "pull request 218" is reused, see ``target_ident``),
    created if missing: name as written in the fact, entity type/project copied from the
    magnet, embedding from ``ingestion.embedding.create_embedder`` with ``task='entity'``.
    An edge stays where it is when the fact names its own number, no identifier, several,
    a range ("#117-119"), only a bare "#N" next to a ticket-free kind word, when the move
-   would join an edge to itself, or when the edge and the entity sit in different groups.
+   would join an edge to itself, or when the edge and the entity belong to different owners.
    Retired edges move by the same rule, so a supersession about one PR stays on one pair.
 2. **Numbers compare the way the shipped guard compares them.** The entity's own number is
    ``ingestion.dedup.identifier_tokens(name)`` (leading zeros dropped) and an entity
@@ -312,7 +312,6 @@ def decide(ident: Ident, fact: str) -> tuple[str, Mention | None]:
 class Entity:
     uuid: str
     owner_id: str
-    group_id: str
     name: str
     entity_type: str | None = None
     supertype: str | None = None
@@ -326,7 +325,6 @@ class Entity:
 class Edge:
     uuid: str
     owner_id: str
-    group_id: str
     src: str
     tgt: str
     fact: str
@@ -340,10 +338,9 @@ class Edge:
 
 @dataclass
 class Target:
-    """Where moves for one (owner, group, identifier) land."""
+    """Where moves for one (owner, identifier) land."""
 
     owner_id: str
-    group_id: str
     ident: Ident
     uuid: str
     name: str
@@ -376,7 +373,7 @@ class Candidate:
 @dataclass
 class Plan:
     moves: list[Move] = field(default_factory=list)
-    targets: dict[tuple[str, str, Ident], Target] = field(default_factory=dict)
+    targets: dict[tuple[str, Ident], Target] = field(default_factory=dict)
     candidates: list[Candidate] = field(default_factory=list)
     losers: list[str] = field(default_factory=list)  # every entity that loses an edge
     clear_summaries: list[str] = field(default_factory=list)
@@ -397,21 +394,21 @@ def plan_repair(entities: Iterable[Entity], edges: Iterable[Edge]) -> Plan:
             live_deg[ed.src] += 1
             live_deg[ed.tgt] += 1
 
-    # Existing landing entities per (owner, group, identifier): most live edges, oldest.
-    landing: dict[tuple[str, str, Ident], Entity] = {}
+    # Existing landing entities per (owner, identifier): most live edges, oldest.
+    landing: dict[tuple[str, Ident], Entity] = {}
     for e in sorted(
         ents.values(), key=lambda e: (-live_deg[e.uuid], str(e.created_at or ""), e.uuid)
     ):
         i = target_ident(e.name)
         if i is not None:
-            landing.setdefault((e.owner_id, e.group_id, i), e)
+            landing.setdefault((e.owner_id, i), e)
 
     plan = Plan()
     st = plan.stats
-    written_forms: dict[tuple[str, str, Ident], Counter[str]] = defaultdict(Counter)
-    pending: list[tuple[Edge, dict[str, tuple[tuple[str, str, Ident], Entity]]]] = []
+    written_forms: dict[tuple[str, Ident], Counter[str]] = defaultdict(Counter)
+    pending: list[tuple[Edge, dict[str, tuple[tuple[str, Ident], Entity]]]] = []
     for ed in edges:
-        wants: dict[str, tuple[tuple[str, str, Ident], Entity]] = {}
+        wants: dict[str, tuple[tuple[str, Ident], Entity]] = {}
         for side in ("src", "tgt"):
             ent = ents.get(getattr(ed, side))
             ident = idents.get(getattr(ed, side))
@@ -419,30 +416,30 @@ def plan_repair(entities: Iterable[Entity], edges: Iterable[Edge]) -> Plan:
                 continue
             fam = ident.family
             st[fam]["endpoints examined"] += 1
-            if (ent.owner_id, ent.group_id) != (ed.owner_id, ed.group_id):
-                st[fam]["stay: edge in another group"] += 1
+            if ent.owner_id != ed.owner_id:
+                st[fam]["stay: edge of another owner"] += 1
                 continue
             verdict, mention = decide(ident, ed.fact)
             if verdict != MOVE or mention is None:
                 st[fam][f"stay: {verdict}"] += 1
                 continue
-            key = (ed.owner_id, ed.group_id, Ident(ident.kind, mention.number))
+            key = (ed.owner_id, Ident(ident.kind, mention.number))
             wants[side] = (key, ent)
             written_forms[key][mention.written] += 1
         if wants:
             pending.append((ed, wants))
 
-    def target_for(key: tuple[str, str, Ident], template: Entity) -> Target:
+    def target_for(key: tuple[str, Ident], template: Entity) -> Target:
         t = plan.targets.get(key)
         if t is None:
             hit = landing.get(key)
             if hit is not None:
-                t = Target(key[0], key[1], key[2], hit.uuid, hit.name, True, template)
+                t = Target(key[0], key[1], hit.uuid, hit.name, True, template)
             else:
                 # Most common spelling among the facts that move there, then first seen.
                 forms = written_forms[key]
                 name = max(forms, key=lambda f: (forms[f], -list(forms).index(f)))
-                t = Target(key[0], key[1], key[2], str(uuidlib.uuid4()), name, False, template)
+                t = Target(key[0], key[1], str(uuidlib.uuid4()), name, False, template)
             plan.targets[key] = t
         return t
 
@@ -513,14 +510,14 @@ def plan_repair(entities: Iterable[Entity], edges: Iterable[Edge]) -> Plan:
 # ------------------------------------------------------------------- database
 
 _ENTITY_SQL = """
-    SELECT uuid, owner_id, group_id, COALESCE(name, ''), entity_type, entity_supertype,
+    SELECT uuid, owner_id, COALESCE(name, ''), entity_type, entity_supertype,
            entity_subtype, project, COALESCE(summary, ''), created_at
       FROM kg_entities
      WHERE name ~* '^\\s*(draft\\s+)?(pr|pull\\s+request|issue|task)\\s*#?\\s*[0-9]+\\s*$'
         OR name ~* '^[a-z][a-z0-9]{1,9}-[0-9]{2,}$'
 """
 _EDGE_COLS = (
-    "uuid, owner_id, group_id, src_uuid, tgt_uuid, COALESCE(fact, ''), name, "
+    "uuid, owner_id, src_uuid, tgt_uuid, COALESCE(fact, ''), name, "
     "t_invalid IS NULL, invalidated_by, t_expired IS NOT NULL, created_at, source_projects"
 )
 
@@ -538,17 +535,17 @@ def _connect(url: str, *, read_only: bool) -> Any:
 def load(conn: Any) -> tuple[list[Entity], list[Edge]]:
     """Every ID-shaped entity, and every edge (live or retired) touching one."""
     ents = [Entity(*r) for r in conn.execute(_ENTITY_SQL).fetchall()]
-    by_scope: dict[tuple[str, str], list[str]] = defaultdict(list)
+    by_owner: dict[str, list[str]] = defaultdict(list)
     for e in ents:
-        by_scope[(e.owner_id, e.group_id)].append(e.uuid)
+        by_owner[e.owner_id].append(e.uuid)
     seen: set[str] = set()
     edges: list[Edge] = []
-    for (owner, group), uuids in sorted(by_scope.items()):
+    for owner, uuids in sorted(by_owner.items()):
         for col in ("src_uuid", "tgt_uuid"):
             rows = conn.execute(
                 f"SELECT {_EDGE_COLS} FROM kg_relationships "  # nosec B608 - fixed columns
-                f"WHERE owner_id = %s AND group_id = %s AND {col} = ANY(%s)",
-                (owner, group, uuids),
+                f"WHERE owner_id = %s AND {col} = ANY(%s)",
+                (owner, uuids),
             ).fetchall()
             for r in rows:
                 if r[0] not in seen:
@@ -626,15 +623,14 @@ def _create_target(conn: Any, t: Target, embedding: list[float], created_table: 
 
     tpl = t.template
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, project, name, normalized_name, "
+        "INSERT INTO kg_entities (uuid, owner_id, project, name, normalized_name, "
         "  entity_type, summary, embedding, created_at, t_created, valid_at, t_valid, "
         "  entity_supertype, entity_subtype) "
-        f"VALUES (%s,%s,%s,%s,%s,%s,%s,'',%s::vector({_EMBED_DIMS}),now(),now(),now(),now(),%s,%s) "
+        f"VALUES (%s,%s,%s,%s,%s,%s,'',%s::vector({_EMBED_DIMS}),now(),now(),now(),now(),%s,%s) "
         "ON CONFLICT (uuid) DO NOTHING",
         (
             t.uuid,
             t.owner_id,
-            t.group_id,
             tpl.project or "",
             t.name,
             _normalize_name(t.name),
@@ -794,9 +790,9 @@ def restore(conn: Any, day: str, *, write: bool) -> dict[str, int]:
             sql.SQL(
                 "DELETE FROM kg_entities e USING {} c WHERE e.uuid = c.uuid "
                 "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
-                "                  AND r.group_id = e.group_id AND r.src_uuid = e.uuid) "
+                "                  AND r.src_uuid = e.uuid) "
                 "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
-                "                  AND r.group_id = e.group_id AND r.tgt_uuid = e.uuid)"
+                "                  AND r.tgt_uuid = e.uuid)"
             ).format(created)
         )
         out["created entities deleted"] = cur.rowcount
@@ -820,7 +816,7 @@ def restore(conn: Any, day: str, *, write: bool) -> dict[str, int]:
 #     both facts name identifiers ('#' and 2+ digits, or a key) and the two sets are disjoint.
 _HEALTH_PR_SQL = """
     SELECT e.uuid, e.name, r.uuid, COALESCE(r.fact, '') FROM kg_entities e
-      JOIN kg_relationships r ON r.owner_id = e.owner_id AND r.group_id = e.group_id
+      JOIN kg_relationships r ON r.owner_id = e.owner_id
                              AND r.{col} = e.uuid AND r.t_invalid IS NULL
      WHERE e.name ~ 'PR #[0-9]+'
 """

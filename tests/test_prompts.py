@@ -253,8 +253,8 @@ class TestEdgeDateExtractor:
         llm = MagicMock()
         llm.messages.create.side_effect = RuntimeError("upstream 500")
         ext = EdgeDateExtractor(llm)
-        # Graceful degradation: extractor must never raise so create_edge
-        # can fall through to its now() default.
+        # Graceful degradation: extractor must never raise so the caller
+        # can fall through to its default valid-from.
         assert ext.extract("Alex works at Acme") == (None, None)
 
     def test_extractor_returns_none_on_malformed_json(self):
@@ -387,7 +387,7 @@ class TestEdgeDateExtractorBatch:
             ["Alex joined in 2020", "She left last week", "Released on 2026-05-10"]
         )
         # Conservative posture: an LLM failure must never block writes.
-        # Each fact falls back to (None, None) so create_edge uses now().
+        # Each fact falls back to (None, None), so Stage 7 uses the segment date or now().
         assert out == [(None, None), (None, None), (None, None)]
         llm.messages.create.assert_called_once()
 

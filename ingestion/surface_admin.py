@@ -18,7 +18,7 @@ the Dockerfile copies ingestion/, mcp_server/, dream/ and schema/, and nothing e
 **Owner** flags the install owner's own KG entity (schema 066), which recall never uses as a
 hop seed (:mod:`ingestion.kg_owner`). It is here because this is the one admin CLI that ships
 in the image, and the flag is set by uuid only: ``owner list`` shows the flagged rows and the
-highest-degree entities per group (the owner's node is the one with thousands of edges), and
+highest-degree entities (the owner's node is the one with thousands of edges), and
 ``set`` and ``clear`` are dry runs until ``--apply``. There is no way to name or search for an
 entity, on purpose.
 
@@ -103,16 +103,11 @@ def _owner(args: argparse.Namespace) -> int:
             rows = kg_owner.flagged(conn)
             print("flagged (never a hop seed):" if rows else "no entity is flagged")
             for r in rows:
-                print(
-                    f"  {r['uuid']}  group={r['group_id']}  edges={r['live_degree']}  {r['name']}"
-                )
-            print("highest live degree per group (the owner's own node has the most edges):")
+                print(f"  {r['uuid']}  edges={r['live_degree']}  {r['name']}")
+            print("highest live degree (the owner's own node has the most edges):")
             for r in kg_owner.candidates(conn):
                 flag = "  [flagged]" if r["is_self"] else ""
-                print(
-                    f"  {r['uuid']}  group={r['group_id']}  edges={r['live_degree']}  "
-                    f"{r['name']}{flag}"
-                )
+                print(f"  {r['uuid']}  edges={r['live_degree']}  {r['name']}{flag}")
             return 0
         act = kg_owner.set_owner if args.owner_cmd == "set" else kg_owner.clear_owner
         code, msg = act(conn, args.uuid, apply=args.apply, key=args.db_url)

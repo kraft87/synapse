@@ -15,7 +15,7 @@ import pytest
 from ingestion.extractor import ExtractionPipeline
 from ingestion.kg_client import KGClient
 from ingestion.models import ExtractedFact
-from tests.helpers.embed import GROUP, onehot
+from tests.helpers.embed import onehot
 
 SEG = "2026-09-01T12:00:00+00:00"
 
@@ -58,7 +58,7 @@ def test_twin_lands_once_with_batch_provenance(pipe, conn):
     ]
     uuid_map = {n: f"new:e-{n}" for f in facts for n in (f.source, f.target)}
 
-    pipe._process_facts_for_group(facts, uuid_map, [41, 42], GROUP, default_valid_at=SEG)
+    pipe._process_facts(facts, uuid_map, [41, 42], default_valid_at=SEG)
 
     rows = conn.execute(
         "SELECT fact, src_uuid, episodes, mention_count, last_supported_at IS NOT NULL, "

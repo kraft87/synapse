@@ -7,6 +7,7 @@ coverage lives in test_preferences_gate.py)."""
 
 from __future__ import annotations
 
+import math
 import os
 
 import psycopg
@@ -23,9 +24,11 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     pytest.skip("no test DB reachable", allow_module_level=True)
 
+import ingestion.preferences_gate as pg  # noqa: E402
 from ingestion.db import Database  # noqa: E402
+from ingestion.db_connection import _EMBED_DIMS, _vector_literal  # noqa: E402
 from mcp_server.preferences_routes import _OWNER, _top_preferences  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
+from tests.helpers.embed import onehot  # noqa: E402
 
 
 def _wipe(conn):
@@ -37,7 +40,6 @@ def test_insert_and_cosine_knn(conn, db_url):
     db = Database(db_url)
     a = db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project="synapse",
         pref="User prefers bullet lists over tables",
         polarity="like",
@@ -47,7 +49,6 @@ def test_insert_and_cosine_knn(conn, db_url):
     )
     db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project="synapse",
         pref="User dislikes em-dashes",
         polarity="dislike",
@@ -56,7 +57,7 @@ def test_insert_and_cosine_knn(conn, db_url):
         source_ref="ep:2",
     )
     # Query nearest to slot-1: the matching pref comes back with sim ~1, ahead of the other.
-    hits = db.find_live_preferences(_OWNER, GROUP, onehot(1), limit=5)
+    hits = db.find_live_preferences(_OWNER, onehot(1), limit=5)
     assert hits[0]["id"] == a
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-4)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-4)
@@ -69,7 +70,6 @@ def test_reassert_bumps_count_and_keeps_text(conn, db_url):
     db = Database(db_url)
     pid = db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=None,
         pref="User prefers concise answers",
         polarity="like",
@@ -93,7 +93,6 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
     db = Database(db_url)
     old = db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=None,
         pref="User prefers dark mode",
         polarity="like",
@@ -103,7 +102,6 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
     )
     new = db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=None,
         pref="User now prefers light mode",
         polarity="dislike",
@@ -117,7 +115,7 @@ def test_supersede_retires_old_and_hides_from_live(conn, db_url):
         "SELECT t_invalid, superseded_by FROM preferences WHERE id = %s", (old,)
     ).fetchone()
     assert row[0] is not None and row[1] == new
-    live_ids = {h["id"] for h in db.find_live_preferences(_OWNER, GROUP, onehot(4), limit=5)}
+    live_ids = {h["id"] for h in db.find_live_preferences(_OWNER, onehot(4), limit=5)}
     assert new in live_ids and old not in live_ids
     db.close()
     _wipe(conn)
@@ -128,7 +126,6 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     db = Database(db_url)
     db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=None,
         pref="User likes short commit messages",
         polarity="like",
@@ -138,7 +135,6 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     )
     strong = db.insert_preference(
         owner_id=_OWNER,
-        group_id="personal",  # cross-group: the block spans all groups for the owner
         project=None,
         pref="User never wants contract roles surfaced",
         polarity="rule",
@@ -146,10 +142,11 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
         embed_model="test",
         source_ref="ep:7",
     )
+    # A row still filed under the retired personal group reads in the same block.
+    conn.execute("UPDATE preferences SET group_id = 'personal' WHERE id = %s", (strong,))
     db.reassert_preference(strong)  # assert_count 2 -> ranks above weak
     retired = db.insert_preference(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=None,
         pref="User prefers tabs",
         polarity="like",
@@ -169,5 +166,110 @@ def test_top_preferences_route_shape_and_order(conn, db_url):
     assert set(top) == {"pref", "polarity", "assert_count", "since"}
     assert top["polarity"] == "rule" and top["assert_count"] == 2
     assert top["since"] and len(top["since"]) == 10  # YYYY-MM-DD
+    db.close()
+    _wipe(conn)
+
+
+# ---------------------------------------------------------------------------
+# The gate against the real store — a live preference filed under either legacy
+# group is the same pool as a fresh write
+# ---------------------------------------------------------------------------
+
+
+def _tilted(slot, cos):
+    """A unit vector at cosine ``cos`` to ``onehot(slot)``."""
+    v = onehot(slot)
+    v[slot] = cos
+    v[slot + 1] = math.sqrt(1 - cos * cos)
+    return v
+
+
+class _VecEmb:
+    model_name = "test"
+
+    def __init__(self, vec):
+        self._vec = vec
+
+    def embed(self, texts, task):
+        return [self._vec for _ in texts]
+
+
+def _seed_pref(conn, *, group_id, slot, polarity):
+    return conn.execute(
+        "INSERT INTO preferences (owner_id, group_id, pref, polarity, embedding, embed_model) "
+        f"VALUES (%s, %s, 'User prefers dark mode', %s, %s::vector({_EMBED_DIMS}), 'test') "
+        "RETURNING id",
+        (_OWNER, group_id, polarity, _vector_literal(onehot(slot))),
+    ).fetchone()[0]
+
+
+def _run_gate(db, monkeypatch, vec, *, polarity, project):
+    monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
+    stated = [{"pref": "User prefers light mode", "polarity": polarity}]
+    monkeypatch.setattr(pg, "parse_with_retry", lambda *a, **k: stated)
+    gate = pg.PreferencesGate(db=db, llm_client=object(), embedder=_VecEmb(vec))
+    gate.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": project})
+
+
+# (group the live preference is filed under, project of the new turn). Each pair is one the
+# old per-group lookup missed: a project-less turn looked only in 'technical', a turn for a
+# personal-leaning project only in 'personal'.
+_ACROSS_GROUPS = [("personal", None), ("technical", "jobs")]
+
+
+@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
+def test_restated_preference_reasserts_the_live_one_in_the_other_group(
+    conn, db_url, monkeypatch, legacy_group, project
+):
+    _wipe(conn)
+    db = Database(db_url)
+    old = _seed_pref(conn, group_id=legacy_group, slot=30, polarity="like")
+    _run_gate(db, monkeypatch, onehot(30), polarity="like", project=project)
+    rows = conn.execute("SELECT id, assert_count FROM preferences WHERE t_invalid IS NULL")
+    assert rows.fetchall() == [(old, 2)]
+    db.close()
+    _wipe(conn)
+
+
+@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
+def test_reversed_preference_supersedes_the_live_one_in_the_other_group(
+    conn, db_url, monkeypatch, legacy_group, project
+):
+    _wipe(conn)
+    db = Database(db_url)
+    old = _seed_pref(conn, group_id=legacy_group, slot=31, polarity="like")
+    _run_gate(db, monkeypatch, _tilted(31, 0.85), polarity="dislike", project=project)
+    live = conn.execute("SELECT id FROM preferences WHERE t_invalid IS NULL").fetchall()
+    assert len(live) == 1 and live[0][0] != old
+    retired = conn.execute("SELECT superseded_by FROM preferences WHERE id = %s", (old,))
+    assert retired.fetchone()[0] == live[0][0]
+    db.close()
+    _wipe(conn)
+
+
+def test_new_preference_takes_the_column_default_group(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    pid = db.insert_preference(
+        owner_id=_OWNER,
+        project=None,
+        pref="User prefers plain text",
+        polarity="like",
+        embedding=onehot(32),
+        embed_model="test",
+        source_ref="ep:32",
+    )
+    row = conn.execute("SELECT group_id FROM preferences WHERE id = %s", (pid,)).fetchone()
+    assert row[0] == "technical"
+    db.close()
+    _wipe(conn)
+
+
+def test_gated_preference_gets_the_default_group_whatever_the_project(conn, db_url, monkeypatch):
+    _wipe(conn)
+    db = Database(db_url)
+    _run_gate(db, monkeypatch, onehot(33), polarity="like", project="jobs")
+    rows = conn.execute("SELECT group_id FROM preferences WHERE owner_id = %s", (_OWNER,))
+    assert rows.fetchall() == [("technical",)]
     db.close()
     _wipe(conn)

@@ -5,21 +5,14 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Iterable
 from typing import Any
 
 import psycopg
 from psycopg.rows import tuple_row
 
 from ingestion.surfaces import FACT_AUDIENCE_PROBE
-from mcp_server.kg_pg import (
-    CROSS_GROUP_EXTRAS,
-    FactRow,
-    _vec_literal,
-    cross_bm25_rows,
-    group_sql,
-    search_kg,
-)
+from mcp_server.kg_pg import _vec_literal, fact_text_key, search_kg_postgres
 from mcp_server.recall_fact_audience import FACT_AUDIENCE_COLUMNS, FactAudienceUnknown
 from mcp_server.recall_presentation import OVERLAY_MIN_SUPPORT, claim_support
 from mcp_server.recall_settings import _SUP_LIMIT
@@ -124,10 +117,11 @@ class RecallSourcesMixin:
 
     def _kg_scope_error(self, allowed_projects: list[str] | None, e: Exception) -> bool:
         """True when ``e`` is the restricted predicate failing closed: a missing column (056
-        or 066 rolled back, or dropped after the probe cached it) or a 066 probe that could
-        not tell. The caller then returns empty. A 066 loss falls back to the
-        provenance-only rule once the probe's TTL lapses; a failure of the probe does not
-        touch its cache, and nor does a missing column that is not the label's."""
+        or 066 rolled back, or dropped after the probe cached it) or a 066 probe that did not
+        say yes. The caller then returns empty. A missing 066 column is recorded on the probe,
+        which asks again once its TTL lapses; until it says yes a restricted read is served
+        nothing. A failure of the probe does not touch its cache, and nor does a missing
+        column that is not the label's."""
         if allowed_projects is None:
             return False
         if isinstance(e, psycopg.errors.UndefinedColumn):
@@ -200,11 +194,9 @@ class RecallSourcesMixin:
         self,
         query: str,
         query_emb: list[float],
-        group_id: str | list[str],
         session_focus: list[str],
         fact_limit: int,
         allowed_projects: list[str] | None = None,
-        cross_bm25: Callable[[], list[FactRow]] | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """KG facts leg over kg_entities / kg_relationships (task #67).
 
@@ -213,14 +205,11 @@ class RecallSourcesMixin:
         Without schema 056 the restricted leg returns nothing and logs one warning. It
         never adds a response warning, matching the pre-056 skip. ``None`` = full trust.
         Schema 066 adds the label rule to the restricted predicate and excludes the flagged
-        owner entity from the hop seeds (every caller); without it both are skipped, so a
-        restricted read serves the provenance-only facts and full trust sends today's SQL.
-        A restricted read whose 066 probe could not tell serves nothing (``_fact_audience_on``).
-        ``group_id``: one group or a list (``kg_pg.read_groups``; ``kg_pg.search_kg``).
-        ``cross_bm25``: the other group's BM25 rows when a caller is already fetching them
-        on another connection (:meth:`_cross_bm25_rows`); it is called once, after the
-        requested group is read, and a failure in it fails this leg as one in the group's
-        own legs does.
+        owner entity from the hop seeds (every caller). A restricted read is served facts only
+        when the probe says 066 is applied: without the label, or with a probe that could not
+        tell, it serves nothing (``_fact_audience_on``), because provenance alone cannot tell
+        a personal fact from a work one in one memory. Full trust never asks; without 066 it
+        sends today's SQL and no seed is excluded.
 
         Runs inside one transaction so the planner GUCs are SET LOCAL — scoped
         to this query, not the thread-local connection that other legs may
@@ -241,16 +230,14 @@ class RecallSourcesMixin:
                     cur.execute("SET LOCAL enable_seqscan = off")
                     cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
                     audience_on = self._fact_audience_on(conn, allowed_projects is not None)
-                    return search_kg(
+                    return search_kg_postgres(
                         cur,
                         query,
                         query_emb,
                         settings._KG_OWNER,
-                        group_id,
                         session_focus,
                         fact_limit,
                         allowed_projects=allowed_projects,
-                        cross_bm25=cross_bm25,
                         fact_audience=audience_on,
                         exclude_seeds=self._owner_seed_uuids(conn) if audience_on else (),
                     )
@@ -260,21 +247,6 @@ class RecallSourcesMixin:
             logger.warning("KG search failed: %s", e)
             _warn(f"KG facts leg failed ({_err_brief(e)}): no facts served.")
             return [], []
-
-    def _cross_bm25_rows(self, query: str, groups: list[str]) -> list[FactRow]:
-        """The BM25 leg of the KG groups a full-trust recall did not ask for
-        (``kg_pg.cross_bm25_rows``), on a connection of its own, so ``recall_overview`` can
-        start it with the first wave of legs and the requested group's search never waits
-        for it. It needs only the query text. Same transaction and planner settings as
-        :meth:`_search_kg`, which the leg's statement was always sent under. Raises on a
-        failure: the consumer (:meth:`_search_kg`) decides what that costs the bucket."""
-        with self._pg() as conn, conn.transaction():
-            cur = conn.cursor(row_factory=tuple_row)
-            cur.execute("SET LOCAL enable_seqscan = off")
-            cur.execute("SET LOCAL max_parallel_workers_per_gather = 0")
-            return cross_bm25_rows(
-                cur, query, self._settings()._KG_OWNER, groups, CROSS_GROUP_EXTRAS
-            )
 
     def _self_session_facts(self, uuids: list[str], self_session: str) -> set[str]:
         """The facts among ``uuids`` whose every source episode belongs to ``self_session``.
@@ -302,7 +274,6 @@ class RecallSourcesMixin:
 
     def _fetch_superseded_pairs_pg(
         self,
-        group_id: str | list[str],
         active_edge_uuids: list[str],
         cap: int,
         allowed_projects: list[str] | None = None,
@@ -349,8 +320,8 @@ class RecallSourcesMixin:
                     FROM kg_relationships a
                     JOIN kg_relationships o
                       ON o.src_uuid = a.src_uuid AND o.tgt_uuid = a.tgt_uuid
-                     AND o.owner_id = a.owner_id AND o.group_id = a.group_id
-                    WHERE a.owner_id = %s AND {group_sql(group_id, "a.group_id")}
+                     AND o.owner_id = a.owner_id
+                    WHERE a.owner_id = %s
                       AND a.uuid = ANY(%s) AND a.t_invalid IS NULL
                       AND o.t_invalid IS NOT NULL AND o.uuid <> a.uuid AND o.web_artifact_id IS NULL
                       AND ((o.invalidated_by = a.uuid
@@ -361,7 +332,6 @@ class RecallSourcesMixin:
                     """,
                     (
                         settings._KG_OWNER,
-                        group_id,
                         active_edge_uuids,
                         settings._SUP_LINK_MAX_DIST,
                         *scope_args,
@@ -396,7 +366,6 @@ class RecallSourcesMixin:
     def _episode_supersessions(
         self,
         episode_ids: list[int],
-        group_id: str | list[str],
         cap: int = 6,
         allowed_projects: list[str] | None = None,
         self_session: str | None = None,
@@ -417,7 +386,10 @@ class RecallSourcesMixin:
         overlay half of self-exclusion (see ``_self_session_facts``).
 
         ``served_text`` (episode id -> the text actually served for it) keeps a successor
-        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``)."""
+        only where that text states P's claim (``OVERLAY_MIN_SUPPORT``).
+
+        The lookup reads the most recently retired edges first (ties by uuid), so the rows
+        kept under the limit do not depend on the plan."""
         settings = self._settings()
         if not episode_ids:
             return {}
@@ -434,7 +406,6 @@ class RecallSourcesMixin:
         params: list[Any] = [
             *(json.dumps([i]) for i in episode_ids),
             settings._KG_OWNER,
-            group_id,
             settings._SUP_LINK_MAX_DIST,
             *scope_args,
             cap if served_text is None else cap * 4,  # headroom for the support filter
@@ -450,10 +421,11 @@ class RecallSourcesMixin:
                     "SELECT p.episodes, p.fact AS old_fact, n.fact FROM kg_relationships p "
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by "
                     f"WHERE p.invalidated_by IS NOT NULL AND ({ors}) "
-                    f"  AND p.owner_id = %s AND {group_sql(group_id, 'p.group_id')} AND n.t_invalid IS NULL "
+                    "  AND p.owner_id = %s AND n.t_invalid IS NULL "
                     "  AND n.web_artifact_id IS NULL "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}{self_sql}"
+                    "ORDER BY p.t_invalid DESC NULLS LAST, p.uuid "
                     "LIMIT %s",
                     params,
                 ).fetchall()
@@ -489,10 +461,10 @@ class RecallSourcesMixin:
     def _surface_supersessions(
         self,
         query_emb: list[float] | None,
-        group_id: str | list[str],
         served_uuids: set[str],
         cap: int = _SUP_LIMIT,
         allowed_projects: list[str] | None = None,
+        served_fact_texts: Iterable[str] = (),
     ) -> list[dict[str, Any]]:
         """A query that matches a now-INVALID fact should still return the CURRENT answer.
 
@@ -503,6 +475,10 @@ class RecallSourcesMixin:
         itself. Shape matches the KG fact leg ({fact, _uuid, _date, _ongoing, _supported}) so it
         flows through fact serving.
         Fail-open — a lookup error just yields no extras.
+
+        ``served_fact_texts`` are the texts already served. The fact leg serves a text once however
+        many rows carry it, so a successor repeating a served text, or an earlier successor's,
+        is skipped and the next candidate takes its slot.
 
         ``allowed_projects`` (restricted surface) requires both the matched superseded edge
         and its served successor to pass the schema-056 provenance rule."""
@@ -529,14 +505,13 @@ class RecallSourcesMixin:
                     "JOIN kg_relationships n ON n.uuid = p.invalidated_by AND n.t_invalid IS NULL "
                     "  AND n.web_artifact_id IS NULL "
                     "WHERE p.t_invalid IS NOT NULL AND p.invalidated_by IS NOT NULL "
-                    f"  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s AND {group_sql(group_id, 'p.group_id')} "
+                    "  AND p.fact_embedding IS NOT NULL AND p.owner_id = %s "
                     f"  AND {_link_close_sql('p', 'n', settings._EMBED_DIMS)} "
                     f"{scope_sql}"
                     f"ORDER BY p.fact_embedding::halfvec({settings._EMBED_DIMS}) <=> %s::halfvec({settings._EMBED_DIMS}) LIMIT %s",
                     (
                         vec,
                         settings._KG_OWNER,
-                        group_id,
                         settings._SUP_LINK_MAX_DIST,
                         *scope_args,
                         vec,
@@ -549,22 +524,28 @@ class RecallSourcesMixin:
             logger.warning("supersession surface failed: %s", e)
             return []
         out: list[dict[str, Any]] = []
+        seen_text = {fact_text_key(t) for t in served_fact_texts}
         for r in rows:
             d = r.get("d")
             if d is None or d > settings._SUP_MAX_DIST:
                 continue
             u, fact = r.get("uuid"), r.get("fact")
-            if u and fact and u not in served_uuids:
-                out.append(
-                    {
-                        "fact": fact,
-                        "_uuid": u,
-                        "_date": r.get("t_valid"),
-                        "_ongoing": r.get("ongoing"),
-                        "_supported": r.get("last_supported_at"),
-                    }
-                )
-                served_uuids.add(u)
-                if len(out) >= cap:
-                    break
+            if not (u and fact) or u in served_uuids:
+                continue
+            text_key = fact_text_key(fact)
+            if text_key in seen_text:
+                continue
+            seen_text.add(text_key)
+            out.append(
+                {
+                    "fact": fact,
+                    "_uuid": u,
+                    "_date": r.get("t_valid"),
+                    "_ongoing": r.get("ongoing"),
+                    "_supported": r.get("last_supported_at"),
+                }
+            )
+            served_uuids.add(u)
+            if len(out) >= cap:
+                break
         return out

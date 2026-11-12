@@ -11,8 +11,14 @@ texts that share a slot are identical vectors.
    the pair. Pinned: one live edge, mention_count 2, the union of both batches' episodes.
 2. Edge-less entities. Stage 5 wrote every new entity a fact named before Stage 6/7 decided
    which facts get written, so an entity whose only fact was then dropped (6b duplicate,
-   6c restatement, same-batch twin, cross-group) was left with no edge. And two workers
-   that resolved the same new name both inserted it.
+   6c restatement, same-batch twin) was left with no edge. And two workers that resolved
+   the same new name both inserted it.
+3. The old personal/technical split. Names the old classifier sent to different piles
+   still get their fact written, and rows still carrying group_id 'personal' (the data
+   is merged once, by schema 067) are found by every lookup the write path makes.
+4. What the write path leaves for the labeller. A new fact carries no audience label, so a
+   restricted device is not served it until the labeller has judged it, even when its
+   provenance lies inside the device's allowlist.
 
 Only symbols that predate the fix are imported, so the file also runs against the
 pre-fix pipeline (where every reproduction fails on its assertion).
@@ -27,12 +33,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import ingestion.extractor as extractor_mod
 from ingestion.dedup import _index_cache_reset
 from ingestion.extractor import ExtractionPipeline
 from ingestion.kg_client import KGClient
+from ingestion.kg_pg_write import _vec
 from ingestion.models import ExtractedEntity, ExtractedFact, ExtractionResult
+from ingestion.surfaces import FULL_TRUST, SurfaceTrust
+from mcp_server import kg_pg
 from tests.helpers.embed import onehot
+from tests.test_kg_fact_audience_db import _recall_engine
 
 SEG = "2026-09-01T12:00:00+00:00"
 ITEM = {"content_type": "chunk", "content": "window", "project": None, "session_id": "s1"}
@@ -294,21 +303,6 @@ class TestNoEntityWithoutAWrittenFact:
         assert {"Lantern", "Calendar", "Meadow", "Backup"} <= set(_entity_names(graph))
         assert _edgeless(graph) == []
 
-    def test_cross_group_fact(self, graph, monkeypatch):
-        monkeypatch.setenv("SYNAPSE_PERSONAL_SCOPE", "1")
-        monkeypatch.setattr(
-            extractor_mod,
-            "_classify_entity_group",
-            lambda name, summary, default: "personal" if name == "Pebble" else default,
-        )
-        cross = _fact("Pebble is moored at the harbor", "Pebble", "Harbor")
-
-        _pipeline(_Embedder(), [cross, _CONTROL], WINDOW_A).process_item(dict(ITEM))
-
-        assert [e[0] for e in _live_edges(graph)] == [_CONTROL.fact]
-        assert _entity_names(graph) == ["Backup", "Meadow"]
-        assert _edgeless(graph) == []
-
 
 # ---------------------------------------------------------------------------------------
 # Same new name resolved by two workers at once
@@ -338,3 +332,191 @@ def test_same_new_name_from_parallel_workers_is_one_entity(graph, before_b):
     assert sorted(e[0] for e in edges) == sorted([fact_a.fact, fact_b.fact])
     assert {e[1] for e in edges} == {harbors[0][0]}
     assert _edgeless(graph) == []
+
+
+# ---------------------------------------------------------------------------------------
+# 3. Rows written under the old personal/technical split
+# ---------------------------------------------------------------------------------------
+#
+# Until the one-time merge, pre-existing rows may still carry group_id 'personal'. The
+# write path must resolve a mention onto such a row, not mint a twin beside it.
+
+
+def _seed_entity(conn, uuid: str, name: str, *, group: str = "personal", slot: int | None = None):
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, entity_type, "
+        "summary, embedding, created_at, t_created, valid_at, t_valid) "
+        "VALUES (%s, 'default', %s, %s, %s, 'Concept', '', %s::vector, now(), now(), now(), now())",
+        (uuid, group, name, name.lower(), None if slot is None else _vec(onehot(slot))),
+    )
+
+
+def _seed_edge(conn, uuid: str, src: str, tgt: str, fact: str, slot: int, group: str = "personal"):
+    conn.execute(
+        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "fact_embedding, created_at, t_created, valid_at, t_valid) "
+        "VALUES (%s, 'default', %s, %s, %s, 'R', %s, %s::vector, now(), now(), now(), now())",
+        (uuid, group, src, tgt, fact, _vec(onehot(slot))),
+    )
+
+
+_HOSTS = _fact("Harbor hosts the build cache", "Harbor", "Cache")
+
+
+def test_fact_across_old_piles_is_written(graph):
+    """The two names sat in different piles under the old name classifier, which dropped
+    a fact between them; there is one memory now, so it is written like any other.
+
+    A regression guard on the outcome only. It sets nothing that selected the old routing (the
+    personal-scope switch defaulted to on and is not touched here), so whether it failed on the
+    old code depended on the environment. Do not read it as proof that the routing is gone."""
+    across = _fact(
+        "A dentist appointment is booked after the Postgres upgrade",
+        "dentist appointment",
+        "Postgres",
+    )
+
+    _pipeline(_Embedder(), [across, _CONTROL], WINDOW_A).process_item(dict(ITEM))
+
+    assert sorted(e[0] for e in _live_edges(graph)) == sorted([across.fact, _CONTROL.fact])
+    assert {"dentist appointment", "Postgres"} <= set(_entity_names(graph))
+    assert _edgeless(graph) == []
+
+
+def test_exact_name_resolves_onto_an_entity_left_in_the_personal_group(graph):
+    _seed_entity(graph, "p-harbor", "Harbor")
+
+    _pipeline(_Embedder(), [_HOSTS], WINDOW_A).process_item(dict(ITEM))
+
+    assert _entity_names(graph) == ["Cache", "Harbor"]
+    assert [e[1] for e in _live_edges(graph)] == ["p-harbor"]
+
+
+def test_same_name_guard_finds_an_entity_written_to_the_personal_group_meanwhile(graph):
+    pipe = _pipeline(_Embedder(), [_HOSTS], WINDOW_A)
+    resolve = pipe._stage4_resolve
+
+    def resolve_then_another_worker_writes(*args: Any, **kwargs: Any) -> Any:
+        resolved = resolve(*args, **kwargs)
+        _seed_entity(graph, "p-harbor", "Harbor")  # after Stage 4 said "new", before Stage 5
+        return resolved
+
+    pipe._stage4_resolve = resolve_then_another_worker_writes  # type: ignore[method-assign]
+    pipe.process_item(dict(ITEM))
+
+    assert _entity_names(graph) == ["Cache", "Harbor"]
+    assert [e[1] for e in _live_edges(graph)] == ["p-harbor"]
+
+
+def test_vector_match_resolves_onto_an_entity_left_in_the_personal_group(graph):
+    _seed_entity(graph, "p-zephyr", "Zephyr", slot=5)
+    fact = _fact("Gale hosts the build cache", "Gale", "Cache")
+
+    # "Gale" is short, so it skips fuzzy matching and goes to the vector search; its
+    # embedding is the stored entity's, which is how the old row is found.
+    _pipeline(_Embedder({"Gale": 5}), [fact], WINDOW_A).process_item(dict(ITEM))
+
+    assert _entity_names(graph) == ["Cache", "Zephyr"]
+    assert [e[1] for e in _live_edges(graph)] == ["p-zephyr"]
+
+
+def test_contradiction_search_retires_a_fact_left_in_the_personal_group(graph):
+    _seed_entity(graph, "p-harbor", "Harbor")
+    _seed_entity(graph, "p-shore", "Shore")
+    _seed_edge(graph, "p-edge", "p-harbor", "p-shore", "Harbor is on the north shore", slot=7)
+    newer = _fact("Harbor is on the south shore", "Harbor", "Shore")
+
+    def judge_retires_every_candidate(facts, candidates_map):
+        retired = {i: [c["uuid"] for c in pair + sem] for i, (pair, sem) in candidates_map.items()}
+        return set(), retired, {}, True
+
+    _pipeline(
+        _Embedder({newer.fact: 7}), [newer], WINDOW_A, judge=judge_retires_every_candidate
+    ).process_item(dict(ITEM))
+
+    retired_at, superseder = graph.execute(
+        "SELECT t_invalid, invalidated_by FROM kg_relationships WHERE uuid = 'p-edge'"
+    ).fetchone()
+    new_uuid, new_src = graph.execute(
+        "SELECT uuid, src_uuid FROM kg_relationships WHERE fact = %s", (newer.fact,)
+    ).fetchone()
+    assert retired_at is not None and superseder == new_uuid
+    assert new_src == "p-harbor"
+    assert [e[0] for e in _live_edges(graph)] == [newer.fact]
+
+
+# ---------------------------------------------------------------------------------------
+# 4. A new fact is unlabelled, so a restricted device is not served it
+# ---------------------------------------------------------------------------------------
+#
+# The restricted serving rule needs a fact labelled work-safe (or unlabelled and older than
+# the cutover stamp schema 066 wrote). Nothing on the write path labels a fact, and that is
+# what keeps a fact from a personal conversation away from a work device until the labeller
+# has judged it. The read-side tests seed their rows by hand, so they cannot see a write path
+# that starts stamping a label, by an explicit value or by a column default; this one runs
+# the real write.
+
+HOBBY = "gadget-hobby"  # a project the restricted device below is allowed to read
+RESTRICTED = SurfaceTrust(trust="restricted", allowed_projects=(HOBBY,), known=True)
+
+
+@pytest.fixture()
+def hobby_episodes(graph):
+    ids = [
+        graph.execute(
+            "INSERT INTO episodes (session_id, sequence, project, content) "
+            "VALUES ('hobby-session', %s, %s, 'a turn') RETURNING id",
+            (n, HOBBY),
+        ).fetchone()[0]
+        for n in (1, 2)
+    ]
+    yield ids
+    graph.execute("DELETE FROM episodes WHERE id = ANY(%s)", (ids,))
+
+
+def test_a_new_fact_stays_hidden_from_a_restricted_device_until_it_is_labelled(
+    graph, hobby_episodes, db_url
+):
+    fact = _fact("A widget is kept in the gadget cabinet", "Widget", "Cabinet")
+    pipe = _pipeline(_Embedder({fact.fact: 0}), [fact], hobby_episodes)
+
+    pipe.process_item({**ITEM, "project": HOBBY})
+
+    fact_uuid, fact_id, audience, version, model, sources = graph.execute(
+        "SELECT uuid, id, audience, label_version, label_model, source_projects "
+        "FROM kg_relationships WHERE fact = %s",
+        (fact.fact,),
+    ).fetchone()
+    cutover = int(
+        graph.execute(
+            "SELECT value FROM synapse_meta WHERE key = %s", (kg_pg.FACT_AUDIENCE_CUTOVER_KEY,)
+        ).fetchone()[0]
+    )
+    assert (audience, version, model) == (None, None, None), "the write path labels nothing"
+    assert fact_id > cutover, "so the legacy clause that serves unlabelled facts cannot apply"
+    assert sources == [HOBBY], "provenance alone would serve it: it sits inside the allowlist"
+
+    engine = _recall_engine(db_url)
+
+    def search(allowed: list[str] | None) -> set[str]:
+        facts, _ = engine._search_kg("widget", onehot(0), [], 20, allowed_projects=allowed)
+        return {f["_uuid"] for f in facts}
+
+    def recall(trust: SurfaceTrust) -> set[str]:
+        out = engine.recall("widget", trust=trust)
+        return {f["id"].removeprefix("f:") for f in out.get("facts") or []}
+
+    assert search([HOBBY]) == set()
+    assert recall(RESTRICTED) == set()
+    # the fact is there for the read that needs no label
+    assert search(None) == {fact_uuid}
+    assert recall(FULL_TRUST) == {fact_uuid}
+
+    # the same restricted reads serve it once the label is the only thing that changed
+    graph.execute(
+        "UPDATE kg_relationships SET audience = 'work-safe', label_version = 1, "
+        "label_model = 'hand' WHERE uuid = %s",
+        (fact_uuid,),
+    )
+    assert search([HOBBY]) == {fact_uuid}
+    assert recall(RESTRICTED) == {fact_uuid}
