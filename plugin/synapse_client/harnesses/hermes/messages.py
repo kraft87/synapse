@@ -24,6 +24,18 @@ actually sent, with the memory context it injected, our own nudge included), not
   ``agent/context_compressor._SYNTHETIC_USER_ROW_PREFIXES``,
   ``agent/conversation_compression_scaffolding._SYNTHETIC_USER_PREFIXES``). The flags are
   not persisted, so a resumed session's rows are recognised by their text.
+- An assistant row is a reply only when it shows what the user got. Hermes types the
+  two kinds of assistant row that are not (agent/turn_failure_copy.py and its writers):
+  ``display_kind`` "failed_turn", the boundary Hermes appends when a turn fails ("This
+  turn did not complete...", agent/conversation_loop.py, gateway/run_turn_persistence.py,
+  gateway/session_results.py), is dropped: failure text is never stored as something
+  the assistant said. "hidden", a held turn's interim commentary or rejected answer
+  (agent/stream_delivery.py ``withhold_held_row``) or the empty interrupt placeholder,
+  keeps only its tool calls, if any. Any other ``display_kind`` on an assistant row is
+  treated as "hidden". A row persisted before Hermes typed its boundaries is recognised,
+  as Hermes recognises it (``untyped_failed_turn_display_kind``), by text that is
+  exactly one of the three notices; a reply that quotes one stays a reply. Every other
+  ``display_kind`` Hermes writes is on a user row (above).
 - Tool results are capped at 2000 characters and tool-call arguments at 1000; the
   server renders less of either. User and assistant text are sent whole.
 
@@ -34,6 +46,11 @@ turn ending in one is still running (Hermes's list is live and may be read mid-t
 Only complete turns are uploaded. Synthetic rows do not count towards a turn's key
 either: Hermes adds them after a finished turn (a task-list snapshot after compression),
 and that must neither reopen the turn nor make it look new.
+
+A failed turn therefore never completes, and its user message is not sent either: it
+got no reply, Hermes asks the user to send it again, and the server, which groups rows
+at each user row, would otherwise file it with no answer or as the next turn's
+context. The turn after it takes the last complete turn before it as its context.
 """
 
 from __future__ import annotations
@@ -61,6 +78,16 @@ _SYNTHETIC_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
     "_dropped_toolcall_nudge",
+)
+#: Hermes's failed-turn boundary (agent/turn_failure_copy.py ``FAILED_TURN_DISPLAY_KIND``)
+#: and the three notices it writes as its text.
+_FAILED_TURN_KIND = "failed_turn"
+_FAILED_TURN_NOTICES = (
+    "Your request was not processed. Send it again if you still want me to carry it out.",
+    "This turn did not complete. Some actions may already have run; verify their effects "
+    "before resending.",
+    "An automated delivery was interrupted and was not run again. Some actions may already "
+    "have run; verify their effects.",
 )
 _SYNTHETIC_PREFIXES = (
     "[System:",
@@ -152,6 +179,13 @@ def _record(message: Any) -> Record | None:
             record["synthetic"] = True
     elif role == "assistant":
         calls = _tool_calls(message.get("tool_calls"))
+        kind = message.get("display_kind")
+        if kind == _FAILED_TURN_KIND or (not kind and text in _FAILED_TURN_NOTICES):
+            return None
+        if kind:
+            if not calls:
+                return None
+            record["content"] = ""
         if calls:
             record["tool_calls"] = calls
     else:

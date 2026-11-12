@@ -299,6 +299,16 @@ _DRIVER = textwrap.dedent(
         "steer_kind": prompt_builder.STEER_DISPLAY_KIND,
     }
 
+    from agent import turn_failure_copy as failures
+
+    notices = [failures.FAILED_TURN_NOTICE, failures.PARTIAL_FAILED_TURN_NOTICE,
+               failures.AUTOMATION_INTERRUPTED_NOTICE]
+    out["markers"].update(
+        failed_kind=failures.FAILED_TURN_DISPLAY_KIND,
+        failed_notices=notices,
+        untyped=[failures.untyped_failed_turn_display_kind("assistant", n) for n in notices],
+    )
+
     # The gateway's names for a local session, as the checkout makes them.
     try:
         from gateway.config import Platform
@@ -485,6 +495,15 @@ def test_synapse_runs_inside_hermes(tmp_path: Path, server: _Server, isolation: 
     for prefix in markers["prefixes"]:
         assert hm._synthetic({}, prefix + " body"), prefix
     assert hm._synthetic({"display_kind": markers["steer_kind"]}, "steer text")
+
+    # This Hermes's failed-turn boundary, typed or as bare text, is never a reply.
+    assert markers["failed_kind"] == hm._FAILED_TURN_KIND
+    assert sorted(markers["failed_notices"]) == sorted(hm._FAILED_TURN_NOTICES)
+    assert markers["untyped"] == [hm._FAILED_TURN_KIND] * 3
+    for notice in markers["failed_notices"]:
+        assert hm.to_records([{"role": "assistant", "content": notice}]) == []
+        typed = {"role": "assistant", "content": notice, "display_kind": markers["failed_kind"]}
+        assert hm.to_records([typed]) == []
 
     # The gateway's local-session names are the ones sessions.py recognises.
     assert "gateway_error" not in out, out.get("gateway_error")
