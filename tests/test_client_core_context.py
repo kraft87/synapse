@@ -115,12 +115,15 @@ def test_prompt_nudge_is_byte_identical_to_the_hook(scratch, monkeypatch, capsys
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     hook = load_script("recall_nudge")
-    fixed = time.localtime(_NOW)
+    # The hook asks the core for the current time; this test's clock is _NOW.
     monkeypatch.setattr(
-        hook, "time", SimpleNamespace(strftime=lambda fmt: time.strftime(fmt, fixed))
+        context,
+        "time",
+        SimpleNamespace(strftime=time.strftime, localtime=lambda now=None: time.localtime(_NOW)),
     )
     hook.main()
-    assert context.prompt_nudge(Settings.load(), now=_NOW) == _hook_context(capsys)
+    expected = context.prompt_nudge(Settings.load(), now=_NOW)
+    assert expected == _hook_context(capsys)
 
 
 def test_prompt_nudge_names_the_tools_as_the_harness_does(tmp_path):

@@ -17,6 +17,7 @@ import ast
 import hashlib
 import io
 import json
+import re
 import sys
 import threading
 from collections.abc import Iterator
@@ -670,6 +671,46 @@ def test_preferences_block_kill_switch(scratch, monkeypatch, capsys, server):
     server.answer("/preferences/top", _PREFERENCES)
     assert _run_hook(monkeypatch, capsys, "preferences_block") == ""
     assert server.seen == []
+
+
+# ---------------------------------------------------------------------------
+# Per prompt: recall_nudge.py prints the core's prompt_nudge
+# ---------------------------------------------------------------------------
+
+#: The timestamp line, as the hook has always printed it ("[Wed 2026-08-26 15:55:01 EDT]").
+_CLOCK_LINE = re.compile(
+    r"\[(Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [^\]\"]*\]"
+)
+_PROMPT_NUDGE = (
+    "[Synapse] IMPORTANT: the user's cross-session history is searchable \\u2014 assume it "
+    "has context on any past work, project, device, or person they name. BEFORE answering "
+    "anything that references the past: synapse:recall (skip only if the answer is "
+    "already in this conversation). About to say 'noted' or 'I'll remember'? Call "
+    "synapse:remember FIRST, then reply."
+)
+_PROMPT = '{"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": '
+_BOTH = _PROMPT + '"[TS]\\n' + _PROMPT_NUDGE + '"}}\n'
+
+
+@pytest.mark.parametrize(
+    ("env", "printed"),
+    [
+        ({}, _BOTH),
+        ({"SYNAPSE_RECALL_NUDGE": "0"}, _PROMPT + '"[TS]"}}\n'),
+        ({"SYNAPSE_PROMPT_TIMESTAMP": "0"}, _PROMPT + '"' + _PROMPT_NUDGE + '"}}\n'),
+        ({"SYNAPSE_RECALL_NUDGE": "0", "SYNAPSE_PROMPT_TIMESTAMP": "0"}, ""),
+        ({"CLAUDE_PLUGIN_OPTION_SYNAPSE_RECALL_NUDGE": "0"}, _PROMPT + '"[TS]"}}\n'),
+        ({"SYNAPSE_RECALL_NUDGE": "", "SYNAPSE_PROMPT_TIMESTAMP": "off"}, _BOTH),
+    ],
+    ids=["defaults", "no-nudge", "no-timestamp", "both-off", "plugin-option", "only-0-is-off"],
+)
+def test_recall_nudge_prints_the_time_and_the_nudge(scratch, monkeypatch, capsys, env, printed):
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    out = _run_hook(monkeypatch, capsys, "recall_nudge")
+    masked, stamps = _CLOCK_LINE.subn("[TS]", out)
+    assert masked == printed
+    assert stamps == printed.count("[TS]")
 
 
 # ---------------------------------------------------------------------------
