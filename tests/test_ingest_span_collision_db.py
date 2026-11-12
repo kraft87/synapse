@@ -9,7 +9,7 @@ prod, 15 POSTs from 2026-10-30 to 11-05 all failed on the one span
 ``jsonl:6033958e-...`` (its spelling then), stored once as session 24d5dada's turn 12.
 
 Two layers, one test each: the route probes the span globally before writing, and an
-upsert that still hits the span index (another writer committed the span between the
+append that still hits the span index (another writer committed the span between the
 probe and the INSERT) skips that one turn instead of failing the batch.
 
 Runs against the shared Postgres test DB (tagged into the ``db`` xdist group via
@@ -116,13 +116,13 @@ def test_a_span_stored_under_another_session_is_skipped_not_a_500(
     # Every span the route tries to INSERT. The except leg alone would also return 200,
     # so this is what holds the probe to its job: the stored span never reaches the INSERT.
     attempted: list[str] = []
-    real_upsert = Database.upsert_episode
+    real_append = Database.append_episode
 
     def _spy(self, ep):
         attempted.append(ep.span_id)
-        return real_upsert(self, ep)
+        return real_append(self, ep)
 
-    monkeypatch.setattr(Database, "upsert_episode", _spy)
+    monkeypatch.setattr(Database, "append_episode", _spy)
 
     with caplog.at_level(logging.WARNING, logger="mcp_server.ingest_route"):
         r = _post(db_url, batch)
@@ -152,3 +152,49 @@ def test_a_span_written_between_the_probe_and_the_insert_skips_one_turn(
     r = _post(db_url, batch)
 
     _assert_skipped(conn, r, tag, sid_a, sid_b, span)
+
+
+def test_a_row_another_writer_adds_mid_batch_is_never_overwritten(tag, conn, db_url, monkeypatch):
+    """Another writer adds a row to the session after the route has read its span index.
+    The batch's turns land after that row; the row keeps its own text, project and stamp."""
+    from ingestion.db import Database
+    from ingestion.models import Episode
+
+    sid = f"spantest-{tag}-a"
+    batch = _turn(sid, f"/work/{tag}/alpha", f"first {tag}", f"m1-{tag}") + _turn(
+        sid, f"/work/{tag}/alpha", f"second {tag}", f"m2-{tag}"
+    )
+    real_index = Database.get_session_span_index
+
+    def _index_then_another_writer(self, session_id):
+        out = real_index(self, session_id)
+        other = Database(db_url)
+        try:
+            other.append_episode(
+                Episode(
+                    session_id=session_id,
+                    sequence=1,
+                    project="other-project",
+                    content="the other writer's text",
+                    surface_id="dev-other",
+                )
+            )
+        finally:
+            other.close()
+        return out
+
+    monkeypatch.setattr(Database, "get_session_span_index", _index_then_another_writer)
+
+    r = _post(db_url, batch)
+
+    assert r.status_code == 200 and r.json()["ingested"] == 2, r.text
+    assert conn.execute(
+        "SELECT sequence, span_id, content, project, surface_id FROM episodes "
+        "WHERE session_id = %s ORDER BY sequence",
+        (sid,),
+    ).fetchall()[0] == (1, None, "the other writer's text", "other-project", "dev-other")
+    assert _rows(conn, sid) == [
+        (1, None),
+        (2, f"claude_code:m1-{tag}"),
+        (3, f"claude_code:m2-{tag}"),
+    ]

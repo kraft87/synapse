@@ -52,6 +52,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import use_core
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
 _CODEX = _REPO / "plugin-codex"
@@ -152,7 +154,9 @@ def engine() -> ModuleType:
 
 @pytest.fixture()
 def project() -> ModuleType:
-    return _load("synapse_project_unserved_t", _SCRIPTS / "synapse_project.py")
+    """The resolver itself, in the client core (plugin/synapse_client/project.py)."""
+    use_core()
+    return importlib.import_module("synapse_client.project")
 
 
 @pytest.fixture()

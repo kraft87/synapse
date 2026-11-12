@@ -163,12 +163,13 @@ Slash commands:
 CLI (`synapse …` from any terminal once the client is installed; `!` prefix in a session):
 
 - **`synapse login`** (alias `synapse-login`) — sign in, enroll this machine with one
-  approval, and wire Claude Code / Codex. On an enrolled machine it keeps the existing
+  approval, and wire Claude Code / Codex / Hermes. On an enrolled machine it keeps the existing
   device token; `--reenroll` replaces it, `--token` stores a minted one (it asks for it, hidden).
 - **`synapse config [key [value]]`** — read or change this machine's settings.
-- **`synapse install claude|codex`** — the wiring step alone.
+- **`synapse install claude|codex|hermes`** — the wiring step alone (Hermes: below).
 - **`synapse update`** — install the client version the server now serves, and update
-  this plugin.
+  this plugin and every other harness already wired.
+- **`synapse status`** — one line per harness: wired, found and not wired, or not found.
 - **`synapse skill retire <name>`** — retire a skill everywhere (below).
 - **`synapse skill scope <name> global|project:<label>`** — move a skill to another scope
   (below).
@@ -256,6 +257,50 @@ intent nor writes one twice. Log: `/tmp/synapse-remember-spool.log` (`SYNAPSE_SP
 
 Server requirement: schema 052 (`remember_intents`) and the `/remember/spool` route. Against
 an older server the flush fails loudly into the log and the spool simply keeps its intents.
+
+## Hermes
+
+The same client wires [Hermes](https://github.com/NousResearch/hermes-agent) as a memory
+provider. `synapse login` does it when it finds Hermes; to do it alone:
+
+```
+synapse install hermes                         # the home is $HERMES_HOME, else ~/.hermes
+synapse install hermes --hermes-home PATH      # another home (a Hermes profile)
+synapse install hermes --replace               # take over from another external provider
+```
+
+It writes `$HERMES_HOME/plugins/synapse/` (a copy of the client core and a `plugin.yaml`)
+and sets `memory.provider: synapse` in that home's `config.yaml`: through `hermes config
+set` when Hermes already has a config there, by writing a new two-line file when there is
+none. Hermes runs one external memory provider at a time, so a different one already
+selected is left alone unless you pass `--replace`; Hermes's built-in memory keeps working
+either way. `synapse update` rebuilds the folder for a new client version, and `synapse
+status` says whether it is wired. Restart Hermes to load it.
+
+**What it does.** In a session you run on this machine (the Hermes CLI, TUI, Desktop or an
+ACP editor): the board and your preferences in the system prompt at session start, the
+recall nudge each turn, the memory tools (`recall`, `recall_full_turns`, `fetch`,
+`fetch_session`, `remember`, `recall_feedback`), and each finished turn uploaded. Cron jobs
+get the tools and nothing else. Chat-platform sessions (Telegram, Discord, Slack and the
+rest, through Hermes's gateway), the API server, and subagents get nothing: there, other
+people talk to the agent, and they must not read your memory or be stored as you. The
+reasons and the Hermes source behind them: [docs/client-harnesses.md](../docs/client-harnesses.md).
+
+**What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
+with this machine's device token. At session start: `GET /context` and
+`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each finished turn: a
+`POST /ingest` (format `messages`, client `hermes`) holding the session id, the project
+label and working directory, the model name, and per message its role, text, tool-call
+names and arguments (first 1000 characters), tool results (first 2000) and timestamp.
+Hermes scrubs secrets from what it hands a memory provider before the client sees it.
+Not sent: the system prompt, Hermes's compaction summaries, the memory context it injects
+into prompts, reasoning, and its own bookkeeping fields. Uploads that fail wait in
+`$HERMES_HOME/synapse/outbox/` and go with the next successful one. A session marked
+private (`synapse private on <session-id>`) uploads nothing.
+
+**Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
+queued), the recall-feedback nudge, a Hermes command for private mode, skills and config
+sync, and importing past Hermes sessions from its `state.db`.
 
 ## More
 

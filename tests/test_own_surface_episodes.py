@@ -473,6 +473,48 @@ def test_remember_archive_is_stamped_from_bound_trust_only(remember_env):
         assert _archived_stamp(remember_env, out["episode_id"]) is None
 
 
+def test_remember_into_a_session_adds_a_row_and_leaves_the_devices_row_alone(
+    remember_env, monkeypatch
+):
+    """The session already holds a device's row, labelled with its project and stamped. A
+    remember with no project into that session is a new row with no project: it never
+    takes the device's number, so it cannot carry the device's label onto other text."""
+    from ingestion.db import Database
+    from mcp_server import server
+
+    # Reading the highest sequence and upserting at the next one gives the same rows here,
+    # so the only way to tell the writer appends is that it never upserts.
+    def _boom(self, ep):
+        raise AssertionError("remember upserted a row instead of appending it")
+
+    monkeypatch.setattr(Database, "upsert_episode", _boom)
+    sid = f"own-{uuid.uuid4().hex[:8]}"
+    device_row = _episode(remember_env, "work-x", "device turn", "dev-a", session_id=sid)
+    before = remember_env.execute("SELECT * FROM episodes WHERE id = %s", (device_row,)).fetchone()
+
+    out = asyncio.run(
+        server._remember_as(
+            trust=UNKNOWN_SURFACE,
+            hook="Personal fact about the build",
+            body="The build uses the cache.",
+            type="project",
+            session_id=sid,
+        )
+    )
+
+    rows = remember_env.execute(
+        "SELECT sequence, id, project, surface_id, content FROM episodes "
+        "WHERE session_id = %s ORDER BY sequence",
+        (sid,),
+    ).fetchall()
+    assert [(r[0], r[2], r[3]) for r in rows] == [(1, "work-x", "dev-a"), (2, None, None)]
+    assert rows[1][1] == out["episode_id"] and "Personal fact" in rows[1][4]
+    assert (
+        remember_env.execute("SELECT * FROM episodes WHERE id = %s", (device_row,)).fetchone()
+        == before
+    )
+
+
 def _spool_client(db_url):
     from fastmcp import FastMCP
     from starlette.testclient import TestClient
@@ -620,7 +662,7 @@ def test_pre057_restricted_reads_serve_the_allowlist_only(pre057, clean):
 def test_pre057_a_column_lost_after_a_positive_probe_falls_back(pre057, clean):
     """Belt and braces: if the probe already cached "applied" and the column then
     disappears (057 rolled back under a running process), the read legs and the episode
-    upsert fall back to the pre-057 statements instead of failing."""
+    upsert and append fall back to the pre-057 statements instead of failing."""
     from ingestion.db import Database
     from ingestion.models import Episode
 
@@ -639,12 +681,21 @@ def test_pre057_a_column_lost_after_a_positive_probe_falls_back(pre057, clean):
         eid = db.upsert_episode(
             Episode(session_id="s-lost", sequence=1, content="x", surface_id="dev-a")
         )
+        OWN_SURFACE_PROBE._ok[url] = True
+        appended, seq = db.append_episode(
+            Episode(session_id="s-lost", sequence=1, content="y", surface_id="dev-a")
+        )
     finally:
         db.close()
+    assert seq == 2
     assert clean.execute(
         f"SELECT 1 FROM {schema}.episodes WHERE id = %s",
         (eid,),
     ).fetchone()
+    assert clean.execute(
+        f"SELECT content FROM {schema}.episodes WHERE id = %s",
+        (appended,),
+    ).fetchone() == ("y",)
 
 
 def test_full_trust_and_unknown_callers_never_probe(monkeypatch, db_url):

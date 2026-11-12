@@ -56,6 +56,103 @@ the file again.
 - `ingestion/backfill.py` from a checkout older than this change raises on a turn that is
   already stored (it has no span-collision handler). It is a manual tool; run it from a
   current checkout.
+
+## 2026-11-12 — guards: only a full-trust device takes a session back on the record; appends to one session take turns (plugin 0.24.1)
+
+**What changed**
+
+- **`DELETE /private-sessions/{session_id}` needs a full-trust device.** It removes the row
+  that keeps an off-the-record session from being ingested, and it sat behind the ordinary
+  client gate, so a restricted device or the root token could put back on the record a
+  session another device had taken off it. It now sits behind the admin gate: a caller that
+  clears the client gate only gets a 403 with a plain reason. `PUT` and `GET` are unchanged.
+- **`private_mode.py off --forget` says what happened** (the Claude plugin and its Codex
+  copy). A 403 says the delete must be done from a full-trust device. Any other failed
+  delete reads the flag back first: still there after an HTTP error means the session stays
+  off the record; still there after a transport error means the delete may still be
+  applying, check `status`; gone means the forget worked; unreadable means unknown. Every
+  failure also says the local marker was removed, which leaves the session where a plain
+  `off` leaves it.
+- **Appends to one session take turns.** `remember`, `/ingest` and the backfills each read
+  the session's highest sequence number and then upserted at the next one, so two writers
+  could pick the same number and the second replaced the first one's row.
+  `EpisodeStore.append_episode` takes a per-session advisory lock and takes the number
+  inside the `INSERT`; a row is never rewritten by another writer's append.
+  `upsert_episode` stays for a deliberate rewrite of a known row.
+- **A remembered item reads session context only from turns of its own project.** The
+  names handed to the extraction model came from every turn of the session, so a name from
+  another project could end up in a fact that cites only this one's episode.
+
+**On each machine**
+
+1. Nothing to migrate and no setting to change.
+2. `synapse update` for the 0.24.1 `private_mode.py` wording (older clients keep working;
+   they print the old lines). The server change takes effect with the image.
+3. To take a session back on the record, run `private_mode.py off --forget` on a full-trust
+   device.
+
+**Proven**
+
+- A restricted device's `DELETE` through the routes the server itself registers gets a 403
+  and its `PUT` lands; a full-trust device's `DELETE` removes the row.
+- A writer that loses its number appends after the winner, and many appends at once get
+  distinct numbers and keep their own rows; the tests fail
+  if the session lock is released before the `INSERT` runs or a writer goes back to
+  upserting.
+
+## 2026-11-12 — client: Hermes gets Synapse as its memory provider; the CLI walks one harness list (plugin 0.24.0)
+
+**What changed**
+
+- **A Hermes adapter on the client core** (`plugin/synapse_client/harnesses/hermes/`): a
+  `MemoryProvider` with the board and preferences in the system prompt, the recall nudge
+  each turn, the six memory tools proxied to MCP `tools/call`, and every finished turn
+  uploaded to `/ingest` in the `messages` format (client `hermes`, source `hermes-sync`).
+  Failed uploads wait in `$HERMES_HOME/synapse/outbox/`. No server change: the `messages`
+  format landed in #251.
+- **Local sessions only.** The provider is active for a primary session on the Hermes
+  CLI, TUI, Desktop or ACP with no chat identity. Cron jobs get the tools only; gateway
+  (chat-platform) sessions, the API server and subagents get nothing, and a tool call
+  there returns an error. The rule and the Hermes source lines it rests on:
+  `docs/client-harnesses.md`.
+- **`synapse install hermes [--hermes-home PATH] [--replace]`** builds
+  `$HERMES_HOME/plugins/synapse/` (a copy of the core plus `harnesses/hermes/`, swapped in
+  whole) and selects `memory.provider: synapse`. Another external provider already selected
+  is left alone unless `--replace`. The `hermes` program is only run on a home that already
+  has a `config.yaml`; a home without one gets a new two-line file.
+- **The CLI walks one list** (`harness.harnesses()`): Claude Code and Codex wrapped over
+  their old functions, then the core's registry. `synapse login` and `synapse install`
+  wire Hermes when they find it, `synapse update` rebuilds the Hermes folder when it is
+  wired, and the new `synapse status` prints a line per harness. Claude Code and Codex
+  behave and print exactly as before.
+
+**On each machine**
+
+1. `synapse update` (the server must serve 0.24.0 first: merge, then the image).
+2. On a machine with Hermes: `synapse login` (re-wires, no new sign-in) or
+   `synapse install hermes`; for a Hermes profile, add `--hermes-home <profile home>`.
+   Restart Hermes. `synapse status` should print `Hermes: wired`.
+3. If the report says another provider was left selected, decide: `--replace`, or keep it
+   (Hermes runs one external provider at a time).
+
+**Proven**
+
+- Full non-db suite: 3457 passed, 32 skipped.
+- `tests/test_hermes_integration.py` against a real Hermes checkout
+  (`SYNAPSE_HERMES_CHECKOUT=~/workspace/hermes-agent`): Hermes's own loader and
+  `MemoryManager` through initialize, system prompt, prefetch, a tool call, two synced
+  turns, pre-compress, session end and shutdown, with plugins in-process and with
+  `plugins.isolation: host`. The fake server's bodies, parsed by the route's own
+  `MessagesParser`, are four turns each stored once; no connection left the loopback
+  address; the temp Hermes home stayed at about 145 KB.
+
+**Open**
+
+- Not ported to Hermes: the remember spool, the recall-feedback nudge, a private-mode
+  command, skills and config sync, a `state.db` history importer, and any gateway session.
+- Claude Code's hooks and Codex's still carry their own config and HTTP code; moving them
+  onto the core is next, Codex first.
+
 ## 2026-11-11 — one memory per owner: the personal/technical split is gone (schema 067)
 
 **What changed**

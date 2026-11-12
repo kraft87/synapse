@@ -124,7 +124,10 @@ Then it wires every harness it finds. **Claude Code**: it installs the plugin
 (`claude plugin marketplace add kraft87/synapse`, `claude plugin install synapse@synapse`)
 with the server URL; restart Claude Code or run `/reload-plugins`. **Codex**: it writes the
 hooks and the `synapse` MCP server into `~/.codex/config.toml`; start `codex`, run `/hooks`
-and trust them. Re-running `synapse login` wires a harness you install later and never asks
+and trust them. **Hermes**: it installs a memory provider in `$HERMES_HOME/plugins/synapse/`
+and selects it (`synapse install hermes [--hermes-home PATH] [--replace]` does that alone;
+local sessions only, see [plugin/README.md](../plugin/README.md#hermes)); restart Hermes.
+`synapse status` shows which harnesses are wired. Re-running `synapse login` wires a harness you install later and never asks
 for a new sign-in on an enrolled machine (`--reenroll` does that on purpose).
 
 Settings live in `~/.synapse/config.json`, owned by no harness: `synapse config` lists
@@ -301,8 +304,9 @@ fold (a dry run unless `--apply`); read `python scripts/pile_merge.py --help` be
 it. A fresh install needs none of this: its first boot applies 067 with nothing to merge.
 
 Clients follow the server: `synapse update` on each machine fetches the client version the
-server now serves (the same `/install`), updates the Claude Code plugin, and keeps Codex's
-hook commands as they were, so their trust survives. An install from before 0.20 keeps
+server now serves (the same `/install`), updates the Claude Code plugin, keeps Codex's
+hook commands as they were, so their trust survives, and rebuilds the Hermes provider folder
+when Hermes is wired. An install from before 0.20 keeps
 working with no action, reading its old Claude plugin settings; the first `synapse login`
 copies those answers into `~/.synapse/config.json`.
 

@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 def write_backfill_session(db: Database, session_id: str, eps: list[Episode]) -> int:
     """Append one session's episodes: span_id-dedup against what's already stored,
-    renumber sequences past the existing high-water mark, and enqueue extraction
-    for each written non-empty episode.
+    append each after the session's existing rows (in parsed order), and enqueue
+    extraction for each written non-empty episode.
 
     Shared by the claude.ai and Cursor-SQLite backfill CLIs (their _write_session
     was a byte-identical copy of this). The Claude Code JSONL path uses
@@ -40,23 +40,20 @@ def write_backfill_session(db: Database, session_id: str, eps: list[Episode]) ->
     if PrivateSessions(db).is_private(session_id):
         logger.info("skipping private session %s (schema/050)", session_id)
         return 0
-    existing = db.get_session_episodes(session_id)
-    next_seq = (max((e["sequence"] for e in existing), default=0)) + 1
     written = 0
     for ep in sorted(eps, key=lambda e: e.sequence):
         if ep.span_id and db.span_id_exists(ep.span_id):
             continue
-        ep_to_write = ep.model_copy(update={"sequence": next_seq + written})
-        episode_id = db.upsert_episode(ep_to_write)
+        episode_id, _ = db.append_episode(ep)
         written += 1
-        if episode_id and ep_to_write.content.strip():
+        if episode_id and ep.content.strip():
             db.enqueue_extraction(
                 ExtractionItem(
                     episode_id=episode_id,
-                    session_id=ep_to_write.session_id,
-                    content=ep_to_write.content,
+                    session_id=ep.session_id,
+                    content=ep.content,
                     content_type="episode",
-                    project=ep_to_write.project,
+                    project=ep.project,
                 )
             )
     return written
@@ -68,7 +65,7 @@ def _write_session_episodes(
     parsed_eps: list[Episode],
     project_default: str | None,
 ) -> int:
-    """Write episodes for one session, preserving existing sequence offsets."""
+    """Write episodes for one session, appended after its existing rows in parsed order."""
     # Private mode (schema/050) is session-scoped, so it drops the whole session before
     # any per-episode work. The marker file only stops the LIVE hook; the transcript is
     # still on disk, and this sweep is exactly the path that would ingest it later.
@@ -77,9 +74,8 @@ def _write_session_episodes(
         return 0
     existing = db.get_session_episodes(session_id)
     existing_uuids = {
-        e["span_id"] for e in existing if e.get("span_id", "").startswith("claude_code:")
+        e["span_id"] for e in existing if (e.get("span_id") or "").startswith("claude_code:")
     }
-    next_seq = (max((e["sequence"] for e in existing), default=0)) + 1
     written = 0
 
     for ep in sorted(parsed_eps, key=lambda e: e.sequence):
@@ -96,13 +92,8 @@ def _write_session_episodes(
         if is_scratch_turn(ep.project, ep.metadata):
             continue
 
-        ep_to_write = ep.model_copy(
-            update={
-                "sequence": next_seq + written,
-                "project": ep.project or project_default,
-            }
-        )
-        episode_id = db.upsert_episode(ep_to_write)
+        ep_to_write = ep.model_copy(update={"project": ep.project or project_default})
+        episode_id, _ = db.append_episode(ep_to_write)
         written += 1
 
         if episode_id and ep_to_write.content.strip():

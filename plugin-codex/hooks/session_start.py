@@ -7,7 +7,7 @@ hook entry as a separate process; one fetch pass is cheaper):
 
   * board_block     — GET /context, the always-injected index of explicit
                       memories, project-scoped by the shared project resolver
-                      (plugin/scripts/synapse_project.py), as every hook labels it
+                      (plugin/synapse_client/project.py), as every hook labels it
   * preferences_block — GET /preferences/top, max 8 lines
   * ingest catchup  — detached ``synapse_stop_hook.py --catchup`` sweep that
                       ships any rollout tails the live hook missed, and retries

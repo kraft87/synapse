@@ -190,12 +190,9 @@ def register(
             # recall engine's read connection clean and avoids transaction leakage.
             db = Database(db_url())
             try:
-                existing = db.get_session_episodes(sid)
-                seq = (max(e["sequence"] for e in existing) + 1) if existing else 1
-
                 ep = Episode(
                     session_id=sid,
-                    sequence=seq,
+                    sequence=0,  # unused: append_episode numbers the row
                     project=project,
                     content=ep_content,
                     source="manual",
@@ -203,7 +200,7 @@ def register(
                     # argument. A self-reported `surface` or an unknown caller stamps NULL.
                     surface_id=trust.stamp_surface_id,
                 )
-                episode_id = db.upsert_episode(ep)
+                episode_id, _ = db.append_episode(ep)
 
                 db.enqueue_extraction(
                     ExtractionItem(

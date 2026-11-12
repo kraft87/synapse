@@ -1,0 +1,449 @@
+{
+  "generated_by": "scripts/gen_client_tool_schemas.py",
+  "tools": [
+    {
+      "name": "recall",
+      "description": "Search the user's long-term memory: tens of thousands of reranked\npast-conversation turns and the knowledge-graph facts extracted from them.\n\nBEFORE answering anything that references past work — a prior decision or\ndiscussion, any device, purchase, tool, project, or person the user names,\ntheir preferences, or history this session alone can't supply — call this\nfirst. WHEN the topic shifts to something plausibly discussed before, call it\nagain. Assume memory has the context; the failure mode is not checking.\n\nDo NOT call for facts already visible in this conversation, nor for\ngeneric-knowledge questions with no user-history angle.\n\nThis is the overview: compressed passages plus the buckets below, the right\nfirst call. Its drill-down sibling recall_full_turns serves complete raw\nturns: the follow-up when a passage is truncated, the retry when this comes\nback thin.\n\nQuery in plain language carrying the message's distinctive nouns; leave\n`project` unset unless results come back noisy from another domain. Served\npassages carry `role` (user / assistant / mixed) and a `date`: for \"current\nstate of X\", weight newer user-stated content over older assistant-role text,\nwhich may be speculation or a plan that never happened.\n\nFacts: `date` is when the fact became true as stored, not when it was last\nconfirmed. `ongoing: true` marks a habit, usage, or state that can lapse\nunannounced; `supported` is when the user last asserted it (absent = never).\nAn ongoing fact without recent `supported` is a lead to ask about, not\ncurrent truth. A fact supports only what it states; one about a profile or\ndocument describes that document.\n\nEvery served item carries an `id` (e:N episode, n:N note, f:<uuid> fact incl.\nsuperseded_facts pairs, w:N web); copy it into recall_feedback to rate it.\nOnly e:/n: ids are fetch()-able: fetch(ids) expands a truncated passage or\nnote body.\n\nA `warnings` list means a leg degraded or this connection is served (almost)\nnothing: a config problem, not empty memory.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Natural language search query."
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional project slug to filter results (e.g. \"synapse\")."
+          },
+          "session_focus": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Entity names active in current conversation for KG bias."
+          },
+          "self_session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "NEVER set this yourself. The client's PreToolUse hook injects\nthe calling session's id so serving can suppress self-session domination;\ncalls without it simply skip that suppression."
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "DEPRECATED and ignored — the server identifies the calling\ndevice from its own credential. Never set it."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "recall_full_turns",
+      "description": "Search the complete, unabridged text of past conversation turns — the\ndrill-down and retry sibling of recall().\n\nrecall() serves compressed ~1400-char passage slices blended with facts,\nnotes and web; this serves WHOLE turns and nothing else, ranked by relevance +\nrecency (keyword + semantic search + rerank over the full archive). `limit`\nsizes the response: 1-2 turns for a pinpoint quote, the default 5 to\nreconstruct a discussion (weak trailing matches drop automatically).\n\nThree triggers —\n- Exact wording: \"what exactly did we say about X\", quoting the actual\n  exchange, reconstructing how a specific conversation went.\n- The retry: an overview recall came back thin or off-topic for something\n  plausibly discussed before. Re-query here with the message's distinctive\n  keywords BEFORE falling back to files, grep, or the live system — if it\n  was ever said in a session, this is the tool that finds the saying.\n- Full context: an overview passage hit but the ~1400-char slice cut off\n  what you need and you want the surrounding discussion.\n\nDo NOT open with this for general past-work questions — recall() is the\nright first call (cheaper, blended, usually sufficient). Do NOT use it to\nexpand an id you already hold — fetch(ids) does that directly. Do NOT\nquery it for live system state (ports, configs, processes) — it returns\nwhat was SAID, which may be stale; the box is ground truth for that.\n\nServed turns carry e:N ids — fetch()-able and rateable in recall_feedback.\n\nA `warnings` list appears when a retrieval leg degraded; empty results with a\nwarning mean a config problem, not empty memory.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Plain-language query carrying the distinctive nouns/keywords."
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional project slug to filter results (e.g. \"synapse\")."
+          },
+          "limit": {
+            "default": 5,
+            "type": "integer",
+            "description": "Max turns returned (1-10, default 5)."
+          },
+          "self_session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "NEVER set this yourself. The client's PreToolUse hook\ninjects the calling session's id so your own session's turns are\nexcluded; calls without it simply skip that exclusion."
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Scope to ONE conversation — the `session` field from a\nrecall/fetch result, or \"self\" for the current session."
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "DEPRECATED and ignored — the server identifies the calling\ndevice from its own credential. Never set it."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "fetch",
+      "description": "Expand memory ids into full records: episode ids from recall results\n(\"e:227168\") and note ids from the board (\"n:12\"), mixed freely in one call.\n\nWHEN a recall() passage is relevant but truncated and you need the whole\nturn, or WHEN a hook on the session-start board block (its n:ID lines)\nmatters and you need the note body — pass the ids here. Bare numeric ids\nare treated as episode ids.\n\nDo NOT search with this — it only expands ids you already hold; recall()\nfinds things. Do NOT re-fetch ids already expanded this session. Unknown or\nunparseable ids are returned under \"skipped\"; at most 20 ids per call.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "description": "Ids to expand — \"e:N\" episodes, \"n:N\" notes, bare N = episode."
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "DEPRECATED and ignored — the server identifies the calling\ndevice from its own credential. Never set it."
+          }
+        },
+        "required": [
+          "ids"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "fetch_session",
+      "description": "Read one conversation in order: the turn `around` (e:N) in full with\n±`radius` neighbor heads, or pages of a whole session via offset/limit.\n\nDo NOT search with this — recall_full_turns(query, session_id=...) does.\nAn unindexed session returns an error: read the on-disk transcript instead.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "description": "A recall/fetch episode's `session` field, or \"self\"."
+          },
+          "around": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Anchor episode id (\"e:N\")."
+          },
+          "radius": {
+            "default": 3,
+            "type": "integer",
+            "description": "Neighbors per side of the anchor (0-10, default 3)."
+          },
+          "offset": {
+            "default": 0,
+            "type": "integer",
+            "description": "Anchorless paging start (default 0)."
+          },
+          "limit": {
+            "default": 10,
+            "type": "integer",
+            "description": "Anchorless page size (1-25, default 10)."
+          },
+          "self_session": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "NEVER set this yourself; the client hook injects it."
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "DEPRECATED and ignored. Never set it."
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "remember",
+      "description": "Write to the user's curated long-term memory: reconciles a NOTE into the\nexplicit notes store (deduped against the live set, superseded on\ncontradiction) AND archives the text as an episode with knowledge-graph\nextraction.\n\nWHEN the user states a durable fact, preference, or decision, corrects\nsomething you had wrong, or explicitly asks you to remember → call this.\nIf you are about to reply \"noted\" / \"got it\" / \"I'll remember that,\" call\nthis FIRST, then reply. Also bank a 2-3 sentence summary of what was\ndecided before a session ends or is cleared.\n\nDo NOT call for transient task state, to restate something already stored,\nor to save your own speculation or an unconfirmed plan. Routine\nconversation is ingested automatically.\n\nForm — pass hook + body (+ type). `hook` is the one-line index entry\n(target ~120 chars, hard cap 200, whitespace collapsed); `body` is the\nfull note, fetched on demand by id. Passing either selects this form and\nboth must then be non-empty — a lone hook never falls back to legacy.\nThe legacy content-only form stays for compatibility (hook derived from\nthe first sentence, type 'project'); content alongside a full hook + body\npair becomes the archived episode text.\n\nType semantics — user: durable facts about the user, and feedback:\ncorrections to agent behavior (both global — every session); project:\nscoped to `project`, staleness-managed (the default);\nreference: pointers to canonical sources.\n\nThe write contract — a good note:\n- States decisions WITH reasons: \"chose X because Y\" survives; \"merged\n  the fix\" is noise.\n- Is DECLARATIVE, not imperative: \"User prefers concise responses\",\n  never \"Always respond concisely\" — imperative memory re-reads as a\n  standing directive.\n- Has no PR numbers, commit SHAs, \"phase N done\", file counts — anything\n  week-stale belongs in the episode archive (written automatically),\n  never in a note.\n- Uses absolute dates (\"2026-07-12\"), never \"yesterday\" or \"last week\".\n- Is self-contained: the body must stand alone months later.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Legacy form — full text to remember (hook and type derived)."
+          },
+          "hook": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Preferred form — one-line note index entry (target ~120 chars)."
+          },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Preferred form — the full, self-contained note text."
+          },
+          "type": {
+            "default": "project",
+            "type": "string",
+            "description": "Note type — 'user' | 'feedback' | 'project' (default) | 'reference'."
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional project slug (scopes 'project' notes and the episode)."
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional session ID to attach the episode to."
+          },
+          "surface": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "DEPRECATED and ignored — the server identifies the calling\ndevice from its own credential. Never set it."
+          },
+          "audience": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "'personal' (default) or 'work-safe' — who may be SERVED this\nnote later. Leave unset unless the user says where it may appear;\nthe server derives it from the calling host and the project."
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "recall_feedback",
+      "description": "Report retrieval quality after a recall() whose results you used: which\nserved ids helped, which were noise, plus free-text comment on the serving.\n\nAFTER acting on a recall's results, call this ONCE with that recall's\nquery string. `helpful` = served ids that were load-bearing; `noise` =\nserved ids that were irrelevant or distracting. Everything else goes in\n`comment`, free text: too much dumped at once, load-bearing hit buried,\nwrong granularity or ordering, a misleading passage, an improvement idea.\n\n`missing` is the exception, not a per-report field — most recalls lack\nnothing; then OMIT it (never file \"nothing missing\"). Set it only when\nyou can name the specific content you needed AND have concrete reason to\nbelieve memory holds it (a past session covered it, or the user said it\nwas stored). Never-discussed content is not a miss; weak results belong\nin `comment`. A `missing` without `found_via` is unusable, so always pair\nthem: \"full_turns\" / \"fetch\" / \"another_recall\" (memory HAD it — a\nserving miss, the highest-value signal) vs \"filesystem\" / \"live_system\" /\n\"web\" / \"user\" (memory never had it) vs \"nowhere\" (still unresolved).\n\nRate any served id verbatim — \"e:N\" episodes, \"f:<uuid>\" facts (and\nsuperseded_facts), \"w:N\" web — plus\n\"n:N\" note ids from the session-start board or fetch(): WHEN a board\nnote shaped your answer (or misled it), rate it too. A comment-only\nreport is still valuable when the serving itself was the problem.\n\nThis is offline labeled data (eval goldens, reranker tuning). Recall's own\nranking never reads it; the one live use is the session-start board, which\norders notes within a type by their helpful \"n:N\" ratings, so a noise rating\nchanges nothing and honest negatives are safe and wanted. Do NOT\nfile more than one report per recall query, do NOT rate results you\nnever used, and do NOT invent ids — report only ids actually served to\nyou by recall, the board, or fetch.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The recall query being rated, verbatim."
+          },
+          "helpful": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Served ids that were load-bearing (\"e:123\", \"f:<uuid>\", \"w:7\")."
+          },
+          "noise": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Served ids that were irrelevant or distracting."
+          },
+          "missing": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The specific content you needed but were not served — omit\nentirely unless you can name it AND believe memory holds it.\nAlways pair with `found_via`."
+          },
+          "found_via": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Where the missing info turned up (\"full_turns\"/\"fetch\"/\n\"another_recall\" = memory had it; \"filesystem\"/\"live_system\"/\n\"web\"/\"user\" = it never did; \"nowhere\" = unresolved). Set it\nwhenever `missing` is set."
+          },
+          "comment": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Free text for anything the other fields can't say — serving\nvolume, ordering, presentation, misleading results, improvement ideas."
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional session id for grouping reports."
+          },
+          "project": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional project slug the recall was scoped to."
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      }
+    }
+  ]
+}

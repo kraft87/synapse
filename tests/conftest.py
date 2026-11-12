@@ -40,6 +40,7 @@ os.environ["SYNAPSE_DB_URL"] = DB_URL
 # parallel workers. Pure-Python test files are left untagged and fan out freely.
 _DB_FILES = {
     "test_db.py",
+    "test_episode_append_db.py",
     "test_poller.py",
     "test_schema.py",
     "test_mcp_server.py",

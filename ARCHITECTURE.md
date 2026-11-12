@@ -59,7 +59,7 @@ graph TD
 **Data flow summary**:
 
 1. A Claude Code `Stop` hook (`scripts/synapse_ingest_hook.py`) fires on every turn and POSTs a bounded **tail** of the raw session JSONL to `http://<server-host>:8765/ingest`. It runs detached and never blocks the turn. (Any other agent frontend that drives the real `claude` CLI ingests the same way.)
-2. `/ingest` parses the tail, drops transcript contamination, **dedups by `span_id`**, and appends genuinely-new turns as episodes at `max(sequence)+1`, enqueuing each for KG extraction.
+2. `/ingest` parses the tail, drops transcript contamination, **dedups by `span_id`**, and appends genuinely-new turns as episodes, enqueuing each for KG extraction.
 3. The **poller** (a maintenance loop, *not* an ingester) rebuilds sliding-window chunks, embeds pending episodes/chunks via Voyage AI, and drains the extraction queue.
 4. KG extraction runs on **chunks** (3–5 turn windows): Haiku extracts entities + facts, resolves entities against the Postgres KG, dedups/contradicts against existing facts, and writes bitemporal relationship edges (`kg_relationships`).
 5. When a new session calls `synapse:recall`, the MCP server runs four legs in parallel (episodes, KG facts, web, bitemporal history) and returns a compact ranked result.
@@ -186,7 +186,7 @@ flowchart TD
     CONTAM -- yes --> DROP[drop]
     CONTAM -- no --> DEDUP{span_id already\nin session index?}
     DEDUP -- yes --> SKIP[skip]
-    DEDUP -- no --> APPEND[sequence = max+1\nupsert_episode]
+    DEDUP -- no --> APPEND[append_episode\nnext sequence taken in the insert]
     APPEND --> ENQ[enqueue_extraction\ncontent_type=episode]
 
     subgraph Poller maintenance loop
@@ -205,29 +205,28 @@ for ep in episodes:
     if is_transcript_contamination(ep.content):    # reject known PII-bearing payloads
         dropped += 1; continue
     if ep.session_id not in index:
-        index[ep.session_id] = db.get_session_span_index(ep.session_id)   # (seen span_ids, max_seq)
-    seen, max_seq = index[ep.session_id]
+        index[ep.session_id] = db.get_session_span_index(ep.session_id)   # seen span_ids
+    seen = index[ep.session_id]
     if not ep.span_id or ep.span_id in seen:
         continue                                   # no identity, or already stored — skip
-    max_seq += 1
-    ep.sequence = max_seq                          # the tail's positional seq is discarded
+    eid, _ = db.append_episode(ep)                 # the tail's positional seq is ignored
     seen.add(ep.span_id)
-    eid = db.upsert_episode(ep)
     if ep.content and ep.content.strip():
         db.enqueue_extraction(ExtractionItem(episode_id=eid, session_id=ep.session_id,
                                              content=ep.content, content_type="episode", project=ep.project))
 ```
 
-- **Dedup by `span_id`** — a turn's stable last-record UUID. The session's `(seen span_ids, max_seq)` index is loaded once per session. The tail's own positional sequence is discarded (a tail renumbers from 1 and would collide).
+- **Dedup by `span_id`** — a turn's stable last-record UUID. The session's set of stored span ids is loaded once per session. The tail's own positional sequence is ignored (a tail renumbers from 1 and would collide).
 - **Cross-session content guard** (schema 036, `SYNAPSE_CONTENT_DEDUP=0` to disable) — the span guard is per-session, so a retry session or re-import that replays a turn under a *fresh* session/span id sails through it. A second check skips any turn whose content is byte-identical (`md5(content)` index) to an episode already stored in the same project, or stored from the same working directory under any label (so a replay whose first copy carries an older label for that folder, before `scripts/relabel_projects.py` merges them, is still caught). Measured on a real corpus: ~4.6% of episodes were exact replays (agent re-runs, mid-session forks, re-imports) before this guard.
-- **Append at `max(seq)+1`** — new turns extend the session.
+- **Append** — new turns extend the session through `EpisodeStore.append_episode`, which is also what `remember()` and the backfills use. Appenders to one session take turns on a per-session advisory lock, and the next sequence number is taken inside the INSERT (the session's highest plus one); an INSERT that finds the number held by a writer outside the lock inserts nothing and is run again, which stays as the backstop, so an append never rewrites another writer's row. A row's text, project and provenance stamp therefore always belong to one write; `upsert_episode` remains for a deliberate rewrite of a known row.
 - **Contamination filter** — `is_transcript_contamination` drops PII-bearing third-party transcript payloads (produced by another agent project sharing the same hooks).
-- **Private-mode filter** (schema 050) — `PrivateSessions.is_private` drops every turn whose `session_id` sits in `private_sessions`. Same chokepoint, same shape as the contamination predicate, and `ingestion/backfill.py` applies it too, so a session taken off the record can't be ingested by a path that bypasses the hook (catch-up sweep, disk backfill, a re-import months later). Rows are permanent by design: the transcript survives on disk, so deleting the row would re-expose exactly the turns the user hid.
+- **Private-mode filter** (schema 050) — `PrivateSessions.is_private` drops every turn whose `session_id` sits in `private_sessions`. Same chokepoint, same shape as the contamination predicate, and `ingestion/backfill.py` applies it too, so a session taken off the record can't be ingested by a path that bypasses the hook (catch-up sweep, disk backfill, a re-import months later). Rows are permanent by design: the transcript survives on disk, so deleting the row would re-expose exactly the turns the user hid. The one way to delete a row, `DELETE /private-sessions/{session_id}` (`private_mode.py off --forget`), is on the admin gate: only a full-trust device may take a session back on the record, and the root token or a restricted device gets a 403.
 - Runs in a threadpool so the async route never blocks.
 
 
 **Project labels.** Every client labels a session's project with one resolver,
-`plugin/scripts/synapse_project.py` (the Codex plugin loads the same file): a
+`plugin/synapse_client/project.py` (the hooks of both plugins import it as
+`synapse_project`, a re-exporting stub in `plugin/scripts/`): a
 `.synapse-project` marker file (its first non-comment line; searched from the working
 directory up to the git toplevel, and in a linked worktree also at the main checkout's
 root), else the git toplevel's name (a linked worktree, including Claude Code's
@@ -381,12 +380,12 @@ elif content_type == "chunk":
     det_entities = self._stage2_deterministic([{"content": content, "metadata": {}}])
     llm_result = self._stage3_llm(content, det_entities)  # full extraction on the window
 else:  # summary or manual
-    episodes_raw = self._db.get_session_episodes(session_id) if session_id else []
+    episodes_raw = [e for e in self._db.get_session_episodes(session_id) if e.project == project] if session_id else []  # own project only
     det_entities = self._stage2_deterministic(episodes_raw)
     llm_result = self._stage3_llm(content, det_entities)
 ```
 
-**Chunks are the live fact source.** Episodes get deterministic-only extraction, which produces zero facts and returns early (the old "LLM extraction only on summaries" rule is dead). The `summary`/`manual` branch remains for back-compat and the `remember()` tool, but no summaries are enqueued anymore.
+**Chunks are the live fact source.** Episodes get deterministic-only extraction, which produces zero facts and returns early (the old "LLM extraction only on summaries" rule is dead). The `summary`/`manual` branch remains for back-compat and the `remember()` tool, but no summaries are enqueued anymore. That branch takes its code-pass context only from session turns whose project equals the item's own (case-insensitive; a missing project matches only a missing project): the facts it writes cite only the item's episode, so every name in them has to come from turns a reader of that episode's project may also read.
 
 ### 5.2 Stages
 
@@ -581,8 +580,8 @@ The `label` is display only and deliberately never matched against an existing r
 
 | Gate | Admits | Guards |
 | --- | --- | --- |
-| **client** (`_machine_authorized`) | root token, or any APPROVED device token | `/ingest`, `POST /recall`, `GET /context`, skills / config / timeline / preferences / private-session / remember-spool routes |
-| **admin** (`_admin_authorized`) | APPROVED **full-trust device** token only — **never the root token** | `/surfaces` list + `PUT`/`DELETE`, `/surfaces/mint`, every `/dash/api/*` route |
+| **client** (`_machine_authorized`) | root token, or any APPROVED device token | `/ingest`, `POST /recall`, `GET /context`, skills / config / timeline / preferences / remember-spool routes, `PUT`/`GET /private-sessions/{id}` |
+| **admin** (`_admin_authorized`) | APPROVED **full-trust device** token only — **never the root token** | `/surfaces` list + `PUT`/`DELETE`, `/surfaces/mint`, `DELETE /private-sessions/{id}`, every `/dash/api/*` route |
 
 The root machine token is the services' credential for `/ingest` and the internal write paths, and every machine that ever ran the plugin has held it. A credential that widespread must not be able to create a *new* credential, list who is trusted, or read the dashboard's unfiltered view — hence it clears neither the admin gate nor enrollment. `/dash/*` had to move for the same reason (it serves the whole corpus unfiltered and can flag/edit, so leaving it on root would be a bypass around the entire filter); the dashboard login flow now mints a full-trust device token for the OAuth-allowlisted identity (`dash:<login>`, rotated per login, one row per identity) instead of handing the browser the root token. `issue_machine_token` refuses device tokens: leaves do not fetch the root.
 
@@ -987,6 +986,7 @@ synapse/
 │
 ├── plugin/                    # the Claude Code plugin (hooks, commands, dream→skills lane) + the `synapse` CLI
 │                              #   (synapse_cli.py, harness.py, synapse_home.py, mcp_headers.py, synapse_run.py)
+│   └── synapse_client/        # the client core: stdlib package every harness adapter builds on (docs/client-harnesses.md)
 ├── plugin-codex/              # the Codex hooks + installer (reuses plugin/scripts by relative path)
 │   └── README.md
 ├── .claude-plugin/marketplace.json  # makes the repo a self-hosted plugin marketplace

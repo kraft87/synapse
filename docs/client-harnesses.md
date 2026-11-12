@@ -1,0 +1,249 @@
+# The client: one core, one adapter per harness
+
+Synapse runs inside other people's agents ("harnesses"): Claude Code, Codex, Hermes. Each
+has its own way of running extension code, but what Synapse does in all of them is the
+same: put the board in front of the model at session start, nudge it to recall, upload
+each finished turn, and give it the memory tools. This page describes how the client code
+is split so that the shared part exists once and a new harness is a small adapter.
+
+## Layout
+
+```
+plugin/                          what every install method ships
+  synapse_client/                THE CORE: a real Python package, stdlib only
+    settings.py                  ~/.synapse/config.json + env -> Settings (no globals)
+    credentials.py               which token is sent where (pure functions)
+    http.py                      bearer, User-Agent, timeouts; JSON and MCP tools/call
+    api.py                       Client: one method per server endpoint
+    context.py                   session-start block, per-prompt nudge (the wording)
+    private.py                   is this session private (the marker file and its TTL)
+    project.py                   project label for a working directory
+    outbox.py                    durable queue for uploads that failed
+    tools.py + tool_schemas.json the memory tools, as static schemas + a tools/call proxy
+    harnesses/
+      __init__.py                the Harness protocol and the registry
+      hermes/                    provider, message normaliser, installer, plugin template
+  scripts/                       Claude Code hook scripts and the `synapse` CLI
+  hooks/, commands/, bin/        Claude Code plugin surface
+plugin-codex/                    Codex hook scripts and installer
+```
+
+`plugin/` keeps its name because it is the directory the Claude marketplace, the managed
+client (`~/.synapse/lib/<version>/`) and the server's `/install` bundle all copy.
+
+## Rules for the core
+
+1. **Standard library only**, Python 3.11+. It runs inside other programs' interpreters.
+2. **Relative imports only.** The package is copied into a Hermes plugin directory and
+   imported there under a name Hermes chooses, so `import synapse_client` from inside the
+   package would not resolve.
+3. **Nothing is resolved at import.** URL, token and flags live on a `Settings` value that
+   a caller builds and passes down. A long-running host (Hermes) may hold several
+   instances; module-level state would mix them.
+4. **The core never imports a harness, and a harness imports only the core.** The Hermes
+   installer copies the core plus `harnesses/hermes/` and nothing else.
+5. **Wording lives in the core.** The nudge, the preferences block and the enrollment
+   notices are the same text in every harness; an adapter only chooses the envelope.
+
+## What an adapter provides
+
+| Piece | Question it answers |
+|---|---|
+| Wiring | Is the harness on this machine, how is Synapse installed into it, how is it updated, is it wired already? (`Harness.detect / install / update / wired`) |
+| Lifecycle mapping | Which harness event calls which core function, and in what envelope does the result go back? |
+| Transcript source | Where do finished turns come from, and which `/ingest` format carries them? |
+| Skills folder | Where does this harness read skills from? |
+
+`synapse login`, `synapse install`, `synapse update` and `synapse status` walk one list,
+`harnesses()` in `plugin/scripts/harness.py`: Claude Code and Codex, as small objects over
+the functions that already wired them, then the core's registry. A harness added to the
+registry is picked up by all four without a change to the CLI.
+
+## Lifecycle mapping
+
+| Synapse behaviour | Claude Code | Codex | Hermes |
+|---|---|---|---|
+| Board + preferences at session start | `SessionStart` hooks | `SessionStart` hook | `system_prompt_block()`, fetched once in `initialize()` |
+| Which sessions | every session | every session | local sessions only (below) |
+| Per-prompt recall nudge + timestamp | `UserPromptSubmit` hook | `UserPromptSubmit` hook (nudge only, no timestamp line) | `prefetch()` (returns both; no recall is run) |
+| Upload a finished turn | `Stop` hook reads the session JSONL | `Stop` hook reads the rollout | `sync_turn(messages=...)` |
+| Catch up after failed uploads | `SessionStart --catchup` sweep | session-start sweep | outbox, flushed in `initialize()` and after each upload |
+| Memory tools | MCP entry in the plugin manifest | MCP entry in `config.toml` | `get_tool_schemas()` / `handle_tool_call()`, proxied to MCP `tools/call` |
+| Caller's session id on tool calls | `PreToolUse` hook | `PreToolUse` hook | set by the provider before the proxy call |
+| `/ingest` format | `claude_code` | `codex` | `messages` (client `hermes`) |
+| Install | `claude plugin install` | hook blocks in `config.toml` | `synapse install hermes`: folder in `$HERMES_HOME/plugins/synapse/` + `memory.provider: synapse` |
+
+## Hermes
+
+Hermes loads a memory provider as a class (`agent/memory_provider.py`, `MemoryProvider`),
+inside its own process or, with `plugins.isolation: host`, in its plugin host, where the
+agent holds a proxy; the provider works the same in both. One external provider can be
+active at a time; selecting Synapse takes that slot and leaves Hermes's built-in
+MEMORY.md / USER.md alone.
+
+**Local sessions only.** Synapse is one person's memory, and Hermes also runs as a chat
+bot (Telegram, Discord, Slack and the rest, through its gateway) and an API server, where
+other people talk to it. The provider decides once, in `initialize()`, from the keywords
+Hermes passes:
+
+- **Active**: `agent_context` "primary" (Hermes's default) on a local surface, `platform`
+  "cli" (Hermes's default), "tui", "desktop" or "acp", with no chat identity. The board,
+  the nudge, uploads and the tools all work.
+- **Cron** (`agent_context` or `platform` "cron"): the tools work; nothing is injected and
+  nothing is uploaded. A scheduled job may need the memory, but its prompts are not a
+  conversation the user had.
+- **Inert**, everything else: subagents and other forks, the API server, and every
+  messaging gateway. A chat identity (`gateway_session_key`, `chat_id`, `chat_name`,
+  `chat_type`, `thread_id`, `user_id_alt`, `user_name`) marks a gateway session even on a
+  platform the list does not know. Nothing is injected or uploaded, and a tool call
+  returns an error: someone else in a group chat must not read the owner's memory through
+  the agent, nor have their messages stored as the owner's. `user_id` alone does not
+  count, because the TUI and Desktop pass the owner's own login there.
+
+The Hermes source this rests on: `_memory_provider_init_kwargs` in
+`agent/agent_init_memory_provider.py` (platform defaults to "cli"; `agent_context` is the
+agent's `memory_agent_context`, else "cron" or "subagent" by platform, else "primary";
+the chat identity is `_GATEWAY_IDENTITY_PARAMS` in `agent/agent_init_params.py`),
+`gateway/session_execution.py` (a gateway passes its platform and the chat identity),
+`gateway/platforms/api_server.py` ("api_server"), `tui_gateway/agent_factory.py` ("tui",
+"desktop"), `acp_adapter/session.py` ("acp"), `cron/scheduler.py` ("cron") and
+`tools/delegate_tool.py` (`memory_agent_context="subagent"`). A gateway session that
+should use Synapse is a later, deliberate change: it needs a way to say whose chat it is.
+
+**Install.**
+
+```
+synapse install hermes [--hermes-home PATH] [--replace] [--dry-run]
+```
+
+`synapse login` does the same when it finds Hermes (a `hermes` program on PATH, or a
+Hermes home on disk), and `synapse update` rebuilds the folder when it was built by
+another client version. `synapse status` (new in 0.24.0) prints a line per harness:
+wired, found and not wired, or not found. The Hermes home is
+`--hermes-home`, else `$HERMES_HOME`, else Hermes's default (`~/.hermes`). Selecting the
+provider:
+
+- With the `hermes` program on PATH and a `config.yaml` already in the home, through
+  `hermes config get` / `hermes config set memory.provider synapse`. An empty value or
+  one of Hermes's built-in names is replaced; another external provider is left alone
+  and the report says how to switch, unless `--replace` is given.
+- A home with no `config.yaml` gets one with the two lines `memory:` / `provider:
+  synapse`. The program is never run there: a first launch sets up the home, which
+  downloads Hermes's toolchain.
+- A `config.yaml` without the program on PATH is left as it is, and the report names
+  the `hermes config set` command to run.
+
+**Installed layout.** The folder is self-contained:
+
+```
+$HERMES_HOME/plugins/synapse/
+  plugin.yaml                    name, version, kind: exclusive
+  __init__.py                    register(ctx) -> SynapseMemoryProvider()
+  synapse_client/                copy of the core + harnesses/hermes
+```
+
+`__init__.py` is the only top-level module: Hermes executes every top-level `*.py` beside
+it before the package exists. A new folder is built beside the old one under a dot-name,
+which Hermes skips, and swapped in with two renames, so Hermes never loads half of one.
+Settings and the credential are not copied: the provider reads `~/.synapse/config.json`
+like every other harness, so there is no Hermes setup wizard step.
+
+**What each provider method does.**
+
+| Method | Behaviour |
+|---|---|
+| `is_available()` | A URL and a token resolve. No network. |
+| `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences side by side within 5 seconds, fail-open, then drains the outbox on a thread of its own. |
+| `system_prompt_block()` | The text fetched in `initialize()`, in an active session. Hermes caches it for the session and asks again after a compression. |
+| `prefetch(query)` | The timestamp line and the recall nudge, in an active session. No request is made. |
+| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. |
+| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, and nothing for a private session. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
+| `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
+| `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. |
+| `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
+| `handle_tool_call(name, args)` | `tools.call()`: adds the session id the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text: a JSON object as it is, other text as `{"result": ...}`, the shape Hermes's own providers return. Never raises: a failure, or a call in an inert session, comes back as a JSON object with an `error` field. |
+
+**What is uploaded.** Hermes passes the whole conversation on every turn, as live message
+dicts, after scrubbing secrets from them. The normaliser keeps only `role`, the text
+content, tool-call names and arguments (capped at 1000 characters), tool results (capped
+at 2000), `timestamp` and `message_uid` (as the record `id`). The model is not read from
+the messages: it is the batch's `model`, from `on_turn_start`. Everything else is
+dropped, in particular `api_content` (which holds the memory context Hermes injected,
+our own nudge included), `display_metadata`, reasoning blobs and compaction summaries
+(`_compressed_summary`). A user-role row Hermes wrote itself (a nudge, a task-list
+snapshot, a `/steer` message, a control frame) is sent marked `synthetic`, which the
+server skips. The dicts are never modified: Hermes hands out references to its own
+transcript. A turn is uploaded once it is complete: it ends in an assistant reply with
+no tool calls.
+
+**Not there yet.** These work in Claude Code and are not ported to Hermes: the remember
+spool (a `remember` call that fails is reported to the model, not queued), the
+recall-feedback nudge, a private-mode toggle (markers are honoured; there is no Hermes
+command that writes one), skills sync into `$HERMES_HOME/skills`, config sync, a history
+importer for `state.db`, and Synapse in gateway and API-server sessions (above). Skill
+invocations are uploaded as Hermes hands them over: the manager strips the skill body
+from the user text it passes, not from `messages`.
+
+**Tests.** `tests/test_hermes_messages.py`, `test_hermes_provider.py` (against a stub of
+Hermes's base class) and `test_hermes_install.py` run everywhere.
+`tests/test_hermes_integration.py` runs only with `SYNAPSE_HERMES_CHECKOUT` set to a Hermes
+checkout with its `.venv`: it installs into a temp home, loads the provider with Hermes's
+own loader and drives Hermes's `MemoryManager`, in-process and with
+`plugins.isolation: host`, against a local fake server.
+
+## Where the migration stands
+
+The core and its first adapter exist: every module in the layout above, the `Harness`
+protocol, and a registry holding Hermes (plugin 0.24.0). The CLI walks one list for
+login, install, update and status, with Claude Code and Codex wrapped as list entries
+over their old functions. Claude Code's hooks (`plugin/scripts/`) and Codex's
+(`plugin-codex/`) still carry their own configuration and HTTP code (`config.py`,
+`common.py`); moving them onto the core is the next two changes, Codex first, and their
+wiring then moves into `harnesses/` beside Hermes's.
+
+A module moves like this: the code goes into `synapse_client/`, the old path keeps a
+few-line stub that imports it (hook commands and Codex's trusted command text never name
+a new path), and the tests that loaded the old file by path are pointed at the package.
+`project.py` is the first module moved this way.
+
+`tool_schemas.json` is a snapshot of the server's tools/list, written by
+`scripts/gen_client_tool_schemas.py` (no database needed); a test regenerates it and fails
+when the server's tools change without it.
+
+### Where the core differs from the hooks
+
+The core ports the hooks' behaviour and wording, with these differences:
+
+- **MCP without a handshake.** The server runs stateless streamable HTTP, so `tools/call`
+  goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
+  read as JSON or as server-sent events, up to the answer to this call.
+- **The bearer stays on its origin.** `http.Transport` sends it only to the configured
+  server (and the ingest URL's origin), and drops it when a redirect leaves that origin.
+  urllib's stock handler, which `config.py` uses, forwards it to wherever a redirect
+  points.
+- **Legacy credentials are passed in, not read.** `Settings.load` takes the old
+  `device.json` record and `credentials.json` token as arguments (`legacy_device`,
+  `legacy_token`); the harness that has those files reads them.
+- **Session-start order** is notice, upload warning, board, preferences in every harness.
+  Codex's hook puts preferences before the board today.
+- **Enrollment notices** take the login hint as an argument; the restricted-device
+  notice has no Claude-only "paste it into /plugin" aside.
+- **Private mode** ignores a session id that is not a plain file name (the ingest hook
+  joins it into a path as is) and falls back to 12 hours when
+  `SYNAPSE_PRIVATE_TTL_HOURS` does not parse (the ingest hook fails at import).
+- **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
+  processes can drain one directory. A payload the server refuses with a 4xx other than
+  401, 403, 408 or 429 is dropped; anything else stops the drain and waits. The
+  session-start warning is the retry module's sentence, dated from the oldest payload.
+
+## Adding a harness
+
+1. Decide the transcript source. If the harness can hand over chat messages, use the
+   `messages` ingest format with a new `client` name: no server change. Only a harness
+   whose transcript exists solely as a file in its own format needs a server parser.
+2. Add `synapse_client/harnesses/<name>/` with the wiring (`detect / install / update /
+   wired`) and register it. `synapse login` picks it up.
+3. Map the harness's events onto the core: session start -> `context.session_block`,
+   prompt -> `context.prompt_nudge`, turn end -> `Client.ingest` (+ outbox), tool calls ->
+   `tools.call`.
+4. Add a column to the table above and say what is not ported.

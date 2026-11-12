@@ -1,6 +1,6 @@
 """Server-side project labels: the fallback for transcripts that arrive without one.
 
-Clients resolve the label themselves (``plugin/scripts/synapse_project.py``: a
+Clients resolve the label themselves (``plugin/synapse_client/project.py``: a
 ``.synapse-project`` marker, else the git toplevel's name, else the folder's name) and
 send it with every /ingest body. A body without one — a catch-up sweep of a transcript
 whose folder is gone, an older plugin, a backfill — is labelled here from the

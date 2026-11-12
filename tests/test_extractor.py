@@ -1598,6 +1598,83 @@ class TestProcessItemEndpointDrops:
         }
 
 
+class TestProcessItemSessionContext:
+    """A remembered item's code-pass names come only from session turns of its own project.
+
+    The facts written for the item cite only the item's own episode, so a name taken
+    from a turn in another project would sit in a fact a reader of the item's project
+    can see, with no trace of where it came from."""
+
+    _ALPHA = "[user] see /srv/alpha/handlers/ingest_alpha.py and https://alpha-host.example.test/x"
+    _BETA = "[user] see /srv/beta/jobs/report_beta.py and https://beta-host.example.test/y"
+    _ALPHA_NAMES = frozenset({"handlers/ingest_alpha.py", "alpha-host.example.test"})
+    _BETA_NAMES = frozenset({"jobs/report_beta.py", "beta-host.example.test"})
+
+    def _llm_context_names(
+        self, turns: list[tuple[str | None, str]], item_project: str | None
+    ) -> set[str]:
+        """Run one manual item over a session made of ``turns`` and return the names the
+        LLM step was handed as context."""
+        db = MagicMock()
+        db.get_session_episodes.return_value = [
+            {"project": project, "content": content, "metadata": {}} for project, content in turns
+        ]
+        db.get_episodes_valid_at.return_value = None
+        embedder = MagicMock()
+        embedder.embed.side_effect = lambda names, task=None: [[0.0, 0.0, 0.0, 0.0] for _ in names]
+        pipe = ExtractionPipeline(
+            db=db,
+            llm_client=MagicMock(),
+            embedder=embedder,
+            kg_client=_mock_falkordb(similar_nodes=[]),
+        )
+        pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=[], facts=[]))
+        pipe._stage4_resolve = MagicMock(return_value={})
+        pipe._stage5_write_nodes = MagicMock()
+        pipe._process_facts = MagicMock()
+        pipe.process_item(
+            {
+                "content_type": "manual",
+                "content": "a remembered note",
+                "project": item_project,
+                "session_id": "s1",
+                "episode_id": 7,
+            }
+        )
+        db.get_session_episodes.assert_called_once_with("s1")
+        context = pipe._stage3_llm.call_args.args[1]
+        return {e.name for e in context}
+
+    def test_names_come_only_from_the_items_own_project(self):
+        names = self._llm_context_names([("alpha", self._ALPHA), ("beta", self._BETA)], "alpha")
+
+        assert names == self._ALPHA_NAMES
+        assert not names & self._BETA_NAMES
+
+    def test_project_match_ignores_letter_case(self):
+        names = self._llm_context_names([("alpha", self._ALPHA), ("beta", self._BETA)], "Alpha")
+
+        assert names == self._ALPHA_NAMES
+
+    @pytest.mark.parametrize("item_project", [None, ""], ids=["none", "empty"])
+    def test_an_item_with_no_project_reads_only_turns_with_no_project(self, item_project):
+        names = self._llm_context_names(
+            [
+                (None, "[user] see /srv/delta/jobs/plain_delta.py"),
+                ("", "[user] see /srv/gamma/tasks/plain_gamma.py"),
+                ("alpha", self._ALPHA),
+            ],
+            item_project,
+        )
+
+        assert names == {"jobs/plain_delta.py", "tasks/plain_gamma.py"}
+
+    def test_a_session_wholly_in_the_items_project_reads_every_turn(self):
+        names = self._llm_context_names([("alpha", self._ALPHA), ("alpha", self._BETA)], "alpha")
+
+        assert names == self._ALPHA_NAMES | self._BETA_NAMES
+
+
 # ---------------------------------------------------------------------------
 # Stage 6a candidate-pool sizing (token-bloat reduction)
 # ---------------------------------------------------------------------------

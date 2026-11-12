@@ -112,9 +112,9 @@ class TestEpisodeWriter:
         row = db.get_episode(ep_id)
         assert row["metadata"]["cwd"] == "/home/user/services/synapse"
 
-    def test_span_index_returns_span_ids_and_max_seq(self, db):
-        """/ingest dedups by span_id and appends at max(sequence)+1 — the span
-        index must report exactly the stored span_ids and the high-water sequence."""
+    def test_span_index_returns_the_stored_span_ids(self, db):
+        """/ingest dedups by span_id — the span index must report exactly the span_ids
+        stored for the session, and none for a row without one."""
         for seq in (1, 2, 3):
             db.upsert_episode(
                 Episode(
@@ -124,16 +124,16 @@ class TestEpisodeWriter:
                     span_id=f"claude_code:u{seq}",
                 )
             )
-        span_ids, max_seq = db.get_session_span_index("db-test-span")
-        assert span_ids == {"claude_code:u1", "claude_code:u2", "claude_code:u3"}
-        assert max_seq == 3
+        db.upsert_episode(Episode(session_id="db-test-span", sequence=4, content="no span"))
+        assert db.get_session_span_index("db-test-span") == {
+            "claude_code:u1",
+            "claude_code:u2",
+            "claude_code:u3",
+        }
 
     def test_span_index_empty_session(self, db):
-        """An unseen session reports no span_ids and a 0 high-water mark, so the
-        first new turn appends at sequence 1."""
-        span_ids, max_seq = db.get_session_span_index("db-test-span-empty")
-        assert span_ids == set()
-        assert max_seq == 0
+        """An unseen session reports no span_ids."""
+        assert db.get_session_span_index("db-test-span-empty") == set()
 
     def test_content_dup_exists_cross_session_same_project(self, db):
         """A retried session re-ships identical content under a new session id and
