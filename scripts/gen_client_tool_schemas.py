@@ -8,13 +8,19 @@ brings it back in line:
 
     uv run python scripts/gen_client_tool_schemas.py [--out PATH]
 
-It needs no database and sends nothing anywhere. Before the server is imported, every
-SYNAPSE_* and LOGFIRE_* variable of the calling shell is dropped (so the snapshot does
-not depend on who ran it), telemetry is switched off (the server sends spans only when
-LOGFIRE_TOKEN is set), and the server's .env fallback is pointed at a file that does not
-exist. The snapshot keeps the server's tool order and, per tool, only what tools/list
-shows a client: name, description and inputSchema. Tools hidden from tools/list are
-left out.
+It needs no database and sends nothing anywhere. Before the server is imported:
+
+- every variable the server reads at import is dropped from the calling shell's
+  environment (SYNAPSE_*, LOGFIRE_*, the GitHub and OIDC login settings, VOYAGE_*), so
+  the snapshot does not depend on who ran it and no login provider is configured;
+- telemetry is off. The server passes ``send_to_logfire="if-token-present"`` itself, so
+  LOGFIRE_SEND_TO_LOGFIRE alone would not do it: what does is that no token is left,
+  neither LOGFIRE_TOKEN nor a ``.logfire/`` credentials folder, since the import runs
+  with an empty temporary directory as its working directory;
+- the server's .env fallback is pointed at a file that does not exist.
+
+The snapshot keeps the server's tool order and, per tool, only what tools/list shows a
+client: name, description and inputSchema. Tools hidden from tools/list are left out.
 """
 
 from __future__ import annotations
@@ -31,11 +37,13 @@ from typing import Any
 _REPO = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = _REPO / "plugin" / "synapse_client" / "tool_schemas.json"
 _FIELDS = ("name", "description", "inputSchema")
+#: Prefixes of the variables mcp_server/server.py (and what it imports) reads at import.
+_DROP = ("SYNAPSE_", "LOGFIRE_", "GITHUB_", "OIDC_", "ALLOWED_", "VOYAGE_", "MCP_")
 
 
 def _quiet_environment(env_file: str) -> None:
     for name in list(os.environ):
-        if name.startswith(("SYNAPSE_", "LOGFIRE_")):
+        if name.startswith(_DROP):
             del os.environ[name]
     os.environ["LOGFIRE_SEND_TO_LOGFIRE"] = "false"
     os.environ["LOGFIRE_CONSOLE"] = "false"
@@ -68,11 +76,17 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="where to write")
     args = parser.parse_args(argv)
+    out = args.out.resolve()
+    here = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
         _quiet_environment(os.path.join(tmp, "absent.env"))
-        data = snapshot()
-    args.out.write_text(render(data), encoding="utf-8", newline="\n")
-    print(f"{len(data['tools'])} tools -> {args.out}", file=sys.stderr)
+        os.chdir(tmp)  # no .logfire/ credentials folder where the server looks for one
+        try:
+            data = snapshot()
+        finally:
+            os.chdir(here)
+    out.write_text(render(data), encoding="utf-8", newline="\n")
+    print(f"{len(data['tools'])} tools -> {out}", file=sys.stderr)
     return 0
 
 
