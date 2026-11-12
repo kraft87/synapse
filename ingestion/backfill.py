@@ -74,7 +74,7 @@ def _write_session_episodes(
         return 0
     existing = db.get_session_episodes(session_id)
     existing_uuids = {
-        e["span_id"] for e in existing if (e.get("span_id") or "").startswith("jsonl:")
+        e["span_id"] for e in existing if (e.get("span_id") or "").startswith("claude_code:")
     }
     written = 0
 

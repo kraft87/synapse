@@ -177,7 +177,7 @@ class OpenAIChatParser:
             if not content_parts:
                 continue
 
-            span_id = f"openai:{last_msg_id}" if last_msg_id else None
+            span_id = f"chatgpt:{last_msg_id}" if last_msg_id else None
             if span_id is not None:
                 if span_id in seen_span_ids:
                     continue

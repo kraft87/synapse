@@ -121,11 +121,15 @@ class TestEpisodeWriter:
                     session_id="db-test-span",
                     sequence=seq,
                     content=f"turn {seq}",
-                    span_id=f"jsonl:u{seq}",
+                    span_id=f"claude_code:u{seq}",
                 )
             )
         db.upsert_episode(Episode(session_id="db-test-span", sequence=4, content="no span"))
-        assert db.get_session_span_index("db-test-span") == {"jsonl:u1", "jsonl:u2", "jsonl:u3"}
+        assert db.get_session_span_index("db-test-span") == {
+            "claude_code:u1",
+            "claude_code:u2",
+            "claude_code:u3",
+        }
 
     def test_span_index_empty_session(self, db):
         """An unseen session reports no span_ids."""
@@ -140,7 +144,7 @@ class TestEpisodeWriter:
                 sequence=1,
                 project="proj-x",
                 content="identical replayed turn",
-                span_id="jsonl:dup-a1",
+                span_id="claude_code:dup-a1",
             )
         )
         assert db.content_dup_exists("proj-x", "identical replayed turn") is True
@@ -155,7 +159,7 @@ class TestEpisodeWriter:
                 sequence=1,
                 project="proj-x",
                 content="same words, other silo",
-                span_id="jsonl:dup-b1",
+                span_id="claude_code:dup-b1",
             )
         )
         assert db.content_dup_exists("proj-y", "same words, other silo") is False
@@ -166,7 +170,7 @@ class TestEpisodeWriter:
                 sequence=1,
                 project=None,
                 content="null-project turn",
-                span_id="jsonl:dup-c1",
+                span_id="claude_code:dup-c1",
             )
         )
         assert db.content_dup_exists(None, "null-project turn") is True
@@ -182,7 +186,7 @@ class TestEpisodeWriter:
                 sequence=1,
                 project="tickets",
                 content="replayed across the label change",
-                span_id="jsonl:dup-d1",
+                span_id="claude_code:dup-d1",
                 metadata={"cwd": cwd},
             )
         )
