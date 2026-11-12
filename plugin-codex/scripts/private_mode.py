@@ -63,11 +63,27 @@ def _fail(msg: str) -> int:
     return 1
 
 
-def _forget_failed(msg: str) -> int:
+def _marker_removed_note() -> None:
+    """Last line of every failed --forget. _off removes the marker before it sends the
+    DELETE, so a --forget that does not finish leaves the session as a plain `off` does:
+    the Stop hook sends its turns again, and the server drops them while the row is there."""
+    print(
+        "The local marker was removed. While the server row is kept, this session is in the "
+        "same state as after a plain `off`: its turns are sent and the server discards them.",
+        file=sys.stderr,
+    )
+
+
+def _forget_failed(
+    msg: str,
+    closing: str = "The server row was not deleted; the session stays off the record.",
+) -> int:
     """A --forget that left the server row in place: the session stays off the record, so
-    _fail's closing line ("NOT off the record") would say the opposite."""
+    _fail's closing line ("NOT off the record") would say the opposite. ``closing`` is
+    replaced when the DELETE may still be in flight and the row's fate is not settled."""
     print(f"private mode FAILED: {msg}", file=sys.stderr)
-    print("The server row was not deleted; the session stays off the record.", file=sys.stderr)
+    print(closing, file=sys.stderr)
+    _marker_removed_note()
     return 1
 
 
@@ -97,6 +113,7 @@ def _off(session_id: str, forget: bool) -> int:
         print("  server: row KEPT — those turns stay uningestable. --forget to delete it.")
         return 0
     delete_error = ""
+    delete_answered = False  # the server replied with an HTTP status, so it is done with it
     try:
         _server("DELETE", session_id)
     except (urllib.error.URLError, OSError, ValueError) as e:
@@ -107,6 +124,7 @@ def _off(session_id: str, forget: bool) -> int:
         # Not a clear refusal: a timeout or a 5xx may come after the server committed the
         # delete, so say nothing about the row until it has been read back.
         delete_error = f"{type(e).__name__}: {str(e)[:160]}"
+        delete_answered = isinstance(e, urllib.error.HTTPError)
     try:
         still_private = _server_private(session_id)
     except (urllib.error.URLError, OSError, ValueError) as e:
@@ -117,8 +135,18 @@ def _off(session_id: str, forget: bool) -> int:
             f"({type(e).__name__}: {str(e)[:160]}). Check with: private_mode.py status {session_id}",
             file=sys.stderr,
         )
+        _marker_removed_note()
         return 1
     if still_private:
+        if delete_error and not delete_answered:
+            # The request may not have reached the server, or may still be working through
+            # it: the row was there at read-back and the DELETE can yet remove it.
+            return _forget_failed(
+                f"server DELETE did not finish ({delete_error}) and the row was still "
+                "present when read back.",
+                "The DELETE may still be applying on the server. "
+                f"Check with: private_mode.py status {session_id}",
+            )
         return _forget_failed(
             f"server DELETE failed ({delete_error})."
             if delete_error
