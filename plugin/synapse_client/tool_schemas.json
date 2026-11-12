@@ -38,11 +38,6 @@
             "default": null,
             "description": "Entity names active in current conversation for KG bias."
           },
-          "group_id": {
-            "default": "technical",
-            "type": "string",
-            "description": "Knowledge graph scope — \"technical\" (default) or \"personal\"; a trusted host also gets top matches from the other."
-          },
           "self_session": {
             "anyOf": [
               {
