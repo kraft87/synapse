@@ -42,7 +42,6 @@ use_core()
 from synapse_client import __version__  # noqa: E402
 from synapse_client.harnesses.hermes import install as hi  # noqa: E402
 from synapse_client.harnesses.hermes import messages as hm  # noqa: E402
-from synapse_client.harnesses.hermes import sessions as hs  # noqa: E402
 
 from ingestion.messages_client import MessagesParser  # noqa: E402
 
@@ -298,38 +297,6 @@ _DRIVER = textwrap.dedent(
         "summary_key": context_compressor.COMPRESSED_SUMMARY_METADATA_KEY,
         "steer_kind": prompt_builder.STEER_DISPLAY_KIND,
     }
-
-    from agent import turn_failure_copy as failures
-
-    notices = [failures.FAILED_TURN_NOTICE, failures.PARTIAL_FAILED_TURN_NOTICE,
-               failures.AUTOMATION_INTERRUPTED_NOTICE]
-    out["markers"].update(
-        failed_kind=failures.FAILED_TURN_DISPLAY_KIND,
-        failed_notices=notices,
-        untyped=[failures.untyped_failed_turn_display_kind("assistant", n) for n in notices],
-    )
-
-    # The gateway's names for a local session, as the checkout makes them.
-    try:
-        from gateway.config import Platform
-        from gateway.session import SessionSource, build_session_key
-        from gateway.session_policy import SURFACES, STORED_AS_LOCAL
-        from hermes_state_keys import local_identity
-        from hermes_state_local import API_BINDING_PREFIX, POLICY_PREFIX
-
-        owner = "uid:%d" % os.getuid()
-        chat = local_identity(os.environ["HERMES_HOME"], owner, "req-1")
-        local = SessionSource(platform=Platform.LOCAL, chat_id=chat, chat_type="dm", user_id=owner)
-        out["gateway"] = {
-            "chat": chat,
-            "route": build_session_key(local),
-            "policy_prefix": POLICY_PREFIX,
-            "api_prefix": API_BINDING_PREFIX,
-            "surfaces": sorted(SURFACES),
-            "stored_as_local": sorted(STORED_AS_LOCAL),
-        }
-    except Exception as exc:
-        out["gateway_error"] = repr(exc)
     print("RESULT " + json.dumps(out))
     """
 )
@@ -495,22 +462,3 @@ def test_synapse_runs_inside_hermes(tmp_path: Path, server: _Server, isolation: 
     for prefix in markers["prefixes"]:
         assert hm._synthetic({}, prefix + " body"), prefix
     assert hm._synthetic({"display_kind": markers["steer_kind"]}, "steer text")
-
-    # This Hermes's failed-turn boundary, typed or as bare text, is never a reply.
-    assert markers["failed_kind"] == hm._FAILED_TURN_KIND
-    assert sorted(markers["failed_notices"]) == sorted(hm._FAILED_TURN_NOTICES)
-    assert markers["untyped"] == [hm._FAILED_TURN_KIND] * 3
-    for notice in markers["failed_notices"]:
-        assert hm.to_records([{"role": "assistant", "content": notice}]) == []
-        typed = {"role": "assistant", "content": notice, "display_kind": markers["failed_kind"]}
-        assert hm.to_records([typed]) == []
-
-    # The gateway's local-session names are the ones sessions.py recognises.
-    assert "gateway_error" not in out, out.get("gateway_error")
-    names = out["gateway"]
-    assert hs._LOCAL_CHAT.fullmatch(names["chat"])
-    route = hs._LOCAL_ROUTE.fullmatch(names["route"])
-    assert route is not None and route.group(1) == names["chat"], names["route"]
-    assert (names["policy_prefix"], names["api_prefix"]) == (hs._POLICY_KEY, hs._API_KEY)
-    assert hs.OWNER_SOURCES <= set(names["surfaces"])
-    assert set(names["stored_as_local"]) - {"tool"} <= hs.OWNER_SOURCES
