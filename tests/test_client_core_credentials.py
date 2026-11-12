@@ -7,31 +7,23 @@ values. The hooks still use config.py, so the EQUIVALENCE test below builds the 
 scratch home for both and asserts the same ``(token, note)``: that is what keeps the two
 implementations from drifting until the hooks move onto the core.
 
-Stdlib only, no network: config.py is loaded by path, as the other client tests do.
+No network: config.py is loaded by path over a scratch home (tests/helpers/client_core.py).
 """
 
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import json
 import os
-import sys
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[1]
-_PLUGIN = str(_REPO / "plugin")
-if _PLUGIN not in sys.path:
-    sys.path.append(_PLUGIN)
+from tests.helpers.client_core import drop_scripts, load_script, scratch_user, use_core
 
+use_core()
 from synapse_client import credentials  # noqa: E402
 from synapse_client.settings import Settings  # noqa: E402
-
-_SCRIPTS = _REPO / "plugin" / "scripts"
-_MODULES = ("config", "synapse_home", "enroll")
 
 # Distinctive values, so "no token material in the output" can check prefixes too.
 _DEVICE = "tkDEV3w8Pq1ZmK7r"
@@ -208,34 +200,10 @@ def test_a_withheld_note_renders_the_withheld_notice():
 
 @pytest.fixture()
 def scratch(monkeypatch, tmp_path):
-    """Everything both implementations read lives under tmp_path: HOME, SYNAPSE_HOME
-    (config.json), CLAUDE_CONFIG_DIR (the Claude plugin's settings.json), SYNAPSE_DATA_DIR
-    (the legacy device.json and credentials file, never written here) and a cwd with no
-    project .claude. No setting arrives through the real environment."""
-    home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("SYNAPSE_HOME", str(home / ".synapse"))
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
-    monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.chdir(tmp_path)
-    keep = ("SYNAPSE_HOME", "SYNAPSE_DATA_DIR")
-    for var in list(os.environ):
-        if var.startswith(("SYNAPSE_", "CLAUDE_PLUGIN_OPTION_")) and var not in keep:
-            monkeypatch.delenv(var)
-    yield home
-    for mod in _MODULES:
-        sys.modules.pop(mod, None)
-
-
-def _load_config() -> ModuleType:
-    """config.py as a fresh hook process imports it: it resolves the token at import."""
-    for mod in _MODULES:
-        sys.modules.pop(mod, None)
-    spec = importlib.util.spec_from_file_location("config", _SCRIPTS / "config.py")
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+    """Everything both implementations read lives under tmp_path (see
+    tests/helpers/client_core.py); no setting arrives through the real environment."""
+    yield scratch_user(monkeypatch, tmp_path)
+    drop_scripts()
 
 
 def _write_json(path: Path, data: object) -> None:
@@ -311,7 +279,7 @@ def test_the_core_resolves_exactly_as_config_py(scratch, monkeypatch, case):
     _write_json(scratch / ".synapse" / "config.json", home_json)
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    cfg = _load_config()
+    cfg = load_script("config")
     core = Settings.load()
 
     assert (core.token, dict(core.token_note)) == (cfg.INGEST_TOKEN, cfg.TOKEN_OVERRIDE)
@@ -381,9 +349,65 @@ def test_extra_candidates_reproduce_the_claude_plugin_sources(scratch, monkeypat
     )
     for key, value in env.items():
         monkeypatch.setenv(key, value)
-    cfg = _load_config()
+    cfg = load_script("config")
     core = Settings.load(extra_candidates=_plugin_extras())
 
     assert (core.token, dict(core.token_note)) == (cfg.INGEST_TOKEN, cfg.TOKEN_OVERRIDE)
     assert core.base_url == cfg.BASE_URL
+    assert core.device_origins == cfg.device_origins()
+
+
+# (config.json, legacy device.json, legacy credentials.json token, environment): the
+# pre-0.20 files in the Claude plugin's data dir, which config.py still reads and an
+# adapter hands to Settings.load explicitly.
+_DATA_DIR_MATRIX = {
+    "legacy-record-enrolls": (
+        {"url": _URL, "token": _DEVICE},
+        _record(),
+        "",
+        {"SYNAPSE_INGEST_TOKEN": _STALE},
+    ),
+    "config-json-record-wins": (
+        {"url": _URL, "token": _DEVICE, "device": _record()},
+        {"surface_id": "dev-old", "token_sha256": _sha(_STALE)},
+        "",
+        {"SYNAPSE_INGEST_TOKEN": _STALE},
+    ),
+    "empty-config-json-record-falls-back": (
+        {"url": _URL, "token": _DEVICE, "device": {}},
+        _record(),
+        "",
+        {"SYNAPSE_INGEST_TOKEN": _STALE},
+    ),
+    "credentials-file-is-the-last-fallback": ({"url": _URL}, None, _OTHER, {}),
+    "credentials-file-sent-elsewhere": (
+        {"url": _URL, "token": _DEVICE, "device": _record()},
+        None,
+        _OTHER,
+        {"SYNAPSE_URL": _FOREIGN},
+    ),
+    "credentials-file-never-the-device-token-elsewhere": (
+        {"url": _URL, "token": _DEVICE, "device": _record()},
+        None,
+        _DEVICE,
+        {"SYNAPSE_URL": _FOREIGN},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_DATA_DIR_MATRIX))
+def test_legacy_data_dir_files_resolve_as_config_py(scratch, monkeypatch, case, tmp_path):
+    home_json, device_file, cred_token, env = _DATA_DIR_MATRIX[case]
+    _write_json(scratch / ".synapse" / "config.json", home_json)
+    if device_file is not None:
+        _write_json(tmp_path / "data" / "device.json", device_file)
+    if cred_token:
+        _write_json(tmp_path / "data" / "credentials.json", {"SYNAPSE_INGEST_TOKEN": cred_token})
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    cfg = load_script("config")
+    core = Settings.load(legacy_device=device_file, legacy_token=cred_token)
+
+    assert (core.token, dict(core.token_note)) == (cfg.INGEST_TOKEN, cfg.TOKEN_OVERRIDE)
+    assert core.enrolled == bool(cfg.read_device_state().get("surface_id"))
     assert core.device_origins == cfg.device_origins()

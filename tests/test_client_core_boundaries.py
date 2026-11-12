@@ -90,19 +90,25 @@ def _import_time_value(node: ast.expr | None, where: str) -> list[str]:
     outside the allowlist, anywhere inside it."""
     if node is None:
         return []
+    # A literal handed straight to MappingProxyType/frozenset is frozen there, and one in
+    # a subscript is a type expression (``Callable[[str], None]``), not a value.
+    exempt = {
+        id(arg)
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Call) and _dotted(sub.func) in _IMPORT_TIME_CALLS
+        for arg in sub.args
+    }
+    exempt |= {
+        id(inner)
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.Subscript)
+        for inner in ast.walk(sub.slice)
+        if isinstance(inner, ast.List)
+    }
     out = []
     for sub in ast.walk(node):
         if isinstance(sub, _MUTABLE):
-            parent_ok = False
-            # A literal handed straight to MappingProxyType/frozenset is frozen there.
-            for call in ast.walk(node):
-                if (
-                    isinstance(call, ast.Call)
-                    and _dotted(call.func) in _IMPORT_TIME_CALLS
-                    and sub in call.args
-                ):
-                    parent_ok = True
-            if not parent_ok:
+            if id(sub) not in exempt:
                 out.append(f"line {sub.lineno}: mutable {type(sub).__name__} {where}")
         elif isinstance(sub, ast.Call) and not _allowed_call(sub):
             out.append(f"line {sub.lineno}: call to {_dotted(sub.func) or '?'} {where}")
@@ -250,6 +256,7 @@ def test_the_import_time_rule_accepts_frozen_constants():
         "PAIR = ('a', 'b')\n"
         "RX = re.compile(r'x')\n"
         "Origin = tuple[str, str]\n"
+        "Log = Callable[[str], None]\n"
         "@dataclass(frozen=True)\n"
         "class S:\n"
         "    a: int = field(default=0, repr=False)\n"

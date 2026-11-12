@@ -8,36 +8,19 @@ string for each name, so the two cannot drift while the hooks still use config.p
 
 from __future__ import annotations
 
-import importlib.util
 import json
-import os
-import sys
 from pathlib import Path
-from types import ModuleType
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[1]
-_PLUGIN = str(_REPO / "plugin")
-if _PLUGIN not in sys.path:
-    sys.path.append(_PLUGIN)
+from tests.helpers.client_core import REPO, drop_scripts, load_script, scratch_user, use_core
 
+use_core()
 import synapse_client  # noqa: E402
 from synapse_client import settings as settings_mod  # noqa: E402
 from synapse_client.settings import Settings  # noqa: E402
 
-_SCRIPTS = _REPO / "plugin" / "scripts"
 _TOKEN = "tkSET4r9Wq2Lm8Zx"
-
-
-def _load(name: str, path: Path) -> ModuleType:
-    sys.modules.pop(name, None)
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec and spec.loader
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def _write_config(home: Path, data: object) -> Path:
@@ -47,37 +30,11 @@ def _write_config(home: Path, data: object) -> Path:
     return path
 
 
-_SCRIPT_MODULES = ("harness", "config", "synapse_home", "enroll")
-
-
 @pytest.fixture()
 def scratch(monkeypatch, tmp_path):
-    """A scratch user for loading the hook modules: config.py reads HOME, SYNAPSE_HOME,
-    CLAUDE_CONFIG_DIR (settings.json), SYNAPSE_DATA_DIR and the cwd's .claude at import,
-    so all of them point under tmp_path and nothing of the real user's is read."""
-    home = tmp_path / "home"
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("SYNAPSE_HOME", str(home / ".synapse"))
-    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
-    monkeypatch.setenv("SYNAPSE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.chdir(tmp_path)
-    keep = ("SYNAPSE_HOME", "SYNAPSE_DATA_DIR")
-    for name in list(os.environ):
-        if name.startswith(("SYNAPSE_", "CLAUDE_PLUGIN_OPTION_")) and name not in keep:
-            monkeypatch.delenv(name)
-    yield home
-    for mod in _SCRIPT_MODULES:
-        sys.modules.pop(mod, None)
-    if str(_SCRIPTS) in sys.path:
-        sys.path.remove(str(_SCRIPTS))
-
-
-def _load_harness() -> ModuleType:
-    if str(_SCRIPTS) not in sys.path:
-        sys.path.insert(0, str(_SCRIPTS))
-    for mod in _SCRIPT_MODULES:
-        sys.modules.pop(mod, None)
-    return _load("harness", _SCRIPTS / "harness.py")
+    """A scratch user for loading the hook modules (tests/helpers/client_core.py)."""
+    yield scratch_user(monkeypatch, tmp_path)
+    drop_scripts()
 
 
 # ---------------------------------------------------------------------------
@@ -86,12 +43,12 @@ def _load_harness() -> ModuleType:
 
 
 def test_version_matches_the_plugin_manifest():
-    manifest = json.loads((_REPO / "plugin" / ".claude-plugin" / "plugin.json").read_text())
+    manifest = json.loads((REPO / "plugin" / ".claude-plugin" / "plugin.json").read_text())
     assert synapse_client.__version__ == manifest["version"]
 
 
 def test_config_keys_mirror_synapse_home(scratch):
-    home = _load("synapse_home", _SCRIPTS / "synapse_home.py")
+    home = load_script("synapse_home")
     assert dict(settings_mod.KEYS) == home.KEYS
 
 
@@ -204,13 +161,13 @@ def test_a_legacy_ingest_url_still_names_the_server_and_the_ingest_endpoint(tmp_
     ],
 )
 def test_normalize_url_matches_the_cli(scratch, raw):
-    harness = _load_harness()
+    harness = load_script("harness")
     assert settings_mod.normalize_url(raw) == harness.normalize_url(raw)
 
 
 @pytest.mark.parametrize("raw", ["", "ftp://x", "https://s.example/?q=1", "https://a b"])
 def test_normalize_url_rejects_what_the_cli_rejects(scratch, raw):
-    harness = _load_harness()
+    harness = load_script("harness")
     with pytest.raises(ValueError):
         harness.normalize_url(raw)
     with pytest.raises(ValueError):
@@ -326,9 +283,7 @@ def test_flag_returns_what_config_py_returns(scratch, monkeypatch, case):
     for key, value in env.items():
         monkeypatch.setenv(key, value)
 
-    for mod in _SCRIPT_MODULES:
-        sys.modules.pop(mod, None)
-    cfg = _load("config", _SCRIPTS / "config.py")
+    cfg = load_script("config")
     prefix = "CLAUDE_PLUGIN_OPTION_"
     extras = [
         ("plugin_option", {k[len(prefix) :]: v for k, v in env.items() if k.startswith(prefix)}),

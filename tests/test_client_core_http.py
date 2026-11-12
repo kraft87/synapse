@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import socket
-import sys
 import threading
 import time
 import urllib.error
@@ -17,16 +16,13 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-_REPO = Path(__file__).resolve().parents[1]
-_PLUGIN = str(_REPO / "plugin")
-if _PLUGIN not in sys.path:
-    sys.path.append(_PLUGIN)
+from tests.helpers.client_core import use_core
 
+use_core()
 from synapse_client import http as core_http  # noqa: E402
 from synapse_client.api import Client  # noqa: E402
 from synapse_client.http import ToolError, Transport  # noqa: E402

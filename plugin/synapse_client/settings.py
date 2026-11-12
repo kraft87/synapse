@@ -143,7 +143,8 @@ class Settings:
     ``base_url`` is "" when no URL is configured anywhere (config.py falls back to
     http://localhost:8765; the core sends nothing instead). ``token`` is the bearer to
     send and ``token_note`` what it overrode (credentials.resolve). ``device`` is the
-    enrollment record from config.json and ``enrolled`` whether it names a surface.
+    enrollment record (config.json's, else a legacy one the caller passed) and
+    ``enrolled`` whether it names a surface.
     ``device_origins`` are where the device token may go (empty when unenrolled).
     The token and the raw sources are left out of ``repr``.
     """
@@ -179,6 +180,9 @@ class Settings:
         env: Mapping[str, str] | None = None,
         home: str | os.PathLike[str] | None = None,
         extra_candidates: Iterable[tuple[str, Mapping[str, Any]]] = (),
+        *,
+        legacy_device: Mapping[str, Any] | None = None,
+        legacy_token: str = "",
     ) -> Settings:
         """Read ``env`` (default: the process environment) and config.json, and resolve.
 
@@ -187,6 +191,11 @@ class Settings:
         order: ``values`` maps env-style names to values, and ``source`` is the name the
         token rules know it by (credentials.PLUGIN_SOURCES for the Claude plugin's
         stores). Empty values count as unset.
+
+        ``legacy_device`` and ``legacy_token`` are the Claude plugin's pre-0.20 stores
+        (its data dir's device.json and credentials.json), for an adapter that still
+        honours them: the record is used when config.json holds none, the token is the
+        last fallback. The core reads neither file itself.
 
         Never raises over a missing or malformed config.json: that reads as nothing
         configured, as it does for the hooks."""
@@ -210,7 +219,9 @@ class Settings:
             url + "/ingest" if url else ""
         )
         record = config.get("device")
-        device: dict[str, Any] = record if isinstance(record, dict) else {}
+        if not (isinstance(record, dict) and record):
+            record = legacy_device
+        device: dict[str, Any] = dict(record) if isinstance(record, Mapping) else {}
         candidates = [
             ("env", snapshot.get(_TOKEN, "")),
             ("config_file", option(config, _TOKEN)),
@@ -225,7 +236,12 @@ class Settings:
         }
         saved = option(config, "SYNAPSE_URL")
         token, note = credentials.resolve(
-            candidates, device, [url, ingest], saved_url=saved, plugin_origins=plugin_origins
+            candidates,
+            device,
+            [url, ingest],
+            saved_url=saved,
+            plugin_origins=plugin_origins,
+            legacy_token=legacy_token,
         )
         allowed = credentials.enrolled_origins(
             device, candidates, saved_url=saved, plugin_origins=plugin_origins
