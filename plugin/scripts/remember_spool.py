@@ -60,21 +60,35 @@ import sys
 import time
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from synapse_filelock import lock_exclusive
 
+
+def _env_number(name: str, default: str, kind: type = float) -> Any:
+    """``kind`` of the environment variable ``name``, or of ``default`` when it is unset
+    or does not parse: one mistyped setting must not stop the hook at import."""
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        return kind(default)
+
+
 SPOOL_PATH = config.DATA_DIR / "remember_spool.jsonl"
 LOCK_PATH = str(SPOOL_PATH) + ".lock"
 FLUSH_LOCK_PATH = str(SPOOL_PATH) + ".flush.lock"
 LOG_PATH = os.environ.get("SYNAPSE_SPOOL_LOG", "/tmp/synapse-remember-spool.log")
-TIMEOUT = float(os.environ.get("SYNAPSE_SPOOL_TIMEOUT", "10"))
-PROBE_TIMEOUT = float(os.environ.get("SYNAPSE_SPOOL_PROBE_TIMEOUT", "4"))
-BUDGET = float(os.environ.get("SYNAPSE_SPOOL_BUDGET", "12"))
-MAX_PER_FLUSH = int(os.environ.get("SYNAPSE_SPOOL_MAX", "25"))
+TIMEOUT = _env_number("SYNAPSE_SPOOL_TIMEOUT", "10")
+PROBE_TIMEOUT = _env_number("SYNAPSE_SPOOL_PROBE_TIMEOUT", "4")
+BUDGET = _env_number("SYNAPSE_SPOOL_BUDGET", "12")
+MAX_PER_FLUSH = _env_number("SYNAPSE_SPOOL_MAX", "25", int)
 
 ROUTE = "/remember/spool"
+#: 4xx statuses about the credential or the timing, not the payload: the line is kept and
+#: the flush stops, as for a transport failure. Any other 4xx refuses the payload itself.
+_RETRY_4XX = frozenset({401, 403, 408, 429})
 _VALID_TYPES = ("user", "feedback", "project", "reference")
 
 
@@ -234,7 +248,9 @@ def flush(*, max_items: int = MAX_PER_FLUSH, budget: float | None = None) -> dic
     first transport failure (the server is down; the rest would fail too) and at `budget`
     seconds so a SessionStart flush stays inside its hook timeout. A 4xx refusal is NOT a
     transport failure: the payload is unreplayable, so the line is dropped and logged rather
-    than retried at every session start forever."""
+    than retried at every session start forever. The exceptions are 401, 403, 408 and 429
+    (_RETRY_4XX): a refused credential, a timeout or a rate limit says nothing about the
+    payload, so they stop the flush and the line waits for the next one."""
     records = load()
     if not records:
         return {"flushed": [], "left": 0, "error": None, "busy": False}
@@ -264,7 +280,7 @@ def flush(*, max_items: int = MAX_PER_FLUSH, budget: float | None = None) -> dic
                 resp = post_intent(rec)
             except Exception as e:
                 code = getattr(e, "code", None)
-                if code is not None and 400 <= int(code) < 500 and int(code) != 401:
+                if code is not None and 400 <= int(code) < 500 and int(code) not in _RETRY_4XX:
                     done_ids.add(rec["id"])
                     _log(f"DROP rejected {rec['id']} HTTP {code}: {str(e)[:120]}")
                     continue

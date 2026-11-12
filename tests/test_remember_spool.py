@@ -25,6 +25,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import scratch_user
+
 _REPO = Path(__file__).resolve().parents[1]
 _SPOOL = _REPO / "plugin" / "scripts" / "remember_spool.py"
 
@@ -288,6 +290,43 @@ def test_flush_drops_a_4xx_refusal_but_keeps_a_5xx(spool, stub_server):
     res = spool.flush()
     assert res["flushed"] == [] and res["error"]
     assert [r["id"] for r in spool.load()] == [other["id"]]
+
+
+@pytest.fixture()
+def scratch_spool(monkeypatch, tmp_path, stub_server) -> ModuleType:
+    """``spool``, with HOME and every other file config.py reads at import under tmp_path."""
+    scratch_user(monkeypatch, tmp_path)
+    return _load(monkeypatch, tmp_path, stub_server.url)
+
+
+@pytest.mark.parametrize("code", [401, 403, 408, 429])
+def test_flush_keeps_an_intent_refused_for_the_credential_or_the_timing(
+    scratch_spool, stub_server, code
+):
+    """These say nothing about the payload: the flush stops there (like a 5xx) and the
+    line waits for the next flush. Only 401 was kept before: a 403, 408 or 429 dropped a
+    memory write for good."""
+    first = _add(scratch_spool, hook="Refused for now")
+    later = _add(scratch_spool, hook="Behind it")
+    stub_server.status_for[first["id"]] = code
+    res = scratch_spool.flush()
+    assert res["flushed"] == [] and str(code) in (res["error"] or "")
+    assert [r["id"] for r in scratch_spool.load()] == [first["id"], later["id"]]
+    assert [c.get("intent_id") for c in stub_server.calls] == [first["id"]]
+
+    del stub_server.status_for[first["id"]]  # the next flush delivers both
+    assert [f["id"] for f in scratch_spool.flush()["flushed"]] == [first["id"], later["id"]]
+    assert scratch_spool.load() == []
+
+
+@pytest.mark.parametrize("code", [400, 404, 409, 413, 422])
+def test_flush_still_drops_an_intent_whose_payload_is_refused(scratch_spool, stub_server, code):
+    bad = _add(scratch_spool, hook="Rejected")
+    good = _add(scratch_spool, hook="Fine")
+    stub_server.status_for[bad["id"]] = code
+    res = scratch_spool.flush()
+    assert [f["id"] for f in res["flushed"]] == [good["id"]] and res["error"] is None
+    assert scratch_spool.load() == []
 
 
 def test_flush_respects_its_budget(spool):

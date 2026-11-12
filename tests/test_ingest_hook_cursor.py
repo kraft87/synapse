@@ -29,6 +29,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import core_http
+
 _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
 
@@ -342,7 +344,7 @@ def test_post_records_sends_a_real_user_agent(hook, monkeypatch):
         seen.update({k.lower(): v for k, v in req.header_items()})
         return _Resp()
 
-    monkeypatch.setattr(hook.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     hook._post_records([_u("u1")])
     assert seen.get("user-agent") == hook.config._UA
     assert not seen["user-agent"].startswith("Python-urllib")

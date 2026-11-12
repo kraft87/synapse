@@ -30,6 +30,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import core_http
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
 _CODEX = _REPO / "plugin-codex"
@@ -201,7 +203,7 @@ def test_every_hook_sends_the_device_token(monkeypatch, tmp_path):
         seen.append(req.get_header("Authorization"))
         return _Resp(b"{}")
 
-    monkeypatch.setattr(cfg.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     cfg.post_json("/x", {})
     cfg.get_json("/x")
     cfg.request_json("PUT", "/x")

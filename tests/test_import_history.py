@@ -9,7 +9,8 @@ non-zero only when every file failed, and (f) tell the user re-running/Ctrl-C is
 safe (server dedups by span_id).
 
 Stdlib-only script loaded by path (it lives outside the package, next to the
-hook it shares its POST helper with). No live server: urlopen is monkeypatched.
+hook it shares its POST helper with). No live server: the client core's urlopen, which
+the POST helper opens its request through, is monkeypatched.
 """
 
 from __future__ import annotations
@@ -20,9 +21,10 @@ import json
 import os
 import sys
 import time
-import urllib.request
 from pathlib import Path
 from types import ModuleType
+
+from tests.helpers.client_core import core_http
 
 _REPO = Path(__file__).resolve().parents[1]
 _IMPORT_SCRIPT = _REPO / "plugin" / "scripts" / "import_history.py"
@@ -113,8 +115,9 @@ class _FakeResponse:
 
 
 def _capture_posts(monkeypatch, ingested_per_call: int = 1, fail_urls: set[str] | None = None):
-    """Replace urllib.request.urlopen with a recorder. Returns the call list:
-    (url, parsed body, headers) per POST."""
+    """Replace the client core's urlopen (the one the POST helper opens its request
+    through) with a recorder. Returns the call list: (url, parsed body, headers) per
+    POST."""
     calls: list[tuple[str, dict, dict]] = []
 
     def fake_urlopen(req, timeout=None):
@@ -124,7 +127,7 @@ def _capture_posts(monkeypatch, ingested_per_call: int = 1, fail_urls: set[str] 
         calls.append((url, json.loads(req.data), dict(req.header_items())))
         return _FakeResponse(json.dumps({"status": "ok", "ingested": ingested_per_call}).encode())
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     return calls
 
 
@@ -347,7 +350,7 @@ def test_everything_failed_exits_nonzero(monkeypatch, tmp_path):
     def fake_urlopen(req, timeout=None):
         raise OSError("connection refused")
 
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     root = tmp_path / "projects"
     _write_transcript(root / "p" / "s.jsonl", _turns(1))
     assert mod.main(["--projects-dir", str(root), "--yes"]) == 1

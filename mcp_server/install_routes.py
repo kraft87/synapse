@@ -36,16 +36,43 @@ _TREES = ("plugin", "plugin-codex")
 _TEMPLATE = Path(__file__).resolve().with_name("install_script.py")
 _ORIGIN_RE = re.compile(r"^https?://(?:[A-Za-z0-9.\-]+|\[[0-9A-Fa-f:]+\])(?::\d{1,5})?$")
 _FIXED_TIME = (1980, 1, 1, 0, 0, 0)  # zip mtimes, so equal trees give equal bundles
+#: Tool, environment and VCS directories: nothing under one is client code. Other
+#: dot-directories are (plugin/.claude-plugin/plugin.json), so they are not skipped.
+_SKIP_PARTS = frozenset(
+    {
+        "__pycache__",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".pytest_cache",
+        ".venv",
+        "venv",
+        "node_modules",
+        ".git",
+    }
+)
 
 _cache: dict[str, tuple[str, bytes, str]] = {}
 
 
+def _bundled(base: Path, path: Path) -> bool:
+    """Whether ``path``, found under the client tree ``base``, goes in the bundle: a
+    regular file, not bytecode, under no skipped directory, and reached through no
+    symlink, file or directory (a link would put whatever it points at into a public
+    download)."""
+    rel = path.relative_to(base).parts
+    if path.suffix == ".pyc" or any(part in _SKIP_PARTS for part in rel):
+        return False
+    step = base
+    for part in rel:
+        step = step / part
+        if step.is_symlink():
+            return False
+    return path.is_file()
+
+
 def _client_files(root: Path) -> list[Path]:
     return sorted(
-        p
-        for tree in _TREES
-        for p in (root / tree).rglob("*")
-        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"
+        p for tree in _TREES for p in (root / tree).rglob("*") if _bundled(root / tree, p)
     )
 
 

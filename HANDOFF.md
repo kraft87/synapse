@@ -3,6 +3,70 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — client: six defect fixes from the client parity review (plugin 0.24.2)
+
+**What changed**
+
+- **The bearer stays on its own origin.** Every hook that sends a credential now opens
+  through the core's `synapse_client.http.urlopen`: Claude Code's config helpers, the
+  ingest hook, the login's machine-token call, and Codex's helpers and Stop hook. A
+  redirect to another scheme, host or port drops the Authorization header; a redirect
+  within the server keeps it. Before, urllib copied the header wherever the server
+  pointed.
+- **A session id must be a plain file name before a hook puts it in a path.** An id
+  holding `/`, `\` or NUL, or one that is `.` or `..`, is not a plain file name. The
+  ingest hook and Codex's Stop hook build no private-marker path from such an id (it
+  reads as not private). Both private-mode toggles refuse it, and quote the id in the
+  URL they send to the server. `config_review accept` refuses a file key that resolves
+  outside the config directory, and writes and applies nothing.
+- **A mistyped number in the environment no longer stops a hook.** The ingest hook,
+  Codex's Stop hook, the remember spool and git_feeder fall back to their defaults.
+  Before, `SYNAPSE_INGEST_TIMEOUT=thirty` killed the hook at import.
+- **The remember spool keeps an intent refused with 401, 403, 408 or 429** and retries it
+  at the next flush. Any other 4xx still drops it.
+- **The core outbox (Hermes) drops a payload only on 400, 413 or 422.** Every other
+  status, 404 included, keeps it.
+  - The cap rose from 500 to 2000.
+  - Payloads dropped for the cap or as refused are counted in `.dropped` beside the
+    queue, and the session-start warning names the count.
+  - A drain that leaves the queue empty clears the count, along with the recorded
+    reason.
+- **The `/install` bundle leaves out symlinks**, and anything under `__pycache__`,
+  `.mypy_cache`, `.ruff_cache`, `.pytest_cache`, `.venv`, `venv`, `node_modules` or
+  `.git`. This is the one server change. Other dot-directories, such as
+  `.claude-plugin`, stay in.
+
+**On each machine**
+
+1. Nothing beyond the usual update: `synapse update` once the server serves 0.24.2
+   (merge, then the image).
+
+**Proven**
+
+- Full non-db suite: 3640 passed, 34 skipped. Ruff check and format are clean.
+- With each fix's source reverted at the final commit, its own tests fail:
+  - redirect: 27 (`test_client_redirect_bearer.py`, `test_client_core_http.py`);
+  - session id: 32 (`test_session_id_paths.py`);
+  - env numbers: 55 (`test_hook_env_numbers.py`);
+  - spool: 3 (`test_remember_spool.py`; 401 was already kept);
+  - outbox: 18 (`test_client_core_outbox.py`);
+  - bundle: 8 (`test_install_route.py`).
+- The redirect tests drive all eight credential senders at two real stdlib servers on
+  127.0.0.1, one redirecting to the other's port.
+
+**Open**
+
+- `scripts/synapse_ingest_hook.py`, the stale copy outside the plugin, still has the
+  redirect, session-id and env-number defects. Deleting it is a separate change.
+- Codex's Stop hook, with no `transcript_path` in the payload, still puts the session id
+  into an `rglob` pattern (`_find_rollout`). It reads only what the payload could already
+  name through `transcript_path`.
+- On Windows, the plain-name rule (in the core and in the hook copies) allows a
+  drive-relative `C:x`.
+- The spool and the outbox keep different 4xx rules:
+  - the spool drops every 4xx except 401, 403, 408 and 429;
+  - the outbox drops only 400, 413 and 422.
+
 ## 2026-11-12 — span ids start with the platform; `/ingest` takes a neutral `messages` format (schema 068)
 
 **What changed**

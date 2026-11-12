@@ -104,21 +104,31 @@ import synapse_ingest_retry as retry
 import synapse_project
 from synapse_filelock import lock_exclusive
 
+
+def _env_number(name: str, default: str, kind: type = float) -> Any:
+    """``kind`` of the environment variable ``name``, or of ``default`` when it is unset
+    or does not parse: one mistyped setting must not stop the hook at import."""
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        return kind(default)
+
+
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
 LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", "/tmp/synapse-ingest-hook.log")
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
-TAIL_RECORDS = int(os.environ.get("SYNAPSE_INGEST_TAIL", "400"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_INGEST_CATCHUP_DAYS", "3"))
-ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
+TIMEOUT = _env_number("SYNAPSE_INGEST_TIMEOUT", "30")
+TAIL_RECORDS = _env_number("SYNAPSE_INGEST_TAIL", "400", int)
+CATCHUP_DAYS = _env_number("SYNAPSE_INGEST_CATCHUP_DAYS", "3")
+ACTIVE_GRACE = _env_number("SYNAPSE_INGEST_ACTIVE_GRACE", "300")
+CATCHUP_MAX_FILES = _env_number("SYNAPSE_INGEST_CATCHUP_MAX", "20", int)
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
 _HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
 _WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
 _WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
-_PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
+_PRIVATE_TTL_HOURS = _env_number("SYNAPSE_PRIVATE_TTL_HOURS", "12")
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).
@@ -353,6 +363,18 @@ def _emit_failure_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _plain_name(session_id: str) -> bool:
+    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
+    core's rule (synapse_client/private.py), copied: a record's sessionId is joined into
+    a path below, and an id like ``../x`` would stat and unlink outside PRIVATE_DIR."""
+    seps = {"/", "\\", os.sep, os.altsep or "/"}
+    return (
+        session_id not in (".", "..")
+        and "\0" not in session_id
+        and not any(sep in session_id for sep in seps)
+    )
+
+
 def _is_private(session_id: str) -> bool:
     """True if `session_id` is in private mode → ship NOTHING for it.
 
@@ -369,8 +391,15 @@ def _is_private(session_id: str) -> bool:
       * UNREADABLE marker dir → treated as PRIVATE. If we can't prove a session is not
         private, silently capturing it is the unacceptable failure; a deferred turn is
         not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
+
+    An id that is not a plain file name (``_plain_name``) names no marker private_mode.py
+    could have written: it reads as not private, and nothing outside PRIVATE_DIR is
+    touched.
     """
     if not session_id:
+        return False
+    if not _plain_name(session_id):
+        _log(f"PRIVATE ignored a session id that is not a file name: {session_id[:80]!r}")
         return False
     marker = os.path.join(str(PRIVATE_DIR), session_id)
     try:
@@ -429,7 +458,9 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # user-configured Synapse URL
+    # Through the core, as config.post_json: the bearer does not follow a redirect to
+    # another origin.
+    with config._urlopen(req, timeout=TIMEOUT) as resp:  # user-configured Synapse URL
         return resp.read().decode()[:200]
 
 

@@ -368,6 +368,98 @@ def test_bundle_leaves_out_bytecode_and_pycache(tmp_path):
     assert "plugin-codex/stray.pyc" not in names
 
 
+def _symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=target.is_dir())
+    except OSError as e:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {e}")
+
+
+def test_bundle_leaves_out_a_symlinked_file(tmp_path):
+    """The bundle is a public download: a link must not carry a file from elsewhere on
+    the server into it, nor a second copy of one inside the tree."""
+    tree = _tree(tmp_path / "client")
+    secret = tmp_path / "server-only.env"
+    secret.write_text("SECRET=1\n", encoding="utf-8")
+    _symlink(tree / "plugin" / "scripts" / "settings.env", secret)
+    _symlink(tree / "plugin-codex" / "again.py", tree / "plugin-codex" / "install.py")
+    _, data, _ = install_routes.bundle(tree)
+    names = _zip_names(data)
+    assert "plugin/scripts/settings.env" not in names
+    assert "plugin-codex/again.py" not in names
+    assert b"SECRET=1" not in data
+    assert {"plugin/scripts/synapse_home.py", "plugin-codex/install.py"} <= set(names)
+
+
+def test_bundle_leaves_out_a_symlinked_directory(tmp_path):
+    """Nothing reached through a linked directory. (Path.rglob does not descend into one on
+    the Pythons in use; the bundle does not rely on that.)"""
+    tree = _tree(tmp_path / "client")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "notes.txt").write_text("outside the client\n", encoding="utf-8")
+    _symlink(tree / "plugin" / "linked", outside)
+    _symlink(tree / "plugin-codex" / "scripts-again", tree / "plugin" / "scripts")
+    _, data, _ = install_routes.bundle(tree)
+    names = _zip_names(data)
+    assert not [n for n in names if n.startswith(("plugin/linked", "plugin-codex/scripts-again"))]
+    assert "plugin/scripts/synapse_run.py" in names
+
+
+@pytest.mark.parametrize(
+    "litter",
+    [".mypy_cache", ".ruff_cache", ".pytest_cache", ".venv", "venv", "node_modules", ".git"],
+)
+def test_bundle_leaves_out_tool_environment_and_vcs_directories(tmp_path, litter):
+    tree = _tree(
+        tmp_path / "client",
+        extra={
+            f"plugin/{litter}/top.py": "X = 1\n",
+            f"plugin/scripts/{litter}/nested/deep.txt": "x\n",
+            f"plugin-codex/{litter}/config": "x\n",
+        },
+    )
+    _, data, _ = install_routes.bundle(tree)
+    names = _zip_names(data)
+    assert not [n for n in names if f"/{litter}/" in n]
+    # Only those: a dot-directory the client needs is still carried.
+    assert "plugin/.claude-plugin/plugin.json" in names
+    assert "plugin/scripts/synapse_run.py" in names
+
+
+def test_bundle_keeps_dot_directories_that_are_client_code(tmp_path):
+    tree = _tree(
+        tmp_path / "client",
+        extra={
+            "plugin/.hooks/run.json": "{}",
+            "plugin-codex/.codex-plugin/plugin.json": "{}",
+            "plugin/scripts/.hidden.py": "Y = 2\n",
+        },
+    )
+    names = _zip_names(install_routes.bundle(tree)[1])
+    for kept in (
+        "plugin/.claude-plugin/plugin.json",
+        "plugin/.hooks/run.json",
+        "plugin-codex/.codex-plugin/plugin.json",
+        "plugin/scripts/.hidden.py",
+    ):
+        assert kept in names
+
+
+def test_bundle_carries_every_real_client_core_file():
+    """The filter takes nothing the client needs: all of plugin/synapse_client and the
+    plugin manifest are in the real bundle."""
+    core = _REPO / "plugin" / "synapse_client"
+    expected = {
+        p.relative_to(_REPO).as_posix()
+        for p in core.rglob("*")
+        if p.is_file() and "__pycache__" not in p.parts and p.suffix != ".pyc"
+    }
+    names = set(_zip_names(install_routes.bundle()[1]))
+    assert expected and expected <= names
+    assert "plugin/.claude-plugin/plugin.json" in names
+
+
 @posix_only
 def test_bundle_keeps_each_files_permission_bits(tmp_path):
     _, data, _ = install_routes.bundle(_tree(tmp_path / "client"))

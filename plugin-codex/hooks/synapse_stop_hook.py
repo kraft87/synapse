@@ -89,18 +89,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
 import synapse_ingest_retry as retry
 import synapse_project
-from common import INGEST_URL, TOKEN
+from common import INGEST_URL, TOKEN, _urlopen
 from synapse_filelock import lock_exclusive
 
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
+
+def _env_number(name: str, default: str, kind: type = float) -> Any:
+    """``kind`` of the environment variable ``name``, or of ``default`` when it is unset
+    or does not parse: one mistyped setting must not stop the hook at import."""
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        return kind(default)
+
+
+TIMEOUT = _env_number("SYNAPSE_INGEST_TIMEOUT", "30")
 LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
 CURSORS_PATH = Path(
     os.path.expanduser(os.environ.get("SYNAPSE_CODEX_CURSORS", "~/.synapse/codex_cursors.json"))
 )
 PRIVATE_DIR = Path(os.path.expanduser(os.environ.get("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
 SESSIONS_ROOT = Path(os.path.expanduser("~/.codex/sessions"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_CODEX_CATCHUP_DAYS", "3"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_CODEX_CATCHUP_MAX", "20"))
+CATCHUP_DAYS = _env_number("SYNAPSE_CODEX_CATCHUP_DAYS", "3")
+CATCHUP_MAX_FILES = _env_number("SYNAPSE_CODEX_CATCHUP_MAX", "20", int)
 # The sweep skips rollouts written this recently: a live session's own Stop hook
 # owns them, and a sweep that caught one mid-turn would ship half a turn.
 ACTIVE_GRACE = 300.0
@@ -223,6 +233,18 @@ def failure_warning(now: float | None = None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _plain_name(session_id: str) -> bool:
+    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
+    core's rule (plugin/synapse_client/private.py), copied: the id is joined into the
+    private marker's path, and ``../x`` would test a file outside PRIVATE_DIR."""
+    seps = {"/", "\\", os.sep, os.altsep or "/"}
+    return (
+        session_id not in (".", "..")
+        and "\0" not in session_id
+        and not any(sep in session_id for sep in seps)
+    )
+
+
 def _find_rollout(session_id: str) -> Path | None:
     matches = sorted(SESSIONS_ROOT.rglob(f"rollout-*-{session_id}.jsonl"))
     return matches[-1] if matches else None
@@ -269,7 +291,9 @@ def _post(
     req = urllib.request.Request(
         INGEST_URL, data=json.dumps(body).encode(), method="POST", headers=headers
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+    # Through the core (common._urlopen): the bearer does not follow a redirect to
+    # another origin.
+    with _urlopen(req, timeout=TIMEOUT) as r:
         resp: dict[str, Any] = json.loads(r.read() or b"{}")
         return resp
 
@@ -283,7 +307,11 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
     if not session_id:
         _log("skip: no session_id in hook payload")
         return (0, 0)
-    if (PRIVATE_DIR / session_id).exists():
+    # An id that is not a plain file name names no marker private_mode.py could have
+    # written: it reads as not private, as in the Claude hook and the core.
+    if not _plain_name(session_id):
+        _log(f"private check skipped: session id is not a file name: {session_id[:80]!r}")
+    elif (PRIVATE_DIR / session_id).exists():
         _log(f"skip: private session {session_id}")
         return (0, 0)
     path = Path(transcript) if transcript else _find_rollout(session_id)

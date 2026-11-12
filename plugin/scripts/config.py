@@ -592,6 +592,21 @@ def requested_trust() -> str | None:
 _UA = "synapse-plugin/0.9"
 
 
+def _urlopen(req: urllib.request.Request, timeout: float):
+    """Open ``req`` through the client core (synapse_client.http.urlopen), whose redirect
+    handler keeps the bearer off a redirect to another origin; urllib's stock one copies
+    it wherever the server points. Every hook that sends the bearer goes through here or
+    through the core itself. The core is imported at send time, as synapse_project.py
+    reaches it (plugin/ on sys.path), so a copy of this file without the core beside it
+    still imports."""
+    plugin = str(Path(__file__).resolve().parents[1])
+    if plugin not in sys.path:
+        sys.path.insert(0, plugin)
+    from synapse_client.http import urlopen
+
+    return urlopen(req, timeout=timeout)
+
+
 def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
     """POST JSON to a Synapse endpoint under BASE_URL and return the parsed JSON reply.
 
@@ -605,7 +620,7 @@ def post_json(path: str, payload: dict, timeout: float = 30.0) -> dict:
     req = urllib.request.Request(
         url, data=json.dumps(payload).encode(), method="POST", headers=headers
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 
 
@@ -622,7 +637,7 @@ def get_json(path: str, params: dict | None = None, timeout: float = 30.0) -> di
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(url, method="GET", headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 
 
@@ -642,7 +657,7 @@ def request_json(
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout=timeout) as r:
         return json.loads(r.read() or b"{}")
 
 

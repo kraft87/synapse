@@ -69,7 +69,20 @@ def cmd_show(cid: int) -> None:
 def _apply_rule(file_key: str, rule: str) -> tuple[str, bool]:
     """Append the rule (as a bullet) to CONFIG_DIR/file_key on this surface. Returns (path, wrote).
     Idempotent: if the exact rule line is already present, nothing is written. Creates the file with
-    a header if it doesn't exist yet."""
+    a header if it doesn't exist yet.
+
+    The key comes from the server. Raises ValueError, writing nothing, for one that would land
+    outside CONFIG_DIR: an absolute path, another drive, or a `..` that climbs out, with either
+    slash read as a separator (Windows reads both). Checked on the text, not with resolve(), so a
+    symlink the user keeps inside the config dir still works."""
+    base = os.path.abspath(config.CONFIG_DIR)
+    target = os.path.abspath(os.path.join(base, file_key.replace("\\", "/")))
+    try:
+        inside = target != base and os.path.commonpath([base, target]) == base
+    except ValueError:  # another drive (Windows)
+        inside = False
+    if not inside:
+        raise ValueError(f"config file key {file_key!r} is outside {config.CONFIG_DIR}")
     path = config.CONFIG_DIR / file_key
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = path.read_text(encoding="utf-8") if path.exists() else ""
@@ -86,7 +99,11 @@ def cmd_accept(cid: int, local: bool) -> None:
     r = config.act("/config", cid, "accept", expect="accepted", scope=scope)
     if r is None:
         return
-    path, wrote = _apply_rule(r["file_key"], r.get("rule") or r.get("summary") or "")
+    try:
+        path, wrote = _apply_rule(r["file_key"], r.get("rule") or r.get("summary") or "")
+    except ValueError as e:
+        print(f"accepted [{cid}], but nothing written and not applied: {e}")
+        return
     done = config.post_json("/config/proposals/act", {"id": cid, "action": "apply"})
     if done.get("status") != "applied":
         print(f"accepted [{cid}], wrote {path}, but server apply failed: {done.get('detail')}")

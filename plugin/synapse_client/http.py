@@ -4,7 +4,8 @@
 server and never anywhere else: not to an absolute URL at another origin (unless the
 caller names that origin), and not across a redirect to another origin. urllib's stock
 redirect handler forwards every header, Authorization included, wherever a server
-redirects; plugin/scripts/config.py inherits that, this module does not.
+redirects; this module's handler does not, and ``urlopen`` lends it to the hook scripts
+that still build their own requests (plugin/scripts/config.py and the rest).
 
 Everything here RAISES: urllib.error.HTTPError for an HTTP error status, URLError or
 OSError (TimeoutError included) when the server cannot be reached, ValueError for a
@@ -48,9 +49,34 @@ class ToolError(Exception):
         self.code = code
 
 
+def _keeps_auth(old_url: str, new_url: str) -> bool:
+    """Whether a redirect from ``old_url`` to ``new_url`` may carry the Authorization
+    header: the same origin (scheme, host and port, a default port written out or not),
+    or the upgrade from http to https on the same host and the default ports (80 to 443).
+    Any other change of scheme, host or port drops it. The upgrade is the one exception
+    the ``requests`` library makes too: a server URL configured as http:// behind a TLS
+    redirect would otherwise lose its bearer and answer 401."""
+    old, new = urllib.parse.urlsplit(old_url), urllib.parse.urlsplit(new_url)
+    try:
+        old_port, new_port = old.port, new.port
+    except ValueError:  # a port that is not a number: nothing to compare
+        return False
+    if old.hostname != new.hostname:
+        return False
+    old_scheme, new_scheme = old.scheme.lower(), new.scheme.lower()
+    default_ports = {"http": 80, "https": 443}
+    if old_port is None:
+        old_port = default_ports.get(old_scheme)
+    if new_port is None:
+        new_port = default_ports.get(new_scheme)
+    if old_scheme == new_scheme:
+        return old_port == new_port
+    return (old_scheme, old_port, new_scheme, new_port) == ("http", 80, "https", 443)
+
+
 class _SameOriginAuth(urllib.request.HTTPRedirectHandler):
     """Follow redirects as urllib does, minus the Authorization header when the redirect
-    leaves the origin the request was sent to."""
+    leaves the origin the request was sent to (``_keeps_auth``)."""
 
     def redirect_request(
         self,
@@ -62,11 +88,23 @@ class _SameOriginAuth(urllib.request.HTTPRedirectHandler):
         newurl: str,
     ) -> urllib.request.Request | None:
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and origin(newurl) != origin(req.full_url):
+        if new is not None and not _keeps_auth(req.full_url, newurl):
             for name in list(new.headers):
                 if name.lower() == "authorization":
                     del new.headers[name]
         return new
+
+
+def urlopen(req: urllib.request.Request, timeout: float | None = None) -> Any:
+    """``urllib.request.urlopen(req, timeout=timeout)`` with this module's redirect
+    handler: a redirect is followed as urllib follows it, but the Authorization header
+    goes along only where ``_keeps_auth`` allows. For the hook scripts that build their
+    own requests (plugin/scripts/config.py, plugin-codex/scripts/common.py), so that the
+    rule exists once. Raises as urlopen does."""
+    opener = urllib.request.build_opener(_SameOriginAuth())
+    if timeout is None:
+        return opener.open(req)
+    return opener.open(req, timeout=timeout)
 
 
 def _decode(raw: bytes) -> Any:

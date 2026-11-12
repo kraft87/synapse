@@ -184,6 +184,20 @@ SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 _UA = "synapse-codex-plugin/0.1"
 
 
+def _urlopen(req: urllib.request.Request, timeout: float) -> Any:
+    """Open ``req`` through the client core (synapse_client.http.urlopen), whose redirect
+    handler keeps the bearer off a redirect to another origin; urllib's stock one copies
+    it wherever the server points. The core lives in the sibling plugin/ (as
+    synapse_home.py does) and is imported at send time, so this module still imports
+    without it."""
+    plugin = str(Path(__file__).resolve().parents[2] / "plugin")
+    if plugin not in sys.path:
+        sys.path.insert(0, plugin)
+    from synapse_client.http import urlopen
+
+    return urlopen(req, timeout=timeout)
+
+
 def _request(
     method: str,
     path: str,
@@ -201,7 +215,7 @@ def _request(
         headers["Authorization"] = f"Bearer {TOKEN}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _urlopen(req, timeout=timeout) as r:
         out: dict[str, Any] = json.loads(r.read() or b"{}")
         return out
 

@@ -46,6 +46,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+from tests.helpers.client_core import core_http
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
 _CODEX_HOOKS = _REPO / "plugin-codex" / "hooks"
@@ -336,14 +338,15 @@ class _Resp:
 
 
 def _capture_bodies(monkeypatch, mod: ModuleType, reply: bytes) -> list[dict]:
-    """Patch urlopen on the loaded module; return the JSON bodies it would have sent."""
+    """Patch the core's urlopen, which the loaded module sends through; return the JSON
+    bodies it would have sent."""
     bodies: list[dict] = []
 
     def fake_urlopen(req, timeout=None):
         bodies.append(json.loads(req.data))
         return _Resp(reply)
 
-    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     return bodies
 
 

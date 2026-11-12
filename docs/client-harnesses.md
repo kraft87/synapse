@@ -218,9 +218,12 @@ The core ports the hooks' behaviour and wording, with these differences:
   goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
   read as JSON or as server-sent events, up to the answer to this call.
 - **The bearer stays on its origin.** `http.Transport` sends it only to the configured
-  server (and the ingest URL's origin), and drops it when a redirect leaves that origin.
-  urllib's stock handler, which `config.py` uses, forwards it to wherever a redirect
-  points.
+  server (and the ingest URL's origin); the hooks' helpers send it to any absolute URL
+  they are given. A redirect carries it only within its origin, or from http to https on
+  the same host and the default ports (80 to 443, the rule the `requests` library uses).
+  The hooks open their requests through the same handler (`http.urlopen`, reached through
+  `config._urlopen` and Codex's `common._urlopen`): urllib's stock one forwards the header
+  to wherever a redirect points.
 - **Legacy credentials are passed in, not read.** `Settings.load` takes the old
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.
@@ -228,13 +231,15 @@ The core ports the hooks' behaviour and wording, with these differences:
   Codex's hook puts preferences before the board today.
 - **Enrollment notices** take the login hint as an argument; the restricted-device
   notice has no Claude-only "paste it into /plugin" aside.
-- **Private mode** ignores a session id that is not a plain file name (the ingest hook
-  joins it into a path as is) and falls back to 12 hours when
-  `SYNAPSE_PRIVATE_TTL_HOURS` does not parse (the ingest hook fails at import).
 - **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
-  processes can drain one directory. A payload the server refuses with a 4xx other than
-  401, 403, 408 or 429 is dropped; anything else stops the drain and waits. The
-  session-start warning is the retry module's sentence, dated from the oldest payload.
+  processes can drain one directory. Up to 2000 wait; past that the oldest are dropped. A
+  payload the server refuses with 400, 413 or 422 is dropped; any other failure, 404
+  included, stops the drain and waits. Payloads dropped for the cap or as refused are
+  counted in `.dropped` beside the queue, and the count is cleared, with the recorded
+  reason, when a drain leaves the queue empty: it covers the current backlog. The
+  session-start warning is the retry module's sentence, dated from the oldest payload,
+  followed by "N uploads were dropped and will not be retried." while the count is not
+  zero; the count alone does not raise the warning.
 
 ## Adding a harness
 
