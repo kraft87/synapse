@@ -353,6 +353,18 @@ def _emit_failure_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _plain_name(session_id: str) -> bool:
+    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
+    core's rule (synapse_client/private.py), copied: a record's sessionId is joined into
+    a path below, and an id like ``../x`` would stat and unlink outside PRIVATE_DIR."""
+    seps = {"/", "\\", os.sep, os.altsep or "/"}
+    return (
+        session_id not in (".", "..")
+        and "\0" not in session_id
+        and not any(sep in session_id for sep in seps)
+    )
+
+
 def _is_private(session_id: str) -> bool:
     """True if `session_id` is in private mode → ship NOTHING for it.
 
@@ -369,8 +381,15 @@ def _is_private(session_id: str) -> bool:
       * UNREADABLE marker dir → treated as PRIVATE. If we can't prove a session is not
         private, silently capturing it is the unacceptable failure; a deferred turn is
         not (the cursor doesn't advance, so nothing is lost if the skip was wrong).
+
+    An id that is not a plain file name (``_plain_name``) names no marker private_mode.py
+    could have written: it reads as not private, and nothing outside PRIVATE_DIR is
+    touched.
     """
     if not session_id:
+        return False
+    if not _plain_name(session_id):
+        _log(f"PRIVATE ignored a session id that is not a file name: {session_id[:80]!r}")
         return False
     marker = os.path.join(str(PRIVATE_DIR), session_id)
     try:

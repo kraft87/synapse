@@ -33,11 +33,24 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
 PRIVATE_DIR = config.PRIVATE_DIR
+
+
+def _plain_name(session_id: str) -> bool:
+    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
+    core's rule (synapse_client/private.py), copied: the id is joined into the marker's
+    path, and ``../x`` would write or delete a file outside PRIVATE_DIR."""
+    seps = {"/", "\\", os.sep, os.altsep or "/"}
+    return (
+        session_id not in (".", "..")
+        and "\0" not in session_id
+        and not any(sep in session_id for sep in seps)
+    )
 
 
 def _marker(session_id: str):
@@ -59,7 +72,8 @@ def _remove_marker(session_id: str) -> bool:
 
 
 def _server(method: str, session_id: str) -> dict:
-    return config.request_json(method, f"/private-sessions/{session_id}", timeout=15)
+    sid = urllib.parse.quote(session_id, safe="")
+    return config.request_json(method, f"/private-sessions/{sid}", timeout=15)
 
 
 def _server_private(session_id: str) -> bool:
@@ -134,7 +148,7 @@ def _session_end() -> int:
         session_id = (json.load(sys.stdin) or {}).get("session_id") or ""
     except Exception:
         return 0
-    if session_id:
+    if isinstance(session_id, str) and session_id and _plain_name(session_id):
         try:
             _remove_marker(session_id)
         except OSError:
@@ -150,7 +164,7 @@ def main(argv: list[str]) -> int:
         print("usage: private_mode.py on|off|status <session_id> [--forget]", file=sys.stderr)
         return 2
     action, session_id = argv[0], argv[1].strip()
-    if not session_id or "/" in session_id or session_id in (".", ".."):
+    if not session_id or not _plain_name(session_id):
         return _fail(f"invalid session id {session_id!r}")
     if session_id.startswith("-"):
         # `off --forget <id>` would otherwise read the flag as the id and

@@ -223,6 +223,18 @@ def failure_warning(now: float | None = None) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _plain_name(session_id: str) -> bool:
+    """One ordinary path component: no separator, not ``.``/``..``, no NUL. The client
+    core's rule (plugin/synapse_client/private.py), copied: the id is joined into the
+    private marker's path, and ``../x`` would test a file outside PRIVATE_DIR."""
+    seps = {"/", "\\", os.sep, os.altsep or "/"}
+    return (
+        session_id not in (".", "..")
+        and "\0" not in session_id
+        and not any(sep in session_id for sep in seps)
+    )
+
+
 def _find_rollout(session_id: str) -> Path | None:
     matches = sorted(SESSIONS_ROOT.rglob(f"rollout-*-{session_id}.jsonl"))
     return matches[-1] if matches else None
@@ -285,7 +297,11 @@ def _ship(payload: dict[str, Any]) -> tuple[int, int]:
     if not session_id:
         _log("skip: no session_id in hook payload")
         return (0, 0)
-    if (PRIVATE_DIR / session_id).exists():
+    # An id that is not a plain file name names no marker private_mode.py could have
+    # written: it reads as not private, as in the Claude hook and the core.
+    if not _plain_name(session_id):
+        _log(f"private check skipped: session id is not a file name: {session_id[:80]!r}")
+    elif (PRIVATE_DIR / session_id).exists():
         _log(f"skip: private session {session_id}")
         return (0, 0)
     path = Path(transcript) if transcript else _find_rollout(session_id)
