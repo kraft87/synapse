@@ -25,8 +25,8 @@ changed, what to do on each machine, what was proven, and what is still open.
     does);
   - a golden render for each of jsonl, codex and messages, pinning the full content
     string, so their differences stay visible: jsonl puts a record's tool lines before
-    its `[assistant]` line and messages after; jsonl keeps the last text block, codex
-    and messages join the parts; jsonl drops `Stop hook feedback:` text; messages hashes
+    its `[assistant]` line and messages after; all three join a message's text parts
+    with a newline; jsonl drops `Stop hook feedback:` text; messages hashes
     a turn's own lines before `[context]` is added;
   - a source guard that fails when an `ingestion/*_client.py` file spells a line prefix
     in a string or f-string, or defines `_strip_nulls`. claude.ai's two lines are its
@@ -52,13 +52,15 @@ changed, what to do on each machine, what was proven, and what is still open.
 
 **Open**
 
-- Left exactly as they were, though they look like defects:
-  - jsonl keeps only the last text block of a message, so a reply split into several
-    text blocks loses the earlier ones;
-  - a null tool name renders as `[tool:None]` in jsonl and codex (messages falls back to
-    `tool`);
-  - jsonl renders a whitespace-only tool detail (codex and messages drop it);
-  - Cursor renders tool results as `[tool:name]` lines, never `[result]`.
+- Three defects this change left alone were fixed the same day, in the parsers:
+  - jsonl kept only the last text block of a record. It now joins every text block in
+    order, and in a user record leaves out a block of Claude Code machinery;
+  - a null tool name rendered as `[tool:None]` in jsonl and codex. It now falls back to
+    `tool` (codex: `function` for a function call), as messages does;
+  - jsonl rendered a whitespace-only tool detail. It now gets no line.
+  - None of the three changes what any transcript on cortex renders to: Claude Code
+    writes one block to a record.
+- Left as it is: Cursor renders tool results as `[tool:name]` lines, never `[result]`.
 - codex's "a group with only `[context]` is kept" cannot happen: every group after the
   first opens with a user message, which always renders a `[user]` line.
 ## 2026-11-12 — plugin-codex: the Codex hooks run on the client core (plugin 0.24.4)

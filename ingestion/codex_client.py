@@ -107,10 +107,10 @@ def _tool_call_line(payload: dict[str, Any]) -> str | None:
     """Render a tool-call response_item as a compact [tool:name] line."""
     ptype = payload.get("type")
     if ptype == "custom_tool_call":
-        name = payload.get("name", "tool")
+        name = payload.get("name") or "tool"
         detail = str(payload.get("input") or "")
     elif ptype == "function_call":
-        name = payload.get("name", "function")
+        name = payload.get("name") or "function"
         detail = str(payload.get("arguments") or "")
     elif ptype == "local_shell_call":
         name = "shell"
