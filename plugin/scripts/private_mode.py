@@ -110,6 +110,7 @@ def _off(session_id: str, forget: bool) -> int:
         print(f"private mode OFF for {session_id} (marker removed)")
         print("  server: row KEPT — those turns stay uningestable. --forget to delete it.")
         return 0
+    delete_error = ""
     try:
         _server("DELETE", session_id)
     except (urllib.error.URLError, OSError, ValueError) as e:
@@ -117,7 +118,9 @@ def _off(session_id: str, forget: bool) -> int:
             return _forget_failed(
                 "taking a session back on the record must be done from a full-trust device."
             )
-        return _forget_failed(f"server DELETE failed ({type(e).__name__}: {str(e)[:160]}).")
+        # Not a clear refusal: a timeout or a 5xx may come after the server committed the
+        # delete, so say nothing about the row until it has been read back.
+        delete_error = f"{type(e).__name__}: {str(e)[:160]}"
     try:
         still_private = _server_private(session_id)
     except (urllib.error.URLError, OSError, ValueError) as e:
@@ -130,7 +133,17 @@ def _off(session_id: str, forget: bool) -> int:
         )
         return 1
     if still_private:
-        return _forget_failed("server still reports the session as private after DELETE.")
+        return _forget_failed(
+            f"server DELETE failed ({delete_error})."
+            if delete_error
+            else "server still reports the session as private after DELETE."
+        )
+    if delete_error:
+        print(
+            f"private mode: the DELETE reported an error ({delete_error}), but the server "
+            "no longer lists the session as private.",
+            file=sys.stderr,
+        )
     print(f"private mode OFF for {session_id} (marker removed, server row deleted)")
     return 0
 

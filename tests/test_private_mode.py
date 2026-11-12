@@ -344,6 +344,7 @@ class _StubServer:
         self.lie_on_put = False  # simulate a write that silently doesn't land
         self.ignore_delete = False  # simulate a DELETE that answers 200 but removes nothing
         self.fail_with: dict[str, int] = {}  # method -> HTTP status to answer with instead
+        self.delete_lands_anyway = False  # a DELETE that errors after the row is already gone
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -352,6 +353,8 @@ class _StubServer:
                 outer.calls.append((self.command, sid))
                 status = outer.fail_with.get(self.command, 200)
                 if status != 200:
+                    if self.command == "DELETE" and outer.delete_lands_anyway:
+                        outer.rows.discard(sid)
                     body = json.dumps({"status": "error", "detail": "refused"}).encode()
                 else:
                     if self.command == "PUT" and not outer.lie_on_put:
@@ -472,6 +475,40 @@ def test_off_forget_that_leaves_the_row_says_the_session_stays_off_the_record(
     assert "full-trust device" not in err
     assert "NOT off the record" not in err
     assert sid in stub_server.rows
+
+
+def test_off_forget_whose_delete_errors_after_committing_ends_on_the_success_path(
+    toggle, stub_server, capsys
+):
+    """A 5xx or a timeout can follow a delete the server already made: the read-back
+    decides, and a row that is gone is a successful --forget, not a failed one."""
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with["DELETE"] = 500
+    stub_server.delete_lands_anyway = True
+    capsys.readouterr()
+    assert toggle.main(["off", sid, "--forget"]) == 0
+    out, err = capsys.readouterr()
+    assert "marker removed, server row deleted" in out
+    assert "the DELETE reported an error" in err
+    assert "no longer lists the session as private" in err
+    assert "stays off the record" not in err
+    assert [c[0] for c in stub_server.calls[-2:]] == ["DELETE", "GET"]
+    assert sid not in stub_server.rows
+
+
+def test_off_forget_that_errors_and_cannot_read_the_row_back_claims_neither_outcome(
+    toggle, stub_server, capsys
+):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with.update({"DELETE": 500, "GET": 500})
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "could not read back the server row" in err
+    assert f"private_mode.py status {sid}" in err
+    assert "was not deleted" not in err
+    assert "stays off the record" not in err
 
 
 def test_off_forget_that_cannot_read_the_row_back_claims_neither_outcome(
