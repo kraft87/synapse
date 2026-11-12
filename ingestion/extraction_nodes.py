@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PendingNodes:
-    """One group's NEW entities, held back until Stage 7's write decision is known.
+    """The item's NEW entities, held back until Stage 7's write decision is known.
 
     ``entities`` are the ones Stage 4 resolved to a "new:" uuid; the rest is what
     ``_stage5_write_nodes`` needs to write them."""
@@ -32,7 +32,7 @@ class ExtractionNodesMixin:
     _llm: LLMExtractor
     _resolver: EntityResolver
     _kg: Any
-    _dedupers: dict[str, Any]
+    _deduper: Any | None
 
     def _stage2_deterministic(self, episodes: list[dict[str, Any]]) -> list[ExtractedEntity]:
         import logfire
@@ -65,24 +65,18 @@ class ExtractionNodesMixin:
     def _stage4_resolve(
         self,
         entities: list[ExtractedEntity],
-        group_id: str,
         deduper: Any | None = None,
     ) -> dict[str, str]:
         import logfire
 
-        with logfire.span(
-            "stage4_resolve grp={grp} entities={n}",
-            grp=group_id,
-            n=len(entities),
-        ):
-            return self._resolver.resolve(entities, self._kg, group_id, deduper=deduper)
+        with logfire.span("stage4_resolve entities={n}", n=len(entities)):
+            return self._resolver.resolve(entities, self._kg, deduper=deduper)
 
     def _stage5_write_nodes(
         self,
         entities: list[ExtractedEntity],
         uuid_map: dict[str, str],
         project: str | None,
-        group_id: str,
         embeddings: dict[str, list[float]] | None = None,
         deduper: Any | None = None,
     ) -> None:
@@ -131,7 +125,6 @@ class ExtractionNodesMixin:
                 name=entity.name,
                 entity_type=entity.type,
                 summary=summary_to_write,
-                group_id=group_id,
                 project=project,
                 embedding=emb,
                 supertype=supertype,
@@ -148,14 +141,13 @@ class ExtractionNodesMixin:
         facts: list[ExtractedFact],
         uuid_map: dict[str, str],
         skip_indices: set[int],
-        group_id: str,
         pending: PendingNodes,
     ) -> None:
-        """Write the group's NEW entities that a fact Stage 7 will create links, no others.
+        """Write the NEW entities that a fact Stage 7 will create links, no others.
 
         Runs right after Stage 6c, inside Stage 7 before its edge writes, with the same
         create guard Stage 7 applies (not skipped, both endpoints resolved). A new entity whose facts were all
-        dropped (cross-group, same-batch twin, 6b or 6c duplicate, unresolved endpoint) is
+        dropped (same-batch twin, 6b or 6c duplicate, unresolved endpoint) is
         never written, so it cannot be left without an edge. ``uuid_map`` is updated in
         place when the same-name guard routes a name to an entity written meanwhile."""
         linked: set[str] = set()
@@ -176,17 +168,16 @@ class ExtractionNodesMixin:
                 to_write,
                 uuid_map,
                 pending.project,
-                group_id,
                 pending.embeddings,
                 deduper=pending.deduper,
             )
 
-    def _deduper_for(self, group_id: str) -> Any:
-        """Cached per-group NodeDeduper (thin shell; see ingestion.dedup).
+    def _deduper_for(self) -> Any:
+        """Cached NodeDeduper (thin shell; see ingestion.dedup).
 
         The expensive part — the O(all entities) LSH index — is no longer
         on the deduper: it lives in a process-shared cache inside the dedup
-        module, one copy per group per PROCESS instead of one per worker
+        module, one copy per PROCESS instead of one per worker
         thread (4 threads x ~366MB of index copies is what OOM-killed the
         pollers against their 1GiB caps). The shared index carries its own
         TTL (SYNAPSE_DEDUP_CACHE_TTL_SECONDS) bounding staleness from other
@@ -197,13 +188,9 @@ class ExtractionNodesMixin:
         """
         from ingestion.dedup import NodeDeduper
 
-        if group_id not in self._dedupers:
-            self._dedupers[group_id] = NodeDeduper(
-                kg_client=self._kg,
-                group_id=group_id,
-                llm_client=self._llm._client,
-            )
-        return self._dedupers[group_id]
+        if self._deduper is None:
+            self._deduper = NodeDeduper(kg_client=self._kg, llm_client=self._llm._client)
+        return self._deduper
 
     # ------------------------------------------------------------------
     # Orchestrator

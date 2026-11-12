@@ -143,7 +143,7 @@ _RERANK_DOC_CAP = 4000  # per-doc char cap (~1k tokens) sent to the reranker (bo
 # (tail retr@5 0.139→0.889; natural 0.929→0.929 retr@5, 0.952→0.976 retr@10). Disable with
 # SYNAPSE_RERANK_WINDOW=0.
 _RERANK_WINDOW = os.getenv("SYNAPSE_RERANK_WINDOW", "1") != "0"
-_FACT_LIMIT = 12  # KG facts returned by recall()
+_FACT_LIMIT = 20  # KG facts returned by recall()
 # Raised 5→12 (2026-06-03). The KG is the STRONGEST layer on relational/multi-hop
 # questions — its real job — where it beats summaries+chunks (kg_only 0.715 vs 0.489,
 # marginal +0.307; scripts/kg_relational_baseline.py on a 40-Q relational golden set).
@@ -152,6 +152,12 @@ _FACT_LIMIT = 12  # KG facts returned by recall()
 # 0.119→0.214, while nudging broad +0.015 — safe on all query types (kg_factcount_safety.py).
 # A wide-pool fact reranker added only +0.01-0.03 more for a per-recall API call — not
 # worth it; just serving more is the win. Costs ~+200 fact-tokens/recall (facts are short).
+# Raised 12→20 (2026-11-11) with the one-memory merge. A caller used to get 12 facts of its
+# own pile plus up to 4 of the other; one list cut at 12 lost gold facts (171→169 gold hits
+# over 491 questions) and served fewer facts that past feedback marked helpful (433→402).
+# At 20 nothing is lost (171→174, helpful 427→428) for ~+6% context per recall; the relevance
+# floor still trims, so 10-15 are served on average. Deeper legs with the cut left at 12 were
+# worse (167): this limit sets both the leg depth (3x) and the cut.
 _EPISODE_LIMIT = 5  # episodes returned by recall_episodes()
 
 # fetch_session — sequential session read (the Read analog; spec 2026-08-07,
@@ -453,12 +459,9 @@ class Recall(
         self._async_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="recall-feedback"
         )
-        # Leg executor: runs recall()'s independent search legs (summaries, episodes,
-        # web, KG, the other KG group's BM25) concurrently, each borrowing its own
-        # connection (_pg). Legs never submit here, so concurrent recalls queue rather than
-        # deadlock. The one wait between legs is the KG leg on the other group's BM25 leg:
-        # recall_overview enqueues the BM25 leg first and the queue is FIFO, so by the time
-        # a KG leg runs, its BM25 leg is running (it waits on nothing), never behind it.
+        # Leg executor: runs recall()'s independent search legs (episodes, web, KG, notes)
+        # concurrently, each borrowing its own connection (_pg). Legs never submit here,
+        # so concurrent recalls queue rather than deadlock.
         self._leg_executor = ThreadPoolExecutor(max_workers=6, thread_name_prefix="recall-leg")
 
     def _pg(self) -> AbstractContextManager[Any]:

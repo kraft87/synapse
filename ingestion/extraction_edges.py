@@ -51,7 +51,6 @@ class ExtractionEdgesMixin:
         self,
         facts: list[ExtractedFact],
         uuid_map: dict[str, str],
-        group_id: str,
         fact_embeddings: list[list[float]] | None = None,
     ) -> dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
         """Find duplicate/contradiction candidates for each fact.
@@ -83,16 +82,16 @@ class ExtractionEdgesMixin:
             # Pair pool — same source/target endpoints.
             pair_pool: list[dict[str, Any]] = []
             if src_uuid and tgt_uuid:
-                pair_pool = list(self._kg.find_edges_by_pair(src_uuid, tgt_uuid, group_id))
+                pair_pool = list(self._kg.find_edges_by_pair(src_uuid, tgt_uuid))
 
             # Semantic pool — RRF over vector + BM25 hits. Pull 2x the eventual
             # cap from each modality so the long tail of moderate-rank entries
             # in both lists has a chance to win the merge.
             _src_limit = _SEMANTIC_POOL_LIMIT * 2
-            vector_hits = self._kg.find_similar_edges(fact_emb, group_id, limit=_src_limit)
+            vector_hits = self._kg.find_similar_edges(fact_emb, limit=_src_limit)
             fulltext_hits = _on_topic(
                 self._kg.find_edges_by_fulltext(
-                    fact.fact, group_id, limit=_src_limit, fact_embedding=fact_emb
+                    fact.fact, limit=_src_limit, fact_embedding=fact_emb
                 )
             )
             semantic_pool = rrf_merge(vector_hits, fulltext_hits, limit=_SEMANTIC_POOL_LIMIT, k=1)
@@ -240,7 +239,6 @@ class ExtractionEdgesMixin:
         candidates_map: dict[int, tuple[list[dict[str, Any]], list[dict[str, Any]]]],
         invalidate: dict[int, list[str]],
         fact_embeddings: list[list[float]],
-        group_id: str,
     ) -> int:
         """Continuation rounds for facts whose verdict saturated their pool.
 
@@ -282,13 +280,10 @@ class ExtractionEdgesMixin:
                     # starve the pool while earlier hits still dominate
                     # the ranking.
                     src_limit = _SEMANTIC_POOL_LIMIT * 2 + len(seen[idx])
-                    vector_hits = self._kg.find_similar_edges(
-                        fact_embeddings[idx], group_id, limit=src_limit
-                    )
+                    vector_hits = self._kg.find_similar_edges(fact_embeddings[idx], limit=src_limit)
                     fulltext_hits = _on_topic(
                         self._kg.find_edges_by_fulltext(
                             facts[idx].fact,
-                            group_id,
                             limit=src_limit,
                             fact_embedding=fact_embeddings[idx],
                         )
@@ -321,7 +316,7 @@ class ExtractionEdgesMixin:
         except Exception as exc:
             # Same posture as the writer-side detector: a missed
             # contradiction is recoverable, blocking the write path is not.
-            logger.warning("stage6b saturation rounds failed group=%s: %s", group_id, exc)
+            logger.warning("stage6b saturation rounds failed: %s", exc)
         return extra
 
     def _stage7_write_edges(
@@ -329,7 +324,6 @@ class ExtractionEdgesMixin:
         facts: list[ExtractedFact],
         uuid_map: dict[str, str],
         episode_ids: list[int],
-        group_id: str,
         skip_indices: set[int],
         invalidate: dict[int, list[str]],
         fact_embeddings: list[list[float]] | None = None,
@@ -396,7 +390,7 @@ class ExtractionEdgesMixin:
         # the detector firing serially when contradictions exist. Batching
         # collapses N detector LLM calls to ONE.
         batched_contradictions = self._contradiction_detector.detect_contradictions_batch(
-            facts, eligible_srcs, eligible_tgts, group_id, fact_embeddings=eligible_embs
+            facts, eligible_srcs, eligible_tgts, fact_embeddings=eligible_embs
         )
         if before_write is not None:
             before_write(batched_contradictions)
@@ -459,10 +453,9 @@ class ExtractionEdgesMixin:
             # last_supported_at (below) falls back the same way for a user-stated fact.
             logger.warning(
                 "stage7: %d of %d fact(s) written with t_valid=now() "
-                "(no in-text date, no segment date) group=%s queue_id=%s source_episodes=%d",
+                "(no in-text date, no segment date) queue_id=%s source_episodes=%d",
                 now_fallback,
                 len(facts),
-                group_id,
                 queue_id,
                 len(episode_ids),
             )
@@ -512,9 +505,9 @@ class ExtractionEdgesMixin:
                 else:
                     orphan_invalidations.append((old_uuid, inv_at))
         for sup, retired in by_superseder.items():
-            self._kg.invalidate_edges_batch(retired, group_id, invalidated_by=sup)
+            self._kg.invalidate_edges_batch(retired, invalidated_by=sup)
         if orphan_invalidations:
-            self._kg.invalidate_edges_batch(orphan_invalidations, group_id)
+            self._kg.invalidate_edges_batch(orphan_invalidations)
 
         # Build CREATE rows for every eligible fact in one pass, then dispatch
         # one batched MATCH+CREATE round-trip (two if some facts lack
@@ -568,7 +561,7 @@ class ExtractionEdgesMixin:
                 }
             )
         if create_rows:
-            self._kg.create_edges_batch(create_rows, group_id)
+            self._kg.create_edges_batch(create_rows)
 
         # Capture dedup hits: a fact skipped as a pure duplicate still ASSERTED
         # the matched edge(s). Bump their mention_count + union this chunk's
@@ -591,4 +584,4 @@ class ExtractionEdgesMixin:
                         )
                     )
             if reinforce_items:
-                self._kg.reinforce_edges(reinforce_items, group_id)
+                self._kg.reinforce_edges(reinforce_items)

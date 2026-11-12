@@ -25,7 +25,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
-from ingestion.scope import personal_scope_enabled
 from ingestion.surfaces import SurfaceTrust
 from mcp_server.auth_tokens import (
     DEVICE_CLIENT_ID as _DEVICE_CLIENT_ID,
@@ -48,6 +47,7 @@ from mcp_server.caller_trust import caller_trust as _resolve_caller_trust
 from mcp_server.caller_trust import request_trust as _resolve_request_trust
 from mcp_server.feedback_tools import register as _register_feedback_tools
 from mcp_server.hidden_tools import HiddenToolsList as _HiddenToolsList
+from mcp_server.hidden_tools import RetiredToolArgs as _RetiredToolArgs
 from mcp_server.http_auth import admin_authorized, authenticated, is_root, machine_authorized
 from mcp_server.http_auth import bearer as _bearer
 from mcp_server.ingest_route import register as _register_ingest_route
@@ -307,7 +307,7 @@ mcp = FastMCP(
     "synapse",
     instructions=_INSTRUCTIONS,
     auth=_auth,
-    middleware=[*_auth_mw, _HiddenToolsList()],
+    middleware=[*_auth_mw, _HiddenToolsList(), _RetiredToolArgs()],
     # The Postgres pool the HTTP lanes borrow from: opened at startup, closed on shutdown.
     lifespan=lambda _server: pg_pool.held_open(DB_URL),
 )
@@ -390,25 +390,8 @@ async def health(request: Request) -> JSONResponse:
 # exposing a read tool would duplicate the SessionStart hook's injected context.
 
 
-# Personal scope off (SYNAPSE_PERSONAL_SCOPE=0): the tool description must not
-# advertise a graph this deployment does not keep. A model told about a scope
-# that no longer exists spends a call asking for it. The sentence is swapped at
-# import, before FastMCP reads the docstring into the tool description.
-_GROUP_ID_DOC_SPLIT = 'group_id: Knowledge graph scope — "technical" (default) or "personal"; a trusted host also gets top matches from the other.'
-_GROUP_ID_DOC_SINGLE = (
-    "group_id: Knowledge graph scope. This deployment keeps one graph;\n            leave it unset."
-)
-
-
-def _scope_doc(fn):  # type: ignore[no-untyped-def]
-    """Rewrite the personal-scope line out of a tool docstring when the scope is off."""
-    if not personal_scope_enabled() and fn.__doc__:
-        fn.__doc__ = fn.__doc__.replace(_GROUP_ID_DOC_SPLIT, _GROUP_ID_DOC_SINGLE)
-    return fn
-
-
 recall, recall_full_turns, fetch, fetch_session = _register_retrieval_tools(
-    mcp, lambda: _get_recall(), lambda: _caller_trust(), _scope_doc, _access_token
+    mcp, lambda: _get_recall(), lambda: _caller_trust(), _access_token
 )
 
 

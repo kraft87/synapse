@@ -83,7 +83,8 @@ _DB_FILES = {
     "test_private_session_routes.py",
     "test_audience_scoping.py",
     "test_kg_source_projects.py",
-    "test_kg_both_groups.py",
+    "test_one_memory_db.py",
+    "test_retired_tool_args.py",
     "test_kg_hop_order_db.py",
     "test_kg_fact_audience_db.py",
     "test_bm25_filter_db.py",
@@ -104,6 +105,9 @@ _DB_FILES = {
     "test_span_prefix_migration_db.py",
     "test_web_audience_db.py",
     "test_repair_numbered_entity_magnets_db.py",
+    "test_pile_merge_067_db.py",
+    "test_note_tiers_db.py",
+    "test_preference_merge_db.py",
 }
 
 
@@ -180,10 +184,10 @@ def full_surface(conn):
 
 @pytest.fixture(autouse=True)
 def _reset_dedup_index_cache():
-    """The dedup module caches hydrated group indexes process-wide (one shared
-    copy per group instead of one per worker thread). Tests build indexes from
-    per-test fake KG clients under the same group ids, so the cache must be
-    dropped between tests or one test's entities leak into the next."""
+    """The dedup module caches the hydrated entity index process-wide (one shared
+    copy instead of one per worker thread). Tests build indexes from per-test
+    fake KG clients under the same owner, so the cache must be dropped between
+    tests or one test's entities leak into the next."""
     from ingestion import dedup
 
     dedup._index_cache_reset()

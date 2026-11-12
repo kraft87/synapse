@@ -84,7 +84,7 @@ def test_fixture_is_well_formed_and_synthetic(case):
 @pytest.mark.parametrize("case", _cases(), ids=lambda c: c["id"])
 def test_served_fact_carries_its_currency_signals(case):
     r = _wired([_internal(case["served"], "u-1")])
-    out = r.recall(query="q", project=None, session_focus=[], group_id="technical", trust=_FULL)
+    out = r.recall(query="q", project=None, session_focus=[], trust=_FULL)
     (fact,) = out["facts"]
     assert fact["id"] == "f:u-1"
     assert fact["fact"] == case["served"]["fact"]
@@ -99,7 +99,7 @@ def test_pre_058_facts_serve_exactly_as_before():
     r = _wired(
         [{"fact": "User uses Postgres", "_uuid": "u-2", "_date": "2026-06-10T00:00:00+00:00"}]
     )
-    out = r.recall(query="q", project=None, session_focus=[], group_id="technical", trust=_FULL)
+    out = r.recall(query="q", project=None, session_focus=[], trust=_FULL)
     assert out["facts"] == [{"fact": "User uses Postgres", "id": "f:u-2", "date": "2026-06-10"}]
 
 

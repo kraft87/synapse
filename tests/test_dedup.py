@@ -74,16 +74,18 @@ class _FakeKGClient:
     def __init__(self, graph: _FakeGraph) -> None:
         self._graph_obj = graph
 
-    def _graph(self, group_id: str) -> _FakeGraph:
+    def _graph(self) -> _FakeGraph:
         return self._graph_obj
 
     # The deduper now goes through the client-level read methods (which
     # serve from Postgres in production) rather than raw Cypher.
-    def entity_uuid_by_normalized_name(self, normalized: str, group_id: str) -> str | None:
+    def entity_uuid_by_normalized_name(self, normalized: str) -> str | None:
         return self._graph_obj._exact_match.get(normalized)
 
-    def load_entities(self, group_id: str) -> list[tuple[str, ...]]:
-        return list(self._graph_obj._entities)
+    def load_entities(self) -> list[tuple[str, ...]]:
+        # The reader's rows are (uuid, name, summary, supertype, stored normalized_name); the
+        # tests preset (uuid, name, summary[, supertype]) and every row is an old one.
+        return [(*e, *(None,) * (4 - len(e)), "") for e in self._graph_obj._entities]
 
     def load_type_map(self) -> dict[str, str]:
         return dict(self._graph_obj._type_map)
@@ -153,7 +155,7 @@ class TestExactNameMatch:
     def test_exact_name_match_with_trailing_space(self):
         graph = _FakeGraph(exact_match={"falkordb": "uuid-existing"})
         client = _FakeKGClient(graph)
-        deduper = NodeDeduper(client, group_id="technical")
+        deduper = NodeDeduper(client)
 
         # Two entities with names "FalkorDB" and "falkordb " (trailing space)
         # dedup to the same UUID via Strategy 1.
@@ -166,13 +168,13 @@ class TestExactNameMatch:
     def test_no_match_returns_none(self):
         graph = _FakeGraph(exact_match={})
         client = _FakeKGClient(graph)
-        deduper = NodeDeduper(client, group_id="technical")
+        deduper = NodeDeduper(client)
         assert deduper.find_or_none("BrandNewName") is None
 
     def test_register_then_in_memory_hit(self):
         graph = _FakeGraph(exact_match={})
         client = _FakeKGClient(graph)
-        deduper = NodeDeduper(client, group_id="technical")
+        deduper = NodeDeduper(client)
         deduper.register("Synapse", "uuid-syn", summary="memory layer")
         # Next call to find_or_none on the same normalized name resolves
         # via the in-memory map, not Cypher.
@@ -195,7 +197,7 @@ class TestEntropyGateSkipsFuzzy:
             exact_match={},  # exact lookup misses
         )
         client = _FakeKGClient(graph)
-        deduper = NodeDeduper(client, group_id="technical")
+        deduper = NodeDeduper(client)
 
         # "api" has length < 6 AND token_count < 2 → fails has_high_entropy.
         # No exact match → must return None.
@@ -217,7 +219,7 @@ class TestMinHashJaccardMatch:
         )
         client = _FakeKGClient(graph)
         # No LLM → deduper falls back to "Jaccard alone is enough."
-        deduper = NodeDeduper(client, group_id="technical", llm_client=None)
+        deduper = NodeDeduper(client, llm_client=None)
 
         result = deduper.find_or_none("synapse poller", summary="...")
         assert result == "uuid-poller"
@@ -228,7 +230,7 @@ class TestMinHashJaccardMatch:
             exact_match={},
         )
         client = _FakeKGClient(graph)
-        deduper = NodeDeduper(client, group_id="technical", llm_client=None)
+        deduper = NodeDeduper(client, llm_client=None)
         # Very different name shouldn't hit the LSH threshold.
         assert deduper.find_or_none("totally-unrelated-grandstream-router") is None
 
@@ -256,7 +258,7 @@ class TestTypeGate:
             exact_match={},
             type_map={"Database": "Database", "Service": "Service"},
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), llm_client=None)
         # new entity is a Service; the only fuzzy candidate is a Database (not allowlisted) -> dropped
         kind, _payload = deduper.classify("synapse poller", "...", entity_type="Service")
         assert kind == "none"
@@ -268,7 +270,7 @@ class TestTypeGate:
             exact_match={},
             type_map={"Service": "Service"},
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), llm_client=None)
         kind, payload = deduper.classify("synapse poller", "...", entity_type="Service")
         assert kind == "candidates"
         assert payload[0][0] == "uuid-poller"
@@ -281,7 +283,7 @@ class TestTypeGate:
             exact_match={},
             type_map={"Database": "Database"},
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), llm_client=None)
         kind, _payload = deduper.classify("synapse poller", "...")
         assert kind == "candidates"
 
@@ -316,13 +318,13 @@ class TestIdentifierGuard:
         # 'jira12895' vs 'jira12893' share 6 of 8 trigrams (Jaccard 0.75, over the
         # 0.7 floor), so LSH alone would hand the other ticket over as a merge.
         graph = _FakeGraph(entities=[("uuid-12893", "JIRA-12893", "the other ticket")])
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), llm_client=None)
         assert deduper.classify("JIRA-12895", "a ticket") == ("none", None)
         assert deduper.find_or_none("JIRA-12895", "a ticket") is None
 
     def test_lsh_candidate_with_the_same_number_survives(self):
         graph = _FakeGraph(entities=[("uuid-12895", "JIRA-12895", "the ticket")])
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical", llm_client=None)
+        deduper = NodeDeduper(_FakeKGClient(graph), llm_client=None)
         kind, payload = deduper.classify("jira 12895", "the ticket")
         assert kind == "candidates"
         assert payload[0][0] == "uuid-12895"
@@ -341,7 +343,7 @@ class TestLLMConfirm:
         )
         client = _FakeKGClient(graph)
         llm = mock_llm_client("yes")
-        deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
+        deduper = NodeDeduper(client, llm_client=llm)
 
         result = deduper.find_or_none("synapse poller", summary="...")
         assert result == "uuid-poller"
@@ -354,7 +356,7 @@ class TestLLMConfirm:
         )
         client = _FakeKGClient(graph)
         llm = mock_llm_client("no")
-        deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
+        deduper = NodeDeduper(client, llm_client=llm)
 
         result = deduper.find_or_none("synapse poller", summary="...")
         assert result is None
@@ -366,7 +368,7 @@ class TestLLMConfirm:
         )
         client = _FakeKGClient(graph)
         llm = mock_llm_client("uncertain")
-        deduper = NodeDeduper(client, group_id="technical", llm_client=llm)
+        deduper = NodeDeduper(client, llm_client=llm)
         # "uncertain" answers don't accept the merge — return None so the
         # caller writes a new node and the nightly pipeline can re-evaluate.
         assert deduper.find_or_none("synapse poller", summary="...") is None
@@ -409,14 +411,14 @@ class TestClassify:
 
     def test_exact_hit_returns_exact(self):
         graph = _FakeGraph(exact_match={"falkordb": "uuid-existing"})
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
+        deduper = NodeDeduper(_FakeKGClient(graph))
         kind, payload = deduper.classify("FalkorDB", summary="graph db")
         assert kind == "exact"
         assert payload == "uuid-existing"
 
     def test_entropy_gated_returns_none(self):
         graph = _FakeGraph()  # no exact match
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
+        deduper = NodeDeduper(_FakeKGClient(graph))
         # "api" is short + single-token -> entropy gate -> none.
         kind, payload = deduper.classify("api")
         assert kind == "none"
@@ -428,7 +430,7 @@ class TestClassify:
         graph = _FakeGraph(
             entities=[("uuid-sp", "synapse poller", "the poller")],
         )
-        deduper = NodeDeduper(_FakeKGClient(graph), group_id="technical")
+        deduper = NodeDeduper(_FakeKGClient(graph))
         kind, payload = deduper.classify("synapse-poller", summary="...")
         assert kind == "candidates"
         assert isinstance(payload, list) and payload

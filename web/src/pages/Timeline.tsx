@@ -4,14 +4,13 @@
 //            "→ ep-N" opens the episode overlay.
 //   Preferences — the standing like/dislike/rule log, sortable by recency or assert count;
 //                 superseded rows render struck with their superseding note.
-// The header group filter scopes Events (via the domain column); Preferences are
-// cross-domain (spec §1), so they ignore it.
+// Events carry a domain tag (technical / personal) and the tab has its own filter for it;
+// Preferences are cross-domain (spec §1), so they have none.
 import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import {
   fetchTimeline, fetchPreferences,
   type TimelineEvent, type Preference,
 } from '../api';
-import { useStore } from '../state';
 import { openEpisode } from '../hash';
 import { mono, monoHead } from '../tokens';
 import { FlagButton, ErrorBox, EmptyState } from '../components/ui';
@@ -32,6 +31,10 @@ const TL_TYPE_COLOR: Record<string, string> = {
   health: 'var(--ok)', milestone: 'var(--warn)',
 };
 const typeColor = (t?: string | null): string => (t && TL_TYPE_COLOR[t]) || 'var(--txt2)';
+
+// The domain filter: the timeline is the one surface that still tags events by domain.
+const TL_DOMAINS = ['all', 'technical', 'personal'] as const;
+type Domain = (typeof TL_DOMAINS)[number];
 
 // Salience → type ramp, EXACTLY per spec §6 (only the readout goes amber; size+weight carry it).
 const salRamp = (sal: number): { fontSize: string; fontWeight: number } =>
@@ -87,34 +90,34 @@ function EventCard({ ev }: { ev: TimelineEvent }) {
 }
 
 function Events() {
-  const { group } = useStore();
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [activeType, setActiveType] = useState<string | null>(null);
+  const [domain, setDomain] = useState<Domain>('all');
   const [jump, setJump] = useState('');
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(false);
   const seenRef = useRef<Set<number>>(new Set());
 
-  const groupId = group === 'all' ? undefined : group;
+  const domainParam = domain === 'all' ? undefined : domain;
 
   const load = (before?: string) => {
     setLoading(true); setError(false);
     seenRef.current = new Set();
-    fetchTimeline({ before, type: activeType || undefined, group_id: groupId })
+    fetchTimeline({ before, type: activeType || undefined, domain: domainParam })
       .then((r) => { seenRef.current = new Set(r.events.map((e) => e.id)); setEvents(r.events); setNextBefore(r.next_before); })
       .catch(() => setError(true))
       .finally(() => setLoading(false));
   };
 
-  // (re)load whenever the type chip or the header group filter changes.
-  useEffect(() => { setJump(''); load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [activeType, group]);
+  // (re)load whenever the type chip or the domain filter changes.
+  useEffect(() => { setJump(''); load(); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [activeType, domain]);
 
   const loadMore = () => {
     if (!nextBefore || loadingMore) return;
     setLoadingMore(true);
-    fetchTimeline({ before: nextBefore, type: activeType || undefined, group_id: groupId })
+    fetchTimeline({ before: nextBefore, type: activeType || undefined, domain: domainParam })
       .then((r) => {
         const fresh = r.events.filter((e) => !seenRef.current.has(e.id));
         fresh.forEach((e) => seenRef.current.add(e.id));
@@ -159,6 +162,16 @@ function Events() {
               </button>
             );
           })}
+        </div>
+        <div style={{ display: 'flex', border: '1px solid var(--line2)', borderRadius: '6px', overflow: 'hidden' }}>
+          {TL_DOMAINS.map((d, i) => (
+            <button key={d} onClick={() => setDomain(d)}
+              style={{ border: 'none', cursor: 'pointer', padding: '4px 10px', fontSize: '12px', fontFamily: mono,
+                borderLeft: i ? '1px solid var(--line2)' : 'none',
+                background: domain === d ? 'var(--acc-bg)' : 'var(--bg2)', color: domain === d ? 'var(--acc)' : 'var(--txt2)' }}>
+              {d}
+            </button>
+          ))}
         </div>
         <span style={{ flex: 1 }} />
         <select value={jump} onChange={(e) => onJump(e.target.value)}

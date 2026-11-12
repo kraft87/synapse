@@ -56,6 +56,67 @@ the file again.
 - `ingestion/backfill.py` from a checkout older than this change raises on a turn that is
   already stored (it has no span-collision handler). It is a manual tool; run it from a
   current checkout.
+## 2026-11-11 — one memory per owner: the personal/technical split is gone (schema 067)
+
+**What changed**
+
+- **One knowledge graph per owner.** Extraction no longer sorts entities and facts into a
+  `personal` and a `technical` group, so a fact between an entity of each kind is written
+  instead of dropped, and matching and contradiction search see the whole graph. What a
+  restricted device may be served is decided by each fact's audience label (schema 066) and
+  the provenance of its source episodes, never by a group. `domain` survives only as a tag on
+  timeline events.
+- **`recall` takes no `group_id`.** A client that still sends one is accepted and the
+  argument is ignored (the server writes one log line per call that carries it); `tools/list`
+  no longer shows it. `POST /recall` ignores the body field too, without a log line.
+- **`SYNAPSE_PERSONAL_SCOPE` and `SYNAPSE_PERSONAL_PROJECTS` are gone.** Remove them from your
+  `.env`; nothing reads them. `SYNAPSE_OWNER_NAME` and `SYNAPSE_OWNER_ALIASES` stay.
+- **A restricted read needs the label.** Without schema 066 a restricted device is served no
+  facts; the provenance-only fallback is gone. The boot guard keeps a service from starting
+  on a database without 066 unless it is switched off (`SYNAPSE_SCHEMA_CHECK=0`) or could not
+  reach the database at that moment (it logs a warning and does not look again). A new fact
+  is written unlabelled, so a restricted device is not served it until the labeller has
+  marked it `work-safe`.
+- **Schema 067** is required: it merges the existing `personal` rows into `technical`, folds a
+  personal entity into its same-name technical twin, builds three owner-only indexes, gives
+  `group_id` a `'technical'` default on the four tables that carry it, drops the 066 insert
+  trigger and stamps 067. `scripts/pile_merge.py` previews, health-checks and undoes it.
+
+**Order of rollout**
+
+1. Stop the pollers (`docker compose stop poller poller-drain`).
+2. `python scripts/pile_merge.py --preview` (read-only; counts and uuids, no text). Read the
+   numbers.
+3. Apply 067 by itself, before the release: `psql "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 <
+   schema/067_kg_one_memory.sql`. It runs two transactions of its own, so never inside
+   `BEGIN` and never with `-1`. A re-run is safe and does nothing when nothing is left.
+4. `python scripts/pile_merge.py --health --just-merged` must exit 0 (pollers still stopped,
+   no dashboard deletes since step 3). The flag makes two more checks fail the run: no
+   survivor has left `technical`, and the fact count equals the one before the merge. Without
+   the flag (later, once the graph has moved on) those two sit in the `reported_not_checked`
+   block, for reading; they never fail the run.
+5. Deploy the release, then start the pollers. If a poller ran the old image after step 3,
+   it may have written a personal row, or a folded uuid again: apply 067 once more, check
+   with `--health`, and restart the pollers (a poller keeps a deleted uuid in its name index
+   for up to 15 minutes).
+
+**Rolling back**
+
+- Code only (behaviour, latency, a crash): revert the release. The data stays merged and the
+  older code runs on it (a database ahead of a build only logs a warning), but that code
+  writes the personal group again, and without the insert trigger those facts arrive
+  unlabelled, so a restricted device is not served them. Re-deploying the new release and
+  re-running 067 folds them back.
+- Data (a bad fold): revert the code first, stop the pollers, then `python
+  scripts/pile_merge.py --undo` (a dry run) and `--undo --apply`. It re-creates the folded
+  entities from their before-images, restores the groups and the 066 trigger, and stamps 066
+  once every run is undone; a row changed since the merge is reported as drift and left alone.
+- Restores that write `group_id`, `src_uuid` or `tgt_uuid` from an older backup must not run
+  after the merge unless it is undone first: `repair_numbered_entity_magnets.py --restore`
+  of a run made before it, and a restore from the tz-fix backup table.
+
+**Still open**: a later migration drops the `group_id` columns and the `kg_pile_merge_067_*`
+ledger, once nobody needs the undo.
 
 ## 2026-11-07 — dream→config lane: identity by meaning, a coverage gate, a queue that tends itself (plugin 0.23.1, schema 065)
 
@@ -166,7 +227,7 @@ caller is unaffected.
   name is an identifier (`PR #N`, `draft PR #N`, `pull request #N`, `issue #N`, `task #N`,
   a ticket key `ABC-123`), it reads the fact for identifiers of the same kind. A fact that
   names exactly one, other than the endpoint's own number, moves that endpoint to the
-  entity named for it in the same group (an existing one spelled `PR #N`, `PR N` or
+  entity named for it for the same owner (an existing one spelled `PR #N`, `PR N` or
   `pull request N` is reused; created if missing, embedded as an entity, type and project
   copied). Facts naming their own number, none, several or a range stay; so
   does a move that would join an edge to itself. Entities that lose an edge get an empty

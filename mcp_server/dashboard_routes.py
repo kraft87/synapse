@@ -16,7 +16,7 @@ Two auth postures, by design (mirrors the contract's Namespace & auth section):
 Shape rules shared by every api route: PG work runs in a threadpool on ONE short-lived
 psycopg connection per request, and the boundary is fail-soft — an exception becomes a
 500 JSON and is logged, never raised past the JSONResponse. Reads are owner-agnostic
-(an operator sees the whole store); the only group_id/project/source scoping is the
+(an operator sees the whole store); the only project/source/domain scoping is the
 per-endpoint filtering the contract spells out.
 
 Writable surfaces: dashboard_flags + dashboard_audit (schema 042, the soft-flag), and —
@@ -280,19 +280,16 @@ def _catalog(db_url: str) -> dict[str, Any]:
             "SELECT COALESCE(NULLIF(source, ''), 'untagged') AS name, count(*) AS count "
             "FROM episodes GROUP BY 1 ORDER BY count DESC, name"
         ).fetchall()
-        # group_ids: the distinct group scopes across the group-filterable surfaces
-        # (facts.group_id, entities.group_id, timeline.domain), as a plain string array.
-        gids = conn.execute(
-            "SELECT DISTINCT g FROM ("
-            "  SELECT group_id AS g FROM kg_relationships "
-            "  UNION SELECT group_id FROM kg_entities "
-            "  UNION SELECT domain FROM timeline_events"
-            ") s WHERE g IS NOT NULL AND g <> '' ORDER BY g"
+        # domains: the distinct timeline domain tags (the only surface that still carries
+        # one), as a plain string array.
+        domains = conn.execute(
+            "SELECT DISTINCT domain FROM timeline_events "
+            "WHERE domain IS NOT NULL AND domain <> '' ORDER BY domain"
         ).fetchall()
         return {
             "projects": [{"name": r["name"], "count": r["count"]} for r in projects],
             "sources": [{"name": r["name"], "count": r["count"]} for r in sources],
-            "group_ids": [r["g"] for r in gids],
+            "domains": [r["domain"] for r in domains],
         }
 
 
@@ -309,7 +306,7 @@ def _catalog(db_url: str) -> dict[str, Any]:
 
 _EP_SELECT = "SELECT id, created_at, project, source, session_id, sequence, content FROM episodes"
 _FACT_SELECT = (
-    "SELECT r.uuid, r.created_at, r.group_id, r.fact, r.t_valid, r.t_invalid, r.episodes, "
+    "SELECT r.uuid, r.created_at, r.fact, r.t_valid, r.t_invalid, r.episodes, "
     "       se.name AS src_name, te.name AS tgt_name "
     "FROM kg_relationships r "
     "LEFT JOIN kg_entities se ON se.uuid = r.src_uuid "
@@ -338,7 +335,6 @@ def _fact_item(r: dict[str, Any]) -> dict[str, Any]:
         "type": "fact",
         "id": r["uuid"],
         "ts": _iso(r["created_at"]),
-        "group_id": r["group_id"],
         "gist": _gist(r["fact"]),
         "data": {
             "fact": r["fact"],
@@ -358,9 +354,7 @@ def _timeline_item(r: dict[str, Any]) -> dict[str, Any]:
         "id": str(r["id"]),
         "ts": _iso(r["ingested_at"]),
         "project": r["project"],
-        # domain is the timeline's group scope (schema 038); exposed as group_id so the live
-        # SSE client can apply the group filter uniformly across all three feed types.
-        "group_id": r["domain"],
+        "domain": r["domain"],
         "sal": sal,
         "gist": _gist(r["fact"]),
         "data": {
@@ -377,7 +371,6 @@ def _feed(
     cursor: str | None,
     limit: int,
     project: str | None,
-    group_id: str | None,
     source: str | None,
 ) -> dict[str, Any]:
     """Reverse-chron keyset merge of episodes + KG facts + timeline events.
@@ -386,9 +379,8 @@ def _feed(
     keyset predicate when a cursor is present), merged in Python and cut to `limit`. The
     merge key and the SQL predicate are the SAME total order — (ts DESC, id-as-text DESC)
     — so pages don't drop or duplicate rows. Filters apply only where a type has the
-    column (contract): episodes have project+source but no group_id — the group filter
-    must NOT exclude them; facts have group_id but no project/source; timeline has
-    project and (schema 038) a domain column that stands in for group_id.
+    column (contract): episodes have project+source; facts have neither, so no filter
+    excludes them; timeline has project.
     """
     cur = _decode_cursor(cursor) if cursor else None
     cts, cid = cur if cur else (None, None)
@@ -396,7 +388,7 @@ def _feed(
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         candidates: list[dict[str, Any]] = []
 
-        # --- episodes (ts = created_at). Filters: project, source. No group_id column. ---
+        # --- episodes (ts = created_at). Filters: project, source. ---
         ep_where = ["1=1"]
         ep_params: list[Any] = []
         if project is not None:
@@ -421,13 +413,10 @@ def _feed(
             item["_idstr"] = str(r["id"])
             candidates.append(item)
 
-        # --- facts (ts = created_at). Filter: group_id. No project/source column. ---
-        # Columns are r.-qualified: the entity joins below also expose created_at/group_id.
+        # --- facts (ts = created_at). No filter: no project/source column. ---
+        # Columns are r.-qualified: the entity joins below also expose created_at.
         f_where = ["r.created_at IS NOT NULL"]
         f_params: list[Any] = []
-        if group_id is not None:
-            f_where.append("r.group_id = %s")
-            f_params.append(group_id)
         if cts is not None:
             f_where.append(
                 "(r.created_at < %s::timestamptz OR (r.created_at = %s::timestamptz AND r.uuid < %s))"
@@ -444,18 +433,12 @@ def _feed(
             item["_idstr"] = str(r["uuid"])
             candidates.append(item)
 
-        # --- timeline (ts = ingested_at). Filters: project, and domain for group_id. ---
+        # --- timeline (ts = ingested_at). Filter: project. ---
         t_where = ["1=1"]
         t_params: list[Any] = []
         if project is not None:
             t_where.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
             t_params.append(project)
-        if group_id is not None:
-            # 038 added `domain` (technical/personal) as the timeline's group scope; the
-            # contract's feed-filter line names only project for timeline, but the domain
-            # column IS a group_id-equivalent, so the group filter applies here too.
-            t_where.append("domain = %s")
-            t_params.append(group_id)
         if cts is not None:
             t_where.append(
                 "(ingested_at < %s::timestamptz OR (ingested_at = %s::timestamptz AND id::text < %s))"
@@ -534,7 +517,7 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
         # Facts whose `episodes` jsonb array contains this id — as a number OR (defensively)
         # a numeric string, since the extractor's array element type isn't guaranteed.
         facts = conn.execute(
-            "SELECT uuid, fact, group_id, t_valid, t_invalid FROM kg_relationships "
+            "SELECT uuid, fact, t_valid, t_invalid FROM kg_relationships "
             "WHERE episodes @> to_jsonb(%s::bigint) OR episodes @> to_jsonb(%s::text) "
             "ORDER BY t_valid DESC NULLS LAST, uuid LIMIT %s",
             (episode_id, str(episode_id), _DERIVED_CAP),
@@ -549,7 +532,6 @@ def _episode_derived(db_url: str, episode_id: int) -> dict[str, Any]:
                 {
                     "uuid": r["uuid"],
                     "fact": r["fact"],
-                    "group_id": r["group_id"],
                     "t_valid": _iso(r["t_valid"]),
                     "t_invalid": _iso(r["t_invalid"]),
                 }
@@ -920,7 +902,6 @@ def _search(
     offset: int,
     limit: int,
     project: str | None,
-    group_id: str | None,
     source: str | None,
 ) -> dict[str, Any]:
     """BM25 (ParadeDB @@@) for episodes/facts/events, ILIKE-on-name for entities.
@@ -951,22 +932,11 @@ def _search(
             ep_p.append(source)
         ep_and = bm25_filter(ep_filt)
 
-        f_and, f_p = "", []
-        if group_id is not None:
-            f_and, f_p = bm25_filter(["group_id = %s"]), [group_id]
-
         ev_filt, ev_p = [], []
         if project is not None:
             ev_filt.append("COALESCE(NULLIF(project, ''), 'untagged') = %s")
             ev_p.append(project)
-        if group_id is not None:
-            ev_filt.append("domain = %s")
-            ev_p.append(group_id)
         ev_and = bm25_filter(ev_filt)
-
-        en_and, en_p = "", []
-        if group_id is not None:
-            en_and, en_p = " AND group_id = %s", [group_id]
 
         # --- total_by_type: all four counts, every call ---
         total: dict[str, int] = dict.fromkeys(_SEARCH_TYPES, 0)
@@ -978,8 +948,9 @@ def _search(
             )
             total["facts"] = _count(
                 conn,
-                f"SELECT count(*) AS c FROM kg_relationships WHERE id @@@ paradedb.match('fact', %s){f_and}",
-                (safe, *f_p),
+                "SELECT count(*) AS c FROM kg_relationships "
+                "WHERE id @@@ paradedb.match('fact', %s)",
+                (safe,),
             )
             total["events"] = _count(
                 conn,
@@ -988,8 +959,8 @@ def _search(
             )
         total["entities"] = _count(
             conn,
-            f"SELECT count(*) AS c FROM kg_entities WHERE name ILIKE %s{en_and}",
-            (like, *en_p),
+            "SELECT count(*) AS c FROM kg_entities WHERE name ILIKE %s",
+            (like,),
         )
 
         # --- hits for the requested type only ---
@@ -1017,11 +988,11 @@ def _search(
                 )
         elif type_ == "facts" and safe:
             for r in conn.execute(
-                "SELECT uuid, fact, group_id, t_valid, t_invalid, created_at, episodes, "
+                "SELECT uuid, fact, t_valid, t_invalid, created_at, episodes, "
                 "       paradedb.score(id) AS sc FROM kg_relationships "
-                f"WHERE id @@@ paradedb.match('fact', %s){f_and} "
+                "WHERE id @@@ paradedb.match('fact', %s) "
                 "ORDER BY sc DESC, uuid DESC OFFSET %s LIMIT %s",
-                (safe, *f_p, offset, limit),
+                (safe, offset, limit),
             ).fetchall():
                 hits.append(
                     {
@@ -1032,7 +1003,6 @@ def _search(
                         # the episode overlay; contract pins only episodes/entity hit meta,
                         # so this extra field is additive.
                         "meta": {
-                            "group_id": r["group_id"],
                             "t_valid": _iso(r["t_valid"]),
                             "t_invalid": _iso(r["t_invalid"]),
                             "ts": _iso(r["created_at"]),
@@ -1065,9 +1035,9 @@ def _search(
         elif type_ == "entities":
             for r in conn.execute(
                 "SELECT uuid, name, entity_type, summary, degree FROM kg_entities "
-                f"WHERE name ILIKE %s{en_and} "
+                "WHERE name ILIKE %s "
                 "ORDER BY degree DESC, name OFFSET %s LIMIT %s",
-                (like, *en_p, offset, limit),
+                (like, offset, limit),
             ).fetchall():
                 hits.append(
                     {
@@ -1924,10 +1894,10 @@ def _parse_before(before: str | None) -> tuple[str, int | None] | None:
 
 
 def _timeline(
-    db_url: str, before: str | None, limit: int, type_: str | None, group_id: str | None
+    db_url: str, before: str | None, limit: int, type_: str | None, domain: str | None
 ) -> dict[str, Any]:
     """t_valid-DESC keyset page of timeline events. `type` filters event_type (sparse —
-    see honesty note); `group_id` maps to the `domain` column (schema 038). Each event
+    see honesty note); `domain` filters the `domain` column (schema 038). Each event
     carries the coarse `salience` plus the 0.3/0.6/0.9 `sal` readout the type ramp reads,
     the resolved `ep:N` episode id, and its flag state."""
     cur = _parse_before(before)
@@ -1937,9 +1907,9 @@ def _timeline(
         if type_ is not None:
             where.append("event_type = %s")
             params.append(type_)
-        if group_id is not None:
+        if domain is not None:
             where.append("domain = %s")
-            params.append(group_id)
+            params.append(domain)
         if cur is not None:
             ts, cid = cur
             if cid is not None:
@@ -2483,9 +2453,8 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         limit = _limit(qp.get("limit"), _FEED_LIMIT_DEFAULT, _FEED_LIMIT_MAX)
         cursor = qp.get("cursor") or None
         project = qp.get("project") or None
-        group_id = qp.get("group_id") or None
         source = qp.get("source") or None
-        return await _api(request, lambda: _feed(db_url, cursor, limit, project, group_id, source))
+        return await _api(request, lambda: _feed(db_url, cursor, limit, project, source))
 
     @mcp.custom_route("/dash/api/stream", methods=["GET"])  # type: ignore[misc]
     async def dash_stream(request: Request) -> Response:
@@ -2606,11 +2575,10 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         offset = _offset(qp.get("offset"))
         limit = _limit(qp.get("limit"), _SEARCH_LIMIT_DEFAULT, _SEARCH_LIMIT_MAX)
         project = qp.get("project") or None
-        group_id = qp.get("group_id") or None
         source = qp.get("source") or None
         return await _api(
             request,
-            lambda: _search(db_url, q, type_, offset, limit, project, group_id, source),
+            lambda: _search(db_url, q, type_, offset, limit, project, source),
         )
 
     # ---- graph explorer (phase 6) ----
@@ -2678,8 +2646,8 @@ def register(mcp: Any, db_url: str, authorized: Callable[[Request], bool]) -> No
         limit = _limit(qp.get("limit"), _TIMELINE_LIMIT_DEFAULT, _TIMELINE_LIMIT_MAX)
         before = qp.get("before") or None
         type_ = qp.get("type") or None
-        group_id = qp.get("group_id") or None
-        return await _api(request, lambda: _timeline(db_url, before, limit, type_, group_id))
+        domain = qp.get("domain") or None
+        return await _api(request, lambda: _timeline(db_url, before, limit, type_, domain))
 
     @mcp.custom_route("/dash/api/preferences", methods=["GET"])  # type: ignore[misc]
     async def dash_preferences(request: Request) -> JSONResponse:

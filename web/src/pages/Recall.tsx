@@ -1,5 +1,5 @@
 // Recall — the flagship recall() debugging console (spec §5). Runs POST /recall with
-// debug + the global project/group filters (source is inert here, dimmed in the header),
+// debug + the global project filter (source is inert here, dimmed in the header),
 // then renders a latency waterfall + Served / Raw / History tabs. The waterfall is a
 // schematic Gantt: embed → the parallel band (all starting at embed-end) → rerank (at the
 // max parallel end), colored by the app-wide leg tokens.
@@ -125,7 +125,6 @@ export function Recall() {
     postRecall({
       query: trimmed,
       project: store.project === 'all' ? undefined : store.project,
-      group_id: store.group === 'all' ? undefined : store.group,
     })
       .then((res) => { if (id === reqId.current) { setResult(res); setLoading(false); } })
       .catch((e) => { if (id === reqId.current) { setError(String(e?.message || e)); setLoading(false); } });
@@ -289,7 +288,7 @@ export function Recall() {
       {!ran && (
         <div style={{ marginTop: '18px', border: '1px dashed var(--line2)', borderRadius: '10px', padding: '40px 24px', textAlign: 'center', fontFamily: mono, fontSize: '12.5px', color: 'var(--txt3)', lineHeight: 1.7 }}>
           run recall() to see the latency waterfall and exactly what an agent would be served.<br />
-          project + group filters apply; source is inert here.
+          the project filter applies; source is inert here.
         </div>
       )}
     </main>

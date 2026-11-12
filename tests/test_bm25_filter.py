@@ -42,8 +42,8 @@ def test_no_filter_appends_nothing():
 
 
 def test_the_filters_are_one_case_with_their_placeholders_in_order():
-    assert bm25_filter(["owner_id = %s", "group_id = ANY(%s)", "t_invalid IS NULL"]) == (
-        " AND CASE WHEN ((owner_id = %s) AND (group_id = ANY(%s)) AND (t_invalid IS NULL))"
+    assert bm25_filter(["owner_id = %s", "project = ANY(%s)", "t_invalid IS NULL"]) == (
+        " AND CASE WHEN ((owner_id = %s) AND (project = ANY(%s)) AND (t_invalid IS NULL))"
         " THEN 1 END = 1"
     )
 

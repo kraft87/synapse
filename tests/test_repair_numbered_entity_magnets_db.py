@@ -210,6 +210,20 @@ def _run(db_url: str, *args: str) -> None:
     assert rm.main(["--db-url", db_url, *args]) == 0
 
 
+def test_a_landing_entity_left_in_the_old_personal_group_is_reused(kg, db_url, embedder):
+    ep = _ep(kg, "alpha")
+    _ent(kg, "mag", "PR #290")
+    _ent(kg, "p12", "PR #12")
+    kg.execute("UPDATE kg_entities SET group_id = 'personal' WHERE uuid = 'p12'")
+    _ent(kg, "svc", "widget service", etype="service")
+    _edge(kg, "e1", "mag", "svc", "PR #12 changed the widget service", ep)
+
+    _run(db_url, "--apply", "--date", DAY)
+
+    assert _ends(kg, "e1") == ("p12", "svc")
+    assert embedder.calls == []  # nothing was created: the old entity took the edge
+
+
 def test_dry_run_writes_nothing(kg, db_url, embedder, capsys):
     _seed(kg)
     before = _state(kg)

@@ -27,9 +27,10 @@ except Exception:  # pragma: no cover - environment dependent
 
 import ingestion.notes as notes_mod  # noqa: E402
 from ingestion.db import Database  # noqa: E402
+from ingestion.db_connection import _EMBED_DIMS, _vector_literal  # noqa: E402
 from ingestion.db_notes import note_helpful_counts  # noqa: E402
 from ingestion.notes import _OWNER, reconcile_note  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
+from tests.helpers.embed import OneHotEmbedder, onehot  # noqa: E402
 
 
 def _wipe(conn):
@@ -39,7 +40,6 @@ def _wipe(conn):
 def _insert(db, *, type="user", hook="User prefers X", body="Body.", slot=1, **kw):
     args = {
         "owner_id": _OWNER,
-        "group_id": GROUP,
         "project": None,
         "embedding": onehot(slot),
         "embed_model": "test",
@@ -59,11 +59,11 @@ def test_insert_and_cosine_knn(conn, db_url):
     db = Database(db_url)
     a = _insert(db, hook="User prefers bullet lists", slot=1, source_ref="ep:1")
     _insert(db, hook="User dislikes em-dashes", slot=2, source_ref="ep:2")
-    hits = db.find_live_notes(_OWNER, GROUP, onehot(1), limit=5)
+    hits = db.find_live_notes(_OWNER, onehot(1), limit=5)
     assert hits[0]["id"] == a
     assert hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     assert hits[1]["sim"] == pytest.approx(0.0, abs=1e-3)
-    assert set(hits[0]) == {"id", "hook", "body", "type", "project", "sim"}
+    assert set(hits[0]) == {"id", "hook", "body", "type", "project", "audience", "sim"}
     db.close()
     _wipe(conn)
 
@@ -80,7 +80,7 @@ def test_update_refreshes_hook_body_and_updated_at(conn, db_url):
     assert row[0] == "New hook" and row[1] == "New body." and row[2] == "test2"
     assert row[3] > before
     # The refreshed embedding moved the note to slot 4 in KNN space.
-    hits = db.find_live_notes(_OWNER, GROUP, onehot(4), limit=1)
+    hits = db.find_live_notes(_OWNER, onehot(4), limit=1)
     assert hits[0]["id"] == nid and hits[0]["sim"] == pytest.approx(1.0, abs=1e-3)
     db.close()
     _wipe(conn)
@@ -94,8 +94,69 @@ def test_supersede_retires_old_and_links_lineage(conn, db_url):
     db.supersede_note(old, new)
     row = conn.execute("SELECT superseded_by FROM notes WHERE id = %s", (old,)).fetchone()
     assert row[0] == new  # lineage FK points at the replacement
-    live_ids = {h["id"] for h in db.find_live_notes(_OWNER, GROUP, onehot(5), limit=5)}
+    live_ids = {h["id"] for h in db.find_live_notes(_OWNER, onehot(5), limit=5)}
     assert new in live_ids and old not in live_ids
+    db.close()
+    _wipe(conn)
+
+
+def _text_and_tier(conn, note_id):
+    return conn.execute(
+        "SELECT hook, body, audience, superseded_by FROM notes WHERE id = %s", (note_id,)
+    ).fetchone()
+
+
+def test_update_with_if_audience_changes_only_a_live_note_still_in_that_tier(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    nid = _insert(db, hook="Old hook", body="Old body.", slot=3, audience="work-safe")
+    new = {"hook": "New hook", "body": "New body.", "embedding": onehot(4), "embed_model": "t2"}
+
+    # The note is not in the tier the caller read it in: nothing changes.
+    assert db.update_note(nid, if_audience="personal", **new) is False
+    assert _text_and_tier(conn, nid) == ("Old hook", "Old body.", "work-safe", None)
+
+    # In that tier: the row changes, and an explicit audience still moves it.
+    assert db.update_note(nid, if_audience="work-safe", **new) is True
+    assert _text_and_tier(conn, nid) == ("New hook", "New body.", "work-safe", None)
+    assert db.update_note(nid, audience="personal", if_audience="work-safe", **new) is True
+    assert _text_and_tier(conn, nid)[2] == "personal"
+
+    # A retired note is refused even in the right tier, and its text stays.
+    successor = _insert(db, hook="Successor", slot=5, audience="personal")
+    db.supersede_note(nid, successor)
+    assert db.update_note(nid, if_audience="personal", **{**new, "hook": "Later hook"}) is False
+    assert _text_and_tier(conn, nid) == ("New hook", "New body.", "personal", successor)
+
+    # Without the keyword the statement is the plain id write, whatever the tier.
+    assert db.update_note(nid, **{**new, "hook": "Plain hook"}) is True
+    assert _text_and_tier(conn, nid)[0] == "Plain hook"
+    assert db.update_note(999_999_999, **new) is False  # no such row
+    db.close()
+    _wipe(conn)
+
+
+def test_supersede_with_if_audience_retires_only_a_live_note_still_in_that_tier(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    old = _insert(db, hook="Old", slot=6, audience="work-safe")
+    first = _insert(db, hook="First successor", slot=7, audience="personal")
+    second = _insert(db, hook="Second successor", slot=8, audience="personal")
+
+    assert db.supersede_note(old, first, if_audience="personal") is False
+    assert _text_and_tier(conn, old)[3] is None  # still live
+
+    assert db.supersede_note(old, first, if_audience="work-safe") is True
+    assert _text_and_tier(conn, old)[3] == first
+
+    # A retired note is never re-pointed, with the tier right, wrong or not asked for.
+    for kw in ({"if_audience": "work-safe"}, {"if_audience": "personal"}, {}):
+        assert db.supersede_note(old, second, **kw) is False
+        assert _text_and_tier(conn, old)[3] == first
+
+    # Without the keyword a live note is retired whatever its tier.
+    assert db.supersede_note(second, first) is True
+    assert _text_and_tier(conn, second)[3] == first
     db.close()
     _wipe(conn)
 
@@ -109,14 +170,26 @@ def test_type_check_rejects_invalid(conn, db_url):
     _wipe(conn)
 
 
-def test_group_and_owner_scoping(conn, db_url):
+def test_find_live_notes_scopes_by_owner_not_by_legacy_group(conn, db_url):
     _wipe(conn)
     db = Database(db_url)
-    mine = _insert(db, hook="Mine, technical", slot=6)
-    _insert(db, hook="Mine, personal", group_id="personal", slot=6)
+    technical = _insert(db, hook="Mine, technical", slot=6)
+    personal = _insert(db, hook="Mine, personal", slot=6)
+    conn.execute("UPDATE notes SET group_id = 'personal' WHERE id = %s", (personal,))
     _insert(db, hook="Someone else's", owner_id="other", slot=6)
-    hits = db.find_live_notes(_OWNER, GROUP, onehot(6), limit=5)
-    assert [h["id"] for h in hits] == [mine]
+    hits = db.find_live_notes(_OWNER, onehot(6), limit=5)
+    assert {h["id"] for h in hits} == {technical, personal}
+    db.close()
+    _wipe(conn)
+
+
+def test_new_note_takes_the_column_default_group(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    nid = _insert(db, hook="Left to the default", slot=7)
+    assert conn.execute("SELECT group_id FROM notes WHERE id = %s", (nid,)).fetchone()[0] == (
+        "technical"
+    )
     db.close()
     _wipe(conn)
 
@@ -127,7 +200,7 @@ def test_null_embedding_insert_ok_and_skipped_by_knn(conn, db_url):
     nid = _insert(db, hook="Keyless note", embedding=None, embed_model="ignored")
     row = conn.execute("SELECT embedding, embed_model FROM notes WHERE id = %s", (nid,)).fetchone()
     assert row[0] is None and row[1] is None  # embed_model nulled alongside the vector
-    assert db.find_live_notes(_OWNER, GROUP, onehot(1), limit=5) == []
+    assert db.find_live_notes(_OWNER, onehot(1), limit=5) == []
     db.close()
     _wipe(conn)
 
@@ -230,7 +303,7 @@ class _NotesDB:
         self.superseded: list[tuple[int, int]] = []
         self._next_id = 500
 
-    def find_live_notes(self, owner_id, group_id, embedding, limit=5):
+    def find_live_notes(self, owner_id, embedding, limit=5, audience=None):
         self.knn_calls += 1
         return self._candidates
 
@@ -239,11 +312,15 @@ class _NotesDB:
         self._next_id += 1
         return self._next_id
 
-    def update_note(self, note_id, *, hook, body, embedding, embed_model, audience=None):
+    def update_note(
+        self, note_id, *, hook, body, embedding, embed_model, audience=None, if_audience=None
+    ):
         self.updated.append({"note_id": note_id, "hook": hook, "body": body, "audience": audience})
+        return True
 
-    def supersede_note(self, old_id, new_id):
+    def supersede_note(self, old_id, new_id, *, if_audience=None):
         self.superseded.append((old_id, new_id))
+        return True
 
     def restricted_surface_projects(self):
         """No registered restricted surface -> audience derivation falls to 'personal'.
@@ -272,6 +349,7 @@ def _cand(sim: float, type: str = "user", note_id: int = 42) -> dict:
         "body": "Existing body.",
         "type": type,
         "project": None,
+        "audience": "personal",
         "sim": sim,
     }
 
@@ -286,7 +364,6 @@ def _run(monkeypatch, *, candidates=(), relation="same", type="user", raise_llm=
             raise RuntimeError("LLM down")
         return relation
 
-    monkeypatch.setattr(notes_mod, "_group_for", lambda project: "technical")
     monkeypatch.setattr(notes_mod, "parse_with_retry", _fake_parse)
     db = _NotesDB(candidates)
     result = reconcile_note(
@@ -312,7 +389,31 @@ def test_reconcile_creates_when_no_candidates(monkeypatch):
     }
     assert len(db.inserted) == 1 and db.updated == [] and db.superseded == []
     assert db.inserted[0]["source_ref"] == "ep:9"
+    assert "group_id" not in db.inserted[0]  # the column default decides
     assert llm_calls == []  # no candidate -> no confirm call
+
+
+def test_reconcile_for_a_caller_that_is_not_known_never_looks_for_a_match(monkeypatch):
+    """Not a registered device or identity: no tier is searched (the spy sees no KNN call),
+    no judge is asked, and the note is stored with its embedding at the derived tier."""
+    llm_calls: list[dict] = []
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: llm_calls.append(k))
+    db = _NotesDB([_cand(0.99)])
+    result = reconcile_note(
+        db,
+        _StubEmb(),
+        object(),
+        hook="User prefers light mode",
+        body="New body.",
+        type="user",
+        project=None,
+        source_ref="ep:9",
+        caller_known=False,
+    )
+    assert result == {"outcome": "created", "note_id": 501, "prev_id": None, "audience": "personal"}
+    assert db.knn_calls == 0 and llm_calls == []
+    assert db.updated == [] and db.superseded == []
+    assert len(db.inserted) == 1 and db.inserted[0]["embedding"] is not None
 
 
 def test_reconcile_creates_below_threshold(monkeypatch):
@@ -379,7 +480,6 @@ def test_reconcile_threshold_env_override(monkeypatch):
 
 
 def test_reconcile_keyless_embedder_none(monkeypatch):
-    monkeypatch.setattr(notes_mod, "_group_for", lambda project: "technical")
     db = _NotesDB([_cand(0.99)])  # would match — but keyless skips dedup entirely
     result = reconcile_note(
         db,
@@ -397,7 +497,6 @@ def test_reconcile_keyless_embedder_none(monkeypatch):
 
 
 def test_reconcile_embed_failure_degrades_to_insert(monkeypatch):
-    monkeypatch.setattr(notes_mod, "_group_for", lambda project: "technical")
     db = _NotesDB([_cand(0.99)])
     result = reconcile_note(
         db,
@@ -426,3 +525,84 @@ def test_reconcile_rejects_invalid_type():
             project=None,
             source_ref=None,
         )
+
+
+# ---------------------------------------------------------------------------
+# reconcile_note against the real store — a live note filed under either legacy
+# group is the same pool as a fresh write
+# ---------------------------------------------------------------------------
+
+
+def _seed_note(conn, *, group_id, slot):
+    return conn.execute(
+        "INSERT INTO notes (owner_id, group_id, type, hook, body, embedding, embed_model) "
+        f"VALUES (%s, %s, 'user', 'User prefers dark mode', 'Old body.', "
+        f"%s::halfvec({_EMBED_DIMS}), 'test') RETURNING id",
+        (_OWNER, group_id, _vector_literal(onehot(slot))),
+    ).fetchone()[0]
+
+
+def _write_note(db, slot, project):
+    return reconcile_note(
+        db,
+        OneHotEmbedder(slot),
+        object(),
+        hook="User prefers light mode",
+        body="New body.",
+        type="user",
+        project=project,
+        source_ref="ep:1",
+    )
+
+
+# (group the live note is filed under, project of the new write). Each pair is one the
+# old per-group lookup missed: a project-less write looked only in 'technical', a write
+# for a personal-leaning project only in 'personal'.
+_ACROSS_GROUPS = [("personal", None), ("technical", "jobs")]
+
+
+@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
+def test_restated_note_updates_the_live_note_in_the_other_group(
+    conn, db_url, monkeypatch, legacy_group, project
+):
+    _wipe(conn)
+    db = Database(db_url)
+    old = _seed_note(conn, group_id=legacy_group, slot=20)
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "same")
+    result = _write_note(db, 20, project)
+    assert result["outcome"] == "updated" and result["note_id"] == old
+    live = conn.execute("SELECT id, hook FROM notes WHERE superseded_by IS NULL").fetchall()
+    assert live == [(old, "User prefers light mode")]
+    db.close()
+    _wipe(conn)
+
+
+@pytest.mark.parametrize(("legacy_group", "project"), _ACROSS_GROUPS)
+def test_contradicting_note_supersedes_the_live_note_in_the_other_group(
+    conn, db_url, monkeypatch, legacy_group, project
+):
+    _wipe(conn)
+    db = Database(db_url)
+    old = _seed_note(conn, group_id=legacy_group, slot=21)
+    monkeypatch.setattr(notes_mod, "parse_with_retry", lambda *a, **k: "contradicts")
+    result = _write_note(db, 21, project)
+    assert result["outcome"] == "superseded" and result["prev_id"] == old
+    new = result["note_id"]
+    assert (
+        conn.execute("SELECT superseded_by FROM notes WHERE id = %s", (old,)).fetchone()[0] == new
+    )
+    live = conn.execute("SELECT id FROM notes WHERE superseded_by IS NULL").fetchall()
+    assert live == [(new,)]
+    db.close()
+    _wipe(conn)
+
+
+def test_reconciled_note_gets_the_default_group_whatever_the_project(conn, db_url):
+    _wipe(conn)
+    db = Database(db_url)
+    result = _write_note(db, 22, "jobs")
+    assert result["outcome"] == "created"
+    row = conn.execute("SELECT group_id FROM notes WHERE id = %s", (result["note_id"],)).fetchone()
+    assert row[0] == "technical"
+    db.close()
+    _wipe(conn)

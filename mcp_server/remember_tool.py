@@ -220,6 +220,9 @@ def register(
                 # never widen a WRITE — defaulting an unrecognised credential's notes to
                 # work-safe would turn a fail-closed read rule into a leak.
                 caller_restricted = trust.known and trust.restricted
+                # The same unknown caller is also never matched against an existing note
+                # (`caller_known`): a match could overwrite or retire a note it may not
+                # read, and the outcome would tell it that one exists.
 
                 embedder, llm = _notes_deps()
                 res = reconcile_note(
@@ -233,6 +236,7 @@ def register(
                     source_ref=f"ep:{episode_id}",
                     audience=audience,
                     caller_restricted=caller_restricted,
+                    caller_known=trust.known,
                 )
             finally:
                 db.close()

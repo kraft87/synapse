@@ -325,7 +325,6 @@ def test_superseded_source_ref_skip_and_reconcile(conn, db_url, tmp_path, monkey
     db = Database(db_url)
     old = db.insert_note(
         owner_id=_OWNER,
-        group_id="technical",
         project=None,
         type="user",
         hook="Old seeded hook.",
@@ -336,7 +335,6 @@ def test_superseded_source_ref_skip_and_reconcile(conn, db_url, tmp_path, monkey
     )
     winner = db.insert_note(
         owner_id=_OWNER,
-        group_id="technical",
         project=None,
         type="user",
         hook="The contradicting note.",
@@ -383,7 +381,6 @@ def test_high_sim_collision_routes_through_reconcile(conn, db_url, tmp_path, mon
     db = Database(db_url)
     existing = db.insert_note(
         owner_id=_OWNER,
-        group_id="technical",
         project=None,
         type="user",
         hook="User prefers dark mode",

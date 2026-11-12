@@ -10,9 +10,8 @@ timeline gate's turn date, the date recall serves on an episode) goes through
 through :func:`local_iso`.
 
 Transcripts carry UTC timestamps only (no client offset), so the zone is a deployment
-setting. The env var is read per call, like ``SYNAPSE_PERSONAL_SCOPE``, so a process
-can be tested both ways. Only instants are converted: a bare ``YYYY-MM-DD`` (a
-date-precision stamp) is returned as is.
+setting. The env var is read per call, so a process can be tested both ways. Only
+instants are converted: a bare ``YYYY-MM-DD`` (a date-precision stamp) is returned as is.
 """
 
 from __future__ import annotations

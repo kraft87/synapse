@@ -3,9 +3,9 @@
 Covers the parts that write: which facts are picked and in what order, that a label is only
 ever written where the fact is still unlabelled, the version and model stamps, the stop
 conditions, and the poller's stage. The invariants: nothing is labelled before 066 or while
-no restricted device could be served the facts, the personal pile is never touched, a backend
-that fails leaves the rest NULL for the next cycle, and one fact that breaks calls on its own
-neither blocks the queue nor stands in for a dead backend.
+no restricted device could be served the facts, a fact the old personal pile labelled is never
+touched, a backend that fails leaves the rest NULL for the next cycle, and one fact that breaks
+calls on its own neither blocks the queue nor stands in for a dead backend.
 """
 
 from __future__ import annotations
@@ -216,7 +216,9 @@ def test_only_unlabelled_non_web_facts_with_text_are_labelled(restricted, db_url
     from_web = _fact(restricted, "a web page fact", ep=ep, web=7)
     empty = _fact(restricted, "", ep=ep)
     no_text = _fact(restricted, None, ep=ep)
-    personal_group = _fact(restricted, "a personal-group fact", ep=ep, group="personal")
+    # a fact from the old personal pile: 067 kept the personal v0 label 066 stamped on insert
+    regrouped = _fact(restricted, "a regrouped personal fact", ep=ep, audience="personal")
+    restricted.execute("UPDATE kg_relationships SET label_version = 0 WHERE id = %s", (regrouped,))
     stats = _run(db_url)
     assert _audience(restricted, plain) == "work-safe"
     assert _audience(restricted, private) == "personal"
@@ -224,8 +226,7 @@ def test_only_unlabelled_non_web_facts_with_text_are_labelled(restricted, db_url
     assert _audience(restricted, kept_personal) == "personal"
     for fid in (from_web, empty, no_text):
         assert _audience(restricted, fid) is None, fid
-    # stamped by the schema's trigger, so the stage never saw it
-    assert _label(restricted, personal_group)[:2] == ("personal", 0)
+    assert _label(restricted, regrouped)[:2] == ("personal", 0)  # labelled already: never seen
     assert judge.seen == ["a SECRET fact", "a plain fact"]
     assert stats.labelled == {"work-safe": 1, "personal": 1}
 

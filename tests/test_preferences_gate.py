@@ -249,7 +249,7 @@ class _RecDB:
         self.merged: list[tuple[int, str, str]] = []
         self._next_id = 100
 
-    def find_live_preferences(self, owner_id, group_id, embedding, limit=5):
+    def find_live_preferences(self, owner_id, embedding, limit=5, same_readers=None):
         return self._candidates
 
     def insert_preference(self, **kw):
@@ -265,6 +265,9 @@ class _RecDB:
 
     def merge_preference_text(self, pref_id, pref, embedding, embed_model):
         self.merged.append((pref_id, pref, embed_model))
+
+    def restricted_surface_allowlists(self):
+        return []  # no registered restricted device: a merge crosses no allowlist
 
 
 class _StubEmb:
@@ -289,7 +292,6 @@ def _run_flow(monkeypatch, prefs, candidates, confirm=None, embedder=None):
     import ingestion.preferences_gate as pg
 
     monkeypatch.setenv("SYNAPSE_PREFS_GATE", "1")
-    monkeypatch.setattr(pg, "_group_for", lambda project: "technical")
 
     def _fake_parse_with_retry(*a, **k):
         # The gate makes two DIFFERENT calls through this helper; dispatch on the parser.
@@ -318,6 +320,7 @@ def test_flow_insert_new(monkeypatch):
     assert db.inserted[0]["pref"] == "User prefers dark mode"
     assert db.inserted[0]["polarity"] == "like"
     assert db.inserted[0]["source_ref"] == "ep:5"
+    assert "group_id" not in db.inserted[0]  # the column default decides
     assert db.reasserted == [] and db.superseded == []
 
 

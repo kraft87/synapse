@@ -33,9 +33,7 @@ from ingestion.db import Database  # noqa: E402
 from ingestion.notes import _OWNER  # noqa: E402
 from mcp_server import server  # noqa: E402
 from mcp_server.recall import Recall  # noqa: E402
-from tests.helpers.embed import GROUP, onehot  # noqa: E402
-
-# GROUP ("technical") is where _group_for(None) routes project-less notes.
+from tests.helpers.embed import onehot  # noqa: E402
 
 
 class _SlotEmb:
@@ -78,6 +76,13 @@ def env(monkeypatch, conn, db_url):
     monkeypatch.setattr(server, "_recall_engine", engine)
     monkeypatch.setattr(server, "_notes_deps", lambda: (emb, object()))
     monkeypatch.setattr(notes_mod, "parse_with_retry", _fake_parse)
+    # The caller is a registered full-trust device: only a registered caller's write is
+    # matched against the live notes (an unknown caller's is always a new note).
+    device = SimpleNamespace(
+        client_id=server._DEVICE_CLIENT_ID,
+        claims={"kind": "device", "surface_id": "dev-full", "trust": "full"},
+    )
+    monkeypatch.setattr(server, "get_access_token", lambda: device)
 
     db = Database(db_url)
     yield SimpleNamespace(
@@ -89,7 +94,6 @@ def env(monkeypatch, conn, db_url):
 def _seed_note(env, *, hook="User prefers dark mode", type="user", slot=1, project=None) -> int:
     return env.db.insert_note(
         owner_id=_OWNER,
-        group_id=GROUP,
         project=project,
         type=type,
         hook=hook,

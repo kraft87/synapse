@@ -6,12 +6,13 @@ The statements are in test_kg_fact_audience_sql.py; what they do to rows is here
 
   * every restricted leg: vector, BM25, the seed degree gate, the hop, the superseded
     pairs, the supersession surface and the episode overlay
-  * the personal pile's rows are personal on insert (trigger), whatever provenance says
+  * a fact regrouped out of the personal pile keeps its personal v0 label, whatever provenance says
   * a missing cutover stamp fails closed; the BM25 TopK pushdown survives the clause
   * the owner's flagged entity is never a hop seed, for any caller, and its facts are
     still served by the other legs
-  * a database without 066 behaves exactly as before it, with no errors and no warnings;
-    the schema applied under a running engine takes effect without a restart
+  * a database without 066 serves a restricted read nothing, on every leg, and full trust
+    exactly what it did before, with no errors and no warnings; the schema applied under a
+    running engine takes effect without a restart
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ from tests.helpers.embed import GROUP, onehot
 from tests.helpers.surfaces import clear_surfaces, register_full, register_restricted
 
 WORK = "work-proj"
-PERS = "personal"  # the second KG group; its rows are personal on insert (schema 066)
+PERS = "personal"  # the legacy second pile: rows written before 067 still carry it, no read looks
 LEGS = ("v", "b", "h")  # vector, BM25, hop
 
 
@@ -98,12 +99,14 @@ def _fact(
     group: str = GROUP,
     t_invalid: str | None = None,
     invalidated_by: str | None = None,
+    label_version: int | None = None,
 ) -> None:
     conn.execute(
         "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
-        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience) "
+        "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, audience, "
+        "  label_version) "
         "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
-        "        '2026-01-01T00:00:00+00:00', %s, %s, %s)",
+        "        '2026-01-01T00:00:00+00:00', %s, %s, %s, %s)",
         (
             uid,
             group,
@@ -115,6 +118,7 @@ def _fact(
             t_invalid,
             invalidated_by,
             audience,
+            label_version,
         ),
     )
 
@@ -163,8 +167,8 @@ def _engine_on(tx) -> Recall:
     return r
 
 
-def _restricted_kg(r: Recall, group: str = GROUP, **kw: Any) -> set[str]:
-    facts, seeds = r._search_kg("widget", onehot(0), group, [], 20, allowed_projects=[WORK], **kw)
+def _restricted_kg(r: Recall, **kw: Any) -> set[str]:
+    facts, seeds = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK], **kw)
     assert seeds == []
     return _uuids(facts)
 
@@ -215,13 +219,13 @@ def test_a_restricted_read_serves_work_safe_and_legacy_unlabelled_facts_on_every
     r = Recall(db_url, "")
     assert _restricted_kg(r) == SERVED
     # one allowed project more changes nothing: only the label decides here
-    facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20, allowed_projects=[WORK, "other"])
+    facts, _ = r._search_kg("widget", onehot(0), [], 20, allowed_projects=[WORK, "other"])
     assert _uuids(facts) == SERVED
 
 
 def test_full_trust_serves_every_label(kg, cutover, db_url):
     _seed_label_matrix(kg, cutover)
-    facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, seeds = Recall(db_url, "")._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == EVERY
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
 
@@ -294,7 +298,7 @@ def test_a_seed_counts_only_the_edges_a_restricted_caller_may_be_served(
     def _hops(allowed: list[str] | None) -> int:
         executed.clear()
         with psycopg.connect(db_url) as c, c.cursor() as cur:
-            kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", GROUP, [], 5, allowed)
+            kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 5, allowed)
         return sum("src_uuid = %s OR tgt_uuid = %s" in s for s in executed)
 
     assert _hops([WORK]) == (1 if is_seed else 0)
@@ -348,50 +352,50 @@ NOW = ["n-ok", "n-displaced", "n-legacy", "n-served-new"]
 def test_superseded_pairs_need_both_sides_to_pass_the_label_rule(kg, cutover, db_url):
     _seed_pairs(kg, cutover)
     r = Recall(db_url, "")
-    scoped = r._fetch_superseded_pairs_pg(GROUP, NOW, 10, allowed_projects=[WORK])
+    scoped = r._fetch_superseded_pairs_pg(NOW, 10, allowed_projects=[WORK])
     assert [p["id"] for p in scoped] == ["f:o-ok", "f:o-legacy"]
-    full = r._fetch_superseded_pairs_pg(GROUP, NOW, 10)
+    full = r._fetch_superseded_pairs_pg(NOW, 10)
     assert [p["id"] for p in full] == ["f:o-ok", "f:o-displaced", "f:o-legacy", "f:o-served-new"]
 
 
 def test_the_supersession_surface_needs_both_edges_to_pass_the_label_rule(kg, cutover, db_url):
     _seed_pairs(kg, cutover)
     r = Recall(db_url, "")
-    scoped = r._surface_supersessions(onehot(1), GROUP, set(), cap=10, allowed_projects=[WORK])
+    scoped = r._surface_supersessions(onehot(1), set(), cap=10, allowed_projects=[WORK])
     assert _uuids(scoped) == {"n-ok", "n-legacy"}
-    full = r._surface_supersessions(onehot(1), GROUP, set(), cap=10)
+    full = r._surface_supersessions(onehot(1), set(), cap=10)
     assert _uuids(full) == set(NOW)
 
 
 def test_the_episode_overlay_needs_both_edges_to_pass_the_label_rule(kg, cutover, db_url):
     ep = _seed_pairs(kg, cutover)
     r = Recall(db_url, "")
-    scoped = r._episode_supersessions([ep], GROUP, allowed_projects=[WORK])
+    scoped = r._episode_supersessions([ep], allowed_projects=[WORK])
     assert sorted(scoped[ep]) == ["now legacy", "now ok"]
-    full = r._episode_supersessions([ep], GROUP)
+    full = r._episode_supersessions([ep])
     assert sorted(full[ep]) == ["now displaced", "now legacy", "now ok", "now served-new"]
 
 
 # ---------------------------------------------------------------------------
-# The personal pile
+# Facts regrouped out of the personal pile
 # ---------------------------------------------------------------------------
 
 
-def test_a_restricted_request_for_the_personal_group_is_served_nothing(kg, db_url):
-    """Facts still written to the personal group are personal on insert (a trigger), so
-    naming that group is no way round the label, whatever their provenance says."""
+def test_a_regrouped_fact_keeps_personal_v0_and_is_served_a_restricted_request_nothing(kg, db_url):
+    """067 moves every personal-pile fact into the one group and keeps its 'personal' label (it
+    was stamped on insert until then), so naming no pile at all is still no way round the
+    label, whatever the fact's provenance says."""
     ep = _ep(kg)
-    _entity(kg, "p-seed", "PSeed", 0, PERS)
-    _fact(kg, "p-vec", "alpha", ep, audience=None, emb=0, group=PERS)
-    _fact(kg, "p-bm25", "widget thing", ep, audience=None, group=PERS)
-    _fact(kg, "p-hop", "epsilon", ep, audience=None, src="p-seed", group=PERS)
+    _entity(kg, "p-seed", "PSeed", 0)
+    _fact(kg, "p-vec", "alpha", ep, audience="personal", label_version=0, emb=0)
+    _fact(kg, "p-bm25", "widget thing", ep, audience="personal", label_version=0)
+    _fact(kg, "p-hop", "epsilon", ep, audience="personal", label_version=0, src="p-seed")
     assert kg.execute(
-        "SELECT DISTINCT audience, label_version FROM kg_relationships WHERE group_id = %s",
-        (PERS,),
-    ).fetchall() == [("personal", 0)]
+        "SELECT DISTINCT group_id, audience, label_version FROM kg_relationships"
+    ).fetchall() == [(GROUP, "personal", 0)]
     r = Recall(db_url, "")
-    assert _restricted_kg(r, PERS) == set()
-    facts, _ = r._search_kg("widget", onehot(0), PERS, [], 20)
+    assert _restricted_kg(r) == set()
+    facts, _ = r._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == {"p-vec", "p-bm25", "p-hop"}
 
 
@@ -432,7 +436,6 @@ def test_the_restricted_bm25_statement_still_runs_as_a_paradedb_topk_scan(kg, cu
                 "widget",
                 onehot(0),
                 "default",
-                GROUP,
                 [],
                 5,
                 [WORK],
@@ -474,7 +477,6 @@ def _bm25_leg(db_url: str, *, audience: bool, limit: int) -> tuple[list[str], st
             "widget",
             onehot(0),
             "default",
-            GROUP,
             [],
             limit,
             [WORK],
@@ -549,18 +551,18 @@ def _owner_world(conn, group: str = GROUP) -> None:
     _entity(conn, own, "Owner", 0, group)
     _entity(conn, other, "Other", 0, group)
     kw: dict[str, Any] = {"audience": "work-safe", "group": group}
-    _fact(conn, f"hop-own-{group}", "zeta", ep, src=own, **kw)
-    _fact(conn, f"hop-oth-{group}", "eta", ep, src=other, **kw)
-    _fact(conn, f"vec-own-{group}", "alpha beta", ep, emb=0, src=own, **kw)
-    _fact(conn, f"bm-own-{group}", "widget gizmo", ep, src=own, **kw)
+    _fact(conn, f"hop-own-{group}", f"zeta {group}", ep, src=own, **kw)
+    _fact(conn, f"hop-oth-{group}", f"eta {group}", ep, src=other, **kw)
+    _fact(conn, f"vec-own-{group}", f"alpha beta {group}", ep, emb=0, src=own, **kw)
+    _fact(conn, f"bm-own-{group}", f"widget gizmo {group}", ep, src=own, **kw)
 
 
 def _flag(conn, uid: str) -> None:
     conn.execute("UPDATE kg_entities SET is_self = true WHERE uuid = %s", (uid,))
 
 
-def _read(r: Recall, group: str = GROUP, allowed: list[str] | None = None) -> set[str]:
-    facts, _ = r._search_kg("widget", onehot(0), group, [], 20, allowed_projects=allowed)
+def _read(r: Recall, allowed: list[str] | None = None) -> set[str]:
+    facts, _ = r._search_kg("widget", onehot(0), [], 20, allowed_projects=allowed)
     return _uuids(facts)
 
 
@@ -583,19 +585,19 @@ def test_a_cleared_flag_leaves_the_read_as_it_was(kg, db_url):
     assert _read(Recall(db_url, "")) == before
 
 
-def test_each_groups_flagged_owner_is_excluded_in_its_own_read(kg, db_url):
-    """Until the piles merge the owner has a node in each group, and flags both."""
+def test_every_flagged_owner_row_is_excluded_as_a_seed(kg, db_url):
+    """Rows from before 067 can leave the owner a node in each legacy group, both flagged:
+    neither is a hop seed, and the other entities' facts in either group still serve."""
     _owner_world(kg, GROUP)
     _owner_world(kg, PERS)
     _flag(kg, f"own-{GROUP}")
-    r = Recall(db_url, "")
-    assert f"hop-own-{GROUP}" not in _read(r, GROUP)
-    assert f"hop-own-{PERS}" in _read(r, PERS)
+    served = _read(Recall(db_url, ""))
+    assert f"hop-own-{GROUP}" not in served
+    assert f"hop-own-{PERS}" in served
     _flag(kg, f"own-{PERS}")
-    r = Recall(db_url, "")
-    assert f"hop-own-{GROUP}" not in _read(r, GROUP)
-    assert f"hop-own-{PERS}" not in _read(r, PERS)
-    assert f"hop-oth-{PERS}" in _read(r, PERS)
+    served = _read(Recall(db_url, ""))
+    assert f"hop-own-{GROUP}" not in served and f"hop-own-{PERS}" not in served
+    assert {f"hop-oth-{GROUP}", f"hop-oth-{PERS}"} <= served
 
 
 def test_the_flagged_set_is_cached_for_its_ttl(kg, db_url, monkeypatch):
@@ -649,41 +651,39 @@ def no_066(kg, cutover, db_url):
 
 
 PRE_066_PAIRS = ["n-ok", "n-pers", "n-new"]
+NOTHING: dict[str, Any] = {"kg": set(), "pairs": [], "surface": set(), "overlay": {}}
 
 
 def _every_path(r: Recall, ep: int) -> dict[str, Any]:
     allowed = [WORK]
     return {
         "kg": _restricted_kg(r),
-        "pairs": [p["id"] for p in r._fetch_superseded_pairs_pg(GROUP, PRE_066_PAIRS, 10, allowed)],
-        "surface": _uuids(r._surface_supersessions(onehot(1), GROUP, set(), 10, allowed)),
-        "overlay": r._episode_supersessions([ep], GROUP, allowed_projects=allowed),
+        "pairs": [p["id"] for p in r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10, allowed)],
+        "surface": _uuids(r._surface_supersessions(onehot(1), set(), 10, allowed)),
+        "overlay": r._episode_supersessions([ep], allowed_projects=allowed),
     }
 
 
-def test_before_066_restricted_reads_serve_the_provenance_only_facts(no_066, db_url, caplog):
-    """Prod's state until the schema is applied: no label to filter on, so a restricted
-    caller is served what it was served before 066, which is every fact whose provenance
-    is inside the allowlist. No error, no response warning, one log line."""
+def test_before_066_restricted_reads_serve_nothing(no_066, db_url, caplog):
+    """Without the label the only rule left is provenance, which cannot tell a personal fact
+    from a work one, so a restricted caller is served no fact on any path. No error, no
+    response warning, one log line."""
     tx, ep = no_066
     r = _engine_on(tx)
     sink: list[str] = []
     with caplog.at_level(logging.INFO), warn_sink(sink):
         got = _every_path(r, ep)
         again = _every_path(r, ep)
-    assert got == again
-    assert got["kg"] == EVERY
-    assert got["pairs"] == ["f:o-ok", "f:o-pers", "f:o-new"]
-    assert got["surface"] == {"n-ok", "n-pers", "n-new"}
-    assert sorted(got["overlay"][ep]) == ["now new", "now ok", "now pers"]
+    assert got == again == NOTHING
     assert sink == []
     lines = [m for m in caplog.messages if "schema 066" in m]
     assert len(lines) == 1, lines
     assert all(rec.levelno <= logging.WARNING for rec in caplog.records)
 
 
-def test_before_066_the_label_rule_would_have_served_less(no_066):
-    """The control for the test above: with the columns the same data is served less."""
+def test_before_066_the_label_rule_serves_what_the_missing_columns_withhold(no_066):
+    """The control for the test above: with the columns the same data is served by the
+    label rule, so it is the missing columns that withhold it."""
     tx, ep = no_066
     tx.rollback()
     got = _every_path(_engine_on(tx), ep)
@@ -691,7 +691,7 @@ def test_before_066_the_label_rule_would_have_served_less(no_066):
     assert got["pairs"] == ["f:o-ok"]
 
 
-def test_before_066_recall_serves_the_provenance_only_facts(no_066):
+def test_before_066_restricted_recall_serves_no_facts(no_066):
     tx, _ep_id = no_066
     restricted = SurfaceTrust(
         surface_id="dev-restricted", trust="restricted", allowed_projects=(WORK,), known=True
@@ -699,24 +699,24 @@ def test_before_066_recall_serves_the_provenance_only_facts(no_066):
     sink: list[str] = []
     with warn_sink(sink):
         out = _engine_on(tx).recall("widget", trust=restricted)
-    assert {f["id"].removeprefix("f:") for f in out["facts"]} == EVERY
+    assert out["facts"] == []
     assert "warnings" not in out and sink == []
 
 
 def test_before_066_full_trust_is_unchanged(no_066):
     tx, _ep_id = no_066
     r = _engine_on(tx)
-    facts, seeds = r._search_kg("widget", onehot(0), GROUP, [], 20)
+    facts, seeds = r._search_kg("widget", onehot(0), [], 20)
     assert _uuids(facts) == EVERY
     assert [s["uuid"] for s in seeds] == ["seed-ent"]
-    assert len(r._fetch_superseded_pairs_pg(GROUP, PRE_066_PAIRS, 10)) == 3
+    assert len(r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10)) == 3
     assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
 
 
 def test_the_schema_rolled_back_under_a_positive_probe_fails_closed_once(no_066, monkeypatch):
     """The probe said yes, then the columns went away: that call serves nothing (the
     statement names a missing column), the probe flips to missing, and every later call
-    serves the provenance-only rule. A re-probe still finds them gone."""
+    serves nothing too. A re-probe still finds them gone."""
     tx, _ep_id = no_066
     r = _engine_on(tx)
     FACT_AUDIENCE_PROBE._ok[r._db_url] = True
@@ -724,19 +724,19 @@ def test_the_schema_rolled_back_under_a_positive_probe_fails_closed_once(no_066,
     with warn_sink(sink):
         assert _restricted_kg(r) == set()
         assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
-        assert _restricted_kg(r) == EVERY
-        assert r._fetch_superseded_pairs_pg(GROUP, PRE_066_PAIRS, 10, [WORK])
+        assert _restricted_kg(r) == set()
+        assert r._fetch_superseded_pairs_pg(PRE_066_PAIRS, 10, [WORK]) == []
         monkeypatch.setattr(FACT_AUDIENCE_PROBE, "reprobe_s", 0.0)
-        assert _restricted_kg(r) == EVERY
+        assert _restricted_kg(r) == set()
     assert sink == []
 
 
 def test_applying_066_under_a_running_engine_takes_effect_without_a_restart(no_066, monkeypatch):
     tx, _ep_id = no_066
     r = _engine_on(tx)
-    assert _restricted_kg(r) == EVERY
+    assert _restricted_kg(r) == set()
     tx.rollback()  # the migration lands: the columns are there again
-    assert _restricted_kg(r) == EVERY, "a negative probe is trusted until its TTL lapses"
+    assert _restricted_kg(r) == set(), "a negative probe is trusted until its TTL lapses"
     monkeypatch.setattr(FACT_AUDIENCE_PROBE, "reprobe_s", 0.0)
     assert _restricted_kg(r) == SERVED
     assert FACT_AUDIENCE_PROBE.cached(r._db_url) is True
@@ -783,8 +783,8 @@ def test_a_probe_error_on_a_066_database_serves_a_restricted_read_nothing_then_r
     sink: list[str] = []
     with warn_sink(sink):
         blind = _every_path(r, ep)
-        facts, _ = r._search_kg("widget", onehot(0), GROUP, [], 20)
-        assert blind == {"kg": set(), "pairs": [], "surface": set(), "overlay": {}}
+        facts, _ = r._search_kg("widget", onehot(0), [], 20)
+        assert blind == NOTHING
         assert _uuids(facts) == EVERY, "full trust never asks the label question"
         assert FACT_AUDIENCE_PROBE.cached(r._db_url) is None, "a failed probe is not cached"
         broken_probe()
@@ -794,6 +794,34 @@ def test_a_probe_error_on_a_066_database_serves_a_restricted_read_nothing_then_r
     assert healed["surface"] == {"n-ok"}
     assert healed["overlay"] == {ep: ["now ok"]}
     assert sink == []
+
+
+def test_a_probe_that_says_no_serves_a_restricted_read_nothing_and_full_trust_everything(
+    kg, cutover, db_url
+):
+    """The columns are there, but the probe's answer is "not applied": a restricted read
+    must not fall back to the provenance-only rule, which would serve the personal and the
+    post-cutover unlabelled facts too. Full trust never asks, so it is served as before."""
+    _seed_label_matrix(kg, cutover)
+    ep = _ep(kg)
+    _pair(kg, "ok", now="work-safe", old="work-safe", ep=ep)
+    _pair(kg, "pers", now="personal", old="personal", ep=ep)
+    r = _recall_engine(db_url)
+    FACT_AUDIENCE_PROBE.missing(r._db_url)
+    restricted = register_restricted(kg, [WORK])
+    full = register_full(kg)
+    sink: list[str] = []
+    with warn_sink(sink):
+        assert _every_path(r, ep) == NOTHING
+        out = r.recall("widget", surface=restricted)
+        facts, seeds = r._search_kg("widget", onehot(0), [], 20)
+        out_full = r.recall("widget", surface=full)
+    assert FACT_AUDIENCE_PROBE.cached(r._db_url) is False
+    assert out["facts"] == []
+    assert sink == []
+    assert _uuids(facts) == EVERY
+    assert [s["uuid"] for s in seeds] == ["seed-ent"]
+    assert EVERY <= {f["id"].removeprefix("f:") for f in out_full["facts"]}
 
 
 def test_an_unrelated_missing_column_fails_the_call_closed_and_leaves_the_probes_alone(

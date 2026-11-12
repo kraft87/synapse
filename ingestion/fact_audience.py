@@ -39,9 +39,9 @@ The poller's maintenance cycle runs :func:`label_pending`, a clone of
   was before 066.
 
 NULL means "not labelled yet". The write never replaces a label (``audience IS NULL``): a
-concurrent labeller, the personal-pile trigger or a human decision wins. Facts written to the
-personal group are labelled ``personal`` at insert by the schema, so this stage never sees
-them. A usage-limit stop, or a backend that keeps failing, ends the cycle quietly (what was
+concurrent labeller or a human decision wins, and so does the ``personal`` v0 label every fact
+from the old personal pile carries (schema 066 stamped it at insert, 067 kept it when it merged
+the piles), so this stage never sees those. A usage-limit stop, or a backend that keeps failing, ends the cycle quietly (what was
 written stays written, the rest stays NULL) and the poller sits the stage out for a while.
 """
 
@@ -375,8 +375,8 @@ ORDER BY id DESC
 LIMIT %s
 """
 
-# Never overwrites a label: a re-run, a concurrent labeller, the personal-pile trigger or a
-# human decision wins. The columns are out of every index and partial-index predicate, so
+# Never overwrites a label: a re-run, a concurrent labeller, a personal v0 stamp from the old
+# personal pile or a human decision wins. The columns are out of every index and partial-index predicate, so
 # the update can be a heap-only tuple.
 _SET_SQL = """
 UPDATE kg_relationships r

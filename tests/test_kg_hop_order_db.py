@@ -3,8 +3,8 @@
 test_kg_hop_order.py records the statement from a scripted cursor; this file runs it. One
 supernode seed carries more live edges than the per-seed cut, laid out so the answer is
 not the old one: the nearest edges are the OLDEST, an edge with no embedding is the NEWEST,
-and every embedded edge sits at a strictly different distance from the query (the cos/sin
-construction of test_kg_both_groups, so no ties and one possible order). The hop rows are
+and every embedded edge sits at a strictly different distance from the query (a cos/sin
+construction, so no ties and one possible order). The hop rows are
 captured from the statement itself rather than read off the fused facts, because the vector
 leg returns the same edges and would blur what the hop leg picked.
 
@@ -138,9 +138,7 @@ def _hop_rows(db_url: str, allowed_projects: list[str] | None) -> list[list[str]
             return rows
 
     with psycopg.connect(db_url) as c, c.cursor() as cur:
-        kg_pg.search_kg_postgres(
-            _Rec(cur), "q", onehot(0), "default", GROUP, [], 12, allowed_projects
-        )
+        kg_pg.search_kg_postgres(_Rec(cur), "q", onehot(0), "default", [], 12, allowed_projects)
     return hops
 
 

@@ -1,11 +1,10 @@
-// Global/header state. Theme, group, project, source, and token are persisted
+// Global/header state. Theme, project, source, and token are persisted
 // to localStorage (README §State Management). Catalog + live status live here so
 // the header can render them on every page.
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { fetchCatalog, fetchProposals, getToken, clearToken, onAuthFail, type Catalog } from './api';
 import { MOCK } from './mock';
 
-export type Group = 'all' | 'technical' | 'personal';
 export type Page = 'feed' | 'recall' | 'graph' | 'timeline' | 'metrics' | 'review' | 'search';
 
 const ls = {
@@ -18,8 +17,6 @@ interface Store {
   setTokenValue: (t: string | null) => void;
   theme: 'dark' | 'light';
   toggleTheme: () => void;
-  group: Group;
-  setGroup: (g: Group) => void;
   project: string;
   setProject: (p: string) => void;
   source: string;
@@ -52,7 +49,6 @@ export const useStore = (): Store => {
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(() => getToken());
   const [theme, setTheme] = useState<'dark' | 'light'>(() => (ls.get('synapse.theme', 'dark') === 'light' ? 'light' : 'dark'));
-  const [group, setGroupState] = useState<Group>(() => ls.get('synapse.group', 'all') as Group);
   const [project, setProjectState] = useState<string>(() => ls.get('synapse.project', 'all'));
   const [source, setSourceState] = useState<string>(() => ls.get('synapse.source', 'all'));
   const [page, setPage] = useState<Page>('feed');
@@ -82,17 +78,16 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const setTokenValue = useCallback((t: string | null) => { setToken(t); if (!t) clearToken(); }, []);
   const toggleTheme = useCallback(() => setTheme((t) => (t === 'dark' ? 'light' : 'dark')), []);
-  const setGroup = useCallback((g: Group) => { setGroupState(g); ls.set('synapse.group', g); }, []);
   const setProject = useCallback((p: string) => { setProjectState(p); ls.set('synapse.project', p); }, []);
   const setSource = useCallback((s: string) => { setSourceState(s); ls.set('synapse.source', s); }, []);
   const seedGraph = useCallback((uuid: string, name: string) => setGraphSeed({ uuid, name }), []);
   const clearGraphSeed = useCallback(() => setGraphSeed(null), []);
 
   const value = useMemo<Store>(() => ({
-    token, setTokenValue, theme, toggleTheme, group, setGroup, project, setProject,
+    token, setTokenValue, theme, toggleTheme, project, setProject,
     source, setSource, page, setPage, searchQuery, setSearchQuery, catalog, online, setOnline,
     queueDepth, setQueueDepth, reviewPending, setReviewPending, graphSeed, seedGraph, clearGraphSeed,
-  }), [token, theme, group, project, source, page, searchQuery, catalog, online, queueDepth, reviewPending, graphSeed, setTokenValue, toggleTheme, setGroup, setProject, setSource, seedGraph, clearGraphSeed]);
+  }), [token, theme, project, source, page, searchQuery, catalog, online, queueDepth, reviewPending, graphSeed, setTokenValue, toggleTheme, setProject, setSource, seedGraph, clearGraphSeed]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }
