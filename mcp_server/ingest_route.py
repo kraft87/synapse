@@ -184,7 +184,7 @@ def register(
                         private_dropped += 1
                         continue
                     if ep.session_id not in index:
-                        index[ep.session_id] = db.get_session_span_index(ep.session_id)[0]
+                        index[ep.session_id] = db.get_session_span_index(ep.session_id)
                     seen = index[ep.session_id]
                     if not ep.span_id or ep.span_id in seen:
                         continue  # no identity key, or already stored — skip

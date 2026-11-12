@@ -4,8 +4,9 @@ Every stored turn is a row keyed by ``(session_id, sequence)``, and a row carrie
 project and a provenance stamp. The live writers used to work the next number out from
 an earlier read and then upsert, so two writers into one session could pick the same
 number and the second one replaced the first one's text (keeping its project when it
-passed none). ``append_episode`` takes the number inside the INSERT and never rewrites:
-a row's text, project and stamp always belong to one write.
+passed none). ``append_episode`` takes the number inside the INSERT, makes appenders to one session
+take turns on an advisory lock, and never rewrites: a row's text, project and stamp
+always belong to one write.
 
 Runs against the shared Postgres test DB (tagged into the ``db`` xdist group via
 conftest). Every session id starts with a per-test ``append-<hex>-`` prefix and each
@@ -134,9 +135,10 @@ def test_the_span_index_violation_reaches_the_caller(tag, db):
 
 
 def test_a_writer_that_loses_the_number_appends_after_the_winner(tag, conn, db_url):
-    """The collision, made deterministic: another writer holds sequence 1 in an open
-    transaction, so the append's INSERT waits on the index. When that writer commits the
-    append must land at 2 with its own text, project and stamp; the winner's row stays."""
+    """The backstop, made deterministic: a writer outside the session lock (a raw INSERT)
+    holds sequence 1 in an open transaction, so the append's INSERT waits on the index.
+    When that writer commits the INSERT does nothing, is run again, and the append lands
+    at 2 with its own text, project and stamp; the winner's row stays."""
     sid = f"append-{tag}-c"
     outcome: dict = {}
 
@@ -194,20 +196,19 @@ def test_a_writer_that_loses_the_number_appends_after_the_winner(tag, conn, db_u
 
 
 def test_many_appends_at_once_get_distinct_numbers_and_keep_their_own_rows(tag, conn, db_url):
-    """Six writers append together, ten rounds: a barrier starts every round, so each
-    round is six appends in flight for one session. A writer can lose a number only to
-    one of the other five in its round, so no append comes near the attempt bound."""
+    """Six writers append flat out into one session, ten each, after one barrier. They take
+    turns on the session lock, so none loses a number and none runs out of attempts."""
     sid = f"append-{tag}-m"
     writers, per_writer = 6, 10
-    round_start = threading.Barrier(writers)
+    start = threading.Barrier(writers)
     results: list[list[tuple[int, int]]] = [[] for _ in range(writers)]
     errors: list[BaseException] = []
 
     def _writer(w: int) -> None:
         d = Database(db_url)
         try:
+            start.wait(timeout=30)
             for n in range(per_writer):
-                round_start.wait(timeout=30)
                 results[w].append(
                     d.append_episode(
                         Episode(
@@ -242,10 +243,79 @@ def test_many_appends_at_once_get_distinct_numbers_and_keep_their_own_rows(tag, 
             assert stored[seq] == (f"writer {w} turn {n}", f"proj-{w}", f"dev-{w}")
 
 
+def test_an_append_waits_on_the_session_lock_and_lands_after_the_holder(
+    tag, conn, db_url, monkeypatch
+):
+    """Another appender holds the session's advisory lock in an open transaction and has
+    written sequence 1 under it. The append waits on the lock (not on the index), and once
+    the holder commits it lands at 2 on its first try: its INSERT is taken after the lock
+    is granted, so it already sees the holder's row."""
+    sid = f"append-{tag}-l"
+    tries: list[int] = []
+    real = Database._run_episode_sql
+
+    def _counting(self, *args, **kwargs):
+        tries.append(1)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Database, "_run_episode_sql", _counting)
+    outcome: dict = {}
+
+    def _append():
+        d = Database(db_url)
+        try:
+            outcome["ret"] = d.append_episode(
+                Episode(session_id=sid, sequence=1, project="proj-late", content="late text")
+            )
+        except BaseException as exc:  # reported by the assertions below
+            outcome["err"] = exc
+        finally:
+            d.close()
+
+    holder = psycopg.connect(db_url, autocommit=False)
+    thread = threading.Thread(target=_append, daemon=True)
+    try:
+        holder.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", (db_episodes._SESSION_LOCK_KEY + sid,)
+        )
+        holder.execute(
+            "INSERT INTO episodes (session_id, sequence, project, content) "
+            "VALUES (%s, 1, 'proj-holder', 'holder text')",
+            (sid,),
+        )
+        thread.start()
+        deadline = time.monotonic() + 15
+        waiting = 0
+        while thread.is_alive() and time.monotonic() < deadline:
+            waiting = conn.execute(
+                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+                "AND wait_event = 'advisory' AND datname = current_database()"
+            ).fetchone()[0]
+            if waiting:
+                break
+            time.sleep(0.05)
+        assert thread.is_alive(), f"the append did not wait for the lock: {outcome}"
+        assert waiting, "the append never showed up waiting on the advisory lock"
+        holder.commit()
+    finally:
+        holder.rollback()
+        holder.close()
+    thread.join(timeout=15)
+    assert not thread.is_alive(), "the append hung after the holder committed"
+
+    assert "err" not in outcome, outcome.get("err")
+    assert outcome["ret"][1] == 2
+    assert len(tries) == 1
+    assert [r[:3] for r in _rows(conn, sid)] == [
+        (1, "holder text", "proj-holder"),
+        (2, "late text", "proj-late"),
+    ]
+
+
 def test_the_append_gives_up_after_its_bound_and_names_the_session(tag, db, monkeypatch):
     calls: list[dict] = []
 
-    def _never_a_row(self, pre057, stamped, params):
+    def _never_a_row(self, pre057, stamped, params, lock_session=False):
         calls.append(params)
         return None
 
@@ -316,3 +386,25 @@ def test_write_session_episodes_skips_known_spans_and_appends_in_order(tag, conn
     ]
     assert _row(conn, held) == before
     assert _queued(conn, sid) == 2
+
+
+def test_write_session_episodes_copes_with_a_row_that_has_no_span_id(tag, conn, db):
+    """A remember row has no span id. The sweep of a session that holds one must read past
+    it, then append after it."""
+    from ingestion.backfill import _write_session_episodes
+
+    sid = f"append-{tag}-b3"
+    db.append_episode(_parsed(sid, 1, None, "a manual note"))
+    db.append_episode(_parsed(sid, 2, f"jsonl:{tag}-held", "held turn"))
+
+    parsed = [
+        _parsed(sid, 1, f"jsonl:{tag}-held", "held turn again"),
+        _parsed(sid, 2, f"jsonl:{tag}-new", "new turn"),
+    ]
+    assert _write_session_episodes(db, sid, parsed, "proj-default") == 1
+
+    assert [r[:2] for r in _rows(conn, sid)] == [
+        (1, "a manual note"),
+        (2, "held turn"),
+        (3, "new turn"),
+    ]
