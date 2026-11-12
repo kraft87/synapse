@@ -109,8 +109,13 @@ def _tool_result_text(raw: Any) -> str:
 def _extract_blocks(
     message: dict[str, Any], rtype: str
 ) -> tuple[str | None, list[str], list[str], str | None]:
-    """Return (text, tool_use_lines, tool_result_lines, model) from a message."""
-    text: str | None = None
+    """Return (text, tool_use_lines, tool_result_lines, model) from a message.
+
+    ``text`` is every text block of the message, in order, joined by newlines, as the
+    Codex and messages parsers join theirs. In a user record a block of Claude Code
+    machinery is not the user's words and is left out.
+    """
+    texts: list[str] = []
     tool_uses: list[str] = []
     tool_results: list[str] = []
     model = message.get("model") if rtype == "assistant" else None
@@ -121,7 +126,7 @@ def _extract_blocks(
         return (t or None), tool_uses, tool_results, model
 
     if not isinstance(content, list):
-        return text, tool_uses, tool_results, model
+        return None, tool_uses, tool_results, model
 
     for block in content:
         if not isinstance(block, dict):
@@ -129,19 +134,19 @@ def _extract_blocks(
         btype = block.get("type")
         if btype == "text":
             t = str(block.get("text") or block.get("content") or "").strip()
-            if t:
-                text = t
+            if t and not (rtype == "user" and _is_machinery_text(t)):
+                texts.append(t)
         elif btype == "tool_use":
-            name = block.get("name", "tool")
-            detail = _tool_input_detail(block.get("input"))
-            if detail:
-                tool_uses.append(tool_line(name, str(detail)))
+            name = block.get("name") or "tool"
+            detail = str(_tool_input_detail(block.get("input")))
+            if detail.strip():
+                tool_uses.append(tool_line(name, detail))
         elif btype == "tool_result":
             line = result_line(_tool_result_text(block.get("content", "")))
             if line:
                 tool_results.append(line)
 
-    return text, tool_uses, tool_results, model
+    return ("\n".join(texts) or None), tool_uses, tool_results, model
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:

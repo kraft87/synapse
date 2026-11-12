@@ -218,7 +218,7 @@ class TestJSONLGolden:
                 ],
                 "r1",
             ),
-            # Two text blocks: jsonl keeps only the last.
+            # Two text blocks: joined by a newline, as codex and messages join theirs.
             r(
                 "assistant",
                 [{"type": "text", "text": "draft"}, {"type": "text", "text": "One file."}],
@@ -251,9 +251,9 @@ class TestJSONLGolden:
             "[tool:Bash]   ls -la  \n\n"
             "[assistant] Let me look.\n\n"
             "[result] total 2\n-rw-r--r-- 1 u u 0 notes.txt\n\n"
-            "[assistant] One file."
+            "[assistant] draft\nOne file."
         )
-        assert eps[1].content == "[context] One file.\n\n[assistant] Feedback sent."
+        assert eps[1].content == "[context] draft\nOne file.\n\n[assistant] Feedback sent."
         assert eps[2].content == (
             "[context] Feedback sent.\n\n[user] thanks\n\n[assistant] " + "A" * 3000
         )
@@ -263,11 +263,89 @@ class TestJSONLGolden:
         eps = JSONLParser().parse_records(self._records(), "golden")
         assert [e.human_turn for e in eps] == ["list the files", None, "thanks", "bye"]
         assert [e.assistant_turn for e in eps] == [
-            "One file.",
+            "draft\nOne file.",
             "Feedback sent.",
             "A" * 3001,  # the full text, not the capped line
             None,
         ]
+
+
+class TestJSONLBlocks:
+    """What one record's blocks become. Claude Code writes one block to a record, so
+    these shapes come from other writers of the same format."""
+
+    @staticmethod
+    def _rec(rtype: str, content, uuid: str) -> dict:
+        return {
+            "type": rtype,
+            "uuid": uuid,
+            "sessionId": "s-blocks",
+            "message": {"role": rtype, "content": content},
+            "cwd": "/home/user/dev/proj",
+            "timestamp": "2026-11-12T10:00:00Z",
+        }
+
+    def _one(self, records: list[dict]):
+        eps = JSONLParser().parse_records(records, "blocks")
+        assert len(eps) == 1
+        return eps[0]
+
+    def test_every_assistant_text_block_is_kept_in_order(self):
+        blocks = [{"type": "text", "text": t} for t in ("one", "  ", "two", "three")]
+        ep = self._one([self._rec("user", "go", "u1"), self._rec("assistant", blocks, "a1")])
+        assert ep.content == "[user] go\n\n[assistant] one\ntwo\nthree"
+        assert ep.assistant_turn == "one\ntwo\nthree"
+
+    def test_every_user_text_block_is_kept_in_order(self):
+        blocks = [{"type": "text", "text": "first part"}, {"type": "text", "text": "second"}]
+        ep = self._one([self._rec("user", blocks, "u1")])
+        assert ep.human_turn == "first part\nsecond"
+        assert ep.content == "[user] first part\nsecond"
+
+    def test_a_machinery_block_is_not_the_users_words(self):
+        # The last block used to win, so the reminder replaced the question.
+        blocks = [
+            {"type": "text", "text": "what changed?"},
+            {"type": "text", "text": "<system-reminder>internal</system-reminder>"},
+        ]
+        ep = self._one([self._rec("user", blocks, "u1")])
+        assert ep.human_turn == "what changed?"
+        assert "system-reminder" not in ep.content
+
+    def test_an_assistant_block_that_quotes_machinery_is_kept(self):
+        blocks = [{"type": "text", "text": "<system-reminder> is a tag"}]
+        ep = self._one([self._rec("user", "go", "u1"), self._rec("assistant", blocks, "a1")])
+        assert ep.assistant_turn == "<system-reminder> is a tag"
+
+    def test_a_null_tool_name_renders_as_tool(self):
+        call = [{"type": "tool_use", "name": None, "input": {"command": "ls"}}]
+        ep = self._one([self._rec("user", "go", "u1"), self._rec("assistant", call, "a1")])
+        assert ep.content == "[user] go\n\n[tool:tool] ls"
+
+    def test_a_blank_tool_detail_gets_no_line(self):
+        calls = [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "  \n "}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "  ls  "}},
+        ]
+        ep = self._one([self._rec("user", "go", "u1"), self._rec("assistant", calls, "a1")])
+        # A detail with text keeps its own spacing: only an all-blank one is dropped.
+        assert ep.content == "[user] go\n\n[tool:Bash]   ls  "
+
+
+class TestCodexToolNames:
+    def test_a_null_name_falls_back_to_the_call_kind(self):
+        from ingestion.codex_client import _tool_call_line
+
+        custom = {"type": "custom_tool_call", "name": None, "input": "x"}
+        function = {"type": "function_call", "name": None, "arguments": "{}"}
+        assert _tool_call_line(custom) == "[tool:tool] x"
+        assert _tool_call_line(function) == "[tool:function] {}"
+
+    def test_a_given_name_is_kept(self):
+        from ingestion.codex_client import _tool_call_line
+
+        call = {"type": "function_call", "name": "shell", "arguments": "{}"}
+        assert _tool_call_line(call) == "[tool:shell] {}"
 
 
 class TestCodexGolden:
