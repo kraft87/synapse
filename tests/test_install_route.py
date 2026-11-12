@@ -340,6 +340,10 @@ def test_bundle_carries_both_real_client_trees():
         "plugin/scripts/synapse_run.py",
         "plugin/scripts/synapse_cli.py",
         "plugin/scripts/synapse_home.py",
+        # The client core, its data file, and the resolver the hooks reach through it.
+        "plugin/synapse_client/__init__.py",
+        "plugin/synapse_client/project.py",
+        "plugin/synapse_client/tool_schemas.json",
         "plugin-codex/install.py",
         "plugin-codex/scripts/common.py",
     ):
