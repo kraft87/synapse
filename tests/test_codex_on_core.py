@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import io
 import json
+import os
+import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -102,6 +106,7 @@ def scratch(monkeypatch, tmp_path) -> Iterator[Path]:
     home = scratch_user(monkeypatch, tmp_path)
     monkeypatch.setenv("SYNAPSE_CODEX_HOOK_LOG", str(tmp_path / "codex-hook.log"))
     monkeypatch.setenv("SYNAPSE_CODEX_CURSORS", str(tmp_path / "codex_cursors.json"))
+    monkeypatch.setenv("SYNAPSE_CODEX_CATCHUP", "0")  # no detached sweep from a test
     monkeypatch.setattr(sys, "path", list(sys.path))
     saved = sys.modules.get("common")
     yield home
@@ -363,3 +368,219 @@ def test_install_writes_the_branch_point_blocks_byte_for_byte(layout, tmp_path, 
     expected = {"checkout": _INSTALLED_CHECKOUT, "managed": _INSTALLED_MANAGED}[layout]
     assert installer.CONFIG_PATH.read_bytes() == expected.encode("utf-8")
     capsys.readouterr()
+
+
+# ---------------------------------------------------------------------------
+# session_start.py: the core's session block, fetched side by side under a deadline
+# ---------------------------------------------------------------------------
+
+_SESSION_START = _CODEX / "hooks" / "session_start.py"
+_STALE = "tkSTALEenvXq81Lm"
+_WARNING = "[Synapse] uploads have been failing since yesterday (connection refused)."
+_BOARD = {"status": "ok", "text": "[Synapse board]\n- a note"}
+_PREFS = {"items": [{"pref": "short answers", "polarity": "like"}]}
+_PREFS_TEXT = "[Synapse preferences]\n  - (likes) short answers"
+
+
+def _enroll(home: Path, server_url: str) -> None:
+    """config.json as `synapse login` leaves it: URL, device token, enrollment record."""
+    use_core()
+    from synapse_client.credentials import token_sha256
+
+    record = {
+        "surface_id": _SURFACE_ID,
+        "token_sha256": token_sha256(_TOKEN),
+        "server": server_url,
+    }
+    _write_config(home, {"url": server_url, "token": _TOKEN, "device": record})
+
+
+def _start(monkeypatch, cwd: Path, *, warning: str | None = None) -> ModuleType:
+    hook = _load("codex_session_start_on_core", _SESSION_START)
+    monkeypatch.setattr(hook, "_upload_warning", lambda: warning)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"cwd": str(cwd)})))
+    return hook
+
+
+def _printed(capsys) -> dict[str, Any] | None:
+    out = capsys.readouterr().out
+    return json.loads(out) if out.strip() else None
+
+
+def test_session_start_order_is_notice_warning_board_preferences(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    _enroll(scratch, server.url)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _STALE)  # overridden: the notice leads
+    server.answer("/context", _BOARD)
+    server.answer("/preferences/top", _PREFS)
+    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
+    hook.main()
+    out = _printed(capsys)
+    notice = (
+        f"[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "
+        f"enrolled as {_SURFACE_ID}. Remove it from your shell profile or wherever Codex "
+        "inherits it."
+    )
+    assert out == {
+        "systemMessage": _WARNING,
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": "\n\n".join((notice, _WARNING, _BOARD["text"], _PREFS_TEXT)),
+        },
+    }
+    assert sorted(r["path"].split("?")[0] for r in server.seen) == ["/context", "/preferences/top"]
+    for req in server.seen:
+        assert req["headers"]["authorization"] == f"Bearer {_TOKEN}"
+        assert req["headers"]["user-agent"] == _user_agent()
+
+
+def test_session_start_explains_a_machine_that_is_not_enrolled(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", {"detail": "unauthorized"}, status=401)
+    server.answer("/preferences/top", {"detail": "unauthorized"}, status=401)
+    hook = _start(monkeypatch, tmp_path)
+    hook.main()
+    text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
+    assert text == hook.context.not_enrolled_block(hook.context.DEFAULT_LOGIN_HINT)
+    assert text.startswith("[Synapse — this machine is not enrolled]")
+    assert "Run `synapse login` in a terminal and approve the sign-in" in text
+
+
+def test_session_start_explains_a_restricted_caller(scratch, monkeypatch, tmp_path, server, capsys):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", {"status": "ok", "trust": "restricted", "text": "[empty board]"})
+    server.answer("/preferences/top", {"items": []})
+    hook = _start(monkeypatch, tmp_path)
+    hook.main()
+    text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
+    restricted = hook.context.restricted_block(hook.context.DEFAULT_LOGIN_HINT)
+    assert text == f"{restricted}\n\n[empty board]"
+    assert "Server with a sign-in configured: run `synapse login` in a terminal." in text
+
+
+@pytest.mark.parametrize("switch", ["SYNAPSE_BOARD", "SYNAPSE_PREFS_BLOCK"])
+def test_session_start_kill_switches_skip_the_request(
+    scratch, monkeypatch, tmp_path, server, capsys, switch
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _BOARD)
+    server.answer("/preferences/top", _PREFS)
+    hook = _start(monkeypatch, tmp_path)
+    monkeypatch.setenv(switch, "0")  # read when the hook runs, as before
+    hook.main()
+    text = _printed(capsys)["hookSpecificOutput"]["additionalContext"]
+    paths = [r["path"].split("?")[0] for r in server.seen]
+    if switch == "SYNAPSE_BOARD":
+        assert (text, paths) == (_PREFS_TEXT, ["/preferences/top"])
+    else:
+        assert (text, paths) == (_BOARD["text"], ["/context"])
+
+
+@pytest.mark.parametrize("value", ["0", "1"])
+def test_session_start_catchup_kill_switch(scratch, monkeypatch, tmp_path, capsys, value):
+    monkeypatch.setenv("SYNAPSE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("SYNAPSE_CODEX_CATCHUP", value)
+    hook = _start(monkeypatch, tmp_path)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr(hook.subprocess, "Popen", lambda cmd, **kw: spawned.append(cmd))
+    hook.main()
+    assert [cmd[-2] for cmd in spawned] == ([] if value == "0" else ["--catchup"])
+
+
+def test_session_start_prints_nothing_with_nothing_to_say(scratch, monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("SYNAPSE_URL", "http://127.0.0.1:9")  # nothing listens
+    hook = _start(monkeypatch, tmp_path)
+    hook.main()
+    assert capsys.readouterr().out == ""
+
+
+def test_session_start_envelope_without_a_warning_has_no_system_message(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _BOARD)
+    server.answer("/preferences/top", {"items": []})
+    hook = _start(monkeypatch, tmp_path)
+    hook.main()
+    assert _printed(capsys) == {
+        "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": _BOARD["text"]}
+    }
+
+
+def test_session_start_prints_what_arrived_when_one_request_fails(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _BOARD)
+    server.answer("/preferences/top", {"detail": "boom"}, status=500)
+    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
+    hook.main()
+    out = _printed(capsys)
+    assert out["hookSpecificOutput"]["additionalContext"] == f"{_WARNING}\n\n{_BOARD['text']}"
+
+
+def test_session_start_stops_waiting_at_its_deadline(
+    scratch, monkeypatch, tmp_path, server, capsys
+):
+    """The preferences request hangs past the deadline; the board answered in time and
+    is printed, and the hook does not wait out the hung request."""
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/context", _BOARD)
+    server.answer("/preferences/top", _PREFS, delay=30)
+    hook = _start(monkeypatch, tmp_path, warning=_WARNING)
+    monkeypatch.setattr(hook, "_FETCH_TIMEOUT", 30.0)  # only the deadline can stop it
+    monkeypatch.setattr(hook, "_DEADLINE_S", 1.0)
+    monkeypatch.setattr(hook, "_STARTED", time.monotonic())
+    began = time.monotonic()
+    hook.main()
+    assert time.monotonic() - began < 3
+    out = _printed(capsys)
+    assert out["hookSpecificOutput"]["additionalContext"] == f"{_WARNING}\n\n{_BOARD['text']}"
+
+
+def test_session_start_skills_sync_shares_the_deadline(scratch, monkeypatch, tmp_path):
+    monkeypatch.setenv("SYNAPSE_SKILLS_SYNC", "1")
+    hook = _start(monkeypatch, tmp_path)
+    seen: list[float] = []
+    monkeypatch.setattr(hook.subprocess, "run", lambda cmd, **kw: seen.append(kw["timeout"]))
+    monkeypatch.setattr(hook, "_STARTED", time.monotonic() - 10)  # 5 s left of 15
+    hook._sync_skills(str(tmp_path))
+    assert 4 < seen[0] <= 5
+    monkeypatch.setattr(hook, "_STARTED", time.monotonic() - 20)  # past the deadline
+    hook._sync_skills(str(tmp_path))
+    assert len(seen) == 1
+
+
+_HUNG_RUN = """
+import importlib.util, io, sys, time
+spec = importlib.util.spec_from_file_location("codex_session_start", sys.argv[1])
+hook = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hook)
+hook._FETCH_TIMEOUT = 60.0
+hook._DEADLINE_S = 1.0
+hook._STARTED = time.monotonic()
+sys.stdin = io.StringIO("{}")
+hook.main()
+"""
+
+
+def test_a_hung_server_does_not_hold_the_hook_process(scratch, tmp_path, server):
+    """Both requests hang: the process prints and exits at the deadline, without waiting
+    for the request threads (they are daemons)."""
+    server.answer("/context", _BOARD, delay=60)
+    server.answer("/preferences/top", _PREFS, delay=60)
+    env = {**os.environ, "SYNAPSE_URL": server.url}
+    began = time.monotonic()
+    proc = subprocess.run(
+        [sys.executable, "-c", _HUNG_RUN, str(_SESSION_START)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert time.monotonic() - began < 10
+    assert proc.stdout == ""
