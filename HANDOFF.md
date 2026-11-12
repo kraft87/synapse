@@ -3,6 +3,59 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — client: Hermes gets Synapse as its memory provider; the CLI walks one harness list (plugin 0.24.0)
+
+**What changed**
+
+- **A Hermes adapter on the client core** (`plugin/synapse_client/harnesses/hermes/`): a
+  `MemoryProvider` with the board and preferences in the system prompt, the recall nudge
+  each turn, the six memory tools proxied to MCP `tools/call`, and every finished turn
+  uploaded to `/ingest` in the `messages` format (client `hermes`, source `hermes-sync`).
+  Failed uploads wait in `$HERMES_HOME/synapse/outbox/`. No server change: the `messages`
+  format landed in #251.
+- **Local sessions only.** The provider is active for a primary session on the Hermes
+  CLI, TUI, Desktop or ACP with no chat identity. Cron jobs get the tools only; gateway
+  (chat-platform) sessions, the API server and subagents get nothing, and a tool call
+  there returns an error. The rule and the Hermes source lines it rests on:
+  `docs/client-harnesses.md`.
+- **`synapse install hermes [--hermes-home PATH] [--replace]`** builds
+  `$HERMES_HOME/plugins/synapse/` (a copy of the core plus `harnesses/hermes/`, swapped in
+  whole) and selects `memory.provider: synapse`. Another external provider already selected
+  is left alone unless `--replace`. The `hermes` program is only run on a home that already
+  has a `config.yaml`; a home without one gets a new two-line file.
+- **The CLI walks one list** (`harness.harnesses()`): Claude Code and Codex wrapped over
+  their old functions, then the core's registry. `synapse login` and `synapse install`
+  wire Hermes when they find it, `synapse update` rebuilds the Hermes folder when it is
+  wired, and the new `synapse status` prints a line per harness. Claude Code and Codex
+  behave and print exactly as before.
+
+**On each machine**
+
+1. `synapse update` (the server must serve 0.24.0 first: merge, then the image).
+2. On a machine with Hermes: `synapse login` (re-wires, no new sign-in) or
+   `synapse install hermes`; for a Hermes profile, add `--hermes-home <profile home>`.
+   Restart Hermes. `synapse status` should print `Hermes: wired`.
+3. If the report says another provider was left selected, decide: `--replace`, or keep it
+   (Hermes runs one external provider at a time).
+
+**Proven**
+
+- Full non-db suite: 3457 passed, 32 skipped.
+- `tests/test_hermes_integration.py` against a real Hermes checkout
+  (`SYNAPSE_HERMES_CHECKOUT=~/workspace/hermes-agent`): Hermes's own loader and
+  `MemoryManager` through initialize, system prompt, prefetch, a tool call, two synced
+  turns, pre-compress, session end and shutdown, with plugins in-process and with
+  `plugins.isolation: host`. The fake server's bodies, parsed by the route's own
+  `MessagesParser`, are four turns each stored once; no connection left the loopback
+  address; the temp Hermes home stayed at about 145 KB.
+
+**Open**
+
+- Not ported to Hermes: the remember spool, the recall-feedback nudge, a private-mode
+  command, skills and config sync, a `state.db` history importer, and any gateway session.
+- Claude Code's hooks and Codex's still carry their own config and HTTP code; moving them
+  onto the core is next, Codex first.
+
 ## 2026-11-07 — dream→config lane: identity by meaning, a coverage gate, a queue that tends itself (plugin 0.23.1, schema 065)
 
 **What changed**
