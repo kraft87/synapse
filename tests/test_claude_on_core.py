@@ -1,7 +1,8 @@
 """The Claude Code hooks on the client core (plugin/scripts over plugin/synapse_client).
 
 config.py resolves every setting on the core and sends through its Transport; the hook
-scripts print what the core builds. What a Claude Code user sees is pinned here
+scripts print what the core builds, and the Stop hook uploads through the Transport and
+asks the core about private mode. What a Claude Code user sees is pinned here
 literally: the resolution ranking, the token rules, each notice byte for byte, and each
 hook's output for a normal reply, a 401, a restricted caller, a 500 and its kill switch.
 
