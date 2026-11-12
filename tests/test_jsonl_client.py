@@ -206,7 +206,7 @@ class TestParseFile:
         assert "[result]" in ep0.content
         assert "[assistant] Here are the files" in ep0.content
         assert ep0.project == "synapse"
-        assert ep0.span_id == "jsonl:a2"
+        assert ep0.span_id == "claude_code:a2"
         assert ep0.source == "jsonl"
 
     def test_second_episode_has_context_prefix(self, tmp_path: Path):

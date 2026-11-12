@@ -107,15 +107,14 @@ class TestValidClient:
         assert not valid_client(name)
 
     def test_reserved_set(self):
-        # The other parsers' platforms, plus the span-id prefixes not already among them.
+        # The platforms the other parsers stamp. Their span-id prefixes need no entries of
+        # their own: test_span_prefix_is_platform pins each prefix to its platform.
         assert RESERVED_CLIENTS == {
             "claude_code",
             "codex",
             "cursor",
             "chatgpt",
             "claude_ai",
-            "jsonl",
-            "openai",
         }
 
     def test_parser_refuses_a_reserved_client(self):

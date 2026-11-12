@@ -319,7 +319,7 @@ class JSONLParser:
             if not session_id or not content_parts[1 if prev_assistant else 0 :]:
                 continue
 
-            span_id = f"jsonl:{last_uuid}" if last_uuid else None
+            span_id = f"claude_code:{last_uuid}" if last_uuid else None
             if span_id is not None:
                 if span_id in seen_span_ids:
                     continue  # repeated turn (compaction re-dump) — already emitted

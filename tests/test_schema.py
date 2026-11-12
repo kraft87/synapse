@@ -436,7 +436,7 @@ def test_066_is_optional_and_067_required_and_both_registered():
 
     assert is_optional_migration(_SCHEMA_066)
     assert not is_optional_migration(_SCHEMA_067)
-    assert required_schema_version() == "067"
+    assert required_schema_version() >= "067"  # a later required migration raises it
     script = (_SCHEMA_DIR.parent / "scripts" / "apply_schema.sh").read_text()
     assert script.index(_SCHEMA_066.name) < script.index(_SCHEMA_067.name)
 
