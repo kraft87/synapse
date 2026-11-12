@@ -747,6 +747,15 @@ def restore(conn: Any, day: str, *, write: bool) -> dict[str, int]:
         if not backed:
             raise SystemExit(f"no backup tables for {day}")
         now_cols = {r[0] for r in conn.execute(cols_sql, ("kg_entities",))}
+        if "group_id" in backed and "group_id" not in now_cols:
+            # Taken before one memory (067 merged the two groups, 069 dropped the column):
+            # its rows name entities the merge folded into others, and re-creating them
+            # would split those entities again.
+            raise SystemExit(
+                f"the backup tables for {day} were taken before one memory: they carry "
+                "group_id and kg_entities no longer does. Restoring them would bring back "
+                "entities the merge folded away, so this backup cannot be restored."
+            )
         cols = sql.SQL(", ").join(sql.Identifier(c) for c in backed if c in now_cols)
         cur = conn.execute(
             sql.SQL(

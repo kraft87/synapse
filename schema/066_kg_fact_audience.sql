@@ -78,23 +78,46 @@ BEGIN
 END
 $$;
 DROP TRIGGER IF EXISTS kg_rel_personal_audience ON kg_relationships;
-CREATE TRIGGER kg_rel_personal_audience
-    BEFORE INSERT ON kg_relationships
-    FOR EACH ROW
-    WHEN (NEW.group_id = 'personal' AND NEW.audience IS NULL)
-    EXECUTE FUNCTION kg_relationships_personal_audience_trg();
+-- The trigger, the seed and the one-self index below name group_id, which 069 drops: each
+-- runs only while the column exists.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_relationships'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE TRIGGER kg_rel_personal_audience
+            BEFORE INSERT ON kg_relationships
+            FOR EACH ROW
+            WHEN (NEW.group_id = 'personal' AND NEW.audience IS NULL)
+            EXECUTE FUNCTION kg_relationships_personal_audience_trg();
+    END IF;
+END
+$$;
 
 -- Seed: every personal-pile fact, live and retired, is personal. The trigger is in
 -- place first, so nothing inserted while this runs is missed.
-UPDATE kg_relationships
-   SET audience = 'personal', label_version = 0
- WHERE group_id = 'personal' AND audience IS NULL;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_relationships'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        UPDATE kg_relationships
+           SET audience = 'personal', label_version = 0
+         WHERE group_id = 'personal' AND audience IS NULL;
+    END IF;
+END
+$$;
 
 ALTER TABLE kg_entities ADD COLUMN IF NOT EXISTS is_self BOOLEAN NOT NULL DEFAULT false;
 -- One flagged entity per (owner_id, group_id): an install whose facts still sit in two
 -- piles flags the owner's node in each.
-CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_one_self
-    ON kg_entities (owner_id, group_id) WHERE is_self;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_entities'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_one_self
+            ON kg_entities (owner_id, group_id) WHERE is_self;
+    END IF;
+END
+$$;
 
 -- The seed touches too few rows to trigger autovacuum's analyze, so without this `audience`
 -- has no statistics until the labeller has written many rows, and the planner guesses

@@ -4,11 +4,12 @@ All tests should pass once scripts/apply_schema.sh has been applied.
 """
 
 import shutil
-import subprocess
 from pathlib import Path
 
 import psycopg
 import pytest
+
+from tests.helpers import one_memory_states as states
 
 # ---------------------------------------------------------------------------
 # Extensions
@@ -21,17 +22,19 @@ def _clean(clean_tables):
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _database_at_067(conn, db_url):
-    """The tests below read what 067 leaves (no insert trigger, the group defaults, the owner-only
-    indexes). conftest applies no schema, and a 066 re-run, here or from another checkout's suite
-    on the same database, puts the 066 trigger back; apply 067 first when it is not in place (a
-    re-run of a finished file changes nothing)."""
-    stamp = conn.execute("SELECT value FROM synapse_meta WHERE key = 'schema_version'").fetchone()
-    trigger = conn.execute(
-        "SELECT 1 FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'"
+def _database_past_069(conn, db_url):
+    """The tests below read what 067 and 069 leave (no insert trigger, no group column, the
+    owner-only indexes). conftest applies no schema, and a test elsewhere that rebuilt an older
+    state and stopped before putting it back would leave the column there; finish 067 and 069
+    first when it is (a re-run of a finished file changes nothing)."""
+    column = conn.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = 'public' AND column_name = 'group_id' AND table_name = ANY(%s)",
+        (list(states.TABLES),),
     ).fetchone()
-    if stamp is None or stamp[0] < "067" or trigger:
-        _apply_067(db_url)
+    stamp = states.stamp(conn)
+    if column or stamp is None or stamp < "069":
+        states.to_069(conn, db_url, stamp)
 
 
 def test_pgvector_extension(conn):
@@ -313,11 +316,6 @@ _CUTOVER_SQL = "SELECT value FROM synapse_meta WHERE key = 'fact_audience_legacy
 
 def _wipe_kg(conn) -> None:
     conn.execute("TRUNCATE kg_relationships, kg_entities RESTART IDENTITY CASCADE")
-    # a 067 run on a re-applied 066 leaves its ledger behind (tests/test_pile_merge_067_db.py owns that)
-    for (t,) in conn.execute(
-        "SELECT tablename FROM pg_tables WHERE tablename LIKE 'kg_pile_merge_067_%'"
-    ).fetchall():
-        conn.execute(f'DROP TABLE IF EXISTS "{t}"')
 
 
 @pytest.fixture()
@@ -328,19 +326,27 @@ def kg_rows(conn):
     _wipe_kg(conn)
 
 
-def _fact(conn, uid: str, group: str, audience: str | None = None):
+def _fact(conn, uid: str, audience: str | None = None):
     return conn.execute(
-        "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact, audience) "
-        "VALUES (%s, %s, 'a', 'b', 'f', %s) RETURNING audience, label_version",
-        (uid, group, audience),
+        "INSERT INTO kg_relationships (uuid, src_uuid, tgt_uuid, fact, audience) "
+        "VALUES (%s, 'a', 'b', 'f', %s) RETURNING audience, label_version",
+        (uid, audience),
     ).fetchone()
 
 
-def _entity(conn, uid: str, group: str, *, owner: str = "default", flag: bool = False) -> None:
+def _fact_in(conn, uid: str, group: str) -> None:
+    """A fact written into a group, on a database from before 069 dropped the column."""
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, is_self) "
-        "VALUES (%s, %s, %s, 'n', %s)",
-        (uid, owner, group, flag),
+        "INSERT INTO kg_relationships (uuid, group_id, src_uuid, tgt_uuid, fact) "
+        "VALUES (%s, %s, 'a', 'b', 'f')",
+        (uid, group),
+    )
+
+
+def _entity(conn, uid: str, *, owner: str = "default", flag: bool = False) -> None:
+    conn.execute(
+        "INSERT INTO kg_entities (uuid, owner_id, name, is_self) VALUES (%s, %s, 'n', %s)",
+        (uid, owner, flag),
     )
 
 
@@ -363,11 +369,11 @@ def test_fact_audience_columns_exist_with_the_documented_types(conn):
 
 
 def test_the_audience_vocabulary_is_the_notes_one(kg_rows):
-    _fact(kg_rows, "w", "technical", "work-safe")
-    _fact(kg_rows, "p", "technical", "personal")
-    assert _fact(kg_rows, "n", "technical") == (None, None)
+    _fact(kg_rows, "w", "work-safe")
+    _fact(kg_rows, "p", "personal")
+    assert _fact(kg_rows, "n") == (None, None)
     with pytest.raises(psycopg.errors.CheckViolation):
-        _fact(kg_rows, "bad", "technical", "private")
+        _fact(kg_rows, "bad", "private")
 
 
 def test_the_cutover_is_stamped_as_a_row_id(conn):
@@ -375,9 +381,9 @@ def test_the_cutover_is_stamped_as_a_row_id(conn):
     assert row is not None and row[0].isdigit()
 
 
-def test_067_dropped_the_personal_insert_trigger_so_no_group_is_labelled_on_insert(kg_rows):
-    """066 labelled every insert into the personal group; 067 merged that pile, dropped the
-    trigger and the function, and keeps no group special."""
+def test_067_dropped_the_personal_insert_trigger_so_no_insert_is_labelled(kg_rows):
+    """066 labelled every insert into the personal group; 067 merged that pile and dropped the
+    trigger and the function, and 069 dropped the group column."""
     assert (
         kg_rows.execute(
             "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'"
@@ -390,19 +396,8 @@ def test_067_dropped_the_personal_insert_trigger_so_no_group_is_labelled_on_inse
         ).fetchone()[0]
         == 0
     )
-    assert _fact(kg_rows, "p1", "personal") == (None, None)
-    assert _fact(kg_rows, "t1", "technical") == (None, None)
-    assert _fact(kg_rows, "p2", "personal", "work-safe") == ("work-safe", None)
-
-
-@pytest.mark.parametrize("table", ["kg_entities", "kg_relationships", "notes", "preferences"])
-def test_067_makes_technical_the_default_group_of_every_row(conn, table):
-    default = conn.execute(
-        "SELECT column_default FROM information_schema.columns "
-        "WHERE table_name = %s AND column_name = 'group_id'",
-        (table,),
-    ).fetchone()
-    assert default == ("'technical'::text",)
+    assert _fact(kg_rows, "f1") == (None, None)
+    assert _fact(kg_rows, "f2", "work-safe") == ("work-safe", None)
 
 
 def test_067_built_the_owner_only_indexes_valid(conn):
@@ -415,17 +410,16 @@ def test_067_built_the_owner_only_indexes_valid(conn):
     assert valid == {"kg_rel_pair_any": True, "kg_rel_tgt_any": True, "kg_entities_norm_any": True}
 
 
-def test_the_owner_flag_defaults_off_and_is_unique_per_owner_and_group(kg_rows):
-    _entity(kg_rows, "e0", "technical")
+def test_the_owner_flag_defaults_off_and_is_unique_per_owner(kg_rows):
+    _entity(kg_rows, "e0")
     assert kg_rows.execute("SELECT is_self FROM kg_entities WHERE uuid = 'e0'").fetchone() == (
         False,
     )
-    _entity(kg_rows, "e1", "technical", flag=True)
-    _entity(kg_rows, "e2", "elsewhere", flag=True)  # one per group (067 leaves the index as it was)
-    _entity(kg_rows, "e3", "technical", owner="someone-else", flag=True)  # one per owner
-    _entity(kg_rows, "e4", "technical")  # unflagged rows are not limited
+    _entity(kg_rows, "e1", flag=True)
+    _entity(kg_rows, "e3", owner="someone-else", flag=True)  # one per owner
+    _entity(kg_rows, "e4")  # unflagged rows are not limited
     with pytest.raises(psycopg.errors.UniqueViolation):
-        _entity(kg_rows, "e5", "technical", flag=True)
+        _entity(kg_rows, "e5", flag=True)
 
 
 def test_066_is_optional_and_067_required_and_both_registered():
@@ -441,11 +435,7 @@ def test_066_is_optional_and_067_required_and_both_registered():
 def _apply(db_url: str, path: Path) -> None:
     if shutil.which("psql") is None:  # pragma: no cover - CI installs the client
         pytest.skip("psql not installed")
-    subprocess.run(
-        ["psql", db_url, "-q", "-v", "ON_ERROR_STOP=1", "-f", str(path)],
-        check=True,
-        capture_output=True,
-    )
+    states.psql(db_url, path)
 
 
 def _apply_066(db_url: str) -> None:
@@ -461,13 +451,16 @@ def _apply_067(db_url: str) -> None:
 def test_a_rerun_of_066_never_moves_the_cutover_and_reseeds_a_straggling_personal_row(
     kg_rows, db_url
 ):
-    """066 on a database already at 067 seeds the personal rows old code wrote since, and puts
-    its insert trigger back; 067 then regroups them (keeping the label) and drops the trigger."""
-    stamp = kg_rows.execute(_CUTOVER_SQL).fetchone()
-    _fact(kg_rows, "t1", "technical")
-    _fact(kg_rows, "p1", "personal")
-    kg_rows.execute("UPDATE kg_relationships SET audience = NULL, label_version = NULL")
+    """066 on a database at 068 (the group column still there) seeds the personal rows old
+    code wrote since, and puts its insert trigger back; 067 then regroups them (keeping the
+    label) and drops the trigger."""
+    before = states.stamp(kg_rows)
     try:
+        states.to_068(kg_rows, db_url)
+        stamp = kg_rows.execute(_CUTOVER_SQL).fetchone()
+        _fact_in(kg_rows, "t1", "technical")
+        _fact_in(kg_rows, "p1", "personal")
+        kg_rows.execute("UPDATE kg_relationships SET audience = NULL, label_version = NULL")
         _apply_066(db_url)
         _apply_066(db_url)
         assert kg_rows.execute(_CUTOVER_SQL).fetchone() == stamp
@@ -475,37 +468,40 @@ def test_a_rerun_of_066_never_moves_the_cutover_and_reseeds_a_straggling_persona
             "SELECT uuid, audience, label_version FROM kg_relationships"
         ).fetchall()
         assert dict((u, (a, v)) for u, a, v in rows) == {"t1": (None, None), "p1": ("personal", 0)}
+        _apply_067(db_url)
+        rows = kg_rows.execute(
+            "SELECT uuid, group_id, audience, label_version FROM kg_relationships"
+        ).fetchall()
+        assert {r[0]: r[1:] for r in rows} == {
+            "t1": ("technical", None, None),
+            "p1": ("technical", "personal", 0),
+        }
+        assert (
+            kg_rows.execute(
+                "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'"
+            ).fetchone()[0]
+            == 0
+        )
     finally:
-        _apply_067(db_url)  # 066 put its insert trigger back, whatever the assertions said
-    rows = kg_rows.execute(
-        "SELECT uuid, group_id, audience, label_version FROM kg_relationships"
-    ).fetchall()
-    assert {r[0]: r[1:] for r in rows} == {
-        "t1": ("technical", None, None),
-        "p1": ("technical", "personal", 0),
-    }
-    assert (
-        kg_rows.execute(
-            "SELECT count(*) FROM pg_trigger WHERE tgname = 'kg_rel_personal_audience'"
-        ).fetchone()[0]
-        == 0
-    )
+        states.to_069(kg_rows, db_url, before)
 
 
 def test_066_leaves_statistics_on_the_label_column(kg_rows, db_url):
     """The seed touches too few rows for autovacuum to analyze the column, so the file does."""
-    _fact(kg_rows, "p1", "personal")
-    _fact(kg_rows, "t1", "technical")
-    kg_rows.execute("UPDATE kg_relationships SET audience = NULL, label_version = NULL")
-    kg_rows.execute("ANALYZE kg_relationships")
-    kg_rows.execute("UPDATE kg_relationships SET audience = 'work-safe' WHERE uuid = 't1'")
+    before = states.stamp(kg_rows)
     try:
+        states.to_068(kg_rows, db_url)
+        _fact_in(kg_rows, "p1", "personal")
+        _fact_in(kg_rows, "t1", "technical")
+        kg_rows.execute("UPDATE kg_relationships SET audience = NULL, label_version = NULL")
+        kg_rows.execute("ANALYZE kg_relationships")
+        kg_rows.execute("UPDATE kg_relationships SET audience = 'work-safe' WHERE uuid = 't1'")
         _apply_066(db_url)
         stat = kg_rows.execute(
             "SELECT n_distinct, null_frac FROM pg_stats "
             "WHERE tablename = 'kg_relationships' AND attname = 'audience'"
         ).fetchone()
     finally:
-        _apply_067(db_url)  # 066 put its insert trigger back
+        states.to_069(kg_rows, db_url, before)
     # t1 is work-safe and p1 was re-seeded personal: no NULLs left, and the stats say so
     assert stat is not None and stat[1] == 0

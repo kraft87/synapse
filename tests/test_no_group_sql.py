@@ -1,11 +1,10 @@
 """No SQL in the application names the legacy ``group_id`` column.
 
-The knowledge graph is one memory per owner. ``group_id`` is still a column on
-``kg_entities``, ``kg_relationships``, ``notes`` and ``preferences``, but schema 067 gave it
-a default and the application neither reads nor writes it; only ``scripts/pile_merge.py``
-(the merge and its undo) does. A new statement that selects, filters or inserts it would
-quietly bring the two-pile split back, and nothing else would fail: the column still exists,
-and after 067 every row says ``technical``. This test scans ``ingestion/`` and
+The knowledge graph is one memory per owner. Schema 069 drops ``group_id`` from
+``kg_entities``, ``kg_relationships``, ``notes`` and ``preferences``, and it is applied by
+hand after the release, so the same image runs on a database with the column and on one
+without. A statement that names it would fail on the second, and on the first a write that
+names it would quietly bring the two-pile split back. This test scans ``ingestion/`` and
 ``mcp_server/`` and fails on the first such statement, naming the file and line.
 
 How it tells SQL from prose. The sources are parsed with ``ast``, so comments are never
@@ -121,7 +120,7 @@ def test_no_statement_in_the_application_names_group_id():
         if (rel, text) not in ALLOWED
     ]
     assert not findings, (
-        "group_id is a legacy column the application must not read or write (schema 067). "
+        "group_id is a legacy column the application must not read or write (schema 069 drops it). "
         "If a literal is not SQL, add it to ALLOWED with the reason.\n" + "\n".join(findings)
     )
 

@@ -348,6 +348,20 @@ def test_restore_puts_everything_back(kg, db_url, embedder, tmp_path, capsys):
     assert _state(kg) == before
 
 
+def test_restore_refuses_a_backup_taken_before_one_memory(kg, db_url, embedder):
+    """A backup that carries group_id was taken before 067 merged the two groups: its rows
+    name entities the merge folded away, and re-creating them would split those again."""
+    _seed(kg)
+    _run(db_url, "--apply", "--date", DAY)
+    kg.execute(
+        f"ALTER TABLE kg_magnet_repair_{DAY}_entities ADD COLUMN group_id text DEFAULT 'technical'"
+    )
+    after = _state(kg)
+    with pytest.raises(SystemExit, match="before one memory"):
+        rm.main(["--db-url", db_url, "--restore", DAY, "--apply"])
+    assert _state(kg) == after
+
+
 def test_restore_keeps_a_created_entity_that_new_facts_use(kg, db_url, embedder, capsys):
     ep = _seed(kg)["ep"]
     _run(db_url, "--apply", "--date", DAY)

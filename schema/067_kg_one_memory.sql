@@ -161,6 +161,14 @@ DECLARE
     v_kg      boolean;
     v_np      boolean;
 BEGIN
+    -- Past 069 the four tables have no group_id: there is no pile left to merge.
+    IF (SELECT count(*) FROM pg_attribute
+         WHERE attrelid IN ('public.kg_entities'::regclass, 'public.kg_relationships'::regclass,
+                            'public.notes'::regclass, 'public.preferences'::regclass)
+           AND attname = 'group_id' AND NOT attisdropped) < 4 THEN
+        RETURN;
+    END IF;
+
     -- Folded entities of the runs not undone, and the survivor each stood for. A writer
     -- whose name index still held a deleted uuid writes it again; those rows are folded by
     -- rule (d). Filled below, under the lock.
@@ -749,6 +757,14 @@ DECLARE
     stamped   text;
     bad       text;
 BEGIN
+    -- Past 069 there is no group_id to give a default, and 066 builds no trigger to drop.
+    IF (SELECT count(*) FROM pg_attribute
+         WHERE attrelid IN ('public.kg_entities'::regclass, 'public.kg_relationships'::regclass,
+                            'public.notes'::regclass, 'public.preferences'::regclass)
+           AND attname = 'group_id' AND NOT attisdropped) < 4 THEN
+        RETURN;
+    END IF;
+
     -- The two retry settings, before any lock. A count of 0 or less would skip the loop
     -- without an error, and a huge count or an endless pause would keep SHARE ROW EXCLUSIVE
     -- for as long as the loop runs (statement_timeout is 0 here); neither may reach it.

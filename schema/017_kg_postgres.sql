@@ -45,8 +45,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_uuid ON kg_entities (uuid);
 -- dedup / alias lookup is owner-scoped (normalized_name is intentionally NOT unique:
 -- the live graph still carries duplicate-name nodes -- that's the #49 fragmentation
 -- this migration's resolution pass will collapse, not something the schema rejects).
-CREATE INDEX IF NOT EXISTS kg_entities_norm  ON kg_entities (owner_id, group_id, normalized_name);
-CREATE INDEX IF NOT EXISTS kg_entities_owner ON kg_entities (owner_id, group_id);
+-- Both lead with group_id, which 069 drops and them with it: built only while it exists.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_entities'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS kg_entities_norm  ON kg_entities (owner_id, group_id, normalized_name);
+        CREATE INDEX IF NOT EXISTS kg_entities_owner ON kg_entities (owner_id, group_id);
+    END IF;
+END
+$$;
 -- entity vector seed search (recall._search_kg seed leg). halfvec: 2048 > pgvector's
 -- 2000-dim vector-HNSW limit, so the index is on the half-precision cast (loss-free
 -- in practice; see schema/014). Full vector(2048) stays in the heap for exact rescore.
@@ -79,12 +87,20 @@ CREATE TABLE IF NOT EXISTS kg_relationships (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS kg_rel_uuid  ON kg_relationships (uuid);
-CREATE INDEX IF NOT EXISTS kg_rel_src   ON kg_relationships (owner_id, group_id, src_uuid);
-CREATE INDEX IF NOT EXISTS kg_rel_tgt   ON kg_relationships (owner_id, group_id, tgt_uuid);
--- per-pair lookup drives the contradiction detector (find_edges_by_pair) and is the
--- lock target for the write-path race fix (SELECT ... FOR UPDATE on the pair).
-CREATE INDEX IF NOT EXISTS kg_rel_pair  ON kg_relationships (owner_id, group_id, src_uuid, tgt_uuid);
-CREATE INDEX IF NOT EXISTS kg_rel_owner ON kg_relationships (owner_id, group_id);
+-- All four lead with group_id, which 069 drops and them with it: built only while it exists.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'kg_relationships'::regclass AND attname = 'group_id' AND NOT attisdropped) THEN
+        CREATE INDEX IF NOT EXISTS kg_rel_src   ON kg_relationships (owner_id, group_id, src_uuid);
+        CREATE INDEX IF NOT EXISTS kg_rel_tgt   ON kg_relationships (owner_id, group_id, tgt_uuid);
+        -- per-pair lookup drives the contradiction detector (find_edges_by_pair) and is the
+        -- lock target for the write-path race fix (SELECT ... FOR UPDATE on the pair).
+        CREATE INDEX IF NOT EXISTS kg_rel_pair  ON kg_relationships (owner_id, group_id, src_uuid, tgt_uuid);
+        CREATE INDEX IF NOT EXISTS kg_rel_owner ON kg_relationships (owner_id, group_id);
+    END IF;
+END
+$$;
 -- live-fact vector search: ONLY currently-true facts are ANN-searchable, so the
 -- HNSW index is partial on t_invalid IS NULL (avoids the HNSW-prefilter-then-filter
 -- under-return on dead edges).

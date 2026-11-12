@@ -65,9 +65,9 @@ _RESTATED_OVERFETCH = 32
 
 #: Which entity answers when several rows share a name: the owner's flagged entity, then the
 #: oldest. The id never changes, so the SQL lookup below, the in-memory name index
-#: (``load_entities``, read by ``dedup``) and the one-memory merge (schema/067,
-#: scripts/pile_merge.py) pick the same row for a name that exists twice. All three key a row
-#: the same way: by its stored normalized_name, or by lower(trim(name)) when that is empty.
+#: (``load_entities``, read by ``dedup``) and the one-memory merge (schema/067) pick the same
+#: row for a name that exists twice. All three key a row the same way: by its stored
+#: normalized_name, or by lower(trim(name)) when that is empty.
 SURVIVOR_ORDER = "is_self DESC, id"
 
 
