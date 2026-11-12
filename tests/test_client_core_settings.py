@@ -158,6 +158,13 @@ def test_a_legacy_ingest_url_still_names_the_server_and_the_ingest_endpoint(tmp_
         " http://10.0.0.5:8765/mcp ",
         "http://[::1]:8765",
         "https://s.example/a/b",
+        "https://s.example/ingest",
+        "https://s.example/recall",
+        "https://s.example/skills/",
+        "https://s.example/sub/recall//",
+        "https://s.example/install/mcp",
+        "http://mcp",
+        "http://mcp/mcp",
     ],
 )
 def test_normalize_url_matches_the_cli(scratch, raw):
@@ -165,7 +172,19 @@ def test_normalize_url_matches_the_cli(scratch, raw):
     assert settings_mod.normalize_url(raw) == harness.normalize_url(raw)
 
 
-@pytest.mark.parametrize("raw", ["", "ftp://x", "https://s.example/?q=1", "https://a b"])
+def test_normalize_url_checks_the_same_pattern_as_the_cli(scratch):
+    """harness.py keeps its own copy of the rule rather than calling the core's: `synapse
+    update` normalizes the URL before the installer runs, and importing the core then
+    would leave the old client's package in sys.modules for the harnesses the update
+    builds afterwards (harness._core_registry). So the two copies are pinned equal."""
+    harness = load_script("harness")
+    assert settings_mod._URL_RE.pattern == harness._URL_RE.pattern
+    assert settings_mod._URL_RE.flags == harness._URL_RE.flags
+
+
+@pytest.mark.parametrize(
+    "raw", ["", "ftp://x", "https://s.example/?q=1", "https://a b", "HTTPS://s.example"]
+)
 def test_normalize_url_rejects_what_the_cli_rejects(scratch, raw):
     harness = load_script("harness")
     with pytest.raises(ValueError):

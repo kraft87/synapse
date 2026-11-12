@@ -468,3 +468,38 @@ def test_a_real_enrollment_error_still_reports_itself(monkeypatch, hook, capsys)
     assert hook.enroll() == {}
     err = capsys.readouterr().err
     assert "device_flow_disabled" in err and "Enable Device Flow" in err
+
+
+# ---------------------------------------------------------------------------
+# The two notices that carry the bootstrap and paste commands, pinned byte for byte
+# ---------------------------------------------------------------------------
+
+_BOOTSTRAP_HINT = (
+    "No sign-in is configured on this Synapse, so there is nothing to approve.\n"
+    "Mint this machine a token on the server instead:\n"
+    '    docker compose exec mcp-server synapse-admin bootstrap "<label>"\n'
+    "then store it here with `synapse login --token` (it becomes this machine's "
+    "SYNAPSE_INGEST_TOKEN; the legacy /plugin > synapse > Synapse token slot works too)."
+)
+_RESTRICTED_BLOCK = (
+    "[Synapse — this machine is served nothing]\n"
+    "The server answered, but this caller is `restricted` with no projects: it holds no "
+    "device credential of its own (schema 054), so the board and recall come back empty.\n"
+    "Fix it either way:\n"
+    "  - Server with a sign-in configured: run `! synapse-login` in this session.\n"
+    "  - Local server, no sign-in: run\n"
+    '        docker compose exec mcp-server synapse-admin bootstrap "<label>"\n'
+    "    on the server, then run `synapse login --token` here (or paste it into\n"
+    "    /plugin > synapse > Synapse token)."
+)
+
+
+def test_the_bootstrap_hint_is_pinned(hook):
+    """The commands in it come from the client core (synapse_client.context); the
+    notice a user reads must not change with where they are defined."""
+    assert hook.bootstrap_hint() == _BOOTSTRAP_HINT
+    assert hook.bootstrap_hint("synapse: ") == "synapse: " + _BOOTSTRAP_HINT
+
+
+def test_the_restricted_block_is_pinned(hook):
+    assert hook.restricted_block() == _RESTRICTED_BLOCK

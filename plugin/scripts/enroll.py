@@ -41,6 +41,14 @@ from collections.abc import Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 
+# The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# The command that mints a device token on a server with no identity provider (a local
+# `docker compose` install, the common case for a fresh clone), and where a token minted
+# that way goes on this machine. Defined once, in the core, for every notice that names
+# them.
+from synapse_client.context import BOOTSTRAP_CMD, PASTE_CMD
+
 #: Poll ceiling. The IdP's own device_code expiry (`expires_in`, typically 15 min) wins
 #: when it is shorter; this is the backstop for a server that reports neither.
 _MAX_WAIT_S = 900
@@ -49,14 +57,6 @@ _MAX_WAIT_S = 900
 def is_enrolled() -> bool:
     """True once this machine holds a token minted for it (as opposed to a pasted one)."""
     return bool(config.read_device_state().get("surface_id"))
-
-
-#: The command that mints a device token on a server with no identity provider — a
-#: local `docker compose` install, which is the common case for a fresh clone. Kept as
-#: one string so the wording can't drift between the hook, `synapse-login` and enroll.
-BOOTSTRAP_CMD = 'docker compose exec mcp-server synapse-admin bootstrap "<label>"'
-#: Where a token minted that way goes on this machine (it asks for the token, hidden).
-PASTE_CMD = "synapse login --token"
 
 
 def bootstrap_hint(prefix: str = "") -> str:
