@@ -210,8 +210,10 @@ class EpisodeStore(DatabaseConnection):
         when the number is already held (it never rewrites that row) and is run again, up
         to a bound, for a writer that does not take the lock: ``upsert_episode`` at an
         explicit number, or an older process during a deploy. A violation of the span
-        index propagates to the caller. The caller must not hold an outer ``_conn()``
-        across the call, since the lock lasts to the end of the outermost transaction."""
+        index propagates to the caller. The caller must not hold its own ``_conn()`` block
+        across the call: every ``_conn()`` exit commits, nested ones included, so the lock
+        is released when the append's own block exits, and the caller's partial work would
+        be committed by that exit (or rolled back with the append on a span violation)."""
         params = self._episode_params(ep)
         for _ in range(_APPEND_ATTEMPTS):
             row = self._run_episode_sql(_APPEND, _APPEND_STAMPED, params, lock_session=True)

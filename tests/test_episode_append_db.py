@@ -26,6 +26,7 @@ from ingestion import db_episodes
 from ingestion.db import Database
 from ingestion.models import Episode
 from ingestion.surfaces import OWN_SURFACE_PROBE
+from tests.helpers.pre057 import pre057_schema
 
 #: A hung thread fails the test instead of hanging the suite.
 _JOIN_S = 60.0
@@ -62,6 +63,41 @@ def _rows(conn, sid: str) -> list[tuple]:
         "WHERE session_id = %s ORDER BY sequence",
         (sid,),
     ).fetchall()
+
+
+def _session_lock_is_free(conn, sid: str) -> bool:
+    """Whether a third connection can take the session's append lock right now."""
+    return conn.execute(
+        "SELECT pg_try_advisory_xact_lock(hashtext(%s))", (db_episodes._SESSION_LOCK_KEY + sid,)
+    ).fetchone()[0]
+
+
+def _wait_until_blocked_on_a_row(conn, thread: threading.Thread, outcome: dict) -> None:
+    """Block until the thread's append is waiting on a row another transaction holds open."""
+    deadline = time.monotonic() + 15
+    waiting = 0
+    while thread.is_alive() and time.monotonic() < deadline:
+        waiting = conn.execute(
+            "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
+            "AND datname = current_database() AND query LIKE 'INSERT INTO episodes%'"
+        ).fetchone()[0]
+        if waiting:
+            break
+        time.sleep(0.05)
+    assert thread.is_alive(), f"the append did not wait for the open row: {outcome}"
+    assert waiting, "the append never showed up waiting on the open row"
+
+
+def _no_upsert(monkeypatch) -> None:
+    """The writers that used to number their own rows read the highest sequence and upserted
+    at the next one, which lands in an empty slot and so looks like an append until another
+    writer is there. Appending is the only way a live writer may write, so an upsert here
+    is that old path."""
+
+    def _boom(self, ep):
+        raise AssertionError("a live writer upserted a row instead of appending it")
+
+    monkeypatch.setattr(Database, "upsert_episode", _boom)
 
 
 def test_appends_number_from_one_and_leave_earlier_rows_alone(tag, conn, db):
@@ -136,9 +172,10 @@ def test_the_span_index_violation_reaches_the_caller(tag, db):
 
 def test_a_writer_that_loses_the_number_appends_after_the_winner(tag, conn, db_url):
     """The backstop, made deterministic: a writer outside the session lock (a raw INSERT)
-    holds sequence 1 in an open transaction, so the append's INSERT waits on the index.
-    When that writer commits the INSERT does nothing, is run again, and the append lands
-    at 2 with its own text, project and stamp; the winner's row stays."""
+    holds sequence 1 in an open transaction, so the append's INSERT waits on the index,
+    still holding the session lock it took first. When that writer commits the INSERT
+    does nothing, is run again, and the append lands at 2 with its own text, project and
+    stamp; the winner's row stays."""
     sid = f"append-{tag}-c"
     outcome: dict = {}
 
@@ -168,18 +205,10 @@ def test_a_writer_that_loses_the_number_appends_after_the_winner(tag, conn, db_u
             (sid,),
         )
         thread.start()
-        deadline = time.monotonic() + 15
-        waiting = 0
-        while thread.is_alive() and time.monotonic() < deadline:
-            waiting = conn.execute(
-                "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' "
-                "AND datname = current_database() AND query LIKE 'INSERT INTO episodes%'"
-            ).fetchone()[0]
-            if waiting:
-                break
-            time.sleep(0.05)
-        assert thread.is_alive(), f"the append did not wait for the open row: {outcome}"
-        assert waiting, "the append never showed up waiting on the open row"
+        _wait_until_blocked_on_a_row(conn, thread, outcome)
+        # The lock was taken in the transaction the INSERT is waiting in. Taken in a block
+        # of its own it would already be released, and nothing else here would notice.
+        assert not _session_lock_is_free(conn, sid), "the session lock was not held at the INSERT"
         winner.commit()
     finally:
         winner.rollback()
@@ -193,6 +222,46 @@ def test_a_writer_that_loses_the_number_appends_after_the_winner(tag, conn, db_u
         (1, "first writer text", "proj-first", "dev-first"),
         (2, "late writer text", "proj-late", "dev-late"),
     ]
+
+
+def test_the_pre057_fallback_takes_the_session_lock_again(tag, conn, db_url):
+    """The probe said the provenance column exists and it is gone (schema 057 rolled back
+    under a running process): the stamped INSERT fails, its transaction and the lock with
+    it, and the pre-057 INSERT runs in a new one. That one must hold the lock too, so the
+    open row it then waits on is seen with the lock still taken."""
+    sid = f"append-{tag}-f"
+    outcome: dict = {}
+
+    with pre057_schema(conn, db_url) as (url, _schema):
+
+        def _append():
+            d = Database(url)
+            try:
+                outcome["ret"] = d.append_episode(Episode(session_id=sid, sequence=1, content="x"))
+            except BaseException as exc:  # reported by the assertions below
+                outcome["err"] = exc
+            finally:
+                d.close()
+
+        OWN_SURFACE_PROBE._ok[url] = True
+        winner = psycopg.connect(url, autocommit=False)
+        thread = threading.Thread(target=_append, daemon=True)
+        try:
+            winner.execute(
+                "INSERT INTO episodes (session_id, sequence, content) VALUES (%s, 1, 'held')",
+                (sid,),
+            )
+            thread.start()
+            _wait_until_blocked_on_a_row(conn, thread, outcome)
+            assert not _session_lock_is_free(conn, sid), "the fallback ran without the lock"
+            winner.commit()
+        finally:
+            winner.rollback()
+            winner.close()
+        thread.join(timeout=15)
+        assert not thread.is_alive(), "the append hung after the other writer committed"
+        assert "err" not in outcome, outcome.get("err")
+        assert outcome["ret"][1] == 2
 
 
 def test_many_appends_at_once_get_distinct_numbers_and_keep_their_own_rows(tag, conn, db_url):
@@ -342,12 +411,13 @@ def _queued(conn, sid: str) -> int:
     ).fetchone()[0]
 
 
-def test_write_backfill_session_skips_known_spans_and_appends_in_order(tag, conn, db):
+def test_write_backfill_session_skips_known_spans_and_appends_in_order(tag, conn, db, monkeypatch):
     from ingestion.backfill import write_backfill_session
 
     sid = f"append-{tag}-b1"
     held, _ = db.append_episode(_parsed(sid, 1, f"imp:{tag}:held", "held turn", "proj-held"))
     before = _row(conn, held)
+    _no_upsert(monkeypatch)
 
     parsed = [
         _parsed(sid, 3, f"imp:{tag}:c", "turn c"),
@@ -365,12 +435,13 @@ def test_write_backfill_session_skips_known_spans_and_appends_in_order(tag, conn
     assert _queued(conn, sid) == 2
 
 
-def test_write_session_episodes_skips_known_spans_and_appends_in_order(tag, conn, db):
+def test_write_session_episodes_skips_known_spans_and_appends_in_order(tag, conn, db, monkeypatch):
     from ingestion.backfill import _write_session_episodes
 
     sid = f"append-{tag}-b2"
     held, _ = db.append_episode(_parsed(sid, 1, f"jsonl:{tag}-held", "held turn", "proj-held"))
     before = _row(conn, held)
+    _no_upsert(monkeypatch)
 
     parsed = [
         _parsed(sid, 3, f"jsonl:{tag}-c", "turn c", "proj-c"),

@@ -473,12 +473,21 @@ def test_remember_archive_is_stamped_from_bound_trust_only(remember_env):
         assert _archived_stamp(remember_env, out["episode_id"]) is None
 
 
-def test_remember_into_a_session_adds_a_row_and_leaves_the_devices_row_alone(remember_env):
+def test_remember_into_a_session_adds_a_row_and_leaves_the_devices_row_alone(
+    remember_env, monkeypatch
+):
     """The session already holds a device's row, labelled with its project and stamped. A
     remember with no project into that session is a new row with no project: it never
     takes the device's number, so it cannot carry the device's label onto other text."""
+    from ingestion.db import Database
     from mcp_server import server
 
+    # Reading the highest sequence and upserting at the next one gives the same rows here,
+    # so the only way to tell the writer appends is that it never upserts.
+    def _boom(self, ep):
+        raise AssertionError("remember upserted a row instead of appending it")
+
+    monkeypatch.setattr(Database, "upsert_episode", _boom)
     sid = f"own-{uuid.uuid4().hex[:8]}"
     device_row = _episode(remember_env, "work-x", "device turn", "dev-a", session_id=sid)
     before = remember_env.execute("SELECT * FROM episodes WHERE id = %s", (device_row,)).fetchone()
