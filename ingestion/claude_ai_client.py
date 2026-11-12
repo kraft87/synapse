@@ -33,12 +33,9 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.render import context_line, group_turns, join_lines, strip_nulls, title_line
 
 logger = logging.getLogger(__name__)
-
-
-def _strip_nulls(text: str) -> str:
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _parse_iso(ts: Any) -> datetime | None:
@@ -99,19 +96,8 @@ class ClaudeAIParser:
         # Sort defensively by created_at to handle out-of-order exports
         msgs = sorted(msgs, key=lambda m: m.get("created_at") or "")
 
-        # Group messages into turns. A new turn starts at each "human" with text.
-        groups: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        for m in msgs:
-            sender = m.get("sender")
-            has_text = bool(_msg_text(m))
-            if sender == "human" and has_text and current:
-                groups.append(current)
-                current = [m]
-            else:
-                current.append(m)
-        if current:
-            groups.append(current)
+        # A new turn starts at each "human" message with text.
+        groups = group_turns(msgs, lambda m: m.get("sender") == "human" and bool(_msg_text(m)))
 
         name = (convo.get("name") or "").strip()
         episodes: list[Episode] = []
@@ -129,9 +115,9 @@ class ClaudeAIParser:
             last_msg_uuid: str | None = None
 
             if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
+                content_parts.append(context_line(prev_assistant))
             elif seq == 1 and name:
-                content_parts.append(f"[title] {name[:200]}")
+                content_parts.append(title_line(name))
 
             for m in group:
                 ts = ts or m.get("created_at")
@@ -166,9 +152,9 @@ class ClaudeAIParser:
                     project=None,
                     platform="claude_ai",
                     model=None,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=strip_nulls(human_turn) if human_turn else None,
+                    assistant_turn=strip_nulls(assistant_turn) if assistant_turn else None,
+                    content=join_lines(content_parts),
                     span_id=f"claude_ai:{session_id}:{last_msg_uuid}" if last_msg_uuid else None,
                     source="claude_ai",
                     metadata={

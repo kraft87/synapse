@@ -23,14 +23,26 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.render import (
+    USER_CAP,
+    assistant_line,
+    context_line,
+    group_turns,
+    join_lines,
+    strip_nulls,
+    tool_line,
+    user_line,
+)
 
 logger = logging.getLogger(__name__)
 
 _BUBBLE_KEY_RE = re.compile(r"^bubbleId:([0-9a-f-]{36}):([0-9a-f-]{36})$")
 
 
-def _strip_nulls(text: str) -> str:
-    return text.replace("\x00", "") if "\x00" in text else text
+def _is_user_turn(bubble: dict[str, Any]) -> bool:
+    """A user bubble with text opens a new turn."""
+    text = (bubble.get("text") or "").strip()
+    return bubble.get("type") == 1 and bool(text)
 
 
 def _parse_iso(ts: Any) -> datetime | None:
@@ -114,20 +126,7 @@ class CursorSQLiteParser:
 
     @staticmethod
     def _composer_to_episodes(composer_id: str, bubbles: list[dict[str, Any]]) -> Iterable[Episode]:
-        # Group bubbles into user-turn exchanges
-        groups: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        for b in bubbles:
-            is_user = b.get("type") == 1
-            text = (b.get("text") or "").strip()
-            if is_user and text and current:
-                groups.append(current)
-                current = [b]
-            else:
-                current.append(b)
-        if current:
-            groups.append(current)
-
+        groups = group_turns(bubbles, _is_user_turn)
         prev_assistant: str | None = None
         seq = 0
 
@@ -144,7 +143,7 @@ class CursorSQLiteParser:
             last_bubble_id: str | None = None
 
             if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
+                content_parts.append(context_line(prev_assistant))
 
             for b in group:
                 ts = ts or b.get("createdAt")
@@ -159,12 +158,12 @@ class CursorSQLiteParser:
 
                 if btype == 1:  # user
                     if text and human_turn is None:
-                        human_turn = text[:3000]
-                        content_parts.append(f"[user] {human_turn}")
+                        human_turn = text[:USER_CAP]
+                        content_parts.append(user_line(human_turn))
                 elif btype == 2:  # assistant
                     if text:
                         assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:3000]}")
+                        content_parts.append(assistant_line(text))
                     # surface tool invocations
                     tool_results = b.get("toolResults") or []
                     for tr in tool_results if isinstance(tool_results, list) else []:
@@ -176,7 +175,7 @@ class CursorSQLiteParser:
                             result = orjson.dumps(result).decode()[:300]
                         result_text = str(result).strip()
                         if len(result_text) > 20:
-                            content_parts.append(f"[tool:{name}] {result_text[:300]}")
+                            content_parts.append(tool_line(name, result_text))
 
             if not content_parts or not (human_turn or assistant_turn):
                 continue
@@ -192,9 +191,9 @@ class CursorSQLiteParser:
                 project=project,
                 platform="cursor",
                 model=model,
-                human_turn=_strip_nulls(human_turn) if human_turn else None,
-                assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                content=_strip_nulls("\n\n".join(content_parts)),
+                human_turn=strip_nulls(human_turn) if human_turn else None,
+                assistant_turn=strip_nulls(assistant_turn) if assistant_turn else None,
+                content=join_lines(content_parts),
                 span_id=f"cursor:{composer_id}:{last_bubble_id}" if last_bubble_id else None,
                 source="cursor_sqlite",
                 metadata={
