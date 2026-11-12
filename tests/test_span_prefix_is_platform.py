@@ -63,3 +63,16 @@ def test_the_migration_renames_exactly_the_three_format_named_prefixes() -> None
     renames = dict(re.findall(r"LIKE '([a-z-]+):%'\s+THEN '([a-z_]+):'", function))
     assert renames == {"jsonl": "claude_code", "openai": "chatgpt", "cursor-sqlite": "cursor"}
     assert set(renames.values()) <= RESERVED_CLIENTS
+
+
+def test_068_is_required_and_registered_after_067() -> None:
+    # Not optional: a build that looks for claude_code:<uuid> on a database still holding
+    # jsonl:<uuid> would store every re-sent turn a second time, so it must not start.
+    from ingestion.schema_check import is_optional_migration, required_schema_version
+
+    schema = _INGESTION.parent / "schema"
+    migration = schema / "068_span_id_prefix_is_platform.sql"
+    assert not is_optional_migration(migration)
+    assert required_schema_version() >= "068"
+    script = (_INGESTION.parent / "scripts" / "apply_schema.sh").read_text()
+    assert script.index("067_kg_one_memory.sql") < script.index(migration.name)
