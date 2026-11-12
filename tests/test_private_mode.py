@@ -342,23 +342,22 @@ class _StubServer:
         self.calls: list[tuple[str, str]] = []
         self.rows: set[str] = set()
         self.lie_on_put = False  # simulate a write that silently doesn't land
-        self.refuse_delete = False  # simulate a caller that is not a full-trust device
+        self.ignore_delete = False  # simulate a DELETE that answers 200 but removes nothing
+        self.fail_with: dict[str, int] = {}  # method -> HTTP status to answer with instead
         outer = self
 
         class Handler(BaseHTTPRequestHandler):
             def _reply(self) -> None:
                 sid = self.path.rsplit("/", 1)[-1]
                 outer.calls.append((self.command, sid))
-                status = 200
-                if self.command == "PUT" and not outer.lie_on_put:
-                    outer.rows.add(sid)
-                elif self.command == "DELETE" and outer.refuse_delete:
-                    status = 403
-                elif self.command == "DELETE":
-                    outer.rows.discard(sid)
-                if status == 403:
-                    body = json.dumps({"status": "error", "detail": "forbidden"}).encode()
+                status = outer.fail_with.get(self.command, 200)
+                if status != 200:
+                    body = json.dumps({"status": "error", "detail": "refused"}).encode()
                 else:
+                    if self.command == "PUT" and not outer.lie_on_put:
+                        outer.rows.add(sid)
+                    elif self.command == "DELETE" and not outer.ignore_delete:
+                        outer.rows.discard(sid)
                     body = json.dumps({"status": "ok", "private": sid in outer.rows}).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
@@ -446,12 +445,47 @@ def test_off_forget_deletes_the_row(toggle, stub_server):
 def test_off_forget_refused_says_a_full_trust_device_is_needed(toggle, stub_server, capsys):
     sid = "s-abc"
     assert toggle.main(["on", sid]) == 0
-    stub_server.refuse_delete = True
+    stub_server.fail_with["DELETE"] = 403
     assert toggle.main(["off", sid, "--forget"]) == 1
     err = capsys.readouterr().err
     assert "must be done from a full-trust device" in err
+    assert "The server row was not deleted; the session stays off the record." in err
     assert "NOT off the record" not in err  # the row is still there: the session stays private
     assert sid in stub_server.rows
+
+
+@pytest.mark.parametrize(
+    "how", ["server_error", "delete_ignored"], ids=["delete-fails", "row-still-there"]
+)
+def test_off_forget_that_leaves_the_row_says_the_session_stays_off_the_record(
+    toggle, stub_server, capsys, how
+):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    if how == "server_error":
+        stub_server.fail_with["DELETE"] = 500
+    else:
+        stub_server.ignore_delete = True
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "The server row was not deleted; the session stays off the record." in err
+    assert "full-trust device" not in err
+    assert "NOT off the record" not in err
+    assert sid in stub_server.rows
+
+
+def test_off_forget_that_cannot_read_the_row_back_claims_neither_outcome(
+    toggle, stub_server, capsys
+):
+    sid = "s-abc"
+    assert toggle.main(["on", sid]) == 0
+    stub_server.fail_with["GET"] = 500
+    assert toggle.main(["off", sid, "--forget"]) == 1
+    err = capsys.readouterr().err
+    assert "could not read back the server row" in err
+    assert f"private_mode.py status {sid}" in err
+    assert "was not deleted" not in err
+    assert "NOT off the record" not in err
 
 
 def test_session_end_removes_marker_but_not_the_row(toggle, stub_server, monkeypatch):
