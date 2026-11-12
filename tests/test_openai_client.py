@@ -75,7 +75,7 @@ class TestParseConversation:
         assert first.session_id == CONV_ID
         assert first.human_turn == "how do I sort a list?"
         assert first.assistant_turn == "Use sorted(xs)."
-        assert first.span_id == "openai:m-a1"
+        assert first.span_id == "chatgpt:m-a1"
         assert first.source == "openai"
         assert first.platform == "chatgpt"
         assert first.model == "gpt-5"
@@ -84,7 +84,7 @@ class TestParseConversation:
         assert first.created_at.year == 2025
 
         assert second.human_turn == "and descending?"
-        assert second.span_id == "openai:m-a2"
+        assert second.span_id == "chatgpt:m-a2"
         assert second.content.startswith("[context] Use sorted(xs).")
 
     def test_abandoned_branch_excluded(self):

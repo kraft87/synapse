@@ -124,6 +124,60 @@ changed, what to do on each machine, what was proven, and what is still open.
   - the spool drops every 4xx except 401, 403, 408 and 429;
   - the outbox drops only 400, 413 and 422.
 
+## 2026-11-12 — span ids start with the platform; `/ingest` takes a neutral `messages` format (schema 068)
+
+**What changed**
+
+- **One name per client.** A turn's span id now starts with the platform that produced it.
+  Three parsers used the transcript format instead, so one row said `claude_code` in
+  `platform` and `jsonl:` in `span_id`. Renamed: `jsonl:` → `claude_code:`, `openai:` →
+  `chatgpt:`, `cursor-sqlite:` → `cursor:`. `codex:` and `claude_ai:` already matched.
+  `source` still names the transcript format.
+- **Schema 068** renames the stored span ids and leaves a trigger
+  (`episodes_canonical_span_id`) that rewrites the three old spellings on every write.
+- **`/ingest` format `messages`**: a client that holds its conversation as chat messages
+  posts them with its own `client` name (ARCHITECTURE §4.1). Nothing uses it yet; the
+  Hermes provider will. A client may not take a name another parser stamps.
+
+**Order of rollout: the database first, then the image**
+
+1. Merge order: after schema 067. 068 stamps the database past 067, and the boot guard
+   only compares the highest number, so 067 must already be applied.
+2. Apply `schema/068_span_id_prefix_is_platform.sql` while the previous image is still
+   serving. That image keeps writing `jsonl:<uuid>`; the trigger stores `claude_code:<uuid>`,
+   and a turn that is already stored hits `episodes_span_id_idx`, which the route counts as
+   a span collision and skips. The boot guard lets a build start on a database ahead of it.
+3. Then merge, so watchtower ships the image. Not the other way round: the new image on a
+   database without 068 would miss every stored `jsonl:` span and store re-sent turns a
+   second time. 068 is therefore not marked optional, and the new image refuses to start
+   without it.
+4. `VACUUM (ANALYZE) episodes` afterwards. The UPDATE rewrites every renamed row (32k of
+   54k on prod: 27,554 `jsonl:`, 3,944 `cursor-sqlite:`, 490 `openai:`), and each new row
+   version is entered into the BM25 and HNSW indexes too.
+
+If 068 stops with "stored under both the old and the new span id", a newer build already
+ran against the database. Nothing was changed; delete the newer copy of each pair and run
+the file again.
+
+**What was proven**
+
+- On a scratch ParadeDB built to 066 and seeded with every spelling a parser has written:
+  068 renamed exactly the three old prefixes, left `codex:`, `claude_ai:`, the older
+  `cursor:<hash>:<n>` rows, bare Logfire ids and NULLs alone, and a second run changed
+  nothing.
+- `tests/test_span_prefix_migration_db.py`: the trigger on insert and update; the
+  both-spellings refusal; and the route end to end with the previous build's parser
+  re-sending a stored turn (`ingested: 1, span_collisions: 1`, no second row).
+- Prod, read-only: no `cursor-sqlite:` span collides with an existing `cursor:` one, and
+  `episodes` and `episodes_quarantine` are the only tables with a span-id column.
+
+**Still open**
+
+- Not rehearsed on a copy of prod, so the UPDATE's run time there is an estimate.
+- `ingestion/backfill.py` from a checkout older than this change raises on a turn that is
+  already stored (it has no span-collision handler). It is a manual tool; run it from a
+  current checkout.
+
 ## 2026-11-12 — guards: only a full-trust device takes a session back on the record; appends to one session take turns (plugin 0.24.1)
 
 **What changed**

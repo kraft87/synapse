@@ -84,7 +84,7 @@ def test_span_ids_stable_and_unique():
     """Each turn gets a span_id derived from its transcript UUID (idempotency key)."""
     eps = JSONLParser().parse_records(_transcript(), "hook", None)
     span_ids = [e.span_id for e in eps]
-    assert all(s and s.startswith("jsonl:") for s in span_ids)
+    assert all(s and s.startswith("claude_code:") for s in span_ids)
     assert len(span_ids) == len(set(span_ids))  # unique per turn
 
 

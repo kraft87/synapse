@@ -109,7 +109,7 @@ def test_appends_number_from_one_and_leave_earlier_rows_alone(tag, conn, db):
         project="proj-a",
         content="first turn",
         surface_id="dev-a",
-        span_id=f"jsonl:{tag}-1",
+        span_id=f"claude_code:{tag}-1",
         metadata={"cwd": "/work/a"},
     )
     id1, seq1 = db.append_episode(first)
@@ -158,7 +158,7 @@ def test_append_strips_nul_and_keeps_event_time(tag, conn, db):
 
 
 def test_the_span_index_violation_reaches_the_caller(tag, db):
-    span = f"jsonl:{tag}-shared"
+    span = f"claude_code:{tag}-shared"
     db.append_episode(Episode(session_id=f"append-{tag}-a", sequence=1, content="x", span_id=span))
     with pytest.raises(psycopg.errors.UniqueViolation) as exc:
         db.append_episode(
@@ -439,14 +439,16 @@ def test_write_session_episodes_skips_known_spans_and_appends_in_order(tag, conn
     from ingestion.backfill import _write_session_episodes
 
     sid = f"append-{tag}-b2"
-    held, _ = db.append_episode(_parsed(sid, 1, f"jsonl:{tag}-held", "held turn", "proj-held"))
+    held, _ = db.append_episode(
+        _parsed(sid, 1, f"claude_code:{tag}-held", "held turn", "proj-held")
+    )
     before = _row(conn, held)
     _no_upsert(monkeypatch)
 
     parsed = [
-        _parsed(sid, 3, f"jsonl:{tag}-c", "turn c", "proj-c"),
-        _parsed(sid, 1, f"jsonl:{tag}-held", "held turn again"),
-        _parsed(sid, 2, f"jsonl:{tag}-b", "turn b"),
+        _parsed(sid, 3, f"claude_code:{tag}-c", "turn c", "proj-c"),
+        _parsed(sid, 1, f"claude_code:{tag}-held", "held turn again"),
+        _parsed(sid, 2, f"claude_code:{tag}-b", "turn b"),
     ]
     assert _write_session_episodes(db, sid, parsed, "proj-default") == 2
 
@@ -466,11 +468,11 @@ def test_write_session_episodes_copes_with_a_row_that_has_no_span_id(tag, conn, 
 
     sid = f"append-{tag}-b3"
     db.append_episode(_parsed(sid, 1, None, "a manual note"))
-    db.append_episode(_parsed(sid, 2, f"jsonl:{tag}-held", "held turn"))
+    db.append_episode(_parsed(sid, 2, f"claude_code:{tag}-held", "held turn"))
 
     parsed = [
-        _parsed(sid, 1, f"jsonl:{tag}-held", "held turn again"),
-        _parsed(sid, 2, f"jsonl:{tag}-new", "new turn"),
+        _parsed(sid, 1, f"claude_code:{tag}-held", "held turn again"),
+        _parsed(sid, 2, f"claude_code:{tag}-new", "new turn"),
     ]
     assert _write_session_episodes(db, sid, parsed, "proj-default") == 1
 

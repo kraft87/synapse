@@ -263,7 +263,7 @@ def _episode(session_id: str, seq: int = 1):
     return Episode(
         session_id=session_id,
         sequence=seq,
-        span_id=f"jsonl:{session_id}:{seq}",
+        span_id=f"claude_code:{session_id}:{seq}",
         content=f"[user] hello {seq}",
         project="demo",
     )

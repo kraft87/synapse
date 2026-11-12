@@ -195,7 +195,7 @@ class CursorSQLiteParser:
                 human_turn=_strip_nulls(human_turn) if human_turn else None,
                 assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
                 content=_strip_nulls("\n\n".join(content_parts)),
-                span_id=f"cursor-sqlite:{composer_id}:{last_bubble_id}" if last_bubble_id else None,
+                span_id=f"cursor:{composer_id}:{last_bubble_id}" if last_bubble_id else None,
                 source="cursor_sqlite",
                 metadata={
                     "composer_id": composer_id,

@@ -257,10 +257,10 @@ first); everything after the parser is the same for all three.
 ```
 
 - `client` (required) becomes `episodes.platform` and the span-id prefix. It must match
-  `^[a-z][a-z0-9_]{0,31}$` and must not be reserved: `claude_code`, `codex`, `cursor`,
-  `chatgpt` and `claude_ai` are the platforms the other parsers write, which other lanes
-  select on (the skills lane mines `platform = 'claude_code'`), and `jsonl` and `openai`
-  are the span-id prefixes of the Claude Code and ChatGPT parsers.
+  `^[a-z][a-z0-9_]{0,31}$` and must not be `claude_code`, `codex`, `cursor`, `chatgpt` or
+  `claude_ai`: those are the platforms the other parsers write. Other lanes select on
+  platform (the skills lane mines `platform = 'claude_code'`), and every parser's span ids
+  start with its platform, so a client by one of those names could claim them.
 - `session_id` (required) is stored as sent. Session ids from every client share one
   namespace, so it should be globally unique.
 - `project` is cleaned as for any other format; without one, the last component of `cwd`
@@ -282,7 +282,11 @@ row left empty is dropped: that is recalled memory the client put into the promp
 something the user said. Turns are grouped at each user row and rendered with the Codex
 parser's labels and truncation.
 
-**Span id.** `<client>:<id>` of the last message in the turn that carries an `id`. A turn
+**Span id.** Every parser's span ids start with the platform it stamps (`claude_code:`,
+`codex:`, `chatgpt:`, `cursor:`, `claude_ai:`); schema 068 renamed the three that used the
+transcript format instead (`jsonl:`, `openai:`, `cursor-sqlite:`) and rewrites those
+spellings on insert, so a build from before it cannot store a turn twice. Here that is
+`<client>:<id>`, from the last message in the turn that carries an `id`. A turn
 with no ids gets `<client>:<session_id>:<h>`, where `h` is the first 24 hex characters of
 the sha256 of the turn's own rendered lines, the `[context]` line excluded, so the hash
 does not depend on whether the previous turn was in the batch. Ids are the reliable key: a
@@ -684,6 +688,7 @@ Migrations are numbered SQL files applied manually (no runner — small project;
 - **065 config lane identity** — `config_proposals.embedding` (the rule's founding embedding, the identity anchor), `proposed_at`, `recommendation`, `coverage`. Marked `-- schema-check: optional`: until it is applied the lane probes, logs one line and idles (its scan watermark does not move), and the review routes leave the recommendation out.
 - **066 fact audience** — `kg_relationships.audience` / `label_version` / `label_model` (a per-fact sensitivity label, seeded `personal` for the facts the old personal pile held), the `fact_audience_legacy_max_id` stamp in `synapse_meta`, and `kg_entities.is_self` (the owner's entity). Marked `-- schema-check: optional`, but a build that requires 067 covers it: 067 needs 066 applied, and the boot guard compares against 067's number. Restricted reads are served no facts while the label is absent ([§7.5](#75-audience-scoping--credential-bound-surface-trust-schema-053--054)).
 - **067 one memory** — merges the two group piles into one memory per owner, as a one-time data migration plus a small DDL tail. Every `personal` entity, fact, note and preference becomes `technical` (the `group_id` column and its old indexes stay, unread, until a later cleanup); a personal entity with a same-name technical twin folds into the twin, picked by `SURVIVOR_ORDER` (the owner's flagged entity first, then the lowest id), and its facts are re-pointed to the survivor. No fact is deleted and no fact uuid changes, and a fact keeps its audience label (an unlabelled one becomes `personal`, `label_version` 0, first). It builds three owner-only indexes (`kg_rel_pair_any`, `kg_rel_tgt_any`, `kg_entities_norm_any`), sets `DEFAULT 'technical'` on the four `group_id` columns so writers can leave the column out, drops the 066 insert trigger and its function, and stamps itself. **Required** (no optional marker): a build that no longer names `group_id` refuses to start on a database that has not applied it. It runs two transactions of its own, so pipe it alone and never wrap it in `BEGIN`. Every run is recorded in `kg_pile_merge_067_*` tables, which `scripts/pile_merge.py` reads: `--preview` (what it would do, read-only), `--health` (post-merge checks, read-only, non-zero on a failed check), `--undo` (reverse, after reverting the code; a dry run unless `--apply`) and `--exclude FILE` (keep named personal twins from being folded). See [docs/install.md](docs/install.md#upgrading) and the file's header.
+- **068 span id prefix** — a turn's span id starts with its platform. Renames the span ids three parsers wrote under their transcript format (`jsonl:` → `claude_code:`, `openai:` → `chatgpt:`, `cursor-sqlite:` → `cursor:`) and adds `episodes_canonical_span_id`, a trigger that rewrites those spellings on every write, so a build from before 068 cannot store a turn a second time on a renamed database. Apply it BEFORE the image that ships with it; it is not marked optional.
 - **033 `timeline_events`** — the episodic date log ([§3.5](#35-timeline-events--the-episodic-date-log)).
 - **034 embedding meta** — `synapse_meta` records provisioned embed dims/model; app validates against it at boot. The same table carries the `schema_version` stamp `apply_schema.sh` writes after a full run — every service checks it at startup (`ingestion/schema_check.py`) and refuses to boot when the database is behind the code's schema, pointing at the upgrade command instead of failing mid-request (`SYNAPSE_SCHEMA_CHECK=0` skips). Two exceptions only warn: a database *ahead* of the build (migrations are additive), and one behind only by migrations whose header carries `-- schema-check: optional`, the marker for a migration whose code probes for it and keeps its pre-migration behaviour until it is applied (056 is the first), so the image can land before the hand-applied migration without a crash loop.
 - **035 `preferences`** — standing user-preference store. Fed by the ingestion preferences gate and read by `/preferences/top` (the SessionStart block) and the dashboard. It was ALSO a `recall()` bucket until 2026-07-27, when the leg was removed: measured on `recall_feedback` since all six buckets became citable, prefs served 380 rows for 6 helpful citations (1.6% of served, 11.1% of the rated subset) against episodes 39.0% / facts 16.8% / timeline 8.2% — ~2.68 items of context cost on nearly every recall for nothing.
