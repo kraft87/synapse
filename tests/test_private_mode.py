@@ -265,9 +265,9 @@ class _StubDB:
     def span_id_exists(self, span_id: str) -> bool:
         return False
 
-    def upsert_episode(self, ep: object) -> int:
+    def append_episode(self, ep: object) -> tuple[int, int]:
         self.written.append(ep)
-        return len(self.written)
+        return len(self.written), len(self.written)
 
     def enqueue_extraction(self, item: object) -> None:
         self.enqueued.append(item)

@@ -145,16 +145,18 @@ def register(
                 # positional sequence is meaningless here — turn 50 arrives numbered 1
                 # and would collide with the real turn 1. Identity is the span_id (a
                 # turn's last record uuid), stable across full and tail parses. Per
-                # session, load the stored span_ids + max sequence ONCE, then:
+                # session, load the stored span_ids ONCE, then:
                 #   * span_id already stored -> skip wholesale. Idempotent no-op; also
                 #     stops a tail's truncated leading fragment (same span_id as the
                 #     full turn it tails) from overwriting that turn.
-                #   * new span_id            -> append at max_seq+1 and enqueue for KG.
+                #   * new span_id            -> append (the store takes the next sequence
+                #     number inside the INSERT, so a row another writer added to the
+                #     session since that load is never overwritten) and enqueue for KG.
                 # Backward compatible with a full-transcript POST (old hook): every old
-                # turn skips, only genuinely-new tail turns append at the same numbers
-                # they had positionally — same final state, minus the O(turns^2)
-                # re-upsert/re-enqueue churn the full re-ship used to cause.
-                index: dict[str, tuple[set[str], int]] = {}
+                # turn skips, only genuinely-new tail turns append — same final state,
+                # minus the O(turns^2) re-upsert/re-enqueue churn the full re-ship used
+                # to cause.
+                index: dict[str, set[str]] = {}
                 written = 0
                 dropped = 0
                 private_dropped = 0
@@ -182,8 +184,8 @@ def register(
                         private_dropped += 1
                         continue
                     if ep.session_id not in index:
-                        index[ep.session_id] = db.get_session_span_index(ep.session_id)
-                    seen, max_seq = index[ep.session_id]
+                        index[ep.session_id] = db.get_session_span_index(ep.session_id)[0]
+                    seen = index[ep.session_id]
                     if not ep.span_id or ep.span_id in seen:
                         continue  # no identity key, or already stored — skip
                     # Cross-session replay guard (schema 036): a retried session ships the
@@ -206,17 +208,14 @@ def register(
                     if db.span_id_exists(ep.span_id):
                         span_collisions.append((ep.session_id, ep.span_id))
                         continue
-                    ep.sequence = max_seq + 1
                     try:
-                        eid = db.upsert_episode(ep)
+                        eid, _ = db.append_episode(ep)
                     except psycopg.errors.UniqueViolation as exc:
                         if exc.diag.constraint_name != "episodes_span_id_idx":
                             raise
                         span_collisions.append((ep.session_id, ep.span_id))
                         continue
-                    max_seq += 1
                     seen.add(ep.span_id)
-                    index[ep.session_id] = (seen, max_seq)
                     if ep.content and ep.content.strip():
                         db.enqueue_extraction(
                             ExtractionItem(

@@ -59,7 +59,7 @@ graph TD
 **Data flow summary**:
 
 1. A Claude Code `Stop` hook (`scripts/synapse_ingest_hook.py`) fires on every turn and POSTs a bounded **tail** of the raw session JSONL to `http://<server-host>:8765/ingest`. It runs detached and never blocks the turn. (Any other agent frontend that drives the real `claude` CLI ingests the same way.)
-2. `/ingest` parses the tail, drops transcript contamination, **dedups by `span_id`**, and appends genuinely-new turns as episodes at `max(sequence)+1`, enqueuing each for KG extraction.
+2. `/ingest` parses the tail, drops transcript contamination, **dedups by `span_id`**, and appends genuinely-new turns as episodes, enqueuing each for KG extraction.
 3. The **poller** (a maintenance loop, *not* an ingester) rebuilds sliding-window chunks, embeds pending episodes/chunks via Voyage AI, and drains the extraction queue.
 4. KG extraction runs on **chunks** (3–5 turn windows): Haiku extracts entities + facts, resolves entities against the Postgres KG, dedups/contradicts against existing facts, and writes bitemporal relationship edges (`kg_relationships`).
 5. When a new session calls `synapse:recall`, the MCP server runs four legs in parallel (episodes, KG facts, web, bitemporal history) and returns a compact ranked result.
@@ -186,7 +186,7 @@ flowchart TD
     CONTAM -- yes --> DROP[drop]
     CONTAM -- no --> DEDUP{span_id already\nin session index?}
     DEDUP -- yes --> SKIP[skip]
-    DEDUP -- no --> APPEND[sequence = max+1\nupsert_episode]
+    DEDUP -- no --> APPEND[append_episode\nnext sequence taken in the insert]
     APPEND --> ENQ[enqueue_extraction\ncontent_type=episode]
 
     subgraph Poller maintenance loop
@@ -205,22 +205,20 @@ for ep in episodes:
     if is_transcript_contamination(ep.content):    # reject known PII-bearing payloads
         dropped += 1; continue
     if ep.session_id not in index:
-        index[ep.session_id] = db.get_session_span_index(ep.session_id)   # (seen span_ids, max_seq)
-    seen, max_seq = index[ep.session_id]
+        index[ep.session_id] = db.get_session_span_index(ep.session_id)[0]   # seen span_ids
+    seen = index[ep.session_id]
     if not ep.span_id or ep.span_id in seen:
         continue                                   # no identity, or already stored — skip
-    max_seq += 1
-    ep.sequence = max_seq                          # the tail's positional seq is discarded
+    eid, _ = db.append_episode(ep)                 # the tail's positional seq is ignored
     seen.add(ep.span_id)
-    eid = db.upsert_episode(ep)
     if ep.content and ep.content.strip():
         db.enqueue_extraction(ExtractionItem(episode_id=eid, session_id=ep.session_id,
                                              content=ep.content, content_type="episode", project=ep.project))
 ```
 
-- **Dedup by `span_id`** — a turn's stable last-record UUID. The session's `(seen span_ids, max_seq)` index is loaded once per session. The tail's own positional sequence is discarded (a tail renumbers from 1 and would collide).
+- **Dedup by `span_id`** — a turn's stable last-record UUID. The session's set of stored span ids is loaded once per session. The tail's own positional sequence is ignored (a tail renumbers from 1 and would collide).
 - **Cross-session content guard** (schema 036, `SYNAPSE_CONTENT_DEDUP=0` to disable) — the span guard is per-session, so a retry session or re-import that replays a turn under a *fresh* session/span id sails through it. A second check skips any turn whose content is byte-identical (`md5(content)` index) to an episode already stored in the same project, or stored from the same working directory under any label (so a replay whose first copy carries an older label for that folder, before `scripts/relabel_projects.py` merges them, is still caught). Measured on a real corpus: ~4.6% of episodes were exact replays (agent re-runs, mid-session forks, re-imports) before this guard.
-- **Append at `max(seq)+1`** — new turns extend the session.
+- **Append** — new turns extend the session through `EpisodeStore.append_episode`, which is also what `remember()` and the backfills use. The next sequence number is taken inside the INSERT (the session's highest plus one), and an INSERT that loses the number to another writer inserts nothing and is run again, so an append never rewrites another writer's row. A row's text, project and provenance stamp therefore always belong to one write; `upsert_episode` remains for a deliberate rewrite of a known row.
 - **Contamination filter** — `is_transcript_contamination` drops PII-bearing third-party transcript payloads (produced by another agent project sharing the same hooks).
 - **Private-mode filter** (schema 050) — `PrivateSessions.is_private` drops every turn whose `session_id` sits in `private_sessions`. Same chokepoint, same shape as the contamination predicate, and `ingestion/backfill.py` applies it too, so a session taken off the record can't be ingested by a path that bypasses the hook (catch-up sweep, disk backfill, a re-import months later). Rows are permanent by design: the transcript survives on disk, so deleting the row would re-expose exactly the turns the user hid. The one way to delete a row, `DELETE /private-sessions/{session_id}` (`private_mode.py off --forget`), is on the admin gate: only a full-trust device may take a session back on the record, and the root token or a restricted device gets a 403.
 - Runs in a threadpool so the async route never blocks.
