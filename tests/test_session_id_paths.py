@@ -110,7 +110,6 @@ def test_every_copy_of_the_rule_agrees_with_the_core(scratch):
         "ingest_hook": load_script("ingest_hook")._plain_name,
         "claude private_mode": _private_mode("claude")._plain_name,
         "codex private_mode": _private_mode("codex")._plain_name,
-        "codex stop hook": _codex_stop_hook()._plain_name,
     }
     ids = ["s-1", _UUID, "...", ".hidden", "a.b", "C:x", ".", "..", "../x", "/etc/x"]
     ids += ["a/b", "..\\x", "C:\\x", "a\\b", "a\0b"]

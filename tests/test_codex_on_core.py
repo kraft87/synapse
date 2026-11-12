@@ -714,3 +714,91 @@ def test_feedback_nudge_text_takes_the_tool_name():
     assert json.dumps(text).encode() in _FEEDBACK_OUT
     named = recall_feedback_nudge(recall_feedback="synapse:recall_feedback")
     assert named == text.replace("call recall_feedback(", "call synapse:recall_feedback(")
+
+
+# ---------------------------------------------------------------------------
+# synapse_stop_hook.py: private mode is the core's rule
+# ---------------------------------------------------------------------------
+
+_SESSION = "0b6c2f1e-4d3a-4c55-9a7e-2f1d8b9c0a11"
+
+
+def _rollout(path: Path) -> Path:
+    def item(role: str, kind: str, text: str) -> dict[str, Any]:
+        content = [{"type": kind, "text": text}]
+        payload = {"type": "message", "role": role, "content": content}
+        return {"type": "response_item", "payload": payload}
+
+    recs = [item("user", "input_text", "q"), item("assistant", "output_text", "r")]
+    path.write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
+    return path
+
+
+def _ship(monkeypatch, tmp_path: Path, session_id: str) -> tuple[ModuleType, list[str]]:
+    """The Stop hook shipping one rollout for ``session_id``; returns the hook and the
+    session ids it posted."""
+    hook = _load("codex_stop_hook_private_on_core", _CODEX / "hooks" / "synapse_stop_hook.py")
+    posted: list[str] = []
+    monkeypatch.setattr(
+        hook, "_post", lambda recs, sid, project=None: posted.append(sid) or {"ingested": 1}
+    )
+    rollout = _rollout(tmp_path / f"rollout-2026-11-12T09-00-00-{_SESSION}.jsonl")
+    hook._ship({"session_id": session_id, "transcript_path": str(rollout)})
+    return hook, posted
+
+
+def _hook_log(tmp_path: Path) -> str:
+    log = tmp_path / "codex-hook.log"
+    return log.read_text(encoding="utf-8") if log.exists() else ""
+
+
+def test_stop_hook_honours_a_fresh_private_marker(scratch, monkeypatch, tmp_path):
+    marker = Path(os.environ["SYNAPSE_PRIVATE_DIR"]) / _SESSION
+    marker.parent.mkdir(parents=True)
+    marker.write_text("", encoding="utf-8")
+    _hook, posted = _ship(monkeypatch, tmp_path, _SESSION)
+    assert posted == [] and marker.exists()
+    assert f"skip: private session {_SESSION}" in _hook_log(tmp_path)
+
+
+@pytest.mark.parametrize("ttl", [None, "1"])
+def test_stop_hook_removes_a_stale_private_marker_and_ships(scratch, monkeypatch, tmp_path, ttl):
+    if ttl:
+        monkeypatch.setenv("SYNAPSE_PRIVATE_TTL_HOURS", ttl)
+    marker = Path(os.environ["SYNAPSE_PRIVATE_DIR"]) / _SESSION
+    marker.parent.mkdir(parents=True)
+    marker.write_text("", encoding="utf-8")
+    age = (2 if ttl else 13) * 3600
+    os.utime(marker, (time.time() - age, time.time() - age))
+    _hook, posted = _ship(monkeypatch, tmp_path, _SESSION)
+    assert posted == [_SESSION] and not marker.exists()
+    assert f"PRIVATE stale marker removed {_SESSION}" in _hook_log(tmp_path)
+
+
+def test_stop_hook_treats_an_unreadable_marker_as_private(scratch, monkeypatch, tmp_path):
+    """The private dir is a file, so the marker cannot even be looked up (the stat fails
+    with NotADirectoryError, root or not): the session is not shipped."""
+    private_dir = Path(os.environ["SYNAPSE_PRIVATE_DIR"])
+    private_dir.write_text("not a directory", encoding="utf-8")
+    _hook, posted = _ship(monkeypatch, tmp_path, _SESSION)
+    assert posted == []
+    log = _hook_log(tmp_path)
+    assert f"PRIVATE unreadable {_SESSION}: NotADirectoryError" in log
+    assert f"skip: private session {_SESSION}" in log
+
+
+@pytest.mark.parametrize("session_id", ["..", "../victim", "a/b", "..\\victim"])
+def test_stop_hook_rejects_a_session_id_that_is_not_a_file_name(
+    scratch, monkeypatch, tmp_path, session_id
+):
+    """No marker can be named that: not private, and nothing outside the private dir is
+    looked at or removed, however old."""
+    private_dir = Path(os.environ["SYNAPSE_PRIVATE_DIR"])
+    private_dir.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_text("keep", encoding="utf-8")
+    os.utime(victim, (time.time() - 48 * 3600, time.time() - 48 * 3600))
+    _hook, posted = _ship(monkeypatch, tmp_path, session_id)
+    assert posted == [session_id]
+    assert victim.read_text(encoding="utf-8") == "keep"
+    assert "PRIVATE ignored a session id that is not a file name" in _hook_log(tmp_path)
