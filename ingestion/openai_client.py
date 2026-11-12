@@ -51,14 +51,21 @@ from typing import Any
 import orjson
 
 from ingestion.models import Episode
+from ingestion.render import (
+    USER_CAP,
+    assistant_line,
+    context_line,
+    group_turns,
+    join_lines,
+    repeated_span,
+    strip_nulls,
+    title_line,
+    user_line,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONTENT_TYPES = ("text", "multimodal_text")
-
-
-def _strip_nulls(text: str) -> str:
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _epoch_to_dt(ts: Any) -> datetime | None:
@@ -127,16 +134,7 @@ class OpenAIChatParser:
         if not msgs:
             return []
 
-        groups: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        for m in msgs:
-            if (m.get("author") or {}).get("role") == "user" and current:
-                groups.append(current)
-                current = [m]
-            else:
-                current.append(m)
-        if current:
-            groups.append(current)
+        groups = group_turns(msgs, lambda m: (m.get("author") or {}).get("role") == "user")
 
         title = (convo.get("title") or "").strip()
         default_model = convo.get("default_model_slug")
@@ -157,9 +155,9 @@ class OpenAIChatParser:
             last_msg_id: str | None = None
 
             if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
+                content_parts.append(context_line(prev_assistant))
             elif seq == 1 and title:
-                content_parts.append(f"[title] {title[:200]}")
+                content_parts.append(title_line(title))
 
             for m in group:
                 ts = ts or m.get("create_time")
@@ -168,20 +166,18 @@ class OpenAIChatParser:
                 text = _msg_text(m)
                 if (m.get("author") or {}).get("role") == "user":
                     if human_turn is None:
-                        human_turn = text[:3000]
-                        content_parts.append(f"[user] {human_turn}")
+                        human_turn = text[:USER_CAP]
+                        content_parts.append(user_line(human_turn))
                 else:
                     assistant_turn = text
-                    content_parts.append(f"[assistant] {text[:3000]}")
+                    content_parts.append(assistant_line(text))
 
             if not content_parts:
                 continue
 
             span_id = f"chatgpt:{last_msg_id}" if last_msg_id else None
-            if span_id is not None:
-                if span_id in seen_span_ids:
-                    continue
-                seen_span_ids.add(span_id)
+            if repeated_span(seen_span_ids, span_id):
+                continue
 
             created_at = _epoch_to_dt(ts) or _epoch_to_dt(convo.get("create_time"))
 
@@ -192,9 +188,9 @@ class OpenAIChatParser:
                     project=None,
                     platform="chatgpt",
                     model=model or default_model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=strip_nulls(human_turn) if human_turn else None,
+                    assistant_turn=strip_nulls(assistant_turn) if assistant_turn else None,
+                    content=join_lines(content_parts),
                     span_id=span_id,
                     source="openai",
                     metadata={

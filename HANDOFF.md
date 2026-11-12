@@ -3,6 +3,66 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — ingest: the transcript line rules live in one module
+
+**What changed**
+
+- **New `ingestion/render.py`.** It holds what every transcript parser rendered by hand:
+  - the line shapes `[context]`, `[user]`, `[assistant]`, `[tool:name]`, `[result]` and
+    `[title]`, with their caps (300, 3000, 3000, 300, 500, 200);
+  - a `[result]` line only for text longer than 20 characters;
+  - the NUL strip and the blank-line join;
+  - the loop that opens a new group at each user turn;
+  - the check that emits a repeated span id once.
+- **The six parsers use it** (`jsonl`, `codex`, `messages`, `openai`, `cursor_sqlite`,
+  `claude_ai`). Their private `_strip_nulls` copies and grouping loops are gone. Each
+  parser still decides which records become which line, in what order, and when a group
+  is too empty to keep.
+- `claude_ai_client.py` keeps its own `[user]` and `[assistant]` lines: it caps them at
+  5000, not 3000.
+- **New `tests/test_ingest_render.py`:**
+  - unit tests for each rule at its boundary (a 20-character result gets no line, 21
+    does);
+  - a golden render for each of jsonl, codex and messages, pinning the full content
+    string, so their differences stay visible: jsonl puts a record's tool lines before
+    its `[assistant]` line and messages after; all three join a message's text parts
+    with a newline; jsonl drops `Stop hook feedback:` text; messages hashes
+    a turn's own lines before `[context]` is added;
+  - a source guard that fails when an `ingestion/*_client.py` file spells a line prefix
+    in a string or f-string, or defines `_strip_nulls`. claude.ai's two lines are its
+    one named exception.
+
+**On each machine**
+
+1. Nothing. Server-only refactor; no schema, plugin or config change. Stored span ids
+   and content do not move.
+
+**Proven**
+
+- Output is byte-identical. A throwaway differential script ran the parsers from
+  origin/main and from this branch over the same inputs and compared every Episode
+  field: 17,507 local Claude Code transcripts (plus 3,502 each re-parsed whole and as a
+  tail through the `/ingest` seam), 28 Codex rollouts (whole, pushed, tail), synthetic
+  messages, ChatGPT, claude.ai and Cursor inputs built from 599 real turns, and the 174
+  parser calls the old and new tests make. 25,543 cases, 33,663 episodes, 0 differences.
+  The same run with origin/main on both sides also found 0, and a deliberately changed
+  rule was caught.
+- Full non-db suite: 3782 passed, 34 skipped, 2 xfailed. Ruff check and format are
+  clean; mypy reports nothing in `ingestion/`; bandit finds no issues.
+
+**Open**
+
+- Three defects this change left alone were fixed the same day, in the parsers:
+  - jsonl kept only the last text block of a record. It now joins every text block in
+    order, and in a user record leaves out a block of Claude Code machinery;
+  - a null tool name rendered as `[tool:None]` in jsonl and codex. It now falls back to
+    `tool` (codex: `function` for a function call), as messages does;
+  - jsonl rendered a whitespace-only tool detail. It now gets no line.
+  - None of the three changes what any transcript on cortex renders to: Claude Code
+    writes one block to a record.
+- Left as it is: Cursor renders tool results as `[tool:name]` lines, never `[result]`.
+- codex's "a group with only `[context]` is kept" cannot happen: every group after the
+  first opens with a user message, which always renders a `[user]` line.
 ## 2026-11-12 — plugin-codex: the Codex hooks run on the client core (plugin 0.24.4)
 
 **What changed**

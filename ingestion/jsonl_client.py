@@ -24,6 +24,18 @@ import orjson
 
 from ingestion.models import Episode
 from ingestion.project_label import label_from_path
+from ingestion.render import (
+    USER_CAP,
+    assistant_line,
+    context_line,
+    group_turns,
+    join_lines,
+    repeated_span,
+    result_line,
+    strip_nulls,
+    tool_line,
+    user_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,11 +98,6 @@ def _tool_input_detail(inp: Any) -> str:
     )
 
 
-def _strip_nulls(text: str) -> str:
-    """Postgres TEXT columns reject NUL bytes — strip them defensively."""
-    return text.replace("\x00", "") if "\x00" in text else text
-
-
 def _tool_result_text(raw: Any) -> str:
     if isinstance(raw, list):
         return " ".join(
@@ -102,8 +109,13 @@ def _tool_result_text(raw: Any) -> str:
 def _extract_blocks(
     message: dict[str, Any], rtype: str
 ) -> tuple[str | None, list[str], list[str], str | None]:
-    """Return (text, tool_use_lines, tool_result_lines, model) from a message."""
-    text: str | None = None
+    """Return (text, tool_use_lines, tool_result_lines, model) from a message.
+
+    ``text`` is every text block of the message, in order, joined by newlines, as the
+    Codex and messages parsers join theirs. In a user record a block of Claude Code
+    machinery is not the user's words and is left out.
+    """
+    texts: list[str] = []
     tool_uses: list[str] = []
     tool_results: list[str] = []
     model = message.get("model") if rtype == "assistant" else None
@@ -114,7 +126,7 @@ def _extract_blocks(
         return (t or None), tool_uses, tool_results, model
 
     if not isinstance(content, list):
-        return text, tool_uses, tool_results, model
+        return None, tool_uses, tool_results, model
 
     for block in content:
         if not isinstance(block, dict):
@@ -122,19 +134,19 @@ def _extract_blocks(
         btype = block.get("type")
         if btype == "text":
             t = str(block.get("text") or block.get("content") or "").strip()
-            if t:
-                text = t
+            if t and not (rtype == "user" and _is_machinery_text(t)):
+                texts.append(t)
         elif btype == "tool_use":
-            name = block.get("name", "tool")
-            detail = _tool_input_detail(block.get("input"))
-            if detail:
-                tool_uses.append(f"[tool:{name}] {str(detail)[:300]}")
+            name = block.get("name") or "tool"
+            detail = str(_tool_input_detail(block.get("input")))
+            if detail.strip():
+                tool_uses.append(tool_line(name, detail))
         elif btype == "tool_result":
-            txt = _tool_result_text(block.get("content", ""))
-            if len(txt) > 20:
-                tool_results.append(f"[result] {txt[:500]}")
+            line = result_line(_tool_result_text(block.get("content", "")))
+            if line:
+                tool_results.append(line)
 
-    return text, tool_uses, tool_results, model
+    return ("\n".join(texts) or None), tool_uses, tool_results, model
 
 
 def _cwd_to_project(cwd: str | None) -> str | None:
@@ -241,17 +253,7 @@ class JSONLParser:
 
     @staticmethod
     def _group_into_turns(records: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
-        groups: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        for rec in records:
-            if _is_user_turn(rec) and current:
-                groups.append(current)
-                current = [rec]
-            else:
-                current.append(rec)
-        if current:
-            groups.append(current)
-        return groups
+        return group_turns(records, _is_user_turn)
 
     @staticmethod
     def _groups_to_episodes(
@@ -287,7 +289,7 @@ class JSONLParser:
             git_branch: str | None = None
 
             if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
+                content_parts.append(context_line(prev_assistant))
 
             for rec in group:
                 session_id = session_id or rec.get("sessionId")
@@ -304,8 +306,8 @@ class JSONLParser:
                     if text and text.startswith(_HOOK_FEEDBACK_PREFIX):
                         text = None
                     if text and human_turn is None and len(text) > 0:
-                        human_turn = text[:3000]
-                        content_parts.append(f"[user] {human_turn}")
+                        human_turn = text[:USER_CAP]
+                        content_parts.append(user_line(human_turn))
                     for tr in tresults:
                         content_parts.append(tr)
                 else:  # assistant
@@ -313,17 +315,15 @@ class JSONLParser:
                         content_parts.append(tu)
                     if text:
                         assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:3000]}")
+                        content_parts.append(assistant_line(text))
 
             # A hook bounce with no reply leaves only the [context] prefix: nothing to store.
             if not session_id or not content_parts[1 if prev_assistant else 0 :]:
                 continue
 
             span_id = f"claude_code:{last_uuid}" if last_uuid else None
-            if span_id is not None:
-                if span_id in seen_span_ids:
-                    continue  # repeated turn (compaction re-dump) — already emitted
-                seen_span_ids.add(span_id)
+            if repeated_span(seen_span_ids, span_id):
+                continue  # repeated turn (compaction re-dump) — already emitted
 
             try:
                 created_at = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
@@ -343,9 +343,9 @@ class JSONLParser:
                     project=project,
                     platform="claude_code",
                     model=model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=strip_nulls(human_turn) if human_turn else None,
+                    assistant_turn=strip_nulls(assistant_turn) if assistant_turn else None,
+                    content=join_lines(content_parts),
                     span_id=span_id,
                     source="jsonl",
                     metadata={
