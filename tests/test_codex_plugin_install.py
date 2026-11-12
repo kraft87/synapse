@@ -111,7 +111,7 @@ def test_header_helper_fails_closed(monkeypatch, capsys, tmp_path, token, url, s
     config.INGEST_TOKEN = token
     config._FILE_OPTIONS = {}
     config.synapse_home = SimpleNamespace(home=lambda: tmp_path)
-    # config decides whether the device token may go there (config._device_origins).
+    # config decides whether the device token may go there (synapse_client.credentials).
     withheld = bool(server) and server != "https://memory.example"
     config.TOKEN_OVERRIDE = (
         {"withheld": "https://memory.example", "server": server} if withheld else {}

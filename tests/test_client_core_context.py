@@ -297,6 +297,14 @@ def test_the_pieces_compose_into_the_block(tmp_path):
     assert context.assemble(pieces) == context.session_block(client, "p", s, upload_warning="W")
 
 
+def test_notice_part_passes_the_harness_wording_through(tmp_path):
+    s = _noted_settings(tmp_path)
+    own = {"env": "[Synapse] env token ignored for {surface}."}
+    assert context.notice_part(s, source_lines=own) == "[Synapse] env token ignored for dev-9."
+    assert context.notice_part(s, source_lines={"env": ""}) == ""
+    assert context.notice_part(s, env_location="~/a b/.env").endswith("Remove it from ~/a b/.env.")
+
+
 @pytest.mark.parametrize(
     ("flags", "expected"),
     [

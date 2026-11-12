@@ -156,14 +156,23 @@ def board_parts(
 
 
 def notice_part(
-    settings: Settings, *, env_location: str = "your shell profile", hint: str = ""
+    settings: Settings,
+    *,
+    env_location: str = "your shell profile",
+    hint: str = "",
+    config_path: str = "~/.synapse/config.json",
+    source_lines: Mapping[str, str] | None = None,
 ) -> str:
     """The credential notice for ``settings.token_note`` (see credentials.override_notice
-    for ``env_location`` and ``hint``); "" when nothing was overridden. Local, no
-    request. Never raises."""
+    for ``env_location``, ``hint``, ``config_path`` and ``source_lines``); "" when
+    nothing was overridden. Local, no request. Never raises."""
     try:
         return credentials.override_notice(
-            settings.token_note, env_location=env_location, hint=hint
+            settings.token_note,
+            env_location=env_location,
+            config_path=config_path,
+            hint=hint,
+            source_lines=source_lines,
         )
     except Exception:
         return ""

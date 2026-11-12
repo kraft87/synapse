@@ -193,6 +193,22 @@ def test_a_withheld_note_renders_the_withheld_notice():
     assert f"synapse config url {_FOREIGN} --same-server" in text
 
 
+def test_a_harness_words_its_own_sources_and_names_its_config_path():
+    note = {"surface_id": _SURFACE_ID, "sources": ["env", "plugin_option", "plugin_config"]}
+    own = {"plugin_option": "[Synapse] Mine is ignored for {surface}.", "plugin_config": ""}
+    text = credentials.override_notice(note, env_location="~/x.env", source_lines=own)
+    assert text.splitlines() == [
+        "[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "
+        f"enrolled as {_SURFACE_ID}. Remove it from ~/x.env.",
+        f"[Synapse] Mine is ignored for {_SURFACE_ID}.",
+    ]
+    cfg = credentials.override_notice(
+        {"surface_id": _SURFACE_ID, "sources": ["config_file"]}, config_path="C:\\u\\cfg.json"
+    )
+    assert cfg.startswith("[Synapse] The token in C:\\u\\cfg.json is ignored")
+    assert credentials.override_notice(note, source_lines={}) == credentials.override_notice(note)
+
+
 # ---------------------------------------------------------------------------
 # Equivalence with plugin/scripts/config.py
 # ---------------------------------------------------------------------------

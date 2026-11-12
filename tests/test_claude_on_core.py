@@ -1,0 +1,540 @@
+"""The Claude Code hooks on the client core (plugin/scripts over plugin/synapse_client).
+
+config.py resolves every setting on the core and sends through its Transport; the hook
+scripts print what the core builds. What a Claude Code user sees is pinned here
+literally: the resolution ranking, the token rules, each notice byte for byte, and each
+hook's output for a normal reply, a 401, a restricted caller, a 500 and its kill switch.
+
+Every script is loaded by path, or run as Claude Code runs it, with HOME, SYNAPSE_HOME and
+every other file it reads at import under a temp dir (scratch_user), and talks to a local
+stdlib server on 127.0.0.1. No test reaches a configured Synapse server or reads a real
+credential.
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import json
+import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from tests.helpers.client_core import PLUGIN, SCRIPTS, drop_scripts, load_script, scratch_user
+
+_TOKEN = "tkCLAUDEcore5Vn8Qx"
+_DEVICE = "tkDEVICEclaude7Rq2"
+_STALE = "tkSTALEclaude9Wm4"
+_SURFACE_ID = "dev-claude-test"
+_SERVER = "https://syn.example.net"
+
+
+# ---------------------------------------------------------------------------
+# A local Synapse stand-in
+# ---------------------------------------------------------------------------
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server: _Server
+
+    def log_message(self, format: str, *args: Any) -> None:  # silence
+        pass
+
+    def _handle(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        path = self.path.split("?", 1)[0]
+        self.server.seen.append(
+            {
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": json.loads(body) if body else None,
+            }
+        )
+        status, reply, delay = self.server.routes.get(path, (200, {}, 0.0))
+        if delay:
+            self.server.release.wait(delay)
+        raw = json.dumps(reply).encode()
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except OSError:  # the client gave up waiting
+            pass
+
+    do_GET = do_POST = do_PUT = do_DELETE = _handle
+
+
+class _Server(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _Handler)
+        self.seen: list[dict[str, Any]] = []
+        #: path -> (status, JSON reply, seconds to stall before answering)
+        self.routes: dict[str, tuple[int, Any, float]] = {}
+        self.release = threading.Event()
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.server_address[1]}"
+
+    def answer(self, path: str, reply: Any, status: int = 200, delay: float = 0.0) -> None:
+        self.routes[path] = (status, reply, delay)
+
+
+@pytest.fixture()
+def server() -> Iterator[_Server]:
+    srv = _Server()
+    threading.Thread(target=srv.serve_forever, args=(0.02,), daemon=True).start()
+    yield srv
+    srv.release.set()
+    srv.shutdown()
+    srv.server_close()
+
+
+@pytest.fixture()
+def scratch(monkeypatch, tmp_path) -> Iterator[Path]:
+    """A scratch user; sys.path and the hook modules put back after."""
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    yield scratch_user(monkeypatch, tmp_path)
+    drop_scripts()
+
+
+def _write_config(home: Path, data: dict[str, Any]) -> None:
+    path = home / ".synapse" / "config.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _write_settings(home: Path, data: dict[str, Any]) -> None:
+    path = home / ".claude" / "settings.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _options(values: dict[str, Any]) -> dict[str, Any]:
+    return {"pluginConfigs": {"synapse@synapse": {"options": values}}}
+
+
+def _record(token: str = _DEVICE, server: str = _SERVER) -> dict[str, Any]:
+    return {
+        "surface_id": _SURFACE_ID,
+        "server": server,
+        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+    }
+
+
+def _user_agent() -> str:
+    version = json.loads((PLUGIN / ".claude-plugin" / "plugin.json").read_text())["version"]
+    return f"synapse-client/{version} claude-code"
+
+
+# ---------------------------------------------------------------------------
+# config.py: the read path is the core's
+# ---------------------------------------------------------------------------
+
+
+def _words(path: Path) -> tuple[set[str], set[str]]:
+    """The modules ``path`` imports, and its identifiers and string literals."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    words: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported |= {alias.name for alias in node.names}
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module)
+        elif isinstance(node, ast.Name):
+            words.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            words.add(node.attr)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            words.add(node.value)
+    return imported, words
+
+
+def test_config_has_no_http_or_token_resolution_of_its_own(scratch, monkeypatch):
+    imported, words = _words(SCRIPTS / "config.py")
+    assert not imported & {"urllib.parse", "urllib.error", "http.client", "hashlib"}
+    assert not words & {"Authorization", "sha256", "hexdigest", "build_opener"}
+    assert not any(word.startswith("Bearer") for word in words)
+
+    monkeypatch.setenv("SYNAPSE_URL", _SERVER + "/mcp")
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+    config = load_script("config")
+    from synapse_client.settings import Settings
+
+    assert isinstance(config.SETTINGS, Settings)
+    assert Path(sys.modules["synapse_client"].__file__).parents[1] == PLUGIN
+    assert config.BASE_URL == config.SETTINGS.base_url == _SERVER
+    assert config.INGEST_URL == config.SETTINGS.ingest_url == _SERVER + "/ingest"
+    assert config.INGEST_TOKEN == config.SETTINGS.token == _TOKEN
+
+
+_URLS: dict[str, tuple[dict[str, str], dict[str, Any], dict[str, Any], tuple[str, str, str]]] = {
+    # case: (env, config.json, plugin options in settings.json) -> (base, ingest, mcp)
+    "nothing-is-localhost": ({}, {}, {}, ("http://localhost:8765", "", "")),
+    "env-beats-config-json": (
+        {"SYNAPSE_URL": "https://env.example/"},
+        {"url": "https://cfg.example"},
+        {"SYNAPSE_URL": "https://opt.example"},
+        ("https://env.example", "", ""),
+    ),
+    "config-json-beats-the-options": (
+        {"CLAUDE_PLUGIN_OPTION_SYNAPSE_URL": "https://exported.example"},
+        {"url": "https://cfg.example"},
+        {"SYNAPSE_URL": "https://opt.example"},
+        ("https://cfg.example", "", ""),
+    ),
+    "an-exported-option-beats-settings-json": (
+        {"CLAUDE_PLUGIN_OPTION_SYNAPSE_URL": "https://exported.example/ingest"},
+        {},
+        {"SYNAPSE_URL": "https://opt.example"},
+        ("https://exported.example", "", ""),
+    ),
+    "settings-json-last": (
+        {},
+        {},
+        {"SYNAPSE_URL": "https://opt.example/mcp"},
+        ("https://opt.example", "", ""),
+    ),
+    "a-legacy-ingest-url-names-the-server": (
+        {"SYNAPSE_INGEST_URL": "https://ing.example/ingest"},
+        {},
+        {},
+        ("https://ing.example", "https://ing.example/ingest", ""),
+    ),
+    "the-legacy-endpoint-keys-still-win": (
+        {"SYNAPSE_URL": "https://env.example"},
+        {},
+        {
+            "SYNAPSE_INGEST_URL": "https://ing.example/in",
+            "SYNAPSE_MCP_URL": "https://m.example/mcp",
+        },
+        ("https://env.example", "https://ing.example/in", "https://m.example/mcp"),
+    ),
+    "an-empty-env-value-is-unset": (
+        {"SYNAPSE_URL": ""},
+        {"url": "https://cfg.example/"},
+        {},
+        ("https://cfg.example", "", ""),
+    ),
+    "a-url-of-only-slashes-leaves-relative-endpoints": (
+        {"SYNAPSE_URL": "//"},
+        {},
+        {},
+        ("", "/ingest", "/mcp"),
+    ),
+    "a-falsy-json-option-reads-as-its-string": (
+        {},
+        {},
+        {"SYNAPSE_URL": 0},
+        ("0", "0/ingest", "0/mcp"),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_URLS))
+def test_url_resolution_ranking(scratch, monkeypatch, case):
+    env, home_json, options, (base, ingest, mcp) = _URLS[case]
+    _write_config(scratch, home_json)
+    _write_settings(scratch, _options(options))
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    config = load_script("config")
+    assert config.BASE_URL == base
+    assert config.INGEST_URL == (ingest or base + "/ingest")
+    assert config.MCP_URL == (mcp or base + "/mcp")
+    assert config.SKILLS_URL == base + "/skills"
+
+
+def test_flags_rank_env_then_config_json_then_the_options_and_read_live(scratch, monkeypatch):
+    _write_config(scratch, {"role": "work", "config_paths": []})
+    _write_settings(scratch, _options({"SYNAPSE_BOARD": "0", "SYNAPSE_CONFIG_PATHS": "~/stale/*"}))
+    monkeypatch.setenv("CLAUDE_PLUGIN_OPTION_SYNAPSE_SURFACE", "exported")
+    config = load_script("config")
+    assert config.MACHINE_ROLE == "work" and config.requested_trust() == "restricted"
+    assert config._cfg("SYNAPSE_BOARD", "1") == "0"
+    assert config.CONFIG_PATHS == []  # a cleared list does not fall through
+    assert config.SURFACE == "exported"
+    monkeypatch.setenv("SYNAPSE_BOARD", "1")
+    monkeypatch.setenv("SYNAPSE_MACHINE_ROLE", "Personal ")
+    assert config._cfg("SYNAPSE_BOARD", "x") == "1"
+    assert config.machine_role() == "personal"
+    monkeypatch.delenv("SYNAPSE_MACHINE_ROLE")
+    config.set_home_values({"role": "personal"})
+    assert config.machine_role() == "personal"
+
+
+# The token rules: (env, config.json, settings.json) -> (token sent, note, notice).
+_NOTICE_ENV_SHELL = (
+    "[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "
+    "enrolled as dev-claude-test. Remove it from your shell profile."
+)
+_NOTICE_ENV_BLOCK = (
+    "[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "
+    'enrolled as dev-claude-test. Remove it from the "env" block of ~/.claude/settings.json.'
+)
+_NOTICE_PLUGIN_OPTION = (
+    "[Synapse] The Synapse token Claude Code loaded for this session is ignored: this "
+    "machine is enrolled as dev-claude-test, and hooks use its device token. Run "
+    "/reload-plugins (or restart) so recall uses it too."
+)
+_NOTICE_CONFIG_FILE = (
+    "[Synapse] The token in ~/.synapse/config.json is ignored: this machine is enrolled "
+    "as dev-claude-test with a different one. Run `synapse login --reenroll` to replace "
+    "the enrollment, or `synapse config token --unset`."
+)
+
+
+def _withheld(url: str) -> str:
+    return (
+        f"[Synapse] {url} is not the server this machine enrolled with ({_SERVER}), so its "
+        f"device token is not sent there. The same server at a new address: `synapse "
+        f"config url {url} --same-server`. Another server: `synapse login --url {url} "
+        "--reenroll`."
+    )
+
+
+_ENROLLED = {"url": _SERVER, "token": _DEVICE, "device": _record()}
+_TOKENS: dict[str, tuple[dict, dict, dict, str, dict, str]] = {
+    "unenrolled-env-token-is-sent": (
+        {"SYNAPSE_INGEST_TOKEN": _TOKEN},
+        {"url": _SERVER},
+        {},
+        _TOKEN,
+        {},
+        "",
+    ),
+    "unenrolled-config-token": ({}, {"url": _SERVER, "token": _TOKEN}, {}, _TOKEN, {}, ""),
+    "unenrolled-options-token": (
+        {},
+        {"url": _SERVER},
+        _options({"SYNAPSE_INGEST_TOKEN": _TOKEN}),
+        _TOKEN,
+        {},
+        "",
+    ),
+    "the-device-token-beats-an-env-token": (
+        {"SYNAPSE_INGEST_TOKEN": _STALE},
+        _ENROLLED,
+        {},
+        _DEVICE,
+        {"surface_id": _SURFACE_ID, "sources": ["env"]},
+        _NOTICE_ENV_SHELL,
+    ),
+    "the-notice-names-the-settings-env-block": (
+        {"SYNAPSE_INGEST_TOKEN": _STALE},
+        _ENROLLED,
+        {"env": {"SYNAPSE_INGEST_TOKEN": _STALE}},
+        _DEVICE,
+        {"surface_id": _SURFACE_ID, "sources": ["env"]},
+        _NOTICE_ENV_BLOCK,
+    ),
+    "a-device-token-in-settings-json-beats-the-rest": (
+        {"SYNAPSE_INGEST_TOKEN": _STALE, "CLAUDE_PLUGIN_OPTION_SYNAPSE_INGEST_TOKEN": "tkOPT1"},
+        {"url": _SERVER, "token": "tkCFG2", "device": _record()},
+        _options({"SYNAPSE_INGEST_TOKEN": _DEVICE}),
+        _DEVICE,
+        {"surface_id": _SURFACE_ID, "sources": ["env", "config_file", "plugin_option"]},
+        "\n".join([_NOTICE_ENV_SHELL, _NOTICE_CONFIG_FILE, _NOTICE_PLUGIN_OPTION]),
+    ),
+    "a-stale-config-token-with-no-device-token-anywhere-is-sent": (
+        {},
+        {"url": _SERVER, "token": _STALE, "device": _record()},
+        {},
+        _STALE,
+        {},
+        "",
+    ),
+    "the-device-token-is-withheld-from-another-server": (
+        {"SYNAPSE_URL": "https://other.example.org"},
+        _ENROLLED,
+        {},
+        "",
+        {
+            "surface_id": _SURFACE_ID,
+            "sources": [],
+            "withheld": "https://other.example.org",
+            "server": _SERVER,
+        },
+        _withheld("https://other.example.org"),
+    ),
+    "and-from-the-localhost-default": (
+        {},
+        {"token": _DEVICE, "device": _record()},
+        {},
+        "",
+        {
+            "surface_id": _SURFACE_ID,
+            "sources": [],
+            "withheld": "http://localhost:8765",
+            "server": _SERVER,
+        },
+        _withheld("http://localhost:8765"),
+    ),
+    "a-falsy-json-token-in-settings-json-is-no-token": (
+        {},
+        {"url": _SERVER},
+        _options({"SYNAPSE_INGEST_TOKEN": 0}),
+        "",
+        {},
+        "",
+    ),
+    "a-falsy-json-url-in-settings-json-is-no-address-for-the-device-token": (
+        {},
+        {"device": _record()},
+        _options({"SYNAPSE_INGEST_TOKEN": _DEVICE, "SYNAPSE_URL": {}}),
+        "",
+        {"surface_id": _SURFACE_ID, "sources": [], "withheld": "://", "server": _SERVER},
+        _withheld("://"),
+    ),
+    "a-url-of-only-slashes-is-no-address-for-the-device-token": (
+        {"SYNAPSE_URL": "/"},
+        _ENROLLED,
+        {},
+        "",
+        {"surface_id": _SURFACE_ID, "sources": [], "withheld": "://", "server": _SERVER},
+        _withheld("://"),
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_TOKENS))
+def test_token_rules_and_notices(scratch, monkeypatch, case):
+    env, home_json, settings, token, note, notice = _TOKENS[case]
+    _write_config(scratch, home_json)
+    _write_settings(scratch, settings)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    config = load_script("config")
+    assert config.INGEST_TOKEN == token
+    assert config.TOKEN_OVERRIDE == note
+    assert config.token_override_notice() == notice
+    for secret in (_TOKEN, _DEVICE, _STALE):
+        assert secret not in notice
+
+
+def test_device_origins_read_the_files_as_they_are_now(scratch):
+    _write_config(scratch, {"url": "http://srv-a:8765"})
+    config = load_script("config")
+    assert config.device_origins() == set()
+    config.set_home_values({"device": _record()})
+    assert config.device_origins() == {("https", "syn.example.net")}
+    assert config.read_device_state() == _record()
+
+
+def test_config_requests_carry_the_client_user_agent_and_the_bearer(scratch, monkeypatch, server):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+    config = load_script("config")
+    server.answer("/context", {"status": "ok"})
+    assert config.get_json("/context", {"project": "p"}) == {"status": "ok"}
+    config.post_json("/skills/list", {"a": 1})
+    config.request_json("PUT", "/private-sessions/s-1", timeout=5)
+    assert [(r["method"], r["path"]) for r in server.seen] == [
+        ("GET", "/context?project=p"),
+        ("POST", "/skills/list"),
+        ("PUT", "/private-sessions/s-1"),
+    ]
+    for req in server.seen:
+        assert req["headers"]["user-agent"] == _user_agent()
+        assert req["headers"]["authorization"] == f"Bearer {_TOKEN}"
+    assert server.seen[1]["body"] == {"a": 1}
+
+
+@pytest.mark.parametrize("key", ["SYNAPSE_INGEST_URL", "SYNAPSE_MCP_URL"])
+def test_the_bearer_goes_to_the_ingest_and_mcp_origins(scratch, monkeypatch, server, key):
+    monkeypatch.setenv("SYNAPSE_URL", "http://localhost:9")
+    monkeypatch.setenv(key, server.url + "/x")
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+    config = load_script("config")
+    config.post_json(server.url + "/elsewhere", {})
+    assert server.seen[0]["headers"]["authorization"] == f"Bearer {_TOKEN}"
+
+
+def test_config_keeps_the_bearer_off_another_origin(scratch, monkeypatch, server):
+    """Intended with the move to the core's Transport: an absolute URL at an origin none
+    of this machine's URLs name is sent without the bearer."""
+    monkeypatch.setenv("SYNAPSE_URL", "http://localhost:9")
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+    config = load_script("config")
+    config.post_json(server.url + "/elsewhere", {})
+    config.get_json(server.url + "/elsewhere")
+    assert len(server.seen) == 2
+    assert all("authorization" not in r["headers"] for r in server.seen)
+
+
+def test_act_gates_on_the_expected_status(scratch, monkeypatch, server, capsys):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    config = load_script("config")
+    server.answer("/skills/proposals/act", {"status": "applied"})
+    assert config.act("/skills", 7, "accept", expect="applied", reason="r") == {"status": "applied"}
+    assert server.seen[0]["body"] == {"id": 7, "action": "accept", "reason": "r"}
+    server.answer("/skills/proposals/act", {"status": "x", "detail": "nope"})
+    assert config.act("/skills", 7, "accept", expect="applied") is None
+    assert capsys.readouterr().out == "nope\n"
+
+
+def test_hooks_json_is_unchanged():
+    """The move changes no hook registration: the file is byte-identical to the one the
+    hooks shipped with before it."""
+    raw = (PLUGIN / "hooks" / "hooks.json").read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == (
+        "b0a2f7e92bf1903f6bc907695df50a2ded3328651c5c3dc245db1d02e7e0df50"
+    )
+
+
+# ---------------------------------------------------------------------------
+# harness.py: the registry comes from the managed client's core
+# ---------------------------------------------------------------------------
+
+
+def _fake_core(root: Path, marker: str) -> Path:
+    pkg = root / "plugin" / "synapse_client"
+    (pkg / "harnesses").mkdir(parents=True)
+    (pkg / "__init__.py").write_text(f'__version__ = "{marker}"\n', encoding="utf-8")
+    (pkg / "harnesses" / "__init__.py").write_text(
+        f"def registry():\n    return [{marker!r}]\n", encoding="utf-8"
+    )
+    return root / "plugin"
+
+
+@pytest.fixture()
+def saved_core() -> Iterator[None]:
+    saved = {n: m for n, m in sys.modules.items() if n.split(".")[0] == "synapse_client"}
+    yield
+    for name in [n for n in sys.modules if n.split(".")[0] == "synapse_client"]:
+        del sys.modules[name]
+    sys.modules.update(saved)
+
+
+def test_the_registry_is_the_managed_clients_not_the_one_config_imported(
+    scratch, monkeypatch, tmp_path, saved_core
+):
+    """`synapse update` runs the old client's CLI: config.py imported that client's core.
+    The harnesses built after the installer ran must come from the new one."""
+    harness = load_script("harness")
+    old = sys.modules["synapse_client"]
+    assert Path(old.__file__).parents[1] == PLUGIN
+    managed = _fake_core(tmp_path / "managed", "9.9.9-new")
+    monkeypatch.setattr(harness, "_core_parent", lambda: managed)
+    assert harness._core_registry() == ["9.9.9-new"]
+    assert sys.modules["synapse_client"].__version__ == "9.9.9-new"
+    assert harness.config.credentials is old.credentials  # loaded modules keep theirs
+
+
+def test_the_core_config_imported_stays_when_it_is_the_one_to_load(scratch, saved_core):
+    harness = load_script("harness")
+    loaded = sys.modules["synapse_client"]
+    harness._forget_other_core(str(PLUGIN))
+    assert sys.modules["synapse_client"] is loaded
