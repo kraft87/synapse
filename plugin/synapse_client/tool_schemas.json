@@ -50,6 +50,18 @@
             "default": null,
             "description": "NEVER set this yourself. The client's PreToolUse hook injects\nthe calling session's id so serving can suppress self-session domination;\ncalls without it simply skip that suppression."
           },
+          "self_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "NEVER set this yourself; the client hook injects the time of this\nsession's last compaction, so only your turns since then are left out."
+          },
           "surface": {
             "anyOf": [
               {
@@ -107,6 +119,18 @@
             ],
             "default": null,
             "description": "NEVER set this yourself. The client's PreToolUse hook\ninjects the calling session's id so your own session's turns are\nexcluded; calls without it simply skip that exclusion."
+          },
+          "self_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "NEVER set this yourself; the client hook injects the time of this\nsession's last compaction, so only your turns since then are left out."
           },
           "session_id": {
             "anyOf": [

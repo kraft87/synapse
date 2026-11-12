@@ -32,6 +32,7 @@ import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager
+from datetime import UTC, datetime
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -487,7 +488,24 @@ class Recall(
         return self._reranker
 
     @staticmethod
-    def _exclude_self(ranked_eps: list[dict[str, Any]], self_session: str) -> list[dict[str, Any]]:
+    def _self_cutoff(self_session: str | None, self_since: Any) -> datetime | None:
+        """The caller's last compaction as an aware UTC time, or None to hide the whole session.
+
+        ``self_since`` is ISO-8601 from the client hook (``Z``, an offset, or naive = UTC).
+        Anything unusable (empty, malformed, not a string, or no ``self_session`` to cut)
+        is None, which is the exclusion as it was before the cut existed."""
+        if not self_session or not isinstance(self_since, str) or not self_since.strip():
+            return None
+        try:
+            cut = datetime.fromisoformat(self_since.strip())
+            return cut.replace(tzinfo=UTC) if cut.tzinfo is None else cut.astimezone(UTC)
+        except (ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _exclude_self(
+        ranked_eps: list[dict[str, Any]], self_session: str, since: datetime | None = None
+    ) -> list[dict[str, Any]]:
         """Drop the calling session's own episodes from the serving pool.
 
         Runs whenever the call carries ``self_session`` (injected by the client's
@@ -495,8 +513,21 @@ class Recall(
         them back wastes tokens, crowds out older real history, and was the top
         measured recall_feedback noise driver. A session-scoped drill-down
         (``session_id`` set, or fetch) is never excluded.
+
+        ``since`` (from ``_self_cutoff``) is the caller's last compaction: turns before
+        it are gone from its context, so they serve again. An own turn without a usable
+        ``created_at`` stays hidden, since it cannot be placed before the cut.
         """
-        return [e for e in ranked_eps if e.get("session_id") != self_session]
+
+        def _keep(e: dict[str, Any]) -> bool:
+            if e.get("session_id") != self_session:
+                return True
+            at = e.get("created_at")
+            if since is None or not isinstance(at, datetime):
+                return False
+            return (at if at.tzinfo else at.replace(tzinfo=UTC)) < since
+
+        return [e for e in ranked_eps if _keep(e)]
 
 
 __all__ = [

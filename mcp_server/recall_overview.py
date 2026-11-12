@@ -34,6 +34,7 @@ class RecallOverviewMixin:
         source: str | None = None,
         debug: bool = False,
         self_session: str | None = None,
+        self_since: str | None = None,
         surface: str | None = None,
         trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
@@ -91,6 +92,7 @@ class RecallOverviewMixin:
                 source=source,
                 debug=debug,
                 self_session=self_session,
+                self_since=self_since,
                 surface=surface,
                 trust=trust,
             )
@@ -105,11 +107,14 @@ class RecallOverviewMixin:
         source: str | None = None,
         debug: bool = False,
         self_session: str | None = None,
+        self_since: str | None = None,
         surface: str | None = None,
         trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """recall()'s body, run with ``warnings`` bound as the active degradation sink."""
         settings = self._settings()
+        # The caller's last compaction: its own turns before it are no longer in its context.
+        cut = self._self_cutoff(self_session, self_since)
         t_start = time.perf_counter()
         ex = self._leg_executor
         st = self._resolve_trust(surface, trust)
@@ -242,7 +247,7 @@ class RecallOverviewMixin:
         n_self_facts_excluded = 0
         if self_session and facts_internal:
             own_facts = self._self_session_facts(
-                [f["_uuid"] for f in facts_internal if f.get("_uuid")], self_session
+                [f["_uuid"] for f in facts_internal if f.get("_uuid")], self_session, since=cut
             )
             if own_facts:
                 facts_internal = [f for f in facts_internal if f.get("_uuid") not in own_facts]
@@ -284,7 +289,7 @@ class RecallOverviewMixin:
         n_self_excluded = 0
         if self_session:
             pre_excl = len(ranked_eps)
-            ranked_eps = self._exclude_self(ranked_eps, self_session)
+            ranked_eps = self._exclude_self(ranked_eps, self_session, since=cut)
             n_self_excluded = pre_excl - len(ranked_eps)
         # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
         # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
@@ -353,7 +358,7 @@ class RecallOverviewMixin:
         )
         if sup_extras and self_session:
             own_facts = self._self_session_facts(
-                [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
+                [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session, since=cut
             )
             sup_extras = [f for f in sup_extras if f.get("_uuid") not in own_facts]
             n_self_facts_excluded += len(own_facts)
@@ -392,6 +397,7 @@ class RecallOverviewMixin:
                 list(served_text),
                 self_session=self_session,
                 served_text=served_text,
+                since=cut,
                 **kg_scope,
             )
             if sup:
@@ -457,6 +463,12 @@ class RecallOverviewMixin:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
             served_ids["n_self_facts_excluded"] = n_self_facts_excluded
+        # With a cut, the caller's turns from before its last compaction may serve again;
+        # count them so the effect of the cut is measurable.
+        if cut is not None:
+            own_ids = {e.get("id") for e in ranked_eps if e.get("session_id") == self_session}
+            served_ids["self_since"] = cut.isoformat()
+            served_ids["n_self_served"] = sum(i in own_ids for i in served_ids["episodes"])
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.
