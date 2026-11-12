@@ -227,7 +227,8 @@ for ep in episodes:
 
 
 **Project labels.** Every client labels a session's project with one resolver,
-`plugin/scripts/synapse_project.py` (the Codex plugin loads the same file): a
+`plugin/synapse_client/project.py` (the hooks of both plugins import it as
+`synapse_project`, a re-exporting stub in `plugin/scripts/`): a
 `.synapse-project` marker file (its first non-comment line; searched from the working
 directory up to the git toplevel, and in a linked worktree also at the main checkout's
 root), else the git toplevel's name (a linked worktree, including Claude Code's
