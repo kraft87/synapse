@@ -466,7 +466,7 @@ def mcp_url(request) -> Iterator[str]:
     asgi = app.http_app(path="/mcp", stateless_http=True, json_response=request.param)
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(uvicorn.Config(asgi, log_level="warning", lifespan="on"))
+    server = uvicorn.Server(uvicorn.Config(asgi, log_level="warning", lifespan="on", ws="none"))
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     deadline = time.monotonic() + 10
