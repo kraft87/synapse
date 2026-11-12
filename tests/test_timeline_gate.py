@@ -182,29 +182,37 @@ def _gated(monkeypatch, event, exists):
     return db.inserted
 
 
-def test_gate_threads_domain_to_insert(monkeypatch):
+@pytest.mark.parametrize("domain", ["personal", "technical"])
+def test_gate_always_asks_for_and_stores_the_domain(monkeypatch, domain):
+    """The domain rule rides every prompt and the model's label is what gets stored."""
     import ingestion.timeline_gate as tg
 
     monkeypatch.setenv("SYNAPSE_TIMELINE_GATE", "1")
+    monkeypatch.setenv("SYNAPSE_TIMELINE_DEDUP", "0")
     db = _Rec(exists=False)
     g = tg.TimelineGate(db=db, llm_client=object(), embedder=_StubEmb())
-    monkeypatch.setattr(
-        tg,
-        "structured_call",
-        lambda *a, **k: _gate_events(
+    prompts: list[str] = []
+
+    def _structured(*a, **k):
+        prompts.append(k["base_prompt"])
+        return _gate_events(
             [
                 {
                     "event": "booked a dentist appointment",
                     "salience": 1,
                     "event_type": "action",
-                    "domain": "personal",
+                    "domain": domain,
                     "date": None,
                 }
             ]
-        ),
-    )
+        )
+
+    monkeypatch.setattr(tg, "structured_call", _structured)
     g.process({"id": 1, "episode_id": 5, "content": "x" * 500, "project": "neuron"})
-    assert db.inserted[0]["domain"] == "personal"
+    assert len(prompts) == 1
+    assert 'domain: "personal"' in prompts[0]
+    assert '"domain": "personal"|"technical"' in prompts[0]
+    assert db.inserted[0]["domain"] == domain
 
 
 def test_commit_announcement_with_known_ident_skips(monkeypatch):

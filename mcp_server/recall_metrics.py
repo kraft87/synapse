@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any
 from psycopg.types.json import Json as PgJson
 
 from ingestion import pg_pool
-from mcp_server.kg_pg import group_sql
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,6 @@ _METRIC_COLS = (
     "kind",
     "source",
     "query",
-    "group_id",
     "write_feedback",
     "ms_total",
     "ms_embed",
@@ -74,22 +72,19 @@ class RecallMetricsMixin:
         except Exception as error:
             logger.warning("Failed to increment retrieval counts: %s", error)
 
-    def _increment_fact_retrieval_counts(
-        self, edge_uuids: list[str], group_id: str | list[str]
-    ) -> None:
-        """Bump surfaced fact counters asynchronously, over the group(s) the recall read
-        (``kg_pg.read_groups``): a fact served from the other group is bumped too."""
+    def _increment_fact_retrieval_counts(self, edge_uuids: list[str]) -> None:
+        """Bump surfaced fact counters asynchronously."""
         if edge_uuids:
-            self._async_executor.submit(self._do_increment, list(edge_uuids), group_id)
+            self._async_executor.submit(self._do_increment, list(edge_uuids))
 
-    def _do_increment(self, edge_uuids: list[str], group_id: str | list[str]) -> None:
+    def _do_increment(self, edge_uuids: list[str]) -> None:
         try:
             with pg_pool.connection(self._db_url) as connection:
                 connection.execute(
                     "UPDATE kg_relationships "
                     "SET retrieval_count = COALESCE(retrieval_count, 0) + 1 "
-                    f"WHERE owner_id = %s AND {group_sql(group_id)} AND uuid = ANY(%s)",
-                    (self._kg_owner, group_id, edge_uuids),
+                    "WHERE owner_id = %s AND uuid = ANY(%s)",
+                    (self._kg_owner, edge_uuids),
                 )
         except Exception as error:
             logger.debug("Background fact-bump (PG) failed: %s", error)
@@ -119,7 +114,6 @@ class RecallMetricsMixin:
         *,
         source: str | None = None,
         query: str | None = None,
-        group_id: str | None = None,
         ms_total: float | None = None,
         chars: int | None = None,
         est_tokens: int | None = None,
@@ -131,7 +125,6 @@ class RecallMetricsMixin:
                 "kind": kind,
                 "source": source,
                 "query": query,
-                "group_id": group_id,
                 "ms_total": ms_total,
                 "chars": chars,
                 "est_tokens": est_tokens,

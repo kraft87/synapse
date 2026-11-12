@@ -40,6 +40,13 @@ DSN="${1:-${SYNAPSE_DB_URL:-}}"
 #                                         no-op where already built. On a large
 #                                         populated DB build CONCURRENTLY by
 #                                         hand instead (see the file header).
+#   067  one memory                     — runs two explicit transactions of its own (the
+#                                         merge, then the tail), so like every file here it
+#                                         is applied under psql autocommit: never wrap it in
+#                                         BEGIN or pass -1/--single-transaction. On a
+#                                         populated database pipe it ALONE with the pollers
+#                                         stopped (see the file header); here, on an empty
+#                                         one, it only builds the indexes and the tail.
 FILES=(
   001_initial.sql
   002_span_id.sql
@@ -106,6 +113,7 @@ FILES=(
   064_skills_autopilot.sql
   065_config_lane_identity.sql
   066_kg_fact_audience.sql
+  067_kg_one_memory.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means

@@ -6,7 +6,7 @@ Pinned:
   case/whitespace folding, or a twin under the same-batch rule) is skipped, and that edge
   is reinforced through Stage 7's ordinary duplicate path. Near misses (a changed number,
   a substituted word) are written.
-* Facts already skipped, or missing an endpoint, are never looked up; one query per group.
+* Facts already skipped, or missing an endpoint, are never looked up; one query for the batch.
 * An edge this batch retires is never the match, and a restated fact that also retires
   something links the retirement to the edge it was absorbed into.
 * A new entity is written only when a fact Stage 7 creates links it; a name another
@@ -96,14 +96,14 @@ class TestRecheckRestated:
         reinforce: dict[int, list[str]] = {}
 
         moved = recheck_restated(
-            facts, [EMB, EMB], {"S": "u-s", "T": "u-t"}, "g", kg, skip, {}, reinforce
+            facts, [EMB, EMB], {"S": "u-s", "T": "u-t"}, kg, skip, {}, reinforce
         )
 
         assert moved == 1
         assert skip == {0}
         assert reinforce == {0: ["e1"]}
         kg.nearest_live_edges.assert_called_once_with(
-            [EMB, EMB], "g", max_distance=_RECHECK_MAX_DIST, limit=_RECHECK_NEIGHBOURS
+            [EMB, EMB], max_distance=_RECHECK_MAX_DIST, limit=_RECHECK_NEIGHBOURS
         )
 
     def test_skipped_and_unresolved_facts_are_not_looked_up(self):
@@ -119,7 +119,6 @@ class TestRecheckRestated:
             facts,
             [[0.0, 1.0], [0.0, 2.0], [0.0, 3.0]],
             {"S": "new:u-s", "T": "u-t"},
-            "g",
             kg,
             skip,
             {},
@@ -131,7 +130,7 @@ class TestRecheckRestated:
 
     def test_nothing_to_create_means_no_query(self):
         kg = _kg()
-        assert recheck_restated([_fact("x")], [EMB], {}, "g", kg, set(), {}, {}) == 0
+        assert recheck_restated([_fact("x")], [EMB], {}, kg, set(), {}, {}) == 0
         kg.nearest_live_edges.assert_not_called()
 
     def test_an_edge_this_batch_retires_is_never_the_match(self):
@@ -144,7 +143,7 @@ class TestRecheckRestated:
         skip: set[int] = set()
         reinforce: dict[int, list[str]] = {}
         recheck_restated(
-            facts, [EMB, EMB], {"S": "u", "T": "v"}, "g", kg, skip, {1: ["e-retiring"]}, reinforce
+            facts, [EMB, EMB], {"S": "u", "T": "v"}, kg, skip, {1: ["e-retiring"]}, reinforce
         )
         assert reinforce == {0: ["e-live"]}
 
@@ -152,7 +151,7 @@ class TestRecheckRestated:
         facts = [_fact("The build cache lives on the NAS")]
         kg = _kg([_edge("e-old", "The build cache lives on the NAS")])
         skip: set[int] = set()
-        recheck_restated(facts, [EMB], {"S": "u", "T": "v"}, "g", kg, skip, {0: ["e-old"]}, {})
+        recheck_restated(facts, [EMB], {"S": "u", "T": "v"}, kg, skip, {0: ["e-old"]}, {})
         assert skip == set()
 
 
@@ -195,10 +194,10 @@ class TestStage7Wiring:
         uuid_map = {n: f"u-{n}" for f in facts for n in (f.source, f.target)}
         pipe = _pipe(nearest=[[_edge("e-live", "The build cache lives on the NAS")], []])
 
-        pipe._process_facts_for_group(facts, uuid_map, [4, 5], "g", default_valid_at=SEG)
+        pipe._process_facts(facts, uuid_map, [4, 5], default_valid_at=SEG)
 
         assert [r["fact"] for r in _created(pipe)] == ["PR #7 was merged into main"]
-        pipe._kg.reinforce_edges.assert_called_once_with([("e-live", [4, 5], SEG, 5)], "g")
+        pipe._kg.reinforce_edges.assert_called_once_with([("e-live", [4, 5], SEG, 5)])
 
     def test_restated_fact_that_retires_an_edge_links_it_to_the_absorbing_edge(self):
         facts = [_fact("The build cache lives on the NAS", "Cache", "NAS")]
@@ -208,11 +207,11 @@ class TestStage7Wiring:
             judge=lambda fs, cands: (set(), {0: ["e-old-san"]}, {}, True),
         )
 
-        pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
+        pipe._process_facts(facts, uuid_map, [4], default_valid_at=SEG)
 
         assert _created(pipe) == []
         pipe._kg.invalidate_edges_batch.assert_called_once_with(
-            [("e-old-san", SEG)], "g", invalidated_by="e-live"
+            [("e-old-san", SEG)], invalidated_by="e-live"
         )
 
     def test_writer_side_verdict_of_a_restated_fact_still_retires_linked(self):
@@ -223,11 +222,11 @@ class TestStage7Wiring:
             ["e-old-san"]
         ]
 
-        pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
+        pipe._process_facts(facts, uuid_map, [4], default_valid_at=SEG)
 
         assert _created(pipe) == []
         pipe._kg.invalidate_edges_batch.assert_called_once_with(
-            [("e-old-san", SEG)], "g", invalidated_by="e-live"
+            [("e-old-san", SEG)], invalidated_by="e-live"
         )
 
     def test_writer_side_verdict_against_the_near_copy_writes_a_replacement(self):
@@ -238,12 +237,12 @@ class TestStage7Wiring:
             ["e-live"]
         ]
 
-        pipe._process_facts_for_group(facts, uuid_map, [4], "g", default_valid_at=SEG)
+        pipe._process_facts(facts, uuid_map, [4], default_valid_at=SEG)
 
         created = _created(pipe)
         assert [r["fact"] for r in created] == ["The build cache lives on the NAS"]
         pipe._kg.invalidate_edges_batch.assert_called_once_with(
-            [("e-live", SEG)], "g", invalidated_by=created[0]["edge_uuid"]
+            [("e-live", SEG)], invalidated_by=created[0]["edge_uuid"]
         )
 
 
@@ -268,11 +267,10 @@ class TestNewEntityDeferral:
         uuid_map = {"Cache": "new:c", "NAS": "u-nas", "PR #7": "new:p", "main": "new:m"}
         pipe = _pipe(nearest=[[_edge("e-live", "The build cache lives on the NAS")], []])
 
-        pipe._process_facts_for_group(
+        pipe._process_facts(
             facts,
             uuid_map,
             [4],
-            "g",
             default_valid_at=SEG,
             new_nodes=_pending("Cache", "PR #7", "main"),
         )
@@ -283,8 +281,8 @@ class TestNewEntityDeferral:
     def test_entity_of_a_fact_missing_its_other_endpoint_is_not_written(self):
         facts = [_fact("Ghost depends on the cache", "Ghost", "Cache")]
         pipe = _pipe()
-        pipe._process_facts_for_group(
-            facts, {"Cache": "new:c"}, [4], "g", default_valid_at=SEG, new_nodes=_pending("Cache")
+        pipe._process_facts(
+            facts, {"Cache": "new:c"}, [4], default_valid_at=SEG, new_nodes=_pending("Cache")
         )
         assert _upserted(pipe) == []
         assert _created(pipe) == []
@@ -300,11 +298,10 @@ class TestNewEntityDeferral:
         deduper.type_map = {}
         pipe = _pipe()
 
-        pipe._process_facts_for_group(
+        pipe._process_facts(
             facts,
             uuid_map,
             [4],
-            "g",
             default_valid_at=SEG,
             new_nodes=_pending("Cache", "NAS", deduper=deduper),
         )
@@ -317,7 +314,7 @@ class TestNewEntityDeferral:
 
 
 class TestProcessItemSplit:
-    def test_existing_entities_update_up_front_new_ones_wait_for_their_group(self):
+    def test_existing_entities_update_up_front_new_ones_wait_for_stage_7(self):
         embedder = MagicMock()
         embedder.embed.side_effect = lambda names, task=None: [EMB for _ in names]
         db = MagicMock()
@@ -336,7 +333,7 @@ class TestProcessItemSplit:
         )
         pipe._deduper_for = MagicMock(return_value=MagicMock())  # type: ignore[method-assign]
         pipe._stage5_write_nodes = MagicMock()  # type: ignore[method-assign]
-        pipe._process_facts_for_group = MagicMock()  # type: ignore[method-assign]
+        pipe._process_facts = MagicMock()  # type: ignore[method-assign]
 
         pipe.process_item(
             {"content_type": "summary", "content": "x", "project": None, "session_id": "s1"}
@@ -344,5 +341,5 @@ class TestProcessItemSplit:
 
         (call,) = pipe._stage5_write_nodes.call_args_list
         assert [e.name for e in call.args[0]] == ["NAS"]
-        pending = pipe._process_facts_for_group.call_args.kwargs["new_nodes"]
+        pending = pipe._process_facts.call_args.kwargs["new_nodes"]
         assert [e.name for e in pending.entities] == ["Cache"]

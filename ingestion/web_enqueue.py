@@ -115,8 +115,7 @@ def enqueue_web_chunks(
     """Enqueue gate-passing, not-yet-queued web chunks for KG extraction.
 
     Idempotent: re-runs are no-ops via the partial UNIQUE index. `project`
-    stays NULL — web research has no project tag; the per-entity group
-    classifier in the extractor routes personal-domain entities regardless.
+    stays NULL — web research has no project tag.
 
     ``since`` filters on the parent artifact's fetched_at (go-forward lane);
     None means no cutoff (explicit backfill runs).

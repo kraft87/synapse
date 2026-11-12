@@ -40,7 +40,7 @@ function openHit(h: SearchHit) {
 
 export function Search() {
   const s = useStore();
-  const { searchQuery, project, group, source } = s;
+  const { searchQuery, project, source } = s;
   const [tab, setTab] = useState<SearchTab>('episodes');
   const [res, setRes] = useState<SearchResult | null>(null);
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -52,13 +52,13 @@ export function Search() {
   const run = (offset: number) => {
     if (offset === 0) setLoading(true);
     setError(false);
-    fetchSearch({ q: searchQuery, type: tab, offset, limit: LIMIT, project, group_id: group, source })
+    fetchSearch({ q: searchQuery, type: tab, offset, limit: LIMIT, project, source })
       .then((r) => { setRes(r); setHits((prev) => (offset === 0 ? r.hits : prev.concat(r.hits))); })
       .catch(() => setError(true))
       .finally(() => setLoading(false));
   };
 
-  useEffect(() => { setHits([]); run(0); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [searchQuery, tab, project, group, source]);
+  useEffect(() => { setHits([]); run(0); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [searchQuery, tab, project, source]);
 
   // A delete can also fire from the episode overlay opened off one of these hits, so the
   // list drops the row on the shared event rather than only in its own success handler.

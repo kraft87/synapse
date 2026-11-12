@@ -44,8 +44,37 @@ Write-time tagging at the single chokepoint, `ingestion/notes.py:reconcile_note`
    restricted surfaces' `allowed_projects`, else `personal`. This keeps the work board
    from decaying to empty without inventing new classification machinery.
 
-The dream notes judge (retype / re-project / supersede) preserves `audience` on update,
-and re-derives it by rule 3 if it changes a note's `project`.
+Reconciling a write against the live notes works one tier at a time. A write never edits
+a live note of another tier, and a restricted caller never sees, edits or retires a
+personal note:
+
+- Only a registered caller's write can match, edit or retire an existing note. A caller
+  whose credential is not a registered device or identity (the shared root token, an
+  unregistered OAuth identity, no token) is restricted for reads, so its write looks at no
+  note: no tier is searched, no judge is called, and the note is stored at its derived
+  tier. The answer is "created" whether or not a similar note exists, so it cannot be used
+  to find out that one does. The nightly lane merges same-tier duplicates later.
+- A restricted caller is matched against `work-safe` notes only, in SQL, whatever
+  `audience` it passed. The personal tier is never queried for it.
+- A full-trust caller is matched in the tier its write will be stored under, then in the
+  other tier. In the other tier, a contradiction retires the note and the new note takes
+  its own tier; a restatement leaves the note alone and creates the new note in its own
+  tier (so the same wording can have a twin in each tier); only an explicit `audience`
+  updates the note in place and moves it. An LLM outage or `SYNAPSE_NOTES_CONFIRM=0`
+  counts as a restatement.
+- A restatement within a tier keeps the stored `audience`.
+- The edit or retirement that follows the confirm call applies only if the note is still
+  live and still in the tier it was read in. If another write moved or retired it in the
+  meantime, the note is left as it is and the new note is created instead.
+- The nightly notes lane follows the same rule. A DUPLICATE verdict on two notes of
+  different tiers is not applied (neither is retired, the pair is memoised, and the
+  curation row says `kept: other tier`), so it cannot undo the twin a restatement made. A
+  CORRECTION is applied whatever the tiers, as a contradiction is at write time.
+
+The dream notes judge (retype / re-project / supersede) never changes `audience`. A
+retype moves a note's type and project only, so the project a model picks cannot change
+who can read the note. A tier moves only by an explicit write (an `audience` argument or
+the backfill script).
 
 ### 2. Timeline
 
@@ -53,7 +82,21 @@ and re-derives it by rule 3 if it changes a note's `project`.
 IN ('personal','technical')` (038), which fails open (NULL) — adding a second
 overlapping label with opposite fail semantics invites drift. Instead: the board's
 last-7-days digest for a restricted surface filters events by the surface's project
-allowlist, excluding NULL project (fail-closed).
+allowlist, excluding NULL project (fail-closed). `domain` is only a tag on the event: no
+serving rule reads it (the dashboard's Timeline page filters on it, as an operator view).
+
+### 2b. Knowledge-graph facts: one memory, a label on each fact
+
+The knowledge graph is one memory per owner. No graph partition is a trust boundary, and no
+serving path reads the `group_id` column (schema 067 merged the former personal and
+technical groups). What a restricted surface may be served is decided per fact by two
+things: the fact's provenance (below) and its audience label, `kg_relationships.audience`
+(schema 066), which uses the same two tiers as notes: `personal` or `work-safe`, NULL until
+labelled. A `personal` fact is never served on a restricted surface. A fact written after
+066 is born unlabelled (extraction writes no label) and is served only once the labeller has
+marked it `work-safe`; a fact from before 066 that was never labelled follows its provenance
+alone. A restricted read serves no facts unless the label exists, so a database without 066
+never falls back to provenance alone.
 
 ### 3. Trust — a surface is a CREDENTIAL, not a hostname (schema 054)
 
@@ -175,12 +218,21 @@ project included, so an unknown caller serves *nothing* rather than everything.
   `kg_relationships.source_projects` (the distinct projects of its source episodes,
   trigger-maintained) is known, non-empty, and a subset of `allowed_projects`. Unknown (a
   missing or project-less source episode, or no episode provenance) and mixed provenance
-  are never served. Before 056 is applied, no facts.
+  are never served, and the fact must also pass the audience label rule (see 2b). Before
+  056 is applied, no facts.
 - **fetch(ids) / fetch_session**: same predicates — ids are guessable, drill-down must
   not bypass the overview filter.
 - **Plain-HTTP `POST /recall`**: same enforcement, resolved from the bearer.
 - **`/timeline/recent`**: the board digest's predicate. **`/preferences/top`**: project
-  allowlist only (a merged preference's text has no per-turn provenance). **`/config/*`**:
+  allowlist only. A preference has no tier and its merged text has no per-turn provenance,
+  so a new preference is matched only against live preferences with the same readers: for
+  every approved restricted device, both projects on its allowlist or both off it
+  (case-insensitive, a missing project on no list; if the lists cannot be read, the same
+  project only). A row with other readers is never re-asserted, merged into or retired by
+  the write, and the judge never sees its text; the new item is stored as its own row. The
+  check is made at write time: adding a project to a device's allowlist shows that device
+  the project's preferences as they stand, including wording merged in earlier from other
+  projects that had the same readers at the time. **`/config/*`**:
   a restricted device reads and writes only its own mirror, and sees only proposals whose
   every evidence session consists solely of its own turns. All resolved from the bearer;
   the root token and unknown callers get nothing.
@@ -220,8 +272,8 @@ so an operator who runs it out of order locks themselves out of their own dashbo
 - No retroactive classification of 40k+ episodes. Project allowlist is the episode
   boundary; accept the coarseness.
 - No client-side filtering. The plugin never sees what it isn't served.
-- No KG fact whose provenance is unknown or mixed on restricted surfaces (see above),
-  and no entity summaries there at all.
+- No KG fact whose provenance is unknown or mixed, or whose label is not `work-safe`, on
+  restricted surfaces (see above), and no entity summaries there at all.
 - No device-token expiry or rotation schedule. Revocation is manual and immediate; a
   TTL would add a renewal path (and a renewal credential) for no threat this model has.
 - No enrollment without an identity provider. A bearer-only deployment has no identity

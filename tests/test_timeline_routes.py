@@ -7,7 +7,7 @@ and per-field storage (project / salience / t_valid land as sent).
 
 from __future__ import annotations
 
-from mcp_server.timeline_routes import _ingest_events
+from mcp_server.timeline_routes import _event_domain, _ingest_events
 
 SRC = "test-evt"
 
@@ -124,3 +124,12 @@ def test_recent_events_per_project_day_cap(conn, db_url):
     # the quiet day survives instead of being pushed out by the burst
     assert "decided the quiet-day thing" in facts
     _wipe(conn)
+
+
+def test_event_domain_follows_the_pushed_label():
+    # Git events are technical by construction; an explicit label is kept as pushed;
+    # anything else stays unlabeled and fails open at read.
+    assert _event_domain({"source": "git:demo", "domain": None}) == "technical"
+    assert _event_domain({"source": "chat", "domain": "personal"}) == "personal"
+    assert _event_domain({"source": "chat", "domain": "technical"}) == "technical"
+    assert _event_domain({"source": "chat", "domain": None}) is None

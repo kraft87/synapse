@@ -12,7 +12,8 @@ uuid), so a retry after a partial failure is safe.
 
 ``owner_id`` is written as the single-owner constant ``'default'``; the #49
 owner axis can thread a real owner through ``SYNAPSE_KG_OWNER_ID`` without
-touching any call site.
+touching any call site. The legacy ``group_id`` column is never written: its
+column default fills it.
 """
 
 from __future__ import annotations
@@ -110,7 +111,6 @@ class KGPostgresWriter:
         normalized_name: str,
         entity_type: str,
         summary: str,
-        group_id: str,
         project: str | None,
         created_at: str | None,
         valid_at: str | None,
@@ -141,10 +141,10 @@ class KGPostgresWriter:
         def _do(cur: Any) -> None:
             cur.execute(
                 "INSERT INTO kg_entities "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "  (uuid, owner_id, group_id, project, name, normalized_name, "
+                "  (uuid, owner_id, project, name, normalized_name, "
                 "   entity_type, summary, embedding, created_at, t_created, "
                 "   valid_at, t_valid, entity_supertype, entity_subtype) "
-                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,%s,%s,%s) "
+                f"VALUES (%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s,%s,%s,%s,%s,%s) "
                 "ON CONFLICT (uuid) DO UPDATE SET "
                 f"   name = CASE WHEN {same_name} THEN EXCLUDED.name ELSE kg_entities.name END, "
                 "   summary = EXCLUDED.summary, "
@@ -158,7 +158,6 @@ class KGPostgresWriter:
                 (
                     uuid,
                     OWNER,
-                    group_id,
                     project or "",
                     strip_nul(name or ""),
                     strip_nul(normalized_name or ""),
@@ -176,7 +175,7 @@ class KGPostgresWriter:
 
         self._run(_do)
 
-    def create_edges(self, rows: list[dict[str, Any]], group_id: str) -> None:
+    def create_edges(self, rows: list[dict[str, Any]]) -> None:
         """Insert relationship edges. One multi-row INSERT, ON CONFLICT (uuid)
         DO NOTHING (re-creating an existing edge is a retry no-op).
 
@@ -199,7 +198,6 @@ class KGPostgresWriter:
                 (
                     r["edge_uuid"],
                     OWNER,
-                    group_id,
                     r["src"],
                     r["tgt"],
                     strip_nul(r.get("name") or ""),
@@ -223,11 +221,11 @@ class KGPostgresWriter:
             # the rows, and a fixed query string keeps every value bound.
             cur.executemany(
                 "INSERT INTO kg_relationships "  # nosec B608 — _EMBED_DIMS is a validated int, not user input
-                "(uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+                "(uuid, owner_id, src_uuid, tgt_uuid, name, fact, "
                 "fact_embedding, episodes, retrieval_count, created_at, t_created, "
                 "valid_at, t_valid, web_artifact_id, ongoing, last_supported_at, "
                 "last_supported_by) VALUES "
-                f"(%s,%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s::jsonb,%s,%s,%s,%s,%s,%s,"
+                f"(%s,%s,%s,%s,%s,%s,%s::vector({_EMBED_DIMS}),%s::jsonb,%s,%s,%s,%s,%s,%s,"
                 "%s,%s,%s) "
                 "ON CONFLICT (uuid) DO NOTHING",
                 params,
@@ -238,7 +236,6 @@ class KGPostgresWriter:
     def invalidate_edges(
         self,
         items: list[tuple[str, str | None]],
-        group_id: str,
         invalidated_by: str | None = None,
     ) -> None:
         """Set ``t_invalid`` (and the legacy ``invalid_at``) on each edge.
@@ -280,8 +277,8 @@ class KGPostgresWriter:
         serving: the facts leg's seed KNN takes 25 entities and keeps those with live
         degree, so every orphan near the query burns a seed slot (19% of entities on prod
         by 2026-10-10). The age gate keeps a sweep from racing an in-flight extraction.
-        The anti-join covers edges in any group (a few cross groups); the re-check at
-        delete time is the indexed same-group probe, for an edge written mid-statement."""
+        The anti-join picks the entities no edge references; the re-check at delete time is
+        the indexed probe on the owner's endpoints, for an edge written mid-statement."""
         deleted = 0
 
         def _do(cur: Any) -> None:
@@ -295,9 +292,9 @@ class KGPostgresWriter:
                 ") o "
                 "WHERE e.id = o.id "
                 "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
-                "                  AND r.group_id = e.group_id AND r.src_uuid = e.uuid) "
+                "                  AND r.src_uuid = e.uuid) "
                 "  AND NOT EXISTS (SELECT 1 FROM kg_relationships r WHERE r.owner_id = e.owner_id "
-                "                  AND r.group_id = e.group_id AND r.tgt_uuid = e.uuid)",
+                "                  AND r.tgt_uuid = e.uuid)",
                 (min_age_hours,),
             )
             deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
@@ -305,7 +302,7 @@ class KGPostgresWriter:
         self._run(_do)
         return deleted
 
-    def reinforce_edges(self, items: list[tuple[Any, ...]], group_id: str) -> None:
+    def reinforce_edges(self, items: list[tuple[Any, ...]]) -> None:
         """Capture dedup hits: a newly-extracted fact restated an existing edge.
 
         For each ``(edge_uuid, source_episode_ids[, support_at, support_episode])``:

@@ -24,13 +24,16 @@ from ingestion.llm_client import MalformedResponseError
 _T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def _note(note_id: int, *, type="user", project=None, days=0, hook=None, body="Body."):
+def _note(
+    note_id: int, *, type="user", project=None, days=0, hook=None, body="Body.", audience="personal"
+):
     return {
         "id": note_id,
         "hook": hook or f"Example note {note_id}",
         "body": body,
         "type": type,
         "project": project,
+        "audience": audience,
         "updated_at": _T0 + timedelta(days=days),
     }
 
@@ -192,8 +195,8 @@ class _FakeDB:
         self.retypes = list(retypes)
         self.projects = list(projects)
         self.superseded: list[tuple[int, int]] = []
+        self.superseded_if_audience: list[str | None] = []
         self.retyped: list[tuple[int, str, str]] = []
-        self.retyped_audience: list[str | None] = []
         self.curation: list[dict] = []
         self.closed = False
 
@@ -209,16 +212,13 @@ class _FakeDB:
     def project_slug_exists(self, slug):
         return slug in self.projects
 
-    def supersede_note(self, old_id, new_id):
+    def supersede_note(self, old_id, new_id, *, if_audience=None):
         self.superseded.append((old_id, new_id))
+        self.superseded_if_audience.append(if_audience)
+        return True
 
-    def retype_note(self, note_id, *, type, project, audience=None):
+    def retype_note(self, note_id, *, type, project):
         self.retyped.append((note_id, type, project))
-        self.retyped_audience.append(audience)
-
-    def restricted_surface_projects(self):
-        """No registered restricted surface -> every re-project derives 'personal'."""
-        return []
 
     def record_curation(self, **kw):
         self.curation.append(kw)
@@ -270,6 +270,43 @@ def test_pair_merge_records_audit_and_sample(monkeypatch):
     assert row["verdict"] == "DUPLICATE" and row["applied"] is True
     assert row["detail"]["sim"] == 0.94 and row["detail"]["reason"] == "consensus"
     assert len(row["detail"]["orders"]) == 2  # both judgements kept for the audit trail
+
+
+def test_a_cross_tier_duplicate_is_memoized_without_spending_the_apply_budget(monkeypatch):
+    """The first pair spans two tiers, so neither note is retired and nothing is counted;
+    the budget of one is still there for the same-tier pair behind it."""
+    _stub_llm(monkeypatch, pair_verdicts=[_DUP, _DUP, _DUP, _DUP])
+    db = _FakeDB(
+        pairs=[
+            (_note(1, audience="work-safe"), _note(2, days=1), 0.95),
+            (_note(3), _note(4, days=1), 0.94),
+        ]
+    )
+    res = run_lane(db=db, llm=object(), max_apply=1)
+    assert db.superseded == [(3, 4)]
+    assert res["counts"]["applied_supersede"] == 1 and res["counts"]["pairs_judged"] == 2
+    assert res["samples"] == ["n:3 -> superseded by n:4 (duplicate)"]
+    kept, applied = db.curation
+    assert kept["verdict"] == "DUPLICATE" and kept["applied"] is False
+    assert kept["detail"]["kept"] == "other tier"
+    assert applied["applied"] is True and "kept" not in applied["detail"]
+
+
+@pytest.mark.parametrize(("keep_slot", "loser", "tier"), [(2, 1, "work-safe"), (1, 2, "personal")])
+def test_a_pair_retirement_carries_the_tier_the_loser_was_read_in(
+    monkeypatch, keep_slot, loser, tier
+):
+    """The write that retires the loser is conditioned on the tier the lane read on it,
+    whichever side of the pair the loser was."""
+    _stub_llm(monkeypatch, pair_verdicts=[_corr(keep_slot), _corr(3 - keep_slot)])
+    db = _FakeDB(
+        pairs=[
+            (_note(1, audience="work-safe"), _note(2, days=1, audience="personal"), 0.9),
+        ]
+    )
+    run_lane(db=db, llm=object())
+    assert [old for old, _ in db.superseded] == [loser]
+    assert db.superseded_if_audience == [tier]
 
 
 def test_distinct_pair_is_memoized_but_not_applied(monkeypatch):
@@ -339,19 +376,13 @@ def test_retype_applies_for_a_known_project(monkeypatch):
     _stub_llm(monkeypatch, scope_verdicts=[{"scope": "PROJECT", "project": "demo-api"}])
     db = _FakeDB(retypes=[_note(7, type="feedback", hook="demo-api runs migrations on boot")])
     res = run_lane(db=db, llm=object())
+    # retype_note takes no audience at all, so the stored tier is what survives.
     assert db.retyped == [(7, "project", "demo-api")]
-    # A re-project re-derives audience by the project rule (schema 053). No restricted
-    # surface allows 'demo-api' here, so it lands back on the fail-closed tier.
-    assert db.retyped_audience == ["personal"]
     assert res["counts"]["applied_retype"] == 1
     assert res["samples"] == ["n:7 feedback -> project:demo-api"]
     (row,) = db.curation
     assert row["verdict"] == "PROJECT" and row["applied"] is True
-    assert row["detail"] == {
-        "from_type": "feedback",
-        "project": "demo-api",
-        "audience": "personal",
-    }
+    assert row["detail"] == {"from_type": "feedback", "project": "demo-api"}
 
 
 def test_retype_skips_an_unknown_project_slug_but_records_it(monkeypatch):

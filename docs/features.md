@@ -15,7 +15,7 @@ The parts of Synapse, and the stack they run on. How they fit together is
   from turns by an LLM gate and fed by git commits, serving "when / in what order" questions.
   A re-told happening confirm-merges into its existing row (an LLM reads both source turns,
   both presentation orders must agree) instead of duplicating; each event carries a
-  `personal`/`technical` domain label so personal-scope queries exclude work noise; and
+  `personal`/`technical` domain tag, which the dashboard's Timeline page can filter on; and
   happenings narrated inside quoted third-party material (someone else's email, a pasted
   transcript, an article) are never logged as the user's own.
 - **Web-research capture** — WebFetch/Exa/Firecrawl/search results are captured and embedded

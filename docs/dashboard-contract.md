@@ -29,18 +29,19 @@ Response:
 ```json
 {"projects": [{"name": "synapse", "count": 3403}],
  "sources":  [{"name": "claude-code", "count": 31000}],
- "group_ids": ["technical", "personal"]}
+ "domains": ["technical", "personal"]}
 ```
 Projects/sources aggregated from episodes (NULL project or source → name "untagged").
-`group_ids` = distinct scopes across kg_relationships/kg_entities group_id ∪
-timeline_events.domain. Cached in-process ~5 min.
+`domains` = distinct timeline_events.domain values (the only surface that still carries a
+domain tag). Cached in-process ~5 min. The web app does not read it: the Timeline page's
+domain control is a fixed all / technical / personal list.
 
-### GET /dash/api/feed?cursor&limit=30&project&group_id&source
+### GET /dash/api/feed?cursor&limit=30&project&source
 Reverse-chronological merge of episodes + KG facts + timeline events, keyset-paged.
 - `cursor`: opaque string from a previous response (`next_cursor`); absent = newest.
 - `limit` ≤ 100. Filters apply where the column exists (episodes: project+source;
-  facts: group_id; timeline: project + group_id via its `domain` column, schema 038) —
-  a filter a type lacks does not exclude that type.
+  timeline: project; facts carry neither) — a filter a type lacks does not exclude that
+  type. There is no group or domain filter; a `group_id` or `domain` param is ignored.
 - Feed timestamps: episode `created_at`, fact `created_at`, timeline `ingested_at`
   (the feed shows when memory was WRITTEN; the event's own date is `t_valid` in data).
 
@@ -49,12 +50,12 @@ Reverse-chronological merge of episodes + KG facts + timeline events, keyset-pag
   {"type": "episode", "id": "227168", "ts": "...", "project": "synapse",
    "source": "claude-code", "gist": "first meaningful line…", "flagged": false,
    "data": {"session_id": "…", "sequence": 12}},
-  {"type": "fact", "id": "<uuid>", "ts": "...", "group_id": "technical",
+  {"type": "fact", "id": "<uuid>", "ts": "...",
    "gist": "<fact text>", "flagged": false,
    "data": {"fact": "…", "src_name": "…", "tgt_name": "…", "t_valid": "…",
              "t_invalid": null, "provenance_episode_id": 227168}},
   {"type": "timeline_event", "id": "8841", "ts": "...", "project": "synapse",
-   "gist": "<event text>", "flagged": false, "sal": 0.9,
+   "domain": "technical", "gist": "<event text>", "flagged": false, "sal": 0.9,
    "data": {"fact": "…", "t_valid": "…", "source": "git:synapse", "episode_id": 227001}}
  ],
  "next_cursor": "…" }
@@ -73,7 +74,7 @@ fully inline (no expand fetch); episode expansion fetches `/dash/api/episode/:id
 
 ### GET /dash/api/episode/{id}/derived
 ```json
-{"facts": [{"uuid": "…", "fact": "…", "group_id": "…", "t_valid": "…", "t_invalid": null}],
+{"facts": [{"uuid": "…", "fact": "…", "t_valid": "…", "t_invalid": null}],
  "timeline_events": [{"id": 8841, "fact": "…", "t_valid": "…", "salience": 2}]}
 ```
 Facts whose `episodes` jsonb array contains the id; events with `source_ref = 'ep:<id>'`.
@@ -101,7 +102,7 @@ Facts = live + superseded edges touching the uuid (superseded have `t_invalid` s
 `served` = sum of edge `retrieval_count`. Mentions = distinct provenance episodes, newest
 first, paged. (Timeline/preference cross-links: reserved for a later phase.)
 
-### GET /dash/api/search?q&type=episodes|facts|entities|events&offset=0&limit=20&project&group_id&source
+### GET /dash/api/search?q&type=episodes|facts|entities|events&offset=0&limit=20&project&source
 ParadeDB BM25 (`@@@`) for episodes / facts / events; entity names via ILIKE. NOT recall().
 ```json
 {"hits": [{"type": "episodes", "id": "227168", "snippet": "…",
@@ -133,13 +134,14 @@ Phase 2 adds the Recall debugging page. It reuses the existing `POST /recall` ro
 
 ### POST /recall — `debug` flag
 
-`POST /recall` already accepts `{query, group_id?, write_feedback?, source?}` (machine-token
-gated, same bearer as `/dash/api/*`). Phase 2 adds two body fields:
+`POST /recall` already accepts `{query, write_feedback?, source?}` (machine-token
+gated, same bearer as `/dash/api/*`; a `group_id` field from an older caller is ignored, as
+on the MCP tool). Phase 2 adds two body fields:
 
 - `project?` (string) — scopes the episode legs, same as the MCP `recall(project=…)` arg.
 - `debug?` (bool, default false) — when true the response gains a `debug` envelope.
 
-The dashboard console calls it with `{query, project?, group_id, debug: true, source: "dashboard"}`
+The dashboard console calls it with `{query, project?, debug: true, source: "dashboard"}`
 and **never** sets `write_feedback` (it defaults false on this route) — a debug recall must not
 bump the retrieval-count feedback signal.
 
@@ -349,9 +351,8 @@ on the first subscriber and stops when the last disconnects; with no client conn
 is no LISTEN connection and NOTIFY is discarded by Postgres.
 
 **Deviations from spec §7.**
-- Timeline FeedItems now carry a top-level `group_id` (mirroring the `domain` column, schema
-  038) so the live client can apply the group filter uniformly across all three feed types.
-  Additive — episodes/facts are unchanged; `/feed` timeline items gain the same field.
+- Timeline FeedItems carry a top-level `domain` (the `domain` column, schema 038). Additive —
+  episodes/facts are unchanged; `/feed` timeline items carry the same field.
 - `processing_status` is a plain event with no event id (ids track only the resumable feed
   events); spec §7 lists it among the stream's event names, which it is.
 - The NOTIFY payload is `{type, id}` only (NOTIFY's 8KB cap) — the server re-SELECTs the full
@@ -458,7 +459,7 @@ fail-soft. No new migration — these read existing tables.
   `/behavior/file` returns no history and the client's change-history timeline stays hidden —
   it is NOT fabricated. Adding a versions store is a later phase.
 
-### GET /dash/api/timeline?before&limit=50&type&group_id
+### GET /dash/api/timeline?before&limit=50&type&domain
 `t_valid`-DESC keyset page of timeline events (the Events tab).
 ```json
 {"events": [
@@ -469,7 +470,10 @@ fail-soft. No new migration — these read existing tables.
 ```
 - `limit` ≤ 200 (default 50). `sal` maps salience `0/1/2 → 0.3/0.6/0.9` (the feed mapping); the
   salience type ramp reads `sal`. `episode_id` is the resolved `ep:N` `source_ref` (git SHAs → null).
-- `type` filters `event_type` (see honesty note). `group_id` filters the `domain` column (schema 038).
+- `type` filters `event_type` (see honesty note). `domain` filters the `domain` column (schema 038);
+  a `group_id` param is ignored. The Timeline page's Events tab sends it from a three-way
+  control (all, technical, personal); `all` sends no `domain`, and an event with no domain
+  label (NULL) appears only there. There is no header-level group or domain filter any more.
 - `before` is the keyset cursor: a **bare ISO timestamp** (the jump-to-date case → strict
   `t_valid < ts`) OR a compound **`ts|id`** (a prior `next_before` → the full `(t_valid, id)`
   keyset, so ties on `t_valid` never drop or duplicate a row). `next_before` is set whenever a
@@ -489,7 +493,7 @@ The full standing-preference log (the Preferences tab). LIVE rows first, then su
   → `assert_count DESC, last_asserted DESC`. Live-first is applied before the sort in both.
 - Superseded rows carry `t_invalid` + `superseded_by` + `superseded_by_text` (the replacing
   row's pref text, joined in) so the UI names what won. Capped at 500 (a single owner accrues
-  dozens). No group filter — preferences are cross-domain (spec §1).
+  dozens). No domain filter — preferences are cross-domain (spec §1).
 
 ### GET /dash/api/dream/report?limit=20
 Recent `dream_runs` (044), newest first — the Dream-report page's drill-in source. Same row

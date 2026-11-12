@@ -37,7 +37,6 @@ from ingestion.llm_client import (
 )
 from ingestion.llm_schemas import TimelineGateEvents
 from ingestion.localtime import local_date
-from ingestion.scope import personal_scope_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -109,34 +108,14 @@ salience: 2 = milestone / shipped to prod / major decision or life event; 1 = a 
 event_type: "decision" (a choice/direction was reached), "action" (something was executed or done), "finding" (a result/diagnosis/measurement was learned), or "milestone" (a phase completed / shipped / achieved).
 """
 
-# The domain sentence and its slot in the output JSON. Dropped from the prompt
-# when SYNAPSE_PERSONAL_SCOPE=0: with one domain there is no distinction to
-# make, and asking for one costs tokens on a label the writer discards.
 _DOMAIN_RULE = """domain: "personal" = the user's OWN life outside engineering work — health, medication, family, appointments, purchases, home, travel, mood, errands, job applications and career moves. "technical" = code, infrastructure, homelab, deployments, benchmarks, research, tooling. Judge by what the event is ABOUT, not who executed it (an agent booking the user's appointment is still personal).
 """
 
-_DOMAIN_FIELD = ' "domain": "personal"|"technical",'
-
 _OUTPUT_RULE = """
-Output ONLY JSON: {"events": [{"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone",%s "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}]} — at most 3 events, ordered by importance. Most turns: {"events": []}
+Output ONLY JSON: {"events": [{"event": "<naked past-tense fact>", "salience": 0|1|2, "event_type": "decision"|"action"|"finding"|"milestone", "domain": "personal"|"technical", "date": "YYYY-MM-DD" (optional — omit unless the event happened on a different day)}]} — at most 3 events, ordered by importance. Most turns: {"events": []}
 """
 
-
-def gate_prompt() -> str:
-    """The gate prompt for this deployment.
-
-    Personal scope on (the default): the model is asked to label each event
-    personal or technical. Off: both the rule and the JSON field are gone, and
-    the writer stamps every event technical.
-    """
-    if personal_scope_enabled():
-        return _GATE_PROMPT_BASE + _DOMAIN_RULE + (_OUTPUT_RULE % _DOMAIN_FIELD)
-    return _GATE_PROMPT_BASE + (_OUTPUT_RULE % "")
-
-
-#: Back-compat alias: the full prompt with the domain rule. ``gate_prompt()`` is
-#: what the gate calls, because the switch is read at call time.
-GATE_PROMPT = _GATE_PROMPT_BASE + _DOMAIN_RULE + (_OUTPUT_RULE % _DOMAIN_FIELD)
+GATE_PROMPT = _GATE_PROMPT_BASE + _DOMAIN_RULE + _OUTPUT_RULE
 
 
 _MAX_EVENTS_PER_TURN = 3
@@ -264,8 +243,7 @@ class TimelineGate:
             self._llm_client,
             output_model=TimelineGateEvents,
             base_prompt=(
-                f"{gate_prompt()}\nThis turn happened on {turn_date}."
-                f"\n\nTHE TURN:\n{content[:6000]}"
+                f"{GATE_PROMPT}\nThis turn happened on {turn_date}.\n\nTHE TURN:\n{content[:6000]}"
             ),
             model=self._model,
             max_tokens=512,
@@ -319,9 +297,7 @@ class TimelineGate:
                 # fallback covers test stubs that only implement embed().
                 embed_model=getattr(self._embedder, "model_name", None) or "voyage-4-large",
                 event_type=gate.get("event_type"),
-                # Personal scope off: one domain exists, so the stored label is
-                # deterministic rather than whatever the model happened to emit.
-                domain=gate.get("domain") if personal_scope_enabled() else "technical",
+                domain=gate.get("domain"),
                 # Inherit the turn's provenance (schema 057) for restricted-board serving.
                 source_episode_id=int(episode_id),
             )

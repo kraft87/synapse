@@ -28,7 +28,6 @@ from starlette.responses import JSONResponse
 
 from ingestion import pg_pool
 from ingestion.embedding import create_embedder, embed_dims, embed_provider
-from ingestion.scope import coerce_group
 from ingestion.surfaces import (
     UNKNOWN_SURFACE,
     SurfaceTrust,
@@ -56,14 +55,12 @@ def _event_domain(e: dict[str, Any]) -> str | None:
     """The stored ``domain`` for one pushed event (schema 038).
 
     Git-sourced events are technical by construction; other pushers may label
-    explicitly; anything else stays NULL, which fails open at read. With the
-    personal scope off (SYNAPSE_PERSONAL_SCOPE=0) only one domain exists, so a
-    pushed "personal" label is stored as technical.
+    explicitly; anything else stays NULL, which fails open at read.
     """
     domain = e.get("domain")
     if domain not in ("personal", "technical"):
         domain = "technical" if str(e["source"]).startswith("git:") else None
-    return coerce_group(domain)
+    return domain
 
 
 def _ingest_events(

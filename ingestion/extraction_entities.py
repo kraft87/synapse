@@ -91,7 +91,6 @@ class EntityResolver:
         self,
         entities: list[ExtractedEntity],
         kg_client: Any,
-        group_id: str,
         deduper: Any | None = None,
     ) -> dict[str, str]:
         """Resolve entities using write-time dedup then Postgres vector search.
@@ -157,7 +156,7 @@ class EntityResolver:
             names = [e.name for e in vector_needed]
             embeddings = self._embedder.embed(names, task="entity")
             for entity, emb in zip(vector_needed, embeddings, strict=True):
-                candidates = kg_client.find_similar_nodes(emb, group_id, limit=5)
+                candidates = kg_client.find_similar_nodes(emb, limit=5)
                 # A node naming another number is never this entity, however close
                 # the embedding ('PR #290' vs 'PR #269' sits at cosine 0.97): drop it
                 # before both the autoconfirm and the LLM confirm see it.

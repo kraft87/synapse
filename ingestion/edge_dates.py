@@ -2,9 +2,9 @@
 
 Wraps the verbatim Graphiti prompt at
 ``ingestion.prompts.extract_edge_dates`` with the structured-response
-schema and error handling needed at write time. Used by
-``KGClient.create_edge`` to populate ``t_valid`` / ``t_invalid`` from
-fact text when the caller hasn't supplied them already.
+schema and error handling needed at write time. Used by the extractor's
+Stage 7 to populate ``t_valid`` / ``t_invalid`` from fact text when the
+caller hasn't supplied them already.
 
 Why this lives outside ``contradiction.py``: the contradiction detector and
 edge-date extractor share the bi-temporal write path but are otherwise

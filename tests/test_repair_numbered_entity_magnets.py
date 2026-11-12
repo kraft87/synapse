@@ -8,8 +8,8 @@ These tests pin what the repair moves and what it leaves alone:
   resolver guard's own reading);
 * what a fact text names (kind words, bare '#N', URLs, ranges, ticket keys);
 * the per-endpoint decision (own number / none / several / range / bare / move);
-* the plan: targets reused or created (named as written), self-joins and cross-group edges
-  skipped, retired edges moved with their successors, summaries of losers cleared;
+* the plan: targets reused or created (named as written), self-joins and edges of another
+  owner skipped, retired edges moved with their successors, summaries of losers cleared;
 * supersession candidates: disjoint identifiers only, never when another live edge on
   the pair carries the old fact's identifier, never for an expired edge.
 The end-to-end writes, backup and restore are in test_repair_numbered_entity_magnets_db.py.
@@ -34,7 +34,6 @@ sys.modules["repair_numbered_entity_magnets"] = rm
 _SPEC.loader.exec_module(rm)
 
 Ident, Entity, Edge = rm.Ident, rm.Entity, rm.Edge
-G = "technical"
 
 
 # ---------------------------------------------------------------- entity names
@@ -152,14 +151,12 @@ def test_decide_for_a_ticket_key_endpoint():
 # ---------------------------------------------------------------- the plan
 
 
-def _ent(uuid, name, *, group=G, summary="", etype="pull_request", project="alpha"):
-    return Entity(uuid, "default", group, name, etype, "artifact", etype, project, summary)
+def _ent(uuid, name, *, owner="default", summary="", etype="pull_request", project="alpha"):
+    return Entity(uuid, owner, name, etype, "artifact", etype, project, summary)
 
 
-def _edge(
-    uuid, src, tgt, fact, *, live=True, by=None, group=G, created="2026-01-01", expired=False
-):
-    return Edge(uuid, "default", group, src, tgt, fact, "RELATES", live, by, expired, created)
+def _edge(uuid, src, tgt, fact, *, live=True, by=None, created="2026-01-01", expired=False):
+    return Edge(uuid, "default", src, tgt, fact, "RELATES", live, by, expired, created)
 
 
 def _world():
@@ -231,23 +228,23 @@ def test_plan_names_a_new_entity_as_the_facts_write_it():
     assert target.name == "PR #31"
 
 
-def test_plan_never_joins_an_edge_to_itself_or_crosses_groups():
+def test_plan_never_joins_an_edge_to_itself_or_crosses_owners():
     ents = [
         _ent("m", "PR #290"),
         _ent("p218", "PR #218"),
-        _ent("other", "PR #77", group="personal"),
+        _ent("other", "PR #77", owner="someone-else"),
         _ent("x", "widget"),
     ]
     edges = [
         # Moving the magnet end onto PR #218 would make PR #218 -> PR #218.
         _edge("self", "m", "p218", "PR #218 was reviewed"),
-        # The entity sits in another group than the edge: nothing to say about it here.
+        # The entity belongs to another owner than the edge: nothing to say about it here.
         _edge("cross", "other", "x", "PR #12 was merged"),
     ]
     plan = rm.plan_repair(ents, edges)
     assert plan.moves == []
     assert plan.stats["pr #"]["stay: move would join the edge to itself"] == 1
-    assert plan.stats["pr #"]["stay: edge in another group"] == 1
+    assert plan.stats["pr #"]["stay: edge of another owner"] == 1
 
 
 def test_both_endpoints_move_when_each_names_its_own_kind():

@@ -190,7 +190,6 @@ def _note(db_url: str, hook: str, body: str) -> int:
     try:
         return db.insert_note(
             owner_id=_OWNER,
-            group_id="technical",
             project="tool-surface",
             type="project",
             hook=hook,

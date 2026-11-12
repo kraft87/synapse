@@ -160,8 +160,8 @@ def _check(db_url: str, sent: list[tuple[str, Any]], n: int) -> None:
 
 
 @pytest.mark.parametrize("restricted", [False, True])
-def test_the_requested_groups_fact_leg(corpus, sent, db_url, restricted):
-    """Four filters, eight with a restricted device's provenance and label rule."""
+def test_the_fact_leg(corpus, sent, db_url, restricted):
+    """Three filters, seven with a restricted device's provenance and label rule."""
     with psycopg.connect(db_url, autocommit=True) as c, c.cursor() as cur:
         _session(c)
         kg_pg.search_kg_postgres(
@@ -169,18 +169,10 @@ def test_the_requested_groups_fact_leg(corpus, sent, db_url, restricted):
             "widget",
             onehot(0),
             "default",
-            GROUP,
             [],
             10,
             allowed_projects=["work"] if restricted else None,
         )
-    _check(db_url, sent, 1)
-
-
-def test_the_other_groups_fact_leg(corpus, sent, db_url):
-    with psycopg.connect(db_url, autocommit=True) as c, c.cursor() as cur:
-        _session(c)
-        kg_pg.cross_bm25_rows(cur, "widget", "default", ["personal"], 3)
     _check(db_url, sent, 1)
 
 
@@ -207,7 +199,7 @@ def test_the_episode_leg(corpus, sent, db_url, kw):
 
 def test_the_extraction_candidate_leg(corpus, sent, db_url, monkeypatch):
     monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
-    assert KGPostgresReader().find_edges_by_fulltext("widget", GROUP)
+    assert KGPostgresReader().find_edges_by_fulltext("widget")
     _check(db_url, sent, 1)
 
 
@@ -215,9 +207,11 @@ def test_the_extraction_candidate_leg(corpus, sent, db_url, monkeypatch):
 @pytest.mark.parametrize("project", ["p", "untagged"])
 def test_the_dashboard_search(corpus, sent, db_url, type_, project):
     """Its three counts and the requested tab's hits; 'untagged' is a NULL or empty project."""
-    out = dashboard_routes._search(db_url, "widget", type_, 0, 10, project, GROUP, "s")
+    out = dashboard_routes._search(db_url, "widget", type_, 0, 10, project, "s")
     assert out["hits"]
-    _check(db_url, sent, 4)
+    # The fact and entity statements carry no filter, so there is nothing in them to fold.
+    sent[:] = [s for s in sent if "FROM kg_relationships" not in s[0]]
+    _check(db_url, sent, 2 if type_ == "facts" else 3)
 
 
 def test_a_filter_that_is_null_or_false_drops_the_row_as_the_plain_where_does(conn):

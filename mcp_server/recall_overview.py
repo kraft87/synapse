@@ -8,9 +8,7 @@ import time
 from typing import Any
 
 from ingestion import embedding as _embedding
-from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust
-from mcp_server.kg_pg import CROSS_GROUP_EXTRAS, read_groups
 from mcp_server.recall_presentation import apply_supersessions as _apply_supersessions
 from mcp_server.recall_presentation import parse_episode_ids as _parse_episode_ids
 from mcp_server.recall_presentation import to_web_recall_item as _to_web_recall_item
@@ -32,7 +30,6 @@ class RecallOverviewMixin:
         query: str,
         project: str | None = None,
         session_focus: list[str] | None = None,
-        group_id: str = "technical",
         write_feedback: bool = True,
         source: str | None = None,
         debug: bool = False,
@@ -70,22 +67,13 @@ class RecallOverviewMixin:
         surface, the episodes it ingested itself: schema 057 ``surface_id``), notes to
         ``audience='work-safe'``, and KG facts to those whose provenance is known and
         lies wholly inside the allowlist (schema 056 ``source_projects``: every source
-        episode exists, has a project, and that project is allowed). The same rule
-        covers every KG-derived extra (superseded pairs, the supersession surface, the
-        episode-validity overlay). An empty allowlist, or a database without schema 056,
-        serves no facts at all. Bare calls with no surface therefore serve a narrow
-        result on purpose; that is the design, not a regression.
-
-        ``group_id`` is coerced through ``coerce_group``: with the personal scope
-        off (SYNAPSE_PERSONAL_SCOPE=0) a request for the personal graph is served
-        from the technical one, because that is where every fact was written. A
-        model that asks for a scope this deployment does not run gets answers
-        instead of an empty graph. A full-trust caller is then served the requested
-        graph exactly as before PLUS what the other graph adds: up to
-        ``kg_pg.CROSS_GROUP_EXTRAS`` facts and the superseded pairs of those served
-        (``kg_pg.read_groups`` / ``kg_pg.search_kg``). The supersession surface and the
-        episode-validity overlay stay on the requested graph. A restricted caller reads
-        the requested graph alone. The recall_metrics row keeps the requested group.
+        episode exists, has a project, and that project is allowed) and that are
+        labelled ``work-safe`` (schema 066; an unlabelled fact older than 066 counts as
+        labelled). The same rule covers every KG-derived extra (superseded pairs, the
+        supersession surface, the episode-validity overlay). An empty allowlist, or a
+        database without schema 056 or 066, serves no facts at all. Bare calls with no
+        surface therefore serve a narrow result on purpose; that is the design, not a
+        regression.
 
         A ``warnings`` list is attached when a leg degraded (embedding or rerank
         backend down, KG or notes leg errored). The key is ABSENT on a healthy call,
@@ -99,7 +87,6 @@ class RecallOverviewMixin:
                 warnings=warnings,
                 project=project,
                 session_focus=session_focus,
-                group_id=group_id,
                 write_feedback=write_feedback,
                 source=source,
                 debug=debug,
@@ -114,7 +101,6 @@ class RecallOverviewMixin:
         warnings: list[str],
         project: str | None = None,
         session_focus: list[str] | None = None,
-        group_id: str = "technical",
         write_feedback: bool = True,
         source: str | None = None,
         debug: bool = False,
@@ -124,7 +110,6 @@ class RecallOverviewMixin:
     ) -> dict[str, Any]:
         """recall()'s body, run with ``warnings`` bound as the active degradation sink."""
         settings = self._settings()
-        group_id = coerce_group(group_id) or "technical"
         t_start = time.perf_counter()
         ex = self._leg_executor
         st = self._resolve_trust(surface, trust)
@@ -138,10 +123,6 @@ class RecallOverviewMixin:
         # subset of nothing.
         kg_scope: dict[str, Any] = {"allowed_projects": allowed} if st.restricted else {}
         kg_off = st.restricted and not allowed
-        # Every KG read below, the bump included, covers these groups. A list (full trust)
-        # adds the other group's facts after the requested group's, never in their place.
-        kg_groups = read_groups(group_id, st.restricted)
-        other_groups = kg_groups[1:] if isinstance(kg_groups, list) else []
 
         # BM25 is pure text search — it does NOT need the query embedding. Start it
         # FIRST so its ~165ms fetch overlaps the ~170ms Voyage query-embedding call
@@ -158,15 +139,6 @@ class RecallOverviewMixin:
             None,
             allowed,
             own,
-        )
-
-        # The other KG group's fact BM25 leg is text-only too, and what it costs is a second
-        # serial scan behind the requested group's search; started here it runs under the
-        # embed call and the requested group's search, on a connection of its own, and the
-        # KG leg below picks its rows up when it needs them. It is enqueued BEFORE the KG
-        # leg, so the KG leg can only be running once this one is, and waiting on it is safe.
-        f_kg_cross = (
-            _submit_ctx(ex, self._cross_bm25_rows, query, other_groups) if other_groups else None
         )
 
         t_emb = time.perf_counter()
@@ -216,11 +188,9 @@ class RecallOverviewMixin:
             return self._search_kg(
                 query,
                 query_emb,
-                kg_groups,
                 session_focus or [],
                 fact_limit=settings._FACT_LIMIT,
                 **kg_scope,
-                **({"cross_bm25": f_kg_cross.result} if f_kg_cross is not None else {}),
             )
 
         f_vec = (
@@ -265,8 +235,8 @@ class RecallOverviewMixin:
         web_ranked, ms_web = f_web.result()
         (kg_results, _seed_entities), ms_kg = f_kg.result()  # entities display retired
 
-        # carry _uuid for bump + superseded pairs; cross-group extras ride after the limit
-        facts_internal = kg_results[: settings._FACT_LIMIT + CROSS_GROUP_EXTRAS]
+        # carry _uuid for bump + superseded pairs
+        facts_internal = kg_results[: settings._FACT_LIMIT]
         # Self-exclusion, facts half: drop facts sourced only from the calling session.
         # Runs before the retrieval_count bump so an unserved fact is not reinforced.
         n_self_facts_excluded = 0
@@ -281,7 +251,7 @@ class RecallOverviewMixin:
         # float higher next time. Already fire-and-forget — never blocks the response.
         surfaced_edge_uuids = [f["_uuid"] for f in facts_internal if f.get("_uuid")]
         if surfaced_edge_uuids and write_feedback:
-            self._increment_fact_retrieval_counts(surfaced_edge_uuids, kg_groups)
+            self._increment_fact_retrieval_counts(surfaced_edge_uuids)
 
         # Second wave, concurrent with the episode rerank: the bi-temporal superseded-pairs
         # fetch and the fact-floor rerank both need the KG leg's facts, nothing else.
@@ -291,26 +261,13 @@ class RecallOverviewMixin:
             else _submit_ctx(
                 ex,
                 functools.partial(self._fetch_superseded_pairs_pg, **kg_scope),
-                kg_groups,
                 surfaced_edge_uuids,
                 settings._SUPERSEDED_LIMIT,
             )
         )
-        # The requested group's facts and the other group's extras are floored by a request
-        # each, started together: the slower one is waited on, not the two in series. Each
-        # request scores exactly the batch it always did. (One request over both would
-        # shift every score by ~1e-3, which moves near-tied facts and facts at the floor.)
-        own_facts = [f for f in facts_internal if not f.get("_cross")]
-        extra_facts = [f for f in facts_internal if f.get("_cross")]
-        floor_on = settings._RECALL_FACT_FLOOR > 0
-        f_floor_own = (
-            _submit_ctx(ex, self._floor_facts, query, own_facts)
-            if floor_on and len(own_facts) > 1
-            else None
-        )
-        f_floor_extra = (
-            _submit_ctx(ex, self._floor_facts, query, extra_facts)
-            if floor_on and extra_facts
+        f_floor = (
+            _submit_ctx(ex, self._floor_facts, query, facts_internal)
+            if settings._RECALL_FACT_FLOOR > 0 and len(facts_internal) > 1
             else None
         )
         scored, ms_rerank = f_rerank.result()
@@ -381,31 +338,19 @@ class RecallOverviewMixin:
         # the one place the "recall returns irrelevant stuff" lever measurably works. OFF by
         # default (adds one rerank of the served facts), so this is a no-op until enabled.
         # Its rerank was started with the second wave above, beside the episode rerank.
-        served_facts = facts_internal
-        if f_floor_own is not None or f_floor_extra is not None:
-            served_facts = (f_floor_own.result() if f_floor_own is not None else own_facts) + (
-                f_floor_extra.result() if f_floor_extra is not None else extra_facts
-            )
+        served_facts = f_floor.result() if f_floor is not None else facts_internal
         # Supersession surface: if the query matched a now-invalid fact, pull in its CURRENT successor
         # (deduped) so a query about something that changed still gets today's answer, not nothing.
-        # Requested group only, on purpose: the other group's surface is a serial scan over its
-        # retired edges (no index orders them; 0.4-2s on prod 2026-11-06), on the critical path.
         sup_extras = (
             []
             if kg_off
             else self._surface_supersessions(
                 query_emb,
-                group_id,
                 {f.get("_uuid") for f in served_facts if f.get("_uuid")},
+                served_fact_texts=[f["fact"] for f in served_facts],
                 **kg_scope,
             )
         )
-        # A superseded pair fetched for a cross-group extra the floor then dropped would
-        # pair a fact nobody is served; the requested group's pairs keep the base behaviour.
-        if other_groups and superseded_facts:
-            served_now = {f["fact"] for f in served_facts}
-            dropped = {f["fact"] for f in facts_internal if f.get("_cross")} - served_now
-            superseded_facts = [p for p in superseded_facts if p["superseded_by"] not in dropped]
         if sup_extras and self_session:
             own_facts = self._self_session_facts(
                 [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
@@ -445,7 +390,6 @@ class RecallOverviewMixin:
                     served_text[eid] = served_text.get(eid, "") + (it.get("content") or "")
             sup = self._episode_supersessions(
                 list(served_text),
-                group_id,
                 self_session=self_session,
                 served_text=served_text,
                 **kg_scope,
@@ -513,11 +457,6 @@ class RecallOverviewMixin:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
             served_ids["n_self_facts_excluded"] = n_self_facts_excluded
-        # Which served facts came from the group the caller did not ask for (key present
-        # only when some did), so their helpful/noise rate can be read off recall_feedback.
-        cross = [f["_uuid"] for f in served_facts if f.get("_cross") and f.get("_uuid")]
-        if cross:
-            served_ids["facts_cross_group"] = cross
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.
@@ -527,7 +466,6 @@ class RecallOverviewMixin:
             "kind": "recall",
             "source": source or "mcp",
             "query": query[:200],
-            "group_id": group_id,
             "write_feedback": write_feedback,
             "ms_total": round((time.perf_counter() - t_start) * 1000.0, 1),
             "ms_embed": round(ms_embed, 1),

@@ -79,14 +79,11 @@ class TestNowFallbackWarning:
         # fact 1 carries an in-text date, so only facts 0 and 2 take the now() branch
         pipe = _pipe(3, dates=[(None, None), (IN_TEXT, None), (None, None)])
         with caplog.at_level(logging.WARNING, logger="ingestion.extraction_edges"):
-            pipe._stage7_write_edges(
-                facts, _uuid_map(facts), [41, 42], "g-tech", set(), {}, queue_id=1234
-            )
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [41, 42], set(), {}, queue_id=1234)
         (rec,) = _fallback_records(caplog)
         assert rec.levelno == logging.WARNING
         msg = rec.getMessage()
         assert msg.startswith("stage7: 2 of 3 fact(s)")
-        assert "group=g-tech" in msg
         assert "queue_id=1234" in msg
         assert "source_episodes=2" in msg
 
@@ -94,7 +91,7 @@ class TestNowFallbackWarning:
         facts = [_fact(0), _fact(1)]
         pipe = _pipe(2)
         with caplog.at_level(logging.DEBUG):
-            pipe._stage7_write_edges(facts, _uuid_map(facts), [], "g", set(), {}, queue_id=7)
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [], set(), {}, queue_id=7)
         assert _fallback_records(caplog)
         assert "private-text" not in caplog.text
 
@@ -104,7 +101,7 @@ class TestNowFallbackWarning:
         facts = [_fact(0)]
         pipe = _pipe(1)
         with caplog.at_level(logging.WARNING, logger="ingestion.extraction_edges"):
-            pipe._stage7_write_edges(facts, _uuid_map(facts), [], "g", set(), {})
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [], set(), {})
         (rec,) = _fallback_records(caplog)
         assert "source_episodes=0" in rec.getMessage()
         assert "queue_id=None" in rec.getMessage()
@@ -113,16 +110,14 @@ class TestNowFallbackWarning:
         facts = [_fact(0), _fact(1)]
         pipe = _pipe(2)
         with caplog.at_level(logging.DEBUG):
-            pipe._stage7_write_edges(
-                facts, _uuid_map(facts), [1], "g", set(), {}, default_valid_at=SEG
-            )
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [1], set(), {}, default_valid_at=SEG)
         assert _fallback_records(caplog) == []
 
     def test_silent_when_every_fact_has_its_own_date(self, caplog):
         facts = [_fact(0)]
         pipe = _pipe(1, dates=[(IN_TEXT, None)])
         with caplog.at_level(logging.DEBUG):
-            pipe._stage7_write_edges(facts, _uuid_map(facts), [], "g", set(), {})
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [], set(), {})
         assert _fallback_records(caplog) == []
 
     def test_silent_on_the_web_lane(self, caplog):
@@ -130,7 +125,7 @@ class TestNowFallbackWarning:
         facts = [_fact(0)]
         pipe = _pipe(1)
         with caplog.at_level(logging.DEBUG):
-            pipe._stage7_write_edges(facts, _uuid_map(facts), [], "g", set(), {}, web_artifact_id=9)
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [], set(), {}, web_artifact_id=9)
         assert _fallback_records(caplog) == []
 
     def test_facts_that_are_not_written_are_not_counted(self, caplog):
@@ -140,7 +135,7 @@ class TestNowFallbackWarning:
         umap = _uuid_map(facts)
         del umap["T1"]
         with caplog.at_level(logging.WARNING, logger="ingestion.extraction_edges"):
-            pipe._stage7_write_edges(facts, umap, [], "g", {0}, {})
+            pipe._stage7_write_edges(facts, umap, [], {0}, {})
         (rec,) = _fallback_records(caplog)
         assert rec.getMessage().startswith("stage7: 1 of 3 fact(s)")
 
@@ -148,7 +143,7 @@ class TestNowFallbackWarning:
         facts = [_fact(0), _fact(1)]
         pipe = _pipe(2, dates=[(None, None), (IN_TEXT, None)])
         with caplog.at_level(logging.WARNING, logger="ingestion.extraction_edges"):
-            pipe._stage7_write_edges(facts, _uuid_map(facts), [], "g", set(), {})
+            pipe._stage7_write_edges(facts, _uuid_map(facts), [], set(), {})
         r0, r1 = _rows(pipe)
         assert r0["t_valid"] == r0["valid_at"] == r0["t_created"]  # the write clock, as before
         assert r1["t_valid"] == IN_TEXT
@@ -170,12 +165,12 @@ class TestNowFallbackWarning:
         monkeypatch.setattr(logfire, "span", _span)
         facts = [_fact(0), _fact(1)]
         pipe = _pipe(2, dates=[(None, None), (IN_TEXT, None)])
-        pipe._stage7_write_edges(facts, _uuid_map(facts), [], "g", set(), {})
+        pipe._stage7_write_edges(facts, _uuid_map(facts), [], set(), {})
         assert seen["span"] == "stage7_resolve_valid_at {n}"
         assert seen["now_fallback"] == 1
 
-    def test_queue_id_reaches_the_warning_through_the_group_path(self, caplog):
-        # process_item hands the queue id to _process_facts_for_group, which must pass it
+    def test_queue_id_reaches_the_warning_through_process_facts(self, caplog):
+        # process_item hands the queue id to _process_facts, which must pass it
         # on to Stage 7; the unit tests above call Stage 7 directly and would not notice.
         facts = [_fact(0)]
         pipe = _pipe(1)
@@ -185,7 +180,7 @@ class TestNowFallbackWarning:
         pipe._stage6b_batch_confirm = MagicMock(return_value=(set(), {}, {}, True))
         pipe._kg.nearest_live_edges.side_effect = lambda embs, *a, **k: [[] for _ in embs]
         with caplog.at_level(logging.WARNING, logger="ingestion.extraction_edges"):
-            pipe._process_facts_for_group(facts, _uuid_map(facts), [], "g", queue_id=99)
+            pipe._process_facts(facts, _uuid_map(facts), [], queue_id=99)
         (rec,) = _fallback_records(caplog)
         assert "queue_id=99" in rec.getMessage()
         assert len(_rows(pipe)) == 1
@@ -210,10 +205,10 @@ def _item_pipeline(db) -> ExtractionPipeline:
     pipe._stage2_deterministic = MagicMock(return_value=[])
     pipe._stage3_llm = MagicMock(return_value=ExtractionResult(entities=entities, facts=facts))
     pipe._stage4_resolve = MagicMock(
-        side_effect=lambda ents, group_id, deduper=None: {e.name: f"new:{e.name}" for e in ents}
+        side_effect=lambda ents, deduper=None: {e.name: f"new:{e.name}" for e in ents}
     )
     pipe._stage5_write_nodes = MagicMock()
-    pipe._process_facts_for_group = MagicMock()
+    pipe._process_facts = MagicMock()
     pipe._deduper_for = MagicMock(return_value=MagicMock())
     return pipe
 
@@ -251,8 +246,8 @@ def test_failed_episode_lookup_is_logged_and_extraction_continues(caplog, conten
     # Same behavior as the bare except it replaces: no source episodes, no segment date,
     # and the facts are still processed (with the queue id for the stage-7 warning).
     db.get_episodes_valid_at.assert_not_called()
-    kwargs = pipe._process_facts_for_group.call_args.kwargs
-    assert pipe._process_facts_for_group.call_args.args[2] == []  # episode_ids
+    kwargs = pipe._process_facts.call_args.kwargs
+    assert pipe._process_facts.call_args.args[2] == []  # episode_ids
     assert kwargs["default_valid_at"] is None
     assert kwargs["reference_time"] is None
     assert kwargs["queue_id"] == 555
@@ -268,7 +263,7 @@ def test_successful_lookup_logs_nothing(caplog):
             {"id": 1, "content_type": "chunk", "content": "x", "session_id": "sess-1"}
         )
     assert [r for r in caplog.records if r.name == "ingestion.extractor"] == []
-    assert pipe._process_facts_for_group.call_args.kwargs["default_valid_at"] == SEG
+    assert pipe._process_facts.call_args.kwargs["default_valid_at"] == SEG
 
 
 # ---------------------------------------------------------------------------

@@ -80,7 +80,7 @@ def _wired(*, embed_fail: bool = False, rerank_fail: bool = False, pool: list[di
     r._search_bm25_web = lambda q, n: []
     r._search_kg = lambda *a, **k: ([], [])
     r._search_notes = lambda q, emb, proj, audience=None: []
-    r._fetch_superseded_pairs_pg = lambda gid, uuids, cap: []
+    r._fetch_superseded_pairs_pg = lambda uuids, cap: []
     r._surface_supersessions = lambda *a, **k: []
     r._episode_supersessions = lambda *a, **k: {}
     r._compact_to_passages = lambda q, eps, n, **_k: [

@@ -54,7 +54,7 @@ def test_query_matching_invalid_fact_surfaces_successor(conn, db_url):
     _seed(conn)
     r = Recall(db_url, "")
     # query aligns with the SUPERSEDED fact P (axis 1) -> surface its successor N.
-    out = r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
+    out = r._surface_supersessions(_axis_list(1), served_uuids=set())
     assert len(out) == 1
     assert out[0]["_uuid"] == "n-1"
     assert out[0]["fact"] == "Synapse uses Postgres now"  # the CURRENT fact, not the stale one
@@ -64,7 +64,7 @@ def test_query_matching_invalid_fact_surfaces_successor(conn, db_url):
 def test_already_served_successor_is_deduped(conn, db_url):
     _seed(conn)
     r = Recall(db_url, "")
-    out = r._surface_supersessions(_axis_list(1), GROUP, served_uuids={"n-1"})
+    out = r._surface_supersessions(_axis_list(1), served_uuids={"n-1"})
     assert out == []  # successor already in the facts bucket -> not added again
 
 
@@ -73,7 +73,7 @@ def test_off_topic_superseded_fact_is_gated_out(conn, db_url):
     r = Recall(db_url, "")
     # query aligns with the SUCCESSOR (axis 0); the superseded P (axis 1) is cosine-distance 1.0
     # away -> beyond _SUP_MAX_DIST -> nothing surfaced (the live leg already owns this case).
-    assert r._surface_supersessions(_axis_list(0), GROUP, served_uuids=set()) == []
+    assert r._surface_supersessions(_axis_list(0), served_uuids=set()) == []
 
 
 def _seed_pairs(conn) -> None:
@@ -99,7 +99,7 @@ def _seed_pairs(conn) -> None:
 def test_superseded_pair_needs_a_link_or_the_same_predicate(conn, db_url):
     _seed_pairs(conn)
     r = Recall(db_url, "")
-    out = r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)
+    out = r._fetch_superseded_pairs_pg(["a"], 10)
     # DISTINCT ON keeps the most recently retired genuine predecessor: the linked one.
     assert [x["id"] for x in out] == ["f:linked"]
     assert out[0]["superseded_by"] == "User corrected the assistant on 10-08"
@@ -109,14 +109,14 @@ def test_unrelated_retired_edge_on_the_same_endpoints_is_never_paired(conn, db_u
     _seed_pairs(conn)
     conn.execute("DELETE FROM kg_relationships WHERE uuid IN ('linked', 'same-name')")
     r = Recall(db_url, "")
-    assert r._fetch_superseded_pairs_pg(GROUP, ["a"], 10) == []
+    assert r._fetch_superseded_pairs_pg(["a"], 10) == []
 
 
 def test_same_predicate_without_a_link_still_pairs(conn, db_url):
     _seed_pairs(conn)
     conn.execute("DELETE FROM kg_relationships WHERE uuid = 'linked'")
     r = Recall(db_url, "")
-    assert [x["id"] for x in r._fetch_superseded_pairs_pg(GROUP, ["a"], 10)] == ["f:same-name"]
+    assert [x["id"] for x in r._fetch_superseded_pairs_pg(["a"], 10)] == ["f:same-name"]
 
 
 def _seed_far_link(conn) -> dict[str, int]:
@@ -141,12 +141,10 @@ def _seed_far_link(conn) -> dict[str, int]:
 def test_far_successor_link_is_not_believed_by_any_leg(conn, db_url):
     ids = _seed_far_link(conn)
     r = Recall(db_url, "")
-    surfaced = {
-        x["_uuid"] for x in r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
-    }
+    surfaced = {x["_uuid"] for x in r._surface_supersessions(_axis_list(1), served_uuids=set())}
     assert "n-far" not in surfaced and "n-1" in surfaced  # the close link still surfaces
-    assert r._episode_supersessions([ids["episode"]], GROUP) == {}
-    assert r._fetch_superseded_pairs_pg(GROUP, ["n-far"], 10) == []
+    assert r._episode_supersessions([ids["episode"]]) == {}
+    assert r._fetch_superseded_pairs_pg(["n-far"], 10) == []
 
 
 def test_close_successor_link_still_overlays_its_episode(conn, db_url):
@@ -159,8 +157,8 @@ def test_close_successor_link_still_overlays_its_episode(conn, db_url):
         "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)
     )
     r = Recall(db_url, "")
-    assert r._episode_supersessions([eid], GROUP) == {eid: ["Synapse uses Postgres now"]}
-    pairs = r._fetch_superseded_pairs_pg(GROUP, ["n-1"], 10)
+    assert r._episode_supersessions([eid]) == {eid: ["Synapse uses Postgres now"]}
+    pairs = r._fetch_superseded_pairs_pg(["n-1"], 10)
     assert [x["id"] for x in pairs] == ["f:p-1"]
 
 
@@ -178,11 +176,11 @@ def test_no_supersession_helper_serves_a_web_derived_fact(conn, db_url):
     r = Recall(db_url, "")
 
     def _served() -> tuple[list[str], dict[int, list[str]], list[str]]:
-        surfaced = r._surface_supersessions(_axis_list(1), GROUP, served_uuids=set())
+        surfaced = r._surface_supersessions(_axis_list(1), served_uuids=set())
         return (
             [x["_uuid"] for x in surfaced],
-            r._episode_supersessions([eid], GROUP),
-            [x["id"] for x in r._fetch_superseded_pairs_pg(GROUP, ["n-1"], 10)],
+            r._episode_supersessions([eid]),
+            [x["id"] for x in r._fetch_superseded_pairs_pg(["n-1"], 10)],
         )
 
     assert _served() == (["n-1"], {eid: ["Synapse uses Postgres now"]}, ["f:p-1"])
@@ -208,7 +206,7 @@ def test_overlay_never_serves_a_retired_successor(conn, db_url):
         "UPDATE kg_relationships SET episodes = %s::jsonb WHERE uuid = 'p-1'", (f"[{eid}]",)
     )
     conn.execute("UPDATE kg_relationships SET t_invalid = now() WHERE uuid = 'n-1'")
-    assert Recall(db_url, "")._episode_supersessions([eid], GROUP) == {}
+    assert Recall(db_url, "")._episode_supersessions([eid]) == {}
 
 
 def test_overlay_needs_the_served_text_to_state_the_retired_claim(conn, db_url):
@@ -230,11 +228,11 @@ def test_overlay_needs_the_served_text_to_state_the_retired_claim(conn, db_url):
         off: "[user] set up restic backups to the nas please",
     }
     r = Recall(db_url, "")
-    assert r._episode_supersessions([on, off], GROUP, served_text=served) == {
+    assert r._episode_supersessions([on, off], served_text=served) == {
         on: ["Synapse uses Postgres now"]
     }
     # Without served text (drill-down callers) the citation alone still links.
-    assert set(r._episode_supersessions([on, off], GROUP)) == {on, off}
+    assert set(r._episode_supersessions([on, off])) == {on, off}
 
 
 def test_claim_support_scoring():

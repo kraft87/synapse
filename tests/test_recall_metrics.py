@@ -29,7 +29,6 @@ def test_served_ids_and_leg_columns_round_trip(conn, db_url):
             "kind": "recall",
             "source": "test",
             "query": "q",
-            "group_id": "technical",
             "n_timeline": 2,
             "ms_timeline": 12.5,
             "n_prefs": 1,

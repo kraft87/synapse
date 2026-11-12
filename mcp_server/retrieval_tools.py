@@ -9,7 +9,6 @@ from typing import Any
 import logfire
 from fastmcp import FastMCP
 
-from ingestion.scope import coerce_group
 from ingestion.surfaces import SurfaceTrust, own_surface_served
 from mcp_server.caller_trust import note_ignored_surface
 from mcp_server.recall_warnings import serving_notice, with_notice
@@ -21,7 +20,6 @@ def register(
     mcp: FastMCP,
     _get_recall: Callable[[], Any],
     _caller_trust: Callable[[], SurfaceTrust],
-    _scope_doc: Callable[[Any], Any],
     _access_token: Callable[[], Any],
 ) -> tuple[Any, ...]:
     """Register the four read tools.
@@ -43,12 +41,10 @@ def register(
         return with_notice(out, serving_notice(trust, own))
 
     @mcp.tool()
-    @_scope_doc
     def recall(
         query: str,
         project: str | None = None,
         session_focus: list[str] | None = None,
-        group_id: str = "technical",
         self_session: str | None = None,
         surface: str | None = None,
     ) -> dict:
@@ -94,7 +90,6 @@ def register(
             query: Natural language search query.
             project: Optional project slug to filter results (e.g. "synapse").
             session_focus: Entity names active in current conversation for KG bias.
-            group_id: Knowledge graph scope — "technical" (default) or "personal"; a trusted host also gets top matches from the other.
             self_session: NEVER set this yourself. The client's PreToolUse hook injects
                 the calling session's id so serving can suppress self-session domination;
                 calls without it simply skip that suppression.
@@ -102,21 +97,12 @@ def register(
                 device from its own credential. Never set it.
         """
         note_ignored_surface(surface, "mcp.recall")
-        # With the personal scope off, "personal" is an alias for the one graph that
-        # exists; coerced here too so the telemetry span records what was searched.
-        group_id = coerce_group(group_id) or "technical"
-        with logfire.span(
-            "mcp.recall {query!r}",
-            query=query[:80],
-            project=project,
-            group_id=group_id,
-        ):
+        with logfire.span("mcp.recall {query!r}", query=query[:80], project=project):
             trust = _caller_trust()
             out = _get_recall().recall(
                 query=query,
                 project=project,
                 session_focus=session_focus or [],
-                group_id=group_id,
                 source="mcp-tool",
                 self_session=self_session,
                 trust=trust,
