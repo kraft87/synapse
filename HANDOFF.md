@@ -3,6 +3,63 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
+
+**What changed**
+
+- **`scripts/synapse_ingest_hook.py` is gone.** It was the stale Stop hook outside the
+  plugin, still carrying the defects listed in the 0.24.2 entry below. Nothing shipped
+  or ran it: no Dockerfile, compose file, Makefile, CI job or `/install` bundle names
+  it. ARCHITECTURE.md now describes the live hook, `plugin/scripts/ingest_hook.py`, in
+  the overview, the ingest diagram, §4.2 and the repo tree, and names the Codex `Stop`
+  hook where the same holds for it.
+- **Code that only tests called is removed:**
+  - `ingest_hook._select_tail`. The Stop path seeds its cursor inline in `_ship`.
+  - `config.RECALL_URL` (and its `SYNAPSE_RECALL_URL` docstring line),
+    `config.PROPOSALS_DIR` and `config.ensure_dirs`. A pasted `/recall` suffix is still
+    stripped from the base URL.
+- **`enroll.py` takes `BOOTSTRAP_CMD` and `PASTE_CMD` from the core**
+  (`synapse_client.context`), reaching it the way `synapse_project.py` does. The two
+  notices that use them are unchanged byte for byte.
+- **New `tests/test_client_server_rule_parity.py`.** It pins the hooks' copies of server
+  rules:
+  - the machinery prefixes, for Claude Code and for Codex;
+  - whether a record starts a turn, on a table of records for each;
+  - the Hermes `<memory-context>` pattern.
+
+**On each machine**
+
+1. Nothing beyond the usual update: `synapse update` once the server serves 0.24.3. No
+   behaviour changes.
+
+**Proven**
+
+- Full non-db suite: 3721 passed, 34 skipped, 3 xfailed. Ruff check and format are clean.
+- The new byte-for-byte tests of `bootstrap_hint()` and `restricted_block()` passed on
+  the old definitions in `enroll.py`, and still pass after the switch.
+- `harness.normalize_url` and the core's `settings.normalize_url` agree on every case in
+  the parity table, and their patterns and flags are equal.
+- With `--runxfail`, each of the three known differences fails at the hook's answer or
+  the server's exception, not in the test's setup.
+
+**Open**
+
+- The hooks and the server differ on three records. Each is an xfail in the parity
+  tests; no code changed:
+  - A sidechain user record with real text: `ingest_hook._is_turn_start` treats it as a
+    turn start, but the server drops sidechain records before grouping.
+  - A Claude Code record with `"message": null`: the server's
+    `JSONLParser._filter_records` raises AttributeError, and the hook answers no. Claude
+    Code is not known to write such a record.
+  - A Codex user message whose only part is `output_text`: the server counts it as a
+    turn, but the hook's `_is_user_boundary` reads only `input_text` and `text`.
+- `harness.normalize_url` keeps its own copy of the core's rule. `synapse update` calls
+  it before the installer runs. Importing the core at that point would leave the old
+  client's `synapse_client` in `sys.modules`, and the update would build its harness
+  registry from that one. Instead, a test pins the two copies equal.
+- No test covers `_ship`'s stop-mode fallback: when the tail window holds no turn
+  boundary, it seeds the cursor at offset 0.
+
 ## 2026-11-12 — client: six defect fixes from the client parity review (plugin 0.24.2)
 
 **What changed**
