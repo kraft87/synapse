@@ -275,7 +275,9 @@ set` when Hermes already has a config there, by writing a new two-line file when
 none. Hermes runs one external memory provider at a time, so a different one already
 selected is left alone unless you pass `--replace`; Hermes's built-in memory keeps working
 either way. `synapse update` rebuilds the folder for a new client version, and `synapse
-status` says whether it is wired. Restart Hermes to load it.
+status` says whether it is wired. Restart Hermes to load it: `hermes chat` and the TUI run
+their turns in Hermes's gateway daemon, so stop it with `hermes gateway stop` (the next
+`hermes chat` starts it again).
 
 **What it does.** In a session you run on this machine (the Hermes CLI, TUI, Desktop or an
 ACP editor): the board and your preferences in the system prompt at session start, the
@@ -288,10 +290,11 @@ reasons and the Hermes source behind them: [docs/client-harnesses.md](../docs/cl
 
 **What leaves the machine.** Requests go only to the server in `~/.synapse/config.json`,
 with this machine's device token. At session start: `GET /context` and
-`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each finished turn: a
-`POST /ingest` (format `messages`, client `hermes`) holding the session id, the project
-label and working directory, the model name, and per message its role, text, tool-call
-names and arguments (first 1000 characters), tool results (first 2000) and timestamp.
+`GET /preferences/top`. Each tool call: one MCP `tools/call`. Each finished turn, not
+one that failed: a `POST /ingest` (format `messages`, client `hermes`) holding the
+session id, the project label and working directory, the model name, and per message its
+role, text, tool-call names and arguments (first 1000 characters), tool results (first
+2000) and timestamp.
 Hermes scrubs secrets from what it hands a memory provider before the client sees it.
 Not sent: the system prompt, Hermes's compaction summaries, the memory context it injects
 into prompts, reasoning, and its own bookkeeping fields. Uploads that fail wait in

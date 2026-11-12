@@ -83,32 +83,46 @@ MEMORY.md / USER.md alone.
 
 **Local sessions only.** Synapse is one person's memory, and Hermes also runs as a chat
 bot (Telegram, Discord, Slack and the rest, through its gateway) and an API server, where
-other people talk to it. The provider decides once, in `initialize()`, from the keywords
-Hermes passes:
+other people talk to it. The provider decides in `initialize()`, from the keywords Hermes
+passes and, for a session they allow, Hermes's own record of who created it
+(`harnesses/hermes/sessions.py` has the rule):
 
 - **Active**: `agent_context` "primary" (Hermes's default) on a local surface, `platform`
-  "cli" (Hermes's default), "tui", "desktop" or "acp", with no chat identity. The board,
-  the nudge, uploads and the tools all work.
-- **Cron** (`agent_context` or `platform` "cron"): the tools work; nothing is injected and
-  nothing is uploaded. A scheduled job may need the memory, but its prompts are not a
-  conversation the user had.
-- **Inert**, everything else: subagents and other forks, the API server, and every
-  messaging gateway. A chat identity (`gateway_session_key`, `chat_id`, `chat_name`,
-  `chat_type`, `thread_id`, `user_id_alt`, `user_name`) marks a gateway session even on a
-  platform the list does not know. Nothing is injected or uploaded, and a tool call
-  returns an error: someone else in a group chat must not read the owner's memory through
-  the agent, nor have their messages stored as the owner's. `user_id` alone does not
-  count, because the TUI and Desktop pass the owner's own login there.
+  "cli" (Hermes's default), "tui", "desktop" or "acp", run by this machine's owner. With
+  no chat identity the agent runs in the process that created it (the stdio TUI and
+  Desktop backend, ACP, the classic CLI). `hermes chat` and the TUI run their turns in
+  the gateway daemon, which passes a chat identity even for them: such a session is
+  active only with the shape of a local session (`chat_id` `local-<hex>`, `chat_type`
+  "dm", its `agent:<profile>:local:dm:` route, `user_id` `uid:<this OS user>`) and a
+  creation receipt in `<hermes_home>/state.db`, read read-only, naming the owner as its
+  creator, an owner's chat as its source (not `--source tool`) and no Bot Chat. The
+  board, the nudge, uploads and the tools all work.
+- **Cron** (`agent_context` or `platform` "cron", no chat identity): the tools work;
+  nothing is injected and nothing is uploaded. A scheduled job may need the memory, but
+  its prompts are not a conversation the user had.
+- **Inert**, everything else: subagents and other forks, the API server, every messaging
+  gateway, hosted rooms and peer agents, the Bot Chat, a session created by someone else
+  or by a third-party integration, one the store does not know, and any shape not listed
+  above. Nothing is injected or uploaded, and a tool call returns an error: someone else
+  must not read the owner's memory through the agent, nor have their messages stored as
+  the owner's. The reason is logged once.
+
+The session's row in `state.db` (title, stored source, chat) is read again before each
+nudge, upload and tool call, since a session can be renamed "Bot Chat" or switched to
+another (`/resume`, compression) without a new provider; one that no longer passes turns
+the instance inert for good. A gateway session's project comes from the `cwd` its client
+sent, never the daemon's.
 
 The Hermes source this rests on: `_memory_provider_init_kwargs` in
 `agent/agent_init_memory_provider.py` (platform defaults to "cli"; `agent_context` is the
 agent's `memory_agent_context`, else "cron" or "subagent" by platform, else "primary";
 the chat identity is `_GATEWAY_IDENTITY_PARAMS` in `agent/agent_init_params.py`),
 `gateway/session_execution.py` (a gateway passes its platform and the chat identity),
-`gateway/platforms/api_server.py` ("api_server"), `tui_gateway/agent_factory.py` ("tui",
-"desktop"), `acp_adapter/session.py` ("acp"), `cron/scheduler.py` ("cron") and
-`tools/delegate_tool.py` (`memory_agent_context="subagent"`). A gateway session that
-should use Synapse is a later, deliberate change: it needs a way to say whose chat it is.
+`hermes_state_keys.py` and `hermes_state_local.py` (the local chat id and its creation
+receipt), `gateway/control_socket.py` (the `uid:` subject, minted for a peer of the same
+OS user), `gateway/platforms/api_server.py` ("api_server"), `tui_gateway/agent_factory.py`
+("tui", "desktop"), `acp_adapter/session.py` ("acp"), `cron/scheduler.py` ("cron") and
+`tools/delegate_tool.py` (`memory_agent_context="subagent"`).
 
 **Install.**
 
@@ -124,14 +138,14 @@ wired, found and not wired, or not found. The Hermes home is
 provider:
 
 - With the `hermes` program on PATH and a `config.yaml` already in the home, through
-  `hermes config get` / `hermes config set memory.provider synapse`. An empty value or
-  one of Hermes's built-in names is replaced; another external provider is left alone
-  and the report says how to switch, unless `--replace` is given.
+  `hermes config get --json` / `hermes config set memory.provider synapse`. An empty
+  value or one of Hermes's built-in names is replaced; another external provider is left
+  alone and the report says how to switch, unless `--replace` is given.
 - A home with no `config.yaml` gets one with the two lines `memory:` / `provider:
   synapse`. The program is never run there: a first launch sets up the home, which
   downloads Hermes's toolchain.
 - A `config.yaml` without the program on PATH is left as it is, and the report names
-  the `hermes config set` command to run.
+  the `hermes config set` command to run, or says it is already selected.
 
 **Installed layout.** The folder is self-contained:
 
@@ -174,22 +188,29 @@ our own nudge included), `display_metadata`, reasoning blobs and compaction summ
 snapshot, a `/steer` message, a control frame) is sent marked `synthetic`, which the
 server skips. The dicts are never modified: Hermes hands out references to its own
 transcript. A turn is uploaded once it is complete: it ends in an assistant reply with
-no tool calls.
+no tool calls. Hermes's notice for a failed turn (an assistant row typed `failed_turn`,
+or one holding only the bare notice) is not a reply, so a failed turn is never uploaded,
+its user message included; an assistant row of any other `display_kind` (a held turn's
+interim text, the interrupt placeholder) keeps only its tool calls.
 
 **Not there yet.** These work in Claude Code and are not ported to Hermes: the remember
 spool (a `remember` call that fails is reported to the model, not queued), the
 recall-feedback nudge, a private-mode toggle (markers are honoured; there is no Hermes
 command that writes one), skills sync into `$HERMES_HOME/skills`, config sync, a history
-importer for `state.db`, and Synapse in gateway and API-server sessions (above). Skill
-invocations are uploaded as Hermes hands them over: the manager strips the skill body
-from the user text it passes, not from `messages`.
+importer for `state.db`, and Synapse in messaging-gateway and API-server sessions
+(above). Skill invocations are uploaded as Hermes hands them over: the manager strips
+the skill body from the user text it passes, not from `messages`.
 
 **Tests.** `tests/test_hermes_messages.py`, `test_hermes_provider.py` (against a stub of
-Hermes's base class) and `test_hermes_install.py` run everywhere.
-`tests/test_hermes_integration.py` runs only with `SYNAPSE_HERMES_CHECKOUT` set to a Hermes
-checkout with its `.venv`: it installs into a temp home, loads the provider with Hermes's
-own loader and drives Hermes's `MemoryManager`, in-process and with
-`plugins.isolation: host`, against a local fake server.
+Hermes's base class) and `test_hermes_install.py` run everywhere, with
+`test_hermes_gateway_sessions.py` (the rule, over a `state.db` built like Hermes's),
+`test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` and
+`test_hermes_install_selection.py`. `tests/test_hermes_integration.py` runs only with
+`SYNAPSE_HERMES_CHECKOUT` set to a Hermes checkout with its `.venv`: it installs into a
+temp home, loads the provider with Hermes's own loader and drives Hermes's
+`MemoryManager`, in-process and with `plugins.isolation: host`, against a local fake
+server. `tests/test_hermes_checkout_names.py`, under the same variable, checks the
+failed-turn notices and local-session names the client copies against the checkout.
 
 ## Where the migration stands
 
@@ -245,7 +266,12 @@ The core ports the hooks' behaviour and wording, with these differences:
   reason, when a drain leaves the queue empty: it covers the current backlog. The
   session-start warning is the retry module's sentence, dated from the oldest payload,
   followed by "N uploads were dropped and will not be retried." while the count is not
-  zero; the count alone does not raise the warning.
+  zero; the count alone does not raise the warning. A harness whose process may exit
+  mid-request (Hermes) queues each payload before its own send, `put(..., sending=s)`,
+  and removes it once delivered or `keep`s it as waiting when the send fails. No drain
+  takes such a payload, nor does the cap count it, until `s` seconds have passed; after
+  that its sender is taken for dead and a drain sends it, at most once more than needed,
+  which the server's span-id dedup absorbs.
 
 ## Adding a harness
 

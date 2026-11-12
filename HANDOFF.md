@@ -3,6 +3,95 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — hermes: the provider works on `hermes chat`, for the owner only; failed turns and exits no longer corrupt or lose uploads (plugin 0.24.5)
+
+**What changed**
+
+- **Before this change the provider did nothing on `hermes chat`.** `hermes chat` and
+  the TUI run their turns in Hermes's gateway daemon, which passes a chat identity even
+  for the owner's own terminal. The provider read any chat identity as a messaging
+  gateway and went inert: no board, no nudge, no upload, and every tool call an error.
+  Only the in-process surfaces (stdio TUI backend, Desktop, ACP, the classic CLI) worked.
+- **A daemon session is active only when it is provably the owner's local session**
+  (`harnesses/hermes/sessions.py`):
+  - the local shape: `chat_id` `local-<hex>`, `chat_type` "dm", the
+    `agent:<profile>:local:dm:` route and `user_id` `uid:<this OS user>`;
+  - and a creation receipt in `<hermes_home>/state.db`, opened read-only, that names
+    the owner as creator, an owner's chat as the source (not `--source tool`), and no
+    Bot Chat.
+  - Everything else stays inert: messaging platforms, the API server, hosted rooms,
+    peer agents, the Bot Chat, subagents, sessions someone else created, and any shape
+    not listed. The reason is logged once.
+  - The session's row is read again before each nudge, upload and tool call. A session
+    that stops passing turns the instance inert for good.
+  - The project comes from the `cwd` the client sent, never from the daemon's.
+- **A failed turn is never uploaded.** Hermes's notice for a failed turn (an assistant
+  row typed `display_kind: failed_turn`, or the bare notice) was uploaded as the
+  assistant's reply. The failed turn is now dropped, its user message included. An
+  assistant row of any other `display_kind` keeps only its tool calls.
+- **An upload in flight when the process exits waits in the outbox.**
+  - Each batch is written to the outbox before its request, unsynced, as
+    `<name>.json.<deadline>.sending`. It is removed once delivered; a failed send renames
+    it to waiting.
+  - No drain takes it until three times the request timeout has passed (60 s for a turn
+    upload). After that a drain sends it, at most once more than needed, which the
+    server's span-id dedup absorbs.
+  - This holds for every session and process sharing a home's outbox. It adds about
+    0.2 ms per batch on Hermes's background worker.
+- **The outbox's directories are owner-only**, every parent it creates included (POSIX).
+- **`synapse install hermes`** reads `memory.provider` with `hermes config get --json`.
+  - A provider named "null" now counts as another external provider, not as Hermes's
+    built-in memory.
+  - A config.yaml that already selects synapse is reported "already selected": without
+    the program, or when the program cannot answer. It no longer prints a command to
+    run.
+
+**On each machine**
+
+1. `synapse update` once the server serves 0.24.5 (or `synapse install hermes`).
+2. `hermes gateway stop`, so that the daemon loads the new provider; the next
+   `hermes chat` starts it again. Until then a running daemon keeps the old provider,
+   which stays inert on `hermes chat`.
+3. Nothing on the server.
+
+**Proven**
+
+- 151 new tests in six new files: `test_hermes_gateway_sessions.py` (the rule, over a
+  `state.db` built like Hermes's), `test_hermes_failed_turns.py`,
+  `test_hermes_inflight_upload.py` (a child process killed mid-request, sessions
+  sharing an outbox), `test_client_core_outbox_writeahead.py`,
+  `test_client_core_outbox_private_dirs.py`, `test_hermes_install_selection.py`.
+  - Full suite: 3937 passed, 34 skipped, 2 xfailed.
+  - With `SYNAPSE_HERMES_CHECKOUT`, the integration test and
+    `test_hermes_checkout_names.py` pass against Hermes `bca51750`. Ruff is clean.
+- Real `hermes chat` (Hermes `bca51750`, a scripted stub model, the production server):
+  ten messages, nine complete turns and one failed; seven turns uploaded.
+  - The board and preferences reached the system prompt and the nudge reached each
+    user message. A `recall` call round-tripped to the model.
+  - Each complete turn became one row, platform `hermes`, project `hermes-scratch`
+    (from the client's cwd). A resumed session's second turn added exactly one row.
+  - A turn whose model call failed was not uploaded. Neither its notice nor its user
+    message is in the next turn's upload.
+  - A turn whose upload hung (a black-hole proxy) was still in the outbox after
+    `hermes gateway stop`. The next session, past the deadline, sent it once (one POST
+    in the server log) and left the outbox empty.
+  - Two concurrent `hermes chat` sessions in one daemon got one row each, each holding
+    only its own turn.
+  - Sessions started with `--source tool` stayed inert: no board, no nudge, no upload,
+    the reason logged. The model's `recall` there got the local-only JSON error and
+    nothing reached the server.
+
+**Open**
+
+- Messaging-gateway and API-server sessions still get nothing: they need a way to say
+  whose chat it is.
+- Not driven live in this change: `hermes --tui` over the daemon (it reaches the
+  provider as `hermes chat` does), Desktop and ACP.
+- A session-start upload warning counts batches in flight as waiting. With several
+  uploads in flight at once, it can warn about one that is still going.
+- Hermes keeps the nudge in its stored transcript (`api_content`). The upload strips
+  it; the transcript is Hermes's.
+
 ## 2026-11-12 — plugin-codex: the Codex hooks run on the client core (plugin 0.24.4)
 
 **What changed**
