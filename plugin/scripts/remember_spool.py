@@ -60,19 +60,30 @@ import sys
 import time
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 from synapse_filelock import lock_exclusive
 
+
+def _env_number(name: str, default: str, kind: type = float) -> Any:
+    """``kind`` of the environment variable ``name``, or of ``default`` when it is unset
+    or does not parse: one mistyped setting must not stop the hook at import."""
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        return kind(default)
+
+
 SPOOL_PATH = config.DATA_DIR / "remember_spool.jsonl"
 LOCK_PATH = str(SPOOL_PATH) + ".lock"
 FLUSH_LOCK_PATH = str(SPOOL_PATH) + ".flush.lock"
 LOG_PATH = os.environ.get("SYNAPSE_SPOOL_LOG", "/tmp/synapse-remember-spool.log")
-TIMEOUT = float(os.environ.get("SYNAPSE_SPOOL_TIMEOUT", "10"))
-PROBE_TIMEOUT = float(os.environ.get("SYNAPSE_SPOOL_PROBE_TIMEOUT", "4"))
-BUDGET = float(os.environ.get("SYNAPSE_SPOOL_BUDGET", "12"))
-MAX_PER_FLUSH = int(os.environ.get("SYNAPSE_SPOOL_MAX", "25"))
+TIMEOUT = _env_number("SYNAPSE_SPOOL_TIMEOUT", "10")
+PROBE_TIMEOUT = _env_number("SYNAPSE_SPOOL_PROBE_TIMEOUT", "4")
+BUDGET = _env_number("SYNAPSE_SPOOL_BUDGET", "12")
+MAX_PER_FLUSH = _env_number("SYNAPSE_SPOOL_MAX", "25", int)
 
 ROUTE = "/remember/spool"
 _VALID_TYPES = ("user", "feedback", "project", "reference")

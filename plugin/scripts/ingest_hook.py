@@ -104,21 +104,31 @@ import synapse_ingest_retry as retry
 import synapse_project
 from synapse_filelock import lock_exclusive
 
+
+def _env_number(name: str, default: str, kind: type = float) -> Any:
+    """``kind`` of the environment variable ``name``, or of ``default`` when it is unset
+    or does not parse: one mistyped setting must not stop the hook at import."""
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        return kind(default)
+
+
 INGEST_URL = config.INGEST_URL
 INGEST_TOKEN = config.INGEST_TOKEN  # bearer for hosted/central endpoints
 LOG_PATH = os.environ.get("SYNAPSE_INGEST_LOG", "/tmp/synapse-ingest-hook.log")
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
-TAIL_RECORDS = int(os.environ.get("SYNAPSE_INGEST_TAIL", "400"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_INGEST_CATCHUP_DAYS", "3"))
-ACTIVE_GRACE = float(os.environ.get("SYNAPSE_INGEST_ACTIVE_GRACE", "300"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_INGEST_CATCHUP_MAX", "20"))
+TIMEOUT = _env_number("SYNAPSE_INGEST_TIMEOUT", "30")
+TAIL_RECORDS = _env_number("SYNAPSE_INGEST_TAIL", "400", int)
+CATCHUP_DAYS = _env_number("SYNAPSE_INGEST_CATCHUP_DAYS", "3")
+ACTIVE_GRACE = _env_number("SYNAPSE_INGEST_ACTIVE_GRACE", "300")
+CATCHUP_MAX_FILES = _env_number("SYNAPSE_INGEST_CATCHUP_MAX", "20", int)
 CURSOR_PATH = config.DATA_DIR / "ingest_cursors.json"
 _CURSOR_TTL_DAYS = 45  # drop state for transcripts idle this long (or deleted); pending ones stay
 _HEALTH_KEY = retry.HEALTH_KEY  # the upload-streak record in the cursor file
 _WARN_AFTER_FAILS = retry.WARN_AFTER_FAILS
 _WARN_AFTER_HOURS = retry.WARN_AFTER_HOURS
 PRIVATE_DIR = config.PRIVATE_DIR  # marker file per off-the-record session (private mode)
-_PRIVATE_TTL_HOURS = float(os.environ.get("SYNAPSE_PRIVATE_TTL_HOURS", "12"))
+_PRIVATE_TTL_HOURS = _env_number("SYNAPSE_PRIVATE_TTL_HOURS", "12")
 
 # Mirror of ingestion.jsonl_client._MACHINERY_PREFIXES — kept inline so the hook
 # stays dependency-free (it runs under the CLI's bare Python, off the repo path).

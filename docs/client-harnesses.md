@@ -231,11 +231,6 @@ The core ports the hooks' behaviour and wording, with these differences:
   Codex's hook puts preferences before the board today.
 - **Enrollment notices** take the login hint as an argument; the restricted-device
   notice has no Claude-only "paste it into /plugin" aside.
-- **Private mode** falls back to 12 hours when `SYNAPSE_PRIVATE_TTL_HOURS` does not parse
-  (the ingest hook fails at import). A session id that is not a plain file name is read
-  as not private everywhere: the core, the ingest hook and the Codex stop hook apply the
-  same rule (`private._plain_name`, copied into each hook), and both `private_mode.py`
-  toggles refuse such an id.
 - **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
   processes can drain one directory. A payload the server refuses with a 4xx other than
   401, 403, 408 or 429 is dropped; anything else stops the drain and waits. The

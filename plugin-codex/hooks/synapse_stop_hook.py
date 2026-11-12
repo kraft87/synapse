@@ -92,15 +92,25 @@ import synapse_project
 from common import INGEST_URL, TOKEN, _urlopen
 from synapse_filelock import lock_exclusive
 
-TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
+
+def _env_number(name: str, default: str, kind: type = float) -> Any:
+    """``kind`` of the environment variable ``name``, or of ``default`` when it is unset
+    or does not parse: one mistyped setting must not stop the hook at import."""
+    try:
+        return kind(os.environ.get(name, default))
+    except ValueError:
+        return kind(default)
+
+
+TIMEOUT = _env_number("SYNAPSE_INGEST_TIMEOUT", "30")
 LOG_PATH = os.environ.get("SYNAPSE_CODEX_HOOK_LOG", "/tmp/synapse-codex-hook.log")
 CURSORS_PATH = Path(
     os.path.expanduser(os.environ.get("SYNAPSE_CODEX_CURSORS", "~/.synapse/codex_cursors.json"))
 )
 PRIVATE_DIR = Path(os.path.expanduser(os.environ.get("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
 SESSIONS_ROOT = Path(os.path.expanduser("~/.codex/sessions"))
-CATCHUP_DAYS = float(os.environ.get("SYNAPSE_CODEX_CATCHUP_DAYS", "3"))
-CATCHUP_MAX_FILES = int(os.environ.get("SYNAPSE_CODEX_CATCHUP_MAX", "20"))
+CATCHUP_DAYS = _env_number("SYNAPSE_CODEX_CATCHUP_DAYS", "3")
+CATCHUP_MAX_FILES = _env_number("SYNAPSE_CODEX_CATCHUP_MAX", "20", int)
 # The sweep skips rollouts written this recently: a live session's own Stop hook
 # owns them, and a sweep that caught one mid-turn would ship half a turn.
 ACTIVE_GRACE = 300.0

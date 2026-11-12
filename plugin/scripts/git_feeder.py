@@ -123,7 +123,10 @@ def main() -> None:
     repos = _repos()
     if not repos:
         return  # feature off until repos are configured
-    since_days = int(_cfg("SYNAPSE_TIMELINE_SINCE_DAYS", "30") or "30")
+    try:
+        since_days = int(_cfg("SYNAPSE_TIMELINE_SINCE_DAYS", "30") or "30")
+    except ValueError:  # a mistyped setting falls back to the default, not a traceback
+        since_days = 30
     for repo in repos:
         if not (repo / ".git").exists():
             continue  # quiet skip — hooks stay silent in the user's session
