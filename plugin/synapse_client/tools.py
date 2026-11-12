@@ -10,9 +10,12 @@ The session id travels the way the Claude and Codex PreToolUse hooks send it
 (plugin/scripts/self_session_inject.py): ``self_session`` on recall, recall_full_turns
 and fetch_session, so serving leaves out the calling session's own turns, which are
 already in the model's context; ``session_id`` on recall_feedback and remember, which
-accept nothing else. The model never sees those parameters: ``schemas()`` hides them,
-and ``surface`` (deprecated and ignored by the server) everywhere. The user-facing
-``session_id`` of recall_full_turns and fetch_session, the conversation to read, stays.
+accept nothing else. recall and recall_full_turns also take ``self_since``, the time of
+the session's last compaction: the turns before it have left the model's context, so
+serving hides only the ones since. The model never sees those parameters: ``schemas()``
+hides them, and ``surface`` (deprecated and ignored by the server) everywhere. The
+user-facing ``session_id`` of recall_full_turns and fetch_session, the conversation to
+read, stays.
 
 ``schemas()`` RAISES when the snapshot is missing or unreadable (a broken install, to be
 seen at startup); ``inject_session`` raises TypeError for arguments that are not a
@@ -43,6 +46,8 @@ SESSION_FIELD = MappingProxyType(
         "remember": "session_id",
     }
 )
+#: Tools that take the time of the caller's last compaction, in ``self_since``.
+SINCE_TOOLS = frozenset({"recall", "recall_full_turns"})
 #: Parameters no tool shows the model: deprecated, and ignored by the server.
 HIDDEN_EVERYWHERE = frozenset({"surface"})
 DEFAULT_TIMEOUT = 60.0
@@ -50,9 +55,10 @@ DEFAULT_TIMEOUT = 60.0
 
 def hidden_parameters(tool: str) -> frozenset[str]:
     """The parameters of ``tool`` that ``schemas()`` leaves out: ``surface``, and the
-    session parameter ``inject_session`` fills."""
+    session parameters ``inject_session`` fills."""
     field = SESSION_FIELD.get(tool)
-    return HIDDEN_EVERYWHERE | {field} if field else HIDDEN_EVERYWHERE
+    since = {"self_since"} if tool in SINCE_TOOLS else set()
+    return HIDDEN_EVERYWHERE | since | ({field} if field else set())
 
 
 def _snapshot() -> list[dict[str, Any]]:
@@ -100,14 +106,19 @@ def schemas() -> list[dict[str, Any]]:
 
 
 def inject_session(
-    tool: str, arguments: Mapping[str, Any] | None, session_id: str | None
+    tool: str,
+    arguments: Mapping[str, Any] | None,
+    session_id: str | None,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """A copy of ``arguments`` with the caller's session id in the parameter ``tool``
     takes it in (``SESSION_FIELD``), as the PreToolUse hooks add it. A value already
     there is never overwritten (a retry, a nested call); an empty one counts as unset,
     as it does for the hooks. No session id, or a tool without the parameter (fetch, or
-    one this module does not know): the copy, unchanged. RAISES TypeError when
-    ``arguments`` is not a mapping."""
+    one this module does not know): the copy, unchanged. ``since``, the time of the
+    session's last compaction, goes in ``self_since`` on ``SINCE_TOOLS`` when the call
+    excludes this same session, on the same never-overwrite terms. RAISES TypeError
+    when ``arguments`` is not a mapping."""
     if arguments is None:
         arguments = {}
     if not isinstance(arguments, Mapping):
@@ -116,6 +127,14 @@ def inject_session(
     field = SESSION_FIELD.get(tool)
     if field and session_id and not out.get(field):
         out[field] = session_id
+    if (
+        tool in SINCE_TOOLS
+        and since
+        and session_id
+        and out.get("self_session") == session_id
+        and not out.get("self_since")
+    ):
+        out["self_since"] = since
     return out
 
 
@@ -132,16 +151,17 @@ def call(
     arguments: Mapping[str, Any] | None,
     session_id: str | None = None,
     timeout: float = DEFAULT_TIMEOUT,
+    since: str | None = None,
 ) -> str:
-    """Call ``tool`` on the server with the session id injected (``inject_session``)
-    and return its text. Never raises: any failure comes back as a JSON object with an
-    ``error`` field (and ``tool``), for the model to read like any other result. A tool
-    error carries the server's message, and ``code`` when the JSON-RPC layer refused the
-    request; a transport failure carries a short reason built from the error's type and
-    status only (``outbox.short_reason``), never from text that could echo a URL or a
-    header."""
+    """Call ``tool`` on the server with the session id and the compaction cut injected
+    (``inject_session``) and return its text. Never raises: any failure comes back as a
+    JSON object with an ``error`` field (and ``tool``), for the model to read like any
+    other result. A tool error carries the server's message, and ``code`` when the
+    JSON-RPC layer refused the request; a transport failure carries a short reason built
+    from the error's type and status only (``outbox.short_reason``), never from text that
+    could echo a URL or a header."""
     try:
-        args = inject_session(tool, arguments, session_id)
+        args = inject_session(tool, arguments, session_id, since)
     except TypeError:
         return _failure(tool, "the arguments must be a JSON object")
     try:

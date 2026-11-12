@@ -23,10 +23,10 @@ from typing import Any
 
 import pytest
 
-from tests.helpers.client_core import PLUGIN, REPO, use_core
+from tests.helpers.client_core import PLUGIN, REPO, transcript, use_core
 
 use_core()
-from synapse_client import tools  # noqa: E402
+from synapse_client import compaction, tools  # noqa: E402
 from synapse_client.api import Client  # noqa: E402
 from synapse_client.http import ToolError  # noqa: E402
 from synapse_client.settings import Settings  # noqa: E402
@@ -130,6 +130,20 @@ def test_self_session_is_hidden_where_the_core_fills_it(name):
     assert "self_session" not in _params(name)["properties"]
 
 
+@pytest.mark.parametrize("name", ["recall", "recall_full_turns"])
+def test_self_since_is_hidden_where_the_core_fills_it(name):
+    assert "self_since" in _raw_props(name)
+    assert "self_since" not in _params(name)["properties"]
+
+
+def test_self_since_is_on_the_tools_the_core_fills_it_on_and_no_others():
+    """The other three tools reject an unknown argument, so the core must never send
+    self_since to a tool the server does not take it on."""
+    assert {t["name"] for t in _raw() if "self_since" in _raw_props(t["name"])} == set(
+        tools.SINCE_TOOLS
+    )
+
+
 @pytest.mark.parametrize("name", ["recall_feedback", "remember"])
 def test_session_id_is_hidden_where_the_core_fills_it(name):
     assert "session_id" in _raw_props(name)
@@ -197,10 +211,22 @@ def _ids(case: tuple[str, dict[str, Any]]) -> str:
     return f"{case[0]}-{json.dumps(case[1], sort_keys=True)}"
 
 
-def _hook(hook: Path, tool: str, arguments: dict[str, Any], session_id: str) -> dict[str, Any]:
+def _hook(
+    hook: Path,
+    tool: str,
+    arguments: dict[str, Any],
+    session_id: str,
+    transcript_path: Path | None = None,
+) -> dict[str, Any]:
     """What the hook makes of the call: its updatedInput, or the input unchanged when it
     emits nothing. Run as the harness runs it, with no Synapse configuration at all."""
-    payload = {"tool_name": _MCP + tool, "session_id": session_id, "tool_input": arguments}
+    payload: dict[str, Any] = {
+        "tool_name": _MCP + tool,
+        "session_id": session_id,
+        "tool_input": arguments,
+    }
+    if transcript_path is not None:
+        payload["transcript_path"] = str(transcript_path)
     proc = subprocess.run(
         [sys.executable, str(hook)],
         input=json.dumps(payload),
@@ -220,6 +246,79 @@ def test_inject_session_matches_the_hooks(hook, case):
     tool, arguments = case
     expected = _hook(hook, tool, dict(arguments), _SID)
     assert tools.inject_session(tool, arguments, _SID) == expected
+
+
+_AT = "2026-11-12T14:10:54.738Z"
+
+
+def _compacted(hook: Path, folder: Path) -> Path:
+    """A transcript in the hook's harness format whose last compaction is at ``_AT``."""
+    return transcript(folder, codex=hook == _CODEX_HOOK, at=_AT)
+
+
+@pytest.mark.parametrize("hook", [_CC_HOOK, _CODEX_HOOK], ids=["claude-code", "codex"])
+@pytest.mark.parametrize("case", _CASES, ids=[_ids(c) for c in _CASES])
+def test_inject_session_matches_the_hooks_after_a_compaction(hook, case, tmp_path):
+    """With the cut the hook reads from the transcript, ``inject_session`` adds exactly
+    what the hook adds, in the same order."""
+    tool, arguments = case
+    path = _compacted(hook, tmp_path)
+    scan = compaction.codex_cut if hook == _CODEX_HOOK else compaction.claude_code_cut
+    assert scan(path) == _AT
+    expected = _hook(hook, tool, dict(arguments), _SID, path)
+    assert json.dumps(tools.inject_session(tool, arguments, _SID, _AT)) == json.dumps(expected)
+
+
+_SINCE_CASES = [
+    ("recall", {"query": "q", "self_since": "2026-01-01T00:00:00Z"}),
+    ("recall", {"query": "q", "self_since": ""}),
+    ("recall", {"self_session": _SID, "query": "q"}),
+    ("recall_full_turns", {"session_id": "abc", "self_session": "s-orig"}),
+    ("recall_full_turns", {"self_session": _SID, "self_since": "2026-01-01T00:00:00Z"}),
+]
+
+
+@pytest.mark.parametrize("hook", [_CC_HOOK, _CODEX_HOOK], ids=["claude-code", "codex"])
+@pytest.mark.parametrize("case", _SINCE_CASES, ids=[_ids(c) for c in _SINCE_CASES])
+def test_inject_session_matches_the_hooks_on_the_cut_cases(hook, case, tmp_path):
+    tool, arguments = case
+    path = _compacted(hook, tmp_path)
+    expected = _hook(hook, tool, dict(arguments), _SID, path)
+    assert json.dumps(tools.inject_session(tool, arguments, _SID, _AT)) == json.dumps(expected)
+
+
+@pytest.mark.parametrize("tool", ["recall", "recall_full_turns"])
+def test_the_cut_is_added_where_the_session_is_excluded(tool):
+    assert tools.inject_session(tool, {"query": "q"}, _SID, _AT) == {
+        "query": "q",
+        "self_session": _SID,
+        "self_since": _AT,
+    }
+    found = tools.inject_session(tool, {"self_session": _SID}, _SID, _AT)
+    assert found == {"self_session": _SID, "self_since": _AT}
+
+
+@pytest.mark.parametrize("tool", ["fetch_session", "recall_feedback", "remember", "fetch"])
+def test_the_cut_never_goes_to_a_tool_that_rejects_it(tool):
+    assert "self_since" not in tools.inject_session(tool, {"query": "q"}, _SID, _AT)
+
+
+def test_the_cut_never_goes_with_someone_elses_session():
+    out = tools.inject_session("recall", {"self_session": "s-orig"}, _SID, _AT)
+    assert out == {"self_session": "s-orig"}
+
+
+def test_a_cut_already_set_is_never_overwritten():
+    out = tools.inject_session("recall", {"self_since": "2026-01-01T00:00:00Z"}, _SID, _AT)
+    assert out["self_since"] == "2026-01-01T00:00:00Z"
+    assert tools.inject_session("recall", {"self_since": ""}, _SID, _AT)["self_since"] == _AT
+
+
+@pytest.mark.parametrize(
+    ("session_id", "since"), [(_SID, None), (_SID, ""), (None, _AT), ("", _AT)]
+)
+def test_no_cut_or_no_session_adds_no_cut(session_id, since):
+    assert "self_since" not in tools.inject_session("recall", {"query": "q"}, session_id, since)
 
 
 @pytest.mark.parametrize("tool", ["recall", "recall_full_turns", "fetch_session"])
@@ -294,6 +393,16 @@ def test_call_injects_the_session_and_returns_the_tools_text():
     out = tools.call(client, "recall", {"query": "q"}, session_id=_SID, timeout=5)
     assert out == "three results"
     assert client.calls == [("recall", {"query": "q", "self_session": _SID}, 5)]
+
+
+def test_call_carries_the_cut():
+    client = _FakeClient()
+    tools.call(client, "recall_full_turns", {"query": "q"}, session_id=_SID, since=_AT)
+    tools.call(client, "remember", {"content": "x"}, session_id=_SID, since=_AT)
+    assert [args for _, args, _ in client.calls] == [
+        {"query": "q", "self_session": _SID, "self_since": _AT},
+        {"content": "x", "session_id": _SID},
+    ]
 
 
 def test_call_defaults_to_the_api_timeout():
