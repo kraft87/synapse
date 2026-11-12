@@ -203,15 +203,15 @@ def test_the_facts_are_ranked_across_both_values_not_one_value_then_the_other(kg
 
 def test_recall_serves_the_fact_limit_over_both_values_and_no_extras(kg, db_url):
     ep = _ep(kg)
-    for i in range(9):
+    limit = recall_mod._FACT_LIMIT
+    for i in range(limit * 3 // 4):  # each value alone is short of the limit, both pass it
         _fact(kg, f"t{i}", TECH, f"widget tech {i}", ep, emb=0)
         _fact(kg, f"p{i}", PERS, f"widget personal {i}", ep, emb=0)
     metrics: list[dict[str, Any]] = []
     out = _engine(db_url, metrics=metrics).recall("widget", trust=FULL_TRUST)
-    limit = recall_mod._FACT_LIMIT
     assert len(out["facts"]) == limit
     assert len(metrics[0]["served_ids"]["facts"]) == limit
-    # both values are in it, not one value's twelve with the other's after
+    # both values are in it, not one value's full list with the other's after
     assert {u[0] for u in _served(out)} == {"t", "p"}
 
 

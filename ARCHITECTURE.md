@@ -387,7 +387,7 @@ flowchart TD
     EMB --> W1{Wave 1 — parallel}
     W1 --> EP[episode pool:\nBM25 + halfvec HNSW vector\nfetch 100/leg → RRF]
     W1 --> WEB[web: vector over web_chunks]
-    W1 --> KG[KG: vector + BM25 + 1-hop\nRRF, _FACT_LIMIT=12]
+    W1 --> KG[KG: vector + BM25 + 1-hop\nRRF, _FACT_LIMIT=20]
     EP --> W2{Wave 2 — parallel}
     W2 --> RR[Voyage rerank-3-lite\npool 100 → top 5]
     W2 --> HIST[bitemporal history pairs]
