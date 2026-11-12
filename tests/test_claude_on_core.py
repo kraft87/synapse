@@ -17,9 +17,11 @@ import ast
 import hashlib
 import io
 import json
+import os
 import re
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -62,6 +64,12 @@ class _Handler(BaseHTTPRequestHandler):
         status, reply, delay = self.server.routes.get(path, (200, {}, 0.0))
         if delay:
             self.server.release.wait(delay)
+        if 300 <= status < 400:  # a redirect: the reply is the Location
+            self.send_response(status)
+            self.send_header("Location", reply)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         raw = json.dumps(reply).encode()
         try:
             self.send_response(status)
@@ -711,6 +719,159 @@ def test_recall_nudge_prints_the_time_and_the_nudge(scratch, monkeypatch, capsys
     masked, stamps = _CLOCK_LINE.subn("[TS]", out)
     assert masked == printed
     assert stamps == printed.count("[TS]")
+
+
+# ---------------------------------------------------------------------------
+# Stop: ingest_hook.py posts through the core's Transport, private mode is the core's
+# ---------------------------------------------------------------------------
+
+_SID = "s-claude-1"
+
+
+def _records(cwd: Path, sid: str = _SID) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "user",
+            "uuid": "u1",
+            "sessionId": sid,
+            "cwd": str(cwd),
+            "message": {"role": "user", "content": "hello"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "a1",
+            "sessionId": sid,
+            "cwd": str(cwd),
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
+        },
+    ]
+
+
+def _ship(scratch: Path, *, sid: str = _SID, record_sid: str = _SID):
+    """Ship one transcript as the detached Stop child does (``--ship``): returns the hook
+    module, ``_ship``'s (posts, records) and the records written."""
+    cwd = scratch.parent
+    records = _records(cwd, record_sid)
+    path = cwd / "projects" / f"{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+    hook = load_script("ingest_hook")
+    return hook, hook._ship(str(path)), records
+
+
+def _logged(scratch: Path) -> list[str]:
+    """The ingest log's lines without their timestamps."""
+    log = scratch.parent / "ingest.log"
+    lines = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return [line.split(" ", 1)[1] for line in lines]
+
+
+@pytest.mark.parametrize("suffix", ["/ingest", "/ingest/", "/ingest//", "/ingest?x=1"])
+def test_ingest_posts_to_the_ingest_url_exactly_as_configured(scratch, monkeypatch, server, suffix):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    monkeypatch.setenv("SYNAPSE_INGEST_URL", server.url + suffix)
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+    server.answer(suffix.split("?")[0], {"status": "ok", "inserted": 2})
+    _hook, shipped, records = _ship(scratch)
+    assert shipped == (1, 2)
+    (req,) = server.seen
+    assert (req["method"], req["path"]) == ("POST", suffix)
+    assert req["headers"]["user-agent"] == _user_agent()
+    assert req["headers"]["authorization"] == f"Bearer {_TOKEN}"
+    assert req["headers"]["content-type"] == "application/json"
+    assert req["body"] == {"records": records, "source": "hook", "project": scratch.parent.name}
+    assert _logged(scratch) == [
+        f'OK {_SID}.jsonl stop 2 recs cur=0 -> {{"status": "ok", "inserted": 2}}'
+    ]
+
+
+def test_ingest_sends_the_bearer_to_the_ingest_origin(scratch, monkeypatch, server):
+    """The ingest URL may name another host than SYNAPSE_URL: the bearer goes to it, as
+    it always has."""
+    monkeypatch.setenv("SYNAPSE_URL", "http://localhost:9")
+    monkeypatch.setenv("SYNAPSE_INGEST_URL", server.url + "/ingest")
+    monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+    _ship(scratch)
+    assert server.seen[0]["headers"]["authorization"] == f"Bearer {_TOKEN}"
+
+
+def test_ingest_keeps_the_bearer_off_another_origin(scratch, monkeypatch, server):
+    """A redirect to another origin is followed without the bearer."""
+    other = _Server()
+    threading.Thread(target=other.serve_forever, args=(0.02,), daemon=True).start()
+    try:
+        monkeypatch.setenv("SYNAPSE_URL", server.url)
+        monkeypatch.setenv("SYNAPSE_INGEST_TOKEN", _TOKEN)
+        server.answer("/ingest", other.url + "/ingest", status=302)
+        other.answer("/ingest", {"status": "ok"})
+        _hook, shipped, _records_sent = _ship(scratch)
+        assert shipped == (1, 2)
+        assert server.seen[0]["headers"]["authorization"] == f"Bearer {_TOKEN}"
+        assert "authorization" not in other.seen[0]["headers"]
+    finally:
+        other.shutdown()
+        other.server_close()
+
+
+@pytest.mark.parametrize(
+    ("status", "line", "reason"),
+    [
+        (401, "HTTPError: HTTP Error 401: Unauthorized", "HTTP 401 Unauthorized"),
+        (500, "HTTPError: HTTP Error 500: Internal Server Error", "HTTP 500 Internal Server Error"),
+    ],
+)
+def test_ingest_failure_is_logged_and_recorded(scratch, monkeypatch, server, status, line, reason):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    server.answer("/ingest", {"detail": "no"}, status=status)
+    hook, shipped, _records_sent = _ship(scratch)
+    path = str(scratch.parent / "projects" / f"{_SID}.jsonl")
+    assert shipped == (0, 0)
+    assert _logged(scratch) == [f"ERR stop {path}: {line}"]
+    state = json.loads(Path(hook.CURSOR_PATH).read_text(encoding="utf-8"))
+    assert (state[path]["offset"], state[path]["fails"]) == (0, 1)
+    assert state[path]["last_error"] == reason
+
+
+def _marker(scratch: Path, sid: str, hours_old: float) -> Path:
+    marker = scratch.parent / "private" / sid
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")
+    then = time.time() - hours_old * 3600
+    os.utime(marker, (then, then))
+    return marker
+
+
+@pytest.mark.parametrize("record_sid", [_SID, "s-resumed"])
+def test_ingest_ships_nothing_for_a_private_session(scratch, monkeypatch, server, record_sid):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    marker = _marker(scratch, record_sid, 1)
+    _hook, shipped, _records_sent = _ship(scratch, record_sid=record_sid)
+    assert shipped == (0, 0) and server.seen == []
+    suffix = "" if record_sid == _SID else " (record sid)"
+    assert _logged(scratch) == [f"PRIVATE skip stop {_SID}.jsonl{suffix}"]
+    assert marker.exists()
+
+
+@pytest.mark.parametrize(("ttl", "hours_old"), [(None, 13), ("2", 3)])
+def test_ingest_removes_a_stale_marker_and_ships(scratch, monkeypatch, server, ttl, hours_old):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    if ttl:
+        monkeypatch.setenv("SYNAPSE_PRIVATE_TTL_HOURS", ttl)
+    marker = _marker(scratch, _SID, hours_old)
+    _hook, shipped, _records_sent = _ship(scratch)
+    assert shipped == (1, 2) and not marker.exists()
+    first = _logged(scratch)[0]
+    assert re.fullmatch(rf"PRIVATE stale marker removed {_SID} \(age \d+s\)", first)
+
+
+def test_ingest_reads_a_record_id_that_is_a_path_as_not_private(scratch, monkeypatch, server):
+    monkeypatch.setenv("SYNAPSE_URL", server.url)
+    outside = _marker(scratch, "../outside", 40)
+    _hook, shipped, _records_sent = _ship(scratch, record_sid="../outside")
+    assert shipped == (1, 2) and outside.exists()
+    assert _logged(scratch)[0] == (
+        "PRIVATE ignored a session id that is not a file name: '../outside'"
+    )
 
 
 # ---------------------------------------------------------------------------

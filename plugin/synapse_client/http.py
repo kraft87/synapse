@@ -234,6 +234,20 @@ class Transport:
         # scripts' own helpers use it too, so a test that fakes the network patches one name.
         return urlopen(req, timeout=self.default_timeout if timeout is None else timeout)
 
+    def open(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> Any:
+        """Send ``body`` as given (bytes, or None for no body) with any HTTP method and
+        return the open response, for a caller that reads the reply itself (a body that
+        need not be JSON). The user agent and the bearer as for every request here;
+        ``headers`` are added. Use it as a context manager. Raises as urlopen does."""
+        return self._open(method, path, body, headers or {}, timeout)
+
     def request_json(
         self,
         method: str,

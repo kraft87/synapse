@@ -12,14 +12,16 @@ Every file a hook reads at import is under a temp dir (scratch_user).
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 
 import pytest
 
-from tests.helpers.client_core import REPO, drop_scripts, load_script, scratch_user
+from tests.helpers.client_core import REPO, core_http, drop_scripts, load_script, scratch_user
 
 
 def _codex_stop_hook() -> ModuleType:
@@ -49,7 +51,6 @@ CASES = [
     (_script("ingest_hook"), "SYNAPSE_INGEST_CATCHUP_DAYS", "CATCHUP_DAYS", 3.0),
     (_script("ingest_hook"), "SYNAPSE_INGEST_ACTIVE_GRACE", "ACTIVE_GRACE", 300.0),
     (_script("ingest_hook"), "SYNAPSE_INGEST_CATCHUP_MAX", "CATCHUP_MAX_FILES", 20),
-    (_script("ingest_hook"), "SYNAPSE_PRIVATE_TTL_HOURS", "_PRIVATE_TTL_HOURS", 12.0),
     (_codex_stop_hook, "SYNAPSE_INGEST_TIMEOUT", "TIMEOUT", 30.0),
     (_codex_stop_hook, "SYNAPSE_CODEX_CATCHUP_DAYS", "CATCHUP_DAYS", 3.0),
     (_codex_stop_hook, "SYNAPSE_CODEX_CATCHUP_MAX", "CATCHUP_MAX_FILES", 20),
@@ -117,9 +118,31 @@ def test_the_ingest_hook_ships_with_a_mistyped_timeout(scratch, monkeypatch, tmp
         seen.append(timeout)
         return _Resp()
 
-    monkeypatch.setattr(hook.config, "_urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     hook._post_records([])
     assert seen == [30.0]
+
+
+@pytest.mark.parametrize(
+    ("value", "hours"),
+    [("soon", 12), ("", 12), ("1,5", 12), ("2.5x", 12), ("7", 7)],
+)
+def test_the_ingest_hook_private_marker_ttl(scratch, monkeypatch, value, hours):
+    """SYNAPSE_PRIVATE_TTL_HOURS is read where the private check runs (the client core),
+    with the same fallback: a value that does not parse means 12 hours. A marker an hour
+    younger than the TTL keeps the session private; one an hour older is stale."""
+    monkeypatch.setenv("SYNAPSE_PRIVATE_TTL_HOURS", value)
+    hook = _script("ingest_hook")()
+    private_dir = Path(hook.PRIVATE_DIR)
+    private_dir.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    for sid, age in (("s-young", hours - 1), ("s-old", hours + 1)):
+        marker = private_dir / sid
+        marker.write_text("")
+        os.utime(marker, (now - age * 3600, now - age * 3600))
+    assert hook._is_private("s-young") is True
+    assert hook._is_private("s-old") is False
+    assert not (private_dir / "s-old").exists()
 
 
 def test_git_feeder_falls_back_to_30_days(scratch, monkeypatch, tmp_path):
