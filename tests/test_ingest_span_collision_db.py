@@ -6,7 +6,7 @@ session (a resumed or forked session, its records keeping their uuids) therefore
 the INSERT, raised UniqueViolation and 500'd the whole POST. The hook never advances its
 cursor on a failure, so every later turn of that transcript was lost on every retry: in
 prod, 15 POSTs from 2026-10-30 to 11-05 all failed on the one span
-``jsonl:6033958e-...``, stored once as session 24d5dada's turn 12.
+``jsonl:6033958e-...`` (its spelling then), stored once as session 24d5dada's turn 12.
 
 Two layers, one test each: the route probes the span globally before writing, and an
 upsert that still hits the span index (another writer committed the span between the
@@ -53,7 +53,7 @@ def _post(db_url, records: list[dict]):
 
 
 def _turn(sid: str, cwd: str, text: str, last_uuid: str) -> list[dict]:
-    """One Claude Code turn; its span_id is ``jsonl:<last_uuid>``."""
+    """One Claude Code turn; its span_id is ``claude_code:<last_uuid>``."""
     base = {"sessionId": sid, "cwd": cwd, "timestamp": "2026-10-30T13:41:00Z"}
     return [
         {**base, "type": "user", "uuid": f"u-{last_uuid}", "message": {"role": "user", "content": f"q {text}"}},
@@ -90,7 +90,7 @@ def _seed_and_replay(conn, db_url, hx: str) -> tuple[str, str, str, list[dict]]:
         + _turn(sid_b, f"/work/{hx}/beta", f"replayed {hx}", shared)
         + _turn(sid_b, f"/work/{hx}/beta", f"third {hx}", f"b3-{hx}")
     )
-    return sid_a, sid_b, f"jsonl:{shared}", batch
+    return sid_a, sid_b, f"claude_code:{shared}", batch
 
 
 def _assert_skipped(conn, r, hx: str, sid_a: str, sid_b: str, span: str) -> None:
@@ -99,7 +99,7 @@ def _assert_skipped(conn, r, hx: str, sid_a: str, sid_b: str, span: str) -> None
     # The third count is what tells this skip apart from the content guard's.
     assert r.json()["span_collisions"] == 1, r.json()
     # The turns either side of the collision landed, numbered with no gap.
-    assert _rows(conn, sid_b) == [(1, f"jsonl:b1-{hx}"), (2, f"jsonl:b3-{hx}")]
+    assert _rows(conn, sid_b) == [(1, f"claude_code:b1-{hx}"), (2, f"claude_code:b3-{hx}")]
     # The stored turn is untouched and still the only row holding that span.
     holders = conn.execute(
         "SELECT session_id, sequence FROM episodes WHERE span_id = %s", (span,)
@@ -128,7 +128,7 @@ def test_a_span_stored_under_another_session_is_skipped_not_a_500(
         r = _post(db_url, batch)
 
     _assert_skipped(conn, r, tag, sid_a, sid_b, span)
-    assert attempted == [f"jsonl:b1-{tag}", f"jsonl:b3-{tag}"]
+    assert attempted == [f"claude_code:b1-{tag}", f"claude_code:b3-{tag}"]
     warnings = [m for m in caplog.records if m.levelno == logging.WARNING]
     assert len(warnings) == 1, [m.getMessage() for m in warnings]
     assert sid_b in warnings[0].getMessage() and span in warnings[0].getMessage()

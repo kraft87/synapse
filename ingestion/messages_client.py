@@ -61,13 +61,12 @@ logger = logging.getLogger(__name__)
 CLIENT_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
 _CLIENT_RE = re.compile(CLIENT_PATTERN)
 
-#: Names a messages client may not take. The first five are the platforms the other
-#: parsers stamp, and platform is provenance other lanes select on (the skills lane mines
-#: ``platform = 'claude_code'``). "jsonl" and "openai" are the span-id prefixes of the
-#: Claude Code and ChatGPT parsers: span ids are unique across every session, so a client
-#: by either name could claim span ids those parsers will write.
+#: Names a messages client may not take: the platforms the other parsers stamp. Platform
+#: is provenance other lanes select on (the skills lane mines ``platform = 'claude_code'``),
+#: and every parser's span ids start with its platform (schema 068), so a client by one of
+#: these names could also claim span ids that parser will write.
 RESERVED_CLIENTS: frozenset[str] = frozenset(
-    {"claude_code", "codex", "cursor", "chatgpt", "claude_ai", "jsonl", "openai"}
+    {"claude_code", "codex", "cursor", "chatgpt", "claude_ai"}
 )
 
 _ROLES = ("user", "assistant", "tool")

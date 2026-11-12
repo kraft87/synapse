@@ -76,7 +76,9 @@ def _write_session_episodes(
         logger.info("skipping private session %s (schema/050)", session_id)
         return 0
     existing = db.get_session_episodes(session_id)
-    existing_uuids = {e["span_id"] for e in existing if e.get("span_id", "").startswith("jsonl:")}
+    existing_uuids = {
+        e["span_id"] for e in existing if e.get("span_id", "").startswith("claude_code:")
+    }
     next_seq = (max((e["sequence"] for e in existing), default=0)) + 1
     written = 0
 

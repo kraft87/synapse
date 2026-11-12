@@ -106,6 +106,7 @@ FILES=(
   064_skills_autopilot.sql
   065_config_lane_identity.sql
   066_kg_fact_audience.sql
+  068_span_id_prefix_is_platform.sql
 )
 
 # Drift guard: a numbered .sql in schema/ that isn't in the list above means
