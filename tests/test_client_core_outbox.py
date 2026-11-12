@@ -92,6 +92,38 @@ def test_past_the_cap_the_oldest_are_dropped(tmp_path):
     assert len(lines) == 3 and all("outbox full (5)" in line for line in lines)
 
 
+def test_the_default_cap_is_2000(tmp_path):
+    """A long outage keeps 2000 payloads before the oldest go (it was 500). The first
+    2000 are written in place, as put names them, so the test stays quick."""
+    box = Outbox(tmp_path)
+    assert box.cap == outbox_mod.DEFAULT_CAP == 2000
+    for n in range(2000):
+        (tmp_path / f"{n + 1:020d}-1-00000000.json").write_text(json.dumps({"n": n}))
+    box.put({"n": 2000})
+    assert box.pending() == 2000 and _payloads(box)[0] == {"n": 1}
+    assert box.dropped() == 1
+
+
+def test_payloads_dropped_for_the_cap_are_counted_beside_the_queue(tmp_path):
+    box = Outbox(tmp_path, cap=5)
+    assert box.dropped() == 0
+    for n in range(8):
+        box.put({"n": n})
+    assert box.dropped() == 3
+    assert Outbox(tmp_path).dropped() == 3  # persisted, not held in the object
+    assert (tmp_path / ".dropped").read_text() == "3"
+    assert box.pending() == 5  # the count is not a payload
+
+
+def test_a_count_that_does_not_parse_reads_as_zero_and_counts_on(tmp_path):
+    box = Outbox(tmp_path, cap=1)
+    (tmp_path / ".dropped").write_text("garbage")
+    assert box.dropped() == 0
+    box.put({"n": 0})
+    box.put({"n": 1})
+    assert box.dropped() == 1
+
+
 # ---------------------------------------------------------------------------
 # drain
 # ---------------------------------------------------------------------------
@@ -125,7 +157,7 @@ def test_drain_stops_at_the_first_transport_failure(tmp_path):
     assert not any(n.endswith(".claim") for n in os.listdir(tmp_path))
 
 
-@pytest.mark.parametrize("code", [400, 404, 413, 422])
+@pytest.mark.parametrize("code", [400, 413, 422])
 def test_a_payload_the_server_refuses_is_dropped(tmp_path, code):
     lines: list[str] = []
     box = Outbox(tmp_path, log=lines.append)
@@ -143,7 +175,7 @@ def test_a_payload_the_server_refuses_is_dropped(tmp_path, code):
     assert len(lines) == 1 and f"HTTP {code}" in lines[0] and "dropped" in lines[0]
 
 
-@pytest.mark.parametrize("code", [401, 403, 408, 429, 500, 502, 503])
+@pytest.mark.parametrize("code", [401, 403, 404, 405, 408, 409, 410, 429, 500, 502, 503])
 def test_a_status_that_is_not_about_the_payload_keeps_it(tmp_path, code):
     box = Outbox(tmp_path)
     for n in range(3):
@@ -154,6 +186,26 @@ def test_a_status_that_is_not_about_the_payload_keeps_it(tmp_path, code):
 
     assert box.drain(send) == (0, 3)
     assert box.last_error().startswith(f"HTTP {code}")
+    assert box.dropped() == 0
+
+
+def test_rejected_payloads_are_counted_until_the_queue_is_empty(tmp_path):
+    """400, 413 and 422 drop the payload and count it; a later failure stops the drain
+    with the count kept. The drain that empties the queue clears it, with the reason."""
+    box = Outbox(tmp_path)
+    for n in range(4):
+        box.put({"n": n})
+    codes = {0: 400, 1: 413, 3: 503}
+
+    def send(payload):
+        if payload["n"] in codes:
+            raise _http(codes[payload["n"]])
+
+    assert box.drain(send) == (1, 1)
+    assert box.dropped() == 2 and box.last_error().startswith("HTTP 503")
+    assert box.drain(lambda p: None) == (1, 0)
+    assert box.dropped() == 0 and box.last_error() == ""
+    assert os.listdir(tmp_path) == []
 
 
 def test_drain_handles_at_most_max_items(tmp_path):
@@ -298,6 +350,31 @@ def test_three_waiting_payloads_warn(tmp_path):
     assert line.endswith(
         "(HTTP 503 Service Unavailable); transcripts will be retried automatically."
     )
+
+
+@pytest.mark.parametrize(
+    ("dropped", "sentence"),
+    [
+        (1, " 1 upload was dropped and will not be retried."),
+        (4, " 4 uploads were dropped and will not be retried."),
+    ],
+)
+def test_the_warning_names_the_payloads_dropped(tmp_path, dropped, sentence):
+    box = Outbox(tmp_path, cap=3)
+    for n in range(3 + dropped):
+        box.put({"n": n}, reason="HTTP 503 Service Unavailable")
+    line = failure_warning(box)
+    assert line and line.endswith(
+        "(HTTP 503 Service Unavailable); transcripts will be retried automatically." + sentence
+    )
+
+
+def test_dropped_payloads_alone_do_not_raise_the_warning(tmp_path):
+    """The sentence rides on the existing warning; it does not change when one is shown."""
+    box = Outbox(tmp_path, cap=1)
+    box.put({"n": 0}, reason="timed out")
+    box.put({"n": 1})
+    assert box.dropped() == 1 and failure_warning(box) is None
 
 
 def test_one_payload_older_than_a_day_warns(tmp_path):

@@ -11,8 +11,14 @@ processes draining at once, exactly one rename succeeds. A claim older than
 locks and no fcntl, so it works the same on Windows.
 
 ``put`` RAISES OSError (the caller must know a payload was lost). ``drain``,
-``pending``, ``oldest_age`` and ``failure_warning`` never raise over a missing or
-unreadable directory, and ``drain`` never raises over a failed send: it stops there.
+``pending``, ``oldest_age``, ``dropped`` and ``failure_warning`` never raise over a
+missing or unreadable directory, and ``drain`` never raises over a failed send: it stops
+there.
+
+Payloads dropped for the cap or as refused by the server are counted in ``.dropped``
+beside the queue (dot-prefixed, so never taken for a payload) and named in the
+session-start warning. The count belongs to the current backlog: it is cleared, with the
+recorded reason, when a drain leaves the queue empty.
 """
 
 from __future__ import annotations
@@ -31,16 +37,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-DEFAULT_CAP = 500
+DEFAULT_CAP = 2000
 DEFAULT_STALE_CLAIM = 600.0
 WARN_AFTER_FAILS = 3  # payloads waiting -> warn at session start
 WARN_AFTER_HOURS = 24.0  # ...or an oldest payload this old
-#: 4xx statuses that say nothing about the payload: the credential, a timeout, a rate
-#: limit. Every other 4xx means the server will never take this payload, so it is dropped.
-_RETRY_4XX = frozenset({401, 403, 408, 429})
+#: Statuses that refuse the payload itself: malformed, too large, unprocessable. The server
+#: will never take it, so it is dropped. Every other status, 404 included (a route not
+#: deployed yet, a proxy in the way), says nothing about the payload: it is kept.
+_DROP_4XX = frozenset({400, 413, 422})
 _SUFFIX = ".json"
 _CLAIM = ".claim"
 _LAST_ERROR = ".last_error"
+_DROPPED = ".dropped"
 
 Log = Callable[[str], None]
 
@@ -88,7 +96,8 @@ class Outbox:
     """The queue in ``directory`` (created on the first ``put``).
 
     ``cap`` bounds the payloads kept: past it, the oldest waiting ones are dropped.
-    ``log`` receives a line for each payload dropped (cap, rejected, unreadable)."""
+    ``log`` receives a line for each payload dropped (cap, rejected, unreadable), and
+    ``dropped`` counts those dropped for the cap or as rejected."""
 
     def __init__(
         self,
@@ -148,6 +157,22 @@ class Outbox:
         except OSError:
             pass
 
+    def dropped(self) -> int:
+        """Payloads dropped for the cap or as rejected since the queue was last empty after
+        a drain; 0 when none are recorded."""
+        try:
+            return max(0, int((self.directory / _DROPPED).read_text(encoding="ascii")))
+        except (OSError, ValueError):
+            return 0
+
+    def _count_dropped(self) -> None:
+        """One more for ``dropped``. A read and a rewrite: two processes dropping at once
+        can lose one count, never a payload."""
+        try:
+            self._write(self.directory / _DROPPED, str(self.dropped() + 1).encode("ascii"))
+        except OSError:
+            pass
+
     # -- writing -------------------------------------------------------------------
 
     def _ensure_dir(self) -> None:
@@ -197,6 +222,7 @@ class Outbox:
                 os.unlink(self.directory / name)
             except OSError:
                 continue
+            self._count_dropped()
             self._say(f"outbox full ({self.cap}): dropped the oldest payload {name}")
 
     # -- draining ------------------------------------------------------------------
@@ -250,11 +276,13 @@ class Outbox:
         raises on failure: ``Client.ingest``). Returns ``(sent, kept)``: how many were
         delivered, and how many are still waiting.
 
-        A delivered payload is deleted. One the server refused with a 4xx other than
-        401, 403, 408 or 429 is dropped (and logged): it will never be accepted, and
-        keeping it would block everything behind it. Any other failure puts the payload
-        back, records its reason and STOPS, since the next send would fail the same way.
-        An unreadable payload file is dropped. Never raises over a failed send."""
+        A delivered payload is deleted. One the server refused with 400, 413 or 422 is
+        dropped (logged and counted): it will never be accepted, and keeping it would
+        block everything behind it. Any other failure, every other HTTP status included,
+        puts the payload back, records its reason and STOPS, since the next send would
+        fail the same way. An unreadable payload file is dropped (logged). A drain that
+        leaves the queue empty clears the recorded reason and the dropped count. Never
+        raises over a failed send."""
         self._recover(time.time_ns())
         sent = done = 0
         for name in self._waiting():
@@ -274,10 +302,11 @@ class Outbox:
             try:
                 send(payload)
             except urllib.error.HTTPError as err:
-                if 400 <= err.code < 500 and err.code not in _RETRY_4XX:
+                if err.code in _DROP_4XX:
                     self._drop(
                         claimed, f"outbox: server refused {name}: {short_reason(err)}; dropped"
                     )
+                    self._count_dropped()
                     continue
                 self._release(claimed, name)
                 self._set_last_error(short_reason(err))
@@ -293,10 +322,11 @@ class Outbox:
             sent += 1
         kept = self.pending()
         if not kept:
-            try:
-                os.unlink(self.directory / _LAST_ERROR)
-            except OSError:
-                pass
+            for record in (_LAST_ERROR, _DROPPED):
+                try:
+                    os.unlink(self.directory / record)
+                except OSError:
+                    pass
         return sent, kept
 
 
@@ -305,7 +335,8 @@ def failure_warning(outbox: Outbox, now: float | None = None) -> str | None:
 
     Shown when at least WARN_AFTER_FAILS payloads are waiting, or the oldest has waited
     WARN_AFTER_HOURS; the same sentence as synapse_ingest_retry.failure_warning, dated
-    from the oldest waiting payload. Never raises."""
+    from the oldest waiting payload, and one more naming the payloads dropped (for the
+    cap or as rejected) when there are any. Never raises."""
     try:
         now = time.time() if now is None else now
         count = outbox.pending()
@@ -316,9 +347,15 @@ def failure_warning(outbox: Outbox, now: float | None = None) -> str | None:
             return None
         when = datetime.fromtimestamp(now - age).strftime("%Y-%m-%d %H:%M")
         reason = outbox.last_error() or "unknown error"
-        return (
+        line = (
             f"Synapse uploads have been failing since {when} ({reason}); "
             "transcripts will be retried automatically."
         )
+        dropped = outbox.dropped()
+        if dropped == 1:
+            line += " 1 upload was dropped and will not be retried."
+        elif dropped:
+            line += f" {dropped} uploads were dropped and will not be retried."
+        return line
     except Exception:
         return None

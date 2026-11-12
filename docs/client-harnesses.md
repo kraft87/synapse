@@ -232,9 +232,14 @@ The core ports the hooks' behaviour and wording, with these differences:
 - **Enrollment notices** take the login hint as an argument; the restricted-device
   notice has no Claude-only "paste it into /plugin" aside.
 - **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
-  processes can drain one directory. A payload the server refuses with a 4xx other than
-  401, 403, 408 or 429 is dropped; anything else stops the drain and waits. The
-  session-start warning is the retry module's sentence, dated from the oldest payload.
+  processes can drain one directory. Up to 2000 wait; past that the oldest are dropped. A
+  payload the server refuses with 400, 413 or 422 is dropped; any other failure, 404
+  included, stops the drain and waits. Payloads dropped for the cap or as refused are
+  counted in `.dropped` beside the queue, and the count is cleared, with the recorded
+  reason, when a drain leaves the queue empty: it covers the current backlog. The
+  session-start warning is the retry module's sentence, dated from the oldest payload,
+  followed by "N uploads were dropped and will not be retried." while the count is not
+  zero; the count alone does not raise the warning.
 
 ## Adding a harness
 
