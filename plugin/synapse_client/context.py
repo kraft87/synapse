@@ -48,6 +48,16 @@ _NUDGE = (
     "then reply."
 )
 _TIMESTAMP = "[%a %Y-%m-%d %H:%M:%S %Z]"
+_FEEDBACK_NUDGE = (
+    "[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:) "
+    "in your answer, call {recall_feedback}(query=<verbatim query>, helpful=[...], "
+    'noise=[...], comment="...") ONCE to close the retrieval-quality loop: '
+    "helpful=load-bearing ids, noise=irrelevant ids, comment=free text for anything "
+    "else (too much served, buried hit, bad ordering). ONLY IF you needed specific "
+    "content memory likely holds and it was not served, add missing=what it was + "
+    "found_via=where you got it instead (full_turns/filesystem/user/nowhere...) — "
+    "omit both otherwise. Skip the call only if you used none of the results."
+)
 
 
 def _sentence(hint: str) -> str:
@@ -248,3 +258,16 @@ def prompt_nudge(
     except Exception:
         pass
     return "\n".join(lines)
+
+
+def recall_feedback_nudge(*, recall_feedback: str = "recall_feedback") -> str:
+    """The reminder shown after a recall that served rateable ids: close the
+    retrieval-quality loop with ``recall_feedback`` (the tool's name as this harness's
+    model sees it).
+
+    A developer setting, OFF by default in every harness: the labels only serve whoever
+    tunes the retrieval stack, and for everyone else the line is noise after each recall
+    plus an extra tool call. A harness shows it only when ``SYNAPSE_RECALL_FEEDBACK_NUDGE``
+    is exactly "1"; the hook applies that rule (it reads its own settings). Text only,
+    no request; never raises."""
+    return _FEEDBACK_NUDGE.format(recall_feedback=recall_feedback)

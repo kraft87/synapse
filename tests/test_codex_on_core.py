@@ -642,3 +642,75 @@ def test_prompt_hook_as_codex_runs_it(scratch):
     assert proc.returncode == 0, proc.stderr
     text = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
     assert _STAMP.match(text.split("\n")[0]) and text.endswith(_CODEX_NUDGE)
+
+
+# ---------------------------------------------------------------------------
+# The recall-feedback nudge: one text (the core's), OFF unless the setting is "1"
+# ---------------------------------------------------------------------------
+
+_CLAUDE_FEEDBACK_HOOK = REPO / "plugin" / "scripts" / "recall_feedback_nudge.py"
+_CODEX_FEEDBACK_HOOK = _CODEX / "hooks" / "post_tool_use.py"
+# What both hooks printed with the nudge on, before the text moved into the core: the
+# Claude hook's output must not change by a byte.
+_FEEDBACK_OUT = (
+    b'{"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": '
+    b'"[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:) '
+    b"in your answer, call recall_feedback(query=<verbatim query>, helpful=[...], "
+    b'noise=[...], comment=\\"...\\") ONCE to close the retrieval-quality loop: '
+    b"helpful=load-bearing ids, noise=irrelevant ids, comment=free text for anything "
+    b"else (too much served, buried hit, bad ordering). ONLY IF you needed specific "
+    b"content memory likely holds and it was not served, add missing=what it was + "
+    b"found_via=where you got it instead (full_turns/filesystem/user/nowhere...) "
+    b"\\u2014 omit both otherwise. Skip the call only if you used none of the "
+    b'results."}}\n'
+)
+
+
+def _feedback_hook(path: Path, setting: str | None, tool: str = "mcp__synapse__recall") -> bytes:
+    env = {k: v for k, v in os.environ.items() if k != "SYNAPSE_RECALL_FEEDBACK_NUDGE"}
+    if setting is not None:
+        env["SYNAPSE_RECALL_FEEDBACK_NUDGE"] = setting
+    proc = subprocess.run(
+        [sys.executable, str(path)],
+        input=json.dumps({"tool_name": tool}).encode(),
+        capture_output=True,
+        env=env,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+@pytest.mark.parametrize(
+    "hook", [_CLAUDE_FEEDBACK_HOOK, _CODEX_FEEDBACK_HOOK], ids=["claude", "codex"]
+)
+@pytest.mark.parametrize("setting", [None, "0", "", "true", "yes", "2"])
+def test_feedback_nudge_is_off_unless_the_setting_is_1(scratch, hook, setting):
+    assert _feedback_hook(hook, setting) == b""
+
+
+@pytest.mark.parametrize(
+    "hook", [_CLAUDE_FEEDBACK_HOOK, _CODEX_FEEDBACK_HOOK], ids=["claude", "codex"]
+)
+def test_feedback_nudge_on_with_1_prints_the_pinned_bytes(scratch, hook):
+    assert _feedback_hook(hook, "1") == _FEEDBACK_OUT
+
+
+@pytest.mark.parametrize("tool", ["mcp__synapse__recall_full_turns", "mcp__synapse__recall"])
+def test_codex_feedback_nudge_follows_rateable_tools(scratch, tool):
+    assert _feedback_hook(_CODEX_FEEDBACK_HOOK, "1", tool) == _FEEDBACK_OUT
+
+
+@pytest.mark.parametrize("tool", ["mcp__synapse__recall_feedback", "mcp__synapse__fetch", ""])
+def test_codex_feedback_nudge_keeps_its_tool_name_guard(scratch, tool):
+    assert _feedback_hook(_CODEX_FEEDBACK_HOOK, "1", tool) == b""
+
+
+def test_feedback_nudge_text_takes_the_tool_name():
+    use_core()
+    from synapse_client.context import recall_feedback_nudge
+
+    text = recall_feedback_nudge()
+    assert json.dumps(text).encode() in _FEEDBACK_OUT
+    named = recall_feedback_nudge(recall_feedback="synapse:recall_feedback")
+    assert named == text.replace("call recall_feedback(", "call synapse:recall_feedback(")
