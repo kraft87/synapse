@@ -9,7 +9,7 @@ instead, and the body names what a message list does not carry itself:
      "project": optional label, "cwd": optional path, "model": optional default,
      "source": optional cosmetic label, "records": [<message>, ...]}
 
-``client`` becomes ``Episode.platform`` and the span-id prefix. Each message is a dict:
+``client`` becomes ``Episode.platform``. Each message is a dict:
 - "role"        — "user", "assistant" or "tool". Any other role (system, developer,
   ...) is skipped.
 - "content"     — a string, or a list of parts of which only "text", "input_text"
@@ -34,9 +34,11 @@ CodexRolloutParser does (a new group at each user row; the same [context] / [use
 episodes read alike. A batch that begins mid-turn yields a leading group with no
 [user] line, as it does there.
 
-Identity is the span_id, which the route dedups on: "<client>:<id>" of the group's
-last message carrying an id, so overlapping pushes converge. A client without ids
-gets "<client>:<session_id>:<hash>" over the group's own rendered lines, the
+Identity is the span_id, which the route dedups on. Like every parser's, it starts
+with the parser's ``source`` ("jsonl:", "codex:", here "messages:"), so no client name
+can produce another parser's span ids: "messages:<client>:<id>" of the group's last
+message carrying an id, so overlapping pushes converge. A client without ids gets
+"messages:<client>:<session_id>:<hash>" over the group's own rendered lines, the
 [context] line excluded, so a turn hashes the same in whichever batch carries it.
 That only converges when every batch starts at a user row: a batch that begins
 mid-turn renders a fragment, which hashes as a turn of its own.
@@ -61,14 +63,15 @@ logger = logging.getLogger(__name__)
 CLIENT_PATTERN = r"^[a-z][a-z0-9_]{0,31}$"
 _CLIENT_RE = re.compile(CLIENT_PATTERN)
 
-#: Names a messages client may not take. The first five are the platforms the other
-#: parsers stamp, and platform is provenance other lanes select on (the skills lane mines
-#: ``platform = 'claude_code'``). "jsonl" and "openai" are the span-id prefixes of the
-#: Claude Code and ChatGPT parsers: span ids are unique across every session, so a client
-#: by either name could claim span ids those parsers will write.
+#: Names a messages client may not take: the platforms the other parsers stamp. Platform
+#: is provenance other lanes select on (the skills lane mines ``platform = 'claude_code'``),
+#: so a client must not be able to file its turns under one of them.
 RESERVED_CLIENTS: frozenset[str] = frozenset(
-    {"claude_code", "codex", "cursor", "chatgpt", "claude_ai", "jsonl", "openai"}
+    {"claude_code", "codex", "cursor", "chatgpt", "claude_ai"}
 )
+
+#: ``Episode.source`` for this parser, and so the span-id prefix (see the module docstring).
+SOURCE = "messages"
 
 _ROLES = ("user", "assistant", "tool")
 _TEXT_PARTS = ("text", "input_text", "output_text")
@@ -271,10 +274,11 @@ class MessagesParser:
                 continue
 
             if last_id:
-                span_id = f"{client}:{last_id}"
+                span_id = f"{SOURCE}:{client}:{last_id}"
             else:
                 rendered = "\n\n".join(parts).encode("utf-8", "surrogatepass")
-                span_id = f"{client}:{session_id}:{hashlib.sha256(rendered).hexdigest()[:24]}"
+                digest = hashlib.sha256(rendered).hexdigest()[:24]
+                span_id = f"{SOURCE}:{client}:{session_id}:{digest}"
             if span_id in seen_span_ids:
                 continue  # replayed turn — already emitted
             seen_span_ids.add(span_id)
@@ -293,7 +297,7 @@ class MessagesParser:
                     assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
                     content=_strip_nulls("\n\n".join(parts)),
                     span_id=span_id,
-                    source="messages",
+                    source=SOURCE,
                     metadata={
                         "source_label": source_label,
                         "ts": created_at.isoformat() if created_at else None,

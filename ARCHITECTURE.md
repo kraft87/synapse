@@ -257,11 +257,10 @@ first); everything after the parser is the same for all three.
  "records": [<message>, ...]}
 ```
 
-- `client` (required) becomes `episodes.platform` and the span-id prefix. It must match
-  `^[a-z][a-z0-9_]{0,31}$` and must not be reserved: `claude_code`, `codex`, `cursor`,
-  `chatgpt` and `claude_ai` are the platforms the other parsers write, which other lanes
-  select on (the skills lane mines `platform = 'claude_code'`), and `jsonl` and `openai`
-  are the span-id prefixes of the Claude Code and ChatGPT parsers.
+- `client` (required) becomes `episodes.platform`. It must match
+  `^[a-z][a-z0-9_]{0,31}$` and must not be `claude_code`, `codex`, `cursor`, `chatgpt` or
+  `claude_ai`: those are the platforms the other parsers write, and other lanes select on
+  them (the skills lane mines `platform = 'claude_code'`).
 - `session_id` (required) is stored as sent. Session ids from every client share one
   namespace, so it should be globally unique.
 - `project` is cleaned as for any other format; without one, the last component of `cwd`
@@ -283,10 +282,13 @@ row left empty is dropped: that is recalled memory the client put into the promp
 something the user said. Turns are grouped at each user row and rendered with the Codex
 parser's labels and truncation.
 
-**Span id.** `<client>:<id>` of the last message in the turn that carries an `id`. A turn
-with no ids gets `<client>:<session_id>:<h>`, where `h` is the first 24 hex characters of
-the sha256 of the turn's own rendered lines, the `[context]` line excluded, so the hash
-does not depend on whether the previous turn was in the batch. Ids are the reliable key: a
+**Span id.** Every parser's span ids start with its `source` (`jsonl:`, `codex:`,
+`openai:`), which keeps them apart in the one unique index they share; this parser's
+source is `messages`. A turn's span id is `messages:<client>:<id>`, from the last message
+in the turn that carries an `id`. A turn with no ids gets
+`messages:<client>:<session_id>:<h>`, where `h` is the first 24 hex characters of the
+sha256 of the turn's own rendered lines, the `[context]` line excluded, so the hash does
+not depend on whether the previous turn was in the batch. Ids are the reliable key: a
 hashed turn converges only when every batch starts at a user row (a batch that begins
 mid-turn renders a fragment, which hashes as a new turn), and two identical turns in one
 session hash the same, so the second is skipped.

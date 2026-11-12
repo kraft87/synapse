@@ -107,16 +107,32 @@ class TestValidClient:
         assert not valid_client(name)
 
     def test_reserved_set(self):
-        # The other parsers' platforms, plus the span-id prefixes not already among them.
+        # The platforms the other parsers stamp. Their span-id prefixes need no entry:
+        # every span id this parser writes starts with its own source, "messages:".
         assert RESERVED_CLIENTS == {
             "claude_code",
             "codex",
             "cursor",
             "chatgpt",
             "claude_ai",
-            "jsonl",
-            "openai",
         }
+
+    @pytest.mark.parametrize("client", ["hermes", "jsonl", "openai", "x"])
+    def test_span_id_starts_with_the_source_whatever_the_client_is_called(self, client):
+        # "jsonl:" and "openai:" are other parsers' span-id prefixes; a client by that
+        # name still writes under "messages:", so it can never claim one of their ids.
+        withid, noid = MessagesParser().parse_records(
+            [
+                {"role": "user", "content": "first question", "id": "m1"},
+                {"role": "user", "content": "second question"},
+            ],
+            "t",
+            session_id="s1",
+            client=client,
+        )
+        assert withid.source == noid.source == "messages"
+        assert withid.span_id == f"messages:{client}:m1"
+        assert noid.span_id.startswith(f"messages:{client}:s1:")
 
     def test_parser_refuses_a_reserved_client(self):
         with pytest.raises(ValueError):
@@ -137,14 +153,14 @@ class TestGrouping:
         assert first.human_turn == "hi"
         assert first.assistant_turn == "Hello! How can I help?"
         assert first.content == "[user] hi\n\n[assistant] Hello! How can I help?"
-        assert first.span_id == "hermes:m2"
+        assert first.span_id == "messages:hermes:m2"
         assert first.platform == "hermes"
         assert first.source == "messages"
 
         assert second.sequence == 2
         assert second.human_turn == "run the tests"
         assert second.assistant_turn == "All 47 tests pass."
-        assert second.span_id == "hermes:m6"
+        assert second.span_id == "messages:hermes:m6"
         assert second.content.split("\n\n") == [
             "[context] Hello! How can I help?",
             "[user] run the tests",
@@ -163,7 +179,7 @@ class TestGrouping:
             frag.content
             == "[result] 47 passed in 3.21s — all green\n\n[assistant] All 47 tests pass."
         )
-        assert frag.span_id == "hermes:m6"  # the full turn's span id: the route skips it
+        assert frag.span_id == "messages:hermes:m6"  # the full turn's span id: the route skips it
         assert turn.human_turn == "next"
         assert turn.content.startswith("[context] All 47 tests pass.\n\n[user] next")
 
@@ -253,7 +269,7 @@ class TestRendering:
         (ep,) = _parse(records)
         assert ep.human_turn == "q1"
         assert ep.assistant_turn == "done"
-        assert ep.span_id == "hermes:m4"
+        assert ep.span_id == "messages:hermes:m4"
         assert "[harness]" not in ep.content
 
     def test_short_tool_output_is_dropped_and_long_truncated(self):
@@ -328,12 +344,12 @@ class TestSpanId:
     def test_last_id_in_the_group(self):
         records = [_user("q", "u1"), _asst("a", "a1"), _tool("x" * 30), _asst("b", 99)]
         (ep,) = _parse(records)
-        assert ep.span_id == "hermes:a1"  # the trailing rows carry no string id
+        assert ep.span_id == "messages:hermes:a1"  # the trailing rows carry no string id
 
     def test_hash_fallback_without_ids(self):
         (ep,) = _parse([_user("q"), _asst("a")])
         digest = hashlib.sha256(b"[user] q\n\n[assistant] a").hexdigest()[:24]
-        assert ep.span_id == f"hermes:{SID}:{digest}"
+        assert ep.span_id == f"messages:hermes:{SID}:{digest}"
 
     def test_hash_ignores_the_context_line(self):
         turn = [_user("second question"), _asst("second answer")]
@@ -352,7 +368,7 @@ class TestSpanId:
     def test_a_replayed_turn_is_emitted_once(self):
         replay = [_user("hi", "m1"), _asst("hello", "m2")]
         eps = _parse([*replay, *replay, _user("next", "m3"), _asst("ok", "m4")])
-        assert [e.span_id for e in eps] == ["hermes:m2", "hermes:m4"]
+        assert [e.span_id for e in eps] == ["messages:hermes:m2", "messages:hermes:m4"]
         assert [e.sequence for e in eps] == [1, 3]  # the skipped group still counts
         assert eps[1].content.startswith("[context] hello")
 
