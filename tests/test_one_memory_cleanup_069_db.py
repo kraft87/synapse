@@ -12,7 +12,8 @@ and the 067 ledger. What only a database shows:
   * a step takes its table's ACCESS EXCLUSIVE lock first: a reader that then writes is
     never a deadlock victim
   * the stamp certifies the end state: a column dropped by hand without its index built
-    again is not stamped; a run that stopped after its first step completes when run again
+    again is not stamped, nor is a one-self index of another shape under the same name; a
+    run that stopped after its first step completes when run again
   * a second run changes nothing and waits for no lock; the stamp never moves down
   * 017, 035, 041, 066 and 067 build what names group_id only while it exists: applied
     again after 069 they bring back no old index, ledger, column, trigger or function, and
@@ -412,6 +413,39 @@ def test_a_column_dropped_by_hand_without_its_index_is_not_stamped(at_068, db_ur
         at_068.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS kg_entities_one_self ON kg_entities (owner_id) "
             "WHERE is_self"
+        )
+
+
+WRONG_ONE_SELF = {
+    "not unique": "CREATE INDEX kg_entities_one_self ON kg_entities (owner_id) WHERE is_self",
+    "another key": "CREATE UNIQUE INDEX kg_entities_one_self ON kg_entities (uuid) WHERE is_self",
+    "a predicate that reads more than is_self": (
+        "CREATE UNIQUE INDEX kg_entities_one_self ON kg_entities (owner_id) "
+        "WHERE is_self AND name IS NOT NULL"
+    ),
+    "a predicate that does not read is_self": (
+        "CREATE UNIQUE INDEX kg_entities_one_self ON kg_entities (owner_id) "
+        "WHERE normalized_name = 'alpha' AND uuid = 't-alpha'"
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(WRONG_ONE_SELF))
+def test_a_one_self_index_of_another_shape_is_not_stamped(at_068, db_url, case):
+    """The last step certifies the rule, not the name: an index called kg_entities_one_self
+    that is not unique, has another key, or whose predicate reads anything but is_self does
+    not earn the stamp."""
+    at_068.execute("ALTER TABLE kg_entities DROP COLUMN group_id")
+    at_068.execute(WRONG_ONE_SELF[case])
+    try:
+        code, err = _run_069(db_url)
+        assert code != 0
+        assert "kg_entities_one_self is not a valid UNIQUE (owner_id) WHERE is_self" in err
+        assert catalog(at_068)["stamp"] == "068"
+    finally:
+        at_068.execute("DROP INDEX IF EXISTS kg_entities_one_self")
+        at_068.execute(
+            "CREATE UNIQUE INDEX kg_entities_one_self ON kg_entities (owner_id) WHERE is_self"
         )
 
 

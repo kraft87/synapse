@@ -237,14 +237,20 @@ BEGIN
                       AND i.indkey[0] = (SELECT attnum FROM pg_attribute
                                           WHERE attrelid = 'public.kg_entities'::regclass
                                             AND attname = 'owner_id')
-                      -- The predicate is read from its stored tree, a lone is_self: both
-                      -- pg_get_expr and pg_get_indexdef lock the table, and a second run
-                      -- waits for no lock.
-                      AND i.indpred::text ~ ('^\(?\{VAR :varno 1 :varattno '
-                            || (SELECT attnum FROM pg_attribute
-                                 WHERE attrelid = 'public.kg_entities'::regclass
-                                   AND attname = 'is_self')
-                            || ' [^{}]*\}\)?$')) THEN
+                      -- The predicate is checked by the columns the index depends on:
+                      -- its key and is_self, nothing else. Printing it (pg_get_expr,
+                      -- pg_get_indexdef) would lock the table, and a second run waits for
+                      -- no lock; its stored tree is an internal format.
+                      AND i.indpred IS NOT NULL
+                      AND (SELECT array_agg(DISTINCT d.refobjsubid ORDER BY d.refobjsubid)
+                             FROM pg_depend d
+                            WHERE d.classid = 'pg_class'::regclass AND d.objid = i.indexrelid
+                              AND d.refclassid = 'pg_class'::regclass
+                              AND d.refobjid = i.indrelid AND d.refobjsubid > 0)
+                          = (SELECT array_agg(a.attnum::int ORDER BY a.attnum)
+                               FROM pg_attribute a
+                              WHERE a.attrelid = 'public.kg_entities'::regclass
+                                AND a.attname IN ('owner_id', 'is_self'))) THEN
         RAISE EXCEPTION '069: kg_entities_one_self is not a valid UNIQUE (owner_id) WHERE is_self; build it so (CREATE UNIQUE INDEX kg_entities_one_self ON kg_entities (owner_id) WHERE is_self) and run the file again';
     END IF;
 
