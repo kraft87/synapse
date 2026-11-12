@@ -107,6 +107,17 @@ def _off(session_id: str, forget: bool) -> int:
         if _server_private(session_id):
             return _fail("server still reports the session as private after DELETE")
     except (urllib.error.URLError, OSError, ValueError) as e:
+        if isinstance(e, urllib.error.HTTPError) and e.code == 403:
+            # _fail's "NOT off the record" would be backwards here: the row is still there.
+            print(
+                "private mode FAILED: taking a session back on the record must be done "
+                "from a full-trust device.",
+                file=sys.stderr,
+            )
+            print(
+                "The server row was not deleted; the session stays off the record.", file=sys.stderr
+            )
+            return 1
         return _fail(f"server row not deleted ({type(e).__name__}: {str(e)[:160]})")
     print(f"private mode OFF for {session_id} (marker removed, server row deleted)")
     return 0

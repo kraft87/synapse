@@ -4,7 +4,9 @@ Two things only a database can prove:
 
   * the toggle routes (``mcp_server/private_session_routes``) round-trip the durable flag
     the CLI verifies — PUT is idempotent, GET reads it back, DELETE is the deliberate
-    un-private escape hatch — and they're gated by the machine token like every sibling;
+    un-private escape hatch. PUT and GET sit behind the client gate like every sibling;
+    DELETE sits behind the admin gate, so only a full-trust device can take a session
+    back on the record;
   * ``/ingest`` actually DROPS turns from a flagged session. That's the chokepoint the
     whole design rests on: the marker file only covers the live hook, so a catch-up sweep,
     a backfill, or any other client posting the same transcript must still land nothing.
@@ -31,22 +33,33 @@ try:
 except Exception:  # pragma: no cover - environment dependent
     pytest.skip("no test DB reachable", allow_module_level=True)
 
+from mcp_server.http_auth import admin_authorized, machine_authorized  # noqa: E402
 from mcp_server.private_session_routes import register  # noqa: E402
+from tests.helpers.surfaces import clear_surfaces, register_device  # noqa: E402
 
 _TOKEN = "test-machine-token"
+_FULL_TOKEN = "full-trust-device-token"
+_WORK_TOKEN = "restricted-device-token"
 _H = {"Authorization": f"Bearer {_TOKEN}"}
+_FULL_H = {"Authorization": f"Bearer {_FULL_TOKEN}"}
+_WORK_H = {"Authorization": f"Bearer {_WORK_TOKEN}"}
 _SID = "s-private-route-test"
 _PUBLIC = "s-public-route-test"
 
 
 def _client(db_url):
+    """The routes behind the server's real gates: ``_TOKEN`` is the root token, and the
+    devices a test registers (see ``devices``) are checked against the surfaces table."""
     from fastmcp import FastMCP
 
     def authorized(request):
-        return request.headers.get("authorization", "") == f"Bearer {_TOKEN}"
+        return machine_authorized(request, _TOKEN, db_url)
+
+    def admin(request):
+        return admin_authorized(request, _TOKEN, db_url)
 
     test_mcp = FastMCP("test-private")
-    register(test_mcp, db_url, authorized)
+    register(test_mcp, db_url, authorized, admin)
     return TestClient(test_mcp.http_app())
 
 
@@ -55,10 +68,24 @@ def clean(conn):
     def _wipe():
         conn.execute("DELETE FROM private_sessions WHERE session_id = ANY(%s)", ([_SID, _PUBLIC],))
         conn.execute("DELETE FROM episodes WHERE session_id = ANY(%s)", ([_SID, _PUBLIC],))
+        clear_surfaces(conn)
 
     _wipe()
     yield
     _wipe()
+
+
+@pytest.fixture()
+def devices(clean, conn):
+    """One full-trust and one restricted approved device, beside the root token."""
+    register_device(conn, _FULL_TOKEN, trust="full", surface_id="dev-full")
+    register_device(conn, _WORK_TOKEN, trust="restricted", projects=["w"], surface_id="dev-work")
+
+
+def _rows(conn) -> int:
+    return conn.execute(
+        "SELECT count(*) FROM private_sessions WHERE session_id = %s", (_SID,)
+    ).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +101,7 @@ def test_routes_require_machine_token(clean, db_url):
             assert r.json() == {"status": "error", "detail": "unauthorized"}
 
 
-def test_put_get_delete_round_trip(clean, conn, db_url):
+def test_put_get_delete_round_trip(devices, conn, db_url):
     with _client(db_url) as client:
         assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is False
 
@@ -89,7 +116,7 @@ def test_put_get_delete_round_trip(clean, conn, db_url):
         ).fetchone()[0]
         assert n == 1
 
-        r = client.delete(f"/private-sessions/{_SID}", headers=_H)
+        r = client.delete(f"/private-sessions/{_SID}", headers=_FULL_H)
         assert r.status_code == 200 and r.json() == {
             "status": "ok",
             "session_id": _SID,
@@ -97,6 +124,56 @@ def test_put_get_delete_round_trip(clean, conn, db_url):
             "deleted": 1,
         }
         assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is False
+
+
+def test_a_credential_that_matches_nothing_is_a_401_on_every_verb(devices, conn, db_url):
+    with _client(db_url) as client:
+        client.put(f"/private-sessions/{_SID}", headers=_H)
+        for send in (client.put, client.get, client.delete):
+            r = send(f"/private-sessions/{_SID}", headers={"Authorization": "Bearer nope"})
+            assert r.status_code == 401
+    assert _rows(conn) == 1
+
+
+def test_a_restricted_device_cannot_delete(devices, conn, db_url):
+    with _client(db_url) as client:
+        client.put(f"/private-sessions/{_SID}", headers=_H)
+        r = client.delete(f"/private-sessions/{_SID}", headers=_WORK_H)
+        assert r.status_code == 403
+        assert r.json() == {
+            "status": "error",
+            "detail": "un-privating a session needs a full-trust device",
+        }
+        assert client.get(f"/private-sessions/{_SID}", headers=_H).json()["private"] is True
+    assert _rows(conn) == 1
+
+
+def test_the_root_token_cannot_delete(devices, conn, db_url):
+    with _client(db_url) as client:
+        client.put(f"/private-sessions/{_SID}", headers=_WORK_H)
+        r = client.delete(f"/private-sessions/{_SID}", headers=_H)
+        assert r.status_code == 403
+        assert r.json()["detail"] == "un-privating a session needs a full-trust device"
+    assert _rows(conn) == 1
+
+
+def test_a_full_trust_device_can_delete(devices, conn, db_url):
+    with _client(db_url) as client:
+        client.put(f"/private-sessions/{_SID}", headers=_WORK_H)
+        assert _rows(conn) == 1
+        r = client.delete(f"/private-sessions/{_SID}", headers=_FULL_H)
+        assert r.status_code == 200 and r.json()["deleted"] == 1
+    assert _rows(conn) == 0
+
+
+@pytest.mark.parametrize("headers", [_H, _WORK_H], ids=["root", "restricted"])
+def test_put_and_get_stay_on_the_client_gate(devices, conn, db_url, headers):
+    with _client(db_url) as client:
+        r = client.put(f"/private-sessions/{_SID}", headers=headers)
+        assert r.status_code == 200 and r.json()["private"] is True
+        r = client.get(f"/private-sessions/{_SID}", headers=headers)
+        assert r.status_code == 200 and r.json()["private"] is True
+    assert _rows(conn) == 1
 
 
 def test_db_predicate_sees_the_flag(clean, db_url):
