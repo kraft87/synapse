@@ -1,28 +1,50 @@
-"""Shared config + HTTP layer for the Codex-side Synapse hooks.
+"""Configuration and HTTP for the Codex-side Synapse hooks: a thin layer over the client
+core (plugin/synapse_client).
 
-Mirror of plugin/scripts/config.py, adapted for Codex: hooks inherit plain env only, so
-resolution is env var, then ~/.synapse/config.json (what `synapse login` writes; the
-same file the Claude plugin reads), then the Synapse *Claude Code* plugin's legacy saved
-options in ~/.claude/settings.json, then the default. A Codex-only machine therefore
-configures with `synapse login` alone. One exception: on an enrolled machine the saved
-device token beats an env SYNAPSE_INGEST_TOKEN (see _resolve_token). Dependency-free
-(urllib).
+Every setting resolves the way the core resolves it (synapse_client.settings): env var,
+then ~/.synapse/config.json (what `synapse login` writes; the same file the Claude
+plugin reads), then the Synapse *Claude Code* plugin's legacy saved options in
+~/.claude/settings.json, then the default. A Codex-only machine therefore configures
+with `synapse login` alone. On an enrolled machine the device token beats an env
+SYNAPSE_INGEST_TOKEN, and it never goes to a server that did not mint it
+(synapse_client.credentials). Requests go through the core's Transport, which sends the
+bearer to this server's origin only and drops it on a redirect elsewhere.
+
+What this layer adds is Codex's own: the two legacy stores the core does not read itself
+(the Claude plugin's saved options and its pre-0.20 device.json), the
+http://localhost:8765 default the hooks have always had, the User-Agent, and the names
+the hooks import. Settings are read when a hook starts (at import), as before.
 """
 
 from __future__ import annotations
 
-import hashlib
+import dataclasses
 import importlib.util
 import json
 import os
 import socket
 import sys
-import urllib.parse
-import urllib.request
+import types
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-# ~/.synapse/config.json is read through the Claude plugin's module (plugin-codex has no
+# The client core is the sibling plugin/ package, reached the way
+# plugin/scripts/synapse_project.py reaches it: plugin/ first on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "plugin"))
+from synapse_client import __version__, context
+from synapse_client.api import Client
+from synapse_client.http import Transport
+from synapse_client.settings import Settings
+
+#: Where requests go when no URL is configured anywhere. The core sends nothing then;
+#: the Codex hooks have always tried a local server.
+DEFAULT_URL = "http://localhost:8765"
+USER_AGENT = f"synapse-client/{__version__} codex"
+#: Where an environment token most likely comes from, for the token notice.
+ENV_LOCATION = "your shell profile or wherever Codex inherits it"
+
+# The Claude plugin's saved options are parsed by its own module (plugin-codex has no
 # copy), loaded by path from the sibling checkout like skills_sync's engine.
 _HOME_PY = Path(__file__).resolve().parents[2] / "plugin" / "scripts" / "synapse_home.py"
 
@@ -46,44 +68,16 @@ def _claude_plugin_options() -> dict[str, str]:
     return {k: str(v) for k, v in opts.items()}
 
 
-_FALLBACK = _claude_plugin_options()
-_HOME: dict[str, Any] = synapse_home.load()
-
-
-def _cfg(key: str, default: str = "") -> str:
-    if os.environ.get(key):
-        return os.environ[key]
-    if synapse_home.has(_HOME, key):  # set in config.json, even if to nothing
-        return synapse_home.option(_HOME, key) or default
-    return _FALLBACK.get(key) or default
-
-
-def _base_url() -> str:
-    base = _cfg("SYNAPSE_URL") or _cfg("SYNAPSE_INGEST_URL") or "http://localhost:8765"
-    base = base.rstrip("/")
-    for suffix in ("/ingest", "/recall", "/mcp", "/skills"):
-        # a path segment only: a host that happens to be named "mcp" stays
-        if base.endswith(suffix) and "://" in base[: -len(suffix)]:
-            base = base[: -len(suffix)]
-    return base.rstrip("/")
-
-
-BASE_URL = _base_url()
-INGEST_URL = _cfg("SYNAPSE_INGEST_URL") or BASE_URL + "/ingest"
-
-# The enrollment record: "device" in ~/.synapse/config.json, or the pre-0.20 location the
-# Claude plugin wrote (plugin/scripts/config.py DEVICE_FILE). It holds the device token's
-# sha256 and the server that minted it, never the token.
+# The enrollment record's pre-0.20 location, where the Claude plugin wrote it
+# (plugin/scripts/config.py DEVICE_FILE). config.json's "device" wins over it. It holds
+# the device token's sha256 and the server that minted it, never the token.
 _DEVICE_FILE = (
     Path(os.path.expanduser(os.environ.get("SYNAPSE_DATA_DIR") or "~/.local/share/synapse-skills"))
     / "device.json"
 )
 
 
-def _device_state() -> dict[str, Any]:
-    record = _HOME.get("device")
-    if isinstance(record, dict) and record:
-        return record
+def _legacy_device() -> dict[str, Any]:
     try:
         data = json.loads(_DEVICE_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -91,146 +85,82 @@ def _device_state() -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _origin(url: str) -> tuple[str, str]:
-    parts = urllib.parse.urlsplit(url)
-    return parts.scheme.lower(), parts.netloc.lower()
+def load_settings(env: Mapping[str, str] | None = None) -> Settings:
+    """``Settings.load`` with Codex's legacy sources: the Claude plugin's saved options
+    rank below config.json (as ``plugin_config``, the source the token rules know them
+    by), and its old device.json stands in for a config.json without a record. With no
+    URL configured anywhere, the default is resolved as if configured, so the device
+    token's origin rule judges the server requests actually go to."""
+    environ = os.environ if env is None else env
+    extras = [("plugin_config", _claude_plugin_options())]
+    device = _legacy_device()
+    settings = Settings.load(environ, extra_candidates=extras, legacy_device=device)
+    if not settings.base_url:
+        settings = Settings.load(
+            {**environ, "SYNAPSE_URL": DEFAULT_URL}, extra_candidates=extras, legacy_device=device
+        )
+    return settings
 
 
-def _resolve_token() -> tuple[str, str, str]:
-    """Mirror of plugin/scripts/config.py ``_resolve_ingest_token`` (read that for the
-    reasoning), minus the CLAUDE_PLUGIN_OPTION_* source Codex never sets.
-
-    Plain precedence is env, then config.json, then the Claude plugin's saved token,
-    which let a stale SYNAPSE_INGEST_TOKEN in the shell shadow the device token: Codex
-    client configs needed an ``env -u SYNAPSE_INGEST_TOKEN`` wrapper to make the saved
-    token win. Once this machine is enrolled, the device token wins on its own, but only
-    toward a server that already gets it. Returns (token, enrolled surface_id when an
-    env value was overridden, else "", the base URL the device token was withheld from
-    when nothing else could be sent, else "").
-    """
-    env = os.environ.get("SYNAPSE_INGEST_TOKEN") or ""
-    home = synapse_home.option(_HOME, "SYNAPSE_INGEST_TOKEN")
-    saved = _FALLBACK.get("SYNAPSE_INGEST_TOKEN") or ""
-    plain = env or home or saved
-    state = _device_state()
-    surface = str(state.get("surface_id") or "")
-    if not surface:
-        return plain, "", ""
-    pinned = state.get("token_sha256")
-    if pinned:
-        matches = [
-            v for v in (env, home, saved) if v and hashlib.sha256(v.encode()).hexdigest() == pinned
-        ]
-        device = matches[0] if matches else ""
-    else:
-        device = saved  # legacy record: the plugin config is where enrollment wrote it
-    if not device:
-        return plain, "", ""
-    # The server that minted it, plus where the Claude plugin config holding this very
-    # token points; a record too old to name its server, with neither, goes by
-    # config.json's URL (config.py _device_origins).
-    server = state.get("server")
-    allowed = {_origin(str(server))} if server else set()
-    if saved == device:
-        allowed |= {
-            _origin(v) for k in ("SYNAPSE_URL", "SYNAPSE_INGEST_URL") if (v := _FALLBACK.get(k))
-        }
-    if not allowed and (url := synapse_home.option(_HOME, "SYNAPSE_URL")):
-        allowed.add(_origin(url))
-    if any(_origin(url) not in allowed for url in (BASE_URL, INGEST_URL)):
-        # Never the device token toward a server that didn't mint it.
-        other = next((v for v in (env, home, saved) if v and v != device), "")
-        parts = urllib.parse.urlsplit(BASE_URL)
-        return other, "", "" if other else f"{parts.scheme}://{parts.netloc}"
-    return device, (surface if env and env != device else ""), ""
+SETTINGS = load_settings()
+BASE_URL = SETTINGS.base_url
+INGEST_URL = SETTINGS.ingest_url
+TOKEN = SETTINGS.token
 
 
-TOKEN, _OVERRIDDEN_FOR, _WITHHELD_FROM = _resolve_token()
+def live_settings() -> Settings:
+    """``SETTINGS`` with the environment as it is now. The URL and token stay as resolved
+    at start; flags and kill switches follow a variable set or removed since (the hooks'
+    ``_cfg`` always read the live environment)."""
+    snapshot = {k: v for k, v in os.environ.items() if k.startswith("SYNAPSE_")}
+    return dataclasses.replace(SETTINGS, environ=types.MappingProxyType(snapshot))
+
+
+def _cfg(key: str, default: str = "") -> str:
+    """A setting by its env-style name: env, config.json, the Claude plugin's saved
+    options, ``default`` (Settings.flag)."""
+    return live_settings().flag(key, default)
 
 
 def token_override_notice() -> str:
-    """One line when an env token was overridden by the device token, or when the device
-    token is not sent at all, else "". Names the surface, never a token value or any
-    part of one."""
-    if _WITHHELD_FROM:
-        server = str(_device_state().get("server") or "")
-        enrolled = (
-            f"the server this machine enrolled with ({server})"
-            if server
-            else "where this machine's device token was enrolled"
-        )
-        return (
-            f"[Synapse] {_WITHHELD_FROM} is not {enrolled}, so its device token is not sent "
-            f"there. The same server at a new address: `synapse config url {_WITHHELD_FROM} "
-            f"--same-server`. Another server: `synapse login --url {_WITHHELD_FROM} --reenroll`."
-        )
-    if not _OVERRIDDEN_FOR:
-        return ""
-    return (
-        f"[Synapse] SYNAPSE_INGEST_TOKEN from your environment is ignored: this machine is "
-        f"enrolled as {_OVERRIDDEN_FOR}. Remove it from your shell profile or wherever "
-        "Codex inherits it."
-    )
+    """The credential notice (synapse_client.context.notice_part): one line per token
+    source the device token overrode, or why the device token is not sent at all, else
+    "". Names the source and the surface, never a token value or any part of one."""
+    return context.notice_part(SETTINGS, env_location=ENV_LOCATION)
 
 
 PRIVATE_DIR = Path(os.path.expanduser(_cfg("SYNAPSE_PRIVATE_DIR", "~/.synapse/private")))
 # This machine's display NAME. Since schema 054 it grants nothing and identifies
-# nothing — trust rides on the device token in SYNAPSE_INGEST_TOKEN. Same env-override +
-# hostname fallback as plugin/scripts/config.py so the label matches across both
-# plugins; enrollment itself is `synapse login`, and this mirror reuses the token it
-# writes.
+# nothing — trust rides on the device token. Same env-override + hostname fallback as
+# plugin/scripts/config.py so the label matches across both plugins.
 SURFACE = _cfg("SYNAPSE_SURFACE") or socket.gethostname() or "default"
 
-_UA = "synapse-codex-plugin/0.1"
+
+def client() -> Client:
+    """The core's API client for this machine's server and credential."""
+    return Client(SETTINGS, USER_AGENT)
 
 
-def _urlopen(req: urllib.request.Request, timeout: float) -> Any:
-    """Open ``req`` through the client core (synapse_client.http.urlopen), whose redirect
-    handler keeps the bearer off a redirect to another origin; urllib's stock one copies
-    it wherever the server points. The core lives in the sibling plugin/ (as
-    synapse_home.py does) and is imported at send time, so this module still imports
-    without it."""
-    plugin = str(Path(__file__).resolve().parents[2] / "plugin")
-    if plugin not in sys.path:
-        sys.path.insert(0, plugin)
-    from synapse_client.http import urlopen
-
-    return urlopen(req, timeout=timeout)
-
-
-def _request(
-    method: str,
-    path: str,
-    payload: dict[str, Any] | None,
-    params: dict[str, Any] | None,
-    timeout: float,
-) -> dict[str, Any]:
-    url = path if path.startswith("http") else BASE_URL + path
-    if params:
-        url += "?" + urllib.parse.urlencode(params)
-    headers = {"User-Agent": _UA}
-    if payload is not None:
-        headers["Content-Type"] = "application/json"
-    if TOKEN:
-        headers["Authorization"] = f"Bearer {TOKEN}"
-    data = json.dumps(payload).encode() if payload is not None else None
-    req = urllib.request.Request(url, data=data, method=method.upper(), headers=headers)
-    with _urlopen(req, timeout=timeout) as r:
-        out: dict[str, Any] = json.loads(r.read() or b"{}")
-        return out
+def _transport() -> Transport:
+    # Built per request from the module's names, so a caller that repoints them (a test)
+    # is obeyed. The bearer goes to BASE_URL's origin and to INGEST_URL's.
+    return Transport(BASE_URL, TOKEN, USER_AGENT, token_origins=(INGEST_URL,))
 
 
 def get_json(
     path: str, params: dict[str, Any] | None = None, timeout: float = 30.0
 ) -> dict[str, Any]:
-    return _request("GET", path, None, params, timeout)
+    out: dict[str, Any] = _transport().get_json(path, params, timeout=timeout)
+    return out
 
 
 def post_json(path: str, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
-    return _request("POST", path, payload, None, timeout)
+    out: dict[str, Any] = _transport().post_json(path, payload, timeout=timeout)
+    return out
 
 
 def request_json(
     method: str, path: str, payload: dict[str, Any] | None = None, timeout: float = 30.0
 ) -> dict[str, Any]:
-    return _request(method, path, payload, None, timeout)
+    out: dict[str, Any] = _transport().request_json(method, path, payload, timeout=timeout)
+    return out

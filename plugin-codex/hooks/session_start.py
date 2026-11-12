@@ -2,30 +2,40 @@
 # mypy: ignore-errors
 """Codex ``SessionStart`` hook → board + preferences into context, catchup sweep.
 
-Folds three Claude-plugin SessionStart hooks into one script (Codex runs each
-hook entry as a separate process; one fetch pass is cheaper):
+Folds the Claude plugin's SessionStart hooks into one script (Codex runs each hook entry
+as a separate process; one pass is cheaper). The text is the client core's
+(synapse_client.context), the same as every harness gets:
 
-  * board_block     — GET /context, the always-injected index of explicit
-                      memories, project-scoped by the shared project resolver
-                      (plugin/synapse_client/project.py), as every hook labels it
-  * preferences_block — GET /preferences/top, max 8 lines
-  * ingest catchup  — detached ``synapse_stop_hook.py --catchup`` sweep that
-                      ships any rollout tails the live hook missed, and retries
-                      failed uploads however old
-  * upload warning  — when uploads keep failing, one line saying since when and
-                      why (local cursor state only, no network)
-  * skills sync     — ``scripts/skills_sync.py --cwd <cwd>`` (opt-in: ``synapse
-                      login`` asks), run inline under a wall-clock budget so the
-                      synced skills exist before Codex scans ~/.agents/skills and
-                      the project's <root>/.agents/skills
+  * token notice    — the device token overrode a configured one, or is withheld
+  * upload warning  — when uploads keep failing, one line saying since when and why
+                      (the Stop hook's local cursor state, no network)
+  * board           — GET /context, the always-injected index of explicit memories,
+                      project-scoped by the shared project resolver
+                      (plugin/synapse_client/project.py); for a machine that is not
+                      enrolled, or is served as ``restricted`` with no device token,
+                      the explainer that says how to fix it
+  * preferences     — GET /preferences/top, max 7 lines
+
+and, around them:
+
+  * ingest catchup  — detached ``synapse_stop_hook.py --catchup`` sweep that ships any
+                      rollout tails the live hook missed, and retries failed uploads
+                      however old
+  * skills sync     — ``scripts/skills_sync.py --cwd <cwd>`` (opt-in: ``synapse login``
+                      asks), run inline so the synced skills exist before Codex scans
+                      ~/.agents/skills and the project's <root>/.agents/skills
+
+Time: Codex kills this hook at 20 s (install.py's block). The board and preferences are
+fetched side by side, each request bounded at 10 s, while the skills sync runs (at most
+12 s, ``SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT``); everything is cut off 15 s after the hook
+starts, and whatever is ready by then is printed.
 
 Output is Codex's JSON envelope: {"hookSpecificOutput": {"hookEventName":
-"SessionStart", "additionalContext": ...}} — Codex does not read plain stdout.
-The upload warning also goes out as the top-level ``systemMessage``, which
-Codex surfaces to the user as a warning.
-Disable pieces with SYNAPSE_BOARD=0 / SYNAPSE_PREFS_BLOCK=0 /
-SYNAPSE_CODEX_CATCHUP=0 / SYNAPSE_SKILLS_SYNC=0. Fail-open everywhere: a broken board must never
-break a session start.
+"SessionStart", "additionalContext": ...}} — Codex does not read plain stdout. The upload
+warning also goes out as the top-level ``systemMessage``, which Codex surfaces to the
+user as a warning. Disable pieces with SYNAPSE_BOARD=0 / SYNAPSE_PREFS_BLOCK=0 /
+SYNAPSE_CODEX_CATCHUP=0 / SYNAPSE_SKILLS_SYNC=0. Fail-open everywhere: a broken board
+must never break a session start.
 """
 
 from __future__ import annotations
@@ -35,6 +45,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 # The project resolver is the Claude plugin's, so both plugins label a folder the same
@@ -43,43 +55,38 @@ sys.path.append(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "plugin", "scripts")
 )
 import synapse_project
-from common import _cfg, get_json, token_override_notice
+from common import _cfg, client, live_settings, token_override_notice
+from synapse_client import context
 
 _SCRIPTS = sys.path[0]
 _STOP_HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "synapse_stop_hook.py")
 
-_MAX_PREF_LINES = 7
-_PREF_MARK = {"like": "likes", "dislike": "dislikes", "rule": "rule"}
+#: How a Codex user signs in, for the not-enrolled and restricted explainers.
+_LOGIN_HINT = context.DEFAULT_LOGIN_HINT
+#: Each request's own bound, as before the move onto the core.
+_FETCH_TIMEOUT = 10.0
+#: Everything is done this long after the hook starts: 5 s of margin under Codex's 20 s
+#: for the interpreter's start, the print, and a slow machine.
+_DEADLINE_S = 15.0
+_STARTED = time.monotonic()
 
 
-def _board_text(project: str | None) -> str | None:
-    if _cfg("SYNAPSE_BOARD", "1") == "0":
-        return None
-    try:
-        # No `surface` param since schema 054: the bearer identifies the caller, and a
-        # host name the client asserts identifies nothing. This mirror reads whatever
-        # credential is configured — including the device token the Claude Code plugin's
-        # enroll.py writes into the shared settings.json, so a machine running both
-        # plugins is ONE surface rather than two.
-        r = get_json("/context", {"project": project} if project else {}, timeout=10)
-        return r.get("text") if r.get("status") == "ok" else None
-    except Exception:
-        return None
+def _left() -> float:
+    """Seconds left before the hook's deadline (negative once past it)."""
+    return _STARTED + _DEADLINE_S - time.monotonic()
 
 
-def _prefs_text() -> str | None:
-    if _cfg("SYNAPSE_PREFS_BLOCK", "1") == "0":
-        return None
-    try:
-        items = (get_json("/preferences/top", {"limit": 8}, timeout=10)).get("items") or []
-        lines = ["[Synapse preferences]"]
-        for it in items[:_MAX_PREF_LINES]:
-            if it.get("pref"):
-                tag = _PREF_MARK.get(it.get("polarity"), it.get("polarity") or "")
-                lines.append(f"  - ({tag}) {it['pref']}")
-        return "\n".join(lines) if len(lines) > 1 else None
-    except Exception:
-        return None
+def _board_text(project: str | None) -> str:
+    # No `surface` param since schema 054: the bearer identifies the caller. "" when
+    # SYNAPSE_BOARD=0 or anything fails (context.board_part).
+    return context.board_part(
+        client(), project, live_settings(), timeout=_FETCH_TIMEOUT, login_hint=_LOGIN_HINT
+    )
+
+
+def _prefs_text() -> str:
+    # "" when SYNAPSE_PREFS_BLOCK=0 or anything fails (context.preferences_part).
+    return context.preferences_part(client(), live_settings(), timeout=_FETCH_TIMEOUT)
 
 
 def _upload_warning() -> str | None:
@@ -116,11 +123,13 @@ def _spawn_catchup(skip_path: str = "") -> None:
 def _sync_skills(cwd: str | None = None) -> None:
     if _cfg("SYNAPSE_SKILLS_SYNC", "0") in ("", "0"):
         return
-    # Bounded: the hook block's timeout is 20s and the board fetch still has to fit. A kill
-    # mid-pull is safe — the engine's next pass re-mirrors the skill and a push can never
-    # shrink the server's file set.
+    # Bounded by its own setting and by the hook's deadline: Codex kills the hook at 20s.
+    # A kill mid-pull is safe — the engine's next pass re-mirrors the skill and a push can
+    # never shrink the server's file set.
     try:
-        budget = float(_cfg("SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT", "12"))
+        budget = min(float(_cfg("SYNAPSE_CODEX_SKILLS_SYNC_TIMEOUT", "12")), _left())
+        if budget <= 0:
+            return
         subprocess.run(
             [sys.executable, os.path.join(_SCRIPTS, "skills_sync.py")]
             + (["--cwd", cwd] if cwd else []),
@@ -133,6 +142,27 @@ def _sync_skills(cwd: str | None = None) -> None:
         pass
 
 
+def _fetch(project: str | None) -> tuple[list[threading.Thread], dict[str, str]]:
+    """Start the board and preferences requests side by side; each lands in the returned
+    dict when it finishes. Daemon threads: the hook prints and exits at its deadline
+    without waiting for a request that is still out."""
+    ready: dict[str, str] = {}
+
+    def run(name: str, fetch, *args) -> None:
+        try:
+            ready[name] = fetch(*args) or ""
+        except Exception:
+            pass
+
+    threads = [
+        threading.Thread(target=run, args=("board", _board_text, project), daemon=True),
+        threading.Thread(target=run, args=("prefs", _prefs_text), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    return threads, ready
+
+
 def main() -> None:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
@@ -142,22 +172,25 @@ def main() -> None:
     # a sweep that succeeds ends the streak.
     warning = _upload_warning()
     _spawn_catchup(str(payload.get("transcript_path") or ""))
-    _sync_skills(str(payload.get("cwd") or os.getcwd()))
     project = synapse_project.project_label(payload.get("cwd")) or synapse_project.project_label(
         os.getcwd()
     )
-    # The credential notice is local and leads: an env token silently overridden by the
-    # device token is exactly the split this line exists to surface. The upload warning,
-    # also local, follows it.
-    parts = [
-        t for t in (token_override_notice(), warning, _prefs_text(), _board_text(project)) if t
-    ]
-    if not parts:
+    threads, ready = _fetch(project)
+    _sync_skills(str(payload.get("cwd") or os.getcwd()))
+    for thread in threads:
+        thread.join(max(0.0, _left()))
+    ready = dict(ready)  # what arrived by the deadline; a late reply is dropped
+    # The local lines lead (the credential notice, then the upload warning), so they show
+    # even with the server down; then the board, then the preferences.
+    text = context.assemble(
+        (token_override_notice(), warning, ready.get("board"), ready.get("prefs"))
+    )
+    if not text:
         return
     out = {
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
-            "additionalContext": "\n\n".join(parts),
+            "additionalContext": text,
         },
     }
     if warning:

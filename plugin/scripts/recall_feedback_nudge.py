@@ -30,20 +30,16 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import _cfg
 
+# The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
+# The text is the core's, shared with the Codex hook.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synapse_client.context import recall_feedback_nudge
+
 
 def main() -> None:
     if _cfg("SYNAPSE_RECALL_FEEDBACK_NUDGE", "0") != "1":
         return
-    msg = (
-        "[Synapse] recall() returned. If you used any of the served ids (e:/n:/f:/t:/w:) "
-        "in your answer, call recall_feedback(query=<verbatim query>, helpful=[...], "
-        'noise=[...], comment="...") ONCE to close the retrieval-quality loop: '
-        "helpful=load-bearing ids, noise=irrelevant ids, comment=free text for anything "
-        "else (too much served, buried hit, bad ordering). ONLY IF you needed specific "
-        "content memory likely holds and it was not served, add missing=what it was + "
-        "found_via=where you got it instead (full_turns/filesystem/user/nowhere...) — "
-        "omit both otherwise. Skip the call only if you used none of the results."
-    )
+    msg = recall_feedback_nudge()
     print(
         json.dumps(
             {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": msg}}
