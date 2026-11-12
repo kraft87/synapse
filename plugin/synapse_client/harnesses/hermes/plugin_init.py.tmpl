@@ -1,0 +1,13 @@
+"""Synapse memory for Hermes (synapse-client $version), installed by `synapse install hermes`.
+
+Hermes loads this folder as the memory provider "synapse" when config.yaml selects it
+(memory.provider: synapse). The code is the synapse_client package beside this file;
+this module only hands Hermes a new provider through register_memory_provider.
+`synapse update` rebuilds the folder, so edits here do not last.
+"""
+
+from .synapse_client.harnesses.hermes.provider import SynapseMemoryProvider
+
+
+def register(ctx):
+    ctx.register_memory_provider(SynapseMemoryProvider())

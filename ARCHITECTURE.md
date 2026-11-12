@@ -227,7 +227,8 @@ for ep in episodes:
 
 
 **Project labels.** Every client labels a session's project with one resolver,
-`plugin/scripts/synapse_project.py` (the Codex plugin loads the same file): a
+`plugin/synapse_client/project.py` (the hooks of both plugins import it as
+`synapse_project`, a re-exporting stub in `plugin/scripts/`): a
 `.synapse-project` marker file (its first non-comment line; searched from the working
 directory up to the git toplevel, and in a linked worktree also at the main checkout's
 root), else the git toplevel's name (a linked worktree, including Claude Code's
@@ -982,6 +983,7 @@ synapse/
 │
 ├── plugin/                    # the Claude Code plugin (hooks, commands, dream→skills lane) + the `synapse` CLI
 │                              #   (synapse_cli.py, harness.py, synapse_home.py, mcp_headers.py, synapse_run.py)
+│   └── synapse_client/        # the client core: stdlib package every harness adapter builds on (docs/client-harnesses.md)
 ├── plugin-codex/              # the Codex hooks + installer (reuses plugin/scripts by relative path)
 │   └── README.md
 ├── .claude-plugin/marketplace.json  # makes the repo a self-hosted plugin marketplace

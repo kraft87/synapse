@@ -9,7 +9,7 @@ a lowercase drive letter, several casings of the folder name, one label per subf
 session was started in, one per git worktree, and a hyphen/underscore twin when two
 machines named the checkout differently. Clients now resolve one label (a
 ``.synapse-project`` marker, else the git toplevel's name, else the folder's name; see
-``plugin/scripts/synapse_project.py``); this script brings the stored history in line.
+``plugin/synapse_client/project.py``); this script brings the stored history in line.
 
 How a label is mapped (the dry run prints the reason for every change):
 

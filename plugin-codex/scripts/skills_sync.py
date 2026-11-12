@@ -13,7 +13,7 @@ Two folders, the ones Codex itself reads:
 * global scope <-> ``SYNAPSE_CODEX_SKILLS_DIR`` (default ``~/.agents/skills``, Codex's
   user-skills directory);
 * ``project:<label>`` <-> ``<project root>/.agents/skills`` for the session's project
-  (``--cwd``, labelled by the shared resolver ``plugin/scripts/synapse_project.py``; the
+  (``--cwd``, labelled by the shared resolver ``plugin/synapse_client/project.py``; the
   root is the marker's folder or the git toplevel). Codex reads ``.agents/skills`` from
   the working directory up to the repository root, so a session in any subfolder sees
   them. Each skill folder pulled there is listed in the repository's .git/info/exclude.

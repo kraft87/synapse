@@ -5,7 +5,7 @@ the transcript's cwd on "/" only, so a Windows session (``C:\\Users\\pat\\Acme\\
 filed under its whole path, a lowercase-drive variant under another, and every
 subfolder became a project of its own. Three things are pinned here:
 
-1. ``label_from_path`` — the client copy (``plugin/scripts/synapse_project.py``) and the
+1. ``label_from_path`` — the client copy (``plugin/synapse_client/project.py``) and the
    server copy (``ingestion/project_label.py``) give the same answer for ANY string:
    either separator, trailing separators dropped, the last component with its case,
    nothing for a bare drive, ``.``, ``..`` or an empty path, capped at 200 characters.
@@ -42,7 +42,7 @@ from ingestion.codex_client import CodexRolloutParser
 from ingestion.jsonl_client import JSONLParser
 
 _REPO = Path(__file__).resolve().parents[1]
-_CLIENT_PATH = _REPO / "plugin" / "scripts" / "synapse_project.py"
+_CLIENT_PATH = _REPO / "plugin" / "synapse_client" / "project.py"
 
 
 def _load_client() -> ModuleType:

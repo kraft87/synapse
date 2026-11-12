@@ -340,6 +340,18 @@ def test_bundle_carries_both_real_client_trees():
         "plugin/scripts/synapse_run.py",
         "plugin/scripts/synapse_cli.py",
         "plugin/scripts/synapse_home.py",
+        # The client core, its data file, and the resolver the hooks reach through it.
+        "plugin/synapse_client/__init__.py",
+        "plugin/synapse_client/project.py",
+        "plugin/synapse_client/tool_schemas.json",
+        # The Hermes adapter `synapse install hermes` copies, its templates included.
+        "plugin/synapse_client/harnesses/__init__.py",
+        "plugin/synapse_client/harnesses/hermes/__init__.py",
+        "plugin/synapse_client/harnesses/hermes/messages.py",
+        "plugin/synapse_client/harnesses/hermes/provider.py",
+        "plugin/synapse_client/harnesses/hermes/install.py",
+        "plugin/synapse_client/harnesses/hermes/plugin.yaml.tmpl",
+        "plugin/synapse_client/harnesses/hermes/plugin_init.py.tmpl",
         "plugin-codex/install.py",
         "plugin-codex/scripts/common.py",
     ):

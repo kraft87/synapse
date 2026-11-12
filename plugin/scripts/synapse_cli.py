@@ -5,8 +5,9 @@
     synapse login [--url URL] [--role personal|work] [--skills-sync yes|no]
                   [--token TOKEN] [--reenroll] [--browser] [--no-install]
     synapse config [KEY [VALUE] | KEY --unset]
-    synapse install [claude|codex] [--dry-run]
+    synapse install [claude|codex|hermes] [--dry-run] [--hermes-home PATH] [--replace]
     synapse update
+    synapse status
     synapse skill retire NAME
     synapse skill scope NAME global|project:LABEL
     synapse devices|private|import ...     (the synapse-devices/-private/-import tools)
@@ -15,13 +16,14 @@
 `synapse login` is the one setup step on a machine: it signs in and enrolls (one
 approval, see enroll.py), asks this machine's questions once (personal or work; sync
 skills here?), saves the answers to ~/.synapse/config.json, then wires every harness it
-finds: the Claude Code plugin and Codex's hooks + MCP entry (harness.py). Re-running it
-wires a harness installed since, and never signs in again on an enrolled machine
-(`--reenroll` does that on purpose).
+finds: the Claude Code plugin, Codex's hooks + MCP entry, and Hermes's memory provider
+(harness.py). Re-running it wires a harness installed since, and never signs in again on
+an enrolled machine (`--reenroll` does that on purpose).
 
 `synapse config` reads and sets the saved settings; login is not a settings tool.
 `synapse install` is the wiring step alone. `synapse update` fetches the client matching
-the server's version from <server>/install, then updates the Claude plugin.
+the server's version from <server>/install, then refreshes every harness already wired.
+`synapse status` says, per harness, whether it is here and whether Synapse is wired in.
 
 The same code runs from the managed client (~/.synapse/bin/synapse, put there by
 `curl <server>/install | python3 -`) and from the Claude plugin's bin/ inside sessions.
@@ -390,15 +392,27 @@ def _restore_static_slot(url: str) -> None:
         pass
 
 
-def _wire(url: str, which: str | None, dry_run: bool = False, vouched: bool = False) -> int:
+def _wire(
+    url: str,
+    which: str | None,
+    dry_run: bool = False,
+    vouched: bool = False,
+    options: dict | None = None,
+) -> int:
     # A harness opens the MCP connection itself, and Claude Code falls back to the
     # plugin's static token header: never point one at a server this machine's
     # credential doesn't belong to (``vouched``: the user said it is the same server).
     held = _credential_origins()
     if held and not vouched and _origin(url) not in held:
         return _fail(_move_refusal(url, held))
-    found = harness.detect()
-    targets = [which] if which else [h for h in ("claude", "codex") if found[h]]
+    every = harness.harnesses()
+    if which:
+        targets = [h for h in every if h.name == which]
+        if not targets:
+            names = ", ".join(h.name for h in every)
+            return _fail(f"no harness named {which!r}; choose one of: {names}")
+    else:
+        targets = [h for h in every if h.detect()]
     if not targets:
         print(
             "No Claude Code or Codex found on this machine. Install one, then run "
@@ -408,15 +422,9 @@ def _wire(url: str, which: str | None, dry_run: bool = False, vouched: bool = Fa
     failed = False
     for target in targets:
         try:
-            if target == "claude":
-                if dry_run:
-                    print(f"Claude Code: would install the plugin with SYNAPSE_URL={url}")
-                    continue
-                print(harness.install_claude(url))
-            else:
-                print(harness.install_codex(url, dry_run=dry_run))
+            print(target.install(url, dry_run=dry_run, **(options or {})))
         except (RuntimeError, ValueError, OSError) as e:
-            print(f"{'Claude Code' if target == 'claude' else 'Codex'}: not wired: {e}")
+            print(f"{target.label}: not wired: {e}")
             failed = True
     return 1 if failed else 0
 
@@ -575,7 +583,10 @@ def cmd_install(args) -> int:
     url = _configured_url()
     if not url:
         return _fail("no server URL yet: run `synapse login` (or `synapse config url <url>`)")
-    return _wire(url, args.harness, dry_run=args.dry_run)
+    options = {"hermes_home": args.hermes_home, "replace": args.replace}
+    return _wire(
+        url, args.harness, dry_run=args.dry_run, options={k: v for k, v in options.items() if v}
+    )
 
 
 def cmd_update(_args) -> int:
@@ -591,18 +602,32 @@ def cmd_update(_args) -> int:
     done = subprocess.run([sys.executable, "-", url], input=script, check=False)
     if done.returncode != 0:
         return _fail("the installer failed; the previous client is still in place")
-    claude = harness.update_claude()
-    if claude:
-        print(claude)
-    if harness.codex_wired():
+
+    def refusal() -> str:
         held = _credential_origins()
-        if held and _origin(url) not in held:
-            print(f"Codex: not re-wired: {_move_refusal(url, held)}")
-            return 0
+        return _move_refusal(url, held) if held and _origin(url) not in held else ""
+
+    # Built now, after the installer: the core's harnesses come from the new client.
+    for target in harness.harnesses(url, refusal):
         try:
-            print(harness.install_codex(url))
+            line = target.update()
         except (RuntimeError, ValueError, OSError) as e:
-            print(f"Codex: not re-wired: {e}")
+            line = f"{target.label}: not updated: {e}"
+        if line:
+            print(line)
+    return 0
+
+
+def cmd_status(_args) -> int:
+    """One line per harness: wired, found but not wired, or not found."""
+    for target in harness.harnesses():
+        if target.wired():
+            state = "wired"
+        elif target.detect():
+            state = "found, not wired"
+        else:
+            state = "not found"
+        print(f"{target.label}: {state}")
     return 0
 
 
@@ -693,7 +718,7 @@ def _parser() -> argparse.ArgumentParser:
         "--reenroll", action="store_true", help="replace this machine's device token"
     )
     login.add_argument("--browser", action="store_true", help="legacy same-host browser sign-in")
-    login.add_argument("--no-install", action="store_true", help="don't wire Claude Code / Codex")
+    login.add_argument("--no-install", action="store_true", help="don't wire any harness")
     login.set_defaults(func=cmd_login)
 
     cfg = sub.add_parser("config", help="read or set this machine's saved settings")
@@ -707,13 +732,26 @@ def _parser() -> argparse.ArgumentParser:
     )
     cfg.set_defaults(func=cmd_config)
 
-    ins = sub.add_parser("install", help="wire Claude Code and/or Codex (no sign-in)")
-    ins.add_argument("harness", nargs="?", choices=("claude", "codex"))
+    ins = sub.add_parser("install", help="wire Claude Code, Codex or Hermes (no sign-in)")
+    ins.add_argument(
+        "harness", nargs="?", help="claude, codex or hermes (default: every one found here)"
+    )
     ins.add_argument("--dry-run", action="store_true")
+    ins.add_argument(
+        "--hermes-home", metavar="PATH", help="Hermes: its home (default $HERMES_HOME, ~/.hermes)"
+    )
+    ins.add_argument(
+        "--replace",
+        action="store_true",
+        help="Hermes: select Synapse even over another external memory provider",
+    )
     ins.set_defaults(func=cmd_install)
 
     upd = sub.add_parser("update", help="install the client version the server serves")
     upd.set_defaults(func=cmd_update)
+
+    status = sub.add_parser("status", help="which harnesses are here, and which are wired")
+    status.set_defaults(func=cmd_status)
 
     skill = sub.add_parser("skill", help="manage skills in Synapse")
     skill_sub = skill.add_subparsers(dest="action", required=True)

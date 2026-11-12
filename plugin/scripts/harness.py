@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # mypy: ignore-errors
-"""Wire Synapse into the coding harnesses on this machine: Claude Code and Codex.
+"""Wire Synapse into the coding harnesses on this machine: Claude Code, Codex and the
+ones the client core knows (Hermes).
 
 `synapse login` and `synapse install` call this; nothing here asks questions or signs in.
 Each harness keeps only the server URL in its own config, because it opens the MCP
@@ -16,6 +17,13 @@ interactive session has started, so the first session runs without it.
 Codex: [mcp_servers.synapse] and the hook blocks in ~/.codex/config.toml, through
 plugin-codex/install.py. `codex mcp add` can't set a headers helper, and on a server with
 OAuth it would start a browser sign-in whose token outranks the device credential.
+
+`harnesses()` is the one list `synapse login`, `install`, `update` and `status` walk:
+Claude Code and Codex as small objects over the functions here, then the client core's
+registry (plugin/synapse_client/harnesses), which is where Hermes lives. The core is
+imported only when the list is built, from the managed client's current version when
+one is installed: `synapse update` builds it after the installer ran, so an adapter's
+copy of the core is the new one.
 """
 
 from __future__ import annotations
@@ -389,3 +397,94 @@ def codex_wired() -> bool:
         return "[mcp_servers.synapse]" in path.read_text(encoding="utf-8")
     except OSError:
         return False
+
+
+# --------------------------------------------------------------------------- the list
+
+
+class _Claude:
+    """Claude Code in the harness list; the work is the functions above."""
+
+    name = "claude"
+    label = "Claude Code"
+
+    def detect(self) -> bool:
+        return bool(detect()["claude"])
+
+    def install(self, url: str, *, dry_run: bool = False, **_options) -> str:
+        if dry_run:
+            return f"Claude Code: would install the plugin with SYNAPSE_URL={url}"
+        return install_claude(url)
+
+    def update(self) -> str | None:
+        return update_claude()
+
+    def wired(self) -> bool:
+        return bool(claude_plugin_id())
+
+
+class _Codex:
+    """Codex in the harness list. Its update re-writes the wiring for ``url``, unless
+    ``refusal()`` names a reason that URL must not get this machine's credential."""
+
+    name = "codex"
+    label = "Codex"
+
+    def __init__(self, url: str = "", refusal=None) -> None:
+        self._url = url
+        self._refusal = refusal or (lambda: "")
+
+    def detect(self) -> bool:
+        return bool(detect()["codex"])
+
+    def install(self, url: str, *, dry_run: bool = False, **_options) -> str:
+        return install_codex(url, dry_run=dry_run)
+
+    def update(self) -> str | None:
+        if not codex_wired():
+            return None
+        refusal = self._refusal()
+        if refusal:
+            return f"Codex: not re-wired: {refusal}"
+        try:
+            return install_codex(self._url)
+        except (RuntimeError, ValueError, OSError) as e:
+            return f"Codex: not re-wired: {e}"
+
+    def wired(self) -> bool:
+        return codex_wired()
+
+
+def _core_parent() -> Path:
+    """The folder holding the synapse_client to load: the managed client's current
+    version when installed, else the plugin this script is in."""
+    try:
+        managed = managed_root()
+    except Exception:
+        managed = None
+    if managed is not None and (managed / "plugin" / "synapse_client").is_dir():
+        return managed / "plugin"
+    return Path(__file__).resolve().parents[1]
+
+
+def _core_registry() -> list:
+    """The client core's harnesses (``synapse_client.harnesses.registry``); [] when the
+    core cannot be loaded, which is said on stderr."""
+    parent = str(_core_parent())
+    if not sys.path or sys.path[0] != parent:
+        sys.path.insert(0, parent)
+    try:
+        from synapse_client.harnesses import registry
+    except ImportError:
+        return []  # a client older than the registry
+    try:
+        return list(registry())
+    except Exception as e:
+        print(f"synapse: the client core's harnesses could not be loaded: {e}", file=sys.stderr)
+        return []
+
+
+def harnesses(url: str = "", refusal=None) -> list:
+    """Every harness, in the order the CLI walks them: Claude Code, Codex, then the
+    core's. ``url`` and ``refusal`` are for Codex's update (see _Codex)."""
+    return [_Claude(), _Codex(url, refusal), *_core_registry()]
