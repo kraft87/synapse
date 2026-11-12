@@ -429,7 +429,9 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     if INGEST_TOKEN:
         headers["Authorization"] = f"Bearer {INGEST_TOKEN}"
     req = urllib.request.Request(INGEST_URL, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:  # user-configured Synapse URL
+    # Through the core, as config.post_json: the bearer does not follow a redirect to
+    # another origin.
+    with config._urlopen(req, timeout=TIMEOUT) as resp:  # user-configured Synapse URL
         return resp.read().decode()[:200]
 
 

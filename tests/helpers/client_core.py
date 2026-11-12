@@ -43,6 +43,16 @@ def use_core() -> None:
         sys.path.append(str(PLUGIN))
 
 
+def core_http() -> ModuleType:
+    """The core's ``synapse_client.http``. Every hook that sends the bearer opens its
+    request through its ``urlopen`` (config._urlopen, Codex's common._urlopen), so a test
+    that fakes the network patches that one name."""
+    use_core()
+    from synapse_client import http
+
+    return http
+
+
 def scratch_user(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point everything a hook reads at import under ``tmp_path``; returns the scratch
     HOME. Every SYNAPSE_* and CLAUDE_PLUGIN_OPTION_* variable from the real environment

@@ -39,6 +39,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import core_http
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
 _CODEX_SCRIPTS = _REPO / "plugin-codex" / "scripts"
@@ -190,14 +192,15 @@ class _Resp(io.BytesIO):
 
 
 def _capture_requests(monkeypatch, cfg: ModuleType) -> list[tuple[str, str | None]]:
-    """(url, Authorization header) for every request the module sends."""
+    """(url, Authorization header) for every request the module sends (``cfg`` opens
+    them through the core's urlopen)."""
     seen: list[tuple[str, str | None]] = []
 
     def fake_urlopen(req, timeout=None):
         seen.append((req.full_url, req.get_header("Authorization")))
         return _Resp(b"{}")
 
-    monkeypatch.setattr(cfg.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     return seen
 
 

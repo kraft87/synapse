@@ -233,9 +233,9 @@ def test_a_cross_origin_redirect_drops_the_bearer(serve, code):
 
 
 def test_stock_urllib_forwards_the_bearer_across_origins(serve):
-    """Why the transport has its own redirect handler: plain urlopen, which
-    plugin/scripts/config.py uses, sends the Authorization header to wherever the
-    server redirects."""
+    """Why the core has its own redirect handler: plain urllib.request.urlopen sends the
+    Authorization header to wherever the server redirects. The hook scripts that build
+    their own requests open them through ``core_http.urlopen`` instead."""
     home, away = serve(), serve()
     home.routes["/context"] = lambda h: h.redirect(away.url + "/context")
     away.routes["/context"] = _echo
@@ -245,6 +245,55 @@ def test_stock_urllib_forwards_the_bearer_across_origins(serve):
     with urllib.request.urlopen(req, timeout=5) as resp:
         resp.read()
     assert away.seen[-1]["headers"].get("authorization") == f"Bearer {_TOKEN}"
+
+
+def test_the_core_urlopen_drops_the_bearer_where_stock_urllib_forwards_it(serve):
+    home, away = serve(), serve()
+    home.routes["/context"] = lambda h: h.redirect(away.url + "/context")
+    home.routes["/old"] = lambda h: h.redirect("/context")
+    away.routes["/context"] = _echo
+    for path in ("/context", "/old"):
+        req = urllib.request.Request(home.url + path, headers={"Authorization": f"Bearer {_TOKEN}"})
+        with core_http.urlopen(req, timeout=5) as resp:
+            resp.read()
+    assert "authorization" not in away.seen[-1]["headers"]
+    # the same-origin hop still carries it: /old -> /context on home
+    assert home.seen[-1]["path"] == "/context"
+    assert home.seen[-1]["headers"]["authorization"] == f"Bearer {_TOKEN}"
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "keeps"),
+    [
+        ("http://s.example/a", "http://s.example/b", True),
+        ("http://s.example/a", "http://s.example:80/b", True),
+        ("https://s.example:443/a", "https://s.example/b", True),
+        ("http://s.example:8080/a", "http://s.example:8080/b", True),
+        ("http://S.Example/a", "http://s.example/b", True),
+        # the upgrade to TLS on the default ports, the one change of scheme allowed
+        ("http://s.example/a", "https://s.example/b", True),
+        ("http://s.example:80/a", "https://s.example:443/b", True),
+        # any other change of scheme, host or port drops it
+        ("http://s.example:8080/a", "https://s.example:8443/b", False),
+        ("http://s.example:8080/a", "https://s.example/b", False),
+        ("http://s.example/a", "https://s.example:8443/b", False),
+        ("https://s.example/a", "http://s.example/b", False),
+        ("http://s.example/a", "http://other.example/b", False),
+        ("http://s.example/a", "http://s.example.evil.example/b", False),
+        ("http://s.example/a", "https://other.example/b", False),
+        ("http://s.example:8080/a", "http://s.example:8081/b", False),
+        ("http://s.example/a", "http://s.example:8080/b", False),
+        ("http://s.example/a", "ftp://s.example/b", False),
+        ("http://s.example/a", "http://s.example:bad/b", False),
+    ],
+)
+def test_which_redirects_keep_the_bearer(old, new, keeps):
+    assert core_http._keeps_auth(old, new) is keeps
+    req = urllib.request.Request(old, headers={"Authorization": f"Bearer {_TOKEN}"})
+    out = core_http._SameOriginAuth().redirect_request(req, None, 302, "Found", {}, new)
+    assert out is not None
+    assert (out.get_header("Authorization") == f"Bearer {_TOKEN}") is keeps
+    assert out.get_header("Authorization") in (None, f"Bearer {_TOKEN}")
 
 
 # ---------------------------------------------------------------------------

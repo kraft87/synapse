@@ -89,7 +89,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 sys.path.append(str(Path(__file__).resolve().parents[2] / "plugin" / "scripts"))
 import synapse_ingest_retry as retry
 import synapse_project
-from common import INGEST_URL, TOKEN
+from common import INGEST_URL, TOKEN, _urlopen
 from synapse_filelock import lock_exclusive
 
 TIMEOUT = float(os.environ.get("SYNAPSE_INGEST_TIMEOUT", "30"))
@@ -269,7 +269,9 @@ def _post(
     req = urllib.request.Request(
         INGEST_URL, data=json.dumps(body).encode(), method="POST", headers=headers
     )
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+    # Through the core (common._urlopen): the bearer does not follow a redirect to
+    # another origin.
+    with _urlopen(req, timeout=TIMEOUT) as r:
         resp: dict[str, Any] = json.loads(r.read() or b"{}")
         return resp
 

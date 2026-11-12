@@ -136,7 +136,9 @@ def _mcp_call_token(access_token: str) -> str:
         req = urllib.request.Request(
             MCP_URL, data=json.dumps(payload).encode(), method="POST", headers=auth
         )
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as r:
+        # Through the core (config._urlopen): the access token does not follow a
+        # redirect to another origin. The helpers above send no credential header.
+        with config._urlopen(req, timeout=_TIMEOUT) as r:
             raw = r.read().decode()
         out: list[dict] = []
         for line in raw.splitlines():

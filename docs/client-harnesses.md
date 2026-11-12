@@ -218,9 +218,12 @@ The core ports the hooks' behaviour and wording, with these differences:
   goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
   read as JSON or as server-sent events, up to the answer to this call.
 - **The bearer stays on its origin.** `http.Transport` sends it only to the configured
-  server (and the ingest URL's origin), and drops it when a redirect leaves that origin.
-  urllib's stock handler, which `config.py` uses, forwards it to wherever a redirect
-  points.
+  server (and the ingest URL's origin); the hooks' helpers send it to any absolute URL
+  they are given. A redirect carries it only within its origin, or from http to https on
+  the same host and the default ports (80 to 443, the rule the `requests` library uses).
+  The hooks open their requests through the same handler (`http.urlopen`, reached through
+  `config._urlopen` and Codex's `common._urlopen`): urllib's stock one forwards the header
+  to wherever a redirect points.
 - **Legacy credentials are passed in, not read.** `Settings.load` takes the old
   `device.json` record and `credentials.json` token as arguments (`legacy_device`,
   `legacy_token`); the harness that has those files reads them.

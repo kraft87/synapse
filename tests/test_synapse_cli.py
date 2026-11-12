@@ -52,6 +52,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import core_http
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPTS = _REPO / "plugin" / "scripts"
 _MODULES = ("config", "enroll", "synapse_login", "harness", "synapse_cli", "synapse_home")
@@ -688,7 +690,10 @@ def test_login_reloads_the_client_so_enrollment_reaches_the_url_and_role_it_just
             }
         return _Resp(json.dumps(reply).encode())
 
+    # The device flow's helpers open with urllib; enrollment goes through config.post_json,
+    # which opens through the client core.
     monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     monkeypatch.setattr(time, "sleep", lambda _s: None)
     monkeypatch.setattr(webbrowser, "open", lambda *_a, **_k: True)
     mod = _load("synapse_cli")
@@ -2013,7 +2018,7 @@ def test_enrollment_requests_carry_no_bearer(monkeypatch):
         seen.append(req.get_header("Authorization"))
         return _Resp(json.dumps({"error": "access_denied"}).encode())
 
-    monkeypatch.setattr(enroll.config.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(core_http(), "urlopen", fake_urlopen)
     enroll._post("/device/code", {})
     assert seen == [None]
     assert enroll.config.INGEST_TOKEN == _DEVICE  # the process's own token is back
