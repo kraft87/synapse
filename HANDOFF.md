@@ -3,7 +3,6 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
-<<<<<<< HEAD
 ## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
 
 **What changed**
@@ -64,8 +63,6 @@ changed, what to do on each machine, what was proven, and what is still open.
 - No test covers `_ship`'s stop-mode fallback: when the tail window holds no turn
   boundary, it seeds the cursor at offset 0.
 
-=======
->>>>>>> origin/main
 ## 2026-11-12 — client: six defect fixes from the client parity review (plugin 0.24.2)
 
 **What changed**
