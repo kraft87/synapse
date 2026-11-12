@@ -215,6 +215,9 @@ class _Cli:
         self.plugin_id: str | None = None
         self.codex_is_wired = False
         self.claude_update: str | None = None
+        self.hermes_is_wired = False
+        self.hermes_update: str | None = None
+        self.real_core_registry = None
 
     def terminal(self, *answers: str) -> None:
         self.answers = list(answers)
@@ -236,6 +239,8 @@ class _Cli:
         mp.setattr(harness, "claude_plugin_id", lambda runner=None: self.plugin_id)
         mp.setattr(harness, "codex_wired", lambda: self.codex_is_wired)
         mp.setattr(harness, "update_claude", lambda runner=None: self.claude_update)
+        self.real_core_registry = harness._core_registry
+        mp.setattr(harness, "_core_registry", lambda: [_FakeHermes(self)])
         mp.setattr(enroll, "enroll", self._enroll)
         real_main = login.main
 
@@ -286,6 +291,32 @@ class _Cli:
             cfg.clear_device_state()
         cfg.store_token(_NEW, record)
         return record
+
+
+class _FakeHermes:
+    """The client core's Hermes harness, as the CLI walks it (harness._core_registry):
+    found when ``cli.found["hermes"]`` says so, recording into ``cli.wired``."""
+
+    name = "hermes"
+    label = "Hermes"
+
+    def __init__(self, cli: _Cli) -> None:
+        self.cli = cli
+
+    def detect(self) -> bool:
+        return self.cli.found.get("hermes", False)
+
+    def install(self, url, *, dry_run=False, **options):
+        self.cli.wired.append(("hermes", url, dry_run, options))
+        if "hermes" in self.cli.wire_errors:
+            raise self.cli.wire_errors["hermes"]
+        return "Hermes: wired"
+
+    def update(self):
+        return self.cli.hermes_update
+
+    def wired(self) -> bool:
+        return self.cli.hermes_is_wired
 
 
 @pytest.fixture()
@@ -559,6 +590,13 @@ def test_login_wires_only_the_harnesses_it_finds(cli, capsys):
     assert cli.run("login") == 0
     assert cli.wired == []
     assert "No Claude Code or Codex found on this machine" in capsys.readouterr().out
+
+
+def test_login_wires_hermes_when_it_finds_it(cli, capsys):
+    cli.found = {"claude": True, "codex": False, "hermes": True}
+    assert cli.run("login", "--url", _URL) == 0
+    assert cli.wired == [("claude", _URL), ("hermes", _URL, False, {})]
+    assert "Hermes: wired" in capsys.readouterr().out
 
 
 def test_login_reports_a_harness_it_could_not_wire_and_exits_nonzero(cli, capsys):
@@ -1680,6 +1718,57 @@ def test_install_dry_run_passes_through_and_never_touches_claude(cli, capsys):
     )
 
 
+def test_install_hermes_passes_its_options(cli):
+    _write_home({"url": _URL})
+    assert cli.run("install", "hermes", "--hermes-home", "/srv/hermes", "--replace") == 0
+    assert cli.wired == [("hermes", _URL, False, {"hermes_home": "/srv/hermes", "replace": True})]
+    cli.wired.clear()
+    assert cli.run("install", "hermes", "--dry-run") == 0
+    assert cli.wired == [("hermes", _URL, True, {})]
+
+
+def test_install_without_a_name_wires_hermes_when_found(cli):
+    _write_home({"url": _URL})
+    cli.found = {"claude": False, "codex": True, "hermes": True}
+    assert cli.run("install") == 0
+    assert cli.wired == [("codex", _URL, False), ("hermes", _URL, False, {})]
+
+
+def test_install_names_the_harnesses_it_knows(cli, capsys):
+    _write_home({"url": _URL})
+    assert cli.run("install", "cursor") == 1
+    assert "no harness named 'cursor'; choose one of: claude, codex, hermes" in (
+        capsys.readouterr().err
+    )
+    assert cli.wired == []
+
+
+def test_a_hermes_that_cannot_be_wired_is_reported(cli, capsys):
+    _write_home({"url": _URL})
+    cli.wire_errors["hermes"] = RuntimeError("Hermes was not found on this machine")
+    assert cli.run("install", "hermes") == 1
+    assert "Hermes: not wired: Hermes was not found on this machine" in capsys.readouterr().out
+
+
+def test_install_hermes_builds_the_plugin_folder(cli, monkeypatch, tmp_path, capsys):
+    """The real core harness, end to end: no `hermes` on PATH, a named home."""
+    _write_home({"url": _URL})
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv("PATH", str(empty))
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    mod = cli.load()
+    cli.mp.setattr(mod.harness, "_core_registry", cli.real_core_registry)
+    home = tmp_path / "hermes-home"
+    assert cli.run("install", "hermes", "--hermes-home", str(home)) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Hermes: memory provider ")
+    assert (home / "plugins" / "synapse" / "plugin.yaml").is_file()
+    assert (home / "config.yaml").read_text(encoding="utf-8") == "memory:\n  provider: synapse\n"
+    assert cli.run("status") == 0
+    assert "Hermes: not found" in capsys.readouterr().out  # ~/.hermes is not this home
+
+
 def test_install_takes_the_url_from_the_legacy_plugin_settings(cli):
     _write_settings(
         {"pluginConfigs": {"synapse@synapse": {"options": {"SYNAPSE_URL": _URL + "/"}}}}
@@ -1836,6 +1925,35 @@ def test_update_needs_a_configured_url(cli, capsys):
     assert cli.run("update") == 1
     assert "no server URL yet" in capsys.readouterr().err
     assert seen["requests"] == []
+
+
+def test_update_refreshes_hermes_after_claude_and_codex(cli, capsys):
+    _write_home({"url": _URL})
+    cli.claude_update = "Claude Code: plugin updated"
+    cli.codex_is_wired = True
+    cli.hermes_update = "Hermes: memory provider updated to 9.9.9"
+    _fake_update(cli)
+    assert cli.run("update") == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-3:] == [
+        "Claude Code: plugin updated",
+        "Codex: wired",
+        "Hermes: memory provider updated to 9.9.9",
+    ]
+
+
+def test_status_has_a_line_per_harness(cli, capsys):
+    cli.found = {"claude": True, "codex": False, "hermes": True}
+    cli.plugin_id = "synapse@synapse"
+    assert cli.run("status") == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "Claude Code: wired",
+        "Codex: not found",
+        "Hermes: found, not wired",
+    ]
+    cli.hermes_is_wired = True
+    assert cli.run("status") == 0
+    assert "Hermes: wired" in capsys.readouterr().out.splitlines()
 
 
 def test_a_codex_rewire_failure_after_an_update_is_reported_not_fatal(cli, capsys):
