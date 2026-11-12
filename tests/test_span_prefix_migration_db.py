@@ -197,3 +197,40 @@ def test_an_older_build_resending_a_stored_turn_does_not_store_it_twice(
     assert resent.status_code == 200, resent.text
     assert resent.json() == {"status": "ok", "ingested": 1, "span_collisions": 1}
     assert _spans(conn, sid) == [f"claude_code:t1-{tag}", f"claude_code:t2-{tag}"]
+
+
+def _stamp(conn) -> str:
+    return conn.execute("SELECT value FROM synapse_meta WHERE key = 'schema_version'").fetchone()[0]
+
+
+def _set_stamp(conn, value: str) -> None:
+    conn.execute("UPDATE synapse_meta SET value = %s WHERE key = 'schema_version'", (value,))
+
+
+def test_the_file_stamps_068_itself_and_never_moves_a_later_stamp_down(conn):
+    # It is applied by hand, ahead of the image, and that image refuses a lower stamp:
+    # without its own stamp the release would crash-loop on a correctly migrated database.
+    before = _stamp(conn)
+    try:
+        _set_stamp(conn, "067")
+        conn.execute(_MIGRATION.read_text())
+        assert _stamp(conn) == "068"
+        _set_stamp(conn, "071")
+        conn.execute(_MIGRATION.read_text())
+        assert _stamp(conn) == "071"
+    finally:
+        _set_stamp(conn, before)
+
+
+def test_this_build_refuses_a_database_at_067_and_starts_once_the_file_is_applied(conn, db_url):
+    from ingestion import schema_check
+
+    before = _stamp(conn)
+    try:
+        _set_stamp(conn, "067")
+        with pytest.raises(SystemExit):
+            schema_check.check_schema_version(db_url)
+        conn.execute(_MIGRATION.read_text())
+        schema_check.check_schema_version(db_url)  # returns
+    finally:
+        _set_stamp(conn, before)

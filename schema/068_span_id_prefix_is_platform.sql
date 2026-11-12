@@ -36,8 +36,11 @@
 -- including the BM25 and HNSW ones. Expect minutes on tens of thousands of episodes, and
 -- run VACUUM (ANALYZE) episodes afterwards.
 --
--- Re-running is a no-op: the functions and the trigger are replaced, and no row matches
--- the UPDATE once it has run.
+-- The file stamps schema_version 068 itself, last: it is applied by hand, ahead of the
+-- image, and that image will not start on a database stamped lower.
+--
+-- Re-running is a no-op: the functions and the trigger are replaced, no row matches the
+-- UPDATE once it has run, and the stamp only ever moves up.
 
 CREATE OR REPLACE FUNCTION canonical_span_id(span TEXT) RETURNS TEXT
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $SPAN$
@@ -112,3 +115,9 @@ BEGIN
     END IF;
 END
 $SPAN$;
+
+-- Last, so a failure above leaves the stamp where it was, and the build that needs this
+-- file still refuses to start. Guarded: a re-run never moves the stamp down.
+INSERT INTO synapse_meta (key, value) VALUES ('schema_version', '068')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+ WHERE synapse_meta.value < EXCLUDED.value;
