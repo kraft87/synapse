@@ -681,6 +681,13 @@ def test_preferences_block_kill_switch(scratch, monkeypatch, capsys, server):
     assert server.seen == []
 
 
+def test_the_enrollment_explainers_are_the_claude_wording(scratch):
+    """enroll.py builds both from the core with this plugin's sign-in and token slot."""
+    enroll = load_script("enroll")
+    assert enroll.not_enrolled_block() == _NOT_ENROLLED
+    assert enroll.restricted_block() == _RESTRICTED
+
+
 # ---------------------------------------------------------------------------
 # Per prompt: recall_nudge.py prints the core's prompt_nudge
 # ---------------------------------------------------------------------------

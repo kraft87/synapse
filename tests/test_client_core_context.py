@@ -193,8 +193,20 @@ def test_the_explainers_match_enroll_with_the_claude_hints(scratch):
     assert context.restricted_block(_CLAUDE_RESTRICTED_HINT) == enroll.restricted_block().replace(
         _PASTE_HINT, ""
     )
+    assert (
+        context.restricted_block(_CLAUDE_RESTRICTED_HINT, paste_aside=_PASTE_HINT)
+        == enroll.restricted_block()
+    )
     assert context.BOOTSTRAP_CMD == enroll.BOOTSTRAP_CMD
     assert context.PASTE_CMD == enroll.PASTE_CMD
+
+
+def test_the_paste_aside_closes_the_restricted_explainer():
+    plain = context.restricted_block()
+    assert plain.endswith(f"    on the server, then run `{context.PASTE_CMD}` here.")
+    assert context.restricted_block(paste_aside="") == plain
+    aside = context.restricted_block(paste_aside=" (or in the token slot)")
+    assert aside == plain[:-1] + " (or in the token slot)."
 
 
 def test_the_default_hint_is_harness_neutral():

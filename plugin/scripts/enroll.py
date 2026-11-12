@@ -21,7 +21,7 @@ Enrollment is the IdP's device flow (RFC 8628), and it IS the sign-in: one appro
      (``config.store_token``), where the hooks and both harnesses' MCP headers helper
      read it. The record keeps only the token's sha256, which is how the hooks prefer
      it over a stale SYNAPSE_INGEST_TOKEN left in the environment
-     (config._resolve_ingest_token).
+     (synapse_client.credentials.resolve, through config.py).
 
 Interactive by nature — it prints a code and waits for a human — so the SessionStart
 hook never runs it. The hook only reports that this machine is not enrolled; `synapse
@@ -43,11 +43,20 @@ import config
 
 # The client core, reached the way synapse_project.py reaches it: plugin/ first on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from synapse_client import context
+
 # The command that mints a device token on a server with no identity provider (a local
 # `docker compose` install, the common case for a fresh clone), and where a token minted
 # that way goes on this machine. Defined once, in the core, for every notice that names
 # them.
 from synapse_client.context import BOOTSTRAP_CMD, PASTE_CMD
+
+#: How a user signs in from Claude Code, worded for the core's enrollment explainers (a
+#: lowercase imperative clause): the 401 one also names the terminal command, the
+#: restricted one names the session command only and adds where else a pasted token goes.
+_LOGIN_HINT = "run `! synapse-login` in this session (or `synapse-login` in a terminal)"
+_RESTRICTED_LOGIN_HINT = "run `! synapse-login` in this session"
+_PASTE_ASIDE = " (or paste it into\n    /plugin > synapse > Synapse token)"
 
 #: Poll ceiling. The IdP's own device_code expiry (`expires_in`, typically 15 min) wins
 #: when it is shorter; this is the backstop for a server that reports neither.
@@ -81,18 +90,9 @@ def restricted_block() -> str:
     on an open server, or one holding the shared root token, gets a perfectly successful
     200 with an empty board. Same outcome as a 401 — no memory — with none of the signal,
     which is how a new install ends up looking like "Synapse just has nothing in it".
+    The wording is the client core's, with this plugin's sign-in and token slot.
     """
-    return (
-        "[Synapse — this machine is served nothing]\n"
-        "The server answered, but this caller is `restricted` with no projects: it holds no "
-        "device credential of its own (schema 054), so the board and recall come back empty.\n"
-        "Fix it either way:\n"
-        "  - Server with a sign-in configured: run `! synapse-login` in this session.\n"
-        "  - Local server, no sign-in: run\n"
-        f"        {BOOTSTRAP_CMD}\n"
-        f"    on the server, then run `{PASTE_CMD}` here (or paste it into\n"
-        "    /plugin > synapse > Synapse token)."
-    )
+    return context.restricted_block(_RESTRICTED_LOGIN_HINT, paste_aside=_PASTE_ASIDE)
 
 
 def not_enrolled_block() -> str:
@@ -100,15 +100,9 @@ def not_enrolled_block() -> str:
 
     A machine with no credential of its own is served nothing, and an unexplained empty
     session start is worse than a restricted one — so say the reason and the one command
-    that fixes it.
+    that fixes it. The wording is the client core's, with this plugin's sign-in.
     """
-    return (
-        "[Synapse — this machine is not enrolled]\n"
-        "No memory is being served here: since schema 054 every machine authenticates "
-        "with its own device token.\n"
-        "Run `! synapse-login` in this session (or `synapse-login` in a terminal) and "
-        "approve the sign-in on any device."
-    )
+    return context.not_enrolled_block(_LOGIN_HINT)
 
 
 def _post(path: str, payload: dict, timeout: float = 30.0) -> dict:

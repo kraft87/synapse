@@ -99,10 +99,13 @@ def not_enrolled_block(login_hint: str = DEFAULT_LOGIN_HINT) -> str:
     )
 
 
-def restricted_block(login_hint: str = DEFAULT_LOGIN_HINT) -> str:
+def restricted_block(login_hint: str = DEFAULT_LOGIN_HINT, *, paste_aside: str = "") -> str:
     """Why the server answered but served nothing: this caller is ``restricted`` with no
     device credential of its own (an open server, or the shared root token). The quiet
-    twin of ``not_enrolled_block``: same outcome, no error to notice."""
+    twin of ``not_enrolled_block``: same outcome, no error to notice.
+
+    ``paste_aside`` follows "here" in the last line, before its full stop: another place
+    this harness takes a pasted token, worded as the harness shows it ("": none)."""
     return (
         "[Synapse — this machine is served nothing]\n"
         "The server answered, but this caller is `restricted` with no projects: it holds no "
@@ -111,7 +114,7 @@ def restricted_block(login_hint: str = DEFAULT_LOGIN_HINT) -> str:
         f"  - Server with a sign-in configured: {login_hint}.\n"
         "  - Local server, no sign-in: run\n"
         f"        {BOOTSTRAP_CMD}\n"
-        f"    on the server, then run `{PASTE_CMD}` here."
+        f"    on the server, then run `{PASTE_CMD}` here{paste_aside}."
     )
 
 
