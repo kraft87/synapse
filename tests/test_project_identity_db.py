@@ -786,7 +786,7 @@ def test_messages_ingest_stores_the_client_as_platform_and_a_label(ident, conn, 
         "FROM episodes WHERE session_id = %s",
         (sid,),
     ).fetchone()
-    assert tuple(row) == ("hermes", "Alpha", f"messages:hermes:a-{tag}", "messages", "hermes")
+    assert tuple(row) == ("hermes", "Alpha", f"hermes:a-{tag}", "messages", "hermes")
     assert _post(db_url, body).json()["ingested"] == 0
 
 
