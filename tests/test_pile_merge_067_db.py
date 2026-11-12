@@ -100,11 +100,18 @@ def _to_066(conn, db_url: str) -> None:
 
 @pytest.fixture()
 def piles(conn, db_url):
-    """A database at 066, empty. Afterwards: wiped and merged (067 applied), as the suite expects."""
+    """A database at 066, empty. Afterwards: wiped and merged (067 applied), as the suite expects,
+    and stamped as it was before: 067 only ever raises the stamp to 067, and the suite's database
+    may carry a later migration's."""
+    before = conn.execute("SELECT value FROM synapse_meta WHERE key = 'schema_version'").fetchone()
     _to_066(conn, db_url)
     yield conn
     _wipe(conn)
     _psql(db_url, _SQL_067)
+    if before and before[0] > "067":
+        conn.execute(
+            "UPDATE synapse_meta SET value = %s WHERE key = 'schema_version'", (before[0],)
+        )
 
 
 def _vec(slot: int) -> str:
@@ -1366,22 +1373,37 @@ def test_the_shared_text_is_read_from_067_and_the_preview_runs_it():
     assert parts["map"] in sql and parts["fx"] in sql and parts["counts"] in sql
 
 
-def test_067_is_required_not_optional_and_registered_after_066():
+def _schema_through_067(tmp_path: Path) -> Path:
+    """The schema directory of the build 067 shipped in: every migration up to it. Later
+    migrations raise what the current build requires, which is not what these tests are about."""
+    view = tmp_path / "schema-through-067"
+    view.mkdir()
+    for f in _SQL_067.parent.glob("*.sql"):
+        if f.name[:3] <= "067":
+            (view / f.name).write_text(f.read_text())
+    return view
+
+
+def test_067_is_required_not_optional_and_registered_after_066(tmp_path):
     assert not schema_check.is_optional_migration(_SQL_067)
-    assert schema_check.required_schema_version() == "067"
-    assert schema_check.expected_schema_version() == "067"
+    through_067 = _schema_through_067(tmp_path)
+    assert schema_check.required_schema_version(through_067) == "067"
+    assert schema_check.expected_schema_version(through_067) == "067"
+    assert schema_check.required_schema_version() >= "067"
     files = re.findall(
         r"^\s+(\d{3}_\w+\.sql)$", (_ROOT / "scripts" / "apply_schema.sh").read_text(), re.M
     )
     assert files.index("067_kg_one_memory.sql") == files.index("066_kg_fact_audience.sql") + 1
-    assert files[-1] == "067_kg_one_memory.sql"
 
 
-def test_a_build_that_needs_067_refuses_a_database_stamped_066_and_runs_on_067(seeded, db_url):
+def test_a_build_that_needs_067_refuses_a_database_stamped_066_and_runs_on_067(
+    seeded, db_url, tmp_path
+):
+    through_067 = _schema_through_067(tmp_path)
     with pytest.raises(SystemExit):
-        schema_check.check_schema_version(db_url)
+        schema_check.check_schema_version(db_url, through_067)
     merge(db_url)
-    schema_check.check_schema_version(db_url)  # returns
+    schema_check.check_schema_version(db_url, through_067)  # returns
 
 
 # ---------------------------------------------------------------------------
