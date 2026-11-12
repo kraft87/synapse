@@ -16,6 +16,7 @@ plugin/                          what every install method ships
     http.py                      bearer, User-Agent, timeouts; JSON and MCP tools/call
     api.py                       Client: one method per server endpoint
     context.py                   session-start block, per-prompt nudge (the wording)
+    private.py                   is this session private (the marker file and its TTL)
     project.py                   project label for a working directory
     outbox.py                    durable queue for uploads that failed
     tools.py + tool_schemas.json the memory tools, as static schemas + a tools/call proxy
@@ -101,8 +102,8 @@ like every other harness, so there is no Hermes setup wizard step.
 | `sync_turn(user, assistant, messages=...)` | Uploads the turn that just finished. A failed upload goes to the outbox. Skipped for private sessions and for `cron` / `subagent` contexts. |
 | `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded. Hermes calls the first at every compression as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
 | `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). |
-| `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order. Parameters a hook fills in elsewhere (`self_session`, `surface`, `session_id`) are not shown to the model. Static: Hermes asks before `initialize()`. |
-| `handle_tool_call(name, args)` | Adds the session id the way the `PreToolUse` hook does, calls the server's MCP tool, returns its JSON. |
+| `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |
+| `handle_tool_call(name, args)` | `tools.call()`: adds the session id the way the `PreToolUse` hook does (never over a value already set), calls the server's MCP tool, returns its text. Never raises: a failure comes back as a JSON object with an `error` field. |
 
 **What is uploaded.** Hermes passes the whole conversation on every turn, as live message
 dicts. The normaliser keeps only `role`, the text content, tool-call names and arguments,
@@ -120,14 +121,46 @@ for `state.db`.
 
 ## Where the migration stands
 
-The core is new. Claude Code's hooks (`plugin/scripts/`) and Codex's (`plugin-codex/`)
-still carry their own configuration and HTTP code (`config.py`, `common.py`); moving them
-onto the core is the next two changes, Codex first.
+The core exists without an adapter: every module in the layout above, the `Harness`
+protocol, and a registry that is still empty; `harnesses/hermes/` is next. Claude Code's
+hooks (`plugin/scripts/`) and Codex's (`plugin-codex/`) still carry their own
+configuration and HTTP code (`config.py`, `common.py`); moving them onto the core is the
+next two changes, Codex first.
 
 A module moves like this: the code goes into `synapse_client/`, the old path keeps a
 few-line stub that imports it (hook commands and Codex's trusted command text never name
 a new path), and the tests that loaded the old file by path are pointed at the package.
 `project.py` is the first module moved this way.
+
+`tool_schemas.json` is a snapshot of the server's tools/list, written by
+`scripts/gen_client_tool_schemas.py` (no database needed); a test regenerates it and fails
+when the server's tools change without it.
+
+### Where the core differs from the hooks
+
+The core ports the hooks' behaviour and wording, with these differences:
+
+- **MCP without a handshake.** The server runs stateless streamable HTTP, so `tools/call`
+  goes out alone, with `MCP-Protocol-Version: 2025-06-18`; no `initialize`. The reply is
+  read as JSON or as server-sent events, up to the answer to this call.
+- **The bearer stays on its origin.** `http.Transport` sends it only to the configured
+  server (and the ingest URL's origin), and drops it when a redirect leaves that origin.
+  urllib's stock handler, which `config.py` uses, forwards it to wherever a redirect
+  points.
+- **Legacy credentials are passed in, not read.** `Settings.load` takes the old
+  `device.json` record and `credentials.json` token as arguments (`legacy_device`,
+  `legacy_token`); the harness that has those files reads them.
+- **Session-start order** is notice, upload warning, board, preferences in every harness.
+  Codex's hook puts preferences before the board today.
+- **Enrollment notices** take the login hint as an argument; the restricted-device
+  notice has no Claude-only "paste it into /plugin" aside.
+- **Private mode** ignores a session id that is not a plain file name (the ingest hook
+  joins it into a path as is) and falls back to 12 hours when
+  `SYNAPSE_PRIVATE_TTL_HOURS` does not parse (the ingest hook fails at import).
+- **Failed uploads** go to `Outbox`, one file per payload, claimed by rename so several
+  processes can drain one directory. A payload the server refuses with a 4xx other than
+  401, 403, 408 or 429 is dropped; anything else stops the drain and waits. The
+  session-start warning is the retry module's sentence, dated from the oldest payload.
 
 ## Adding a harness
 

@@ -927,6 +927,7 @@ synapse/
 │
 ├── plugin/                    # the Claude Code plugin (hooks, commands, dream→skills lane) + the `synapse` CLI
 │                              #   (synapse_cli.py, harness.py, synapse_home.py, mcp_headers.py, synapse_run.py)
+│   └── synapse_client/        # the client core: stdlib package every harness adapter builds on (docs/client-harnesses.md)
 ├── plugin-codex/              # the Codex hooks + installer (reuses plugin/scripts by relative path)
 │   └── README.md
 ├── .claude-plugin/marketplace.json  # makes the repo a self-hosted plugin marketplace
