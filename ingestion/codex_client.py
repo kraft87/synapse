@@ -36,6 +36,18 @@ import orjson
 
 from ingestion.models import Episode
 from ingestion.project_label import label_from_path
+from ingestion.render import (
+    USER_CAP,
+    assistant_line,
+    context_line,
+    group_turns,
+    join_lines,
+    repeated_span,
+    result_line,
+    strip_nulls,
+    tool_line,
+    user_line,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -72,11 +84,6 @@ _ITEM_TYPES = (
 
 def _is_machinery_text(text: str) -> bool:
     return text.lstrip().startswith(_MACHINERY_PREFIXES)
-
-
-def _strip_nulls(text: str) -> str:
-    """Postgres TEXT columns reject NUL bytes — strip them defensively."""
-    return text.replace("\x00", "") if "\x00" in text else text
 
 
 def _content_text(content: Any) -> str:
@@ -119,7 +126,7 @@ def _tool_call_line(payload: dict[str, Any]) -> str | None:
     detail = detail.strip()
     if not detail:
         return None
-    return f"[tool:{name}] {detail[:300]}"
+    return tool_line(name, detail)
 
 
 def _tool_output_text(payload: dict[str, Any]) -> str:
@@ -226,16 +233,7 @@ class CodexRolloutParser:
         if not session_id or not items:
             return []
 
-        groups: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        for rec in items:
-            if _is_user_turn(rec) and current:
-                groups.append(current)
-                current = [rec]
-            else:
-                current.append(rec)
-        if current:
-            groups.append(current)
+        groups = group_turns(items, _is_user_turn)
 
         episodes: list[Episode] = []
         prev_assistant: str | None = None
@@ -254,7 +252,7 @@ class CodexRolloutParser:
             ts: str | None = None
 
             if prev_assistant:
-                content_parts.append(f"[context] {prev_assistant.strip()[:300]}")
+                content_parts.append(context_line(prev_assistant))
 
             for rec in group:
                 ts = ts or rec.get("timestamp")
@@ -268,28 +266,26 @@ class CodexRolloutParser:
                         continue
                     if payload.get("role") == "user":
                         if human_turn is None:
-                            human_turn = text[:3000]
-                            content_parts.append(f"[user] {human_turn}")
+                            human_turn = text[:USER_CAP]
+                            content_parts.append(user_line(human_turn))
                     else:
                         assistant_turn = text
-                        content_parts.append(f"[assistant] {text[:3000]}")
+                        content_parts.append(assistant_line(text))
                 elif ptype in ("custom_tool_call_output", "function_call_output"):
-                    txt = _tool_output_text(payload)
-                    if len(txt) > 20:
-                        content_parts.append(f"[result] {txt[:500]}")
+                    line = result_line(_tool_output_text(payload))
+                    if line:
+                        content_parts.append(line)
                 else:
                     line = _tool_call_line(payload)
                     if line:
                         content_parts.append(line)
 
-            if not content_parts:
+            if not content_parts:  # the [context] line counts here, unlike in JSONLParser
                 continue
 
             span_id = f"codex:{last_item_id}" if last_item_id else None
-            if span_id is not None:
-                if span_id in seen_span_ids:
-                    continue  # replayed item (resume/fork re-dump) — already emitted
-                seen_span_ids.add(span_id)
+            if repeated_span(seen_span_ids, span_id):
+                continue  # replayed item (resume/fork re-dump) — already emitted
 
             try:
                 created_at = datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
@@ -303,9 +299,9 @@ class CodexRolloutParser:
                     project=project_override or _cwd_to_project(cwd),
                     platform="codex",
                     model=model,
-                    human_turn=_strip_nulls(human_turn) if human_turn else None,
-                    assistant_turn=_strip_nulls(assistant_turn) if assistant_turn else None,
-                    content=_strip_nulls("\n\n".join(content_parts)),
+                    human_turn=strip_nulls(human_turn) if human_turn else None,
+                    assistant_turn=strip_nulls(assistant_turn) if assistant_turn else None,
+                    content=join_lines(content_parts),
                     span_id=span_id,
                     source="codex",
                     metadata={
