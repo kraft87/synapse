@@ -71,7 +71,6 @@ def test_settings_json_url_drives_all_endpoints(monkeypatch, tmp_path):
     cfg = _fresh_config(monkeypatch, tmp_path, options={"SYNAPSE_URL": "https://syn.example.net"})
     assert cfg.BASE_URL == "https://syn.example.net"
     assert cfg.INGEST_URL == "https://syn.example.net/ingest"
-    assert cfg.RECALL_URL == "https://syn.example.net/recall"
     assert cfg.MCP_URL == "https://syn.example.net/mcp"
 
 

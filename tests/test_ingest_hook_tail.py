@@ -1,10 +1,8 @@
-"""The Stop hook ships a bounded TAIL, not the whole transcript.
+"""The Stop hook's turn-boundary rule and its endpoint resolution.
 
-``_select_tail`` must (a) start the slice at a real turn boundary so a leading
-fragment of an already-ingested turn is never POSTed, and (b) fall back to the
-full file when the tail window holds no boundary (a single mega-turn longer than
-the window) so that turn still lands complete. The hook is the plugin's
-``plugin/scripts/ingest_hook.py``.
+The hook (the plugin's ``plugin/scripts/ingest_hook.py``) chunks and seeds its
+cursor at turn boundaries, so slash-command and system-reminder user records must
+never count as a turn start.
 
 The hook also resolves its endpoint through the plugin config layer
 (``plugin/scripts/config.py``) — regression-tested here so it can never again
@@ -66,65 +64,6 @@ def _isolated_plugin_env(monkeypatch, tmp_path, options: dict | None = None) -> 
     monkeypatch.chdir(tmp_path)  # keep Path.cwd()/.claude from finding real project settings
     for var in _PLUGIN_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
-
-
-def _records() -> list[dict]:
-    sid = "s-tail-1"
-
-    def u(uid: str, text: str) -> dict:
-        return {"type": "user", "uuid": uid, "sessionId": sid, "message": {"content": text}}
-
-    def a(uid: str, text: str) -> dict:
-        return {
-            "type": "assistant",
-            "uuid": uid,
-            "sessionId": sid,
-            "message": {"content": [{"type": "text", "text": text}]},
-        }
-
-    # 3 turns, 6 records: u1 a1 | u2 a2 | u3 a3
-    return [
-        u("u1", "q1"),
-        a("a1", "r1"),
-        u("u2", "q2"),
-        a("a2", "r2"),
-        u("u3", "q3"),
-        a("a3", "r3"),
-    ]
-
-
-def _lines(recs: list[dict]) -> list[bytes]:
-    return [json.dumps(r).encode() for r in recs]
-
-
-def test_tail_starts_at_turn_boundary(monkeypatch):
-    mod = _load_hook(_PLUGIN_HOOK)
-    monkeypatch.setattr(mod, "TAIL_RECORDS", 3)
-    records, mode = mod._select_tail(_lines(_records()))
-    # last 3 raw records are [a2, u3, a3]; trimmed to the first turn-start (u3)
-    assert mode == "tail"
-    assert [r["uuid"] for r in records] == ["u3", "a3"]
-
-
-def test_tail_drops_leading_fragment(monkeypatch):
-    """When the window cuts mid-turn, the dangling tail of the prior turn is dropped
-    (it was already ingested); the slice begins at the next user turn."""
-    mod = _load_hook(_PLUGIN_HOOK)
-    monkeypatch.setattr(mod, "TAIL_RECORDS", 5)
-    records, mode = mod._select_tail(_lines(_records()))
-    # last 5 = [a1, u2, a2, u3, a3]; first turn-start is u2 → drop a1
-    assert mode == "tail"
-    assert [r["uuid"] for r in records] == ["u2", "a2", "u3", "a3"]
-
-
-def test_full_fallback_when_no_boundary_in_window(monkeypatch):
-    """A window with no turn boundary (one mega-turn) falls back to the full file."""
-    mod = _load_hook(_PLUGIN_HOOK)
-    monkeypatch.setattr(mod, "TAIL_RECORDS", 1)
-    records, mode = mod._select_tail(_lines(_records()))
-    # last 1 record = a3 (an assistant record, not a turn-start) → ship everything
-    assert mode == "full-fallback"
-    assert len(records) == 6
 
 
 def test_machinery_user_record_is_not_a_boundary():

@@ -412,7 +412,6 @@ def test_the_config_json_url_drives_every_endpoint():
     cfg = _load_config()
     assert cfg.BASE_URL == "https://syn.example.net"
     assert cfg.INGEST_URL == "https://syn.example.net/ingest"
-    assert cfg.RECALL_URL == "https://syn.example.net/recall"
     assert cfg.MCP_URL == "https://syn.example.net/mcp"
     assert cfg.SKILLS_URL == "https://syn.example.net/skills"
 
