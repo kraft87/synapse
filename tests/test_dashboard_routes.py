@@ -100,13 +100,11 @@ def _episode(
     ).fetchone()[0]
 
 
-def _entity(
-    conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0, group_id="technical"
-):
+def _entity(conn, uuid, *, name, entity_type="Technology", summary="a thing", degree=0):
     return conn.execute(
-        "INSERT INTO kg_entities (uuid, group_id, name, entity_type, summary, degree, created_at) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
-        (uuid, group_id, name, entity_type, summary, degree, _t(0)),
+        "INSERT INTO kg_entities (uuid, name, entity_type, summary, degree, created_at) "
+        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        (uuid, name, entity_type, summary, degree, _t(0)),
     ).fetchone()[0]
 
 
@@ -118,7 +116,6 @@ def _rel(
     tgt,
     name="uses",
     fact="x uses y",
-    group_id="technical",
     episodes=None,
     t_valid=None,
     t_invalid=None,
@@ -127,11 +124,10 @@ def _rel(
 ):
     return conn.execute(
         "INSERT INTO kg_relationships "
-        "(uuid, group_id, src_uuid, tgt_uuid, name, fact, episodes, retrieval_count, "
-        " created_at, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        "(uuid, src_uuid, tgt_uuid, name, fact, episodes, retrieval_count, "
+        " created_at, t_valid, t_invalid) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
-            group_id,
             src,
             tgt,
             name,
@@ -176,19 +172,19 @@ def _event(
     ).fetchone()[0]
 
 
-def _note(conn, *, hook="User prefers X", group_id="technical", source_ref=None):
+def _note(conn, *, hook="User prefers X", source_ref=None):
     return conn.execute(
-        "INSERT INTO notes (owner_id, group_id, type, hook, body, source_ref) "
-        "VALUES ('default',%s,'user',%s,'body',%s) RETURNING id",
-        (group_id, hook, source_ref),
+        "INSERT INTO notes (owner_id, type, hook, body, source_ref) "
+        "VALUES ('default','user',%s,'body',%s) RETURNING id",
+        (hook, source_ref),
     ).fetchone()[0]
 
 
-def _pref(conn, *, pref="User prefers bullet lists", group_id="technical", source_ref=None):
+def _pref(conn, *, pref="User prefers bullet lists", source_ref=None):
     return conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, pref, polarity, source_ref) "
-        "VALUES ('default',%s,%s,'like',%s) RETURNING id",
-        (group_id, pref, source_ref),
+        "INSERT INTO preferences (owner_id, pref, polarity, source_ref) "
+        "VALUES ('default',%s,'like',%s) RETURNING id",
+        (pref, source_ref),
     ).fetchone()[0]
 
 
@@ -314,8 +310,8 @@ def test_catalog_counts(clean, conn, db_url):
     _episode(conn, session="a", seq=1, project="synapse", source="claude-code")
     _episode(conn, session="a", seq=2, project="synapse", source="claude-code")
     _episode(conn, session="b", seq=1, project=None, source="cursor")
-    _entity(conn, "e1", name="Widget", group_id="personal")
-    _rel(conn, "r1", src="e1", tgt="e1", group_id="technical")
+    _entity(conn, "e1", name="Widget")
+    _rel(conn, "r1", src="e1", tgt="e1")
     _event(conn, source_ref="tb:c1", domain="technical")
     _event(conn, source_ref="tb:c2", domain="technical")
     _event(conn, source_ref="tb:c3", domain="personal")
@@ -327,7 +323,7 @@ def test_catalog_counts(clean, conn, db_url):
     assert {"name": "claude-code", "count": 2} in body["sources"]
     assert {"name": "cursor", "count": 1} in body["sources"]
     # domains: the distinct timeline domains only, as a plain string list; the knowledge
-    # graph's own group_id column no longer reaches the catalog.
+    # graph has no group to add to it.
     assert body["domains"] == ["personal", "technical"]
     assert "group_ids" not in body
 
@@ -1469,7 +1465,6 @@ def _pref_row(
     *,
     pref,
     polarity="like",
-    group_id="technical",
     assert_count=1,
     first_seen=None,
     last_asserted=None,
@@ -1477,11 +1472,10 @@ def _pref_row(
     superseded_by=None,
 ):
     return conn.execute(
-        "INSERT INTO preferences (owner_id, group_id, pref, polarity, assert_count, "
+        "INSERT INTO preferences (owner_id, pref, polarity, assert_count, "
         " first_seen, last_asserted, t_invalid, superseded_by) "
-        "VALUES ('default',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+        "VALUES ('default',%s,%s,%s,%s,%s,%s,%s) RETURNING id",
         (
-            group_id,
             pref,
             polarity,
             assert_count,
@@ -1505,9 +1499,9 @@ def _gent(conn, uuid, *, name, degree, entity_type="Technology", normalized_name
     entity_type — the graph payloads serve BOTH (client colors by supertype)."""
     return conn.execute(
         "INSERT INTO kg_entities "
-        "(uuid, group_id, name, normalized_name, entity_type, entity_supertype, summary, "
+        "(uuid, name, normalized_name, entity_type, entity_supertype, summary, "
         " degree, created_at) "
-        "VALUES (%s,'technical',%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
+        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING uuid",
         (
             uuid,
             name,

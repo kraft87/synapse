@@ -10,7 +10,6 @@ from __future__ import annotations
 import uuid
 
 from mcp_server.recall import Recall
-from tests.helpers.embed import GROUP
 
 
 def _episode(conn, session_id: str, seq: int) -> int:
@@ -22,9 +21,9 @@ def _episode(conn, session_id: str, seq: int) -> int:
 
 def _fact(conn, fact_uuid: str, episodes: str | None) -> None:
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact,"
-        " episodes) VALUES (%s, 'default', %s, 'a', 'b', 'R', %s, %s::jsonb)",
-        (fact_uuid, GROUP, f"fact {fact_uuid}", episodes),
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact,"
+        " episodes) VALUES (%s, 'default', 'a', 'b', 'R', %s, %s::jsonb)",
+        (fact_uuid, f"fact {fact_uuid}", episodes),
     )
 
 
@@ -63,18 +62,16 @@ def test_lookup_failure_fails_open(db_url):
 
 def _superseded(conn, old_uuid: str, new_uuid: str, old_eps: str, new_eps: str) -> None:
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact,"
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact,"
         " episodes, t_invalid, invalidated_by) VALUES"
-        " (%s, 'default', %s, 'a', 'b', 'R', %s, %s::jsonb, now(), %s),"
-        " (%s, 'default', %s, 'a', 'b', 'R', %s, %s::jsonb, NULL, NULL)",
+        " (%s, 'default', 'a', 'b', 'R', %s, %s::jsonb, now(), %s),"
+        " (%s, 'default', 'a', 'b', 'R', %s, %s::jsonb, NULL, NULL)",
         (
             old_uuid,
-            GROUP,
             f"old {old_uuid}",
             old_eps,
             new_uuid,
             new_uuid,
-            GROUP,
             f"now {new_uuid}",
             new_eps,
         ),

@@ -27,7 +27,7 @@ from typing import Any
 import pytest
 
 from mcp_server import kg_pg
-from tests.helpers.embed import GROUP, onehot
+from tests.helpers.embed import onehot
 
 _SPEC = importlib.util.spec_from_file_location(
     "repair_numbered_entity_magnets",
@@ -87,12 +87,12 @@ def _ep(conn, project: str) -> int:
 
 def _ent(conn, uid: str, name: str, *, summary: str = "", etype: str = "pull_request") -> None:
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, project, name, normalized_name, "
+        "INSERT INTO kg_entities (uuid, owner_id, project, name, normalized_name, "
         "  entity_type, summary, embedding, created_at, t_created, valid_at, t_valid, "
         "  entity_supertype, entity_subtype) "
-        "VALUES (%s, 'default', %s, 'alpha', %s, lower(%s), %s, %s, %s::vector, "
+        "VALUES (%s, 'default', 'alpha', %s, lower(%s), %s, %s, %s::vector, "
         "        '2026-01-01', '2026-01-01', '2026-01-01', '2026-01-01', 'artifact', %s)",
-        (uid, GROUP, name, name, etype, summary, kg_pg._vec_literal(onehot(1)), etype),
+        (uid, name, name, etype, summary, kg_pg._vec_literal(onehot(1)), etype),
     )
 
 
@@ -108,14 +108,13 @@ def _edge(
     created: str = "2026-01-02",
 ) -> None:
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, "
         "  fact, fact_embedding, episodes, created_at, t_valid, t_invalid, invalid_at, "
         "  invalidated_by) "
-        "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, %s, "
+        "VALUES (%s, 'default', %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, %s, "
         "        %s, %s, %s, %s)",
         (
             uid,
-            GROUP,
             src,
             tgt,
             fact,
@@ -210,11 +209,10 @@ def _run(db_url: str, *args: str) -> None:
     assert rm.main(["--db-url", db_url, *args]) == 0
 
 
-def test_a_landing_entity_left_in_the_old_personal_group_is_reused(kg, db_url, embedder):
+def test_an_existing_landing_entity_is_reused(kg, db_url, embedder):
     ep = _ep(kg, "alpha")
     _ent(kg, "mag", "PR #290")
     _ent(kg, "p12", "PR #12")
-    kg.execute("UPDATE kg_entities SET group_id = 'personal' WHERE uuid = 'p12'")
     _ent(kg, "svc", "widget service", etype="service")
     _edge(kg, "e1", "mag", "svc", "PR #12 changed the widget service", ep)
 

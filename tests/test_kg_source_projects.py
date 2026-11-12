@@ -39,7 +39,7 @@ from mcp_server import kg_pg
 from mcp_server import recall_sources as recall_sources_mod
 from mcp_server.recall import Recall
 from mcp_server.recall_warnings import warn_sink
-from tests.helpers.embed import GROUP, onehot
+from tests.helpers.embed import onehot
 from tests.helpers.surfaces import clear_surfaces, register_full, register_restricted
 
 _SCHEMA_056 = Path(__file__).resolve().parent.parent / "schema" / "056_kg_source_projects.sql"
@@ -91,14 +91,13 @@ def _fact(
     defaults to work-safe, so these provenance tests are decided by provenance alone;
     test_kg_fact_audience_db.py is the one that varies the label."""
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, "
         "  fact, fact_embedding, episodes, t_valid, t_invalid, invalidated_by, web_artifact_id, "
         "  audience) "
-        "VALUES (%s, 'default', %s, %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
+        "VALUES (%s, 'default', %s, %s, 'RELATES', %s, %s::vector, %s::jsonb, "
         "        '2026-01-01T00:00:00+00:00', %s, %s, %s, %s)",
         (
             uid,
-            GROUP,
             src,
             tgt,
             fact,
@@ -315,10 +314,9 @@ def _seed_kg(conn) -> dict[str, int]:
     leg; only hop facts touch the seed entity; only BM25 facts say "widget"."""
     w, w2, p = _ep(conn, WORK), _ep(conn, WORK2), _ep(conn, PERSONAL)
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, summary, "
-        "  embedding) VALUES ('seed-ent', 'default', %s, 'Seed', 'seed', 'seed summary', "
-        "  %s::vector)",
-        (GROUP, kg_pg._vec_literal(onehot(0))),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, summary, embedding) "
+        "VALUES ('seed-ent', 'default', 'Seed', 'seed', 'seed summary', %s::vector)",
+        (kg_pg._vec_literal(onehot(0)),),
     )
     # vector leg
     _fact(conn, "v-ok", "alpha beta", f"[{w}]", emb=0)
@@ -385,9 +383,9 @@ def test_seed_with_only_web_derived_edges_takes_no_seed_slot(kg, db_url):
     from web pages, at either end of its edges, is not a seed (it would hop to nothing)."""
     w = _ep(kg, WORK)
     kg.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, embedding) "
-        "VALUES ('page-ent', 'default', %s, 'Page', 'page', %s::vector)",
-        (GROUP, kg_pg._vec_literal(onehot(0))),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, embedding) "
+        "VALUES ('page-ent', 'default', 'Page', 'page', %s::vector)",
+        (kg_pg._vec_literal(onehot(0)),),
     )
     _fact(kg, "page-out", "kappa", f"[{w}]", emb=None, src="page-ent", web_artifact_id=7)
     _fact(kg, "page-in", "lambda", f"[{w}]", emb=None, tgt="page-ent", web_artifact_id=7)
@@ -411,9 +409,9 @@ def test_restricted_seed_degree_counts_only_servable_edges(kg, db_url):
     """A seed whose only live edges are out of scope must not consume a seed slot."""
     p = _ep(kg, PERSONAL)
     kg.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, embedding) "
-        "VALUES ('lonely', 'default', %s, 'Lonely', 'lonely', %s::vector)",
-        (GROUP, kg_pg._vec_literal(onehot(0))),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, embedding) "
+        "VALUES ('lonely', 'default', 'Lonely', 'lonely', %s::vector)",
+        (kg_pg._vec_literal(onehot(0)),),
     )
     _fact(kg, "lonely-edge", "omega", f"[{p}]", emb=None, src="lonely")
     executed: list[tuple[str, Any]] = []

@@ -16,8 +16,6 @@ from psycopg.rows import dict_row
 
 from ingestion import kg_owner, surface_admin
 
-TECH, PERS = "technical", "personal"
-
 
 @pytest.fixture()
 def kg(conn):
@@ -29,11 +27,10 @@ def kg(conn):
     _wipe()
 
 
-def _entity(conn, uid: str, name: str, group: str = TECH, owner: str = "default") -> None:
+def _entity(conn, uid: str, name: str, owner: str = "default") -> None:
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name) "
-        "VALUES (%s, %s, %s, %s, %s)",
-        (uid, owner, group, name, name.lower()),
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name) VALUES (%s, %s, %s, %s)",
+        (uid, owner, name, name.lower()),
     )
 
 
@@ -42,19 +39,17 @@ def _edge(
     src: str,
     tgt: str,
     *,
-    group: str = TECH,
     owner: str = "default",
     live=True,
     web: int | None = None,
 ):
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, fact, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, fact, "
         "  t_invalid, web_artifact_id, audience) "
-        "VALUES (%s, %s, %s, %s, %s, 'f', %s, %s, 'work-safe')",
+        "VALUES (%s, %s, %s, %s, 'f', %s, %s, 'work-safe')",
         (
             uuid.uuid4().hex,
             owner,
-            group,
             src,
             tgt,
             None if live else "2026-02-01T00:00:00+00:00",
@@ -94,14 +89,14 @@ def test_set_is_a_dry_run_until_apply(kg, db_url, capsys):
     assert "already flagged" in capsys.readouterr().out
 
 
-def test_an_owner_holds_one_flagged_entity_whichever_legacy_group_it_sits_in(kg, db_url, capsys):
+def test_an_owner_holds_one_flagged_entity(kg, db_url, capsys):
     _entity(kg, "me", "Owner")
     _entity(kg, "twin", "Owner twin")
-    _entity(kg, "me-p", "Owner", PERS)
+    _entity(kg, "me-2", "Owner")
     assert _run(db_url, "set", "me", "--apply") == 0
     assert _run(db_url, "set", "twin", "--apply") == 1
     assert "me is already flagged: clear it first" in capsys.readouterr().err
-    assert _run(db_url, "set", "me-p", "--apply") == 1
+    assert _run(db_url, "set", "me-2", "--apply") == 1
     assert "me is already flagged: clear it first" in capsys.readouterr().err
     assert _flags(kg) == {"me"}
 
@@ -169,18 +164,17 @@ def test_the_parser_has_no_name_or_search_argument(db_url, capsys):
 def test_list_shows_the_flagged_rows_and_the_highest_degree_entities(kg, db_url, capsys):
     _entity(kg, "hub", "Hub")
     _entity(kg, "minor", "Minor")
-    _entity(kg, "hub-p", "Hub", PERS)
+    _entity(kg, "hub-2", "Hub")
     for i in range(3):
         _edge(kg, "hub", f"leaf{i}")
     _edge(kg, "minor", "hub")
-    _edge(kg, "hub-p", "leaf", group=PERS)
+    _edge(kg, "hub-2", "leaf")
     assert _run(db_url, "list") == 0
     out = capsys.readouterr().out
     assert "no entity is flagged" in out
     lines = [ln.split() for ln in out.splitlines() if ln.startswith("  ")]
-    # by degree across the whole memory: hub (4: three out, one in) before minor (1) and the
-    # entity left in the old personal group (1), ties by age
-    assert [ln[0] for ln in lines] == ["hub", "minor", "hub-p"]
+    # by degree: hub (4: three out, one in) before minor (1) and the second Hub (1), ties by age
+    assert [ln[0] for ln in lines] == ["hub", "minor", "hub-2"]
     assert lines[0][1] == "edges=4"
     assert _run(db_url, "set", "hub", "--apply") == 0
     capsys.readouterr()

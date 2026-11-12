@@ -271,10 +271,7 @@ def test_extraction_queue_cascade_delete(conn):
 def test_notes_audience_defaults_personal_and_is_constrained(conn):
     """Fail-closed in the SCHEMA, not just in the application: a note inserted by any
     path that forgets the column lands on the tier that never leaves a trusted host."""
-    conn.execute(
-        "INSERT INTO notes (owner_id, group_id, type, hook, body) "
-        "VALUES ('t', 'technical', 'user', 'h', 'b')"
-    )
+    conn.execute("INSERT INTO notes (owner_id, type, hook, body) VALUES ('t', 'user', 'h', 'b')")
     row = conn.execute(
         "SELECT audience FROM notes WHERE owner_id = 't' ORDER BY id DESC LIMIT 1"
     ).fetchone()
@@ -282,8 +279,8 @@ def test_notes_audience_defaults_personal_and_is_constrained(conn):
 
     with pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(
-            "INSERT INTO notes (owner_id, group_id, type, hook, body, audience) "
-            "VALUES ('t', 'technical', 'user', 'h', 'b', 'public')"
+            "INSERT INTO notes (owner_id, type, hook, body, audience) "
+            "VALUES ('t', 'user', 'h', 'b', 'public')"
         )
     conn.execute("DELETE FROM notes WHERE owner_id = 't'")
 

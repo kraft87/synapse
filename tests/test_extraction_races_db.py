@@ -14,8 +14,8 @@ texts that share a slot are identical vectors.
    6c restatement, same-batch twin) was left with no edge. And two workers that resolved
    the same new name both inserted it.
 3. The old personal/technical split. Names the old classifier sent to different piles
-   still get their fact written, and rows still carrying group_id 'personal' (the data
-   is merged once, by schema 067) are found by every lookup the write path makes.
+   still get their fact written, and rows already in the graph (the old piles, merged once
+   by schema 067) are found by every lookup the write path makes.
 4. What the write path leaves for the labeller. A new fact carries no audience label, so a
    restricted device is not served it until the labeller has judged it, even when its
    provenance lies inside the device's allowlist.
@@ -338,25 +338,25 @@ def test_same_new_name_from_parallel_workers_is_one_entity(graph, before_b):
 # 3. Rows written under the old personal/technical split
 # ---------------------------------------------------------------------------------------
 #
-# Until the one-time merge, pre-existing rows may still carry group_id 'personal'. The
-# write path must resolve a mention onto such a row, not mint a twin beside it.
+# Rows the old personal pile held are in the one memory now. The write path must resolve a
+# mention onto such a row, not mint a twin beside it.
 
 
-def _seed_entity(conn, uuid: str, name: str, *, group: str = "personal", slot: int | None = None):
+def _seed_entity(conn, uuid: str, name: str, *, slot: int | None = None):
     conn.execute(
-        "INSERT INTO kg_entities (uuid, owner_id, group_id, name, normalized_name, entity_type, "
+        "INSERT INTO kg_entities (uuid, owner_id, name, normalized_name, entity_type, "
         "summary, embedding, created_at, t_created, valid_at, t_valid) "
-        "VALUES (%s, 'default', %s, %s, %s, 'Concept', '', %s::vector, now(), now(), now(), now())",
-        (uuid, group, name, name.lower(), None if slot is None else _vec(onehot(slot))),
+        "VALUES (%s, 'default', %s, %s, 'Concept', '', %s::vector, now(), now(), now(), now())",
+        (uuid, name, name.lower(), None if slot is None else _vec(onehot(slot))),
     )
 
 
-def _seed_edge(conn, uuid: str, src: str, tgt: str, fact: str, slot: int, group: str = "personal"):
+def _seed_edge(conn, uuid: str, src: str, tgt: str, fact: str, slot: int):
     conn.execute(
-        "INSERT INTO kg_relationships (uuid, owner_id, group_id, src_uuid, tgt_uuid, name, fact, "
+        "INSERT INTO kg_relationships (uuid, owner_id, src_uuid, tgt_uuid, name, fact, "
         "fact_embedding, created_at, t_created, valid_at, t_valid) "
-        "VALUES (%s, 'default', %s, %s, %s, 'R', %s, %s::vector, now(), now(), now(), now())",
-        (uuid, group, src, tgt, fact, _vec(onehot(slot))),
+        "VALUES (%s, 'default', %s, %s, 'R', %s, %s::vector, now(), now(), now(), now())",
+        (uuid, src, tgt, fact, _vec(onehot(slot))),
     )
 
 
@@ -383,7 +383,7 @@ def test_fact_across_old_piles_is_written(graph):
     assert _edgeless(graph) == []
 
 
-def test_exact_name_resolves_onto_an_entity_left_in_the_personal_group(graph):
+def test_exact_name_resolves_onto_an_entity_already_in_the_graph(graph):
     _seed_entity(graph, "p-harbor", "Harbor")
 
     _pipeline(_Embedder(), [_HOSTS], WINDOW_A).process_item(dict(ITEM))
@@ -392,7 +392,7 @@ def test_exact_name_resolves_onto_an_entity_left_in_the_personal_group(graph):
     assert [e[1] for e in _live_edges(graph)] == ["p-harbor"]
 
 
-def test_same_name_guard_finds_an_entity_written_to_the_personal_group_meanwhile(graph):
+def test_same_name_guard_finds_an_entity_written_meanwhile(graph):
     pipe = _pipeline(_Embedder(), [_HOSTS], WINDOW_A)
     resolve = pipe._stage4_resolve
 
@@ -408,7 +408,7 @@ def test_same_name_guard_finds_an_entity_written_to_the_personal_group_meanwhile
     assert [e[1] for e in _live_edges(graph)] == ["p-harbor"]
 
 
-def test_vector_match_resolves_onto_an_entity_left_in_the_personal_group(graph):
+def test_vector_match_resolves_onto_an_entity_already_in_the_graph(graph):
     _seed_entity(graph, "p-zephyr", "Zephyr", slot=5)
     fact = _fact("Gale hosts the build cache", "Gale", "Cache")
 
@@ -420,7 +420,7 @@ def test_vector_match_resolves_onto_an_entity_left_in_the_personal_group(graph):
     assert [e[1] for e in _live_edges(graph)] == ["p-zephyr"]
 
 
-def test_contradiction_search_retires_a_fact_left_in_the_personal_group(graph):
+def test_contradiction_search_retires_a_fact_already_in_the_graph(graph):
     _seed_entity(graph, "p-harbor", "Harbor")
     _seed_entity(graph, "p-shore", "Shore")
     _seed_edge(graph, "p-edge", "p-harbor", "p-shore", "Harbor is on the north shore", slot=7)
