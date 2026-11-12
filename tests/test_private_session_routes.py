@@ -17,6 +17,7 @@ predicate, toggle CLI — lives in test_private_mode.py).
 
 from __future__ import annotations
 
+import importlib
 import os
 
 import psycopg
@@ -45,6 +46,18 @@ _FULL_H = {"Authorization": f"Bearer {_FULL_TOKEN}"}
 _WORK_H = {"Authorization": f"Bearer {_WORK_TOKEN}"}
 _SID = "s-private-route-test"
 _PUBLIC = "s-public-route-test"
+
+_SERVER_AUTH_KEYS = (
+    "SYNAPSE_MACHINE_TOKEN",
+    "GITHUB_CLIENT_ID",
+    "GITHUB_CLIENT_SECRET",
+    "ALLOWED_GITHUB_USERS",
+    "SYNAPSE_OAUTH_SIGNING_KEY",
+    "OIDC_CONFIG_URL",
+    "OIDC_CLIENT_ID",
+    "OIDC_CLIENT_SECRET",
+    "ALLOWED_OIDC_USERS",
+)
 
 
 def _client(db_url):
@@ -174,6 +187,42 @@ def test_put_and_get_stay_on_the_client_gate(devices, conn, db_url, headers):
         r = client.get(f"/private-sessions/{_SID}", headers=headers)
         assert r.status_code == 200 and r.json()["private"] is True
     assert _rows(conn) == 1
+
+
+@pytest.fixture()
+def real_server(devices, db_url, monkeypatch):
+    """``mcp_server.server`` reloaded against the test database with ``_TOKEN`` as its root
+    token, so the private-session routes are the ones ``auxiliary_routes`` registers with
+    the server's own gates, then put back as it was."""
+    monkeypatch.setenv("SYNAPSE_ENV_FILE", "/nonexistent/synapse-test.env")
+    for key in _SERVER_AUTH_KEYS:
+        monkeypatch.setenv(key, "")
+    monkeypatch.setenv("SYNAPSE_MACHINE_TOKEN", _TOKEN)
+    monkeypatch.setenv("SYNAPSE_DB_URL", db_url)
+    import mcp_server.server as s
+
+    yield importlib.reload(s)
+    monkeypatch.undo()
+    importlib.reload(s)
+
+
+def test_the_real_server_puts_the_delete_behind_the_full_trust_gate(real_server, conn):
+    """The unit-level gates above are the test's own. Here the routes come from the server's
+    registration, so a restricted device, which clears the ordinary device gate (its PUT
+    lands), still has to be refused the DELETE: the server must hand the routes its
+    full-trust gate, not the ordinary one."""
+    with TestClient(real_server.mcp.http_app()) as client:
+        r = client.put(f"/private-sessions/{_SID}", headers=_WORK_H)
+        assert r.status_code == 200 and r.json()["private"] is True
+
+        r = client.delete(f"/private-sessions/{_SID}", headers=_WORK_H)
+        assert r.status_code == 403
+        assert r.json()["detail"] == "un-privating a session needs a full-trust device"
+        assert _rows(conn) == 1
+
+        r = client.delete(f"/private-sessions/{_SID}", headers=_FULL_H)
+        assert r.status_code == 200 and r.json()["deleted"] == 1
+    assert _rows(conn) == 0
 
 
 def test_db_predicate_sees_the_flag(clean, db_url):
