@@ -293,6 +293,22 @@ def test_turn_key_is_the_last_id_else_a_stable_hash():
     )
 
 
+def test_a_synthetic_row_after_a_finished_turn_neither_reopens_it_nor_changes_its_key():
+    """Hermes appends a task-list snapshot (a synthetic user row) after compression; it
+    lands on the end of the turn before it."""
+    finished = [
+        {"role": "user", "content": "q", "id": "q"},
+        {"role": "assistant", "content": "r", "id": "r"},
+    ]
+    snapshot = {"role": "user", "content": "[Your active task list", "synthetic": True}
+    later = [*finished, {**snapshot, "id": "s"}]
+    assert hm.complete(later)
+    assert hm.turn_key(later) == hm.turn_key(finished) == "r"
+    bare = [{k: v for k, v in r.items() if k != "id"} for r in finished]
+    assert hm.turn_key([*bare, snapshot]) == hm.turn_key(bare)
+    assert not hm.complete([{"role": "user", "content": "q"}, snapshot])
+
+
 def _numbered(n: int) -> list[list[dict]]:
     return [
         [

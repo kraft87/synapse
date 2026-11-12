@@ -28,10 +28,12 @@ actually sent, with the memory context it injected, our own nudge included), not
   server renders less of either. User and assistant text are sent whole.
 
 A turn starts at a real user row (not synthetic, not empty) and runs to the next one.
-It is complete when its last record is an assistant row with text and no tool calls:
-an assistant row that calls tools is followed by their results, so a turn ending in one
-is still running (Hermes's list is live and may be read mid-turn). Only complete turns
-are uploaded.
+It is complete when its last record that is not synthetic is an assistant row with text
+and no tool calls: an assistant row that calls tools is followed by their results, so a
+turn ending in one is still running (Hermes's list is live and may be read mid-turn).
+Only complete turns are uploaded. Synthetic rows do not count towards a turn's key
+either: Hermes adds them after a finished turn (a task-list snapshot after compression),
+and that must neither reopen the turn nor make it look new.
 """
 
 from __future__ import annotations
@@ -190,21 +192,28 @@ def turns(records: Sequence[Record]) -> list[Turn]:
     return out
 
 
+def _real(turn: Sequence[Record]) -> list[Record]:
+    return [record for record in turn if not record.get("synthetic")]
+
+
 def complete(turn: Sequence[Record]) -> bool:
-    """Whether ``turn`` has finished: it ends in an assistant row with text and no tool
-    calls."""
-    if not turn:
+    """Whether ``turn`` has finished: its last record that is not synthetic is an
+    assistant row with text and no tool calls."""
+    real = _real(turn)
+    if not real:
         return False
-    last = turn[-1]
+    last = real[-1]
     return last["role"] == "assistant" and bool(last["content"]) and not last.get("tool_calls")
 
 
 def turn_key(turn: Sequence[Record]) -> str:
-    """A stable key for ``turn``: its last record's ``id``, else a hash of its records."""
-    last_id = turn[-1].get("id") if turn else None
+    """A stable key for ``turn``: the ``id`` of its last record that is not synthetic,
+    else a hash of those records."""
+    real = _real(turn)
+    last_id = real[-1].get("id") if real else None
     if isinstance(last_id, str) and last_id:
         return last_id
-    blob = json.dumps(list(turn), ensure_ascii=False, sort_keys=True, default=str)
+    blob = json.dumps(real, ensure_ascii=False, sort_keys=True, default=str)
     return "sha256:" + hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
