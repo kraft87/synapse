@@ -16,7 +16,7 @@
 --                                   'error:<model id>' marks a 'personal' fallback written
 --                                   for a fact the labeller could not get a verdict on.
 --   kg_entities.is_self             the install owner's own entity: never a hop seed.
---                                   At most one per (owner_id, group_id). Set only by
+--                                   At most one per owner (069). Set only by
 --                                   `synapse-admin owner set <uuid>`, never by name.
 --
 -- Legacy clause. synapse_meta 'fact_audience_legacy_max_id' records the highest
@@ -64,9 +64,9 @@ INSERT INTO synapse_meta (key, value)
 SELECT 'fact_audience_legacy_max_id', COALESCE(max(id), 0)::text FROM kg_relationships
 ON CONFLICT (key) DO NOTHING;
 
--- Facts still written to the personal pile (until writes go one-group) are personal
--- on insert, like the seeded rows below: the labeller never sees them, and a restricted
--- caller that names group 'personal' is served nothing from that pile.
+-- While two piles existed, facts written to the personal pile were personal on insert,
+-- like the seeded rows below: the labeller never saw them. 067 merged the piles and drops
+-- the trigger and this function.
 CREATE OR REPLACE FUNCTION kg_relationships_personal_audience_trg()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -107,8 +107,8 @@ END
 $$;
 
 ALTER TABLE kg_entities ADD COLUMN IF NOT EXISTS is_self BOOLEAN NOT NULL DEFAULT false;
--- One flagged entity per (owner_id, group_id): an install whose facts still sit in two
--- piles flags the owner's node in each.
+-- One flagged entity per (owner_id, group_id) while two piles existed; 069 builds the
+-- index again on owner_id alone.
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM pg_attribute

@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS preferences (
 );
 
 -- Live-set lookup: the gate's dedup KNN and both serving paths only ever read live rows
--- for one owner/group, so the partial index over exactly that predicate keeps them fast.
+-- for one owner, so the partial index over exactly that predicate keeps them fast.
 -- Built this way only while group_id is there: 069 drops the column and builds the index
 -- again on owner_id alone.
 DO $$
