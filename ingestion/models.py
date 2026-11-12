@@ -144,7 +144,7 @@ class Episode(BaseModel):
     session_id: str
     sequence: int
     project: str | None = None
-    platform: str | None = None  # claude_code | cursor | claude_ai
+    platform: str | None = None  # open client label: claude_code, codex, cursor, hermes, ...
     model: str | None = None
     human_turn: str | None = None
     assistant_turn: str | None = None

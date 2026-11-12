@@ -242,6 +242,55 @@ device's allowlist matches labels case-insensitively (`resolve_caller` widens it
 stored casing of its entries). `scripts/relabel_projects.py` maps labels stored before this
 onto canonical names (`--dry-run` first; the alias file stays outside the repository).
 
+#### The `messages` format
+
+The body's `format` picks the parser: `claude_code` (the default, `JSONLParser`), `codex`
+(`CodexRolloutParser`; `session_id` stands in for the rollout's `session_meta` line, which
+a tail usually lacks) or `messages` (`MessagesParser`, `ingestion/messages_client.py`).
+Anything else is a 400. `messages` is for a client that keeps its conversation as
+OpenAI-style chat messages instead of writing a transcript file (the Hermes agent is the
+first); everything after the parser is the same for all three.
+
+```
+{"format": "messages", "client": "hermes", "session_id": "...",
+ "project": "<label>", "cwd": "/abs/path", "model": "...", "source": "...",
+ "records": [<message>, ...]}
+```
+
+- `client` (required) becomes `episodes.platform` and the span-id prefix. It must match
+  `^[a-z][a-z0-9_]{0,31}$` and must not be reserved: `claude_code`, `codex`, `cursor`,
+  `chatgpt` and `claude_ai` are the platforms the other parsers write, which other lanes
+  select on (the skills lane mines `platform = 'claude_code'`), and `jsonl` and `openai`
+  are the span-id prefixes of the Claude Code and ChatGPT parsers.
+- `session_id` (required) is stored as sent. Session ids from every client share one
+  namespace, so it should be globally unique.
+- `project` is cleaned as for any other format; without one, the last component of `cwd`
+  labels the turns. `cwd` is kept in `metadata.cwd`, where the scratch-folder filter and
+  the cross-session replay guard read it. `model` is the default for turns whose messages
+  name none.
+
+A missing or malformed `client`, a reserved one, or a missing `session_id` is a 400.
+
+Each message is a dict with `role` (`user`, `assistant` or `tool`; any other role is
+skipped) and `content` (a string, or a list of parts of which only `text`, `input_text`
+and `output_text` parts are read). Optional: `tool_calls` on assistant rows (OpenAI's
+`{"function": {"name", "arguments"}}` or a flat `{"name", "arguments"}`, arguments a
+string or an object), `name` or `tool_name` on tool rows, `id`, `ts` (epoch seconds or
+ISO-8601), `model` (overrides the batch default for its turn), and `synthetic: true` for a
+row the harness injected in the user's place, which is skipped. Every
+`<memory-context>...</memory-context>` block is removed from user text first, and a user
+row left empty is dropped: that is recalled memory the client put into the prompt, not
+something the user said. Turns are grouped at each user row and rendered with the Codex
+parser's labels and truncation.
+
+**Span id.** `<client>:<id>` of the last message in the turn that carries an `id`. A turn
+with no ids gets `<client>:<session_id>:<h>`, where `h` is the first 24 hex characters of
+the sha256 of the turn's own rendered lines, the `[context]` line excluded, so the hash
+does not depend on whether the previous turn was in the batch. Ids are the reliable key: a
+hashed turn converges only when every batch starts at a user row (a batch that begins
+mid-turn renders a fragment, which hashes as a new turn), and two identical turns in one
+session hash the same, so the second is skipped.
+
 ### 4.2 The Stop hook
 
 `scripts/synapse_ingest_hook.py` fires on every turn. It ships a **bounded tail** (default `SYNAPSE_INGEST_TAIL=400` raw records), trimmed to start at a real turn boundary; if the window holds no boundary (one mega-turn) it falls back to the full file. It POSTs detached (`start_new_session=True`) and always `sys.exit(0)` — **it never blocks or fails a turn**. A disk-sweep backstop re-ingests anything a failed POST drops. Shipping a tail (not the full transcript) plus enqueue-gating on new `(session, span_id)` fixed an earlier O(turns²) re-extraction loop (#61, #105, #106).
