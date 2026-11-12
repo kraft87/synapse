@@ -164,7 +164,9 @@ def test_real_last_entry_runs_to_the_end_of_the_file():
     assert notes == _REAL[_REAL.index(_H_0200) :].rstrip() + "\n"
 
 
-@pytest.mark.parametrize("version", ["0.9.1", "0.24.5", "0.2.4", "1.0.0"])
+# Near misses of real entries, all below the current version. Versions only go up, so
+# none of these can gain an entry later (a pin on the next version would).
+@pytest.mark.parametrize("version", ["0.9.1", "0.2.4", "0.2.44", "0.4.4"])
 def test_real_version_with_no_entry(version):
     assert rn.notes_for(_REAL, version) is None
 
@@ -313,14 +315,34 @@ def test_client_file_rule(path, mode, client):
     assert rn.is_client_file(path, mode) is client
 
 
-@needs_git
-def test_the_client_set_is_what_install_bundles():
-    """Over every tracked regular file in the real client trees, the release rule and
-    /install's bundle rule agree, and the skipped directories are the same list."""
+def _is_checkout() -> bool:
+    """Whether this tree is its own git checkout. A copied tree or a source tarball is
+    not, and has no list of tracked files to walk."""
+    if shutil.which("git") is None:
+        return False
+    top = subprocess.run(
+        ["git", "-C", str(_REPO), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return top.returncode == 0 and Path(top.stdout.strip()).resolve() == _REPO
+
+
+def test_the_client_trees_and_skipped_directories_are_the_installers():
     from mcp_server import install_routes
 
     assert rn.SKIP_PARTS == install_routes._SKIP_PARTS
     assert rn.CLIENT_TREES == install_routes._TREES
+
+
+def test_the_client_set_is_what_install_bundles():
+    """Over every tracked regular file in the real client trees, the release rule and
+    /install's bundle rule agree."""
+    if not _is_checkout():
+        pytest.skip("needs this repository's own git checkout to list its tracked files")
+    from mcp_server import install_routes
+
     listed = subprocess.run(
         ["git", "-C", str(_REPO), "ls-files", "-s", "-z", "--", *rn.CLIENT_TREES],
         capture_output=True,
