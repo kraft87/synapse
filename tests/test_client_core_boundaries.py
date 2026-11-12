@@ -3,7 +3,9 @@
 plugin/synapse_client/ is shipped to every client machine and imported by harnesses that
 bring their own interpreter (Python 3.11 and up) and their own import path:
 
-- standard library only, so it runs wherever the harness runs;
+- standard library only, so it runs wherever the harness runs; the one exception is a
+  harness adapter's module that subclasses its host's base class (``_HOST_IMPORTS``);
+- the core never imports a harness adapter, and an adapter imports only the core;
 - relative imports inside the package, never ``import synapse_client``, so a host that
   vendors it under another name still loads it;
 - no work at import time and no module-level mutable state, so a long-lived host that
@@ -26,6 +28,12 @@ _ROOT = Path(__file__).resolve().parents[1]
 _PACKAGE = _ROOT / "plugin" / "synapse_client"
 _MODULES = sorted(_PACKAGE.rglob("*.py"))
 _MAX_LINES = 600
+_HARNESSES = _PACKAGE / "harnesses"
+# The host modules an adapter module may import, by module: Hermes loads its provider
+# as a subclass of its own base class, so that one module needs it.
+_HOST_IMPORTS = {
+    _HARNESSES / "hermes" / "provider.py": frozenset({"agent.memory_provider"}),
+}
 
 # Calls allowed at import time (module and class level, decorators): each builds an
 # immutable value or declares a type, and touches nothing outside the process.
@@ -60,7 +68,7 @@ def _dotted(node: ast.expr) -> str:
     return ""
 
 
-def _import_violations(tree: ast.Module) -> list[str]:
+def _import_violations(tree: ast.Module, host: frozenset[str] = frozenset()) -> list[str]:
     out = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -73,9 +81,31 @@ def _import_violations(tree: ast.Module) -> list[str]:
             top = name.split(".", 1)[0]
             if top == "synapse_client":
                 out.append(f"line {node.lineno}: absolute import of {name}; use a relative one")
-            elif top not in sys.stdlib_module_names:
+            elif top not in sys.stdlib_module_names and name not in host:
                 out.append(f"line {node.lineno}: {name} is not in the standard library")
     return out
+
+
+def _relative_targets(path: Path, tree: ast.Module) -> list[tuple[int, str]]:
+    """``(line, package-relative path)`` of what each relative import in ``path`` names:
+    ``harnesses/hermes/messages`` for ``from .messages import x`` in harnesses/hermes/,
+    ``harnesses`` for ``from .. import harnesses`` in a core module."""
+    out = []
+    here = path.parent.relative_to(_PACKAGE).parts
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.ImportFrom) and node.level):
+            continue
+        base = here[: len(here) - (node.level - 1)] if node.level > 1 else here
+        module = tuple((node.module or "").split(".")) if node.module else ()
+        if node.module:
+            out.append((node.lineno, "/".join(base + module)))
+        else:
+            out += [(node.lineno, "/".join((*base, alias.name))) for alias in node.names]
+    return out
+
+
+def _in_harnesses(target: str) -> bool:
+    return target == "harnesses" or target.startswith("harnesses/")
 
 
 def _allowed_call(call: ast.Call) -> bool:
@@ -170,7 +200,51 @@ def test_the_package_is_where_the_rules_look():
 
 @pytest.mark.parametrize("path", _MODULES, ids=_ids)
 def test_standard_library_and_relative_imports_only(path: Path) -> None:
-    assert _import_violations(_parse(path)) == []
+    assert _import_violations(_parse(path), _HOST_IMPORTS.get(path, frozenset())) == []
+
+
+def test_the_host_exception_is_one_module():
+    """Hermes's base class is allowed in its provider module and nowhere else: every
+    other module is held to the plain rule above."""
+    assert list(_HOST_IMPORTS) == [_HARNESSES / "hermes" / "provider.py"]
+    assert all(path in _MODULES for path in _HOST_IMPORTS)
+    assert _import_violations(ast.parse("from agent.memory_provider import MemoryProvider\n"))
+
+
+@pytest.mark.parametrize("path", _MODULES, ids=_ids)
+def test_the_core_imports_no_harness_and_an_adapter_only_the_core(path: Path) -> None:
+    targets = _relative_targets(path, _parse(path))
+    rel = path.relative_to(_PACKAGE)
+    if rel.parts[0] != "harnesses":
+        bad = [t for t in targets if _in_harnesses(t[1])]
+        assert bad == [], f"{_ids(path)} imports a harness: {bad}"
+    elif len(rel.parts) > 2:
+        own = "/".join(rel.parts[:2])
+        bad = [
+            t
+            for t in targets
+            if _in_harnesses(t[1]) and not (t[1] == own or t[1].startswith(own + "/"))
+        ]
+        assert bad == [], f"{_ids(path)} imports another harness: {bad}"
+
+
+def test_the_harness_rule_reads_relative_imports():
+    core = _PACKAGE / "context.py"
+    hermes = _HARNESSES / "hermes" / "provider.py"
+    assert _relative_targets(core, ast.parse("from .harnesses import registry\n")) == [
+        (1, "harnesses")
+    ]
+    assert _relative_targets(core, ast.parse("from . import harnesses, api\n")) == [
+        (1, "harnesses"),
+        (1, "api"),
+    ]
+    assert _relative_targets(hermes, ast.parse("from ...api import Client\n")) == [(1, "api")]
+    assert _relative_targets(hermes, ast.parse("from . import messages\n")) == [
+        (1, "harnesses/hermes/messages")
+    ]
+    assert _relative_targets(hermes, ast.parse("from ..codex import x\n")) == [
+        (1, "harnesses/codex")
+    ]
 
 
 @pytest.mark.parametrize("path", _MODULES, ids=_ids)
