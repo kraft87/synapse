@@ -7,11 +7,15 @@ source guard that keeps the line prefixes out of the parser files.
 from __future__ import annotations
 
 import ast
+import hashlib
 from pathlib import Path
 
 import pytest
 
 from ingestion import render
+from ingestion.codex_client import CodexRolloutParser
+from ingestion.jsonl_client import JSONLParser
+from ingestion.messages_client import MessagesParser
 from ingestion.render import (
     assistant_line,
     context_line,
@@ -234,8 +238,6 @@ class TestJSONLGolden:
         ]
 
     def test_content(self):
-        from ingestion.jsonl_client import JSONLParser
-
         eps = JSONLParser().parse_records(self._records(), "golden")
         assert [e.sequence for e in eps] == [1, 2, 4, 6]
         assert [e.span_id for e in eps] == [
@@ -258,8 +260,6 @@ class TestJSONLGolden:
         assert eps[3].content == "[context] " + "A" * 300 + "\n\n[user] bye"
 
     def test_turns(self):
-        from ingestion.jsonl_client import JSONLParser
-
         eps = JSONLParser().parse_records(self._records(), "golden")
         assert [e.human_turn for e in eps] == ["list the files", None, "thanks", "bye"]
         assert [e.assistant_turn for e in eps] == [
@@ -320,8 +320,6 @@ class TestCodexGolden:
         ]
 
     def test_content(self):
-        from ingestion.codex_client import CodexRolloutParser
-
         eps = CodexRolloutParser().parse_records(self._records(), "golden")
         assert [e.sequence for e in eps] == [1, 2, 4]
         assert [e.span_id for e in eps] == ["codex:f1", "codex:a2", "codex:u3"]
@@ -339,8 +337,6 @@ class TestCodexGolden:
         assert eps[2].content == "[context] " + "A" * 300 + "\n\n[user] bye"
 
     def test_turns(self):
-        from ingestion.codex_client import CodexRolloutParser
-
         eps = CodexRolloutParser().parse_records(self._records(), "golden")
         assert [e.human_turn for e in eps] == ["run the\ntests", "q" * 3000, "bye"]
         assert [e.assistant_turn for e in eps] == [
@@ -390,14 +386,10 @@ class TestMessagesGolden:
 
     @staticmethod
     def _hash_span(own_lines: str) -> str:
-        import hashlib
-
         digest = hashlib.sha256(own_lines.encode()).hexdigest()[:24]
         return f"hermes:hermes-golden:{digest}"
 
     def test_content(self):
-        from ingestion.messages_client import MessagesParser
-
         eps = MessagesParser().parse_records(
             self._records(), "golden", session_id=self.SID, client="hermes"
         )
@@ -421,8 +413,6 @@ class TestMessagesGolden:
         assert eps[2].content == "[context] You're welcome.\n\n[user] bye"
 
     def test_turns(self):
-        from ingestion.messages_client import MessagesParser
-
         eps = MessagesParser().parse_records(
             self._records(), "golden", session_id=self.SID, client="hermes"
         )
