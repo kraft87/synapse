@@ -3,6 +3,56 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.4)
+
+**What changed**
+
+- **Self-exclusion stops at the last compaction.** `recall` and `recall_full_turns` leave
+  out the calling session's own turns because the model still holds them. That stops being
+  true when the harness compacts the conversation: the turns before that point are gone
+  from the context and were still hidden, so a long session could not look up its own
+  earlier work. Both tools now take `self_since`, the time of the session's last
+  compaction. With it the server hides only the session's turns from that time on, and a
+  fact counts as the session's own only when every source is one of those turns. Without
+  it nothing changes.
+- **The client reads the compaction time from the transcript.** The Claude Code and Codex
+  PreToolUse hooks add `self_since` next to `self_session`
+  (`plugin/synapse_client/compaction.py`: the last `compact_boundary` line of a Claude Code
+  transcript, at the first message the harness kept verbatim when the line names one; the
+  last `compacted` line of a Codex rollout). The Hermes provider takes the time when Hermes
+  commits an in-place compression. A transcript that cannot be read, or one with no
+  compaction, sends nothing, and the whole session stays hidden as before.
+- **Telemetry.** A call that carried a cut records `self_since` and `n_self_served` (how
+  many of the served episodes are the caller's own) in `recall_metrics.served_ids`.
+
+**On each machine**
+
+1. Nothing to migrate and no setting to change. The server part takes effect with the image.
+2. `synapse update` for plugin 0.24.4; until then a client sends no `self_since` and
+   behaves as before. A server older than this release rejects the argument, so the client
+   must not get ahead of its server; `synapse update` cannot, because the installer serves
+   the client that matches the server it runs on.
+
+**Proven**
+
+- With no cut the SQL and its parameters are what they were, and the standard recall bench
+  (489 questions) matches the previous release within run-to-run noise.
+- Replayed on 48 real recalls made after a compaction: the old path served none of the
+  session's own turns; with the cut, 28 calls served some. A pairwise judge preferred the
+  new results in 17 of the 36 calls whose results changed and the old in 12, with 7 ties;
+  the 17 are questions about the session's own earlier work.
+- Each rule has a test that fails when the rule is broken: the comparison at the cut; an
+  own turn with no usable time stays hidden; the session-scoped drill-down ignores the cut;
+  the hooks add it only to the two tools, only for their own session, and never overwrite
+  one; a marker that appears inside tool output is skipped.
+
+**Still open**
+
+- Hermes keeps a verbatim tail across an in-place compression. Those few turns are stamped
+  before the cut, so they can be served while still in the context.
+- Subagent calls are unchanged: they carry the parent's session id, and now its cut.
+- Not run on Windows: the scan maps the transcript read-only while the harness appends to it.
+
 ## 2026-11-12 — plugin: the Claude Code hooks run on the client core (plugin 0.24.5)
 
 **What changed**
@@ -224,6 +274,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   `systemMessage` warning, the 20 s kill, the skills sync's time on a large folder, and
   payloads Codex might send that the tests do not.
 - Claude Code's hooks are next onto the core.
+
 
 ## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
 
