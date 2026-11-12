@@ -164,7 +164,9 @@ def test_real_last_entry_runs_to_the_end_of_the_file():
     assert notes == _REAL[_REAL.index(_H_0200) :].rstrip() + "\n"
 
 
-@pytest.mark.parametrize("version", ["0.9.1", "0.24.5", "0.2.4", "1.0.0"])
+# Near misses of real entries, all below the current version. Versions only go up, so
+# none of these can gain an entry later (a pin on the next version would).
+@pytest.mark.parametrize("version", ["0.9.1", "0.2.4", "0.2.44", "0.4.4"])
 def test_real_version_with_no_entry(version):
     assert rn.notes_for(_REAL, version) is None
 
