@@ -47,8 +47,11 @@ Uploads
 Hermes calls ``sync_turn`` on its background worker after each turn with the whole
 conversation. Every complete turn not sent yet goes up (messages.pending), with the
 turn before it as context; a resumed session looks back at most ten turns the first
-time. A batch that fails goes to the outbox under ``<hermes_home>/synapse/outbox`` and
-counts as handled; the next successful upload drains it. Turns are remembered by
+time. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
+its request and removed once delivered, so a batch in flight when the process exits
+waits there; one that fails stays and counts as handled. The next successful upload
+drains the outbox, which every session of the home shares; no drain takes a batch in
+flight until its request has had three times its timeout. Turns are remembered by
 ``messages.turn_key`` in memory only: the server dedups on span id, so a restart that
 re-sends a turn costs a request, not a duplicate. A private session (private.is_private)
 sends nothing and remembers nothing, as the Claude Code hook does.
@@ -387,14 +390,22 @@ class SynapseMemoryProvider(MemoryProvider):
         for records, new in hm.batches(selected):
             payload = self._payload(sid, records)
             if not failed:
+                # Queued before the request, so a process that exits mid-request leaves
+                # it in the outbox; removed once delivered.
+                ahead = self._ahead(outbox, payload, timeout)
                 try:
                     client.ingest(payload, timeout=timeout)
                     sent_any = True
+                    if outbox is not None and ahead is not None:
+                        outbox.remove(ahead)
                     continue
                 except Exception as err:
                     failed = True
                     reason = short_reason(err)
                     _say(f"synapse: upload failed ({reason}); queued for retry")
+                    if outbox is not None and ahead is not None:
+                        outbox.keep(ahead, reason)
+                        continue
             if not self._queue(outbox, payload, reason):
                 with self._lock:
                     self._sent -= {hm.turn_key(turn) for turn in new}
@@ -411,6 +422,18 @@ class SynapseMemoryProvider(MemoryProvider):
             "source": "hermes-sync",
             "records": records,
         }
+
+    @staticmethod
+    def _ahead(outbox: Outbox | None, payload: Mapping[str, Any], timeout: float) -> Path | None:
+        """``payload`` queued for this send, or None when it could not be (the batch is
+        then queued only if its send fails, as before). ``timeout`` bounds each socket
+        wait, not the request: no drain takes it for three times that."""
+        if outbox is None:
+            return None
+        try:
+            return outbox.put(payload, sending=3 * timeout)
+        except (OSError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _queue(outbox: Outbox | None, payload: Mapping[str, Any], reason: str) -> bool:

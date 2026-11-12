@@ -15,6 +15,13 @@ locks and no fcntl, so it works the same on Windows.
 missing or unreadable directory, and ``drain`` never raises over a failed send: it stops
 there.
 
+A caller may also queue a payload for its own send (``put(..., sending=seconds)``), so
+that a process that exits mid-request leaves it queued. It is written as
+``<name>.<deadline_ns>.sending``, which no drain takes before that deadline: its caller
+then ``remove``s it once delivered, or ``keep``s it as waiting when the send failed.
+Past the deadline its sender died or hung, and a drain puts it back as waiting; one
+still sending then sends it once more, which the server's dedup absorbs.
+
 Payloads dropped for the cap or as refused by the server are counted in ``.dropped``
 beside the queue (dot-prefixed, so never taken for a payload) and named in the
 session-start warning. The count belongs to the current backlog: it is cleared, with the
@@ -47,6 +54,7 @@ WARN_AFTER_HOURS = 24.0  # ...or an oldest payload this old
 _DROP_4XX = frozenset({400, 413, 422})
 _SUFFIX = ".json"
 _CLAIM = ".claim"
+_SENDING = ".sending"
 _LAST_ERROR = ".last_error"
 _DROPPED = ".dropped"
 
@@ -134,8 +142,9 @@ class Outbox:
         return [n for n in self._names() if n.endswith(_SUFFIX)]
 
     def pending(self) -> int:
-        """Payloads not yet delivered: waiting, plus those a drain holds right now."""
-        return sum(1 for n in self._names() if n.endswith((_SUFFIX, _CLAIM)))
+        """Payloads not yet delivered: waiting, plus those a drain or their own sender
+        holds right now."""
+        return sum(1 for n in self._names() if n.endswith((_SUFFIX, _CLAIM, _SENDING)))
 
     def oldest_age(self, now: float | None = None) -> float | None:
         """Seconds since the oldest undelivered payload was queued; None when empty."""
@@ -181,7 +190,7 @@ class Outbox:
             if os.name != "nt":
                 os.chmod(self.directory, 0o700)
 
-    def _write(self, path: Path, data: bytes) -> None:
+    def _write(self, path: Path, data: bytes, *, sync: bool = True) -> None:
         """``data`` to ``path`` atomically: a dot-prefixed temp file, then a rename."""
         tmp = path.parent / f".{path.name}.{secrets.token_hex(4)}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
@@ -189,7 +198,8 @@ class Outbox:
             with os.fdopen(fd, "wb") as f:
                 f.write(data)
                 f.flush()
-                os.fsync(f.fileno())
+                if sync:
+                    os.fsync(f.fileno())
             os.replace(tmp, path)
         except BaseException:
             try:
@@ -198,15 +208,23 @@ class Outbox:
                 pass
             raise
 
-    def put(self, payload: Mapping[str, Any], reason: str = "") -> Path:
+    def put(self, payload: Mapping[str, Any], reason: str = "", *, sending: float = 0) -> Path:
         """Queue ``payload`` (a JSON object) and return its file. ``reason`` is why it is
         being queued (``short_reason`` of the failed send), kept for ``failure_warning``;
         it must not carry token material. Past the cap, the oldest waiting payloads are
-        dropped. RAISES OSError when the payload could not be written, TypeError or
-        ValueError when it is not JSON-serialisable."""
+        dropped. ``sending`` (seconds) queues it for the caller's own send instead: no
+        drain takes it, and the cap does not count it, for that long, and it is not
+        synced to disk (it must outlive the process, not the machine). RAISES OSError
+        when the payload could not be written, TypeError or ValueError when it is not
+        JSON-serialisable."""
         data = json.dumps(dict(payload), ensure_ascii=False).encode("utf-8")
         self._ensure_dir()
         name = f"{time.time_ns():020d}-{os.getpid()}-{secrets.token_hex(4)}{_SUFFIX}"
+        if sending > 0:
+            deadline = time.time_ns() + int(sending * 1e9)
+            path = self.directory / f"{name}.{deadline}{_SENDING}"
+            self._write(path, data, sync=False)
+            return path
         path = self.directory / name
         self._write(path, data)
         if reason:
@@ -214,9 +232,39 @@ class Outbox:
         self._enforce_cap()
         return path
 
+    def remove(self, path: Path) -> None:
+        """Delete a payload queued for its caller's send, once delivered. Never raises."""
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    def keep(self, path: Path, reason: str) -> None:
+        """A payload queued for its caller's send that failed now waits, as ``put`` would
+        have queued it: synced to disk, ``reason`` recorded, the cap applied. Never
+        raises; past its deadline a drain owns it, and the outcome of its send."""
+        try:
+            fd = os.open(path, os.O_RDWR | getattr(os, "O_BINARY", 0))
+        except OSError:
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+        try:
+            os.rename(path, path.with_name(path.name[: -len(_SENDING)].rpartition(".")[0]))
+        except OSError:
+            return
+        if reason:
+            self._set_last_error(reason)
+        self._enforce_cap()
+
     def _enforce_cap(self) -> None:
-        waiting = self._waiting()
-        excess = self.pending() - self.cap
+        names = self._names()
+        waiting = [n for n in names if n.endswith(_SUFFIX)]
+        excess = len(waiting) + sum(1 for n in names if n.endswith(_CLAIM)) - self.cap
         for name in waiting[: max(0, excess)]:
             try:
                 os.unlink(self.directory / name)
@@ -228,7 +276,8 @@ class Outbox:
     # -- draining ------------------------------------------------------------------
 
     def _recover(self, now_ns: int) -> None:
-        """Put back claims, and remove temp files, left by a process that died."""
+        """Put back claims, and payloads past their send's deadline, and remove temp
+        files, left by a process that died."""
         limit = int(self.stale_claim * 1e9)
         try:
             names = os.listdir(self.directory)
@@ -239,6 +288,13 @@ class Outbox:
             if name.endswith(_CLAIM) and not name.startswith("."):
                 base, _, claimed = name[: -len(_CLAIM)].rpartition(".")
                 if claimed.isdigit() and now_ns - int(claimed) > limit:
+                    try:
+                        os.rename(path, self.directory / base)
+                    except OSError:
+                        pass
+            elif name.endswith(_SENDING) and not name.startswith("."):
+                base, _, deadline = name[: -len(_SENDING)].rpartition(".")
+                if deadline.isdigit() and now_ns > int(deadline):
                     try:
                         os.rename(path, self.directory / base)
                     except OSError:
