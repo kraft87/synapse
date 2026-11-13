@@ -16,7 +16,10 @@ does not tell them from a new turn, so the harness says when each turn starts
 (``begin``): of the turns such a session holds when it is first found on the record,
 only a last one seen to begin there is uploaded. The others stay out, as turns and as
 context, by the row that opens each (messages.opening_key): however such a turn goes on
-or ends later, it is the same turn.
+or ends later, it is the same turn. An upload notes the turns it is shown, and one that
+ends no turn may be shown part of the conversation (a flush before a compression): for
+a harness that says when turns start, the session stays as it was first found until an
+upload that ends a turn has shown all of it.
 """
 
 from __future__ import annotations
@@ -71,7 +74,9 @@ class TurnUploader:
     one session its own. A look-back of 0 is for a conversation that was off the record
     until now: of what its records hold when it is first found on the record, only a
     last turn seen to begin there (``begin``) is uploaded, and the others do not go as
-    the context of a later turn either. No look-back is for a conversation new here,
+    the context of a later turn either. With ``begins`` that look-back stays until an
+    upload that ends a turn (``finished``), which holds the whole conversation: one
+    before it notes the turns it is shown. No look-back is for a conversation new here,
     or one whose turns from before may all go up. With ``begins`` (the harness calls
     ``begin`` at every turn start), one started with no look-back and no session it
     goes on from is checked: when its first turn start or its first upload shows it
@@ -125,9 +130,13 @@ class TurnUploader:
         turn-start hook: of the turns a session holds when it is first found on the
         record (it was off it, or they are copies), only one seen here to begin on the
         record is uploaded. One begun while the session is private is counted until the
-        upload that ends it (``finished``) has been seen, so an upload that runs late is
-        not taken for the end of a later turn. One begun while the server has not said
-        yet counts as begun on the record until it says "private" (``upload``).
+        upload that ends it (``finished``) has been seen, and the turn before is counted
+        with it when its end was not seen yet. Which turn an upload ends is not known
+        here, so the count errs to private: the late upload of a turn begun off the
+        record is not taken for the end of a later turn, and the late upload of the turn
+        before is not taken for the end of the one begun off the record (neither goes
+        up then). One begun while the server has not said yet counts as begun on the
+        record until it says "private" (``upload``).
 
         ``earlier`` says the conversation held a turn before this one. When the first
         turn start of a session said to be new (``start``) says so, those turns are
@@ -142,10 +151,13 @@ class TurnUploader:
             state = self._sessions.get(session_id)
             if state is None:
                 state = self._sessions[session_id] = _Session(self._lookback, self._begins)
+            unended = state.began  # the turn before: its end has not been seen
             for other in self._sessions.values():
                 other.began = False  # one turn runs at a time, and it is this one
             state.began = not private
-            state.unseen += private
+            # The upload that ends the turn before may still come, after this start: it
+            # is counted too, or it would pass for the end of this turn.
+            state.unseen += private + (private and unended)
             if state.new and not state.begun and earlier:
                 state.close()
             state.begun += 1
@@ -183,10 +195,12 @@ class TurnUploader:
         last turn is uploaded when ``finished`` says a turn has ended and it is
         complete; without ``finished`` it is left for the next upload to settle, as is
         any last turn still running then, since it may be about to begin. A turn noted
-        as off the record before stays there.
-        The same noting is done when the turn that has just ended began off the record,
-        and at every upload refused as private. Nothing else is remembered of a private
-        session.
+        as off the record before stays there. Without ``finished`` the records may be
+        part of the conversation (a flush before a compression): for a harness that
+        says when turns start, the noting is done again at each upload until one that
+        ends a turn. It is done as well when the turn that has just ended began off the
+        record, and at every upload refused as private. Nothing else is remembered of a
+        private session.
 
         A session said to be new (``start``) uploads nothing at a flush before its
         first turn start, and is taken to hold turns from before when its first upload
@@ -240,7 +254,10 @@ class TurnUploader:
                     state.close()
                 state.new = False
             if state.lookback == 0 or (began_off and state.was_private):
-                rest, state.lookback = all_turns, None
+                # A flush may hold part of the conversation only (a compression hands
+                # over the rows it is about to summarise): what it shows is noted, and
+                # the look-back stays until a turn ends, which shows the whole of it.
+                rest, state.lookback = all_turns, None if finished or not self._begins else 0
                 last = rest[-1] if rest else None
                 if last and not messages.joined(last):
                     if finished:

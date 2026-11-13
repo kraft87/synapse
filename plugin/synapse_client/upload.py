@@ -66,7 +66,7 @@ class Uploader:
         self._unmarked: set[str] = set()
         self._owed: set[str] = set()
         self._asking: dict[str, tuple[str, ...]] = {}
-        self._settled: dict[str, Callable[[], None]] = {}
+        self._settled: dict[str, Callable[[bool], None]] = {}
         self._made: set[str] = set()
         self._holding = threading.Lock()  # guards the five, which two threads change
 
@@ -130,7 +130,7 @@ class Uploader:
         session_id: str,
         *,
         timeout: float | None = 5,
-        settled: Callable[[], None] | None = None,
+        settled: Callable[[bool], None] | None = None,
     ) -> bool:
         """Keep a conversation off the record when it goes on under a new session id (a
         compression that starts a new session, a branch): private mode is kept per id,
@@ -157,9 +157,11 @@ class Uploader:
         since (``synapse private off --forget``) stays there.
 
         ``settled`` is called once the question is closed for ``session_id``: the server
-        said no earlier id is private, or it has the session's own row. It is the
-        caller's note that the session need not be asked about again, and is not called
-        when there was nothing to ask. Never raises."""
+        said no earlier id is private (it is called with False), or the session was
+        made private here and the server has its own row (True). It is the caller's
+        note that the session need not be asked about again, and of how the question
+        ended: a session made private this way holds turns spoken off the record, also
+        once it is back on it. Not called when there was nothing to ask. Never raises."""
         ids = tuple(dict.fromkeys(sid for sid in earlier if sid))
         failed = ""
         lines: list[str] = []
@@ -237,9 +239,10 @@ class Uploader:
         """Nothing is left open for ``session_id``: tell whoever asked to know."""
         with self._holding:
             settled = self._settled.pop(session_id, None)
+            made = session_id in self._made
         if settled is not None:
             try:
-                settled()
+                settled(made)
             except Exception:
                 pass
 

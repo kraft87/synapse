@@ -22,7 +22,8 @@ turn before, which then has a new key, as does the reply to a user row with no t
 The row that opens a turn stays its own however the turn goes on (``opening_key``), and
 ``joined`` says a turn holds more than its own exchange. For that an adapter keeps
 every user row, also one that opens no turn: left out, the reply to it would read as the
-reply of the turn before.
+reply of the turn before. And a row its harness folded two user messages into is
+followed by a synthetic row with no text: one row cannot show that it holds two.
 """
 
 from __future__ import annotations

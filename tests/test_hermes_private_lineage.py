@@ -7,7 +7,8 @@ or Hermes builds a new agent for it, as the TUI and Desktop do for every branch
 (tui_gateway/methods_session_branch.py ``_branch_live``: the child's row is written,
 then the agent is built) and the gateway daemon does after a restart. These are the
 tests of the second way: what the session store says a session holds turns of
-(lineage.continues), and what ``initialize`` does with it.
+(lineage.continues), what ``initialize`` does with it, and what is recorded of a session
+once that is settled (carried.py).
 
 The fixtures are the provider tests' own: the plugin as Hermes loads it, a fake server
 that keeps the rows of the private-session routes, a ``state.db`` with the columns the
@@ -186,6 +187,77 @@ def test_a_session_is_settled_once_it_is_recorded(tmp_path):
     # The names are hashes of session ids: the folders made for them are the owner's.
     for folder in (record.parent, record.parent.parent):
         assert folder.stat().st_mode & 0o777 == 0o700
+
+
+def test_the_record_says_whether_the_session_was_made_private(tmp_path):
+    """A session made private holds turns spoken off the record. Its record says so,
+    and goes on saying so whatever is recorded for it later."""
+    carried.settle(tmp_path, _CHILD)
+    assert carried.settled(tmp_path, _CHILD) and not carried.held(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD, True)
+    assert carried.held(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD)
+    carried.settle(tmp_path, _CHILD, False)
+    assert carried.held(tmp_path, _CHILD) and carried.settled(tmp_path, _CHILD)
+    carried.settle(tmp_path, _PARENT, True)  # with no record before it
+    assert carried.held(tmp_path, _PARENT) and not carried.held(tmp_path, _GRAND)
+    records = sorted((tmp_path / "synapse" / "settled").iterdir())
+    assert len(records) == 2  # nothing is left beside them
+    for record in records:
+        assert record.read_bytes() == b"held\n" and record.stat().st_mode & 0o777 == 0o600
+    assert not carried.held(None, _CHILD) and not carried.held(tmp_path, "")
+
+
+class _Carrier:
+    """An uploader's ``carry_private``, with a set answer."""
+
+    def __init__(self, made: bool) -> None:
+        self.made = made
+        self.calls: list[tuple[list[str], str, float | None]] = []
+        self.settled: Any = None
+
+    def carry_private(
+        self, earlier: list[str], session_id: str, *, timeout: float | None, settled: Any
+    ) -> bool:
+        self.calls.append((list(earlier), session_id, timeout))
+        self.settled = settled
+        return self.made
+
+
+@pytest.mark.parametrize(
+    ("made", "passed"),
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["on the record", "made private", "holds a held one's turns", "both"],
+)
+def test_a_carry_answers_for_a_private_session_and_for_one_that_holds_such_turns(
+    tmp_path, made, passed
+):
+    """A session holds turns spoken off the record when one it holds turns of is
+    private, or holds such turns itself though it is back on the record. Its record
+    says which way the question ended once it is closed, not before."""
+    if passed:
+        carried.settle(tmp_path, _GRAND, True)
+    uploader = _Carrier(made)
+    answer = carried.carry(uploader, tmp_path, [_PARENT, None, _GRAND], _CHILD, 5)
+    assert answer is (made or passed)
+    assert uploader.calls == [([_PARENT, _GRAND], _CHILD, 5)]
+    assert not carried.settled(tmp_path, _CHILD)
+    uploader.settled(made)
+    assert carried.settled(tmp_path, _CHILD)
+    assert carried.held(tmp_path, _CHILD) is (made or passed)
+
+
+def test_a_settled_session_is_not_carried_again_and_its_record_answers(tmp_path):
+    uploader = _Carrier(True)
+    carried.settle(tmp_path, _CHILD)
+    assert carried.carry(uploader, tmp_path, [_PARENT], _CHILD, None) is False
+    carried.settle(tmp_path, _CHILD, True)
+    assert carried.carry(uploader, tmp_path, [_PARENT], _CHILD, None) is True
+    # With no session to go by, or no id, there is nothing to ask.
+    carried.settle(tmp_path, _PARENT, True)
+    assert carried.carry(uploader, tmp_path, [None, ""], _GRAND, None) is False
+    assert carried.carry(uploader, tmp_path, [_PARENT], "", None) is False
+    assert uploader.calls == []
 
 
 def test_a_chain_is_asked_about_as_far_as_its_first_settled_session(tmp_path):
@@ -574,7 +646,7 @@ def test_an_id_is_read_once_also_when_its_answer_could_not_be_recorded(
     _child(home, None)
     provider = _open(plugin, home, _PARENT, resumed=True)
     module = sys.modules[type(provider).__module__]  # the provider's own copy of the core
-    monkeypatch.setattr(module.carried, "settle", lambda home, session_id: None)
+    monkeypatch.setattr(module.carried, "settle", lambda home, session_id, made=False: None)
     _say(provider, _conversation(2), _CHILD)
     _say(provider, _conversation(3), _CHILD)
     assert server.asked() == [_PARENT] and len(server.posts()) == 2

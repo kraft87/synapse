@@ -41,13 +41,13 @@ daemon, those it was started with.
 
 Uploads
 -------
-Hermes calls ``sync_turn`` on its background worker after each turn with the whole
-conversation. messages.py turns it into records and the core uploads them
-(turn_upload.TurnUploader): every complete turn not sent yet goes up, with the turn
-before it as context; a resumed session, and one first met at an upload, looks back at
-most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name no
-session: they upload under the id Hermes named last (live.py) when that is the bound one
-or goes on from it, and nothing otherwise, since nothing says then whose turns they
+Hermes calls ``sync_turn`` on its background worker after each turn that ended with a
+reply, with the whole conversation. messages.py turns it into records and the core
+uploads them (turn_upload.TurnUploader): every complete turn not sent yet goes up, with
+the turn before it as context; a resumed session, and one first met at an upload, looks
+back at most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name
+no session: they upload under the id Hermes named last (live.py) when that is the bound
+one or goes on from it, and nothing otherwise, since nothing says then whose turns they
 hold. Each batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before
 its request and removed once delivered; one that fails stays and counts as handled. The
 next successful upload drains the outbox, which every session of the home shares; no
@@ -66,9 +66,9 @@ builds a new agent for it (``initialize``, from the session store) and before th
 upload under any other id (``_follow``, from the store too). ``/new`` and ``/resume``
 open another conversation: nothing is carried to it. Put back on the record (``synapse
 private off --forget``), such a session keeps the turns from before out, under any id it
-goes on with, and uploads the ones this agent sees begin there (``on_turn_start``); so
-does one Hermes said was new, once its first turn start or first upload shows that it
-holds turns all the same (an ACP fork copies them in after the agent is built).
+goes on with and in agents built for it later (carried.py's record), and uploads those
+an agent sees begin there (``on_turn_start``); so does one Hermes said was new, once its
+first turn start or upload shows it holds turns all the same (an ACP fork's copies).
 
 Compression
 -----------

@@ -12,7 +12,11 @@ Hermes's own sequences of hooks:
   * an ACP fork: its agent is built before its row and its copied history are written,
     and the row names no origin (acp_adapter/session.py ``fork_session``);
   * the first turns after ``off --forget``: a flush as the turn starts or in the middle
-    of it, an upload that runs late, a turn Hermes began itself, a message with no text.
+    of it, an upload that runs late, a turn Hermes began itself, a message with no text;
+  * a compression of the head alone (``/compress here N``), whose flush hooks are handed
+    the rows to be summarised and not the turns kept;
+  * a message Hermes folded into one that got no reply
+    (agent/agent_runtime_helpers.py ``_merge_consecutive_users``).
 
 The fixtures and helpers are those of tests/test_hermes_private_moves.py.
 """
@@ -132,6 +136,28 @@ def test_an_acp_fork_uploads_none_of_the_turns_copied_into_it(plugin, server, tm
     assert _posted(server)[2:] == [(_LATER, ["question 6"])]
     assert [one.name for one in (tmp_path / "private").iterdir()] == [_ACP]
     assert server.puts() == []
+
+
+def test_a_fork_keeps_its_copies_out_under_an_id_only_the_switch_says_it_goes_on_to(
+    plugin, server, tmp_path
+):
+    """A compression moves the fork to a new id, and the new id's row does not say yet
+    what it goes on from: the switch does. Nothing on disk says the fork holds copies
+    either (it was never made private), so the agent takes that along to the new id."""
+    home = tmp_path / "hermes-a"
+    _store(home, _ACP, source="acp", receipt=False, chat_id="")
+    _marker(tmp_path, _ACP)
+    server.private_rows.add(_ACP)
+    fork = _open(plugin, home, _FORK, platform="acp", message_count=0)
+    _store(home, _FORK, source="acp", receipt=False, chat_id="")
+    fork.on_turn_start(4, "question 4", previous_message="question 3")
+    fork.prefetch("question 4", session_id=_FORK)
+    fork.sync_turn("question 4", "a", session_id=_FORK, messages=_conversation(4))
+    assert _posted(server) == [(_FORK, ["question 4"])]
+    _store(home, _LATER, source="acp", receipt=False, chat_id="")  # no parent named
+    fork.on_session_switch(_LATER, parent_session_id=_FORK, reason="compression")
+    _say(fork, _conversation(5), _LATER)
+    assert _posted(server)[1:] == [(_LATER, ["question 5"])]
 
 
 def test_an_acp_forks_first_message_with_no_text_takes_no_copied_turn_along(
@@ -322,3 +348,155 @@ def test_a_message_with_no_text_takes_no_copied_turn_along(plugin, server, tmp_p
     provider.on_turn_start(5, "question 4", previous_message="")
     provider.sync_turn("question 4", "a", session_id=_CHILD, messages=said + _conversation(4)[-2:])
     assert _posted(server) == [(_CHILD, ["question 4"])]
+
+
+# ---------------------------------------------------------------------------
+# A flush that shows part of the conversation
+# ---------------------------------------------------------------------------
+
+
+#: The row a compression leaves where the turns it summarised were.
+_SUMMARY = {
+    "role": "assistant",
+    "content": "[CONTEXT COMPACTION] Earlier turns were summarised.",
+    "_compressed_summary": True,
+    "message_uid": "sum1",
+}
+
+
+@pytest.mark.parametrize("where", ["in process", "gateway"])
+def test_a_compression_of_the_head_alone_lets_none_of_the_kept_turns_out(
+    plugin, server, tmp_path, where
+):
+    """``/compress here 2`` after ``off --forget``, before any turn has ended on the
+    record. Hermes hands the hooks the rows it is about to summarise and no others
+    (agent/conversation_compression_manual.py). In process both flush hooks get that
+    head, and the session keeps its id. The gateway gives ``on_pre_compress`` the head,
+    then flushes the agent's whole list as it lets the agent go: the only turn that
+    agent saw begin was interrupted, so no refused upload noted anything. The two
+    exchanges kept as they were are still the private parent's."""
+    home = tmp_path / "hermes-a"
+    provider = _carried(plugin, server, tmp_path)
+    whole = _conversation(3)
+    if where == "gateway":
+        provider.on_turn_start(4, "question 4", previous_message="question 3")  # interrupted
+    _forget(server, tmp_path, _CHILD)
+    provider.on_pre_compress(whole[:-4])
+    provider.on_session_end(whole[:-4] if where == "in process" else whole)
+    assert server.posts() == []
+    if where == "in process":
+        provider.on_session_switch(
+            _CHILD, parent_session_id=_CHILD, reset=False, reason="compression"
+        )
+    else:
+        provider = _open(plugin, home, resumed=True, message_count=6)  # the next agent
+    _say(provider, [whole[0], _SUMMARY, *whole[-4:], *_conversation(4)[-2:]], _CHILD)
+    assert _posted(server) == [(_CHILD, ["question 4"])]
+
+
+# ---------------------------------------------------------------------------
+# An upload that runs late, past a turn begun off the record
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("forgot", ["before the late upload", "after it"])
+def test_a_late_upload_is_not_the_end_of_a_turn_begun_off_the_record_since(
+    plugin, server, tmp_path, forgot
+):
+    """Back on the record, question 5 begins. Hermes has one background worker for the
+    memory hooks and nothing waits for it between turns (agent/memory_manager.py), so
+    the upload of question 5 may run after question 6 has begun: here the session was
+    marked by hand in between, and question 6 began off the record. ``off --forget``
+    while the model works on it. Two ends are then owed, and nothing tells which
+    upload is whose: neither turn goes up, whether the late upload was refused or
+    not. Taken for the end of question 6, it would let question 6 out at its own."""
+    provider = _carried(plugin, server, tmp_path)
+    _forget(server, tmp_path, _CHILD)
+    _say(provider, _conversation(4), _CHILD)
+    provider.on_turn_start(5, "question 5", previous_message="question 4")
+    _marker(tmp_path, _CHILD)  # `synapse private on`
+    provider.on_turn_start(6, "question 6", previous_message="question 5")
+    if forgot == "before the late upload":
+        _forget(server, tmp_path, _CHILD)
+    provider.sync_turn("question 5", "a", session_id=_CHILD, messages=_conversation(5))
+    if forgot == "after it":
+        _forget(server, tmp_path, _CHILD)
+    provider.sync_turn("question 6", "a", session_id=_CHILD, messages=_conversation(6))
+    assert _posted(server) == [(_CHILD, ["question 4"])]
+    _say(provider, _conversation(7), _CHILD)
+    assert _posted(server)[1:] == [(_CHILD, ["question 7"])]
+
+
+def test_a_turn_that_ended_before_one_begun_off_the_record_is_not_counted_with_it(
+    plugin, server, tmp_path
+):
+    """The same, in order: question 5 ends before the session is marked. One end is
+    owed, question 6's, and the turn after it goes up."""
+    provider = _carried(plugin, server, tmp_path)
+    _forget(server, tmp_path, _CHILD)
+    _say(provider, _conversation(4), _CHILD)
+    _say(provider, _conversation(5), _CHILD)
+    _marker(tmp_path, _CHILD)
+    provider.on_turn_start(6, "question 6", previous_message="question 5")
+    _forget(server, tmp_path, _CHILD)
+    provider.sync_turn("question 6", "a", session_id=_CHILD, messages=_conversation(6))
+    _say(provider, _conversation(7), _CHILD)
+    assert _posted(server) == [
+        (_CHILD, ["question 4"]),
+        (_CHILD, _questions(4, 5)),
+        (_CHILD, ["question 7"]),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# A message Hermes folded into the one before it
+# ---------------------------------------------------------------------------
+
+
+def _folded(n: int) -> list[dict[str, Any]]:
+    """Message ``n`` got no reply, and Hermes folded the next one into its row, in
+    place (agent/agent_runtime_helpers.py ``_merge_consecutive_users``): one user row
+    with both texts, which keeps the first one's id, and the reply."""
+    return [
+        {
+            "role": "user",
+            "content": f"question {n}\n\nquestion {n + 1}",
+            "message_uid": f"u{n}",
+            "_merged_turn_prefix": f"question {n}",
+            "_absorbed_message_uids": [f"u{n + 1}"],
+        },
+        {"role": "assistant", "content": f"answer {n + 1}", "message_uid": f"a{n + 1}"},
+    ]
+
+
+def test_a_message_folded_into_one_from_off_the_record_does_not_take_it_along(
+    plugin, server, tmp_path
+):
+    """The private parent's last message got no reply: its turn failed, or Hermes was
+    killed. The branch copied the row. After ``off --forget`` Hermes folds the first
+    message into it, and the turn begins on the record with one user row that holds
+    both texts. Nothing in the row says where one ends, so the turn stays out, whole;
+    the next one goes up without it."""
+    provider = _carried(plugin, server, tmp_path)
+    _forget(server, tmp_path, _CHILD)
+    said = [*_conversation(3), *_folded(4)]
+    provider.on_turn_start(5, "question 5", previous_message="question 4")
+    provider.sync_turn("question 5", "answer 5", session_id=_CHILD, messages=said)
+    assert server.posts() == []
+    _say(provider, [*said, *_conversation(6)[-2:]], _CHILD)
+    assert _posted(server) == [(_CHILD, ["question 6"])]
+
+
+def test_in_a_session_with_no_turn_from_before_a_folded_message_goes_up_as_it_is(
+    plugin, server, tmp_path
+):
+    """Both texts are the session's own, and the reply answers both: the row is sent
+    whole, with the row that marks it (harnesses/hermes/messages.py)."""
+    home = tmp_path / "hermes-a"
+    _store(home, _PARENT, source="tui", receipt=False, chat_id="")
+    provider = _open(plugin, home, _PARENT)
+    provider.on_turn_start(1, "question 1", previous_message="")  # cut short: no reply
+    provider.on_turn_start(2, "question 2", previous_message="question 1")
+    said = [_conversation(0)[0], *_folded(1)]
+    provider.sync_turn("question 2", "answer 2", session_id=_PARENT, messages=said)
+    assert _posted(server) == [(_PARENT, ["question 1\n\nquestion 2", ""])]

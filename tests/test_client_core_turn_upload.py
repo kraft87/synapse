@@ -9,6 +9,8 @@ it was moved to, a late upload for the one it left. Pinned here:
   * of the turns such a session holds when it is first found on the record, one goes
     up only when it was seen to begin there (``begin``): not one that began off it,
     holds more than its own exchange, or was there before any turn start was seen;
+  * an upload that ends no turn notes the turns it is shown and settles nothing more,
+    and one that runs late is not taken for the end of another turn;
   * a session said to be new is not believed when its turn starts show otherwise;
   * an upload acts on the server's answer only when it got the answer itself
     (``Uploader.settle``).
@@ -164,6 +166,13 @@ def test_only_the_first_upload_of_a_session_looks_back(tmp_path):
     said = [row for n in range(1, 5) for row in _turn(n)]  # turn 3's own upload never ran
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
     assert _sent(wire) == [("s-1", ["u1", "u2"]), ("s-1", ["u2", "u3", "u4"])]
+
+
+def test_a_look_back_counts_finished_turns_only(tmp_path):
+    turns, wire = _turns(tmp_path, lookback=2)
+    said = _turn(1) + _turn(2) + _turn(3) + _turn(4, done=False)
+    assert turns.upload(said, "s-1", timeout=5) is True
+    assert _records(wire) == [_turn(1) + _turn(2) + _turn(3)]  # 1 is the context of 2
 
 
 def test_a_session_that_was_off_the_record_is_never_looked_back_at(tmp_path):
@@ -608,6 +617,143 @@ def test_a_reply_the_user_did_not_ask_for_goes_up_with_a_turn_on_the_record(tmp_
     said = said + _goes_on(1, shown=True)
     assert turns.upload(said, "s-1", timeout=5, finished=True) is True
     assert _records(wire)[1] == said  # turn 2 as it is now, after turn 1 as its context
+
+
+# ---------------------------------------------------------------------------
+# A flush that shows part of the conversation, and uploads that run late
+# ---------------------------------------------------------------------------
+
+
+def _back(tmp_path):
+    """A session that was off the record, as a harness that says when turns start
+    (``begins``) starts it. Nothing marks it now: it is back on the record."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    turns.start("s-1", 0)
+    return turns, wire
+
+
+@pytest.mark.parametrize("shown", [0, 2, 4], ids=["no turn", "the first two", "all four"])
+def test_a_flush_notes_the_turns_it_is_shown_and_uses_up_no_look_back(tmp_path, shown):
+    """A compression hands a flush the rows it is about to summarise, which need not be
+    all of them (Hermes: `/compress here N`). The turns it was not shown were spoken off
+    the record as well: they stay out when the next turn ends, which shows them all."""
+    turns, wire = _back(tmp_path)
+    said = [row for n in range(1, 5) for row in _turn(n)]
+    assert turns.upload(said[: 2 * shown], "s-1", timeout=5) is False
+    turns.begin("s-1", earlier=True)
+    assert turns.upload(said + _turn(5), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(5)]
+
+
+def test_a_flush_that_shows_the_rest_sends_none_of_it(tmp_path):
+    """Two flushes and no turn in between (the Hermes gateway: one before the
+    compression, with the rows to be summarised, and one as the agent is released,
+    with all of them)."""
+    turns, wire = _back(tmp_path)
+    said = [row for n in range(1, 5) for row in _turn(n)]
+    assert turns.upload(said[:4], "s-1", timeout=5) is False
+    assert turns.upload(said, "s-1", timeout=5) is False and wire.tries == 0
+
+
+def test_an_upload_that_runs_late_is_not_the_end_of_a_turn_begun_off_the_record_since(tmp_path):
+    """The other way round from the test above. Turn 4 began on the record and its
+    upload runs late: after `private on`, the start of turn 5 and `off --forget`. The
+    upload that ends turn 4 is not taken for the end of turn 5, which would leave turn
+    5's own upload with nothing to say it began off the record. Which of the two an
+    upload ends is not known here, so neither goes up."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    turns.begin("s-1")  # turn 4, on the record
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 5, off it: turn 4's upload has not run yet
+    marker.unlink()
+    said = said + _turn(4)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    assert turns.upload(said + _turn(5), "s-1", timeout=5, finished=True) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(5) + _turn(6), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3), _turn(6)]
+
+
+def test_a_turn_begun_off_the_record_is_counted_once_when_the_turn_before_has_ended(tmp_path):
+    """The turn before it was seen to end, so one upload is still to come, not two:
+    the turn after it goes up."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 4, off the record
+    marker.unlink()
+    said = said + _turn(4)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    turns.begin("s-1")
+    assert turns.upload(said + _turn(5), "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3), _turn(5)]
+
+
+def test_a_turn_begun_on_the_record_is_not_counted_for_the_turn_before_it(tmp_path):
+    """No upload ended turn 4 (Hermes sends none for a turn cut short). Turn 5 begins on
+    the record as turn 4 did: nothing began off it, and both go up when turn 5 ends."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    turns.begin("s-1")  # turn 4, on the record: its end is not seen
+    turns.begin("s-1")  # turn 5, on the record too
+    said = said + _turn(4) + _turn(5)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    assert _records(wire) == [_turn(3), _turn(3) + _turn(4) + _turn(5)]
+
+
+def test_each_turn_begun_off_the_record_is_counted_until_its_own_end(tmp_path):
+    """Two turns begin off the record, and both uploads run late, after `off --forget`.
+    The first does not take the count of both."""
+    turns, wire = _back(tmp_path)
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 2
+    turns.begin("s-1")  # turn 3: turn 2's upload has not run yet
+    marker.unlink()
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    assert turns.upload(said + _turn(3), "s-1", timeout=5, finished=True) is False
+    assert wire.tries == 0
+
+
+def test_turns_begun_off_the_record_under_two_ids_left_are_all_counted(tmp_path):
+    """The new id goes on from both, and each had a turn whose end was not seen."""
+    turns, wire = _turns(tmp_path, begins=True, lookback=10)
+    for left in ("s-a", "s-b"):
+        turns.start(left, 0)
+        marker = _mark(tmp_path, left)
+        turns.begin(left)
+        marker.unlink()
+    turns.start("s-1", 0, continues=["s-a", "s-b"])
+    said = _turn(1) + _turn(2)
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    assert turns.upload(said + _turn(3), "s-1", timeout=5, finished=True) is False
+    assert wire.tries == 0
+
+
+def test_a_flush_is_not_the_end_of_a_turn_begun_off_the_record(tmp_path):
+    """Turn 4 ended on the record and its upload waits. A flush while turn 5, begun off
+    the record, runs sends it: only an upload that ends a turn takes one for begun off
+    the record. Sent, turn 4 stays on the record when that upload comes."""
+    turns, wire = _back(tmp_path)
+    said = _turn(1) + _turn(2) + _turn(3)
+    turns.begin("s-1")
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is True
+    turns.begin("s-1")  # turn 4, on the record
+    marker = _mark(tmp_path, "s-1")
+    turns.begin("s-1")  # turn 5, off it
+    marker.unlink()
+    said = said + _turn(4)
+    assert turns.upload(said + _turn(5, done=False), "s-1", timeout=5) is True
+    assert turns.upload(said, "s-1", timeout=5, finished=True) is False
+    assert turns.upload(said + _turn(5), "s-1", timeout=5, finished=True) is False
+    assert _records(wire) == [_turn(3), _turn(3) + _turn(4)]
 
 
 # ---------------------------------------------------------------------------

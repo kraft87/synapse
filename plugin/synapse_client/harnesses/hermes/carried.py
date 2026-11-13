@@ -6,17 +6,25 @@ TUI and Desktop for every branch, the gateway daemon after a restart. So the pro
 settles the question when it is bound to such a session (upload.Uploader.carry_private),
 and once only: a branch made before its parent went private stays on the record, and a
 session put back on the record (``synapse private off --forget``) is not taken off again
-because of the session it came from. This is where "once" is kept: one empty owner-only
-file per settled session under ``<hermes_home>/synapse/settled/``, named by the SHA-256
-of its id. A record that could not be written does not undo it within one agent: the
+because of the session it came from. This is where "once" is kept: one owner-only file
+per settled session under ``<hermes_home>/synapse/settled/``, named by the SHA-256 of
+its id. A record that could not be written does not undo it within one agent: the
 uploader makes a session private this way once too (``carry_private``).
+
+The record also says how the question ended. A session that was made private holds
+turns spoken off the record: the ones it took over, and its own until it is put back.
+Its file is not empty, and that outlives the marker and the server's row: an agent
+built for the session later, also after ``off --forget``, does not look back at them
+(``held``). A session that holds the turns of such a one holds those turns too, and its
+record says the same, whether or not it was made private.
 
 A settled session's own answer stands for the sessions above it: it took them into
 account when it was settled. So a session is asked about up its chain only as far as the
 first settled one (``to_ask``).
 
 Nothing here raises. A record that cannot be written or read leaves the session to be
-asked about again, which errs on the side of private.
+asked about again, which errs on the side of private. One that holds turns from off the
+record is written whole or not at all (a file beside it, moved into place).
 """
 
 from __future__ import annotations
@@ -61,9 +69,22 @@ def to_ask(home: Any, chain: Iterable[str]) -> list[str]:
     return ask
 
 
-def settle(home: Any, session_id: str) -> None:
-    """Record that ``session_id`` is settled. Without a home or an id, and when the
-    record cannot be written, nothing is kept."""
+def held(home: Any, session_id: str) -> bool:
+    """Whether ``session_id`` was settled as one made private because a session it
+    holds turns of was: it holds turns spoken off the record, whatever it is now.
+    False when that cannot be read, and without a home or an id."""
+    if not home or not session_id:
+        return False
+    try:
+        return os.lstat(_file(home, session_id)).st_size > 0
+    except (OSError, ValueError):
+        return False
+
+
+def settle(home: Any, session_id: str, made: bool = False) -> None:
+    """Record that ``session_id`` is settled, and with ``made`` that it was made
+    private (``held``); a record that says so keeps saying it. Without a home or an
+    id, and when the record cannot be written, nothing is kept."""
     if not home or not session_id:
         return
     try:
@@ -72,7 +93,17 @@ def settle(home: Any, session_id: str) -> None:
             folder = folder / part
             if not folder.is_dir():
                 folder.mkdir(mode=0o700, exist_ok=True)
-        os.close(os.open(_file(home, session_id), os.O_WRONLY | os.O_CREAT, 0o600))
+        path = _file(home, session_id)
+        if not made:
+            os.close(os.open(path, os.O_WRONLY | os.O_CREAT, 0o600))
+            return
+        beside = path.with_name(path.name + ".new")
+        fd = os.open(beside, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, b"held\n")
+        finally:
+            os.close(fd)
+        os.replace(beside, path)
     except (OSError, ValueError):
         return
 
@@ -80,13 +111,23 @@ def settle(home: Any, session_id: str) -> None:
 def carry(
     uploader: Uploader, home: Any, earlier: Iterable[Any], session_id: Any, timeout: float | None
 ) -> bool:
-    """Whether ``session_id`` is off the record because a session of ``earlier``, whose
-    turns it holds, is (Uploader.carry_private). With no marker to say so the server is
-    asked at the session's first upload, and the answer is False for now. Once per
-    session of ``home``: a settled one is left as it is. With ``timeout`` None no request
-    is made here, and telling the server is left to the caller or that upload."""
+    """Whether ``session_id`` holds turns spoken off the record because of a session of
+    ``earlier``, whose turns it holds: that one is private (Uploader.carry_private:
+    ``session_id`` is made private too), or it holds such turns itself, also when it is
+    back on the record (``held``: ``session_id`` is left on the record). With no marker
+    to say a session of ``earlier`` is private the server is asked at the session's
+    first upload, and that part of the answer is False for now. Once per session of
+    ``home``: a settled one is left as it is, and the answer is what its record says.
+    With ``timeout`` None no request is made here, and telling the server is left to
+    the caller or that upload."""
     sid = str(session_id or "")
+    if settled(home, sid):
+        return held(home, sid)
     ids = [str(one) for one in earlier if one]
-    if not sid or not ids or settled(home, sid):
+    if not sid or not ids:
         return False
-    return uploader.carry_private(ids, sid, timeout=timeout, settled=lambda: settle(home, sid))
+    passed = any(held(home, one) for one in ids)
+    made = uploader.carry_private(
+        ids, sid, timeout=timeout, settled=lambda made: settle(home, sid, made or passed)
+    )
+    return made or passed
