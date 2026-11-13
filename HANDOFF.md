@@ -218,6 +218,51 @@ changed, what to do on each machine, what was proven, and what is still open.
     chat is marked with it;
   - every session of a home whose marks folder cannot be read.
 
+## 2026-11-12 — install: `synapse` is linked into `~/.local/bin` when that is on PATH
+
+**What changed**
+
+- **The command works without a profile edit where the usual user bin directory exists.**
+  The installer keeps the client in `~/.synapse` and its shim in `~/.synapse/bin`, as
+  before. On Linux and macOS, when `~/.synapse/bin` is not on `PATH` but `~/.local/bin` is
+  an existing directory on `PATH`, it now also creates `~/.local/bin/synapse` as a
+  symlink to the shim, and says so. Before, it only printed the line to add to a shell
+  profile, so on a machine where nobody added it the command was not found outside a
+  Claude Code session.
+- **It takes the name only when the name is free.** A file, or a link to anything else,
+  named `synapse` in `~/.local/bin` is left as it is; the installer says so and prints the
+  profile line as before. It never creates `~/.local/bin` and never edits a profile.
+- **Only the default home is linked.** An install under a `SYNAPSE_HOME` other than
+  `~/.synapse` is a side install and gets the printed line, never the link.
+- **Windows is unchanged** (the installer already adds `~/.synapse/bin` to the user
+  `PATH` there).
+
+**On each machine**
+
+1. Nothing until the server runs this image. Then `synapse update` (or
+   `~/.synapse/bin/synapse update` where the command is not found yet): the update runs the
+   installer again, which creates the link. No plugin version change; the installer is
+   served by the server.
+2. A line that adds `~/.synapse/bin` to `PATH` in a shell profile can stay or go; with it
+   the installer finds the directory on `PATH` and creates no link.
+3. To remove the client by hand, remove `~/.local/bin/synapse` along with `~/.synapse`.
+
+**Proven**
+
+- `tests/test_install_route.py` runs the rendered installer in a subprocess with a scratch
+  `HOME`: the default home with `~/.local/bin` on `PATH` gets the link, `synapse` resolves
+  through it and runs the installed client, no profile line is printed, and a second run
+  finds the link and says nothing; with `~/.local/bin` missing or off `PATH` there is no
+  link, the directory is not created and the line is printed; a regular file, a link
+  elsewhere and a dangling link of that name are each left untouched; a `SYNAPSE_HOME`
+  elsewhere is never linked.
+- Each rule was broken once (side home linked, off-`PATH` directory linked, foreign file
+  replaced, own link not recognized, link never made) and a test failed each time.
+
+**Still open**
+
+- No uninstall command exists; removal is by hand (step 3).
+
 ## 2026-11-12 — recall: after a compaction, a session can find its own earlier turns again (plugin 0.24.6)
 
 **What changed**
@@ -503,7 +548,6 @@ changed, what to do on each machine, what was proven, and what is still open.
   `systemMessage` warning, the 20 s kill, the skills sync's time on a large folder, and
   payloads Codex might send that the tests do not.
 - Claude Code's hooks are next onto the core.
-
 
 ## 2026-11-12 — client: dead code out, and the hooks' copies of server rules pinned (plugin 0.24.3)
 
