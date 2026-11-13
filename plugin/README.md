@@ -353,11 +353,12 @@ The first turn back is left out when Hermes added a row of its own to it (a nudg
 reply to a background-process notice), when its message had no text, or when Hermes
 folded the message into an earlier one that got no reply. A message cut short off the
 record that you retry on the record is uploaded by an agent built since, as the gateway
-builds one for `/retry`, and not by the agent that saw the message begin. For each
-reply you stopped while such a session was off the record, one turn after
-`off --forget` is not uploaded. A turn from off the record can still go up after
-`off --forget` in a few narrow orders, such as when the uploads of the two turns before
-it were both still waiting as it began (a server that hangs).
+builds one for `/retry`, and not by the agent that saw the message begin. Once you
+have stopped a reply in such a session, the first turn after each `off --forget` is
+not uploaded, for as long as that agent runs. A turn from off the record can still go
+up after `off --forget` in a few narrow orders: when the uploads of the two turns
+before it were both still waiting as it began (a server that hangs), or after an
+`/undo` in the TUI that follows a failed turn with a compression in it (`HANDOFF.md`).
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use
