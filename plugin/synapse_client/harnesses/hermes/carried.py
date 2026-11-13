@@ -8,7 +8,8 @@ and once only: a branch made before its parent went private stays on the record,
 session put back on the record (``synapse private off --forget``) is not taken off again
 because of the session it came from. This is where "once" is kept: one empty owner-only
 file per settled session under ``<hermes_home>/synapse/settled/``, named by the SHA-256
-of its id.
+of its id. A record that could not be written does not undo it within one agent: the
+uploader makes a session private this way once too (``carry_private``).
 
 A settled session's own answer stands for the sessions above it: it took them into
 account when it was settled. So a session is asked about up its chain only as far as the

@@ -311,6 +311,34 @@ def test_a_synthetic_row_after_a_finished_turn_neither_reopens_it_nor_changes_it
     assert not cm.complete([{"role": "user", "content": "q"}, snapshot])
 
 
+def test_stems_are_the_keys_a_turn_had_each_time_it_was_complete_before_it_went_on():
+    """A reply with no real user row before it lands on the finished turn before."""
+    finished = [
+        {"role": "user", "content": "q", "id": "q"},
+        {"role": "assistant", "content": "r", "id": "r"},
+    ]
+    notice = {"role": "user", "content": "[process ended]", "synthetic": True, "id": "n"}
+    reply = {"role": "assistant", "content": "noted", "id": "r2"}
+    assert cm.stems(finished) == []
+    assert cm.stems([*finished, notice]) == []  # a synthetic row alone: nothing went on
+    assert cm.stems([*finished, notice, reply]) == ["r"]
+    assert cm.stems([*finished, reply]) == ["r"]  # the row in the user's place left out
+    again = [*finished, notice, reply, {**notice, "id": "n2"}, {**reply, "id": "r3"}]
+    assert cm.stems(again) == ["r", "r2"]
+    # A tool call and its result are the turn still running, not a turn that went on.
+    call = {
+        "role": "assistant",
+        "content": "On it.",
+        "tool_calls": [{"name": "t", "arguments": ""}],
+        "id": "c",
+    }
+    result = {"role": "tool", "content": "ok", "name": "t", "id": "t"}
+    assert cm.stems([finished[0], call, result, finished[1]]) == []
+    assert cm.stems([*finished, call, result, reply]) == ["r"]
+    bare = [{k: v for k, v in r.items() if k != "id"} for r in finished]
+    assert cm.stems([*bare, notice, reply]) == [cm.turn_key(bare)]
+
+
 def _numbered(n: int) -> list[list[dict]]:
     return [
         [

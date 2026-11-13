@@ -322,8 +322,11 @@ the turns that finish are kept in memory.
 you left, and it is on the record unless you mark it or its own row says it continues a
 private session. `synapse private off --forget <id>` puts a session back on the record
 with the turns spoken in it. For a session that was private because of the one it
-continues, the agent running it uploads only the turns that end from then on; an agent
-started for it later looks back ten turns, copied ones included.
+continues, the agent running it uploads only the turns you begin from then on, also
+after a compression gives the conversation another id. A reply Hermes began itself (to
+a background-process notice) lands on the turn before it, and is not uploaded when that
+one was spoken off the record. An agent started for the session later looks back ten
+turns, copied ones included.
 
 **Not ported yet.** The remember spool (a failed `remember` is reported to the model, not
 queued), the recall-feedback nudge, a Hermes slash command for private mode (use

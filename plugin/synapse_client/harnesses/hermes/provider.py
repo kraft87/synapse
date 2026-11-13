@@ -53,8 +53,10 @@ Uploads
 -------
 Hermes calls ``sync_turn`` on its background worker after each turn with the whole
 conversation. messages.py turns it into records and the core uploads them
-(upload.TurnUploader): every complete turn not sent yet goes up, with the turn before
-it as context; a resumed session looks back at most ten turns the first time. Each
+(turn_upload.TurnUploader): every complete turn not sent yet goes up, with the turn
+before it as context; a resumed session, and one first met at an upload, looks back at
+most ten turns the first time. ``on_session_end`` and ``on_pre_compress`` name no
+session: they upload under the last id Hermes named (live.py). Each
 batch is written to the outbox under ``<hermes_home>/synapse/outbox`` before its request
 and removed once delivered, so a batch in flight when the process exits waits there;
 one that fails stays and counts as handled. The next successful upload drains the
@@ -73,7 +75,8 @@ moves to the new id (``on_session_switch``, from the ids Hermes names), where He
 builds a new agent for it (``initialize``, from the session store: the TUI and Desktop
 build one for every branch) and before the first upload under any other id (``_follow``,
 from the store too), once per session (carried.py). ``/new`` and ``/resume`` open another
-conversation: nothing is carried to it from the one left.
+conversation: nothing is carried to it from the one left. A conversation that was off
+the record under this agent is never looked back at, under any id it goes on with.
 
 Compression
 -----------
@@ -99,7 +102,6 @@ which is safe across threads and processes.
 
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -114,10 +116,12 @@ from ... import __version__, context, project, tools
 from ...api import Client
 from ...outbox import Outbox, failure_warning
 from ...settings import Settings
-from ...upload import TurnUploader, Uploader
+from ...turn_upload import TurnUploader
+from ...upload import Uploader
 from . import carried
 from . import messages as hm
 from . import sessions as hs
+from .live import Live
 
 ACTIVE = "active"
 #: No session is CRON any more (a cron job is INERT); kept so older imports resolve.
@@ -163,22 +167,6 @@ def scope(kwargs: Mapping[str, Any]) -> str:
     return hs.from_keywords(kwargs).mode
 
 
-def _json_result(text: str) -> str:
-    """Hermes wants a JSON string from a tool: a JSON object passes through, any other
-    text is wrapped as ``{"result": text}``, the shape Hermes's own providers use."""
-    try:
-        if isinstance(json.loads(text), dict):
-            return text
-    except (TypeError, ValueError):
-        pass
-    return json.dumps({"result": text}, ensure_ascii=False)
-
-
-def _error(message: str, tool: str = "") -> str:
-    body = {"error": message, "tool": tool} if tool else {"error": message}
-    return json.dumps(body, ensure_ascii=False)
-
-
 class SynapseMemoryProvider(MemoryProvider):
     """Synapse for one Hermes agent. Hermes builds a new instance for every agent it
     loads, then calls ``initialize`` once."""
@@ -210,6 +198,7 @@ class SynapseMemoryProvider(MemoryProvider):
         self._home: str | None = None
         self._said: set[str] = set()
         self._followed: set[str] = set()  # ids whose lineage was read here (_follow)
+        self._live = Live()  # the session a hook that names none is for
         self._cut: str | None = None  # the last in-place compression, for self_since
 
     # -- identity and availability -------------------------------------------------
@@ -260,9 +249,11 @@ class SynapseMemoryProvider(MemoryProvider):
         uploader = Uploader(client, outbox, log=_say, warn=_warn)
         earlier = carried.to_ask(home, verdict.continues)
         private_too = mode == ACTIVE and carried.carry(uploader, home, earlier, session_id, None)
+        # A session first met at an upload is looked back at as a resumed one is.
+        turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=LOOKBACK)
         # Turns spoken off the record are not looked back at.
         lookback = 0 if private_too else LOOKBACK if kwargs.get("resumed") else None
-        turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=lookback)
+        turns.start(str(session_id or ""), lookback)
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
@@ -282,6 +273,7 @@ class SynapseMemoryProvider(MemoryProvider):
             self._home = str(home) if home else None
             self._cut = None
             self._followed = {self._session_id} if verdict.continues else set()
+        self._live.moved(self._session_id)
         if mode == INERT:
             self._say_once(f"synapse: off for session {self._session_id}: {verdict.reason}")
         if mode != ACTIVE:
@@ -345,6 +337,7 @@ class SynapseMemoryProvider(MemoryProvider):
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         """The per-turn nudge (a timestamp and the recall/remember directive). No request."""
+        self._live.moved(str(session_id or ""))  # Hermes calls this as the turn starts
         if self._mode != ACTIVE or self._settings is None:
             return ""
         if not self._still_owner():
@@ -413,8 +406,8 @@ class SynapseMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Rebind to ``new_session_id``. A new id or a reset forgets which turns were
-        sent; the next upload then looks back at most LOOKBACK turns, as for a resume.
+        """Rebind to ``new_session_id``. A new id or a reset starts with no turn counted
+        as sent; its next upload then looks back at most LOOKBACK turns, as for a resume.
         It forgets the compression cut too; a compression that keeps the id sets it.
         A carry that raises turns the instance INERT, as a failed ``initialize`` does:
         the new id would otherwise be uploaded to with nothing known about it."""
@@ -430,7 +423,9 @@ class SynapseMemoryProvider(MemoryProvider):
             uploader = self._uploader if self._mode == ACTIVE else None
             carries = goes_on and kwargs.get("reason") != "resume" and uploader is not None
             try:
-                earlier = [old, parent_session_id]
+                # The id left is the bound one and, after a move Hermes did not announce,
+                # the one its hooks named since.
+                earlier = [old, self._live.id, parent_session_id] if carries else []
                 private_too = carries and carried.carry(uploader, self._home, earlier, new, 5)
             except Exception:
                 self._mode = INERT  # undecided is not on the record
@@ -439,12 +434,14 @@ class SynapseMemoryProvider(MemoryProvider):
                 if reset or goes_on:
                     if self._turns is not None:
                         # Turns spoken off the record are not looked back at.
-                        self._turns.forget(0 if private_too else LOOKBACK)
+                        lookback = 0 if private_too else LOOKBACK
+                        self._turns.start(new or old, lookback, continues=earlier)
                     self._cut = None
                 elif kwargs.get("reason") == "compression":
                     self._cut = _clock()
                 if new:
                     self._session_id = new
+            self._live.moved(new)
         except Exception:
             _log().warning("synapse: on_session_switch failed", exc_info=True)
 
@@ -517,12 +514,13 @@ class SynapseMemoryProvider(MemoryProvider):
     def _upload(
         self, messages: Any, session_id: str, timeout: float, finished: bool = False
     ) -> bool:
-        """Send the complete turns of ``messages`` not sent yet (upload.TurnUploader).
+        """Send the complete turns of ``messages`` not sent yet (turn_upload.TurnUploader).
         True when at least one batch reached the server. ``finished``: a turn has just
         ended. The id is the one Hermes names, which need not be one this instance was
-        moved to, so what its row says it continues is read first (``_follow``)."""
+        moved to, so what its row says it continues is read first (``_follow``); with
+        none named (a flush), the last one it named (live.py)."""
         turns = self._turns
-        sid = str(session_id or self._session_id)
+        sid = self._live.named(str(session_id or ""))
         verdict = self._verdict(sid) if turns is not None else None
         if turns is None or verdict is None:
             return False
@@ -550,8 +548,9 @@ class SynapseMemoryProvider(MemoryProvider):
         if known or not continues or uploader is None or turns is None:
             return
         earlier = carried.to_ask(self._home, continues)
-        if carried.carry(uploader, self._home, earlier, session_id, None):
-            turns.forget(0)  # turns spoken off the record are not looked back at
+        private_too = carried.carry(uploader, self._home, earlier, session_id, None)
+        # Turns spoken off the record are not looked back at.
+        turns.start(session_id, 0 if private_too else LOOKBACK, continues=continues)
         with self._lock:
             self._followed.add(session_id)
 
@@ -575,18 +574,19 @@ class SynapseMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
         """Call ``tool_name`` on the server with this session's id, and on recall and
-        recall_full_turns the compression cut; always a JSON string. Only for an ACTIVE
+        recall_full_turns the compression cut; always a JSON string, as Hermes wants
+        from a tool (other text is wrapped, tools.as_json). Only for an ACTIVE
         session still the owner's: an instance not initialized yet has no session to
         judge, and Hermes itself refuses a tool call before ``initialize``
         (agent/memory_manager.py ``handle_tool_call``, ``caller_scope``)."""
         try:
             client = self._client
             if self._mode != ACTIVE or client is None or not self._still_owner():
-                return _error(_LOCAL_ONLY, tool_name)
+                return tools.failure(tool_name, _LOCAL_ONLY)
             with self._lock:
                 session_id, cut = self._session_id or None, self._cut
             text = tools.call(client, tool_name, args, session_id=session_id, since=cut)
-            return _json_result(text)
+            return tools.as_json(text)
         except Exception as err:
             _log().warning("synapse: tool call %s failed", tool_name, exc_info=True)
-            return _error(f"Synapse could not answer: {type(err).__name__}", tool_name)
+            return tools.failure(tool_name, f"Synapse could not answer: {type(err).__name__}")
