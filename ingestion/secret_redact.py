@@ -10,7 +10,7 @@ ingest path (live /ingest, the disk sweep, the backfills, remember) stores, chun
 extracts the redacted text, and the content-dedup probe compares like with like.
 ``scripts/redact_stored_secrets.py`` applies the same function to rows already stored.
 
-Two rule shapes:
+Three rule shapes:
 
 * Known token formats, recognised by their provider prefix, are replaced wholesale.
   High precision, no context needed.
@@ -18,6 +18,8 @@ Two rule shapes:
   ``scheme://user:pass@host``) keep the name and lose the value, and only when the
   value looks like a credential, so ``password=os.environ[...]``, ``token: str`` and
   ``<your-key>`` placeholders survive.
+* Incoming-webhook URLs (Discord, Slack) keep the host and the first id and lose the
+  rest. The URL is the whole credential: whoever holds it can post to the channel.
 
 The ``[REDACTED:<kind>]`` marker keeps the useful memory (a credential was here, and
 what kind) without the credential. Redaction is idempotent: no rule matches a marker.
@@ -81,6 +83,23 @@ _URL_CREDS = re.compile(
     re.IGNORECASE,
 )
 
+_WEBHOOKS: tuple[re.Pattern[str], ...] = (
+    # Discord: /api/webhooks/<hook id>/<token>, then an optional /slack or /github.
+    re.compile(
+        r"(?P<name>\b(?:ptb\.|canary\.)?discord(?:app)?\.com/api/(?:v\d+/)?webhooks/\d+)"
+        r"(?P<sep>/)(?P<value>[A-Za-z0-9_-]{16,})",
+        re.IGNORECASE,
+    ),
+    # Slack: /services/<workspace>/<hook>/<token>; /workflows and /triggers put other
+    # ids before the token. Everything after the workspace goes, so the rule does not
+    # depend on where the token sits.
+    re.compile(
+        r"(?P<name>\bhooks\.slack\.com/(?:services|workflows|triggers)/[A-Za-z0-9]+)"
+        r"(?P<sep>/)(?P<value>[A-Za-z0-9_/-]{16,})",
+        re.IGNORECASE,
+    ),
+)
+
 _PLACEHOLDER = re.compile(
     r"x{3,}|\*{3,}|\.\.\.|redacted|changeme|change_me|placeholder|example|your[-_]|^my[-_]"
     r"|^(?:none|null|true|false|undefined|password|secret|token|pass)$",
@@ -110,12 +129,17 @@ def _keep_name(kind: str) -> Callable[[re.Match[str]], str]:
     return sub
 
 
-def _url_sub(m: re.Match[str]) -> str:
-    # user:pass@host is unambiguous, so a password without digits still goes;
-    # only placeholders and env references (excluded by the value class) survive.
-    if _PLACEHOLDER.search(m["value"]):
-        return m[0]
-    return f"{m['name']}{m['sep']}{_MARK.format('password')}"
+def _keep_url(kind: str) -> Callable[[re.Match[str]], str]:
+    """re.sub callback for a credential whose place in a URL is unambiguous
+    (``user:pass@host``, the path of a webhook): a value without digits still goes;
+    only placeholders and env references (excluded by the value class) survive."""
+
+    def sub(m: re.Match[str]) -> str:
+        if _PLACEHOLDER.search(m["value"]):
+            return m[0]
+        return f"{m['name']}{m['sep']}{_MARK.format(kind)}"
+
+    return sub
 
 
 @overload
@@ -126,8 +150,12 @@ def redact_secrets(text: str | None) -> str | None:
     """Replace credentials in ``text`` with ``[REDACTED:<kind>]`` markers."""
     if not text:
         return text
+    # Webhooks first: a token-format rule that matched inside the token would mark part
+    # of it and leave the rest in place.
+    for pattern in _WEBHOOKS:
+        text = pattern.sub(_keep_url("webhook"), text)
     for kind, pattern in _TOKEN_RULES:
         text = pattern.sub(_MARK.format(kind), text)
     text = _BEARER.sub(_keep_name("bearer"), text)
-    text = _URL_CREDS.sub(_url_sub, text)
+    text = _URL_CREDS.sub(_keep_url("password"), text)
     return _ASSIGNMENT.sub(_keep_name("secret"), text)

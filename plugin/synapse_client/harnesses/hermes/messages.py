@@ -40,7 +40,7 @@ actually sent, with the memory context it injected, our own nudge included), not
   server renders less of either. User and assistant text are sent whole.
 
 The records are cut into turns, and the finished ones uploaded, by the core
-(``synapse_client/messages.py``, ``upload.TurnUploader``). Two of the rules above exist
+(``synapse_client/messages.py``, ``turn_upload.TurnUploader``). Two of the rules above exist
 for that cut. Synthetic rows do not count towards a turn's key: Hermes adds them after a
 finished turn (a task-list snapshot after compression), and that must neither reopen the
 turn nor make it look new. And a failed turn never completes, so its user message is not
