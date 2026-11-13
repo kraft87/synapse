@@ -3,6 +3,71 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-13 — ingest: a webhook URL is a credential; the stored-row repair leaves no rule out
+
+**What changed**
+
+- **Incoming-webhook URLs are redacted.** A Discord or Slack webhook URL is the whole
+  credential: whoever holds it can post to the channel. `redact_secrets` matched
+  neither, so one pasted into a session was stored and served back by recall. Now
+  `discord.com/api/webhooks/<hook id>/<token>` (also `discordapp.com`, `ptb.`,
+  `canary.` and `/api/v<n>/`) keeps the host and the hook id and loses the token, and
+  `hooks.slack.com/{services,workflows,triggers}/<workspace>/...` keeps the workspace
+  id and loses the rest of the path. The marker is `[REDACTED:webhook]`. The scheme is
+  not needed. A placeholder (`<id>/<token>`, `$TOKEN`, Slack's all-`X` example) and a
+  URL with no token stay as they are.
+- **The webhook rule runs before the provider-token rules.** A webhook token can
+  contain what reads as a provider key. A provider rule that ran first would mark that
+  part and leave the characters before it.
+- **`scripts/redact_stored_secrets.py` had no prefilter entry for seven rule shapes.**
+  The script fetches only the rows its server-side prefilter matches. The six formats
+  added after the script was written (Logfire, Matrix, Voyage, Firecrawl, ElevenLabs,
+  Telegram) and `private_key=` assignments had no entry. A stored row holding only
+  such a value was never fetched, and the report counted its table as clean. Long rows
+  were mostly fetched anyway, because `token`, `basic` or `://` appears somewhere in
+  them; a short one (a fact, a note hook) was not. The prefilter now has an entry for
+  every rule, and for a webhook URL written without a scheme.
+- **A test keeps the rules and the prefilter in step.**
+  `tests/test_redact_stored_secrets_db.py` holds one sample per rule, checks in Postgres
+  that the prefilter matches each, and fails when a rule has no sample. It also runs
+  the script against a scratch table: a dry run writes nothing, `--apply` rewrites the
+  row a rule changes and no other, and the report prints no value. The script had no
+  test before.
+
+**On each machine**
+
+- **Server:** nothing to do. New ingests are redacted once the image is deployed.
+- **Rows already stored:** run the script once per database, dry run first
+  (`python scripts/redact_stored_secrets.py <DSN>`, then the same with `--apply`). It
+  is idempotent. As before, embeddings and earlier backups keep what they had.
+- **A webhook that was ever stored:** regenerate it. That makes every old copy
+  harmless, including the ones in backups.
+- **Clients:** nothing. No client file changed.
+
+**Proven**
+
+- The tests fail when the rule is broken: with the webhook rule removed (11 fail);
+  with it moved after the provider rules (the token-taken-whole test); with `/` taken
+  out of the Slack value (the three Slack shapes); with the placeholder check removed
+  (the two placeholder URLs).
+- A second pass over redacted text changes nothing, for every shape. An earlier draft
+  that kept Slack's later ids and marked only the last segment failed this: the second
+  pass took a long id for a token.
+- The prefilter on main misses 16 of the 52 samples: the six formats, the three
+  `private_key` spellings, and the seven webhook shapes without a scheme. The new one
+  misses none, and each of its 32 entries carries at least one sample: removing any
+  one entry makes the test fail.
+- The full suite (unit, db, db pooled), ruff and mypy pass on PostgreSQL 17. CI runs
+  PostgreSQL 18.
+
+**Still open**
+
+- Other URLs that are credentials have no rule: Teams and Office connectors, IFTTT
+  maker keys, Zapier catch hooks, Home Assistant webhook ids.
+- The placeholder check reads three `x` in a row as a placeholder, so about one real
+  Discord token in 500 would be left. The same check already guards
+  `scheme://user:pass@host`.
+
 ## 2026-11-12 — cli: `synapse update` lets the client it installed update the harnesses (plugin 0.24.9)
 
 **What changed**
