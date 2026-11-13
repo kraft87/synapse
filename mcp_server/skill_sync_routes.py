@@ -54,13 +54,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
+import queue
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from psycopg.rows import class_row, dict_row
+from psycopg.rows import class_row, dict_row, tuple_row
 from psycopg.types.json import Json
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -71,7 +74,7 @@ from dream.skills.skill_doc import (
     replace_description,
     valid_skill_name,
 )
-from dream.skills.skill_measure import skill_description
+from dream.skills.skill_measure import load_catalog, skill_description
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
@@ -1317,41 +1320,64 @@ def _proposal_act(
     return {"status": "error", "detail": f"unknown action {action!r}"}
 
 
+# The review client waits 30 s for an accept (plugin/scripts/config.py). The routing check
+# gets this much of it; an answer took about 8 s when this was set.
+_ROUTING_EVAL_BUDGET_S = 20.0
+
+
+def _answer_within(ask: Callable[[], str], budget_s: float) -> str | None:
+    """`ask()`'s answer, or None once `budget_s` has passed; an error `ask` raises is raised
+    here. `ask` runs on a daemon thread: a late answer is dropped, and neither the request
+    nor a shutdown waits for it."""
+    box: queue.SimpleQueue[str | Exception] = queue.SimpleQueue()
+
+    def _run() -> None:
+        try:
+            box.put(ask())
+        except Exception as ex:
+            box.put(ex)
+
+    threading.Thread(target=_run, name="routing-eval", daemon=True).start()
+    try:
+        got = box.get(timeout=budget_s)
+    except queue.Empty:
+        return None
+    if isinstance(got, Exception):
+        raise got
+    return got
+
+
 def _routing_eval(c, cid: int, name: str) -> str:
     """Advisory: would the under-trigger phrasings route to `name` under current descriptions?
-    Best-effort single LLM pass; any failure degrades to a skip note (never blocks accept)."""
+    One LLM pass with _ROUTING_EVAL_BUDGET_S to answer; any failure degrades to a skip note
+    (never blocks accept). It reads through cursors of its own, so the rows are the same
+    whatever rows the caller's connection makes, and ends the read before the model is asked,
+    so no transaction stays open while it answers."""
     try:
-        import json as _json
+        from ingestion.llm_client import create_llm_client, stage_model
 
-        from ingestion.llm_client import create_llm_client
-
-        cur = c.cursor()
-        ev = cur.execute(
-            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
-        ).fetchone()[0]
+        found = (
+            c.cursor(row_factory=tuple_row)
+            .execute("SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,))
+            .fetchone()
+        )
         phrasings = [
-            e.get("phrasing", "")
-            for e in ev
+            e["phrasing"]
+            for e in (found[0] if found else None) or []
             if e.get("signal") == "under_trigger" and e.get("phrasing")
-        ]
+        ][:8]
         if not phrasings:
             return "routing-eval: no phrasings to eval"
-        catalog = "\n".join(
-            f"- {n}: {d}"
-            for n, d in cur.execute(
-                "SELECT name, description FROM skills_lane.skill_registry ORDER BY name"
-            ).fetchall()
-        )
+        catalog = "\n".join(f"- {n}: {d}" for n, d in load_catalog(c))
+        c.commit()
         prompt = (
             f"Skill catalog:\n{catalog}\n\nFor each user phrasing, name the ONE skill whose "
             f"description best matches, or 'none'. We expect '{name}' to be the match.\n"
-            + "\n".join(f"- {p}" for p in phrasings[:8])
+            + "\n".join(f"- {p}" for p in phrasings)
             + '\n\nOutput JSON only: {"matches":["skill-or-none", ...]} in phrasing order.'
         )
 
-        def _gen() -> str:
-            from ingestion.llm_client import stage_model
-
+        def _ask() -> str:
             resp = create_llm_client().messages.create(
                 model=stage_model("SKILLS", "claude-opus-4-8"),
                 max_tokens=400,
@@ -1359,16 +1385,26 @@ def _routing_eval(c, cid: int, name: str) -> str:
             )
             return str(resp.content[0].text)
 
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            raw = pool.submit(_gen).result(timeout=120)
+        raw = _answer_within(_ask, _ROUTING_EVAL_BUDGET_S)
+        if raw is None:
+            logger.warning(
+                "routing-eval for skill candidate %s: no answer within %gs",
+                cid,
+                _ROUTING_EVAL_BUDGET_S,
+            )
+            return f"routing-eval skipped: no answer within {_ROUTING_EVAL_BUDGET_S:g}s"
         s, e = raw.find("{"), raw.rfind("}")
-        matches = _json.loads(raw[s : e + 1]).get("matches", []) if s >= 0 else []
+        if s < 0 or e < s:
+            return "routing-eval skipped: the answer is not JSON"
+        matches = json.loads(raw[s : e + 1]).get("matches")
+        if not isinstance(matches, list) or len(matches) != len(phrasings):
+            n = len(matches) if isinstance(matches, list) else 0
+            return f"routing-eval skipped: {n} answers for {len(phrasings)} phrasings"
         hit = sum(1 for m in matches if m == name)
         return f"routing-eval: {hit}/{len(matches)} missed phrasings already map to '{name}'"
-    except Exception as ex:  # pragma: no cover - advisory only
-        return f"routing-eval skipped: {ex}"
+    except Exception as ex:  # advisory only: the accept goes on without it
+        logger.warning("routing-eval for skill candidate %s failed", cid, exc_info=True)
+        return f"routing-eval skipped: {type(ex).__name__}: {ex}"
 
 
 # -------------------------------------------------------------------- register

@@ -3,6 +3,50 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-13 — skills: accepting a retune runs its routing check, which had never run
+
+**What changed**
+
+- **The routing check on a retune accept had never run.** `/skills/proposals/act` hands
+  the check a connection whose rows are dicts. The check read its first row by position,
+  its own `except` swallowed the error, and every retune accept came back with the note
+  `routing-eval skipped: 0`.
+- **Now it runs.** Accepting a retune proposal that has a draft asks the skills model
+  (`SYNAPSE_SKILLS_MODEL`, default Opus) once: for up to eight of the phrasings the skill
+  missed, which active skill does each one route to today. The accept result carries the
+  answer (`routing-eval: 2/3 missed phrasings already map to '<skill>'`) and the review
+  CLI prints it.
+- **It is advisory and bounded.** The accept is applied whatever the check says. The check
+  gets 20 seconds, because the review client waits 30 for the accept. After that the
+  accept goes on with `routing-eval skipped: no answer within 20s`. A failure is logged as
+  a warning on the server and reported as `routing-eval skipped: <error type>: <message>`.
+  An answer that does not name one skill per phrasing is not counted.
+- **The catalog the model sees is the active skills.** It was every registry row, retired
+  ones included.
+- **No transaction is open while the model answers.**
+- The dashboard's approve still makes no model call.
+
+**On each machine**
+
+1. Nothing to do: no migration, no setting, no client update.
+2. Expect `accept` on a retune proposal to take about 8 seconds longer, and to make one
+   model call from the MCP server container, on the login the pollers use.
+
+**Proven**
+
+- `tests/test_skill_accept_applies.py` runs the real check through the real accept, with
+  only the model replaced: the count, the catalog (active skills, each with its own
+  description), no call when there are no missed phrasings, an answer that does not fit, a
+  model that fails, a model that does not answer in time, and no open transaction while
+  the model is asked. All seven failed before the fix with `routing-eval skipped: 0`.
+- Three deliberate breaks (the read left open, the model waited for, retired skills in the
+  catalog) each fail one of those tests.
+- One real accept on a scratch database with 28 skills and the real model: applied in
+  8.8 seconds, `2/3 missed phrasings already map`.
+
+**Still open**: the check asks about the descriptions as they are before the accept is
+applied. Whether the new description routes the missed phrasings better is not asked.
+
 ## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
 
 **What changed**
