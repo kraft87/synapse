@@ -218,7 +218,11 @@ class RecallRerankMixin:
         return self._floor_by_rerank(query, facts, self._settings()._RECALL_FACT_FLOOR, keep_min=1)
 
     def _select_episodes(
-        self, query: str, pool: list[dict[str, Any]], limit: int
+        self,
+        query: str,
+        pool: list[dict[str, Any]],
+        limit: int,
+        own_session: str | None = None,
     ) -> tuple[list[dict[str, Any]], int, float]:
         """Rerank `pool`, re-inject recency + suppress query echo, and pick what to serve.
 
@@ -230,18 +234,31 @@ class RecallRerankMixin:
         score-cutoff (keep score >= tau*top, clamped [_EPISODE_CUTOFF_MIN_K, _EPISODE_CUTOFF_MAX_K])
         over the recency-adjusted scores. Echoed episodes (the query quoting itself) are dropped
         BEFORE the final slice/cutoff so the next-ranked candidates backfill the freed slots. Always
-        degrades to RRF order on rerank failure; never hard-fails."""
+        degrades to RRF order on rerank failure; never hard-fails.
+
+        ``own_session`` marks the caller's own turns from before its last compaction in
+        ``pool`` (a few, at their fused positions; see _self_prior). They share the one rerank
+        call, but everything above runs on the other turns alone, so those are chosen exactly
+        as without them and ``rerank_top`` is theirs (a lone other turn keeps the one-doc
+        sentinel it gets when reranked alone). Then at most _RECALL_SELF_PRIOR_LIMIT own turns
+        that are not echoes are added, each only if it scores at least as well as the weakest
+        other turn served, or, when the order is the fused one (rerank degraded or off), ranks
+        above the last one served. With no other turn served there is nothing to beat. The
+        merged list is in score order (fused order when degraded)."""
         settings = self._settings()
         if not pool:
             return [], 0, 0.0
         scored = self._rerank_pool_scored(query, pool)
         if not scored:
             return [], 0, 0.0
-        rerank_top = scored[0][1]  # RAW top score (telemetry + shadow floor) — pre-recency
+        own = {i for i, e in enumerate(pool) if own_session and e.get("session_id") == own_session}
+        theirs = [(i, s) for i, s in scored if i not in own]
+        # RAW top score (telemetry + shadow floor) — pre-recency
+        rerank_top = (1.0 if len(theirs) == 1 else theirs[0][1]) if theirs else 0.0
         degraded = rerank_top <= 0.0  # reranker down/disabled -> RRF order, fixed-k
-        scored = self._apply_rerank_recency(scored, pool)  # no-op when disabled/degraded
-        ranked = [pool[i] for i, _ in scored]
-        ranked_scores = [s for _, s in scored]
+        theirs = self._apply_rerank_recency(theirs, pool)  # no-op when disabled/degraded
+        ranked = [pool[i] for i, _ in theirs]
+        ranked_scores = [s for _, s in theirs]
         fixed_k = settings._EPISODE_CUTOFF_TAU <= 0 or degraded
         # Echo suppression's lazy scan only needs enough survivors to cover the serve
         # window: `limit` on the fixed-k path, at most _EPISODE_CUTOFF_MAX_K on the tau
@@ -251,12 +268,30 @@ class RecallRerankMixin:
         if n_echo:
             ranked = [ranked[i] for i in keep]
             ranked_scores = [ranked_scores[i] for i in keep]
-        if fixed_k:
-            return ranked[:limit], n_echo, rerank_top
-        k = _cutoff_k(
-            ranked_scores,
-            settings._EPISODE_CUTOFF_TAU,
-            settings._EPISODE_CUTOFF_MIN_K,
-            settings._EPISODE_CUTOFF_MAX_K,
+        k = (
+            limit
+            if fixed_k
+            else _cutoff_k(
+                ranked_scores,
+                settings._EPISODE_CUTOFF_TAU,
+                settings._EPISODE_CUTOFF_MIN_K,
+                settings._EPISODE_CUTOFF_MAX_K,
+            )
         )
-        return ranked[:k], n_echo, rerank_top
+        served = ranked[:k]
+        if not own:
+            return served, n_echo, rerank_top
+        # The second lane, after the others are chosen.
+        fused = scored[0][1] <= 0.0  # the call degraded or was off: the order is the fused one
+        mine = self._apply_rerank_recency([(i, s) for i, s in scored if i in own], pool)
+        keep, _ = self._filter_query_echo(query, [pool[i] for i, _ in mine], len(mine))
+        mine = [mine[j] for j in keep]
+        at = {id(e): i for i, e in enumerate(pool)}
+        if served and fused:
+            mine = [(i, s) for i, s in mine if i < at[id(served[-1])]]
+        elif served:
+            mine = [(i, s) for i, s in mine if s >= ranked_scores[len(served) - 1]]
+        merged = [(at[id(e)], s) for e, s in zip(served, ranked_scores, strict=False)]
+        merged += mine[: settings._RECALL_SELF_PRIOR_LIMIT]
+        merged.sort(key=(lambda t: t[0]) if fused else (lambda t: -t[1]))
+        return [pool[i] for i, _ in merged], n_echo, rerank_top

@@ -8,7 +8,9 @@ hook re-grows a surface injection — because a client that starts sending one a
 would look harmless while quietly reviving a spoofable trust input.
 
 Both the Claude Code hook and its Codex port are covered here; they are separate files
-that must not drift.
+that must not drift. Both also add `self_since` (the time of the session's last
+compaction, read from the transcript the harness hands the hook) to recall and
+recall_full_turns, and to nothing else.
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ import sys
 from pathlib import Path
 
 import pytest
+
+from tests.helpers.client_core import transcript
 
 _ROOT = Path(__file__).resolve().parent.parent
 _CC_HOOK = _ROOT / "plugin" / "scripts" / "self_session_inject.py"
@@ -191,3 +195,80 @@ def test_no_client_hook_still_references_a_surface_param():
         # Drop docstrings (odd-indexed chunks); they explain the removal on purpose.
         live = "".join(chunk for i, chunk in enumerate(code) if i % 2 == 0)
         assert '"surface"' not in live and "_SURFACE_TOOLS" not in live
+
+
+# ---------------------------------------------------------------------------
+# self_since: the time of the session's last compaction
+# ---------------------------------------------------------------------------
+
+_AT = "2026-11-12T14:10:54.738Z"
+
+
+def _with_transcript(hook: Path, folder: Path, tool: str, tool_input: dict, at=_AT) -> dict:
+    path = transcript(folder, codex=hook == _CODEX_HOOK, at=at)
+    return {
+        "tool_name": _MCP + tool,
+        "session_id": "s-1",
+        "tool_input": tool_input,
+        "transcript_path": str(path),
+    }
+
+
+@_HOOKS
+@pytest.mark.parametrize("tool", ["recall", "recall_full_turns"])
+def test_self_since_is_added_after_a_compaction(hook, tool, tmp_path):
+    ti = _run(hook, _with_transcript(hook, tmp_path, tool, {"query": "q"}))
+    assert ti == {"query": "q", "self_session": "s-1", "self_since": _AT}
+
+
+@_HOOKS
+@pytest.mark.parametrize("tool", ["recall", "recall_full_turns"])
+def test_self_since_is_added_when_the_input_already_names_this_session(hook, tool, tmp_path):
+    ti = _run(hook, _with_transcript(hook, tmp_path, tool, {"self_session": "s-1"}))
+    assert ti == {"self_session": "s-1", "self_since": _AT}
+
+
+@_HOOKS
+@pytest.mark.parametrize("tool", ["fetch_session", "recall_feedback", "remember"])
+def test_self_since_never_goes_to_the_other_tools(hook, tool, tmp_path):
+    """Their schemas reject an unknown argument: sending it would fail the call."""
+    ti = _run(hook, _with_transcript(hook, tmp_path, tool, {"query": "q"}))
+    assert ti is not None and "self_since" not in ti
+
+
+@_HOOKS
+def test_self_since_never_goes_with_someone_elses_session(hook, tmp_path):
+    ti = _run(hook, _with_transcript(hook, tmp_path, "recall", {"self_session": "s-orig"}))
+    assert ti is None
+
+
+@_HOOKS
+def test_a_self_since_already_set_is_never_overwritten(hook, tmp_path):
+    kept = {"query": "q", "self_since": "2026-01-01T00:00:00Z"}
+    ti = _run(hook, _with_transcript(hook, tmp_path, "recall", dict(kept)))
+    assert ti == {**kept, "self_session": "s-1"}
+    both = {"self_session": "s-1", "self_since": "2026-01-01T00:00:00Z"}
+    assert _run(hook, _with_transcript(hook, tmp_path, "recall", dict(both))) is None
+
+
+@_HOOKS
+@pytest.mark.parametrize("case", ["never-compacted", "missing-file", "no-transcript-path"])
+def test_no_compaction_means_no_self_since(hook, case, tmp_path):
+    payload = _with_transcript(hook, tmp_path, "recall", {"query": "q"}, at=None)
+    if case == "missing-file":
+        payload["transcript_path"] = str(tmp_path / "gone.jsonl")
+    elif case == "no-transcript-path":
+        del payload["transcript_path"]
+    assert _run(hook, payload) == {"query": "q", "self_session": "s-1"}
+
+
+@_HOOKS
+def test_a_client_core_that_cannot_load_costs_only_the_cut(hook, tmp_path):
+    """The hook copied where no client core sits beside it: the import fails inside the
+    hook, and the session id still goes."""
+    rel = hook.relative_to(_ROOT)
+    copy = tmp_path / "client" / rel
+    copy.parent.mkdir(parents=True)
+    copy.write_bytes(hook.read_bytes())
+    ti = _run(copy, _with_transcript(hook, tmp_path, "recall", {"query": "q"}))
+    assert ti == {"query": "q", "self_session": "s-1"}

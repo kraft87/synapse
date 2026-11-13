@@ -27,6 +27,7 @@ class RecallEpisodesMixin:
         limit: int = _EPISODE_LIMIT,
         source: str | None = None,
         self_session: str | None = None,
+        self_since: str | None = None,
         session_id: str | None = None,
         surface: str | None = None,
         trust: SurfaceTrust | None = None,
@@ -62,6 +63,7 @@ class RecallEpisodesMixin:
                 limit=limit,
                 source=source,
                 self_session=self_session,
+                self_since=self_since,
                 session_id=session_id,
                 surface=surface,
                 trust=trust,
@@ -76,6 +78,7 @@ class RecallEpisodesMixin:
         limit: int,
         source: str | None,
         self_session: str | None,
+        self_since: str | None,
         session_id: str | None,
         surface: str | None,
         trust: SurfaceTrust | None,
@@ -112,13 +115,21 @@ class RecallEpisodesMixin:
         # Same self-exclusion as recall(): the caller's own turns are already in
         # its context window. Pool-level so excluded slots backfill before rerank.
         # Skipped under a session filter — the caller explicitly asked for that
-        # session's turns, including when it is its own.
+        # session's turns, including when it is its own. With the cut (the caller's
+        # last compaction) a few of its turns from before it stay in the pool as a
+        # second lane: they share the rerank call and may be added to what the other
+        # turns serve, never swapped into it (see _select_episodes).
+        cut = None if session_id else self._self_cutoff(self_session, self_since)
         n_self_excluded = 0
+        own_session = None
         if self_session and not session_id:
-            pre_excl = len(pool)
-            pool = self._exclude_self(pool, self_session)
-            n_self_excluded = pre_excl - len(pool)
-        episodes, n_echo_suppressed, rerank_top = self._select_episodes(query, pool, limit)
+            n_self_excluded = len(pool) - len(self._exclude_self(pool, self_session, since=cut))
+            prior = {id(e) for e in self._self_prior(pool, self_session, cut)}
+            pool = [e for e in pool if e.get("session_id") != self_session or id(e) in prior]
+            own_session = self_session if prior else None
+        episodes, n_echo_suppressed, rerank_top = self._select_episodes(
+            query, pool, limit, own_session=own_session
+        )
 
         # Increment feedback counts BEFORE slimming (we lose the parseable id afterwards)
         ep_ids = [
@@ -145,6 +156,9 @@ class RecallEpisodesMixin:
         if self_session:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
+        if cut is not None:
+            served_ids["self_since"] = cut.isoformat()
+            served_ids["n_self_served"] = sum(r.get("session_id") == self_session for r in episodes)
         if session_id:
             served_ids["session_id"] = session_id  # session-scoped drill-down call
         # Shadow abstention floor (telemetry only) — same RAW pre-recency score contract

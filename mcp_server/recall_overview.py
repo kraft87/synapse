@@ -34,6 +34,7 @@ class RecallOverviewMixin:
         source: str | None = None,
         debug: bool = False,
         self_session: str | None = None,
+        self_since: str | None = None,
         surface: str | None = None,
         trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
@@ -91,6 +92,7 @@ class RecallOverviewMixin:
                 source=source,
                 debug=debug,
                 self_session=self_session,
+                self_since=self_since,
                 surface=surface,
                 trust=trust,
             )
@@ -105,11 +107,14 @@ class RecallOverviewMixin:
         source: str | None = None,
         debug: bool = False,
         self_session: str | None = None,
+        self_since: str | None = None,
         surface: str | None = None,
         trust: SurfaceTrust | None = None,
     ) -> dict[str, Any]:
         """recall()'s body, run with ``warnings`` bound as the active degradation sink."""
         settings = self._settings()
+        # The caller's last compaction: its own turns before it are no longer in its context.
+        cut = self._self_cutoff(self_session, self_since)
         t_start = time.perf_counter()
         ex = self._leg_executor
         st = self._resolve_trust(surface, trust)
@@ -242,7 +247,7 @@ class RecallOverviewMixin:
         n_self_facts_excluded = 0
         if self_session and facts_internal:
             own_facts = self._self_session_facts(
-                [f["_uuid"] for f in facts_internal if f.get("_uuid")], self_session
+                [f["_uuid"] for f in facts_internal if f.get("_uuid")], self_session, since=cut
             )
             if own_facts:
                 facts_internal = [f for f in facts_internal if f.get("_uuid") not in own_facts]
@@ -282,10 +287,16 @@ class RecallOverviewMixin:
         # Episodes: rerank order (recency-adjusted above).
         ranked_eps = [x for x in ranked if x.get("doc_type") == "episode"]
         n_self_excluded = 0
+        prior: list[dict[str, Any]] = []
         if self_session:
-            pre_excl = len(ranked_eps)
+            n_self_excluded = len(ranked_eps) - len(
+                self._exclude_self(ranked_eps, self_session, since=cut)
+            )
             ranked_eps = self._exclude_self(ranked_eps, self_session)
-            n_self_excluded = pre_excl - len(ranked_eps)
+            # The cut's second lane: a few of the caller's turns from before its last
+            # compaction, the first in fused order. They are already in the rerank above and
+            # never enter the selection below; the passage stage adds them after it.
+            prior = self._self_prior(ep_pool, self_session, cut)
         # Query-echo suppression: drop episodes that are the prompt quoting itself (compaction
         # copies / re-ingested repeats); the slices below backfill freed slots from next-ranked.
         # Passage mining reads the top _RECALL_PASSAGE_SRC_K, so that bounds the lazy scan.
@@ -294,6 +305,19 @@ class RecallOverviewMixin:
         )
         if n_echo_suppressed:
             ranked_eps = [ranked_eps[i] for i in keep]
+        # Floor enforcement (applied below): a weak match under WORKING retrieval (query_emb
+        # present, a real top score in (0, floor)). The top is the whole pool's, own turns
+        # included, so no own turn clears the floor when it fires and the lane adds none.
+        floored = (
+            settings._RECALL_FLOOR_ENFORCE
+            and query_emb is not None
+            and 0.0 < rerank_top < settings._RECALL_FLOOR
+        )
+        if prior and not floored:
+            keep, _ = self._filter_query_echo(query, prior, len(prior))
+            prior = [prior[i] for i in keep]
+        else:
+            prior = []
         # Stage 2: serve compact passages of the top reranked episodes instead of whole
         # turns. NO fallback: compaction yielding nothing means no passage cleared the
         # bar — LOW relevance — and low relevance must cost FEWER tokens, not more. The
@@ -303,27 +327,29 @@ class RecallOverviewMixin:
         # drill-down paths (recall_episodes / fetch) still return full turns on demand.
         ep_items: list[dict[str, Any]] | None = None
         passage_stats: dict[str, int] = {}
-        if ranked_eps:
+        if ranked_eps or prior:
+            sources = ranked_eps[: settings._RECALL_PASSAGE_SRC_K]
+            if prior:
+                # Own turns sit at their rank in the episode order, which places them when
+                # the passages fit without a rerank.
+                at = {id(e): i for i, e in enumerate(ranked)}
+                sources = sorted(sources + prior, key=lambda e: at[id(e)])
             ep_items = (
                 self._compact_to_passages(
                     query,
-                    ranked_eps[: settings._RECALL_PASSAGE_SRC_K],
+                    sources,
                     settings._RECALL_PASSAGE_N,
                     stats=passage_stats,
+                    own_session=self_session if prior else None,
                 )
                 or None
             )
-        # Floor enforcement: when even the top episode passage is below the floor — a weak
-        # match under WORKING retrieval (query_emb present, a real score in (0, floor)) —
-        # drop the episode bucket. Complements the compaction gate above at a harder
-        # threshold and keeps low relevance cheap. Facts/timeline stay (their own
-        # relevance gates). The same condition is still shadow-marked in served_ids below.
-        # recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
-        if (
-            settings._RECALL_FLOOR_ENFORCE
-            and query_emb is not None
-            and 0.0 < rerank_top < settings._RECALL_FLOOR
-        ):
+        # Floor enforcement: when even the top episode passage is below the floor (see
+        # `floored` above), drop the episode bucket. Complements the compaction gate above
+        # at a harder threshold and keeps low relevance cheap. Facts/timeline stay (their
+        # own relevance gates). The same condition is still shadow-marked in served_ids
+        # below. recall_episodes() (drill-down) does NOT enforce — the caller asked for turns.
+        if floored:
             if settings._RECALL_FLOOR_KEEP_MIN > 0 and ep_items:
                 ep_items = ep_items[: settings._RECALL_FLOOR_KEEP_MIN] or None
             else:
@@ -353,7 +379,7 @@ class RecallOverviewMixin:
         )
         if sup_extras and self_session:
             own_facts = self._self_session_facts(
-                [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session
+                [f["_uuid"] for f in sup_extras if f.get("_uuid")], self_session, since=cut
             )
             sup_extras = [f for f in sup_extras if f.get("_uuid") not in own_facts]
             n_self_facts_excluded += len(own_facts)
@@ -383,19 +409,28 @@ class RecallOverviewMixin:
         # superseded, attach the CURRENT fact (via the invalidated_by link). Augments, never replaces
         # — the turn is immutable history and usually carries more than the stale claim. Deduped
         # against the facts bucket above. Cheap (partial GIN, fail-open); usually a no-op.
+        # Own turns from the second lane get a lookup of their own: it is row-limited, and the
+        # others' must come back exactly as they would without them.
+        own_ids = {e.get("id") for e in prior}
         if ep_items and not kg_off:
-            served_text: dict[int, str] = {}
-            for it in ep_items:
-                for eid in _parse_episode_ids([it.get("id")]):
-                    served_text[eid] = served_text.get(eid, "") + (it.get("content") or "")
-            sup = self._episode_supersessions(
-                list(served_text),
-                self_session=self_session,
-                served_text=served_text,
-                **kg_scope,
-            )
-            if sup:
-                _apply_supersessions(ep_items, sup, {f["fact"] for f in facts})
+            theirs = [it for it in ep_items if it.get("id") not in own_ids]
+            mine = [it for it in ep_items if it.get("id") in own_ids]
+            for items in (theirs, mine):
+                if not items:
+                    continue
+                served_text: dict[int, str] = {}
+                for it in items:
+                    for eid in _parse_episode_ids([it.get("id")]):
+                        served_text[eid] = served_text.get(eid, "") + (it.get("content") or "")
+                sup = self._episode_supersessions(
+                    list(served_text),
+                    self_session=self_session,
+                    served_text=served_text,
+                    since=cut,
+                    **kg_scope,
+                )
+                if sup:
+                    _apply_supersessions(items, sup, {f["fact"] for f in facts})
 
         # Entity DISPLAY bucket retired 2026-07-23: seed entities are name-keyed
         # side summaries (often just filenames), uninstrumented and uncitable, and
@@ -457,6 +492,11 @@ class RecallOverviewMixin:
             served_ids["self_session"] = self_session
             served_ids["n_self_excluded"] = n_self_excluded
             served_ids["n_self_facts_excluded"] = n_self_facts_excluded
+        # With a cut, the caller's turns from before its last compaction may serve again;
+        # count them so the effect of the cut is measurable.
+        if cut is not None:
+            served_ids["self_since"] = cut.isoformat()
+            served_ids["n_self_served"] = sum(i in own_ids for i in served_ids["episodes"])
         # Shadow abstention floor (telemetry only): mark when an enforced floor WOULD have
         # abstained. Compares the RAW pre-recency rerank_top recorded below — NOT the
         # recency-adjusted ordering — so the marker and rerank_top_score always agree.

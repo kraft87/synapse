@@ -15,7 +15,10 @@ instance, no live DB.
 from __future__ import annotations
 
 from contextlib import nullcontext
+from datetime import UTC, datetime
 from typing import Any, ClassVar
+
+import pytest
 
 import mcp_server.recall as recall_mod
 from ingestion.surfaces import FULL_TRUST, SurfaceTrust
@@ -227,9 +230,11 @@ def test_vector_leg_scopes_to_session():
     assert "session_id = %s" in sql and "sess-1" in params and "proj" in params
 
 
-def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
+@pytest.mark.parametrize("self_since", [None, "2026-11-12T14:00:00Z"])
+def test_session_scoped_recall_skips_self_exclusion(monkeypatch, self_since):
     """An explicit session ask must never be suppressed — even for the caller's
-    own session (the whole point is reading yourself back)."""
+    own session (the whole point is reading yourself back). A compaction cut changes
+    nothing there: there is no exclusion for it to narrow."""
     r = _bare()
     seen: dict[str, Any] = {}
 
@@ -239,24 +244,27 @@ def test_session_scoped_recall_skips_self_exclusion(monkeypatch):
         seen["session_id"] = session_id
         return []
 
-    def _excl(pool, sid):
-        seen["excluded"] = True
+    def _excl(pool, sid, since=None):
+        seen["excluded"] = since
         return pool
 
     r._episode_pool = _pool  # type: ignore[method-assign]
     r._exclude_self = _excl  # type: ignore[method-assign]
-    r._select_episodes = lambda q, pool, limit: (pool, 0, 0.0)  # type: ignore[method-assign]
+    r._select_episodes = lambda q, pool, limit, **_k: (pool, 0, 0.0)  # type: ignore[method-assign]
     r._record_metrics = lambda m: seen.setdefault("metrics", m)  # type: ignore[method-assign]
     r._increment_retrieval_counts = lambda ids: None  # type: ignore[method-assign]
 
-    r.recall_episodes("q", self_session="me", session_id="sess-1")
+    r.recall_episodes("q", self_session="me", self_since=self_since, session_id="sess-1")
     assert seen["session_id"] == "sess-1"  # filter reached the pool
     assert "excluded" not in seen  # self-exclusion skipped for scoped calls
     assert seen["metrics"]["served_ids"]["session_id"] == "sess-1"
+    assert "self_since" not in seen["metrics"]["served_ids"]
 
     seen.clear()
-    r.recall_episodes("q", self_session="me")
+    r.recall_episodes("q", self_session="me", self_since=self_since)
     assert "excluded" in seen  # unscoped calls still self-exclude
+    cut = None if self_since is None else datetime(2026, 11, 12, 14, tzinfo=UTC)
+    assert seen["excluded"] == cut  # the cut reaches the exclusion parsed
 
 
 # ---------------------------------------------------------------------------

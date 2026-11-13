@@ -91,7 +91,7 @@ def _wired(*, embed_fail: bool = False, rerank_fail: bool = False, pool: list[di
     r._episode_pool = (
         lambda q, emb, proj, session_id=None, allowed_projects=None, own_surface=None: list(p)
     )
-    r._select_episodes = lambda q, pl, limit: (pl[:limit], 0, 0.9)
+    r._select_episodes = lambda q, pl, limit, **_k: (pl[:limit], 0, 0.9)
     r._record_metrics = lambda m: None
     return r
 
