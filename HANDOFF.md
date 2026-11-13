@@ -3,6 +3,78 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-12 — client: the private-mode check sits where a turn leaves the machine (plugin 0.24.8)
+
+**What changed**
+
+- **Before, every uploader had to remember the check.** A session in private mode is kept
+  off the server by a check each uploader made before it called the sender. The senders
+  themselves sent whatever they were handed. `synapse-import` made no check at all: it
+  relied on the server's `private_sessions` row alone, so a session whose row had not
+  landed (the toggle then exits nonzero and leaves the marker in place) was imported.
+- **Now the sender refuses.** `private.check_payload` reads the sessions a body names
+  (its own `session_id`, and each record's `sessionId`) and raises `PrivateSession`
+  before any request when one is in private mode, or has a marker that cannot be read.
+  It runs in:
+  - `Client.ingest`, the only place the client core posts to the ingest route;
+  - `_post_records` in the Claude Code Stop hook, which the catch-up sweep and
+    `synapse-import` share;
+  - `_post` in the Codex Stop hook.
+  The uploaders keep their own earlier check (it saves reading the transcript). A session
+  marked between that check and the request is skipped, and is not counted as a failed
+  upload: no cursor moves, nothing is marked pending, no warning streak starts.
+- **`synapse-import` skips private sessions**, by the transcript's file name and by its
+  records, prints `skipped (private session)` for each, and no longer exits nonzero when
+  the only files it did not import were private ones.
+- **One uploader in the core** (`plugin/synapse_client/upload.py`). `Uploader.send` queues
+  a body ahead of its request, sends it, and removes it or keeps it as waiting; it answers
+  sent, queued, lost or private. `TurnUploader` uploads a conversation's finished turns
+  once each in the `messages` format. Both were inside the Hermes provider; the turn
+  rules moved with them (`plugin/synapse_client/messages.py`), and the Hermes adapter
+  keeps only the conversion from Hermes's message dicts. A fourth harness hands its
+  records to `TurnUploader` and gets the check, the queue and the retry with them.
+- **A drain no longer sends what went private while it waited.** A queued upload whose
+  session was taken off the record afterwards is dropped by the next drain (the server
+  would refuse it anyway). One whose marker cannot be read stays queued, unsent. The
+  drain goes on to the rest in both cases.
+- **Hermes: a session is no longer skipped because another one started at the same
+  moment.** The marks lookup (`harnesses/hermes/marks.py`) asked "is anything there?"
+  and then "is it a broken link?" as two steps. When another session of the same home
+  created `<hermes_home>/synapse/` between them, the lookup took the new folder for a
+  broken link, and that call was skipped with `the session store or its marks could not
+  be read`. It now looks once more. This was the cause of a test that failed about one
+  run in twelve.
+
+**On each machine**
+
+1. `synapse update` for plugin 0.24.8. Nothing to migrate, no setting to change, no
+   server change.
+
+**Proven**
+
+- `tests/test_client_core_upload.py` (24 tests): `Client.ingest` sends nothing for a
+  private session however the body names it; an unreadable marker refuses without
+  claiming the session is private; a body is on disk before its request and gone after;
+  a failed send waits with its reason; a private session is neither sent nor queued,
+  including one marked between the uploader's check and the request; a drain drops what
+  went private, keeps what it cannot tell about, and sends the rest; turns go once each,
+  with the lookback and the retry the Hermes provider had.
+- Claude Code hook, Codex hook and import: each sender refuses a private batch with no
+  request made; a session marked after the first check is skipped with nothing recorded
+  as failed; the import skips by file name, by record and for an unreadable marker, and
+  still imports the rest.
+- The Hermes provider's own tests pass unchanged apart from where the moved functions are
+  imported from, the in-flight and failed-turn suites included.
+- The marks race: a test that creates the folder between the two looks fails on the old
+  code and passes on the new. The concurrency test that failed 1 run in 12 on main passed
+  40 of 40 with the fix.
+
+**Still open**
+
+- Claude Code's and Codex's Stop hooks still have their own shippers (cursor files, the
+  catch-up sweep). They run the shared check; they do not use `Uploader` yet.
+- The private-mode toggle is still one script per harness, and Hermes has none.
+
 ## 2026-11-12 — hermes: the provider works on `hermes chat`, for the owner only; failed turns and exits no longer corrupt or lose uploads (plugin 0.24.7)
 
 **What changed**

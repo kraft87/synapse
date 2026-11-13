@@ -19,6 +19,8 @@ plugin/                          what every install method ships
     private.py                   is this session private (the marker file and its TTL)
     project.py                   project label for a working directory
     outbox.py                    durable queue for uploads that failed
+    messages.py                  a conversation in the `messages` format, cut into turns
+    upload.py                    the one way out for a turn: private check, send, queue
     tools.py + tool_schemas.json the memory tools, as static schemas + a tools/call proxy
     harnesses/
       __init__.py                the Harness protocol and the registry
@@ -70,6 +72,14 @@ server-only change leaves the version alone. The rules live in `scripts/release_
    installer copies the core plus `harnesses/hermes/` and nothing else.
 5. **Wording lives in the core.** The nudge, the preferences block and the enrollment
    notices are the same text in every harness; an adapter only chooses the envelope.
+6. **A turn leaves through one door, and the private rule stands at it.** `Client.ingest`
+   is the only place the core posts to the ingest route. It refuses a body that names a
+   session in private mode before any request (`private.check_payload`: the body's own
+   `session_id` and each record's `sessionId`). An adapter hands its records to
+   `upload.TurnUploader`, or a ready body to `upload.Uploader`, and never posts to the
+   ingest route itself, so no adapter can forget the check. The two older shippers that
+   still post on their own (Claude Code's and Codex's Stop hooks) run the same check
+   inside their senders.
 
 ## What an adapter provides
 
@@ -319,8 +329,10 @@ importer for `state.db`, and Synapse in messaging-gateway and API-server session
 (above). Skill invocations are uploaded as Hermes hands them over: the manager strips
 the skill body from the user text it passes, not from `messages`.
 
-**Tests.** `tests/test_hermes_messages.py`, `test_hermes_provider.py` (against a stub of
-Hermes's base class) and `test_hermes_install.py` run everywhere, with
+**Tests.** The uploader and the private rule at the request are in
+`tests/test_client_core_upload.py`. `tests/test_hermes_messages.py`,
+`test_hermes_provider.py` (against a stub of Hermes's base class) and
+`test_hermes_install.py` run everywhere, with
 `test_hermes_gateway_sessions.py` (the rule, over a `state.db` built like Hermes's),
 `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` and
 `test_hermes_install_selection.py`. `tests/test_hermes_integration.py` runs only with
@@ -339,7 +351,8 @@ over their old functions.
 
 Codex's hooks (`plugin-codex/`) run on the core since plugin 0.24.4: `common.py` resolves
 with `Settings.load` and sends through `Transport`, and session start, the prompt nudge,
-the recall-feedback nudge and the Stop hook's private check come from the core. Codex
+the recall-feedback nudge and the Stop hook's private check come from the core; its
+sender (`_post`) runs `private.check_payload` on the body it is about to send. Codex
 keeps its own Stop-hook shipper (rollout cursors, catch-up sweep and retry), the
 session-id injection hook (`pre_tool_use.py`), the private-mode toggle
 (`scripts/private_mode.py`) and the skills-sync glue.
@@ -348,7 +361,9 @@ Claude Code's hooks (`plugin/scripts/`) run on the core since plugin 0.24.5: `co
 resolves with `Settings.load` and sends through `Transport`; the board, preferences and
 prompt-nudge hooks print what `context` builds, with Claude Code's enrollment wording
 (`enroll.py`) passed in; the Stop hook uploads through `Transport` and its private check
-is `private.is_private`. Claude Code keeps its own Stop-hook shipper (byte cursor,
+is `private.is_private`, with `private.check_payload` run again inside the sender
+(`_post_records`), which the catch-up sweep and `synapse-import` share. Claude Code keeps
+its own Stop-hook shipper (byte cursor,
 chunking, the detached `--ship`, retry bookkeeping, the catch-up sweep), the session-id
 injection hook (`self_session_inject.py`), the private-mode toggle
 (`scripts/private_mode.py`), the remember spool, the git feeder and the skills and config
@@ -400,6 +415,13 @@ The core ports the hooks' behaviour and wording, with these differences:
   takes such a payload, and neither the cap nor the warning counts it, until `s` seconds
   have passed; after that its sender is taken for dead and a drain sends it, at most
   once more than needed, which the server's span-id dedup absorbs.
+- **Uploads go through `upload`.** `Uploader.send` is that sequence (queue ahead, send,
+  remove or keep) behind one call that answers sent, queued, lost or private, and
+  `Uploader.drain` sends what waits. A payload whose session went private after it was
+  queued is dropped by the drain; one whose marker cannot be read stays, unsent; the
+  drain goes on to the rest either way. `TurnUploader` is the `messages` uploader Hermes
+  started with: finished turns once each, the turn before as context, a resumed
+  conversation looking back only so far.
 
 ## Adding a harness
 
@@ -409,6 +431,9 @@ The core ports the hooks' behaviour and wording, with these differences:
 2. Add `synapse_client/harnesses/<name>/` with the wiring (`detect / install / update /
    wired`) and register it. `synapse login` picks it up.
 3. Map the harness's events onto the core: session start -> `context.session_block`,
-   prompt -> `context.prompt_nudge`, turn end -> `Client.ingest` (+ outbox), tool calls ->
-   `tools.call`.
+   prompt -> `context.prompt_nudge`, turn end -> `upload.TurnUploader.upload` with the
+   conversation as `messages` records (`messages.py` says what a record holds; the
+   adapter only converts its harness's shapes), tool calls -> `tools.call`. Do not post
+   to the ingest route from the adapter: the uploader is where a private session's turns
+   are stopped and a failed upload is queued.
 4. Add a column to the table above and say what is not ported.

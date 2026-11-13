@@ -23,6 +23,10 @@ does not count, before that deadline: its caller then ``remove``s it once delive
 Past the deadline its sender died or hung, and a drain puts it back as waiting; one
 still sending then sends it once more, which the server's dedup absorbs.
 
+A drain's ``send`` may also raise ``Skip`` for a payload that must not go (a session
+taken off the record since it was queued): it is dropped or left waiting, as the
+``Skip`` says, and the drain goes on to the next.
+
 Payloads dropped for the cap or as refused by the server are counted in ``.dropped``
 beside the queue (dot-prefixed, so never taken for a payload) and named in the
 session-start warning. The count belongs to the current backlog: it is cleared, with the
@@ -60,6 +64,17 @@ _LAST_ERROR = ".last_error"
 _DROPPED = ".dropped"
 
 Log = Callable[[str], None]
+
+
+class Skip(Exception):
+    """Raised by a drain's ``send``: this payload must not be sent. With ``drop`` it is
+    deleted (logged with ``why``, not counted as dropped: nothing failed); without, it
+    stays waiting. Either way the drain goes on."""
+
+    def __init__(self, why: str, *, drop: bool) -> None:
+        super().__init__(why)
+        self.why = why
+        self.drop = drop
 
 
 def short_reason(err: BaseException) -> str:
@@ -360,11 +375,12 @@ class Outbox:
 
         A delivered payload is deleted. One the server refused with 400, 413 or 422 is
         dropped (logged and counted): it will never be accepted, and keeping it would
-        block everything behind it. Any other failure, every other HTTP status included,
-        puts the payload back, records its reason and STOPS, since the next send would
-        fail the same way. An unreadable payload file is dropped (logged). A drain that
-        leaves the queue empty clears the recorded reason and the dropped count. Never
-        raises over a failed send."""
+        block everything behind it. One ``send`` raises ``Skip`` for is dropped or left
+        waiting, as the Skip says, and the drain goes on. Any other failure, every other
+        HTTP status included, puts the payload back, records its reason and STOPS, since
+        the next send would fail the same way. An unreadable payload file is dropped
+        (logged). A drain that leaves the queue empty clears the recorded reason and the
+        dropped count. Never raises over a failed send."""
         self._recover(time.time_ns())
         sent = done = 0
         for name in self._waiting():
@@ -383,6 +399,12 @@ class Outbox:
                 continue
             try:
                 send(payload)
+            except Skip as skip:
+                if skip.drop:
+                    self._drop(claimed, f"outbox: dropped {name}: {_one_line(skip.why)}")
+                else:
+                    self._release(claimed, name)
+                continue
             except urllib.error.HTTPError as err:
                 if err.code in _DROP_4XX:
                     self._drop(

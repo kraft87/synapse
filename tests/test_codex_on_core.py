@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 
-from tests.helpers.client_core import REPO, scratch_user, use_core
+from tests.helpers.client_core import REPO, fake_urlopen, scratch_user, use_core
 
 _CODEX = REPO / "plugin-codex"
 _TOKEN = "tkCODEXcore7Rq2Wm9"
@@ -759,6 +759,28 @@ def test_stop_hook_honours_a_fresh_private_marker(scratch, monkeypatch, tmp_path
     _hook, posted = _ship(monkeypatch, tmp_path, _SESSION)
     assert posted == [] and marker.exists()
     assert f"skip: private session {_SESSION}" in _hook_log(tmp_path)
+
+
+def test_stop_hook_sender_itself_refuses_a_private_session(scratch, monkeypatch, tmp_path):
+    """The rule sits where a body leaves the machine. A session marked between _ship's
+    own look and the request is not sent, and is not an upload that failed."""
+    hook = _load("codex_stop_hook_private_at_request", _CODEX / "hooks" / "synapse_stop_hook.py")
+    seen = fake_urlopen(monkeypatch, {"status": "ok", "ingested": 1})
+    marker = Path(os.environ["SYNAPSE_PRIVATE_DIR"]) / _SESSION
+    marker.parent.mkdir(parents=True)
+    marker.write_text("", encoding="utf-8")
+    with pytest.raises(hook.private.PrivateSession):
+        hook._post([{"type": "response_item"}], _SESSION)
+    assert seen == []
+
+    rollout = _rollout(tmp_path / f"rollout-2026-11-12T09-00-00-{_SESSION}.jsonl")
+    monkeypatch.setattr(hook.private, "is_private", lambda *args, **kwargs: False)
+    assert hook._ship({"session_id": _SESSION, "transcript_path": str(rollout)}) == (0, 0)
+    assert seen == [] and hook._load_state() == {} and hook.failure_warning() is None
+    assert f"skip: private session {_SESSION} (at the request)" in _hook_log(tmp_path)
+    marker.unlink()  # back on the record: the same rollout ships, from the start
+    assert hook._ship({"session_id": _SESSION, "transcript_path": str(rollout)}) == (1, 2)
+    assert len(seen) == 1
 
 
 @pytest.mark.parametrize("ttl", [None, "1"])

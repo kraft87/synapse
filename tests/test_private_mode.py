@@ -32,6 +32,8 @@ from types import ModuleType
 
 import pytest
 
+from tests.helpers.client_core import fake_urlopen
+
 _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
 _TOGGLE = _REPO / "plugin" / "scripts" / "private_mode.py"
@@ -210,6 +212,33 @@ def test_unreadable_marker_dir_skips_ingestion(hook, tmp_path, monkeypatch):
     assert hook._is_private(sid) is True
     assert hook._ship(str(path), mode="stop") == (0, 0)
     assert posted == []
+
+
+def test_the_sender_itself_refuses_a_private_batch(hook, monkeypatch):
+    """The rule sits where a batch leaves the machine, so a caller that left its own
+    look out (the history import had none) still sends nothing."""
+    seen = fake_urlopen(monkeypatch, {"status": "ok", "ingested": 1})
+    _mark(Path(os.environ["SYNAPSE_PRIVATE_DIR"]), "s-private")
+    with pytest.raises(hook.private.PrivateSession) as refused:
+        hook._post_records([_u("u1", "s-public"), _a("a1", "s-private")], source="import")
+    assert refused.value.session_id == "s-private" and seen == []
+    hook._post_records([_u("u1", "s-public"), _a("a1", "s-public")], source="import")
+    assert len(seen) == 1
+
+
+def test_a_session_marked_after_the_first_look_is_skipped_not_failed(hook, tmp_path, monkeypatch):
+    """The marker lands between _ship's own look and the request. Nothing is sent, and
+    it is not an upload that failed: no cursor, no pending mark, no failure streak."""
+    sid = "s-private"
+    path = _transcript(tmp_path, sid)
+    seen = fake_urlopen(monkeypatch, {"status": "ok", "ingested": 2})
+    monkeypatch.setattr(hook, "_is_private", lambda session_id: False)
+    _mark(Path(os.environ["SYNAPSE_PRIVATE_DIR"]), sid)
+
+    assert hook._ship(str(path), mode="stop") == (0, 0)
+    assert seen == [] and hook._load_state() == {}
+    log = (tmp_path / "hook.log").read_text(encoding="utf-8")
+    assert "PRIVATE skip stop s-private.jsonl (at the request)" in log and "ERR" not in log
 
 
 def test_no_marker_ships_normally(hook, tmp_path, monkeypatch):

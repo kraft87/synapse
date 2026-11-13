@@ -28,7 +28,7 @@ shares, so what they read, send and print matches the Claude plugin:
 - the recall-feedback nudge has the same text and the same rule: off unless
   `SYNAPSE_RECALL_FEEDBACK_NUDGE=1`;
 - the Stop hook asks the core whether a session is private, with the same marker age
-  limit.
+  limit, and asks again where the request is sent.
 
 It differs where Codex works differently:
 

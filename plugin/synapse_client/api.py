@@ -3,15 +3,17 @@
 Every method RAISES what the transport raises (http.py's module docstring): an HTTP
 error, an unreachable server, a malformed reply, a tool error. None is swallowed here;
 the callers that must fail open (session-start blocks, the ingest hook) catch around
-the call, and context.py's pieces do exactly that.
+the call, and context.py's pieces do exactly that. ``ingest`` alone holds a rule of its
+own: it refuses a private session's turns (private.py) before any request.
 """
 
 from __future__ import annotations
 
 import urllib.parse
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from . import private
 from .http import Transport
 from .settings import Settings
 
@@ -56,10 +58,23 @@ class Client:
         items = reply.get("items") or []
         return [item for item in items if isinstance(item, dict)]
 
-    def ingest(self, payload: Mapping[str, Any], timeout: float = 30) -> Any:
+    def ingest(
+        self,
+        payload: Mapping[str, Any],
+        timeout: float = 30,
+        *,
+        sessions: Iterable[str] = (),
+        log: Callable[[str], None] | None = None,
+    ) -> Any:
         """``POST`` ``payload`` to the ingest URL and return the parsed reply. The payload
         is the ingest route's body (``format``, ``records``, ``source``, ``project``, ...);
-        the server answers 400 for a format it does not know. Raises."""
+        the server answers 400 for a format it does not know. Raises.
+
+        A body that names a session in private mode is refused first, with no request:
+        RAISES private.PrivateSession (private.check_payload; ``sessions`` are ids the
+        body belongs to and does not carry). This is the only place the core posts to the
+        ingest route, so nothing uploaded through it skips the check."""
+        private.check_payload(self.settings, payload, sessions, log)
         return self.transport.post_json(self.settings.ingest_url, dict(payload), timeout=timeout)
 
     def _private(self, method: str, session_id: str, timeout: float) -> dict[str, Any]:

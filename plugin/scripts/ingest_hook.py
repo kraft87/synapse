@@ -352,6 +352,13 @@ def _emit_failure_warning() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _private_settings() -> Any:
+    """The client core's settings for the private check: this hook's marker folder, and
+    the TTL read from the environment only, as this hook always has."""
+    settings = config.SETTINGS.with_sources(environ=os.environ, config={}, extra_candidates=())
+    return dataclasses.replace(settings, private_dir=Path(PRIVATE_DIR))
+
+
 def _is_private(session_id: str) -> bool:
     """True if `session_id` is in private mode → ship NOTHING for it.
 
@@ -373,11 +380,10 @@ def _is_private(session_id: str) -> bool:
         private_mode.py could have written: it reads as not private, and nothing outside
         PRIVATE_DIR is touched.
 
-    The TTL is read from the environment only, as this hook always has.
+    _post_records runs the same rule again on the batch it is about to send
+    (private.check_payload), so a caller that left this check out still sends nothing.
     """
-    settings = config.SETTINGS.with_sources(environ=os.environ, config={}, extra_candidates=())
-    settings = dataclasses.replace(settings, private_dir=Path(PRIVATE_DIR))
-    return private.is_private(settings, session_id, _log)
+    return private.is_private(_private_settings(), session_id, _log)
 
 
 def _cwd_labels(records: list[dict[str, Any]]) -> dict[str, str]:
@@ -402,8 +408,13 @@ def _post_records(records: list[dict[str, Any]], source: str = "hook") -> str:
     response body. Shared by the Stop-hook shipper, the catch-up sweep, and the
     bulk history import (import_history.py), so all resolve URL/token identically
     through config.py, and all send the batch's project label (_records_project).
-    Raises on transport/HTTP errors — callers decide how to fail-soft."""
+    Raises on transport/HTTP errors — callers decide how to fail-soft.
+
+    RAISES private.PrivateSession, before any request, when a record of the batch
+    belongs to a session in private mode (or one whose marker cannot be read). The rule
+    sits here, where a batch leaves, so no caller can leave it out."""
     payload: dict[str, Any] = {"records": records, "source": source}
+    private.check_payload(_private_settings(), payload, (), _log)
     by_cwd = _cwd_labels(records)
     if len(set(by_cwd.values())) == 1:
         payload["project"] = next(iter(by_cwd.values()))
@@ -487,6 +498,11 @@ def _ship(transcript_path: str, *, mode: str = "stop") -> tuple[int, int]:
             continue
         try:
             payload = _post_records(records, source="hook" if mode == "stop" else "sweep")
+        except private.PrivateSession:
+            # Taken off the record since the checks above. Not a failed upload: the
+            # cursor stays where it is and nothing is marked pending.
+            _log(f"PRIVATE skip {mode} {os.path.basename(transcript_path)} (at the request)")
+            break
         except Exception as e:
             # Cursor stays at the failure point — the next Stop or the
             # SessionStart sweep resumes exactly there. Earlier chunks stand.

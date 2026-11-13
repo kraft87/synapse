@@ -40,6 +40,7 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config
 import ingest_hook  # shares the /ingest POST + URL/token resolution with the Stop hook
+from synapse_client import private  # ingest_hook put the plugin folder on the path
 
 _PEEK_LINES = 5  # leading lines sniffed to decide "is this a session transcript?"
 
@@ -180,7 +181,14 @@ def batches(records: list[dict[str, Any]], batch_size: int) -> Iterator[list[dic
 
 def ship_file(path: Path, batch_size: int) -> int:
     """POST one transcript full-length in turn-aligned batches. Returns how many
-    genuinely-new turns the server ingested (dedup silently skips the rest)."""
+    genuinely-new turns the server ingested (dedup silently skips the rest).
+
+    RAISES private.PrivateSession, with nothing sent, for the transcript of a session in
+    private mode: the file's name is its session id, as in the Stop hook. A batch whose
+    records name another such session is refused by the sender itself."""
+    state = private.state(ingest_hook._private_settings(), path.stem, ingest_hook._log)
+    if state != private.OPEN:
+        raise private.PrivateSession(path.stem, sure=state == private.PRIVATE)
     with open(path, "rb") as f:
         raw_lines = [line.strip() for line in f if line.strip()]
     records = ingest_hook._parse_lines(raw_lines)
@@ -260,7 +268,7 @@ def main(argv: list[str] | None = None) -> int:
             print("Aborted — nothing was sent.")
             return 1
 
-    ok = failed = ingested_total = 0
+    ok = failed = skipped = ingested_total = 0
     for i, path in enumerate(files, 1):
         try:
             rel: object = path.relative_to(projects_dir)
@@ -268,6 +276,11 @@ def main(argv: list[str] | None = None) -> int:
             rel = path.name
         try:
             n = ship_file(path, args.batch_size)
+        except private.PrivateSession as refused:
+            skipped += 1
+            why = "private session" if refused.sure else "its private marker cannot be read"
+            print(f"[{i}/{len(files)}] {rel} → skipped ({why})", flush=True)
+            continue
         except Exception as e:
             failed += 1
             print(
@@ -281,9 +294,11 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print(f"Done: {ingested_total} new turn(s) ingested from {ok}/{len(files)} file(s).")
+    if skipped:
+        print(f"{skipped} file(s) skipped: private mode keeps their sessions on this machine.")
     if failed:
         print(f"{failed} file(s) failed — re-run to retry; already-ingested turns are skipped.")
-    return 1 if ok == 0 else 0
+    return 1 if failed and ok == 0 else 0
 
 
 if __name__ == "__main__":

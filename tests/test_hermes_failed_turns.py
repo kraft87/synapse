@@ -22,6 +22,7 @@ from tests import test_hermes_provider as base
 from tests.helpers.client_core import use_core
 
 use_core()
+from synapse_client import messages as cm  # noqa: E402
 from synapse_client.harnesses.hermes import messages as hm  # noqa: E402
 
 hermes_stub = base.hermes_stub
@@ -158,8 +159,8 @@ def test_hidden_rows_keep_only_their_tool_calls():
 
 def test_a_turn_whose_only_reply_was_held_back_is_not_complete():
     rows = [_user("u-5", "Fix the tests."), {**_reply("a-5", "Done."), "display_kind": "hidden"}]
-    (turn,) = hm.turns(hm.to_records(rows))
-    assert not hm.complete(turn)
+    (turn,) = cm.turns(hm.to_records(rows))
+    assert not cm.complete(turn)
 
 
 @pytest.mark.parametrize(
@@ -190,11 +191,11 @@ def _text(records: list[dict[str, Any]]) -> str:
 
 
 def test_a_failed_turn_never_completes_and_its_message_is_not_sent():
-    turns = hm.turns(hm.to_records(_conversation()))
-    assert [hm.complete(t) for t in turns] == [True, False, True]
-    (only,) = hm.batches(hm.pending(turns, set()))
+    turns = cm.turns(hm.to_records(_conversation()))
+    assert [cm.complete(t) for t in turns] == [True, False, True]
+    (only,) = cm.batches(cm.pending(turns, set()))
     records, new = only
-    assert [hm.turn_key(t) for t in new] == ["a-1", "a-3"]
+    assert [cm.turn_key(t) for t in new] == ["a-1", "a-3"]
     for absent in ("Deploy it to staging", "make deploy", "did not complete", "provider_error"):
         assert absent not in _text(records)
     first, second = _episodes(records)
@@ -207,9 +208,9 @@ def test_a_failed_turn_never_completes_and_its_message_is_not_sent():
 
 
 def test_the_turn_after_a_failure_leads_with_the_last_complete_turn():
-    turns = hm.turns(hm.to_records(_conversation()))
-    ((records, new),) = hm.batches(hm.pending(turns, {"a-1"}))
-    assert [hm.turn_key(t) for t in new] == ["a-3"]
+    turns = cm.turns(hm.to_records(_conversation()))
+    ((records, new),) = cm.batches(cm.pending(turns, {"a-1"}))
+    assert [cm.turn_key(t) for t in new] == ["a-3"]
     assert [r.get("id") for r in records] == ["u-1", "a-1", "u-3", "a-3"]
     (episode,) = _episodes(records)[1:]
     assert episode.content.startswith("[context] Two commits since the last tag.")
@@ -217,8 +218,8 @@ def test_the_turn_after_a_failure_leads_with_the_last_complete_turn():
 
 def test_a_failure_at_the_end_sends_nothing():
     rows = _conversation()[:7]
-    turns = hm.turns(hm.to_records(rows))
-    assert hm.pending(turns, {"a-1"}) == []
+    turns = cm.turns(hm.to_records(rows))
+    assert cm.pending(turns, {"a-1"}) == []
 
 
 # ---------------------------------------------------------------------------
