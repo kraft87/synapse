@@ -1,11 +1,16 @@
 """Boot-time schema-version guard.
 
-``scripts/apply_schema.sh`` stamps ``synapse_meta.schema_version`` (table
-from migration 034) after a full run; every long-lived service (poller,
-MCP server, dream) calls :func:`check_schema_version` at startup. A
+``scripts/apply_schema.sh`` records every schema file it applies in
+``schema_migrations`` and keeps ``synapse_meta.schema_version`` (table from
+migration 034) at the highest number recorded; every long-lived service
+(poller, MCP server, dream) calls :func:`check_schema_version` at startup. A
 database that is missing the stamp or behind the code's schema fails FAST
 with upgrade instructions, instead of surfacing as confusing runtime
 errors mid-request.
+
+The guard reads the stamp, not the ledger: the ledger says what the script
+still has to apply, and a file applied some other way has no row in it. A
+missing row must not keep a service down on a database that has the file.
 
 Fail-open cases — the guard never blocks on its own infrastructure:
   * ``SYNAPSE_SCHEMA_CHECK=0`` skips the check entirely (escape hatch).
@@ -144,7 +149,7 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
         logger.warning(
             "Database is at schema %s, behind this build's schema %s, but every newer "
             "migration is marked optional (this build keeps its pre-migration behaviour "
-            "without them); continuing. Apply them one at a time, in order (see "
+            "without them); continuing. scripts/apply_schema.sh applies them (see "
             "docs/install.md > Upgrading).",
             applied,
             expected,
@@ -157,7 +162,7 @@ def check_schema_version(db_url: str, schema_dir: Path | None = None) -> None:
     )
     logger.critical(
         "Database %s but this build expects schema %s. "
-        "Apply the schema files above its stamp to it, one at a time, in order "
+        "Run scripts/apply_schema.sh against it, which applies the files it has not had "
         "(see docs/install.md > Upgrading), then restart. "
         "To skip this check: SYNAPSE_SCHEMA_CHECK=0.",
         state,

@@ -111,6 +111,7 @@ _DB_FILES = {
     "test_note_tiers_db.py",
     "test_preference_merge_db.py",
     "test_redact_stored_secrets_db.py",
+    "test_apply_schema_runner_db.py",
 }
 
 

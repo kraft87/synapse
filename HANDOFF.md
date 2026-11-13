@@ -3,6 +3,91 @@
 Newest first. One entry per change that alters how a machine is set up or operated: what
 changed, what to do on each machine, what was proven, and what is still open.
 
+## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
+
+**What changed**
+
+- **Before, the script was for an empty database.** It ran every schema file each time,
+  and a second run stopped at 001. An upgrade meant reading the stamp and piping the files
+  above it to `psql` by hand, one at a time.
+- **Now the script records what it applies.** A table, `schema_migrations`, holds one row
+  per schema file the database has had (`version` is the file's number, plus `filename`
+  and `applied_at`). A run applies the files that have no row, in order, and records each.
+  A second run does nothing. An upgrade is `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`
+  from a checkout of the new version.
+- **The script creates the table itself.** It is not a numbered schema file, so this
+  release has no new schema number, the stamp does not move, and no service waits on it.
+- **A database from before the ledger starts from its stamp.** The first run records
+  every file up to `synapse_meta.schema_version` without running it (`applied_at` is NULL
+  on those rows) and applies the rest. It refuses a database that has a schema and no
+  stamp, a stamp that is not a file's number, and a stamp above the newest file in the
+  checkout: in each case it cannot tell which files the database has had.
+- **A file can be marked manual**, with the header line `-- schema-apply: manual`. On a
+  database that holds episodes an upgrade does not run such a file: it leaves an optional
+  one alone and names it, and it stops before a required one with exit status 2.
+  `--only NNN` runs it. 067 (the pollers are stopped first) and 069 (no undo) carry the
+  marker. A database with no episodes runs them in turn, as first boot and CI do.
+- **Two new modes.** `--status` prints the stamp, what is applied and what is pending, and
+  changes nothing. `--only NNN` applies one file, and refuses to step over an earlier file
+  that an upgrade would apply.
+- **A file, its row and the stamp go through one `psql` session, in that order.** A file
+  that fails leaves no row, so the next run starts at it. The stamp is the highest number
+  in the ledger and never moves down.
+- **The boot check is unchanged: it reads the stamp, not the ledger.** A file piped to
+  `psql` by hand has no row, and a check that read the ledger would keep the services
+  down on a database that has the file.
+- **The script passes `-X`**, so a `~/.psqlrc` (`\set AUTOCOMMIT off`, for one) cannot
+  change how the files run.
+- **The file list is checked before anything runs**: three-digit numbers, one file per
+  number, in rising order. A number the ledger holds under another filename stops the run
+  (two branches used the same number).
+
+**On each machine**
+
+1. The release itself needs nothing: no migration, no setting, no client update. No
+   service reads the ledger.
+2. To start the ledger on an existing database, once, whenever you want:
+   `scripts/apply_schema.sh --status "$SYNAPSE_DB_URL"` shows what a run would do, then
+   `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`. On a database stamped 069 it records 001
+   to 069 and applies nothing. If an optional file below the stamp was never applied
+   there, delete its row afterwards and run the script again.
+3. From then on an upgrade is: pull, run the script, restart. A file applied some other
+   way needs its row inserted by hand (`docs/install.md` > Upgrading).
+
+**Rolling back**
+
+- Revert as usual. The table stays and nothing reads it; the older script ignores it.
+- `DROP TABLE schema_migrations` removes the ledger. The next run of the new script starts
+  it again from the stamp, which forgets any file below the stamp that was left alone.
+
+**Proven**
+
+- `tests/test_apply_schema_runner_db.py` runs the real script, its file list swapped for
+  eight stand-ins, on a scratch database: an empty database gets every file once, in
+  order, with a row for each; a second run applies nothing; a file with no row is the only
+  one applied; a file that fails leaves no row and the next run resumes at it; a
+  `~/.psqlrc` with `AUTOCOMMIT off` changes nothing; a database from before the ledger is
+  recorded from its stamp and gets only the files above it; `--status` creates nothing;
+  each refusal above changes nothing; an optional manual file is left alone and a required
+  one stops the run, on a database that holds episodes only; `--only` runs a manual file
+  and steps over nothing an upgrade would apply; the stamp never moves down.
+- Each of seven deliberate breaks of the script (no `-X`, the manual marker ignored, the
+  marker applied to a database with no episodes, no row written, the stamp moved down,
+  `--only` stepping over an optional file, a stamp above the newest file trusted) fails
+  that module.
+- `tests/test_schema.py`: the database CI provisions with the script has a row for every
+  schema file.
+- The real 68 files on PostgreSQL 17, through the first-boot hook of a new container: all
+  68 applied (68 rows, stamp 069), and a second run applied none. Then, with one episode
+  in it and the rows for 061, 067, 068 and 069 deleted: a run applied 061 and stopped
+  before 067 (exit 2); `--only 068` was refused; `--only 067` ran it; the next run applied
+  068 and left 069 alone; `--only 069` ran it.
+- On a database built by the previous script, where that script's second run fails at
+  001, `--status` changed nothing and the first run recorded 68 files and applied none.
+
+**Still open**: no live database has been moved onto the ledger yet. A fresh install still
+replays all 68 files; folding them into one baseline file is a separate change.
+
 ## 2026-11-13 — ingest: a webhook URL is a credential; the stored-row repair leaves no rule out
 
 **What changed**

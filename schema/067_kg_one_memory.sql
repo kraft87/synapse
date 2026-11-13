@@ -37,6 +37,11 @@
 -- audience label (a NULL one is stamped 'personal', label_version 0, first: the rule the
 -- 066 insert trigger applied).
 --
+-- MANUAL on a database that holds episodes: the pollers are stopped first (below), so
+-- scripts/apply_schema.sh stops before this file on an upgrade and it is run by name,
+-- `scripts/apply_schema.sh --only 067`. A database with no episodes runs it in turn.
+-- schema-apply: manual
+--
 -- TWO TRANSACTIONS, piped as this file ALONE:
 --     psql -v ON_ERROR_STOP=1 < 067_kg_one_memory.sql
 -- never wrapped in BEGIN ... COMMIT and never run with --single-transaction or -1 (the
