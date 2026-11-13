@@ -122,7 +122,7 @@ changed, what to do on each machine, what was proven, and what is still open.
   `test_hermes_failed_turns.py`, `test_hermes_inflight_upload.py` (a child process
   killed mid-request, sessions sharing an outbox), `test_client_core_outbox_writeahead.py`,
   `test_client_core_outbox_private_dirs.py`, `test_hermes_install_selection.py`.
-  - Non-db suite: 4444 passed, 38 skipped, 2 xfailed.
+  - Non-db suite: 4463 passed, 38 skipped, 2 xfailed.
   - With `SYNAPSE_HERMES_CHECKOUT`, the integration test and
     `test_hermes_checkout_names.py` pass against Hermes `bca51750`, the columns the
     rule reads from its store and the `model_config` keys that name a copy's origin
