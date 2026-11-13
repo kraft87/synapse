@@ -47,6 +47,10 @@
 -- table wait behind it; after 5 s (lock_timeout) it fails instead, the step rolls back, and
 -- the file can be run again.
 -- schema-check: optional
+--
+-- Manual as well: there is no undo (a dump first is the only way back), so an upgrade with
+-- scripts/apply_schema.sh leaves this file alone and names it; `--only 069` runs it.
+-- schema-apply: manual
 
 \set ON_ERROR_STOP on
 SET lock_timeout = '5s';

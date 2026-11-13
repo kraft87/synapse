@@ -78,6 +78,15 @@ def test_schema_version_stamp_matches_code(conn):
     assert row[0] == expected_schema_version()
 
 
+def test_the_ledger_has_a_row_for_every_schema_file(conn):
+    """apply_schema.sh records each file it applies in schema_migrations; that ledger is
+    how the next run knows which files this database has not had."""
+    shipped = {f.name[:3]: f.name for f in _SCHEMA_DIR.glob("[0-9][0-9][0-9]_*.sql")}
+    recorded = dict(conn.execute("SELECT version, filename FROM schema_migrations").fetchall())
+    missing = sorted(set(shipped.items()) - set(recorded.items()))
+    assert not missing, f"no ledger row for {missing}: run scripts/apply_schema.sh"
+
+
 # ---------------------------------------------------------------------------
 # episodes
 # ---------------------------------------------------------------------------

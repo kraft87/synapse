@@ -231,6 +231,156 @@ changed, what to do on each machine, what was proven, and what is still open.
 - From 0.24.8, unchanged: turns of a Hermes session whose marker cannot be read are not
   uploaded and are lost at exit.
 
+## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
+
+**What changed**
+
+- **Before, the script was for an empty database.** It ran every schema file each time,
+  and a second run stopped at 001. An upgrade meant reading the stamp and piping the files
+  above it to `psql` by hand, one at a time.
+- **Now the script records what it applies.** A table, `schema_migrations`, holds one row
+  per schema file the database has had (`version` is the file's number, plus `filename`
+  and `applied_at`). A run applies the files that have no row, in order, and records each.
+  A second run does nothing. An upgrade is `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`
+  from a checkout of the new version.
+- **The script creates the table itself.** It is not a numbered schema file, so this
+  release has no new schema number, the stamp does not move, and no service waits on it.
+- **A database from before the ledger starts from its stamp.** The first run records
+  every file up to `synapse_meta.schema_version` without running it (`applied_at` is NULL
+  on those rows) and applies the rest. It refuses a database that has a schema and no
+  stamp, a stamp that is not a file's number, and a stamp above the newest file in the
+  checkout: in each case it cannot tell which files the database has had.
+- **A file can be marked manual**, with the header line `-- schema-apply: manual`. On a
+  database that holds episodes an upgrade does not run such a file: it leaves an optional
+  one alone and names it, and it stops before a required one with exit status 2.
+  `--only NNN` runs it. 067 (the pollers are stopped first) and 069 (no undo) carry the
+  marker. A database with no episodes runs them in turn, as first boot and CI do.
+- **Two new modes.** `--status` prints the stamp, what is applied and what is pending, and
+  changes nothing. `--only NNN` applies one file, and refuses to step over an earlier file
+  that an upgrade would apply.
+- **A file, its row and the stamp go through one `psql` session, in that order.** A file
+  that fails leaves no row, so the next run starts at it. The stamp is the highest number
+  in the ledger and never moves down.
+- **The boot check is unchanged: it reads the stamp, not the ledger.** A file piped to
+  `psql` by hand has no row, and a check that read the ledger would keep the services
+  down on a database that has the file.
+- **The script passes `-X`**, so a `~/.psqlrc` (`\set AUTOCOMMIT off`, for one) cannot
+  change how the files run.
+- **The file list is checked before anything runs**: three-digit numbers, one file per
+  number, in rising order. A number the ledger holds under another filename stops the run
+  (two branches used the same number).
+
+**On each machine**
+
+1. The release itself needs nothing: no migration, no setting, no client update. No
+   service reads the ledger.
+2. To start the ledger on an existing database, once, whenever you want:
+   `scripts/apply_schema.sh --status "$SYNAPSE_DB_URL"` shows what a run would do, then
+   `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`. On a database stamped 069 it records 001
+   to 069 and applies nothing. If an optional file below the stamp was never applied
+   there, delete its row afterwards and run the script again.
+3. From then on an upgrade is: pull, run the script, restart. A file applied some other
+   way needs its row inserted by hand (`docs/install.md` > Upgrading).
+
+**Rolling back**
+
+- Revert as usual. The table stays and nothing reads it; the older script ignores it.
+- `DROP TABLE schema_migrations` removes the ledger. The next run of the new script starts
+  it again from the stamp, which forgets any file below the stamp that was left alone.
+
+**Proven**
+
+- `tests/test_apply_schema_runner_db.py` runs the real script, its file list swapped for
+  eight stand-ins, on a scratch database: an empty database gets every file once, in
+  order, with a row for each; a second run applies nothing; a file with no row is the only
+  one applied; a file that fails leaves no row and the next run resumes at it; a
+  `~/.psqlrc` with `AUTOCOMMIT off` changes nothing; a database from before the ledger is
+  recorded from its stamp and gets only the files above it; `--status` creates nothing;
+  each refusal above changes nothing; an optional manual file is left alone and a required
+  one stops the run, on a database that holds episodes only; `--only` runs a manual file
+  and steps over nothing an upgrade would apply; the stamp never moves down.
+- Each of seven deliberate breaks of the script (no `-X`, the manual marker ignored, the
+  marker applied to a database with no episodes, no row written, the stamp moved down,
+  `--only` stepping over an optional file, a stamp above the newest file trusted) fails
+  that module.
+- `tests/test_schema.py`: the database CI provisions with the script has a row for every
+  schema file.
+- The real 68 files on PostgreSQL 17, through the first-boot hook of a new container: all
+  68 applied (68 rows, stamp 069), and a second run applied none. Then, with one episode
+  in it and the rows for 061, 067, 068 and 069 deleted: a run applied 061 and stopped
+  before 067 (exit 2); `--only 068` was refused; `--only 067` ran it; the next run applied
+  068 and left 069 alone; `--only 069` ran it.
+- On a database built by the previous script, where that script's second run fails at
+  001, `--status` changed nothing and the first run recorded 68 files and applied none.
+
+**Still open**: no live database has been moved onto the ledger yet. A fresh install still
+replays all 68 files; folding them into one baseline file is a separate change.
+
+## 2026-11-13 — ingest: a webhook URL is a credential; the stored-row repair leaves no rule out
+
+**What changed**
+
+- **Incoming-webhook URLs are redacted.** A Discord or Slack webhook URL is the whole
+  credential: whoever holds it can post to the channel. `redact_secrets` matched
+  neither, so one pasted into a session was stored and served back by recall. Now
+  `discord.com/api/webhooks/<hook id>/<token>` (also `discordapp.com`, `ptb.`,
+  `canary.` and `/api/v<n>/`) keeps the host and the hook id and loses the token, and
+  `hooks.slack.com/{services,workflows,triggers}/<workspace>/...` keeps the workspace
+  id and loses the rest of the path. The marker is `[REDACTED:webhook]`. The scheme is
+  not needed. A placeholder (`<id>/<token>`, `$TOKEN`, Slack's all-`X` example) and a
+  URL with no token stay as they are.
+- **The webhook rule runs before the provider-token rules.** A webhook token can
+  contain what reads as a provider key. A provider rule that ran first would mark that
+  part and leave the characters before it.
+- **`scripts/redact_stored_secrets.py` had no prefilter entry for seven rule shapes.**
+  The script fetches only the rows its server-side prefilter matches. The six formats
+  added after the script was written (Logfire, Matrix, Voyage, Firecrawl, ElevenLabs,
+  Telegram) and `private_key=` assignments had no entry. A stored row holding only
+  such a value was never fetched, and the report counted its table as clean. Long rows
+  were mostly fetched anyway, because `token`, `basic` or `://` appears somewhere in
+  them; a short one (a fact, a note hook) was not. The prefilter now has an entry for
+  every rule, and for a webhook URL written without a scheme.
+- **A test keeps the rules and the prefilter in step.**
+  `tests/test_redact_stored_secrets_db.py` holds one sample per rule, checks in Postgres
+  that the prefilter matches each, and fails when a rule has no sample. It also runs
+  the script against a scratch table: a dry run writes nothing, `--apply` rewrites the
+  row a rule changes and no other, and the report prints no value. The script had no
+  test before.
+
+**On each machine**
+
+- **Server:** nothing to do. New ingests are redacted once the image is deployed.
+- **Rows already stored:** run the script once per database, dry run first
+  (`python scripts/redact_stored_secrets.py <DSN>`, then the same with `--apply`). It
+  is idempotent. As before, embeddings and earlier backups keep what they had.
+- **A webhook that was ever stored:** regenerate it. That makes every old copy
+  harmless, including the ones in backups.
+- **Clients:** nothing. No client file changed.
+
+**Proven**
+
+- The tests fail when the rule is broken: with the webhook rule removed (11 fail);
+  with it moved after the provider rules (the token-taken-whole test); with `/` taken
+  out of the Slack value (the three Slack shapes); with the placeholder check removed
+  (the two placeholder URLs).
+- A second pass over redacted text changes nothing, for every shape. An earlier draft
+  that kept Slack's later ids and marked only the last segment failed this: the second
+  pass took a long id for a token.
+- The prefilter on main misses 16 of the 52 samples: the six formats, the three
+  `private_key` spellings, and the seven webhook shapes without a scheme. The new one
+  misses none, and each of its 32 entries carries at least one sample: removing any
+  one entry makes the test fail.
+- The full suite (unit, db, db pooled), ruff and mypy pass on PostgreSQL 17. CI runs
+  PostgreSQL 18.
+
+**Still open**
+
+- Other URLs that are credentials have no rule: Teams and Office connectors, IFTTT
+  maker keys, Zapier catch hooks, Home Assistant webhook ids.
+- The placeholder check reads three `x` in a row as a placeholder, so about one real
+  Discord token in 500 would be left. The same check already guards
+  `scheme://user:pass@host`.
+
 ## 2026-11-12 — cli: `synapse update` lets the client it installed update the harnesses (plugin 0.24.9)
 
 **What changed**
