@@ -135,6 +135,10 @@ def _say(line: str) -> None:
     _log().info("%s", line)
 
 
+def _warn(line: str) -> None:
+    _log().warning("%s", line)
+
+
 def _clock() -> str:
     """Now on the client's wall clock (time.time, as Hermes stamps a message), ISO-8601."""
     return datetime.fromtimestamp(time.time(), tz=UTC).isoformat()
@@ -240,7 +244,7 @@ class SynapseMemoryProvider(MemoryProvider):
         settings = Settings.load()
         client = Client(settings, f"synapse-client/{__version__} hermes")
         outbox = Outbox(Path(str(home)) / "synapse" / "outbox", log=_say) if home else None
-        uploader = Uploader(client, outbox, log=_say)
+        uploader = Uploader(client, outbox, log=_say, warn=_warn)
         lookback = LOOKBACK if kwargs.get("resumed") else None
         turns = TurnUploader(uploader, client="hermes", source="hermes-sync", lookback=lookback)
         cwd = kwargs.get("cwd")

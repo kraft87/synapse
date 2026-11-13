@@ -226,7 +226,7 @@ def test_a_session_taken_off_the_record_mid_send_leaves_nothing_queued(tmp_path)
 
     box = _MarkedMeanwhile(tmp_path / "q")
     assert upload.Uploader(client, box).send(_body("s-1"), timeout=5) == (upload.PRIVATE, "")
-    assert wire.tries == 0 and _queued(box) == []
+    assert wire.tries == 0 and os.listdir(box.directory) == []
 
 
 def test_without_an_outbox_a_failed_send_is_lost(tmp_path):
@@ -246,6 +246,21 @@ def test_a_failed_send_that_cannot_be_queued_is_lost_and_said(tmp_path):
     up = upload.Uploader(client, Outbox(tmp_path / "q"), log=lines.append)
     assert up.send(_body("s-1"), timeout=5)[0] == upload.LOST
     assert len(lines) == 2 and lines[1].startswith("synapse: could not queue a failed upload (")
+    assert lines[1].endswith("; it is lost")
+
+
+def test_a_lost_upload_is_said_to_warn_when_there_is_one(tmp_path):
+    """Nothing sends a lost batch again, so its line is the one a harness raises above
+    its ordinary log."""
+    client, wire = _client(tmp_path)
+    (tmp_path / "q").write_text("a file where the outbox goes")
+    lines: list[str] = []
+    warned: list[str] = []
+    wire.fail = TimeoutError("timed out")
+    up = upload.Uploader(client, Outbox(tmp_path / "q"), log=lines.append, warn=warned.append)
+    assert up.send(_body("s-1"), timeout=5)[0] == upload.LOST
+    assert [line.split(" (")[0] for line in lines] == ["synapse: upload failed"]
+    assert [line.split(" (")[0] for line in warned] == ["synapse: could not queue a failed upload"]
 
 
 def test_a_raising_log_does_not_stop_an_upload(tmp_path):
@@ -281,6 +296,27 @@ def test_a_drain_drops_what_went_private_and_goes_on_to_the_rest(tmp_path):
     blind.unlink()  # readable again, and not private
     assert up.drain(timeout=5) == (1, 0)
     assert wire.sessions() == ["s-on", "s-blind"] and _queued(box) == []
+
+
+def test_bodies_a_drain_must_leave_do_not_keep_it_from_the_rest(tmp_path):
+    """Each one left waiting used to count toward the drain's allowance: enough of them
+    at the head of the queue and no drain reached what was behind."""
+    client, wire = _client(tmp_path)
+    box = Outbox(tmp_path / "q")
+    lines: list[str] = []
+    up = upload.Uploader(client, box, log=lines.append)
+    for _ in range(3):
+        box.put(_body("s-blind"), reason="timeout")
+    for session_id in ("s-1", "s-2", "s-3"):
+        box.put(_body(session_id), reason="timeout")
+    _unreadable(tmp_path, "s-blind")
+
+    assert up.drain(timeout=5, max_items=2) == (2, 4)
+    assert wire.sessions() == ["s-1", "s-2"]
+    assert up.drain(timeout=5, max_items=2) == (1, 3)
+    assert wire.sessions() == ["s-1", "s-2", "s-3"]
+    assert _queued(box) == [_body("s-blind")] * 3
+    assert any(line.startswith("PRIVATE unreadable s-blind") for line in lines)
 
 
 def test_a_drain_stops_at_a_send_that_fails_and_keeps_it(tmp_path):
@@ -343,6 +379,27 @@ def test_nothing_is_sent_or_remembered_for_a_private_session(tmp_path):
     assert wire.tries == 0 and not (tmp_path / "q").exists()
     marker.unlink()
     assert turns.upload(_turn(1), "s-1", timeout=5) is True  # it was not counted as sent
+
+
+def test_a_turn_refused_at_the_request_is_not_counted_as_sent(tmp_path):
+    """The marker lands after the turn was claimed for this upload. Nothing goes and
+    nothing is queued; once the session is back on the record the turn is sent."""
+    client, wire = _client(tmp_path)
+    marked: list[Path] = []
+
+    class _MarkedMeanwhile(Outbox):
+        def put(self, payload: Any, reason: str = "", *, sending: float = 0) -> Path:
+            if not marked:
+                marked.append(_mark(tmp_path, "s-1"))
+            return super().put(payload, reason, sending=sending)
+
+    box = _MarkedMeanwhile(tmp_path / "q")
+    turns = upload.TurnUploader(upload.Uploader(client, box), client="t", source="t-sync")
+    assert turns.upload(_turn(1), "s-1", timeout=5) is False
+    assert wire.tries == 0 and os.listdir(box.directory) == []
+    marked[0].unlink()
+    assert turns.upload(_turn(1), "s-1", timeout=5) is True
+    assert wire.posts[0]["body"]["records"] == _turn(1)
 
 
 def test_a_turn_that_fails_waits_in_the_outbox_and_is_not_sent_twice(tmp_path):

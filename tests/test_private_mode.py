@@ -21,6 +21,7 @@ covered DB-backed in test_private_session_routes.py.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -32,7 +33,7 @@ from types import ModuleType
 
 import pytest
 
-from tests.helpers.client_core import fake_urlopen
+from tests.helpers.client_core import core_http, fake_urlopen
 
 _REPO = Path(__file__).resolve().parents[1]
 _PLUGIN_HOOK = _REPO / "plugin" / "scripts" / "ingest_hook.py"
@@ -239,6 +240,41 @@ def test_a_session_marked_after_the_first_look_is_skipped_not_failed(hook, tmp_p
     assert seen == [] and hook._load_state() == {}
     log = (tmp_path / "hook.log").read_text(encoding="utf-8")
     assert "PRIVATE skip stop s-private.jsonl (at the request)" in log and "ERR" not in log
+
+
+def test_a_session_marked_between_two_chunks_keeps_its_place(hook, tmp_path, monkeypatch):
+    """A long transcript goes in several requests, and the marker lands after the first.
+    The rest stays on the machine, the cursor stays at the end of what went, and nothing
+    is recorded as a failed upload. Back on the record, the next run sends the rest."""
+    sid = "s-private"
+    path = tmp_path / f"{sid}.jsonl"
+    _write_jsonl(path, [r for i in range(1, 5) for r in (_u(f"u{i}", sid), _a(f"a{i}", sid))])
+    monkeypatch.setattr(hook, "TAIL_RECORDS", 2)  # one turn a request
+    monkeypatch.setattr(hook, "_is_private", lambda session_id: False)
+    private_dir = Path(os.environ["SYNAPSE_PRIVATE_DIR"])
+    sent: list[list[str]] = []
+
+    def answer(req, timeout=None):
+        sent.append([r["uuid"] for r in json.loads(req.data)["records"]])
+        if len(sent) == 1:
+            _mark(private_dir, sid)  # off the record from here on
+        return io.BytesIO(json.dumps({"status": "ok", "ingested": 1}).encode())
+
+    monkeypatch.setattr(core_http(), "urlopen", answer)
+    assert hook._ship(str(path), mode="sweep") == (1, 2)
+    assert sent == [["u1", "a1"]]
+    state = hook._load_state()
+    entry = state[str(path)]
+    assert entry["size"] == -1 and 0 < entry["offset"] < path.stat().st_size
+    # Not a failed upload: no pending mark, and no failure counted toward the warning.
+    assert "pending" not in entry and not (state.get("_health") or {}).get("fails")
+    log = (tmp_path / "hook.log").read_text(encoding="utf-8")
+    assert "PRIVATE skip sweep s-private.jsonl (at the request)" in log and "ERR" not in log
+
+    (private_dir / sid).unlink()
+    assert hook._ship(str(path), mode="sweep") == (3, 6)
+    assert sent[1:] == [["u2", "a2"], ["u3", "a3"], ["u4", "a4"]]
+    assert hook._load_state()[str(path)]["size"] == path.stat().st_size
 
 
 def test_no_marker_ships_normally(hook, tmp_path, monkeypatch):

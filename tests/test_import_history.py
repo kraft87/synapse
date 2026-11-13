@@ -370,7 +370,8 @@ def test_a_private_session_is_skipped_and_the_rest_import(monkeypatch, tmp_path,
     assert "other-name.jsonl → skipped (private session)" in out
     assert "s-blind.jsonl → skipped (its private marker cannot be read)" in out
     assert "s-open.jsonl → ingested" in out
-    assert "3 file(s) skipped: private mode keeps their sessions on this machine." in out
+    assert "2 file(s) skipped: private mode keeps their sessions on this machine." in out
+    assert "1 file(s) not imported: a private marker could not be read" in out
     assert "failed" not in out
     assert [[r["uuid"] for r in body["records"]] for _, body, _ in calls] == [
         ["u1", "a1", "u2", "a2"]
@@ -387,6 +388,46 @@ def test_only_private_sessions_is_not_a_failed_import(monkeypatch, tmp_path):
     (tmp_path / "private" / "s-named").write_text("")
     assert mod.main(["--projects-dir", str(root), "--yes"]) == 0
     assert calls == []
+
+
+def test_a_file_with_a_private_session_in_a_later_batch_sends_nothing(
+    monkeypatch, tmp_path, capsys
+):
+    """The sender refused the batch that named the private session, after the batches
+    before it had gone: half a file was imported and reported as skipped."""
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    records = _turns(3)
+    records[4:] = [{**r, "sessionId": "s-inside"} for r in records[4:]]
+    _write_transcript(root / "p" / "s-mixed.jsonl", records)
+    (tmp_path / "private").mkdir()
+    (tmp_path / "private" / "s-inside").write_text("")
+
+    assert mod.main(["--projects-dir", str(root), "--yes", "--batch-size", "2"]) == 0
+    assert calls == []
+    assert "s-mixed.jsonl → skipped (private session)" in capsys.readouterr().out
+
+
+def test_nothing_imported_because_no_marker_could_be_read_is_a_failure(
+    monkeypatch, tmp_path, capsys
+):
+    """Skipping every file because the marker folder cannot be read is not "private mode
+    kept them": the import did nothing and says so with its exit code."""
+    _isolated_plugin_env(monkeypatch, tmp_path)
+    mod = _load_importer()
+    calls = _capture_posts(monkeypatch)
+    root = tmp_path / "projects"
+    _write_transcript(root / "p" / "s-1.jsonl", _turns(1))
+    _write_transcript(root / "p" / "s-2.jsonl", _turns(1))
+    (tmp_path / "private").write_text("a file where the marker folder goes")
+
+    assert mod.main(["--projects-dir", str(root), "--yes"]) == 1
+    out = capsys.readouterr().out
+    assert calls == []
+    assert "2 file(s) not imported: a private marker could not be read" in out
+    assert "private mode keeps their sessions" not in out
 
 
 def test_everything_failed_exits_nonzero(monkeypatch, tmp_path):
