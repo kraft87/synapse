@@ -30,11 +30,11 @@ ENV UV_LINK_MODE=copy
 # Pre-fetch the voyage-4-large tokenizer IN THE BASE so cold-start containers
 # never block on HuggingFace Hub AND code merges never re-download it (this
 # layer previously lived in the runtime stage, where every code change busted
-# it — a per-merge HF download on ephemeral CI runners). The voyage SDK
-# lazy-loads it on the first `count_tokens()` call; each uncached call does a
-# HEAD etag check (~1s wall) before reading the local file. `tokenizers` is
-# installed throwaway into system python just to fetch — the runtime uses the
-# venv's copy; only the HF_HOME cache files matter here.
+# it — a per-merge HF download on ephemeral CI runners). The Voyage backend
+# loads it the first time it has to split a multi-text embed into batches; an
+# uncached load does a HEAD etag check (~1s wall) before reading the local
+# file. `tokenizers` is installed throwaway into system python just to fetch —
+# the runtime uses the venv's copy; only the HF_HOME cache files matter here.
 ENV HF_HOME=/root/.cache/huggingface
 RUN uv pip install --system tokenizers && \
     python3 -c "from tokenizers import Tokenizer; Tokenizer.from_pretrained('voyageai/voyage-4-large')"

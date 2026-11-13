@@ -15,6 +15,6 @@ logs:
 test:
 	uv run pytest -x -q
 
-## schema: apply all numbered migrations in schema/ to $$SYNAPSE_DB_URL
+## schema: apply the migrations in schema/ that $$SYNAPSE_DB_URL has not had yet
 schema:
 	scripts/apply_schema.sh "$$SYNAPSE_DB_URL"

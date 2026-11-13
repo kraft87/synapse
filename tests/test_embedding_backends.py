@@ -9,23 +9,33 @@ Covers:
   ``dimensions`` param heuristic + SYNAPSE_EMBED_SEND_DIMS override),
   response mapping (index-ordered), LOUD dims-mismatch validation, retry
   semantics (429/5xx transient, 4xx not), key never echoed.
+* ``VoyageEmbeddingModel``: request and response mapping for embed and rerank,
+  the two retry budgets (patient on 429, brief on 5xx/transport), key and
+  endpoint resolution, and that every instance and thread shares one kept-open
+  connection.
 * ``create_reranker`` provider selection (voyage default, http, none → None).
 * ``HTTPReranker``: request mapping, both response shapes (Cohere/Infinity
   ``{"results": [...]}`` and TEI bare-list), top_k slicing.
 * ``check_embedding_meta``: config↔database mismatch is loud.
 * Recall's rerank=none path: fusion-only order, facts kept, passages skipped.
 
-No network: every HTTP test uses ``httpx.MockTransport``.
+No network: every HTTP test uses ``httpx.MockTransport``, except the connection
+reuse test, which counts real connections to a server on loopback.
 """
 
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 import httpx
 import pytest
+from tenacity import stop_after_attempt
 
+import ingestion.embedding as embedding_mod
 import mcp_server.recall as recall_mod
 from ingestion.embedding import (
     EmbeddingConfigError,
@@ -362,6 +372,339 @@ class TestOpenAIEmbedErrors:
         emb = _openai_model(handler)
         with pytest.raises(EmbeddingHTTPError, match="non-JSON"):
             emb.embed(["x"])
+
+
+# ---------------------------------------------------------------------------
+# Voyage — REST backend
+# ---------------------------------------------------------------------------
+
+
+def _voyage_model(handler, *, api_key: str = _API_KEY, dims: int = 4) -> VoyageEmbeddingModel:
+    return VoyageEmbeddingModel(api_key=api_key, dims=dims, transport=httpx.MockTransport(handler))
+
+
+def _rerank_body(scored: list[tuple[int, float]]) -> dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [{"index": i, "relevance_score": s} for i, s in scored],
+        "model": "rerank-3-lite",
+        "usage": {"total_tokens": 7},
+    }
+
+
+class _CharTokenizer:
+    """One token per character, so a test can size batches by string length."""
+
+    def encode(self, text: str) -> list[int]:
+        return [0] * len(text)
+
+
+class TestVoyageEmbedMapping:
+    def test_query_request_and_response(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            seen["auth"] = request.headers.get("Authorization")
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_embeddings_body([[0.1, 0.2, 0.3, 0.4]]))
+
+        emb = _voyage_model(handler)
+        assert emb.embed(["where is munich?"], task="query") == [[0.1, 0.2, 0.3, 0.4]]
+        assert seen["url"] == "https://api.voyageai.com/v1/embeddings"
+        assert seen["auth"] == f"Bearer {_API_KEY}"
+        assert seen["payload"] == {
+            "input": ["where is munich?"],
+            "model": "voyage-4-large",
+            "input_type": "query",
+            "truncation": True,
+            "output_dimension": 4,
+        }
+
+    @pytest.mark.parametrize("task", ["document", "entity"])
+    def test_other_tasks_embed_as_documents(self, task):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_embeddings_body([[0.0] * 4]))
+
+        _voyage_model(handler).embed(["x"], task=task)
+        assert seen["payload"]["input_type"] == "document"
+
+    def test_response_is_put_back_in_input_order(self, monkeypatch):
+        monkeypatch.setattr(embedding_mod, "_voyage_tokenizer", lambda model: _CharTokenizer())
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_embeddings_body([[1.0] * 4, [2.0] * 4], shuffle=True))
+
+        assert _voyage_model(handler).embed(["a", "b"]) == [[1.0] * 4, [2.0] * 4]
+
+    def test_one_item_never_loads_the_tokenizer(self, monkeypatch):
+        def no_tokenizer(model: str) -> Any:
+            raise AssertionError("a single item needs no token count")
+
+        monkeypatch.setattr(embedding_mod, "_voyage_tokenizer", no_tokenizer)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_embeddings_body([[0.5] * 4]))
+
+        assert _voyage_model(handler).embed(["just a query"], task="query") == [[0.5] * 4]
+
+    def test_batches_are_packed_by_token_count(self, monkeypatch):
+        monkeypatch.setattr(embedding_mod, "_voyage_tokenizer", lambda model: _CharTokenizer())
+        monkeypatch.setattr(VoyageEmbeddingModel, "_TARGET_BATCH_TOKENS", 10)
+        batches: list[list[str]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            batch = json.loads(request.content)["input"]
+            batches.append(batch)
+            return httpx.Response(200, json=_embeddings_body([[float(len(t))] * 4 for t in batch]))
+
+        texts = ["aaaa", "bbbb", "cccccc", "d"]  # 4 + 4 fit under 10; 6 does not join them
+        out = _voyage_model(handler).embed(texts)
+        assert batches == [["aaaa", "bbbb"], ["cccccc", "d"]]
+        assert [v[0] for v in out] == [4.0, 4.0, 6.0, 1.0]
+
+    def test_empty_input_makes_no_call(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no request expected")
+
+        assert _voyage_model(handler).embed([]) == []
+
+    def test_vector_count_mismatch_is_an_error(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_embeddings_body([]))
+
+        with pytest.raises(EmbeddingHTTPError, match="sent 1 inputs, got 0"):
+            _voyage_model(handler).embed(["x"])
+
+
+class TestVoyageRerankMapping:
+    def test_request_and_scored_response(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["url"] = str(request.url)
+            seen["auth"] = request.headers.get("Authorization")
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_rerank_body([(1, 0.9), (0, 0.2)]))
+
+        rr = _voyage_model(handler)
+        assert rr.rerank_scored("where is munich?", ["doc a", "doc b"]) == [(1, 0.9), (0, 0.2)]
+        assert seen["url"] == "https://api.voyageai.com/v1/rerank"
+        assert seen["auth"] == f"Bearer {_API_KEY}"
+        assert seen["payload"] == {
+            "query": "where is munich?",
+            "documents": ["doc a", "doc b"],
+            "model": embedding_mod._RERANK_MODEL,
+            "top_k": 2,
+            "truncation": True,
+        }
+
+    def test_rerank_returns_indices_and_passes_top_k(self):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["payload"] = json.loads(request.content)
+            return httpx.Response(200, json=_rerank_body([(2, 0.8)]))
+
+        assert _voyage_model(handler).rerank("q", ["a", "b", "c"], top_k=1) == [2]
+        assert seen["payload"]["top_k"] == 1
+
+    def test_no_documents_makes_no_call(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("no request expected")
+
+        rr = _voyage_model(handler)
+        assert rr.rerank_scored("q", []) == []
+        assert rr.rerank("q", []) == []
+
+    def test_malformed_response_is_an_error(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.5}]})
+
+        with pytest.raises(EmbeddingHTTPError, match="malformed response shape"):
+            _voyage_model(handler).rerank_scored("q", ["a"])
+
+
+class TestVoyageRetry:
+    """Two budgets: a 429 clears on its own, so it is waited out for minutes; anything
+    else transient may be an outage, so it gets a few quick attempts and then raises."""
+
+    def test_429_recovers(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) < 3:
+                return httpx.Response(429, json={"detail": "rate limited"})
+            return httpx.Response(200, json=_rerank_body([(0, 0.5)]))
+
+        assert _voyage_model(handler).rerank_scored("q", ["a"]) == [(0, 0.5)]
+        assert len(calls) == 3
+
+    def test_429_outlasts_the_budget_for_other_failures(self, monkeypatch):
+        # With sleeps patched out the real 180s budget would spin, so give the 429 lane an
+        # attempt count of its own, above the six every other transient failure gets.
+        monkeypatch.setattr(embedding_mod, "_RATE_LIMIT_STOP", stop_after_attempt(9))
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(429, json={"detail": "rate limited"})
+
+        with pytest.raises(TransientEmbeddingHTTPError, match="429"):
+            _voyage_model(handler).embed(["x"])
+        assert len(calls) == 9
+
+    def test_5xx_is_retried_six_times_then_raised(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(503, text="unavailable")
+
+        with pytest.raises(TransientEmbeddingHTTPError, match="503"):
+            _voyage_model(handler).rerank_scored("q", ["a"])
+        assert len(calls) == 6
+
+    def test_dropped_connection_is_retried(self):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            if len(calls) == 1:
+                raise httpx.RemoteProtocolError("Server disconnected without sending a response.")
+            return httpx.Response(200, json=_embeddings_body([[0.1] * 4]))
+
+        assert _voyage_model(handler).embed(["x"]) == [[0.1] * 4]
+        assert len(calls) == 2
+
+    @pytest.mark.parametrize("status", [400, 401, 422])
+    def test_permanent_errors_fail_fast_without_the_key(self, status):
+        calls: list[int] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(1)
+            return httpx.Response(status, json={"detail": "Provided API key is invalid."})
+
+        with pytest.raises(EmbeddingHTTPError) as exc_info:
+            _voyage_model(handler).embed(["x"])
+        assert len(calls) == 1
+        assert not isinstance(exc_info.value, TransientEmbeddingHTTPError)
+        assert str(status) in str(exc_info.value)
+        assert _API_KEY not in str(exc_info.value)
+        assert _API_KEY not in repr(exc_info.value)
+
+
+class TestVoyageKeyAndEndpoint:
+    def _auth_seen(self, api_key: str) -> tuple[str | None, str]:
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["auth"] = request.headers.get("Authorization")
+            seen["host"] = request.url.host
+            return httpx.Response(200, json=_embeddings_body([[0.0] * 4]))
+
+        _voyage_model(handler, api_key=api_key).embed(["x"])
+        return seen["auth"], seen["host"]
+
+    def test_blank_key_falls_back_to_the_environment(self):
+        assert self._auth_seen("") == ("Bearer voyage-test-key", "api.voyageai.com")
+
+    def test_key_file_wins_over_the_environment_variable(self, monkeypatch, tmp_path):
+        key_file = tmp_path / "voyage.key"
+        key_file.write_text("pa-from-file\n")
+        monkeypatch.setenv("VOYAGE_API_KEY_PATH", str(key_file))
+        assert self._auth_seen("")[0] == "Bearer pa-from-file"
+
+    def test_no_key_anywhere_is_a_config_error(self, monkeypatch):
+        monkeypatch.delenv("VOYAGE_API_KEY")
+        with pytest.raises(EmbeddingConfigError, match="VOYAGE_API_KEY"):
+            VoyageEmbeddingModel(api_key="")
+
+    def test_atlas_keys_use_the_atlas_endpoint(self):
+        assert self._auth_seen("al-atlas-key") == ("Bearer al-atlas-key", "ai.mongodb.com")
+
+
+class _CountingVoyageServer(ThreadingHTTPServer):
+    """A loopback stand-in for Voyage that counts the TCP connections it accepts."""
+
+    daemon_threads = True
+
+    def __init__(self) -> None:
+        super().__init__(("127.0.0.1", 0), _CountingVoyageHandler)
+        self.connections = 0
+        self.requests = 0
+        self.lock = threading.Lock()
+
+
+class _CountingVoyageHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # keep-alive, as Voyage serves
+    server: _CountingVoyageServer
+
+    def setup(self) -> None:
+        super().setup()
+        with self.server.lock:
+            self.server.connections += 1
+
+    def do_POST(self) -> None:
+        payload = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with self.server.lock:
+            self.server.requests += 1
+        if self.path.endswith("/rerank"):
+            body = _rerank_body([(i, 0.5) for i in range(len(payload["documents"]))])
+        else:
+            body = _embeddings_body([[0.0] * 4 for _ in payload["input"]])
+        raw = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+@pytest.fixture()
+def voyage_server(monkeypatch):
+    """Point the Voyage backend at a loopback server, with a client registry of its own."""
+    server = _CountingVoyageServer()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    clients: dict[str, httpx.Client] = {}
+    monkeypatch.setattr(embedding_mod, "_VOYAGE_CLIENTS", clients)
+    monkeypatch.setattr(
+        embedding_mod, "_VOYAGE_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}/v1"
+    )
+    yield server
+    for client in clients.values():
+        client.close()
+    server.shutdown()
+    server.server_close()
+
+
+class TestVoyageSharedConnection:
+    def test_instances_with_one_key_share_a_client(self, voyage_server):
+        a = VoyageEmbeddingModel(api_key="k1")
+        assert VoyageEmbeddingModel(api_key="k1")._http is a._http
+        assert VoyageEmbeddingModel(api_key="k2")._http is not a._http
+
+    def test_every_instance_and_thread_reuses_one_connection(self, voyage_server):
+        # The shape of one recall: the embedder on the calling thread, then the reranker
+        # (a second instance) on a worker thread, then the caller again.
+        embedder = VoyageEmbeddingModel(api_key="k", dims=4)
+        reranker = VoyageEmbeddingModel(api_key="k")
+        embedder.embed(["q"], task="query")
+        with ThreadPoolExecutor(max_workers=1) as leg:
+            assert leg.submit(reranker.rerank_scored, "q", ["a", "b"]).result() == [
+                (0, 0.5),
+                (1, 0.5),
+            ]
+        reranker.rerank_scored("q", ["a"])
+        assert voyage_server.requests == 3
+        assert voyage_server.connections == 1
 
 
 # ---------------------------------------------------------------------------

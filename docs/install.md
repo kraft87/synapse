@@ -250,21 +250,33 @@ containers and volumes.
 
 ## Upgrading
 
-First-boot init never re-runs on an existing data volume.
-[`scripts/apply_schema.sh`](../scripts/apply_schema.sh) lists the migrations in order, but
-it is for an empty database: on one that already has a schema it stops at the first file
-that cannot be applied twice (001, 004 and 023 cannot). To bring an existing database up to
-date, read its stamp (`SELECT value FROM synapse_meta WHERE key = 'schema_version'`) and
-apply the files above it one at a time, in that order, each with
-`psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/<file>.sql` (`-X` so a `~/.psqlrc`
-that turns autocommit off cannot wrap a file in one transaction); for 067 and 069, the
-commands in their sections below. Files from 067 on stamp the version they bring; when the
-last file applied is older, stamp its number yourself:
-`INSERT INTO synapse_meta (key, value) VALUES ('schema_version', 'NNN') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`.
+First-boot init never re-runs on an existing data volume. To bring an existing database up
+to date, run [`scripts/apply_schema.sh`](../scripts/apply_schema.sh) against it, from a
+checkout of the version you are upgrading to: `scripts/apply_schema.sh "$SYNAPSE_DB_URL"`.
+The script keeps a ledger, the `schema_migrations` table, with one row per schema file the
+database has had. It applies the files that have no row, in order, and records each, so a
+second run does nothing. `scripts/apply_schema.sh --status "$SYNAPSE_DB_URL"` prints what is
+applied and what is pending, and changes nothing.
 
-Every service verifies at boot that the database schema matches the code (the stamp records
-the applied version; a mismatch refuses to start with instructions rather than failing
-mid-request). So the upgrade order is: pull, apply the files above the stamp, restart.
+- **A database from before the ledger** carries only its stamp
+  (`SELECT value FROM synapse_meta WHERE key = 'schema_version'`). The first run takes every
+  file up to that number as applied, records them without running them, and applies the
+  rest. If you skipped an optional file below the stamp, delete its row afterwards
+  (`DELETE FROM schema_migrations WHERE version = 'NNN'`) and run the script again.
+- **A file marked `-- schema-apply: manual`** needs you first on a database that holds
+  episodes: 067 wants the pollers stopped, 069 has no undo. An upgrade does not run such a
+  file. It leaves an optional one alone and names it, and it stops before a required one
+  (exit status 2). Follow the file's section below, which ends in
+  `scripts/apply_schema.sh --only NNN "$SYNAPSE_DB_URL"`, then run the script once more for
+  the files after it. A database with no episodes runs these files in turn.
+- **A file applied some other way** (piped to `psql` by hand) has no row, so the script
+  would apply it again. Record it instead:
+  `INSERT INTO schema_migrations (version, filename) VALUES ('NNN', 'NNN_name.sql')`.
+
+Every service verifies at boot that the database schema matches the code (the script keeps
+`synapse_meta.schema_version` at the highest number it has recorded; a database behind the
+code refuses to start with instructions rather than failing mid-request). So the upgrade
+order is: pull, run `apply_schema.sh`, restart.
 `SYNAPSE_SCHEMA_CHECK=0` skips the guard. A database that is behind only by migrations marked
 `-- schema-check: optional` boots with a warning: the code shipped with them runs without
 them and keeps its old behaviour until they are applied.
@@ -274,26 +286,29 @@ schema 067, which merges the old `personal` group into `technical` and folds a p
 entity into its same-name technical twin. Its services refuse to start on a database that
 has not applied it, so on a database that holds data apply 067 first and deploy the release
 after (an older image on a database that already has 067 only logs a warning). The file runs
-two transactions of its own, so apply it by itself and never wrap it in `BEGIN` or pass
-`-1`. It needs 066 applied first.
+two transactions of its own, so it is applied by itself and never wrapped in `BEGIN` or
+run with `-1`. It needs 066 applied first, and an upgrade applies the files up to 066 and
+then stops before 067, which is marked manual.
 
 1. Stop the pollers (`docker compose stop poller poller-drain`), so nothing writes graph
    rows during the merge.
-2. Apply: `psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 < schema/067_kg_one_memory.sql`.
+2. Apply: `scripts/apply_schema.sh --only 067 "$SYNAPSE_DB_URL"`.
    It takes minutes on a large graph (graph writers wait while it runs; the merge itself
    does not block readers) and does nothing when there is nothing left to merge, so a
    re-run is safe. It stamps 067 only once the graph holds no personal row and no
    owner-only index is missing or the 066 insert trigger left.
-3. Deploy the release and start the pollers.
+3. Run `scripts/apply_schema.sh "$SYNAPSE_DB_URL"` once more for the files after 067.
+4. Deploy the release and start the pollers.
 
 The merge's preview, health check and undo (`scripts/pile_merge.py`) are retired, and so is
 the ledger they read. A fresh install needs none of this: its first boot applies 067 with
 nothing to merge.
 
-**Schema 069, the cleanup.** Optional: no service needs it, so apply it by hand to the
-running system, nothing stopped, once 068 is in place:
-`psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/069_one_memory_cleanup.sql` (under
-autocommit; never `-1`; after a failed step, run the whole file again). It drops `group_id` from the knowledge graph, notes and
+**Schema 069, the cleanup.** Optional: no service needs it, and it is marked manual because
+it has no undo, so an upgrade leaves it alone. Apply it to the running system, nothing
+stopped, once 068 is in place and you have a dump:
+`scripts/apply_schema.sh --only 069 "$SYNAPSE_DB_URL"` (after a failed step, run the same
+command again). It drops `group_id` from the knowledge graph, notes and
 preferences, the indexes that lead with it, and the `kg_pile_merge_067_*` tables. A
 preflight refuses, changing nothing, below 068, on a row whose `group_id` is not
 `technical`, on a missing owner-only index, and on anything else that depends on the column;
@@ -370,8 +385,8 @@ env var says so in its HANDOFF.md entry.
 - **`python3: not found`.** The hooks and scripts are stdlib Python 3, so put it on PATH.
 - **Device-flow login fails on an older server.** It needs `/device/code` and "Enable Device
   Flow" on the GitHub OAuth App; fall back to `synapse login --browser`.
-- **A service refuses to start, complaining about the schema version.** Apply the schema
-  files above the database's stamp, one at a time, then restart. See
+- **A service refuses to start, complaining about the schema version.** Run
+  `scripts/apply_schema.sh` against the database, then restart. See
   [Upgrading](#upgrading).
 
 ## Next

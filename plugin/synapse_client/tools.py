@@ -138,11 +138,24 @@ def inject_session(
     return out
 
 
-def _failure(tool: str, message: str, code: int | None = None) -> str:
+def failure(tool: str, message: str, code: int | None = None) -> str:
+    """A tool's failure as the JSON object ``call`` answers with: ``error``, ``tool``
+    and, when given, ``code``."""
     body: dict[str, Any] = {"error": message, "tool": tool}
     if code is not None:
         body["code"] = code
     return json.dumps(body, ensure_ascii=False)
+
+
+def as_json(text: str) -> str:
+    """``text`` for a harness whose tools must answer with a JSON string: a JSON object
+    passes through, any other text is wrapped as ``{"result": text}``."""
+    try:
+        if isinstance(json.loads(text), dict):
+            return text
+    except (TypeError, ValueError):
+        pass
+    return json.dumps({"result": text}, ensure_ascii=False)
 
 
 def call(
@@ -163,10 +176,10 @@ def call(
     try:
         args = inject_session(tool, arguments, session_id, since)
     except TypeError:
-        return _failure(tool, "the arguments must be a JSON object")
+        return failure(tool, "the arguments must be a JSON object")
     try:
         return client.call_tool(tool, args, timeout=timeout)
     except ToolError as err:
-        return _failure(tool, str(err) or "the tool reported an error", err.code)
+        return failure(tool, str(err) or "the tool reported an error", err.code)
     except Exception as err:
-        return _failure(tool, f"Synapse could not answer: {short_reason(err)}")
+        return failure(tool, f"Synapse could not answer: {short_reason(err)}")
