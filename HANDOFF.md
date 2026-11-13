@@ -52,16 +52,18 @@ The previous image runs on a database with 070. To remove the table:
   the check a connection whose rows are dicts. The check read its first row by position,
   its own `except` swallowed the error, and every retune accept came back with the note
   `routing-eval skipped: 0`.
-- **Now it runs.** Accepting a retune proposal that has a draft asks the skills model
-  (`SYNAPSE_SKILLS_MODEL`, default Opus) once: for up to eight of the phrasings the skill
-  missed, which active skill does each one route to today. The accept result carries the
-  answer (`routing-eval: 2/3 missed phrasings already map to '<skill>'`) and the review
+- **Now it runs.** Once a retune proposal is applied, the skills model
+  (`SYNAPSE_SKILLS_MODEL`, default Opus) is asked once: for up to eight of the phrasings
+  the skill missed, which active skill does each one route to, with the registry as the
+  accept left it. The accept result carries the answer
+  (`routing-eval: 2/3 missed phrasings map to '<skill>' after the retune`) and the review
   CLI prints it.
-- **It is advisory and bounded.** The accept is applied whatever the check says. The check
-  gets 20 seconds, because the review client waits 30 for the accept. After that the
-  accept goes on with `routing-eval skipped: no answer within 20s`. A failure is logged as
-  a warning on the server and reported as `routing-eval skipped: <error type>: <message>`.
-  An answer that does not name one skill per phrasing is not counted.
+- **It is advisory and bounded.** The accept is applied before the check is asked,
+  whatever it then says. The check gets 20 seconds, because the review client waits 30
+  for the accept. After that the result comes back with
+  `routing-eval skipped: no answer within 20s`. A failure is logged as a warning on the
+  server and reported as `routing-eval skipped: <error type>: <message>`. An answer that
+  does not name one skill per phrasing is not counted.
 - **The catalog the model sees is the active skills.** It was every registry row, retired
   ones included.
 - **No transaction is open while the model answers.**
@@ -70,8 +72,9 @@ The previous image runs on a database with 070. To remove the table:
 **On each machine**
 
 1. Nothing to do: no migration, no setting, no client update.
-2. Expect `accept` on a retune proposal to take about 8 seconds longer, and to make one
-   model call from the MCP server container, on the login the pollers use.
+2. Expect `accept` on a retune proposal to take 6 to 12 seconds longer (19 was measured
+   once), and to make one model call from the MCP server container, on the login the
+   pollers use. An accept that is refused makes no call.
 
 **Proven**
 
@@ -85,8 +88,26 @@ The previous image runs on a database with 070. To remove the table:
 - One real accept on a scratch database with 28 skills and the real model: applied in
   8.8 seconds, `2/3 missed phrasings already map`.
 
-**Still open**: the check asks about the descriptions as they are before the accept is
-applied. Whether the new description routes the missed phrasings better is not asked.
+**Done since** (the same day): the check was first asked before the accept was applied,
+so it judged the description the retune was about to replace. It is now asked after the
+apply, and reads the registry the accept wrote. Four things follow.
+
+- The catalog carries the retuned description, including one the reviewer supplied with
+  `--body-file`.
+- A refused accept makes no model call. Before, a stale draft or a rename waited for the
+  model and was then refused.
+- The skill asked about is the one the retune was written to, not the candidate's name.
+- The prompt no longer tells the model which skill is hoped for.
+
+Proven by four more tests in `tests/test_skill_accept_applies.py`, each failing on the
+earlier code, and by a real accept on a scratch database with 27 skills and the real
+model. Asked directly before the accept, with a description that did not cover the three
+missed phrasings, the check answered 0/3. The accept's own answer, after the retune was
+written, was 3/3, and the accept took 6.6 seconds.
+
+**Still open**: the comment at the top of `plugin/scripts/skill_review.py` still says the
+check "runs first". Changing it is a client change and needs a client version, so it was
+left for the next one.
 
 ## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
 

@@ -47,6 +47,7 @@ def _skill(name: str, desc: str, step: str) -> str:
 
 V1 = _skill("acc-backup", "Back up the demo database.", "Dump the database.")
 V2 = _skill("acc-backup", "Back up the demo database.", "Dump the database, then verify it.")
+RETUNED = _skill("acc-backup", "Back up, dump or copy the demo database.", "Dump the database.")
 
 
 @pytest.fixture()
@@ -314,7 +315,7 @@ def test_detail_reports_target_scope_and_registry_body(acc, db_url):
 
 
 # ------------------------------------------------------------------ the routing check
-# A retune accept asks a model whether the phrasings the skill missed already route to it.
+# Once a retune is applied, a model is asked where the phrasings the skill missed route now.
 # These run the real _routing_eval, on the connection _proposal_act hands it; only the
 # model is a stand-in.
 
@@ -350,9 +351,10 @@ def _missed(*phrasings):
     ]
 
 
-def _retune_with_misses(acc, db_url, *phrasings):
+def _retune_with_misses(acc, db_url, *phrasings, **candidate):
     _publish(db_url, "acc-backup", V1, description="Back up the demo database.")
-    return _candidate(acc, body=V2, base=body_hash(V1), evidence=_missed(*phrasings))
+    candidate = {"body": RETUNED, "base": body_hash(V1), **candidate}
+    return _candidate(acc, evidence=_missed(*phrasings), **candidate)
 
 
 def test_a_retune_accept_asks_where_the_missed_phrasings_route(acc, db_url, model):
@@ -365,14 +367,55 @@ def test_a_retune_accept_asks_where_the_missed_phrasings_route(acc, db_url, mode
     r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
 
     assert r["status"] == "promoted"
-    assert r["routing_eval"] == "routing-eval: 1/2 missed phrasings already map to 'acc-backup'"
+    assert r["routing_eval"] == (
+        "routing-eval: 1/2 missed phrasings map to 'acc-backup' after the retune"
+    )
     (prompt,) = fake.prompts
-    # the catalog is the active skills, each with its own description
-    assert "- acc-backup: Back up the demo database.\n" in prompt
+    # the catalog is the active skills, each with the description it has after the retune
+    assert "- acc-backup: Back up, dump or copy the demo database.\n" in prompt
+    assert "Back up the demo database." not in prompt
     assert "- acc-restore: Restore the demo database.\n" in prompt
     assert "acc-gone" not in prompt
     assert "- name: description" not in prompt
     assert "- dump the db for me\n- save a copy of the database\n" in prompt
+    # and the model is not told which skill is hoped for: its catalog line is the one mention
+    assert prompt.count("acc-backup") == 1
+
+
+def test_the_routing_check_reads_the_description_the_reviewer_supplied(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me")
+    edited = _skill("acc-backup", "Dump the demo database to a file.", "Dump the database.")
+    fake = model('{"matches": ["acc-backup"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval, body=edited)
+
+    assert r["status"] == "promoted"
+    (prompt,) = fake.prompts
+    assert "- acc-backup: Dump the demo database to a file.\n" in prompt
+    assert "Back up, dump or copy" not in prompt
+
+
+def test_the_routing_check_asks_about_the_skill_the_retune_was_written_to(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me", name="acc-backup-widen")
+    model('{"matches": ["acc-backup"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert (r["status"], r["skill"]) == ("promoted", "acc-backup")
+    assert r["routing_eval"] == (
+        "routing-eval: 1/1 missed phrasings map to 'acc-backup' after the retune"
+    )
+
+
+def test_a_refused_retune_asks_nothing(acc, db_url, model):
+    cid = _retune_with_misses(acc, db_url, "dump the db for me", base=body_hash(V2))  # stale
+    fake = model('{"matches": ["acc-backup"]}')
+
+    r = _proposal_act(db_url, cid, "accept", None, _routing_eval)
+
+    assert (r["status"], r["reason"]) == ("refused", "stale")
+    assert "routing_eval" not in r and fake.prompts == []
+    assert _registry(acc, "acc-backup")[0] == V1
 
 
 def test_a_retune_with_no_missed_phrasings_asks_nothing(acc, db_url, model):
@@ -444,7 +487,7 @@ def test_no_transaction_is_open_while_the_model_is_asked(acc, db_url, model):
     cid = _retune_with_misses(acc, db_url, "dump the db for me")
     seen = []
     with pg_pool.connection(db_url, autocommit=False, row_factory=dict_row) as c:
-        c.execute("SELECT 1").fetchone()  # the caller's read is open, as in _proposal_act
+        c.execute("SELECT 1").fetchone()  # a read is open on the connection it is handed
 
         def _answer(_prompt):
             seen.append(c.info.transaction_status)
@@ -454,7 +497,7 @@ def test_no_transaction_is_open_while_the_model_is_asked(acc, db_url, model):
         note = _routing_eval(c, cid, "acc-backup")
         c.commit()
 
-    assert note == "routing-eval: 1/1 missed phrasings already map to 'acc-backup'"
+    assert note == "routing-eval: 1/1 missed phrasings map to 'acc-backup' after the retune"
     assert seen == [TransactionStatus.IDLE]
 
 

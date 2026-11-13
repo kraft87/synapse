@@ -1215,14 +1215,14 @@ def _proposal_act(
             return revert_applied(c, cid, reason=reason or "manual", actor="human", force=force)
 
         if action == "accept" and row["kind"] != "consolidate":
-            note = ""
-            drafted = (body if body is not None else row["proposal_body"] or "").strip()
-            if row["kind"] == "retune" and row["status"] != "promoted" and drafted:
-                note = llm(c, cid, row["name"])  # advisory routing-eval, never blocks
             c.commit()  # close the read; the apply runs in its own locked transaction
             res = _apply_accept(c, cid, body, scope, force)
-            if note and res.get("status") == "promoted":
-                res["routing_eval"] = note
+            if row["kind"] == "retune" and res.get("status") == "promoted":
+                # The advisory routing-eval, asked once the retune is in the registry, so it
+                # judges the description machines are now served; a refused accept asks nothing.
+                note = llm(c, cid, res["skill"])
+                if note:
+                    res["routing_eval"] = note
             return res
 
         if action == "accept":  # consolidate: a merge is done by hand, accept only records it
@@ -1321,7 +1321,7 @@ def _proposal_act(
 
 
 # The review client waits 30 s for an accept (plugin/scripts/config.py). The routing check
-# gets this much of it; an answer took about 8 s when this was set.
+# gets this much of it. Measured on 27 skills: 6 to 12 s for most answers, 19 s for one.
 _ROUTING_EVAL_BUDGET_S = 20.0
 
 
@@ -1348,9 +1348,10 @@ def _answer_within(ask: Callable[[], str], budget_s: float) -> str | None:
 
 
 def _routing_eval(c, cid: int, name: str) -> str:
-    """Advisory: would the under-trigger phrasings route to `name` under current descriptions?
-    One LLM pass with _ROUTING_EVAL_BUDGET_S to answer; any failure degrades to a skip note
-    (never blocks accept). It reads through cursors of its own, so the rows are the same
+    """Advisory, asked after a retune of `name` is applied: with the registry as it now stands,
+    which skill does each phrasing the skill missed route to? The model is not told which
+    skill is hoped for. One LLM pass with _ROUTING_EVAL_BUDGET_S to answer; any failure
+    degrades to a skip note. It reads through cursors of its own, so the rows are the same
     whatever rows the caller's connection makes, and ends the read before the model is asked,
     so no transaction stays open while it answers."""
     try:
@@ -1372,7 +1373,7 @@ def _routing_eval(c, cid: int, name: str) -> str:
         c.commit()
         prompt = (
             f"Skill catalog:\n{catalog}\n\nFor each user phrasing, name the ONE skill whose "
-            f"description best matches, or 'none'. We expect '{name}' to be the match.\n"
+            "description best matches, or 'none'.\n"
             + "\n".join(f"- {p}" for p in phrasings)
             + '\n\nOutput JSON only: {"matches":["skill-or-none", ...]} in phrasing order.'
         )
@@ -1401,8 +1402,10 @@ def _routing_eval(c, cid: int, name: str) -> str:
             n = len(matches) if isinstance(matches, list) else 0
             return f"routing-eval skipped: {n} answers for {len(phrasings)} phrasings"
         hit = sum(1 for m in matches if m == name)
-        return f"routing-eval: {hit}/{len(matches)} missed phrasings already map to '{name}'"
-    except Exception as ex:  # advisory only: the accept goes on without it
+        return (
+            f"routing-eval: {hit}/{len(matches)} missed phrasings map to '{name}' after the retune"
+        )
+    except Exception as ex:  # advisory only: the accept result goes back without it
         logger.warning("routing-eval for skill candidate %s failed", cid, exc_info=True)
         return f"routing-eval skipped: {type(ex).__name__}: {ex}"
 
