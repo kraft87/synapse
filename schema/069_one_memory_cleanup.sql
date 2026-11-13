@@ -7,9 +7,12 @@
 --     indexes that lead with it: kg_entities_norm, kg_entities_owner, kg_entities_one_self,
 --     kg_rel_owner, kg_rel_pair, kg_rel_src, kg_rel_tgt, notes_live_idx and
 --     preferences_live_idx. 067's owner-only indexes (kg_entities_norm_any, kg_rel_pair_any,
---     kg_rel_tgt_any) serve the reads the KG ones served. kg_entities_one_self,
---     notes_live_idx and preferences_live_idx are built again on owner_id alone, before the
---     column goes, so the one-self rule and the live-set lookups never lapse;
+--     kg_rel_tgt_any) serve every read that names the owner, and the services' reads all
+--     do. kg_rel_src has no twin of its own: a read by source is served by the leading
+--     columns of kg_rel_pair_any, so one that does not name the owner has no index to
+--     range over after this file. kg_entities_one_self, notes_live_idx and
+--     preferences_live_idx are built again on owner_id alone, before the column goes, so
+--     the one-self rule and the live-set lookups never lapse;
 --   * the 067 undo ledger, the seven kg_pile_merge_067_* tables.
 --
 -- recall_metrics.group_id stays: it is telemetry history, and old rows carry real values.
@@ -58,8 +61,10 @@ DECLARE
     bad   text;
 BEGIN
     SELECT value INTO stamp FROM synapse_meta WHERE key = 'schema_version';
-    IF stamp IS NULL OR stamp < '067' THEN
-        RAISE EXCEPTION '069 needs 067 applied first (schema_version is %)', COALESCE(stamp, 'not set');
+    -- The file below this one, not only the merge: the stamp is one high-water mark, and
+    -- 069 written over 067 would say 068 ran when it never did.
+    IF stamp IS NULL OR stamp < '068' THEN
+        RAISE EXCEPTION '069 needs 068 applied first (schema_version is %)', COALESCE(stamp, 'not set');
     END IF;
 
     -- Every row is technical, or dropping the column would merge a group 067 never folded.

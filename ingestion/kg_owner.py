@@ -29,12 +29,16 @@ OWNER = os.environ.get("SYNAPSE_KG_OWNER_ID", "default")
 NOT_APPLIED = "schema 066 not applied (kg_entities.is_self does not exist yet)"
 
 # Live degree of one entity, as the recall degree gate counts it: live edges from web pages
-# are not counted. Two index-driven counts, not an OR, which would scan the edge table.
+# are not counted. Two index-driven counts, not an OR, which would scan the edge table. Each
+# names the entity's owner: the edge indexes lead with it (kg_rel_pair_any, kg_rel_tgt_any),
+# and without it a count walks a whole index, or the table for a node with many edges.
 _DEGREE_SQL = """
 SELECT (SELECT count(*) FROM kg_relationships
-         WHERE src_uuid = %(u)s AND t_invalid IS NULL AND web_artifact_id IS NULL)
+         WHERE owner_id = %(o)s AND src_uuid = %(u)s
+           AND t_invalid IS NULL AND web_artifact_id IS NULL)
      + (SELECT count(*) FROM kg_relationships
-         WHERE tgt_uuid = %(u)s AND t_invalid IS NULL AND web_artifact_id IS NULL) AS n
+         WHERE owner_id = %(o)s AND tgt_uuid = %(u)s
+           AND t_invalid IS NULL AND web_artifact_id IS NULL) AS n
 """
 
 _ENTITY_SQL = """
@@ -71,8 +75,8 @@ _SET_SQL = "UPDATE kg_entities SET is_self = true WHERE uuid = %s AND NOT is_sel
 _CLEAR_SQL = "UPDATE kg_entities SET is_self = false WHERE uuid = %s AND is_self"
 
 
-def _degree(conn: Any, uuid: str) -> int:
-    return int(conn.execute(_DEGREE_SQL, {"u": uuid}).fetchone()["n"])
+def _degree(conn: Any, uuid: str, owner_id: str) -> int:
+    return int(conn.execute(_DEGREE_SQL, {"u": uuid, "o": owner_id}).fetchone()["n"])
 
 
 def ready(conn: Any, key: str = "") -> bool:
@@ -83,7 +87,7 @@ def ready(conn: Any, key: str = "") -> bool:
 def flagged(conn: Any) -> list[dict[str, Any]]:
     """The flagged entities, with their live degree: what recall will not hop from."""
     rows = conn.execute(_FLAGGED_SQL).fetchall()
-    return [{**r, "live_degree": _degree(conn, r["uuid"])} for r in rows]
+    return [{**r, "live_degree": _degree(conn, r["uuid"], r["owner_id"])} for r in rows]
 
 
 def candidates(conn: Any, owner_id: str = OWNER, limit: int = 5) -> list[dict[str, Any]]:
@@ -107,7 +111,7 @@ def set_owner(conn: Any, uuid: str, *, apply: bool, key: str = "") -> tuple[int,
     other = conn.execute(_OTHER_FLAGGED_SQL, (row["owner_id"], uuid)).fetchone()
     if other is not None:
         return 1, f"{other['uuid']} is already flagged: clear it first"
-    what = f"{uuid} ({row['name']}, {_degree(conn, uuid)} live edges)"
+    what = f"{uuid} ({row['name']}, {_degree(conn, uuid, row['owner_id'])} live edges)"
     if not apply:
         return 0, f"would flag {what}; re-run with --apply"
     try:

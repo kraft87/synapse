@@ -89,6 +89,24 @@ def test_set_is_a_dry_run_until_apply(kg, db_url, capsys):
     assert "already flagged" in capsys.readouterr().out
 
 
+def test_the_live_degree_counts_the_entitys_own_owners_edges(kg, db_url, capsys):
+    """The count names the entity's owner, as recall's degree gate does, so each half ranges
+    over an index that leads with the owner (after schema 069 there is no other kind on the
+    edge table). An edge filed under another owner is not this entity's edge."""
+    _entity(kg, "me", "The Owner")
+    _edge(kg, "me", "x")
+    _edge(kg, "y", "me")
+    _edge(kg, "me", "z", owner="someone-else")
+    _edge(kg, "w", "me", owner="someone-else")
+    assert _run(db_url, "set", "me") == 0
+    assert "would flag me (The Owner, 2 live edges)" in capsys.readouterr().out
+    _entity(kg, "them", "Another Owner", owner="someone-else")
+    kg.execute("UPDATE kg_entities SET is_self = true WHERE uuid IN ('me', 'them')")
+    with psycopg.connect(db_url, row_factory=dict_row) as c:
+        listed = {r["uuid"]: r["live_degree"] for r in kg_owner.flagged(c)}
+    assert listed == {"me": 2, "them": 0}
+
+
 def test_an_owner_holds_one_flagged_entity(kg, db_url, capsys):
     _entity(kg, "me", "Owner")
     _entity(kg, "twin", "Owner twin")

@@ -17,7 +17,9 @@ Shape rules shared by every api route: PG work runs in a threadpool on ONE short
 psycopg connection per request, and the boundary is fail-soft — an exception becomes a
 500 JSON and is logged, never raised past the JSONResponse. Reads are owner-agnostic
 (an operator sees the whole store); the only project/source/domain scoping is the
-per-endpoint filtering the contract spells out.
+per-endpoint filtering the contract spells out. One entity's edges are read under that
+entity's own owner: an edge is filed under its endpoints' owner, so this hides nothing, and
+every index on the edge table leads with the owner, so without it the read scans the table.
 
 Writable surfaces: dashboard_flags + dashboard_audit (schema 042, the soft-flag), and —
 since phase 7 — the two DELETE routes that hard-delete an episode (with its content
@@ -589,12 +591,13 @@ def _session(db_url: str, session_id: str, highlight: Any) -> dict[str, Any]:
 def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | None:
     with pg_pool.connection(db_url, row_factory=dict_row) as conn:
         ent = conn.execute(
-            "SELECT uuid, name, entity_type, summary, degree, created_at "
+            "SELECT uuid, owner_id, name, entity_type, summary, degree, created_at "
             "FROM kg_entities WHERE uuid = %s",
             (uuid,),
         ).fetchone()
         if ent is None:
             return None
+        edges_of = {"u": uuid, "o": ent["owner_id"]}  # see the module docstring
 
         flags = _flag_set(conn)
 
@@ -607,9 +610,9 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             "FROM kg_relationships r "
             "LEFT JOIN kg_entities oe "
             "  ON oe.uuid = CASE WHEN r.src_uuid = %(u)s THEN r.tgt_uuid ELSE r.src_uuid END "
-            "WHERE r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s "
+            "WHERE r.owner_id = %(o)s AND (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s) "
             "ORDER BY r.t_valid DESC NULLS LAST, r.uuid LIMIT %(lim)s",
-            {"u": uuid, "lim": _ENTITY_FACTS_CAP},
+            {**edges_of, "lim": _ENTITY_FACTS_CAP},
         ).fetchall()
 
         stats = (
@@ -617,8 +620,9 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
                 "SELECT count(*) FILTER (WHERE t_invalid IS NULL) AS edges, "
                 "       count(*) AS facts, "
                 "       COALESCE(sum(retrieval_count), 0) AS served "
-                "FROM kg_relationships WHERE src_uuid = %(u)s OR tgt_uuid = %(u)s",
-                {"u": uuid},
+                "FROM kg_relationships "
+                "WHERE owner_id = %(o)s AND (src_uuid = %(u)s OR tgt_uuid = %(u)s)",
+                edges_of,
             ).fetchone()
             or {}
         )
@@ -633,12 +637,13 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             "  CASE WHEN jsonb_typeof(r.episodes) = 'array' THEN r.episodes ELSE '[]'::jsonb END"
             ") AS elem(v) "
             "JOIN episodes e ON e.id = elem.v::bigint "
-            "WHERE (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s) AND elem.v ~ '^[0-9]+$'"
+            "WHERE r.owner_id = %(o)s AND (r.src_uuid = %(u)s OR r.tgt_uuid = %(u)s) "
+            "  AND elem.v ~ '^[0-9]+$'"
         )
         total_row = (
             conn.execute(
                 f"SELECT count(*) AS total FROM (SELECT DISTINCT e.id FROM {_mentions_from}) m",
-                {"u": uuid},
+                edges_of,
             ).fetchone()
             or {}
         )
@@ -646,7 +651,7 @@ def _entity(db_url: str, uuid: str, mentions_offset: int) -> dict[str, Any] | No
             "SELECT e.id, e.created_at, e.content FROM ("
             f"  SELECT DISTINCT e.id, e.created_at, e.content FROM {_mentions_from}"
             ") e ORDER BY e.created_at DESC, e.id DESC OFFSET %(off)s LIMIT %(lim)s",
-            {"u": uuid, "off": mentions_offset, "lim": _MENTIONS_PAGE},
+            {**edges_of, "off": mentions_offset, "lim": _MENTIONS_PAGE},
         ).fetchall()
 
         return {
@@ -740,7 +745,7 @@ def _graph_entities(db_url: str, q: str, limit: int) -> list[dict[str, Any]]:
 def _resolve_seed(conn: psycopg.Connection[dict[str, Any]], entity: str) -> dict[str, Any] | None:
     """Resolve a seed given a uuid OR a name: exact uuid → exact normalized_name →
     best ILIKE match (highest degree). None when nothing matches."""
-    cols = "uuid, name, entity_type, degree, summary"
+    cols = "uuid, owner_id, name, entity_type, degree, summary"
     row = conn.execute(f"SELECT {cols} FROM kg_entities WHERE uuid = %s", (entity,)).fetchone()
     if row:
         return row
@@ -790,6 +795,7 @@ def _graph_neighborhood(
         if seed is None:
             return None
         seed_uuid = seed["uuid"]
+        owner = seed["owner_id"]  # a neighbourhood lies within its seed's owner (docstring)
 
         # Shared as-of edge-visibility fragment (empty when unset).
         as_of_sql, as_of_params = "", []
@@ -805,8 +811,9 @@ def _graph_neighborhood(
                 break
             rows = conn.execute(
                 "SELECT src_uuid, tgt_uuid FROM kg_relationships "
-                f"WHERE (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} LIMIT %s",
-                (frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+                "WHERE owner_id = %s "
+                f"  AND (src_uuid = ANY(%s) OR tgt_uuid = ANY(%s)){as_of_sql} LIMIT %s",
+                (owner, frontier, frontier, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
             ).fetchall()
             nxt: list[str] = []
             for r in rows:
@@ -835,8 +842,9 @@ def _graph_neighborhood(
         edge_rows = conn.execute(
             "SELECT uuid, src_uuid, tgt_uuid, name, fact, t_valid, t_invalid, episodes, "
             "       retrieval_count FROM kg_relationships "
-            f"WHERE src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
-            (kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
+            "WHERE owner_id = %s "
+            f"  AND src_uuid = ANY(%s) AND tgt_uuid = ANY(%s){as_of_sql} LIMIT %s",
+            (owner, kept, kept, *as_of_params, _GRAPH_EDGE_SCAN_CAP),
         ).fetchall()
 
         # Edge cap (see _GRAPH_EDGE_CAP): keep seed-adjacent edges first, then the

@@ -291,11 +291,11 @@ the ledger they read. A fresh install needs none of this: its first boot applies
 nothing to merge.
 
 **Schema 069, the cleanup.** Optional: no service needs it, so apply it by hand to the
-running system, nothing stopped, once 067 is in place:
+running system, nothing stopped, once 068 is in place:
 `psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/069_one_memory_cleanup.sql` (under
 autocommit; never `-1`; after a failed step, run the whole file again). It drops `group_id` from the knowledge graph, notes and
 preferences, the indexes that lead with it, and the `kg_pile_merge_067_*` tables. A
-preflight refuses, changing nothing, below 067, on a row whose `group_id` is not
+preflight refuses, changing nothing, below 068, on a row whose `group_id` is not
 `technical`, on a missing owner-only index, and on anything else that depends on the column;
 each refusal names what to look at. Each step waits at most 5 s for its lock and the file is
 safe to run again.

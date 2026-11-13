@@ -279,10 +279,12 @@ def test_a_second_run_changes_nothing_and_waits_for_no_lock(at_068, db_url):
 
 
 REFUSALS = {
-    "stamp below 067": (
-        "UPDATE synapse_meta SET value = '066' WHERE key = 'schema_version'",
+    # 067 is the merge 069 cleans up after, and still not enough: stamping 069 over it
+    # would hide that 068 never ran.
+    "stamp below 068": (
+        "UPDATE synapse_meta SET value = '067' WHERE key = 'schema_version'",
         "UPDATE synapse_meta SET value = '068' WHERE key = 'schema_version'",
-        "069 needs 067 applied first (schema_version is 066)",
+        "069 needs 068 applied first (schema_version is 067)",
     ),
     "a row that is not technical": (
         "INSERT INTO notes (owner_id, group_id, type, hook, body) "

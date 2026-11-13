@@ -2000,6 +2000,33 @@ def test_graph_neighborhood_depth_1_vs_2(clean, conn, db_url):
         assert d2["truncated"] is False
 
 
+def test_an_entitys_edges_are_read_under_its_own_owner(clean, conn, db_url):
+    """The dossier and the graph read one entity's edges under that entity's owner: every
+    index on the edge table leads with the owner (after schema 069 there is no other kind),
+    so that is what keeps these reads off a table scan. An edge is filed under its endpoints'
+    owner, so one filed under another owner is not this entity's edge."""
+    for uid in ("own-main", "own-near", "own-far"):
+        _entity(conn, uid, name=uid)
+    ep = _episode(conn, session="own", seq=1, content="near", created_at=_t(1))
+    other = _episode(conn, session="own", seq=2, content="far", created_at=_t(2))
+    _rel(conn, "own-e1", src="own-main", tgt="own-near", episodes=[ep], retrieval_count=2)
+    _rel(conn, "own-e2", src="own-far", tgt="own-main", episodes=[other], retrieval_count=5)
+    _rel(conn, "own-e3", src="own-near", tgt="own-main", episodes=[other], retrieval_count=7)
+    conn.execute(
+        "UPDATE kg_relationships SET owner_id = 'someone-else' WHERE uuid IN ('own-e2', 'own-e3')"
+    )
+    with _client(db_url) as client:
+        dossier = client.get("/dash/api/entity/own-main", headers=_H).json()
+        assert [f["uuid"] for f in dossier["facts"]] == ["own-e1"]
+        assert dossier["stats"] == {"edges": 1, "facts": 1, "served": 2}
+        assert [m["episode_id"] for m in dossier["mentions"]["items"]] == [ep]
+        assert dossier["mentions"]["total"] == 1
+        url = "/dash/api/graph/neighborhood?entity=own-main&depth=2"
+        graph = client.get(url, headers=_H).json()
+        assert {n["uuid"] for n in graph["nodes"]} == {"own-main", "own-near"}
+        assert [e["uuid"] for e in graph["edges"]] == ["own-e1"]
+
+
 def test_graph_neighborhood_as_of_filter(clean, conn, db_url):
     _mini_graph(conn)
     with _client(db_url) as client:

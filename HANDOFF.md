@@ -16,11 +16,16 @@ changed, what to do on each machine, what was proven, and what is still open.
 - **No service needs it.** The boot guard still asks for 068, and the same image runs with
   or without 069. A fresh install gets it at first boot.
 - **It refuses rather than guesses.** A preflight changes nothing and names what to look at
-  when the stamp is below 067, a row's `group_id` is not `technical`, an owner-only index
+  when the stamp is below 068, a row's `group_id` is not `technical`, an owner-only index
   from 067 is missing, or anything else depends on the column (a view, a trigger, a
   generated column, a constraint, an index 069 does not know). Every later step refuses
   unless that preflight passed in the same session, takes its table lock first, and waits
   at most 5 s for it. The stamp moves to 069 only once the file has checked the end state.
+- **Reads of one entity's facts name its owner.** After 069 every index on the fact table
+  leads with `owner_id`; `kg_rel_src`, which 069 drops, was the last narrow one a read by
+  source alone could walk. The dashboard's entity page and graph, and `synapse-admin owner`,
+  now read an entity's facts under that entity's own owner (a fact is filed under its
+  endpoints' owner, so nothing is hidden) and range over an index with or without 069.
 - **The merge's undo is over.** `scripts/pile_merge.py` is deleted, with its preview, health
   check and exclude list (its undo already refused on a database stamped above 067), and
   069 drops the before-images it read. 067 is its file alone, and stamps only once no
@@ -39,7 +44,7 @@ changed, what to do on each machine, what was proven, and what is still open.
 **On each machine**
 
 1. The release itself needs nothing: no migration, no setting, no client update.
-2. The cleanup, whenever you want it, on a database at 067 or later, with nothing stopped:
+2. The cleanup, whenever you want it, on a database at 068 or later, with nothing stopped:
    `psql -X "$SYNAPSE_DB_URL" -v ON_ERROR_STOP=1 -f schema/069_one_memory_cleanup.sql`.
    Never `-1`. Take a dump first: after 069 a dump is the only way back. If a step gives up
    on its lock (a long reader was in the way), nothing is half done: run the whole file
@@ -65,8 +70,32 @@ changed, what to do on each machine, what was proven, and what is still open.
   names `group_id`, and none reads the four tables with `*` (a prepared `SELECT *` fails
   when a column is dropped under it).
 
+- **Rehearsed on a copy of a live database** (53k entities, 105k facts, PostgreSQL 17)
+  brought to 068 the way that database got there. The file applied in 0.35 s while pooled
+  connections of the services' own code held prepared statements on the four tables: no
+  read or write path failed after the drop, and the longest read waited 9 ms. Every row of
+  the four tables was identical before and after, all 21 remaining indexes valid. A reader
+  holding a transaction open made step 1 give up after 5 s with nothing changed; a row not
+  `technical` was refused by the preflight; a second run under an open reader took 0.3 s
+  and no lock; 066, 067 and 068 applied again brought nothing back; the boot check passed
+  on this build and on the one before it.
+- The recall bench on that copy found every gold answer before and after (five gathers).
+  481 of 490 contexts were identical across the cleanup, against 487 of 490 between two
+  gathers before it; about half of the differences are the same ids in another order. The
+  rehearsal wrote and removed its own marker rows between those gathers, and the file
+  touches neither search index, but one changed context was not traced to a cause.
+- The reads that now name the owner, on that copy at 069, without and with the owner: an
+  entity page's facts 27 to 1.5 ms (the owner's own node 29 to 13.5), its counts 30 to 0.3
+  ms, a graph level 23 to 4.9 ms, the graph's edges 24 to 0.8 ms, the owner node's degree
+  46 to 5 ms.
+- The rehearsal found that the preflight accepted a database at 067 and would have stamped
+  069 over a 068 that never ran; the floor is 068 now. The file rehearsed differs from the
+  one shipped in that floor and in comments.
+- CI applies every schema file on PostgreSQL 18, the gate on 17.
+
 **Still open**: `recall_metrics.group_id` (history) and the `group_id` argument that
-`recall` still accepts and ignores.
+`recall` still accepts and ignores. 067 applied again after 069 still runs its two
+`ANALYZE`s (about 2.6 s on that database).
 
 ## 2026-11-12 — install: `synapse` is linked into `~/.local/bin` when that is on PATH
 
