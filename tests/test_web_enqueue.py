@@ -172,6 +172,14 @@ class TestEnqueue:
         _mk_chunk(conn, aid, 0, PROSE)
         assert enqueue_web_chunks(conn).enqueued == 1
 
+    def test_limit_caps_one_pass(self, conn, web_tables):
+        aid = _mk_artifact(conn, tool_use_id="t1")
+        for idx in range(3):
+            _mk_chunk(conn, aid, idx, PROSE)
+        first = enqueue_web_chunks(conn, limit=2)
+        assert (first.candidates, first.enqueued) == (2, 2)
+        assert enqueue_web_chunks(conn, limit=2).enqueued == 1  # the one the first pass left
+
     def test_since_excludes_older_artifacts(self, conn, web_tables):
         # fixture artifacts are fetched_at 2026-06-01
         aid = _mk_artifact(conn, tool_use_id="t1")

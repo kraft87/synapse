@@ -439,6 +439,91 @@ changed, what to do on each machine, what was proven, and what is still open.
 - From 0.24.8, unchanged: turns of a Hermes session whose marker cannot be read are not
   uploaded and are lost at exit.
 
+## 2026-11-13 — notes: a related note is kept beside the old one, and replaced text is kept (schema 070, optional)
+
+**What changed**
+
+- **The fault.** `remember()` compares a new note's hook with the stored notes. A close
+  match of the same type went to a confirm call that could answer only "same" (replace
+  the stored text) or "contradicts" (retire the stored note). A new benchmark result on
+  the topic of an older one fitted neither, was called "same", and replaced the older
+  note's text. Nothing in the notes table kept what was replaced.
+- **A third answer, "related".** Same topic, but each note records its own thing (another
+  measurement, a later event, a different result): the new note is stored beside the old
+  one and the old one is not touched. The prompt says to prefer it when unsure.
+- **A confirm call that fails keeps both notes.** It used to answer "same". A wrong
+  "same" loses text; a wrong "related" leaves a duplicate that the nightly notes lane
+  merges. A new note identical to its match (same hook and body) is "same" without a
+  call, so a replayed write still lands on the stored note. `SYNAPSE_NOTES_CONFIRM=0` is
+  unchanged: every match is "same".
+- **Schema 070, `notes_history`.** Two triggers on `notes` copy the row as it was before
+  any change of hook, body, type, project, tier or `superseded_by`, and before a delete.
+  Every writer is covered, the nightly lane and hand-run SQL included. Read a note's
+  earlier versions with
+  `SELECT * FROM notes_history WHERE note_id = N ORDER BY recorded_at`.
+
+**What to do on each machine**
+
+1. Take the new image. It runs the same with or without 070 (the file is optional).
+2. `scripts/apply_schema.sh "$SYNAPSE_DB_URL"` from a checkout of this version. It
+   applies 070 and moves the stamp. Nothing needs stopping.
+
+**Rollback**
+
+The previous image runs on a database with 070. To remove the table:
+`DROP TRIGGER notes_history_update_trg ON notes; DROP TRIGGER notes_history_delete_trg ON notes; DROP FUNCTION notes_history_record(); DROP TABLE notes_history;`
+
+**What was proven**
+
+- `tests/test_notes_store.py`, `tests/test_remember_notes.py`: "related" and a failed
+  confirm call each insert and leave the stored row as it was; identical text updates
+  with no call; an update, a retirement, a retype and a delete each leave the earlier row
+  in `notes_history`; a write that changes no content leaves none.
+
+## 2026-11-13 — skills: accepting a retune runs its routing check, which had never run
+
+**What changed**
+
+- **The routing check on a retune accept had never run.** `/skills/proposals/act` hands
+  the check a connection whose rows are dicts. The check read its first row by position,
+  its own `except` swallowed the error, and every retune accept came back with the note
+  `routing-eval skipped: 0`.
+- **Now it runs.** Accepting a retune proposal that has a draft asks the skills model
+  (`SYNAPSE_SKILLS_MODEL`, default Opus) once: for up to eight of the phrasings the skill
+  missed, which active skill does each one route to today. The accept result carries the
+  answer (`routing-eval: 2/3 missed phrasings already map to '<skill>'`) and the review
+  CLI prints it.
+- **It is advisory and bounded.** The accept is applied whatever the check says. The check
+  gets 20 seconds, because the review client waits 30 for the accept. After that the
+  accept goes on with `routing-eval skipped: no answer within 20s`. A failure is logged as
+  a warning on the server and reported as `routing-eval skipped: <error type>: <message>`.
+  An answer that does not name one skill per phrasing is not counted.
+- **The catalog the model sees is the active skills.** It was every registry row, retired
+  ones included.
+- **No transaction is open while the model answers.**
+- The dashboard's approve still makes no model call.
+
+**On each machine**
+
+1. Nothing to do: no migration, no setting, no client update.
+2. Expect `accept` on a retune proposal to take about 8 seconds longer, and to make one
+   model call from the MCP server container, on the login the pollers use.
+
+**Proven**
+
+- `tests/test_skill_accept_applies.py` runs the real check through the real accept, with
+  only the model replaced: the count, the catalog (active skills, each with its own
+  description), no call when there are no missed phrasings, an answer that does not fit, a
+  model that fails, a model that does not answer in time, and no open transaction while
+  the model is asked. All seven failed before the fix with `routing-eval skipped: 0`.
+- Three deliberate breaks (the read left open, the model waited for, retired skills in the
+  catalog) each fail one of those tests.
+- One real accept on a scratch database with 28 skills and the real model: applied in
+  8.8 seconds, `2/3 missed phrasings already map`.
+
+**Still open**: the check asks about the descriptions as they are before the accept is
+applied. Whether the new description routes the missed phrasings better is not asked.
+
 ## 2026-11-13 — schema: `apply_schema.sh` keeps a ledger, so an upgrade is one command
 
 **What changed**
@@ -521,8 +606,11 @@ changed, what to do on each machine, what was proven, and what is still open.
 - On a database built by the previous script, where that script's second run fails at
   001, `--status` changed nothing and the first run recorded 68 files and applied none.
 
-**Still open**: no live database has been moved onto the ledger yet. A fresh install still
-replays all 68 files; folding them into one baseline file is a separate change.
+**Done since**: the production database was moved onto the ledger on 2026-11-13. The first
+run recorded 68 files and applied none; the stamp stayed at 069.
+
+**Still open**: a fresh install still replays all 68 files. Folding them into one baseline
+file was considered and dropped.
 
 ## 2026-11-13 — ingest: a webhook URL is a credential; the stored-row repair leaves no rule out
 

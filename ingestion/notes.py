@@ -19,7 +19,7 @@ retire an existing note at all. Which tier is searched:
     the other tier.
 A candidate is the top hit of a tier when its sim >= SYNAPSE_NOTES_SIM_MATCH (default
 0.80) AND it has the same type. Then one small LLM confirm call ({"relation":
-"same"|"contradicts"}):
+"same"|"contradicts"|"related"}):
   - "same" in the write's own tier -> UPDATE the existing note in place (refresh hook/
     body/embedding, bump updated_at — restatements don't pile up); the stored tier is
     kept
@@ -28,15 +28,23 @@ A candidate is the top hit of a tier when its sim >= SYNAPSE_NOTES_SIM_MATCH (de
   - "same" in the OTHER tier -> leave that note alone and INSERT the new one at its own
     tier, so the same wording can hold a twin in each tier; only an explicit
     ``audience`` argument updates the other-tier note in place and moves it to that tier
+  - "related" -> INSERT the new note beside the old one and leave the old one alone: the
+    two share a topic but each records its own thing (a second measurement, a later
+    event, another result), so both stay true and both stay live
   - no candidate in either tier -> INSERT a new live note.
 The confirm call takes seconds, so the update or retirement that follows is conditioned
 on the candidate still being live and still in the tier it was read in. If another write
 moved or retired it meanwhile, it is left as it is and the new note is inserted instead.
 
-Fail-open, always toward "same": the kill switch (SYNAPSE_NOTES_CONFIRM=0) and any
-LLM failure both collapse the confirm to "same" — an over-eager update loses a
-nuance; a missed update duplicates a board line forever. Across tiers that same answer
-means a new note in the write's own tier, never an edit of the other one.
+When the confirm call fails, the answer is "related": the new note is inserted and
+nothing stored is touched. A wrong "same" replaces a stored note's text with a different
+note's (2026-11-13: a new benchmark result overwrote an older, different one), while a
+wrong "related" leaves a duplicate board line that the nightly notes lane merges. A new
+note whose hook and body are identical to the candidate's is "same" without a call, so a
+replayed write still converges during an outage. The kill switch
+(SYNAPSE_NOTES_CONFIRM=0) is the operator choosing no judge at all, and keeps its
+meaning: every candidate is "same". Whatever a write replaces is kept in
+``notes_history`` (schema 070).
 
 Keyless dev/test (no embedder, or the embed call fails) degrades to a straight insert
 with NULL embedding — dedup is silently skipped, never a hard failure (timeline
@@ -80,10 +88,15 @@ NEW (just asserted):
 hook: {new_hook}
 body: {new_body}
 
-- "same": the NEW note restates, refines, or extends the EXISTING one — the same underlying fact or stance, possibly with updated wording or added detail. The store will UPDATE the existing note in place.
+- "same": the NEW note restates, refines, or extends the EXISTING one — the same underlying fact or stance, possibly with updated wording or added detail. The store will REPLACE the existing note's text with the new text, so choose this only when nothing the EXISTING note records would be lost.
 - "contradicts": the NEW note REVERSES or invalidates the EXISTING one — if the new statement is true, the old one no longer is (a decision flipped, a value changed, a rule inverted). The store will retire the old note and link it to the new one.
+- "related": the two notes share a topic but each records its own thing, and both remain true — a different event, test, measurement, result or decision, often with a different date or a different subject. The store will keep both notes.
 
-Output ONLY JSON: {{"relation": "same"}} or {{"relation": "contradicts"}}"""
+Two results of two different experiments are "related" even when they reach the same conclusion. When unsure between "same" and "related", answer "related".
+
+Output ONLY JSON: {{"relation": "same"}}, {{"relation": "contradicts"}} or {{"relation": "related"}}"""
+
+_RELATIONS = ("same", "contradicts", "related")
 
 
 def _sim_match_threshold() -> float:
@@ -97,23 +110,27 @@ def _sim_match_threshold() -> float:
 
 
 def _parse_relation(text: str) -> str:
-    """Parser for parse_with_retry: extract {"relation": "same"|"contradicts"}."""
+    """Parser for parse_with_retry: extract {"relation": "same"|"contradicts"|"related"}."""
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise MalformedResponseError("no JSON object in response", text[:200])
     d = json.loads(text[start : end + 1])
     rel = d.get("relation")
-    if rel not in ("same", "contradicts"):
-        raise MalformedResponseError("'relation' must be 'same' or 'contradicts'", text[:200])
+    if rel not in _RELATIONS:
+        raise MalformedResponseError(f"'relation' must be one of {_RELATIONS}", text[:200])
     return cast(str, rel)
 
 
 def _confirm_relation(llm: Any, existing: dict[str, Any], hook: str, body: str) -> str:
-    """One small LLM call: is the new note a restatement or a contradiction of the
-    existing one? Kill switch (SYNAPSE_NOTES_CONFIRM=0) and ANY LLM failure both
-    collapse to "same" -> UPDATE (no dup, no dangling lineage)."""
+    """One small LLM call: is the new note a restatement of the existing one, a
+    contradiction of it, or a separate note on the same topic? The kill switch
+    (SYNAPSE_NOTES_CONFIRM=0) answers "same" without a call, as does a new note
+    identical to the existing one. ANY LLM failure answers "related" -> INSERT, so a
+    failed call never replaces stored text."""
     if os.environ.get("SYNAPSE_NOTES_CONFIRM", "1") == "0":
         logger.info("notes confirm disabled (SYNAPSE_NOTES_CONFIRM=0); treating as 'same'")
+        return "same"
+    if existing["hook"] == hook and str(existing.get("body") or "") == body:
         return "same"
     prompt = CONFIRM_PROMPT.format(
         existing_hook=existing["hook"],
@@ -130,8 +147,8 @@ def _confirm_relation(llm: Any, existing: dict[str, Any], hook: str, body: str) 
             max_tokens=64,
         )
     except Exception as e:
-        logger.warning("notes confirm LLM failed (%s); collapsing to 'same' -> update", e)
-        return "same"
+        logger.warning("notes confirm LLM failed (%s); keeping both notes", e)
+        return "related"
 
 
 def _live_match(db: Any, vec: list[float], type: str, audience: str) -> dict[str, Any] | None:
@@ -285,11 +302,25 @@ def reconcile_note(
             "audience": new_audience,
         }
 
+    if relation == "related":
+        # Same topic, separate note (or the confirm call failed): the stored note keeps
+        # its text and this write gets its own row.
+        new_id = _insert()
+        logger.info(
+            "note created (#%s, %s, %s) beside related #%s: %s",
+            new_id,
+            type,
+            new_audience,
+            top["id"],
+            hook[:80],
+        )
+        return _created(new_id)
+
     if other_tier and audience is None:
         # The match is a note of the other tier and nobody asked to move it. Editing it
         # would put this text under that tier's label (a personal statement served to a
         # work device, or the reverse), so it stays as it is and this write gets its own
-        # row. This is also where the fail-open "same" lands (kill switch, LLM failure).
+        # row. This is also where the kill switch's "same" lands.
         new_id = _insert()
         logger.info(
             "note created (#%s, %s, %s) beside #%s of the other tier: %s",

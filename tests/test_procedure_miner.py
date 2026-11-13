@@ -56,7 +56,7 @@ class FakeConn:
 
 
 def episode(sid, seq, content, d=TODAY):
-    return (sid, seq, d, content)
+    return pm._CorpusRow(sid, seq, d, content)
 
 
 CONFIRM_OK = json.dumps(

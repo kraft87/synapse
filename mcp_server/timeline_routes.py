@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import psycopg
+from psycopg.rows import class_row
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -134,6 +136,18 @@ def _ingest_events(
 _PER_PROJECT_DAY = 3
 
 
+@dataclass(frozen=True, slots=True)
+class _MilestoneRow:
+    """One event of the milestones feed, as the route serves it."""
+
+    id: int
+    date: str
+    fact: str
+    project: str | None
+    salience: int
+    event_type: str | None
+
+
 def _recent_events(
     db_url: str,
     days: int,
@@ -176,18 +190,8 @@ def _recent_events(
             params.extend(scope[1])
         q += ") ranked WHERE day_rank <= %s ORDER BY t_valid DESC LIMIT %s"
         params.extend([_PER_PROJECT_DAY, limit])
-        rows = conn.execute(q, params).fetchall()
-        return [
-            {
-                "id": r[0],
-                "date": r[1],
-                "fact": r[2],
-                "project": r[3],
-                "salience": r[4],
-                "event_type": r[5],
-            }
-            for r in rows
-        ]
+        rows = conn.cursor(row_factory=class_row(_MilestoneRow)).execute(q, params).fetchall()
+        return [asdict(r) for r in rows]
 
 
 def register(

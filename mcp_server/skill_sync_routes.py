@@ -54,13 +54,16 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
+import queue
 import re
+import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
-from psycopg.rows import dict_row
+from psycopg.rows import class_row, dict_row, tuple_row
 from psycopg.types.json import Json
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -71,7 +74,7 @@ from dream.skills.skill_doc import (
     replace_description,
     valid_skill_name,
 )
-from dream.skills.skill_measure import skill_description
+from dream.skills.skill_measure import load_catalog, skill_description
 from ingestion import pg_pool
 from ingestion.project_label import label_from_path
 from ingestion.schema_check import ColumnProbe
@@ -198,11 +201,24 @@ def whole_skill_hash(body: str, files) -> str:
     return h.hexdigest()
 
 
-def _file_shas(c, name: str) -> list[dict]:
-    return c.execute(
-        "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
-        (name,),
-    ).fetchall()
+@dataclass(frozen=True, slots=True)
+class _FileShaRow:
+    """One bundled file of a skill: its path and the hash of its content."""
+
+    path: str
+    sha256: str
+
+
+def _file_shas(c, name: str) -> list[_FileShaRow]:
+    """The skill's files, as the same rows whatever rows the caller's connection makes."""
+    return (
+        c.cursor(row_factory=class_row(_FileShaRow))
+        .execute(
+            "SELECT path, sha256 FROM skills_lane.skill_files WHERE skill_name=%s ORDER BY path",
+            (name,),
+        )
+        .fetchall()
+    )
 
 
 def _held_names(held) -> list[str] | None:
@@ -242,7 +258,7 @@ def _list_skills(db_url: str, scope: str, access: SkillAccess = FULL_ACCESS, hel
                     "body": s["body"],
                     "description": s["description"],
                     "content_modified_at": _iso(s["content_modified_at"]),
-                    "files": _file_shas(c, s["name"]),
+                    "files": [asdict(f) for f in _file_shas(c, s["name"])],
                 }
                 for s in skills
             ],
@@ -282,7 +298,7 @@ def _past_hashes(c, name: str, files) -> list[str]:
 
 
 def _entry_hashes(c, name: str, body: str) -> tuple[str, list[str]]:
-    files = [(f["path"], f["sha256"]) for f in _file_shas(c, name)]
+    files = [(f.path, f.sha256) for f in _file_shas(c, name)]
     current = whole_skill_hash(body, files)
     past = [h for h in _past_hashes(c, name, files) if h != current]
     return current, [current, *past]
@@ -412,6 +428,23 @@ def _upsert_registry(
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _RetirementRow:
+    """A registry row as the retirement check reads it."""
+
+    status: str
+    retired_at: datetime | None
+    body: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopeRow:
+    """A registry row as the publish's scope check reads it."""
+
+    scope: str
+    status: str
+
+
 def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
     """The retired_at that refuses the publish `p` (edited at `edited`), or None.
 
@@ -424,20 +457,24 @@ def _retirement_holds(c, p: dict, edited: datetime | None) -> datetime | None:
     if not _retired_at_ready(c):
         return None
     name = p["name"]
-    row = c.execute(
-        "SELECT status, retired_at, COALESCE(body,'') FROM skills_lane.skill_registry "
-        "WHERE name=%s FOR UPDATE",
-        (name,),
-    ).fetchone()
-    if row is None or row[0] != "retired" or row[1] is None:
+    row = (
+        c.cursor(row_factory=class_row(_RetirementRow))
+        .execute(
+            "SELECT status, retired_at, COALESCE(body,'') AS body "
+            "FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
+            (name,),
+        )
+        .fetchone()
+    )
+    if row is None or row.status != "retired" or row.retired_at is None:
         return None
-    if edited is None or _utc(edited) <= row[1]:
-        return row[1]
-    retired = whole_skill_hash(row[2], [(f[0], f[1]) for f in _file_shas(c, name)])
+    if edited is None or _utc(edited) <= row.retired_at:
+        return row.retired_at
+    retired = whole_skill_hash(row.body, [(f.path, f.sha256) for f in _file_shas(c, name)])
     pushed = whole_skill_hash(
         p.get("body", ""), [(f["path"], f["sha256"]) for f in p.get("files", [])]
     )
-    return row[1] if pushed == retired else None
+    return row.retired_at if pushed == retired else None
 
 
 def _scope_holds(c, name: str, scope: str, access: SkillAccess) -> dict | str:
@@ -449,21 +486,25 @@ def _scope_holds(c, name: str, scope: str, access: SkillAccess) -> dict | str:
     skill re-scoped for trust would leak again). Moving a skill is /skills/rescope. The
     same scope in another case keeps the registry's spelling. A restricted caller may not
     take over a retired skill of a scope it is not served."""
-    row = c.execute(
-        "SELECT scope, status FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
-        (name,),
-    ).fetchone()
+    row = (
+        c.cursor(row_factory=class_row(_ScopeRow))
+        .execute(
+            "SELECT scope, status FROM skills_lane.skill_registry WHERE name=%s FOR UPDATE",
+            (name,),
+        )
+        .fetchone()
+    )
     if row is None:
         return scope
-    if row[1] == "active":
-        if row[0].lower() != scope.lower():
+    if row.status == "active":
+        if row.scope.lower() != scope.lower():
             return {
                 "status": "scoped",
                 "name": name,
-                "scope": row[0] if access.serves(row[0]) else None,
+                "scope": row.scope if access.serves(row.scope) else None,
             }
-        return row[0]
-    if not access.serves(row[0]):
+        return row.scope
+    if not access.serves(row.scope):
         return {"status": "forbidden", "name": name}
     return scope
 
@@ -1279,41 +1320,64 @@ def _proposal_act(
     return {"status": "error", "detail": f"unknown action {action!r}"}
 
 
+# The review client waits 30 s for an accept (plugin/scripts/config.py). The routing check
+# gets this much of it; an answer took about 8 s when this was set.
+_ROUTING_EVAL_BUDGET_S = 20.0
+
+
+def _answer_within(ask: Callable[[], str], budget_s: float) -> str | None:
+    """`ask()`'s answer, or None once `budget_s` has passed; an error `ask` raises is raised
+    here. `ask` runs on a daemon thread: a late answer is dropped, and neither the request
+    nor a shutdown waits for it."""
+    box: queue.SimpleQueue[str | Exception] = queue.SimpleQueue()
+
+    def _run() -> None:
+        try:
+            box.put(ask())
+        except Exception as ex:
+            box.put(ex)
+
+    threading.Thread(target=_run, name="routing-eval", daemon=True).start()
+    try:
+        got = box.get(timeout=budget_s)
+    except queue.Empty:
+        return None
+    if isinstance(got, Exception):
+        raise got
+    return got
+
+
 def _routing_eval(c, cid: int, name: str) -> str:
     """Advisory: would the under-trigger phrasings route to `name` under current descriptions?
-    Best-effort single LLM pass; any failure degrades to a skip note (never blocks accept)."""
+    One LLM pass with _ROUTING_EVAL_BUDGET_S to answer; any failure degrades to a skip note
+    (never blocks accept). It reads through cursors of its own, so the rows are the same
+    whatever rows the caller's connection makes, and ends the read before the model is asked,
+    so no transaction stays open while it answers."""
     try:
-        import json as _json
+        from ingestion.llm_client import create_llm_client, stage_model
 
-        from ingestion.llm_client import create_llm_client
-
-        cur = c.cursor()
-        ev = cur.execute(
-            "SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,)
-        ).fetchone()[0]
+        found = (
+            c.cursor(row_factory=tuple_row)
+            .execute("SELECT evidence FROM skills_lane.skill_gap_candidates WHERE id=%s", (cid,))
+            .fetchone()
+        )
         phrasings = [
-            e.get("phrasing", "")
-            for e in ev
+            e["phrasing"]
+            for e in (found[0] if found else None) or []
             if e.get("signal") == "under_trigger" and e.get("phrasing")
-        ]
+        ][:8]
         if not phrasings:
             return "routing-eval: no phrasings to eval"
-        catalog = "\n".join(
-            f"- {n}: {d}"
-            for n, d in cur.execute(
-                "SELECT name, description FROM skills_lane.skill_registry ORDER BY name"
-            ).fetchall()
-        )
+        catalog = "\n".join(f"- {n}: {d}" for n, d in load_catalog(c))
+        c.commit()
         prompt = (
             f"Skill catalog:\n{catalog}\n\nFor each user phrasing, name the ONE skill whose "
             f"description best matches, or 'none'. We expect '{name}' to be the match.\n"
-            + "\n".join(f"- {p}" for p in phrasings[:8])
+            + "\n".join(f"- {p}" for p in phrasings)
             + '\n\nOutput JSON only: {"matches":["skill-or-none", ...]} in phrasing order.'
         )
 
-        def _gen() -> str:
-            from ingestion.llm_client import stage_model
-
+        def _ask() -> str:
             resp = create_llm_client().messages.create(
                 model=stage_model("SKILLS", "claude-opus-4-8"),
                 max_tokens=400,
@@ -1321,16 +1385,26 @@ def _routing_eval(c, cid: int, name: str) -> str:
             )
             return str(resp.content[0].text)
 
-        from concurrent.futures import ThreadPoolExecutor
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            raw = pool.submit(_gen).result(timeout=120)
+        raw = _answer_within(_ask, _ROUTING_EVAL_BUDGET_S)
+        if raw is None:
+            logger.warning(
+                "routing-eval for skill candidate %s: no answer within %gs",
+                cid,
+                _ROUTING_EVAL_BUDGET_S,
+            )
+            return f"routing-eval skipped: no answer within {_ROUTING_EVAL_BUDGET_S:g}s"
         s, e = raw.find("{"), raw.rfind("}")
-        matches = _json.loads(raw[s : e + 1]).get("matches", []) if s >= 0 else []
+        if s < 0 or e < s:
+            return "routing-eval skipped: the answer is not JSON"
+        matches = json.loads(raw[s : e + 1]).get("matches")
+        if not isinstance(matches, list) or len(matches) != len(phrasings):
+            n = len(matches) if isinstance(matches, list) else 0
+            return f"routing-eval skipped: {n} answers for {len(phrasings)} phrasings"
         hit = sum(1 for m in matches if m == name)
         return f"routing-eval: {hit}/{len(matches)} missed phrasings already map to '{name}'"
-    except Exception as ex:  # pragma: no cover - advisory only
-        return f"routing-eval skipped: {ex}"
+    except Exception as ex:  # advisory only: the accept goes on without it
+        logger.warning("routing-eval for skill candidate %s failed", cid, exc_info=True)
+        return f"routing-eval skipped: {type(ex).__name__}: {ex}"
 
 
 # -------------------------------------------------------------------- register

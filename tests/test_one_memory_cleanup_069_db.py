@@ -218,7 +218,7 @@ def test_one_self_allows_one_flagged_entity_per_owner(conn):
 def test_069_is_optional_and_068_stays_the_version_the_code_needs():
     assert schema_check.is_optional_migration(states.SQL_069)
     assert schema_check.required_schema_version() == "068"
-    assert schema_check.expected_schema_version() == "069"
+    assert schema_check.expected_schema_version() >= "069"  # a later file raises it
     script = (_ROOT / "scripts" / "apply_schema.sh").read_text()
     assert script.index("068_span_id_prefix_is_platform.sql") < script.index(states.SQL_069.name)
 
@@ -512,7 +512,7 @@ def test_every_schema_file_applied_again_after_069_brings_nothing_back(conn, db_
     files = re.findall(
         r"^  (\d{3}_\S+\.sql)$", (_ROOT / "scripts" / "apply_schema.sh").read_text(), re.M
     )
-    assert files[-1] == states.SQL_069.name
+    assert states.SQL_069.name in files
     failed = {}
     for name in files:
         ran = states.psql(db_url, states.SCHEMA / name, check=False)

@@ -404,7 +404,7 @@ def _notes_deps() -> tuple:
     reconcile_note stores a NULL embedding and skips dedup rather than failing
     the write (same degrade the timeline ingest route uses). LLM ``None`` (e.g.
     a bad SYNAPSE_LLM_PROVIDER): the confirm call fails inside reconcile_note's
-    blanket except and collapses to "same" -> UPDATE (the fail-open design)."""
+    blanket except and the note is inserted beside the one it matched."""
     from ingestion.embedding import create_embedder
     from ingestion.llm_client import create_llm_client
 
