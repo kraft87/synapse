@@ -809,6 +809,97 @@ def test_no_path_advice_when_the_bin_dir_is_already_on_path(tmp_path):
     assert "Now run: synapse login" in r.stdout
 
 
+def _user_home(tmp_path: Path, *, local_bin: bool = True) -> tuple[Path, Path]:
+    """A scratch user home and its ``~/.local/bin`` (created unless told not to)."""
+    user = tmp_path / "home-dir"
+    local = user / ".local" / "bin"
+    if local_bin:
+        local.mkdir(parents=True)
+    else:
+        user.mkdir()
+    return user, local
+
+
+def _with(local: Path) -> str:
+    return os.pathsep.join([str(local), os.environ.get("PATH", "")])
+
+
+def test_the_default_home_is_linked_into_local_bin_when_that_is_on_path(tmp_path):
+    cli = {"plugin/scripts/synapse_cli.py": "import sys\nprint('cli', *sys.argv[1:])\n"}
+    script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client", extra=cli))
+    user, local = _user_home(tmp_path)
+    r = _install(script, None, HOME=str(user), PATH=_with(local))
+    assert r.returncode == 0, r.stdout + r.stderr
+    link, shim = local / "synapse", user / ".synapse" / "bin" / "synapse"
+    assert link.is_symlink() and os.readlink(link) == str(shim)
+    # The name now resolves on that PATH, and what it runs is the installed client.
+    assert shutil.which("synapse", path=str(local)) == str(link)
+    ran = subprocess.run(
+        ["synapse", "hello"],
+        env=_env(None, HOME=str(user), PATH=_with(local)),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert ran.returncode == 0 and ran.stdout.strip() == "cli hello", ran.stdout + ran.stderr
+    assert f"Linked {link} to {shim}." in r.stdout
+    assert "not on your PATH" not in r.stdout
+    assert "Now run: synapse login" in r.stdout
+    # An update runs the installer again: the link is found, and nothing is said about it.
+    again = _install(script, None, HOME=str(user), PATH=_with(local))
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert os.readlink(link) == str(shim)
+    assert "Linked" not in again.stdout and "not on your PATH" not in again.stdout
+
+
+@pytest.mark.parametrize("case", ["off PATH", "no directory"])
+def test_without_a_local_bin_on_path_the_line_to_add_is_printed(tmp_path, case):
+    script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client"))
+    user, local = _user_home(tmp_path, local_bin=case == "off PATH")
+    path = os.environ.get("PATH", "") if case == "off PATH" else _with(local)
+    r = _install(script, None, HOME=str(user), PATH=path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not (local / "synapse").is_symlink() and not (local / "synapse").exists()
+    assert local.is_dir() == (case == "off PATH")  # never created for the link's sake
+    assert f"{user / '.synapse' / 'bin'} is not on your PATH" in r.stdout
+
+
+@pytest.mark.parametrize("case", ["a file", "a link elsewhere", "a dangling link"])
+def test_something_else_named_synapse_in_local_bin_is_left_as_it_is(tmp_path, case):
+    script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client"))
+    user, local = _user_home(tmp_path)
+    taken = local / "synapse"
+    other = tmp_path / "another-tool"
+    if case == "a file":
+        taken.write_text("#!/bin/sh\necho another tool\n", encoding="utf-8")
+    else:
+        if case == "a link elsewhere":
+            other.write_text("another tool\n", encoding="utf-8")
+        taken.symlink_to(other)
+    r = _install(script, None, HOME=str(user), PATH=_with(local))
+    assert r.returncode == 0, r.stdout + r.stderr
+    if case == "a file":
+        assert not taken.is_symlink()
+        assert taken.read_text(encoding="utf-8") == "#!/bin/sh\necho another tool\n"
+    else:
+        assert os.readlink(taken) == str(other)
+    assert f"{taken} is not this client's link; left as it is." in r.stdout
+    assert f"{user / '.synapse' / 'bin'} is not on your PATH" in r.stdout
+
+
+def test_a_synapse_home_somewhere_else_is_never_linked(tmp_path):
+    """A side install must not take the name; it is also what keeps every test here that
+    sets SYNAPSE_HOME out of the real ``~/.local/bin`` of whoever runs the suite."""
+    script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client"))
+    user, local = _user_home(tmp_path)
+    side = tmp_path / "side"
+    r = _install(script, side, HOME=str(user), PATH=_with(local))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (side / "bin" / "synapse").is_file()
+    assert list(local.iterdir()) == []
+    assert f"{side / 'bin'} is not on your PATH" in r.stdout
+
+
 def test_a_tampered_payload_is_refused_and_nothing_is_installed(tmp_path):
     script = _render(tmp_path / "install.py", root=_tree(tmp_path / "client"))
     text = script.read_text(encoding="utf-8")
