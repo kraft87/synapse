@@ -144,9 +144,11 @@ that chat) are read again before the system prompt block, each nudge, upload and
 call, since a session can be renamed "Bot Chat" or switched to another (`/resume`,
 compression) without a new provider; one that no longer passes turns the instance inert
 for good, and so does a gateway session whose row is gone. A turn another agent or
-person wrote (Hermes names its author on `on_turn_start` and passes `turn_author` to
-`sync_turn`; both are None on the owner's own turn) is not uploaded and turns the
-instance inert for good. A gateway session's project comes from the `cwd` its client
+person wrote is not uploaded and turns the instance inert for good. Hermes names a
+turn's author on `on_turn_start` and in `sync_turn`'s `turn_author`: the daemon names
+one on every turn, the owner's own as the session's `user_id` (`uid:<this OS user>`, not
+a bot); in-process, a human turn has none. An author that is a bot, or not the session's
+user, is someone else. A gateway session's project comes from the `cwd` its client
 sent, never the daemon's.
 
 What this does not cover:
@@ -230,8 +232,8 @@ like every other harness, so there is no Hermes setup wizard step.
 | `initialize(session_id, **kw)` | Decides the scope (above), binds the session, the project label for `cwd` and the outbox under `<hermes_home>/synapse/outbox`. In an active session: fetches the board and preferences side by side within 5 seconds, fail-open, then drains the outbox on a thread of its own. |
 | `system_prompt_block()` | The text fetched in `initialize()`, in an active session that the store still says is the owner's. Hermes caches it for the session, stores it with the session and restores it for a continuing one, and asks again after a compression. |
 | `prefetch(query)` | The timestamp line and the recall nudge, in an active session. No request is made. |
-| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn with an author (`author_id`, `author_name`) turns the session inert before its nudge. |
-| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn carries a `turn_author`. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
+| `on_turn_start(n, message, model=...)` | Keeps the model name for the uploads. A turn whose author is a bot or not the session's user turns the session inert before its nudge. |
+| `sync_turn(user, assistant, messages=...)` | Uploads every complete turn not yet uploaded, each batch led by the turn before it as context. A batch that fails goes to the outbox; the next success drains it. Active sessions only, nothing for a private session, and nothing once a turn's `turn_author` is a bot or not the session's user. Hermes runs it on its background worker, whose stall gate skips a provider stuck over 30 seconds, so a request is given 20. |
 | `on_session_end(messages)`, `on_pre_compress(messages)` | Upload any turn not yet uploaded (10-second requests). Hermes calls the first at every compression and `/new` as well as at exit, so both rely on the server's span-id dedup. `on_pre_compress` returns `""`. |
 | `on_session_switch(new_id, ...)` | Rebinds the session id (`/new`, `/resume`, `/branch`, rewind). A reset or a new id starts the uploaded-turn memory afresh, looking back at most ten turns. |
 | `get_tool_schemas()` | `recall`, `recall_full_turns`, `fetch`, `fetch_session`, `remember`, `recall_feedback`, from `tool_schemas.json`, in the server's order (`tools.schemas()`). Not shown to the model: `surface` anywhere, `self_session` on the recall family and `fetch_session`, `session_id` on `remember` and `recall_feedback`. The `session_id` of `recall_full_turns` and `fetch_session` names the conversation to read and stays. Static: Hermes asks before `initialize()`. |

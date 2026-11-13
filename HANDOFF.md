@@ -38,9 +38,13 @@ changed, what to do on each machine, what was proven, and what is still open.
 - **Cron jobs are inert, the tools included.** They used to get the tools: whoever can
   have the bot schedule a job chooses its prompt and where its output is delivered.
   `CRON` stays importable; no session gets it.
-- **A turn another agent or person wrote turns the session inert for good**, logged once:
-  an author on `on_turn_start` (before its nudge) or a `turn_author` on `sync_turn`
-  (that turn is not uploaded).
+- **A turn another agent or person wrote turns the session inert for good**, logged once,
+  and is not uploaded. Hermes names a turn's author on `on_turn_start` (before the
+  nudge) and in `sync_turn`'s `turn_author`. The daemon names one on every turn, the
+  owner's own as the session's `user_id` and not a bot (`gateway/run_turn_runner.py`);
+  in-process, a human turn has none. A bot, another id, or any author in-process is
+  someone else: a Bot Mode delivery run as an in-process one-shot (`HERMES_TURN_AUTHOR`,
+  `hermes_cli/cli_single_query.py`) used to be uploaded as the owner's.
 - **A failed turn is never uploaded.** Hermes's notice for a failed turn (an assistant
   row typed `display_kind: failed_turn`, or the bare notice) was uploaded as the
   assistant's reply. The failed turn is now dropped, its user message included. An
@@ -123,8 +127,8 @@ changed, what to do on each machine, what was proven, and what is still open.
 - Four assertions in `tests/test_hermes_provider.py` pin the old rule and fail until
   that file is updated: `test_scope[kwargs6-cron]` and `test_scope[kwargs7-cron]` (cron
   is now "inert"), `test_a_cron_session_has_tools_and_nothing_else` (no tools for cron),
-  and `test_a_finished_turn_is_uploaded` (it passes a `turn_author`, so nothing is
-  uploaded).
+  and `test_a_finished_turn_is_uploaded` (it passes a non-bot `turn_author` to an
+  in-process session, where Hermes only names relayed bots, so nothing is uploaded).
 
 ## 2026-11-12 — ingest: the transcript line rules live in one module
 

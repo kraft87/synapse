@@ -297,23 +297,57 @@ def test_a_cron_job_gets_nothing_not_even_the_tools(plugin, server, tmp_path):
 # ---------------------------------------------------------------------------
 
 #: agent/turn_author.py ``parse_turn_author``: ``{"id", "name", "is_bot"}``; a bot on
-#: this install is ``bot:<profile>`` (``bot_author_id``).
+#: this install is ``bot:<profile>`` (``bot_author_id``); tools/bot_relay.py
+#: ``delivery_turn_author`` and ``relaying_principal_author`` always mark a relay a bot.
 _BOT = {"id": "bot:research", "name": "research", "is_bot": True}
 
 
-def test_a_turn_author_is_never_uploaded_and_turns_the_session_off(
-    plugin, server, tmp_path, caplog
-):
-    """run_agent.py:919-925 passes ``turn_author`` to ``sync_turn``, None on a human
-    turn; tui_gateway/methods_bot_relay.py:88-96: "an unattributed turn is the HUMAN's
-    to the recipient's memory, so a bot DM must stay bot-authored"."""
+def _owner_author() -> dict[str, Any]:
+    """gateway/run_turn_runner.py:1059-1064: "Sent on every transport"; with no admission
+    author the gateway names ``ctx.source``, the source of the ``user_id`` keyword too
+    (gateway/session_execution.py:174)."""
+    return {"id": gs._owner(), "name": None, "is_bot": False}
+
+
+def test_the_owners_own_turn_author_is_uploaded(plugin, server, tmp_path):
+    """The owner's turn in the daemon carries the owner as its author, on
+    ``on_turn_start`` (agent/turn_context.py:1061-1080) and ``sync_turn``
+    (run_agent.py:919-925)."""
+    home = tmp_path / "hermes-a"
+    _store(home)
+    provider = _start_gateway(_new(plugin), home)
+    author = _owner_author()
+    provider.on_turn_start(
+        1, "q", model="m", author_id=author["id"], author_name=None, author_is_bot=False
+    )
+    assert "Call remember FIRST" in provider.prefetch("x")
+    provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1), turn_author=author)
+    assert len(server.posts()) == 1
+    assert "BOARD-TEXT" in provider.system_prompt_block()
+
+
+@pytest.mark.parametrize(
+    "author",
+    [
+        _BOT,
+        {"id": "bot:relay/1f2e3d", "name": "relayed teammate", "is_bot": True},
+        {"id": "uid:0", "name": "root", "is_bot": False},
+        {"id": None, "name": "someone", "is_bot": False},
+        "not a mapping",
+    ],
+)
+def test_a_turn_author_not_the_owner_is_never_uploaded(plugin, server, tmp_path, caplog, author):
+    """tui_gateway/methods_bot_relay.py:88-96: "an unattributed turn is the HUMAN's to the
+    recipient's memory, so a bot DM must stay bot-authored"."""
     home = tmp_path / "hermes-a"
     _store(home)
     provider = _start_gateway(_new(plugin), home)
     provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(1), turn_author=None)
     assert len(server.posts()) == 1
     with caplog.at_level(logging.INFO):
-        provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(2), turn_author=_BOT)
+        provider.sync_turn(
+            "q", "a", session_id=_LOCAL, messages=_conversation(2), turn_author=author
+        )
         provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(3))
         provider.on_session_end(_conversation(3))
     assert len(server.posts()) == 1
@@ -321,6 +355,20 @@ def test_a_turn_author_is_never_uploaded_and_turns_the_session_off(
     assert "local sessions only" in json.loads(provider.handle_tool_call("recall", {}))["error"]
     said = [r.getMessage() for r in caplog.records if "off for session" in r.getMessage()]
     assert said == [f"synapse: off for session {_LOCAL}: a turn another agent or person wrote"]
+
+
+def test_a_bot_named_as_the_owner_is_still_a_bot(plugin, server, tmp_path):
+    home = tmp_path / "hermes-a"
+    _store(home)
+    provider = _start_gateway(_new(plugin), home)
+    provider.sync_turn(
+        "q",
+        "a",
+        session_id=_LOCAL,
+        messages=_conversation(1),
+        turn_author={**_owner_author(), "is_bot": True},
+    )
+    assert server.posts() == [] and provider.prefetch("x") == ""
 
 
 def test_an_authored_turn_is_off_before_its_nudge(plugin, server, tmp_path):
@@ -340,6 +388,22 @@ def test_an_authored_turn_is_off_before_its_nudge(plugin, server, tmp_path):
     assert "local sessions only" in json.loads(provider.handle_tool_call("recall", {}))["error"]
     provider.sync_turn("q", "a", session_id=_LOCAL, messages=_conversation(3))
     assert server.posts() == []
+
+
+@pytest.mark.parametrize("author", [_BOT, {"id": "1", "name": "kyle", "is_bot": False}])
+def test_any_author_in_process_is_someone_else(plugin, server, tmp_path, author):
+    """In-process a human turn has no author (agent/turn_context.py:1216-1217 resets it
+    each turn; a client's own ``_turn_author`` is refused, tui_gateway/contracts/
+    prompt_voice.py:49-51): the only authors are relayed bots and dispatched deliveries
+    (``HERMES_TURN_AUTHOR``, tools/bot_relay.py ``delivery_env``)."""
+    provider = _new(plugin)
+    provider.initialize(_RESET_CHILD, hermes_home=str(tmp_path / "hermes-a"), **_in_process())
+    provider.sync_turn("q", "a", session_id=_RESET_CHILD, messages=_conversation(1))
+    assert len(server.posts()) == 1
+    provider.sync_turn(
+        "q", "a", session_id=_RESET_CHILD, messages=_conversation(2), turn_author=author
+    )
+    assert len(server.posts()) == 1 and provider.prefetch("x") == ""
 
 
 # ---------------------------------------------------------------------------

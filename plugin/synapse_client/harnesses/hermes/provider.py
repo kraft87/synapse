@@ -36,8 +36,11 @@ The session's rows in the store (title, source, chat, and every row of that chat
 read again before the system prompt block, each nudge, upload and tool call: a session
 renamed "Bot Chat" receives other agents' messages, and ``/resume`` or compression
 switches the agent to another session, without a new instance. A turn another agent or
-person wrote (an author on ``on_turn_start``, a ``turn_author`` on ``sync_turn``) is
-never uploaded either. One that no longer passes turns the instance INERT for good.
+person wrote is never uploaded either: Hermes names a turn's author on ``on_turn_start``
+and in ``sync_turn``'s ``turn_author``. The gateway names one on every turn, the owner's
+own as the session's ``user_id`` and not a bot; in-process, a human turn has none. An
+author that is a bot, or not the session's user, means someone else wrote it. One that
+no longer passes turns the instance INERT for good.
 What is already in the system prompt (the board) cannot be taken back: Hermes stores
 the prompt and restores it verbatim for a continuing session, a renamed, branched or
 handed-off one included.
@@ -146,6 +149,9 @@ class SynapseMemoryProvider(MemoryProvider):
     #: Whether ``initialize`` got the gateway's chat identity; such a session must keep
     #: its row in the store.
     _gateway = False
+    #: The ``user_id`` the gateway bound the session to: the owner's own turns carry it
+    #: as their author. None in-process, where a human turn has no author.
+    _owner_id: str | None = None
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -208,6 +214,8 @@ class SynapseMemoryProvider(MemoryProvider):
         cwd = kwargs.get("cwd")
         cwd = cwd if isinstance(cwd, str) and cwd else verdict.cwd
         self._gateway = hs.gateway_session(kwargs)
+        user_id = kwargs.get("user_id")
+        self._owner_id = user_id if self._gateway and isinstance(user_id, str) else None
         with self._lock:
             self._mode = mode
             self._settings, self._client, self._outbox = settings, client, outbox
@@ -312,13 +320,14 @@ class SynapseMemoryProvider(MemoryProvider):
         return False
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs: Any) -> None:
-        """Note the turn's model. A turn with an author (``author_id``/``author_name``,
-        None on a human turn, agent/turn_context.py) turns the instance INERT before its
-        nudge and tools, as ``sync_turn`` does with ``turn_author``."""
+        """Note the turn's model. A turn someone else wrote (``_foreign``, from the
+        ``author_*`` keywords agent/turn_context.py passes) turns the instance INERT
+        before its nudge and tools, as ``sync_turn`` does with ``turn_author``."""
         model = kwargs.get("model")
         if isinstance(model, str):
             self._model = model
-        if kwargs.get("author_id") is not None or kwargs.get("author_name") is not None:
+        author = kwargs.get("author_id"), kwargs.get("author_name"), kwargs.get("author_is_bot")
+        if self._foreign(*author):
             self._authored()
 
     def on_session_switch(
@@ -355,12 +364,12 @@ class SynapseMemoryProvider(MemoryProvider):
         turn_author: dict[str, Any] | None = None,
     ) -> None:
         """Upload every complete turn not sent yet. Without ``messages``, the two strings
-        are the turn. A ``turn_author`` means someone other than the person at the
-        keyboard wrote the user side (Hermes passes None on a human turn, run_agent.py; a
-        bot or peer delivery names its sender, tools/bot_relay.py): nothing is uploaded and
-        the instance turns INERT for good. Never raises."""
+        are the turn. A ``turn_author`` naming someone other than the owner (``_foreign``;
+        a bot or peer delivery names its sender, tools/bot_relay.py) means nothing is
+        uploaded and the instance turns INERT for good. Never raises."""
         try:
-            if turn_author is not None:
+            author = turn_author if isinstance(turn_author, Mapping) else {"id": turn_author}
+            if self._foreign(author.get("id"), author.get("name"), author.get("is_bot")):
                 self._authored()
                 return
             if messages is None:
@@ -372,6 +381,16 @@ class SynapseMemoryProvider(MemoryProvider):
                 self._drain(SYNC_TIMEOUT)
         except Exception:
             _log().warning("synapse: sync_turn failed", exc_info=True)
+
+    def _foreign(self, author_id: Any, author_name: Any, is_bot: Any) -> bool:
+        """Whether a turn's author is someone other than the owner. No author: the owner
+        at the keyboard (in-process). The gateway names one on every turn, the owner's own
+        as ``{"id": <the session's user_id>, "is_bot": False}``
+        (gateway/run_turn_runner.py, ``ctx.source``, the source of ``user_id`` too); a bot,
+        another id, or any author where no user was bound is someone else."""
+        if author_id is None and author_name is None:
+            return False
+        return bool(is_bot) or self._owner_id is None or author_id != self._owner_id
 
     def _authored(self) -> None:
         """A turn someone else wrote reached this agent: off for good, said once."""
