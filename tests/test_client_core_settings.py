@@ -180,24 +180,23 @@ def test_a_legacy_ingest_url_still_names_the_server_and_the_ingest_endpoint(tmp_
 
 
 @pytest.mark.parametrize(
-    "raw",
+    ("raw", "stored"),
     [
-        "https://s.example/install/",
-        " http://10.0.0.5:8765/mcp ",
-        "http://[::1]:8765",
-        "https://s.example/a/b",
-        "https://s.example/ingest",
-        "https://s.example/recall",
-        "https://s.example/skills/",
-        "https://s.example/sub/recall//",
-        "https://s.example/install/mcp",
-        "http://mcp",
-        "http://mcp/mcp",
+        ("https://s.example/install/", "https://s.example"),
+        (" http://10.0.0.5:8765/mcp ", "http://10.0.0.5:8765"),
+        ("http://[::1]:8765", "http://[::1]:8765"),
+        ("https://s.example/a/b", "https://s.example/a/b"),
+        ("https://s.example/ingest", "https://s.example"),
+        ("https://s.example/recall", "https://s.example"),
+        ("https://s.example/skills/", "https://s.example"),
+        ("https://s.example/sub/recall//", "https://s.example/sub"),
+        ("https://s.example/install/mcp", "https://s.example"),
+        ("http://mcp", "http://mcp"),
+        ("http://mcp/mcp", "http://mcp"),
     ],
 )
-def test_normalize_url_matches_the_cli(scratch, raw):
-    harness = load_script("harness")
-    assert settings_mod.normalize_url(raw) == harness.normalize_url(raw)
+def test_normalize_url_keeps_the_server_and_drops_a_pasted_endpoint(raw, stored):
+    assert settings_mod.normalize_url(raw) == stored
 
 
 def test_the_cli_normalizes_a_url_with_the_cores_rule(scratch):
@@ -209,10 +208,7 @@ def test_the_cli_normalizes_a_url_with_the_cores_rule(scratch):
 @pytest.mark.parametrize(
     "raw", ["", "ftp://x", "https://s.example/?q=1", "https://a b", "HTTPS://s.example"]
 )
-def test_normalize_url_rejects_what_the_cli_rejects(scratch, raw):
-    harness = load_script("harness")
-    with pytest.raises(ValueError):
-        harness.normalize_url(raw)
+def test_normalize_url_rejects_what_is_not_a_plain_http_url(raw):
     with pytest.raises(ValueError):
         settings_mod.normalize_url(raw)
 

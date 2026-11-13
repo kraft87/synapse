@@ -108,9 +108,14 @@ is running. `synapse update` is the one command that changes the client under it
 it is two processes. The first fetches `<server>/install` and runs it. The second is the
 CLI of the client that installer made current, started through the launcher as `synapse
 update --rewire`: it refreshes every wired harness with its own code, and an adapter that
-copies the core (Hermes) copies the new one. Its exit code is the update's. A client from
-before that step (0.24.8 and older, when a server serves one) is asked for a whole
-`synapse update` instead, which every managed client has.
+copies the core (Hermes) copies the new one. Its exit code is the update's. A client
+whose CLI has no such step (0.24.8 and older) is asked for a whole `synapse update`
+instead, which every managed client has. That is the usual case for a CLI newer than
+its server, such as the Claude plugin's `synapse` against a server that is behind. The
+first process tells the two apart by reading the installed CLI for the flag, not by its
+version number, and a process started by a hand-over never hands over again, so the
+update cannot become a chain. Every later client keeps `update --rewire`: an older CLI
+still on some machine asks for it.
 
 ## Lifecycle mapping
 
