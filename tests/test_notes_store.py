@@ -100,6 +100,70 @@ def test_supersede_retires_old_and_links_lineage(conn, db_url):
     _wipe(conn)
 
 
+def _history(conn, note_id):
+    return conn.execute(
+        "SELECT op, hook, body, type, project, audience, superseded_by, source_ref "
+        "FROM notes_history WHERE note_id = %s ORDER BY id",
+        (note_id,),
+    ).fetchall()
+
+
+def _wipe_with_history(conn):
+    """Ids are reused once a fixture restarts the sequence, so the history of an earlier
+    test's note would read as this one's."""
+    _wipe(conn)
+    conn.execute("TRUNCATE notes_history")
+
+
+def test_an_update_keeps_the_replaced_text_in_notes_history(conn, db_url):
+    """schema 070: the row as it was before a text change is copied to notes_history, so
+    a restatement that was really a different note can be put back."""
+    _wipe_with_history(conn)
+    db = Database(db_url)
+    nid = _insert(db, hook="Old hook", body="Old body.", slot=3, source_ref="ep:7")
+    db.update_note(nid, hook="New hook", body="New body.", embedding=onehot(4), embed_model="t")
+    db.update_note(nid, hook="Newer hook", body="New body.", embedding=onehot(4), embed_model="t")
+    assert _history(conn, nid) == [
+        ("updated", "Old hook", "Old body.", "user", None, "personal", None, "ep:7"),
+        ("updated", "New hook", "New body.", "user", None, "personal", None, "ep:7"),
+    ]
+    db.close()
+    _wipe(conn)
+
+
+def test_a_write_that_changes_no_content_records_no_history(conn, db_url):
+    _wipe_with_history(conn)
+    db = Database(db_url)
+    nid = _insert(db, hook="Hook", body="Body.", slot=3)
+    db.update_note(nid, hook="Hook", body="Body.", embedding=onehot(5), embed_model="t2")
+    conn.execute("UPDATE notes SET source_ref = 'ep:9' WHERE id = %s", (nid,))
+    assert _history(conn, nid) == []
+    db.close()
+    _wipe(conn)
+
+
+def test_supersede_retype_and_delete_are_recorded_in_notes_history(conn, db_url):
+    """Every writer is covered because the trigger sits on the table: a retirement, a
+    change of type or project, and a plain DELETE each leave the earlier row."""
+    _wipe_with_history(conn)
+    db = Database(db_url)
+    old = _insert(db, hook="Uses provider A", slot=5)
+    new = _insert(db, hook="Moved to provider B", slot=5)
+    db.supersede_note(old, new)
+    conn.execute("UPDATE notes SET type = 'project', project = 'proj' WHERE id = %s", (old,))
+    conn.execute("DELETE FROM notes WHERE id = %s", (old,))
+    rows = _history(conn, old)
+    assert [(r[0], r[3], r[4], r[6]) for r in rows] == [
+        ("updated", "user", None, None),  # before the retirement
+        ("updated", "user", None, new),  # before the retype
+        ("deleted", "project", "proj", new),  # the row the delete removed
+    ]
+    assert all(r[1] == "Uses provider A" for r in rows)
+    assert _history(conn, new) == []
+    db.close()
+    _wipe(conn)
+
+
 def _text_and_tier(conn, note_id):
     return conn.execute(
         "SELECT hook, body, audience, superseded_by FROM notes WHERE id = %s", (note_id,)
@@ -453,11 +517,37 @@ def test_reconcile_kill_switch_updates_without_llm(monkeypatch):
     assert llm_calls == []  # the LLM was never consulted
 
 
-def test_reconcile_llm_failure_fails_open_to_update(monkeypatch):
-    result, db, llm_calls = _run(monkeypatch, candidates=[_cand(0.92)], raise_llm=True)
-    assert result["outcome"] == "updated"
-    assert db.updated and db.inserted == [] and db.superseded == []
+def test_reconcile_related_inserts_beside(monkeypatch):
+    result, db, llm_calls = _run(monkeypatch, candidates=[_cand(0.92)], relation="related")
+    assert result == {"outcome": "created", "note_id": 501, "prev_id": None, "audience": "personal"}
+    assert len(db.inserted) == 1 and db.updated == [] and db.superseded == []
     assert len(llm_calls) == 1
+
+
+def test_reconcile_llm_failure_inserts_and_touches_nothing(monkeypatch):
+    result, db, llm_calls = _run(monkeypatch, candidates=[_cand(0.92)], raise_llm=True)
+    assert result["outcome"] == "created"
+    assert len(db.inserted) == 1 and db.updated == [] and db.superseded == []
+    assert len(llm_calls) == 1
+
+
+def test_reconcile_identical_text_is_same_without_a_call(monkeypatch):
+    cand = _cand(0.99) | {"hook": "User prefers light mode", "body": "New body."}
+    result, db, llm_calls = _run(monkeypatch, candidates=[cand], raise_llm=True)
+    assert result["outcome"] == "updated"
+    assert db.updated and db.inserted == [] and llm_calls == []
+
+
+@pytest.mark.parametrize("relation", ["same", "contradicts", "related"])
+def test_parse_relation_accepts_the_three_answers(relation):
+    assert notes_mod._parse_relation(f'{{"relation": "{relation}"}}') == relation
+
+
+def test_parse_relation_rejects_anything_else():
+    from ingestion.llm_client import MalformedResponseError
+
+    with pytest.raises(MalformedResponseError):
+        notes_mod._parse_relation('{"relation": "duplicate"}')
 
 
 def test_reconcile_threshold_env_override(monkeypatch):

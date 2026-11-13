@@ -238,14 +238,43 @@ def test_confirm_kill_switch_updates_without_llm(env, monkeypatch):
     assert env.llm_calls == []
 
 
-def test_llm_failure_fails_open_to_update(env):
+def test_high_sim_related_keeps_both_notes(env):
+    """A new note on the same topic that records its own thing (a second result, a later
+    event) is stored beside the old one, which keeps its text."""
     old = _seed_note(env, slot=1)
+    before = _note_row(env, old)
+    env.emb.mapping["User prefers light mode"] = 1
+    env.relation["value"] = "related"
+
+    out = _remember(hook="User prefers light mode", body="B.", type="user")
+    assert out["outcome"] == "created" and out["note_id"] != old
+    assert _note_row(env, old) == before  # text untouched, still live
+    assert _note_row(env, out["note_id"])[5] is None
+    assert len(env.llm_calls) == 1
+
+
+def test_llm_failure_keeps_both_notes(env):
+    """A confirm call that fails never replaces stored text: the new note is inserted."""
+    old = _seed_note(env, slot=1)
+    before = _note_row(env, old)
     env.emb.mapping["User prefers light mode"] = 1
     env.relation["raise"] = True
 
     out = _remember(hook="User prefers light mode", body="B.", type="user")
-    assert out["outcome"] == "updated" and out["note_id"] == old
+    assert out["outcome"] == "created" and out["note_id"] != old
+    assert _note_row(env, old) == before
     assert len(env.llm_calls) == 1
+
+
+def test_an_identical_note_updates_without_a_confirm_call(env):
+    """The same hook and body again is a restatement by definition, so a replayed write
+    converges on the stored note even when the confirm call would fail."""
+    first = _remember(hook="User prefers dark mode", body="B.", type="user")
+    env.relation["raise"] = True
+
+    out = _remember(hook="User prefers dark mode", body="B.", type="user")
+    assert out["outcome"] == "updated" and out["note_id"] == first["note_id"]
+    assert env.llm_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +383,9 @@ def test_notes_deps_llm_construction_failure_degrades_to_none(monkeypatch):
     assert llm is None
 
 
-def test_llm_none_collapses_confirm_to_update(env, monkeypatch):
+def test_llm_none_keeps_both_notes(env, monkeypatch):
     # End-to-end with the REAL parse_with_retry and llm=None: the confirm call
-    # raises inside _confirm_relation's blanket except and collapses to UPDATE.
+    # raises inside _confirm_relation's blanket except and the note is inserted.
     from ingestion.llm_client import parse_with_retry as _real_parse
 
     monkeypatch.setattr(notes_mod, "parse_with_retry", _real_parse)
@@ -366,4 +395,4 @@ def test_llm_none_collapses_confirm_to_update(env, monkeypatch):
 
     out = _remember(hook="User prefers light mode", body="B.", type="user")
     assert out["status"] == "ok"
-    assert out["outcome"] == "updated" and out["note_id"] == old
+    assert out["outcome"] == "created" and out["note_id"] != old
